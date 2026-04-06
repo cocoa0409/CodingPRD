@@ -1,9 +1,9 @@
 ---
-name: prd-bench-generator
-description: Generate PRD-based coding benchmarks from a scenario description. Produces structured seed tables (entity model, state machines, calculations, validations, API endpoints, error catalog), a natural-language PRD, and black-box test suite. Use when the user wants to create a new PRD benchmark, coding challenge, or LLM evaluation task.
+name: prd-bench-scaffold-generator
+description: Generate structured seed tables (entity model, state machines, calculations, validations, API endpoints, error catalog, RBAC) from a scenario description. These seed tables serve as the single source of truth for downstream PRD generation, test suite generation, and reference implementation.
 ---
 
-# PRD Benchmark Generator
+# PRD Benchmark Scaffold Generator
 
 ## Input / Output
 
@@ -11,319 +11,408 @@ description: Generate PRD-based coding benchmarks from a scenario description. P
 
 User provides two things:
 
-1. **场景简述**（scenario）：一段自然语言描述，说明要构建什么系统、涉及哪些角色和核心流程。例如："医院排班调度系统，管理治疗计划、轮班、手术操作和医疗资源分配，需要预算控制和患者安全评分。"
+1. **Scenario description**: A natural-language description of the system to build, including roles and core workflows.
 
-2. **输出文件路径**（output_path）：生成的 YAML 文件要保存到哪里。例如：`./benchmarks/hospital-shifts.yaml`
+2. **Output file path**: Where to save the generated YAML file. Example: `./benchmarks/hospital-shifts.yaml`
 
 ### Output
 
-一个完整的 YAML 文件，保存到用户指定的路径，包含以下 7 个顶层 section：
+A complete YAML file saved to the user-specified path, containing 7 top-level sections:
 
 ```yaml
-scenario: "用户提供的场景简述"
-domain_name: "短横线命名的领域名"
-api_prefix: "/顶层资源路径"
+scenario: "User-provided scenario description"
+domain_name: "kebab-case-domain-name"
+api_prefix: "/top-level-resource-path"
+complexity_profile: { ... }   # Selected archetype and structural dimensions
 
-entities:        # 表1: 实体关系表 — 所有实体、字段、类型、层级
-state_machines:  # 表2: 状态机表 — 每个有状态的实体的完整状态图
-calculations:    # 表3: 计算规则表 — 所有公式、常量、变体
-validations:     # 表4: 验证规则表 — 按优先级排序的校验链
-endpoints:       # 表5: API端点表 — 所有端点的方法、路径、角色、输入输出
-errors:          # 表6: 错误码目录 — 所有错误码及触发条件
-roles:           # 表7: RBAC矩阵 — 角色和专属/共享权限
+entities:        # Table 1: Entity-Relationship Table
+state_machines:  # Table 2: State Machine Table
+calculations:    # Table 3: Calculation Rules Table
+validations:     # Table 4: Validation Rules Table (ordered by priority)
+endpoints:       # Table 5: API Endpoint Table
+errors:          # Table 6: Error Code Catalog
+roles:           # Table 7: RBAC Matrix
 ```
 
-每个 section 的详细结构见下方 Phase 1。完整示例参见 [example-hospital-shifts.yaml](example-hospital-shifts.yaml)。
+For a completed example, see [example-hospital-shifts-v1.yaml](example-hospital-shifts-v1.yaml).
+For a blank template, see [seed-tables-template.yaml](seed-tables-template.yaml).
 
-## Workflow
-
-```
-Phase 1: Seed Tables    → 从场景生成 7 张结构化表，输出为 YAML 文件
-Phase 2: PRD            → 从 YAML 生成自然语言 PRD（后续步骤，非本 skill 直接输出）
-Phase 3: Test Artifacts → 从 YAML 生成类型定义、API client、测试用例（后续步骤）
-```
-
-本 skill 的核心产出是 **Phase 1 的 YAML 文件**。Phase 2 和 Phase 3 是基于该文件的下游加工。
-
-Copy this checklist and track progress:
+## Generation Checklist
 
 ```
-Benchmark Generation Progress:
-- [ ] Phase 1.1: Entity-Relationship Table
-- [ ] Phase 1.2: State Machine Table
-- [ ] Phase 1.3: Calculation Rules Table
-- [ ] Phase 1.4: Validation Rules Table (ordered)
-- [ ] Phase 1.5: API Endpoint Table
-- [ ] Phase 1.6: Error Code Catalog
-- [ ] Phase 1.7: RBAC Matrix
-- [ ] Phase 2: PRD generation (downstream)
-- [ ] Phase 3: Test artifacts (downstream)
+- [ ] 0: Select complexity profile (§Step 0)
+- [ ] 1.1: Entity-Relationship Table
+- [ ] 1.2: State Machine Table
+- [ ] 1.3: Calculation Rules Table
+- [ ] 1.4: Validation Rules Table (ordered)
+- [ ] 1.5: API Endpoint Table
+- [ ] 1.6: Error Code Catalog
+- [ ] 1.7: RBAC Matrix
+- [ ] Final: Quality + Diversity check (§Quality Checklist)
 ```
 
 ---
 
-## Phase 1: Generate Seed Tables
+## Step 0: Complexity Profile Selection
 
-From the user's scenario, generate these tables. They are the **single source of truth** — all downstream artifacts derive from them.
+Before generating tables, select the structural DNA of the benchmark. This is the most important step — it determines the fundamental character of the challenge and prevents convergence toward a single template.
+
+### 0.1 Primary Archetypes
+
+Each archetype represents a fundamentally different core challenge. Choose ONE primary archetype, optionally blend with a secondary.
+
+| Archetype | Core challenge | What makes it hard | Example domains |
+|-----------|---------------|-------------------|-----------------|
+| **Ledger reconciliation** | Same data, two algorithms, different results | Forward-looking vs chronological produce divergent costs for identical inputs | Hospital billing, insurance claims, tax withholding |
+| **Graph constraint** | Entities form a DAG with dependency/ordering rules | Cycle detection, transitive closure, conditional propagation | Course prerequisites, build pipelines, supply chain BOM |
+| **Event sourcing** | State derived by replaying an ordered event stream | Snapshot invalidation, late-arriving events, retroactive corrections | Order lifecycle + refunds, audit reconstruction, version history |
+| **Multi-party negotiation** | Multiple independent actors must reach agreement | Quorum logic, timeout/escalation, conditional delegation, veto power | Contract approval, loan origination, committee voting, peer review |
+| **Temporal windowing** | Overlapping/adjacent time intervals with gap rules | Half-open vs closed intervals, merge/split semantics, cross-resource scheduling | Room booking, spectrum allocation, maintenance windows |
+| **Quota / allocation** | Finite pool competed for, reserved, committed, released | Fragmentation, over-subscription policies, priority preemption, waterfall fallback | Cloud resource quotas, inventory reservation, seat assignment |
+| **Pricing engine** | Dynamic pricing based on multi-dimensional rules | Tiered rates, volume discounts, time-of-use, promotional stacking, rounding traps | Utility billing, SaaS metering, airline yield management |
+| **Workflow orchestration** | Configurable multi-step pipelines with branching | Conditional routing, parallel fan-out/fan-in, compensation on failure, idempotency | CI/CD pipelines, document processing, onboarding flows |
+| **Access control matrix** | Fine-grained, context-dependent permissions | Attribute-based rules, delegation chains, temporary grants, scope inheritance | Document sharing, healthcare data access, multi-tenant SaaS |
+| **Compliance / audit** | Actions constrained by regulatory rules with audit trail | Mandatory cooling-off periods, segregation of duties, tamper-evident logs | Financial trading, pharmaceutical dispensing, government procurement |
+
+### 0.2 Cross-Cutting Complexity Layers
+
+These are independent difficulty dimensions that can be **layered onto any archetype**. Select 2–4 that fit the scenario:
+
+| Layer | What it adds | Difficulty mechanism |
+|-------|-------------|---------------------|
+| **Optimistic concurrency** | Version-based conflict detection | Stale-data races, retry semantics |
+| **Cascading side effects** | One mutation triggers chain of dependent updates | N-level propagation, ordering sensitivity, partial failure |
+| **Dual-variant calculation** | Same inputs, two valid algorithms, different outputs | Provisional vs final, optimistic vs pessimistic, estimate vs actual |
+| **Soft delete / archival** | Resources are deactivated but still queryable | Filter semantics (include archived?), referential integrity with archived parents |
+| **Idempotency** | Repeated identical requests produce same result | Idempotency keys, at-least-once delivery, duplicate detection |
+| **Pagination with filtering** | List endpoints support complex query parameters | Filter + sort + paginate interaction, cursor vs offset, consistency under mutation |
+| **Bulk operations** | Single request affects multiple resources | Partial success/failure, transactional vs best-effort, rollback semantics |
+| **Scheduled / deferred actions** | Actions take effect at a future time | Clock dependency, cancellation before execution, what-if projections |
+| **Multi-tenancy isolation** | Resources partitioned by tenant/scope | Cross-tenant leakage prevention, tenant-scoped uniqueness, shared vs private resources |
+| **Rate / threshold triggers** | Behavior changes at configurable breakpoints | Boundary precision (>=  vs >), cumulative vs instantaneous, threshold reset |
+| **Derived field reconciliation** | Denormalized fields must stay consistent with source data | When to recompute, stale cache detection, consistency on partial update |
+| **Conditional feature flags** | Behavior varies based on entity-level configuration | Combinatorial explosion of code paths, defaults vs overrides, migration from old behavior |
+
+### 0.3 Structural Dimensions
+
+Independent axes that shape the scaffold's skeleton. Let the scenario dictate — do NOT default to any single configuration:
+
+```yaml
+complexity_profile:
+  primary_archetype: <one from §0.1>
+  secondary_archetype: null | <another from §0.1>
+  complexity_layers: [<2-4 from §0.2>]
+
+  entity_topology: hierarchical | flat | graph | hybrid
+  # hierarchical: strict parent-child tree (hospital-shifts)
+  # flat: peer entities with foreign key references (no nesting in URL paths)
+  # graph: many-to-many, DAG, or cyclic references
+  # hybrid: mix of above (e.g., tree with cross-cutting association entities)
+
+  state_machine_shape: linear | branching | cyclic | parallel | compound
+  # linear: A→B→C (simple pipeline)
+  # branching: fork/join, approve-or-reject
+  # cyclic: A→B→A allowed (revision loops, negotiation rounds)
+  # parallel: independent state dimensions on same entity (payment_status × fulfillment_status)
+  # compound: entity state depends on aggregate state of children
+
+  relationship_patterns:
+    # Check all that apply:
+    # - one_to_many: parent has many children
+    # - many_to_many: junction/association entities
+    # - self_referential: entity references itself (tree, linked list)
+    # - polymorphic: one field can reference different entity types
+    # - cross_aggregate: reference across aggregate boundaries
+
+  role_model: approval_chain | peer_roles | hierarchical_override | delegated_authority
+  # approval_chain: Requester → Reviewer → Approver
+  # peer_roles: each role owns different resource types
+  # hierarchical_override: admin superset + override power
+  # delegated_authority: roles can temporarily grant permissions to others
+
+  consistency_model: immediate | eventual | saga
+  # immediate: all changes atomic in single request
+  # eventual: denormalized fields reconciled asynchronously or on read
+  # saga: multi-step workflow with compensation on failure
+```
+
+### 0.4 Difficulty Calibration
+
+Benchmarks exist to test LLM coding ability. Choose a difficulty target:
+
+| Level | Entity count | Endpoint count | Error codes | Calculation variants | State machines | Typical token budget |
+|-------|-------------|---------------|-------------|---------------------|---------------|---------------------|
+| **Starter** | 2–3 | 8–15 | 8–15 | 0–1 | 1 simple | ~15k |
+| **Intermediate** | 4–6 | 15–25 | 15–25 | 1–2 | 2–3 with cascades | ~30k |
+| **Advanced** | 6–10 | 25–40 | 25–40 | 2–3 | 3–5 with reverts + auto-transitions | ~50k |
+| **Expert** | 8–15 | 35–60 | 35–60 | 3+ | 4+ with cycles or parallel dimensions | ~80k |
+
+These are guidelines, not rules. A 3-entity benchmark with one fiendishly tricky calculation can be harder than a 10-entity CRUD app.
+
+**What actually makes a benchmark hard (in order of impact):**
+1. Calculations where two valid interpretations of the same prose produce different numbers
+2. Side effect chains that span 3+ entities and depend on execution order
+3. Validation priority conflicts where the "correct" error depends on check ordering
+4. State transitions where the set of valid next-states depends on sibling/child state
+5. Edge cases at exact boundaries (>=  vs >, empty sets, zero quantities)
+
+---
+
+## Table Specifications
 
 ### 1.1 Entity-Relationship Table
-
-Define every entity, its fields, types, and hierarchy.
 
 ```yaml
 entities:
   - name: EntityName
     parent: ParentEntity | null
+    common_fields: true | false
     fields:
       - name: field_name
-        type: string | number | boolean | enum | datetime
+        type: string | number | integer | boolean | enum | datetime | array | object
         source: input | computed | system
         description: brief purpose
-        constraints: optional validation rules
-    common_fields: true  # auto-include id, created_at, updated_at, version
+        default: optional default value
+        constraints: optional constraint notes
 ```
 
 **Design principles:**
-- 4–8 entities (enough for hierarchy, not overwhelming)
-- At least one entity with computed fields (forces LLM to implement calculation)
-- At least one entity with a ledger/balance pattern (running total that updates on events)
-- Field names must be explicit — these will appear as backticked terms in PRD
+- Entity count follows scenario complexity — don't inflate or compress
+- At least one entity with computed fields that derive from cross-entity data
+- Field names must be explicit — downstream PRD will reference them in prose
+- `common_fields: false` for immutable/append-only resources (event logs, pairings)
+- Consider whether the entity is a **resource** (has lifecycle), **event** (append-only log), or **configuration** (rarely changes)
+
+**Topology patterns:**
+
+| Pattern | Structure | URL shape | When to use |
+|---------|-----------|-----------|-------------|
+| Strict hierarchy | A → B → C (tree) | `/a/{id}/b/{id}/c/{id}` | Clear ownership chain |
+| Flat with references | A, B, C (FK links) | `/a/{id}`, `/b/{id}` with `a_id` in body | Peer entities, many-to-many |
+| Hybrid | Tree + cross-cutting associations | Mix of nested + flat | When some entities span across the tree |
+| Star schema | Central entity with many satellites | `/central/{id}/satellite-type` | Analytics/reporting focused |
+| Event log | Append-only children under a parent | `/parent/{id}/events` | Audit trail, sourced state |
 
 ### 1.2 State Machine Table
-
-For each entity with a `status` field, define the full state graph.
 
 ```yaml
 state_machines:
   - entity: EntityName
-    states: [STATE_A, STATE_B, STATE_C]
+    initial_state: STATE_A
+    terminal_states: [STATE_X, STATE_Y]
     transitions:
       - from: STATE_A
         to: STATE_B
-        trigger: endpoint_name
-        actor: RoleName
-        preconditions: [list of checks]
-        side_effects: [list of cascading changes]
+        trigger: "POST /endpoint or system event description"
+        actor: RoleName | system
+        preconditions: [checks that must pass]
+        side_effects: [cascading changes to this or other entities]
+        note: optional clarification
 ```
 
-**Design principles:**
-- Each entity should have 3–6 states
-- At least one "cascade" transition (parent state change affects children)
-- At least one "revert" transition (e.g., cancel → reopen parent)
-- Terminal states should be clearly marked
+**Shape patterns:**
+
+| Shape | Diagram | Characteristics | When to use |
+|-------|---------|----------------|-------------|
+| Linear pipeline | A→B→C→D | No branching, no going back | Simple approval, manufacturing steps |
+| Diamond (fork-join) | A→{B,C}→D | Parallel paths that converge | Parallel approvals, split-then-merge |
+| Branching with revert | A→B→C, B→A | Forward + rollback | Review/reject cycles |
+| Cyclic | A→B→C→A | Loops allowed | Negotiation rounds, iterative refinement |
+| Parallel dimensions | (payment: P1→P2→P3) × (shipping: S1→S2→S3) | Independent state axes on one entity | Order with payment + fulfillment |
+| Compound/aggregate | Parent state = f(children states) | Parent auto-transitions based on child states | Project = f(task statuses) |
+| Guarded | A→B only if sibling entity in state X | Cross-entity preconditions | Dependent workflows |
+
+**Side effect patterns:**
+
+| Pattern | Description | Example |
+|---------|-------------|---------|
+| Cascade down | Parent change → children change | Cancel project → cancel all tasks |
+| Bubble up | Child change → parent re-evaluates | All tasks done → project auto-completes |
+| Cross-entity | Entity A change → entity B adjusts | Assignment cancel → procedure reverts, rotation demotes |
+| Ledger sync | State change → derived field on ancestor recalculated | Assignment created → plan.cost_balance debited |
+| Conditional cascade | Side effect depends on child's current state | Only cancel non-terminal children |
+| Compensation | Undo side effects of a previous transition | Reject → refund cost + revert safety score |
 
 ### 1.3 Calculation Rules Table
-
-Define every formula the system must compute. This is the core difficulty source.
 
 ```yaml
 calculations:
   - name: rule_name
-    trigger: when this calculation runs
-    algorithm: forward_looking | chronological | aggregation | threshold
+    trigger: "when this calculation runs"
+    algorithm: <algorithm type>
     formula: |
-      pseudocode or mathematical expression
+      pseudocode
+    input_set: "description of which entities/states are included"
     constants:
-      THRESHOLD: 6000
-      MULTIPLIER: 2
-      PRECISION: 2 decimal places, round_half_up
+      KEY: value
+    precision: "2 decimal places, round_half_up"
     variants:
-      - name: variant_name (e.g., provisional vs final)
-        difference: how this variant diverges
+      - name: variant_name
+        when: "context where this variant applies"
+        difference: "how it diverges from the base"
 ```
 
-**Design principles:**
-- At least one calculation with two variants that produce different results for the same data (core difficulty)
-- Include specific numerical constants (LLM must extract these from prose)
-- Define precision/rounding rules explicitly
+**Algorithm types (extensible — add domain-specific ones):**
+
+| Type | Description | Difficulty source |
+|------|-------------|-------------------|
+| `forward_looking` | Estimate based on projected future state | What counts as "projected"? Inclusion set ambiguity |
+| `chronological` | Process in time order, running accumulator | Order-dependent results, tie-breaking rules |
+| `aggregation` | Running totals, sums, counts, averages | Incremental update vs full recompute, consistency |
+| `threshold` | Behavior changes at breakpoints | Boundary precision (>= vs >), partial crossing |
+| `topological` | Graph traversal order determines result | Cycle handling, disconnected components |
+| `projection` | Derive current state from event replay | Late events, snapshot optimization |
+| `interval_merge` | Combine overlapping time windows | Boundary semantics, gap detection |
+| `tiered_pricing` | Rate changes at volume breakpoints | Marginal vs average rate, tier boundary allocation |
+| `weighted_scoring` | Multi-factor score with configurable weights | Normalization, rounding accumulation, weight changes |
+| `decay_function` | Value diminishes over time/usage | Continuous vs step decay, reset events |
+| `constraint_propagation` | Change in one variable forces changes in others | Propagation order, fixed-point convergence |
+| `waterfall_allocation` | Distribute a fixed amount across ordered buckets | Overflow handling, priority ordering, rounding remainders |
+
+**What makes a calculation rule a good benchmark challenge:**
+- Two variants (e.g., provisional vs final) that produce **different results for identical data**
+- Input set that depends on **state filtering** (which statuses to include/exclude)
+- A **reset mechanism** that changes the baseline (servicing resets usage, payment resets balance)
+- **Order sensitivity** — processing the same items in different orders yields different results
+- **Boundary precision** — exact behavior at threshold boundaries (does 6000 trigger, or 6001?)
 
 ### 1.4 Validation Rules Table (Ordered by Priority)
 
 ```yaml
 validations:
   - priority: 1
-    check: header_presence
-    error: ERR_MISSING_HEADER
-    http_status: 400
-  - priority: 2
-    check: role_permission
-    error: ERR_INSUFFICIENT_PERMISSIONS
-    http_status: 403
-  # ... safety checks before fiscal checks ...
+    category: auth | existence | state | business_safety | business_fiscal | business_constraint | business_temporal | business_referential
+    check: "description of what to validate"
+    error_id: ERR_SOMETHING
+    http_status: 400 | 401 | 402 | 403 | 404 | 409 | 422
+    applies_to: "which endpoints or 'all'"
 ```
 
-**Design principles:**
-- Order matters — tests will verify "when two conditions fail, which error wins"
-- Group: auth → existence → state → business-safety → business-fiscal
-- 15–30 error codes total
+**Standard priority grouping (customize per domain):**
+
+```
+1. Authentication (headers present and valid)
+2. Authorization (role permitted for this operation)
+3. Existence (referenced resources exist, validated left-to-right in path)
+4. State preconditions (target resource in correct state for this operation)
+5. Business rules — ordered by domain priority:
+   a. Safety / compliance / regulatory (if applicable)
+   b. Constraint satisfaction (graph deps, temporal conflicts, uniqueness)
+   c. Capacity / quota / budget (fiscal checks last)
+```
+
+The ordering within business rules is domain-specific. In a hospital system, safety checks precede budget checks. In a financial system, compliance checks might precede fraud checks. In an inventory system, availability checks might precede pricing checks.
+
+**Validation patterns to consider:**
+
+| Pattern | Description | Difficulty |
+|---------|-------------|-----------|
+| Priority ordering | Two checks fail simultaneously — which error wins? | Medium |
+| Cascading validation | Check A depends on result of check B | Medium |
+| Cross-entity validation | Validity depends on state of a different entity | High |
+| Temporal validation | Valid now but would create future conflict | High |
+| Aggregate validation | Valid individually but invalid collectively (e.g., total exceeds limit) | High |
+| Conditional validation | Rules change based on entity configuration/flags | High |
 
 ### 1.5 API Endpoint Table
 
 ```yaml
 endpoints:
-  - method: POST
-    path: /resource-name
-    description: Create a new resource
-    authorized_roles: [RoleA]
-    request_body: [field_name: type]
-    response_body: ResourceName object
-    success_code: 201
+  - method: POST | GET | PUT | PATCH | DELETE
+    path: "/resource-path"
+    description: "what it does"
+    roles: [RoleA, RoleB]
+    code: 200 | 201 | 204
+    input: [field_name, other_field?]
+    output: ResourceName | ResourceName[] | null
     side_effects: [triggered calculations or state changes]
 ```
 
 **Design principles:**
-- RESTful nested paths reflecting entity hierarchy
-- 20–30 endpoints
-- Include both CRUD and action endpoints (e.g., `/activate`, `/cancel`)
-- Define response envelope format (meta + data pattern)
+- URL structure reflects entity topology (nested for hierarchical, flat for peer)
+- Include action endpoints (e.g., `/activate`, `/cancel`, `/approve`) — not just CRUD
+- Mutation endpoints accept optional `version?` for OCC, unless resource is immutable
+- Not every entity needs full CRUD — immutable resources may only have create + read
+- Consider whether list endpoints need filtering/sorting parameters
+
+**Endpoint pattern variety:**
+
+| Pattern | Example | When to use |
+|---------|---------|-------------|
+| Standard CRUD | POST/GET/PUT/DELETE /resources | Basic entity management |
+| Action endpoint | POST /resources/{id}/activate | State transition triggers |
+| Bulk action | POST /resources/bulk-approve | Multiple resources at once |
+| Nested creation | POST /parent/{id}/children | Child within parent context |
+| Cross-reference | POST /resources/{id}/link/{otherId} | Association between peers |
+| Computed read | GET /resources/{id}/summary | Returns derived/aggregated data |
+| Conditional action | POST /resources/{id}/escalate | Only valid under certain conditions |
 
 ### 1.6 Error Code Catalog
 
 ```yaml
 errors:
   - id: ERR_DESCRIPTIVE_NAME
-    http_status: 400 | 402 | 403 | 404 | 409
-    triggered_by: concise description of condition
+    http: 400 | 401 | 402 | 403 | 404 | 409 | 422
+    condition: "concise description of trigger condition"
 ```
+
+**Design principles:**
+- Every error must be triggerable by at least one endpoint
+- Use domain-specific names (e.g., `ERR_PREREQUISITE_NOT_MET` not `ERR_INVALID_STATE`)
+- Group logically: auth errors, not-found errors, state errors, business errors
+- Include boundary-condition errors (e.g., `ERR_BUDGET_EXCEEDED` vs `ERR_BUDGET_WOULD_EXCEED`)
 
 ### 1.7 RBAC Matrix
 
 ```yaml
 roles:
   - name: RoleName
-    exclusive_operations: [operations only this role can do]
-    shared_operations: [operations shared with others]
+    description: "role purpose"
+    exclusive_operations: [operations only this role can perform]
+    shared_operations: [operations shared with other roles]
 ```
 
-**Design principles:**
-- 3 roles is the sweet spot
-- Each role should have exclusive operations (not just a superset hierarchy)
+**Role model patterns:**
 
----
-
-## Phase 2: Generate PRD
-
-Transform the seed tables into a natural-language PRD document.
-
-### PRD Structure Template
-
-```markdown
-# {System Name} API — Product Requirements Document
-
-## 1. Introduction
-[1 paragraph: what the system does, why it exists]
-
-## 2. Global Specifications & System-Wide Principles
-### 2.1 Authentication & Authorization
-### 2.2 Response Format
-[JSON envelope example with meta, response_type, data]
-### 2.3 Pagination
-### 2.4–2.N [One subsection per cross-cutting concern]
-
-## 3. Business Logic & Workflows
-### 3.1–3.N [One subsection per workflow/lifecycle]
-
-## 4. Endpoint Definitions
-[Table: Method | Path | Description | Authorized Roles]
-— DO NOT include request/response body columns
-
-## 5. Error Code Catalogue
-[Table: Error ID | HTTP Status Code]
-— DO NOT include triggering conditions
-```
-
-### Information Scattering Rules (Critical for Difficulty)
-
-These rules control how hard the PRD is to implement:
-
-1. **Field names in prose**: Embed using backticks in business narrative, never in a schema table
-   - ✅ "A `ChargeNurse` provides a `plan_name` and a `total_budget`"
-   - ❌ A table listing all fields
-
-2. **Split across sections**: Put different fields of the same endpoint in different sections
-   - e.g., `procedure_id` in §3.3, but `override_protocol_check` in §3.5
-
-3. **Algorithms in prose**: Describe calculation logic as narrative, never as pseudocode
-   - ✅ "the system conservatively estimates future usage..."
-   - ❌ `cost = sum(minutes) * rate * multiplier`
-
-4. **Constants inline**: Embed thresholds in explanatory sentences
-   - ✅ "requiring deep cleaning after 100 hours of operation"
-   - ❌ `MAINTENANCE_THRESHOLD = 6000 minutes`
-
-5. **Implicit relationships**: Don't state foreign keys explicitly
-   - ✅ "proposes an Assignment via a payload containing the `procedure_id`"
-   - ❌ "Assignment has a foreign key to Procedure"
-
-6. **Endpoint table is minimal**: Only Method, Path, Description, Authorized Roles
-   - Request/response bodies must be inferred from §3
-
----
-
-## Phase 3: Generate Test Artifacts
-
-### 3.1 Type Definitions
-
-Mechanically derive from Entity-Relationship Table — create an interface per entity, an enum per status/role.
-
-### 3.2 API Client
-
-Mechanically derive from API Endpoint Table — one typed method per endpoint.
-
-### 3.3 Test Scenario Design
-
-Design test cases across these categories:
-
-**Category A — CRUD & Structure (~25%)**
-- Create each resource, verify response structure
-- List with pagination, verify meta fields
-- Get by ID, 404 for non-existent
-
-**Category B — State Machines (~25%)**
-- Each valid transition: verify status changes
-- Each invalid transition: verify correct error
-- Cascade/revert effects on parent-child hierarchy
-
-**Category C — Calculations (~25%)**
-- Control all inputs precisely (cost=10.0, duration=round numbers)
-- At least one scenario where calculation variants diverge
-- Verify intermediate AND final values
-
-**Category D — Validation & Security (~15%)**
-- Dual-failure → assert higher-priority error wins
-- Boundary values: exactly at threshold, ±1
-- SQL injection, mass assignment of read-only fields
-
-**Category E — Concurrency (~10%)**
-- Race conditions on shared state
-- OCC version mismatch detection
-
-### Test Design Principles
-
-- Every test builds its own environment via API calls (pure black-box)
-- Each test creates a unique top-level resource (UUID isolation, no cleanup needed)
-- Ground truth is hand-calculated from controlled inputs, hardcoded in assertions
-- Tests must not depend on data from other tests
+| Model | Structure | Characteristics | Example |
+|-------|-----------|----------------|---------|
+| Approval chain | Requester → Reviewer → Approver | Sequential, no role can do previous role's work | Expense reports |
+| Peer roles | Role A owns type X, Role B owns type Y | Non-overlapping resource ownership | Nurse vs physician |
+| Hierarchical override | User < Manager < Admin | Each level can do everything below + more | IT helpdesk |
+| Delegated authority | Roles can grant temporary permissions | Dynamic, time-bound | On-call rotation |
+| Segregation of duties | Same person cannot do step A and step B | Compliance-driven | Financial controls |
 
 ---
 
 ## Quality Checklist
 
-Before finalizing:
+Before finalizing the YAML:
 
-- [ ] Every backticked field in PRD maps to exactly one field in Entity table
-- [ ] Every state transition has a test (positive + negative)
-- [ ] Every calculation rule has a test with hand-calculated ground truth
-- [ ] At least one test where calculation variants diverge
-- [ ] Every error code has at least one test that triggers it
-- [ ] Validation priority is tested (dual-failure scenarios)
-- [ ] No test depends on data from another test
-- [ ] All tests use API calls for setup (no DB access)
-- [ ] PRD does NOT contain schema tables or pseudocode
+**Completeness:**
+- [ ] Every entity field has type, source, and description
+- [ ] Every state transition has preconditions and side effects
+- [ ] Calculation rules specify input sets (which states are included/excluded)
+- [ ] Validation priorities are unambiguous per endpoint
+- [ ] Every error code is referenced by at least one validation or transition
+- [ ] Endpoint roles match RBAC matrix
+- [ ] All automatic/system-triggered transitions are captured
+- [ ] Side effect chains are complete (if A→B→C, all three steps are documented)
 
----
+**Difficulty:**
+- [ ] At least one calculation where two valid approaches produce different results
+- [ ] At least one side effect chain spanning 3+ entities
+- [ ] At least one validation priority conflict testable by dual-failure scenario
+- [ ] At least one boundary condition requiring exact precision (>= vs >, zero quantity, empty set)
+- [ ] At least one cross-entity state dependency (entity A's valid transitions depend on entity B's state)
 
-## Reference Materials
+**Diversity (compare against existing examples — hospital-shifts profile for reference):**
 
-- Blank seed tables template: [seed-tables-template.yaml](seed-tables-template.yaml)
-- Completed example (hospital-shifts): [example-hospital-shifts.yaml](example-hospital-shifts.yaml)
+Hospital-shifts v1 uses: ledger reconciliation archetype, strict hierarchy topology, branching-with-revert state machines, peer roles, immediate consistency.
+
+- [ ] Primary archetype differs from all existing examples
+- [ ] Entity topology uses a different pattern
+- [ ] State machine shape uses a different pattern
+- [ ] At least TWO of the three dimensions above differ
+- [ ] Core calculation challenge is structurally different (not "same formula, different constants")
+- [ ] Role model uses a different pattern
+- [ ] Validation priority ordering within business rules follows a different domain logic
