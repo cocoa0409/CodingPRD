@@ -13,7 +13,7 @@ User provides two things:
 
 1. **Scenario description**: A natural-language description of the system to build, including roles and core workflows.
 
-2. **Output file path**: Where to save the generated YAML file. Example: `./benchmarks/hospital-shifts.yaml`
+2. **Output file path**: Where to save the generated YAML file.
 
 ### Output
 
@@ -34,8 +34,8 @@ errors:          # Table 6: Error Code Catalog
 roles:           # Table 7: RBAC Matrix
 ```
 
-For a completed example, see [example-hospital-shifts-v1.yaml](example-hospital-shifts-v1.yaml).
-For a blank template, see [seed-tables-template.yaml](seed-tables-template.yaml).
+For completed examples, see the `examples/` directory (22 scaffolds covering diverse domains)
+For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tables-template.yaml).
 
 ## Generation Checklist
 
@@ -59,39 +59,45 @@ Before generating tables, select the structural DNA of the benchmark. This is th
 
 ### 0.1 Primary Archetypes
 
-Each archetype represents a fundamentally different core challenge. Choose ONE primary archetype, optionally blend with a secondary.
+Each archetype represents a fundamentally different core challenge. Choose ONE primary archetype, optionally blend with a secondary. The coverage column shows how many of the 22 reference scaffolds use each archetype — prioritize underrepresented ones for diversity.
 
-| Archetype | Core challenge | What makes it hard | Example domains |
-|-----------|---------------|-------------------|-----------------|
-| **Ledger reconciliation** | Same data, two algorithms, different results | Forward-looking vs chronological produce divergent costs for identical inputs | Hospital billing, insurance claims, tax withholding |
-| **Graph constraint** | Entities form a DAG with dependency/ordering rules | Cycle detection, transitive closure, conditional propagation | Course prerequisites, build pipelines, supply chain BOM |
-| **Event sourcing** | State derived by replaying an ordered event stream | Snapshot invalidation, late-arriving events, retroactive corrections | Order lifecycle + refunds, audit reconstruction, version history |
-| **Multi-party negotiation** | Multiple independent actors must reach agreement | Quorum logic, timeout/escalation, conditional delegation, veto power | Contract approval, loan origination, committee voting, peer review |
-| **Temporal windowing** | Overlapping/adjacent time intervals with gap rules | Half-open vs closed intervals, merge/split semantics, cross-resource scheduling | Room booking, spectrum allocation, maintenance windows |
-| **Quota / allocation** | Finite pool competed for, reserved, committed, released | Fragmentation, over-subscription policies, priority preemption, waterfall fallback | Cloud resource quotas, inventory reservation, seat assignment |
-| **Pricing engine** | Dynamic pricing based on multi-dimensional rules | Tiered rates, volume discounts, time-of-use, promotional stacking, rounding traps | Utility billing, SaaS metering, airline yield management |
-| **Workflow orchestration** | Configurable multi-step pipelines with branching | Conditional routing, parallel fan-out/fan-in, compensation on failure, idempotency | CI/CD pipelines, document processing, onboarding flows |
-| **Access control matrix** | Fine-grained, context-dependent permissions | Attribute-based rules, delegation chains, temporary grants, scope inheritance | Document sharing, healthcare data access, multi-tenant SaaS |
-| **Compliance / audit** | Actions constrained by regulatory rules with audit trail | Mandatory cooling-off periods, segregation of duties, tamper-evident logs | Financial trading, pharmaceutical dispensing, government procurement |
+| Archetype | Core challenge | What makes it hard | Example domains | Coverage |
+|-----------|---------------|-------------------|-----------------|----------|
+| **Ledger reconciliation** | Same data, two algorithms, different results | Forward-looking vs chronological produce divergent costs for identical inputs | Hospital billing, insurance claims, tax withholding | 9/22 (41%) — OVERREPRESENTED |
+| **Quota / allocation** | Finite pool competed for, reserved, committed, released | Fragmentation, over-subscription policies, priority preemption, waterfall fallback | Cloud resource quotas, inventory reservation, seat assignment | 5/22 (23%) |
+| **Graph constraint** | Entities form a DAG with dependency/ordering rules | Cycle detection, transitive closure, conditional propagation | Course prerequisites, build pipelines, supply chain BOM | 4/22 (18%) |
+| **Posture-driven gating** | Derived aggregate state gates all child operations | Posture computed from children, cascading freezes, ops-run checkpoints | Dock operations, podcast scheduling, sponsorship events | 7/22 (32%) — NEW, observed in real data |
+| **Pricing engine** | Dynamic pricing based on multi-dimensional rules | Tiered rates, volume discounts, time-of-use, promotional stacking, rounding traps | Utility billing, SaaS metering, airline yield management | 1/22 (5%) — UNDERREPRESENTED |
+| **Event sourcing** | State derived by replaying an ordered event stream | Snapshot invalidation, late-arriving events, retroactive corrections | Order lifecycle + refunds, audit reconstruction, version history | 1/22 (5%) — UNDERREPRESENTED |
+| **Access control matrix** | Fine-grained, context-dependent permissions | Attribute-based rules, delegation chains, temporary grants, scope inheritance | Document sharing, healthcare data access, multi-tenant SaaS | 1/22 (5%) — UNDERREPRESENTED |
+| **Multi-party negotiation** | Multiple independent actors must reach agreement | Quorum logic, timeout/escalation, conditional delegation, veto power | Contract approval, loan origination, committee voting, peer review | 0/22 — ABSENT |
+| **Temporal windowing** | Overlapping/adjacent time intervals with gap rules | Half-open vs closed intervals, merge/split semantics, cross-resource scheduling | Room booking, spectrum allocation, maintenance windows | 0/22 — ABSENT |
+| **Workflow orchestration** | Configurable multi-step pipelines with branching | Conditional routing, parallel fan-out/fan-in, compensation on failure, idempotency | CI/CD pipelines, document processing, onboarding flows | 0/22 — ABSENT |
+| **Compliance / audit** | Actions constrained by regulatory rules with audit trail | Mandatory cooling-off periods, segregation of duties, tamper-evident logs | Financial trading, pharmaceutical dispensing, government procurement | 0/22 — ABSENT |
+
+**Diversity guidance**: When generating a new scaffold, check the coverage column. If the scenario could fit multiple archetypes, prefer the underrepresented one. The 4 absent archetypes (multi-party negotiation, temporal windowing, workflow orchestration, compliance/audit) are high-priority targets for new scenarios.
 
 ### 0.2 Cross-Cutting Complexity Layers
 
 These are independent difficulty dimensions that can be **layered onto any archetype**. Select 2–4 that fit the scenario:
 
-| Layer | What it adds | Difficulty mechanism |
-|-------|-------------|---------------------|
-| **Optimistic concurrency** | Version-based conflict detection | Stale-data races, retry semantics |
-| **Cascading side effects** | One mutation triggers chain of dependent updates | N-level propagation, ordering sensitivity, partial failure |
-| **Dual-variant calculation** | Same inputs, two valid algorithms, different outputs | Provisional vs final, optimistic vs pessimistic, estimate vs actual |
-| **Soft delete / archival** | Resources are deactivated but still queryable | Filter semantics (include archived?), referential integrity with archived parents |
-| **Idempotency** | Repeated identical requests produce same result | Idempotency keys, at-least-once delivery, duplicate detection |
-| **Pagination with filtering** | List endpoints support complex query parameters | Filter + sort + paginate interaction, cursor vs offset, consistency under mutation |
-| **Bulk operations** | Single request affects multiple resources | Partial success/failure, transactional vs best-effort, rollback semantics |
-| **Scheduled / deferred actions** | Actions take effect at a future time | Clock dependency, cancellation before execution, what-if projections |
-| **Multi-tenancy isolation** | Resources partitioned by tenant/scope | Cross-tenant leakage prevention, tenant-scoped uniqueness, shared vs private resources |
-| **Rate / threshold triggers** | Behavior changes at configurable breakpoints | Boundary precision (>=  vs >), cumulative vs instantaneous, threshold reset |
-| **Derived field reconciliation** | Denormalized fields must stay consistent with source data | When to recompute, stale cache detection, consistency on partial update |
-| **Conditional feature flags** | Behavior varies based on entity-level configuration | Combinatorial explosion of code paths, defaults vs overrides, migration from old behavior |
+| Layer | What it adds | Difficulty mechanism | Observed in |
+|-------|-------------|---------------------|-------------|
+| **Optimistic concurrency** | Version-based conflict detection | Stale-data races, retry semantics | 18/22 scaffolds |
+| **Cascading side effects** | One mutation triggers chain of dependent updates | N-level propagation, ordering sensitivity, partial failure | 20/22 scaffolds |
+| **Dual-variant calculation** | Same inputs, two valid algorithms, different outputs | Provisional vs final, optimistic vs pessimistic, estimate vs actual | 9/22 scaffolds |
+| **Rate / threshold triggers** | Behavior changes at configurable breakpoints | Boundary precision (>= vs >), cumulative vs instantaneous, threshold reset | 10/22 scaffolds |
+| **Derived field reconciliation** | Denormalized fields must stay consistent with source data | When to recompute, stale cache detection, consistency on partial update | 15/22 scaffolds |
+| **Ops-run checkpoint** | Periodic batch operation advances system epoch | Stale expiry, waitlist promotion, posture recalculation per epoch | 7/22 scaffolds — NEW |
+| **Contagion / risk propagation** | Side effects cascade with multiplicative risk scoring | Penalty accumulation, threshold breach with override, score floor/ceiling | 6/22 scaffolds — NEW |
+| **Version-pinning on approval** | Lock reference object versions when approved | Stale reference detection, re-validation on state change | 3/22 scaffolds — NEW |
+| **Scheduled / deferred actions** | Actions take effect at a future time | Clock dependency, cancellation before execution, what-if projections | 4/22 scaffolds |
+| **Soft delete / archival** | Resources are deactivated but still queryable | Filter semantics (include archived?), referential integrity with archived parents | 3/22 scaffolds |
+| **Idempotency** | Repeated identical requests produce same result | Idempotency keys, at-least-once delivery, duplicate detection | 5/22 scaffolds |
+| **Pagination with filtering** | List endpoints support complex query parameters | Filter + sort + paginate interaction, cursor vs offset, consistency under mutation | 22/22 scaffolds |
+| **Bulk operations** | Single request affects multiple resources | Partial success/failure, transactional vs best-effort, rollback semantics | 2/22 scaffolds |
+| **Multi-tenancy isolation** | Resources partitioned by tenant/scope | Cross-tenant leakage prevention, tenant-scoped uniqueness, shared vs private resources | 3/22 scaffolds |
+| **Conditional feature flags** | Behavior varies based on entity-level configuration | Combinatorial explosion of code paths, defaults vs overrides, migration from old behavior | 1/22 scaffolds |
 
 ### 0.3 Structural Dimensions
 
@@ -105,30 +111,33 @@ complexity_profile:
 
   entity_topology: hierarchical | flat | graph | hybrid
   # hierarchical: strict parent-child tree (hospital-shifts)
-  # flat: peer entities with foreign key references (no nesting in URL paths)
-  # graph: many-to-many, DAG, or cyclic references
-  # hybrid: mix of above (e.g., tree with cross-cutting association entities)
+  # flat: peer entities with foreign key references (no nesting in URL paths) — 0% in current examples, PRIORITIZE
+  # graph: many-to-many, DAG, or cyclic references — 0% in current examples, PRIORITIZE
+  # hybrid: mix of above (e.g., tree with cross-cutting associations) — 100% of current examples, AVOID for diversity
 
-  state_machine_shape: linear | branching | cyclic | parallel | compound
-  # linear: A→B→C (simple pipeline)
-  # branching: fork/join, approve-or-reject
-  # cyclic: A→B→A allowed (revision loops, negotiation rounds)
-  # parallel: independent state dimensions on same entity (payment_status × fulfillment_status)
-  # compound: entity state depends on aggregate state of children
+  state_machine_shape: linear | branching | cyclic | parallel | compound | posture_driven
+  # linear: A→B→C (simple pipeline) — 77% of examples
+  # branching: fork/join, approve-or-reject — 0%, PRIORITIZE
+  # cyclic: A→B→A allowed (revision loops, negotiation rounds) — 0%, PRIORITIZE
+  # parallel: independent state dimensions on same entity (payment_status × fulfillment_status) — rare
+  # compound: entity state depends on aggregate state of children — 23% of examples
+  # posture_driven: derived aggregate field (OPEN/RESTRICTED/FROZEN) gates all child operations — 32% of examples, NEW
 
   relationship_patterns:
     # Check all that apply:
     # - one_to_many: parent has many children
     # - many_to_many: junction/association entities
-    # - self_referential: entity references itself (tree, linked list)
+    # - self_referential: entity references itself (tree, linked list) — 0% in examples, PRIORITIZE
     # - polymorphic: one field can reference different entity types
     # - cross_aggregate: reference across aggregate boundaries
 
-  role_model: approval_chain | peer_roles | hierarchical_override | delegated_authority
+  role_model: approval_chain | peer_roles | hierarchical_override | delegated_authority | single_role | segregation_of_duties
   # approval_chain: Requester → Reviewer → Approver
   # peer_roles: each role owns different resource types
   # hierarchical_override: admin superset + override power
   # delegated_authority: roles can temporarily grant permissions to others
+  # single_role: all operations by any authenticated user (common in simpler PRDs) — 5/22 examples
+  # segregation_of_duties: same person cannot do step A and step B — 0%, PRIORITIZE for compliance
 
   consistency_model: immediate | eventual | saga
   # immediate: all changes atomic in single request
@@ -148,6 +157,12 @@ Benchmarks exist to test LLM coding ability. Choose a difficulty target:
 | **Expert** | 8–15 | 35–60 | 35–60 | 3+ | 4+ with cycles or parallel dimensions | ~80k |
 
 These are guidelines, not rules. A 3-entity benchmark with one fiendishly tricky calculation can be harder than a 10-entity CRUD app.
+
+**Current distribution across 22 reference scaffolds:**
+- Starter: 0 (0%) — **GAP: no entry-level benchmarks exist. Prioritize creating 2–3 Starter scaffolds.**
+- Intermediate: 8 (36%)
+- Advanced: 10 (45%)
+- Expert: 4 (18%)
 
 **What actually makes a benchmark hard (in order of impact):**
 1. Calculations where two valid interpretations of the same prose produce different numbers
@@ -405,14 +420,20 @@ Before finalizing the YAML:
 - [ ] At least one boundary condition requiring exact precision (>= vs >, zero quantity, empty set)
 - [ ] At least one cross-entity state dependency (entity A's valid transitions depend on entity B's state)
 
-**Diversity (compare against existing examples — hospital-shifts profile for reference):**
+**Diversity (compare against the 22 existing example scaffolds in this directory):**
 
-Hospital-shifts v1 uses: ledger reconciliation archetype, strict hierarchy topology, branching-with-revert state machines, peer roles, immediate consistency.
+Current gaps to prioritize when creating new scaffolds:
+- Archetypes with 0 examples: multi-party negotiation, temporal windowing, workflow orchestration, compliance/audit
+- Entity topologies with 0 examples: pure flat, pure graph (all 22 are hybrid)
+- State machine shapes with 0 examples: branching (fork/join), cyclic (A→B→A)
+- Role models with 0 examples: segregation of duties
+- Difficulty levels with 0 examples: Starter (2–3 entities)
 
-- [ ] Primary archetype differs from all existing examples
-- [ ] Entity topology uses a different pattern
-- [ ] State machine shape uses a different pattern
-- [ ] At least TWO of the three dimensions above differ
-- [ ] Core calculation challenge is structurally different (not "same formula, different constants")
-- [ ] Role model uses a different pattern
-- [ ] Validation priority ordering within business rules follows a different domain logic
+Checklist:
+- [ ] Primary archetype is underrepresented (check §0.1 coverage column)
+- [ ] Entity topology is NOT hybrid (prioritize flat or graph)
+- [ ] State machine shape differs from linear (prioritize branching, cyclic, or parallel)
+- [ ] At least TWO of the three dimensions above differ from the majority
+- [ ] Core calculation challenge is structurally different (not another threshold + aggregation)
+- [ ] Role model adds diversity (prioritize segregation_of_duties or delegated_authority)
+- [ ] If scenario allows, target Starter difficulty (2–3 entities, 8–15 endpoints)
