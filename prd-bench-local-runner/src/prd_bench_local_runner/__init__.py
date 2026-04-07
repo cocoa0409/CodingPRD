@@ -1,4 +1,4 @@
-"""prd-bench-runner: Generic benchmark runner for API compliance testing."""
+"""prd-bench-local-runner: Generic benchmark runner for API compliance testing."""
 
 from .runner import BenchmarkRunner
 from .results import BenchmarkResults, TestResult

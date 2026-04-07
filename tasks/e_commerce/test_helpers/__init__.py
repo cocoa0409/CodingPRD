@@ -1,7 +1,7 @@
 """Barrel export: framework generics + e-commerce PRD-specific code."""
 
 # Framework generics (re-exported for convenience)
-from prd_bench_runner.testing import (
+from prd_bench_local_runner.testing import (
     validate_success, validate_error, validate_paginated,
     validate_error_is_one_of, get_success_data,
     is_valid_uuid, is_iso8601_timestamp,

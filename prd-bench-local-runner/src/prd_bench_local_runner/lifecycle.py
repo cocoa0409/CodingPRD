@@ -14,6 +14,7 @@ import time
 from typing import Optional
 
 import requests
+from loguru import logger
 
 from .port_utils import extract_port_from_url, kill_port
 
@@ -42,7 +43,7 @@ class ServerLifecycleManager:
     def __init__(
         self,
         start_command: str,
-        api_url: str = "http://localhost:3000",
+        api_url: str = "http://localhost:10000",
         startup_timeout: float = 30.0,
         poll_interval: float = 0.8,
         liveness_timeout: float = 0.5,
@@ -70,11 +71,11 @@ class ServerLifecycleManager:
     def start(self) -> None:
         """Start the server: kill port → spawn → poll until ready."""
         if self._process and self._process.poll() is None:
-            print("[lifecycle] Server process already running, skipping start.")
+            logger.info("Server process already running, skipping start.")
             return
 
-        print(f"[lifecycle] Starting server: {self.start_command}")
-        print(f"[lifecycle] Target: {self.api_url}")
+        logger.info(f"Starting server: {self.start_command}")
+        logger.info(f"Target: {self.api_url}")
 
         # Kill any existing process on the port
         kill_port(self._port)
@@ -100,7 +101,7 @@ class ServerLifecycleManager:
 
         # Poll until server responds
         self._poll_until_ready(self.startup_timeout)
-        print("[lifecycle] Server started successfully.")
+        logger.info("Server started successfully.")
 
     def _poll_until_ready(self, timeout: float) -> None:
         """Poll the server URL until it responds to any HTTP request."""
@@ -138,7 +139,7 @@ class ServerLifecycleManager:
         if not self._process:
             return
 
-        print("[lifecycle] Stopping server...")
+        logger.info("Stopping server...")
         pid = self._process.pid
 
         # Try graceful shutdown
@@ -146,7 +147,7 @@ class ServerLifecycleManager:
             self._process.terminate()  # SIGTERM
             self._process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            print(f"[lifecycle] SIGTERM timeout, sending SIGKILL to pid {pid}")
+            logger.warning(f"SIGTERM timeout, sending SIGKILL to pid {pid}")
             self._process.kill()  # SIGKILL
             try:
                 self._process.wait(timeout=3)
@@ -157,7 +158,7 @@ class ServerLifecycleManager:
 
         # Safety net: kill anything still on the port
         kill_port(self._port)
-        print("[lifecycle] Server stopped.")
+        logger.info("Server stopped.")
 
     def check_liveness(self) -> bool:
         """Return True if the server responds to HTTP."""
@@ -171,7 +172,7 @@ class ServerLifecycleManager:
         """If server is dead, attempt restart with shorter timeout."""
         if self.check_liveness():
             return
-        print("[lifecycle] Server not responding, attempting restart...")
+        logger.warning("Server not responding, attempting restart...")
         self.stop()
         self.start.__wrapped__ = True  # avoid recursion guard
         # Re-spawn with shorter timeout
@@ -188,9 +189,9 @@ class ServerLifecycleManager:
                 stderr=sys.stderr,
             )
             self._poll_until_ready(15.0)
-            print("[lifecycle] Server restarted successfully.")
+            logger.info("Server restarted successfully.")
         except (ServerStartError, ServerStartTimeout) as e:
-            print(f"[lifecycle] Restart failed: {e}")
+            logger.error(f"Restart failed: {e}")
 
     def _kill_process(self) -> None:
         """Force-kill the current process."""

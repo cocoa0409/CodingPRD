@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 
 def extract_port_from_url(url: str) -> int:
-    """Extract port number from a URL. Defaults to 3000 if not specified."""
+    """Extract port number from a URL. Defaults to 10000 if not specified."""
     parsed = urlparse(url)
     if parsed.port:
         return parsed.port
@@ -15,7 +15,7 @@ def extract_port_from_url(url: str) -> int:
         return 443
     if parsed.scheme == "http":
         return 80
-    return 3000
+    return 10000
 
 
 def is_port_in_use(port: int) -> bool:

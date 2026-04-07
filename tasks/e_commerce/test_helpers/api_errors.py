@@ -5,7 +5,7 @@ Defines all 42 error_id constants and registers the error_id -> HTTP status
 mapping with the generic testing framework at import time.
 """
 
-from prd_bench_runner.testing.validators import set_error_http_status_map
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
 
 # ---------------------------------------------------------------------------
 # Error ID constants

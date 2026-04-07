@@ -1,7 +1,7 @@
 """
 Pytest plugin: per-test liveness check with crash auto-restart.
 
-Registered via `pytest -p prd_bench_runner.pytest_plugin` by the TestExecutor.
+Registered via `pytest -p prd_bench_local_runner.pytest_plugin` by the TestExecutor.
 Reads configuration from environment variables set by the runner:
   _PRD_BENCH_API_URL          - server URL to check
   _PRD_BENCH_START_COMMAND    - command to restart server if crashed
@@ -18,8 +18,9 @@ import time
 
 import pytest
 import requests
+from loguru import logger
 
-_api_url = os.environ.get("_PRD_BENCH_API_URL", "http://localhost:3000")
+_api_url = os.environ.get("_PRD_BENCH_API_URL", "http://localhost:10000")
 _start_command = os.environ.get("_PRD_BENCH_START_COMMAND", "")
 _skip = os.environ.get("_PRD_BENCH_SKIP_LIFECYCLE", "false") == "true"
 
@@ -34,7 +35,7 @@ def _parse_command(command: str) -> tuple[str, str]:
 def _extract_port(url: str) -> int:
     from urllib.parse import urlparse
     parsed = urlparse(url)
-    return parsed.port or 3000
+    return parsed.port or 10000
 
 
 def _kill_port(port: int) -> None:
@@ -93,9 +94,9 @@ def pytest_runtest_setup(item):
         requests.get(_api_url, timeout=0.5)
     except (requests.ConnectionError, requests.Timeout):
         # Server is down — attempt restart
-        print(f"\n[prd-bench] Server at {_api_url} not responding, restarting...")
+        logger.warning(f"Server at {_api_url} not responding, restarting...")
         if _restart_server():
-            print("[prd-bench] Server restarted successfully.")
+            logger.info("Server restarted successfully.")
         else:
             pytest.fail(
                 f"API server at {_api_url} is not responding and restart failed. "

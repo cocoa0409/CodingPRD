@@ -5,12 +5,12 @@ Each assert_<entity>(data) function validates the structural shape and value
 constraints of an entity dict returned by the API.  Domain invariant checkers
 verify cross-field business rules.
 
-All functions use generic helpers from prd_bench_runner.testing.
+All functions use generic helpers from prd_bench_local_runner.testing.
 """
 
 import pytest
 
-from prd_bench_runner.testing import (
+from prd_bench_local_runner.testing import (
     is_valid_uuid,
     is_iso8601_timestamp,
     assert_cost_precision,

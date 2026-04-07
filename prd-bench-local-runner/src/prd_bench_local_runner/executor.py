@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from loguru import logger
+
 from .results import BenchmarkResults
 
 
@@ -19,7 +21,7 @@ class TestExecutor:
     def __init__(
         self,
         test_dir: str,
-        api_url: str = "http://localhost:3000",
+        api_url: str = "http://localhost:10000",
         per_test_timeout: int = 10,
         results_file: Optional[str] = None,
         skip_lifecycle: bool = False,
@@ -40,8 +42,8 @@ class TestExecutor:
             cmd = self._build_command(junit_path)
             env = self._build_env()
 
-            print(f"[executor] Running: {' '.join(cmd)}")
-            print(f"[executor] Test dir: {self.test_dir}")
+            logger.info(f"Running: {' '.join(cmd)}")
+            logger.info(f"Test dir: {self.test_dir}")
 
             proc = subprocess.run(
                 cmd,
@@ -69,7 +71,7 @@ class TestExecutor:
         cmd = [
             sys.executable, "-m", "pytest",
             self.test_dir,
-            "-p", "prd_bench_runner.pytest_plugin",
+            "-p", "prd_bench_local_runner.pytest_plugin",
             f"--junitxml={junit_path}",
             "-v",
             "--tb=short",
@@ -97,10 +99,10 @@ class TestExecutor:
         env["_PRD_BENCH_SKIP_LIFECYCLE"] = "true" if self.skip_lifecycle else "false"
 
         # Add paths to PYTHONPATH:
-        # 1. prd_bench_runner package (for pytest_plugin + testing utilities)
+        # 1. prd_bench_local_runner package (for pytest_plugin + testing utilities)
         # 2. Parent of test_dir (so `from test_helpers import ...` works)
         extra_paths = [
-            str(Path(__file__).parent.parent),          # prd_bench_runner src
+            str(Path(__file__).parent.parent),          # prd_bench_local_runner src
             str(Path(self.test_dir).parent.resolve()),  # parent of test_suite (contains test_helpers)
         ]
         python_path = env.get("PYTHONPATH", "")

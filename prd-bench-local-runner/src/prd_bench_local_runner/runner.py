@@ -22,7 +22,7 @@ class BenchmarkRunner:
         self,
         start_command: Optional[str] = None,
         test_dir: str = "./test_suite",
-        api_url: str = "http://localhost:3000",
+        api_url: str = "http://localhost:10000",
         startup_timeout: float = 30.0,
         per_test_timeout: int = 10,
         results_file: Optional[str] = None,

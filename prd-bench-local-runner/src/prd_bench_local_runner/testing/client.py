@@ -6,7 +6,7 @@ URL construction). Subclass this and add one method per API endpoint.
 
 Usage:
 
-    from prd_bench_runner.testing import GenericApiClient
+    from prd_bench_local_runner.testing import GenericApiClient
 
     class ApiClient(GenericApiClient):
         def create_order(self, payload, headers):
@@ -31,7 +31,7 @@ class GenericApiClient:
 
     def __init__(self, base_url: Optional[str] = None):
         self.base_url = base_url or os.environ.get(
-            "API_BASE_URL", "http://localhost:3000"
+            "API_BASE_URL", "http://localhost:10000"
         )
         self.session = requests.Session()
 

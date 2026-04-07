@@ -4,7 +4,7 @@ E-Commerce Marketplace — pre-built test user headers (scaffold Table 7 RBAC).
 Each variable is a dict ready to pass as ``headers=`` to httpx / requests.
 """
 
-from prd_bench_runner.testing import build_user_headers
+from prd_bench_local_runner.testing import build_user_headers
 
 # ---------------------------------------------------------------------------
 # User IDs  (stable UUIDs for deterministic tests)

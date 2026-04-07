@@ -1,5 +1,5 @@
 """
-prd_bench_runner.testing — Generic testing utilities for API compliance tests.
+prd_bench_local_runner.testing — Generic testing utilities for API compliance tests.
 
 Provides domain-agnostic infrastructure that every test suite needs:
 - GenericApiClient: base HTTP client with _request() method

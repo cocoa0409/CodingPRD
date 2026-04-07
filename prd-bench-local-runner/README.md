@@ -1,4 +1,4 @@
-# prd-bench-runner
+# prd-bench-local-runner
 
 Generic benchmark runner for API compliance testing. Manages the full test lifecycle: server startup, health monitoring, pytest execution, crash recovery, graceful shutdown, and structured result collection.
 
@@ -14,12 +14,12 @@ pip install -e .
 
 ```bash
 # Basic: start server + run tests + stop server
-prd-bench-run \
+prd-bench-local-run \
   --start-command "cd my-impl && python app.py" \
   --test-dir ./test_suite
 
 # Full options
-prd-bench-run \
+prd-bench-local-run \
   --start-command "cd my-impl && python app.py" \
   --test-dir ./test_suite \
   --api-url http://localhost:8080 \
@@ -28,13 +28,13 @@ prd-bench-run \
   --results-file results.json
 
 # Server already running externally
-prd-bench-run --test-dir ./test_suite --skip-lifecycle
+prd-bench-local-run --test-dir ./test_suite --skip-lifecycle
 ```
 
 ### Programmatic
 
 ```python
-from prd_bench_runner import BenchmarkRunner
+from prd_bench_local_runner import BenchmarkRunner
 
 runner = BenchmarkRunner(
     start_command="cd my-impl && python app.py",
@@ -48,7 +48,7 @@ print(f"{results.passed}/{results.total} passed")
 ## What it does
 
 ```
-prd-bench-run --start-command "..." --test-dir ./test_suite
+prd-bench-local-run --start-command "..." --test-dir ./test_suite
         │
         ▼
 ┌─ Kill port ──────────────────────────┐
@@ -68,12 +68,12 @@ prd-bench-run --start-command "..." --test-dir ./test_suite
    results.json (structured)
 ```
 
-## Testing Utilities (`prd_bench_runner.testing`)
+## Testing Utilities (`prd_bench_local_runner.testing`)
 
 The `testing` subpackage provides reusable infrastructure for writing API compliance tests:
 
 ```python
-from prd_bench_runner.testing import (
+from prd_bench_local_runner.testing import (
     GenericApiClient,          # Base HTTP client — subclass and add endpoint methods
     validate_success,          # Validate success response envelope → returns data
     validate_error,            # Validate error envelope + cross-check HTTP status

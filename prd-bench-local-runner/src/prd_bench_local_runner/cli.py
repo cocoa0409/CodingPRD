@@ -1,14 +1,16 @@
-"""CLI entry point for prd-bench-run."""
+"""CLI entry point for prd-bench-local-run."""
 
 import argparse
 import sys
+
+from loguru import logger
 
 from .runner import BenchmarkRunner
 
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="prd-bench-run",
+        prog="prd-bench-local-run",
         description="Run benchmark tests against an API server with automatic lifecycle management.",
     )
     parser.add_argument(
@@ -22,8 +24,8 @@ def main():
     )
     parser.add_argument(
         "--api-url",
-        default="http://localhost:3000",
-        help="API server URL (default: http://localhost:3000)",
+        default="http://localhost:10000",
+        help="API server URL (default: http://localhost:10000)",
     )
     parser.add_argument(
         "--timeout",
@@ -46,8 +48,17 @@ def main():
         action="store_true",
         help="Skip server start/stop (server already running externally)",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO)",
+    )
 
     args = parser.parse_args()
+
+    logger.remove()
+    logger.add(sys.stderr, level=args.log_level)
 
     if not args.skip_lifecycle and not args.start_command:
         parser.error("--start-command is required unless --skip-lifecycle is set")
@@ -64,23 +75,18 @@ def main():
 
     results = runner.run()
 
-    # Print summary
-    print(f"\n{'=' * 60}")
-    print(f"Results: {results.passed}/{results.total} passed, "
-          f"{results.failed} failed, {results.errors} errors, "
-          f"{results.skipped} skipped")
-    print(f"Duration: {results.duration_seconds:.1f}s")
-    print(f"{'=' * 60}")
+    logger.info(f"Results: {results.passed}/{results.total} passed, "
+                f"{results.failed} failed, {results.errors} errors, "
+                f"{results.skipped} skipped")
+    logger.info(f"Duration: {results.duration_seconds:.1f}s")
 
     if results.failed > 0 or results.errors > 0:
-        print("\nFailed tests:")
-        for t in results.tests:
-            if t.status in ("failed", "error"):
-                print(f"  FAIL {t.name}")
-                if t.error_message:
-                    # Show first line of error
-                    first_line = t.error_message.strip().split("\n")[0]
-                    print(f"       {first_line}")
+        failed_tests = [t for t in results.tests if t.status in ("failed", "error")]
+        for t in failed_tests[:20]:
+            first_line = (t.error_message or "").strip().split("\n")[0][:120]
+            logger.error(f"FAIL {t.name}: {first_line}")
+        if len(failed_tests) > 20:
+            logger.error(f"... and {len(failed_tests) - 20} more")
 
     sys.exit(0 if results.failed == 0 and results.errors == 0 else 1)
 

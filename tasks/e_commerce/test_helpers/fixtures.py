@@ -2,7 +2,7 @@
 import math
 from datetime import datetime, timedelta, timezone
 
-from prd_bench_runner.testing import get_success_data
+from prd_bench_local_runner.testing import get_success_data
 from .api_client import api_client
 from .factories import *
 from .test_users import TEST_USERS

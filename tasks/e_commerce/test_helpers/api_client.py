@@ -7,7 +7,7 @@ delegates to GenericApiClient._request().
 
 from typing import Any, Dict, Optional
 
-from prd_bench_runner.testing import GenericApiClient
+from prd_bench_local_runner.testing import GenericApiClient
 
 
 class ApiClient(GenericApiClient):
