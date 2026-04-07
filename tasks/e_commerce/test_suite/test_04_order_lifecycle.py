@@ -12,7 +12,8 @@ Covers:
 
 import pytest
 from test_helpers import (
-    api_client, validate_success, validate_error, validate_paginated,
+    api_client, validate_success, validate_error, validate_error_is_one_of,
+    validate_paginated,
     get_success_data, assert_cost_precision, assert_version_incremented,
     NON_EXISTENT_UUID, TEST_USERS,
     assert_order, assert_order_item, assert_order_invariants,
@@ -354,11 +355,7 @@ class TestInvalidTransitions:
         _shop, _prod, order = _setup_order()
         resp = api_client.start_processing(order["id"], _seller)
         # Accept either error -- the PRD allows both names for this guard.
-        data = resp.json() if hasattr(resp, "json") else resp
-        error_id = data.get("error", {}).get("error_id", "") if isinstance(data, dict) else ""
-        assert error_id in (ERR_ORDER_NOT_PAID, ERR_ORDER_NOT_CONFIRMED), (
-            f"Expected ERR_ORDER_NOT_PAID or ERR_ORDER_NOT_CONFIRMED, got {error_id}"
-        )
+        validate_error_is_one_of(resp, [ERR_ORDER_NOT_PAID, ERR_ORDER_NOT_CONFIRMED])
 
     def test_ship_non_processing(self):
         """ship on a PAID (PENDING fulfillment) order -> ERR_FULFILLMENT_NOT_PROCESSING."""
@@ -419,12 +416,13 @@ class TestDeliverySideEffects:
         assert delivered["commission_amount"] > 0
         assert_cost_precision(delivered["commission_amount"])
 
-    def test_commission_amount_equals_rate_times_total(self):
-        """commission_amount == round(total_amount * commission_rate, 2)."""
+    def test_commission_amount_within_tier1(self):
+        """First order on fresh shop: all in tier 1 (8%), so commission = total * 0.08."""
         shop, product = setup_basic_order_scenario()
         items = [{"product_id": product["id"], "quantity": 1}]
         delivered = place_pay_and_deliver_order(shop["id"], items)
-        expected = round(delivered["total_amount"] * delivered["commission_rate"], 2)
+        # Fresh shop, GMV=0, entire order is in tier 1 (8%)
+        expected = round(delivered["total_amount"] * 0.08, 2)
         assert delivered["commission_amount"] == pytest.approx(expected, abs=0.01)
 
     def test_monthly_gmv_increased(self):

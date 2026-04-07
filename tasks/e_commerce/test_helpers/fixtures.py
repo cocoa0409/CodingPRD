@@ -16,6 +16,14 @@ _seller = TEST_USERS["seller_headers"]
 _admin = TEST_USERS["admin_headers"]
 
 
+def _extract_id(*args):
+    """Extract a UUID-like string from positional args (tests may pass api, headers, id)."""
+    for a in reversed(args):
+        if isinstance(a, str) and len(a) > 8:
+            return a
+    return None
+
+
 # =============================================================================
 # Tier 1: State Progression
 # =============================================================================
@@ -23,7 +31,7 @@ _admin = TEST_USERS["admin_headers"]
 # Each function creates the entity and walks it to the desired status.
 
 
-def create_and_approve_shop(**overrides):
+def create_and_approve_shop(*args, **overrides):
     """Create a shop (PENDING_REVIEW) and approve it (ACTIVE).
 
     Returns the ACTIVE shop dict.  The shop is ready to receive products,
@@ -38,11 +46,12 @@ def create_and_approve_shop(**overrides):
     return approved
 
 
-def create_and_list_product(shop_id, **overrides):
+def create_and_list_product(*args, shop_id=None, **overrides):
     """Create a product (DRAFT) under *shop_id* and list it (LISTED).
 
     The shop must already be ACTIVE.  Returns the LISTED product dict.
     """
+    shop_id = shop_id or _extract_id(*args)
     payload = create_product_payload(**overrides)
     product = get_success_data(
         api_client.create_product(shop_id, payload, _seller)
@@ -54,12 +63,13 @@ def create_and_list_product(shop_id, **overrides):
     return listed
 
 
-def create_and_activate_promotion(shop_id, **overrides):
+def create_and_activate_promotion(*args, shop_id=None, **overrides):
     """Create a promotion (DRAFT) under *shop_id* and activate it (ACTIVE).
 
     Sensible defaults are provided for time window and priority so callers
     only need to override what they care about.  Returns the ACTIVE promotion.
     """
+    shop_id = shop_id or _extract_id(*args)
     now = datetime.now(timezone.utc)
     defaults = {
         "start_time": (now - timedelta(hours=1)).isoformat(),
@@ -115,7 +125,7 @@ def setup_shop_with_promotion(promo_overrides=None, **shop_overrides):
     return shop, product, promo
 
 
-def setup_basic_order_scenario(**overrides):
+def setup_basic_order_scenario(*args, **overrides):
     """Approved shop + 1 LISTED product ready for order placement.
 
     The product has ``inventory_count=100`` and ``base_price=99.99`` by
@@ -228,10 +238,10 @@ def setup_shop_at_gmv(target_gmv, product_price=100.0):
         )
         return shop, products[0]
 
-    # Calculate how many orders we need
-    num_orders = math.ceil(target_gmv / product_price)
-    # Inventory must cover all orders
-    inventory_needed = num_orders + 10  # small buffer
+    # Calculate how many orders we need — use max quantity per order to reduce roundtrips
+    max_qty_per_order = 100  # batch up to 100 units per order
+    total_units = math.ceil(target_gmv / product_price)
+    inventory_needed = total_units + 10
 
     shop, products = setup_shop_with_products(
         num_products=1,
@@ -242,20 +252,14 @@ def setup_shop_at_gmv(target_gmv, product_price=100.0):
     )
     product = products[0]
 
-    # Place orders in batches — each order buys 1 unit at product_price
-    remaining_gmv = target_gmv
-    while remaining_gmv > 0:
-        qty = 1
-        order_value = product_price * qty
-        if order_value > remaining_gmv and remaining_gmv > 0:
-            # For the last order, adjust quantity if possible; otherwise
-            # accept slight overshoot (product_price is the minimum unit).
-            qty = 1
+    remaining_units = total_units
+    while remaining_units > 0:
+        qty = min(remaining_units, max_qty_per_order)
         place_pay_and_deliver_order(
             shop["id"],
             [{"product_id": product["id"], "quantity": qty}],
         )
-        remaining_gmv -= order_value
+        remaining_units -= qty
 
     shop = get_shop_after(shop["id"])
     return shop, product
@@ -293,7 +297,7 @@ def setup_shop_near_tier_boundary(tier_index=0, offset=-500):
 # =============================================================================
 
 
-def setup_completed_order_for_refund(**overrides):
+def setup_completed_order_for_refund(*args, **overrides):
     """Approved shop + product + completed (paid & delivered) order.
 
     Returns ``(shop, product, order)`` ready for a refund request.

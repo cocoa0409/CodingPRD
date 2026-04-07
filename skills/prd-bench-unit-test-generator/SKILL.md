@@ -429,10 +429,19 @@ from .fixtures import *
 
 ---
 
-## Stage 2: Generate `test_suite/`
+## Stage 2: Generate `test_suite/` (AFTER Stage 1 is complete)
 
-With `test_helpers/` complete, now generate the actual test files. Tests import everything from
-`test_helpers` and focus purely on test logic.
+**Stage 2 MUST NOT begin until Stage 1 is fully written to disk.** Before writing any test
+file, read back the generated `test_helpers/` code to know the exact:
+- `ApiClient` method names and signatures (from `api_client.py`)
+- Fixture function signatures and return types (from `fixtures.py`)
+- Exported names (from `__init__.py`)
+- Error ID constants (from `api_errors.py`)
+- Factory function names and parameters (from `factories.py`)
+- Assertion function signatures (from `assertions.py`)
+
+This eliminates the most common generation bug: test_suite guessing test_helpers' interface
+instead of reading it. Tests import everything from `test_helpers` and focus purely on test logic.
 
 ### 2.0 `conftest.py` — Pytest Fixture Bridge
 
@@ -501,6 +510,35 @@ concurrency, and end-to-end integration.
 
 ---
 
+## Generation Quality Rules
+
+These rules apply regardless of generation approach. They address code quality issues that
+cannot be caught by reading test_helpers code — they require understanding of the PRD itself.
+
+### Field names are PRD-exact — never abbreviated
+
+```python
+# WRONG — abbreviated or guessed
+product["price"]              # PRD says "base_price"
+promo.get("value")            # PRD says "promo_value"
+settlement["commission_amount"]  # PRD says "total_commission"
+
+# RIGHT — exact PRD field names in both test_helpers AND test_suite
+product["base_price"]
+promo.get("promo_value")
+settlement["total_commission"]
+```
+
+This applies to both layers: test_helpers (factories, assertions, api_client) and test_suite.
+
+### Required vs optional fields follow the PRD
+
+Before parametrizing `test_missing_required_field`, check each field in the PRD:
+- `required: false` or has a `default` → optional, do NOT test as required
+- All other `source: input` fields → required, test omission
+
+---
+
 ## Code Style
 
 - **pytest** (not `unittest.TestCase`). Module-level functions or `class TestXxx:` groupings.
@@ -520,6 +558,5 @@ After generating both layers, verify:
 4. **Every side effect in Table 2 and Table 5** has a test that verifies it was applied.
 5. **Every RBAC exclusive operation** has a negative test (wrong role → ERR_UNAUTHORIZED).
 6. **Every complexity layer** in `complexity_profile.complexity_layers` has dedicated test coverage.
-7. **Every entity assertion helper** in `test_helpers/assertions.py` is actually called by tests.
 
 If any gap is found, add the missing tests to the most appropriate test file.

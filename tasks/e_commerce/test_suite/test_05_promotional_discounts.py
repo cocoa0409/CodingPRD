@@ -23,7 +23,7 @@ from test_helpers import (
     create_promotion_payload,
     create_and_approve_shop, create_and_list_product, create_and_activate_promotion,
     setup_basic_order_scenario, setup_shop_with_promotion,
-    place_and_pay_order, place_pay_and_deliver_order, create_paid_order,
+    place_and_pay_order, place_pay_and_deliver_order,
     ERR_PROMOTION_USAGE_EXHAUSTED,
 )
 
@@ -794,14 +794,9 @@ class TestUsageLimits:
             priority=1,
             applicable_categories=[],
         )
-        # First order uses the promotion
+        # First order uses the promotion (consumes usage_count)
         order1 = _place_order(shop["id"], [(product["id"], 1)])
         assert order1["discount_amount"] == pytest.approx(10.00, abs=0.01)
-        # Pay the first order to confirm usage_count increment
-        place_and_pay_order(
-            shop["id"],
-            [{"product_id": product["id"], "quantity": 1}],
-        )
 
         # Verify usage_count incremented
         promo_after = get_success_data(
@@ -809,7 +804,7 @@ class TestUsageLimits:
         )
         assert promo_after["usage_count"] >= 1
 
-        # Second order -- promotion should be exhausted (discount = 0 or error)
+        # Second order -- promotion should be exhausted (discount = 0)
         order2 = _place_order(shop["id"], [(product["id"], 1)])
         assert order2["discount_amount"] == pytest.approx(0.00, abs=0.01)
 

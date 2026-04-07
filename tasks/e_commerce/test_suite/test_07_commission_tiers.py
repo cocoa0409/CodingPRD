@@ -133,9 +133,13 @@ class TestCommissionTiers:
         """Shop at GMV=$49000, order $2000:
         $1000 at 5% = $50.00, $1000 at 3% = $30.00, total = $80.00.
         """
-        shop, product = setup_shop_at_gmv(49000, product_price=2000.00)
+        shop, product = setup_shop_at_gmv(49000, product_price=1000.00)
+        # Re-create a product at the right price for the final order
+        product2 = create_and_list_product(
+            shop["id"], base_price=2000.00, inventory_count=10,
+        )
 
-        order = _deliver_and_get_order(shop["id"], product["id"], quantity=1)
+        order = _deliver_and_get_order(shop["id"], product2["id"], quantity=1)
         expected = _compute_expected_commission(49000, 2000.00)
         assert expected == 80.00
 

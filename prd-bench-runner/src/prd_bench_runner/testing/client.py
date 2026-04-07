@@ -61,3 +61,16 @@ class GenericApiClient:
                 kwargs["params"] = params
 
         return self.session.request(method, url, **kwargs)
+
+    # Convenience methods for tests that call api.get/post/put directly
+    def get(self, path: str, headers=None, params=None, **kwargs):
+        return self._request("GET", path, headers=headers, params=params)
+
+    def post(self, path: str, json=None, headers=None, **kwargs):
+        return self._request("POST", path, payload=json, headers=headers)
+
+    def put(self, path: str, json=None, headers=None, **kwargs):
+        return self._request("PUT", path, payload=json, headers=headers)
+
+    def delete(self, path: str, headers=None, params=None, **kwargs):
+        return self._request("DELETE", path, headers=headers, params=params)

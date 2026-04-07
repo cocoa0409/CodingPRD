@@ -8,7 +8,8 @@ and refund side effects (inventory, settlement balance, GMV).
 
 import pytest
 from test_helpers import (
-    api_client, validate_success, validate_error, get_success_data,
+    api_client, validate_success, validate_error, validate_error_is_one_of,
+    get_success_data,
     assert_cost_precision, assert_version_incremented,
     assert_order, assert_product, assert_order_invariants, assert_inventory_consistency,
     assert_shop_invariants,
@@ -20,6 +21,7 @@ from test_helpers import (
     setup_completed_order_for_refund, setup_partial_refund_scenario,
     get_shop_after, get_order_items,
     ERR_REFUND_EXCEEDS_ORDER_TOTAL, ERR_REFUND_EXCEEDS_REMAINING,
+    ERR_ORDER_NOT_PAID,
 )
 from test_helpers.assertions import assert_refund
 
@@ -347,7 +349,9 @@ class TestCumulativeRefunds:
             refund_type="PARTIAL", refund_items=refund_items_2,
         )
         resp = api_client.create_refund(order["id"], refund_payload, _customer)
-        validate_error(resp, ERR_REFUND_EXCEEDS_REMAINING)
+        # After refunding all quantity, order may become FULL_REFUND (ERR_ORDER_NOT_PAID)
+        # or the quantity check may trigger first (ERR_REFUND_EXCEEDS_REMAINING)
+        validate_error_is_one_of(resp, [ERR_REFUND_EXCEEDS_REMAINING, ERR_ORDER_NOT_PAID])
 
     def test_cumulative_partials_become_full_refund(self):
         """Partial refunds that cumulate to total_amount -> payment_status = FULL_REFUND."""

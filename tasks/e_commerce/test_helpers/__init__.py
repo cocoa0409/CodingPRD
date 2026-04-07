@@ -17,5 +17,11 @@ from .api_errors import *
 from .assertions import *
 from .factories import *
 from .constants import *
-from .test_users import TEST_USERS
+from .test_users import (
+    TEST_USERS,
+    CUSTOMER_HEADERS, SELLER_HEADERS, ADMIN_HEADERS,
+    SELLER_2_HEADERS, CUSTOMER_2_HEADERS,
+    CUSTOMER_USER_ID, SELLER_USER_ID, ADMIN_USER_ID,
+    SELLER_2_USER_ID, CUSTOMER_2_USER_ID,
+)
 from .fixtures import *

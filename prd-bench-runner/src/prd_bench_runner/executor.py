@@ -96,10 +96,17 @@ class TestExecutor:
         env["_PRD_BENCH_START_COMMAND"] = self.start_command
         env["_PRD_BENCH_SKIP_LIFECYCLE"] = "true" if self.skip_lifecycle else "false"
 
-        # Ensure the prd_bench_runner package is importable by the pytest subprocess
-        runner_src = str(Path(__file__).parent.parent)
+        # Add paths to PYTHONPATH:
+        # 1. prd_bench_runner package (for pytest_plugin + testing utilities)
+        # 2. Parent of test_dir (so `from test_helpers import ...` works)
+        extra_paths = [
+            str(Path(__file__).parent.parent),          # prd_bench_runner src
+            str(Path(self.test_dir).parent.resolve()),  # parent of test_suite (contains test_helpers)
+        ]
         python_path = env.get("PYTHONPATH", "")
-        if runner_src not in python_path:
-            env["PYTHONPATH"] = f"{runner_src}:{python_path}" if python_path else runner_src
+        for p in extra_paths:
+            if p not in python_path:
+                python_path = f"{p}:{python_path}" if python_path else p
+        env["PYTHONPATH"] = python_path
 
         return env

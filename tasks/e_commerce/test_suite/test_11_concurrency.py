@@ -54,7 +54,7 @@ class TestDoublePaymentRace:
             lambda: api_client.pay_order(order["id"], pay_payload_1, _customer),
             lambda: api_client.pay_order(order["id"], pay_payload_2, _customer),
         )
-        assert_exactly_one_succeeds(results)
+        assert_exactly_one_succeeds(results[0], results[1])
 
     def test_double_pay_final_state_consistent(self):
         """After a double-pay race the order has exactly one payment in PAYING."""
@@ -108,7 +108,7 @@ class TestInventoryReservationRace:
             lambda: api_client.create_order(payload_1, _customer),
             lambda: api_client.create_order(payload_2, _customer),
         )
-        assert_exactly_one_succeeds(results)
+        assert_exactly_one_succeeds(results[0], results[1])
 
         # The failing one should be an inventory error
         for r in results:
@@ -191,7 +191,7 @@ class TestOptimisticConcurrency:
                 {"base_price": 12.0, "version": v}, _seller,
             ),
         )
-        assert_exactly_one_succeeds(results)
+        assert_exactly_one_succeeds(results[0], results[1])
 
 
 # ============================================================================
@@ -216,7 +216,7 @@ class TestDoubleDeliveryRace:
             lambda: api_client.deliver_order(order["id"], _seller),
             lambda: api_client.deliver_order(order["id"], _seller),
         )
-        assert_exactly_one_succeeds(results)
+        assert_exactly_one_succeeds(results[0], results[1])
 
     def test_commission_and_gmv_updated_exactly_once(self):
         """After a double-deliver race, GMV and commission are correct."""
