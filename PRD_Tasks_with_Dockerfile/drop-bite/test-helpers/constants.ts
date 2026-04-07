@@ -1,0 +1,119 @@
+export const ERROR_CODES = {
+
+  BAD_REQUEST: 'ERR_BAD_REQUEST',
+  NOT_FOUND: 'ERR_NOT_FOUND',
+
+  MISSING_IF_MATCH: 'ERR_MISSING_IF_MATCH',
+  VERSION_CONFLICT: 'ERR_VERSION_CONFLICT',
+
+  INVALID_STATE: 'ERR_INVALID_STATE',
+
+  STORE_PAUSED: 'ERR_STORE_PAUSED',
+  DROP_NOT_LIVE: 'ERR_DROP_NOT_LIVE',
+  DROP_PAUSED: 'ERR_DROP_PAUSED',
+  DROP_CLOSED: 'ERR_DROP_CLOSED',
+  QUANTITY_LIMIT_EXCEEDED: 'ERR_QUANTITY_LIMIT_EXCEEDED',
+  CONSTRAINT_VIOLATION: 'ERR_CONSTRAINT_VIOLATION',
+  BUNDLE_FULL: 'ERR_BUNDLE_FULL',
+  BUNDLE_LOCKED: 'ERR_BUNDLE_LOCKED',
+} as const;
+
+export type ErrorCode = typeof ERROR_CODES[keyof typeof ERROR_CODES];
+
+export const POSTURES = {
+  OPEN: 'OPEN',
+  THROTTLED: 'THROTTLED',
+  PAUSED: 'PAUSED',
+} as const;
+
+export type Posture = typeof POSTURES[keyof typeof POSTURES];
+
+export const DROP_STATUSES = {
+  PLANNED: 'PLANNED',
+  LIVE: 'LIVE',
+  PAUSED: 'PAUSED',
+  CLOSED: 'CLOSED',
+} as const;
+
+export type DropStatus = typeof DROP_STATUSES[keyof typeof DROP_STATUSES];
+
+export const ORDER_STATUSES = {
+  DRAFT: 'DRAFT',
+  SUBMITTED: 'SUBMITTED',
+  WAITLISTED: 'WAITLISTED',
+  NEEDS_REVIEW: 'NEEDS_REVIEW',
+  ACCEPTED: 'ACCEPTED',
+  IN_KITCHEN: 'IN_KITCHEN',
+  READY: 'READY',
+  PICKED_UP: 'PICKED_UP',
+  CANCELLED: 'CANCELLED',
+  VOIDED: 'VOIDED',
+} as const;
+
+export type OrderStatus = typeof ORDER_STATUSES[keyof typeof ORDER_STATUSES];
+
+export const ACTIVE_ORDER_STATUSES: OrderStatus[] = [
+  ORDER_STATUSES.DRAFT,
+  ORDER_STATUSES.SUBMITTED,
+  ORDER_STATUSES.WAITLISTED,
+  ORDER_STATUSES.NEEDS_REVIEW,
+  ORDER_STATUSES.ACCEPTED,
+  ORDER_STATUSES.IN_KITCHEN,
+  ORDER_STATUSES.READY,
+];
+
+export const TERMINAL_ORDER_STATUSES: OrderStatus[] = [
+  ORDER_STATUSES.CANCELLED,
+  ORDER_STATUSES.VOIDED,
+  ORDER_STATUSES.PICKED_UP,
+];
+
+export const INTAKE_ORDER_STATUSES: OrderStatus[] = [
+  ORDER_STATUSES.DRAFT,
+  ORDER_STATUSES.SUBMITTED,
+  ORDER_STATUSES.WAITLISTED,
+  ORDER_STATUSES.NEEDS_REVIEW,
+];
+
+export const VOIDABLE_ORDER_STATUSES: OrderStatus[] = [
+  ORDER_STATUSES.ACCEPTED,
+  ORDER_STATUSES.IN_KITCHEN,
+  ORDER_STATUSES.READY,
+];
+
+export const WASTE_VOID_STATUSES: OrderStatus[] = [
+  ORDER_STATUSES.IN_KITCHEN,
+  ORDER_STATUSES.READY,
+];
+
+export const BUNDLE_STATUSES = {
+  DRAFT: 'DRAFT',
+  SEALED: 'SEALED',
+} as const;
+
+export type BundleStatus = typeof BUNDLE_STATUSES[keyof typeof BUNDLE_STATUSES];
+
+export const MAKEGOOD_STATUSES = {
+  ISSUED: 'ISSUED',
+} as const;
+
+export type MakegoodStatus = typeof MAKEGOOD_STATUSES[keyof typeof MAKEGOOD_STATUSES];
+
+export const QUANTITY_LIMITS = {
+  OPEN: 6,
+  THROTTLED: 2,
+} as const;
+
+export const MAKEGOOD = {
+  CENTS_PER_SERVING: 500,
+  MAX_CENTS: 2000,
+} as const;
+
+export const CONSTANTS = {
+  auth: {
+    ROLES: [] as readonly string[]
+  }
+} as const;
+
+export type Role = typeof CONSTANTS.auth.ROLES[number] | string;
+export const DEFAULT_ROLE: Role = 'Admin';
