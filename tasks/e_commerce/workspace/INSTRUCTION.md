@@ -7,7 +7,7 @@ You are building a REST API server based on the requirements in `PRD.md`.
 Place all files in the `./implementation/` directory:
 
 1. **A `Dockerfile`** at `./implementation/Dockerfile`
-2. **Implementation source code** in `./implementation/` — any language and framework
+2. **Implementation source code** in `./implementation/` — no language restriction, use any language and framework you prefer
 
 ## Dockerfile Requirements
 
