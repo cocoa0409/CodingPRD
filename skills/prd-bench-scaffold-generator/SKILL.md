@@ -147,22 +147,16 @@ complexity_profile:
 
 ### 0.4 Difficulty Calibration
 
-Benchmarks exist to test LLM coding ability. Choose a difficulty target:
+Benchmarks exist to stress-test LLM coding ability. Target one of these two difficulty levels:
 
 | Level | Entity count | Endpoint count | Error codes | Calculation variants | State machines | Typical token budget |
 |-------|-------------|---------------|-------------|---------------------|---------------|---------------------|
-| **Starter** | 2–3 | 8–15 | 8–15 | 0–1 | 1 simple | ~15k |
-| **Intermediate** | 4–6 | 15–25 | 15–25 | 1–2 | 2–3 with cascades | ~30k |
-| **Advanced** | 6–10 | 25–40 | 25–40 | 2–3 | 3–5 with reverts + auto-transitions | ~50k |
-| **Expert** | 8–15 | 35–60 | 35–60 | 3+ | 4+ with cycles or parallel dimensions | ~80k |
+| **Advanced** | 10–16 | 18–40 | 15–40 | 2–3 | 3–5 with reverts + auto-transitions | ~50k |
+| **Expert** | 14–30 | 35–65 | 30–60 | 3+ | 4+ with cycles or parallel dimensions | ~80k |
 
-These are guidelines, not rules. A 3-entity benchmark with one fiendishly tricky calculation can be harder than a 10-entity CRUD app.
+**Default to Advanced.** Only go Expert when the scenario naturally demands it (many entity types, complex cross-entity workflows). An overly simple scaffold fails to discriminate between implementations — never generate fewer than 10 entities or 18 endpoints.
 
-**Current distribution across 22 reference scaffolds:**
-- Starter: 0 (0%) — **GAP: no entry-level benchmarks exist. Prioritize creating 2–3 Starter scaffolds.**
-- Intermediate: 8 (36%)
-- Advanced: 10 (45%)
-- Expert: 4 (18%)
+These are guidelines, not hard rules. A 10-entity benchmark with one fiendishly tricky calculation can be harder than a 20-entity CRUD app.
 
 **What actually makes a benchmark hard (in order of impact):**
 1. Calculations where two valid interpretations of the same prose produce different numbers
@@ -427,7 +421,6 @@ Current gaps to prioritize when creating new scaffolds:
 - Entity topologies with 0 examples: pure flat, pure graph (all 22 are hybrid)
 - State machine shapes with 0 examples: branching (fork/join), cyclic (A→B→A)
 - Role models with 0 examples: segregation of duties
-- Difficulty levels with 0 examples: Starter (2–3 entities)
 
 Checklist:
 - [ ] Primary archetype is underrepresented (check §0.1 coverage column)
@@ -436,4 +429,3 @@ Checklist:
 - [ ] At least TWO of the three dimensions above differ from the majority
 - [ ] Core calculation challenge is structurally different (not another threshold + aggregation)
 - [ ] Role model adds diversity (prioritize segregation_of_duties or delegated_authority)
-- [ ] If scenario allows, target Starter difficulty (2–3 entities, 8–15 endpoints)
