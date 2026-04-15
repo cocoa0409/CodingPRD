@@ -83,72 +83,81 @@ Before writing code, decide on:
 
 Build in this order so each layer can be tested incrementally:
 
-#### 3.1 Foundation
-- Response envelope (meta with api_request_id, api_request_timestamp; data; response_type)
-- Error handling (custom exception class that carries error_id, message, http_status)
-- Auth middleware (extract X-User-ID and X-User-Role headers, reject missing/invalid)
-- In-memory data store with UUID generation and timestamp management
-- Common fields (id, created_at, updated_at, version) auto-populated on create/update
+#### 3.1 Foundation — Read From Scaffold, Never Hardcode
+
+**Critical**: Every structural name below must be **read from the scaffold and PRD**, not assumed or defaulted. Different scaffolds use different header names, envelope field names, pagination styles, OCC mechanisms, and error ID patterns. You must faithfully implement whatever the scaffold defines.
+
+**Response envelope** — Read the `response_envelope` section in SCAFFOLD.yaml. It defines:
+- `response_envelope.success`: The exact JSON structure for successful responses — field names for the metadata wrapper, the type discriminator, and the data payload. These names vary per scaffold (e.g., one scaffold might use `meta`/`response_type`/`data`, another might use `result`/`kind`/`payload`).
+- `response_envelope.error`: The exact JSON structure for error responses — field names for the error code and message. These names vary per scaffold (e.g., `error_id`/`message` vs `code`/`detail`).
+- `response_envelope.pagination_fields`: The exact parameter names for pagination (e.g., `limit`/`offset`/`total_count`/`has_more` vs `page_size`/`page_token`/`total_results`/`next_page_token`).
+- `response_envelope.pagination_defaults`: Default values, min, max for pagination parameters.
+
+Implement the response helper to produce exactly the structure the scaffold defines. Do NOT assume any fixed field names.
+
+**Error handling** — Custom exception class that carries `error_id`, `message`, `http_status`. The error_id values come from the `errors` table in the scaffold. The error response body must use the exact field names from `response_envelope.error`.
+
+**Auth middleware** — Read `validations[]` entries with `category: auth` in the scaffold. The `check` field describes exactly which HTTP headers must be present and what role values are valid. Extract the exact header names from this description (e.g., one scaffold might use `X-User-ID`/`X-User-Role`, another might use `X-Student-Number`/`X-Instructor-Id`/`X-Registrar-Id`/`X-Caller-Role`). Also read the corresponding `error_id` values for auth failures — do not assume any fixed error ID.
+
+Additionally, cross-reference with **PRD §2.1** (User and Role-Based Access Control) which explicitly states the auth header names and role values. The PRD's description is authoritative.
+
+**In-memory data store** — UUID generation and timestamp management.
+
+**Common fields** — Read `entities[]` in the scaffold to find which fields are `source: system` (auto-populated on create/update). Field names vary per scaffold — one might use `created_at`/`updated_at`/`version`, another might use `opened_on`/`modified_on`/`enrollment_seq`. Never assume fixed names.
 
 #### 3.2 CRUD for Each Entity
 - Follow the `entities` table field by field
-- Implement `source: system` fields (auto-set by server)
+- Implement `source: system` fields (auto-set by server) using the exact field names from the scaffold
 - Implement `source: computed` fields (derived from other data)
-- For list endpoints: support `limit`, `offset` query params with defaults (limit=20, max=100), return `total_count` and `has_more` in meta
-- Sort list results by `created_at` ascending
+- For list endpoints: use the pagination parameter names and defaults from `response_envelope.pagination_fields` and `response_envelope.pagination_defaults` — do NOT hardcode `limit`/`offset` or any other fixed names
+- Sort list results by the default sort field specified in the scaffold or PRD
 
 #### 3.3 State Machines
 - Implement every transition from the `state_machines` table
-- Enforce `preconditions` — return the correct error if violated
+- Enforce `preconditions` — return the correct error if violated, using the exact error_id from the scaffold
 - Execute `side_effects` — these are where the tricky bugs hide
-- For cascading side effects (e.g., suspending a shop delists all its products), update each child resource independently (each gets its own updated_at and version bump)
-- For parallel state dimensions (e.g., payment_status x fulfillment_status), track them independently and derive the compound status
+- For cascading side effects, update each child resource independently (each gets its own timestamp and concurrency field bump, using whatever field names the scaffold defines)
+- For parallel state dimensions, track them independently and derive the compound status
 
 #### 3.4 Calculations
 - This is the hardest part. Implement each calculation rule from the `calculations` table exactly.
-- **Promotional discount stacking**: Pay close attention to the shop's `discount_strategy` (PERCENTAGE_FIRST vs FIXED_FIRST). The sorting and application order matters. Each step rounds to 2 decimal places (round half up). The running total floors at 0.01.
-- **Discount share allocation**: Proportional distribution with last-item remainder. Sort items by order_item_id ascending. The last item absorbs rounding differences.
-- **Inventory reservation**: Atomic — if any item fails, roll back all. Track reserved_count and available_count.
-- **Commission calculation**: Marginal tiers, not flat rate. An order can span multiple tiers. Calculate based on shop's `monthly_gmv` *before* adding this order.
-- **Refund amount calculation**: Proportional discount reallocation with remainder on last item. Track cumulative refunds to prevent exceeding total_amount.
-- **Settlement reconciliation**: Aggregate completed orders and processed refunds within the period window.
+- Read the `formula`, `precision`, and `variants` fields carefully
+- Follow the exact algorithm described — stacking order, rounding rules, edge case handling
+- When the scaffold specifies precision (decimal places, rounding method), implement it exactly
+- For complex multi-step calculations, trace through the scaffold's description step by step
 
 #### 3.5 Validations
 - Implement validations in the priority order specified in the `validations` table
 - The priority order determines which error is returned when multiple validations fail simultaneously
-- Check auth first (priority 1-2), then existence (3), then state (4), then business rules (5+)
+- Check auth first (lowest priority number), then existence, then state, then business rules
+- Use the exact `error_id` and `http_status` from the scaffold for each validation
 
 #### 3.6 RBAC
 - Enforce role-based access per the `roles` table
-- Ownership checks: Seller can only manage their own shop, Customer can only manage their own orders
-- "Any" role means any authenticated user can access
+- Use the exact role names from `roles[].name` in the scaffold
+- Ownership checks: use the identity header names defined in the scaffold's auth validation rules
+- "Any" role (or equivalent) means any authenticated user can access
 
 ### Step 4: Get the Details Right
 
 These are the things that differentiate a passing implementation from a failing one:
 
-**Response format** — Every response must use the exact envelope structure from the PRD:
-```json
-{
-  "meta": {
-    "api_request_id": "unique-string",
-    "api_request_timestamp": "2026-03-15T14:22:31.847Z"
-  },
-  "response_type": "object" | "array" | "error",
-  "data": { ... }
-}
-```
-List responses add `limit`, `offset`, `total_count`, `has_more` to meta.
+**Response format** — Every response must use the **exact envelope structure defined in the scaffold's `response_envelope` section and described in PRD §2.2**. Do NOT assume any fixed field names. Read the scaffold to determine:
+- What the metadata wrapper field is called and what fields it contains (request ID, timestamp)
+- What the type discriminator field is called and what values it takes
+- What the data wrapper field is called
+- What field names the error response uses for the error code and message
+- What pagination fields are added to list responses and where they appear
 
-**Timestamps** — ISO 8601 UTC with exactly 3 fractional digits: `2026-03-15T14:22:31.847Z`
+**Timestamps** — Read the PRD §2 for the exact timestamp format. Typically ISO 8601 UTC, but the precision (fractional digits) may vary per scaffold.
 
-**Monetary values** — 2 decimal places, round half up. Use Python's `decimal.Decimal` for all money calculations. Never use `float` for money.
+**Monetary/numeric precision** — Read `calculations[].precision` in the scaffold. Use Python's `decimal.Decimal` for precision-sensitive calculations. Never use `float` for money. The rounding method is specified in the scaffold.
 
-**Optimistic concurrency** — When request includes `version`, compare against stored version. Mismatch → `ERR_STALE_DATA` (409). When `version` is omitted, skip the check.
+**Optimistic concurrency** — Read the scaffold's `validations[]` for the OCC check. The concurrency control field name varies per scaffold (e.g., `version`, `enrollment_seq`, `rev`). The corresponding error ID and HTTP status also vary. When the OCC field is provided in the request, compare against the stored value. Mismatch → the scaffold-defined error. When the field is omitted, skip the check.
 
-**Hierarchical resource validation** — Validate path params left to right. For `/shops/{shopId}/products/{productId}`, check shopId exists before productId. Return the first not-found error.
+**Hierarchical resource validation** — Validate path params left to right. For nested paths like `/parents/{parentId}/children/{childId}`, check parentId exists before childId. Return the first not-found error.
 
-**Nested resource ownership** — For shop-scoped resources (products, promotions, settlements), verify the resource belongs to the shop in the URL path.
+**Nested resource ownership** — For scoped resources, verify the resource belongs to the parent in the URL path.
 
 ### Step 5: Build the Dockerfile
 
@@ -169,16 +178,16 @@ CMD ["python", "app.py"]
 
 ### Common Pitfalls to Avoid
 
-1. **Floating point arithmetic for money** — Always use `from decimal import Decimal, ROUND_HALF_UP`. Never use `float`. `0.1 + 0.2 != 0.3` in IEEE 754.
-2. **Wrong rounding** — Python's built-in `round()` uses banker's rounding. Always use `Decimal.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)`.
-3. **Discount stacking order** — The discount_strategy changes *which promotions are applied first*, not just their priority. PERCENTAGE_FIRST means all percentage promos before all fixed promos, regardless of priority. Within each type group, sort by priority.
-4. **Commission tier calculation** — It's marginal, not flat. Don't apply a single rate to the whole order. Split across tier boundaries.
-5. **Refund discount share** — When refunding, the discount must be proportionally un-applied. The refund amount is less than the face value because part of it was "discount".
-6. **Cascade side effects updating version** — Each cascaded child resource must get its own version increment and updated_at change.
-7. **Reservation atomicity** — Check ALL items have sufficient inventory before reserving ANY. If one fails, reserve none.
-8. **Promotion filtering** — Time window check, category match, usage count check, stackability rules, and priority selection all interact. Get the order right.
-9. **Payment flow** — The order has both payment_status and fulfillment_status. The derived order_status depends on both. Don't conflate them.
-10. **Settlement period overlap** — Check against existing non-terminal settlements only. Terminal states (PAID, DISPUTED that's been resolved) don't count... but DISPUTED itself is non-terminal.
+1. **Hardcoding structural names** — The #1 cause of test failures. Auth header names, response envelope field names, pagination parameter names, OCC field names, error IDs — ALL of these must be read from the scaffold and PRD, never assumed. If you find yourself typing `X-User-ID`, `meta`, `response_type`, `data`, `limit`, `offset`, `version`, or `ERR_STALE_DATA` without having verified these are the exact names in this scaffold, STOP and re-read the scaffold.
+2. **Floating point arithmetic for money** — Always use `from decimal import Decimal, ROUND_HALF_UP`. Never use `float`. `0.1 + 0.2 != 0.3` in IEEE 754.
+3. **Wrong rounding** — Python's built-in `round()` uses banker's rounding. When the scaffold specifies a rounding method, use the corresponding `Decimal` rounding mode.
+4. **Cascade side effects not updating concurrency fields** — Each cascaded child resource must get its own concurrency field increment (whatever it's called in this scaffold) and timestamp change.
+5. **Atomicity violations** — When a multi-step operation must be atomic (e.g., reserving multiple items, bulk state transitions), check ALL preconditions before committing ANY changes. If one fails, roll back all.
+6. **State machine precondition ordering** — When multiple validations can fail simultaneously, the scaffold's `validations` table priority order determines which error is returned. Don't just check the first one you think of.
+7. **Calculation formula fidelity** — Implement calculations exactly as the scaffold describes. Pay attention to: marginal vs flat tiers, stacking order, proportional allocation with remainder handling, cumulative limits.
+8. **Parallel state dimensions** — When an entity has multiple independent state fields (e.g., payment_status and fulfillment_status), track them independently. The derived compound status depends on both.
+9. **Auth header semantics** — Some scaffolds use a single identity header for all roles; others use role-specific identity headers (different header per role). Read the scaffold's auth validation rules carefully to understand the expected header scheme.
+10. **Pagination mechanism** — Some scaffolds use offset-based pagination (`limit`/`offset`), others use cursor-based (`page_size`/`page_token`). Implement exactly what the scaffold defines, not what you assume.
 
 ## Output Checklist
 
@@ -187,13 +196,14 @@ Before declaring done, verify:
 - [ ] `implementation/Dockerfile` exists and follows INSTRUCTION.md constraints
 - [ ] Server starts and listens on PORT env var, bound to 0.0.0.0
 - [ ] All endpoints from the endpoint table are implemented
-- [ ] Response envelope matches PRD format exactly (meta, response_type, data)
-- [ ] Auth middleware validates X-User-ID and X-User-Role headers
-- [ ] RBAC enforced per role matrix
+- [ ] Response envelope matches the scaffold's `response_envelope` exactly — correct field names for metadata, type discriminator, data wrapper, and error body
+- [ ] Auth middleware validates the exact headers defined in the scaffold's auth `validations[]` — not hardcoded defaults
+- [ ] RBAC enforced per role matrix using the scaffold's exact role names
 - [ ] All state machines implemented with preconditions and side effects
-- [ ] All calculations implemented with correct precision and rounding
-- [ ] All validations enforced in priority order
-- [ ] All error codes return correct HTTP status
-- [ ] Optimistic concurrency control works when version is provided
-- [ ] Pagination works with limit, offset, total_count, has_more
-- [ ] Timestamps are ISO 8601 UTC with 3 fractional digits
+- [ ] All calculations implemented with correct precision and rounding as specified in the scaffold
+- [ ] All validations enforced in priority order with the scaffold's exact error_ids
+- [ ] All error codes return the correct HTTP status from the scaffold's error catalog
+- [ ] Optimistic concurrency control uses the scaffold's exact OCC field name and error ID
+- [ ] Pagination uses the scaffold's exact parameter names, defaults, min/max from `response_envelope.pagination_fields` and `response_envelope.pagination_defaults`
+- [ ] Timestamps match the format specified in the PRD
+- [ ] **No structural name was assumed or hardcoded** — every header name, field name, error ID, and parameter name was read from the scaffold or PRD
