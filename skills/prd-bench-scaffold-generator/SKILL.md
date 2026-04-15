@@ -77,6 +77,22 @@ Each archetype represents a fundamentally different core challenge. Choose ONE p
 
 **Diversity guidance**: When generating a new scaffold, check the coverage column. If the scenario could fit multiple archetypes, prefer the underrepresented one. The 4 absent archetypes (multi-party negotiation, temporal windowing, workflow orchestration, compliance/audit) are high-priority targets for new scenarios.
 
+### 0.5 Structural Surface Diversity (Anti-Templating)
+
+Beyond archetype and topology diversity, each scaffold must vary its **surface-level naming and structural conventions** so that downstream PRDs and tests exercise different parsing patterns. The goal is that no two scaffolds feel like they came from the same template.
+
+**Core principle**: Every naming choice — header names, error ID patterns, envelope field names, pagination style, field casing, OCC mechanism — should be **invented fresh for the domain**, not picked from a fixed menu. Read the existing 22 example scaffolds, observe what conventions have already been used, and deliberately choose something different. If you find yourself typing the same name you typed in a previous scaffold, stop and rethink.
+
+**Dimensions that must vary** (not an exhaustive list — invent new dimensions as the domain demands):
+
+- **Authentication header names**: Should reflect who the actors are in this domain. A hospital system might use different terminology than a logistics platform or a peer-review system. Header casing, separators, and even whether auth headers exist at all should be domain-driven.
+- **Error ID naming style**: The prefix, verbosity, and vocabulary of error codes should feel native to the domain. Some domains warrant terse codes, others warrant self-documenting long names. The error for "wrong role" doesn't have to be called the same thing in every scaffold.
+- **Concurrency control mechanism**: The field name, where it travels (body vs header), and the corresponding error should be chosen to fit the domain's data model. Not every system calls it `version`.
+- **Response envelope structure**: The field that wraps the payload, the field that discriminates type, the request ID prefix, the timestamp precision, the pagination parameter names and defaults — all should be designed for the domain, not copied from a template.
+- **Field naming convention**: Casing (snake_case, camelCase, etc.), vocabulary (domain-native terms vs generic), and temporal field names (`created_at` vs `submitted_on` vs `opened`) should match the domain's natural language.
+
+**Anti-pattern**: Listing N concrete options and picking one. That just replaces one template with N templates. Instead, treat every surface name as a creative decision informed by the domain.
+
 ### 0.2 Cross-Cutting Complexity Layers
 
 These are independent difficulty dimensions that can be **layered onto any archetype**. Select 2–4 that fit the scenario:
@@ -429,3 +445,8 @@ Checklist:
 - [ ] At least TWO of the three dimensions above differ from the majority
 - [ ] Core calculation challenge is structurally different (not another threshold + aggregation)
 - [ ] Role model adds diversity (prioritize segregation_of_duties or delegated_authority)
+
+**Surface diversity (§0.5 — anti-templating):**
+- [ ] Auth header names, error IDs, OCC field/error, envelope field names, and pagination style are **domain-native** — not reused from a previous scaffold
+- [ ] At least THREE surface naming dimensions differ from the most common pattern among existing examples
+- [ ] No naming choice was made by picking from a fixed list — each was invented for this domain

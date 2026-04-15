@@ -80,6 +80,8 @@ The task name follows the format `task_{NNNN}_{short_label}`:
 
 To determine the index, scan `./tasks/` for existing directories matching `task_NNNN_*`, find the highest `NNNN`, and increment by 1. If no matching directories exist, start at `0001`.
 
+Created directories must not have the same name as existing directories.
+
 ```bash
 max_index=$(ls -d ./tasks/task_[0-9][0-9][0-9][0-9]_* 2>/dev/null | \
   sed 's/.*task_\([0-9]*\)_.*/\1/' | sort -n | tail -1)

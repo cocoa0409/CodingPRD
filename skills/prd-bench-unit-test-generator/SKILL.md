@@ -23,6 +23,8 @@ A single **working directory** containing:
 The skill reads both files from this directory, then creates `test_helpers/` and `test_suite/`
 as subdirectories under it. All generated code uses **relative imports** within this directory.
 
+**Source priority**: The scaffold is the extraction index; the PRD is the contract. See "PRD-First Principle" below.
+
 ```
 {working_dir}/                     # ← input directory (provided by user)
 ├── scaffold.yaml                  #    input: scaffold
@@ -167,18 +169,24 @@ assert_at_least_one_succeeds(*results) -> dict
 The test suite answers: "Does the implementation correctly handle requirement X?" for every X
 in the PRD. The organizing principle is **testable claims**, not code structure.
 
+### The PRD-First Principle (overrides all other rules)
+
+Implementers see only the PRD, never the scaffold. A test that asserts behavior absent from the PRD penalizes correct work. Therefore:
+
+- **The scaffold is the extraction index** — walk it to find claims systematically.
+- **The PRD is the contract** — every claim must trace to a PRD statement before it becomes a test.
+- **Scaffold-only concepts produce no tests.** If the scaffold specifies something the PRD does not express, skip it.
+
+The litmus test: *"Could a developer reading only the PRD reasonably implement the behavior this test asserts?"* If no, the test should not exist.
+
 ### Core Principles
 
-1. **Claim Extraction** — Before writing any test, enumerate every testable claim the scaffold
-   makes. A testable claim is any statement with a verifiable true/false answer against a
-   running API. Every claim gets at least one test.
+1. **Claim Extraction** — Enumerate every testable claim from the scaffold. Every claim gets at least one test — provided it traces to the PRD.
 
 2. **Boundary Precision** — For every numeric threshold or inequality, test the exact boundary.
-   "Exceeds X" → test X-1, X, X+1. The scaffold's `constants` and the PRD's wording together
-   determine exact semantics.
+   "Exceeds X" → test X-1, X, X+1.
 
-3. **Side Effects as First-Class Citizens** — When the scaffold says a transition has side effects,
-   every side effect is a testable claim.
+3. **Side Effects as First-Class Citizens** — Every side effect described in the PRD is a testable claim.
 
 4. **Error ID Specificity** — Assert the exact `error_id` string, not just the HTTP status code.
 
@@ -612,4 +620,6 @@ After generating both layers, verify:
 5. **Every RBAC exclusive operation** has a negative test (wrong role → ERR_UNAUTHORIZED).
 6. **Every complexity layer** in `complexity_profile.complexity_layers` has dedicated test coverage.
 
-If any gap is found, add the missing tests to the most appropriate test file.
+All six checks are subject to the PRD-First Principle: if a scaffold item has no corresponding PRD description, it produces no test. If any gap is found, add the missing tests to the most appropriate test file.
+
+After all tests are generated, do one final pass: for every test that asserts a specific behavior, verify you can cite the PRD sentence that requires it. If you cannot, remove the test.

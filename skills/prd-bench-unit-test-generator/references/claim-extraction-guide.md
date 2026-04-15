@@ -82,6 +82,8 @@ For **side effect patterns** (inspect each transition's `side_effects`):
 | Compensation | Undo transition → all original side effects reversed; no drift |
 | Conditional cascade | Side effect applied only when child is in specific state |
 
+> **PRD-First**: The scaffold may list side effects at higher precision than the PRD. Test only what the PRD specifies — if the PRD is vague where the scaffold is precise, the test must not hard-code the scaffold's specifics.
+
 ---
 
 ## From Table 3 (Calculations)
@@ -183,11 +185,15 @@ For **role model patterns** (`complexity_profile.role_model`):
 | `delegated_authority` | Delegation grant works; delegated permission expires/revocable; delegatee can act |
 | Segregation of duties | Same user cannot do step A and step B (if `X-User-ID` tracked) |
 
+> **PRD-First**: These role model claims apply only if the PRD describes the pattern. The scaffold's `role_model` is designer intent; the PRD's endpoint table is the implementation contract.
+
 ---
 
 ## From Cross-Cutting Complexity Layers
 
-Inspect `complexity_profile.complexity_layers` and generate claims for each active layer:
+> **PRD-First**: Use these layers as a checklist to find PRD claims you might have missed, not as an independent requirements source. If the PRD is silent on a layer, skip it.
+
+Inspect `complexity_profile.complexity_layers` and generate claims for each active layer that the PRD describes:
 
 | Layer | Claims to generate |
 |---|---|
