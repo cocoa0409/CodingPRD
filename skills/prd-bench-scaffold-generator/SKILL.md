@@ -152,10 +152,10 @@ Benchmarks exist to stress-test LLM coding ability. Target one of these two diff
 
 | Level | Entity count | Endpoint count | Error codes | Calculation variants | State machines | Typical token budget |
 |-------|-------------|---------------|-------------|---------------------|---------------|---------------------|
-| **Advanced** | 8–16 | 18–30 | 15–20 | 2–3 | 3–5 with reverts + auto-transitions | ~30k |
-| **Expert** | 14–25 | 28–40 | 20–30 | 3+ | 4+ with cycles or parallel dimensions | ~50k |
+| **Advanced** | 10–16 | 18–40 | 15–40 | 2–3 | 3–5 with reverts + auto-transitions | ~50k |
+| **Expert** | 14–30 | 35–65 | 30–60 | 3+ | 4+ with cycles or parallel dimensions | ~80k |
 
-**Default to Advanced.** Only go Expert when the scenario naturally demands it (many entity types, complex cross-entity workflows). An overly simple scaffold fails to discriminate between implementations — never generate fewer than 8 entities or 18 endpoints.
+**Default to Advanced.** Only go Expert when the scenario naturally demands it (many entity types, complex cross-entity workflows). An overly simple scaffold fails to discriminate between implementations — never generate fewer than 10 entities or 18 endpoints.
 
 These are guidelines, not hard rules. A 10-entity benchmark with one fiendishly tricky calculation can be harder than a 20-entity CRUD app.
 
