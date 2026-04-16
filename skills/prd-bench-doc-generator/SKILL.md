@@ -39,25 +39,33 @@ A single `prd.md` file in the output folder — a prose-style Product Requiremen
 
 Information in the PRD falls into two categories with opposing writing strategies:
 
-### Contract-Level Specifications (must be precise and unambiguous, but derived from scaffold — NOT hardcoded)
+### Contract-Level Specifications (must be precise and unambiguous)
 
 These define the API's **structural contract** — what responses look like, field names and types, pagination mechanics. If these are vague, any reasonable implementation could diverge from the fixed test suite, and the benchmark breaks.
 
-**Critical**: All contract elements below must be **faithfully derived from the scaffold**, not defaulted to fixed names. Different scaffolds use different header names, error ID patterns, field naming conventions, and envelope structures. The PRD must precisely reflect whatever the scaffold defines.
-
-Must be precisely defined — **every item below is read from the scaffold, never assumed or defaulted**:
-- **Response envelope format**: Complete JSON examples (success + error) with every field's name, type, and semantics — from `response_envelope`. Field names, prefixes, and structure vary per scaffold.
-- **Pagination mechanism**: Parameter names, defaults, min/max — from `response_envelope.pagination_defaults`. Names and defaults vary per scaffold.
-- **Common resource properties**: Field names and types from entities with `common_fields: true`. Names vary per scaffold.
-- **Auth headers**: Exact header names from the scaffold's `validations[]` auth checks. Names vary per scaffold — never assume any fixed default.
-- **Status code rules**: 201 for new resource creation, 200 for modifications (unless scaffold specifies otherwise)
-- **Precision rules**: Decimal places and rounding method — from `calculations[].precision`
-- **OCC mechanism**: The concurrency control field name and error ID from the scaffold. Mechanism and naming vary per scaffold — never assume any fixed default.
-- **Sort order**: List endpoints default sort behavior — from scaffold
+Must be precisely defined:
+- **Response envelope format**: Complete JSON examples (success + error) with every `meta` field's name, type, and semantics — derived from `response_envelope` in the scaffold
+- **Pagination mechanism**: Parameter names, defaults, min/max — derived from `response_envelope.pagination_defaults`
+- **Common resource properties**: `id` (UUID), `created_at` (ISO 8601 UTC), `updated_at`, `version` (integer, increments on mutation) — derived from entities with `common_fields: true`
+- **Auth headers**: Exact names `X-User-ID` and `X-User-Role`
+- **Status code rules**: 201 for new resource creation, 200 for modifications
+- **Precision rules**: Decimal places and rounding method — derived from `calculations[].precision`
+- **OCC mechanism**: `version` field behavior (omit to skip check, mismatch yields `ERR_STALE_DATA`)
+- **Sort order**: List endpoints default to `created_at` ascending
 - **Role enumeration**: Exact spelling of all role names — from `roles[].name`
-- **State enumeration values**: Exact strings for every state — from `state_machines[]`
-- **Enum field values**: All enum-type field values — from `entities[].fields` where `type: enum`
-- **Error IDs**: All error ID strings and their HTTP status — from `errors[]`. Naming patterns vary per scaffold.
+- **State enumeration values**: Exact strings for every state — from `state_machines[].initial_state`, `terminal_states`, and all `transitions[].from`/`to`
+- **Certification / category enumeration values**: All enum-type field values — from `entities[].fields` where `type: enum`
+- **Error ID format**: All `error_id` strings and their HTTP status — from `errors[]`
+
+### Scaffold Fidelity (no invention allowed)
+
+The scaffold is the single source of truth. The PRD must faithfully represent **all and only** what the scaffold defines. Specifically:
+
+- **No invented rules**: Do not add states, fields, error codes, calculations, endpoints, validation rules, or side effects that do not exist in the scaffold.
+- **No omitted rules**: Every entity, state transition, calculation formula, validation check, error code, and endpoint in the scaffold must appear somewhere in the PRD.
+- **No reinterpretation**: Do not change the semantics of scaffold rules — e.g., do not turn a `>=` threshold into `>`, do not rename error IDs, do not alter state transition preconditions.
+
+The litmus test: *"Can every statement in the PRD be traced back to a specific entry in the scaffold?"* If a sentence asserts behavior that has no scaffold source, delete it.
 
 ### Business Logic (deliberately scattered to increase inference difficulty)
 
@@ -116,31 +124,31 @@ Most content in this section is **contract-level specification** and must be pre
 
 #### §2.1 User and Role-Based Access Control
 
-- Explicitly state the **exact header names as defined in the scaffold's auth validation rules**. Never assume any fixed default.
+- Explicitly state the header names: `X-User-ID` and `X-User-Role`
 - List all role names with exact spelling — from `roles[].name`
-- Reference the auth-related error IDs from `errors[]` with their exact IDs as the scaffold defines them
+- Reference the auth-related error IDs from `errors[]` (e.g., the ones for missing headers and insufficient permissions)
 
 #### §2.2 API Response Structure (the most critical contract subsection)
 
-**Must provide complete JSON examples**, derived from `response_envelope` in the scaffold. The field names, structure, and naming conventions vary per scaffold — do NOT assume a fixed envelope shape.
+**Must provide complete JSON examples**, derived from `response_envelope` in the scaffold:
 
-Success response — use the structure from `response_envelope.success`, expanding it into a full, formatted JSON block with **domain-specific placeholder values**. Include pagination fields from `response_envelope.pagination_fields`.
+Success response — use the structure from `response_envelope.success`, expanding it into a full, formatted JSON block with domain-specific placeholder values. Include pagination fields from `response_envelope.pagination_fields`.
 
-Error response — use the structure from `response_envelope.error`, expanding it into a full, formatted JSON block with domain-relevant error examples.
+Error response — use the structure from `response_envelope.error`, expanding it into a full, formatted JSON block.
 
-**After the JSON examples**, explain each field's semantics using the **exact field names from the scaffold's response_envelope**:
-- Request ID field: server-generated unique identifier, format description
-- Timestamp field: ISO 8601 UTC with the precision specified by the scaffold
-- Type discriminator field: enumeration of possible values
-- Data wrapper field: business payload semantics
+**After the JSON examples**, explain each field's semantics:
+- `api_request_id`: server-generated unique identifier, format description
+- `api_request_timestamp`: ISO 8601 UTC with 3 fractional digits
+- `response_type`: `"object"` | `"array"` | `"error"` enumeration
+- `data`: business payload (object, array, or empty object)
 - Pagination fields (from `response_envelope.pagination_fields`) appear only in list endpoint responses
-- Error response fields (exact field names from scaffold)
+- Error response `error_id` and `message` fields
 
 #### §2.3 Pagination
 
-- State defaults, min, max for the pagination parameters defined in the scaffold's `response_envelope.pagination_defaults` — use the exact parameter names from the scaffold
-- State default sort order as specified by the scaffold
-- State which pagination fields appear in the metadata section
+- State defaults, min, max for `limit` and `offset` — from `response_envelope.pagination_defaults`
+- State sort order (`created_at` ascending)
+- State which pagination fields appear in `meta`
 
 #### §2.4+ Domain-Specific Cross-Cutting Principles
 
@@ -150,9 +158,9 @@ The following topics **must be covered** (but organization is free — merge rel
 
 - **Hierarchical consistency**: From `state_machines[].transitions[].side_effects` — cascade/revert patterns, parent-child state propagation, `updated_at` and `version` semantics on mutation
 - **Nested resource retrieval**: Left-to-right path parameter validation — derived from the URL hierarchy in `endpoints[].path`
-- **Common resource properties**: Field names and types as defined by the scaffold's `common_fields: true` entities. Note which entities omit mutable tracking fields — those with `common_fields: false`
-- **Precision and rounding**: From `calculations[].precision` — state the exact decimal places and rounding method the scaffold specifies
-- **Optimistic Concurrency Control**: Describe the OCC mechanism using the **exact field name and error ID from the scaffold**. Never assume any fixed default.
+- **Common resource properties**: `id` (UUID), `created_at`/`updated_at` (ISO 8601 UTC with 3 fractional digits), `version` (integer) semantics. Note which entities omit `updated_at` — those with `common_fields: false` in the scaffold
+- **Precision and rounding**: From `calculations[].precision` — state "2 decimal places" and "round half up" (or whatever the scaffold specifies)
+- **Optimistic Concurrency Control**: `version` is optional in request body, mismatch yields `ERR_STALE_DATA`, omit to skip check — derived from endpoints accepting `version?` input
 - **Domain-specific cross-cutting rules**: Ledger principles, safety protocols, resource utilization rules, capacity constraints, etc. — the specific topics depend entirely on the domain's `calculations` and `validations`
 
 ### §3. Business Logic & Workflows (Scattering Zone)
@@ -187,52 +195,6 @@ Generate a summary table from the scaffold's `endpoints[]`. Core principle: **ke
 ### §5. Error Code Catalogue
 
 Generate a summary table from the scaffold's `errors[]`. Core principle: **the table does not include trigger conditions** — trigger conditions are scattered throughout §2 and §3 narratives. The table has only 2 columns: Error ID, HTTP Status Code.
-
----
-
-## Scaffold-PRD Fidelity (Critical)
-
-The PRD is downstream of the scaffold YAML and upstream of the test suite. **Every semantic unit in the scaffold must have a corresponding, unambiguous expression in the PRD.** Information loss at this step is the single most damaging failure mode: it causes tests (which may correctly implement the scaffold) to contradict the PRD, making the benchmark unsolvable for an implementation that follows only the PRD.
-
-### What Counts as Information Loss
-
-"Scattering" means distributing information across multiple narrative locations — NOT diluting precise definitions into vague prose. The following scaffold elements **must preserve their full semantic precision** even when scattered:
-
-1. **State sets used as filters**: When the scaffold defines a "committed schedule" as `{PENDING_SCHEDULE, PROTOCOL_APPROVED, SCHEDULED, COMPLETED}`, the PRD must list those exact statuses somewhere — not replace them with "the committed schedule" without defining the term. The same applies to "non-terminal states", "unresolved assignments", "active commitments", etc.
-
-2. **Cascade side effects**: When the scaffold says `PLANNING → CANCELLED` has side_effects `["All PENDING procedures → CANCELLED", "All associated non-terminal assignments → cascade cancel with refund"]`, the PRD must state which procedure states are affected and what happens to their assignments — not just "the system ensures consistency."
-
-3. **Precondition definitions**: When the scaffold says a transition requires "No unresolved assignments (non-terminal: PENDING_SCHEDULE, PROTOCOL_APPROVED)", the PRD must define what "unresolved" means in concrete terms — not use vague phrases like "definitively scheduled or discarded" without specifying which statuses qualify.
-
-4. **Calculation filters**: When the scaffold says "non-terminal assignments with start_minute < current", the PRD must include BOTH the "non-terminal" qualifier AND the "start_minute <" filter — dropping either changes the calculation's semantics.
-
-5. **Validation trigger conditions**: Every error_id in the scaffold's `errors[]` table must have its trigger condition described somewhere in §2 or §3 narrative. An error that appears only in the §5 table with no narrative trigger is a gap.
-
-6. **Scope exclusions**: When the scaffold says a constraint "excludes medical-resources and certifications", the PRD must make this boundary unambiguous — either by explicit exclusion or by exhaustively listing what IS included (with the omission clearly implying exclusion).
-
-### Scattering vs. Loss — The Critical Distinction
-
-| Scaffold says | Acceptable scattering | Unacceptable loss |
-|---|---|---|
-| `committed = {PENDING_SCHEDULE, PROTOCOL_APPROVED, SCHEDULED, COMPLETED}` | Define "committed" in §2 or §3 once, reference by name elsewhere | Say "committed schedule" without ever listing the statuses |
-| Side effect: "All PENDING procedures → CANCELLED" | Describe in §3.2 when discussing cancellation | Say "resolves dependent resources" without specifying which states are affected |
-| Precondition: "no PENDING_SCHEDULE or PROTOCOL_APPROVED assignments" | Describe in §3.1 when discussing final review | Say "all activities are definitively scheduled or discarded" |
-| Constant: `THRESHOLD: 6000` (minutes) | Write "100 hours of operation" in §2 and reference in §3 | Never mention the threshold value at all |
-| Error: `ERR_SELF_PAIRING` | Mention "a resource cannot be paired with itself" in §3.4 | Only list ERR_SELF_PAIRING in the §5 error table |
-
-### Verification Protocol
-
-After generating the PRD, perform a **scaffold-to-PRD trace** before writing the file:
-
-1. **State machine trace**: For every transition in `state_machines[].transitions`, verify the PRD states (a) the from/to states, (b) the trigger, (c) each precondition with its specific qualifiers, (d) each side effect with affected states explicitly named.
-
-2. **Calculation trace**: For every entry in `calculations[]`, verify the PRD describes (a) the trigger event, (b) the filter/scope of inputs (with exact state qualifiers), (c) the algorithm at narrative level, (d) every constant value (possibly unit-converted), (e) precision rules.
-
-3. **Validation trace**: For every entry in `validations[]`, verify the PRD mentions (a) the check condition, (b) the error_id, (c) any scope exclusions or inclusions.
-
-4. **Error trace**: For every entry in `errors[]`, verify the PRD contains a narrative sentence describing when this error is triggered — not just the error_id in the §5 table.
-
-5. **Field trace**: For every field in `entities[].fields`, verify the field name appears in backticks in §3, with its semantics clear from context.
 
 ---
 
@@ -291,24 +253,17 @@ Do not expose trigger conditions (from `errors[].condition`) in the §5 table. T
 
 ## Quality Checklist
 
-### Scaffold-PRD Fidelity (most critical — check FIRST)
-- [ ] **State-set fidelity**: Every "committed schedule", "non-terminal", "unresolved" term used in the PRD is backed by an explicit list of statuses somewhere in §2 or §3
-- [ ] **Cascade fidelity**: Every cascade side_effect in `state_machines[].transitions[].side_effects` has a corresponding PRD sentence naming the affected states (e.g., "all PENDING procedures → CANCELLED")
-- [ ] **Precondition fidelity**: Every precondition in `state_machines[].transitions[].preconditions` has a PRD sentence with equivalent specificity (not vaguer than the scaffold)
-- [ ] **Calculation filter fidelity**: Every filter qualifier in `calculations[].formula` (e.g., "non-terminal", "start_minute < current") appears in the PRD narrative — dropping a qualifier changes semantics
-- [ ] **Error trigger fidelity**: Every `errors[].id` has its trigger condition described in §2 or §3 narrative — not just listed in the §5 table
-- [ ] **Scope exclusion fidelity**: Every "applies_to" / "excludes" in `validations[]` is unambiguously reflected in the PRD — either by explicit exclusion or exhaustive inclusion list
-- [ ] **No vague paraphrasing**: Terms like "ensures consistency", "resolves dependent resources", "appropriately handled" are NOT used as substitutes for specific state-by-state descriptions from the scaffold
-
-### Contract Precision (§2) — precise but scaffold-derived, not hardcoded
-- [ ] Every structural name in §2 (auth headers, envelope fields, pagination params, OCC field/error, common resource property names) is **read from the scaffold** — no name is assumed or defaulted
-- [ ] §2.2 contains complete success/error JSON examples with field names and placeholder values matching the scaffold's `response_envelope`
-- [ ] §2.3 explicitly states pagination parameter names, defaults, min, max as defined in the scaffold
+### Contract Precision (§2)
+- [ ] §2.2 contains complete success/error JSON examples with precise field names
+- [ ] §2.2 explains each `meta` field's semantics individually
+- [ ] §2.3 explicitly states limit/offset defaults, min, max
+- [ ] §2.3 explicitly states sort order
+- [ ] Common resource properties (id, created_at, updated_at, version) have precise type and format definitions
 - [ ] Precision rules (decimal places + rounding method) are explicitly stated
+- [ ] OCC mechanism is precisely described
 - [ ] All role names are spelled exactly as in `roles[].name`
 - [ ] All state enumeration values are exact strings from `state_machines[]`
-- [ ] All enum-type field values are exact strings from `entities[].fields`
-- [ ] All error IDs match the scaffold's `errors[]` exactly
+- [ ] All enum-type field values (certifications, categories, etc.) are exact strings from `entities[].fields`
 
 ### Scattering Rules (§3)
 - [ ] Every field from `entities[].fields` appears in §3 in backticks
@@ -324,30 +279,16 @@ Do not expose trigger conditions (from `errors[].condition`) in the §5 table. T
 
 ---
 
-## Common Problems (Must Avoid)
-
-### Homogeneity Problems (copying the example or ignoring scaffold diversity)
+## Common Homogeneity Problems (Must Avoid)
 
 These are the most frequent "copying the example" problems when generating PRDs. Self-check before every generation:
 
 1. **§2 subsections mirror the example 1:1**: Subsection numbers, titles, and ordering are nearly identical to the example (e.g., 2.4 is always "System Integrity", 2.5 is always "Fiscal Responsibility"). Subsections should be renamed and reordered based on the domain.
-2. **§2.2 JSON placeholders are identical**: Every generation uses `req_RANDOMALPHANUM123456`, `2025-05-24T10:30:00.123Z`, `UNIQUE_ERROR_IDENTIFIER_STRING`. Use domain-relevant sample values with the scaffold's actual field names, prefixes, and timestamp precision.
+2. **§2.2 JSON placeholders are identical**: Every generation uses `req_RANDOMALPHANUM123456`, `2025-05-24T10:30:00.123Z`, `UNIQUE_ERROR_IDENTIFIER_STRING`. Use domain-relevant sample values.
 3. **§3 follows a fixed 7-subsection pattern**: Exactly 7 subsections arranged as "lifecycle → structure → core op → pairing/restriction → safety/compliance → cost calculation → finalization". Group naturally based on the domain.
 4. **Monotonous paragraph openings**: Multiple consecutive paragraphs starting with "The system...". Alternate among role names, conditional clauses, business events, etc.
 5. **Fixed Introduction format**: Always 1 paragraph of 3–4 sentences starting with "This document outlines...". Adapt length and approach angle to the domain.
 6. **Templated §2 subsection prose**: Every domain's cross-cutting subsections use the same sentence structures (e.g., "The system enforces strict X. Every Y is associated with a Z."). Vary expression style based on concept complexity.
-7. **Hardcoded structural names**: Using any fixed auth header names, OCC field/error names, envelope field names, or pagination parameter names without reading them from the scaffold. Every scaffold defines its own naming conventions — the PRD must reflect them exactly, not substitute defaults from memory or from a previous generation.
-
-### Fidelity Problems (information loss from scaffold — MORE DAMAGING than homogeneity)
-
-These cause the PRD to be logically inconsistent with the scaffold, making downstream tests unsolvable. **Every one of these is a P0 bug.**
-
-7. **Vague cascade descriptions**: Writing "the system ensures consistency" instead of "all PENDING procedures → CANCELLED and all non-terminal assignments → cascade cancel with refund". The scaffold lists specific states; the PRD must name them.
-8. **Undefined filter terms**: Using "committed schedule", "non-terminal", or "unresolved" as if they are self-explanatory without ever listing which assignment/procedure statuses they include. If the scaffold defines a filter set, the PRD must define it too.
-9. **Dropped precondition qualifiers**: If the scaffold says "non-terminal assignments with start_minute < current", writing only "assignments whose procedures are scheduled to start before the current one" drops the "non-terminal" qualifier and changes the calculation semantics.
-10. **Orphaned error codes**: An error_id that appears in the §5 table but has no trigger condition described anywhere in §2 or §3. Every error needs a narrative sentence explaining when it fires.
-11. **Implicit scope boundaries**: The scaffold says a constraint "excludes medical-resources and certifications" but the PRD only lists what IS included, leaving the exclusion ambiguous. Either state the exclusion explicitly or ensure the inclusion list is exhaustive enough that the omission is unambiguous.
-12. **Vague state-transition side effects**: Writing "ledger is adjusted accordingly" instead of "provisional_cost is refunded to cost_balance and bio-risk/override penalties are reversed from patient_safety_score." The scaffold itemizes each side effect; the PRD must preserve that specificity.
 
 ---
 
@@ -363,6 +304,5 @@ Key observations:
 2. How `example-prd.md` §3 scatters field names from `example-scaffold.yaml` throughout narrative paragraphs
 3. The endpoint table has only 4 columns; the error table has only 2 columns
 4. All calculation formulas use narrative, not pseudocode
-5. How `example-prd.md` preserves scaffold fidelity: "committed schedule" is defined with exact statuses (§2.7, §3.4), cascade effects name specific states (§3.2), preconditions give concrete definitions (§3.1), and every error trigger condition appears somewhere in narrative
 
 The scaffold YAML structure is defined in [prd-bench-scaffold-generator](../prd-bench-scaffold-generator/SKILL.md).

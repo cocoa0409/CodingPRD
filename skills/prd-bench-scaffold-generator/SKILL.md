@@ -43,7 +43,7 @@ For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tab
 - [ ] 0: Select complexity profile (§Step 0)
 - [ ] 1.1: Entity-Relationship Table
 - [ ] 1.2: State Machine Table
-- [ ] 1.2.1: Concurrency Rules (if `optimistic_concurrency` layer selected and race scenarios exist)
+- [ ] 1.2.1: Concurrency Rules
 - [ ] 1.3: Calculation Rules Table
 - [ ] 1.4: Validation Rules Table (ordered)
 - [ ] 1.5: API Endpoint Table
@@ -77,22 +77,6 @@ Each archetype represents a fundamentally different core challenge. Choose ONE p
 | **Compliance / audit** | Actions constrained by regulatory rules with audit trail | Mandatory cooling-off periods, segregation of duties, tamper-evident logs | Financial trading, pharmaceutical dispensing, government procurement | 0/22 — ABSENT |
 
 **Diversity guidance**: When generating a new scaffold, check the coverage column. If the scenario could fit multiple archetypes, prefer the underrepresented one. The 4 absent archetypes (multi-party negotiation, temporal windowing, workflow orchestration, compliance/audit) are high-priority targets for new scenarios.
-
-### 0.5 Structural Surface Diversity (Anti-Templating)
-
-Beyond archetype and topology diversity, each scaffold must vary its **surface-level naming and structural conventions** so that downstream PRDs and tests exercise different parsing patterns. The goal is that no two scaffolds feel like they came from the same template.
-
-**Core principle**: Every naming choice — header names, error ID patterns, envelope field names, pagination style, field casing, OCC mechanism — should be **invented fresh for the domain**, not picked from a fixed menu. Read the existing 22 example scaffolds, observe what conventions have already been used, and deliberately choose something different. If you find yourself typing the same name you typed in a previous scaffold, stop and rethink.
-
-**Dimensions that must vary** (not an exhaustive list — invent new dimensions as the domain demands):
-
-- **Authentication header names**: Should reflect who the actors are in this domain. A hospital system might use different terminology than a logistics platform or a peer-review system. Header casing, separators, and even whether auth headers exist at all should be domain-driven.
-- **Error ID naming style**: The prefix, verbosity, and vocabulary of error codes should feel native to the domain. Some domains warrant terse codes, others warrant self-documenting long names. The error for "wrong role" doesn't have to be called the same thing in every scaffold.
-- **Concurrency control mechanism**: The field name, where it travels (body vs header), and the corresponding error should be chosen to fit the domain's data model. Not every system calls it `version`.
-- **Response envelope structure**: The field that wraps the payload, the field that discriminates type, the request ID prefix, the timestamp precision, the pagination parameter names and defaults — all should be designed for the domain, not copied from a template.
-- **Field naming convention**: Casing (snake_case, camelCase, etc.), vocabulary (domain-native terms vs generic), and temporal field names (`created_at` vs `submitted_on` vs `opened`) should match the domain's natural language.
-
-**Anti-pattern**: Listing N concrete options and picking one. That just replaces one template with N templates. Instead, treat every surface name as a creative decision informed by the domain.
 
 ### 0.2 Cross-Cutting Complexity Layers
 
@@ -259,19 +243,11 @@ state_machines:
 | Conditional cascade | Side effect depends on child's current state | Only cancel non-terminal children |
 | Compensation | Undo side effects of a previous transition | Reject → refund cost + revert safety score |
 
-### 1.2.1 Concurrency Rules (Optional)
+### 1.2.1 Concurrency Rules
 
-`optimistic_concurrency` as a complexity layer gives version-based conflict detection on
-PATCH/PUT endpoints. But version checks alone do **not** specify what happens when two
-non-idempotent operations race — e.g., two admins simultaneously assigning different riders
-to the same order, or a restaurant confirming while a customer cancels.
+Every scaffold must define explicit concurrency rules for operations where concurrent execution could produce data integrity issues. Version-based OCC alone only detects stale writes — it does not specify what happens when two non-idempotent operations race (e.g., two riders assigned to the same order, or confirm vs cancel on the same resource).
 
-If the scenario has operations where concurrent execution could produce data integrity
-issues, the scaffold should define the expected behavior explicitly in a `concurrency_rules`
-section. Each rule states:
-1. **What concurrent scenario** is being constrained
-2. **What the system guarantees** (exactly one succeeds, duplicate rejected, etc.)
-3. **What error** the loser receives
+Each rule must provide a rigorous, testable guarantee:
 
 ```yaml
 concurrency_rules:
@@ -285,9 +261,7 @@ concurrency_rules:
     serialization: "First-writer-wins on order status"
 ```
 
-When `concurrency_rules` are defined, also add the corresponding error codes to the Error
-Catalog (Table 6). The PRD generator will include these rules as explicit requirements in
-the PRD document.
+All error codes referenced here must also appear in the Error Catalog (Table 6).
 
 ### 1.3 Calculation Rules Table
 
@@ -476,8 +450,3 @@ Checklist:
 - [ ] At least TWO of the three dimensions above differ from the majority
 - [ ] Core calculation challenge is structurally different (not another threshold + aggregation)
 - [ ] Role model adds diversity (prioritize segregation_of_duties or delegated_authority)
-
-**Surface diversity (§0.5 — anti-templating):**
-- [ ] Auth header names, error IDs, OCC field/error, envelope field names, and pagination style are **domain-native** — not reused from a previous scaffold
-- [ ] At least THREE surface naming dimensions differ from the most common pattern among existing examples
-- [ ] No naming choice was made by picking from a fixed list — each was invented for this domain
