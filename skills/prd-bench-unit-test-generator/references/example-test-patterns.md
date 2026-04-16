@@ -23,7 +23,7 @@ Replace with the PRD's actual domain terminology when generating.
 5. [factories.py — Payload Factories](#15-factoriespy)
 6. [constants.py — Domain Thresholds](#16-constantspy)
 7. [test_users.py — Role Headers](#17-test_userspy)
-8. [fixtures.py — Composite Setup Helpers (6 tiers)](#18-fixturespy)
+8. [fixtures.py — Composite Setup Helpers (5 tiers)](#18-fixturespy)
 9. [\_\_init\_\_.py — Barrel Export](#19-__init__py)
 
 ### Stage 2: `test_suite/` Files
@@ -447,24 +447,6 @@ def setup_finalized_plan(budget=1_000, cost_per_minute=20):
     return final_plan, assignments[0]
 ```
 
-# ─── Tier 6: Concurrency / Race Conditions ───────────
-
-```python
-def setup_race_scenario(include_scheduled=True):
-    """Pre-built scenario for concurrent operation tests."""
-    parent, child, resource = setup_{parent}_with_{child}_and_{resource}()
-    proc = get_success_data(api_client.create_procedure(
-        parent["id"], child["id"], create_procedure_payload(),
-        TEST_USERS["role_b_headers"]))
-    asg = get_success_data(api_client.create_assignment(
-        parent["id"], create_assignment_payload(proc["id"], resource["id"]),
-        TEST_USERS["role_b_headers"]))
-    if include_scheduled:
-        api_client.protocol_approve(parent["id"], asg["id"], TEST_USERS["role_a_headers"])
-    return {"parent": parent, "child": child, "resource": resource,
-            "proc": proc, "asg": asg}
-```
-
 ## 1.9 `__init__.py`
 
 Barrel export: re-exports framework generics + PRD-specific code in one place.
@@ -844,18 +826,20 @@ def test_mass_assignment_ignored(api, role_a_headers):
     assert entity["status"] == "INITIAL_STATE"
 ```
 
-## 2.9 Concurrency
+## 2.9 Concurrency (OCC Only — Race Tests Are PRD-Driven)
+
+Concurrency tests cover **only** what the PRD explicitly defines. The standard patterns are
+optimistic concurrency control (version conflict detection) and any uniqueness constraints
+the PRD specifies.
+
+**Do NOT generate race-condition tests (concurrent state transitions, duplicate resource
+creation races, etc.) unless the PRD explicitly defines the expected outcome** — e.g.,
+"only one delivery may be assigned per order" or "exactly one of confirm/cancel must win."
+The `run_race` and `assert_exactly_one_succeeds` utilities exist in the framework for
+scaffolds whose PRD does define such behavior, but they are not standard patterns to apply
+by default.
 
 ```python
-def test_concurrent_approve_exactly_one_succeeds(api, role_a_headers):
-    """Concurrency: Two concurrent approvals → exactly one succeeds."""
-    # ... create pending assignment ...
-    results = run_race(
-        lambda: api.protocol_approve(parent["id"], asg["id"], role_a_headers),
-        lambda: api.protocol_approve(parent["id"], asg["id"], role_a_headers),
-    )
-    assert_exactly_one_succeeds(results[0], results[1])
-
 def test_stale_version_rejected(api, role_a_headers):
     """OCC claim: Update with stale version → ERR_STALE_DATA."""
     entity = validate_success(api.create_{entity}(..., role_a_headers), 201)

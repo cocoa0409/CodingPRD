@@ -197,7 +197,7 @@ Inspect `complexity_profile.complexity_layers` and generate claims for each acti
 
 | Layer | Claims to generate |
 |---|---|
-| `optimistic_concurrency` | Stale version write → conflict error; correct version → success; version increments on every write |
+| `optimistic_concurrency` | Stale version write → conflict error; correct version → success; version increments on every write. **Does NOT imply race-condition tests** — only generate race tests if the PRD explicitly defines concurrent-operation outcomes (e.g., "only one succeeds", uniqueness constraints on creation). |
 | `cascading_side_effects` | N-level chain verified end-to-end; ordering sensitivity tested; partial failure handled |
 | `dual_variant_calculation` | Both variants produce expected results; delta on switch is correct |
 | `soft_delete` | Soft-deleted entity excluded from lists (default); included when filter specified; references still valid |

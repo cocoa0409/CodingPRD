@@ -43,6 +43,7 @@ For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tab
 - [ ] 0: Select complexity profile (§Step 0)
 - [ ] 1.1: Entity-Relationship Table
 - [ ] 1.2: State Machine Table
+- [ ] 1.2.1: Concurrency Rules (if `optimistic_concurrency` layer selected and race scenarios exist)
 - [ ] 1.3: Calculation Rules Table
 - [ ] 1.4: Validation Rules Table (ordered)
 - [ ] 1.5: API Endpoint Table
@@ -99,7 +100,7 @@ These are independent difficulty dimensions that can be **layered onto any arche
 
 | Layer | What it adds | Difficulty mechanism | Observed in |
 |-------|-------------|---------------------|-------------|
-| **Optimistic concurrency** | Version-based conflict detection | Stale-data races, retry semantics | 18/22 scaffolds |
+| **Optimistic concurrency** | Version-based conflict detection | Stale-data races, retry semantics. OCC alone only covers version-field conflicts on PATCH/PUT. If the scenario also has race-condition constraints (e.g., "at most one delivery per order"), define them explicitly in `concurrency_rules` (see §1.2.1). | 18/22 scaffolds |
 | **Cascading side effects** | One mutation triggers chain of dependent updates | N-level propagation, ordering sensitivity, partial failure | 20/22 scaffolds |
 | **Dual-variant calculation** | Same inputs, two valid algorithms, different outputs | Provisional vs final, optimistic vs pessimistic, estimate vs actual | 9/22 scaffolds |
 | **Rate / threshold triggers** | Behavior changes at configurable breakpoints | Boundary precision (>= vs >), cumulative vs instantaneous, threshold reset | 10/22 scaffolds |
@@ -257,6 +258,36 @@ state_machines:
 | Ledger sync | State change → derived field on ancestor recalculated | Assignment created → plan.cost_balance debited |
 | Conditional cascade | Side effect depends on child's current state | Only cancel non-terminal children |
 | Compensation | Undo side effects of a previous transition | Reject → refund cost + revert safety score |
+
+### 1.2.1 Concurrency Rules (Optional)
+
+`optimistic_concurrency` as a complexity layer gives version-based conflict detection on
+PATCH/PUT endpoints. But version checks alone do **not** specify what happens when two
+non-idempotent operations race — e.g., two admins simultaneously assigning different riders
+to the same order, or a restaurant confirming while a customer cancels.
+
+If the scenario has operations where concurrent execution could produce data integrity
+issues, the scaffold should define the expected behavior explicitly in a `concurrency_rules`
+section. Each rule states:
+1. **What concurrent scenario** is being constrained
+2. **What the system guarantees** (exactly one succeeds, duplicate rejected, etc.)
+3. **What error** the loser receives
+
+```yaml
+concurrency_rules:
+  - scenario: "Two riders assigned to the same order simultaneously"
+    guarantee: "At most one delivery per order; second assignment rejected"
+    error_id: ERR_DELIVERY_ALREADY_ASSIGNED
+    http_status: 409
+
+  - scenario: "Restaurant confirms order while customer cancels simultaneously"
+    guarantee: "Exactly one operation succeeds; loser receives ERR_INVALID_STATE"
+    serialization: "First-writer-wins on order status"
+```
+
+When `concurrency_rules` are defined, also add the corresponding error codes to the Error
+Catalog (Table 6). The PRD generator will include these rules as explicit requirements in
+the PRD document.
 
 ### 1.3 Calculation Rules Table
 
