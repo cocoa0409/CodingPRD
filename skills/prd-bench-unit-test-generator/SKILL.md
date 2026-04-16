@@ -179,31 +179,64 @@ Implementers see only the PRD, never the scaffold. A test that asserts behavior 
 
 The litmus test: *"Could a developer reading only the PRD reasonably implement the behavior this test asserts?"* If no, the test must not exist.
 
-### Mandatory PRD Citation (per-test, not per-file)
+### Mandatory PRD Citation (per-test, not per-file — verbatim, rule-bearing, non-abbreviated)
 
-Every generated test function must carry a **PRD citation** inside its docstring: a short verbatim quote (or a specific paragraph marker) from PRD.md that states the rule being tested. This is the single most effective mechanism against "scaffold-leakage" — a test written without a citation is a test with no accountability.
+Every generated test function must carry a **PRD citation** inside its docstring. The citation is not a courtesy label — it is the accountability record that proves the asserted rule exists in the contract the implementer actually sees. The citation must meet all three criteria below; any failure invalidates the test and the test must either be rewritten or deleted.
+
+**C1. Verbatim, not paraphrased.** The quoted text must appear character-for-character in PRD.md (modulo surrounding whitespace). A citation that paraphrases ("PRD says approve requires a passed home visit") is not acceptable — paraphrases drift from the actual prose and hide both generator bugs and PRD gaps. The citation must survive a literal `grep` of PRD.md.
+
+**C2. Rule-bearing, not endpoint-titular.** The quoted sentence must express the **specific rule** the test asserts — the error_id, the threshold value, the state transition, the side effect, the field name's presence/type. Quoting the endpoint title ("`POST /adopters/{id}/home-visits`") or the section heading is **not** sufficient even if those strings appear in PRD; they do not encode the behavior. If the only PRD text that mentions the subject is a section header, the rule is silent and the test must not be generated.
+
+**C3. Non-abbreviated — quote the full sentence that carries the rule.** Do not truncate to a phrase. If the rule lives in a sentence like *"A pass sets `Adopter.home_visit_status` to `PASSED` and writes `home_visit_expires_at` at 180 days from the completion moment"*, cite the whole sentence. Truncating to *"A pass sets…"* hides whether the cited rule actually covers the specific field/transition under assertion. Prefer quoting one full sentence over quoting a three-word fragment.
 
 Citation format (choose one):
 
 ```python
 def test_void_invoice_with_partial_payment_rejected(api):
     """PRD §3.6: "an invoice that has received any money cannot be voided
-    until the money is refunded (ERR_INVOICE_HAS_PAYMENTS)."
+    until the money is refunded, and such an attempt is rejected with
+    ERR_INVOICE_HAS_PAYMENTS."
 
     Claim: void on PARTIALLY_PAID → ERR_INVOICE_HAS_PAYMENTS (not ERR_INVALID_STATE).
     """
 ```
 
-Or, for rules expressed across multiple sentences:
+For rules expressed across multiple sentences, quote both sentences in full rather than fusing them:
 
 ```python
 def test_approve_requires_animal_current_version(api):
-    """PRD §2.7 (stale-data family) + §3.3 (approve checks): approve
-    re-checks animal_version_pinned → ERR_STALE_ANIMAL_DATA on mismatch.
+    """PRD §2.7: "stale-version checks are the last precondition; on mismatch
+    the platform returns ERR_STALE_ANIMAL_DATA."
+    PRD §3.3: "Approval re-evaluates animal_version_pinned against the live
+    Animal.version at the moment of the call."
 
     Claim: approve with stale animal_version → ERR_STALE_ANIMAL_DATA.
     """
 ```
+
+### The Unique-Derivability Principle (overrides claim extraction — new)
+
+A test is legitimate only when **PRD prose uniquely determines what the test asserts**. If two competent engineers read PRD alone and both arrive at the behavior the test checks, the test is legitimate. If either engineer could plausibly implement a different but still-PRD-consistent behavior and the test would fail on that behavior, **the test is not legitimate and must not be generated**.
+
+This principle closes the gap that PRD-citation alone leaves open. A citation proves PRD mentions the subject; unique derivability proves PRD pins the specific answer the test enforces. Both are required.
+
+**The two-reader thought experiment** — the operational test you must perform before emitting any test:
+
+> Construct two hypothetical implementers, each reading only PRD.md (never scaffold). For the behavior this test asserts, both implementers must arrive at the **same observable outcome**. If one could reasonably implement variant A and the other variant B — both faithful to PRD prose — then PRD has left a design space open. Any test that hard-codes variant A or B over the other must **not** be generated.
+
+**Observed PRD silence patterns that collapse unique derivability** — if you encounter any of these while walking scaffold claims, stop and check PRD carefully before generating:
+
+- **Computed fields mentioned only in formulas.** Scaffold declares `nights` as a computed field on `BoardingReservation`; PRD mentions `nights` only as a variable in a quote formula. A PRD-reader might correctly choose not to expose `nights` on the response (it reads as an intermediate). An assertion that `response["nights"] == 3` requires PRD to explicitly say the reservation **carries** `nights` as an attribute. If PRD does not say so, do not assert presence or value of `nights`.
+
+- **Optional fields without a stated default.** Scaffold declares `{ yard_verified, default: false }`; PRD says only "optionally `yard_verified`". A PRD-reader might store `null`, omit the key entirely, or default to `false` — all faithful to prose. Assertions like `isinstance(data["yard_verified"], bool)` or `data["yard_verified"] is False` on an unsubmitted record are unique-derivability failures. Do not generate them.
+
+- **Asymmetric branch side effects.** Scaffold has PASS-branch and FAIL-branch each with two `side_effects`; PRD renders PASS fully but compresses FAIL to one clause. A PRD-reader has no basis to write the second FAIL-branch side effect. Tests asserting that missing side effect are unfair and must not be generated.
+
+- **State machine enum values appearing only in validators/allowed-lists.** PRD may enumerate adopter `home_visit_status` values as `{PENDING, PASSED, FAILED, EXPIRED}` but never describe what writes `FAILED`. Membership in the enum is not the same as a stated write pathway. Do not generate tests that demand a specific branch write a specific enum value unless prose explicitly states the write.
+
+- **Error-code precedence under cascaded state.** PRD says "loser gets `ERR_A`" for a race, but the implementation's lock serialization will see the loser in a cascaded state that matches an earlier validation priority (e.g., `ERR_INVALID_STATE`). Tests that assert `ERR_A` are legitimate only when PRD explicitly requires the race semantics to **pre-empt** the state-check path — not merely that the loser gets `ERR_A` in the abstract. If PRD only says "the loser receives `ERR_A`" without committing to pre-emption semantics, use `validate_error_is_one_of([ERR_A, ERR_INVALID_STATE])`.
+
+In every case: if the PRD does not uniquely determine the answer, **skip the test** — do not weaken it, do not downgrade it, do not leave a TODO. Raise the gap in the generation summary so it can be fixed in the PRD (via doc-generator's Zero-Silence Rule), not papered over in tests.
 
 ### Rules the scaffold frequently carries that PRD frequently omits (SKIP unless PRD states them)
 
@@ -654,8 +687,19 @@ All six checks are subject to the PRD-First Principle: **if a scaffold item has 
 After all tests are generated, do one final sweep over every test function and confirm:
 
 1. **Every test has a PRD citation in its docstring** (see "Mandatory PRD Citation" above).
-2. **Every cited passage actually exists in PRD.md** — grep the PRD for a distinctive phrase from the citation. If the phrase is not there, either the citation is invented (fix it) or the test is scaffold-only (remove it).
-3. **Every asserted `error_id` is named in the PRD.** If a test asserts `ERR_FOO` but the PRD never mentions `ERR_FOO` outside the §5 table, check whether PRD prose describes the *condition* that triggers `ERR_FOO`; if not, remove the test.
-4. **Every asserted priority/ordering is named in the PRD.** Tests of the form "when A and B both fail, A is reported" require PRD prose stating the precedence. If absent, split into two single-failure tests or remove.
+2. **Every cited passage actually exists in PRD.md, verbatim** — take a distinctive ≥8-word substring of the citation and run a literal `grep` against PRD.md. If the substring does not appear, either the citation is paraphrased (rewrite it to match PRD exactly) or the rule is not in the PRD (remove the test — do not rewrite the PRD from test code).
+3. **Every citation is rule-bearing, not endpoint-titular.** Scan citations that contain only an HTTP method + path or a section heading. Each such citation is a red flag: open the test, check what it asserts, and confirm the asserted rule is actually stated somewhere else in PRD prose. If only the endpoint title is cited and the rule is silent, delete the test.
+4. **Every asserted `error_id` is named in the PRD.** If a test asserts `ERR_FOO` but the PRD never mentions `ERR_FOO` outside the §5 table, check whether PRD prose describes the *condition* that triggers `ERR_FOO`; if not, remove the test.
+5. **Every asserted priority/ordering is named in the PRD.** Tests of the form "when A and B both fail, A is reported" require PRD prose stating the precedence. If absent, split into two single-failure tests or remove.
+6. **Every test passes the two-reader thought experiment.** For each test, re-ask: could a faithful PRD-only implementer reasonably produce an implementation on which this test would fail? If yes, the test assertion has collapsed unique derivability — remove the test or relax the assertion to the range PRD actually determines (e.g., `validate_error_is_one_of([...])`, no assertion on optional-field presence, etc.).
 
-This pass is the last line of defense against scaffold-leakage. A test suite that passes it is guaranteed to be implementable from PRD alone.
+This pass is the last line of defense against scaffold-leakage. A test suite that passes it is guaranteed to be implementable from PRD alone, with every assertion traceable to a verbatim PRD sentence that uniquely determines the expected behavior.
+
+### Summary report requirement
+
+At the end of generation, emit a short report listing:
+- Total tests generated
+- Tests skipped due to PRD silence (categorize by pattern: computed-field, default-value, branch-asymmetry, precedence-silence, concurrency-silence, other)
+- Any scaffold rules that produced zero tests because PRD silence blocked generation
+
+This report is the feedback channel back to the doc-generator. A high skip count for a single category means the PRD generator is systematically eliding that category and its Zero-Silence Rule needs inspection.

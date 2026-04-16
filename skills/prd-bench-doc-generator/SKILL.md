@@ -83,6 +83,19 @@ Two litmus tests must both pass:
 1. *"Can every statement in the PRD be traced back to a specific entry in the scaffold?"* If not, delete the sentence.
 2. *"For every test the unit-test generator would derive from the scaffold, can I cite the PRD sentence that states the rule being tested?"* If not, the PRD is incomplete — add the rule to prose. This second test is the one that most commonly fails because it requires thinking about *rules* (conditions, priorities, race outcomes), not just *names*.
 
+### Zero-Ambiguity Transcription Rule (HARD RULE — cross-cutting)
+
+"Silence" is a PRD that names a scaffold entry without fully transcribing the behavior attached to it — leaving the PRD-only reader with insufficient information to reconstruct the scaffold's specification. A name mentioned without its attached rule, a default without its value, a branch transition without its full side-effect list: each of these is a structural contract violation, not a prose-style choice.
+
+**The rule is methodological, not pattern-enumerated.** For every scaffold entry with semantic content — a field's type / default / source / exposure, a transition's precondition / side-effect, a validation's condition / error_id / priority, a calculation's formula / constant / precision — the PRD prose must express that content in a form where a faithful PRD-only reader arrives at the same specification the scaffold encodes. The question to ask for every scaffold entry is **not** "is its identifier mentioned?" but **"does the PRD prose uniquely determine the scaffold's specification for this entry?"**
+
+Three indicators that a transcription has collapsed and must be repaired:
+- The scaffold entry has structured content (a default value, a type constraint, a list of side effects) that appears as unstructured hedging in prose ("optionally", "as needed", "may cascade") without naming the concrete specification.
+- A scaffold entry exists on an entity or transition, and no PRD sentence places the entry grammatically on its owning entity/transition — the reader can plausibly read the PRD and conclude the entry is internal, elided, or belongs somewhere else.
+- Two sibling scaffold entries (e.g., two branches of one state machine, two enum values of one field) receive asymmetric prose treatment, where the structure of one branch's specification is fully rendered and the sibling is compressed in a way that drops specification bullets.
+
+When any indicator is present, the PRD is ambiguous on that scaffold entry. Pass B must catch this before the PRD ships.
+
 ### Business Logic (scattered across subsections — but every rule still present)
 
 These are the benchmark's discriminating factor — LLMs must piece together complete implementations from scattered narrative. **Scattering governs layout, not content**: every rule must still be findable, it just lives in whichever subsection makes business-narrative sense rather than in one concentrated spec block.
@@ -341,6 +354,14 @@ When a validation's `applies_to` list spans several endpoints, enumerate all of 
 > ✗ Silent (bad): "Compliance holds block make-available and boarding confirm."
 > ✓ Explicit (good): "An `ACTIVE` `HIGH` or `CRITICAL` compliance hold blocks four operations: `/make-available`, boarding `/confirm`, boarding `/check-in`, and adoption `/approve`. In all four, the rejection code is `ERR_COMPLIANCE_HOLD_ACTIVE`."
 
+**5. Field-level structured content — types, defaults, initial values, response-exposure**
+
+For every `entities[].fields[]` entry, the structured attributes attached to the field (its `type`, `default`, `source`, initial value at entity creation) must be reconstructible from PRD prose by a PRD-only reader. Mentioning the field name alone (which Pass A guarantees) does not satisfy this category — Pass A is about identifiers, Pass B category 5 is about the **specification attached to each identifier**. When a field has structured content in scaffold, prose must place that content on the owning entity in a form that excludes competing readings.
+
+**6. Sibling-branch symmetry — equal specification density across parallel scaffold entries**
+
+When scaffold contains parallel entries (sibling transitions out of the same `from` state, parallel branches of a validation, enumerated members of a response shape), PRD prose must render each sibling with equal specification density. Asymmetric treatment — where one branch's bullets are enumerated and the sibling's are compressed — silently drops the sibling's specification. The diagnostic: for every parallel group in scaffold, compare prose coverage of each member against its scaffold bullet count; any member that loses bullets in prose is a Pass B failure.
+
 ### Procedure (full enumeration)
 
 After writing the above four categories, run the rule-coverage check. Enumerate every rule-bearing entry from the scaffold and verify PRD prose covers it:
@@ -360,6 +381,10 @@ After writing the above four categories, run the rule-coverage check. Enumerate 
 
 6. **Endpoint side effects and applies_to scopes** (Category 4 above) — every `endpoints[].side_effects` is described; every `applies_to` list is enumerated.
 
+7. **Field-level structured content** (Category 5 above) — for every `entities[].fields[]` entry, the field's structured attributes (type, default, initial value, source semantics) are reconstructible from PRD prose.
+
+8. **Sibling-branch symmetry** (Category 6 above) — for every parallel scaffold group (sibling transitions, parallel validation branches, etc.), prose coverage per member equals its scaffold bullet count.
+
 ### Produce a rule-coverage report
 
 ```
@@ -371,6 +396,8 @@ Rule coverage check:
 - validations[]: E checked, E conditions matchable to error_id in prose, 0 missing
 - endpoints[].side_effects: F checked, F expressed in prose, 0 missing
 - validations[].applies_to: G scopes checked, G fully enumerated in prose, 0 missing
+- entities[].fields[] structured content: H checked, H structurally reconstructible from prose, 0 missing
+- sibling-branch specification symmetry: I groups checked, I with equal prose density, 0 asymmetric
 Status: PASS
 ```
 
@@ -431,6 +458,8 @@ These four are not arbitrary — they are the categories the downstream `prd-ben
 - [ ] Every `calculations[]` formula, constants, precision, and algorithm are expressed in prose
 - [ ] Every `validations[].check` condition is matchable to its `error_id` via narrative in §2 or §3
 - [ ] Every `endpoints[].side_effects` is expressed in prose
+- [ ] Every `entities[].fields[]` entry's structured content (type, default, initial value, exposure) is reconstructible from PRD prose (Zero-Ambiguity Rule)
+- [ ] Parallel scaffold groups (sibling transitions, branch pairs, validation alternatives) receive symmetric prose coverage (Zero-Ambiguity Rule)
 - [ ] A PASS rule-coverage report was produced before finalizing the PRD
 
 ### Scattering Rules (§3)
