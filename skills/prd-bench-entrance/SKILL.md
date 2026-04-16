@@ -179,6 +179,8 @@ Read `results.json` and extract `passed`, `total`, `failed`. If `passed == total
 
 If tests fail, spawn a **new subagent** for the fix. Each fix subagent gets a clean context — it doesn't carry baggage from previous fix attempts.
 
+The fix-cycle diagnostic order is specifically designed around the **PRD-First Principle**: the implementer sees only PRD.md, so any failing test whose asserted rule is absent from the PRD is an unfair test and must be deleted — not kept, not weakened, not xfailed. SCAFFOLD.yaml is a *generator index*, not a contract the implementer can read. Deletion of PRD-uncovered tests is the correct outcome in that specific case; it is not test-hacking.
+
 Subagent prompt:
 
 ```
@@ -186,19 +188,61 @@ You are a PRD benchmark diagnostic expert. {passed}/{total} tests pass, {failed}
 
 Failed tests: {list of failed test names from results.json}
 
-Diagnostic protocol:
+The benchmark's contract is: implementers read PRD.md only, never SCAFFOLD.yaml.
+Tests must therefore trace to PRD prose — tests that assert scaffold-only rules are
+unfair and must be deleted.
 
-1. Read {task_dir}/workspace/implementation/results.json for full failure details
-2. For each failing test, read the test source in {task_dir}/test_suite/ and {task_dir}/test_helpers/
-3. Cross-reference every assertion against {task_dir}/SCAFFOLD.yaml and {task_dir}/workspace/PRD.md
-4. If a test contradicts the SCAFFOLD or PRD → fix the test to match the spec exactly
-5. If the test is correct → read the relevant code in {task_dir}/workspace/implementation/ and fix it
+Diagnostic protocol — follow IN ORDER for each failing test:
+
+STEP 1: PRD COVERAGE CHECK (must run FIRST, before any code is read)
+  a. Read {task_dir}/test_suite/ and {task_dir}/test_helpers/ to understand
+     what rule the failing test asserts (exact error_id, exact ordering, exact
+     side-effect, exact formula).
+  b. Search {task_dir}/workspace/PRD.md for a sentence or passage that states
+     that specific rule. Grep for distinctive tokens: the error_id, the field
+     name, the threshold constant, the state name pair.
+  c. Decide one of:
+     - PRD COVERS THE RULE: proceed to STEP 2.
+     - PRD IS SILENT ON THE RULE (SCAFFOLD-only): DELETE the test. This is
+       not test-hacking — it is enforcing the benchmark's PRD-First contract.
+       Leave a one-line comment in the deletion commit explaining which
+       SCAFFOLD rule had no PRD counterpart. Proceed to the next failing test.
+     - PRD PARTIALLY COVERS (names the error but not the priority / names the
+       operation but not the side effect): split the test — keep the covered
+       part, delete the uncovered part. A common case: PRD names 4 independent
+       checks but never states their priority; assertions that fix a specific
+       ordering must be removed; assertions on individual error_ids stay.
+
+STEP 2: TEST-vs-PRD CONSISTENCY CHECK (only if STEP 1 says PRD covers the rule)
+  a. Read {task_dir}/workspace/implementation/results.json for the failure
+     detail (tracebacks, request/response payloads).
+  b. Cross-reference the test's assertions against the PRD sentence. Is the
+     test a faithful translation of what the PRD actually says? (Boundary
+     inclusive vs exclusive, field name verbatim, error_id verbatim.)
+     - TEST IS WRONG: fix the test to match PRD wording exactly. The fix must
+       make the test MORE faithful to PRD, never less.
+     - TEST IS FAITHFUL: proceed to STEP 3.
+
+STEP 3: IMPLEMENTATION FIX (only if PRD covers the rule AND the test is faithful)
+  a. Read the relevant code in {task_dir}/workspace/implementation/ and fix
+     the implementation so the test passes.
 
 Cardinal rules:
-- NEVER weaken, delete, skip, or xfail a test to make the implementation pass
-- Test fixes must make the test MORE faithful to the spec, never less
-- Verify test correctness FIRST, fix implementation SECOND
+
+- DELETE a test ONLY when STEP 1 determines the asserted rule is not in PRD.
+  Never delete a test because it is "strict", "brittle", or "hard to pass".
+- NEVER weaken an assertion to make implementation pass. Downgrading an
+  `error_id` check to an HTTP-status check, replacing a boundary test with
+  an approximate one, or adding `pytest.mark.skip` / `@pytest.mark.xfail` are
+  all forbidden.
+- When in doubt about STEP 1, quote the PRD passage you think covers the rule.
+  If you cannot produce a verbatim quote, the rule is not covered — delete.
+- Test fixes (STEP 2) must make the test MORE faithful to PRD, never less.
+- After every batch of fixes, re-run tests. Do not batch multiple
+  interpretation decisions without a verification run.
 ```
+
+The orchestrator does not need to pre-filter "which failures look like scaffold leakage" — the subagent does that per-test in STEP 1. The orchestrator's only job after spawning the subagent is to re-run the docker tests and check whether `passed == total`.
 
 #### 7.4 Iteration Loop
 
@@ -214,18 +258,15 @@ Each iteration is a fresh subagent, so context never accumulates across fix cycl
 
 ## Key Principles
 
-1. **SCAFFOLD.yaml and PRD.md are the sole source of truth.** Every test assertion and every implementation behavior must trace back to a specific entry in these two files. When in doubt, re-read the spec.
+1. **PRD.md is the contract; SCAFFOLD.yaml is the generator index.** Every implementation behavior must trace to PRD prose. Every test assertion must trace to PRD prose. The scaffold exists to *drive generation* — it is not a contract the implementer can read. When test and scaffold agree but PRD is silent, **the PRD wins**: delete the test. When PRD and scaffold disagree on semantics (threshold boundaries, error names, state names), that is a bug in the doc-generator skill — report it rather than silently favoring one side, but if you must proceed, favor PRD.
 
-2. **Unit test correctness is the first priority.** Tests are the benchmark's measuring instrument — if the instrument is wrong, the measurement is meaningless. Before touching any implementation code, verify that every failing test faithfully represents the spec. A test suite that passes by being lenient is worse than useless.
+2. **Unit test correctness is the first priority.** Tests are the benchmark's measuring instrument — if the instrument asserts rules the implementer cannot read, the measurement is meaningless. Before touching any implementation code, verify that every failing test's asserted rule is stated in PRD prose. A test suite that passes by being lenient is worse than useless; a test suite that asserts scaffold-only rules is unfair.
 
-3. **Never hack tests to make implementation pass.** Specifically, never:
-   - Delete a test because it's "too strict"
-   - Change an expected value to match what the implementation currently returns
-   - Weaken an assertion (e.g., checking only HTTP status instead of error_id)
-   - Skip an edge case or boundary test
-   - Add `pytest.mark.skip` or `@pytest.mark.xfail` to dodge failures
-   
-   If a test fails and the test is correct per the spec, the implementation must change — not the test.
+3. **Hacking tests is forbidden. Deleting PRD-uncovered tests is required.** These look similar but are opposites:
+   - **Forbidden (test hacking):** deleting a test because it's "too strict", changing an expected value to match current implementation output, downgrading an `error_id` check to a generic HTTP-status check, adding `@pytest.mark.skip`/`@pytest.mark.xfail` to dodge a failure, weakening a boundary test to an approximate one.
+   - **Required (PRD alignment):** deleting a test whose asserted rule has no PRD coverage (see Step 7.3 STEP 1). This is not a shortcut — it is the only way to keep the benchmark fair.
+
+   The distinguishing question for every candidate deletion: *"Can I produce a verbatim PRD quote that states the rule this test asserts?"* If yes, the test must stay (fix implementation); if no, the test must go.
 
 4. **Scenario description passes through verbatim.** The user's input to this skill is forwarded unmodified to `prd-bench-scaffold-generator`. Do not summarize, restructure, or "improve" it.
 

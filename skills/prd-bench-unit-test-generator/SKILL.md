@@ -171,13 +171,51 @@ in the PRD. The organizing principle is **testable claims**, not code structure.
 
 ### The PRD-First Principle (overrides all other rules)
 
-Implementers see only the PRD, never the scaffold. A test that asserts behavior absent from the PRD penalizes correct work. Therefore:
+Implementers see only the PRD, never the scaffold. A test that asserts behavior absent from the PRD penalizes correct work and makes the benchmark unfair. Therefore:
 
 - **The scaffold is the extraction index** — walk it to find claims systematically.
 - **The PRD is the contract** — every claim must trace to a PRD statement before it becomes a test.
-- **Scaffold-only concepts produce no tests.** If the scaffold specifies something the PRD does not express, skip it.
+- **Scaffold-only concepts produce no tests.** If the scaffold specifies something the PRD does not express, skip it. Do not generate the test, do not leave a TODO, do not weaken the assertion — just skip.
 
-The litmus test: *"Could a developer reading only the PRD reasonably implement the behavior this test asserts?"* If no, the test should not exist.
+The litmus test: *"Could a developer reading only the PRD reasonably implement the behavior this test asserts?"* If no, the test must not exist.
+
+### Mandatory PRD Citation (per-test, not per-file)
+
+Every generated test function must carry a **PRD citation** inside its docstring: a short verbatim quote (or a specific paragraph marker) from PRD.md that states the rule being tested. This is the single most effective mechanism against "scaffold-leakage" — a test written without a citation is a test with no accountability.
+
+Citation format (choose one):
+
+```python
+def test_void_invoice_with_partial_payment_rejected(api):
+    """PRD §3.6: "an invoice that has received any money cannot be voided
+    until the money is refunded (ERR_INVOICE_HAS_PAYMENTS)."
+
+    Claim: void on PARTIALLY_PAID → ERR_INVOICE_HAS_PAYMENTS (not ERR_INVALID_STATE).
+    """
+```
+
+Or, for rules expressed across multiple sentences:
+
+```python
+def test_approve_requires_animal_current_version(api):
+    """PRD §2.7 (stale-data family) + §3.3 (approve checks): approve
+    re-checks animal_version_pinned → ERR_STALE_ANIMAL_DATA on mismatch.
+
+    Claim: approve with stale animal_version → ERR_STALE_ANIMAL_DATA.
+    """
+```
+
+### Rules the scaffold frequently carries that PRD frequently omits (SKIP unless PRD states them)
+
+These categories of scaffold metadata commonly encode behavior that never makes it into PRD prose. Before generating any test derived from one of these sources, search the PRD for the specific rule; if it is not there, **do not generate the test**. No TODO, no `@pytest.mark.skip`, no weakened assertion — just skip.
+
+- **`validations[].error_priority`** — the relative ordering of multiple simultaneously-failing validations. Do NOT generate tests that assert "error A fires before error B" unless the PRD explicitly states the precedence. If the PRD is silent on ordering, test each validation in isolation (i.e., construct a scenario where only validation A can fail and assert error A; construct a separate scenario where only validation B can fail and assert error B). Never construct a scenario where both fail and then assert a specific order.
+
+- **`concurrency_rules[].error_id`** — the specific error code returned by the loser in a concurrent race. If the PRD says "exactly one wins" without naming the loser's error_id, use `assert_exactly_one_succeeds` or `assert_race_outcome(1, 1)` and do NOT assert a specific `error_id` on the failure. Only assert the specific error_id if the PRD names it.
+
+- **`endpoints[].side_effects` that cascade to other entities** — secondary side effects (e.g., "creating a HIGH-severity hold also bumps animal.version") are often omitted from PRD prose even when the primary effect is stated. Test the primary effect. Test the secondary effect only if the PRD names it.
+
+- **`validations[].applies_to`** lists that are scoped more narrowly than PRD prose suggests — e.g., the scaffold may apply a rule to 3 endpoints while PRD prose mentions it for 2. Generate tests only for the endpoints where PRD prose establishes the rule.
 
 ### Core Principles
 
@@ -602,13 +640,22 @@ Before parametrizing `test_missing_required_field`, check each field in the PRD:
 
 After generating both layers, verify:
 
-1. **Every error in Table 6** has at least one test that triggers it.
-2. **Every state transition in Table 2** has a valid-path test and an invalid-from-wrong-state test.
-3. **Every calculation in Table 3** has at least one boundary test.
-4. **Every side effect in Table 2 and Table 5** has a test that verifies it was applied.
-5. **Every RBAC exclusive operation** has a negative test (wrong role → ERR_UNAUTHORIZED).
+1. **Every error in Table 6** has at least one test that triggers it — **if** that error's trigger condition is stated in PRD prose.
+2. **Every state transition in Table 2** has a valid-path test and an invalid-from-wrong-state test — **if** the transition's preconditions are stated in PRD prose.
+3. **Every calculation in Table 3** has at least one boundary test — **if** the formula and thresholds are stated in PRD prose.
+4. **Every side effect in Table 2 and Table 5** has a test that verifies it was applied — **if** the side effect is stated in PRD prose.
+5. **Every RBAC exclusive operation** has a negative test (wrong role → ERR_UNAUTHORIZED) — role assignments are universally expressed in PRD §2.1, so this check rarely gates.
 6. **Every complexity layer** in `complexity_profile.complexity_layers` has dedicated test coverage — but ONLY for behaviors the PRD describes. For `optimistic_concurrency`, this means version-conflict tests and any explicit skip-if-absent semantics; it does NOT automatically mean race-condition tests. Race-condition tests (using `run_race`, `assert_exactly_one_succeeds`, etc.) should ONLY be generated when the PRD explicitly defines the expected outcome of concurrent operations (e.g., "only one delivery per order", "exactly one of confirm/cancel wins"). If the PRD is silent on race semantics, do not generate race tests.
 
-All six checks are subject to the PRD-First Principle: if a scaffold item has no corresponding PRD description, it produces no test. If any gap is found, add the missing tests to the most appropriate test file.
+All six checks are subject to the PRD-First Principle: **if a scaffold item has no corresponding PRD description, it produces no test**. Missing PRD coverage is NOT a reason to generate a "best-effort" test — it is a reason to skip. If you believe the PRD has an unintentional gap, stop generation and surface the gap in a note; do not silently test scaffold-only rules.
 
-After all tests are generated, do one final pass: for every test that asserts a specific behavior, verify you can cite the PRD sentence that requires it. If you cannot, remove the test.
+### Final PRD-Citation Pass (mandatory)
+
+After all tests are generated, do one final sweep over every test function and confirm:
+
+1. **Every test has a PRD citation in its docstring** (see "Mandatory PRD Citation" above).
+2. **Every cited passage actually exists in PRD.md** — grep the PRD for a distinctive phrase from the citation. If the phrase is not there, either the citation is invented (fix it) or the test is scaffold-only (remove it).
+3. **Every asserted `error_id` is named in the PRD.** If a test asserts `ERR_FOO` but the PRD never mentions `ERR_FOO` outside the §5 table, check whether PRD prose describes the *condition* that triggers `ERR_FOO`; if not, remove the test.
+4. **Every asserted priority/ordering is named in the PRD.** Tests of the form "when A and B both fail, A is reported" require PRD prose stating the precedence. If absent, split into two single-failure tests or remove.
+
+This pass is the last line of defense against scaffold-leakage. A test suite that passes it is guaranteed to be implementable from PRD alone.

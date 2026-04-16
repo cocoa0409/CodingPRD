@@ -152,10 +152,10 @@ Benchmarks exist to stress-test LLM coding ability. Target one of these two diff
 
 | Level | Entity count | Endpoint count | Error codes | Calculation variants | State machines | Typical token budget |
 |-------|-------------|---------------|-------------|---------------------|---------------|---------------------|
-| **Advanced** | 10–16 | 18–40 | 15–40 | 2–3 | 3–5 with reverts + auto-transitions | ~50k |
-| **Expert** | 14–30 | 35–65 | 30–60 | 3+ | 4+ with cycles or parallel dimensions | ~80k |
+| **Advanced** | 8–16 | 18–30 | 15–20 | 2–3 | 3–5 with reverts + auto-transitions | ~50k |
+| **Expert** | 14–25 | 28–40 | 20–30 | 3+ | 4+ with cycles or parallel dimensions | ~80k |
 
-**Default to Advanced.** Only go Expert when the scenario naturally demands it (many entity types, complex cross-entity workflows). An overly simple scaffold fails to discriminate between implementations — never generate fewer than 10 entities or 18 endpoints.
+**Default to Advanced.** Only go Expert when the scenario naturally demands it (many entity types, complex cross-entity workflows). An overly simple scaffold fails to discriminate between implementations — never generate fewer than 8 entities or 18 endpoints.
 
 These are guidelines, not hard rules. A 10-entity benchmark with one fiendishly tricky calculation can be harder than a 20-entity CRUD app.
 
@@ -262,6 +262,8 @@ concurrency_rules:
 ```
 
 All error codes referenced here must also appear in the Error Catalog (Table 6).
+
+**Consistency with Tables 2 and 4:** When a concurrency scenario involves an operation whose preconditions (Table 2) or validations (Table 4) define multiple possible error codes, Table 2.1 must list **all** error codes the loser could receive — not just one. For example, if operation X can fail with both `ERR_INVALID_STATE` (wrong status) and `ERR_HAS_DEPENDENCIES` (business precondition), and a race could trigger either depending on execution order, the concurrency rule must document both.
 
 ### 1.3 Calculation Rules Table
 
