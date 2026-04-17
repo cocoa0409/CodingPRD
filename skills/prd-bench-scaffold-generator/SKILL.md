@@ -522,27 +522,34 @@ A machine-readable index of every difficulty feature the scaffold claims to exhi
 
 ```yaml
 scaffold_difficulty_design:
-  - rule_id: <one of: dual_variant_calc | combinatorial_formula | non_linear_state_machine | transitive_cascade | priority_pair_validation_conflict | boundary_precision_check | cross_entity_state_dependency>
-    instances:
-      - name: <unique_lower_snake_case>     # identifier used as the docstring anchor in generated tests
-        grounds:                             # one or more refs into §1.1–§1.6; every ref MUST resolve
-          - calculations.<name>              # or: state_machines.<Entity>.<FROM>_to_<TO>
-          - validations[priority=<N>]        # or: entities.<Entity>.fields.<name>
+  - rule_id: dual_variant_calc                # each rule_id entry MUST carry the number of instances
+    instances:                                 # the quota table below demands — NOT a single instance
+      - name: <instance_1_lower_snake_case>    # instance 1 of ≥2 required for dual_variant_calc
+        grounds:                               # one or more refs into §1.1–§1.6; every ref MUST resolve
+          - calculations.<name>                # or: state_machines.<Entity>.<FROM>_to_<TO>
+          - validations[priority=<N>]          # or: entities.<Entity>.fields.<name>
           - concurrency_rules[<scenario-keyword>]
         distinguishing_aspect: |
           <ONE sentence pinning what structurally distinguishes this instance — the specific variant
           delta, the specific cycle edge, the specific cascade chain tail, the specific boundary value.
           Must be falsifiable: a test must be able to turn this sentence into one concrete assertion.>
         test_recipe:
-          setup:                             # minimal DB + clock state to reach the scenario from empty DB
+          setup:                               # minimal DB + clock state to reach the scenario from empty DB
             - "<precondition 1>"
-          trigger:                           # API call(s) or clock advance(s) that exercise the feature
+          trigger:                             # API call(s) or clock advance(s) that exercise the feature
             - "<endpoint invocation 1>"
-          assert:                            # each line = one pinned observable outcome. Any `assert:` line referencing a numeric value derived from a formula MUST be a literal the scaffold author actually computed by code.
+          assert:                              # each line = one pinned observable outcome. Any `assert:` line referencing a numeric value derived from a formula MUST be a literal the scaffold author actually computed by code.
             - "<comparison or invariant 1>"
+      - name: <instance_2_lower_snake_case>    # instance 2 — MUST cover a different entity domain per Rule 1
+        grounds: [<refs>]
+        distinguishing_aspect: "<…>"
+        test_recipe: { setup: [...], trigger: [...], assert: [...] }
+  - rule_id: combinatorial_formula             # repeat for each of the 7 rule_ids; total ≥13 instances
+    instances: [ <≥1 instance per §0.5 Rule 2 quota> ]
+  # … five more rule_id blocks, each meeting its own minimum from the quota table …
 ```
 
-**Minimum instance quotas (mirror of §0.5; differentiation requirements are authoritative there, not here):**
+**Minimum instance quotas (mirror of §0.5; differentiation requirements are authoritative there, not here). Count is per INSTANCE (the `- name:` entries nested under `instances:`), NOT per `rule_id`. A scaffold with 7 rule_ids each carrying 1 instance = 7 instances = FAIL.**
 
 | rule_id | Minimum | §0.5 ref | Differentiation summary |
 |---------|---------|----------|-------------------------|
@@ -581,7 +588,7 @@ Before finalizing the YAML:
 - [ ] Side effect chains are complete (if A→B→C, all three steps are documented)
 - [ ] Every non-idempotent operation that can race has a `concurrency_rules` entry with required `error_id` and `http_status`
 - [ ] Every error code referenced in `concurrency_rules` also appears in §1.6 Error Catalog
-- [ ] `scaffold_difficulty_design` (§1.8) is present and every Difficulty rule meets its minimum instance quota (2/1/2/2/2/2/2; ≥13 total)
+- [ ] `scaffold_difficulty_design` (§1.8) is present, has exactly 7 `rule_id` groups, and carries **≥ 13 instances in total** counted as `- name:` entries nested under `instances:` (per-rule floor 2/1/2/2/2/2/2) — NOT 7 instances at top level
 - [ ] Every `scaffold_difficulty_design[*].instances[*].grounds[*]` reference resolves to a declared element in §1.1–§1.6
 
 **Self-Consistency:**
