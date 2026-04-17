@@ -538,7 +538,7 @@ scaffold_difficulty_design:
             - "<precondition 1>"
           trigger:                           # API call(s) or clock advance(s) that exercise the feature
             - "<endpoint invocation 1>"
-          assert:                            # each line = one pinned observable outcome
+          assert:                            # each line = one pinned observable outcome. Any `assert:` line referencing a numeric value derived from a formula MUST be a literal the scaffold author actually computed by code.
             - "<comparison or invariant 1>"
 ```
 
@@ -561,6 +561,7 @@ scaffold_difficulty_design:
 3. `distinguishing_aspect` MUST be falsifiable — one sentence the test can turn into a concrete assertion. No hedging ("may differ", "could vary").
 4. `name` MUST be unique across the whole `scaffold_difficulty_design` and stable across regenerations (tests cite it in their docstrings for audit).
 5. `assert:` entries MUST cite exact field names and literal values where possible (e.g., `Order.delivery_fee != Assignment.final_delivery_fee`; `Customer.wallet_balance unchanged after assignment creation`), not paraphrases.
+6. **Any `assert:` line referencing a numeric value derived from a formula MUST be a literal the scaffold author actually computed by code.** Pin the inputs in `setup:`, execute the relevant `calculations[].formula` as code (a short Python snippet against the formula and its `constants:`), and write the resulting literal into the assertion — e.g., `Order.delivery_fee == 5.40`, NOT `Order.delivery_fee == round(3.00 + ceil(2.0)*1.20 + 0, 2)` and NOT a rough estimate. Unresolved formulas, estimates, and "let the test-generator compute it" all propagate arithmetic errors into broken tests whose wrong expected value silently agrees with a wrong implementation. When in doubt, execute the formula.
 
 ---
 
