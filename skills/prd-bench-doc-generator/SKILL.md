@@ -65,62 +65,46 @@ This is the root correctness constraint of this skill. If a test is generated fr
 
 Bi-directional requirements:
 
-- **No invented rules**: Do not add states, fields, error codes, calculations, endpoints, validation rules, or side effects that do not exist in the scaffold.
-- **No omitted rules (HARD RULE)**: Every rule-bearing entry in the scaffold must be expressible in the PRD prose. This covers:
-  - Every `entities[].fields[].name` and its type/source/description
-  - Every `state_machines[].transitions[]` precondition AND side effect AND error_id
-  - Every `calculations[].formula`, `algorithm`, `constants`, and `precision` rule
-  - Every `validations[].check` AND its `error_id`
-  - **Every `validations[].priority`** — when multiple validations can fire on the same request, the relative ordering must be stated in prose (e.g., "the shelter check is evaluated before the vaccination check", or "compliance-hold checks take precedence over version checks"). Do not assume the implementer can infer priority from listing order alone; say it.
-  - Every `concurrency_rules[]` entry — especially the specific `error_id` returned by the losing race participant. "Exactly one wins" is insufficient; if the spec says the loser returns `ERR_FOO`, the PRD must name `ERR_FOO` in the concurrency narrative.
-  - Every `errors[].condition` must be expressed in narrative somewhere the reader can find it (even though the §5 table hides them).
-  - Every `endpoints[]` side_effect must appear in the corresponding workflow narrative.
-- **No omitted names (HARD RULE)**: Every field name defined in the scaffold — entity attributes, endpoint request-body keys, query parameters, path parameters — must appear verbatim in backticks in the PRD. See Rule 1 and the Mandatory Coverage Verification Passes below. A field the implementer never sees named will be guessed, and the guess will usually break the hidden test contract.
-- **No reinterpretation**: Do not change the semantics of scaffold rules — e.g., do not turn a `>=` threshold into `>`, do not rename error IDs, do not alter state transition preconditions.
+- **No invented rules.** Do not add states, fields, error codes, calculations, endpoints, validation rules, or side effects that do not exist in the scaffold.
+- **No omitted names.** Every field name defined in the scaffold must appear verbatim in backticks in the PRD. Enforced by **Contract 1: Field-Name Coverage** below.
+- **No omitted rules.** Every rule-bearing scaffold entry must be expressible in PRD prose so that a PRD-only reader arrives at the same specification. The question for every scaffold entry is **not** *"is its identifier mentioned?"* but *"does the PRD prose uniquely determine the scaffold's specification?"* Enforced by **Contract 2: Rule Coverage** below.
+- **No reinterpretation.** Do not change the semantics of scaffold rules — e.g., do not turn a `>=` threshold into `>`, do not rename error IDs, do not alter state transition preconditions.
+- **No pseudocode.** Scaffold routinely uses symbolic expressions — comparison (`==`, `!=`, `<`, `>`, `≤`, `≥`), assignment/accumulator (`=`, `+=`, `-=`), arithmetic (`+`, `-`, `*`, `/`, `%`), function-style (`min()`, `max()`, `round()`, `ceil()`, `floor()`), boolean (`AND`, `OR`, `NOT`), and set-membership (`IN`, `NOT IN`) operators — in `validations[].check`, `state_machines[].transitions[].preconditions`, `entities[].fields[].constraints`, and `calculations[].formula`. PRD prose must **translate every such expression into natural language**, never copy it verbatim. Applies everywhere (§2 and §3 alike). Two quality constraints on every translation:
+    - **No fuzzy or approximating words.** Reject wording that loses precision: *"approximately"*, *"about"*, *"roughly"*, *"conservatively"*, *"more or less"*, *"around"*, *"~"*, *"in the neighborhood of"*. Preserve every threshold, boundary inclusivity, and operator direction — scaffold's `>= 18` becomes "at least 18", never "about 18 or more".
+    - **Reconstruction test.** A PRD-only reader must be able to reconstruct the scaffold expression exactly from the prose alone — step-for-step, operand-for-operand. If the prose admits two readings that diverge, the translation has failed.
 
-Two litmus tests must both pass:
+    Examples:
+    - Scaffold `Return.status == REQUESTED OR ESCALATED` → PRD "the return is in either `REQUESTED` or `ESCALATED` status".
+    - Scaffold `balance += refund_amount` → PRD "the refund amount is added to the customer's balance".
+    - Scaffold `age >= 18 AND region IN {US, EU}` → PRD "the customer is at least 18 years old and their region is US or EU".
+    - Scaffold `total = round(base + ceil(km) * rate, 2)` → PRD "the total is the base plus the rate multiplied by the number of kilometers rounded up to a whole number, with the final amount rounded half-up to two decimal places".
+    - ✗ Fuzzy: "The system conservatively estimates the total by applying approximately the peak-hour rate to the remaining balance."
+    - ✓ Precise: "The total is the sum of each charge processed in chronological order, each multiplied by its per-tier rate (`tier_1_rate` for the first 100 units, `tier_2_rate` for units 101–500, `tier_3_rate` beyond 500), then rounded half-up to two decimal places."
 
-1. *"Can every statement in the PRD be traced back to a specific entry in the scaffold?"* If not, delete the sentence.
-2. *"For every test the unit-test generator would derive from the scaffold, can I cite the PRD sentence that states the rule being tested?"* If not, the PRD is incomplete — add the rule to prose. This second test is the one that most commonly fails because it requires thinking about *rules* (conditions, priorities, race outcomes), not just *names*.
-
-### Zero-Ambiguity Transcription Rule (HARD RULE — cross-cutting)
-
-"Silence" is a PRD that names a scaffold entry without fully transcribing the behavior attached to it — leaving the PRD-only reader with insufficient information to reconstruct the scaffold's specification. A name mentioned without its attached rule, a default without its value, a branch transition without its full side-effect list: each of these is a structural contract violation, not a prose-style choice.
-
-**The rule is methodological, not pattern-enumerated.** For every scaffold entry with semantic content — a field's type / default / source / exposure, a transition's precondition / side-effect, a validation's condition / error_id / priority, a calculation's formula / constant / precision — the PRD prose must express that content in a form where a faithful PRD-only reader arrives at the same specification the scaffold encodes. The question to ask for every scaffold entry is **not** "is its identifier mentioned?" but **"does the PRD prose uniquely determine the scaffold's specification for this entry?"**
-
-Three indicators that a transcription has collapsed and must be repaired:
-- The scaffold entry has structured content (a default value, a type constraint, a list of side effects) that appears as unstructured hedging in prose ("optionally", "as needed", "may cascade") without naming the concrete specification.
-- A scaffold entry exists on an entity or transition, and no PRD sentence places the entry grammatically on its owning entity/transition — the reader can plausibly read the PRD and conclude the entry is internal, elided, or belongs somewhere else.
-- Two sibling scaffold entries (e.g., two branches of one state machine, two enum values of one field) receive asymmetric prose treatment, where the structure of one branch's specification is fully rendered and the sibling is compressed in a way that drops specification bullets.
-
-When any indicator is present, the PRD is ambiguous on that scaffold entry. Pass B must catch this before the PRD ships.
+    Enum values, state names, and field names (e.g., `REQUESTED`, `ESCALATED`, `balance`, `rate`, `tier_1_rate`) remain in backticks — Contract 1 still requires them. Only operator syntax and fuzzy hedging are forbidden.
 
 ### Business Logic (scattered across subsections — but every rule still present)
 
-These are the benchmark's discriminating factor — LLMs must piece together complete implementations from scattered narrative. **Scattering governs layout, not content**: every rule must still be findable, it just lives in whichever subsection makes business-narrative sense rather than in one concentrated spec block.
-
-Should be scattered (across subsections, not omitted):
-- Which fields each endpoint accepts (spread across multiple §3 subsections)
-- Calculation algorithms (narrative, not pseudocode) — derived from `calculations[].formula` and `calculations[].algorithm`
-- Numeric thresholds and constants (embedded in business statements) — from `calculations[].constants`
-- Entity relationships (implied through actions, not declared as foreign keys)
-- Validation trigger conditions (error table has no condition column) — from `validations[].check`
-- State transition preconditions and side effects (narrative, not state diagrams) — from `state_machines[].transitions`
-- Validation priorities and concurrency loser error_ids (express in the subsection closest to the affected workflow — but express them)
-
-Scattering is never a license to drop a rule. If a rule has no natural home, put it in the closest §2 or §3 subsection as a standalone sentence. Pass B (rule coverage) catches rules that "got lost" during the prose rewrite.
+§3 is the **scattering zone** — the benchmark's discriminating factor, where LLMs must piece together complete implementations from narrative spread across subsection boundaries. Fields, calculations, thresholds, transitions, relationships, validation conditions, concurrency loser `error_id`s: all live in whichever subsection makes business-narrative sense rather than in one concentrated spec block. **Scattering governs layout, not content** — every rule must still be findable, and a rule without a natural home goes into the closest §2 or §3 subsection as a standalone sentence. See §3 Section Generation Rule below for how this looks in practice; **Contract 2: Rule Coverage** catches rules that "got lost" during the prose rewrite.
 
 ---
 
-## Diversity Principle: Do Not Copy the Example's Structure
+## Diversity: Do Not Copy the Example's Structure
 
-The example demonstrates **one** valid transformation. Each new PRD must have its document skeleton designed from scratch based on the current domain. Specific requirements:
+The example demonstrates **one** valid transformation. Each new PRD must have its document skeleton designed from scratch based on the current domain. Four requirements — each paired with the concrete anti-pattern to avoid:
 
-1. **§2 subsections must be domain-derived**: The number of subsections (typically 8–12), their titles, and ordering must be derived from the scaffold's actual domain semantics. Do not copy the example's subsection numbers and titles (e.g., don't always name them "System Integrity and Consistency" or "The Principle of Fiscal Responsibility"). Use domain-specific terminology for subsection titles. **Exception: §2.2 is a fixed contract** (see the §2.2 generation rule) — do not attempt to "domain-specialize" it.
-2. **§3 subsections must be freely grouped**: Do not mechanically replicate the example's subsection pattern (lifecycle → structure → core op → pairing → safety → cost → finalization). Group by the current domain's natural business flows; 5–9 subsections are all acceptable.
-3. **Sentence variety**: Avoid starting every paragraph with "The system...". Alternate among role names, business events, conditional clauses, scenario-driven narration, passive voice, and temporal markers.
-4. **Introduction flexibility**: Can be 1–3 paragraphs, approaching from system goals, user pain points, business context, technical constraints, etc. Length adapts to domain complexity.
+1. **§2 subsections must be domain-derived.** Decide count (typically 8–12), titles, and ordering from the scaffold's actual domain semantics. Use domain-specific terminology for subsection titles.
+   - *Anti-pattern:* 2.4 is always "System Integrity and Consistency", 2.5 is always "The Principle of Fiscal Responsibility". Also: every §2 subsection using the template "The system enforces strict X. Every Y is associated with a Z."
+   - *Exception:* §2.2 is a fixed verbatim contract (see the §2.2 generation rule) and IS identical across tasks.
+
+2. **§3 subsections must be freely grouped.** Choose a grouping strategy (lifecycle stages, role perspective, chronological timeline, cross-cutting concerns interleaved) that fits the domain; 5–9 subsections are all acceptable.
+   - *Anti-pattern:* exactly 7 subsections in the fixed pattern "lifecycle → structure → core op → pairing/restriction → safety/compliance → cost calculation → finalization".
+
+3. **Sentence and paragraph variety.** See Writing Style below for concrete starter types.
+   - *Anti-pattern:* multiple consecutive paragraphs starting with "The system...".
+
+4. **Introduction flexibility.** 1–3 paragraphs; approach angle chosen from system goals, user pain points, business context, or technical constraints; length adapts to domain complexity.
+   - *Anti-pattern:* always 1 paragraph of 3–4 sentences starting with "This document outlines...".
 
 ---
 
@@ -195,27 +179,28 @@ The following topics **must be covered** (but organization is free — merge rel
 
 ### §3. Business Logic & Workflows (Scattering Zone)
 
-This is the **core section** of the PRD where information-scattering rules apply most intensively.
+This is the **core section** of the PRD, and the scattering zone where information is deliberately spread across subsections.
 
-**Subsection division strategy:**
-
-Based on the scaffold's entity hierarchy, state machine complexity, and calculation rule relationships, **decide on 5–9 subsections yourself**. Do not always apply the same organizational pattern. Choose the most natural strategy for the current domain (or mix strategies):
+**Subsection division strategy.** Based on the scaffold's entity hierarchy, state machine complexity, and calculation rule relationships, **decide on 5–9 subsections yourself**. Do not always apply the same organizational pattern. Choose the most natural strategy for the current domain (or mix strategies):
 
 - **By entity lifecycle stages**: Each core entity's creation → operation → termination as one subsection
 - **By role perspective**: Each role's typical workflow as one subsection
 - **By business process timeline**: Organized chronologically from initiation to settlement
 - **By cross-cutting concerns mixed with entities**: Weave safety, financial, compliance concerns into related entity narratives rather than isolating them
 
-Key requirement: Regardless of strategy, information scattering must cross subsection boundaries — parameters for the same endpoint must still be spread across ≥2 subsections.
+**Scattering guidelines** (soft rules for how the scattered prose reads):
 
-**Writing requirements within subsections:**
-- Embed field names in backticks within narrative sentences — no field lists or schema tables. Every field from `entities[].fields` must appear at least once in §3.
-- Describe state transitions through narrative preconditions and side effects — no state diagrams (but state values use exact UPPERCASE strings, e.g., `PENDING_REVIEW`). Source: `state_machines[].transitions`
-- Express calculation logic as business narrative, not pseudocode. Source: `calculations[].formula` — rewrite as prose using phrases like "conservatively estimates", "processes in chronological order"
-- Embed `calculations[].constants` within business context — use unit conversions to increase inference difficulty (e.g., "100 hours" when the system works in minutes, requiring conversion to 6000)
-- Mention `error_id` values naturally in narrative (e.g., "rejected with `ERR_XXX`") but do not explain trigger conditions in a concentrated way. Source: `errors[].id`
-- Distribute the same endpoint's input parameters (`endpoints[].request_body`) across different subsections
-- **Never write HTTP methods or URL paths in §3 (HARD CONTRACT — see Rule 8 and Pass C).** No `POST /orders/{id}/cancel`, no `GET /users`, no `/treatment-plans/{planId}/activate` — not even in backticks. Workflows in §3 are expressed entirely in domain language — entity names, role names, action verbs ("approval", "scheduling", "cancellation"), and state-transition pairs (`ASSIGNED → EN_ROUTE_TO_PICKUP`). HTTP methods and URL paths live exclusively in the §4 endpoint table; §3 readers follow the narrative and cross-reference §4 when they need the HTTP contract. See `example-prd.md` §3 for the target style — it mentions no endpoint paths anywhere in its seven subsections, and uses state-pair disambiguation (`ACTIVE → FINAL_REVIEW_PENDING → COMPLETED`) as the bridge back to §4.
+1. **Parameters distributed across subsections.** Input parameters for the same endpoint (from `endpoints[].request_body`) must be distributed across ≥2 subsections. Core parameters appear in the workflow subsection; safety/override parameters appear in the safety-rules subsection (or equivalent).
+2. **Constants embedded in context.** Numeric thresholds from `calculations[].constants` must be embedded in business statements. Leverage unit conversions to increase inference difficulty (e.g., write "100 hours" when the constant is `THRESHOLD: 6000` in minutes).
+3. **Relationships through actions.** Do not declare foreign keys. Imply relationships through actions like *"payload containing the `procedure_id`"*. Entity parent-child relationships from `entities[].parent` should be expressed through workflow narrative, not explicit schema declarations.
+
+**Hard contracts enforced by the "Hard Contracts" section below:**
+
+- **Field-name coverage (Contract 1)** — every `entities[].fields[].name` and every `endpoints[].request_body`/`query_params`/`path_params` identifier must appear verbatim in backticks somewhere in the PRD. No field lists or schema tables — names reach the reader through narrative.
+- **Rule coverage (Contract 2)** — state-transition preconditions and side-effects, calculation formulas, validation conditions paired with their `error_id`, concurrency losers, and validation priority orderings must all surface in prose.
+- **§3 path purity (Contract 3)** — no HTTP methods or URL paths appear in §3 backticks; endpoints are named via state-transition framing, role + action verb, or capability description. HTTP contract lives only in §4's endpoint table.
+
+**Style minima in §3:** state values appear as exact UPPERCASE strings in narrative (`PENDING_REVIEW`, `ACTIVE`, state-transition pairs like `ASSIGNED → EN_ROUTE_TO_PICKUP`). Error IDs are mentioned naturally (e.g., *"rejected with `ERR_XXX`"*) — trigger conditions live near the workflow they guard, not in a concentrated block. See `example-prd.md` §3 for the target style: no endpoint paths anywhere across its seven subsections, state-pair disambiguation (`ACTIVE → FINAL_REVIEW_PENDING → COMPLETED`) as the bridge back to §4.
 
 ### §4. Endpoint Definitions
 
@@ -229,93 +214,32 @@ Generate a summary table from the scaffold's `errors[]`. Core principle: **the t
 
 ---
 
-## Information Scattering Rules (Apply Only to §3)
+## Hard Contracts (Blocking — Must PASS Before PRD Ships)
 
-These rules **apply only to §3 Business Logic**. Contract content in §2 is not subject to these rules.
+Three non-negotiable contracts. Each has a fixed procedure and a required PASS report. A PRD that fails any one is not ready regardless of prose quality. Contracts 1 and 3 catch missing identifiers and path leaks mechanically; Contract 2 catches missing behaviors — the hardest and most consequential failure mode.
 
-### Rule 1 (HARD CONTRACT — BLOCKING): Complete Field-Name Coverage
+### Contract 1: Field-Name Coverage
 
-**This is a non-negotiable contract, not a scattering guideline.** The model under test only sees the PRD — any field name present in the scaffold but absent from the PRD forces the implementer to guess the JSON key, which silently breaks the hidden test contract (e.g., the implementer writes `vaccine_type` while the tests expect `vaccine_name`).
+**Why it matters.** The model under test only sees the PRD. A field name present in scaffold but absent from PRD forces the implementer to guess the JSON key, silently breaking the hidden test contract (implementer writes `vaccine_type`, tests expect `vaccine_name`). Field omissions are the single highest-impact failure mode — one missing name can cascade to >60% of tests failing.
 
-Every field name defined in the scaffold must appear verbatim, in backticks, somewhere in the PRD. Specifically:
+**The contract.** Every field name defined in the scaffold must appear verbatim, in backticks, somewhere in the PRD:
 
 - Every `entities[].fields[].name` — every entity attribute, regardless of `source` (input, computed, system).
-- Every identifier in `endpoints[].request_body` / `endpoints[].input` — every request-payload key for every endpoint.
+- Every identifier in `endpoints[].request_body` / `endpoints[].input` — every request-payload key.
 - Every identifier in `endpoints[].query_params` (if present) — every query-string parameter name.
 - Every identifier in `endpoints[].path_params` (if present) — every URL path variable.
 
-Scattering is allowed (see Rules 2–5) but **omission is not**. No field lists or schema tables — but the name itself must be reachable in narrative. If a field has no natural home in §3, mention it in §2 (for common/computed fields) or inline with the endpoint discussion — but it MUST appear.
+Scattering across subsections is fine; omission is not. §3 carries no field lists or schema tables — but every field name must still be reachable in narrative. If a field has no natural home in §3, mention it in §2 or inline with the endpoint discussion — but it MUST appear.
 
-### Rule 2: Parameters Distributed Across Subsections
+**Procedure.**
 
-Input parameters for the same endpoint (from `endpoints[].request_body`) must be distributed across ≥2 subsections. Core parameters appear in the workflow subsection; safety/override parameters appear in the safety-rules subsection (or equivalent).
+1. Enumerate every scaffold field name: collect every `fields[].name`, plus every identifier in `request_body`/`input`/`query_params`/`path_params`. Deduplicate into the required set.
+2. Extract every backticked token from the generated PRD. Build the actual set.
+3. Diff: `required − actual` must be empty.
+4. For every missing name, locate its natural home (the subsection discussing its entity or endpoint) and add a sentence that mentions it in backticks. Do not create a dumping-ground paragraph.
+5. Re-run 1–3. Repeat until the diff is empty — **at least two passes**, because the first pass often misses fields that live inside endpoint input lists rather than entity definitions.
 
-### Rule 3: Algorithms as Narrative
-
-Calculation logic from `calculations[].formula` must be rewritten as business narrative. Use phrases like "conservatively estimates", "processes in chronological order" — no pseudocode or mathematical formulas.
-
-### Rule 4: Constants Embedded in Context
-
-Numeric thresholds from `calculations[].constants` must be embedded in business statements. Leverage unit conversions to increase inference difficulty (e.g., write "100 hours" when the constant is `THRESHOLD: 6000` in minutes).
-
-### Rule 5: Relationships Expressed Through Actions
-
-Do not declare foreign keys. Imply relationships through actions like "payload containing the `procedure_id`". Entity parent-child relationships from `entities[].parent` should be expressed through workflow narrative, not explicit schema declarations.
-
-### Rule 6: Endpoint Table Stays Minimal
-
-Do not expose request body / response body / side effects in the §4 table. Readers must infer from §3.
-
-### Rule 7: Error Table Has No Conditions
-
-Do not expose trigger conditions (from `errors[].condition`) in the §5 table. Trigger conditions are scattered in §2 and §3.
-
-### Rule 8 (HARD CONTRACT — BLOCKING): §3 Contains No Endpoint Paths or HTTP Methods
-
-**This is a non-negotiable contract, not a stylistic guideline.** When §3 names endpoints directly, the PRD stops being a domain specification and becomes an API reference — readers copy path names mechanically instead of reconstructing the workflow from business narrative, and an entire class of hidden errors goes invisible (the scaffold's `OFFLINE → ONLINE` transition can silently fail to land in prose when "call `/go-online`" stands in for it).
-
-No backtick token inside §3 may:
-
-- Start with `/` — e.g., `` `/go-online` ``, `` `/delivery/_clock/advance` ``, `` `/orders/{id}/cancel` ``.
-- Be a bare HTTP method in an endpoint-identifier position — `` `POST` ``, `` `GET` ``, `` `PUT` ``, `` `PATCH` ``, `` `DELETE` ``. (HTTP status codes written in prose — "200 OK", "201 Created" — remain allowed.)
-- Combine a method with a path — e.g., `` `POST /orders` ``.
-
-The scaffold's endpoint semantics still must land in §3 (Rule 1 coverage is non-negotiable), so every endpoint is referred to by one of three **rewrite modes**:
-
-1. **State-transition framing.** When the endpoint drives a state machine, name the state pair: *"going online, transitioning `shift_status` to `ONLINE`"*, *"starting pickup advances the delivery from `ASSIGNED` to `EN_ROUTE_TO_PICKUP`"*. `example-prd.md` §3 uses this mode almost exclusively (*"can transition an assignment's `status` to `PROTOCOL_APPROVED`"*).
-2. **Role + action verb.** When the endpoint is named by its action (e.g., approve, reject, cancel, assign), promote the verb to a gerund and pair it with the acting role: *"approval by a `CustomerService` operator"*, *"cancellation by the owning `Customer`"*. When sibling actions share a verb across entities (close, reopen, start), subsection context plus target state disambiguates.
-3. **Capability description.** For internal / admin-only endpoints with no state transition (clock-advance, sweep, bonus-cycle-close), describe the capability and let §4's description column supply the HTTP contract: *"an admin-only test-driving capability advances the logical clock to a supplied `to` instant"*.
-
-Field names from `request_body` (e.g., `to`, `reason`, `resolution_note`) remain in §3 as backticked tokens — Rule 1 still requires them. Only the **path** and **method** are forbidden. Pass C (below) is the mechanical enforcement of this rule.
-
----
-
-## Mandatory Coverage Verification Passes
-
-Three passes are required before declaring the PRD complete: **field-name coverage** (Pass A — catches missing identifiers), **rule coverage** (Pass B — catches missing behaviors), and **path purity** (Pass C — catches endpoint paths leaking into §3 in violation of Rule 8). All three must produce `PASS` reports. Do not skip any — they catch distinct failure modes, and a PRD can pass any two while failing the third.
-
-## Pass A: Field-Name Coverage
-
-Before declaring the PRD complete, run this verification **as a discrete pass**. Do NOT skip it, even if Rule 1 was followed during writing. This pass exists because field omissions are the single highest-impact failure mode in this benchmark — one missing field name can cascade to >60% of tests failing.
-
-### Procedure
-
-1. **Enumerate every scaffold field name.** Build the complete reference set:
-   - For each entity in `entities[]`: collect every `fields[].name`.
-   - For each endpoint in `endpoints[]`: collect every identifier in `request_body` / `input`, `query_params`, `path_params`.
-   - Deduplicate into one flat list of required backtick tokens.
-
-2. **Scan the PRD.** Extract every backticked token from the generated PRD. Build the actual set.
-
-3. **Diff.** Compute `required − actual`. The difference must be empty.
-
-4. **Repair.** For every missing field name, locate its natural home (the subsection discussing its entity or endpoint) and add a sentence that mentions it in backticks. Do not create a dumping-ground paragraph.
-
-5. **Re-run steps 1–3.** Repeat until the diff is empty. This loop is mandatory — **at least two passes**, because the first pass often misses fields that live inside endpoint input lists rather than entity definitions.
-
-### Output requirement
-
-Before writing the final `prd.md`, emit a coverage report to the chat (or as a side note) with the format:
+**Required report:**
 
 ```
 Field coverage check:
@@ -325,129 +249,105 @@ Field coverage check:
 Status: PASS
 ```
 
-If status is not PASS, the PRD is not ready — return to step 4.
+If status is not PASS, repair the missing names and re-run.
 
-### Why this is worth the overhead
+### Contract 2: Rule Coverage
 
-The PRD is a lossy projection of the scaffold. Prose rewriting naturally drops names that don't have a convenient narrative hook ("the list of batch numbers", "vaccine type"). The test suite, however, is generated directly from the scaffold — so every field the scaffold defines becomes a hidden contract the model must match. A missing name in the PRD forces the model to guess, and the guess is right roughly 50% of the time for single-word fields and much worse for compound names. This verification pass is the only mechanism that catches the loss before it reaches evaluation.
+**Why it matters.** Contract 1 catches missing identifiers. Contract 2 catches missing *behaviors* — scaffold entries where the name is present but the specification attached to it (a default, a side-effect cascade, a priority ordering, a concurrency loser `error_id`, a sibling branch) is silent. A PRD that passes Contract 1 can still fail here: a name without its rule is the same as not naming it at all, because the test suite asserts the rule.
 
----
+The governing question for every scaffold entry is not *"is its identifier mentioned?"* but *"does the PRD prose uniquely determine the scaffold's specification for this entry?"*
 
-## Pass B: Rule Coverage (BEHAVIORAL, NOT JUST NOMINAL)
+These are the categories the downstream `prd-bench-unit-test-generator` walks to build its test suite. If the doc-generator omits any of them, the test generator's PRD-First Principle either skips the test (shrinking benchmark signal) or generates it and fails fair implementations — neither outcome is acceptable.
 
-This second pass catches a different failure mode: rules that exist in scaffold structure (priority columns, concurrency sections, precondition fields) but never get stated in PRD prose. A PRD that passes field coverage can still fail rule coverage — names can be present while the *behavior* associated with them is silent.
+**The contract — six high-risk categories, then the tail.** Every entry in these categories must have a PRD sentence, not "metadata":
 
-### The six high-risk categories (WRITE THESE INTO PRD PROSE — do not leave them to inference)
+**1. `validations[].priority` — ordering when multiple validations share an endpoint.**
 
-These six scaffold shapes are the most frequent omissions. They look like "metadata" but carry first-class behavior. If the PRD does not express them, any test derived from them becomes unfair — a correct implementer reading only the PRD has no way to pass. **For every entry in these six categories, produce a PRD sentence before Pass B runs.** Examples below are illustrative, not templates — adapt the phrasing to the domain.
+State the relative priority in prose. Text order is not enough — readers treat "four independent checks" as unordered.
 
-**1. `validations[].priority` — ordering when multiple validations share an endpoint**
+> ✗ Silent: "Approval enforces four independent checks: self-approval, stale-animal, stale-adopter, animal-not-available."
+> ✓ Explicit: "Approval enforces these four checks, evaluated in order — compliance holds first (so a mid-flight hold surfaces as `ERR_COMPLIANCE_HOLD_ACTIVE` rather than being masked by a later check), then animal availability, then self-approval, then the two stale-version checks."
 
-When two or more validations on the same endpoint can fail on the same request, state the relative priority in prose. Text order is not enough — readers treat "four independent checks" as unordered. Spell out the order.
+**2. `concurrency_rules[].error_id` — the specific error returned by the loser.**
 
-> ✗ Silent (bad): "Approval enforces four independent checks: self-approval, stale-animal, stale-adopter, animal-not-available."
-> ✓ Explicit (good): "Approval enforces these four checks, evaluated in order — compliance holds first (so a mid-flight hold surfaces as `ERR_COMPLIANCE_HOLD_ACTIVE` rather than being masked by a later check), then animal availability, then self-approval, then the two stale-version checks. The stale-version checks are last so that a race with a hold-creation does not mask the hold."
+For every entry, name (a) the racing operations, (b) the serialization guarantee, and (c) the exact `error_id` the loser receives. "Exactly one wins" is insufficient — tests assert the loser's `error_id`.
 
-If the scaffold has `priority` values, the prose must produce the same total order the values encode.
+> ✗ Silent: "Two simultaneous voids on the same invoice serialize to exactly one winner."
+> ✓ Explicit: "Two simultaneous voids on the same invoice serialize to exactly one winner; the loser receives `ERR_INVOICE_HAS_PAYMENTS` if payments arrived between the two attempts, or `ERR_INVALID_STATE` if the invoice has already transitioned out of `ISSUED`."
 
-**2. `concurrency_rules[].error_id` — the specific error returned by the loser**
+**3. Cross-entity side effects — secondary effects, not just the primary one.**
 
-For every `concurrency_rules[]` entry, name (a) the racing operations, (b) the serialization guarantee, and (c) **the exact `error_id` the loser receives**. "Exactly one wins" is insufficient — tests will assert the loser's error_id, so the PRD must promise it.
+When a single operation mutates more than one entity, state every cascade. Missing cascades are the hardest omissions for implementers to guess.
 
-> ✗ Silent (bad): "Two simultaneous voids on the same invoice serialize to exactly one winner."
-> ✓ Explicit (good): "Two simultaneous voids on the same invoice serialize to exactly one winner; the loser receives `ERR_INVOICE_HAS_PAYMENTS` if payments arrived between the two attempts, or `ERR_INVALID_STATE` if the invoice has already transitioned out of `ISSUED`."
+> ✗ Silent: "Creating a `HIGH` or `CRITICAL` hold transitions the animal to `UNAVAILABLE`."
+> ✓ Explicit: "Creating a `HIGH` or `CRITICAL` hold transitions the animal to `UNAVAILABLE`, bumps `animal.version`, and refreshes `updated_at`. Any adoption application with an `animal_version_pinned` captured before the hold will fail at approve time with `ERR_STALE_ANIMAL_DATA` — this is the intended serialization point between hold-creation and approval."
 
-**3. `endpoints[].side_effects` that cascade across entities — secondary effects, not just the primary one**
+**4. `validations[].applies_to` scopes — the exact set of endpoints each rule guards.**
 
-When a single operation mutates more than one entity, state every cascade. Missing cascades are the hardest omissions for implementers to guess — they can read "creating a HIGH hold marks the animal UNAVAILABLE" and miss that the same action also bumps `animal.version`, invalidating any pinned version on a pending application.
+Enumerate all of them. If PRD mentions a rule applying to 2 endpoints but scaffold applies it to 3, tests will exercise the third and fail fairly.
 
-> ✗ Silent (bad): "Creating a `HIGH` or `CRITICAL` hold transitions the animal to `UNAVAILABLE`."
-> ✓ Explicit (good): "Creating a `HIGH` or `CRITICAL` hold transitions the animal to `UNAVAILABLE`, and because this is a mutation on `Animal`, the animal's `version` increments and its `updated_at` is refreshed. Any adoption application with an `animal_version_pinned` captured before the hold will fail at approve time with `ERR_STALE_ANIMAL_DATA` — this is the intended serialization point between hold-creation and approval."
+> ✗ Silent: "Compliance holds block make-available and boarding confirm."
+> ✓ Explicit: "An `ACTIVE` `HIGH` or `CRITICAL` compliance hold blocks four operations: make-available, boarding confirm, boarding check-in, and adoption approve. In all four, the rejection code is `ERR_COMPLIANCE_HOLD_ACTIVE`."
 
-**4. `validations[].applies_to` scopes — the exact set of endpoints each rule guards**
+**5. Field-level structured content — types, defaults, initial values, response-exposure.**
 
-When a validation's `applies_to` list spans several endpoints, enumerate all of them in prose. If the PRD mentions a rule applying to 2 endpoints but the scaffold applies it to 3, tests will exercise the third endpoint and fail fairly.
+For every `entities[].fields[]` entry with structured content (type, default, source, initial value), prose must place that content on the owning entity in a form that excludes competing readings. Contract 1 guarantees the identifier; this category guarantees the specification attached to it. If the prose reads "optionally", "as needed", or "may cascade" without naming the concrete default or side-effect, the transcription has collapsed.
 
-> ✗ Silent (bad): "Compliance holds block make-available and boarding confirm."
-> ✓ Explicit (good): "An `ACTIVE` `HIGH` or `CRITICAL` compliance hold blocks four operations: `/make-available`, boarding `/confirm`, boarding `/check-in`, and adoption `/approve`. In all four, the rejection code is `ERR_COMPLIANCE_HOLD_ACTIVE`."
+**6. Sibling-branch symmetry — equal specification density across parallel scaffold entries.**
 
-**5. Field-level structured content — types, defaults, initial values, response-exposure**
+When scaffold contains sibling transitions out of the same `from` state, parallel branches of a validation, or enumerated members of a response shape, PRD prose must render each sibling with equal specification density. Asymmetric treatment — where one branch's bullets are enumerated and the sibling's are compressed — silently drops the sibling's specification.
 
-For every `entities[].fields[]` entry, the structured attributes attached to the field (its `type`, `default`, `source`, initial value at entity creation) must be reconstructible from PRD prose by a PRD-only reader. Mentioning the field name alone (which Pass A guarantees) does not satisfy this category — Pass A is about identifiers, Pass B category 5 is about the **specification attached to each identifier**. When a field has structured content in scaffold, prose must place that content on the owning entity in a form that excludes competing readings.
+**Then the tail — the remaining scaffold rule tables:**
 
-**6. Sibling-branch symmetry — equal specification density across parallel scaffold entries**
+- Every `state_machines[].transitions[]` — `from` and `to` states named; every `preconditions` item paired with its `error_id`; every `side_effects` item stated.
+- Every `calculations[]` — full formula (inputs, evaluation order, `constants`, `precision`, `algorithm`) expressed in **precise** business prose. Scaffold Fidelity's "No pseudocode" rule governs: no operator syntax, no fuzzy/approximating words, and the prose must pass the reconstruction test (a PRD-only reader recovers the formula step-for-step, operand-for-operand).
+- Every `validations[].check` — condition matchable to its `error_id` via narrative in §2 or §3 (the §5 error table has no conditions column).
+- Every `endpoints[].side_effects` — described in the relevant workflow narrative.
 
-When scaffold contains parallel entries (sibling transitions out of the same `from` state, parallel branches of a validation, enumerated members of a response shape), PRD prose must render each sibling with equal specification density. Asymmetric treatment — where one branch's bullets are enumerated and the sibling's are compressed — silently drops the sibling's specification. The diagnostic: for every parallel group in scaffold, compare prose coverage of each member against its scaffold bullet count; any member that loses bullets in prose is a Pass B failure.
+**Procedure.** Walk each category; for each scaffold entry, verify the PRD covers it. When a gap surfaces, locate the right §2/§3 subsection and add a sentence expressing the missing rule.
 
-### Procedure (full enumeration)
-
-After writing the above six categories, run the rule-coverage check. Enumerate every rule-bearing entry from the scaffold and verify PRD prose covers it:
-
-1. **Validation priorities** (Category 1 above) — every `priority` value is reflected in prose ordering.
-
-2. **Concurrency rule outcomes** (Category 2 above) — every `concurrency_rules[]` entry names its loser `error_id`.
-
-3. **Transition preconditions and side effects** (Category 3 above) — for every `state_machines[].transitions[]`:
-   - The `from` and `to` states are named
-   - Every `preconditions` item appears with its specific `error_id`
-   - Every `side_effects` item appears, including cascades to other entities
-
-4. **Calculation formulas.** For every entry in `calculations[]`, PRD expresses the full formula in prose (inputs, steps, precision, rounding). Check `constants`, `precision`, and `algorithm` fields individually.
-
-5. **Validation conditions and their error_ids.** For every entry in `validations[]`, a reader can match the triggering scenario to the specific `error_id`. The §5 error table has no conditions column, so the match must live in §2 or §3 prose.
-
-6. **Endpoint side effects and applies_to scopes** (Category 4 above) — every `endpoints[].side_effects` is described; every `applies_to` list is enumerated.
-
-7. **Field-level structured content** (Category 5 above) — for every `entities[].fields[]` entry, the field's structured attributes (type, default, initial value, source semantics) are reconstructible from PRD prose.
-
-8. **Sibling-branch symmetry** (Category 6 above) — for every parallel scaffold group (sibling transitions, parallel validation branches, etc.), prose coverage per member equals its scaffold bullet count.
-
-### Produce a rule-coverage report
+**Required report:**
 
 ```
 Rule coverage check:
 - validations[] with priority: A checked, A expressed in prose, 0 missing
-- concurrency_rules[] with error_id: B checked, B expressed in prose, 0 missing
+- concurrency_rules[] with error_id: B checked, B expressed, 0 missing
 - state_machines[].transitions: C checked, C fully expressed, 0 missing
 - calculations[]: D checked, D fully expressed, 0 missing
-- validations[]: E checked, E conditions matchable to error_id in prose, 0 missing
-- endpoints[].side_effects: F checked, F expressed in prose, 0 missing
-- validations[].applies_to: G scopes checked, G fully enumerated in prose, 0 missing
-- entities[].fields[] structured content: H checked, H structurally reconstructible from prose, 0 missing
-- sibling-branch specification symmetry: I groups checked, I with equal prose density, 0 asymmetric
+- validations[] conditions: E checked, E matchable to error_id in prose, 0 missing
+- endpoints[].side_effects / applies_to: F checked, F expressed, 0 missing
+- entities[].fields[] structured content: G checked, G reconstructible from prose, 0 missing
+- sibling-branch symmetry: H groups checked, H with equal prose density, 0 asymmetric
 Status: PASS
 ```
 
-If status is not PASS, enumerate the missing rules, locate the right §2 or §3 subsection, and add a sentence that expresses each missing rule. Then re-run. Do not mark the PRD ready until both Pass A and Pass B report `PASS`.
+### Contract 3: §3 Path Purity
 
-### Why the six categories matter
+**Why it matters.** When §3 names endpoints directly via HTTP methods or URL paths, PRD stops being a domain specification and becomes an API reference — readers copy path names mechanically instead of reconstructing the workflow from business narrative, and an entire class of hidden errors goes invisible (the scaffold's `OFFLINE → ONLINE` transition can silently fail to land in prose when "call `/go-online`" stands in for it). Path-based phrasing is also just shorter — *"call `/approve`"* beats *"approval by a `CustomerService` operator"* by several characters, and a writing session accumulates dozens of these shortcuts.
 
-These six are not arbitrary — they are the categories the downstream `prd-bench-unit-test-generator` will walk to build its test suite. A test is generated from `validations[].priority`, another from `concurrency_rules[].error_id`, another from cascade side effects, another from `applies_to`, another from field-level structured content, another from sibling-branch symmetry. Every one of these tests must be implementable from PRD alone. If this skill omits them from PRD, the test generator's PRD-First Principle will either (a) skip the test — shrinking the benchmark's signal — or (b) generate it anyway and fail fair implementations. Neither outcome is acceptable. The responsibility for keeping these rules in the PRD lives **here**, in the doc generator, not in the test generator.
+**The contract.** No backtick token inside §3 may:
 
----
+- Start with `/` — e.g., `` `/go-online` ``, `` `/orders/{id}/cancel` ``.
+- Be a bare HTTP method in endpoint-identifier position — `` `POST` ``, `` `GET` ``, `` `PUT` ``, `` `PATCH` ``, `` `DELETE` ``, `` `OPTIONS` ``. (HTTP status codes in prose — "200 OK", "201 Created" — remain allowed.)
+- Combine a method with a path — e.g., `` `POST /orders` ``.
 
-## Pass C: §3 Path Purity (HARD CONTRACT — BLOCKING)
+Every endpoint is referred to in §3 by one of three **rewrite modes**:
 
-Pass A catches missing identifiers; Pass B catches missing behaviors; Pass C catches a distinct leak — endpoint paths and HTTP methods bleeding into §3 in violation of Rule 8. A PRD that passes A and B can still fail C. This check is mechanical and cheap; run it after Pass B.
+1. **State-transition framing.** When the endpoint drives a state machine, name the state pair: *"going online, transitioning `shift_status` to `ONLINE`"*, *"starting pickup advances the delivery from `ASSIGNED` to `EN_ROUTE_TO_PICKUP`"*. `example-prd.md` §3 uses this mode almost exclusively.
+2. **Role + action verb.** When the endpoint is named by its action (approve, reject, cancel, assign), promote the verb to a gerund and pair it with the acting role: *"approval by a `CustomerService` operator"*. When sibling actions share a verb across entities, subsection context plus target state disambiguates.
+3. **Capability description.** For internal/admin endpoints with no state transition (clock-advance, sweep), describe the capability and let §4's description column supply the HTTP contract: *"an admin-only test-driving capability advances the logical clock to a supplied `to` instant"*.
 
-### Procedure
+Field names from `request_body` (e.g., `to`, `reason`, `resolution_note`) remain in §3 as backticked tokens — Contract 1 still requires them. Only the **path** and **method** are forbidden.
 
-1. **Scope.** Extract only §3 content — from the `## 3.` heading up to the `## 4.` heading. Pass C does not apply to §1, §2, or §4. A system-wide URL mount (e.g., *"mounted under `/delivery`"*) may appear in §1 or §2 without penalty; Pass C only polices §3.
+**Procedure.**
 
-2. **Scan.** Enumerate every backtick-quoted token inside §3. Flag a token as a violation if it:
-   - starts with `/` — e.g., `` `/go-online` ``, `` `/delivery/_clock/advance` ``, `` `/orders/{id}/cancel` ``, or
-   - is a bare HTTP method token — `` `POST` ``, `` `GET` ``, `` `PUT` ``, `` `PATCH` ``, `` `DELETE` ``, `` `OPTIONS` ``, or
-   - combines a method with a path — e.g., `` `POST /orders` ``.
+1. Extract §3 content — from the `## 3.` heading up to `## 4.`. A system-wide URL mount in §1 or §2 (*"mounted under `/delivery`"*) is allowed; this contract polices §3 only.
+2. Enumerate every backticked token inside §3. Flag as violation if it matches any of the three forbidden patterns.
+3. Diff: violation set must be empty.
+4. For every violation, apply one of the three rewrite modes. Preserve Contract 1 coverage — any `request_body` / `query_params` / `path_params` field names inside the offending sentence must remain as backticked tokens. Keep state enumeration values in backticks as the disambiguator back to §4.
+5. Re-run step 2 until the violation set is empty.
 
-3. **Diff.** The violation set must be empty.
-
-4. **Repair.** For every violation, apply one of Rule 8's three rewrite modes — state-transition framing, role + action verb, or capability description. Preserve Rule 1 coverage: any `request_body`, `query_params`, or `path_params` field names that lived inside the offending sentence must remain as backticked tokens in the rewritten prose. Keep state enumeration values (`ASSIGNED`, `EN_ROUTE_TO_PICKUP`) in backticks as the disambiguator back to §4.
-
-5. **Re-run step 2.** Repeat until the violation set is empty.
-
-### Output requirement
-
-Before writing the final `prd.md`, emit a path-purity report:
+**Required report:**
 
 ```
 Path purity check (§3 only):
@@ -458,11 +358,7 @@ Path purity check (§3 only):
 Status: PASS
 ```
 
-If status is not PASS, the PRD is not ready — return to step 4. Do not mark the PRD ready until Pass A, Pass B, and Pass C all report `PASS`.
-
-### Why Pass C is worth running separately
-
-Path-based phrasing is the shortest way to name an action — *"call `/approve`"* beats *"approval by a `CustomerService` operator"* by several characters. A single writing session accumulates dozens of these shortcuts, each individually small, together breaking Rule 8 across most of §3. Pass A and Pass B cannot catch the leak because a PRD full of `/approve` references still has full field and rule coverage — it just stops being a domain specification. Pass C restores the §3 / §4 separation that the downstream unit-test generator and implementation generator both assume.
+All three contracts must report PASS before the PRD ships.
 
 ---
 
@@ -487,67 +383,30 @@ Path-based phrasing is the shortest way to name an action — *"call `/approve`"
 
 ## Quality Checklist
 
-### Contract Precision (§2)
-- [ ] §2.2 matches the fixed verbatim block in the §2.2 generation rule byte-for-byte (including `req_RANDOMALPHANUM123456`, `2025-05-24T10:30:00.123Z`, `UNIQUE_ERROR_IDENTIFIER_STRING`, and `"data": { }` — no synthesized entity payload, no domain-flavored placeholders)
-- [ ] §2.3 explicitly states limit/offset defaults, min, max
-- [ ] §2.3 explicitly states sort order
+### Hard Contracts (all three must PASS — see "Hard Contracts" section for procedures and report formats)
+- [ ] Contract 1 (Field-Name Coverage): PASS report emitted
+- [ ] Contract 2 (Rule Coverage): PASS report emitted
+- [ ] Contract 3 (§3 Path Purity): PASS report emitted
+
+### Contract Precision (§2 items not covered by Contract 2)
+- [ ] §2.2 matches the fixed verbatim block byte-for-byte (including `req_RANDOMALPHANUM123456`, `2025-05-24T10:30:00.123Z`, `UNIQUE_ERROR_IDENTIFIER_STRING`, and `"data": { }` — no synthesized entity payload, no domain-flavored placeholders)
+- [ ] §2.3 explicitly states limit/offset defaults, min, max, and sort order
 - [ ] Common resource properties (id [UUID, no type prefix], created_at, updated_at, version) have precise type and format definitions
 - [ ] Precision rules (decimal places + rounding method) are explicitly stated
 - [ ] OCC mechanism is precisely described
-- [ ] All role names are spelled exactly as in `roles[].name`
-- [ ] §2.1 translates every role's `identity:` field into prose: entity-backed roles state that `X-User-ID` equals the backing entity's `id`; opaque roles state that `X-User-ID` is an opaque operator identifier not compared to any entity id
-- [ ] All state enumeration values are exact strings from `state_machines[]`
-- [ ] All enum-type field values (certifications, categories, etc.) are exact strings from `entities[].fields`
+- [ ] All role names are spelled exactly as in `roles[].name`; every role's `identity:` field is translated into §2.1 prose
+- [ ] All state enumeration values and enum-type field values appear as exact strings from the scaffold
 
-### Field-Name Coverage (Pass A — HARD CONTRACT — check last, after all writing)
-- [ ] Every `entities[].fields[].name` appears verbatim in backticks in the PRD (any section)
-- [ ] Every identifier in `endpoints[].request_body` / `endpoints[].input` appears verbatim in backticks
-- [ ] Every identifier in `endpoints[].query_params` appears verbatim in backticks
-- [ ] Every identifier in `endpoints[].path_params` appears verbatim in backticks
-- [ ] A coverage diff was computed (required set − PRD backtick set = ∅) and re-run at least twice
-- [ ] A PASS coverage report was produced before finalizing the PRD
-
-### Rule Coverage (Pass B — HARD CONTRACT — check last, after all writing)
-- [ ] Every `validations[].priority` ordering is expressed in prose when multiple validations share an endpoint
-- [ ] Every `concurrency_rules[]` names its loser `error_id` in prose, not just "exactly one wins"
-- [ ] Every `state_machines[].transitions[].preconditions` (with its specific error_id) is expressed in prose
-- [ ] Every `state_machines[].transitions[].side_effects` (including cascades) is expressed in prose
-- [ ] Every `calculations[]` formula, constants, precision, and algorithm are expressed in prose
-- [ ] Every `validations[].check` condition is matchable to its `error_id` via narrative in §2 or §3
-- [ ] Every `endpoints[].side_effects` is expressed in prose
-- [ ] Every `entities[].fields[]` entry's structured content (type, default, initial value, exposure) is reconstructible from PRD prose (Zero-Ambiguity Rule)
-- [ ] Parallel scaffold groups (sibling transitions, branch pairs, validation alternatives) receive symmetric prose coverage (Zero-Ambiguity Rule)
-- [ ] A PASS rule-coverage report was produced before finalizing the PRD
-
-### Path Purity (Pass C — HARD CONTRACT — check last, after all writing)
-- [ ] No backtick token in §3 starts with `/`
-- [ ] No bare HTTP-method token (`POST`, `GET`, `PATCH`, `PUT`, `DELETE`, `OPTIONS`) appears in backticks in §3
-- [ ] No method+path combined token (e.g., `POST /orders`) appears in §3
-- [ ] Every endpoint referenced in §3 uses one of Rule 8's three rewrite modes: state-transition framing, role + action verb, or capability description
-- [ ] A PASS path-purity report was produced before finalizing the PRD
-
-### Scattering Rules (§3)
-- [ ] Every constant from `calculations[].constants` is embedded in business context (no bare constant definitions)
-- [ ] Every formula from `calculations[].formula` is expressed as narrative (no pseudocode)
-- [ ] Every `errors[].id` is mentioned somewhere in §2 or §3
+### Scattering Guidelines spot-check (§3 — see §3 Section Generation Rule)
 - [ ] Core endpoint parameters are distributed across ≥2 subsections
-- [ ] §3 contains no field lists or schema tables
+- [ ] Every `calculations[].formula` is expressed as **precise** business narrative — no pseudocode, no mathematical notation, no fuzzy words like "approximately" / "conservatively" / "roughly"; a PRD-only reader can reconstruct the formula from the prose alone, step-for-step, operand-for-operand
+- [ ] Every `calculations[].constants` is embedded in business context
+- [ ] §3 contains no field lists, no schema tables, and no declared foreign keys
+- [ ] Every `errors[].id` is mentioned somewhere in §2 or §3
 
 ### Structure (§4 + §5)
 - [ ] §4 endpoint table has only 4 columns (Method, Path, Description, Authorized Role)
 - [ ] §5 error table has only 2 columns (Error ID, HTTP Status Code)
-
----
-
-## Common Homogeneity Problems (Must Avoid)
-
-These are the most frequent "copying the example" problems when generating PRDs. Self-check before every generation:
-
-1. **§2 subsections mirror the example 1:1**: Subsection numbers, titles, and ordering are nearly identical to the example (e.g., 2.4 is always "System Integrity", 2.5 is always "Fiscal Responsibility"). Subsections should be renamed and reordered based on the domain. (§2.2 is the deliberate exception — it is a fixed verbatim block and MUST be identical across tasks.)
-2. **§3 follows a fixed 7-subsection pattern**: Exactly 7 subsections arranged as "lifecycle → structure → core op → pairing/restriction → safety/compliance → cost calculation → finalization". Group naturally based on the domain.
-3. **Monotonous paragraph openings**: Multiple consecutive paragraphs starting with "The system...". Alternate among role names, conditional clauses, business events, etc.
-4. **Fixed Introduction format**: Always 1 paragraph of 3–4 sentences starting with "This document outlines...". Adapt length and approach angle to the domain.
-5. **Templated §2 subsection prose**: Every domain's cross-cutting subsections use the same sentence structures (e.g., "The system enforces strict X. Every Y is associated with a Z."). Vary expression style based on concept complexity.
 
 ---
 
@@ -559,9 +418,8 @@ The following two files form a complete input → output example. Before generat
 - **Output example** (target PRD): [example-prd.md](example-prd.md) — PRD document generated from the above seed tables
 
 Key observations:
-1. How `example-prd.md` §2.2 matches the canonical verbatim block in `section-2.2-response-structure.md` (§2.2 is fixed across all tasks; do not re-derive per-task)
-2. How `example-prd.md` §3 scatters field names from `example-scaffold.yaml` throughout narrative paragraphs
-3. The endpoint table has only 4 columns; the error table has only 2 columns
-4. All calculation formulas use narrative, not pseudocode
+1. How `example-prd.md` §3 scatters field names from `example-scaffold.yaml` throughout narrative paragraphs
+2. The endpoint table has only 4 columns; the error table has only 2 columns
+3. All calculation formulas use precise business narrative — no pseudocode, no mathematical notation, no fuzzy/approximating words
 
 The scaffold YAML structure is defined in [prd-bench-scaffold-generator](../prd-bench-scaffold-generator/SKILL.md).

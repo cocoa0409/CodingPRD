@@ -40,8 +40,7 @@ roles:                       # §1.7: RBAC Matrix
 
 Do NOT emit `scaffold_difficulty_design:` as a top-level key inside `SCAFFOLD.yaml` — it lives only in the second file.
 
-For completed examples, see the `examples/` directory (22 scaffolds covering diverse domains)
-For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tables-template.yaml).
+For completed examples, see the `examples/` directory. For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tables-template.yaml).
 
 ## Generation Checklist
 
@@ -184,12 +183,12 @@ Seven hard rules that shape the scaffold's contents. They apply **while you are 
 **Rule 1 — Dual-variant calculations across different entity domains**  (`rule_id: dual_variant_calc`, ≥ 2 instances)
 At least two `calculations[]` entries where two valid approaches produce different results. The two calculations MUST operate on different entity domains (e.g., one is cost accounting on an Order, the other is risk scoring on a Customer), so the scaffold exhibits dual-variant logic on more than one subject. A second calculation that repeats the same provisional-vs-final shape on the same entity or metric does NOT count.
 
-**Rule 2 — Combinatorial formula**  (`rule_id: combinatorial_formula`, ≥ 1 instance)
-At least one calculation with combinatorial complexity, satisfied by any of:
+**Rule 2 — Combinatorial formulas across different modes**  (`rule_id: combinatorial_formula`, ≥ 2 instances)
+At least two calculations with combinatorial complexity, each falling into one of these three modes:
 (a) a formula with ≥3 inputs and non-linear interaction (nested `min`/`max`, conditional branches on entity state, tiered-rate selection);
 (b) nested rounding where the order matters — "round per-line-item then sum" vs "sum then round" produce different cents; the scaffold MUST pin one order and state it explicitly;
 (c) a circular-looking dependency where evaluation order must be explicit (e.g., `total = subtotal + fee`, but `fee` is computed from a discount keyed on the total tier — the scaffold pins the evaluation order so the value is well-defined).
-A single-formula `aggregation` + `threshold` calculation does NOT satisfy this.
+The two instances MUST fall in **different modes** from {(a), (b), (c)}, so the scaffold exercises combinatorial complexity along more than one axis. Two instances that both satisfy only (a) (e.g., two tiered-rate formulas on different metrics) do NOT count. A single-formula `aggregation` + `threshold` calculation does NOT satisfy this.
 
 **Rule 3 — Non-linear state-machine shape on different entities**  (`rule_id: non_linear_state_machine`, ≥ 2 instances)
 At least two state machines with non-linear shape — a cycle (A→B→A, revision loops, negotiation rounds), parallel state dimensions on one entity (e.g., `payment_status × fulfillment_status` evolve independently on the same row), OR branching fork-join (A→{B,C}→D with divergent side-effect sets per branch). The two non-linear machines MUST belong to different entities. A scaffold whose state machines are all linear A→B→C→D pipelines — no matter how long each pipeline is — does NOT satisfy this.
@@ -483,26 +482,10 @@ roles:
 
 **The `identity:` field is mandatory and takes exactly one of two forms:**
 
-- `entity_backed:<EntityName>` — when `X-User-Role` is this role, `X-User-ID`
-  equals the `id` of an instance of `<EntityName>`. Use this for every role
-  that corresponds to a persisted entity the user acts as (e.g.,
-  `Customer` → `entity_backed:Customer`, `Restaurant` → `entity_backed:Restaurant`,
-  `Rider` → `entity_backed:Rider`). Ownership checks of the form "the acting
-  X must be the owner of this resource" are then unambiguous: the server
-  compares `X-User-ID` to the resource's foreign-key field for `<EntityName>`.
-- `opaque` — `X-User-ID` is an operator identifier not tied to any persisted
-  entity. Use this for purely operational roles like `PlatformAdmin` and
-  `CustomerService`. Scaffold may still reference the opaque id (e.g., store
-  it on a WorkOrder as `assigned_cs_user_id`) but must never require it to
-  equal any entity's `id`.
+- `entity_backed:<EntityName>` — when `X-User-Role` is this role, `X-User-ID` equals the `id` of an instance of `<EntityName>`. Use this for every role that corresponds to a persisted entity the user acts as (e.g., `Customer` → `entity_backed:Customer`, `Restaurant` → `entity_backed:Restaurant`, `Rider` → `entity_backed:Rider`). Ownership checks of the form "the acting X must be the owner of this resource" are then unambiguous: the server compares `X-User-ID` to the resource's foreign-key field for `<EntityName>`.
+- `opaque` — `X-User-ID` is an operator identifier not tied to any persisted entity. Use this for purely operational roles like `PlatformAdmin` and `CustomerService`. Scaffold may still reference the opaque id (e.g., store it on a WorkOrder as `assigned_cs_user_id`) but must never require it to equal any entity's `id`.
 
-Why this field is mandatory: without it, the PRD, the test fixtures, and
-the implementation each invent their own mapping between `X-User-ID` and
-entity ids. Downstream generators (doc, unit-test, implementation) read
-this field to produce consistent role-to-resource identity semantics. A
-scaffold that demands "Restaurant must own the order" but leaves identity
-unstated forces the three downstream skills to guess — and they guess
-differently, producing unfair tests or mismatched implementations.
+Why this field is mandatory: without it, the PRD, the test fixtures, and the implementation each invent their own mapping between `X-User-ID` and entity ids. Downstream generators (doc, unit-test, implementation) read this field to produce consistent role-to-resource identity semantics. A scaffold that demands "Restaurant must own the order" but leaves identity unstated forces the three downstream skills to guess — and they guess differently, producing unfair tests or mismatched implementations.
 
 **Role model patterns:**
 
@@ -516,63 +499,50 @@ differently, producing unfair tests or mismatched implementations.
 
 ### 1.8 Scaffold Difficulty Design (Test Targeting Index)
 
-**Output location**: this section is written to a separate file `SCAFFOLD_DIFFICULTY_DESIGN.yaml` sibling to `SCAFFOLD.yaml`, with `scaffold_difficulty_design:` as its single top-level key. Do NOT emit it inside `SCAFFOLD.yaml`.
+**Output location**: a separate file `SCAFFOLD_DIFFICULTY_DESIGN.yaml` sibling to `SCAFFOLD.yaml`, with `scaffold_difficulty_design:` as its single top-level key. Do NOT emit it inside `SCAFFOLD.yaml`.
 
-A machine-readable index of every difficulty feature the scaffold claims to exhibit, cross-referenced from §1.1–§1.7 against the **seven Difficulty Rules defined in §0.5**. Its sole purpose is to drive the downstream unit-test-generator toward complete coverage. Every `rule_id` below corresponds verbatim to a `rule_id` declared in §0.5; consult §0.5 for each rule's full text, differentiation requirements, and counter-examples that do NOT count.
+**Purpose**: a machine-readable index of every difficulty feature the scaffold claims to exhibit, cross-referenced from §1.1–§1.7 against the seven Difficulty Rules defined in §0.5. Its sole job is to drive the downstream unit-test-generator toward complete coverage. Every `rule_id` below corresponds verbatim to a `rule_id` in §0.5; **§0.5 is authoritative** for each rule's full text, minimum instance count, differentiation clause, and counter-examples. This section does not restate those.
 
 **Critical semantics:**
-- **Not an independent rule source.** Every instance MUST ground in elements already declared in §1.1–§1.7. Deleting this section must leave the scaffold's declared behavior identical — it only makes test coverage harder to audit.
-- **The doc-generator IGNORES this section.** The PRD must not reference, summarize, or highlight it. Because every instance grounds in other tables (which the PRD losslessly conveys), the rules are already in the PRD through their original tables.
-- **The unit-test-generator MUST cover every instance** with at least one test whose `test_recipe` is realized in test code. Uncovered instances are a Stage 2 failure.
+- **Not an independent rule source.** Every instance MUST ground in elements already declared in §1.1–§1.7. Deleting this file must leave the scaffold's declared behavior identical — it only makes test coverage harder to audit.
+- **Every instance MUST be covered** by at least one unit test whose `test_recipe` is realized in code. Uncovered instances are a Stage 2 failure for the unit-test-generator.
 
 **Schema:**
 
 ```yaml
 scaffold_difficulty_design:
-  - rule_id: dual_variant_calc                # each rule_id entry MUST carry the number of instances
-    instances:                                 # the quota table below demands — NOT a single instance
-      - name: <instance_1_lower_snake_case>    # instance 1 of ≥2 required for dual_variant_calc
-        grounds:                               # one or more refs into §1.1–§1.6; every ref MUST resolve
+  - rule_id: dual_variant_calc
+    instances:
+      - name: <instance_1_lower_snake_case>
+        grounds:                               # refs into §1.1–§1.6; every ref MUST resolve
           - calculations.<name>                # or: state_machines.<Entity>.<FROM>_to_<TO>
           - validations[priority=<N>]          # or: entities.<Entity>.fields.<name>
           - concurrency_rules[<scenario-keyword>]
         distinguishing_aspect: |
-          <ONE sentence pinning what structurally distinguishes this instance — the specific variant
-          delta, the specific cycle edge, the specific cascade chain tail, the specific boundary value.
-          Must be falsifiable: a test must be able to turn this sentence into one concrete assertion.>
+          <ONE falsifiable sentence pinning what structurally distinguishes this instance,
+          naming the specific distinction §0.5 requires of this rule_id.>
         test_recipe:
-          setup:                               # minimal DB + clock state to reach the scenario from empty DB
+          setup:                               # minimal DB + clock state from empty DB
             - "<precondition 1>"
-          trigger:                             # API call(s) or clock advance(s) that exercise the feature
+          trigger:                             # API call(s) or clock advance(s)
             - "<endpoint invocation 1>"
-          assert:                              # each line = one pinned observable outcome. Any `assert:` line referencing a numeric value derived from a formula MUST be a literal the scaffold author actually computed by code.
+          assert:                              # one pinned observable outcome per line
             - "<comparison or invariant 1>"
-      - name: <instance_2_lower_snake_case>    # instance 2 — MUST cover a different entity domain per Rule 1
+      - name: <instance_2_lower_snake_case>
         grounds: [<refs>]
         distinguishing_aspect: "<…>"
         test_recipe: { setup: [...], trigger: [...], assert: [...] }
-  - rule_id: combinatorial_formula             # repeat for each of the 7 rule_ids; total ≥13 instances
-    instances: [ <≥1 instance per §0.5 Rule 2 quota> ]
-  # … five more rule_id blocks, each meeting its own minimum from the quota table …
+  - rule_id: combinatorial_formula
+    instances: [ <one or more, per §0.5 minimum> ]
+  # … five more rule_id blocks, each meeting its own §0.5 minimum …
 ```
 
-**Minimum instance quotas (mirror of §0.5; differentiation requirements are authoritative there, not here). Count is per INSTANCE (the `- name:` entries nested under `instances:`), NOT per `rule_id`. A scaffold with 7 rule_ids each carrying 1 instance = 7 instances = FAIL.**
-
-| rule_id | Minimum | §0.5 ref | Differentiation summary |
-|---------|---------|----------|-------------------------|
-| `dual_variant_calc` | 2 | Rule 1 | Different entity domains |
-| `combinatorial_formula` | 1 | Rule 2 | — |
-| `non_linear_state_machine` | 2 | Rule 3 | Different entities |
-| `transitive_cascade` | 2 | Rule 4 | Different triggers; one depth ≥ 3, the other ≥ 2 |
-| `priority_pair_validation_conflict` | 2 | Rule 5 | Different error-category pairs |
-| `boundary_precision_check` | 2 | Rule 6 | Different metrics AND different endpoints |
-| `cross_entity_state_dependency` | 2 | Rule 7 | Different ordered entity pairs |
-| **total** | **≥ 13 instances** | | |
+**Instance counts**: §0.5 is authoritative. Quick reference — every rule has the same minimum: **≥ 2 instances → ≥ 14 instances total**, counted as `- name:` entries nested under `instances:`. A scaffold with 7 `rule_id`s each carrying a single instance = 7 instances = FAIL.
 
 **Per-instance contract:**
 1. Every `grounds:` entry MUST resolve to a declared element in §1.1–§1.6. A grounds entry naming a missing calculation, transition, validation, field, or race is a dangling claim — remove it or add the grounding.
 2. `test_recipe.setup + trigger + assert` together MUST reproduce the scenario from empty-DB state using only endpoints declared in §1.5. No wall-clock waits; time-gated setups use the clock-advance endpoint §1.5 already provides.
-3. `distinguishing_aspect` MUST be falsifiable — one sentence the test can turn into a concrete assertion. No hedging ("may differ", "could vary").
+3. `distinguishing_aspect` MUST be falsifiable — one sentence the test can turn into a concrete assertion, naming the specific distinction §0.5 requires of this `rule_id` (different entity domain, different error-category pair, etc.). No hedging ("may differ", "could vary").
 4. `name` MUST be unique across the whole `scaffold_difficulty_design` and stable across regenerations (tests cite it in their docstrings for audit).
 5. `assert:` entries MUST cite exact field names and literal values where possible (e.g., `Order.delivery_fee != Assignment.final_delivery_fee`; `Customer.wallet_balance unchanged after assignment creation`), not paraphrases.
 6. **Any `assert:` line referencing a numeric value derived from a formula MUST be a literal the scaffold author actually computed by code.** Pin the inputs in `setup:`, execute the relevant `calculations[].formula` as code (a short Python snippet against the formula and its `constants:`), and write the resulting literal into the assertion — e.g., `Order.delivery_fee == 5.40`, NOT `Order.delivery_fee == round(3.00 + ceil(2.0)*1.20 + 0, 2)` and NOT a rough estimate. Unresolved formulas, estimates, and "let the test-generator compute it" all propagate arithmetic errors into broken tests whose wrong expected value silently agrees with a wrong implementation. When in doubt, execute the formula.
@@ -595,8 +565,7 @@ Before finalizing the YAML:
 - [ ] Side effect chains are complete (if A→B→C, all three steps are documented)
 - [ ] Every non-idempotent operation that can race has a `concurrency_rules` entry with required `error_id` and `http_status`
 - [ ] Every error code referenced in `concurrency_rules` also appears in §1.6 Error Catalog
-- [ ] `SCAFFOLD_DIFFICULTY_DESIGN.yaml` is present as a sibling of `SCAFFOLD.yaml`, with `scaffold_difficulty_design:` as its single top-level key, containing exactly 7 `rule_id` groups and **≥ 13 instances in total** counted as `- name:` entries nested under `instances:` (per-rule floor 2/1/2/2/2/2/2) — NOT 7 instances at top level
-- [ ] `SCAFFOLD.yaml` does NOT contain a `scaffold_difficulty_design:` top-level key (it belongs only in the separate file)
+- [ ] File split honored: `scaffold_difficulty_design:` appears only as the top-level key of `SCAFFOLD_DIFFICULTY_DESIGN.yaml`, and never inside `SCAFFOLD.yaml`
 - [ ] Every `scaffold_difficulty_design[*].instances[*].grounds[*]` reference resolves to a declared element in `SCAFFOLD.yaml`'s §1.1–§1.6
 
 **Self-Consistency:**
@@ -611,21 +580,5 @@ Each declaration in the scaffold is an edge; self-consistency means both ends re
 - [ ] **Computation determinism** — Order-sensitive calculations MUST pin both sort key and tie-break. Multi-step rounding MUST pin the rounding order. Fields referenced inside `formula:` MUST be unambiguous — use the exact field name (`credit_balance_cents`), not paraphrases ("the customer's credit") that could resolve to either a provisional or a finalized field.
 
 **Difficulty (audit — the spec lives at §0.5):**
-- [ ] Every rule in §0.5 (Rules 1–7) is satisfied by the scaffold's §1.1–§1.7 tables, honoring the differentiation clauses ("different entity domains", "different error-category pairs", "different ordered entity pairs", etc.)
-- [ ] `scaffold_difficulty_design` (§1.8) mirrors every §0.5 rule with at least its minimum instance count (2/1/2/2/2/2/2; ≥13 total)
-- [ ] Every §1.8 `instances[*].distinguishing_aspect` sentence traces to the differentiation clause of its `rule_id` in §0.5 — i.e., it is not generic prose but a concrete statement of what §0.5 demands be distinct about this instance
-
-**Diversity (compare against the 22 existing example scaffolds in this directory):**
-
-Diversity is a tie-breaker, not an override. §0.3's "let the scenario dictate" is the dominant rule — when a scenario naturally demands a hierarchical topology or a linear state machine, honour the scenario. Apply the preferences below only when the scenario leaves the choice open.
-
-Current gaps, for use when the scenario is underdetermined:
-- Archetypes with 0 examples: multi-party negotiation, temporal windowing, workflow orchestration, compliance/audit
-- Entity topologies with 0 examples: pure flat, pure graph (all 22 are hybrid)
-- State machine shapes with 0 examples: branching (fork/join), cyclic (A→B→A)
-- Role models with 0 examples: segregation of duties
-
-Preferences (apply only where the scenario leaves room):
-- [ ] Primary archetype chosen from an underrepresented row of §0.1 when the scenario supports it
-- [ ] Entity topology, state machine shape, or role model diverges from the hybrid / linear / approval-chain majority where plausible
-- [ ] Core calculation challenge is structurally distinct from prior scaffolds (not another threshold + aggregation) when the scenario allows
+- [ ] Every §0.5 rule (1–7) is satisfied by §1.1–§1.7, honoring its differentiation clause, and mirrored in `SCAFFOLD_DIFFICULTY_DESIGN.yaml` with ≥2 instances per rule (≥14 instances total)
+- [ ] Every instance's `distinguishing_aspect` names the specific distinction §0.5 demands of its `rule_id` — not generic prose

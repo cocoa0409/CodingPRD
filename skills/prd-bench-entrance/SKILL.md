@@ -35,27 +35,27 @@ Step 3: Copy Dockerfile.test + INSTRUCTION.md (bash, no subagent)
     │
     ▼
 Step 4: Subagent → prd-bench-doc-generator → PRD.md
-        (reads SCAFFOLD.yaml only; SCAFFOLD_DIFFICULTY_DESIGN.yaml is withheld
-         to prevent test-answer leakage into the PRD)
+        (reads SCAFFOLD.yaml only; SCAFFOLD_DIFFICULTY_DESIGN.yaml is withheld to prevent test-answer leakage into PRD)
     │
     ▼
-Step 5: Subagent → prd-bench-unit-test-generator → test_helpers/ + test_suite/
-        (reads SCAFFOLD.yaml + SCAFFOLD_DIFFICULTY_DESIGN.yaml + PRD.md)
-    │
-    ▼
-Step 6: Subagent → prd-bench-implementation-generator → implementation/
-    │
-    ▼
-Step 7: Loop { bash: docker test → Subagent: diagnose & fix → repeat }
+    ┌───────────────────────────────────────────┬───────────────────────────────────────────┐
+    ▼ (concurrent — single assistant message)   ▼
+Step 5: Subagent → prd-bench-unit-test-generator  Step 6: Subagent → prd-bench-implementation-generator
+        → test_helpers/ + test_suite/                    → implementation/
+        (reads SCAFFOLD + DIFFICULTY + PRD)              (reads SCAFFOLD + PRD + INSTRUCTION)
+    │                                           │
+    └───────────────────────┬───────────────────┘
+                            ▼
+Step 7: One long-lived subagent owns the loop { docker test → diagnose → fix → rerun → ... → PASS }
 ```
 
 ## Context Isolation Strategy
 
-Each generation step (2, 4, 5, 6) and each fix iteration (7) runs as a **separate subagent** via the Agent tool. This means:
+Each generation step (2, 4, 5, 6) runs as a **separate subagent** via the Agent tool. Step 7's iteration loop runs as a **single long-lived subagent** that retains context across its internal iterations (see Step 7 below for why). In both modes:
 
-- Each subagent starts with a **completely clean context** — no accumulated history from prior steps
+- A subagent starts with a **completely clean context** at spawn time — no accumulated history from prior steps or from the orchestrator
 - The orchestrator passes only **file paths** to subagents, never file contents
-- Each subagent reads the skill instructions and input files fresh from disk
+- A subagent reads the skill instructions and input files fresh from disk at the start
 - After a subagent finishes, its context is discarded — only the written files persist
 
 This is critical because a scaffold YAML can be 1500+ lines, a PRD 300+ lines, test code thousands of lines — loading all of these into one context would crowd out the working memory needed for each step's actual task.
@@ -69,7 +69,7 @@ Agent({
 })
 ```
 
-Do NOT use `run_in_background` — steps are sequential (each depends on the prior step's output files).
+**Concurrency**: Steps 2 → 4 are strictly sequential (the PRD depends on the scaffold). Steps 5 and 6 have no mutual dependency — they both read only SCAFFOLD.yaml + PRD.md (and INSTRUCTION.md for Step 6) — and MUST be launched concurrently. Concurrency on Claude Code requires a **single assistant message with two Agent tool uses**; two Agent calls across separate messages run sequentially. Besides throughput, concurrent launch gives physical isolation: Step 6's impl-gen subagent cannot read `test_suite/` because the directory does not yet exist when it starts.
 
 ## Execution Steps
 
@@ -98,9 +98,7 @@ mkdir -p ./tasks/${task_name}/workspace
 Spawn a subagent with this prompt:
 
 ```
-Read the skill at {project_root}/skills/prd-bench-scaffold-generator/SKILL.md to understand
-the full generation specification. Then generate the scaffold artifacts from the following
-scenario description and save them to {task_dir}/.
+Read the skill at {project_root}/skills/prd-bench-scaffold-generator/SKILL.md to understand the full generation specification. Then generate the scaffold artifacts from the following scenario description and save them to {task_dir}/.
 
 Scenario description (use verbatim, do not modify):
 {scenario}
@@ -109,12 +107,7 @@ Output files (both required):
 - {task_dir}/SCAFFOLD.yaml                    (§1.0–§1.7; no scaffold_difficulty_design key)
 - {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml  (single top-level key scaffold_difficulty_design)
 
-Hard constraint — DO NOT look at any sibling task under {project_root}/tasks/ (no ls,
-glob, grep, or read of other task_*/ directories, their SCAFFOLD.yaml,
-SCAFFOLD_DIFFICULTY_DESIGN.yaml, PRD.md, tests, or implementation). Generate the
-scaffold purely from the scenario description above plus the scaffold-generator
-skill's own specification. Peeking at existing tasks biases the output toward prior
-designs and defeats the purpose of a fresh scaffold.
+Hard constraint — DO NOT look at any sibling task under {project_root}/tasks/ (no ls, glob, grep, or read of other task_*/ directories, their SCAFFOLD.yaml, SCAFFOLD_DIFFICULTY_DESIGN.yaml, PRD.md, tests, or implementation). Generate the scaffold purely from the scenario description above plus the scaffold-generator skill's own specification. Peeking at existing tasks biases the output toward prior designs and defeats the purpose of a fresh scaffold.
 ```
 
 After the subagent completes, verify BOTH `SCAFFOLD.yaml` and `SCAFFOLD_DIFFICULTY_DESIGN.yaml` exist in `{task_dir}/`.
@@ -131,18 +124,12 @@ cp ./INSTRUCTION.md ./tasks/{task_name}/workspace/INSTRUCTION.md
 Spawn a subagent with this prompt:
 
 ```
-Read the skill at {project_root}/skills/prd-bench-doc-generator/SKILL.md to understand
-the full generation specification. Then read the scaffold at {task_dir}/SCAFFOLD.yaml
-and generate a PRD document.
+Read the skill at {project_root}/skills/prd-bench-doc-generator/SKILL.md to understand the full generation specification. Then read the scaffold at {task_dir}/SCAFFOLD.yaml and generate a PRD document.
 
 Input:  {task_dir}/SCAFFOLD.yaml
 Output: {task_dir}/workspace/PRD.md
 
-Hard constraint — DO NOT read {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml. That file
-is the test-targeting index; it is deliberately withheld from PRD generation so its
-worked example numbers and test_recipe asserts cannot leak into the PRD prose the
-implementer will read. Do not open it, grep it, or reference its contents in any
-way.
+Hard constraint — DO NOT read {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml. That file is the test-targeting index; it is deliberately withheld from PRD generation so its worked example numbers and test_recipe asserts cannot leak into the PRD prose the implementer will read. Do not open it, grep it, or reference its contents in any way.
 ```
 
 ### Step 5: Generate Unit Tests (subagent)
@@ -150,29 +137,16 @@ way.
 Spawn a subagent with this prompt:
 
 ```
-Read the skill at {project_root}/skills/prd-bench-unit-test-generator/SKILL.md to understand
-the full generation specification. Then read all three inputs:
+Read the skill at {project_root}/skills/prd-bench-unit-test-generator/SKILL.md to understand the full generation specification. Then read all three inputs:
 - {task_dir}/SCAFFOLD.yaml                    (scaffold §1.1–§1.7)
 - {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml  (test-targeting index — priority queue for §2.1.A)
 - {task_dir}/workspace/PRD.md                 (the contract under test)
 
-Generate complete test infrastructure in {task_dir}/test_helpers/ and test cases in
-{task_dir}/test_suite/. Both layers are part of the test artifact and both must
-be PRD-faithful:
-  - test_suite/: assertions must match PRD rules verbatim (exact error_ids,
-    exact field names, exact state transitions, exact calculation formulas
-    with correct precision).
-  - test_helpers/: fixtures, factories, and per-role header builders must
-    construct preconditions that the PRD permits the request to be issued
-    under. Concretely: if PRD requires ownership (e.g., "the acting
-    restaurant must be the one that owns the order"), the role-header
-    helper must mint an X-User-ID that resolves to the actual owner id, not
-    a shared constant that would fail any ownership check regardless of
-    implementation. If PRD declares a payload schema, factories must emit
-    that exact schema.
-A fixture that forces the implementation to drop a PRD-required check in
-order to pass is a test bug the generator has the first opportunity to
-prevent.
+Generate complete test infrastructure in {task_dir}/test_helpers/ and test cases in {task_dir}/test_suite/. Both layers are part of the test artifact and both must be PRD-faithful:
+  - test_suite/: assertions must match PRD rules verbatim (exact error_ids, exact field names, exact state transitions, exact calculation formulas with correct precision).
+  - test_helpers/: fixtures, factories, and per-role header builders must construct preconditions that the PRD permits the request to be issued under. Concretely: if PRD requires ownership (e.g., "the acting restaurant must be the one that owns the order"), the role-header helper must mint an X-User-ID that resolves to the actual owner id, not a shared constant that would fail any ownership check regardless of implementation. If PRD declares a payload schema, factories must emit that exact schema.
+
+A fixture that forces the implementation to drop a PRD-required check in order to pass is a test bug the generator has the first opportunity to prevent.
 ```
 
 ### Step 6: Generate Implementation (subagent)
@@ -180,287 +154,149 @@ prevent.
 Spawn a subagent with this prompt:
 
 ```
-Read the skill at {project_root}/skills/prd-bench-implementation-generator/SKILL.md to
-understand the full generation specification. Then read these three files:
+Read the skill at {project_root}/skills/prd-bench-implementation-generator/SKILL.md to understand the full generation specification. Then read these three files:
 - {task_dir}/workspace/INSTRUCTION.md
 - {task_dir}/SCAFFOLD.yaml
 - {task_dir}/workspace/PRD.md
 
-Generate a complete Python + Flask implementation in {task_dir}/workspace/implementation/
-including a Dockerfile.
+Generate a complete Python + Flask implementation in {task_dir}/workspace/implementation/ including a Dockerfile.
 ```
 
 ### Step 7: Run Tests and Iterate
 
-This is the most critical step. The orchestrator runs Docker tests via bash, then spawns a **fresh subagent** for each fix cycle.
+After Steps 5 and 6 complete, spawn **ONE long-lived fix subagent** that owns the entire iteration loop: it runs tests, reads results, diagnoses failures, fixes test or implementation code, reruns, and repeats — all in a single subagent conversation. The subagent, not the orchestrator, drives the loop.
 
-#### 7.1 Run Tests (bash, no subagent)
+**Why one long-lived subagent, not a fresh one per round:**
+- Avoids re-reading 5000+ lines of context (PRD, SCAFFOLD, test_helpers, test_suite, implementation) on every iteration.
+- Preserves the mental model of the domain (state machine, calculation rules, fixture shapes, role-to-resource mappings) across cycles.
+- Preserves cross-iteration insights — "we already determined rule X is PRD-silent; similar cases in this round follow the same verdict."
+- Anchoring on past wrong hypotheses is checked by the diagnostic protocol's STEP 0, which re-reads `results.json` fresh every iteration.
+
+**Orchestrator's role**: spawn the subagent once, wait for it to exit. The subagent exits when `passed == total` and returns a summary.
+
+**Subagent prompt:**
+
+```
+You are a PRD benchmark diagnostic expert. Your job is to iterate tests + fixes in {task_dir} until every test passes. You own the loop: run tests, read results, diagnose failures, fix, rerun, repeat.
+
+Iteration step (you run this yourself each round):
 
 ```bash
 prd-bench-docker-run \
-  --task-dir ./tasks/{task_name} \
-  --impl-dir ./tasks/{task_name}/workspace/implementation \
-  --results-file ./tasks/{task_name}/workspace/implementation/results.json
+  --task-dir {task_dir} \
+  --impl-dir {task_dir}/workspace/implementation \
+  --results-file {task_dir}/workspace/implementation/results.json
 ```
 
-#### 7.2 Check Results (orchestrator reads results.json directly)
+Then read `{task_dir}/workspace/implementation/results.json`. Extract `passed`, `total`, `failed`.
+- If `passed == total` → **exit** with a summary report (see the Summary block at the end of this prompt).
+- Otherwise → apply the diagnostic protocol below to every failing test, make the fixes, rerun the command above, and repeat. No iteration cap.
 
-Read `results.json` and extract `passed`, `total`, `failed`. If `passed == total`, the pipeline is complete.
-
-#### 7.3 Fix Cycle (subagent, fresh context each round)
-
-If tests fail, spawn a **new subagent** for the fix. Each fix subagent gets a clean context — it doesn't carry baggage from previous fix attempts.
-
-The fix-cycle diagnostic order is specifically designed around the **PRD-First Principle**: the implementer sees only PRD.md, so any failing test whose asserted rule is absent from the PRD is an unfair test and must be deleted — not kept, not weakened, not xfailed. SCAFFOLD.yaml is a *generator index*, not a contract the implementer can read. Deletion of PRD-uncovered tests is the correct outcome in that specific case; it is not test-hacking.
-
-Subagent prompt:
-
-```
-You are a PRD benchmark diagnostic expert. {passed}/{total} tests pass, {failed} fail.
-
-Failed tests: {list of failed test names from results.json}
-
-The benchmark's contract is: implementers read PRD.md only, never SCAFFOLD.yaml.
-Both layers of the test artifact must therefore trace to PRD prose:
+The benchmark's contract is: implementers read PRD.md only, never SCAFFOLD.yaml. Both layers of the test artifact must therefore trace to PRD prose:
   - `test_suite/` — the assertion must match a rule stated verbatim in PRD.
-  - `test_helpers/` — the fixtures, factories, and role-header builders must
-    construct preconditions and identities consistent with PRD (e.g., PRD's
-    role-to-resource ownership model, PRD's declared payload shapes, PRD's
-    declared entity statuses).
-A test that asserts scaffold-only rules is unfair and must be deleted. A test
-whose fixture issues a request inconsistent with PRD (so the PRD-faithful
-implementation correctly rejects it) is a test bug — fix the fixture in
-`test_helpers/`, do not strip the PRD-required check from the implementation.
+  - `test_helpers/` — the fixtures, factories, and role-header builders must construct preconditions and identities consistent with PRD (e.g., PRD's role-to-resource ownership model, PRD's declared payload shapes, PRD's declared entity statuses).
+
+A test that asserts scaffold-only rules is unfair and must be deleted. A test whose fixture issues a request inconsistent with PRD (so the PRD-faithful implementation correctly rejects it) is a test bug — fix the fixture in `test_helpers/`, do not strip the PRD-required check from the implementation.
 
 Diagnostic protocol — follow IN ORDER for each failing test:
 
 STEP 0: READ FAILURE DETAIL
 
-  Read {task_dir}/workspace/implementation/results.json for the failure
-  detail of every failing test — tracebacks, the request URL/headers/
-  payload actually sent, the response body actually received, and which
-  assertion tripped. This is ground truth. Do not attribute blame to PRD,
-  tests, or implementation until you have seen what the test actually
-  observed vs. expected.
+  Read {task_dir}/workspace/implementation/results.json for the failure detail of every failing test — tracebacks, the request URL/headers/payload actually sent, the response body actually received, and which assertion tripped. This is ground truth. Do not attribute blame to PRD, tests, or implementation until you have seen what the test actually observed vs. expected.
 
-  Subsequent STEPs operate only on the set of failing tests identified
-  here. Do not re-open passing tests.
+  Subsequent STEPs operate only on the set of failing tests identified here. Do not re-open passing tests.
 
 STEP 1: PRD COVERAGE + UNIQUE-DERIVABILITY CHECK
 
-  This step has TWO sub-checks. Both must pass for the test to stay. A test
-  that fails either one must be deleted — not weakened, not fixed against
-  implementation, not skipped. Deletion is the benchmark's PRD-First contract.
+  This step has TWO sub-checks. Both must pass for the test to stay. A test that fails either one must be deleted — not weakened, not fixed against implementation, not skipped. Deletion is the benchmark's PRD-First contract.
 
   1a. COVERAGE — PRD mentions the rule.
 
-      Read {task_dir}/test_suite/ and {task_dir}/test_helpers/ to understand
-      what rule the failing test asserts (exact error_id, exact ordering, exact
-      side-effect, exact formula, exact response-field presence/type).
+      Read {task_dir}/test_suite/ and {task_dir}/test_helpers/ to understand what rule the failing test asserts (exact error_id, exact ordering, exact side-effect, exact formula, exact response-field presence/type).
 
-      Grep {task_dir}/workspace/PRD.md for distinctive tokens from the test's
-      assertions: the error_id, the field name, the threshold constant, the
-      state name pair, the default value. Demand a verbatim quote — the rule
-      must appear as a full sentence you can copy from PRD.md, not as a
-      heading, not as a formula fragment, not as an enum member alone.
+      Grep {task_dir}/workspace/PRD.md for distinctive tokens from the test's assertions: the error_id, the field name, the threshold constant, the state name pair, the default value. Demand a verbatim quote — the rule must appear as a full sentence you can copy from PRD.md, not as a heading, not as a formula fragment, not as an enum member alone.
 
       Decide one of:
         - PRD VERBATIM-COVERS: proceed to 1b.
         - PRD IS SILENT: DELETE the test. Proceed to next failing test.
 
-  1b. UNIQUE DERIVABILITY — the PRD sentence uniquely determines the
-      assertion's expected outcome.
+  1b. UNIQUE DERIVABILITY — the PRD sentence uniquely determines the assertion's expected outcome.
 
-      Ask the two-reader question: could a faithful PRD-only implementer
-      reasonably produce an implementation on which this test FAILS, while
-      remaining consistent with the cited PRD sentence?
+      Ask the two-reader question: could a faithful PRD-only implementer reasonably produce an implementation on which this test FAILS, while remaining consistent with the cited PRD sentence?
 
-      Common collapse patterns — if ANY of these applies to the failing
-      test, unique derivability is broken; DELETE the test:
+      Common collapse patterns — if ANY of these applies to the failing test, unique derivability is broken; DELETE the test:
 
-        * COMPUTED-FIELD SILENCE: test asserts presence or value of a
-          computed field, but PRD mentions the field only inside a formula
-          (as an intermediate), never as a response-visible resource
-          attribute. A reader could correctly omit the field from the
-          serializer. (Example: `nights` on a reservation.)
+        * COMPUTED-FIELD SILENCE: test asserts presence or value of a computed field, but PRD mentions the field only inside a formula (as an intermediate), never as a response-visible resource attribute. A reader could correctly omit the field from the serializer. (Example: `nights` on a reservation.)
 
-        * DEFAULT-VALUE SILENCE: test asserts a concrete default for an
-          optional input field, but PRD says only "optional" without
-          naming the server-side default. A reader could correctly store
-          `null`, omit the key, or default to a different boolean/enum.
-          (Example: `yard_verified` on SCHEDULED home visits.)
+        * DEFAULT-VALUE SILENCE: test asserts a concrete default for an optional input field, but PRD says only "optional" without naming the server-side default. A reader could correctly store `null`, omit the key, or default to a different boolean/enum. (Example: `yard_verified` on SCHEDULED home visits.)
 
-        * BRANCH-ASYMMETRIC SIDE EFFECT: test asserts a side effect on
-          one branch of a state transition (e.g., the FAIL branch), but
-          PRD renders the happy-path branch fully while leaving the
-          failing branch compressed to a single clause that omits this
-          effect. (Example: FAIL submit writing `Adopter.home_visit_status
-          = FAILED`.)
+        * BRANCH-ASYMMETRIC SIDE EFFECT: test asserts a side effect on one branch of a state transition (e.g., the FAIL branch), but PRD renders the happy-path branch fully while leaving the failing branch compressed to a single clause that omits this effect. (Example: FAIL submit writing `Adopter.home_visit_status = FAILED`.)
 
-        * ERROR PRECEDENCE SILENCE: test asserts `ERR_A` on a race whose
-          loser could, under a reasonable serialization, land in a state
-          that earlier priority levels would report as `ERR_INVALID_STATE`.
-          PRD names the target error but does not state that race
-          semantics pre-empt the state-check path. Relax to
-          `validate_error_is_one_of([ERR_A, ERR_INVALID_STATE])` if the
-          PRD supports at least the "A is possible" reading; otherwise
-          delete.
+        * ERROR PRECEDENCE SILENCE: test asserts `ERR_A` on a race whose loser could, under a reasonable serialization, land in a state that earlier priority levels would report as `ERR_INVALID_STATE`. PRD names the target error but does not state that race semantics pre-empt the state-check path. Relax to `validate_error_is_one_of([ERR_A, ERR_INVALID_STATE])` if the PRD supports at least the "A is possible" reading; otherwise delete.
 
-        * ENUM-MEMBERSHIP-ONLY: test demands a specific branch write a
-          specific enum value, but PRD states only that the enum exists —
-          no prose names the write pathway.
+        * ENUM-MEMBERSHIP-ONLY: test demands a specific branch write a specific enum value, but PRD states only that the enum exists — no prose names the write pathway.
 
-      If none of the above applies and a faithful PRD-only reader would
-      arrive at the same outcome the test asserts, unique derivability
-      holds — proceed to STEP 2.
+      If none of the above applies and a faithful PRD-only reader would arrive at the same outcome the test asserts, unique derivability holds — proceed to STEP 2.
 
-      If uncertain, produce the verbatim PRD quote and the two alternate
-      implementations it admits. If you can articulate both, the test
-      fails unique derivability — DELETE.
+      If uncertain, produce the verbatim PRD quote and the two alternate implementations it admits. If you can articulate both, the test fails unique derivability — DELETE.
 
-  1c. PARTIAL COVERAGE HANDLING. When PRD covers part of the asserted
-      rule but not the rest (e.g., names the error but not the priority;
-      names the cascade entity but not the specific status write; names
-      the race but not the pre-emption semantics), split the test: keep
-      the covered assertion, remove the uncovered assertion. Never
-      preserve an assertion whose rule is not verbatim in PRD.
+  1c. PARTIAL COVERAGE HANDLING. When PRD covers part of the asserted rule but not the rest (e.g., names the error but not the priority; names the cascade entity but not the specific status write; names the race but not the pre-emption semantics), split the test: keep the covered assertion, remove the uncovered assertion. Never preserve an assertion whose rule is not verbatim in PRD.
 
-STEP 2: TEST-vs-PRD CONSISTENCY CHECK (only if STEP 1 says PRD covers and
-        uniquely determines the rule)
+STEP 2: TEST-vs-PRD CONSISTENCY CHECK (only if STEP 1 says PRD covers and uniquely determines the rule)
 
-  Audit the test as a whole — not just the assertion, but the full
-  test environment setup, the request actually issued, and the
-  assertion that tripped. The test artifact spans TWO directories,
-  and both are under audit here:
+  Audit the test as a whole — not just the assertion, but the full test environment setup, the request actually issued, and the assertion that tripped. The test artifact spans TWO directories, and both are under audit here:
     - {task_dir}/test_suite/   (the test function and its assertions)
-    - {task_dir}/test_helpers/ (fixtures, factories, per-role header
-                                builders, conftest, constants, assertion
-                                library)
+    - {task_dir}/test_helpers/ (fixtures, factories, per-role header builders, conftest, constants, assertion library)
 
-  A fixture, factory, or role-header helper that constructs a
-  precondition inconsistent with the PRD is a TEST BUG, not an
-  implementation bug. Test_helpers counts as "the test" for the
-  purpose of this check.
+  A fixture, factory, or role-header helper that constructs a precondition inconsistent with the PRD is a TEST BUG, not an implementation bug. Test_helpers counts as "the test" for the purpose of this check.
 
-  a. Trace the failing test end-to-end. Using STEP 0's captured
-     request/response and the source of the test function, list every
-     helper the test (or its setup chain) invoked:
+  a. Trace the failing test end-to-end. Using STEP 0's captured request/response and the source of the test function, list every helper the test (or its setup chain) invoked:
        - which fixture built the entities in play
        - which factory constructed the request payload
        - which header helper produced X-User-ID / X-User-Role
        - which assertion helper evaluated the response
      Every one of these is part of "the test's expressed logic".
 
-  b. Cross-reference the test's expressed logic — setup + request +
-     assertion together — against the PRD sentence STEP 1 pinned. Does
-     the test express exactly the rule the PRD sentence requires, no
-     more and no less? Check all of:
+  b. Cross-reference the test's expressed logic — setup + request + assertion together — against the PRD sentence STEP 1 pinned. Does the test express exactly the rule the PRD sentence requires, no more and no less? Check all of:
 
-       * Setup state: do the entities created by fixtures satisfy the
-         PRD preconditions for this flow (status, relationships,
-         timestamps, counters, ownership chain)?
-       * Request identity: does X-User-ID / X-User-Role / ownership id
-         match the role-to-resource mapping the PRD requires? For
-         example, if PRD requires "the acting restaurant must be the one
-         that owns the order", does the test send a header whose user-id
-         resolves to the order's restaurant_id — not a shared constant
-         that would fail any ownership check regardless of
-         implementation?
-       * Request payload: field names, types, and required/optional
-         shape match PRD verbatim?
-       * Assertion: expected error_id, expected field name, expected
-         boundary (inclusive vs exclusive), expected status transition
-         match PRD verbatim?
+       * Setup state: do the entities created by fixtures satisfy the PRD preconditions for this flow (status, relationships, timestamps, counters, ownership chain)?
+       * Request identity: does X-User-ID / X-User-Role / ownership id match the role-to-resource mapping the PRD requires? For example, if PRD requires "the acting restaurant must be the one that owns the order", does the test send a header whose user-id resolves to the order's restaurant_id — not a shared constant that would fail any ownership check regardless of implementation?
+       * Request payload: field names, types, and required/optional shape match PRD verbatim?
+       * Assertion: expected error_id, expected field name, expected boundary (inclusive vs exclusive), expected status transition match PRD verbatim?
 
      Decide one of:
-       - TEST IS WRONG: the test's setup, request, or assertion does
-         not faithfully express the PRD rule. Fix the offending artifact
-         in whichever layer it lives:
-           * Assertion mis-translates PRD wording
-             → edit the test function in test_suite/.
-           * Fixture / factory / role-header helper constructs a
-             precondition that violates PRD (wrong ownership mapping,
-             wrong entity status, missing required relationship, shared
-             identity across owners PRD requires to be distinct, etc.)
-             → edit the relevant file in test_helpers/.
-           * Request payload is malformed relative to PRD
-             → edit the factory (or the test function if the test
-             constructs payload inline).
-         The fix must make the test MORE faithful to PRD, never less.
-         Never add skip / xfail. Never downgrade an exact error_id
-         assertion to an HTTP-status assertion. If the fix in
-         test_helpers/ affects many tests, that is fine — it means the
-         fixture bug had wide reach.
-       - TEST IS FAITHFUL: the setup, request, and assertion all
-         faithfully express the PRD rule. Proceed to STEP 3.
+       - TEST IS WRONG: the test's setup, request, or assertion does not faithfully express the PRD rule. Fix the offending artifact in whichever layer it lives:
+           * Assertion mis-translates PRD wording → edit the test function in test_suite/.
+           * Fixture / factory / role-header helper constructs a precondition that violates PRD (wrong ownership mapping, wrong entity status, missing required relationship, shared identity across owners PRD requires to be distinct, etc.) → edit the relevant file in test_helpers/.
+           * Request payload is malformed relative to PRD → edit the factory (or the test function if the test constructs payload inline).
+         The fix must make the test MORE faithful to PRD, never less. Never add skip / xfail. Never downgrade an exact error_id assertion to an HTTP-status assertion. If the fix in test_helpers/ affects many tests, that is fine — it means the fixture bug had wide reach.
+       - TEST IS FAITHFUL: the setup, request, and assertion all faithfully express the PRD rule. Proceed to STEP 3.
 
-STEP 3: IMPLEMENTATION FIX (only if PRD covers the rule, uniquely determines
-        the behavior, AND the test — setup + request + assertion — is
-        faithful to PRD)
+STEP 3: IMPLEMENTATION FIX (only if PRD covers the rule, uniquely determines the behavior, AND the test — setup + request + assertion — is faithful to PRD)
 
-  a. Read the relevant code in {task_dir}/workspace/implementation/ and fix
-     the implementation so the test passes.
-  b. Never remove or weaken an implementation check that PRD requires
-     just because tests fail to exercise it correctly. If a PRD-required
-     check (e.g., ownership, state gate, precondition) only looks "too
-     strict" because the test setup cannot satisfy it, that belongs in
-     STEP 2 (fix test_helpers), not here.
+  a. Read the relevant code in {task_dir}/workspace/implementation/ and fix the implementation so the test passes.
+  b. Never remove or weaken an implementation check that PRD requires just because tests fail to exercise it correctly. If a PRD-required check (e.g., ownership, state gate, precondition) only looks "too strict" because the test setup cannot satisfy it, that belongs in STEP 2 (fix test_helpers), not here.
 
 Cardinal rules:
 
 - DELETE a test when STEP 1a finds PRD silent on the asserted rule.
-- DELETE a test when STEP 1b finds PRD does not uniquely determine the
-  asserted outcome (the two-reader experiment produces divergent
-  implementations).
-- Never delete a test because it is "strict", "brittle", or "hard to pass".
-  The deletion criterion is PRD coverage + unique derivability, not
-  difficulty.
-- NEVER weaken an assertion to make implementation pass. Downgrading an
-  `error_id` check to an HTTP-status check, replacing a boundary test with
-  an approximate one, or adding `pytest.mark.skip` / `@pytest.mark.xfail` are
-  all forbidden. (Exception: relaxing an exact-error assertion to
-  `validate_error_is_one_of([...])` IS permitted when PRD only names a
-  member of the set, not the specific choice — this is a coverage
-  correction, not a hack.)
-- NEVER remove or weaken an implementation check that PRD requires in
-  order to accommodate a test fixture that violates the PRD precondition.
-  If a PRD-required check (ownership, state gate, role scoping,
-  referential integrity) rejects requests the tests issue, and the reason
-  is that test_helpers constructed the request with a precondition PRD
-  forbids (e.g., shared X-User-ID across distinct resource owners), the
-  fixture is the bug — fix test_helpers in STEP 2, do not strip the
-  check from the implementation.
-- TRIAGE HINT: when ≥5 failing tests share the same setup error (e.g.,
-  the same "Setup step failed" trace, the same 4xx from the same helper
-  call), treat test_helpers as the first suspect before attributing to
-  implementation. A common upstream fixture bug routinely masquerades as
-  many independent implementation bugs.
-- When in doubt about STEP 1, produce both: (i) the verbatim PRD quote that
-  states the rule, and (ii) the two divergent PRD-faithful implementations
-  that would and would not pass the test. If you cannot produce (i) or you
-  CAN produce (ii), the test goes.
-- Every deletion must be accompanied by a one-line note in the fix summary
-  naming the test, the silence/collapse pattern, and the scaffold rule that
-  drove the test's generation. These notes aggregate into feedback for
-  doc-generator (Zero-Silence Rule violations) and for unit-test-generator
-  (unique-derivability misses).
-- After every batch of fixes, re-run tests. Do not batch multiple
-  interpretation decisions without a verification run.
+- DELETE a test when STEP 1b finds PRD does not uniquely determine the asserted outcome (the two-reader experiment produces divergent implementations).
+- Never delete a test because it is "strict", "brittle", or "hard to pass". The deletion criterion is PRD coverage + unique derivability, not difficulty.
+- NEVER weaken an assertion to make implementation pass. Downgrading an `error_id` check to an HTTP-status check, replacing a boundary test with an approximate one, or adding `pytest.mark.skip` / `@pytest.mark.xfail` are all forbidden. (Exception: relaxing an exact-error assertion to `validate_error_is_one_of([...])` IS permitted when PRD only names a member of the set, not the specific choice — this is a coverage correction, not a hack.)
+- NEVER remove or weaken an implementation check that PRD requires in order to accommodate a test fixture that violates the PRD precondition. If a PRD-required check (ownership, state gate, role scoping, referential integrity) rejects requests the tests issue, and the reason is that test_helpers constructed the request with a precondition PRD forbids (e.g., shared X-User-ID across distinct resource owners), the fixture is the bug — fix test_helpers in STEP 2, do not strip the check from the implementation.
+- TRIAGE HINT: when ≥5 failing tests share the same setup error (e.g., the same "Setup step failed" trace, the same 4xx from the same helper call), treat test_helpers as the first suspect before attributing to implementation. A common upstream fixture bug routinely masquerades as many independent implementation bugs.
+- When in doubt about STEP 1, produce both: (i) the verbatim PRD quote that states the rule, and (ii) the two divergent PRD-faithful implementations that would and would not pass the test. If you cannot produce (i) or you CAN produce (ii), the test goes.
+- Every deletion must be accompanied by a one-line note in the summary (see below) naming the test, the silence/collapse pattern, and the scaffold rule that drove the test's generation. These notes aggregate into feedback for doc-generator (Zero-Silence Rule violations) and for unit-test-generator (unique-derivability misses).
+- After every batch of fixes, re-run `prd-bench-docker-run` and re-read `results.json` before making any further interpretation decisions. Do not batch multiple interpretation decisions without a verification run in between.
+
+Summary (emit when exiting at `passed == total`):
+- Iterations run.
+- Tests deleted (with PRD-silence category per cardinal rule above).
+- Fixes applied to `test_helpers/` (which file, which fixture/factory/assertion, one-line why).
+- Fixes applied to `implementation/` (which file, which function, one-line why).
 ```
 
-The orchestrator does not need to pre-filter "which failures look like scaffold leakage" — the subagent does that per-test in STEP 1. The orchestrator's only job after spawning the subagent is to re-run the docker tests and check whether `passed == total`.
-
-#### 7.4 Iteration Loop
-
-```
-loop:
-    run prd-bench-docker-run (bash)
-    read results.json
-    if passed == total: break
-    spawn fix subagent (fresh context)
-```
-
-Each iteration is a fresh subagent, so context never accumulates across fix cycles. Keep going until all tests pass — no iteration limit.
+The orchestrator does not need to inspect failures itself — the subagent owns all of that, including the docker run, the results parsing, and the decision whether to continue. The orchestrator just waits for the subagent to exit.
 
 ## Key Principles
 
@@ -475,8 +311,8 @@ Each iteration is a fresh subagent, so context never accumulates across fix cycl
 
 3. **Hacking tests is forbidden. Deleting PRD-uncovered or PRD-ambiguous tests is required. Repairing PRD-inconsistent fixtures is also required.** These look similar but are distinct:
    - **Forbidden (test hacking):** deleting a test because it's "too strict", changing an expected value to match current implementation output, downgrading an `error_id` check to a generic HTTP-status check, adding `@pytest.mark.skip`/`@pytest.mark.xfail` to dodge a failure, weakening a boundary test to an approximate one. **Also forbidden:** stripping a PRD-required check from the implementation because the current test fixtures can't satisfy it — that is implementation-hacking to fit a broken fixture.
-   - **Required (PRD alignment — assertion level):** deleting a test whose asserted rule either (a) has no verbatim PRD coverage, or (b) has PRD coverage but PRD does not uniquely determine the asserted outcome — i.e., a faithful PRD-only implementer could produce a different but still-consistent implementation that the test would fail on. See Step 7.3 STEP 1a/1b.
-   - **Required (PRD alignment — fixture/helper level):** editing `test_helpers/` when a fixture, factory, or role-header helper constructs a precondition inconsistent with PRD (e.g., shared X-User-ID across owners PRD requires to be distinct, wrong entity status before a transition, missing required relationship, payload shape that doesn't match PRD's declared schema). This is STEP 2 of the fix-cycle protocol. See Step 7.3 STEP 2.
+   - **Required (PRD alignment — assertion level):** deleting a test whose asserted rule either (a) has no verbatim PRD coverage, or (b) has PRD coverage but PRD does not uniquely determine the asserted outcome — i.e., a faithful PRD-only implementer could produce a different but still-consistent implementation that the test would fail on. See Step 7's STEP 1a/1b.
+   - **Required (PRD alignment — fixture/helper level):** editing `test_helpers/` when a fixture, factory, or role-header helper constructs a precondition inconsistent with PRD (e.g., shared X-User-ID across owners PRD requires to be distinct, wrong entity status before a transition, missing required relationship, payload shape that doesn't match PRD's declared schema). This is STEP 2 of the fix-cycle protocol. See Step 7's STEP 2.
 
    The distinguishing double question for every candidate **deletion**:
    - *"Can I produce a verbatim PRD quote that states the rule this test asserts?"* (coverage)
@@ -493,7 +329,7 @@ Each iteration is a fresh subagent, so context never accumulates across fix cycl
 
 6. **Docker isolation is required for testing.** Always use `prd-bench-docker-run` (not the local runner) for the test/iterate loop, because it mirrors the real evaluation environment.
 
-7. **Context isolation via subagents.** Every generation step and every fix iteration runs in its own subagent. The orchestrator stays lightweight — it only tracks file paths and pass/fail counts, never loads generated file contents into its own context.
+7. **Context isolation via subagents.** Each generation step runs in its own fresh subagent. The iteration loop (Step 7) runs in a **single long-lived** subagent that retains context across cycles — one sub-conversation that owns the run-diagnose-fix-rerun loop, rather than a fresh subagent per round (which would waste tokens re-reading the domain). The orchestrator stays lightweight — it only tracks file paths and pass/fail exits, never loads generated file contents into its own context.
 
 ## Output
 
