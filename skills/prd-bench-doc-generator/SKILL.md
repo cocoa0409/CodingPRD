@@ -215,7 +215,7 @@ Key requirement: Regardless of strategy, information scattering must cross subse
 - Embed `calculations[].constants` within business context — use unit conversions to increase inference difficulty (e.g., "100 hours" when the system works in minutes, requiring conversion to 6000)
 - Mention `error_id` values naturally in narrative (e.g., "rejected with `ERR_XXX`") but do not explain trigger conditions in a concentrated way. Source: `errors[].id`
 - Distribute the same endpoint's input parameters (`endpoints[].request_body`) across different subsections
-- **Never write HTTP methods or URL paths in §3.** No `POST /orders/{id}/cancel`, no `GET /users`, no `/treatment-plans/{planId}/activate` — not even in backticks. Workflows in §3 are expressed entirely in domain language — entity names, role names, action verbs ("approval", "scheduling", "cancellation"). HTTP methods and URL paths live exclusively in the §4 endpoint table; §3 readers follow the narrative and cross-reference §4 when they need the HTTP contract. See `example-prd.md` §3 for the target style — it mentions no endpoint paths anywhere in its seven subsections.
+- **Never write HTTP methods or URL paths in §3 (HARD CONTRACT — see Rule 8 and Pass C).** No `POST /orders/{id}/cancel`, no `GET /users`, no `/treatment-plans/{planId}/activate` — not even in backticks. Workflows in §3 are expressed entirely in domain language — entity names, role names, action verbs ("approval", "scheduling", "cancellation"), and state-transition pairs (`ASSIGNED → EN_ROUTE_TO_PICKUP`). HTTP methods and URL paths live exclusively in the §4 endpoint table; §3 readers follow the narrative and cross-reference §4 when they need the HTTP contract. See `example-prd.md` §3 for the target style — it mentions no endpoint paths anywhere in its seven subsections, and uses state-pair disambiguation (`ACTIVE → FINAL_REVIEW_PENDING → COMPLETED`) as the bridge back to §4.
 
 ### §4. Endpoint Definitions
 
@@ -270,11 +270,29 @@ Do not expose request body / response body / side effects in the §4 table. Read
 
 Do not expose trigger conditions (from `errors[].condition`) in the §5 table. Trigger conditions are scattered in §2 and §3.
 
+### Rule 8 (HARD CONTRACT — BLOCKING): §3 Contains No Endpoint Paths or HTTP Methods
+
+**This is a non-negotiable contract, not a stylistic guideline.** When §3 names endpoints directly, the PRD stops being a domain specification and becomes an API reference — readers copy path names mechanically instead of reconstructing the workflow from business narrative, and an entire class of hidden errors goes invisible (the scaffold's `OFFLINE → ONLINE` transition can silently fail to land in prose when "call `/go-online`" stands in for it).
+
+No backtick token inside §3 may:
+
+- Start with `/` — e.g., `` `/go-online` ``, `` `/delivery/_clock/advance` ``, `` `/orders/{id}/cancel` ``.
+- Be a bare HTTP method in an endpoint-identifier position — `` `POST` ``, `` `GET` ``, `` `PUT` ``, `` `PATCH` ``, `` `DELETE` ``. (HTTP status codes written in prose — "200 OK", "201 Created" — remain allowed.)
+- Combine a method with a path — e.g., `` `POST /orders` ``.
+
+The scaffold's endpoint semantics still must land in §3 (Rule 1 coverage is non-negotiable), so every endpoint is referred to by one of three **rewrite modes**:
+
+1. **State-transition framing.** When the endpoint drives a state machine, name the state pair: *"going online, transitioning `shift_status` to `ONLINE`"*, *"starting pickup advances the delivery from `ASSIGNED` to `EN_ROUTE_TO_PICKUP`"*. `example-prd.md` §3 uses this mode almost exclusively (*"can transition an assignment's `status` to `PROTOCOL_APPROVED`"*).
+2. **Role + action verb.** When the endpoint is named by its action (e.g., approve, reject, cancel, assign), promote the verb to a gerund and pair it with the acting role: *"approval by a `CustomerService` operator"*, *"cancellation by the owning `Customer`"*. When sibling actions share a verb across entities (close, reopen, start), subsection context plus target state disambiguates.
+3. **Capability description.** For internal / admin-only endpoints with no state transition (clock-advance, sweep, bonus-cycle-close), describe the capability and let §4's description column supply the HTTP contract: *"an admin-only test-driving capability advances the logical clock to a supplied `to` instant"*.
+
+Field names from `request_body` (e.g., `to`, `reason`, `resolution_note`) remain in §3 as backticked tokens — Rule 1 still requires them. Only the **path** and **method** are forbidden. Pass C (below) is the mechanical enforcement of this rule.
+
 ---
 
 ## Mandatory Coverage Verification Passes
 
-Two passes are required before declaring the PRD complete: **field-name coverage** (catches missing identifiers) and **rule coverage** (catches missing behaviors). Both must produce `PASS` reports. Do not skip either — they catch different failure modes.
+Three passes are required before declaring the PRD complete: **field-name coverage** (Pass A — catches missing identifiers), **rule coverage** (Pass B — catches missing behaviors), and **path purity** (Pass C — catches endpoint paths leaking into §3 in violation of Rule 8). All three must produce `PASS` reports. Do not skip any — they catch distinct failure modes, and a PRD can pass any two while failing the third.
 
 ## Pass A: Field-Name Coverage
 
@@ -408,6 +426,46 @@ These six are not arbitrary — they are the categories the downstream `prd-benc
 
 ---
 
+## Pass C: §3 Path Purity (HARD CONTRACT — BLOCKING)
+
+Pass A catches missing identifiers; Pass B catches missing behaviors; Pass C catches a distinct leak — endpoint paths and HTTP methods bleeding into §3 in violation of Rule 8. A PRD that passes A and B can still fail C. This check is mechanical and cheap; run it after Pass B.
+
+### Procedure
+
+1. **Scope.** Extract only §3 content — from the `## 3.` heading up to the `## 4.` heading. Pass C does not apply to §1, §2, or §4. A system-wide URL mount (e.g., *"mounted under `/delivery`"*) may appear in §1 or §2 without penalty; Pass C only polices §3.
+
+2. **Scan.** Enumerate every backtick-quoted token inside §3. Flag a token as a violation if it:
+   - starts with `/` — e.g., `` `/go-online` ``, `` `/delivery/_clock/advance` ``, `` `/orders/{id}/cancel` ``, or
+   - is a bare HTTP method token — `` `POST` ``, `` `GET` ``, `` `PUT` ``, `` `PATCH` ``, `` `DELETE` ``, `` `OPTIONS` ``, or
+   - combines a method with a path — e.g., `` `POST /orders` ``.
+
+3. **Diff.** The violation set must be empty.
+
+4. **Repair.** For every violation, apply one of Rule 8's three rewrite modes — state-transition framing, role + action verb, or capability description. Preserve Rule 1 coverage: any `request_body`, `query_params`, or `path_params` field names that lived inside the offending sentence must remain as backticked tokens in the rewritten prose. Keep state enumeration values (`ASSIGNED`, `EN_ROUTE_TO_PICKUP`) in backticks as the disambiguator back to §4.
+
+5. **Re-run step 2.** Repeat until the violation set is empty.
+
+### Output requirement
+
+Before writing the final `prd.md`, emit a path-purity report:
+
+```
+Path purity check (§3 only):
+- backtick tokens scanned: N
+- tokens starting with `/`: 0
+- bare HTTP-method tokens: 0
+- method+path combined tokens: 0
+Status: PASS
+```
+
+If status is not PASS, the PRD is not ready — return to step 4. Do not mark the PRD ready until Pass A, Pass B, and Pass C all report `PASS`.
+
+### Why Pass C is worth running separately
+
+Path-based phrasing is the shortest way to name an action — *"call `/approve`"* beats *"approval by a `CustomerService` operator"* by several characters. A single writing session accumulates dozens of these shortcuts, each individually small, together breaking Rule 8 across most of §3. Pass A and Pass B cannot catch the leak because a PRD full of `/approve` references still has full field and rule coverage — it just stops being a domain specification. Pass C restores the §3 / §4 separation that the downstream unit-test generator and implementation generator both assume.
+
+---
+
 ## Writing Style
 
 - **Language**: English
@@ -460,6 +518,13 @@ These six are not arbitrary — they are the categories the downstream `prd-benc
 - [ ] Every `entities[].fields[]` entry's structured content (type, default, initial value, exposure) is reconstructible from PRD prose (Zero-Ambiguity Rule)
 - [ ] Parallel scaffold groups (sibling transitions, branch pairs, validation alternatives) receive symmetric prose coverage (Zero-Ambiguity Rule)
 - [ ] A PASS rule-coverage report was produced before finalizing the PRD
+
+### Path Purity (Pass C — HARD CONTRACT — check last, after all writing)
+- [ ] No backtick token in §3 starts with `/`
+- [ ] No bare HTTP-method token (`POST`, `GET`, `PATCH`, `PUT`, `DELETE`, `OPTIONS`) appears in backticks in §3
+- [ ] No method+path combined token (e.g., `POST /orders`) appears in §3
+- [ ] Every endpoint referenced in §3 uses one of Rule 8's three rewrite modes: state-transition framing, role + action verb, or capability description
+- [ ] A PASS path-purity report was produced before finalizing the PRD
 
 ### Scattering Rules (§3)
 - [ ] Every constant from `calculations[].constants` is embedded in business context (no bare constant definitions)
