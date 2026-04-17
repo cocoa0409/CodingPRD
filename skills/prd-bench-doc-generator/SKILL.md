@@ -25,7 +25,6 @@ description: Generate a natural-language PRD document from a scaffold YAML file.
    endpoints                    # §1.5: API Endpoint Table
    errors                       # §1.6: Error Code Catalog
    roles                        # §1.7: RBAC Matrix
-   scaffold_difficulty_design   # §1.8: Test Targeting Index — IGNORED by this skill (see rule below)
    ```
 
 2. **Output folder path**: Directory where the PRD file will be written.
@@ -96,21 +95,6 @@ Three indicators that a transcription has collapsed and must be repaired:
 - Two sibling scaffold entries (e.g., two branches of one state machine, two enum values of one field) receive asymmetric prose treatment, where the structure of one branch's specification is fully rendered and the sibling is compressed in a way that drops specification bullets.
 
 When any indicator is present, the PRD is ambiguous on that scaffold entry. Pass B must catch this before the PRD ships.
-
-### The `scaffold_difficulty_design` Exception (HARD RULE — IGNORE, do NOT transcribe)
-
-The scaffold contains a top-level `scaffold_difficulty_design:` key (§1.8 of the scaffold-generator). It is a **test-targeting index**, not an independent rule source — every instance grounds in entries already declared in `calculations[]`, `state_machines[]`, `validations[]`, `endpoints[]`, `entities[]`, and `concurrency_rules[]`.
-
-**Do not process `scaffold_difficulty_design` when generating the PRD.** Specifically:
-
-- Do NOT emit a PRD subsection for it.
-- Do NOT create prose that repeats its instance names, `rule_id`s, `distinguishing_aspect` sentences, or `test_recipe` contents.
-- Do NOT let it bias §2 or §3 subsection ordering, emphasis, or phrasing.
-- Do NOT cite it in the PRD's introduction or overview.
-
-The underlying rules it indexes are **already obligations** under the Scaffold Fidelity and Zero-Ambiguity Transcription rules above — the PRD must losslessly convey `calculations[]`, `state_machines[]`, `validations[]`, etc., and doing so automatically covers everything `scaffold_difficulty_design` summarizes. Restating the summary in prose would (a) duplicate content, (b) leak test-strategy hints into the implementer's contract, and (c) violate the two-reader thought experiment by telling the implementer which scenarios the unit-test suite is designed to stress. If a rule the scaffold flags as difficulty-load-bearing is genuinely absent from the PRD, the remedy is to transcribe its source entry (the calculation, transition, or validation it grounds in) more completely — never to paste in the summary entry.
-
-Pass A and Pass B do NOT audit `scaffold_difficulty_design`; they audit the tables it points at.
 
 ### Business Logic (scattered across subsections — but every rule still present)
 

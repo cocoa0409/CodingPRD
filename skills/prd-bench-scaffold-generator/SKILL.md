@@ -13,11 +13,13 @@ User provides two things:
 
 1. **Scenario description**: A natural-language description of the system to build, including roles and core workflows.
 
-2. **Output file path**: Where to save the generated YAML file.
+2. **Output directory path**: Where to save the generated YAML files (the skill writes two sibling files into this directory).
 
 ### Output
 
-A complete YAML file saved to the user-specified path, containing 7 top-level sections:
+Two YAML files written into the user-specified directory, in this order:
+
+**1. `SCAFFOLD.yaml`** — §1.0 through §1.7 plus preamble keys:
 
 ```yaml
 scenario: "User-provided scenario description"
@@ -32,8 +34,11 @@ validations:                 # §1.4: Validation Rules Table (ordered by priorit
 endpoints:                   # §1.5: API Endpoint Table
 errors:                      # §1.6: Error Code Catalog
 roles:                       # §1.7: RBAC Matrix
-scaffold_difficulty_design:  # §1.8: Test Targeting Index — summary of §1.1–§1.7 cross-referenced per Difficulty rule
 ```
+
+**2. `SCAFFOLD_DIFFICULTY_DESIGN.yaml`** — single top-level key `scaffold_difficulty_design:` (§1.8: Test Targeting Index — summary of §1.1–§1.7 cross-referenced per Difficulty rule).
+
+Do NOT emit `scaffold_difficulty_design:` as a top-level key inside `SCAFFOLD.yaml` — it lives only in the second file.
 
 For completed examples, see the `examples/` directory (22 scaffolds covering diverse domains)
 For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tables-template.yaml).
@@ -52,8 +57,8 @@ For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tab
 - [ ] 1.5: API Endpoint Table
 - [ ] 1.6: Error Code Catalog
 - [ ] 1.7: RBAC Matrix
-- [ ] 1.8: Scaffold Difficulty Design (Test Targeting Index)
-- [ ] Final: Quality + Diversity check (§Quality Checklist)
+- [ ] 1.8: Scaffold Difficulty Design (Test Targeting Index) → destination file `SCAFFOLD_DIFFICULTY_DESIGN.yaml`
+- [ ] Final: Quality + Diversity check (§Quality Checklist) across both files
 ```
 
 ---
@@ -511,6 +516,8 @@ differently, producing unfair tests or mismatched implementations.
 
 ### 1.8 Scaffold Difficulty Design (Test Targeting Index)
 
+**Output location**: this section is written to a separate file `SCAFFOLD_DIFFICULTY_DESIGN.yaml` sibling to `SCAFFOLD.yaml`, with `scaffold_difficulty_design:` as its single top-level key. Do NOT emit it inside `SCAFFOLD.yaml`.
+
 A machine-readable index of every difficulty feature the scaffold claims to exhibit, cross-referenced from §1.1–§1.7 against the **seven Difficulty Rules defined in §0.5**. Its sole purpose is to drive the downstream unit-test-generator toward complete coverage. Every `rule_id` below corresponds verbatim to a `rule_id` declared in §0.5; consult §0.5 for each rule's full text, differentiation requirements, and counter-examples that do NOT count.
 
 **Critical semantics:**
@@ -588,8 +595,9 @@ Before finalizing the YAML:
 - [ ] Side effect chains are complete (if A→B→C, all three steps are documented)
 - [ ] Every non-idempotent operation that can race has a `concurrency_rules` entry with required `error_id` and `http_status`
 - [ ] Every error code referenced in `concurrency_rules` also appears in §1.6 Error Catalog
-- [ ] `scaffold_difficulty_design` (§1.8) is present, has exactly 7 `rule_id` groups, and carries **≥ 13 instances in total** counted as `- name:` entries nested under `instances:` (per-rule floor 2/1/2/2/2/2/2) — NOT 7 instances at top level
-- [ ] Every `scaffold_difficulty_design[*].instances[*].grounds[*]` reference resolves to a declared element in §1.1–§1.6
+- [ ] `SCAFFOLD_DIFFICULTY_DESIGN.yaml` is present as a sibling of `SCAFFOLD.yaml`, with `scaffold_difficulty_design:` as its single top-level key, containing exactly 7 `rule_id` groups and **≥ 13 instances in total** counted as `- name:` entries nested under `instances:` (per-rule floor 2/1/2/2/2/2/2) — NOT 7 instances at top level
+- [ ] `SCAFFOLD.yaml` does NOT contain a `scaffold_difficulty_design:` top-level key (it belongs only in the separate file)
+- [ ] Every `scaffold_difficulty_design[*].instances[*].grounds[*]` reference resolves to a declared element in `SCAFFOLD.yaml`'s §1.1–§1.6
 
 **Self-Consistency:**
 
