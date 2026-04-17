@@ -25,13 +25,13 @@ domain_name: "kebab-case-domain-name"
 api_prefix: "/top-level-resource-path"
 complexity_profile: { ... }   # Selected archetype and structural dimensions
 
-entities:        # Table 1: Entity-Relationship Table
-state_machines:  # Table 2: State Machine Table
-calculations:    # Table 3: Calculation Rules Table
-validations:     # Table 4: Validation Rules Table (ordered by priority)
-endpoints:       # Table 5: API Endpoint Table
-errors:          # Table 6: Error Code Catalog
-roles:           # Table 7: RBAC Matrix
+entities:        # §1.1: Entity-Relationship Table
+state_machines:  # §1.2: State Machine Table
+calculations:    # §1.3: Calculation Rules Table
+validations:     # §1.4: Validation Rules Table (ordered by priority)
+endpoints:       # §1.5: API Endpoint Table
+errors:          # §1.6: Error Code Catalog
+roles:           # §1.7: RBAC Matrix
 ```
 
 For completed examples, see the `examples/` directory (22 scaffolds covering diverse domains)
@@ -153,8 +153,8 @@ Benchmarks exist to stress-test LLM coding ability. Target one of these two diff
 
 | Level | Entity count | Endpoint count | Error codes | Calculation variants | State machines | Typical token budget |
 |-------|-------------|---------------|-------------|---------------------|---------------|---------------------|
-| **Advanced** | 10–16 | 18–40 | 15–40 | 2–3 | 3–5 with reverts + auto-transitions | ~50k |
-| **Expert** | 14–30 | 35–65 | 30–60 | 3+ | 4+ with cycles or parallel dimensions | ~80k |
+| **Advanced** | 10–15 | 18–35 | 15–35 | 2–3 | 3–5 with reverts + auto-transitions | ~50k |
+| **Expert** | 16–30 | 36–65 | 36–60 | 3+ | 4+ with cycles or parallel dimensions | ~80k |
 
 **Default to Advanced.** Only go Expert when the scenario naturally demands it (many entity types, complex cross-entity workflows). An overly simple scaffold fails to discriminate between implementations — never generate fewer than 10 entities or 18 endpoints.
 
@@ -207,10 +207,10 @@ entities:
 ```
 
 **Design principles:**
-- Entity count follows scenario complexity — don't inflate or compress
+- Entity count is bounded below by §0.4 (≥10 entities, ≥18 endpoints). If the scenario is too small to naturally reach that floor, expand scope — add subsidiary workflows, auxiliary entities, or cross-cutting concerns — rather than ship an under-specified benchmark. Do not inflate above what the scenario supports either; pick the Advanced vs Expert band per §0.4.
 - At least one entity with computed fields that derive from cross-entity data
 - Field names must be explicit — downstream PRD will reference them in prose
-- `common_fields: false` for immutable/append-only resources (event logs, pairings)
+- `common_fields: true` expands to four fields on the entity: `id` (**server-minted UUID with no type prefix** — e.g., `"8a3e1c0b-2f4d-4a91-9c8b-12e7b6a0f1d2"`, NOT `"ord_8a3e1c0b-…"`), `created_at` (ISO 8601 UTC, three fractional digits), `updated_at` (same format, refreshed on every mutation including cascaded side effects), `version` (integer, starts at `1`, increments by one on every mutation). When `common_fields: false`, the entity carries only `id` and `created_at` — use this for immutable or append-only resources (event logs, pairings, ledger entries, configuration snapshots).
 - Consider whether the entity is a **resource** (has lifecycle), **event** (append-only log), or **configuration** (rarely changes)
 
 **Topology patterns:**
@@ -267,7 +267,20 @@ state_machines:
 
 Every scaffold must define explicit concurrency rules for operations where concurrent execution could produce data integrity issues. Version-based OCC alone only detects stale writes — it does not specify what happens when two non-idempotent operations race (e.g., two riders assigned to the same order, or confirm vs cancel on the same resource).
 
-Each rule must provide a rigorous, testable guarantee:
+Each rule uses this schema:
+
+```yaml
+concurrency_rules:
+  - scenario: "<human-readable race condition>"
+    guarantee: "<what the serialization guarantees>"
+    error_id: ERR_XXX              # required — the loser's error_id
+    http_status: 4xx               # required
+    serialization: "<optional — tie-breaker rule (e.g., first-writer-wins on field X)>"
+```
+
+`error_id` and `http_status` are always required structured fields — downstream skills (doc-generator Pass B, test generator) read them by key and do not parse them out of `guarantee` prose.
+
+**Examples:**
 
 ```yaml
 concurrency_rules:
@@ -275,15 +288,18 @@ concurrency_rules:
     guarantee: "At most one delivery per order; second assignment rejected"
     error_id: ERR_DELIVERY_ALREADY_ASSIGNED
     http_status: 409
+    serialization: "First-writer-wins on assignment creation"
 
   - scenario: "Restaurant confirms order while customer cancels simultaneously"
-    guarantee: "Exactly one operation succeeds; loser receives ERR_INVALID_STATE"
+    guarantee: "Exactly one operation succeeds; loser is rejected"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
     serialization: "First-writer-wins on order status"
 ```
 
-All error codes referenced here must also appear in the Error Catalog (Table 6).
+All error codes referenced here must also appear in the Error Catalog (§1.6).
 
-**Consistency with Tables 2 and 4:** When a concurrency scenario involves an operation whose preconditions (Table 2) or validations (Table 4) define multiple possible error codes, Table 2.1 must list **all** error codes the loser could receive — not just one. For example, if operation X can fail with both `ERR_INVALID_STATE` (wrong status) and `ERR_HAS_DEPENDENCIES` (business precondition), and a race could trigger either depending on execution order, the concurrency rule must document both.
+**Consistency with §1.2 and §1.4:** If a single race scenario can legitimately produce more than one loser error (e.g., `ERR_INVALID_STATE` when the status already advanced vs. `ERR_HAS_DEPENDENCIES` when a dependent exists), split it into multiple `concurrency_rules` entries — one per possible loser error — rather than packing alternatives into a single `guarantee`. Downstream tests assert exactly one `error_id` per rule.
 
 ### 1.3 Calculation Rules Table
 
@@ -381,6 +397,7 @@ endpoints:
 ```
 
 **Design principles:**
+- **Testability-completeness (value-level principle, overrides convenience).** The scaffold owes the test layer a reachable path to every state it declares. Walk every state in your state machines and ask: *"can a test reach this from empty-DB using only the endpoints I've listed?"* If a state is gated by wall-clock time, a background sweep, or an external event, you MUST include the test-driving endpoint that makes it reachable — e.g., `POST /_clock/advance` for any time-gated transition (`now() >= X`), `POST /_sweep/run` for any automatic sweep, `POST /_events/emit` for any external-event trigger. Declaring behavior without also declaring the API surface needed to exercise it is an **incomplete contract** — downstream tests will be forced to skip, and skips are forbidden by the unit-test-generator. A scaffold is judged not only by what behavior it specifies, but by whether every specified behavior can be *reached, observed, and asserted* through the declared API.
 - URL structure reflects entity topology (nested for hierarchical, flat for peer)
 - Include action endpoints (e.g., `/activate`, `/cancel`, `/approve`) — not just CRUD
 - Mutation endpoints accept optional `version?` for OCC, unless resource is immutable
@@ -474,26 +491,29 @@ Before finalizing the YAML:
 - [ ] Every role in the RBAC matrix declares an `identity:` field, either `entity_backed:<EntityName>` pointing to a persisted entity, or `opaque` for purely operational roles
 - [ ] All automatic/system-triggered transitions are captured
 - [ ] Side effect chains are complete (if A→B→C, all three steps are documented)
+- [ ] Every non-idempotent operation that can race has a `concurrency_rules` entry with required `error_id` and `http_status`
+- [ ] Every error code referenced in `concurrency_rules` also appears in §1.6 Error Catalog
 
 **Difficulty:**
 - [ ] At least one calculation where two valid approaches produce different results
-- [ ] At least one side effect chain spanning 3+ entities
+- [ ] At least one calculation with combinatorial complexity — satisfied by any of: (a) a formula with ≥3 inputs and non-linear interaction (nested `min`/`max`, conditional branches on entity state, tiered-rate selection), (b) nested rounding where the order matters — "round per-line-item then sum" vs "sum then round" produce different cents; the scaffold MUST pin one order and state it explicitly, (c) a circular-looking dependency where evaluation order must be explicit (e.g., `total = subtotal + fee`, but `fee` is computed from a discount keyed on the total tier — scaffold pins the evaluation order so the value is well-defined). A single-formula `aggregation` + `threshold` calculation does NOT satisfy this.
+- [ ] At least one state machine has non-linear shape — a cycle (A→B→A, revision loops, negotiation rounds), parallel state dimensions on one entity (e.g., `payment_status × fulfillment_status` evolve independently on the same row), OR branching fork-join (A→{B,C}→D with divergent side-effect sets per branch). A scaffold whose state machines are all linear A→B→C→D pipelines does NOT satisfy this, even if individual pipelines are long.
+- [ ] At least one transitive cascade of depth ≥ 3 — an action on entity A mutates B; that mutation on B **itself** triggers a mutation on C; the mutation on C **itself** triggers a mutation on D. Each link is caused by the previous link, not by the original action. A fan-out where one action directly mutates B, C, and D in parallel does NOT count. Spell the chain out in the relevant `state_machines[].transitions[].side_effects` entries so a PRD reader can follow each hop.
 - [ ] At least one validation priority conflict testable by dual-failure scenario
 - [ ] At least one boundary condition requiring exact precision (>= vs >, zero quantity, empty set)
 - [ ] At least one cross-entity state dependency (entity A's valid transitions depend on entity B's state)
 
 **Diversity (compare against the 22 existing example scaffolds in this directory):**
 
-Current gaps to prioritize when creating new scaffolds:
+Diversity is a tie-breaker, not an override. §0.3's "let the scenario dictate" is the dominant rule — when a scenario naturally demands a hierarchical topology or a linear state machine, honour the scenario. Apply the preferences below only when the scenario leaves the choice open.
+
+Current gaps, for use when the scenario is underdetermined:
 - Archetypes with 0 examples: multi-party negotiation, temporal windowing, workflow orchestration, compliance/audit
 - Entity topologies with 0 examples: pure flat, pure graph (all 22 are hybrid)
 - State machine shapes with 0 examples: branching (fork/join), cyclic (A→B→A)
 - Role models with 0 examples: segregation of duties
 
-Checklist:
-- [ ] Primary archetype is underrepresented (check §0.1 coverage column)
-- [ ] Entity topology is NOT hybrid (prioritize flat or graph)
-- [ ] State machine shape differs from linear (prioritize branching, cyclic, or parallel)
-- [ ] At least TWO of the three dimensions above differ from the majority
-- [ ] Core calculation challenge is structurally different (not another threshold + aggregation)
-- [ ] Role model adds diversity (prioritize segregation_of_duties or delegated_authority)
+Preferences (apply only where the scenario leaves room):
+- [ ] Primary archetype chosen from an underrepresented row of §0.1 when the scenario supports it
+- [ ] Entity topology, state machine shape, or role model diverges from the hybrid / linear / approval-chain majority where plausible
+- [ ] Core calculation challenge is structurally distinct from prior scaffolds (not another threshold + aggregation) when the scenario allows

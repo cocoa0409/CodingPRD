@@ -17,14 +17,14 @@ description: Generate a natural-language PRD document from a scaffold YAML file.
    api_prefix        # Top-level URL path (e.g., /treatment-plans)
    complexity_profile # Archetype, layers, structural dimensions
 
-   entities          # Table 1: Entity-Relationship Table
-   state_machines    # Table 2: State Machine Table
-   calculations      # Table 3: Calculation Rules Table
-   validations       # Table 4: Validation Rules Table (priority-ordered)
-   response_envelope # API envelope definition (success/error/pagination)
-   endpoints         # Table 5: API Endpoint Table
-   errors            # Table 6: Error Code Catalog
-   roles             # Table 7: RBAC Matrix
+   entities          # §1.1: Entity-Relationship Table
+   state_machines    # §1.2: State Machine Table
+   calculations      # §1.3: Calculation Rules Table
+   validations       # §1.4: Validation Rules Table (priority-ordered)
+   response_envelope # §1.0: API envelope definition (success/error/pagination)
+   endpoints         # §1.5: API Endpoint Table
+   errors            # §1.6: Error Code Catalog
+   roles             # §1.7: RBAC Matrix
    ```
 
 2. **Output folder path**: Directory where the PRD file will be written.
@@ -44,13 +44,13 @@ Information in the PRD falls into two categories with opposing writing strategie
 These define the API's **structural contract** — what responses look like, field names and types, pagination mechanics. If these are vague, any reasonable implementation could diverge from the fixed test suite, and the benchmark breaks.
 
 Must be precisely defined:
-- **Response envelope format**: Complete JSON examples (success + error) with every `meta` field's name, type, and semantics — derived from `response_envelope` in the scaffold
+- **Response envelope format**: Emit §2.2 verbatim from `section-2.2-response-structure.md` — see the §2.2 generation rule
 - **Pagination mechanism**: Parameter names, defaults, min/max — derived from `response_envelope.pagination_defaults`
-- **Common resource properties**: `id` (UUID), `created_at` (ISO 8601 UTC), `updated_at`, `version` (integer, increments on mutation) — derived from entities with `common_fields: true`
+- **Common resource properties**: `id` (UUID, no type prefix), `created_at` (ISO 8601 UTC), `updated_at`, `version` (integer, increments on mutation) — derived from entities with `common_fields: true`
 - **Auth headers**: Exact names `X-User-ID` and `X-User-Role`
 - **Status code rules**: 201 for new resource creation, 200 for modifications
 - **Precision rules**: Decimal places and rounding method — derived from `calculations[].precision`
-- **OCC mechanism**: `version` field behavior (omit to skip check, mismatch yields `ERR_STALE_DATA`)
+- **OCC mechanism**: `version` field behavior (omit to skip check, mismatch yields the OCC error id the scaffold declares in `errors[]` — commonly `ERR_STALE_DATA` or `ERR_VERSION_CONFLICT`; use the exact id the scaffold nominates, do not invent)
 - **Sort order**: List endpoints default to `created_at` ascending
 - **Role enumeration**: Exact spelling of all role names — from `roles[].name`
 - **State enumeration values**: Exact strings for every state — from `state_machines[].initial_state`, `terminal_states`, and all `transitions[].from`/`to`
@@ -71,7 +71,7 @@ Bi-directional requirements:
   - Every `state_machines[].transitions[]` precondition AND side effect AND error_id
   - Every `calculations[].formula`, `algorithm`, `constants`, and `precision` rule
   - Every `validations[].check` AND its `error_id`
-  - **Every `validations[].error_priority`** — when multiple validations can fire on the same request, the relative ordering must be stated in prose (e.g., "the shelter check is evaluated before the vaccination check", or "compliance-hold checks take precedence over version checks"). Do not assume the implementer can infer priority from listing order alone; say it.
+  - **Every `validations[].priority`** — when multiple validations can fire on the same request, the relative ordering must be stated in prose (e.g., "the shelter check is evaluated before the vaccination check", or "compliance-hold checks take precedence over version checks"). Do not assume the implementer can infer priority from listing order alone; say it.
   - Every `concurrency_rules[]` entry — especially the specific `error_id` returned by the losing race participant. "Exactly one wins" is insufficient; if the spec says the loser returns `ERR_FOO`, the PRD must name `ERR_FOO` in the concurrency narrative.
   - Every `errors[].condition` must be expressed in narrative somewhere the reader can find it (even though the §5 table hides them).
   - Every `endpoints[]` side_effect must appear in the corresponding workflow narrative.
@@ -117,11 +117,10 @@ Scattering is never a license to drop a rule. If a rule has no natural home, put
 
 The example demonstrates **one** valid transformation. Each new PRD must have its document skeleton designed from scratch based on the current domain. Specific requirements:
 
-1. **§2 subsections must be domain-derived**: The number of subsections (typically 8–12), their titles, and ordering must be derived from the scaffold's actual domain semantics. Do not copy the example's subsection numbers and titles (e.g., don't always name them "System Integrity and Consistency" or "The Principle of Fiscal Responsibility"). Use domain-specific terminology for subsection titles.
-2. **§2.2 JSON placeholders must be domain-specific**: Placeholder timestamps, IDs, and example values in JSON blocks should reflect the current domain (e.g., e-commerce uses order-related sample values, logistics uses shipment-related ones). Do not reuse the same `req_RANDOMALPHANUM123456` and `2025-05-24T10:30:00.123Z` every time.
-3. **§3 subsections must be freely grouped**: Do not mechanically replicate the example's subsection pattern (lifecycle → structure → core op → pairing → safety → cost → finalization). Group by the current domain's natural business flows; 5–9 subsections are all acceptable.
-4. **Sentence variety**: Avoid starting every paragraph with "The system...". Alternate among role names, business events, conditional clauses, scenario-driven narration, passive voice, and temporal markers.
-5. **Introduction flexibility**: Can be 1–3 paragraphs, approaching from system goals, user pain points, business context, technical constraints, etc. Length adapts to domain complexity.
+1. **§2 subsections must be domain-derived**: The number of subsections (typically 8–12), their titles, and ordering must be derived from the scaffold's actual domain semantics. Do not copy the example's subsection numbers and titles (e.g., don't always name them "System Integrity and Consistency" or "The Principle of Fiscal Responsibility"). Use domain-specific terminology for subsection titles. **Exception: §2.2 is a fixed contract** (see the §2.2 generation rule) — do not attempt to "domain-specialize" it.
+2. **§3 subsections must be freely grouped**: Do not mechanically replicate the example's subsection pattern (lifecycle → structure → core op → pairing → safety → cost → finalization). Group by the current domain's natural business flows; 5–9 subsections are all acceptable.
+3. **Sentence variety**: Avoid starting every paragraph with "The system...". Alternate among role names, business events, conditional clauses, scenario-driven narration, passive voice, and temporal markers.
+4. **Introduction flexibility**: Can be 1–3 paragraphs, approaching from system goals, user pain points, business context, technical constraints, etc. Length adapts to domain complexity.
 
 ---
 
@@ -164,21 +163,16 @@ Most content in this section is **contract-level specification** and must be pre
   - If `identity: "opaque"`, write a sentence of the form *"When `X-User-Role` is `<RoleName>`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server may record it (for example, as `<field_name>` on `<Entity>` where a scaffold transition writes it) but does not compare it to any entity's `id`."*
   - The two sentences can be combined/collapsed if several roles share the same form, but every role in `roles[]` must be individually named in the resulting prose.
 
-#### §2.2 API Response Structure (the most critical contract subsection)
+#### §2.2 API Response Structure (FIXED — EMIT VERBATIM)
 
-**Must provide complete JSON examples**, derived from `response_envelope` in the scaffold:
+The scaffold's `response_envelope` block is a fixed, byte-identical contract across every task (see `prd-bench-scaffold-generator` §1.0 "FIXED — EMIT VERBATIM"). §2.2 of the PRD is the prose rendering of that block, and it is likewise fixed. **Emit the following Markdown verbatim — do not rewrite, "domain-specialize", or vary placeholder values.** This is a contract, not a style choice. Any deviation (changing `req_RANDOMALPHANUM123456` to a domain-flavored id, substituting a timestamp, or populating `data` with a synthesized entity payload) is a known failure mode: it invents naming conventions that contradict §2.4 and silently breaks the hidden test contract.
 
-Success response — use the structure from `response_envelope.success`, expanding it into a full, formatted JSON block with domain-specific placeholder values. Include pagination fields from `response_envelope.pagination_fields`.
+The canonical §2.2 content is maintained as a separate file to avoid nested-fence ambiguity. Copy it verbatim:
 
-Error response — use the structure from `response_envelope.error`, expanding it into a full, formatted JSON block.
+- Source: [`section-2.2-response-structure.md`](section-2.2-response-structure.md)
+- Action: paste its contents in place where §2.2 belongs in the generated PRD. Do not modify headings, JSON values, or prose.
 
-**After the JSON examples**, explain each field's semantics:
-- `api_request_id`: server-generated unique identifier, format description
-- `api_request_timestamp`: ISO 8601 UTC with 3 fractional digits
-- `response_type`: `"object"` | `"array"` | `"error"` enumeration
-- `data`: business payload (object, array, or empty object)
-- Pagination fields (from `response_envelope.pagination_fields`) appear only in list endpoint responses
-- Error response `error_id` and `message` fields
+Entity field names, `id` format ("server-minted UUID"), timestamps, and `version` semantics all belong to §2.4 and §3, NOT to the §2.2 example. Do not fill `data` with an entity payload; leave it `{ }` exactly as shown in the source file.
 
 #### §2.3 Pagination
 
@@ -188,15 +182,15 @@ Error response — use the structure from `response_envelope.error`, expanding i
 
 #### §2.4+ Domain-Specific Cross-Cutting Principles
 
-Extract cross-cutting concerns from the scaffold's `calculations`, `validations`, `state_machines`, and `complexity_profile`. **Decide the subsection count (typically 5–8) and grouping yourself.** Subsection titles should use **domain-specific terminology** — avoid generic names. Ordering is flexible; arrange by domain logic.
+Extract cross-cutting concerns from the scaffold's `calculations`, `validations`, `state_machines`, and `complexity_profile`. **Decide the subsection count (typically 5–9) and grouping yourself.** Subsection titles should use **domain-specific terminology** — avoid generic names. Ordering is flexible; arrange by domain logic.
 
 The following topics **must be covered** (but organization is free — merge related topics into one subsection or split complex topics across multiple):
 
 - **Hierarchical consistency**: From `state_machines[].transitions[].side_effects` — cascade/revert patterns, parent-child state propagation, `updated_at` and `version` semantics on mutation
 - **Nested resource retrieval**: Left-to-right path parameter validation — derived from the URL hierarchy in `endpoints[].path`
-- **Common resource properties**: `id` (UUID), `created_at`/`updated_at` (ISO 8601 UTC with 3 fractional digits), `version` (integer) semantics. Note which entities omit `updated_at` — those with `common_fields: false` in the scaffold
+- **Common resource properties**: `id` (UUID, no type prefix), `created_at`/`updated_at` (ISO 8601 UTC with 3 fractional digits), `version` (integer) semantics. Entities with `common_fields: false` in the scaffold carry only `id` and `created_at` — both `updated_at` and `version` are absent; say so explicitly for those entities.
 - **Precision and rounding**: From `calculations[].precision` — state "2 decimal places" and "round half up" (or whatever the scaffold specifies)
-- **Optimistic Concurrency Control**: `version` is optional in request body, mismatch yields `ERR_STALE_DATA`, omit to skip check — derived from endpoints accepting `version?` input
+- **Optimistic Concurrency Control**: `version` is optional in request body; mismatch yields the OCC error id the scaffold declares in `errors[]` (do not invent a name); omit to skip the check — derived from endpoints accepting `version?` input
 - **Domain-specific cross-cutting rules**: Ledger principles, safety protocols, resource utilization rules, capacity constraints, etc. — the specific topics depend entirely on the domain's `calculations` and `validations`
 
 ### §3. Business Logic & Workflows (Scattering Zone)
@@ -221,6 +215,7 @@ Key requirement: Regardless of strategy, information scattering must cross subse
 - Embed `calculations[].constants` within business context — use unit conversions to increase inference difficulty (e.g., "100 hours" when the system works in minutes, requiring conversion to 6000)
 - Mention `error_id` values naturally in narrative (e.g., "rejected with `ERR_XXX`") but do not explain trigger conditions in a concentrated way. Source: `errors[].id`
 - Distribute the same endpoint's input parameters (`endpoints[].request_body`) across different subsections
+- **Never write HTTP methods or URL paths in §3.** No `POST /orders/{id}/cancel`, no `GET /users`, no `/treatment-plans/{planId}/activate` — not even in backticks. Workflows in §3 are expressed entirely in domain language — entity names, role names, action verbs ("approval", "scheduling", "cancellation"). HTTP methods and URL paths live exclusively in the §4 endpoint table; §3 readers follow the narrative and cross-reference §4 when they need the HTTP contract. See `example-prd.md` §3 for the target style — it mentions no endpoint paths anywhere in its seven subsections.
 
 ### §4. Endpoint Definitions
 
@@ -324,18 +319,18 @@ The PRD is a lossy projection of the scaffold. Prose rewriting naturally drops n
 
 This second pass catches a different failure mode: rules that exist in scaffold structure (priority columns, concurrency sections, precondition fields) but never get stated in PRD prose. A PRD that passes field coverage can still fail rule coverage — names can be present while the *behavior* associated with them is silent.
 
-### The four high-risk categories (WRITE THESE INTO PRD PROSE — do not leave them to inference)
+### The six high-risk categories (WRITE THESE INTO PRD PROSE — do not leave them to inference)
 
-These four scaffold shapes are the most frequent omissions. They look like "metadata" but carry first-class behavior. If the PRD does not express them, any test derived from them becomes unfair — a correct implementer reading only the PRD has no way to pass. **For every entry in these four categories, produce a PRD sentence before Pass B runs.** Examples below are illustrative, not templates — adapt the phrasing to the domain.
+These six scaffold shapes are the most frequent omissions. They look like "metadata" but carry first-class behavior. If the PRD does not express them, any test derived from them becomes unfair — a correct implementer reading only the PRD has no way to pass. **For every entry in these six categories, produce a PRD sentence before Pass B runs.** Examples below are illustrative, not templates — adapt the phrasing to the domain.
 
-**1. `validations[].error_priority` — ordering when multiple validations share an endpoint**
+**1. `validations[].priority` — ordering when multiple validations share an endpoint**
 
 When two or more validations on the same endpoint can fail on the same request, state the relative priority in prose. Text order is not enough — readers treat "four independent checks" as unordered. Spell out the order.
 
 > ✗ Silent (bad): "Approval enforces four independent checks: self-approval, stale-animal, stale-adopter, animal-not-available."
 > ✓ Explicit (good): "Approval enforces these four checks, evaluated in order — compliance holds first (so a mid-flight hold surfaces as `ERR_COMPLIANCE_HOLD_ACTIVE` rather than being masked by a later check), then animal availability, then self-approval, then the two stale-version checks. The stale-version checks are last so that a race with a hold-creation does not mask the hold."
 
-If the scaffold has `error_priority` values, the prose must produce the same total order the values encode.
+If the scaffold has `priority` values, the prose must produce the same total order the values encode.
 
 **2. `concurrency_rules[].error_id` — the specific error returned by the loser**
 
@@ -368,9 +363,9 @@ When scaffold contains parallel entries (sibling transitions out of the same `fr
 
 ### Procedure (full enumeration)
 
-After writing the above four categories, run the rule-coverage check. Enumerate every rule-bearing entry from the scaffold and verify PRD prose covers it:
+After writing the above six categories, run the rule-coverage check. Enumerate every rule-bearing entry from the scaffold and verify PRD prose covers it:
 
-1. **Validation priorities** (Category 1 above) — every `error_priority` value is reflected in prose ordering.
+1. **Validation priorities** (Category 1 above) — every `priority` value is reflected in prose ordering.
 
 2. **Concurrency rule outcomes** (Category 2 above) — every `concurrency_rules[]` entry names its loser `error_id`.
 
@@ -393,7 +388,7 @@ After writing the above four categories, run the rule-coverage check. Enumerate 
 
 ```
 Rule coverage check:
-- validations[] with error_priority: A checked, A expressed in prose, 0 missing
+- validations[] with priority: A checked, A expressed in prose, 0 missing
 - concurrency_rules[] with error_id: B checked, B expressed in prose, 0 missing
 - state_machines[].transitions: C checked, C fully expressed, 0 missing
 - calculations[]: D checked, D fully expressed, 0 missing
@@ -407,9 +402,9 @@ Status: PASS
 
 If status is not PASS, enumerate the missing rules, locate the right §2 or §3 subsection, and add a sentence that expresses each missing rule. Then re-run. Do not mark the PRD ready until both Pass A and Pass B report `PASS`.
 
-### Why the four categories matter
+### Why the six categories matter
 
-These four are not arbitrary — they are the categories the downstream `prd-bench-unit-test-generator` will walk to build its test suite. A test is generated from `validations[].error_priority`, another from `concurrency_rules[].error_id`, another from cascade side effects, another from `applies_to`. Every one of these tests must be implementable from PRD alone. If this skill omits them from PRD, the test generator's PRD-First Principle will either (a) skip the test — shrinking the benchmark's signal — or (b) generate it anyway and fail fair implementations. Neither outcome is acceptable. The responsibility for keeping these rules in the PRD lives **here**, in the doc generator, not in the test generator.
+These six are not arbitrary — they are the categories the downstream `prd-bench-unit-test-generator` will walk to build its test suite. A test is generated from `validations[].priority`, another from `concurrency_rules[].error_id`, another from cascade side effects, another from `applies_to`, another from field-level structured content, another from sibling-branch symmetry. Every one of these tests must be implementable from PRD alone. If this skill omits them from PRD, the test generator's PRD-First Principle will either (a) skip the test — shrinking the benchmark's signal — or (b) generate it anyway and fail fair implementations. Neither outcome is acceptable. The responsibility for keeping these rules in the PRD lives **here**, in the doc generator, not in the test generator.
 
 ---
 
@@ -435,11 +430,10 @@ These four are not arbitrary — they are the categories the downstream `prd-ben
 ## Quality Checklist
 
 ### Contract Precision (§2)
-- [ ] §2.2 contains complete success/error JSON examples with precise field names
-- [ ] §2.2 explains each `meta` field's semantics individually
+- [ ] §2.2 matches the fixed verbatim block in the §2.2 generation rule byte-for-byte (including `req_RANDOMALPHANUM123456`, `2025-05-24T10:30:00.123Z`, `UNIQUE_ERROR_IDENTIFIER_STRING`, and `"data": { }` — no synthesized entity payload, no domain-flavored placeholders)
 - [ ] §2.3 explicitly states limit/offset defaults, min, max
 - [ ] §2.3 explicitly states sort order
-- [ ] Common resource properties (id, created_at, updated_at, version) have precise type and format definitions
+- [ ] Common resource properties (id [UUID, no type prefix], created_at, updated_at, version) have precise type and format definitions
 - [ ] Precision rules (decimal places + rounding method) are explicitly stated
 - [ ] OCC mechanism is precisely described
 - [ ] All role names are spelled exactly as in `roles[].name`
@@ -456,7 +450,7 @@ These four are not arbitrary — they are the categories the downstream `prd-ben
 - [ ] A PASS coverage report was produced before finalizing the PRD
 
 ### Rule Coverage (Pass B — HARD CONTRACT — check last, after all writing)
-- [ ] Every `validations[].error_priority` ordering is expressed in prose when multiple validations share an endpoint
+- [ ] Every `validations[].priority` ordering is expressed in prose when multiple validations share an endpoint
 - [ ] Every `concurrency_rules[]` names its loser `error_id` in prose, not just "exactly one wins"
 - [ ] Every `state_machines[].transitions[].preconditions` (with its specific error_id) is expressed in prose
 - [ ] Every `state_machines[].transitions[].side_effects` (including cascades) is expressed in prose
@@ -484,12 +478,11 @@ These four are not arbitrary — they are the categories the downstream `prd-ben
 
 These are the most frequent "copying the example" problems when generating PRDs. Self-check before every generation:
 
-1. **§2 subsections mirror the example 1:1**: Subsection numbers, titles, and ordering are nearly identical to the example (e.g., 2.4 is always "System Integrity", 2.5 is always "Fiscal Responsibility"). Subsections should be renamed and reordered based on the domain.
-2. **§2.2 JSON placeholders are identical**: Every generation uses `req_RANDOMALPHANUM123456`, `2025-05-24T10:30:00.123Z`, `UNIQUE_ERROR_IDENTIFIER_STRING`. Use domain-relevant sample values.
-3. **§3 follows a fixed 7-subsection pattern**: Exactly 7 subsections arranged as "lifecycle → structure → core op → pairing/restriction → safety/compliance → cost calculation → finalization". Group naturally based on the domain.
-4. **Monotonous paragraph openings**: Multiple consecutive paragraphs starting with "The system...". Alternate among role names, conditional clauses, business events, etc.
-5. **Fixed Introduction format**: Always 1 paragraph of 3–4 sentences starting with "This document outlines...". Adapt length and approach angle to the domain.
-6. **Templated §2 subsection prose**: Every domain's cross-cutting subsections use the same sentence structures (e.g., "The system enforces strict X. Every Y is associated with a Z."). Vary expression style based on concept complexity.
+1. **§2 subsections mirror the example 1:1**: Subsection numbers, titles, and ordering are nearly identical to the example (e.g., 2.4 is always "System Integrity", 2.5 is always "Fiscal Responsibility"). Subsections should be renamed and reordered based on the domain. (§2.2 is the deliberate exception — it is a fixed verbatim block and MUST be identical across tasks.)
+2. **§3 follows a fixed 7-subsection pattern**: Exactly 7 subsections arranged as "lifecycle → structure → core op → pairing/restriction → safety/compliance → cost calculation → finalization". Group naturally based on the domain.
+3. **Monotonous paragraph openings**: Multiple consecutive paragraphs starting with "The system...". Alternate among role names, conditional clauses, business events, etc.
+4. **Fixed Introduction format**: Always 1 paragraph of 3–4 sentences starting with "This document outlines...". Adapt length and approach angle to the domain.
+5. **Templated §2 subsection prose**: Every domain's cross-cutting subsections use the same sentence structures (e.g., "The system enforces strict X. Every Y is associated with a Z."). Vary expression style based on concept complexity.
 
 ---
 
@@ -501,7 +494,7 @@ The following two files form a complete input → output example. Before generat
 - **Output example** (target PRD): [example-prd.md](example-prd.md) — PRD document generated from the above seed tables
 
 Key observations:
-1. How `example-prd.md` §2.2 precisely defines the response envelope with complete JSON examples
+1. How `example-prd.md` §2.2 matches the canonical verbatim block in `section-2.2-response-structure.md` (§2.2 is fixed across all tasks; do not re-derive per-task)
 2. How `example-prd.md` §3 scatters field names from `example-scaffold.yaml` throughout narrative paragraphs
 3. The endpoint table has only 4 columns; the error table has only 2 columns
 4. All calculation formulas use narrative, not pseudocode

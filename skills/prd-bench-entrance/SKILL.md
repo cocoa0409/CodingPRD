@@ -103,6 +103,12 @@ Scenario description (use verbatim, do not modify):
 {scenario}
 
 Output file: {task_dir}/SCAFFOLD.yaml
+
+Hard constraint — DO NOT look at any sibling task under {project_root}/tasks/ (no ls,
+glob, grep, or read of other task_*/ directories, their SCAFFOLD.yaml, PRD.md, tests,
+or implementation). Generate SCAFFOLD.yaml purely from the scenario description above
+plus the scaffold-generator skill's own specification. Peeking at existing tasks
+biases the output toward prior designs and defeats the purpose of a fresh scaffold.
 ```
 
 After the subagent completes, verify `SCAFFOLD.yaml` exists.
