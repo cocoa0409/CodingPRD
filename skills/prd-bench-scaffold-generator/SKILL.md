@@ -41,6 +41,7 @@ For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tab
 
 ```
 - [ ] 0: Select complexity profile (§Step 0)
+- [ ] 1.0: Response Envelope — emit the FIXED block verbatim (§1.0)
 - [ ] 1.1: Entity-Relationship Table
 - [ ] 1.2: State Machine Table
 - [ ] 1.2.1: Concurrency Rules
@@ -169,6 +170,25 @@ These are guidelines, not hard rules. A 10-entity benchmark with one fiendishly 
 ---
 
 ## Table Specifications
+
+### 1.0 Response Envelope (FIXED — EMIT VERBATIM)
+
+Every scaffold MUST include a top-level `response_envelope:` block with the exact content below. Do not edit field names, key order, pagination defaults, or error-body keys
+
+```yaml
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+```
+
+**Hard rules (copy/paste — no variation):**
+Scenario-specific customization goes into entities, endpoints, errors, calculations — NOT into the envelope.
 
 ### 1.1 Entity-Relationship Table
 
