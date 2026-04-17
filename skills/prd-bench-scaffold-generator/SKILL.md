@@ -420,9 +420,33 @@ errors:
 roles:
   - name: RoleName
     description: "role purpose"
+    identity: "entity_backed:<EntityName>" | "opaque"
     exclusive_operations: [operations only this role can perform]
     shared_operations: [operations shared with other roles]
 ```
+
+**The `identity:` field is mandatory and takes exactly one of two forms:**
+
+- `entity_backed:<EntityName>` — when `X-User-Role` is this role, `X-User-ID`
+  equals the `id` of an instance of `<EntityName>`. Use this for every role
+  that corresponds to a persisted entity the user acts as (e.g.,
+  `Customer` → `entity_backed:Customer`, `Restaurant` → `entity_backed:Restaurant`,
+  `Rider` → `entity_backed:Rider`). Ownership checks of the form "the acting
+  X must be the owner of this resource" are then unambiguous: the server
+  compares `X-User-ID` to the resource's foreign-key field for `<EntityName>`.
+- `opaque` — `X-User-ID` is an operator identifier not tied to any persisted
+  entity. Use this for purely operational roles like `PlatformAdmin` and
+  `CustomerService`. Scaffold may still reference the opaque id (e.g., store
+  it on a WorkOrder as `assigned_cs_user_id`) but must never require it to
+  equal any entity's `id`.
+
+Why this field is mandatory: without it, the PRD, the test fixtures, and
+the implementation each invent their own mapping between `X-User-ID` and
+entity ids. Downstream generators (doc, unit-test, implementation) read
+this field to produce consistent role-to-resource identity semantics. A
+scaffold that demands "Restaurant must own the order" but leaves identity
+unstated forces the three downstream skills to guess — and they guess
+differently, producing unfair tests or mismatched implementations.
 
 **Role model patterns:**
 
@@ -447,6 +471,7 @@ Before finalizing the YAML:
 - [ ] Validation priorities are unambiguous per endpoint
 - [ ] Every error code is referenced by at least one validation or transition
 - [ ] Endpoint roles match RBAC matrix
+- [ ] Every role in the RBAC matrix declares an `identity:` field, either `entity_backed:<EntityName>` pointing to a persisted entity, or `opaque` for purely operational roles
 - [ ] All automatic/system-triggered transitions are captured
 - [ ] Side effect chains are complete (if A→B→C, all three steps are documented)
 

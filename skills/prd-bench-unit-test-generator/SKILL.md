@@ -404,16 +404,29 @@ TEST_DEFAULTS = { "BUDGET": 250_000, "COST_PER_MINUTE": 10.0 }
 
 ### 1.7 `test_users.py` — Pre-Built Role Headers
 
-Uses `build_user_headers()` from the framework.
+Uses `build_user_headers()` from the framework. **This file emits two things per role, driven by `roles[].identity` in the scaffold:**
+
+- **A shared-constant entry in `TEST_USERS`** — used only by tests whose success does NOT depend on the caller owning the subject resource (e.g., 400-on-bad-payload, 404-on-missing-resource, or calls by `opaque` roles).
+- **A per-instance builder function `make_<role>_headers(user_id)`** — **mandatory for every role whose `identity` is `entity_backed:<EntityName>`**. Fixtures MUST call this builder with the actual entity's `id` when the downstream call is ownership-gated (e.g., `make_restaurant_headers(restaurant["id"])` after `create_restaurant`). Falling back to the shared constant for entity_backed roles reproduces the canonical bug: `X-User-ID` is a string that never equals any real entity's `id`, so every ownership check rejects every request, cascading "Setup failed" into dozens of tests.
 
 ```python
 """Pre-built role headers from scaffold Table 7."""
 from prd_bench_local_runner.testing import build_user_headers
 
+# Shared constants — safe for opaque roles, and for tests that don't exercise ownership.
 TEST_USERS = {
+    # entity_backed role: shared constant is a fallback for non-ownership tests only.
     "role_a_headers": build_user_headers("test-role-a-1", "RoleA"),
-    "role_b_headers": build_user_headers("test-role-b-1", "RoleB"),
+    # opaque role: shared constant is the canonical form.
+    "role_admin_headers": build_user_headers("test-admin-1", "Admin"),
 }
+
+
+# Per-instance builders — required for every entity_backed role.
+def make_role_a_headers(user_id: str) -> dict:
+    """For RoleA (entity_backed:EntityA). Pass the actual EntityA.id as user_id
+    whenever the call is ownership-gated."""
+    return build_user_headers(user_id, "RoleA")
 ```
 
 ### 1.8 `fixtures.py` — Composite Setup Helpers
@@ -521,6 +534,18 @@ provides sensible defaults for everything else.
 
 Fixtures use `get_success_data()` (lenient validator) internally, not `validate_success()`,
 so setup failures produce clear "Setup failed" errors instead of confusing assertion failures.
+
+**Identity threading for entity_backed roles (mandatory):** When a fixture creates an entity
+whose role's `identity` in the scaffold is `entity_backed:<EntityName>`, and later in the
+same fixture (or in a fixture that consumes this one) invokes any endpoint requiring that
+role's ownership, the fixture MUST pass `make_<role>_headers(entity["id"])` to that call —
+never fall through to the shared `TEST_USERS["<role>_headers"]` constant. Example: after
+`restaurant = create_restaurant(...)`, any subsequent `confirm_order`, `mark_ready`,
+`cancel_order`, or `create_menu_item` issued as the Restaurant role must be called with
+`headers=make_restaurant_headers(restaurant["id"])`. The shared constant is only valid for
+calls whose success does not depend on the caller owning the subject resource (e.g., a
+public list endpoint, or a 400-on-bad-payload test where the request never reaches the
+ownership check).
 
 ### 1.9 `__init__.py` — Barrel Export
 

@@ -159,6 +159,10 @@ Most content in this section is **contract-level specification** and must be pre
 - Explicitly state the header names: `X-User-ID` and `X-User-Role`
 - List all role names with exact spelling — from `roles[].name`
 - Reference the auth-related error IDs from `errors[]` (e.g., the ones for missing headers and insufficient permissions)
+- **Translate every role's `identity:` field into explicit prose** — this is what ties `X-User-ID` to resource ownership, and without it the implementer, the test generator, and the reader all guess differently. For each role in `roles[]`:
+  - If `identity: "entity_backed:<EntityName>"`, write a sentence of the form *"When `X-User-Role` is `<RoleName>`, `X-User-ID` is the `id` of the acting `<EntityName>`; ownership checks on any resource that references a `<EntityName>` compare the resource's foreign-key field to `X-User-ID`."*
+  - If `identity: "opaque"`, write a sentence of the form *"When `X-User-Role` is `<RoleName>`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server may record it (for example, as `<field_name>` on `<Entity>` where a scaffold transition writes it) but does not compare it to any entity's `id`."*
+  - The two sentences can be combined/collapsed if several roles share the same form, but every role in `roles[]` must be individually named in the resulting prose.
 
 #### §2.2 API Response Structure (the most critical contract subsection)
 
@@ -439,6 +443,7 @@ These four are not arbitrary — they are the categories the downstream `prd-ben
 - [ ] Precision rules (decimal places + rounding method) are explicitly stated
 - [ ] OCC mechanism is precisely described
 - [ ] All role names are spelled exactly as in `roles[].name`
+- [ ] §2.1 translates every role's `identity:` field into prose: entity-backed roles state that `X-User-ID` equals the backing entity's `id`; opaque roles state that `X-User-ID` is an opaque operator identifier not compared to any entity id
 - [ ] All state enumeration values are exact strings from `state_machines[]`
 - [ ] All enum-type field values (certifications, categories, etc.) are exact strings from `entities[].fields`
 
