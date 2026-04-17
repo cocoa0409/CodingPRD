@@ -17,13 +17,15 @@ faithfully satisfies every requirement in a given PRD.
 ## Input
 
 A single **working directory** containing:
-- **`*.yaml`** — the scaffold (entities, state machines, calculations, validations, endpoints, errors, RBAC)
+- **`*.yaml`** — the scaffold (entities, state machines, calculations, validations, endpoints, errors, RBAC, and §1.8 `scaffold_difficulty_design` — the Test Targeting Index)
 - **`*.md`** — the PRD document generated from that scaffold
 
 The skill reads both files from this directory, then creates `test_helpers/` and `test_suite/`
 as subdirectories under it. All generated code uses **relative imports** within this directory.
 
 **Source priority**: The scaffold is the extraction index; the PRD is the contract. See "PRD-First Principle" below.
+
+**`scaffold_difficulty_design` is a mandatory priority queue.** Every instance it declares MUST be covered by at least one test (subject to PRD-First). See §2.1.A "Difficulty Design Coverage" below — this is a hard gate on Stage 2 completion.
 
 ```
 {working_dir}/                     # ← input directory (provided by user)
@@ -630,6 +632,25 @@ def role_a_headers():
 # ... one per role
 ```
 
+### 2.1.A Difficulty Design Coverage (MANDATORY — priority queue, runs before §2.1)
+
+Before the general scaffold walk in §2.1, consume the scaffold's `scaffold_difficulty_design:` section as a **mandatory priority queue**. Every `instances[*]` entry across all `rule_id`s produces at least TWO dedicated test in `test_suite/`. Its declared `test_recipe` drives the fixtures and assertions that test needs.
+
+**Per-instance procedure:**
+
+1. **Read `grounds:`** — these point into §1.1–§1.6 of the scaffold, identifying the underlying rule(s) the instance exercises.
+2. **Locate the PRD prose** that states those underlying rules. PRD-First still applies: each generated test cites the PRD sentence for its underlying rule, not the difficulty-design entry itself.
+3. **Translate `test_recipe.setup`** into fixture setup — reuse helpers from `test_helpers/fixtures.py` where possible; add new ones to `fixtures.py` when the recipe demands state the current fixtures cannot build (e.g., "restaurant with trailing_30d_gross at 9500", "rider with 80 deliveries and 0.02 late ratio", "two assignments eligible for route merge").
+4. **Translate `test_recipe.trigger`** into `ApiClient` method calls.
+5. **Translate each line of `test_recipe.assert`** into a pytest assertion pinned to PRD-exact field names.
+6. **Tag the test's docstring** with `# difficulty: <rule_id>/<instance.name>` so the coverage check in §Completeness can audit which instance each test satisfies.
+
+**PRD-First escalation, not elision.** If the PRD does not state the underlying rule a difficulty-design instance exercises, do NOT silently skip — surface the gap loudly in the summary report under a dedicated bucket `difficulty-coverage-blocked-by-prd-silence`. These gaps indicate the doc-generator dropped a rule the scaffold marked as load-bearing; they demand investigation, not hiding.
+
+**Coverage target: 100% of instances.** Every `scaffold_difficulty_design[*].instances[*]` entry must be covered by at least TWO generated test (or escalated under the bucket above). Zero instances may be silently dropped.
+
+**What changes in Stage 1 as a consequence:** when drafting `test_helpers/fixtures.py`, pre-scan `scaffold_difficulty_design` for `test_recipe.setup` lines that demand non-trivial composite state, and add the corresponding composite fixture up-front (e.g., `setup_restaurant_near_tier_boundary`, `setup_rider_with_bonus_tier`, `setup_mergeable_assignment_pair`). Stage 2 tests should import these helpers by name, not re-invent setup inline.
+
 ### 2.1 Extract Every Testable Claim
 
 Walk through each scaffold table systematically. For every structural element, ask: "What can go
@@ -724,7 +745,9 @@ After generating both layers, verify:
 5. **Every RBAC exclusive operation** has a negative test (wrong role → ERR_UNAUTHORIZED) — role assignments are universally expressed in PRD §2.1, so this check rarely gates.
 6. **Every complexity layer** in `complexity_profile.complexity_layers` has dedicated test coverage — but ONLY for behaviors the PRD describes. For `optimistic_concurrency`, this means version-conflict tests and any explicit skip-if-absent semantics; it does NOT automatically mean race-condition tests. Race-condition tests (using `run_race`, `assert_exactly_one_succeeds`, etc.) should ONLY be generated when the PRD explicitly defines the expected outcome of concurrent operations (e.g., "only one delivery per order", "exactly one of confirm/cancel wins"). If the PRD is silent on race semantics, do not generate race tests.
 
-All six checks are subject to the PRD-First Principle: **if a scaffold item has no corresponding PRD description, it produces no test**. Missing PRD coverage is NOT a reason to generate a "best-effort" test — it is a reason to skip. If you believe the PRD has an unintentional gap, stop generation and surface the gap in a note; do not silently test scaffold-only rules.
+7. **Every `scaffold_difficulty_design[*].instances[*]` entry has at least one test** whose docstring carries the `# difficulty: <rule_id>/<instance.name>` tag. Count expected instances (N) vs. tagged tests (M) — any shortfall is either surfaced in the summary report under `difficulty-coverage-blocked-by-prd-silence` with a cited cause, or it is a generation bug that fails Stage 2. This check is STRICTER than checks 1–6 above: difficulty-design instances may NOT be silently skipped; a missing test must be explicitly escalated.
+
+All seven checks are subject to the PRD-First Principle: **if a scaffold item has no corresponding PRD description, it produces no test**. Missing PRD coverage is NOT a reason to generate a "best-effort" test — it is a reason to skip. If you believe the PRD has an unintentional gap, stop generation and surface the gap in a note; do not silently test scaffold-only rules.
 
 ### Final PRD-Citation Pass (mandatory)
 
@@ -745,5 +768,6 @@ At the end of generation, emit a short report listing:
 - Total tests generated
 - Tests skipped due to PRD silence (categorize by pattern: computed-field, default-value, branch-asymmetry, precedence-silence, concurrency-silence, other)
 - Any scaffold rules that produced zero tests because PRD silence blocked generation
+- **Difficulty-design coverage**: count of `scaffold_difficulty_design[*].instances[*]` declared (N), count of tests carrying a `# difficulty:` tag (M), and — if M < N — an explicit list of uncovered instances bucketed under `difficulty-coverage-blocked-by-prd-silence` with the PRD gap cited for each. M < N without this bucketed escalation is a Stage 2 failure.
 
 This report is the feedback channel back to the doc-generator. A high skip count for a single category means the PRD generator is systematically eliding that category and its Zero-Silence Rule needs inspection.

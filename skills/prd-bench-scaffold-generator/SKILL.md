@@ -25,13 +25,14 @@ domain_name: "kebab-case-domain-name"
 api_prefix: "/top-level-resource-path"
 complexity_profile: { ... }   # Selected archetype and structural dimensions
 
-entities:        # §1.1: Entity-Relationship Table
-state_machines:  # §1.2: State Machine Table
-calculations:    # §1.3: Calculation Rules Table
-validations:     # §1.4: Validation Rules Table (ordered by priority)
-endpoints:       # §1.5: API Endpoint Table
-errors:          # §1.6: Error Code Catalog
-roles:           # §1.7: RBAC Matrix
+entities:                    # §1.1: Entity-Relationship Table
+state_machines:              # §1.2: State Machine Table
+calculations:                # §1.3: Calculation Rules Table
+validations:                 # §1.4: Validation Rules Table (ordered by priority)
+endpoints:                   # §1.5: API Endpoint Table
+errors:                      # §1.6: Error Code Catalog
+roles:                       # §1.7: RBAC Matrix
+scaffold_difficulty_design:  # §1.8: Test Targeting Index — summary of §1.1–§1.7 cross-referenced per Difficulty rule
 ```
 
 For completed examples, see the `examples/` directory (22 scaffolds covering diverse domains)
@@ -50,6 +51,7 @@ For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tab
 - [ ] 1.5: API Endpoint Table
 - [ ] 1.6: Error Code Catalog
 - [ ] 1.7: RBAC Matrix
+- [ ] 1.8: Scaffold Difficulty Design (Test Targeting Index)
 - [ ] Final: Quality + Diversity check (§Quality Checklist)
 ```
 
@@ -477,6 +479,59 @@ differently, producing unfair tests or mismatched implementations.
 | Delegated authority | Roles can grant temporary permissions | Dynamic, time-bound | On-call rotation |
 | Segregation of duties | Same person cannot do step A and step B | Compliance-driven | Financial controls |
 
+### 1.8 Scaffold Difficulty Design (Test Targeting Index)
+
+A machine-readable index of every difficulty feature the scaffold claims to exhibit, cross-referenced from §1.1–§1.7 against the Difficulty rules in the Quality Checklist. Its sole purpose is to drive the downstream unit-test-generator toward complete coverage.
+
+**Critical semantics:**
+- **Not an independent rule source.** Every instance MUST ground in elements already declared in §1.1–§1.7. Deleting this section must leave the scaffold's declared behavior identical — it only makes test coverage harder to audit.
+- **The doc-generator IGNORES this section.** The PRD must not reference, summarize, or highlight it. Because every instance grounds in other tables (which the PRD losslessly conveys), the rules are already in the PRD through their original tables.
+- **The unit-test-generator MUST cover every instance** with at least one test whose `test_recipe` is realized in test code. Uncovered instances are a Stage 2 failure.
+
+**Schema:**
+
+```yaml
+scaffold_difficulty_design:
+  - rule_id: <one of: dual_variant_calc | combinatorial_formula | non_linear_state_machine | transitive_cascade | priority_pair_validation_conflict | boundary_precision_check | cross_entity_state_dependency>
+    instances:
+      - name: <unique_lower_snake_case>     # identifier used as the docstring anchor in generated tests
+        grounds:                             # one or more refs into §1.1–§1.6; every ref MUST resolve
+          - calculations.<name>              # or: state_machines.<Entity>.<FROM>_to_<TO>
+          - validations[priority=<N>]        # or: entities.<Entity>.fields.<name>
+          - concurrency_rules[<scenario-keyword>]
+        distinguishing_aspect: |
+          <ONE sentence pinning what structurally distinguishes this instance — the specific variant
+          delta, the specific cycle edge, the specific cascade chain tail, the specific boundary value.
+          Must be falsifiable: a test must be able to turn this sentence into one concrete assertion.>
+        test_recipe:
+          setup:                             # minimal DB + clock state to reach the scenario from empty DB
+            - "<precondition 1>"
+          trigger:                           # API call(s) or clock advance(s) that exercise the feature
+            - "<endpoint invocation 1>"
+          assert:                            # each line = one pinned observable outcome
+            - "<comparison or invariant 1>"
+```
+
+**Minimum instance quotas (must match the Difficulty checklist):**
+
+| rule_id | Minimum instances | Differentiation requirement |
+|---------|-------------------|-----------------------------|
+| `dual_variant_calc` | 2 | Different entity domains |
+| `combinatorial_formula` | 1 | — |
+| `non_linear_state_machine` | 2 | Different entities |
+| `transitive_cascade` | 2 | Different triggering transitions; one chain of depth ≥ 3, the other ≥ 2 |
+| `priority_pair_validation_conflict` | 2 | Different error-category pairs |
+| `boundary_precision_check` | 2 | Different metrics, different endpoints |
+| `cross_entity_state_dependency` | 2 | Different ordered entity pairs |
+| **total** | **≥ 13 instances** | |
+
+**Per-instance contract:**
+1. Every `grounds:` entry MUST resolve to a declared element in §1.1–§1.6. A grounds entry naming a missing calculation, transition, validation, field, or race is a dangling claim — remove it or add the grounding.
+2. `test_recipe.setup + trigger + assert` together MUST reproduce the scenario from empty-DB state using only endpoints declared in §1.5. No wall-clock waits; time-gated setups use the clock-advance endpoint §1.5 already provides.
+3. `distinguishing_aspect` MUST be falsifiable — one sentence the test can turn into a concrete assertion. No hedging ("may differ", "could vary").
+4. `name` MUST be unique across the whole `scaffold_difficulty_design` and stable across regenerations (tests cite it in their docstrings for audit).
+5. `assert:` entries MUST cite exact field names and literal values where possible (e.g., `Order.delivery_fee != Assignment.final_delivery_fee`; `Customer.wallet_balance unchanged after assignment creation`), not paraphrases.
+
 ---
 
 ## Quality Checklist
@@ -495,6 +550,8 @@ Before finalizing the YAML:
 - [ ] Side effect chains are complete (if A→B→C, all three steps are documented)
 - [ ] Every non-idempotent operation that can race has a `concurrency_rules` entry with required `error_id` and `http_status`
 - [ ] Every error code referenced in `concurrency_rules` also appears in §1.6 Error Catalog
+- [ ] `scaffold_difficulty_design` (§1.8) is present and every Difficulty rule meets its minimum instance quota (2/1/2/2/2/2/2; ≥13 total)
+- [ ] Every `scaffold_difficulty_design[*].instances[*].grounds[*]` reference resolves to a declared element in §1.1–§1.6
 
 **Self-Consistency:**
 
