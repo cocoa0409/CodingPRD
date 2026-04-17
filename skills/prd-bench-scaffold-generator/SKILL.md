@@ -41,7 +41,8 @@ For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tab
 ## Generation Checklist
 
 ```
-- [ ] 0: Select complexity profile (§Step 0)
+- [ ] 0: Select complexity profile (§0.1–§0.4)
+- [ ] 0.5: Internalize the seven Difficulty Rules (§0.5) — keep them in mind while drafting §1.1–§1.7, not as a post-hoc audit
 - [ ] 1.0: Response Envelope — emit the FIXED block verbatim (§1.0)
 - [ ] 1.1: Entity-Relationship Table
 - [ ] 1.2: State Machine Table
@@ -170,6 +171,35 @@ These are guidelines, not hard rules. A 6-entity benchmark with one fiendishly t
 3. Validation priority conflicts where the "correct" error depends on check ordering
 4. State transitions where the set of valid next-states depends on sibling/child state
 5. Edge cases at exact boundaries (>=  vs >, empty sets, zero quantities)
+
+### 0.5 Difficulty Rules
+
+Seven hard rules that shape the scaffold's contents. They apply **while you are drafting §1.1–§1.7** (not as an afterthought), are cross-referenced by §1.8 Scaffold Difficulty Design (Test Targeting Index), and are audited at the end by the Quality Checklist. Each rule has a stable `rule_id` that §1.8 uses verbatim.
+
+**Rule 1 — Dual-variant calculations across different entity domains**  (`rule_id: dual_variant_calc`, ≥ 2 instances)
+At least two `calculations[]` entries where two valid approaches produce different results. The two calculations MUST operate on different entity domains (e.g., one is cost accounting on an Order, the other is risk scoring on a Customer), so the scaffold exhibits dual-variant logic on more than one subject. A second calculation that repeats the same provisional-vs-final shape on the same entity or metric does NOT count.
+
+**Rule 2 — Combinatorial formula**  (`rule_id: combinatorial_formula`, ≥ 1 instance)
+At least one calculation with combinatorial complexity, satisfied by any of:
+(a) a formula with ≥3 inputs and non-linear interaction (nested `min`/`max`, conditional branches on entity state, tiered-rate selection);
+(b) nested rounding where the order matters — "round per-line-item then sum" vs "sum then round" produce different cents; the scaffold MUST pin one order and state it explicitly;
+(c) a circular-looking dependency where evaluation order must be explicit (e.g., `total = subtotal + fee`, but `fee` is computed from a discount keyed on the total tier — the scaffold pins the evaluation order so the value is well-defined).
+A single-formula `aggregation` + `threshold` calculation does NOT satisfy this.
+
+**Rule 3 — Non-linear state-machine shape on different entities**  (`rule_id: non_linear_state_machine`, ≥ 2 instances)
+At least two state machines with non-linear shape — a cycle (A→B→A, revision loops, negotiation rounds), parallel state dimensions on one entity (e.g., `payment_status × fulfillment_status` evolve independently on the same row), OR branching fork-join (A→{B,C}→D with divergent side-effect sets per branch). The two non-linear machines MUST belong to different entities. A scaffold whose state machines are all linear A→B→C→D pipelines — no matter how long each pipeline is — does NOT satisfy this.
+
+**Rule 4 — Transitive cascade chains from different triggers**  (`rule_id: transitive_cascade`, ≥ 2 instances)
+At least two transitive cascades, at least one of depth ≥ 3 and the other of depth ≥ 2. Each cascade chains mutations where an action on entity A mutates B; that mutation on B **itself** triggers a mutation on C; (and so on). Each link MUST be caused by the previous link, not by the original action — a fan-out where one action directly mutates multiple targets in parallel does NOT count. The two cascades MUST originate from different triggering transitions, so the scaffold captures more than one propagation pattern. Spell each chain out in the relevant `state_machines[].transitions[].side_effects` entries so a PRD reader can follow each hop.
+
+**Rule 5 — Validation priority conflicts across different error-category pairs**  (`rule_id: priority_pair_validation_conflict`, ≥ 2 instances)
+At least two validation priority conflicts testable by dual-failure scenarios. The two conflicts MUST involve different error-category pairs (e.g., one is `state` vs `business_fiscal`, another is `business_safety` vs `business_referential`), so the scaffold exercises more than a single priority rule. A second copy of the same pairing does NOT count.
+
+**Rule 6 — Boundary-precision checks on different metrics/endpoints**  (`rule_id: boundary_precision_check`, ≥ 2 instances)
+At least two boundary conditions requiring exact precision (`>=` vs `>`, zero quantity, empty set). The two boundaries MUST sit on different metrics (e.g., one is a numeric threshold crossing, the other is an empty-collection or zero-count edge), and each MUST be reachable through a distinct endpoint. Two boundaries on the same formula do NOT count.
+
+**Rule 7 — Cross-entity state dependencies across different entity pairs**  (`rule_id: cross_entity_state_dependency`, ≥ 2 instances)
+At least two cross-entity state dependencies (entity A's valid transitions depend on entity B's state). The two dependencies MUST cross different entity pairs (e.g., Order→Customer and Shipment→Warehouse), so the scaffold forces reasoning about more than one cross-entity relationship. Two transitions on the same entity pair do NOT count.
 
 ---
 
@@ -481,7 +511,7 @@ differently, producing unfair tests or mismatched implementations.
 
 ### 1.8 Scaffold Difficulty Design (Test Targeting Index)
 
-A machine-readable index of every difficulty feature the scaffold claims to exhibit, cross-referenced from §1.1–§1.7 against the Difficulty rules in the Quality Checklist. Its sole purpose is to drive the downstream unit-test-generator toward complete coverage.
+A machine-readable index of every difficulty feature the scaffold claims to exhibit, cross-referenced from §1.1–§1.7 against the **seven Difficulty Rules defined in §0.5**. Its sole purpose is to drive the downstream unit-test-generator toward complete coverage. Every `rule_id` below corresponds verbatim to a `rule_id` declared in §0.5; consult §0.5 for each rule's full text, differentiation requirements, and counter-examples that do NOT count.
 
 **Critical semantics:**
 - **Not an independent rule source.** Every instance MUST ground in elements already declared in §1.1–§1.7. Deleting this section must leave the scaffold's declared behavior identical — it only makes test coverage harder to audit.
@@ -512,18 +542,18 @@ scaffold_difficulty_design:
             - "<comparison or invariant 1>"
 ```
 
-**Minimum instance quotas (must match the Difficulty checklist):**
+**Minimum instance quotas (mirror of §0.5; differentiation requirements are authoritative there, not here):**
 
-| rule_id | Minimum instances | Differentiation requirement |
-|---------|-------------------|-----------------------------|
-| `dual_variant_calc` | 2 | Different entity domains |
-| `combinatorial_formula` | 1 | — |
-| `non_linear_state_machine` | 2 | Different entities |
-| `transitive_cascade` | 2 | Different triggering transitions; one chain of depth ≥ 3, the other ≥ 2 |
-| `priority_pair_validation_conflict` | 2 | Different error-category pairs |
-| `boundary_precision_check` | 2 | Different metrics, different endpoints |
-| `cross_entity_state_dependency` | 2 | Different ordered entity pairs |
-| **total** | **≥ 13 instances** | |
+| rule_id | Minimum | §0.5 ref | Differentiation summary |
+|---------|---------|----------|-------------------------|
+| `dual_variant_calc` | 2 | Rule 1 | Different entity domains |
+| `combinatorial_formula` | 1 | Rule 2 | — |
+| `non_linear_state_machine` | 2 | Rule 3 | Different entities |
+| `transitive_cascade` | 2 | Rule 4 | Different triggers; one depth ≥ 3, the other ≥ 2 |
+| `priority_pair_validation_conflict` | 2 | Rule 5 | Different error-category pairs |
+| `boundary_precision_check` | 2 | Rule 6 | Different metrics AND different endpoints |
+| `cross_entity_state_dependency` | 2 | Rule 7 | Different ordered entity pairs |
+| **total** | **≥ 13 instances** | | |
 
 **Per-instance contract:**
 1. Every `grounds:` entry MUST resolve to a declared element in §1.1–§1.6. A grounds entry naming a missing calculation, transition, validation, field, or race is a dangling claim — remove it or add the grounding.
@@ -564,14 +594,10 @@ Each declaration in the scaffold is an edge; self-consistency means both ends re
 - [ ] **Cross-entity reference resolvability** — Any precondition or side-effect that references another entity as "a linked X", "a related X", "the associated X", or "the corresponding X" MUST name the foreign-key path or pin the query selector. "A linked WorkOrder is in UNDER_REVIEW" without declaring `WorkOrder.related_order_id == Order.id` forces downstream generators to invent the link.
 - [ ] **Computation determinism** — Order-sensitive calculations MUST pin both sort key and tie-break. Multi-step rounding MUST pin the rounding order. Fields referenced inside `formula:` MUST be unambiguous — use the exact field name (`credit_balance_cents`), not paraphrases ("the customer's credit") that could resolve to either a provisional or a finalized field.
 
-**Difficulty:**
-- [ ] At least two calculations where two valid approaches produce different results — the two calculations MUST operate on different entity domains (e.g., one is cost accounting on an Order, the other is risk scoring on a Customer), so the scaffold exhibits dual-variant logic on more than one subject. A second calculation that repeats the same provisional-vs-final shape on the same entity or metric does NOT count.
-- [ ] At least one calculation with combinatorial complexity — satisfied by any of: (a) a formula with ≥3 inputs and non-linear interaction (nested `min`/`max`, conditional branches on entity state, tiered-rate selection), (b) nested rounding where the order matters — "round per-line-item then sum" vs "sum then round" produce different cents; the scaffold MUST pin one order and state it explicitly, (c) a circular-looking dependency where evaluation order must be explicit (e.g., `total = subtotal + fee`, but `fee` is computed from a discount keyed on the total tier — scaffold pins the evaluation order so the value is well-defined). A single-formula `aggregation` + `threshold` calculation does NOT satisfy this.
-- [ ] At least two state machines with non-linear shape — a cycle (A→B→A, revision loops, negotiation rounds), parallel state dimensions on one entity (e.g., `payment_status × fulfillment_status` evolve independently on the same row), OR branching fork-join (A→{B,C}→D with divergent side-effect sets per branch). The two non-linear machines MUST belong to different entities. A scaffold whose state machines are all linear A→B→C→D pipelines — no matter how long each pipeline is — does NOT satisfy this.
-- [ ] At least two transitive cascades, at least one of depth ≥ 3 and the other of depth ≥ 2 — each cascade chains mutations where an action on entity A mutates B; that mutation on B **itself** triggers a mutation on C; (and so on). Each link MUST be caused by the previous link, not by the original action — a fan-out where one action directly mutates multiple targets in parallel does NOT count. The two cascades MUST originate from different triggering transitions, so the scaffold captures more than one propagation pattern. Spell each chain out in the relevant `state_machines[].transitions[].side_effects` entries so a PRD reader can follow each hop.
-- [ ] At least two validation priority conflicts testable by dual-failure scenarios — the two conflicts MUST involve different error-category pairs (e.g., one is `state` vs `business_fiscal`, another is `business_safety` vs `business_referential`), so the scaffold exercises more than a single priority rule. A second copy of the same pairing does NOT count.
-- [ ] At least two boundary conditions requiring exact precision (>= vs >, zero quantity, empty set) — the two boundaries MUST sit on different metrics (e.g., one is a numeric threshold crossing, the other is an empty-collection or zero-count edge), and each MUST be reachable through a distinct endpoint. Two boundaries on the same formula do NOT count.
-- [ ] At least two cross-entity state dependencies (entity A's valid transitions depend on entity B's state) — the two dependencies MUST cross different entity pairs (e.g., Order→Customer and Shipment→Warehouse), so the scaffold forces reasoning about more than one cross-entity relationship. Two transitions on the same entity pair do NOT count.
+**Difficulty (audit — the spec lives at §0.5):**
+- [ ] Every rule in §0.5 (Rules 1–7) is satisfied by the scaffold's §1.1–§1.7 tables, honoring the differentiation clauses ("different entity domains", "different error-category pairs", "different ordered entity pairs", etc.)
+- [ ] `scaffold_difficulty_design` (§1.8) mirrors every §0.5 rule with at least its minimum instance count (2/1/2/2/2/2/2; ≥13 total)
+- [ ] Every §1.8 `instances[*].distinguishing_aspect` sentence traces to the differentiation clause of its `rule_id` in §0.5 — i.e., it is not generic prose but a concrete statement of what §0.5 demands be distinct about this instance
 
 **Diversity (compare against the 22 existing example scaffolds in this directory):**
 
