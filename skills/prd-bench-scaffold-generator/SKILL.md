@@ -61,45 +61,45 @@ Before generating tables, select the structural DNA of the benchmark. This is th
 
 ### 0.1 Primary Archetypes
 
-Each archetype represents a fundamentally different core challenge. Choose ONE primary archetype, optionally blend with a secondary. The coverage column shows how many of the 22 reference scaffolds use each archetype — prioritize underrepresented ones for diversity.
+Each archetype represents a fundamentally different core challenge. Choose ONE primary archetype, optionally blend with a secondary.
 
-| Archetype | Core challenge | What makes it hard | Example domains | Coverage |
-|-----------|---------------|-------------------|-----------------|----------|
-| **Ledger reconciliation** | Same data, two algorithms, different results | Forward-looking vs chronological produce divergent costs for identical inputs | Hospital billing, insurance claims, tax withholding | 9/22 (41%) — OVERREPRESENTED |
-| **Quota / allocation** | Finite pool competed for, reserved, committed, released | Fragmentation, over-subscription policies, priority preemption, waterfall fallback | Cloud resource quotas, inventory reservation, seat assignment | 5/22 (23%) |
-| **Graph constraint** | Entities form a DAG with dependency/ordering rules | Cycle detection, transitive closure, conditional propagation | Course prerequisites, build pipelines, supply chain BOM | 4/22 (18%) |
-| **Posture-driven gating** | Derived aggregate state gates all child operations | Posture computed from children, cascading freezes, ops-run checkpoints | Dock operations, podcast scheduling, sponsorship events | 7/22 (32%) — NEW, observed in real data |
-| **Pricing engine** | Dynamic pricing based on multi-dimensional rules | Tiered rates, volume discounts, time-of-use, promotional stacking, rounding traps | Utility billing, SaaS metering, airline yield management | 1/22 (5%) — UNDERREPRESENTED |
-| **Event sourcing** | State derived by replaying an ordered event stream | Snapshot invalidation, late-arriving events, retroactive corrections | Order lifecycle + refunds, audit reconstruction, version history | 1/22 (5%) — UNDERREPRESENTED |
-| **Access control matrix** | Fine-grained, context-dependent permissions | Attribute-based rules, delegation chains, temporary grants, scope inheritance | Document sharing, healthcare data access, multi-tenant SaaS | 1/22 (5%) — UNDERREPRESENTED |
-| **Multi-party negotiation** | Multiple independent actors must reach agreement | Quorum logic, timeout/escalation, conditional delegation, veto power | Contract approval, loan origination, committee voting, peer review | 0/22 — ABSENT |
-| **Temporal windowing** | Overlapping/adjacent time intervals with gap rules | Half-open vs closed intervals, merge/split semantics, cross-resource scheduling | Room booking, spectrum allocation, maintenance windows | 0/22 — ABSENT |
-| **Workflow orchestration** | Configurable multi-step pipelines with branching | Conditional routing, parallel fan-out/fan-in, compensation on failure, idempotency | CI/CD pipelines, document processing, onboarding flows | 0/22 — ABSENT |
-| **Compliance / audit** | Actions constrained by regulatory rules with audit trail | Mandatory cooling-off periods, segregation of duties, tamper-evident logs | Financial trading, pharmaceutical dispensing, government procurement | 0/22 — ABSENT |
+| Archetype | Core challenge | What makes it hard | Example domains |
+|-----------|---------------|-------------------|-----------------|
+| **Ledger reconciliation** | Same data, two algorithms, different results | Forward-looking vs chronological produce divergent costs for identical inputs | Hospital billing, insurance claims, tax withholding |
+| **Quota / allocation** | Finite pool competed for, reserved, committed, released | Fragmentation, over-subscription policies, priority preemption, waterfall fallback | Cloud resource quotas, inventory reservation, seat assignment |
+| **Graph constraint** | Entities form a DAG with dependency/ordering rules | Cycle detection, transitive closure, conditional propagation | Course prerequisites, build pipelines, supply chain BOM |
+| **Posture-driven gating** | Derived aggregate state gates all child operations | Posture computed from children, cascading freezes, ops-run checkpoints | Dock operations, podcast scheduling, sponsorship events |
+| **Pricing engine** | Dynamic pricing based on multi-dimensional rules | Tiered rates, volume discounts, time-of-use, promotional stacking, rounding traps | Utility billing, SaaS metering, airline yield management |
+| **Event sourcing** | State derived by replaying an ordered event stream | Snapshot invalidation, late-arriving events, retroactive corrections | Order lifecycle + refunds, audit reconstruction, version history |
+| **Access control matrix** | Fine-grained, context-dependent permissions | Attribute-based rules, delegation chains, temporary grants, scope inheritance | Document sharing, healthcare data access, multi-tenant SaaS |
+| **Multi-party negotiation** | Multiple independent actors must reach agreement | Quorum logic, timeout/escalation, conditional delegation, veto power | Contract approval, loan origination, committee voting, peer review |
+| **Temporal windowing** | Overlapping/adjacent time intervals with gap rules | Half-open vs closed intervals, merge/split semantics, cross-resource scheduling | Room booking, spectrum allocation, maintenance windows |
+| **Workflow orchestration** | Configurable multi-step pipelines with branching | Conditional routing, parallel fan-out/fan-in, compensation on failure, idempotency | CI/CD pipelines, document processing, onboarding flows |
+| **Compliance / audit** | Actions constrained by regulatory rules with audit trail | Mandatory cooling-off periods, segregation of duties, tamper-evident logs | Financial trading, pharmaceutical dispensing, government procurement |
 
-**Diversity guidance**: When generating a new scaffold, check the coverage column. If the scenario could fit multiple archetypes, prefer the underrepresented one. The 4 absent archetypes (multi-party negotiation, temporal windowing, workflow orchestration, compliance/audit) are high-priority targets for new scenarios.
+**Diversity guidance**: When the scenario could fit multiple archetypes, prefer one that is structurally different from recent scaffolds. Multi-party negotiation, temporal windowing, workflow orchestration, and compliance/audit are high-priority targets for new scenarios.
 
 ### 0.2 Cross-Cutting Complexity Layers
 
 These are independent difficulty dimensions that can be **layered onto any archetype**. Select 2–4 that fit the scenario:
 
-| Layer | What it adds | Difficulty mechanism | Observed in |
-|-------|-------------|---------------------|-------------|
-| **Optimistic concurrency** | Version-based conflict detection | Stale-data races, retry semantics. OCC alone only covers version-field conflicts on PATCH/PUT. If the scenario also has race-condition constraints (e.g., "at most one delivery per order"), define them explicitly in `concurrency_rules` (see §1.2.1). | 18/22 scaffolds |
-| **Cascading side effects** | One mutation triggers chain of dependent updates | N-level propagation, ordering sensitivity, partial failure | 20/22 scaffolds |
-| **Dual-variant calculation** | Same inputs, two valid algorithms, different outputs | Provisional vs final, optimistic vs pessimistic, estimate vs actual | 9/22 scaffolds |
-| **Rate / threshold triggers** | Behavior changes at configurable breakpoints | Boundary precision (>= vs >), cumulative vs instantaneous, threshold reset | 10/22 scaffolds |
-| **Derived field reconciliation** | Denormalized fields must stay consistent with source data | When to recompute, stale cache detection, consistency on partial update | 15/22 scaffolds |
-| **Ops-run checkpoint** | Periodic batch operation advances system epoch | Stale expiry, waitlist promotion, posture recalculation per epoch | 7/22 scaffolds — NEW |
-| **Contagion / risk propagation** | Side effects cascade with multiplicative risk scoring | Penalty accumulation, threshold breach with override, score floor/ceiling | 6/22 scaffolds — NEW |
-| **Version-pinning on approval** | Lock reference object versions when approved | Stale reference detection, re-validation on state change | 3/22 scaffolds — NEW |
-| **Scheduled / deferred actions** | Actions take effect at a future time | Clock dependency, cancellation before execution, what-if projections | 4/22 scaffolds |
-| **Soft delete / archival** | Resources are deactivated but still queryable | Filter semantics (include archived?), referential integrity with archived parents | 3/22 scaffolds |
-| **Idempotency** | Repeated identical requests produce same result | Idempotency keys, at-least-once delivery, duplicate detection | 5/22 scaffolds |
-| **Pagination with filtering** | List endpoints support complex query parameters | Filter + sort + paginate interaction, cursor vs offset, consistency under mutation | 22/22 scaffolds |
-| **Bulk operations** | Single request affects multiple resources | Partial success/failure, transactional vs best-effort, rollback semantics | 2/22 scaffolds |
-| **Multi-tenancy isolation** | Resources partitioned by tenant/scope | Cross-tenant leakage prevention, tenant-scoped uniqueness, shared vs private resources | 3/22 scaffolds |
-| **Conditional feature flags** | Behavior varies based on entity-level configuration | Combinatorial explosion of code paths, defaults vs overrides, migration from old behavior | 1/22 scaffolds |
+| Layer | What it adds | Difficulty mechanism |
+|-------|-------------|---------------------|
+| **Optimistic concurrency** | Version-based conflict detection | Stale-data races, retry semantics. OCC alone only covers version-field conflicts on PATCH/PUT. If the scenario also has race-condition constraints (e.g., "at most one delivery per order"), define them explicitly in `concurrency_rules` (see §1.2.1). |
+| **Cascading side effects** | One mutation triggers chain of dependent updates | N-level propagation, ordering sensitivity, partial failure |
+| **Dual-variant calculation** | Same inputs, two valid algorithms, different outputs | Provisional vs final, optimistic vs pessimistic, estimate vs actual |
+| **Rate / threshold triggers** | Behavior changes at configurable breakpoints | Boundary precision (>= vs >), cumulative vs instantaneous, threshold reset |
+| **Derived field reconciliation** | Denormalized fields must stay consistent with source data | When to recompute, stale cache detection, consistency on partial update |
+| **Ops-run checkpoint** | Periodic batch operation advances system epoch | Stale expiry, waitlist promotion, posture recalculation per epoch |
+| **Contagion / risk propagation** | Side effects cascade with multiplicative risk scoring | Penalty accumulation, threshold breach with override, score floor/ceiling |
+| **Version-pinning on approval** | Lock reference object versions when approved | Stale reference detection, re-validation on state change |
+| **Scheduled / deferred actions** | Actions take effect at a future time | Clock dependency, cancellation before execution, what-if projections |
+| **Soft delete / archival** | Resources are deactivated but still queryable | Filter semantics (include archived?), referential integrity with archived parents |
+| **Idempotency** | Repeated identical requests produce same result | Idempotency keys, at-least-once delivery, duplicate detection |
+| **Pagination with filtering** | List endpoints support complex query parameters | Filter + sort + paginate interaction, cursor vs offset, consistency under mutation |
+| **Bulk operations** | Single request affects multiple resources | Partial success/failure, transactional vs best-effort, rollback semantics |
+| **Multi-tenancy isolation** | Resources partitioned by tenant/scope | Cross-tenant leakage prevention, tenant-scoped uniqueness, shared vs private resources |
+| **Conditional feature flags** | Behavior varies based on entity-level configuration | Combinatorial explosion of code paths, defaults vs overrides, migration from old behavior |
 
 ### 0.3 Structural Dimensions
 
@@ -149,16 +149,18 @@ complexity_profile:
 
 ### 0.4 Difficulty Calibration
 
-Benchmarks exist to stress-test LLM coding ability. Target one of these two difficulty levels:
+Benchmarks exist to stress-test LLM coding ability. **Difficulty does NOT come from piling on more entities, endpoints, or error codes.** A small, tightly-coupled scaffold is harder than a big, loosely-coupled one — aim for density, not volume. Keep the surface lean so the interesting mechanics dominate.
+
+Target one of these two difficulty levels:
 
 | Level | Entity count | Endpoint count | Error codes | Calculation variants | State machines | Typical token budget |
 |-------|-------------|---------------|-------------|---------------------|---------------|---------------------|
-| **Advanced** | 10–15 | 18–35 | 15–35 | 2–3 | 3–5 with reverts + auto-transitions | ~50k |
-| **Expert** | 16–30 | 36–65 | 36–60 | 3+ | 4+ with cycles or parallel dimensions | ~80k |
+| **Advanced** | 6–10 | 12–22 | 10–18 | 2–3 | 3–5 with reverts + auto-transitions | ~25k |
+| **Expert** | 10–15 | 20–32 | 18–30 | 3+ | 4+ with cycles or parallel dimensions | ~40k |
 
-**Default to Advanced.** Only go Expert when the scenario naturally demands it (many entity types, complex cross-entity workflows). An overly simple scaffold fails to discriminate between implementations — never generate fewer than 10 entities or 18 endpoints.
+**Default to Advanced.** Only go Expert when the scenario genuinely needs more entity types to express the core coupling — not just because there's more to describe. If you find yourself adding a table to pad the count, delete it: use that token budget to make the remaining entities interact more deeply instead. Never generate fewer than 6 entities or 12 endpoints.
 
-These are guidelines, not hard rules. A 10-entity benchmark with one fiendishly tricky calculation can be harder than a 20-entity CRUD app.
+These are guidelines, not hard rules. A 6-entity benchmark with one fiendishly tricky calculation and 4 cross-cutting gates is harder than a 20-entity CRUD app.
 
 **What actually makes a benchmark hard (in order of impact):**
 1. Calculations where two valid interpretations of the same prose produce different numbers
@@ -207,7 +209,7 @@ entities:
 ```
 
 **Design principles:**
-- Entity count is bounded below by §0.4 (≥10 entities, ≥18 endpoints). If the scenario is too small to naturally reach that floor, expand scope — add subsidiary workflows, auxiliary entities, or cross-cutting concerns — rather than ship an under-specified benchmark. Do not inflate above what the scenario supports either; pick the Advanced vs Expert band per §0.4.
+- Entity count is bounded below by §0.4 (≥6 entities, ≥12 endpoints). If the scenario is too small to naturally reach that floor, expand scope — add subsidiary workflows, auxiliary entities, or cross-cutting concerns — rather than ship an under-specified benchmark. Do not inflate above what the scenario supports either; pick the Advanced vs Expert band per §0.4, and remember: difficulty comes from how tightly the entities you have interact, not from how many you list.
 - At least one entity with computed fields that derive from cross-entity data
 - Field names must be explicit — downstream PRD will reference them in prose
 - `common_fields: true` expands to four fields on the entity: `id` (**server-minted UUID with no type prefix** — e.g., `"8a3e1c0b-2f4d-4a91-9c8b-12e7b6a0f1d2"`, NOT `"ord_8a3e1c0b-…"`), `created_at` (ISO 8601 UTC, three fractional digits), `updated_at` (same format, refreshed on every mutation including cascaded side effects), `version` (integer, starts at `1`, increments by one on every mutation). When `common_fields: false`, the entity carries only `id` and `created_at` — use this for immutable or append-only resources (event logs, pairings, ledger entries, configuration snapshots).
@@ -495,13 +497,13 @@ Before finalizing the YAML:
 - [ ] Every error code referenced in `concurrency_rules` also appears in §1.6 Error Catalog
 
 **Difficulty:**
-- [ ] At least one calculation where two valid approaches produce different results
+- [ ] At least two calculations where two valid approaches produce different results — the two calculations MUST operate on different entity domains (e.g., one is cost accounting on an Order, the other is risk scoring on a Customer), so the scaffold exhibits dual-variant logic on more than one subject. A second calculation that repeats the same provisional-vs-final shape on the same entity or metric does NOT count.
 - [ ] At least one calculation with combinatorial complexity — satisfied by any of: (a) a formula with ≥3 inputs and non-linear interaction (nested `min`/`max`, conditional branches on entity state, tiered-rate selection), (b) nested rounding where the order matters — "round per-line-item then sum" vs "sum then round" produce different cents; the scaffold MUST pin one order and state it explicitly, (c) a circular-looking dependency where evaluation order must be explicit (e.g., `total = subtotal + fee`, but `fee` is computed from a discount keyed on the total tier — scaffold pins the evaluation order so the value is well-defined). A single-formula `aggregation` + `threshold` calculation does NOT satisfy this.
-- [ ] At least one state machine has non-linear shape — a cycle (A→B→A, revision loops, negotiation rounds), parallel state dimensions on one entity (e.g., `payment_status × fulfillment_status` evolve independently on the same row), OR branching fork-join (A→{B,C}→D with divergent side-effect sets per branch). A scaffold whose state machines are all linear A→B→C→D pipelines does NOT satisfy this, even if individual pipelines are long.
-- [ ] At least one transitive cascade of depth ≥ 3 — an action on entity A mutates B; that mutation on B **itself** triggers a mutation on C; the mutation on C **itself** triggers a mutation on D. Each link is caused by the previous link, not by the original action. A fan-out where one action directly mutates B, C, and D in parallel does NOT count. Spell the chain out in the relevant `state_machines[].transitions[].side_effects` entries so a PRD reader can follow each hop.
-- [ ] At least one validation priority conflict testable by dual-failure scenario
-- [ ] At least one boundary condition requiring exact precision (>= vs >, zero quantity, empty set)
-- [ ] At least one cross-entity state dependency (entity A's valid transitions depend on entity B's state)
+- [ ] At least two state machines with non-linear shape — a cycle (A→B→A, revision loops, negotiation rounds), parallel state dimensions on one entity (e.g., `payment_status × fulfillment_status` evolve independently on the same row), OR branching fork-join (A→{B,C}→D with divergent side-effect sets per branch). The two non-linear machines MUST belong to different entities. A scaffold whose state machines are all linear A→B→C→D pipelines — no matter how long each pipeline is — does NOT satisfy this.
+- [ ] At least two transitive cascades, at least one of depth ≥ 3 and the other of depth ≥ 2 — each cascade chains mutations where an action on entity A mutates B; that mutation on B **itself** triggers a mutation on C; (and so on). Each link MUST be caused by the previous link, not by the original action — a fan-out where one action directly mutates multiple targets in parallel does NOT count. The two cascades MUST originate from different triggering transitions, so the scaffold captures more than one propagation pattern. Spell each chain out in the relevant `state_machines[].transitions[].side_effects` entries so a PRD reader can follow each hop.
+- [ ] At least two validation priority conflicts testable by dual-failure scenarios — the two conflicts MUST involve different error-category pairs (e.g., one is `state` vs `business_fiscal`, another is `business_safety` vs `business_referential`), so the scaffold exercises more than a single priority rule. A second copy of the same pairing does NOT count.
+- [ ] At least two boundary conditions requiring exact precision (>= vs >, zero quantity, empty set) — the two boundaries MUST sit on different metrics (e.g., one is a numeric threshold crossing, the other is an empty-collection or zero-count edge), and each MUST be reachable through a distinct endpoint. Two boundaries on the same formula do NOT count.
+- [ ] At least two cross-entity state dependencies (entity A's valid transitions depend on entity B's state) — the two dependencies MUST cross different entity pairs (e.g., Order→Customer and Shipment→Warehouse), so the scaffold forces reasoning about more than one cross-entity relationship. Two transitions on the same entity pair do NOT count.
 
 **Diversity (compare against the 22 existing example scaffolds in this directory):**
 
