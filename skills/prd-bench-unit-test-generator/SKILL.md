@@ -25,7 +25,7 @@ as subdirectories under it. All generated code uses **relative imports** within 
 
 **Source priority**: The scaffold is the extraction index; the PRD is the contract. See "PRD-First Principle" below.
 
-**`scaffold_difficulty_design` is a mandatory priority queue.** Every instance it declares MUST be covered by at least one test (subject to PRD-First). See §2.1.A "Difficulty Design Coverage" below — this is a hard gate on Stage 2 completion.
+**`scaffold_difficulty_design` is a mandatory priority queue.** Every instance it declares MUST be covered by at least TWO tests (subject to PRD-First). See §2.1.A "Difficulty Design Coverage" below — this is a hard gate on Stage 2 completion.
 
 ```
 {working_dir}/                     # ← input directory (provided by user)
@@ -745,7 +745,7 @@ After generating both layers, verify:
 5. **Every RBAC exclusive operation** has a negative test (wrong role → ERR_UNAUTHORIZED) — role assignments are universally expressed in PRD §2.1, so this check rarely gates.
 6. **Every complexity layer** in `complexity_profile.complexity_layers` has dedicated test coverage — but ONLY for behaviors the PRD describes. For `optimistic_concurrency`, this means version-conflict tests and any explicit skip-if-absent semantics; it does NOT automatically mean race-condition tests. Race-condition tests (using `run_race`, `assert_exactly_one_succeeds`, etc.) should ONLY be generated when the PRD explicitly defines the expected outcome of concurrent operations (e.g., "only one delivery per order", "exactly one of confirm/cancel wins"). If the PRD is silent on race semantics, do not generate race tests.
 
-7. **Every `scaffold_difficulty_design[*].instances[*]` entry has at least one test** whose docstring carries the `# difficulty: <rule_id>/<instance.name>` tag. Count expected instances (N) vs. tagged tests (M) — any shortfall is either surfaced in the summary report under `difficulty-coverage-blocked-by-prd-silence` with a cited cause, or it is a generation bug that fails Stage 2. This check is STRICTER than checks 1–6 above: difficulty-design instances may NOT be silently skipped; a missing test must be explicitly escalated.
+7. **Every `scaffold_difficulty_design[*].instances[*]` entry has at least TWO tests** whose docstrings carry the `# difficulty: <rule_id>/<instance.name>` tag. Count expected instances (N) vs. tagged tests (M) — any shortfall (M < 2 × N) is either surfaced in the summary report under `difficulty-coverage-blocked-by-prd-silence` with a cited cause, or it is a generation bug that fails Stage 2. This check is STRICTER than checks 1–6 above: difficulty-design instances may NOT be silently skipped; a missing test must be explicitly escalated.
 
 All seven checks are subject to the PRD-First Principle: **if a scaffold item has no corresponding PRD description, it produces no test**. Missing PRD coverage is NOT a reason to generate a "best-effort" test — it is a reason to skip. If you believe the PRD has an unintentional gap, stop generation and surface the gap in a note; do not silently test scaffold-only rules.
 
@@ -768,6 +768,6 @@ At the end of generation, emit a short report listing:
 - Total tests generated
 - Tests skipped due to PRD silence (categorize by pattern: computed-field, default-value, branch-asymmetry, precedence-silence, concurrency-silence, other)
 - Any scaffold rules that produced zero tests because PRD silence blocked generation
-- **Difficulty-design coverage**: count of `scaffold_difficulty_design[*].instances[*]` declared (N), count of tests carrying a `# difficulty:` tag (M), and — if M < N — an explicit list of uncovered instances bucketed under `difficulty-coverage-blocked-by-prd-silence` with the PRD gap cited for each. M < N without this bucketed escalation is a Stage 2 failure.
+- **Difficulty-design coverage**: count of `scaffold_difficulty_design[*].instances[*]` declared (N), count of tests carrying a `# difficulty:` tag (M), and — if M < 2 × N — an explicit list of under-covered instances bucketed under `difficulty-coverage-blocked-by-prd-silence` with the PRD gap cited for each instance missing its second test. M < 2 × N without this bucketed escalation is a Stage 2 failure.
 
 This report is the feedback channel back to the doc-generator. A high skip count for a single category means the PRD generator is systematically eliding that category and its Zero-Silence Rule needs inspection.
