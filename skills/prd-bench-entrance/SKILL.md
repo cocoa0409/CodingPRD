@@ -138,9 +138,22 @@ the full generation specification. Then read both:
 - {task_dir}/workspace/PRD.md
 
 Generate complete test infrastructure in {task_dir}/test_helpers/ and test cases in
-{task_dir}/test_suite/. Tests must rigorously align with every rule in the SCAFFOLD
-and PRD — exact error_ids, exact field names, exact state transitions, exact calculation
-formulas with correct precision.
+{task_dir}/test_suite/. Both layers are part of the test artifact and both must
+be PRD-faithful:
+  - test_suite/: assertions must match PRD rules verbatim (exact error_ids,
+    exact field names, exact state transitions, exact calculation formulas
+    with correct precision).
+  - test_helpers/: fixtures, factories, and per-role header builders must
+    construct preconditions that the PRD permits the request to be issued
+    under. Concretely: if PRD requires ownership (e.g., "the acting
+    restaurant must be the one that owns the order"), the role-header
+    helper must mint an X-User-ID that resolves to the actual owner id, not
+    a shared constant that would fail any ownership check regardless of
+    implementation. If PRD declares a payload schema, factories must emit
+    that exact schema.
+A fixture that forces the implementation to drop a PRD-required check in
+order to pass is a test bug the generator has the first opportunity to
+prevent.
 ```
 
 ### Step 6: Generate Implementation (subagent)
@@ -189,12 +202,32 @@ You are a PRD benchmark diagnostic expert. {passed}/{total} tests pass, {failed}
 Failed tests: {list of failed test names from results.json}
 
 The benchmark's contract is: implementers read PRD.md only, never SCAFFOLD.yaml.
-Tests must therefore trace to PRD prose — tests that assert scaffold-only rules are
-unfair and must be deleted.
+Both layers of the test artifact must therefore trace to PRD prose:
+  - `test_suite/` — the assertion must match a rule stated verbatim in PRD.
+  - `test_helpers/` — the fixtures, factories, and role-header builders must
+    construct preconditions and identities consistent with PRD (e.g., PRD's
+    role-to-resource ownership model, PRD's declared payload shapes, PRD's
+    declared entity statuses).
+A test that asserts scaffold-only rules is unfair and must be deleted. A test
+whose fixture issues a request inconsistent with PRD (so the PRD-faithful
+implementation correctly rejects it) is a test bug — fix the fixture in
+`test_helpers/`, do not strip the PRD-required check from the implementation.
 
 Diagnostic protocol — follow IN ORDER for each failing test:
 
-STEP 1: PRD COVERAGE + UNIQUE-DERIVABILITY CHECK (must run FIRST, before any code is read)
+STEP 0: READ FAILURE DETAIL
+
+  Read {task_dir}/workspace/implementation/results.json for the failure
+  detail of every failing test — tracebacks, the request URL/headers/
+  payload actually sent, the response body actually received, and which
+  assertion tripped. This is ground truth. Do not attribute blame to PRD,
+  tests, or implementation until you have seen what the test actually
+  observed vs. expected.
+
+  Subsequent STEPs operate only on the set of failing tests identified
+  here. Do not re-open passing tests.
+
+STEP 1: PRD COVERAGE + UNIQUE-DERIVABILITY CHECK
 
   This step has TWO sub-checks. Both must pass for the test to stay. A test
   that fails either one must be deleted — not weakened, not fixed against
@@ -276,20 +309,83 @@ STEP 1: PRD COVERAGE + UNIQUE-DERIVABILITY CHECK (must run FIRST, before any cod
 STEP 2: TEST-vs-PRD CONSISTENCY CHECK (only if STEP 1 says PRD covers and
         uniquely determines the rule)
 
-  a. Read {task_dir}/workspace/implementation/results.json for the failure
-     detail (tracebacks, request/response payloads).
-  b. Cross-reference the test's assertions against the PRD sentence. Is the
-     test a faithful translation of what the PRD actually says? (Boundary
-     inclusive vs exclusive, field name verbatim, error_id verbatim.)
-     - TEST IS WRONG: fix the test to match PRD wording exactly. The fix must
-       make the test MORE faithful to PRD, never less.
-     - TEST IS FAITHFUL: proceed to STEP 3.
+  Audit the test as a whole — not just the assertion, but the full
+  test environment setup, the request actually issued, and the
+  assertion that tripped. The test artifact spans TWO directories,
+  and both are under audit here:
+    - {task_dir}/test_suite/   (the test function and its assertions)
+    - {task_dir}/test_helpers/ (fixtures, factories, per-role header
+                                builders, conftest, constants, assertion
+                                library)
+
+  A fixture, factory, or role-header helper that constructs a
+  precondition inconsistent with the PRD is a TEST BUG, not an
+  implementation bug. Test_helpers counts as "the test" for the
+  purpose of this check.
+
+  a. Trace the failing test end-to-end. Using STEP 0's captured
+     request/response and the source of the test function, list every
+     helper the test (or its setup chain) invoked:
+       - which fixture built the entities in play
+       - which factory constructed the request payload
+       - which header helper produced X-User-ID / X-User-Role
+       - which assertion helper evaluated the response
+     Every one of these is part of "the test's expressed logic".
+
+  b. Cross-reference the test's expressed logic — setup + request +
+     assertion together — against the PRD sentence STEP 1 pinned. Does
+     the test express exactly the rule the PRD sentence requires, no
+     more and no less? Check all of:
+
+       * Setup state: do the entities created by fixtures satisfy the
+         PRD preconditions for this flow (status, relationships,
+         timestamps, counters, ownership chain)?
+       * Request identity: does X-User-ID / X-User-Role / ownership id
+         match the role-to-resource mapping the PRD requires? For
+         example, if PRD requires "the acting restaurant must be the one
+         that owns the order", does the test send a header whose user-id
+         resolves to the order's restaurant_id — not a shared constant
+         that would fail any ownership check regardless of
+         implementation?
+       * Request payload: field names, types, and required/optional
+         shape match PRD verbatim?
+       * Assertion: expected error_id, expected field name, expected
+         boundary (inclusive vs exclusive), expected status transition
+         match PRD verbatim?
+
+     Decide one of:
+       - TEST IS WRONG: the test's setup, request, or assertion does
+         not faithfully express the PRD rule. Fix the offending artifact
+         in whichever layer it lives:
+           * Assertion mis-translates PRD wording
+             → edit the test function in test_suite/.
+           * Fixture / factory / role-header helper constructs a
+             precondition that violates PRD (wrong ownership mapping,
+             wrong entity status, missing required relationship, shared
+             identity across owners PRD requires to be distinct, etc.)
+             → edit the relevant file in test_helpers/.
+           * Request payload is malformed relative to PRD
+             → edit the factory (or the test function if the test
+             constructs payload inline).
+         The fix must make the test MORE faithful to PRD, never less.
+         Never add skip / xfail. Never downgrade an exact error_id
+         assertion to an HTTP-status assertion. If the fix in
+         test_helpers/ affects many tests, that is fine — it means the
+         fixture bug had wide reach.
+       - TEST IS FAITHFUL: the setup, request, and assertion all
+         faithfully express the PRD rule. Proceed to STEP 3.
 
 STEP 3: IMPLEMENTATION FIX (only if PRD covers the rule, uniquely determines
-        the behavior, AND the test is faithful)
+        the behavior, AND the test — setup + request + assertion — is
+        faithful to PRD)
 
   a. Read the relevant code in {task_dir}/workspace/implementation/ and fix
      the implementation so the test passes.
+  b. Never remove or weaken an implementation check that PRD requires
+     just because tests fail to exercise it correctly. If a PRD-required
+     check (e.g., ownership, state gate, precondition) only looks "too
+     strict" because the test setup cannot satisfy it, that belongs in
+     STEP 2 (fix test_helpers), not here.
 
 Cardinal rules:
 
@@ -307,6 +403,19 @@ Cardinal rules:
   `validate_error_is_one_of([...])` IS permitted when PRD only names a
   member of the set, not the specific choice — this is a coverage
   correction, not a hack.)
+- NEVER remove or weaken an implementation check that PRD requires in
+  order to accommodate a test fixture that violates the PRD precondition.
+  If a PRD-required check (ownership, state gate, role scoping,
+  referential integrity) rejects requests the tests issue, and the reason
+  is that test_helpers constructed the request with a precondition PRD
+  forbids (e.g., shared X-User-ID across distinct resource owners), the
+  fixture is the bug — fix test_helpers in STEP 2, do not strip the
+  check from the implementation.
+- TRIAGE HINT: when ≥5 failing tests share the same setup error (e.g.,
+  the same "Setup step failed" trace, the same 4xx from the same helper
+  call), treat test_helpers as the first suspect before attributing to
+  implementation. A common upstream fixture bug routinely masquerades as
+  many independent implementation bugs.
 - When in doubt about STEP 1, produce both: (i) the verbatim PRD quote that
   states the rule, and (ii) the two divergent PRD-faithful implementations
   that would and would not pass the test. If you cannot produce (i) or you
@@ -336,19 +445,28 @@ Each iteration is a fresh subagent, so context never accumulates across fix cycl
 
 ## Key Principles
 
-1. **PRD.md is the contract; SCAFFOLD.yaml is the generator index.** Every implementation behavior must trace to PRD prose. Every test assertion must trace to PRD prose. The scaffold exists to *drive generation* — it is not a contract the implementer can read. When test and scaffold agree but PRD is silent, **the PRD wins**: delete the test. When PRD and scaffold disagree on semantics (threshold boundaries, error names, state names), that is a bug in the doc-generator skill — report it rather than silently favoring one side, but if you must proceed, favor PRD.
+1. **PRD.md is the contract; SCAFFOLD.yaml is the generator index.** Every implementation behavior must trace to PRD prose. Every test artifact — the assertion in `test_suite/` AND the fixture, factory, or role-header helper in `test_helpers/` that sets up the call — must trace to PRD prose. The scaffold exists to *drive generation* — it is not a contract the implementer can read. When test and scaffold agree but PRD is silent, **the PRD wins**: delete the test. When PRD and scaffold disagree on semantics (threshold boundaries, error names, state names), that is a bug in the doc-generator skill — report it rather than silently favoring one side, but if you must proceed, favor PRD.
 
-2. **Unit test correctness is the first priority.** Tests are the benchmark's measuring instrument — if the instrument asserts rules the implementer cannot read, the measurement is meaningless. Before touching any implementation code, verify that every failing test's asserted rule is stated in PRD prose. A test suite that passes by being lenient is worse than useless; a test suite that asserts scaffold-only rules is unfair.
+2. **Unit test correctness is the first priority — and "the test" means BOTH `test_suite/` and `test_helpers/`.** Tests are the benchmark's measuring instrument. A test is the composition of three layers, all generated by the unit-test-generator and all subject to correctness audit:
+   - **Setup/precondition** — fixtures, factories, per-role header builders, conftest scaffolding (in `test_helpers/`). Encodes the *state* and *identity* the request is issued from.
+   - **Request** — the API call the test function issues, often routed through a client/factory helper.
+   - **Assertion** — the expected status code, error_id, field presence, boundary, or state transition (in `test_suite/`).
 
-3. **Hacking tests is forbidden. Deleting PRD-uncovered or PRD-ambiguous tests is required.** These look similar but are opposites:
-   - **Forbidden (test hacking):** deleting a test because it's "too strict", changing an expected value to match current implementation output, downgrading an `error_id` check to a generic HTTP-status check, adding `@pytest.mark.skip`/`@pytest.mark.xfail` to dodge a failure, weakening a boundary test to an approximate one.
-   - **Required (PRD alignment):** deleting a test whose asserted rule either (a) has no verbatim PRD coverage, or (b) has PRD coverage but PRD does not uniquely determine the asserted outcome — i.e., a faithful PRD-only implementer could produce a different but still-consistent implementation that the test would fail on. See Step 7.3 STEP 1a/1b.
+   A bug in any of the three corrupts the measurement. A shared X-User-ID across distinct resource owners in `test_helpers/test_users.py` is just as much a test bug as an off-by-one in a boundary assertion — and can silently cascade into dozens of "implementation" failures that are actually fixture-induced. Before touching any implementation code, verify that every failing test's **setup, request, AND assertion** are all stated in or consistent with PRD prose. A test that passes by being lenient is worse than useless; a test whose fixture forces the implementation to drop a PRD-required check is actively harmful. Fixes to `test_helpers/` that ripple across many tests are normal and expected — the fixture bug's reach is the size of its ripple.
 
-   The distinguishing double question for every candidate deletion:
+3. **Hacking tests is forbidden. Deleting PRD-uncovered or PRD-ambiguous tests is required. Repairing PRD-inconsistent fixtures is also required.** These look similar but are distinct:
+   - **Forbidden (test hacking):** deleting a test because it's "too strict", changing an expected value to match current implementation output, downgrading an `error_id` check to a generic HTTP-status check, adding `@pytest.mark.skip`/`@pytest.mark.xfail` to dodge a failure, weakening a boundary test to an approximate one. **Also forbidden:** stripping a PRD-required check from the implementation because the current test fixtures can't satisfy it — that is implementation-hacking to fit a broken fixture.
+   - **Required (PRD alignment — assertion level):** deleting a test whose asserted rule either (a) has no verbatim PRD coverage, or (b) has PRD coverage but PRD does not uniquely determine the asserted outcome — i.e., a faithful PRD-only implementer could produce a different but still-consistent implementation that the test would fail on. See Step 7.3 STEP 1a/1b.
+   - **Required (PRD alignment — fixture/helper level):** editing `test_helpers/` when a fixture, factory, or role-header helper constructs a precondition inconsistent with PRD (e.g., shared X-User-ID across owners PRD requires to be distinct, wrong entity status before a transition, missing required relationship, payload shape that doesn't match PRD's declared schema). This is STEP 2 of the fix-cycle protocol. See Step 7.3 STEP 2.
+
+   The distinguishing double question for every candidate **deletion**:
    - *"Can I produce a verbatim PRD quote that states the rule this test asserts?"* (coverage)
    - *"Does that quote pin the assertion's expected outcome to a single answer, such that every faithful PRD reader would arrive at it?"* (unique derivability)
 
    Both must be "yes" for the test to stay. Either "no" → the test goes.
+
+   The distinguishing question for every candidate **fixture repair**:
+   - *"Does the PRD require some property of the request (role, ownership id, entity state, payload shape) that the current fixture fails to supply?"* — if yes, the fixture is the bug; fix it in `test_helpers/`, and leave the implementation's PRD-required check intact.
 
 4. **Scenario description passes through verbatim.** The user's input to this skill is forwarded unmodified to `prd-bench-scaffold-generator`. Do not summarize, restructure, or "improve" it.
 
