@@ -46,7 +46,7 @@ For completed examples, see the `examples/` directory. For a blank template, see
 
 ```
 - [ ] 0: Select complexity profile (§0.1–§0.4)
-- [ ] 0.5: Internalize the seven Difficulty Rules (§0.5) — keep them in mind while drafting §1.1–§1.7, not as a post-hoc audit
+- [ ] 0.5: Internalize the nine Difficulty Rules (§0.5) — keep them in mind while drafting §1.1–§1.7, not as a post-hoc audit
 - [ ] 1.0: Response Envelope — emit the FIXED block verbatim (§1.0)
 - [ ] 1.1: Entity-Relationship Table
 - [ ] 1.2: State Machine Table
@@ -179,7 +179,7 @@ These are guidelines, not hard rules. A 6-entity benchmark with one fiendishly t
 
 ### 0.5 Difficulty Rules
 
-Seven hard rules that shape the scaffold's contents. They apply **while you are drafting §1.1–§1.7** (not as an afterthought), are cross-referenced by §1.8 Scaffold Difficulty Design (Test Targeting Index), and are audited at the end by the Quality Checklist. Each rule has a stable `rule_id` that §1.8 uses verbatim.
+Nine hard rules that shape the scaffold's contents. They apply **while you are drafting §1.1–§1.7** (not as an afterthought), are cross-referenced by §1.8 Scaffold Difficulty Design (Test Targeting Index), and are audited at the end by the Quality Checklist. Each rule has a stable `rule_id` that §1.8 uses verbatim.
 
 **Rule 1 — Dual-variant calculations across different entity domains**  (`rule_id: dual_variant_calc`, ≥ 2 instances)
 At least two `calculations[]` entries where two valid approaches produce different results. The two calculations MUST operate on different entity domains (e.g., one is cost accounting on an Order, the other is risk scoring on a Customer), so the scaffold exhibits dual-variant logic on more than one subject. A second calculation that repeats the same provisional-vs-final shape on the same entity or metric does NOT count.
@@ -205,6 +205,12 @@ At least two boundary conditions requiring exact precision (`>=` vs `>`, zero qu
 
 **Rule 7 — Cross-entity state dependencies across different entity pairs**  (`rule_id: cross_entity_state_dependency`, ≥ 2 instances)
 At least two cross-entity state dependencies (entity A's valid transitions depend on entity B's state). The two dependencies MUST cross different entity pairs (e.g., Order→Customer and Shipment→Warehouse), so the scaffold forces reasoning about more than one cross-entity relationship. Two transitions on the same entity pair do NOT count.
+
+**Rule 8 — Resource temporal-overlap conflicts across different interval semantics**  (`rule_id: resource_temporal_overlap`, ≥ 2 instances)
+At least two overlap-detection rules where an interval occupation on a resource is rejected because it collides with another. The two rules MUST differ in **interval semantics** — the geometric treatment of adjacency, buffers, or aggregate capacity — and sit on different resource entities. Two overlap rules with identical interval arithmetic do NOT count.
+
+**Rule 9 — Compensating-action invariants across different conserved quantities**  (`rule_id: compensating_invariant`, ≥ 2 instances)
+At least two invariants where a forward action paired with its compensating action MUST leave a named global quantity unchanged, pinned as an explicit formula over entity fields. The two invariants MUST involve different types of conserved quantities. A cascade that runs end-to-end but leaves drift in the named quantity does NOT satisfy this.
 
 ---
 
@@ -502,7 +508,7 @@ Why this field is mandatory: without it, the PRD, the test fixtures, and the imp
 
 **Output location**: a separate file `SCAFFOLD_DIFFICULTY_DESIGN.yaml` sibling to `SCAFFOLD.yaml`, with `scaffold_difficulty_design:` as its single top-level key. Do NOT emit it inside `SCAFFOLD.yaml`.
 
-**Purpose**: a machine-readable index of every difficulty feature the scaffold claims to exhibit, cross-referenced from §1.1–§1.7 against the seven Difficulty Rules defined in §0.5. Its sole job is to drive the downstream unit-test-generator toward complete coverage. Every `rule_id` below corresponds verbatim to a `rule_id` in §0.5; **§0.5 is authoritative** for each rule's full text, minimum instance count, differentiation clause, and counter-examples. This section does not restate those.
+**Purpose**: a machine-readable index of every difficulty feature the scaffold claims to exhibit, cross-referenced from §1.1–§1.7 against the nine Difficulty Rules defined in §0.5. Its sole job is to drive the downstream unit-test-generator toward complete coverage. Every `rule_id` below corresponds verbatim to a `rule_id` in §0.5; **§0.5 is authoritative** for each rule's full text, minimum instance count, differentiation clause, and counter-examples. This section does not restate those.
 
 **Critical semantics:**
 - **Not an independent rule source.** Every instance MUST ground in elements already declared in §1.1–§1.7. Deleting this file must leave the scaffold's declared behavior identical — it only makes test coverage harder to audit.
@@ -535,10 +541,10 @@ scaffold_difficulty_design:
         test_recipe: { setup: [...], trigger: [...], assert: [...] }
   - rule_id: combinatorial_formula
     instances: [ <one or more, per §0.5 minimum> ]
-  # … five more rule_id blocks, each meeting its own §0.5 minimum …
+  # … seven more rule_id blocks, each meeting its own §0.5 minimum …
 ```
 
-**Instance counts**: §0.5 is authoritative. Quick reference — every rule has the same minimum: **≥ 2 instances → ≥ 14 instances total**, counted as `- name:` entries nested under `instances:`. A scaffold with 7 `rule_id`s each carrying a single instance = 7 instances = FAIL.
+**Instance counts**: §0.5 is authoritative. Quick reference — every rule has the same minimum: **≥ 2 instances → ≥ 18 instances total**, counted as `- name:` entries nested under `instances:`. A scaffold with 9 `rule_id`s each carrying a single instance = 9 instances = FAIL.
 
 **Per-instance contract:**
 1. Every `grounds:` entry MUST resolve to a declared element in §1.1–§1.6. A grounds entry naming a missing calculation, transition, validation, field, or race is a dangling claim — remove it or add the grounding.
@@ -582,5 +588,5 @@ Each declaration in the scaffold is an edge; self-consistency means both ends re
 - [ ] **Computation determinism** — Order-sensitive calculations MUST pin both sort key and tie-break. Multi-step rounding MUST pin the rounding order. Fields referenced inside `formula:` MUST be unambiguous — use the exact field name (`credit_balance_cents`), not paraphrases ("the customer's credit") that could resolve to either a provisional or a finalized field.
 
 **Difficulty (audit — the spec lives at §0.5):**
-- [ ] Every §0.5 rule (1–7) is satisfied by §1.1–§1.7, honoring its differentiation clause, and mirrored in `SCAFFOLD_DIFFICULTY_DESIGN.yaml` with ≥2 instances per rule (≥14 instances total)
+- [ ] Every §0.5 rule (1–9) is satisfied by §1.1–§1.7, honoring its differentiation clause, and mirrored in `SCAFFOLD_DIFFICULTY_DESIGN.yaml` with ≥2 instances per rule (≥18 instances total)
 - [ ] Every instance's `distinguishing_aspect` names the specific distinction §0.5 demands of its `rule_id` — not generic prose
