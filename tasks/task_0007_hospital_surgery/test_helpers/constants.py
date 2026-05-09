@@ -1,0 +1,18 @@
+"""Domain thresholds and well-known numeric constants used in the surgery PRD."""
+
+THRESHOLDS = {
+    "STERILIZATION_EXPIRY_MINUTES": 4320,           # 72 hours
+    "STAFF_MAX_WORKING_MINUTES_PER_DAY": 720,       # 12 hours
+    "WORKING_HOURS_WINDOW_MINUTES": 1440,           # 24-hour rolling window
+    "INSTRUMENT_SET_BASE_FEE": 150.00,
+    "DEFAULT_TURNOVER_BUFFER_MINUTES": 30,
+}
+
+TEST_DEFAULTS = {
+    "ROOM_HOURLY_RATE": 500.00,
+    "ANESTHESIOLOGIST_HOURLY_RATE": 200.00,
+    "SCRUB_NURSE_HOURLY_RATE": 80.00,
+    "CIRCULATING_NURSE_HOURLY_RATE": 70.00,
+    "DEFAULT_SHIFT_START": 0,
+    "DEFAULT_SHIFT_END": 1440,
+}

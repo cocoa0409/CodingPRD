@@ -159,7 +159,7 @@ Read the skill at {project_root}/skills/prd-bench-implementation-generator/SKILL
 - {task_dir}/SCAFFOLD.yaml
 - {task_dir}/workspace/PRD.md
 
-Generate a complete Python + Flask implementation in {task_dir}/workspace/implementation/ including a Dockerfile.
+Generate a complete Python + Flask implementation with well-orgnized folder and file structure in {task_dir}/workspace/implementation/ including a Dockerfile.
 ```
 
 ### Step 7: Run Tests and Iterate
@@ -188,9 +188,9 @@ prd-bench-docker-run \
   --results-file {task_dir}/workspace/implementation/results.json
 ```
 
-Then read `{task_dir}/workspace/implementation/results.json`. Extract `passed`, `total`, `failed`.
-- If `passed == total` → **exit** with a summary report (see the Summary block at the end of this prompt).
-- Otherwise → apply the diagnostic protocol below to every failing test, make the fixes, rerun the command above, and repeat. No iteration cap.
+Then read `{task_dir}/workspace/implementation/results.json`. Extract `passed`, `total`, `failed`, `skipped`.
+- If `passed == total` (i.e. `failed == 0 AND skipped == 0`) → **exit** with a summary report (see the Summary block at the end of this prompt).
+- Otherwise → apply the diagnostic protocol below to every failing AND every skipped test, make the fixes, rerun, and repeat. No iteration cap.
 
 The benchmark's contract is: implementers read PRD.md only, never SCAFFOLD.yaml. Both layers of the test artifact must therefore trace to PRD prose:
   - `test_suite/` — the assertion must match a rule stated verbatim in PRD.
@@ -282,7 +282,8 @@ Cardinal rules:
 - DELETE a test when STEP 1a finds PRD silent on the asserted rule.
 - DELETE a test when STEP 1b finds PRD does not uniquely determine the asserted outcome (the two-reader experiment produces divergent implementations).
 - Never delete a test because it is "strict", "brittle", or "hard to pass". The deletion criterion is PRD coverage + unique derivability, not difficulty.
-- NEVER weaken an assertion to make implementation pass. Downgrading an `error_id` check to an HTTP-status check, replacing a boundary test with an approximate one, or adding `pytest.mark.skip` / `@pytest.mark.xfail` are all forbidden. (Exception: relaxing an exact-error assertion to `validate_error_is_one_of([...])` IS permitted when PRD only names a member of the set, not the specific choice — this is a coverage correction, not a hack.)
+- NEVER weaken an assertion to make implementation pass. Downgrading an `error_id` check to an HTTP-status check, replacing a boundary test with an approximate one, or adding `pytest.mark.skip` / `@pytest.mark.xfail` / inline `pytest.skip(...)` calls are all forbidden. (Exception: relaxing an exact-error assertion to `validate_error_is_one_of([...])` IS permitted when PRD only names a member of the set, not the specific choice — this is a coverage correction, not a hack.)
+- TREAT SKIPPED AS FAILED. A skipped test means the asserted scenario was unreachable under the test's setup — that is a unique-derivability failure, not a pass. Run STEP 1 against it: either the scenario is reachable under a PRD-faithful setup (rewrite the fixture/setup so it actually executes the assertion), or the scenario contradicts PRD (DELETE the test). Inline `pytest.skip(...)` guards inside test bodies must be removed in either branch.
 - NEVER remove or weaken an implementation check that PRD requires in order to accommodate a test fixture that violates the PRD precondition. If a PRD-required check (ownership, state gate, role scoping, referential integrity) rejects requests the tests issue, and the reason is that test_helpers constructed the request with a precondition PRD forbids (e.g., shared X-User-ID across distinct resource owners), the fixture is the bug — fix test_helpers in STEP 2, do not strip the check from the implementation.
 - TRIAGE HINT: when ≥5 failing tests share the same setup error (e.g., the same "Setup step failed" trace, the same 4xx from the same helper call), treat test_helpers as the first suspect before attributing to implementation. A common upstream fixture bug routinely masquerades as many independent implementation bugs.
 - When in doubt about STEP 1, produce both: (i) the verbatim PRD quote that states the rule, and (ii) the two divergent PRD-faithful implementations that would and would not pass the test. If you cannot produce (i) or you CAN produce (ii), the test goes.

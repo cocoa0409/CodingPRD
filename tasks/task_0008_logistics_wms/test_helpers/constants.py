@@ -1,0 +1,74 @@
+"""Domain thresholds — numeric constants from PRD calculations."""
+
+# Inspection sampling tiers (PRD §3.2)
+INSPECTION_SAMPLE_TIERS = [
+    (50, 8),
+    (150, 13),
+    (280, 20),
+    (500, 32),
+]
+INSPECTION_SAMPLE_DEFAULT = 50  # for declared_total_units > 500
+
+# AQL pass threshold (PRD §3.2)
+AQL_PASS_THRESHOLD = 0.025
+
+# Carton physical limits (PRD §3.7)
+CARTON_VOLUME_CM3 = 50000
+CARTON_WEIGHT_G = 20000
+
+# Risk score weights and thresholds (PRD §3.1)
+SHRINKAGE_DENOMINATOR_CENTS = 100  # 1 point per dollar
+ABNORMAL_EVENT_WEIGHT = 10
+RECALL_WEIGHT = 100
+RISK_SCORE_MAX = 1000.00
+POSTURE_FROZEN_THRESHOLD = 200  # > 200 → FROZEN
+POSTURE_RESTRICTED_THRESHOLD = 100  # > 100 (and ≤ 200) → RESTRICTED
+
+# Near-expiry threshold (PRD §3.9)
+NEAR_EXPIRY_DAYS = 30
+
+# Time windows
+ABNORMAL_EVENT_WINDOW_SECONDS = 86400  # 24 hours
+SHRINKAGE_WINDOW_DAYS = 30
+SECONDS_PER_DAY = 86400
+
+# Tracking number prefixes (PRD §3.7)
+TRACKING_PREFIX = {
+    "UPS": "1Z",
+    "FEDEX": "FX",
+    "USPS": "US",
+}
+
+# Carrier values (PRD §3.4)
+VALID_CARRIERS = ["UPS", "FEDEX", "USPS"]
+
+# Bin zones / lot categories (PRD §3.1)
+ZONES = ["AMBIENT", "COLD", "HAZMAT", "RETURNS"]
+
+# Pick strategies (PRD §3.4)
+PICK_STRATEGIES = ["FEFO", "FIFO"]
+
+# Putaway strategies (PRD §3.1)
+PUTAWAY_STRATEGIES = ["DISTANCE_OPTIMIZED", "CAPACITY_OPTIMIZED"]
+
+# Recall reasons (PRD §3.9)
+RECALL_REASONS = ["SUPPLIER_RECALL", "SAFETY_ISSUE", "EXPIRY_BATCH"]
+
+TEST_DEFAULTS = {
+    "WAREHOUSE_NAME": "Test Warehouse",
+    "DOCK_X": 0,
+    "DOCK_Y": 0,
+    "DEFAULT_BIN_CODE_PREFIX": "BIN",
+    "DEFAULT_LOT_CODE_PREFIX": "LOT",
+    "DEFAULT_SKU": "PEN",
+    "DEFAULT_UNIT_VOLUME_CM3": 20,
+    "DEFAULT_UNIT_WEIGHT_G": 10,
+    "DEFAULT_UNIT_VALUE_CENTS": 100,
+    "DEFAULT_BIN_CAPACITY_VOLUME_CM3": 100000,
+    "DEFAULT_BIN_CAPACITY_WEIGHT_G": 100000,
+    "DEFAULT_CLOCK_TIME": "2025-01-01T00:00:00.000Z",
+    "DEFAULT_EXPIRY_DATE": "2030-06-01T00:00:00.000Z",
+    "DEFAULT_MANUFACTURE_DATE": "2024-01-01T00:00:00.000Z",
+    "DEFAULT_SUPPLIER_LOT_REF": "SUP",
+    "DEFAULT_SUPPLIER_NAME": "ACME",
+}
