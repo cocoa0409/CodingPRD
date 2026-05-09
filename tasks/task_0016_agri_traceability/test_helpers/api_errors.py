@@ -1,0 +1,95 @@
+"""Error IDs and HTTP status mapping for the Agri-Traceability API (PRD §5)."""
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    # --- Auth (PRD §2.1) ---
+    ERR_AUTH_MISSING = "ERR_AUTH_MISSING"
+    ERR_AUTH_INVALID_ROLE = "ERR_AUTH_INVALID_ROLE"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+
+    # --- Existence ---
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+
+    # --- State / OCC ---
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+
+    # --- Business safety ---
+    ERR_PROHIBITED_SUBSTANCE = "ERR_PROHIBITED_SUBSTANCE"
+    ERR_SEGREGATION_VIOLATION = "ERR_SEGREGATION_VIOLATION"
+    ERR_RECALL_ALREADY_ACTIVE = "ERR_RECALL_ALREADY_ACTIVE"
+
+    # --- Business referential ---
+    ERR_REGISTRATION_NOT_FOUND = "ERR_REGISTRATION_NOT_FOUND"
+    ERR_WITHDRAWAL_NOT_ELAPSED = "ERR_WITHDRAWAL_NOT_ELAPSED"
+
+    # --- Business temporal ---
+    ERR_LEG_INTERVAL_OVERLAP = "ERR_LEG_INTERVAL_OVERLAP"
+    ERR_READING_OUT_OF_LEG_WINDOW = "ERR_READING_OUT_OF_LEG_WINDOW"
+
+    # --- Business constraint ---
+    ERR_BIN_CAPACITY_EXCEEDED = "ERR_BIN_CAPACITY_EXCEEDED"
+    ERR_DOSAGE_EXCEEDED = "ERR_DOSAGE_EXCEEDED"
+    ERR_QR_ALREADY_BOUND = "ERR_QR_ALREADY_BOUND"
+    ERR_QR_REVOKED = "ERR_QR_REVOKED"
+    ERR_QR_TOKEN_INVALID = "ERR_QR_TOKEN_INVALID"
+    ERR_RECALL_OVER_DISPOSED = "ERR_RECALL_OVER_DISPOSED"
+    ERR_RECALL_RESIDUAL_NONZERO = "ERR_RECALL_RESIDUAL_NONZERO"
+    ERR_RECALL_HAS_DISPOSALS = "ERR_RECALL_HAS_DISPOSALS"
+    ERR_BATCH_CODE_INVALID = "ERR_BATCH_CODE_INVALID"
+    ERR_PLANTING_DATES_INVALID = "ERR_PLANTING_DATES_INVALID"
+    ERR_IDEMPOTENT_REPLAY = "ERR_IDEMPOTENT_REPLAY"
+
+    # --- Generic input shape ---
+    ERR_VALIDATION = "ERR_VALIDATION"
+
+
+HTTP_STATUS_CODES: dict = {
+    # Auth
+    ApiErrorId.ERR_AUTH_MISSING: 401,
+    ApiErrorId.ERR_AUTH_INVALID_ROLE: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+
+    # Existence
+    ApiErrorId.ERR_NOT_FOUND: 404,
+
+    # State / OCC
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+
+    # Business safety
+    ApiErrorId.ERR_PROHIBITED_SUBSTANCE: 422,
+    ApiErrorId.ERR_SEGREGATION_VIOLATION: 403,
+    ApiErrorId.ERR_RECALL_ALREADY_ACTIVE: 409,
+
+    # Business referential
+    ApiErrorId.ERR_REGISTRATION_NOT_FOUND: 422,
+    ApiErrorId.ERR_WITHDRAWAL_NOT_ELAPSED: 422,
+
+    # Business temporal
+    ApiErrorId.ERR_LEG_INTERVAL_OVERLAP: 422,
+    ApiErrorId.ERR_READING_OUT_OF_LEG_WINDOW: 422,
+
+    # Business constraint
+    ApiErrorId.ERR_BIN_CAPACITY_EXCEEDED: 409,
+    ApiErrorId.ERR_DOSAGE_EXCEEDED: 422,
+    ApiErrorId.ERR_QR_ALREADY_BOUND: 409,
+    ApiErrorId.ERR_QR_REVOKED: 409,
+    ApiErrorId.ERR_QR_TOKEN_INVALID: 403,
+    ApiErrorId.ERR_RECALL_OVER_DISPOSED: 422,
+    ApiErrorId.ERR_RECALL_RESIDUAL_NONZERO: 422,
+    ApiErrorId.ERR_RECALL_HAS_DISPOSALS: 409,
+    ApiErrorId.ERR_BATCH_CODE_INVALID: 422,
+    ApiErrorId.ERR_PLANTING_DATES_INVALID: 422,
+    ApiErrorId.ERR_IDEMPOTENT_REPLAY: 200,
+
+    # Generic
+    ApiErrorId.ERR_VALIDATION: 400,
+}
+
+
+# Register with framework so validate_error() auto-checks HTTP status
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})
