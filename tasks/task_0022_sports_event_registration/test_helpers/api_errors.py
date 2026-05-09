@@ -1,0 +1,82 @@
+"""Error IDs and HTTP status mapping (PRD §5).
+
+Registered with the framework so validate_error() auto-checks status codes.
+"""
+from __future__ import annotations
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    # --- Auth / RBAC / existence ---
+    ERR_AUTH = "ERR_AUTH"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_REFERENCE_NOT_FOUND = "ERR_REFERENCE_NOT_FOUND"
+
+    # --- State / posture ---
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_EVENT_FROZEN = "ERR_EVENT_FROZEN"
+
+    # --- Registration / capacity / draw ---
+    ERR_REGISTRATION_CLOSED = "ERR_REGISTRATION_CLOSED"
+    ERR_REGISTRATION_BELOW_MIN = "ERR_REGISTRATION_BELOW_MIN"
+    ERR_CAPACITY_EXCEEDED = "ERR_CAPACITY_EXCEEDED"
+    ERR_AVOIDANCE_INFEASIBLE = "ERR_AVOIDANCE_INFEASIBLE"
+
+    # --- Result entry ---
+    ERR_INVALID_SCORE = "ERR_INVALID_SCORE"
+    ERR_DUPLICATE_REFEREE_ENTRY = "ERR_DUPLICATE_REFEREE_ENTRY"
+    ERR_RESULT_DISAGREEMENT = "ERR_RESULT_DISAGREEMENT"
+
+    # --- Referee assignment ---
+    ERR_REFEREE_NOT_QUALIFIED = "ERR_REFEREE_NOT_QUALIFIED"
+    ERR_CONFLICT_OF_INTEREST = "ERR_CONFLICT_OF_INTEREST"
+    ERR_REFEREE_TIME_CONFLICT = "ERR_REFEREE_TIME_CONFLICT"
+    ERR_PARTICIPANT_TIME_CONFLICT = "ERR_PARTICIPANT_TIME_CONFLICT"
+
+    # --- Fiscal ---
+    ERR_ENTRY_FEE_MISMATCH = "ERR_ENTRY_FEE_MISMATCH"
+    ERR_TAX_OUT_OF_RANGE = "ERR_TAX_OUT_OF_RANGE"
+
+    # --- Doping ---
+    ERR_CHAIN_OF_CUSTODY_BROKEN = "ERR_CHAIN_OF_CUSTODY_BROKEN"
+    ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+    ERR_APPEAL_WINDOW_CLOSED = "ERR_APPEAL_WINDOW_CLOSED"
+
+    # --- Concurrency / generic ---
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+    ERR_VALIDATION = "ERR_VALIDATION"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_AUTH: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_REFERENCE_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_EVENT_FROZEN: 409,
+    ApiErrorId.ERR_REGISTRATION_CLOSED: 409,
+    ApiErrorId.ERR_REGISTRATION_BELOW_MIN: 409,
+    ApiErrorId.ERR_CAPACITY_EXCEEDED: 409,
+    ApiErrorId.ERR_AVOIDANCE_INFEASIBLE: 422,
+    ApiErrorId.ERR_INVALID_SCORE: 422,
+    ApiErrorId.ERR_DUPLICATE_REFEREE_ENTRY: 409,
+    ApiErrorId.ERR_RESULT_DISAGREEMENT: 409,
+    ApiErrorId.ERR_REFEREE_NOT_QUALIFIED: 422,
+    ApiErrorId.ERR_CONFLICT_OF_INTEREST: 422,
+    ApiErrorId.ERR_REFEREE_TIME_CONFLICT: 409,
+    ApiErrorId.ERR_PARTICIPANT_TIME_CONFLICT: 409,
+    ApiErrorId.ERR_ENTRY_FEE_MISMATCH: 422,
+    ApiErrorId.ERR_TAX_OUT_OF_RANGE: 422,
+    ApiErrorId.ERR_CHAIN_OF_CUSTODY_BROKEN: 409,
+    ApiErrorId.ERR_SEGREGATION_OF_DUTIES: 403,
+    ApiErrorId.ERR_APPEAL_WINDOW_CLOSED: 422,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_VALIDATION: 422,
+}
+
+
+# Register with framework so validate_error() can cross-check HTTP statuses.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})
