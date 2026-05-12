@@ -1,0 +1,69 @@
+"""Error IDs and HTTP status mapping (PRD §5).
+
+Registered with the framework so validate_error() auto-checks status codes.
+"""
+from __future__ import annotations
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    # Parse-time
+    ERR_BAD_REQUEST = "ERR_BAD_REQUEST"
+    # Auth / RBAC
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_FORBIDDEN_NOT_OWNER = "ERR_FORBIDDEN_NOT_OWNER"
+    # Existence
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    # Conflict / state
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_EQUIPMENT_LIFECYCLE = "ERR_EQUIPMENT_LIFECYCLE"
+    ERR_EQUIPMENT_BUSY = "ERR_EQUIPMENT_BUSY"
+    ERR_NO_ACTIVE_PLAN = "ERR_NO_ACTIVE_PLAN"
+    ERR_PAUSE_TOO_FRESH = "ERR_PAUSE_TOO_FRESH"
+    ERR_REQUISITIONS_PENDING = "ERR_REQUISITIONS_PENDING"
+    ERR_PARTS_NOT_ISSUED = "ERR_PARTS_NOT_ISSUED"
+    ERR_INSUFFICIENT_STOCK = "ERR_INSUFFICIENT_STOCK"
+    ERR_INSUFFICIENT_AVAILABLE = "ERR_INSUFFICIENT_AVAILABLE"
+    # Validation (422)
+    ERR_PLAN_KIND_FIELDS = "ERR_PLAN_KIND_FIELDS"
+    ERR_CROSS_SITE_REFERENCE = "ERR_CROSS_SITE_REFERENCE"
+    ERR_EVIDENCE_MISSING = "ERR_EVIDENCE_MISSING"
+    ERR_SKILL_MISMATCH = "ERR_SKILL_MISMATCH"
+    ERR_RETURN_QTY_INVALID = "ERR_RETURN_QTY_INVALID"
+    ERR_TEMPORAL_INVALID = "ERR_TEMPORAL_INVALID"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_BAD_REQUEST: 400,
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_FORBIDDEN_NOT_OWNER: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_EQUIPMENT_LIFECYCLE: 409,
+    ApiErrorId.ERR_EQUIPMENT_BUSY: 409,
+    ApiErrorId.ERR_NO_ACTIVE_PLAN: 409,
+    ApiErrorId.ERR_PAUSE_TOO_FRESH: 409,
+    ApiErrorId.ERR_REQUISITIONS_PENDING: 409,
+    ApiErrorId.ERR_PARTS_NOT_ISSUED: 409,
+    ApiErrorId.ERR_INSUFFICIENT_STOCK: 409,
+    ApiErrorId.ERR_INSUFFICIENT_AVAILABLE: 409,
+    ApiErrorId.ERR_PLAN_KIND_FIELDS: 422,
+    ApiErrorId.ERR_CROSS_SITE_REFERENCE: 422,
+    ApiErrorId.ERR_EVIDENCE_MISSING: 422,
+    ApiErrorId.ERR_SKILL_MISMATCH: 422,
+    ApiErrorId.ERR_RETURN_QTY_INVALID: 422,
+    ApiErrorId.ERR_TEMPORAL_INVALID: 422,
+}
+
+
+# Register with framework so validate_error() can cross-check HTTP statuses.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})
+
+
+__all__ = ["ApiErrorId", "HTTP_STATUS_CODES"]

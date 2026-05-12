@@ -1,0 +1,40 @@
+"""Tunable constants from scaffold §1.3 and PRD §3."""
+
+# Firmware
+MIN_FIRMWARE_VERSION = "2.0.0"
+HEARTBEAT_TIMEOUT_SECONDS = 600  # 10 minutes (used implicitly; tests drive via offline endpoint)
+
+# Deposit / pickup
+MAX_RETRY = 3
+WRONG_DEPOSIT_GRACE_SECONDS = 900  # 15 minutes
+PICKUP_PENDING_TIMEOUT_SECONDS = 600
+
+# Long-stay path
+LONG_STAY_THRESHOLD_HOURS = 168
+RECALL_WINDOW_HOURS = 72
+DISPOSE_THRESHOLD_HOURS = 336
+
+# Overtime fee tiers
+FREE_HOURS = 24
+TIER1_END_HOURS = 72
+TIER2_END_HOURS = 168
+TIER1_RATE_CENTS = 100   # $1.00/hour
+TIER2_RATE_CENTS = 200   # $2.00/hour
+TIER3_RATE_CENTS = 400   # $4.00/hour
+FEE_CAP_CENTS = 10000    # $100.00 hard cap
+
+# Capacity warning ratios
+NEAR_FULL_RATIO = 0.80
+PEAK_NEAR_FULL_RATIO = 0.70
+FULL_BLOCK_RATIO = 0.95
+
+# Courier reputation
+BLACKLIST_THRESHOLD_RATE = 0.10
+BLACKLIST_COMPLAINT_THRESHOLD = 5
+W_SUCCESS = 0.5
+W_LOW_WRONG = 0.3
+W_LOW_COMPLAINT = 0.2
+COMPLAINT_NORM = 5
+
+# Settlement
+PARTNER_SHARE_RATIO = 0.30
