@@ -1,0 +1,79 @@
+"""Error IDs and HTTP status mapping for the Public Library API (PRD §5).
+
+Registers the mapping with the framework so validate_error() auto-checks HTTP status.
+All values transcribed verbatim from PRD §5 Error Code Catalogue.
+"""
+
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    # Auth & headers
+    ERR_AUTH_REQUIRED = "ERR_AUTH_REQUIRED"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+
+    # Existence
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+
+    # Input validation
+    ERR_INVALID_INPUT = "ERR_INVALID_INPUT"
+
+    # Concurrency
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+
+    # State preconditions
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_COPY_NOT_AVAILABLE = "ERR_COPY_NOT_AVAILABLE"
+    ERR_CARD_NOT_ACTIVE = "ERR_CARD_NOT_ACTIVE"
+    ERR_IDENTITY_NOT_VERIFIED = "ERR_IDENTITY_NOT_VERIFIED"
+    ERR_READER_BLACKLISTED = "ERR_READER_BLACKLISTED"
+    ERR_HOLD_EXPIRED = "ERR_HOLD_EXPIRED"
+    ERR_LOAN_RECALLED = "ERR_LOAN_RECALLED"
+
+    # Fiscal
+    ERR_UNPAID_FINE = "ERR_UNPAID_FINE"
+    ERR_INVALID_WAIVER = "ERR_INVALID_WAIVER"
+    ERR_FINE_OVERPAYMENT = "ERR_FINE_OVERPAYMENT"
+    ERR_PAYMENT_EVENT_MISSING = "ERR_PAYMENT_EVENT_MISSING"
+
+    # Business constraints
+    ERR_QUOTA_EXCEEDED = "ERR_QUOTA_EXCEEDED"
+    ERR_RENEWAL_LIMIT_REACHED = "ERR_RENEWAL_LIMIT_REACHED"
+    ERR_RESERVATION_BLOCKS_RENEWAL = "ERR_RESERVATION_BLOCKS_RENEWAL"
+    ERR_DUPLICATE_RESERVATION = "ERR_DUPLICATE_RESERVATION"
+
+    # ILL
+    ERR_UNKNOWN_PARTNER = "ERR_UNKNOWN_PARTNER"
+    ERR_ILL_LOAN_PERIOD_NOT_MET = "ERR_ILL_LOAN_PERIOD_NOT_MET"
+
+
+HTTP_STATUS_CODES = {
+    ApiErrorId.ERR_AUTH_REQUIRED: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_INPUT: 422,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_COPY_NOT_AVAILABLE: 409,
+    ApiErrorId.ERR_CARD_NOT_ACTIVE: 409,
+    ApiErrorId.ERR_IDENTITY_NOT_VERIFIED: 409,
+    ApiErrorId.ERR_READER_BLACKLISTED: 409,
+    ApiErrorId.ERR_UNPAID_FINE: 409,
+    ApiErrorId.ERR_QUOTA_EXCEEDED: 409,
+    ApiErrorId.ERR_RENEWAL_LIMIT_REACHED: 409,
+    ApiErrorId.ERR_RESERVATION_BLOCKS_RENEWAL: 409,
+    ApiErrorId.ERR_LOAN_RECALLED: 409,
+    ApiErrorId.ERR_HOLD_EXPIRED: 409,
+    ApiErrorId.ERR_INVALID_WAIVER: 422,
+    ApiErrorId.ERR_FINE_OVERPAYMENT: 409,
+    ApiErrorId.ERR_UNKNOWN_PARTNER: 422,
+    ApiErrorId.ERR_ILL_LOAN_PERIOD_NOT_MET: 409,
+    ApiErrorId.ERR_DUPLICATE_RESERVATION: 409,
+    ApiErrorId.ERR_PAYMENT_EVENT_MISSING: 409,
+}
+
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(HTTP_STATUS_CODES)

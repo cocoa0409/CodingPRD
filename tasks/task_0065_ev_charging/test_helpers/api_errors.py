@@ -1,0 +1,88 @@
+"""Error IDs and HTTP status mapping (PRD §5).
+
+After definition the mapping is registered with the framework so
+validate_error() can auto-check HTTP status codes.
+"""
+from __future__ import annotations
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import (
+    set_error_http_status_map,
+)
+
+
+class ApiErrorId(str, Enum):
+    # Auth and generic existence (PRD §2.1, §2.5)
+    ERR_AUTH_MISSING = "ERR_AUTH_MISSING"
+    ERR_AUTH_INVALID = "ERR_AUTH_INVALID"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+
+    # Concurrency / state (PRD §2.4, §3.x)
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_INVALID_SESSION_STATE = "ERR_INVALID_SESSION_STATE"
+
+    # Pile availability and dependents (PRD §3.1, §3.4)
+    ERR_PILE_UNAVAILABLE = "ERR_PILE_UNAVAILABLE"
+    ERR_PILE_HAS_DEPENDENTS = "ERR_PILE_HAS_DEPENDENTS"
+    ERR_PILE_ALREADY_RESERVED = "ERR_PILE_ALREADY_RESERVED"
+
+    # Reservation / queue (PRD §3.3, §3.4)
+    ERR_RESERVATION_EXPIRED = "ERR_RESERVATION_EXPIRED"
+    ERR_RESERVATION_MISMATCH = "ERR_RESERVATION_MISMATCH"
+    ERR_QUEUE_NOT_AT_FRONT = "ERR_QUEUE_NOT_AT_FRONT"
+
+    # Curve / pricing (PRD §3.2, §3.4)
+    ERR_CURVE_NON_MONOTONIC = "ERR_CURVE_NON_MONOTONIC"
+    ERR_PRICING_WINDOW_OVERLAP = "ERR_PRICING_WINDOW_OVERLAP"
+    ERR_TOU_WINDOWS_OVERLAP = "ERR_TOU_WINDOWS_OVERLAP"
+
+    # Member / safety (PRD §3.3, §3.4)
+    ERR_NO_SHOW_THRESHOLD_EXCEEDED = "ERR_NO_SHOW_THRESHOLD_EXCEEDED"
+    ERR_INSUFFICIENT_BALANCE = "ERR_INSUFFICIENT_BALANCE"
+
+    # Settlement / payout (PRD §3.6, §3.7)
+    ERR_SETTLEMENT_OVER_ALLOCATION = "ERR_SETTLEMENT_OVER_ALLOCATION"
+    ERR_INVALID_PAYOUT_WINDOW = "ERR_INVALID_PAYOUT_WINDOW"
+    ERR_PAYOUT_NEGATIVE_NET = "ERR_PAYOUT_NEGATIVE_NET"
+    ERR_PAYOUT_PERIOD_DRIFT = "ERR_PAYOUT_PERIOD_DRIFT"
+
+    # Generic body validation
+    ERR_VALIDATION = "ERR_VALIDATION"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_AUTH_MISSING: 401,
+    ApiErrorId.ERR_AUTH_INVALID: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_INVALID_SESSION_STATE: 409,
+    ApiErrorId.ERR_PILE_UNAVAILABLE: 409,
+    ApiErrorId.ERR_PILE_HAS_DEPENDENTS: 409,
+    ApiErrorId.ERR_PILE_ALREADY_RESERVED: 409,
+    ApiErrorId.ERR_RESERVATION_EXPIRED: 409,
+    ApiErrorId.ERR_RESERVATION_MISMATCH: 422,
+    ApiErrorId.ERR_QUEUE_NOT_AT_FRONT: 409,
+    ApiErrorId.ERR_CURVE_NON_MONOTONIC: 422,
+    ApiErrorId.ERR_PRICING_WINDOW_OVERLAP: 409,
+    ApiErrorId.ERR_TOU_WINDOWS_OVERLAP: 422,
+    ApiErrorId.ERR_NO_SHOW_THRESHOLD_EXCEEDED: 409,
+    ApiErrorId.ERR_INSUFFICIENT_BALANCE: 402,
+    ApiErrorId.ERR_SETTLEMENT_OVER_ALLOCATION: 422,
+    ApiErrorId.ERR_INVALID_PAYOUT_WINDOW: 422,
+    ApiErrorId.ERR_PAYOUT_NEGATIVE_NET: 409,
+    ApiErrorId.ERR_PAYOUT_PERIOD_DRIFT: 409,
+    ApiErrorId.ERR_VALIDATION: 422,
+}
+
+
+# Register with framework so validate_error() can cross-check HTTP statuses.
+set_error_http_status_map(
+    {k.value: v for k, v in HTTP_STATUS_CODES.items()}
+)
+
+
+__all__ = ["ApiErrorId", "HTTP_STATUS_CODES"]
