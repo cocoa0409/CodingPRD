@@ -1,0 +1,89 @@
+"""Error IDs and HTTP status mapping (PRD §5).
+
+After definition the mapping is registered with the framework so
+validate_error() can auto-check HTTP status codes.
+"""
+from __future__ import annotations
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import (
+    set_error_http_status_map,
+)
+
+
+class ApiErrorId(str, Enum):
+    # --- auth / authz (PRD §2.1) ---
+    ERR_AUTH_REQUIRED = "ERR_AUTH_REQUIRED"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+
+    # --- existence (PRD §2.7) ---
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+
+    # --- state / concurrency (PRD §2.5, §2.8) ---
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+    ERR_FACTOR_VERSION_CONFLICT = "ERR_FACTOR_VERSION_CONFLICT"
+
+    # --- multi-tenancy (PRD §2.7) ---
+    ERR_CROSS_ORG_REFERENCE = "ERR_CROSS_ORG_REFERENCE"
+
+    # --- business safety (PRD §3.6, §3.7) ---
+    ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+    ERR_CREDIT_DOUBLE_COUNTED = "ERR_CREDIT_DOUBLE_COUNTED"
+    ERR_ASSURANCE_NOT_READY = "ERR_ASSURANCE_NOT_READY"
+    ERR_TRACEABILITY_MISSING = "ERR_TRACEABILITY_MISSING"
+
+    # --- business temporal (PRD §3.4, §3.5, §3.2) ---
+    ERR_ACTIVITY_OUTSIDE_PERIOD = "ERR_ACTIVITY_OUTSIDE_PERIOD"
+    ERR_ACTIVITY_INTERVAL_OVERLAP = "ERR_ACTIVITY_INTERVAL_OVERLAP"
+    ERR_PERIOD_OVERLAP = "ERR_PERIOD_OVERLAP"
+    ERR_BOUNDARY_CHANGE_ORDER = "ERR_BOUNDARY_CHANGE_ORDER"
+    ERR_FACTOR_EFFECTIVE_FROM_ORDER = "ERR_FACTOR_EFFECTIVE_FROM_ORDER"
+
+    # --- business referential / constraint (PRD §3.1, §3.3, §3.5) ---
+    ERR_NO_APPLICABLE_FACTOR = "ERR_NO_APPLICABLE_FACTOR"
+    ERR_ESTIMATION_BASIS_REQUIRED = "ERR_ESTIMATION_BASIS_REQUIRED"
+    ERR_FACILITY_OUT_OF_BOUNDARY = "ERR_FACILITY_OUT_OF_BOUNDARY"
+    ERR_MATERIALITY_OUT_OF_RANGE = "ERR_MATERIALITY_OUT_OF_RANGE"
+    ERR_SCOPE3_CATEGORY_MISMATCH = "ERR_SCOPE3_CATEGORY_MISMATCH"
+    ERR_DENOMINATOR_INVALID = "ERR_DENOMINATOR_INVALID"
+
+    # --- generic input shape (PRD §2.6, §5) ---
+    ERR_VALIDATION_FAILED = "ERR_VALIDATION_FAILED"
+
+
+# PRD §5 — Error Code Catalogue
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_AUTH_REQUIRED: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_FACTOR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_CROSS_ORG_REFERENCE: 403,
+    ApiErrorId.ERR_SEGREGATION_OF_DUTIES: 403,
+    ApiErrorId.ERR_CREDIT_DOUBLE_COUNTED: 409,
+    ApiErrorId.ERR_ASSURANCE_NOT_READY: 422,
+    ApiErrorId.ERR_TRACEABILITY_MISSING: 422,
+    ApiErrorId.ERR_ACTIVITY_OUTSIDE_PERIOD: 422,
+    ApiErrorId.ERR_ACTIVITY_INTERVAL_OVERLAP: 409,
+    ApiErrorId.ERR_PERIOD_OVERLAP: 409,
+    ApiErrorId.ERR_BOUNDARY_CHANGE_ORDER: 422,
+    ApiErrorId.ERR_FACTOR_EFFECTIVE_FROM_ORDER: 422,
+    ApiErrorId.ERR_NO_APPLICABLE_FACTOR: 422,
+    ApiErrorId.ERR_ESTIMATION_BASIS_REQUIRED: 422,
+    ApiErrorId.ERR_FACILITY_OUT_OF_BOUNDARY: 422,
+    ApiErrorId.ERR_MATERIALITY_OUT_OF_RANGE: 422,
+    ApiErrorId.ERR_SCOPE3_CATEGORY_MISMATCH: 422,
+    ApiErrorId.ERR_DENOMINATOR_INVALID: 422,
+    ApiErrorId.ERR_VALIDATION_FAILED: 422,
+}
+
+
+# Register with framework so validate_error() can cross-check HTTP statuses.
+set_error_http_status_map(
+    {k.value: v for k, v in HTTP_STATUS_CODES.items()}
+)
+
+
+__all__ = ["ApiErrorId", "HTTP_STATUS_CODES"]

@@ -59,25 +59,7 @@ Before writing code, decide on:
 
 - **Language & framework**: Always use **Python + Flask**. This is the mandated stack for all benchmark implementations — it produces correct behavior, is easy to reason about, and the Dockerfile is minimal.
 - **Data storage**: In-memory is fine (and recommended). These benchmarks test API correctness, not database durability. Use dictionaries/maps keyed by ID.
-- **Code organization**: Group by concern. Follow this layout:
-  ```
-  implementation/
-  ├── Dockerfile
-  ├── requirements.txt
-  ├── app.py              # Entry point, error handlers, route registration
-  ├── db.py               # In-memory data store
-  ├── errors.py           # Error classes and error ID constants
-  ├── response.py         # Standard response envelope helpers
-  ├── middleware.py        # Auth header extraction, role checking
-  ├── routes/             # One file per resource group
-  │   ├── shops.py
-  │   ├── products.py
-  │   └── ...
-  └── services/           # Business logic, calculations, state transitions
-      ├── shop.py
-      ├── discount.py
-      └── ...
-  ```
+- **Code organization**: Ensure the code is strictly modularized — split by concern (entry point, data store, error definitions, response helpers, auth/middleware, per-resource routes, business-logic services) so no single file accumulates unrelated responsibilities. The exact filenames and directory layout are up to you; pick names that match the entities and concerns in the scaffold.
 
 ### Step 3: Implement — Follow This Priority Order
 
