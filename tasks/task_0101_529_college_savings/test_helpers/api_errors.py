@@ -1,0 +1,92 @@
+"""Error IDs and HTTP status mapping (PRD §5 Error Code Catalogue).
+
+After definition, the mapping is registered with the framework so
+validate_error() can auto-check HTTP status codes without each test
+passing them explicitly.
+"""
+from __future__ import annotations
+
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import (
+    set_error_http_status_map,
+)
+
+
+class ApiErrorId(str, Enum):
+    # Auth — PRD §2.1
+    ERR_AUTH_MISSING = "ERR_AUTH_MISSING"
+    ERR_AUTH_INVALID_ROLE = "ERR_AUTH_INVALID_ROLE"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+
+    # Existence — PRD §2.6
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+
+    # State — PRD §2.7
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_ACCOUNT_RESTRICTED = "ERR_ACCOUNT_RESTRICTED"
+
+    # Fiscal — PRD §3.3, §3.5
+    ERR_INSUFFICIENT_BALANCE = "ERR_INSUFFICIENT_BALANCE"
+    ERR_LIFETIME_CAP_WOULD_EXCEED = "ERR_LIFETIME_CAP_WOULD_EXCEED"
+    ERR_GIFT_EXCLUSION_EXCEEDED = "ERR_GIFT_EXCLUSION_EXCEEDED"
+    ERR_K12_CAP_EXCEEDED = "ERR_K12_CAP_EXCEEDED"
+
+    # Receipts — PRD §3.5
+    ERR_EXPENSE_CATEGORY_MISMATCH = "ERR_EXPENSE_CATEGORY_MISMATCH"
+    ERR_EXPENSE_OUT_OF_YEAR = "ERR_EXPENSE_OUT_OF_YEAR"
+
+    # Beneficiary change — PRD §3.6
+    ERR_BENEFICIARY_IDENTICAL_TO_CURRENT = (
+        "ERR_BENEFICIARY_IDENTICAL_TO_CURRENT"
+    )
+    ERR_BENEFICIARY_RELATIONSHIP_FORBIDDEN = (
+        "ERR_BENEFICIARY_RELATIONSHIP_FORBIDDEN"
+    )
+    ERR_BENEFICIARY_GENERATION_SKIP = "ERR_BENEFICIARY_GENERATION_SKIP"
+    ERR_STALE_BENEFICIARY_SNAPSHOT = "ERR_STALE_BENEFICIARY_SNAPSHOT"
+
+    # TaxReport — PRD §3.7
+    ERR_TAX_REPORT_LOCKED = "ERR_TAX_REPORT_LOCKED"
+
+    # OCC — PRD §2.5
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+
+    # Test clock — PRD §3.8
+    ERR_CLOCK_NOT_MOVING_FORWARD = "ERR_CLOCK_NOT_MOVING_FORWARD"
+
+    # Generic input — PRD §5
+    ERR_VALIDATION_FAILED = "ERR_VALIDATION_FAILED"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_AUTH_MISSING: 401,
+    ApiErrorId.ERR_AUTH_INVALID_ROLE: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_ACCOUNT_RESTRICTED: 409,
+    ApiErrorId.ERR_INSUFFICIENT_BALANCE: 422,
+    ApiErrorId.ERR_LIFETIME_CAP_WOULD_EXCEED: 422,
+    ApiErrorId.ERR_GIFT_EXCLUSION_EXCEEDED: 422,
+    ApiErrorId.ERR_K12_CAP_EXCEEDED: 422,
+    ApiErrorId.ERR_EXPENSE_CATEGORY_MISMATCH: 422,
+    ApiErrorId.ERR_EXPENSE_OUT_OF_YEAR: 422,
+    ApiErrorId.ERR_BENEFICIARY_IDENTICAL_TO_CURRENT: 422,
+    ApiErrorId.ERR_BENEFICIARY_RELATIONSHIP_FORBIDDEN: 422,
+    ApiErrorId.ERR_BENEFICIARY_GENERATION_SKIP: 422,
+    ApiErrorId.ERR_STALE_BENEFICIARY_SNAPSHOT: 409,
+    ApiErrorId.ERR_TAX_REPORT_LOCKED: 409,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_CLOCK_NOT_MOVING_FORWARD: 422,
+    ApiErrorId.ERR_VALIDATION_FAILED: 400,
+}
+
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(
+    {k.value: v for k, v in HTTP_STATUS_CODES.items()},
+)
+
+
+__all__ = ["ApiErrorId", "HTTP_STATUS_CODES"]

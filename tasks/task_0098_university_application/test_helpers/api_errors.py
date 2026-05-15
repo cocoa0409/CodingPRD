@@ -1,0 +1,85 @@
+"""Error IDs and HTTP status mapping (PRD §5).
+
+After definition, the mapping is registered with the framework so
+validate_error() can auto-check HTTP status codes without each test
+passing them explicitly.
+"""
+from __future__ import annotations
+
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    # Auth (PRD §2.1, §5)
+    ERR_AUTH_MISSING = "ERR_AUTH_MISSING"
+    ERR_AUTH_INVALID_ROLE = "ERR_AUTH_INVALID_ROLE"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+
+    # Existence (PRD §2.6, §5)
+    ERR_APPLICANT_NOT_FOUND = "ERR_APPLICANT_NOT_FOUND"
+    ERR_UNIVERSITY_NOT_FOUND = "ERR_UNIVERSITY_NOT_FOUND"
+    ERR_PROGRAM_NOT_FOUND = "ERR_PROGRAM_NOT_FOUND"
+    ERR_APPLICATION_NOT_FOUND = "ERR_APPLICATION_NOT_FOUND"
+    ERR_RESOURCE_NOT_FOUND = "ERR_RESOURCE_NOT_FOUND"
+
+    # Validation / shape (PRD §2.7, §5)
+    ERR_VALIDATION = "ERR_VALIDATION"
+    ERR_ESSAY_LENGTH = "ERR_ESSAY_LENGTH"
+
+    # State / concurrency (PRD §2.7, §2.10, §5)
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+    ERR_SWEEP_IN_PROGRESS = "ERR_SWEEP_IN_PROGRESS"
+
+    # Business: ED / submission gates (PRD §3.6, §5)
+    ERR_ED_ALREADY_BOUND = "ERR_ED_ALREADY_BOUND"
+    ERR_ED_DEADLINE_PASSED = "ERR_ED_DEADLINE_PASSED"
+    ERR_DEADLINE_PASSED = "ERR_DEADLINE_PASSED"
+    ERR_ESSAY_NOT_CUSTOMIZED = "ERR_ESSAY_NOT_CUSTOMIZED"
+    ERR_INSUFFICIENT_RECOMMENDATIONS = "ERR_INSUFFICIENT_RECOMMENDATIONS"
+    ERR_WEAK_LETTER = "ERR_WEAK_LETTER"
+    ERR_MISSING_EFC = "ERR_MISSING_EFC"
+
+    # Business: capacity / enrollment (PRD §3.7, §3.9, §3.10, §5)
+    ERR_PROGRAM_AT_CAPACITY = "ERR_PROGRAM_AT_CAPACITY"
+    ERR_ENROLLMENT_DEADLINE_PASSED = "ERR_ENROLLMENT_DEADLINE_PASSED"
+    ERR_OFFER_EXPIRED = "ERR_OFFER_EXPIRED"
+    ERR_ALREADY_ENROLLED_ELSEWHERE = "ERR_ALREADY_ENROLLED_ELSEWHERE"
+
+
+# Per PRD §5 Error Code Catalogue.
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_AUTH_MISSING: 401,
+    ApiErrorId.ERR_AUTH_INVALID_ROLE: 403,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_APPLICANT_NOT_FOUND: 404,
+    ApiErrorId.ERR_UNIVERSITY_NOT_FOUND: 404,
+    ApiErrorId.ERR_PROGRAM_NOT_FOUND: 404,
+    ApiErrorId.ERR_APPLICATION_NOT_FOUND: 404,
+    ApiErrorId.ERR_RESOURCE_NOT_FOUND: 404,
+    ApiErrorId.ERR_VALIDATION: 400,
+    ApiErrorId.ERR_ESSAY_LENGTH: 422,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_SWEEP_IN_PROGRESS: 409,
+    ApiErrorId.ERR_ED_ALREADY_BOUND: 409,
+    ApiErrorId.ERR_ED_DEADLINE_PASSED: 409,
+    ApiErrorId.ERR_DEADLINE_PASSED: 409,
+    ApiErrorId.ERR_ESSAY_NOT_CUSTOMIZED: 422,
+    ApiErrorId.ERR_INSUFFICIENT_RECOMMENDATIONS: 422,
+    ApiErrorId.ERR_WEAK_LETTER: 422,
+    ApiErrorId.ERR_MISSING_EFC: 422,
+    ApiErrorId.ERR_PROGRAM_AT_CAPACITY: 409,
+    ApiErrorId.ERR_ENROLLMENT_DEADLINE_PASSED: 409,
+    ApiErrorId.ERR_OFFER_EXPIRED: 409,
+    ApiErrorId.ERR_ALREADY_ENROLLED_ELSEWHERE: 409,
+}
+
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})
+
+
+__all__ = ["ApiErrorId", "HTTP_STATUS_CODES"]

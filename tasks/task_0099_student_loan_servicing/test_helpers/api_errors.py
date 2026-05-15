@@ -1,0 +1,69 @@
+"""Error IDs and HTTP status mapping from PRD §5.
+
+Registers the mapping with the test framework so validate_error()
+auto-checks HTTP status against the catalogue.
+"""
+from __future__ import annotations
+
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    # Auth and authorization
+    ERR_AUTH_REQUIRED = "ERR_AUTH_REQUIRED"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_SOD_VIOLATION = "ERR_SOD_VIOLATION"
+    # Existence (404)
+    ERR_BORROWER_NOT_FOUND = "ERR_BORROWER_NOT_FOUND"
+    ERR_RESOURCE_NOT_FOUND = "ERR_RESOURCE_NOT_FOUND"
+    ERR_LOAN_NOT_FOUND = "ERR_LOAN_NOT_FOUND"
+    # Input shape (400)
+    ERR_BAD_DATE_WINDOW = "ERR_BAD_DATE_WINDOW"
+    ERR_AMOUNT_INVALID = "ERR_AMOUNT_INVALID"
+    ERR_PAGINATION_INVALID = "ERR_PAGINATION_INVALID"
+    # State / concurrency (409)
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+    ERR_PLAN_CONFLICT = "ERR_PLAN_CONFLICT"
+    # Business semantics (422)
+    ERR_PLAN_LOAN_INELIGIBLE = "ERR_PLAN_LOAN_INELIGIBLE"
+    ERR_AGI_NOT_CERTIFIED = "ERR_AGI_NOT_CERTIFIED"
+    ERR_VETERAN_INELIGIBLE = "ERR_VETERAN_INELIGIBLE"
+    ERR_PSLF_NO_EMPLOYMENT_EVIDENCE = "ERR_PSLF_NO_EMPLOYMENT_EVIDENCE"
+    ERR_PSLF_INSUFFICIENT_PAYMENTS = "ERR_PSLF_INSUFFICIENT_PAYMENTS"
+    ERR_FORBEARANCE_CAP_EXCEEDED = "ERR_FORBEARANCE_CAP_EXCEEDED"
+    ERR_PLUS_INELIGIBLE_FOR_IN_SCHOOL = "ERR_PLUS_INELIGIBLE_FOR_IN_SCHOOL"
+    ERR_REHAB_ALREADY_USED = "ERR_REHAB_ALREADY_USED"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_AUTH_REQUIRED: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_SOD_VIOLATION: 403,
+    ApiErrorId.ERR_BORROWER_NOT_FOUND: 404,
+    ApiErrorId.ERR_RESOURCE_NOT_FOUND: 404,
+    ApiErrorId.ERR_LOAN_NOT_FOUND: 404,
+    ApiErrorId.ERR_BAD_DATE_WINDOW: 400,
+    ApiErrorId.ERR_AMOUNT_INVALID: 400,
+    ApiErrorId.ERR_PAGINATION_INVALID: 400,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_PLAN_CONFLICT: 409,
+    ApiErrorId.ERR_PLAN_LOAN_INELIGIBLE: 422,
+    ApiErrorId.ERR_AGI_NOT_CERTIFIED: 422,
+    ApiErrorId.ERR_VETERAN_INELIGIBLE: 422,
+    ApiErrorId.ERR_PSLF_NO_EMPLOYMENT_EVIDENCE: 422,
+    ApiErrorId.ERR_PSLF_INSUFFICIENT_PAYMENTS: 422,
+    ApiErrorId.ERR_FORBEARANCE_CAP_EXCEEDED: 422,
+    ApiErrorId.ERR_PLUS_INELIGIBLE_FOR_IN_SCHOOL: 422,
+    ApiErrorId.ERR_REHAB_ALREADY_USED: 422,
+}
+
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})
+
+
+__all__ = ["ApiErrorId", "HTTP_STATUS_CODES"]
