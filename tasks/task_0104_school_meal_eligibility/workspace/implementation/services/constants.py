@@ -1,0 +1,43 @@
+"""Numeric constants from SCAFFOLD §1.3 calculations."""
+
+# frl_tier_classification
+FREE_THRESHOLD_RATIO = 1.30
+REDUCED_THRESHOLD_RATIO = 1.85
+
+FEDERAL_POVERTY_GUIDELINE_BY_SIZE = {
+    1: 1500000,
+    2: 2030000,
+    3: 2560000,
+    4: 3090000,
+    5: 3620000,
+    6: 4150000,
+    7: 4680000,
+    8: 5210000,
+}
+
+# meal_charge_calc
+REDUCED_COPAY_CENTS = 40
+
+# usda_reimbursement rates
+USDA_FREE_RATE_CENTS = 480
+USDA_REDUCED_RATE_CENTS = 420
+USDA_PAID_RATE_CENTS = 50
+
+# meal_nutrition_label
+HIGH_SODIUM_THRESHOLD_MG = 600
+
+# Renewal tolerances
+RENEWAL_INCOME_TOLERANCE = 0.05  # ±5%
+RENEWAL_YEAR_DAYS_TARGET = 365
+RENEWAL_YEAR_DAYS_TOLERANCE = 5
+
+# Allergen enumeration
+ALLERGENS = {"PEANUT", "TREE_NUT", "DAIRY", "EGG", "SOY", "WHEAT", "FISH", "SHELLFISH"}
+SEVERITIES = {"MILD", "MODERATE", "SEVERE"}
+
+# Tiers
+TIERS = {"FREE", "REDUCED", "PAID"}
+DECIDED_TIERS = {"FREE", "REDUCED", "DENIED_PAID"}
+
+# Auto-renewal sentinel
+SYSTEM_AUTO_RENEW_USER_ID = "SYSTEM_AUTO_RENEW"

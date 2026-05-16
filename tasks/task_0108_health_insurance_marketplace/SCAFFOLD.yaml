@@ -1,0 +1,1457 @@
+scenario: |
+  Health Insurance Marketplace Enrollment (HealthCare.gov style): household composition and MAGI income,
+  APTC subsidy calculation, Bronze/Silver/Gold/Platinum tiers, Special Enrollment Period (SEP events),
+  effective date rules, CSR Plus.
+
+domain_name: "health-insurance-marketplace"
+api_prefix: "/applications"
+
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - dual_variant_calculation        # APTC estimated (forward-looking) vs reconciled (chronological replay of MAGI swings)
+    - rate_threshold_triggers          # FPL % breakpoints drive CSR Plus eligibility and applicable percentage table
+    - scheduled_deferred_actions       # SEP effective dates and OEP open/close gates use clock advancement
+    - version_pinning_on_approval      # plan/rate version locked at enrollment time; later catalog edits do not retro-adjust active enrollments
+    - cascading_side_effects           # SEP verification opens an enrollment window; new household member triggers application re-determination, premium re-calc, and CSR variant swap
+  entity_topology: hybrid                       # Application is a tree root; Plan/PlanVariant/Insurer/SEPEvent live as peer aggregates with foreign-key references
+  state_machine_shape: branching                # Application branches DRAFT→SUBMITTED→{APPROVED,DENIED} with revert; Enrollment has parallel coverage_status × payment_status dimensions
+  relationship_patterns:
+    - one_to_many                               # Application → HouseholdMember, Application → SEPEvent, Enrollment → PremiumInvoice
+    - cross_aggregate                            # Enrollment.plan_id references Plan across aggregate; PlanVariant.plan_id references Plan
+    - polymorphic                                # IncomeRecord can attach to HouseholdMember of different filer_type values
+  role_model: peer_roles                        # Applicant owns Application; MarketplaceAdmin verifies SEPs and runs reconciliation; Insurer manages Plans; CustomerService can override on appeal
+  consistency_model: immediate                  # all derived fields (MAGI, APTC, CSR variant, applicable-percentage) recompute synchronously inside the triggering request
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Application
+    parent: null
+    common_fields: true
+    fields:
+      - name: applicant_id
+        type: string
+        source: input
+        description: "X-User-ID of the Applicant who created the application; immutable after creation."
+        constraints: "must be a non-empty opaque user id; one applicant may have at most one application per coverage_year in non-terminal status"
+      - name: coverage_year
+        type: integer
+        source: input
+        description: "Plan year for which coverage is sought (e.g., 2026)."
+        constraints: "must be the current_year or current_year+1 relative to /_clock.now()"
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle stage of the application."
+        constraints: "one of {DRAFT, SUBMITTED, ELIGIBILITY_DETERMINED, APPROVED, DENIED}"
+        default: DRAFT
+      - name: filing_state
+        type: enum
+        source: input
+        description: "U.S. state where the household resides; determines applicable Plans catalog and Medicaid-expansion flag."
+        constraints: "two-letter state code; one of the 50 states + DC"
+      - name: enrollment_window
+        type: enum
+        source: computed
+        description: "Whether the applicant is currently inside an Open Enrollment Period (OEP) window or holds a verified Special Enrollment Period (SEP)."
+        constraints: "one of {OEP, SEP, CLOSED}; CLOSED blocks APPROVE→Enrollment creation"
+      - name: household_size
+        type: integer
+        source: computed
+        description: "Count of HouseholdMember rows where include_in_household=true; recomputed on member add/remove."
+      - name: total_magi_cents
+        type: integer
+        source: computed
+        description: "Sum of MAGI in cents across HouseholdMember rows where include_in_magi=true; recomputed on income mutation."
+      - name: fpl_percentage
+        type: number
+        source: computed
+        description: "total_magi_cents divided by FPL_TABLE[coverage_year][household_size], expressed as a percentage rounded to 1 decimal place."
+      - name: csr_eligibility
+        type: enum
+        source: computed
+        description: "Cost-sharing reduction tier the household qualifies for; only applies to Silver plan variants."
+        constraints: "one of {NONE, CSR_73, CSR_87, CSR_94, CSR_PLUS}; thresholds in calculations.csr_tier_classification"
+      - name: aptc_estimated_cents
+        type: integer
+        source: computed
+        description: "Estimated annual APTC subsidy in cents based on benchmark Silver plan; populated on ELIGIBILITY_DETERMINED."
+      - name: aptc_reconciled_cents
+        type: integer
+        source: computed
+        description: "Reconciled APTC after replaying chronological MAGI swings; populated only by reconciliation sweep at year-end."
+        default: null
+      - name: pinned_fpl_table_version
+        type: integer
+        source: computed
+        description: "Version of the FPL constants table snapshotted at SUBMIT time; protects against retroactive shifts."
+      - name: submitted_at
+        type: datetime
+        source: computed
+        description: "Server timestamp at which status moved to SUBMITTED."
+        default: null
+      - name: approved_at
+        type: datetime
+        source: computed
+        description: "Server timestamp at which status moved to APPROVED."
+        default: null
+
+  - name: HouseholdMember
+    parent: Application
+    common_fields: true
+    fields:
+      - name: application_id
+        type: string
+        source: system
+        description: "FK to parent Application."
+      - name: filer_type
+        type: enum
+        source: input
+        description: "Tax-filing relationship to the household."
+        constraints: "one of {PRIMARY_FILER, SPOUSE, DEPENDENT}; exactly one PRIMARY_FILER per Application"
+      - name: date_of_birth
+        type: string
+        source: input
+        description: "ISO 8601 date (YYYY-MM-DD)."
+      - name: include_in_household
+        type: boolean
+        source: input
+        description: "Whether this member counts toward household_size."
+        default: true
+      - name: include_in_magi
+        type: boolean
+        source: input
+        description: "Whether this member's income counts toward total_magi_cents."
+        default: true
+      - name: is_tobacco_user
+        type: boolean
+        source: input
+        description: "Whether the member declared tobacco use; affects premium surcharge for ages >= 21."
+        default: false
+      - name: medicaid_eligible
+        type: boolean
+        source: computed
+        description: "Whether this member individually qualifies for Medicaid; computed from age, filing_state's medicaid_expansion flag, and member-level FPL share."
+      - name: member_magi_cents
+        type: integer
+        source: computed
+        description: "Sum of IncomeRecord.amount_cents for this member."
+
+  - name: IncomeRecord
+    parent: HouseholdMember
+    common_fields: false                          # immutable, append-only ledger of declared income lines
+    fields:
+      - name: member_id
+        type: string
+        source: system
+        description: "FK to HouseholdMember."
+      - name: source_type
+        type: enum
+        source: input
+        description: "Income classification per IRS Form 8962 categories."
+        constraints: "one of {WAGES, SELF_EMPLOYMENT, SOCIAL_SECURITY, INTEREST_DIVIDEND, RETIREMENT, RENTAL, OTHER}"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Projected annual income from this source, in cents."
+        constraints: "may be negative (business losses) but member_magi_cents floor is 0"
+      - name: effective_date
+        type: string
+        source: input
+        description: "ISO 8601 date the income line starts; used by reconciliation replay."
+      - name: superseded_by_id
+        type: string
+        source: computed
+        description: "Id of the IncomeRecord that supersedes this one; set when a corrective record arrives for the same source_type after SUBMIT."
+        default: null
+
+  - name: Insurer
+    parent: null
+    common_fields: false                          # configuration data, rarely mutated; updates create new rows
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Issuer display name."
+      - name: filing_states
+        type: array
+        source: input
+        description: "Two-letter state codes where this insurer offers plans."
+      - name: contact_phone
+        type: string
+        source: input
+        description: "Customer service phone number."
+
+  - name: Plan
+    parent: null
+    common_fields: true
+    fields:
+      - name: insurer_id
+        type: string
+        source: input
+        description: "FK to Insurer."
+      - name: coverage_year
+        type: integer
+        source: input
+        description: "Plan year the rates apply to."
+      - name: filing_state
+        type: enum
+        source: input
+        description: "State where this plan is offered; must be a member of Insurer.filing_states."
+      - name: tier
+        type: enum
+        source: input
+        description: "Metal tier."
+        constraints: "one of {BRONZE, SILVER, GOLD, PLATINUM}"
+      - name: base_monthly_premium_cents
+        type: integer
+        source: input
+        description: "Catalog premium for the reference adult age (21) before tobacco surcharge or APTC."
+      - name: is_benchmark_silver
+        type: boolean
+        source: input
+        description: "Whether this is the Second-Lowest-Cost-Silver-Plan (SLCSP) for its filing_state and coverage_year; used as denominator in APTC formula."
+        default: false
+      - name: status
+        type: enum
+        source: computed
+        description: "Catalog availability."
+        constraints: "one of {ACTIVE, WITHDRAWN}; WITHDRAWN plans cannot anchor new Enrollments but existing ones remain valid via version pinning"
+        default: ACTIVE
+      - name: catalog_version
+        type: integer
+        source: computed
+        description: "Monotonic version number incremented every time base_monthly_premium_cents or status changes; pinned onto Enrollment at creation."
+
+  - name: PlanVariant
+    parent: Plan
+    common_fields: false                          # immutable CSR overlay
+    fields:
+      - name: plan_id
+        type: string
+        source: system
+        description: "FK to parent Plan; only Silver tier may carry CSR variants."
+      - name: csr_level
+        type: enum
+        source: input
+        description: "CSR tier this variant serves."
+        constraints: "one of {STANDARD, CSR_73, CSR_87, CSR_94, CSR_PLUS}; STANDARD is the default variant for all Silver plans"
+      - name: actuarial_value
+        type: number
+        source: input
+        description: "Actuarial value percentage (e.g., 73 for CSR_73, 94 for CSR_94, 97 for CSR_PLUS)."
+      - name: out_of_pocket_max_cents
+        type: integer
+        source: input
+        description: "Maximum out-of-pocket cap for this variant."
+
+  - name: SEPEvent
+    parent: Application
+    common_fields: true
+    fields:
+      - name: application_id
+        type: string
+        source: system
+        description: "FK to parent Application."
+      - name: event_type
+        type: enum
+        source: input
+        description: "Qualifying life event."
+        constraints: "one of {LOSS_OF_COVERAGE, MARRIAGE, BIRTH_ADOPTION, MOVE, INCOME_CHANGE, MEDICAID_LOSS, GAINED_CITIZENSHIP}"
+      - name: event_date
+        type: string
+        source: input
+        description: "ISO 8601 date the qualifying event occurred."
+      - name: reported_at
+        type: datetime
+        source: system
+        description: "Server timestamp when the SEP claim was filed."
+      - name: status
+        type: enum
+        source: computed
+        description: "Verification state."
+        constraints: "one of {SUBMITTED, VERIFIED, REJECTED, EXPIRED}"
+        default: SUBMITTED
+      - name: window_opens_on
+        type: string
+        source: computed
+        description: "First calendar day the applicant may submit an Enrollment under this SEP; equals event_date for most event_types, equals first-of-following-month for INCOME_CHANGE."
+      - name: window_closes_on
+        type: string
+        source: computed
+        description: "Last calendar day the applicant may submit an Enrollment under this SEP; window_opens_on + 60 days (calendar)."
+      - name: effective_date
+        type: string
+        source: computed
+        description: "First day coverage takes effect if Enrollment is approved under this SEP; see calculations.sep_effective_date."
+
+  - name: Enrollment
+    parent: null
+    common_fields: true
+    fields:
+      - name: application_id
+        type: string
+        source: input
+        description: "FK to Application; Application must be in APPROVED status."
+      - name: plan_variant_id
+        type: string
+        source: input
+        description: "FK to PlanVariant chosen by applicant; CSR variant must match Application.csr_eligibility."
+      - name: pinned_plan_catalog_version
+        type: integer
+        source: computed
+        description: "Plan.catalog_version at the moment Enrollment was created; protects against retroactive premium changes."
+      - name: coverage_status
+        type: enum
+        source: computed
+        description: "Lifecycle of coverage."
+        constraints: "one of {PENDING_PAYMENT, ACTIVE, GRACE_PERIOD, TERMINATED}"
+        default: PENDING_PAYMENT
+      - name: payment_status
+        type: enum
+        source: computed
+        description: "Latest known payment posture; parallel dimension that evolves independently of coverage_status."
+        constraints: "one of {AWAITING_BINDER, CURRENT, DELINQUENT_M1, DELINQUENT_M2, DELINQUENT_M3}"
+        default: AWAITING_BINDER
+      - name: coverage_start_date
+        type: string
+        source: computed
+        description: "First day coverage is in force; copied from SEPEvent.effective_date or computed from OEP rule."
+      - name: coverage_end_date
+        type: string
+        source: computed
+        description: "Last day coverage is in force; null while ACTIVE."
+        default: null
+      - name: monthly_premium_gross_cents
+        type: integer
+        source: computed
+        description: "Sum of per-member premium contributions (age curve + tobacco surcharge) for chosen plan_variant_id."
+      - name: monthly_aptc_applied_cents
+        type: integer
+        source: computed
+        description: "Monthly APTC dollars applied to this Enrollment; floor 0, capped at monthly_premium_gross_cents."
+      - name: monthly_net_premium_cents
+        type: integer
+        source: computed
+        description: "monthly_premium_gross_cents minus monthly_aptc_applied_cents; the consumer's net bill."
+      - name: terminated_reason
+        type: enum
+        source: computed
+        description: "Why coverage ended."
+        constraints: "null until TERMINATED; one of {NON_PAYMENT, APPLICANT_CANCELLED, SEP_REVOKED, COVERAGE_YEAR_ENDED}"
+        default: null
+
+  - name: PremiumInvoice
+    parent: Enrollment
+    common_fields: false                          # append-only billing log; corrections produce new rows
+    fields:
+      - name: enrollment_id
+        type: string
+        source: system
+        description: "FK to parent Enrollment."
+      - name: billing_month
+        type: string
+        source: input
+        description: "Calendar month the invoice covers, in YYYY-MM."
+      - name: gross_amount_cents
+        type: integer
+        source: computed
+        description: "Snapshot of Enrollment.monthly_premium_gross_cents at issue time."
+      - name: aptc_amount_cents
+        type: integer
+        source: computed
+        description: "Snapshot of Enrollment.monthly_aptc_applied_cents at issue time."
+      - name: net_amount_cents
+        type: integer
+        source: computed
+        description: "gross_amount_cents minus aptc_amount_cents."
+      - name: due_date
+        type: string
+        source: computed
+        description: "ISO 8601 date the consumer payment is due; first of billing_month."
+      - name: status
+        type: enum
+        source: computed
+        description: "Settlement state of this invoice."
+        constraints: "one of {ISSUED, PAID, WAIVED, VOIDED}"
+        default: ISSUED
+      - name: paid_at
+        type: datetime
+        source: computed
+        description: "Timestamp at which a payment posting flipped status to PAID."
+        default: null
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Application
+    initial_state: DRAFT
+    terminal_states: [DENIED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /applications/{id}/submit"
+        actor: Applicant
+        preconditions:
+          - "Application has exactly one HouseholdMember with filer_type=PRIMARY_FILER"
+          - "All members with include_in_magi=true have at least one IncomeRecord"
+          - "Application.coverage_year is current_year or current_year+1"
+        side_effects:
+          - "set submitted_at = /_clock.now()"
+          - "snapshot pinned_fpl_table_version from FPL_TABLE constants"
+          - "compute household_size, total_magi_cents, fpl_percentage (calculations.fpl_percentage)"
+
+      - from: SUBMITTED
+        to: ELIGIBILITY_DETERMINED
+        trigger: "POST /applications/{id}/determine-eligibility"
+        actor: MarketplaceAdmin
+        preconditions:
+          - "Application.status = SUBMITTED"
+        side_effects:
+          - "compute Application.csr_eligibility (calculations.csr_tier_classification)"
+          - "compute Application.aptc_estimated_cents (calculations.aptc_estimated)"
+          - "per-member compute medicaid_eligible (calculations.medicaid_eligibility)"
+
+      - from: ELIGIBILITY_DETERMINED
+        to: APPROVED
+        trigger: "POST /applications/{id}/approve"
+        actor: MarketplaceAdmin
+        preconditions:
+          - "Application.enrollment_window is OEP or SEP (not CLOSED)"
+          - "at least one HouseholdMember with medicaid_eligible=false (otherwise must be DENIED)"
+        side_effects:
+          - "set approved_at = /_clock.now()"
+
+      - from: ELIGIBILITY_DETERMINED
+        to: DENIED
+        trigger: "POST /applications/{id}/deny"
+        actor: MarketplaceAdmin
+        preconditions:
+          - "all HouseholdMembers with include_in_household=true have medicaid_eligible=true, OR enrollment_window=CLOSED"
+        side_effects: []
+
+      - from: SUBMITTED
+        to: DRAFT
+        trigger: "POST /applications/{id}/amend"
+        actor: Applicant
+        preconditions:
+          - "Application.status = SUBMITTED (cannot amend after ELIGIBILITY_DETERMINED without an open SEP)"
+        side_effects:
+          - "clear submitted_at, pinned_fpl_table_version, fpl_percentage, total_magi_cents (set to null)"
+
+      - from: APPROVED
+        to: ELIGIBILITY_DETERMINED
+        trigger: "POST /applications/{id}/redetermine"
+        actor: MarketplaceAdmin
+        preconditions:
+          - "Application has at least one SEPEvent in VERIFIED status whose window is currently open"
+        side_effects:
+          - "recompute fpl_percentage, csr_eligibility, aptc_estimated_cents"
+          - "if Application has an active Enrollment: cascade — recompute Enrollment.monthly_aptc_applied_cents, Enrollment.monthly_net_premium_cents, and emit fresh PremiumInvoice for next billing_month (depth-3 chain: Application redeterm → Enrollment recalc → PremiumInvoice)"
+
+  - entity: Enrollment
+    initial_state: PENDING_PAYMENT
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: PENDING_PAYMENT
+        to: ACTIVE
+        trigger: "POST /enrollments/{id}/post-binder-payment (first PremiumInvoice transitions to PAID)"
+        actor: system
+        preconditions:
+          - "Enrollment.payment_status was AWAITING_BINDER and is now CURRENT"
+          - "/_clock.now() >= Enrollment.coverage_start_date"
+        side_effects:
+          - "set coverage_status = ACTIVE"
+
+      - from: ACTIVE
+        to: GRACE_PERIOD
+        trigger: "system — PremiumInvoice for billing_month becomes OVERDUE (no PAID by due_date+30 days)"
+        actor: system
+        preconditions:
+          - "Enrollment.payment_status transitions to DELINQUENT_M1"
+        side_effects:
+          - "set coverage_status = GRACE_PERIOD"
+
+      - from: GRACE_PERIOD
+        to: ACTIVE
+        trigger: "POST /enrollments/{id}/post-payment that brings all open PremiumInvoices to PAID"
+        actor: system
+        preconditions:
+          - "all PremiumInvoice rows with due_date <= /_clock.now() have status=PAID"
+        side_effects:
+          - "set coverage_status = ACTIVE"
+          - "set payment_status = CURRENT"
+
+      - from: GRACE_PERIOD
+        to: TERMINATED
+        trigger: "system — 90-day grace period elapses without bringing payment_status back to CURRENT"
+        actor: system
+        preconditions:
+          - "Enrollment.payment_status = DELINQUENT_M3"
+          - "/_clock.now() >= last PAID PremiumInvoice.due_date + 90 days"
+        side_effects:
+          - "set coverage_status = TERMINATED, terminated_reason = NON_PAYMENT"
+          - "set coverage_end_date = last PAID PremiumInvoice.billing_month last day"
+          - "cascade: parent Application stays APPROVED (terminated enrollments are kept for history)"
+
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /enrollments/{id}/cancel"
+        actor: Applicant
+        preconditions:
+          - "Enrollment.coverage_status = ACTIVE"
+        side_effects:
+          - "set coverage_end_date = last day of current billing_month per /_clock.now()"
+          - "set terminated_reason = APPLICANT_CANCELLED"
+          - "depth-2 cascade: VOID all PremiumInvoice rows with billing_month > coverage_end_date"
+
+  - entity: SEPEvent
+    initial_state: SUBMITTED
+    terminal_states: [REJECTED, EXPIRED]
+    transitions:
+      - from: SUBMITTED
+        to: VERIFIED
+        trigger: "POST /applications/{app_id}/sep-events/{id}/verify"
+        actor: MarketplaceAdmin
+        preconditions:
+          - "event_date is within 60 calendar days of /_clock.now()"
+          - "parent Application.status in {SUBMITTED, ELIGIBILITY_DETERMINED, APPROVED}"
+        side_effects:
+          - "compute window_opens_on, window_closes_on, effective_date (calculations.sep_effective_date)"
+          - "set parent Application.enrollment_window = SEP"
+          - "depth-3 cascade for MARRIAGE/BIRTH_ADOPTION/MEDICAID_LOSS: if parent Application is APPROVED and has an ACTIVE Enrollment, force /applications/{id}/redetermine → Enrollment recalc → fresh PremiumInvoice"
+
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /applications/{app_id}/sep-events/{id}/reject"
+        actor: MarketplaceAdmin
+        preconditions:
+          - "event_date is more than 60 calendar days in the past OR insufficient supporting evidence (admin discretion)"
+        side_effects: []
+
+      - from: VERIFIED
+        to: EXPIRED
+        trigger: "system — /_clock.now() > window_closes_on"
+        actor: system
+        preconditions:
+          - "no Enrollment was created during the SEP window"
+        side_effects:
+          - "if Application has no other VERIFIED SEP and is not in OEP: set Application.enrollment_window = CLOSED"
+
+      - from: REJECTED
+        to: SUBMITTED
+        trigger: "POST /applications/{app_id}/sep-events/{id}/appeal"
+        actor: CustomerService
+        preconditions:
+          - "appeal filed within 30 days of rejection"
+        side_effects: []
+
+  - entity: PremiumInvoice
+    initial_state: ISSUED
+    terminal_states: [PAID, VOIDED]
+    transitions:
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /premium-invoices/{id}/post-payment"
+        actor: system
+        preconditions:
+          - "payment amount in cents >= net_amount_cents"
+        side_effects:
+          - "set paid_at = /_clock.now()"
+          - "update Enrollment.payment_status per calculations.payment_status_rollup"
+          - "if Enrollment.coverage_status = PENDING_PAYMENT and this is the binder invoice: trigger Enrollment PENDING_PAYMENT→ACTIVE"
+
+      - from: ISSUED
+        to: WAIVED
+        trigger: "POST /premium-invoices/{id}/waive"
+        actor: CustomerService
+        preconditions:
+          - "net_amount_cents = 0 (fully subsidized) OR documented hardship on file"
+        side_effects:
+          - "treat as PAID for purposes of Enrollment.payment_status rollup"
+
+      - from: ISSUED
+        to: VOIDED
+        trigger: "system — issued during an Enrollment recalc or cancel cascade"
+        actor: system
+        preconditions:
+          - "parent Enrollment was either CANCELLED or had monthly_premium recomputed before due_date"
+        side_effects: []
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - scenario: "Two admins click /approve and /deny on the same Application simultaneously"
+    guarantee: "Exactly one wins; loser sees ERR_INVALID_STATE because Application.status has already left ELIGIBILITY_DETERMINED"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    serialization: "First-writer-wins on Application.status"
+
+  - scenario: "Applicant submits two Enrollments under the same Application+coverage_year concurrently"
+    guarantee: "At most one Enrollment per Application per coverage_year; second rejected"
+    error_id: ERR_ENROLLMENT_ALREADY_EXISTS
+    http_status: 409
+    serialization: "First-writer-wins on (application_id, coverage_year) uniqueness"
+
+  - scenario: "Insurer updates Plan.base_monthly_premium_cents while Applicant submits Enrollment referencing the same Plan"
+    guarantee: "Enrollment pins the Plan.catalog_version that existed when the Enrollment write committed; the loser of the race (insurer) sees their update succeed but does not affect the in-flight Enrollment"
+    error_id: ERR_STALE_VERSION
+    http_status: 409
+    serialization: "Optimistic concurrency on Plan.version; in-flight Enrollment snapshots catalog_version atomically"
+
+  - scenario: "Two PremiumInvoice /post-payment requests race for the same invoice"
+    guarantee: "Exactly one transitions ISSUED→PAID; second rejected"
+    error_id: ERR_INVOICE_ALREADY_PAID
+    http_status: 409
+    serialization: "First-writer-wins on PremiumInvoice.status"
+
+  - scenario: "Two admins click /verify on different SEPEvents under the same Application within the same OEP-CLOSED window"
+    guarantee: "Both verifications may succeed but Application.enrollment_window remains SEP; only one SEP's effective_date governs the next Enrollment (earliest VERIFIED whose window is still open)"
+    error_id: ERR_SEP_CONFLICT
+    http_status: 409
+    serialization: "Tie-break on SEPEvent.reported_at ascending; later VERIFIED SEPEvent does NOT override an earlier one already governing an Enrollment"
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: fpl_percentage
+    trigger: "every Application SUBMIT or member income mutation while status=SUBMITTED"
+    algorithm: aggregation
+    formula: |
+      total_magi_cents = sum(IncomeRecord.amount_cents) over all IncomeRecord rows
+        WHERE IncomeRecord.member_id IN { HouseholdMember.id WHERE include_in_magi=true }
+          AND IncomeRecord.superseded_by_id IS NULL
+      household_size = count(HouseholdMember WHERE include_in_household=true)
+      fpl_denominator_cents = FPL_TABLE[pinned_fpl_table_version][household_size]
+      fpl_percentage = round( (total_magi_cents / fpl_denominator_cents) * 100, 1 )   # one decimal place, round_half_up
+    input_set: "All HouseholdMember rows of the Application; all IncomeRecord rows whose superseded_by_id IS NULL. PRIMARY_FILER and SPOUSE always counted; DEPENDENT counted only if include_in_household=true."
+    constants:
+      FPL_TABLE:
+        v1:                                       # 2025 plan year denominators (cents)
+          1: 1525500
+          2: 2067500
+          3: 2609500
+          4: 3151500
+          5: 3693500
+          6: 4235500
+          per_additional_after_6: 542000
+        v2:                                       # 2026 plan year denominators (cents) — used when coverage_year advances
+          1: 1572500
+          2: 2131000
+          3: 2689500
+          4: 3248000
+          5: 3806500
+          6: 4365000
+          per_additional_after_6: 558500
+    precision: "fpl_percentage rounded to 1 decimal place, round_half_up"
+    variants: []
+
+  - name: aptc_estimated
+    trigger: "Application transition SUBMITTED→ELIGIBILITY_DETERMINED, or redetermine after SEP verification"
+    algorithm: forward_looking
+    formula: |
+      # Forward-looking: uses CURRENT total_magi_cents and CURRENT household_size,
+      # ignoring intra-year MAGI swings. Pinned at ELIGIBILITY_DETERMINED time.
+      ap_pct = APPLICABLE_PERCENTAGE_TABLE_LOOKUP(fpl_percentage)
+      expected_household_contribution_cents = round_half_up(total_magi_cents * ap_pct)
+      benchmark_silver = Plan WHERE filing_state=Application.filing_state
+                              AND coverage_year=Application.coverage_year
+                              AND is_benchmark_silver=true
+                              AND status=ACTIVE
+                              (exactly one expected; if zero → ERR_NO_BENCHMARK_PLAN)
+      annual_benchmark_cents = age_adjusted_premium(benchmark_silver, household_members)
+      aptc_estimated_cents = max(0, annual_benchmark_cents - expected_household_contribution_cents)
+    input_set: "Households whose fpl_percentage is in [100.0, 400.0]; below 100% redirected to Medicaid evaluation, above 400% no APTC (aptc_estimated_cents=0). The benchmark_silver Plan MUST exist for the Application.filing_state and coverage_year."
+    constants:
+      APPLICABLE_PERCENTAGE_TABLE:                # FPL % range → expected contribution as fraction of MAGI
+        # half-open intervals [lower, upper)
+        - { lower: 100.0, upper: 150.0, fraction: 0.0000 }
+        - { lower: 150.0, upper: 200.0, fraction: 0.0200 }
+        - { lower: 200.0, upper: 250.0, fraction: 0.0400 }
+        - { lower: 250.0, upper: 300.0, fraction: 0.0600 }
+        - { lower: 300.0, upper: 400.0, fraction: 0.0850 }
+        - { lower: 400.0, upper: 99999.0, fraction: 1.0000 }     # no subsidy band
+      AGE_CURVE_MULTIPLIERS:
+        # multiplier applied to Plan.base_monthly_premium_cents per HouseholdMember based on age
+        "0-14": 0.765
+        "15-20": 0.833
+        "21-24": 1.000
+        "25-29": 1.061
+        "30-34": 1.150
+        "35-39": 1.181
+        "40-44": 1.278
+        "45-49": 1.444
+        "50-54": 1.706
+        "55-59": 2.040
+        "60-63": 2.411
+        "64+": 3.000
+      TOBACCO_SURCHARGE: 1.50                     # multiplied onto member premium if is_tobacco_user=true and age >= 21
+    precision: "all intermediate currency values held in cents; round_half_up to nearest cent only at the final aptc_estimated_cents step"
+    variants:
+      - name: estimated
+        when: "Application transitions SUBMITTED→ELIGIBILITY_DETERMINED"
+        difference: "Uses CURRENT total_magi_cents and household_size at the moment of determination. Future income changes during the coverage_year do NOT alter aptc_estimated_cents."
+      - name: reconciled
+        when: "year-end reconciliation sweep via POST /_sweep/reconcile-aptc"
+        difference: "Replays IncomeRecord history CHRONOLOGICALLY: for each month in coverage_year, recomputes total_magi_cents using only IncomeRecord rows whose effective_date <= month_start AND (superseded_by_id IS NULL OR superseded record's effective_date > month_start). Sums each month's allowed APTC and writes aptc_reconciled_cents. For identical IncomeRecord inputs, estimated and reconciled can differ when a corrective IncomeRecord arrives mid-year — the estimated value sees the corrective record (running totals after submission) while the reconciled value time-slices the ledger so the corrective record only affects months on/after its effective_date."
+
+  - name: csr_tier_classification
+    trigger: "Application transition SUBMITTED→ELIGIBILITY_DETERMINED, and any redetermine"
+    algorithm: threshold
+    formula: |
+      # CSR Plus is a newer tier for very-low-income enrollees; thresholds are HALF-OPEN [lower, upper).
+      # Use the precision: > inclusive at lower, < strict at upper.
+      if fpl_percentage < 100.0:
+          return NONE                              # Medicaid territory
+      elif 100.0 <= fpl_percentage < 138.0:
+          return CSR_PLUS                          # CSR Plus: AV 97
+      elif 138.0 <= fpl_percentage < 150.0:
+          return CSR_94                            # AV 94
+      elif 150.0 <= fpl_percentage < 200.0:
+          return CSR_87                            # AV 87
+      elif 200.0 <= fpl_percentage < 250.0:
+          return CSR_73                            # AV 73
+      else:
+          return NONE                              # >=250% gets no CSR
+    input_set: "Application.fpl_percentage as computed by fpl_percentage; only Silver tier PlanVariant rows honor csr_tier_classification — Bronze/Gold/Platinum ignore the field."
+    constants: {}
+    precision: "fpl_percentage compared at 1-decimal-place precision; e.g., 149.9 → CSR_94, 150.0 → CSR_87"
+    variants: []
+
+  - name: sep_effective_date
+    trigger: "SEPEvent transition SUBMITTED→VERIFIED"
+    algorithm: chronological
+    formula: |
+      # event_type determines effective_date semantics
+      reported_month_start = first day of month containing reported_at
+      next_month_start = first day of month after reported_month_start
+      if event_type in {BIRTH_ADOPTION, MARRIAGE}:
+          effective_date = event_date                      # retroactive to event
+          window_opens_on = event_date
+      elif event_type in {LOSS_OF_COVERAGE, MEDICAID_LOSS}:
+          effective_date = first day of month AFTER reported_at        # forward-looking
+          window_opens_on = event_date
+      elif event_type == MOVE:
+          if reported_at <= event_date + 60 days:
+              effective_date = first day of month AFTER reported_at
+          else:
+              effective_date = first day of month AFTER (event_date + 60 days)  # capped
+          window_opens_on = event_date
+      elif event_type == INCOME_CHANGE:
+          effective_date = first day of month AFTER reported_at
+          window_opens_on = next_month_start
+      elif event_type == GAINED_CITIZENSHIP:
+          effective_date = first day of month AFTER reported_at
+          window_opens_on = event_date
+      window_closes_on = window_opens_on + 60 calendar days
+    input_set: "Single SEPEvent row; reported_at is the server timestamp at SEPEvent creation; event_date is applicant-provided."
+    constants: {}
+    precision: "all dates handled as calendar dates (no time component); 'after' uses strict > on month boundary"
+    variants: []
+
+  - name: monthly_premium
+    trigger: "Enrollment creation, and any Enrollment redetermine cascade"
+    algorithm: tiered_pricing
+    formula: |
+      # Sum per-member premium contributions; rounding order PINNED: per-member round, then sum.
+      monthly_premium_gross_cents = 0
+      for member in HouseholdMember WHERE include_in_household=true:
+          age = years between member.date_of_birth and Enrollment.coverage_start_date
+          age_bracket = AGE_BRACKET_FOR(age)
+          age_mult = AGE_CURVE_MULTIPLIERS[age_bracket]
+          member_premium_cents = round_half_up( Plan.base_monthly_premium_cents * age_mult )
+          if member.is_tobacco_user and age >= 21:
+              member_premium_cents = round_half_up( member_premium_cents * TOBACCO_SURCHARGE )
+          monthly_premium_gross_cents += member_premium_cents
+
+      monthly_aptc_applied_cents = min(
+          round_half_up(aptc_estimated_cents / 12),
+          monthly_premium_gross_cents
+      )
+      monthly_net_premium_cents = monthly_premium_gross_cents - monthly_aptc_applied_cents
+    input_set: "All HouseholdMember rows where include_in_household=true; PlanVariant chosen on enrollment; APPLICABLE_PERCENTAGE_TABLE pinned at ELIGIBILITY_DETERMINED."
+    constants:
+      ROUNDING_ORDER: "per-member round to nearest cent, THEN sum (NOT sum then round)"
+    precision: "per-member intermediate rounding to 1 cent, round_half_up; final aggregates are exact sums of rounded cents"
+    variants: []
+
+  - name: medicaid_eligibility
+    trigger: "Application transition SUBMITTED→ELIGIBILITY_DETERMINED for each HouseholdMember"
+    algorithm: threshold
+    formula: |
+      age = years between HouseholdMember.date_of_birth and Application.coverage_year start
+      state_expanded = MEDICAID_EXPANSION[filing_state]
+      member_fpl_share = fpl_percentage   # household-level FPL applies to all members
+      if age < 19:
+          # children: 200% FPL regardless of state expansion
+          return member_fpl_share < 200.0
+      elif age >= 65:
+          # seniors: not Medicaid via marketplace (Medicare territory)
+          return false
+      elif state_expanded:
+          # Medicaid expansion states: 138% FPL for adults
+          return member_fpl_share < 138.0
+      else:
+          # non-expansion: adults rarely qualify (very low income + categorical)
+          return member_fpl_share < 50.0
+    input_set: "Per HouseholdMember of an Application in SUBMITTED status; uses parent Application.filing_state and Application.fpl_percentage."
+    constants:
+      MEDICAID_EXPANSION:
+        CA: true
+        NY: true
+        WA: true
+        TX: false
+        FL: false
+        GA: false
+        # ... abbreviated; PRD lists all 51 entries
+    precision: "fpl thresholds compared at 1 decimal place"
+    variants: []
+
+  - name: payment_status_rollup
+    trigger: "PremiumInvoice transitions, and /_sweep/age-invoices clock advancement"
+    algorithm: chronological
+    formula: |
+      # Replay invoices in (billing_month ASC, id ASC) order
+      now = /_clock.now()
+      oldest_unpaid = MIN(billing_month) WHERE status=ISSUED AND due_date <= now
+      if oldest_unpaid is null:
+          payment_status = CURRENT
+      else:
+          days_overdue = now - (first day of oldest_unpaid + 30 days)        # 30-day grace start
+          if days_overdue <= 0:
+              payment_status = CURRENT                                       # within grace
+          elif days_overdue <= 30:
+              payment_status = DELINQUENT_M1                                 # day 1-30 of grace
+          elif days_overdue <= 60:
+              payment_status = DELINQUENT_M2                                 # day 31-60
+          else:
+              payment_status = DELINQUENT_M3                                 # day 61-90; day 91 triggers TERMINATED
+    input_set: "All PremiumInvoice rows for the Enrollment except status=VOIDED; tie-break on id ascending when billing_month equal."
+    constants:
+      GRACE_PERIOD_DAYS: 30
+      TERMINATION_THRESHOLD_DAYS: 90
+    precision: "day-count comparisons use UTC calendar days; both endpoints inclusive at lower bound, exclusive at upper (>= 1 AND < 31 means DELINQUENT_M1)"
+    variants: []
+
+# =============================================================================
+# 1.4 Validation Rules Table (Ordered by Priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "Request carries X-User-ID and X-User-Role headers"
+    error_id: ERR_AUTH_REQUIRED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "Role permitted for this operation per RBAC matrix §1.7"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "Path parameter ids resolve to existing resources, left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all path-parameterized endpoints"
+
+  - priority: 4
+    category: existence
+    check: "When Applicant acts on Application, X-User-ID equals Application.applicant_id"
+    error_id: ERR_NOT_APPLICATION_OWNER
+    http_status: 403
+    applies_to: "all Applicant-scoped writes under /applications/{id}"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which the requested transition is allowed (per §1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-mutating endpoints"
+
+  - priority: 6
+    category: business_constraint
+    check: "Application has exactly one PRIMARY_FILER HouseholdMember on SUBMIT"
+    error_id: ERR_MISSING_PRIMARY_FILER
+    http_status: 422
+    applies_to: "POST /applications/{id}/submit"
+
+  - priority: 7
+    category: business_constraint
+    check: "Application.coverage_year is current_year or current_year+1 at SUBMIT time"
+    error_id: ERR_COVERAGE_YEAR_INVALID
+    http_status: 422
+    applies_to: "POST /applications/{id}/submit"
+
+  - priority: 8
+    category: business_temporal
+    check: "Application.enrollment_window is OEP or SEP (not CLOSED) before APPROVE"
+    error_id: ERR_OUTSIDE_ENROLLMENT_WINDOW
+    http_status: 409
+    applies_to: "POST /applications/{id}/approve, POST /enrollments"
+
+  - priority: 9
+    category: business_referential
+    check: "Enrollment's plan_variant_id references a PlanVariant whose Plan.filing_state matches Application.filing_state and Plan.coverage_year matches Application.coverage_year"
+    error_id: ERR_PLAN_STATE_MISMATCH
+    http_status: 422
+    applies_to: "POST /enrollments"
+
+  - priority: 10
+    category: business_referential
+    check: "Selected PlanVariant.csr_level matches Application.csr_eligibility (STANDARD if csr_eligibility=NONE, otherwise must equal Application.csr_eligibility)"
+    error_id: ERR_CSR_VARIANT_MISMATCH
+    http_status: 422
+    applies_to: "POST /enrollments"
+
+  - priority: 11
+    category: business_temporal
+    check: "Enrollment.coverage_start_date is within an active SEP window or the OEP window for Application.coverage_year"
+    error_id: ERR_OUTSIDE_SEP_WINDOW
+    http_status: 422
+    applies_to: "POST /enrollments"
+
+  - priority: 12
+    category: business_fiscal
+    check: "Sum across IncomeRecord rows does not yield total_magi_cents < 0 (the household-level MAGI floor is 0; per-member individual losses can be negative but household sum cannot go below 0)"
+    error_id: ERR_MAGI_NEGATIVE
+    http_status: 422
+    applies_to: "POST /applications/{id}/submit, POST /applications/{id}/redetermine"
+
+  - priority: 13
+    category: business_safety
+    check: "All HouseholdMembers with include_in_household=true must have a benchmark Silver plan available in Application.filing_state for Application.coverage_year"
+    error_id: ERR_NO_BENCHMARK_PLAN
+    http_status: 422
+    applies_to: "POST /applications/{id}/determine-eligibility"
+
+  - priority: 14
+    category: business_constraint
+    check: "At most one Enrollment per (application_id, coverage_year) — uniqueness constraint"
+    error_id: ERR_ENROLLMENT_ALREADY_EXISTS
+    http_status: 409
+    applies_to: "POST /enrollments"
+
+  - priority: 15
+    category: business_constraint
+    check: "PremiumInvoice payment amount >= net_amount_cents"
+    error_id: ERR_PAYMENT_INSUFFICIENT
+    http_status: 422
+    applies_to: "POST /premium-invoices/{id}/post-payment"
+
+  - priority: 16
+    category: business_constraint
+    check: "Plan.is_benchmark_silver may be set true for at most one Plan per (filing_state, coverage_year)"
+    error_id: ERR_BENCHMARK_CONFLICT
+    http_status: 409
+    applies_to: "POST /plans, PATCH /plans/{id}"
+
+  - priority: 17
+    category: business_temporal
+    check: "SEPEvent.event_date is within 60 calendar days of /_clock.now() when verifying"
+    error_id: ERR_SEP_WINDOW_EXPIRED
+    http_status: 422
+    applies_to: "POST /applications/{app_id}/sep-events/{id}/verify"
+
+  - priority: 18
+    category: business_constraint
+    check: "Optimistic concurrency: provided If-Match version equals stored version on mutation"
+    error_id: ERR_STALE_VERSION
+    http_status: 409
+    applies_to: "PATCH /applications/{id}, PATCH /plans/{id}, PATCH /enrollments/{id}"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Applications ----
+  - method: POST
+    path: "/applications"
+    description: "Create a DRAFT application"
+    roles: [Applicant]
+    code: 201
+    input: [coverage_year, filing_state]
+    output: Application
+    side_effects: []
+
+  - method: GET
+    path: "/applications/{id}"
+    description: "Fetch one Application with denormalized rollups (household_size, fpl_percentage, csr_eligibility, aptc_estimated_cents)"
+    roles: [Applicant, MarketplaceAdmin, CustomerService]
+    code: 200
+    input: []
+    output: Application
+    side_effects: []
+
+  - method: GET
+    path: "/applications"
+    description: "List applications; Applicant sees only own; admins see all"
+    roles: [Applicant, MarketplaceAdmin, CustomerService]
+    code: 200
+    input: ["status?", "coverage_year?", "filing_state?", "limit?", "offset?"]
+    output: Application[]
+    side_effects: []
+
+  - method: POST
+    path: "/applications/{id}/submit"
+    description: "DRAFT → SUBMITTED"
+    roles: [Applicant]
+    code: 200
+    input: []
+    output: Application
+    side_effects:
+      - "fpl_percentage recomputed"
+      - "pinned_fpl_table_version snapshotted"
+
+  - method: POST
+    path: "/applications/{id}/amend"
+    description: "SUBMITTED → DRAFT (revert for editing)"
+    roles: [Applicant]
+    code: 200
+    input: []
+    output: Application
+    side_effects:
+      - "clears fpl_percentage, total_magi_cents, pinned_fpl_table_version"
+
+  - method: POST
+    path: "/applications/{id}/determine-eligibility"
+    description: "SUBMITTED → ELIGIBILITY_DETERMINED"
+    roles: [MarketplaceAdmin]
+    code: 200
+    input: []
+    output: Application
+    side_effects:
+      - "csr_tier_classification computed → Application.csr_eligibility"
+      - "aptc_estimated computed → Application.aptc_estimated_cents"
+      - "medicaid_eligibility computed for each HouseholdMember"
+
+  - method: POST
+    path: "/applications/{id}/approve"
+    description: "ELIGIBILITY_DETERMINED → APPROVED"
+    roles: [MarketplaceAdmin]
+    code: 200
+    input: []
+    output: Application
+    side_effects: []
+
+  - method: POST
+    path: "/applications/{id}/deny"
+    description: "ELIGIBILITY_DETERMINED → DENIED"
+    roles: [MarketplaceAdmin]
+    code: 200
+    input: ["reason?"]
+    output: Application
+    side_effects: []
+
+  - method: POST
+    path: "/applications/{id}/redetermine"
+    description: "APPROVED → ELIGIBILITY_DETERMINED; recompute eligibility after SEP"
+    roles: [MarketplaceAdmin]
+    code: 200
+    input: []
+    output: Application
+    side_effects:
+      - "fpl_percentage, csr_eligibility, aptc_estimated_cents recomputed"
+      - "if active Enrollment exists: cascade monthly_premium recompute + fresh PremiumInvoice (depth-3)"
+
+  # ---- HouseholdMember + IncomeRecord ----
+  - method: POST
+    path: "/applications/{id}/household-members"
+    description: "Add a HouseholdMember to a DRAFT (or amended) Application"
+    roles: [Applicant]
+    code: 201
+    input: [filer_type, date_of_birth, "include_in_household?", "include_in_magi?", "is_tobacco_user?"]
+    output: HouseholdMember
+    side_effects:
+      - "Application.household_size recomputed"
+
+  - method: PATCH
+    path: "/applications/{id}/household-members/{member_id}"
+    description: "Update a HouseholdMember while parent Application is DRAFT"
+    roles: [Applicant]
+    code: 200
+    input: ["include_in_household?", "include_in_magi?", "is_tobacco_user?", version]
+    output: HouseholdMember
+    side_effects:
+      - "Application.household_size and total_magi_cents recomputed"
+
+  - method: DELETE
+    path: "/applications/{id}/household-members/{member_id}"
+    description: "Remove a non-PRIMARY_FILER HouseholdMember while parent Application is DRAFT"
+    roles: [Applicant]
+    code: 204
+    input: []
+    output: null
+    side_effects:
+      - "Application.household_size recomputed"
+
+  - method: POST
+    path: "/applications/{id}/household-members/{member_id}/income-records"
+    description: "Append an IncomeRecord (immutable; corrections create a new row that supersedes the prior)"
+    roles: [Applicant]
+    code: 201
+    input: [source_type, amount_cents, effective_date, "supersedes_id?"]
+    output: IncomeRecord
+    side_effects:
+      - "if supersedes_id provided: target IncomeRecord.superseded_by_id is set"
+      - "HouseholdMember.member_magi_cents and Application.total_magi_cents recomputed"
+
+  # ---- SEP Events ----
+  - method: POST
+    path: "/applications/{id}/sep-events"
+    description: "File a SEP claim under an Application"
+    roles: [Applicant]
+    code: 201
+    input: [event_type, event_date]
+    output: SEPEvent
+    side_effects: []
+
+  - method: POST
+    path: "/applications/{app_id}/sep-events/{id}/verify"
+    description: "SEPEvent SUBMITTED → VERIFIED"
+    roles: [MarketplaceAdmin]
+    code: 200
+    input: []
+    output: SEPEvent
+    side_effects:
+      - "sep_effective_date computed → window_opens_on, window_closes_on, effective_date"
+      - "parent Application.enrollment_window = SEP"
+      - "for MARRIAGE/BIRTH_ADOPTION/MEDICAID_LOSS on APPROVED Application: cascade redetermine + Enrollment recalc + fresh PremiumInvoice"
+
+  - method: POST
+    path: "/applications/{app_id}/sep-events/{id}/reject"
+    description: "SEPEvent SUBMITTED → REJECTED"
+    roles: [MarketplaceAdmin]
+    code: 200
+    input: ["reason?"]
+    output: SEPEvent
+    side_effects: []
+
+  - method: POST
+    path: "/applications/{app_id}/sep-events/{id}/appeal"
+    description: "SEPEvent REJECTED → SUBMITTED"
+    roles: [CustomerService]
+    code: 200
+    input: []
+    output: SEPEvent
+    side_effects: []
+
+  # ---- Insurer + Plan + PlanVariant ----
+  - method: POST
+    path: "/insurers"
+    description: "Create an Insurer (operator-only)"
+    roles: [MarketplaceAdmin]
+    code: 201
+    input: [name, filing_states, contact_phone]
+    output: Insurer
+    side_effects: []
+
+  - method: GET
+    path: "/insurers"
+    description: "List insurers"
+    roles: [Applicant, MarketplaceAdmin, CustomerService, Insurer]
+    code: 200
+    input: ["filing_state?", "limit?", "offset?"]
+    output: Insurer[]
+    side_effects: []
+
+  - method: POST
+    path: "/plans"
+    description: "Create a Plan in the catalog"
+    roles: [Insurer, MarketplaceAdmin]
+    code: 201
+    input: [insurer_id, coverage_year, filing_state, tier, base_monthly_premium_cents, "is_benchmark_silver?"]
+    output: Plan
+    side_effects: []
+
+  - method: PATCH
+    path: "/plans/{id}"
+    description: "Update a Plan (base premium or withdraw); bumps catalog_version and Plan.version"
+    roles: [Insurer, MarketplaceAdmin]
+    code: 200
+    input: ["base_monthly_premium_cents?", "status?", "is_benchmark_silver?", version]
+    output: Plan
+    side_effects:
+      - "catalog_version increments; existing Enrollment rows retain pinned_plan_catalog_version"
+
+  - method: GET
+    path: "/plans"
+    description: "List plans, filterable by state/year/tier"
+    roles: [Applicant, MarketplaceAdmin, CustomerService, Insurer]
+    code: 200
+    input: ["filing_state?", "coverage_year?", "tier?", "status?", "limit?", "offset?"]
+    output: Plan[]
+    side_effects: []
+
+  - method: POST
+    path: "/plans/{id}/variants"
+    description: "Attach a CSR variant to a Silver plan"
+    roles: [Insurer, MarketplaceAdmin]
+    code: 201
+    input: [csr_level, actuarial_value, out_of_pocket_max_cents]
+    output: PlanVariant
+    side_effects: []
+
+  # ---- Enrollment ----
+  - method: POST
+    path: "/enrollments"
+    description: "Create an Enrollment binding an APPROVED Application to a PlanVariant"
+    roles: [Applicant]
+    code: 201
+    input: [application_id, plan_variant_id]
+    output: Enrollment
+    side_effects:
+      - "pinned_plan_catalog_version snapshotted from parent Plan"
+      - "monthly_premium computed → monthly_premium_gross_cents, monthly_aptc_applied_cents, monthly_net_premium_cents"
+      - "coverage_start_date derived from active SEP.effective_date or OEP rule (Jan 1 of coverage_year if applied during OEP)"
+      - "first PremiumInvoice issued automatically"
+
+  - method: GET
+    path: "/enrollments/{id}"
+    description: "Fetch one Enrollment"
+    roles: [Applicant, MarketplaceAdmin, CustomerService, Insurer]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: []
+
+  - method: POST
+    path: "/enrollments/{id}/cancel"
+    description: "ACTIVE → TERMINATED via applicant cancellation"
+    roles: [Applicant]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects:
+      - "VOID future PremiumInvoice rows (depth-2 cascade)"
+      - "set coverage_end_date"
+
+  # ---- PremiumInvoice ----
+  - method: GET
+    path: "/enrollments/{id}/premium-invoices"
+    description: "List invoices for an Enrollment in (billing_month ASC, id ASC) order"
+    roles: [Applicant, MarketplaceAdmin, CustomerService]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: PremiumInvoice[]
+    side_effects: []
+
+  - method: POST
+    path: "/premium-invoices/{id}/post-payment"
+    description: "ISSUED → PAID; amount must >= net_amount_cents"
+    roles: [Applicant, CustomerService]
+    code: 200
+    input: [amount_cents]
+    output: PremiumInvoice
+    side_effects:
+      - "Enrollment.payment_status recomputed (payment_status_rollup)"
+      - "if binder + coverage_start_date reached: Enrollment PENDING_PAYMENT→ACTIVE"
+
+  - method: POST
+    path: "/premium-invoices/{id}/waive"
+    description: "ISSUED → WAIVED (zero-net invoices or hardship)"
+    roles: [CustomerService]
+    code: 200
+    input: ["reason?"]
+    output: PremiumInvoice
+    side_effects:
+      - "treated as PAID for payment_status_rollup"
+
+  # ---- Test-driving endpoints (required per §1.5 testability-completeness) ----
+  - method: POST
+    path: "/_clock/advance"
+    description: "Advance the server clock to a fixed ISO 8601 timestamp; required for date-gated SEP windows, OEP open/close, grace-period aging, and CSR threshold edge cases"
+    roles: [MarketplaceAdmin]
+    code: 200
+    input: [to_timestamp]
+    output: object
+    side_effects:
+      - "any SEPEvent whose window_closes_on < new_now and is in VERIFIED with no Enrollment transitions to EXPIRED"
+      - "Enrollment.payment_status rollup re-runs"
+
+  - method: POST
+    path: "/_sweep/age-invoices"
+    description: "Walk all Enrollment rows in ACTIVE/GRACE_PERIOD; transition coverage_status per payment_status thresholds and possibly TERMINATE on day 91 of non-payment"
+    roles: [MarketplaceAdmin]
+    code: 200
+    input: []
+    output: object
+    side_effects:
+      - "ACTIVE→GRACE_PERIOD when payment_status flips DELINQUENT_M1"
+      - "GRACE_PERIOD→TERMINATED when payment_status=DELINQUENT_M3 and 90-day threshold elapsed"
+
+  - method: POST
+    path: "/_sweep/reconcile-aptc"
+    description: "Year-end APTC reconciliation: replays IncomeRecord history chronologically and writes Application.aptc_reconciled_cents"
+    roles: [MarketplaceAdmin]
+    code: 200
+    input: [coverage_year]
+    output: object
+    side_effects:
+      - "Application.aptc_reconciled_cents populated for every Application in APPROVED status for the given coverage_year"
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_AUTH_REQUIRED
+    http: 401
+    condition: "Missing or malformed X-User-ID / X-User-Role headers"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Role not permitted for the requested operation per RBAC matrix"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Path parameter id does not resolve to an existing resource"
+  - id: ERR_NOT_APPLICATION_OWNER
+    http: 403
+    condition: "Applicant attempts to act on Application whose applicant_id does not equal X-User-ID"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource is not in a state from which the requested transition is allowed"
+  - id: ERR_STALE_VERSION
+    http: 409
+    condition: "Provided If-Match version does not equal current stored version"
+  - id: ERR_MISSING_PRIMARY_FILER
+    http: 422
+    condition: "Application has zero or more than one HouseholdMember with filer_type=PRIMARY_FILER at SUBMIT"
+  - id: ERR_COVERAGE_YEAR_INVALID
+    http: 422
+    condition: "coverage_year is not equal to current_year or current_year+1 per /_clock.now()"
+  - id: ERR_OUTSIDE_ENROLLMENT_WINDOW
+    http: 409
+    condition: "Application.enrollment_window=CLOSED at the moment of approve/enroll"
+  - id: ERR_PLAN_STATE_MISMATCH
+    http: 422
+    condition: "PlanVariant's parent Plan.filing_state or coverage_year does not match the Application"
+  - id: ERR_CSR_VARIANT_MISMATCH
+    http: 422
+    condition: "PlanVariant.csr_level does not match Application.csr_eligibility (must be STANDARD when csr_eligibility=NONE; otherwise must equal csr_eligibility verbatim)"
+  - id: ERR_OUTSIDE_SEP_WINDOW
+    http: 422
+    condition: "Enrollment.coverage_start_date does not fall inside an open SEP window or the OEP window for the coverage_year"
+  - id: ERR_MAGI_NEGATIVE
+    http: 422
+    condition: "Sum of IncomeRecord rows yields total_magi_cents < 0 at SUBMIT or redetermine"
+  - id: ERR_NO_BENCHMARK_PLAN
+    http: 422
+    condition: "No Plan with is_benchmark_silver=true exists for Application.filing_state and coverage_year at ELIGIBILITY_DETERMINED time"
+  - id: ERR_ENROLLMENT_ALREADY_EXISTS
+    http: 409
+    condition: "An Enrollment already exists for the (application_id, coverage_year) pair"
+  - id: ERR_PAYMENT_INSUFFICIENT
+    http: 422
+    condition: "Payment amount_cents less than PremiumInvoice.net_amount_cents"
+  - id: ERR_BENCHMARK_CONFLICT
+    http: 409
+    condition: "Attempt to set is_benchmark_silver=true on a Plan when another active Plan in the same (filing_state, coverage_year) already holds it"
+  - id: ERR_SEP_WINDOW_EXPIRED
+    http: 422
+    condition: "SEPEvent.event_date is more than 60 calendar days before /_clock.now() at verify time"
+  - id: ERR_SEP_CONFLICT
+    http: 409
+    condition: "Two SEPEvents under the same Application race for governance of an Enrollment effective_date"
+  - id: ERR_INVOICE_ALREADY_PAID
+    http: 409
+    condition: "PremiumInvoice.status is no longer ISSUED at post-payment time"
+  - id: ERR_DEPENDENT_AGE_INVALID
+    http: 422
+    condition: "HouseholdMember with filer_type=DEPENDENT has date_of_birth implying age >= 26 (max dependent age)"
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Applicant
+    description: "Consumer enrolling in coverage; owns one Application per coverage_year"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /applications"
+      - "POST /applications/{id}/submit"
+      - "POST /applications/{id}/amend"
+      - "POST /applications/{id}/household-members"
+      - "PATCH /applications/{id}/household-members/{member_id}"
+      - "DELETE /applications/{id}/household-members/{member_id}"
+      - "POST /applications/{id}/household-members/{member_id}/income-records"
+      - "POST /applications/{id}/sep-events"
+      - "POST /enrollments"
+      - "POST /enrollments/{id}/cancel"
+    shared_operations:
+      - "GET /applications/{id}"
+      - "GET /applications"
+      - "GET /enrollments/{id}"
+      - "GET /enrollments/{id}/premium-invoices"
+      - "POST /premium-invoices/{id}/post-payment"
+      - "GET /plans"
+      - "GET /insurers"
+
+  - name: MarketplaceAdmin
+    description: "Marketplace operator: verifies SEPs, runs eligibility determinations, manages clock and sweeps"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /applications/{id}/determine-eligibility"
+      - "POST /applications/{id}/approve"
+      - "POST /applications/{id}/deny"
+      - "POST /applications/{id}/redetermine"
+      - "POST /applications/{app_id}/sep-events/{id}/verify"
+      - "POST /applications/{app_id}/sep-events/{id}/reject"
+      - "POST /insurers"
+      - "POST /_clock/advance"
+      - "POST /_sweep/age-invoices"
+      - "POST /_sweep/reconcile-aptc"
+    shared_operations:
+      - "GET /applications/{id}"
+      - "GET /applications"
+      - "POST /plans"
+      - "PATCH /plans/{id}"
+      - "GET /plans"
+      - "POST /plans/{id}/variants"
+      - "GET /enrollments/{id}"
+      - "GET /enrollments/{id}/premium-invoices"
+
+  - name: Insurer
+    description: "Health-plan issuer; manages own Plan catalog and CSR variants"
+    identity: "entity_backed:Insurer"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /plans"
+      - "PATCH /plans/{id}"
+      - "GET /plans"
+      - "POST /plans/{id}/variants"
+      - "GET /insurers"
+      - "GET /enrollments/{id}"
+
+  - name: CustomerService
+    description: "Support operator with appeal and waiver authority"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /applications/{app_id}/sep-events/{id}/appeal"
+      - "POST /premium-invoices/{id}/waive"
+    shared_operations:
+      - "GET /applications/{id}"
+      - "GET /applications"
+      - "GET /enrollments/{id}"
+      - "GET /enrollments/{id}/premium-invoices"
+      - "POST /premium-invoices/{id}/post-payment"

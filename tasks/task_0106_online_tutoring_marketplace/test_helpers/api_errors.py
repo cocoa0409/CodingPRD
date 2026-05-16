@@ -1,0 +1,82 @@
+"""Error IDs and HTTP status mapping (PRD §5 Error Code Catalogue).
+
+After definition, the mapping is registered with the framework so
+validate_error() can auto-check HTTP status codes without each test
+passing them explicitly.
+"""
+from __future__ import annotations
+
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import (
+    set_error_http_status_map,
+)
+
+
+class ApiErrorId(str, Enum):
+    # Auth — PRD §2.1
+    ERR_AUTH_REQUIRED = "ERR_AUTH_REQUIRED"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_NOT_AUTHORIZED_FOR_RESOURCE = "ERR_NOT_AUTHORIZED_FOR_RESOURCE"
+
+    # Existence — PRD §2.5
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+
+    # State + concurrency — PRD §2.6, §2.7
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+    ERR_SESSION_OVERLAP = "ERR_SESSION_OVERLAP"
+    ERR_DISPUTE_ALREADY_OPEN = "ERR_DISPUTE_ALREADY_OPEN"
+    ERR_PAYOUT_STALE = "ERR_PAYOUT_STALE"
+
+    # Business — PRD §2.6
+    ERR_SEGREGATION_VIOLATION = "ERR_SEGREGATION_VIOLATION"
+    ERR_MINOR_REQUIRES_PARENT = "ERR_MINOR_REQUIRES_PARENT"
+    ERR_SUBJECT_NOT_OFFERED = "ERR_SUBJECT_NOT_OFFERED"
+    ERR_TUTOR_NOT_VERIFIED = "ERR_TUTOR_NOT_VERIFIED"
+    ERR_INVALID_SESSION_WINDOW = "ERR_INVALID_SESSION_WINDOW"
+    ERR_TRIAL_ALREADY_USED = "ERR_TRIAL_ALREADY_USED"
+    ERR_CHILD_LIMIT_EXCEEDED = "ERR_CHILD_LIMIT_EXCEEDED"
+    ERR_DISPUTE_WINDOW_CLOSED = "ERR_DISPUTE_WINDOW_CLOSED"
+    ERR_AMOUNT_OUT_OF_RANGE = "ERR_AMOUNT_OUT_OF_RANGE"
+    ERR_CREDIT_APPLY_INVALID = "ERR_CREDIT_APPLY_INVALID"
+    ERR_ESCALATION_NOT_ALLOWED = "ERR_ESCALATION_NOT_ALLOWED"
+    ERR_ADJUSTED_MINUTES_OUT_OF_RANGE = "ERR_ADJUSTED_MINUTES_OUT_OF_RANGE"
+
+    # Generic input — PRD §5
+    ERR_VALIDATION = "ERR_VALIDATION"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_AUTH_REQUIRED: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_AUTHORIZED_FOR_RESOURCE: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_SESSION_OVERLAP: 409,
+    ApiErrorId.ERR_DISPUTE_ALREADY_OPEN: 409,
+    ApiErrorId.ERR_PAYOUT_STALE: 409,
+    ApiErrorId.ERR_SEGREGATION_VIOLATION: 403,
+    ApiErrorId.ERR_MINOR_REQUIRES_PARENT: 403,
+    ApiErrorId.ERR_SUBJECT_NOT_OFFERED: 422,
+    ApiErrorId.ERR_TUTOR_NOT_VERIFIED: 422,
+    ApiErrorId.ERR_INVALID_SESSION_WINDOW: 422,
+    ApiErrorId.ERR_TRIAL_ALREADY_USED: 422,
+    ApiErrorId.ERR_CHILD_LIMIT_EXCEEDED: 422,
+    ApiErrorId.ERR_DISPUTE_WINDOW_CLOSED: 422,
+    ApiErrorId.ERR_AMOUNT_OUT_OF_RANGE: 422,
+    ApiErrorId.ERR_CREDIT_APPLY_INVALID: 422,
+    ApiErrorId.ERR_ESCALATION_NOT_ALLOWED: 422,
+    ApiErrorId.ERR_ADJUSTED_MINUTES_OUT_OF_RANGE: 422,
+    ApiErrorId.ERR_VALIDATION: 400,
+}
+
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(
+    {k.value: v for k, v in HTTP_STATUS_CODES.items()},
+)
+
+
+__all__ = ["ApiErrorId", "HTTP_STATUS_CODES"]
