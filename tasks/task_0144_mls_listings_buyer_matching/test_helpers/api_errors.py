@@ -1,0 +1,77 @@
+"""Error IDs and HTTP status mapping (PRD §5 Error Code Catalogue).
+
+After definition, the mapping is registered with the framework so
+validate_error() can auto-check HTTP status codes without each test
+passing them explicitly.
+"""
+from __future__ import annotations
+
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import (
+    set_error_http_status_map,
+)
+
+
+class ApiErrorId(str, Enum):
+    # Auth / RBAC — PRD §2.1
+    ERR_AUTH_MISSING = "ERR_AUTH_MISSING"
+    ERR_AUTH_INVALID = "ERR_AUTH_INVALID"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_FORBIDDEN_NOT_OWNER = "ERR_FORBIDDEN_NOT_OWNER"
+
+    # Existence — PRD §2.5
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+
+    # State — PRD §2.11
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_LISTING_ALREADY_UNDER_CONTRACT = "ERR_LISTING_ALREADY_UNDER_CONTRACT"
+    ERR_OFFER_NOT_SUBMITTED = "ERR_OFFER_NOT_SUBMITTED"
+    ERR_LOCKBOX_STATE = "ERR_LOCKBOX_STATE"
+    ERR_LOCKBOX_NOT_ARMED = "ERR_LOCKBOX_NOT_ARMED"
+    ERR_SHOWING_TIME_OVERLAP = "ERR_SHOWING_TIME_OVERLAP"
+    ERR_COUNTER_EXPIRED = "ERR_COUNTER_EXPIRED"
+    ERR_OFFER_EXPIRED = "ERR_OFFER_EXPIRED"
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+    ERR_CONTINGENCY_ALREADY_FAILED = "ERR_CONTINGENCY_ALREADY_FAILED"
+
+    # Schema / fiscal — PRD §3
+    ERR_CONTINGENCY_DEADLINE_INVALID = "ERR_CONTINGENCY_DEADLINE_INVALID"
+    ERR_INVALID_LISTING_FIELDS = "ERR_INVALID_LISTING_FIELDS"
+    ERR_INVALID_BUYER_FIELDS = "ERR_INVALID_BUYER_FIELDS"
+    ERR_INVALID_OFFER_FISCAL = "ERR_INVALID_OFFER_FISCAL"
+    ERR_INVALID_SHOWING_WINDOW = "ERR_INVALID_SHOWING_WINDOW"
+
+
+# PRD §5 Error Code Catalogue — HTTP status per error_id.
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_AUTH_MISSING: 401,
+    ApiErrorId.ERR_AUTH_INVALID: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_FORBIDDEN_NOT_OWNER: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_LISTING_ALREADY_UNDER_CONTRACT: 409,
+    ApiErrorId.ERR_OFFER_NOT_SUBMITTED: 409,
+    ApiErrorId.ERR_LOCKBOX_STATE: 409,
+    ApiErrorId.ERR_LOCKBOX_NOT_ARMED: 409,
+    ApiErrorId.ERR_SHOWING_TIME_OVERLAP: 409,
+    ApiErrorId.ERR_COUNTER_EXPIRED: 409,
+    ApiErrorId.ERR_OFFER_EXPIRED: 409,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_CONTINGENCY_ALREADY_FAILED: 409,
+    ApiErrorId.ERR_CONTINGENCY_DEADLINE_INVALID: 422,
+    ApiErrorId.ERR_INVALID_LISTING_FIELDS: 422,
+    ApiErrorId.ERR_INVALID_BUYER_FIELDS: 422,
+    ApiErrorId.ERR_INVALID_OFFER_FISCAL: 422,
+    ApiErrorId.ERR_INVALID_SHOWING_WINDOW: 422,
+}
+
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(
+    {k.value: v for k, v in HTTP_STATUS_CODES.items()},
+)
+
+
+__all__ = ["ApiErrorId", "HTTP_STATUS_CODES"]

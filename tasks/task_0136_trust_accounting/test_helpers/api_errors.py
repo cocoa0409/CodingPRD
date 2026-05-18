@@ -1,0 +1,105 @@
+"""Error IDs and HTTP status mapping (PRD §5 Error Code Catalogue).
+
+After definition, the mapping is registered with the framework so
+validate_error() can auto-check HTTP status codes without each test
+passing them explicitly.
+"""
+from __future__ import annotations
+
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import (
+    set_error_http_status_map,
+)
+
+
+class ApiErrorId(str, Enum):
+    # Auth — PRD §2.1
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+
+    # Existence — PRD §2.6
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+
+    # OCC / state — PRD §2.5, §2.8
+    ERR_VERSION_MISMATCH = "ERR_VERSION_MISMATCH"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+
+    # Business referential / safety — PRD §3.4, §3.1
+    ERR_BENEFICIARY_TERMINATED = "ERR_BENEFICIARY_TERMINATED"
+    ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+    ERR_IRREVOCABLE_CANNOT_REVOKE = "ERR_IRREVOCABLE_CANNOT_REVOKE"
+    ERR_TRUST_NOT_ACTIVE = "ERR_TRUST_NOT_ACTIVE"
+
+    # Tax-year temporal — PRD §3.3, §3.4, §3.5
+    ERR_TAX_YEAR_CLOSED = "ERR_TAX_YEAR_CLOSED"
+    ERR_TAX_YEAR_NOT_OPEN = "ERR_TAX_YEAR_NOT_OPEN"
+    ERR_TAX_YEAR_NOT_ENDED = "ERR_TAX_YEAR_NOT_ENDED"
+    ERR_TAX_YEAR_CLOSING_IN_PROGRESS = "ERR_TAX_YEAR_CLOSING_IN_PROGRESS"
+    ERR_TAX_YEAR_NOT_CLOSED = "ERR_TAX_YEAR_NOT_CLOSED"
+    ERR_NEWER_YEAR_CLOSED = "ERR_NEWER_YEAR_CLOSED"
+
+    # Activation preconditions — PRD §3.1, §2.8
+    ERR_NO_PRIMARY_TRUSTEE = "ERR_NO_PRIMARY_TRUSTEE"
+    ERR_NO_BENEFICIARY = "ERR_NO_BENEFICIARY"
+    ERR_NO_OPEN_TAX_YEAR = "ERR_NO_OPEN_TAX_YEAR"
+
+    # Compatibility / fiscal — PRD §3.1, §3.4
+    ERR_GRANTOR_STATUS_INCOMPATIBLE = "ERR_GRANTOR_STATUS_INCOMPATIBLE"
+    ERR_INSUFFICIENT_PRINCIPAL = "ERR_INSUFFICIENT_PRINCIPAL"
+    ERR_INSUFFICIENT_INCOME = "ERR_INSUFFICIENT_INCOME"
+    ERR_INSUFFICIENT_INCOME_FOR_TAX = "ERR_INSUFFICIENT_INCOME_FOR_TAX"
+
+    # Termination / cleanup — PRD §3.1, §3.2
+    ERR_HAS_APPROVED_DISTRIBUTIONS = "ERR_HAS_APPROVED_DISTRIBUTIONS"
+    ERR_HAS_PENDING_DISTRIBUTIONS = "ERR_HAS_PENDING_DISTRIBUTIONS"
+    ERR_HAS_UNDISTRIBUTED_ASSETS = "ERR_HAS_UNDISTRIBUTED_ASSETS"
+    ERR_NONZERO_BALANCE = "ERR_NONZERO_BALANCE"
+
+    # Amendment integrity — PRD §3.5
+    ERR_K1_STALE_REFERENCE = "ERR_K1_STALE_REFERENCE"
+
+    # Bad request shape — PRD §2.8
+    ERR_BAD_REQUEST = "ERR_BAD_REQUEST"
+
+
+# PRD §5 — Error Code Catalogue (HTTP status mapping).
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_VERSION_MISMATCH: 409,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_BENEFICIARY_TERMINATED: 409,
+    ApiErrorId.ERR_SEGREGATION_OF_DUTIES: 403,
+    ApiErrorId.ERR_IRREVOCABLE_CANNOT_REVOKE: 403,
+    ApiErrorId.ERR_TRUST_NOT_ACTIVE: 409,
+    ApiErrorId.ERR_TAX_YEAR_CLOSED: 409,
+    ApiErrorId.ERR_TAX_YEAR_NOT_OPEN: 409,
+    ApiErrorId.ERR_TAX_YEAR_NOT_ENDED: 409,
+    ApiErrorId.ERR_TAX_YEAR_CLOSING_IN_PROGRESS: 409,
+    ApiErrorId.ERR_TAX_YEAR_NOT_CLOSED: 409,
+    ApiErrorId.ERR_NEWER_YEAR_CLOSED: 409,
+    ApiErrorId.ERR_NO_PRIMARY_TRUSTEE: 409,
+    ApiErrorId.ERR_NO_BENEFICIARY: 409,
+    ApiErrorId.ERR_NO_OPEN_TAX_YEAR: 409,
+    ApiErrorId.ERR_GRANTOR_STATUS_INCOMPATIBLE: 422,
+    ApiErrorId.ERR_INSUFFICIENT_PRINCIPAL: 409,
+    ApiErrorId.ERR_INSUFFICIENT_INCOME: 409,
+    ApiErrorId.ERR_INSUFFICIENT_INCOME_FOR_TAX: 409,
+    ApiErrorId.ERR_HAS_APPROVED_DISTRIBUTIONS: 409,
+    ApiErrorId.ERR_HAS_PENDING_DISTRIBUTIONS: 409,
+    ApiErrorId.ERR_HAS_UNDISTRIBUTED_ASSETS: 409,
+    ApiErrorId.ERR_NONZERO_BALANCE: 409,
+    ApiErrorId.ERR_K1_STALE_REFERENCE: 409,
+    ApiErrorId.ERR_BAD_REQUEST: 400,
+}
+
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(
+    {k.value: v for k, v in HTTP_STATUS_CODES.items()},
+)
+
+
+__all__ = ["ApiErrorId", "HTTP_STATUS_CODES"]

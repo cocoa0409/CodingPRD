@@ -1,0 +1,101 @@
+"""Error IDs and HTTP status mapping (PRD §5 Error Code Catalogue).
+
+After definition, the mapping is registered with the framework so
+validate_error() can auto-check HTTP status codes without each test
+passing them explicitly.
+"""
+from __future__ import annotations
+
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import (
+    set_error_http_status_map,
+)
+
+
+class ApiErrorId(str, Enum):
+    # Auth / existence — PRD §2.1, §2.4, §5
+    ERR_AUTH_MISSING = "ERR_AUTH_MISSING"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+
+    # State / OCC — PRD §2.8, §5
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+
+    # Disclosure-related — PRD §3.2, §5
+    ERR_DISCLOSURE_INCOMPLETE = "ERR_DISCLOSURE_INCOMPLETE"
+    ERR_DISCLOSURE_INCONSISTENT = "ERR_DISCLOSURE_INCONSISTENT"
+    ERR_DUPLICATE_DISCLOSURE = "ERR_DUPLICATE_DISCLOSURE"
+    ERR_REJECTION_REASON_REQUIRED = "ERR_REJECTION_REASON_REQUIRED"
+
+    # Answer / default window — PRD §3.1, §5
+    ERR_ANSWER_WINDOW_EXPIRED = "ERR_ANSWER_WINDOW_EXPIRED"
+    ERR_ANSWER_WINDOW_OPEN = "ERR_ANSWER_WINDOW_OPEN"
+
+    # Parenting plan — PRD §3.3, §5
+    ERR_COUNTER_BY_PROPOSER = "ERR_COUNTER_BY_PROPOSER"
+    ERR_SELF_ACCEPT = "ERR_SELF_ACCEPT"
+    ERR_OVERNIGHTS_INVALID = "ERR_OVERNIGHTS_INVALID"
+
+    # Support order — PRD §3.5, §5
+    ERR_PLAN_REQUIRED_OR_FORBIDDEN = "ERR_PLAN_REQUIRED_OR_FORBIDDEN"
+    ERR_NOT_ELIGIBLE_FOR_SPOUSAL = "ERR_NOT_ELIGIBLE_FOR_SPOUSAL"
+
+    # Mediation — PRD §3.4, §5
+    ERR_MEDIATION_CAP_REACHED = "ERR_MEDIATION_CAP_REACHED"
+    ERR_MEDIATION_NOT_EXHAUSTED = "ERR_MEDIATION_NOT_EXHAUSTED"
+    ERR_MEDIATOR_DOUBLE_BOOKED = "ERR_MEDIATOR_DOUBLE_BOOKED"
+    ERR_SESSION_OUT_OF_WINDOW = "ERR_SESSION_OUT_OF_WINDOW"
+    ERR_SESSION_NOT_OVER = "ERR_SESSION_NOT_OVER"
+    ERR_SESSION_ALREADY_STARTED = "ERR_SESSION_ALREADY_STARTED"
+    ERR_OUTCOME_REQUIRED = "ERR_OUTCOME_REQUIRED"
+
+    # Temporary order — PRD §3.6, §5
+    ERR_TEMP_ORDER_FIELDS = "ERR_TEMP_ORDER_FIELDS"
+
+    # Petition — PRD §3.1, §5
+    ERR_SEPARATION_BEFORE_MARRIAGE = "ERR_SEPARATION_BEFORE_MARRIAGE"
+
+    # Clock — PRD §2.6, §5
+    ERR_CLOCK_NOT_MONOTONE = "ERR_CLOCK_NOT_MONOTONE"
+
+
+# PRD §5 — Error Code Catalogue (HTTP status mapping).
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_AUTH_MISSING: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_DISCLOSURE_INCOMPLETE: 409,
+    ApiErrorId.ERR_DISCLOSURE_INCONSISTENT: 422,
+    ApiErrorId.ERR_DUPLICATE_DISCLOSURE: 409,
+    ApiErrorId.ERR_REJECTION_REASON_REQUIRED: 422,
+    ApiErrorId.ERR_ANSWER_WINDOW_EXPIRED: 409,
+    ApiErrorId.ERR_ANSWER_WINDOW_OPEN: 409,
+    ApiErrorId.ERR_COUNTER_BY_PROPOSER: 422,
+    ApiErrorId.ERR_SELF_ACCEPT: 422,
+    ApiErrorId.ERR_OVERNIGHTS_INVALID: 422,
+    ApiErrorId.ERR_PLAN_REQUIRED_OR_FORBIDDEN: 422,
+    ApiErrorId.ERR_NOT_ELIGIBLE_FOR_SPOUSAL: 422,
+    ApiErrorId.ERR_MEDIATION_CAP_REACHED: 409,
+    ApiErrorId.ERR_MEDIATION_NOT_EXHAUSTED: 409,
+    ApiErrorId.ERR_MEDIATOR_DOUBLE_BOOKED: 409,
+    ApiErrorId.ERR_SESSION_OUT_OF_WINDOW: 409,
+    ApiErrorId.ERR_SESSION_NOT_OVER: 409,
+    ApiErrorId.ERR_SESSION_ALREADY_STARTED: 409,
+    ApiErrorId.ERR_OUTCOME_REQUIRED: 422,
+    ApiErrorId.ERR_TEMP_ORDER_FIELDS: 422,
+    ApiErrorId.ERR_SEPARATION_BEFORE_MARRIAGE: 422,
+    ApiErrorId.ERR_CLOCK_NOT_MONOTONE: 409,
+}
+
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(
+    {k.value: v for k, v in HTTP_STATUS_CODES.items()},
+)
+
+
+__all__ = ["ApiErrorId", "HTTP_STATUS_CODES"]
