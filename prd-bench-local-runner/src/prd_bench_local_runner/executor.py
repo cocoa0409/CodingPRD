@@ -101,14 +101,18 @@ class TestExecutor:
         # Add paths to PYTHONPATH:
         # 1. prd_bench_local_runner package (for pytest_plugin + testing utilities)
         # 2. Parent of test_dir (so `from test_helpers import ...` works)
+        #
+        # Compare against the colon-split list, not raw substring, otherwise
+        # "/tests" gets silently dropped when "/tests/prd-bench-local-runner/src"
+        # is already present.
         extra_paths = [
             str(Path(__file__).parent.parent),          # prd_bench_local_runner src
             str(Path(self.test_dir).parent.resolve()),  # parent of test_suite (contains test_helpers)
         ]
-        python_path = env.get("PYTHONPATH", "")
+        existing = env.get("PYTHONPATH", "").split(":") if env.get("PYTHONPATH") else []
         for p in extra_paths:
-            if p not in python_path:
-                python_path = f"{p}:{python_path}" if python_path else p
-        env["PYTHONPATH"] = python_path
+            if p not in existing:
+                existing.insert(0, p)
+        env["PYTHONPATH"] = ":".join(existing)
 
         return env

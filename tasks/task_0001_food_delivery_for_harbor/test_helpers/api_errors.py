@@ -1,0 +1,45 @@
+"""Error IDs and HTTP status mapping from the food delivery platform's error catalogue (PRD §5)."""
+
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_AUTH_REQUIRED = "ERR_AUTH_REQUIRED"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_VERSION_CONFLICT = "ERR_VERSION_CONFLICT"
+    ERR_ORDER_ALREADY_ASSIGNED = "ERR_ORDER_ALREADY_ASSIGNED"
+    ERR_DUPLICATE_RETURN = "ERR_DUPLICATE_RETURN"
+    ERR_RESTAURANT_UNAVAILABLE = "ERR_RESTAURANT_UNAVAILABLE"
+    ERR_SUSPEND_CRITERIA_NOT_MET = "ERR_SUSPEND_CRITERIA_NOT_MET"
+    ERR_RETURN_WINDOW_EXPIRED = "ERR_RETURN_WINDOW_EXPIRED"
+    ERR_REFUND_AMOUNT_INVALID = "ERR_REFUND_AMOUNT_INVALID"
+    ERR_ORDER_INVALID = "ERR_ORDER_INVALID"
+    ERR_RELATED_RETURN_UNRESOLVED = "ERR_RELATED_RETURN_UNRESOLVED"
+    ERR_VALIDATION = "ERR_VALIDATION"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_AUTH_REQUIRED: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_VERSION_CONFLICT: 409,
+    ApiErrorId.ERR_ORDER_ALREADY_ASSIGNED: 409,
+    ApiErrorId.ERR_DUPLICATE_RETURN: 409,
+    ApiErrorId.ERR_RESTAURANT_UNAVAILABLE: 422,
+    ApiErrorId.ERR_SUSPEND_CRITERIA_NOT_MET: 422,
+    ApiErrorId.ERR_RETURN_WINDOW_EXPIRED: 422,
+    ApiErrorId.ERR_REFUND_AMOUNT_INVALID: 422,
+    ApiErrorId.ERR_ORDER_INVALID: 422,
+    ApiErrorId.ERR_RELATED_RETURN_UNRESOLVED: 422,
+    ApiErrorId.ERR_VALIDATION: 422,
+}
+
+# The validator accepts either the enum member (which is a str subclass) or the raw string id.
+# Register both forms to match however callers reference the id.
+_STRING_KEYED_MAP = {k.value: v for k, v in HTTP_STATUS_CODES.items()}
+set_error_http_status_map(_STRING_KEYED_MAP)
