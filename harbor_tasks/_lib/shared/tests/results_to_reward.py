@@ -44,7 +44,7 @@ def convert(path: Path) -> dict:
 
     total = int(d.get("total", 0))
     passed = int(d.get("passed", 0))
-    rate = (passed / total) if total > 0 else 0.0
+    rate = 1.0 if total > 0 and passed == total else 0.0
     return {"reward": rate}
 
 
