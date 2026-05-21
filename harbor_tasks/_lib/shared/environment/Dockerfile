@@ -23,6 +23,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir uv
 
+# Pre-install Claude Code via npm. Harbor's claude-code agent normally bootstraps
+# via `curl -fsSL https://claude.ai/install.sh | bash`, but Cloudflare blocks
+# that endpoint from this container's egress IP (403 challenge). The npm package
+# goes through registry.npmjs.org, which is not gated. We still need to satisfy
+# Harbor's install step, so we shim `curl` below to no-op the claude.ai URL.
+RUN npm install -g @anthropic-ai/claude-code \
+ && command -v claude >/dev/null
+
+# Shim curl so Harbor's hardcoded `curl ... claude.ai/install.sh | bash` exits 0
+# (claude is already installed). Other curl usage is unaffected — we exec the
+# real binary for any URL that isn't the claude.ai installer.
+RUN mv /usr/bin/curl /usr/bin/curl.real \
+ && printf '%s\n' \
+    '#!/bin/bash' \
+    'for arg in "$@"; do' \
+    '  case "$arg" in' \
+    '    *claude.ai/install.sh*|*downloads.claude.ai/claude-code-releases/bootstrap.sh*)' \
+    '      echo ": claude-code pre-installed in image, skipping bootstrap"' \
+    '      exit 0' \
+    '      ;;' \
+    '  esac' \
+    'done' \
+    'exec /usr/bin/curl.real "$@"' \
+    > /usr/bin/curl \
+ && chmod +x /usr/bin/curl
+
 WORKDIR /app
 
 # Bring every file from environment/ (e.g. INSTRUCTION.md, PRD.md) into /app so
