@@ -6,39 +6,48 @@ You are building a REST API server based on the requirements in `PRD.md`.
 
 Place all files in the `./implementation/` directory:
 
-1. **A `Dockerfile`** at `./implementation/Dockerfile`
+1. **`start.sh`** at `./implementation/start.sh` — a single shell script that:
+   - Installs all dependencies your implementation needs
+   - Starts your HTTP server in the foreground (the script must not exit while the server is running)
 2. **Implementation source code** in `./implementation/` — no language restriction, use any language and framework you prefer
 
-## Dockerfile Requirements
+## Startup Requirements
 
-Your Dockerfile must:
+Your `start.sh` must:
 
-- Build your application from source
-- Start the server via `CMD` (not `ENTRYPOINT` with shell form)
-- The server **must listen on the port specified by the `PORT` environment variable** (default: 10000)
-- The server **must bind to `0.0.0.0`** (not `127.0.0.1`)
-- The server must respond to HTTP requests within 60 seconds of container start
+- Listen on the port specified by the `PORT` environment variable (default: 10000)
+- Bind to `0.0.0.0` (not `127.0.0.1`)
+- Respond to HTTP requests within 60 seconds of `start.sh` being invoked
+- Keep the server running in the foreground (use `exec` for the final server command, or do not background it)
 
-Example minimal Dockerfile (Python/Flask):
+## How the Evaluator Will Run Your Code
 
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-CMD ["python", "app.py"]
+The evaluator will execute, from `./implementation/`:
+
+```bash
+bash start.sh
 ```
 
-Example minimal Dockerfile (Node.js/Express):
+That is the entire contract. No Dockerfile, no other entrypoint is consulted.
 
-```dockerfile
-FROM node:18-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install
-COPY . .
-CMD ["node", "server.js"]
+## Examples
+
+Python / Flask:
+
+```bash
+#!/bin/bash
+set -e
+pip install -q -r requirements.txt
+exec python app.py
+```
+
+Node.js / Express:
+
+```bash
+#!/bin/bash
+set -e
+npm install --silent
+exec node server.js
 ```
 
 All API requirements are defined in `PRD.md`. Read it carefully and implement accordingly.
