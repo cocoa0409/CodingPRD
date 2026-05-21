@@ -1,0 +1,1224 @@
+scenario: |
+  Employee Stock Purchase Plan (ESPP): offering period (6-24 months), contribution
+  rate (<=15%/$25k cap), Lookback, Qualifying/Disqualifying disposition, IRS Form
+  3922, Disqualifying Sale.
+
+domain_name: "espp"
+api_prefix: "/plans"
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: ledger_reconciliation
+  complexity_layers:
+    - dual_variant_calculation         # qualifying vs disqualifying tax basis
+    - rate_threshold_triggers          # 15% contribution cap, $25k accrual cap, lookback price selection
+    - cascading_side_effects           # purchase -> Form3922 issuance -> holding-period clock -> disposition classification -> tax-basis recompute
+    - ops_run_checkpoint               # POST /_clock/advance and POST /_sweep/run drive period close, purchase event, holding-period maturation
+    - scheduled_deferred_actions       # purchase date and 1-year/2-year holding thresholds fire on clock advance
+    - compliance_audit                 # 423 plan rules, segregation of duties between PlanAdministrator and PayrollAgent, immutable Form 3922
+  entity_topology: hybrid
+  # Plan -> OfferingPeriod -> Enrollment -> Contribution (hierarchical), with
+  # Purchase referencing OfferingPeriod + Enrollment (cross-cutting), Form3922
+  # bound to Purchase, Disposition referencing Purchase, all under one Plan.
+  state_machine_shape: posture_driven
+  # OfferingPeriod posture (OPEN / CLOSED / PURCHASED) gates enrollment, contribution,
+  # purchase, and disposition operations on its descendants. Purchase has a parallel
+  # holding_period_status dimension that advances independently on clock ticks.
+  relationship_patterns:
+    - one_to_many                      # Plan->OfferingPeriod, OfferingPeriod->Enrollment, Enrollment->Contribution
+    - cross_aggregate                  # Purchase references both OfferingPeriod and Enrollment; Form3922 binds 1:1 to Purchase; Disposition references Purchase
+  role_model: segregation_of_duties
+  # PlanAdministrator configures plans and triggers purchases; PayrollAgent posts
+  # contributions; Participant enrolls / changes rate / reports dispositions;
+  # TaxAuthority is read-only for 3922 audit. Same X-User-ID cannot both post a
+  # contribution and trigger the purchase that consumes it.
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Plan
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Human-readable ESPP plan name."
+        constraints: "1..120 chars, unique across plans."
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle of the plan."
+        default: DRAFT
+        constraints: "Enum {DRAFT, ACTIVE, TERMINATED}."
+      - name: offering_period_months
+        type: integer
+        source: input
+        description: "Length of each offering period in months."
+        constraints: "Integer in [6, 24]; mandated by IRC 423(b)(7)."
+      - name: max_contribution_rate_bp
+        type: integer
+        source: input
+        description: "Maximum participant contribution rate in basis points of eligible compensation."
+        default: 1500
+        constraints: "Integer in (0, 1500]; 1500 bp == 15.00%."
+      - name: annual_accrual_cap_cents
+        type: integer
+        source: input
+        description: "IRS Section 423 accrual cap per participant per calendar year."
+        default: 2500000
+        constraints: "Integer > 0; defaults to 2,500,000 cents ($25,000)."
+      - name: lookback_enabled
+        type: boolean
+        source: input
+        description: "If true, purchase price uses MIN(grant_date_fmv, purchase_date_fmv)."
+        default: true
+      - name: discount_bp
+        type: integer
+        source: input
+        description: "Discount applied to the chosen FMV in basis points."
+        default: 1500
+        constraints: "Integer in [0, 1500]; 1500 bp == 15.00%."
+      - name: effective_date
+        type: datetime
+        source: input
+        description: "UTC date the plan first becomes ACTIVE."
+        constraints: "ISO 8601; must equal first OfferingPeriod.start_date when ACTIVE."
+
+  - name: OfferingPeriod
+    parent: Plan
+    common_fields: true
+    fields:
+      - name: plan_id
+        type: string
+        source: input
+        description: "Owning Plan id."
+      - name: sequence_number
+        type: integer
+        source: system
+        description: "1-based ordinal of this offering period within the plan."
+      - name: start_date
+        type: datetime
+        source: input
+        description: "UTC grant date; FMV captured here for lookback."
+      - name: end_date
+        type: datetime
+        source: computed
+        description: "start_date + Plan.offering_period_months; purchase fires at end_date."
+      - name: grant_date_fmv_cents
+        type: integer
+        source: input
+        description: "FMV of one share on start_date, in cents."
+        constraints: "Integer > 0."
+      - name: purchase_date_fmv_cents
+        type: integer
+        source: input
+        description: "FMV of one share on end_date, in cents. Set when CLOSE_PERIOD is invoked."
+        constraints: "Integer > 0; null until CLOSE_PERIOD."
+      - name: status
+        type: enum
+        source: computed
+        description: "Posture that gates enrollment / contribution / purchase on this period and its descendants."
+        default: OPEN
+        constraints: "Enum {OPEN, CLOSED, PURCHASED}; CLOSED is the brief window between period end and purchase batch; PURCHASED is terminal."
+
+  - name: Enrollment
+    parent: OfferingPeriod
+    common_fields: true
+    fields:
+      - name: offering_period_id
+        type: string
+        source: input
+        description: "Offering period this enrollment belongs to."
+      - name: participant_id
+        type: string
+        source: input
+        description: "Participant id (matches X-User-ID for Participant role)."
+      - name: contribution_rate_bp
+        type: integer
+        source: input
+        description: "Elected contribution rate in basis points of eligible compensation."
+        constraints: "Integer in (0, Plan.max_contribution_rate_bp]."
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle of the enrollment within the offering period."
+        default: ACTIVE
+        constraints: "Enum {ACTIVE, WITHDRAWN, COMPLETED}; WITHDRAWN refunds contributions and blocks purchase; COMPLETED is set after the period's purchase batch runs."
+      - name: ytd_accrual_cents
+        type: integer
+        source: computed
+        description: "Cumulative IRC 423 accrual (FMV-at-grant basis) charged to this participant in the calendar year that contains start_date."
+        default: 0
+
+  - name: Contribution
+    parent: Enrollment
+    common_fields: false
+    fields:
+      - name: enrollment_id
+        type: string
+        source: input
+        description: "Enrollment this contribution funds."
+      - name: pay_period_end
+        type: datetime
+        source: input
+        description: "UTC end date of the payroll period."
+      - name: gross_pay_cents
+        type: integer
+        source: input
+        description: "Eligible gross compensation for the pay period, in cents."
+        constraints: "Integer >= 0."
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "round_half_up(gross_pay_cents * Enrollment.contribution_rate_bp / 10000); subject to remaining annual accrual cap."
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle of the contribution."
+        default: POSTED
+        constraints: "Enum {POSTED, REFUNDED, CONSUMED}; REFUNDED on withdrawal; CONSUMED when purchase batch sweeps it."
+
+  - name: Purchase
+    parent: Plan
+    common_fields: true
+    fields:
+      - name: plan_id
+        type: string
+        source: input
+        description: "Owning Plan id."
+      - name: offering_period_id
+        type: string
+        source: system
+        description: "Offering period whose purchase batch produced this row."
+      - name: enrollment_id
+        type: string
+        source: system
+        description: "Enrollment consumed."
+      - name: participant_id
+        type: string
+        source: system
+        description: "Participant who received the shares."
+      - name: purchase_date
+        type: datetime
+        source: system
+        description: "Equals OfferingPeriod.end_date for the producing period."
+      - name: contributions_used_cents
+        type: integer
+        source: system
+        description: "Sum of Contribution.amount_cents (status==CONSUMED) charged to this purchase."
+      - name: chosen_fmv_cents
+        type: integer
+        source: computed
+        description: "If lookback_enabled: MIN(grant_date_fmv_cents, purchase_date_fmv_cents); else purchase_date_fmv_cents."
+      - name: purchase_price_cents
+        type: integer
+        source: computed
+        description: "round_half_up(chosen_fmv_cents * (10000 - Plan.discount_bp) / 10000)."
+      - name: shares_purchased
+        type: integer
+        source: computed
+        description: "floor(contributions_used_cents / purchase_price_cents)."
+      - name: refund_cents
+        type: integer
+        source: computed
+        description: "contributions_used_cents - (shares_purchased * purchase_price_cents)."
+      - name: holding_period_status
+        type: enum
+        source: computed
+        description: "Parallel dimension on Purchase that advances independently of disposition status."
+        default: WITHIN_BOTH
+        constraints: "Enum {WITHIN_BOTH, PAST_ONE_YEAR_FROM_PURCHASE, QUALIFYING_MATURE}; WITHIN_BOTH = within 1y of purchase AND within 2y of grant; PAST_ONE_YEAR_FROM_PURCHASE = >=1y from purchase_date but <2y from grant_date; QUALIFYING_MATURE = >=2y from grant_date AND >=1y from purchase_date."
+      - name: disposition_status
+        type: enum
+        source: computed
+        description: "Outcome of any reported sale."
+        default: HELD
+        constraints: "Enum {HELD, DISPOSED_QUALIFYING, DISPOSED_DISQUALIFYING}; HELD until a Disposition row is created."
+
+  - name: Form3922
+    parent: Purchase
+    common_fields: false
+    fields:
+      - name: purchase_id
+        type: string
+        source: system
+        description: "Purchase the form documents (1:1)."
+      - name: participant_id
+        type: string
+        source: system
+        description: "Copy of Purchase.participant_id (immutable)."
+      - name: grant_date
+        type: datetime
+        source: system
+        description: "Box 1 — OfferingPeriod.start_date."
+      - name: purchase_date
+        type: datetime
+        source: system
+        description: "Box 2 — OfferingPeriod.end_date."
+      - name: fmv_grant_date_cents
+        type: integer
+        source: system
+        description: "Box 3 — OfferingPeriod.grant_date_fmv_cents at issuance."
+      - name: fmv_purchase_date_cents
+        type: integer
+        source: system
+        description: "Box 4 — OfferingPeriod.purchase_date_fmv_cents at issuance."
+      - name: exercise_price_per_share_cents
+        type: integer
+        source: system
+        description: "Box 5 — Purchase.purchase_price_cents at issuance."
+      - name: shares_transferred
+        type: integer
+        source: system
+        description: "Box 6 — Purchase.shares_purchased at issuance."
+      - name: legal_title_date
+        type: datetime
+        source: system
+        description: "Box 7 — same as purchase_date for these plans."
+      - name: issuance_timestamp
+        type: datetime
+        source: system
+        description: "Server-assigned at issuance."
+
+  - name: Disposition
+    parent: Purchase
+    common_fields: true
+    fields:
+      - name: purchase_id
+        type: string
+        source: input
+        description: "Purchase being disposed (must belong to acting Participant)."
+      - name: participant_id
+        type: string
+        source: system
+        description: "Mirror of Purchase.participant_id."
+      - name: disposition_date
+        type: datetime
+        source: input
+        description: "UTC date the shares were sold/transferred."
+      - name: shares_disposed
+        type: integer
+        source: input
+        description: "Shares sold; <= remaining undisposed shares on this purchase."
+      - name: sale_price_per_share_cents
+        type: integer
+        source: input
+        description: "Per-share sale proceeds in cents."
+        constraints: "Integer > 0."
+      - name: classification
+        type: enum
+        source: computed
+        description: "Determined at creation from Purchase.holding_period_status snapshot at disposition_date."
+        constraints: "Enum {QUALIFYING, DISQUALIFYING}; QUALIFYING iff disposition_date >= grant_date+2y AND disposition_date >= purchase_date+1y."
+      - name: ordinary_income_cents
+        type: integer
+        source: computed
+        description: "Variant taxable ordinary income — formula depends on classification."
+      - name: capital_gain_cents
+        type: integer
+        source: computed
+        description: "Residual capital gain (may be negative for losses)."
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle of the disposition record."
+        default: REPORTED
+        constraints: "Enum {REPORTED, AMENDED, VOIDED}; only the Participant who owns the Purchase may transition."
+
+  - name: SystemClock
+    parent: null
+    common_fields: false
+    fields:
+      - name: current_time
+        type: datetime
+        source: system
+        description: "Server-authoritative wall clock used by all state machines (UTC, ISO 8601 with milliseconds)."
+      - name: last_sweep_at
+        type: datetime
+        source: system
+        description: "Timestamp of the most recent /_sweep/run that materialized period close / purchase / holding maturation."
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Plan
+    initial_state: DRAFT
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /plans/{id}/activate"
+        actor: PlanAdministrator
+        preconditions:
+          - "Plan.offering_period_months in [6, 24]"
+          - "Plan.max_contribution_rate_bp in (0, 1500]"
+          - "Plan.discount_bp in [0, 1500]"
+          - "Plan.effective_date >= SystemClock.current_time"
+        side_effects:
+          - "Create OfferingPeriod with sequence_number=1, start_date=Plan.effective_date, end_date=start_date + offering_period_months months, status=OPEN."
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /plans/{id}/terminate"
+        actor: PlanAdministrator
+        preconditions:
+          - "No OfferingPeriod of this Plan has status==OPEN"
+        side_effects:
+          - "Block creation of new OfferingPeriods."
+
+  - entity: OfferingPeriod
+    initial_state: OPEN
+    terminal_states: [PURCHASED]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /_sweep/run when SystemClock.current_time >= end_date and purchase_date_fmv_cents has been recorded via PATCH /offering-periods/{id}/fmv"
+        actor: system
+        preconditions:
+          - "SystemClock.current_time >= OfferingPeriod.end_date"
+          - "OfferingPeriod.purchase_date_fmv_cents IS NOT NULL"
+        side_effects:
+          - "Reject any subsequent POST /enrollments referencing this period (ERR_PERIOD_NOT_OPEN)."
+          - "Reject any subsequent POST /contributions whose Enrollment.offering_period_id == this period (ERR_PERIOD_NOT_OPEN)."
+      - from: CLOSED
+        to: PURCHASED
+        trigger: "POST /offering-periods/{id}/run-purchase"
+        actor: PlanAdministrator
+        preconditions:
+          - "OfferingPeriod.status == CLOSED"
+          - "Acting X-User-ID has never posted a Contribution.enrollment_id whose Enrollment.offering_period_id == this period (segregation of duties)"
+        side_effects:
+          - "For each Enrollment with status==ACTIVE on this period: compute chosen_fmv, purchase_price, eligible_contributions (capped to remaining annual accrual at GRANT FMV basis), shares_purchased, refund; create Purchase row; mark consumed contributions CONSUMED; set Enrollment.status=COMPLETED; charge ytd_accrual_cents += shares_purchased * grant_date_fmv_cents; issue Form3922 immutably."
+          - "Create the next OfferingPeriod with sequence_number=N+1, start_date=this.end_date, end_date=start_date + Plan.offering_period_months months, status=OPEN."
+
+  - entity: Enrollment
+    initial_state: ACTIVE
+    terminal_states: [WITHDRAWN, COMPLETED]
+    transitions:
+      - from: ACTIVE
+        to: WITHDRAWN
+        trigger: "POST /enrollments/{id}/withdraw"
+        actor: Participant
+        preconditions:
+          - "Acting X-User-ID == Enrollment.participant_id"
+          - "Enrollment.OfferingPeriod.status == OPEN"
+        side_effects:
+          - "Mark every Contribution.status=POSTED on this enrollment as REFUNDED; the participant is excluded from this period's purchase batch."
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "POST /offering-periods/{id}/run-purchase (system, per-enrollment within the batch)"
+        actor: system
+        preconditions:
+          - "Enrollment.status == ACTIVE at the moment the purchase batch executes"
+        side_effects:
+          - "Produce the Purchase row described under OfferingPeriod CLOSED->PURCHASED."
+
+  - entity: Purchase
+    initial_state: WITHIN_BOTH
+    terminal_states: []   # holding_period_status is parallel and never terminal; disposition_status terminates on DISPOSED_*
+    transitions:
+      # Parallel dimension A: holding_period_status (driven by clock)
+      - from: WITHIN_BOTH
+        to: PAST_ONE_YEAR_FROM_PURCHASE
+        trigger: "POST /_sweep/run when SystemClock.current_time >= purchase_date + 1 year AND SystemClock.current_time < grant_date + 2 years"
+        actor: system
+        preconditions:
+          - "Purchase.disposition_status == HELD"
+        side_effects:
+          - "Subsequent dispositions reported with disposition_date in this window remain DISQUALIFYING (2-year-from-grant rule)."
+      - from: WITHIN_BOTH
+        to: QUALIFYING_MATURE
+        trigger: "POST /_sweep/run when SystemClock.current_time >= grant_date + 2 years AND SystemClock.current_time >= purchase_date + 1 year"
+        actor: system
+        preconditions:
+          - "Purchase.disposition_status == HELD"
+        side_effects:
+          - "Subsequent dispositions become QUALIFYING."
+      - from: PAST_ONE_YEAR_FROM_PURCHASE
+        to: QUALIFYING_MATURE
+        trigger: "POST /_sweep/run when SystemClock.current_time >= grant_date + 2 years"
+        actor: system
+        preconditions:
+          - "Purchase.disposition_status == HELD"
+        side_effects:
+          - "Subsequent dispositions become QUALIFYING."
+      # Parallel dimension B: disposition_status (driven by Disposition creation)
+      - from: HELD
+        to: DISPOSED_QUALIFYING
+        trigger: "POST /dispositions when classification resolves to QUALIFYING and shares_disposed == remaining undisposed shares on Purchase"
+        actor: Participant
+        preconditions:
+          - "Acting X-User-ID == Purchase.participant_id"
+          - "disposition_date >= Purchase.grant_date + 2y AND disposition_date >= Purchase.purchase_date + 1y"
+          - "shares_disposed equals (Purchase.shares_purchased - SUM(prior Disposition.shares_disposed where status IN {REPORTED, AMENDED}))"
+        side_effects:
+          - "Disposition.ordinary_income_cents = shares_disposed * round_half_up(Purchase.grant_date_fmv_cents * Plan.discount_bp / 10000)."
+          - "Disposition.capital_gain_cents = shares_disposed * (sale_price_per_share_cents - Purchase.grant_date_fmv_cents) + shares_disposed * round_half_up(Purchase.grant_date_fmv_cents * Plan.discount_bp / 10000)."
+          - "Purchase.disposition_status set to DISPOSED_QUALIFYING."
+      - from: HELD
+        to: DISPOSED_DISQUALIFYING
+        trigger: "POST /dispositions when classification resolves to DISQUALIFYING and shares_disposed == remaining undisposed shares on Purchase"
+        actor: Participant
+        preconditions:
+          - "Acting X-User-ID == Purchase.participant_id"
+          - "disposition_date < Purchase.grant_date + 2y OR disposition_date < Purchase.purchase_date + 1y"
+          - "shares_disposed equals (Purchase.shares_purchased - SUM(prior Disposition.shares_disposed where status IN {REPORTED, AMENDED}))"
+        side_effects:
+          - "Disposition.ordinary_income_cents = shares_disposed * (Purchase.purchase_date_fmv_cents - Purchase.purchase_price_cents)."
+          - "Disposition.capital_gain_cents = shares_disposed * (sale_price_per_share_cents - Purchase.purchase_date_fmv_cents)."
+          - "Purchase.disposition_status set to DISPOSED_DISQUALIFYING."
+          - "Recompute and persist Enrollment ytd_accrual_cents downstream only if PUT /participants/{id}/refile-3922 is then invoked; the 3922 itself is immutable."
+
+  - entity: Disposition
+    initial_state: REPORTED
+    terminal_states: [VOIDED]
+    transitions:
+      - from: REPORTED
+        to: AMENDED
+        trigger: "PATCH /dispositions/{id}"
+        actor: Participant
+        preconditions:
+          - "Acting X-User-ID == Disposition.participant_id"
+          - "Disposition.status == REPORTED"
+        side_effects:
+          - "Replace shares_disposed / sale_price_per_share_cents / disposition_date; recompute classification, ordinary_income_cents, capital_gain_cents from current Purchase fields; if classification flips, update Purchase.disposition_status accordingly."
+      - from: REPORTED
+        to: VOIDED
+        trigger: "DELETE /dispositions/{id}"
+        actor: Participant
+        preconditions:
+          - "Acting X-User-ID == Disposition.participant_id"
+        side_effects:
+          - "Restore Purchase.disposition_status to HELD if no other non-VOIDED Disposition exists for this Purchase."
+      - from: AMENDED
+        to: VOIDED
+        trigger: "DELETE /dispositions/{id}"
+        actor: Participant
+        preconditions:
+          - "Acting X-User-ID == Disposition.participant_id"
+        side_effects:
+          - "Restore Purchase.disposition_status to HELD if no other non-VOIDED Disposition exists for this Purchase."
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - scenario: "Participant submits two enrollments to the same OfferingPeriod simultaneously"
+    guarantee: "At most one Enrollment row exists for (offering_period_id, participant_id); second creation rejected."
+    error_id: ERR_DUPLICATE_ENROLLMENT
+    http_status: 409
+    serialization: "First-writer-wins on (offering_period_id, participant_id)."
+
+  - scenario: "Participant POSTs withdraw while PlanAdministrator triggers run-purchase on the same OfferingPeriod"
+    guarantee: "Exactly one wins. If run-purchase commits first, the enrollment is COMPLETED and withdraw is rejected. If withdraw commits first, the run-purchase batch skips this enrollment."
+    error_id: ERR_INVALID_ENROLLMENT_STATE
+    http_status: 409
+    serialization: "First-writer-wins on Enrollment.status."
+
+  - scenario: "Two parallel PATCH /offering-periods/{id}/fmv calls update purchase_date_fmv_cents with different values"
+    guarantee: "First write wins; second is rejected on version mismatch."
+    error_id: ERR_VERSION_CONFLICT
+    http_status: 409
+    serialization: "Optimistic concurrency on OfferingPeriod.version."
+
+  - scenario: "Two concurrent run-purchase invocations on the same CLOSED OfferingPeriod"
+    guarantee: "Exactly one batch executes; the second observes status==PURCHASED and is rejected."
+    error_id: ERR_INVALID_PERIOD_STATE
+    http_status: 409
+    serialization: "First-writer-wins on OfferingPeriod.status."
+
+  - scenario: "Participant files two Disposition rows simultaneously, each claiming all remaining shares of the same Purchase"
+    guarantee: "At most the share inventory of the Purchase may be disposed in aggregate; the second creation that would exceed remaining shares is rejected."
+    error_id: ERR_SHARES_EXCEED_BALANCE
+    http_status: 409
+    serialization: "First-writer-wins on Purchase remaining-share invariant."
+
+  - scenario: "Participant PATCHes a Disposition while another caller DELETEs the same row"
+    guarantee: "Exactly one wins; loser observes Disposition.status outside REPORTED/AMENDED."
+    error_id: ERR_INVALID_DISPOSITION_STATE
+    http_status: 409
+    serialization: "First-writer-wins on Disposition.status."
+
+  - scenario: "PlanAdministrator activates a Plan while another PlanAdministrator activates a second plan whose effective_date and name collide"
+    guarantee: "Plan.name uniqueness is enforced exactly once; second activation rejected."
+    error_id: ERR_DUPLICATE_PLAN_NAME
+    http_status: 409
+    serialization: "First-writer-wins on Plan.name."
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: contribution_amount
+    trigger: "POST /contributions (creation) and side-effect of POST /offering-periods/{id}/run-purchase"
+    algorithm: threshold
+    formula: |
+      raw_amount_cents = round_half_up(gross_pay_cents * Enrollment.contribution_rate_bp / 10000)
+      remaining_accrual_cents = Plan.annual_accrual_cap_cents - Enrollment.ytd_accrual_cents
+      # IRS 423 cap is on grant-FMV-priced accrual, not on cash withholding;
+      # we therefore translate remaining_accrual into a withholding cap using
+      # the grant_date_fmv_cents of the CURRENT offering period.
+      remaining_cash_cap_cents = floor(remaining_accrual_cents * (10000 - Plan.discount_bp) / 10000)
+      amount_cents = min(raw_amount_cents, max(0, remaining_cash_cap_cents))
+    input_set: "Each POST /contributions in the order received; Enrollment must have status==ACTIVE and parent OfferingPeriod.status==OPEN."
+    constants:
+      BP_DENOM: 10000
+    precision: "Integer cents; round_half_up at the per-pay-period multiplication."
+    variants:
+      - name: under_cap
+        when: "raw_amount_cents <= remaining_cash_cap_cents"
+        difference: "amount_cents = raw_amount_cents; full deduction posts."
+      - name: capped
+        when: "raw_amount_cents > remaining_cash_cap_cents"
+        difference: "amount_cents = remaining_cash_cap_cents; the excess is NOT carried forward — it is returned via payroll outside this API."
+
+  - name: purchase_settlement
+    trigger: "Side-effect of OfferingPeriod CLOSED -> PURCHASED transition (POST /offering-periods/{id}/run-purchase)."
+    algorithm: tiered_pricing
+    formula: |
+      # Step A — lookback FMV selection
+      if Plan.lookback_enabled:
+        chosen_fmv_cents = min(OfferingPeriod.grant_date_fmv_cents, OfferingPeriod.purchase_date_fmv_cents)
+      else:
+        chosen_fmv_cents = OfferingPeriod.purchase_date_fmv_cents
+      # Step B — apply discount, ROUND ONCE at the per-share price
+      purchase_price_cents = round_half_up(chosen_fmv_cents * (10000 - Plan.discount_bp) / 10000)
+      # Step C — eligible contributions for this batch
+      total_contrib_cents = SUM(Contribution.amount_cents WHERE Contribution.enrollment_id == E.id AND status==POSTED)
+      # Step D — floor to whole shares
+      shares_purchased = floor(total_contrib_cents / purchase_price_cents)
+      refund_cents = total_contrib_cents - shares_purchased * purchase_price_cents
+      # Step E — IRC 423 accrual charge uses GRANT-DATE FMV, not purchase price
+      accrual_charge_cents = shares_purchased * OfferingPeriod.grant_date_fmv_cents
+      # Step F — if accrual_charge would exceed remaining accrual, reduce shares
+      remaining_accrual_cents = Plan.annual_accrual_cap_cents - Enrollment.ytd_accrual_cents
+      if accrual_charge_cents > remaining_accrual_cents:
+          shares_purchased = floor(remaining_accrual_cents / OfferingPeriod.grant_date_fmv_cents)
+          refund_cents = total_contrib_cents - shares_purchased * purchase_price_cents
+          accrual_charge_cents = shares_purchased * OfferingPeriod.grant_date_fmv_cents
+      Enrollment.ytd_accrual_cents += accrual_charge_cents
+    input_set: "All Contribution rows of Enrollment with status==POSTED. Per-enrollment, evaluated in ascending Enrollment.id order to keep order-determinism, but enrollments do not share state so order is observationally inert."
+    constants:
+      BP_DENOM: 10000
+    precision: "round_half_up at Step B only; integer floor at Steps D and F; everything else is integer arithmetic in cents."
+    variants:
+      - name: lookback_grant_lower
+        when: "Plan.lookback_enabled AND grant_date_fmv_cents <= purchase_date_fmv_cents"
+        difference: "chosen_fmv_cents == grant_date_fmv_cents; purchase price is anchored to the cheaper grant-date FMV."
+      - name: lookback_purchase_lower
+        when: "Plan.lookback_enabled AND purchase_date_fmv_cents < grant_date_fmv_cents"
+        difference: "chosen_fmv_cents == purchase_date_fmv_cents; purchase price drops with the stock."
+      - name: no_lookback
+        when: "Plan.lookback_enabled == false"
+        difference: "chosen_fmv_cents == purchase_date_fmv_cents regardless of grant FMV; legally produces a different number than lookback_grant_lower for the same inputs."
+
+  - name: disposition_tax_split
+    trigger: "POST /dispositions and PATCH /dispositions/{id}"
+    algorithm: forward_looking
+    formula: |
+      if classification == QUALIFYING:
+          # Lesser-of test under IRC 423(c)
+          actual_gain_per_share = sale_price_per_share_cents - Purchase.purchase_price_cents
+          theoretical_discount_per_share = round_half_up(Purchase.chosen_fmv_cents * Plan.discount_bp / 10000)
+          ordinary_per_share = max(0, min(actual_gain_per_share, theoretical_discount_per_share))
+          ordinary_income_cents = shares_disposed * ordinary_per_share
+          capital_basis_per_share = Purchase.purchase_price_cents + ordinary_per_share
+          capital_gain_cents = shares_disposed * (sale_price_per_share_cents - capital_basis_per_share)
+      else:  # DISQUALIFYING
+          # Spread at purchase = FMV at purchase MINUS exercise price
+          ordinary_per_share = max(0, Purchase.purchase_date_fmv_cents - Purchase.purchase_price_cents)
+          ordinary_income_cents = shares_disposed * ordinary_per_share
+          capital_basis_per_share = Purchase.purchase_price_cents + ordinary_per_share
+          capital_gain_cents = shares_disposed * (sale_price_per_share_cents - capital_basis_per_share)
+    input_set: "Per-share fields from the Purchase row that the Disposition references; classification determined from disposition_date vs grant_date+2y and purchase_date+1y."
+    constants:
+      BP_DENOM: 10000
+    precision: "round_half_up only on theoretical_discount_per_share; all other steps are integer cents."
+    variants:
+      - name: qualifying
+        when: "disposition_date >= Purchase.grant_date + 2y AND disposition_date >= Purchase.purchase_date + 1y"
+        difference: "Ordinary income is the LESSER of actual gain or theoretical discount — taxpayer-favorable."
+      - name: disqualifying
+        when: "disposition_date < Purchase.grant_date + 2y OR disposition_date < Purchase.purchase_date + 1y"
+        difference: "Ordinary income is the FULL spread at purchase (FMV_at_purchase - exercise_price), regardless of sale price; capital gain/loss measured from stepped-up basis."
+
+  - name: ytd_accrual_remaining_view
+    trigger: "GET /participants/{id}/accrual-summary"
+    algorithm: aggregation
+    formula: |
+      # Sums across ALL ACTIVE enrollments for this participant that share a
+      # plan and whose offering_period start_date falls in the requested
+      # calendar_year. Both the grant-FMV charge already incurred (from
+      # completed purchases) and the projected charge for in-flight enrollments
+      # (estimated at current offering's grant_date_fmv_cents) are reported.
+      committed_cents = SUM(Enrollment.ytd_accrual_cents
+                            WHERE participant_id == :id
+                              AND OfferingPeriod.start_date.year == :calendar_year
+                              AND status IN {ACTIVE, COMPLETED, WITHDRAWN})
+      projected_cents = SUM_OVER ACTIVE_enrollments(
+                           floor( SUM(POSTED Contribution.amount_cents)
+                                  / round_half_up(min(OfferingPeriod.grant_date_fmv_cents, COALESCE(OfferingPeriod.purchase_date_fmv_cents, OfferingPeriod.grant_date_fmv_cents)) * (10000 - Plan.discount_bp) / 10000) )
+                           * OfferingPeriod.grant_date_fmv_cents)
+      remaining_cents = Plan.annual_accrual_cap_cents - committed_cents - projected_cents
+    input_set: "All Enrollments for the participant whose OfferingPeriod.start_date falls in the requested calendar year, summed with explicit status filter; tie-break by Enrollment.id ascending when ordering matters in a list response."
+    constants:
+      BP_DENOM: 10000
+      ACCRUAL_CAP_BASIS: grant_date_fmv
+    precision: "Integer cents."
+    variants:
+      - name: committed_only
+        when: "?include_projection=false"
+        difference: "Reports only committed_cents from already-COMPLETED purchases; in-flight contributions excluded."
+      - name: with_projection
+        when: "?include_projection=true (default)"
+        difference: "Adds projected_cents from POSTED contributions on ACTIVE enrollments at the current chosen_fmv; produces a smaller remaining_cents than committed_only."
+
+  - name: purchase_dilution_warning_score
+    trigger: "POST /offering-periods/{id}/run-purchase (pre-commit) and GET /plans/{id}/dilution-preview"
+    algorithm: weighted_scoring
+    formula: |
+      # Three-input weighted score with non-linear interaction:
+      #   - rate_factor:    Plan.max_contribution_rate_bp / 1500  (caps at 1.0)
+      #   - cap_factor:     Plan.annual_accrual_cap_cents / 2_500_000
+      #   - participation:  active_enrollment_count / max(1, eligible_employee_count supplied in query)
+      # The score is gated on rate_factor (if rate_factor < 0.5, cap and participation are scaled by rate_factor squared).
+      rate_factor = min(1.0, Plan.max_contribution_rate_bp / 1500)
+      cap_factor = Plan.annual_accrual_cap_cents / 2500000
+      participation = active_enrollment_count / max(1, eligible_employee_count)
+      if rate_factor < 0.5:
+          dilution_score = round_half_up(100 * (0.4 * rate_factor + 0.3 * cap_factor * rate_factor * rate_factor + 0.3 * participation * rate_factor * rate_factor))
+      else:
+          dilution_score = round_half_up(100 * (0.4 * rate_factor + 0.3 * cap_factor + 0.3 * participation))
+    input_set: "Plan-level configuration plus the count of Enrollments with status==ACTIVE attached to the Plan's currently-OPEN OfferingPeriod, plus eligible_employee_count from the request."
+    constants:
+      RATE_NORM: 1500
+      CAP_NORM: 2500000
+      LOW_RATE_GATE: 0.5
+      W_RATE: 0.4
+      W_CAP: 0.3
+      W_PARTICIPATION: 0.3
+    precision: "round_half_up at the final 100x scaling; integer score in [0, 100]."
+
+# =============================================================================
+# 1.4 Validation Rules Table (Ordered by Priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and non-empty"
+    error_id: ERR_AUTH_REQUIRED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "X-User-Role is one of {PlanAdministrator, PayrollAgent, Participant, TaxAuthority}"
+    error_id: ERR_AUTH_INVALID_ROLE
+    http_status: 401
+    applies_to: "all"
+  - priority: 3
+    category: auth
+    check: "Role permitted for this operation per §1.7 RBAC matrix"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+  - priority: 4
+    category: existence
+    check: "Path identifiers (plan_id, offering_period_id, enrollment_id, purchase_id, disposition_id, participant_id) resolve to existing rows, left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 5
+    category: state
+    check: "Plan.status == ACTIVE for any operation on its children (Enrollment, Contribution, Purchase batch)"
+    error_id: ERR_PLAN_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /enrollments, POST /contributions, POST /offering-periods/{id}/run-purchase"
+  - priority: 6
+    category: state
+    check: "OfferingPeriod.status == OPEN for enrollment / contribution creation; CLOSED for run-purchase; never PURCHASED"
+    error_id: ERR_PERIOD_NOT_OPEN
+    http_status: 409
+    applies_to: "POST /enrollments, POST /contributions, POST /offering-periods/{id}/run-purchase"
+  - priority: 7
+    category: state
+    check: "Enrollment.status == ACTIVE for withdraw or contribution; Disposition.status == REPORTED for PATCH"
+    error_id: ERR_INVALID_ENROLLMENT_STATE
+    http_status: 409
+    applies_to: "POST /enrollments/{id}/withdraw, POST /contributions, PATCH /dispositions/{id}"
+  - priority: 8
+    category: business_safety
+    check: "Segregation of duties — the X-User-ID invoking POST /offering-periods/{id}/run-purchase MUST NOT appear as a poster of any Contribution.enrollment_id belonging to that period (PayrollAgent vs PlanAdministrator separation, even if the user happens to hold both roles in different requests)"
+    error_id: ERR_SOD_VIOLATION
+    http_status: 403
+    applies_to: "POST /offering-periods/{id}/run-purchase"
+  - priority: 9
+    category: business_constraint
+    check: "Plan.offering_period_months in [6, 24]"
+    error_id: ERR_PERIOD_LENGTH_OUT_OF_RANGE
+    http_status: 422
+    applies_to: "POST /plans, PATCH /plans/{id}"
+  - priority: 10
+    category: business_constraint
+    check: "Enrollment.contribution_rate_bp in (0, Plan.max_contribution_rate_bp], where Plan.max_contribution_rate_bp <= 1500"
+    error_id: ERR_CONTRIBUTION_RATE_OUT_OF_RANGE
+    http_status: 422
+    applies_to: "POST /enrollments, PATCH /enrollments/{id}"
+  - priority: 11
+    category: business_fiscal
+    check: "Projected ytd_accrual_cents + this contribution's accrual charge (in grant-FMV basis) <= Plan.annual_accrual_cap_cents"
+    error_id: ERR_ANNUAL_ACCRUAL_CAP_EXCEEDED
+    http_status: 422
+    applies_to: "POST /contributions, POST /offering-periods/{id}/run-purchase"
+  - priority: 12
+    category: business_temporal
+    check: "OfferingPeriod.purchase_date_fmv_cents may only be PATCHed when SystemClock.current_time >= OfferingPeriod.end_date; before that timestamp the FMV is rejected as a future event"
+    error_id: ERR_FMV_BEFORE_PERIOD_END
+    http_status: 409
+    applies_to: "PATCH /offering-periods/{id}/fmv"
+  - priority: 13
+    category: business_temporal
+    check: "Disposition.disposition_date >= Purchase.purchase_date and <= SystemClock.current_time"
+    error_id: ERR_DISPOSITION_DATE_OUT_OF_RANGE
+    http_status: 422
+    applies_to: "POST /dispositions, PATCH /dispositions/{id}"
+  - priority: 14
+    category: business_referential
+    check: "Disposition.shares_disposed <= Purchase.shares_purchased - SUM(prior Disposition.shares_disposed where status IN {REPORTED, AMENDED}); cannot dispose more shares than remain"
+    error_id: ERR_SHARES_EXCEED_BALANCE
+    http_status: 422
+    applies_to: "POST /dispositions, PATCH /dispositions/{id}"
+  - priority: 15
+    category: business_referential
+    check: "Form3922 is immutable after creation; any PATCH/PUT/DELETE on /form-3922/{id} is rejected"
+    error_id: ERR_FORM_3922_IMMUTABLE
+    http_status: 409
+    applies_to: "PATCH /form-3922/{id}, DELETE /form-3922/{id}"
+  - priority: 16
+    category: business_referential
+    check: "Disposition references Purchase whose participant_id == X-User-ID for Participant role"
+    error_id: ERR_NOT_OWNER
+    http_status: 403
+    applies_to: "POST /dispositions, PATCH /dispositions/{id}, DELETE /dispositions/{id}"
+  - priority: 17
+    category: state
+    check: "Optimistic concurrency: request body 'version' (when present) equals stored row version"
+    error_id: ERR_VERSION_CONFLICT
+    http_status: 409
+    applies_to: "PATCH /plans/{id}, PATCH /enrollments/{id}, PATCH /offering-periods/{id}/fmv, PATCH /dispositions/{id}"
+  - priority: 18
+    category: business_constraint
+    check: "Pagination params (limit, offset) within bounds"
+    error_id: ERR_PAGINATION_INVALID
+    http_status: 422
+    applies_to: "all GET list endpoints"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Plan ---
+  - method: POST
+    path: "/plans"
+    description: "Create a Plan in DRAFT."
+    roles: [PlanAdministrator]
+    code: 201
+    input: [name, offering_period_months, "max_contribution_rate_bp?", "annual_accrual_cap_cents?", "lookback_enabled?", "discount_bp?", effective_date]
+    output: Plan
+    side_effects: []
+  - method: GET
+    path: "/plans/{plan_id}"
+    description: "Retrieve a Plan."
+    roles: [PlanAdministrator, PayrollAgent, Participant, TaxAuthority]
+    code: 200
+    input: []
+    output: Plan
+    side_effects: []
+  - method: GET
+    path: "/plans"
+    description: "List Plans (paginated; filter ?status=)."
+    roles: [PlanAdministrator, TaxAuthority]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Plan[]
+    side_effects: []
+  - method: PATCH
+    path: "/plans/{plan_id}"
+    description: "Edit DRAFT plan fields (name, period length, caps, lookback flag, discount, effective_date). OCC via version."
+    roles: [PlanAdministrator]
+    code: 200
+    input: ["name?", "offering_period_months?", "max_contribution_rate_bp?", "annual_accrual_cap_cents?", "lookback_enabled?", "discount_bp?", "effective_date?", version]
+    output: Plan
+    side_effects: []
+  - method: POST
+    path: "/plans/{plan_id}/activate"
+    description: "Transition Plan DRAFT -> ACTIVE; auto-create OfferingPeriod sequence_number=1."
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: Plan
+    side_effects: ["Create OfferingPeriod #1."]
+  - method: POST
+    path: "/plans/{plan_id}/terminate"
+    description: "Transition Plan ACTIVE -> TERMINATED; rejected if any OPEN OfferingPeriod remains."
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: Plan
+    side_effects: []
+  - method: GET
+    path: "/plans/{plan_id}/dilution-preview"
+    description: "Returns purchase_dilution_warning_score using a query-supplied eligible_employee_count."
+    roles: [PlanAdministrator]
+    code: 200
+    input: [eligible_employee_count]
+    output: object
+    side_effects: []
+
+  # --- Offering Period ---
+  - method: GET
+    path: "/plans/{plan_id}/offering-periods"
+    description: "List offering periods of the plan (paginated)."
+    roles: [PlanAdministrator, PayrollAgent, Participant, TaxAuthority]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: OfferingPeriod[]
+    side_effects: []
+  - method: GET
+    path: "/offering-periods/{offering_period_id}"
+    description: "Retrieve an OfferingPeriod."
+    roles: [PlanAdministrator, PayrollAgent, Participant, TaxAuthority]
+    code: 200
+    input: []
+    output: OfferingPeriod
+    side_effects: []
+  - method: POST
+    path: "/plans/{plan_id}/offering-periods/{offering_period_id}/grant-fmv"
+    description: "Record OfferingPeriod.grant_date_fmv_cents (allowed only on the day SystemClock.current_time == start_date and the field is null)."
+    roles: [PlanAdministrator]
+    code: 200
+    input: [grant_date_fmv_cents]
+    output: OfferingPeriod
+    side_effects: []
+  - method: PATCH
+    path: "/offering-periods/{offering_period_id}/fmv"
+    description: "Record OfferingPeriod.purchase_date_fmv_cents (must be after end_date). OCC via version."
+    roles: [PlanAdministrator]
+    code: 200
+    input: [purchase_date_fmv_cents, version]
+    output: OfferingPeriod
+    side_effects: []
+  - method: POST
+    path: "/offering-periods/{offering_period_id}/run-purchase"
+    description: "Execute purchase batch; transitions OfferingPeriod CLOSED -> PURCHASED, creates Purchase + Form3922 per ACTIVE Enrollment, auto-creates next OfferingPeriod."
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: object
+    side_effects: ["Create Purchase rows", "Issue Form3922 rows (immutable)", "Mark consumed Contributions CONSUMED", "Set Enrollment.status=COMPLETED", "Create next OfferingPeriod with sequence_number+1"]
+
+  # --- Enrollment ---
+  - method: POST
+    path: "/offering-periods/{offering_period_id}/enrollments"
+    description: "Participant enrolls for the OPEN period at a given rate."
+    roles: [Participant]
+    code: 201
+    input: [contribution_rate_bp]
+    output: Enrollment
+    side_effects: []
+  - method: GET
+    path: "/enrollments/{enrollment_id}"
+    description: "Retrieve an Enrollment."
+    roles: [PlanAdministrator, PayrollAgent, Participant, TaxAuthority]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: []
+  - method: PATCH
+    path: "/enrollments/{enrollment_id}"
+    description: "Change contribution_rate_bp while OfferingPeriod.status==OPEN. OCC via version."
+    roles: [Participant]
+    code: 200
+    input: [contribution_rate_bp, version]
+    output: Enrollment
+    side_effects: []
+  - method: POST
+    path: "/enrollments/{enrollment_id}/withdraw"
+    description: "Participant withdraws; all POSTED contributions on this enrollment become REFUNDED."
+    roles: [Participant]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: ["Mark every POSTED Contribution on this enrollment as REFUNDED."]
+  - method: GET
+    path: "/participants/{participant_id}/accrual-summary"
+    description: "Returns ytd_accrual_remaining_view with optional projection."
+    roles: [PlanAdministrator, Participant, TaxAuthority]
+    code: 200
+    input: [calendar_year, "include_projection?"]
+    output: object
+    side_effects: []
+
+  # --- Contribution ---
+  - method: POST
+    path: "/enrollments/{enrollment_id}/contributions"
+    description: "PayrollAgent posts a contribution for a pay period; amount_cents is computed and capped."
+    roles: [PayrollAgent]
+    code: 201
+    input: [pay_period_end, gross_pay_cents]
+    output: Contribution
+    side_effects: ["Apply contribution_amount calculation; status=POSTED."]
+  - method: GET
+    path: "/enrollments/{enrollment_id}/contributions"
+    description: "List contributions on an enrollment (paginated)."
+    roles: [PlanAdministrator, PayrollAgent, Participant, TaxAuthority]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Contribution[]
+    side_effects: []
+
+  # --- Purchase ---
+  - method: GET
+    path: "/purchases/{purchase_id}"
+    description: "Retrieve a Purchase."
+    roles: [PlanAdministrator, Participant, TaxAuthority]
+    code: 200
+    input: []
+    output: Purchase
+    side_effects: []
+  - method: GET
+    path: "/participants/{participant_id}/purchases"
+    description: "List a participant's purchases (paginated; filter ?holding_period_status=, ?disposition_status=)."
+    roles: [PlanAdministrator, Participant, TaxAuthority]
+    code: 200
+    input: ["holding_period_status?", "disposition_status?", "limit?", "offset?"]
+    output: Purchase[]
+    side_effects: []
+
+  # --- Form 3922 ---
+  - method: GET
+    path: "/form-3922/{form_id}"
+    description: "Retrieve a Form 3922 (immutable). Visible to PlanAdministrator, TaxAuthority, owning Participant."
+    roles: [PlanAdministrator, Participant, TaxAuthority]
+    code: 200
+    input: []
+    output: Form3922
+    side_effects: []
+  - method: GET
+    path: "/participants/{participant_id}/form-3922"
+    description: "List Form 3922 records for a participant in a calendar year (paginated)."
+    roles: [PlanAdministrator, Participant, TaxAuthority]
+    code: 200
+    input: [calendar_year, "limit?", "offset?"]
+    output: Form3922[]
+    side_effects: []
+
+  # --- Disposition ---
+  - method: POST
+    path: "/dispositions"
+    description: "Participant reports a sale; classification + tax split computed."
+    roles: [Participant]
+    code: 201
+    input: [purchase_id, disposition_date, shares_disposed, sale_price_per_share_cents]
+    output: Disposition
+    side_effects: ["Apply disposition_tax_split", "Update Purchase.disposition_status when shares_disposed exhausts remaining shares"]
+  - method: GET
+    path: "/dispositions/{disposition_id}"
+    description: "Retrieve a Disposition."
+    roles: [PlanAdministrator, Participant, TaxAuthority]
+    code: 200
+    input: []
+    output: Disposition
+    side_effects: []
+  - method: PATCH
+    path: "/dispositions/{disposition_id}"
+    description: "Amend a Disposition while status==REPORTED. OCC via version."
+    roles: [Participant]
+    code: 200
+    input: ["disposition_date?", "shares_disposed?", "sale_price_per_share_cents?", version]
+    output: Disposition
+    side_effects: ["Recompute disposition_tax_split; possibly flip Purchase.disposition_status."]
+  - method: DELETE
+    path: "/dispositions/{disposition_id}"
+    description: "Void a Disposition (status -> VOIDED)."
+    roles: [Participant]
+    code: 204
+    input: []
+    output: null
+    side_effects: ["Restore Purchase.disposition_status to HELD if no other non-VOIDED Disposition exists for this Purchase."]
+  - method: GET
+    path: "/participants/{participant_id}/dispositions"
+    description: "List dispositions for a participant (paginated; filter ?classification=, ?status=)."
+    roles: [PlanAdministrator, Participant, TaxAuthority]
+    code: 200
+    input: ["classification?", "status?", "limit?", "offset?"]
+    output: Disposition[]
+    side_effects: []
+
+  # --- System / clock / sweep (mandatory for time-gated transitions) ---
+  - method: POST
+    path: "/_clock/advance"
+    description: "Advance SystemClock.current_time forward to the supplied ISO 8601 timestamp; must be strictly greater than current value."
+    roles: [PlanAdministrator]
+    code: 200
+    input: [to_timestamp]
+    output: SystemClock
+    side_effects: []
+  - method: GET
+    path: "/_clock"
+    description: "Return SystemClock."
+    roles: [PlanAdministrator, PayrollAgent, Participant, TaxAuthority]
+    code: 200
+    input: []
+    output: SystemClock
+    side_effects: []
+  - method: POST
+    path: "/_sweep/run"
+    description: "Run the maturation sweep: (a) advance any OfferingPeriod from OPEN to CLOSED whose end_date <= current_time and FMV is recorded; (b) advance Purchase.holding_period_status across the WITHIN_BOTH -> PAST_ONE_YEAR_FROM_PURCHASE / QUALIFYING_MATURE thresholds; (c) update SystemClock.last_sweep_at."
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: object
+    side_effects: ["Transitions OfferingPeriod OPEN -> CLOSED.", "Transitions Purchase holding_period_status."]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_AUTH_REQUIRED
+    http: 401
+    condition: "Missing or empty X-User-ID / X-User-Role header."
+  - id: ERR_AUTH_INVALID_ROLE
+    http: 401
+    condition: "X-User-Role not in {PlanAdministrator, PayrollAgent, Participant, TaxAuthority}."
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Role not permitted for the requested operation per RBAC matrix."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Path resource id does not resolve."
+  - id: ERR_NOT_OWNER
+    http: 403
+    condition: "Acting Participant is not the owner of the referenced Enrollment/Disposition/Purchase."
+  - id: ERR_PLAN_NOT_ACTIVE
+    http: 409
+    condition: "Operation requires Plan.status==ACTIVE but plan is DRAFT or TERMINATED."
+  - id: ERR_PERIOD_NOT_OPEN
+    http: 409
+    condition: "Operation requires OfferingPeriod.status==OPEN (enrollment, contribution) or ==CLOSED (run-purchase), but observed status differs."
+  - id: ERR_INVALID_PERIOD_STATE
+    http: 409
+    condition: "OfferingPeriod is already PURCHASED, or run-purchase invoked on OPEN/PURCHASED."
+  - id: ERR_INVALID_ENROLLMENT_STATE
+    http: 409
+    condition: "Operation requires Enrollment.status==ACTIVE but row is WITHDRAWN or COMPLETED."
+  - id: ERR_INVALID_DISPOSITION_STATE
+    http: 409
+    condition: "Operation requires Disposition.status==REPORTED but row is AMENDED or VOIDED."
+  - id: ERR_DUPLICATE_ENROLLMENT
+    http: 409
+    condition: "An Enrollment already exists for (offering_period_id, participant_id)."
+  - id: ERR_DUPLICATE_PLAN_NAME
+    http: 409
+    condition: "Plan.name is not unique."
+  - id: ERR_PERIOD_LENGTH_OUT_OF_RANGE
+    http: 422
+    condition: "Plan.offering_period_months not in [6, 24]."
+  - id: ERR_CONTRIBUTION_RATE_OUT_OF_RANGE
+    http: 422
+    condition: "Enrollment.contribution_rate_bp <= 0 or > Plan.max_contribution_rate_bp."
+  - id: ERR_ANNUAL_ACCRUAL_CAP_EXCEEDED
+    http: 422
+    condition: "Projected ytd accrual would exceed Plan.annual_accrual_cap_cents."
+  - id: ERR_FMV_BEFORE_PERIOD_END
+    http: 409
+    condition: "PATCH /offering-periods/{id}/fmv invoked before SystemClock.current_time >= OfferingPeriod.end_date."
+  - id: ERR_GRANT_FMV_WINDOW
+    http: 409
+    condition: "POST /offering-periods/{id}/grant-fmv invoked outside the start_date window or when grant_date_fmv_cents already set."
+  - id: ERR_DISPOSITION_DATE_OUT_OF_RANGE
+    http: 422
+    condition: "disposition_date < Purchase.purchase_date or > SystemClock.current_time."
+  - id: ERR_SHARES_EXCEED_BALANCE
+    http: 422
+    condition: "Disposition.shares_disposed exceeds remaining undisposed shares on Purchase."
+  - id: ERR_FORM_3922_IMMUTABLE
+    http: 409
+    condition: "Mutating call on a Form 3922 record."
+  - id: ERR_SOD_VIOLATION
+    http: 403
+    condition: "Same X-User-ID has posted a Contribution on the period and now attempts run-purchase (segregation of duties)."
+  - id: ERR_VERSION_CONFLICT
+    http: 409
+    condition: "Request body version does not match stored row version (OCC)."
+  - id: ERR_PAGINATION_INVALID
+    http: 422
+    condition: "limit or offset outside allowed bounds."
+  - id: ERR_CLOCK_NOT_ADVANCING
+    http: 422
+    condition: "POST /_clock/advance with to_timestamp <= SystemClock.current_time."
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlanAdministrator
+    description: "Configures and operates ESPP plans; runs purchase batches; advances clock and sweep."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /plans"
+      - "PATCH /plans/{plan_id}"
+      - "POST /plans/{plan_id}/activate"
+      - "POST /plans/{plan_id}/terminate"
+      - "POST /plans/{plan_id}/offering-periods/{offering_period_id}/grant-fmv"
+      - "PATCH /offering-periods/{offering_period_id}/fmv"
+      - "POST /offering-periods/{offering_period_id}/run-purchase"
+      - "GET /plans/{plan_id}/dilution-preview"
+      - "POST /_clock/advance"
+      - "POST /_sweep/run"
+    shared_operations:
+      - "GET /plans, /plans/{id}, /offering-periods/*, /purchases/*, /form-3922/*, /participants/{id}/accrual-summary, /participants/{id}/dispositions, /participants/{id}/purchases, /participants/{id}/form-3922, /_clock"
+
+  - name: PayrollAgent
+    description: "Posts contributions to enrollments. Cannot run purchases or modify plan config (segregation of duties)."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /enrollments/{enrollment_id}/contributions"
+    shared_operations:
+      - "GET /plans/{id}, /offering-periods/*, /enrollments/{id}, /enrollments/{id}/contributions, /_clock"
+
+  - name: Participant
+    description: "Employee who enrolls, may withdraw, and reports dispositions on their own purchases."
+    identity: "entity_backed:Participant"
+    # Note: Participant is represented by participant_id on Enrollment/Disposition/Purchase rows;
+    # the row's participant_id MUST equal X-User-ID for the operation to succeed.
+    # The Participant entity is materialized implicitly: any participant_id supplied via
+    # X-User-ID is treated as an existing Participant identifier.
+    exclusive_operations:
+      - "POST /offering-periods/{offering_period_id}/enrollments"
+      - "PATCH /enrollments/{enrollment_id}"
+      - "POST /enrollments/{enrollment_id}/withdraw"
+      - "POST /dispositions"
+      - "PATCH /dispositions/{disposition_id}"
+      - "DELETE /dispositions/{disposition_id}"
+    shared_operations:
+      - "GET /plans/{id}, /offering-periods/*, /enrollments/{id}, /enrollments/{id}/contributions, /purchases/{id}, /form-3922/{id}, /participants/{me}/* views, /_clock"
+
+  - name: TaxAuthority
+    description: "Read-only audit role with access to all participants' Form 3922 and Disposition records."
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations:
+      - "GET /plans, /plans/{id}, /offering-periods/*, /purchases/*, /form-3922/*, /participants/{id}/accrual-summary, /participants/{id}/dispositions, /participants/{id}/purchases, /participants/{id}/form-3922, /_clock"

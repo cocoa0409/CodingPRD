@@ -1,0 +1,1590 @@
+scenario: |
+  Unemployment Insurance Benefit Application: base period wage calculation,
+  weeks of eligibility, weekly certification (Work Search Log), employer
+  charge (Experience Rate), Overpayment recovery, appeal, Pandemic emergency
+  extension.
+
+domain_name: unemployment-insurance
+api_prefix: /claims
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: ledger_reconciliation
+  complexity_layers:
+    - dual_variant_calculation        # Standard base period vs Alternate base period
+    - cascading_side_effects          # Overpayment -> employer charge reversal -> experience rate recompute
+    - rate_threshold_triggers         # Wage minimums, weeks of eligibility tiers, work-search count threshold
+    - version_pinning_on_approval     # Appeal locks the claim version it adjudicates
+    - scheduled_deferred_actions      # Pandemic extension window activation; weekly certification windows
+  entity_topology: hybrid
+  state_machine_shape: branching       # Claim decisions branch, Appeal forks
+  relationship_patterns:
+    - one_to_many                      # Claim -> WeeklyCertification, WeeklyCertification -> WorkSearchEntry
+    - many_to_many                     # Claimant has many WageRecords from many Employers
+    - cross_aggregate                  # Appeal references Claim or WeeklyCertification or Overpayment
+  role_model: segregation_of_duties    # Adjudicator decides, AppealOfficer reviews; same person cannot do both on same claim
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entities
+# =============================================================================
+entities:
+  - name: Claimant
+    parent: null
+    common_fields: true
+    fields:
+      - name: ssn_last4
+        type: string
+        source: input
+        description: Last four digits of SSN (used for identification only)
+        constraints: "exactly 4 digits"
+      - name: full_name
+        type: string
+        source: input
+        description: Claimant legal name
+      - name: state_residence
+        type: string
+        source: input
+        description: Two-letter US state code of residence
+        constraints: "matches /^[A-Z]{2}$/"
+      - name: date_of_birth
+        type: string
+        source: input
+        description: ISO 8601 date (YYYY-MM-DD)
+      - name: lifetime_overpayment_balance_cents
+        type: integer
+        source: computed
+        description: Sum of all OUTSTANDING Overpayment.balance_cents for this claimant; recomputed on overpayment create/update.
+        default: 0
+
+  - name: Employer
+    parent: null
+    common_fields: true
+    fields:
+      - name: ein
+        type: string
+        source: input
+        description: Employer Identification Number (federal)
+        constraints: "exactly 9 digits, unique"
+      - name: legal_name
+        type: string
+        source: input
+        description: Employer legal name
+      - name: reserve_ratio_basis_cents
+        type: integer
+        source: input
+        description: Long-run reserve dollars in the employer's account, used as the denominator of experience rate formula.
+        constraints: "> 0"
+      - name: taxable_payroll_cents
+        type: integer
+        source: input
+        description: Total taxable wages paid in the preceding calendar year; denominator for experience rate.
+        constraints: ">= 0"
+      - name: experience_rate_bps
+        type: integer
+        source: computed
+        description: Current experience rate in basis points (1 bp = 0.01%). Recomputed whenever a charge is created or reversed.
+        default: 270
+        constraints: "100 <= experience_rate_bps <= 540 (1.00% floor, 5.40% ceiling)"
+
+  - name: WageRecord
+    parent: null
+    common_fields: false
+    fields:
+      - name: claimant_id
+        type: string
+        source: input
+        description: Foreign key to Claimant.id
+      - name: employer_id
+        type: string
+        source: input
+        description: Foreign key to Employer.id
+      - name: quarter_year
+        type: integer
+        source: input
+        description: Calendar year of the wage quarter (e.g., 2025)
+        constraints: "2000 <= quarter_year <= current_year"
+      - name: quarter_index
+        type: integer
+        source: input
+        description: Quarter number 1-4 (Q1=Jan-Mar, Q2=Apr-Jun, Q3=Jul-Sep, Q4=Oct-Dec)
+        constraints: "1 <= quarter_index <= 4"
+      - name: wages_cents
+        type: integer
+        source: input
+        description: Gross wages reported for this employer-quarter
+        constraints: ">= 0"
+    # No version field — immutable wage report once filed; corrections require a new WageRecord (append-only).
+
+  - name: Claim
+    parent: Claimant
+    common_fields: true
+    fields:
+      - name: claimant_id
+        type: string
+        source: input
+        description: Owning Claimant.id
+      - name: filing_date
+        type: string
+        source: system
+        description: ISO 8601 datetime when the claim was filed (server clock)
+      - name: benefit_year_start
+        type: string
+        source: computed
+        description: First Sunday on or before filing_date (ISO date)
+      - name: benefit_year_end
+        type: string
+        source: computed
+        description: 364 days after benefit_year_start (52-week benefit year, inclusive)
+      - name: base_period_variant
+        type: enum
+        source: computed
+        description: Which base period was used for the wage calculation
+        constraints: "one of {STANDARD, ALTERNATE}"
+      - name: base_period_total_wages_cents
+        type: integer
+        source: computed
+        description: Sum of WageRecord.wages_cents over the four quarters of base_period_variant.
+      - name: high_quarter_wages_cents
+        type: integer
+        source: computed
+        description: Maximum WageRecord.wages_cents across the four base-period quarters
+      - name: weekly_benefit_amount_cents
+        type: integer
+        source: computed
+        description: WBA per calculation rule weekly_benefit_amount (capped, floor-rounded)
+      - name: max_weeks_of_eligibility
+        type: integer
+        source: computed
+        description: Weeks of regular benefit eligibility (capped, see calculation max_weeks_of_eligibility)
+        constraints: "0 <= max_weeks_of_eligibility <= 26"
+      - name: status
+        type: enum
+        source: computed
+        description: Claim lifecycle status
+        constraints: "one of {DRAFT, PENDING_ADJUDICATION, MONETARILY_ELIGIBLE, DENIED, ACTIVE, EXHAUSTED, EXTENDED, CLOSED}"
+      - name: weeks_paid
+        type: integer
+        source: computed
+        description: Count of WeeklyCertification under this claim with status=APPROVED.
+        default: 0
+      - name: weeks_remaining
+        type: integer
+        source: computed
+        description: max_weeks_of_eligibility (plus any active extension weeks) minus weeks_paid; floored at 0.
+      - name: pandemic_extension_weeks_granted
+        type: integer
+        source: computed
+        description: Extra weeks granted by an active PandemicExtension at the time the claim became EXTENDED. Zero until extension applied.
+        default: 0
+      - name: extension_id
+        type: string
+        source: computed
+        description: PandemicExtension.id whose window applied to this claim, or null if never extended.
+        default: null
+
+  - name: WeeklyCertification
+    parent: Claim
+    common_fields: true
+    fields:
+      - name: claim_id
+        type: string
+        source: input
+        description: Owning Claim.id
+      - name: week_ending_date
+        type: string
+        source: input
+        description: ISO 8601 date (must be a Saturday) marking the end of the calendar week being certified
+      - name: status
+        type: enum
+        source: computed
+        description: Certification lifecycle
+        constraints: "one of {SUBMITTED, APPROVED, DENIED, OVERPAID}"
+      - name: earnings_reported_cents
+        type: integer
+        source: input
+        description: Gross earnings the claimant reports for the week
+        constraints: ">= 0"
+      - name: able_and_available
+        type: boolean
+        source: input
+        description: Claimant declares they were able and available for work all week
+      - name: work_search_count
+        type: integer
+        source: computed
+        description: Count of WorkSearchEntry submitted under this certification (also enforced at submit time).
+        default: 0
+      - name: payable_amount_cents
+        type: integer
+        source: computed
+        description: Net amount payable after earnings offset; result of calculation weekly_payable_amount.
+        default: 0
+      - name: payment_id
+        type: string
+        source: computed
+        description: Foreign key to BenefitPayment.id once paid (null until APPROVED).
+        default: null
+
+  - name: WorkSearchEntry
+    parent: WeeklyCertification
+    common_fields: false
+    fields:
+      - name: certification_id
+        type: string
+        source: input
+        description: Owning WeeklyCertification.id
+      - name: contact_date
+        type: string
+        source: input
+        description: ISO 8601 date the work-search contact was made
+      - name: employer_name
+        type: string
+        source: input
+        description: Free-text name of the prospective employer contacted
+      - name: contact_method
+        type: enum
+        source: input
+        description: How the contact was made
+        constraints: "one of {ONLINE_APPLICATION, IN_PERSON, PHONE, EMAIL, REFERRAL}"
+    # Immutable log entry — common_fields:false (id + created_at only).
+
+  - name: BenefitPayment
+    parent: Claim
+    common_fields: false
+    fields:
+      - name: claim_id
+        type: string
+        source: system
+        description: Owning Claim.id
+      - name: certification_id
+        type: string
+        source: system
+        description: WeeklyCertification.id that triggered the payment
+      - name: amount_cents
+        type: integer
+        source: system
+        description: Net dollar amount paid for the week
+      - name: issued_at
+        type: string
+        source: system
+        description: ISO 8601 datetime the payment was issued (server clock)
+      - name: status
+        type: enum
+        source: computed
+        description: Payment status
+        constraints: "one of {ISSUED, REVERSED}"
+      - name: reversed_reason
+        type: string
+        source: computed
+        description: Free-text reason if the payment was reversed; null when status=ISSUED.
+        default: null
+
+  - name: Overpayment
+    parent: Claim
+    common_fields: true
+    fields:
+      - name: claim_id
+        type: string
+        source: system
+        description: Owning Claim.id
+      - name: certification_id
+        type: string
+        source: system
+        description: WeeklyCertification.id whose audit produced the overpayment (null if assessed without a specific week)
+        default: null
+      - name: principal_cents
+        type: integer
+        source: system
+        description: Original overpaid principal
+        constraints: "> 0"
+      - name: balance_cents
+        type: integer
+        source: computed
+        description: Outstanding balance; principal minus sum of repayments and waived amounts.
+      - name: classification
+        type: enum
+        source: input
+        description: Cause of overpayment
+        constraints: "one of {AGENCY_ERROR, NON_FRAUD, FRAUD}"
+      - name: status
+        type: enum
+        source: computed
+        description: Overpayment lifecycle
+        constraints: "one of {OUTSTANDING, REPAID, WAIVED, WRITTEN_OFF}"
+
+  - name: Appeal
+    parent: null
+    common_fields: true
+    fields:
+      - name: claim_id
+        type: string
+        source: input
+        description: Claim.id under appeal
+      - name: subject_type
+        type: enum
+        source: input
+        description: What is being appealed
+        constraints: "one of {MONETARY_DETERMINATION, WEEKLY_DENIAL, OVERPAYMENT_ASSESSMENT}"
+      - name: subject_id
+        type: string
+        source: input
+        description: Id of the subject (Claim.id for MONETARY_DETERMINATION, WeeklyCertification.id for WEEKLY_DENIAL, Overpayment.id for OVERPAYMENT_ASSESSMENT)
+      - name: subject_locked_version
+        type: integer
+        source: system
+        description: The subject entity's `version` field at the moment the appeal was filed; immutable thereafter.
+      - name: assigned_adjudicator_id
+        type: string
+        source: system
+        description: X-User-ID of the Adjudicator who decided the subject; the AppealOfficer assigned to this appeal must differ (segregation of duties).
+      - name: assigned_appeal_officer_id
+        type: string
+        source: input
+        description: X-User-ID of the AppealOfficer who will hear the appeal
+      - name: filed_at
+        type: string
+        source: system
+        description: Datetime appeal was filed
+      - name: deadline_at
+        type: string
+        source: computed
+        description: filed_at plus APPEAL_WINDOW_DAYS (30 days)
+      - name: status
+        type: enum
+        source: computed
+        description: Appeal lifecycle
+        constraints: "one of {FILED, IN_HEARING, SUSTAINED, REVERSED, WITHDRAWN, DISMISSED_LATE}"
+      - name: decision_at
+        type: string
+        source: computed
+        description: Datetime of SUSTAINED or REVERSED decision; null otherwise
+        default: null
+
+  - name: EmployerCharge
+    parent: Employer
+    common_fields: true
+    fields:
+      - name: employer_id
+        type: string
+        source: system
+        description: Owning Employer.id
+      - name: claim_id
+        type: string
+        source: system
+        description: Source Claim.id
+      - name: payment_id
+        type: string
+        source: system
+        description: BenefitPayment.id this charge was generated from
+      - name: charge_cents
+        type: integer
+        source: system
+        description: Dollars charged to this employer for the source payment (weighted by base-period wage share).
+      - name: status
+        type: enum
+        source: computed
+        description: Charge lifecycle
+        constraints: "one of {ACTIVE, REVERSED, RELIEVED}"
+
+  - name: PandemicExtension
+    parent: null
+    common_fields: true
+    fields:
+      - name: program_name
+        type: string
+        source: input
+        description: Human label (e.g., "PEUC-2026")
+      - name: effective_start
+        type: string
+        source: input
+        description: ISO date when the extension window opens (extension may be applied to claims that EXHAUST on or after this date).
+      - name: effective_end
+        type: string
+        source: input
+        description: ISO date when the extension window closes (inclusive)
+      - name: extra_weeks
+        type: integer
+        source: input
+        description: Number of additional weeks granted per qualifying claim
+        constraints: "1 <= extra_weeks <= 26"
+      - name: status
+        type: enum
+        source: computed
+        description: Program activation status
+        constraints: "one of {SCHEDULED, ACTIVE, EXPIRED}"
+
+  - name: SystemClock
+    parent: null
+    common_fields: false
+    fields:
+      - name: now
+        type: string
+        source: system
+        description: Current logical server datetime (ISO 8601). Single-row singleton; advanced by /_clock/advance for testing.
+
+# =============================================================================
+# §1.2 State Machines
+# =============================================================================
+state_machines:
+  - entity: Claim
+    initial_state: DRAFT
+    terminal_states: [DENIED, CLOSED]
+    transitions:
+      - from: DRAFT
+        to: PENDING_ADJUDICATION
+        trigger: "POST /claims/{id}/submit"
+        actor: Claimant
+        preconditions:
+          - "Claim exists and is owned by acting Claimant (X-User-ID == Claim.claimant_id)"
+          - "Claimant has at least one WageRecord in the candidate base periods"
+        side_effects:
+          - "Compute base_period_variant, base_period_total_wages_cents, high_quarter_wages_cents per calculation base_period_wage_calculation"
+          - "Compute weekly_benefit_amount_cents per calculation weekly_benefit_amount"
+          - "Compute max_weeks_of_eligibility per calculation max_weeks_of_eligibility"
+          - "Set filing_date = SystemClock.now, benefit_year_start, benefit_year_end"
+          - "Increment Claim.version"
+
+      - from: PENDING_ADJUDICATION
+        to: MONETARILY_ELIGIBLE
+        trigger: "POST /claims/{id}/adjudicate (decision='ELIGIBLE')"
+        actor: Adjudicator
+        preconditions:
+          - "Claim.base_period_total_wages_cents >= MIN_BASE_PERIOD_WAGES_CENTS (150000 = $1500)"
+          - "Claim.high_quarter_wages_cents >= MIN_HIGH_QUARTER_WAGES_CENTS (90000 = $900)"
+          - "Claim.weekly_benefit_amount_cents > 0"
+        side_effects:
+          - "Record assigned_adjudicator_id = X-User-ID on the claim's adjudication record (used later for segregation of duties on appeals)"
+          - "Increment Claim.version"
+
+      - from: PENDING_ADJUDICATION
+        to: DENIED
+        trigger: "POST /claims/{id}/adjudicate (decision='DENIED')"
+        actor: Adjudicator
+        preconditions:
+          - "Claim.base_period_total_wages_cents < MIN_BASE_PERIOD_WAGES_CENTS OR Claim.high_quarter_wages_cents < MIN_HIGH_QUARTER_WAGES_CENTS"
+        side_effects:
+          - "Record assigned_adjudicator_id"
+          - "Increment Claim.version"
+
+      - from: MONETARILY_ELIGIBLE
+        to: ACTIVE
+        trigger: "POST /claims/{id}/weekly-certifications first APPROVED certification"
+        actor: system
+        preconditions:
+          - "At least one WeeklyCertification under this Claim has transitioned SUBMITTED -> APPROVED"
+        side_effects:
+          - "No further state changes triggered by this transition; subsequent certifications operate while ACTIVE"
+
+      - from: ACTIVE
+        to: EXHAUSTED
+        trigger: "system on WeeklyCertification APPROVED when weeks_paid reaches max_weeks_of_eligibility + pandemic_extension_weeks_granted"
+        actor: system
+        preconditions:
+          - "weeks_paid + 1 >= max_weeks_of_eligibility + pandemic_extension_weeks_granted after the latest APPROVED certification"
+        side_effects:
+          - "Set Claim.weeks_remaining = 0"
+          - "Increment Claim.version"
+
+      - from: EXHAUSTED
+        to: EXTENDED
+        trigger: "POST /claims/{id}/apply-extension"
+        actor: Claimant
+        preconditions:
+          - "There exists a PandemicExtension with status=ACTIVE whose [effective_start, effective_end] window contains SystemClock.now"
+          - "Claim.status == EXHAUSTED"
+          - "Claim.extension_id IS NULL (cannot stack extensions)"
+        side_effects:
+          - "Set Claim.extension_id = chosen PandemicExtension.id"
+          - "Set Claim.pandemic_extension_weeks_granted = PandemicExtension.extra_weeks"
+          - "Recompute Claim.weeks_remaining"
+          - "Increment Claim.version"
+
+      - from: EXTENDED
+        to: EXHAUSTED
+        trigger: "system on WeeklyCertification APPROVED when extension weeks consumed"
+        actor: system
+        preconditions:
+          - "weeks_paid >= max_weeks_of_eligibility + pandemic_extension_weeks_granted"
+        side_effects:
+          - "Set Claim.weeks_remaining = 0"
+
+      - from: MONETARILY_ELIGIBLE
+        to: CLOSED
+        trigger: "system on SystemClock.now > Claim.benefit_year_end"
+        actor: system
+        preconditions:
+          - "SystemClock.now > Claim.benefit_year_end"
+        side_effects:
+          - "Reject any subsequent WeeklyCertification submissions with ERR_BENEFIT_YEAR_EXPIRED"
+
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "system on SystemClock.now > Claim.benefit_year_end"
+        actor: system
+        preconditions:
+          - "SystemClock.now > Claim.benefit_year_end"
+        side_effects: []
+
+      - from: EXHAUSTED
+        to: CLOSED
+        trigger: "system on SystemClock.now > Claim.benefit_year_end"
+        actor: system
+        preconditions:
+          - "SystemClock.now > Claim.benefit_year_end"
+        side_effects: []
+
+      - from: DENIED
+        to: MONETARILY_ELIGIBLE
+        trigger: "POST /appeals/{id}/decide (decision='REVERSED') where Appeal.subject_type=MONETARY_DETERMINATION"
+        actor: AppealOfficer
+        preconditions:
+          - "Appeal.status == IN_HEARING"
+          - "Appeal.subject_locked_version == Claim.version (no intervening mutation since appeal was filed)"
+        side_effects:
+          - "Set Claim.status = MONETARILY_ELIGIBLE"
+          - "Increment Claim.version"
+
+  - entity: WeeklyCertification
+    initial_state: SUBMITTED
+    terminal_states: [OVERPAID]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /claims/{cid}/weekly-certifications (auto-approve when work_search_count >= MIN_WORK_SEARCH_CONTACTS and able_and_available and payable_amount_cents > 0)"
+        actor: system
+        preconditions:
+          - "Claim.status IN {MONETARILY_ELIGIBLE, ACTIVE, EXTENDED}"
+          - "Claim.weeks_remaining > 0"
+          - "work_search_count >= MIN_WORK_SEARCH_CONTACTS (3)"
+          - "able_and_available == true"
+          - "payable_amount_cents > 0 (after earnings offset per calculation weekly_payable_amount)"
+          - "week_ending_date is a Saturday"
+          - "week_ending_date strictly later than the latest APPROVED certification's week_ending_date for this claim (no duplicates, no out-of-order)"
+        side_effects:
+          - "Create BenefitPayment with amount_cents = payable_amount_cents, status=ISSUED"
+          - "Set WeeklyCertification.payment_id = BenefitPayment.id"
+          - "Recompute Claim.weeks_paid; if claim was MONETARILY_ELIGIBLE then transition to ACTIVE"
+          - "Recompute Claim.weeks_remaining; if zero, transition Claim ACTIVE/EXTENDED -> EXHAUSTED"
+          - "Per calculation employer_charge_allocation: create EmployerCharge rows weighted by base-period wage share for each Employer in base period"
+          - "Per calculation employer_experience_rate: recompute Employer.experience_rate_bps for each charged Employer"
+
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /claims/{cid}/weekly-certifications (denied when preconditions for APPROVED not met)"
+        actor: system
+        preconditions:
+          - "work_search_count < MIN_WORK_SEARCH_CONTACTS OR able_and_available == false OR payable_amount_cents == 0"
+        side_effects:
+          - "No payment issued; Claim.weeks_paid unchanged"
+
+      - from: APPROVED
+        to: OVERPAID
+        trigger: "POST /claims/{cid}/weekly-certifications/{id}/audit (audit finds ineligibility)"
+        actor: Adjudicator
+        preconditions:
+          - "WeeklyCertification.payment_id IS NOT NULL"
+          - "BenefitPayment.status == ISSUED"
+        side_effects:
+          - "Set BenefitPayment.status = REVERSED, set reversed_reason"
+          - "Create Overpayment with principal_cents = BenefitPayment.amount_cents, status=OUTSTANDING, balance_cents=principal_cents"
+          - "Recompute Claimant.lifetime_overpayment_balance_cents"
+          - "For each EmployerCharge with payment_id == this BenefitPayment.id and status=ACTIVE: set status=REVERSED, recompute Employer.experience_rate_bps"
+          - "Decrement Claim.weeks_paid by 1; recompute Claim.weeks_remaining; if Claim was EXHAUSTED and weeks_remaining > 0 then revert to ACTIVE/EXTENDED based on extension_id"
+          - "Increment Claim.version and WeeklyCertification.version"
+
+  - entity: Appeal
+    initial_state: FILED
+    terminal_states: [SUSTAINED, REVERSED, WITHDRAWN, DISMISSED_LATE]
+    transitions:
+      - from: FILED
+        to: IN_HEARING
+        trigger: "POST /appeals/{id}/start-hearing"
+        actor: AppealOfficer
+        preconditions:
+          - "X-User-ID == Appeal.assigned_appeal_officer_id"
+          - "X-User-ID != Appeal.assigned_adjudicator_id (segregation of duties)"
+          - "SystemClock.now <= Appeal.deadline_at (else auto DISMISSED_LATE)"
+        side_effects: []
+
+      - from: FILED
+        to: DISMISSED_LATE
+        trigger: "system on SystemClock.now > Appeal.deadline_at"
+        actor: system
+        preconditions:
+          - "SystemClock.now > Appeal.deadline_at"
+        side_effects: []
+
+      - from: FILED
+        to: WITHDRAWN
+        trigger: "POST /appeals/{id}/withdraw"
+        actor: Claimant
+        preconditions:
+          - "X-User-ID == Claim.claimant_id (the Claim referenced by this Appeal)"
+        side_effects: []
+
+      - from: IN_HEARING
+        to: SUSTAINED
+        trigger: "POST /appeals/{id}/decide (decision='SUSTAINED')"
+        actor: AppealOfficer
+        preconditions:
+          - "Appeal.subject_locked_version == current subject_entity.version (otherwise stale reference)"
+        side_effects:
+          - "Set Appeal.decision_at = SystemClock.now"
+          - "No change to subject; original determination stands"
+
+      - from: IN_HEARING
+        to: REVERSED
+        trigger: "POST /appeals/{id}/decide (decision='REVERSED')"
+        actor: AppealOfficer
+        preconditions:
+          - "Appeal.subject_locked_version == current subject_entity.version"
+        side_effects:
+          - "Set Appeal.decision_at"
+          - "If subject_type=MONETARY_DETERMINATION: transition Claim DENIED -> MONETARILY_ELIGIBLE"
+          - "If subject_type=WEEKLY_DENIAL: transition WeeklyCertification DENIED -> APPROVED (which cascades: BenefitPayment created, EmployerCharge created, experience_rate recomputed)"
+          - "If subject_type=OVERPAYMENT_ASSESSMENT: set Overpayment.status=WAIVED, balance_cents=0, recompute Claimant.lifetime_overpayment_balance_cents"
+
+  - entity: Overpayment
+    initial_state: OUTSTANDING
+    terminal_states: [REPAID, WAIVED, WRITTEN_OFF]
+    transitions:
+      - from: OUTSTANDING
+        to: REPAID
+        trigger: "POST /overpayments/{id}/repay (with amount_cents)"
+        actor: Claimant
+        preconditions:
+          - "amount_cents > 0"
+          - "amount_cents <= Overpayment.balance_cents (no overpayment of overpayment)"
+        side_effects:
+          - "Decrement Overpayment.balance_cents by amount_cents"
+          - "If balance_cents reaches 0, set status=REPAID"
+          - "Recompute Claimant.lifetime_overpayment_balance_cents"
+
+      - from: OUTSTANDING
+        to: WAIVED
+        trigger: "POST /overpayments/{id}/waive"
+        actor: Adjudicator
+        preconditions:
+          - "Overpayment.classification IN {AGENCY_ERROR, NON_FRAUD}  (FRAUD overpayments cannot be waived)"
+        side_effects:
+          - "Set balance_cents=0, status=WAIVED"
+          - "Recompute Claimant.lifetime_overpayment_balance_cents"
+
+      - from: OUTSTANDING
+        to: WRITTEN_OFF
+        trigger: "POST /overpayments/{id}/write-off"
+        actor: Adjudicator
+        preconditions:
+          - "SystemClock.now - Overpayment.created_at >= STATUTE_OF_LIMITATIONS_DAYS (1825 = 5 years)"
+        side_effects:
+          - "Set balance_cents=0, status=WRITTEN_OFF"
+          - "Recompute Claimant.lifetime_overpayment_balance_cents"
+
+  - entity: PandemicExtension
+    initial_state: SCHEDULED
+    terminal_states: [EXPIRED]
+    transitions:
+      - from: SCHEDULED
+        to: ACTIVE
+        trigger: "system on SystemClock.now >= PandemicExtension.effective_start"
+        actor: system
+        preconditions:
+          - "SystemClock.now >= effective_start"
+          - "SystemClock.now <= effective_end"
+        side_effects: []
+
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system on SystemClock.now > PandemicExtension.effective_end"
+        actor: system
+        preconditions:
+          - "SystemClock.now > effective_end"
+        side_effects: []
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - scenario: "Two weekly certifications submitted with the same week_ending_date on the same claim simultaneously"
+    guarantee: "At most one WeeklyCertification per (claim_id, week_ending_date); second is rejected"
+    error_id: ERR_DUPLICATE_WEEK
+    http_status: 409
+    serialization: "Unique constraint on (claim_id, week_ending_date); first-writer-wins"
+
+  - scenario: "Adjudicator marks a payment OVERPAID while AppealOfficer reverses an unrelated weekly denial that creates a payment for the same week"
+    guarantee: "Only one outcome on a given week_ending_date persists; the loser of the race sees ERR_DUPLICATE_WEEK"
+    error_id: ERR_DUPLICATE_WEEK
+    http_status: 409
+    serialization: "First-writer-wins on (claim_id, week_ending_date) row"
+
+  - scenario: "Two appeals filed on the same subject (same Claim/Cert/Overpayment) simultaneously"
+    guarantee: "At most one Appeal per subject_id; second rejected"
+    error_id: ERR_APPEAL_ALREADY_FILED
+    http_status: 409
+    serialization: "Unique constraint on (subject_type, subject_id)"
+
+  - scenario: "AppealOfficer decides the appeal while the Adjudicator audits the same certification, advancing its version"
+    guarantee: "Appeal decision rejects when subject_locked_version != current subject.version"
+    error_id: ERR_STALE_APPEAL_SUBJECT
+    http_status: 409
+    serialization: "Version-pin check at decide time; loser is whoever submits second"
+
+  - scenario: "Two repayments posted simultaneously to the same Overpayment summing to more than balance_cents"
+    guarantee: "Repayments are serialized; loser whose amount would drive balance below zero is rejected"
+    error_id: ERR_REPAY_EXCEEDS_BALANCE
+    http_status: 409
+    serialization: "Row-level lock on Overpayment; first-writer-wins"
+
+  - scenario: "Two simultaneous apply-extension requests on the same EXHAUSTED claim"
+    guarantee: "At most one extension applied per claim (Claim.extension_id immutable once set); second rejected"
+    error_id: ERR_EXTENSION_ALREADY_APPLIED
+    http_status: 409
+    serialization: "First-writer-wins on Claim.extension_id"
+
+# =============================================================================
+# §1.3 Calculations
+# =============================================================================
+calculations:
+  - name: base_period_wage_calculation
+    trigger: "On Claim DRAFT -> PENDING_ADJUDICATION (POST /claims/{id}/submit)"
+    algorithm: forward_looking
+    formula: |
+      Let filing_date = SystemClock.now (date portion).
+      Let filing_quarter = (year(filing_date), ceil(month/3)).
+
+      STANDARD base period = the four completed calendar quarters
+        immediately preceding filing_quarter's "previous quarter".
+        i.e., quarters [filing_quarter - 5, filing_quarter - 4,
+                        filing_quarter - 3, filing_quarter - 2].
+        (This drops the lag quarter to allow employer wage reporting.)
+
+      ALTERNATE base period = the four most recently completed calendar
+        quarters, i.e., quarters [filing_quarter - 4, filing_quarter - 3,
+                                  filing_quarter - 2, filing_quarter - 1].
+
+      For each variant V in {STANDARD, ALTERNATE}:
+        total_wages_V = sum of WageRecord.wages_cents where claimant_id=this.claimant_id
+                        and (quarter_year, quarter_index) in V's four quarters.
+
+      Variant selection rule (pin order):
+        1. If STANDARD total_wages_V >= MIN_BASE_PERIOD_WAGES_CENTS, pick STANDARD.
+        2. Else if ALTERNATE total_wages_V >= MIN_BASE_PERIOD_WAGES_CENTS, pick ALTERNATE.
+        3. Else pick STANDARD (the claim will fail monetary eligibility under either).
+
+      Outputs:
+        Claim.base_period_variant = chosen V
+        Claim.base_period_total_wages_cents = total_wages_chosen
+        Claim.high_quarter_wages_cents = max(WageRecord.wages_cents in chosen V's quarters)
+    input_set: "WageRecord rows for this Claimant whose (quarter_year, quarter_index) lies in either the STANDARD or ALTERNATE base period defined by filing_date."
+    constants:
+      MIN_BASE_PERIOD_WAGES_CENTS: 150000     # $1,500.00 floor
+      MIN_HIGH_QUARTER_WAGES_CENTS: 90000     # $900.00 floor
+    precision: "Cents (integer); no rounding ambiguity at this stage."
+    variants:
+      - name: standard_base_period
+        when: "STANDARD total_wages meets the floor"
+        difference: "Uses quarters [t-5..t-2]; drops the lag quarter, so the most recent quarter of work is NOT counted. Older work — sometimes more — is."
+      - name: alternate_base_period
+        when: "STANDARD fails the floor but ALTERNATE meets it"
+        difference: "Uses quarters [t-4..t-1]; includes the most recently completed quarter (the lag quarter). For a worker whose wages spiked in that lag quarter, total_wages_ALTERNATE > total_wages_STANDARD; the claim is monetarily eligible only under ALTERNATE."
+
+  - name: weekly_benefit_amount
+    trigger: "On Claim DRAFT -> PENDING_ADJUDICATION (after base_period_wage_calculation)"
+    algorithm: tiered_pricing
+    formula: |
+      wba_raw_cents = floor(Claim.high_quarter_wages_cents / WBA_DIVISOR)
+      wba_cents = max(MIN_WBA_CENTS, min(MAX_WBA_CENTS, wba_raw_cents))
+      # Floor (truncate) — NOT round_half_up.
+      Claim.weekly_benefit_amount_cents = wba_cents
+    input_set: "Claim.high_quarter_wages_cents from base_period_wage_calculation."
+    constants:
+      WBA_DIVISOR: 26          # WBA ≈ 1/26 of high-quarter wages
+      MIN_WBA_CENTS: 4000      # $40.00
+      MAX_WBA_CENTS: 60000     # $600.00
+    precision: "Cents; floor division (truncate toward zero)."
+    variants: []
+
+  - name: max_weeks_of_eligibility
+    trigger: "On Claim DRAFT -> PENDING_ADJUDICATION (after weekly_benefit_amount)"
+    algorithm: tiered_pricing
+    formula: |
+      # Tiered by replacement ratio: total_wages divided by WBA gives potential weeks.
+      potential_weeks = floor(Claim.base_period_total_wages_cents
+                              / (Claim.weekly_benefit_amount_cents * WEEKS_DENOMINATOR_FACTOR))
+      # The factor 3 converts to weeks-of-benefits per dollar earned.
+      Claim.max_weeks_of_eligibility = min(MAX_REGULAR_WEEKS, max(MIN_REGULAR_WEEKS, potential_weeks))
+    input_set: "Claim.base_period_total_wages_cents and Claim.weekly_benefit_amount_cents."
+    constants:
+      WEEKS_DENOMINATOR_FACTOR: 3
+      MIN_REGULAR_WEEKS: 13
+      MAX_REGULAR_WEEKS: 26
+    precision: "Integer weeks; floor division."
+    variants: []
+
+  - name: weekly_payable_amount
+    trigger: "On POST /claims/{cid}/weekly-certifications (before APPROVED transition decision)"
+    algorithm: threshold
+    formula: |
+      wba = Claim.weekly_benefit_amount_cents
+      earnings = WeeklyCertification.earnings_reported_cents
+      disregard = floor(wba * EARNINGS_DISREGARD_PCT / 100)
+      # Earnings up to disregard do not reduce the benefit; earnings above reduce dollar-for-dollar.
+      offset = max(0, earnings - disregard)
+      payable = max(0, wba - offset)
+      WeeklyCertification.payable_amount_cents = payable
+    input_set: "Claim.weekly_benefit_amount_cents and WeeklyCertification.earnings_reported_cents."
+    constants:
+      EARNINGS_DISREGARD_PCT: 25     # 25% of WBA is disregarded before offset
+    precision: "Cents; floor (truncate) the disregard."
+    variants: []
+
+  - name: employer_charge_allocation
+    trigger: "On WeeklyCertification SUBMITTED -> APPROVED (side_effects of BenefitPayment creation)"
+    algorithm: waterfall_allocation
+    formula: |
+      Let base_quarters = Claim.base_period_variant's four quarters.
+      Let total = Claim.base_period_total_wages_cents.
+      For each Employer E with at least one WageRecord(claimant_id=Claim.claimant_id,
+                                                       employer_id=E.id,
+                                                       quarter in base_quarters):
+        wages_E = sum of WageRecord.wages_cents for E in base_quarters
+        share_E = wages_E / total                  # rational, kept as fraction
+        charge_E_raw = BenefitPayment.amount_cents * share_E
+
+      Rounding order (PINNED):
+        1. Compute every employer's charge_E_raw to full precision (no rounding).
+        2. Round each to nearest cent using round_half_up.
+        3. Compute residual = BenefitPayment.amount_cents - sum(rounded charges).
+        4. Assign residual cents (positive or negative) one-by-one to employers
+           sorted by wages_E DESCENDING; tie-break by Employer.id ASCENDING.
+        # This guarantees sum(EmployerCharge.charge_cents) == BenefitPayment.amount_cents (conservation invariant).
+
+      Create EmployerCharge(employer_id=E.id, claim_id, payment_id,
+                            charge_cents=adjusted_charge_E, status=ACTIVE)
+    input_set: "WageRecord rows whose (claimant_id, quarter) lies in Claim.base_period_variant; one EmployerCharge per distinct employer_id in that set."
+    constants: {}
+    precision: "Cents; round_half_up per employer, then residual reconciliation."
+    variants: []
+
+  - name: employer_experience_rate
+    trigger: "On EmployerCharge create (ACTIVE) and on EmployerCharge status change to REVERSED or RELIEVED"
+    algorithm: threshold
+    formula: |
+      # Smaller reserve ratio = higher rate.
+      net_charges_cents = sum(EmployerCharge.charge_cents WHERE employer_id=E.id AND status=ACTIVE)
+                          - sum(EmployerCharge.charge_cents WHERE employer_id=E.id AND status=RELIEVED)
+      adjusted_reserve_cents = max(0, E.reserve_ratio_basis_cents - net_charges_cents)
+      reserve_ratio = adjusted_reserve_cents / E.taxable_payroll_cents      # rational
+
+      Tier table (rate in basis points, applied at the smallest reserve_ratio that
+      satisfies the lower bound; lower bounds are STRICT >=):
+        reserve_ratio >= 0.10  -> 100   (1.00% floor)
+        reserve_ratio >= 0.07  -> 180
+        reserve_ratio >= 0.04  -> 270
+        reserve_ratio >= 0.01  -> 380
+        reserve_ratio >= 0.00  -> 460
+        reserve_ratio <  0.00  -> 540   (5.40% ceiling)
+
+      E.experience_rate_bps = chosen tier.
+    input_set: "All EmployerCharge rows for the employer E plus E.reserve_ratio_basis_cents and E.taxable_payroll_cents."
+    constants:
+      FLOOR_RATE_BPS: 100
+      CEILING_RATE_BPS: 540
+    precision: "Reserve ratio computed as exact rational; tier selection uses >= boundary semantics."
+    variants:
+      - name: charge_active
+        when: "EmployerCharge ACTIVE"
+        difference: "Charge counted at full charge_cents in net_charges_cents (drives rate up)."
+      - name: charge_relieved
+        when: "EmployerCharge status=RELIEVED (granted upon successful appeal of charge)"
+        difference: "Charge subtracted from net_charges_cents (drives rate down). This produces a different experience_rate_bps than ACTIVE — same inputs, two algorithms, different result."
+
+  - name: overpayment_recovery_balance
+    trigger: "On Overpayment create; on POST /overpayments/{id}/repay; on POST /overpayments/{id}/waive; on POST /overpayments/{id}/write-off; on appeal REVERSED of OVERPAYMENT_ASSESSMENT."
+    algorithm: aggregation
+    formula: |
+      # Per-overpayment balance.
+      balance_cents = principal_cents
+                    - sum(repayment.amount_cents for this overpayment)
+                    - (principal_cents if status IN {WAIVED, WRITTEN_OFF} or appeal_reversed else 0)
+      Overpayment.balance_cents = max(0, balance_cents)
+
+      # Claimant aggregate.
+      Claimant.lifetime_overpayment_balance_cents =
+          sum(Overpayment.balance_cents for o in OutstandingOverpayments
+              where o.claim_id IN claims_owned_by_this_claimant)
+    input_set: "All Overpayment rows owned (via Claim) by this Claimant whose status=OUTSTANDING."
+    constants: {}
+    precision: "Cents; no rounding."
+    variants: []
+
+# =============================================================================
+# §1.4 Validations (priority-ordered; lowest priority number wins)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role header present and is one of {Claimant, Adjudicator, AppealOfficer, EmployerAgent, SystemAdmin}; X-User-ID header present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted by the RBAC matrix for the endpoint"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "All referenced resources in the URL path exist (left-to-right): /claimants/{cid}, /claims/{id}, /weekly-certifications/{id}, /overpayments/{id}, /appeals/{id}, /employers/{id}"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: business_referential
+    check: "When Claimant acts on a resource (Claim, WeeklyCertification, Overpayment, Appeal), X-User-ID == owning Claimant.id"
+    error_id: ERR_NOT_OWNER
+    http_status: 403
+    applies_to: "Claimant-targeted endpoints"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state where the requested transition is legal per §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: all
+
+  - priority: 6
+    category: business_safety
+    check: "Segregation of duties: on POST /appeals/{id}/start-hearing and POST /appeals/{id}/decide, X-User-ID != Appeal.assigned_adjudicator_id"
+    error_id: ERR_SEGREGATION_OF_DUTIES_VIOLATION
+    http_status: 403
+    applies_to: "POST /appeals/{id}/start-hearing, POST /appeals/{id}/decide"
+
+  - priority: 7
+    category: business_temporal
+    check: "Appeal filed within APPEAL_WINDOW_DAYS (30 days) of subject decision_at; otherwise auto-DISMISSED_LATE on create"
+    error_id: ERR_APPEAL_WINDOW_EXPIRED
+    http_status: 409
+    applies_to: "POST /appeals"
+
+  - priority: 8
+    category: business_referential
+    check: "Appeal decide rejects when subject_locked_version != current subject_entity.version (stale appeal subject)"
+    error_id: ERR_STALE_APPEAL_SUBJECT
+    http_status: 409
+    applies_to: "POST /appeals/{id}/decide"
+
+  - priority: 9
+    category: business_constraint
+    check: "WeeklyCertification.week_ending_date must be a Saturday (ISO weekday == 6)"
+    error_id: ERR_NOT_SATURDAY
+    http_status: 422
+    applies_to: "POST /claims/{cid}/weekly-certifications"
+
+  - priority: 10
+    category: business_temporal
+    check: "WeeklyCertification.week_ending_date must be > the latest APPROVED certification's week_ending_date for this claim AND must lie within [Claim.benefit_year_start, Claim.benefit_year_end]"
+    error_id: ERR_WEEK_OUT_OF_RANGE
+    http_status: 409
+    applies_to: "POST /claims/{cid}/weekly-certifications"
+
+  - priority: 11
+    category: business_constraint
+    check: "No existing WeeklyCertification with same (claim_id, week_ending_date)"
+    error_id: ERR_DUPLICATE_WEEK
+    http_status: 409
+    applies_to: "POST /claims/{cid}/weekly-certifications"
+
+  - priority: 12
+    category: business_constraint
+    check: "WorkSearchEntry count attached to a SUBMITTED certification at submit time >= MIN_WORK_SEARCH_CONTACTS (3); else certification auto-DENIED rather than APPROVED"
+    error_id: ERR_INSUFFICIENT_WORK_SEARCH
+    http_status: 422
+    applies_to: "POST /claims/{cid}/weekly-certifications"
+
+  - priority: 13
+    category: business_fiscal
+    check: "Repayment amount_cents > 0 and amount_cents <= Overpayment.balance_cents"
+    error_id: ERR_REPAY_EXCEEDS_BALANCE
+    http_status: 409
+    applies_to: "POST /overpayments/{id}/repay"
+
+  - priority: 14
+    category: business_safety
+    check: "Overpayment waive forbidden when classification=FRAUD"
+    error_id: ERR_FRAUD_NOT_WAIVABLE
+    http_status: 403
+    applies_to: "POST /overpayments/{id}/waive"
+
+  - priority: 15
+    category: business_fiscal
+    check: "Claim.base_period_total_wages_cents >= MIN_BASE_PERIOD_WAGES_CENTS AND Claim.high_quarter_wages_cents >= MIN_HIGH_QUARTER_WAGES_CENTS, else Adjudicator decision='ELIGIBLE' is rejected"
+    error_id: ERR_INSUFFICIENT_BASE_PERIOD_WAGES
+    http_status: 422
+    applies_to: "POST /claims/{id}/adjudicate"
+
+  - priority: 16
+    category: business_temporal
+    check: "Apply-extension requires a PandemicExtension with status=ACTIVE whose [effective_start, effective_end] window contains SystemClock.now"
+    error_id: ERR_NO_ACTIVE_EXTENSION
+    http_status: 409
+    applies_to: "POST /claims/{id}/apply-extension"
+
+  - priority: 17
+    category: business_constraint
+    check: "Claim.extension_id IS NULL at time of apply-extension (no stacking)"
+    error_id: ERR_EXTENSION_ALREADY_APPLIED
+    http_status: 409
+    applies_to: "POST /claims/{id}/apply-extension"
+
+  - priority: 18
+    category: business_constraint
+    check: "OCC version check: when client supplies `version`, it must match current entity.version on PATCH or action endpoints"
+    error_id: ERR_VERSION_CONFLICT
+    http_status: 409
+    applies_to: "all PATCH and action endpoints accepting optional `version`"
+
+  - priority: 19
+    category: business_constraint
+    check: "Statute of limitations: Overpayment write-off requires SystemClock.now - Overpayment.created_at >= 1825 days (5 years)"
+    error_id: ERR_STATUTE_NOT_REACHED
+    http_status: 409
+    applies_to: "POST /overpayments/{id}/write-off"
+
+# =============================================================================
+# §1.5 API Endpoints
+# =============================================================================
+endpoints:
+  # ----- Claimants -----
+  - method: POST
+    path: /claimants
+    description: "Create a new Claimant identity"
+    roles: [SystemAdmin, Claimant]
+    code: 201
+    input: [ssn_last4, full_name, state_residence, date_of_birth]
+    output: Claimant
+    side_effects: []
+
+  - method: GET
+    path: /claimants/{id}
+    description: "Read claimant (includes lifetime_overpayment_balance_cents)"
+    roles: [Claimant, Adjudicator, AppealOfficer, SystemAdmin]
+    code: 200
+    input: []
+    output: Claimant
+    side_effects: []
+
+  # ----- Employers -----
+  - method: POST
+    path: /employers
+    description: "Register an Employer"
+    roles: [SystemAdmin]
+    code: 201
+    input: [ein, legal_name, reserve_ratio_basis_cents, taxable_payroll_cents]
+    output: Employer
+    side_effects: ["Initialize experience_rate_bps via employer_experience_rate calculation (no charges yet, so based on raw reserve_ratio)"]
+
+  - method: GET
+    path: /employers/{id}
+    description: "Read employer (includes current experience_rate_bps)"
+    roles: [EmployerAgent, SystemAdmin]
+    code: 200
+    input: []
+    output: Employer
+    side_effects: []
+
+  - method: GET
+    path: /employers/{id}/charges
+    description: "List EmployerCharge rows for an employer"
+    roles: [EmployerAgent, SystemAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: EmployerCharge[]
+    side_effects: []
+
+  - method: POST
+    path: /employers/{id}/charges/{charge_id}/relieve
+    description: "Employer requests charge relief (e.g., separation not the employer's fault)"
+    roles: [EmployerAgent, Adjudicator]
+    code: 200
+    input: [reason]
+    output: EmployerCharge
+    side_effects:
+      - "Set EmployerCharge.status = RELIEVED"
+      - "Recompute Employer.experience_rate_bps (charge_relieved variant)"
+
+  # ----- Wage records -----
+  - method: POST
+    path: /claimants/{cid}/wage-records
+    description: "File a quarterly wage record (immutable, append-only)"
+    roles: [SystemAdmin]
+    code: 201
+    input: [employer_id, quarter_year, quarter_index, wages_cents]
+    output: WageRecord
+    side_effects: []
+
+  - method: GET
+    path: /claimants/{cid}/wage-records
+    description: "List wage records for a claimant"
+    roles: [Claimant, Adjudicator, SystemAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WageRecord[]
+    side_effects: []
+
+  # ----- Claims -----
+  - method: POST
+    path: /claimants/{cid}/claims
+    description: "Open a new Claim in DRAFT"
+    roles: [Claimant]
+    code: 201
+    input: []
+    output: Claim
+    side_effects: []
+
+  - method: GET
+    path: /claims/{id}
+    description: "Read a claim (includes all computed fields)"
+    roles: [Claimant, Adjudicator, AppealOfficer, SystemAdmin]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: []
+
+  - method: POST
+    path: /claims/{id}/submit
+    description: "Submit DRAFT claim for adjudication; runs base-period wage calc, WBA, max weeks"
+    roles: [Claimant]
+    code: 200
+    input: []
+    output: Claim
+    side_effects:
+      - "Run base_period_wage_calculation"
+      - "Run weekly_benefit_amount"
+      - "Run max_weeks_of_eligibility"
+      - "Transition DRAFT -> PENDING_ADJUDICATION"
+
+  - method: POST
+    path: /claims/{id}/adjudicate
+    description: "Adjudicator decides monetary eligibility"
+    roles: [Adjudicator]
+    code: 200
+    input: [decision, "version?"]
+    output: Claim
+    side_effects:
+      - "Transition PENDING_ADJUDICATION -> MONETARILY_ELIGIBLE or DENIED"
+      - "Record assigned_adjudicator_id on the claim"
+
+  - method: POST
+    path: /claims/{id}/apply-extension
+    description: "Claimant requests pandemic extension once benefits are EXHAUSTED"
+    roles: [Claimant]
+    code: 200
+    input: [extension_id, "version?"]
+    output: Claim
+    side_effects:
+      - "Transition EXHAUSTED -> EXTENDED"
+      - "Set extension_id, pandemic_extension_weeks_granted"
+      - "Recompute weeks_remaining"
+
+  # ----- Weekly certifications -----
+  - method: POST
+    path: /claims/{cid}/weekly-certifications
+    description: "Submit a weekly certification (Work Search Log)"
+    roles: [Claimant]
+    code: 201
+    input: [week_ending_date, earnings_reported_cents, able_and_available, work_search_entries]
+    output: WeeklyCertification
+    side_effects:
+      - "Create WorkSearchEntry rows from work_search_entries[]"
+      - "Run weekly_payable_amount"
+      - "Transition SUBMITTED -> APPROVED or DENIED per preconditions"
+      - "On APPROVED: create BenefitPayment, run employer_charge_allocation, run employer_experience_rate"
+      - "Recompute Claim.weeks_paid and weeks_remaining; cascade Claim transitions"
+
+  - method: GET
+    path: /claims/{cid}/weekly-certifications
+    description: "List weekly certifications for a claim"
+    roles: [Claimant, Adjudicator, AppealOfficer, SystemAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: WeeklyCertification[]
+    side_effects: []
+
+  - method: GET
+    path: /weekly-certifications/{id}
+    description: "Read a weekly certification (includes payment_id, payable_amount)"
+    roles: [Claimant, Adjudicator, AppealOfficer, SystemAdmin]
+    code: 200
+    input: []
+    output: WeeklyCertification
+    side_effects: []
+
+  - method: POST
+    path: /weekly-certifications/{id}/audit
+    description: "Adjudicator audits an APPROVED certification and marks it OVERPAID"
+    roles: [Adjudicator]
+    code: 200
+    input: [classification, reason, "version?"]
+    output: WeeklyCertification
+    side_effects:
+      - "Transition APPROVED -> OVERPAID"
+      - "Reverse the BenefitPayment"
+      - "Create Overpayment (status=OUTSTANDING)"
+      - "Reverse linked EmployerCharge rows; recompute experience_rate"
+      - "Decrement Claim.weeks_paid; cascade Claim state if applicable"
+
+  # ----- Overpayments -----
+  - method: GET
+    path: /overpayments/{id}
+    description: "Read an overpayment"
+    roles: [Claimant, Adjudicator, AppealOfficer, SystemAdmin]
+    code: 200
+    input: []
+    output: Overpayment
+    side_effects: []
+
+  - method: GET
+    path: /claims/{cid}/overpayments
+    description: "List overpayments under a claim"
+    roles: [Claimant, Adjudicator, AppealOfficer, SystemAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Overpayment[]
+    side_effects: []
+
+  - method: POST
+    path: /overpayments/{id}/repay
+    description: "Claimant posts a repayment"
+    roles: [Claimant]
+    code: 200
+    input: [amount_cents, "version?"]
+    output: Overpayment
+    side_effects:
+      - "Decrement balance_cents"
+      - "Recompute Claimant.lifetime_overpayment_balance_cents"
+      - "Possibly transition OUTSTANDING -> REPAID"
+
+  - method: POST
+    path: /overpayments/{id}/waive
+    description: "Adjudicator waives an overpayment (forbidden for FRAUD)"
+    roles: [Adjudicator]
+    code: 200
+    input: [reason, "version?"]
+    output: Overpayment
+    side_effects:
+      - "Transition OUTSTANDING -> WAIVED"
+      - "Recompute Claimant.lifetime_overpayment_balance_cents"
+
+  - method: POST
+    path: /overpayments/{id}/write-off
+    description: "Adjudicator writes off an overpayment past statute of limitations"
+    roles: [Adjudicator]
+    code: 200
+    input: ["version?"]
+    output: Overpayment
+    side_effects:
+      - "Transition OUTSTANDING -> WRITTEN_OFF"
+
+  # ----- Appeals -----
+  - method: POST
+    path: /appeals
+    description: "File an appeal of a monetary determination, weekly denial, or overpayment"
+    roles: [Claimant]
+    code: 201
+    input: [claim_id, subject_type, subject_id, assigned_appeal_officer_id]
+    output: Appeal
+    side_effects:
+      - "Pin Appeal.subject_locked_version = current subject_entity.version"
+      - "Pin Appeal.assigned_adjudicator_id = adjudicator who decided the subject"
+      - "Set deadline_at = SystemClock.now + APPEAL_WINDOW_DAYS"
+      - "If SystemClock.now > subject.decision_at + APPEAL_WINDOW_DAYS, auto-transition to DISMISSED_LATE on creation"
+
+  - method: GET
+    path: /appeals/{id}
+    description: "Read an appeal"
+    roles: [Claimant, AppealOfficer, Adjudicator, SystemAdmin]
+    code: 200
+    input: []
+    output: Appeal
+    side_effects: []
+
+  - method: POST
+    path: /appeals/{id}/start-hearing
+    description: "AppealOfficer opens the hearing"
+    roles: [AppealOfficer]
+    code: 200
+    input: []
+    output: Appeal
+    side_effects:
+      - "Transition FILED -> IN_HEARING"
+
+  - method: POST
+    path: /appeals/{id}/decide
+    description: "AppealOfficer issues SUSTAINED or REVERSED decision"
+    roles: [AppealOfficer]
+    code: 200
+    input: [decision, "version?"]
+    output: Appeal
+    side_effects:
+      - "Validate subject_locked_version == current subject_entity.version (else ERR_STALE_APPEAL_SUBJECT)"
+      - "Transition IN_HEARING -> SUSTAINED or REVERSED"
+      - "On REVERSED, apply remedy to subject (claim eligibility flip, certification re-approve with full cascade, or overpayment waive)"
+
+  - method: POST
+    path: /appeals/{id}/withdraw
+    description: "Claimant withdraws a filed appeal"
+    roles: [Claimant]
+    code: 200
+    input: []
+    output: Appeal
+    side_effects:
+      - "Transition FILED -> WITHDRAWN"
+
+  # ----- Pandemic extensions -----
+  - method: POST
+    path: /pandemic-extensions
+    description: "Create a pandemic emergency extension program"
+    roles: [SystemAdmin]
+    code: 201
+    input: [program_name, effective_start, effective_end, extra_weeks]
+    output: PandemicExtension
+    side_effects: []
+
+  - method: GET
+    path: /pandemic-extensions
+    description: "List pandemic extensions"
+    roles: [Claimant, Adjudicator, AppealOfficer, EmployerAgent, SystemAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: PandemicExtension[]
+    side_effects: []
+
+  # ----- System / test driving -----
+  - method: POST
+    path: /_clock/advance
+    description: "Advance the SystemClock by N seconds (test harness)"
+    roles: [SystemAdmin]
+    code: 200
+    input: [seconds]
+    output: SystemClock
+    side_effects:
+      - "On crossing PandemicExtension.effective_start: SCHEDULED -> ACTIVE"
+      - "On crossing PandemicExtension.effective_end: ACTIVE -> EXPIRED"
+      - "On crossing Claim.benefit_year_end: MONETARILY_ELIGIBLE/ACTIVE/EXHAUSTED -> CLOSED"
+      - "On crossing Appeal.deadline_at while still FILED: FILED -> DISMISSED_LATE"
+
+  - method: GET
+    path: /_clock
+    description: "Read current SystemClock.now"
+    roles: [Claimant, Adjudicator, AppealOfficer, EmployerAgent, SystemAdmin]
+    code: 200
+    input: []
+    output: SystemClock
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing or invalid X-User-Role or X-User-ID header"
+
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Acting role not permitted to invoke this endpoint per RBAC matrix"
+
+  - id: ERR_NOT_OWNER
+    http: 403
+    condition: "Acting Claimant is not the owner of the targeted resource"
+
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced resource id does not exist"
+
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not allowed from current state per §1.2"
+
+  - id: ERR_SEGREGATION_OF_DUTIES_VIOLATION
+    http: 403
+    condition: "AppealOfficer X-User-ID equals the assigned_adjudicator_id for the subject — same person cannot decide and appeal-review"
+
+  - id: ERR_APPEAL_WINDOW_EXPIRED
+    http: 409
+    condition: "Appeal filed more than APPEAL_WINDOW_DAYS after the subject's decision_at"
+
+  - id: ERR_STALE_APPEAL_SUBJECT
+    http: 409
+    condition: "subject entity's version changed since appeal was filed (subject_locked_version mismatch)"
+
+  - id: ERR_APPEAL_ALREADY_FILED
+    http: 409
+    condition: "An Appeal with the same (subject_type, subject_id) already exists"
+
+  - id: ERR_NOT_SATURDAY
+    http: 422
+    condition: "WeeklyCertification.week_ending_date is not a Saturday"
+
+  - id: ERR_WEEK_OUT_OF_RANGE
+    http: 409
+    condition: "week_ending_date not after the latest APPROVED certification, or outside [benefit_year_start, benefit_year_end]"
+
+  - id: ERR_DUPLICATE_WEEK
+    http: 409
+    condition: "A WeeklyCertification already exists for (claim_id, week_ending_date)"
+
+  - id: ERR_INSUFFICIENT_WORK_SEARCH
+    http: 422
+    condition: "Fewer than MIN_WORK_SEARCH_CONTACTS WorkSearchEntry rows on a SUBMITTED certification — certification will auto-DENY"
+
+  - id: ERR_BENEFIT_YEAR_EXPIRED
+    http: 409
+    condition: "Operation attempted on a Claim whose benefit_year_end has passed (Claim is CLOSED)"
+
+  - id: ERR_REPAY_EXCEEDS_BALANCE
+    http: 409
+    condition: "Repayment amount > remaining Overpayment.balance_cents"
+
+  - id: ERR_FRAUD_NOT_WAIVABLE
+    http: 403
+    condition: "Attempt to waive an Overpayment whose classification = FRAUD"
+
+  - id: ERR_INSUFFICIENT_BASE_PERIOD_WAGES
+    http: 422
+    condition: "Adjudicator decision='ELIGIBLE' but base_period or high_quarter wages fall below required floors"
+
+  - id: ERR_NO_ACTIVE_EXTENSION
+    http: 409
+    condition: "Apply-extension when no PandemicExtension is ACTIVE in current clock window"
+
+  - id: ERR_EXTENSION_ALREADY_APPLIED
+    http: 409
+    condition: "Claim already has extension_id set"
+
+  - id: ERR_STATUTE_NOT_REACHED
+    http: 409
+    condition: "Write-off attempted before statute_of_limitations days elapsed since Overpayment.created_at"
+
+  - id: ERR_VERSION_CONFLICT
+    http: 409
+    condition: "Client-supplied version does not match current entity.version (OCC)"
+
+  - id: ERR_VALIDATION_FAILED
+    http: 422
+    condition: "Generic body-shape / type validation (missing required field, wrong type, etc.)"
+
+# =============================================================================
+# §1.7 RBAC
+# =============================================================================
+roles:
+  - name: Claimant
+    description: "Person filing a UI claim and certifying weekly"
+    identity: "entity_backed:Claimant"
+    exclusive_operations:
+      - "POST /claimants/{cid}/claims"
+      - "POST /claims/{id}/submit"
+      - "POST /claims/{id}/apply-extension"
+      - "POST /claims/{cid}/weekly-certifications"
+      - "POST /overpayments/{id}/repay"
+      - "POST /appeals"
+      - "POST /appeals/{id}/withdraw"
+    shared_operations:
+      - "GET /claimants/{id} (owner-scoped)"
+      - "GET /claims/{id} (owner-scoped)"
+      - "GET /claims/{cid}/weekly-certifications"
+      - "GET /weekly-certifications/{id}"
+      - "GET /claims/{cid}/overpayments"
+      - "GET /overpayments/{id}"
+      - "GET /appeals/{id}"
+      - "GET /pandemic-extensions"
+      - "GET /_clock"
+      - "GET /claimants/{cid}/wage-records"
+      - "POST /claimants (self-registration)"
+
+  - name: Adjudicator
+    description: "Agency officer who decides monetary eligibility, audits payments, manages overpayments"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /claims/{id}/adjudicate"
+      - "POST /weekly-certifications/{id}/audit"
+      - "POST /overpayments/{id}/waive"
+      - "POST /overpayments/{id}/write-off"
+    shared_operations:
+      - "POST /employers/{id}/charges/{charge_id}/relieve"
+      - "GET /claimants/{id}"
+      - "GET /claims/{id}"
+      - "GET /claimants/{cid}/wage-records"
+      - "GET /claims/{cid}/weekly-certifications"
+      - "GET /weekly-certifications/{id}"
+      - "GET /claims/{cid}/overpayments"
+      - "GET /overpayments/{id}"
+      - "GET /appeals/{id}"
+      - "GET /pandemic-extensions"
+      - "GET /_clock"
+
+  - name: AppealOfficer
+    description: "Hearings officer who reviews appeals; cannot be the same person as the original adjudicator on a given appeal"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /appeals/{id}/start-hearing"
+      - "POST /appeals/{id}/decide"
+    shared_operations:
+      - "GET /claimants/{id}"
+      - "GET /claims/{id}"
+      - "GET /claims/{cid}/weekly-certifications"
+      - "GET /weekly-certifications/{id}"
+      - "GET /claims/{cid}/overpayments"
+      - "GET /overpayments/{id}"
+      - "GET /appeals/{id}"
+      - "GET /pandemic-extensions"
+      - "GET /_clock"
+
+  - name: EmployerAgent
+    description: "Authorized agent of an Employer; can view charges and request charge relief"
+    identity: "entity_backed:Employer"
+    exclusive_operations: []
+    shared_operations:
+      - "GET /employers/{id} (owner-scoped: X-User-ID == Employer.id)"
+      - "GET /employers/{id}/charges (owner-scoped)"
+      - "POST /employers/{id}/charges/{charge_id}/relieve (owner-scoped)"
+      - "GET /pandemic-extensions"
+      - "GET /_clock"
+
+  - name: SystemAdmin
+    description: "Operational/admin role with full system access (also drives test harness)"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /employers"
+      - "POST /claimants/{cid}/wage-records"
+      - "POST /pandemic-extensions"
+      - "POST /_clock/advance"
+    shared_operations:
+      - "POST /claimants"
+      - "GET /claimants/{id}"
+      - "GET /employers/{id}"
+      - "GET /employers/{id}/charges"
+      - "GET /claims/{id}"
+      - "GET /claims/{cid}/weekly-certifications"
+      - "GET /weekly-certifications/{id}"
+      - "GET /claims/{cid}/overpayments"
+      - "GET /overpayments/{id}"
+      - "GET /appeals/{id}"
+      - "GET /pandemic-extensions"
+      - "GET /_clock"
+      - "GET /claimants/{cid}/wage-records"

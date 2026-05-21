@@ -1,0 +1,108 @@
+"""Barrel export: framework generics + SNAP/EBT PRD-specific code."""
+
+# Framework generics
+from prd_bench_local_runner.testing import (
+    validate_success, validate_error, validate_paginated,
+    validate_error_is_one_of, get_success_data,
+    is_valid_uuid, is_iso8601_timestamp,
+    assert_cost_precision, assert_version_incremented, assert_timestamp_format,
+    assert_race_outcome, assert_exactly_one_succeeds, assert_at_least_one_succeeds,
+    run_race, build_user_headers, NON_EXISTENT_UUID,
+)
+
+# PRD-specific
+from .types import *
+from .api_client import api_client, ApiClient
+from .api_errors import *
+from .assertions import (
+    assert_household,
+    assert_member,
+    assert_application,
+    assert_ebt_card,
+    assert_benefit_ledger_entry,
+    assert_transaction,
+    assert_merchant,
+    assert_fraud_case,
+    assert_abawd_waiver,
+    assert_emergency_allotment,
+    assert_card_balance_matches_ledger,
+    assert_envelope_success_object,
+    CASE_NUMBER_PATTERN,
+    BENEFIT_MONTH_PATTERN,
+    STATE_CODES,
+    HOUSEHOLD_CERT_STATUSES,
+    APPLICATION_STATES,
+    CARD_STATUSES,
+    TRANSACTION_STATUSES,
+    FRAUD_CASE_STATES,
+    WAIVER_STATES,
+    EA_STATES,
+)
+from .factories import (
+    create_household_payload,
+    create_member_payload,
+    create_merchant_payload,
+    create_application_payload,
+    create_transaction_payload,
+    create_fraud_case_payload,
+    create_abawd_waiver_payload,
+    create_emergency_allotment_payload,
+)
+from .constants import (
+    VALID_STATE_CODES,
+    STANDARD_DEDUCTION_TABLE,
+    DEPENDENT_CARE_CAP_CENTS,
+    EXCESS_SHELTER_CAP_CENTS,
+    MAX_ALLOTMENT_TABLE,
+    MINIMUM_BENEFIT_CENTS,
+    GROSS_INCOME_LIMIT_TABLE,
+    NET_INCOME_LIMIT_TABLE,
+    EA_FLOOR_CENTS,
+    ROLLING_WINDOW_DAYS,
+    FRAUD_SUBSTANTIATE_THRESHOLD,
+    FRAUD_WEIGHT_A,
+    FRAUD_WEIGHT_B,
+    FRAUD_WEIGHT_C,
+    TRANSACTION_REVERSAL_WINDOW_HOURS,
+    FRAUD_APPEAL_WINDOW_DAYS,
+    CERTIFICATION_PERIOD_MONTHS,
+    PAGINATION_MIN_LIMIT,
+    PAGINATION_MAX_LIMIT,
+    PAGINATION_DEFAULT_LIMIT,
+    MIN_LINE_ITEMS,
+    MAX_LINE_ITEMS,
+    ALLOWED_EA_TABLE_VERSIONS,
+)
+from .test_users import (
+    TEST_USERS,
+    make_household_head_headers,
+    make_merchant_headers,
+)
+from .fixtures import (
+    dob_for_age, iso_now, iso_future, iso_past,
+    create_household,
+    add_member,
+    create_merchant,
+    create_draft_application,
+    walk_to_interview_done,
+    approve_application,
+    setup_household_with_members,
+    setup_basic_household,
+    setup_approved_household,
+    setup_approved_household_and_capture_card,
+    setup_approved_household_with_active_card,
+    activate_card,
+    setup_authorized_merchant,
+    setup_full_purchase_scene,
+    setup_household_at_net_income,
+    setup_approved_household_at_net_income,
+    open_fraud_case,
+    assign_fraud_case,
+    setup_substantiated_fraud_case,
+    setup_substantiated_household,
+    setup_closed_application,
+    create_draft_ea,
+    setup_declared_ea,
+    request_abawd_waiver,
+    setup_approved_abawd_waiver,
+)
