@@ -4,7 +4,7 @@ description: >
   Generate a complete REST API server implementation from a PRD benchmark task.
   Each task lives under tasks/<task_name>/ and contains workspace/PRD.md (natural
   language requirements), SCAFFOLD.yaml (structured entity/state-machine/calculation
-  definitions), and workspace/INSTRUCTION.md (development-quality guidance). The
+  definitions), and workspace/INSTRUCTION.md (build contract: produce ./implementation/start.sh + source code; PORT/0.0.0.0/foreground; evaluator runs `bash start.sh`). The
   skill produces a fully working codebase in workspace/implementation/ — source code,
   a start.sh launcher, and all dependencies — that passes the benchmark's automated
   test suite (driven by `prd-bench-local-run --isolation per-test-server`, which
@@ -28,7 +28,7 @@ tasks/<task_name>/
 ├── SCAFFOLD.yaml              # Structured spec: entities, state machines, calculations, validations, endpoints, errors, RBAC
 ├── workspace/
 │   ├── PRD.md                 # Natural language requirements document
-│   ├── INSTRUCTION.md         # Development-quality guidance (PRD-faithful, incremental, self-tested, modular)
+│   ├── INSTRUCTION.md         # Build contract: produce ./implementation/start.sh + source code; PORT/0.0.0.0/foreground; evaluator runs `bash start.sh`
 │   └── implementation/        # YOUR OUTPUT GOES HERE (source code + start.sh)
 ```
 
@@ -38,7 +38,7 @@ tasks/<task_name>/
 
 Read them in this order — each layer adds context the next one needs:
 
-1. **`workspace/INSTRUCTION.md`** — Short. Describes the development-quality bar (PRD-faithful, minimum runnable skeleton first, deepen one rule at a time, self-tests gating progress, strict modularisation). It does **not** name the runtime artifacts — those are mandated by this skill: produce `./implementation/start.sh` plus source code, listen on the `PORT` env var (default `10000`), bind `0.0.0.0`, and respond to HTTP within 60 seconds of `start.sh` launching. The test harness is `prd-bench-local-run --isolation per-test-server`, which means **the server process will be killed and re-launched via `start.sh` before every pytest test** — your implementation must therefore boot cleanly from a fresh process with no carry-over state from the previous run.
+1. **`workspace/INSTRUCTION.md`** — Short. The build contract any evaluator (us or third parties) reads. You must produce `./implementation/start.sh` + source code; `start.sh` installs dependencies and runs the server in the foreground (use `exec` so signals propagate), listens on the `PORT` env var (default `10000`), binds `0.0.0.0`, and responds to HTTP within 60 seconds of being invoked. The evaluator's entire contract is `bash start.sh` from `./implementation/` — no Dockerfile, no other entrypoint. INSTRUCTION.md imposes **no language restriction** (its examples show Python/Flask and Node.js/Express), but **this skill mandates Python + Flask** for benchmark consistency (see Step 2). Beyond INSTRUCTION's contract, the test harness adds one extra constraint: `prd-bench-local-run --isolation per-test-server` kills and re-launches the server via `start.sh` before every pytest test, so your implementation must boot cleanly from a fresh process with no carry-over state from the previous run.
 
 2. **`SCAFFOLD.yaml`** — The structured backbone. Contains:
    - `entities` — Every data model, its fields, types, sources (input/computed/system), and parent relationships
@@ -59,7 +59,7 @@ Read them in this order — each layer adds context the next one needs:
 Before writing code, decide on:
 
 - **Language & framework**: Always use **Python + Flask**. This is the mandated stack for all benchmark implementations — it produces correct behavior, is easy to reason about, and the launcher (`start.sh`) is minimal.
-- **Data storage**: In-memory is fine (and recommended). These benchmarks test API correctness, not database durability. Use dictionaries/maps keyed by ID.
+- **Data storage**: In-memory is fine (and recommended). These benchmarks test API correctness, not database durability. Use dictionaries/maps keyed by ID. **The store starts empty on every boot — the implementation MUST NOT seed, preload, register, or hardcode any entities at startup.** Every entity any test needs is constructed by the test itself via the declared API surface (see scaffold §1.5 endpoint table + §1.8 `setup_api_calls`). If you find yourself writing a `seed_*()` function, calling it from `app.py` startup, or populating `db.stores = {<concrete records>}` at module load, stop — that operation belongs in a scaffold-declared endpoint, not in implementation startup. If no declared endpoint produces the required state, that is a scaffold-generator gap to escalate, never a license to seed in implementation.
 - **Code organization**: Group by concern. Follow this layout:
   ```
   implementation/
@@ -162,14 +162,14 @@ These are the things that differentiate a passing implementation from a failing 
 
 ### Step 5: Write start.sh
 
-The test harness (`prd-bench-local-run --isolation per-test-server`) spawns the server as a subprocess by running `bash start.sh` with the implementation directory as the working directory, then HTTP-pings it until it responds. **Before every individual pytest test, that subprocess is killed and `start.sh` is invoked again** — so the script must be a fast, deterministic, foreground launcher.
+INSTRUCTION.md owns the hard contract: `./implementation/start.sh` installs dependencies and runs the server in the foreground (`exec`), `0.0.0.0:$PORT` (default 10000), HTTP ready within 60s. Honor it verbatim.
 
-Place `start.sh` at `./implementation/start.sh`. Minimal Python + Flask launcher:
+Given the skill's Python + Flask stack, the minimal `start.sh`:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-# The test runner sets PORT; default to 10000 if invoked standalone.
+pip install -q -r requirements.txt
 exec python app.py
 ```
 
@@ -179,14 +179,6 @@ And in `app.py`:
 import os
 app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
 ```
-
-Hard requirements:
-
-- `start.sh` must run in the **foreground** (use `exec` so signals propagate; do not background with `&` or `nohup`).
-- The server must listen on `0.0.0.0:$PORT`, where `PORT` is taken from the environment (the runner sets it; default to `10000` if unset).
-- The server must accept HTTP within 60 seconds of `start.sh` launching.
-- Boot must be **stateless**: per-test-server isolation kills the process between tests, so any in-memory state from a previous run is gone. Do not rely on cross-restart caches or sidecar files; rebuild whatever you need from scratch on every boot.
-- Do not write to stdout/stderr at a rate that fills the runner's pipe buffer — log sparingly.
 
 ### Common Pitfalls to Avoid
 
@@ -207,7 +199,7 @@ Before declaring done, verify:
 
 - [ ] `implementation/start.sh` exists, is a foreground bash launcher, and uses `exec` to hand off to the server process
 - [ ] Server starts and listens on `PORT` env var (default 10000), bound to `0.0.0.0`
-- [ ] Boot is stateless — no reliance on artifacts from a previous run, since `prd-bench-local-run --isolation per-test-server` restarts the process before every test
+- [ ] **No entity seeding at startup** — `app.py` and module-init code MUST NOT populate `db.*` dicts, call any `seed_*()` helper, or otherwise inject entities at boot. The store starts empty; tests build all preconditions via the declared API surface.
 - [ ] All endpoints from the endpoint table are implemented
 - [ ] Response envelope matches the scaffold's `response_envelope` exactly — correct field names for metadata, type discriminator, data wrapper, and error body
 - [ ] Auth middleware validates the exact headers defined in the scaffold's auth `validations[]` — not hardcoded defaults

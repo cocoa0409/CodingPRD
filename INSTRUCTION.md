@@ -1,7 +1,53 @@
-Build the system as specified in /app/INSTRUCTION.md.
+# Implementation Instructions
 
-Develop a deep understanding of the PRD's scenarios and logic, and plan the development path with care. Begin from a minimum end-to-end runnable skeleton — get the full functional path working first, even if each stage is only a placeholder — and from there deepen the system one PRD rule or capability at a time, treating that as the smallest unit of progress. At any point during development, the code already in place must remain in a runnable, responsive state verified by self-tests; do not let unverified code accumulate in large stretches, and keep every change small enough to be reviewed and judged for correctness on its own.
+You are building a REST API server based on the requirements in `PRD.md`.
 
-To uphold implementation quality, cover every piece of logic in the PRD with thorough self-tests, run them against the actual code, and let those self-tests drive an iterative loop of refinement. The self-tests must be granular enough to map to individual PRD rules and must be independently runnable with their own pass/fail verdict; for each capability completed, evidence of it working should be demonstrable immediately on the running system. Before delivery, reread the PRD and actively seek out any clause, branch, or error path not yet covered by a self-test; as long as any unverified logic remains in the PRD, the task is not complete. Ensure the self-tests are exhaustive and the implementation passes.
+## What You Must Produce
 
-Deliver a code implementation that meets the requirements, with sound development practice and strict modularisation that keeps the codebase maintainable — each source file should carry a single responsibility, and the module boundaries should allow every module to be verified independently, without requiring the rest of the system to be fully in place.
+Place all files in the `./implementation/` directory:
+
+1. **`start.sh`** at `./implementation/start.sh` — a single shell script that:
+   - Installs all dependencies your implementation needs
+   - Starts your HTTP server in the foreground (the script must not exit while the server is running)
+2. **Implementation source code** in `./implementation/` — no language restriction, use any language and framework you prefer
+
+## Startup Requirements
+
+Your `start.sh` must:
+
+- Listen on the port specified by the `PORT` environment variable (default: 10000)
+- Bind to `0.0.0.0` (not `127.0.0.1`)
+- Respond to HTTP requests within 60 seconds of `start.sh` being invoked
+- Keep the server running in the foreground (use `exec` for the final server command, or do not background it)
+
+## How the Evaluator Will Run Your Code
+
+The evaluator will execute, from `./implementation/`:
+
+```bash
+bash start.sh
+```
+
+That is the entire contract. No Dockerfile, no other entrypoint is consulted.
+
+## Examples
+
+Python / Flask:
+
+```bash
+#!/bin/bash
+set -e
+pip install -q -r requirements.txt
+exec python app.py
+```
+
+Node.js / Express:
+
+```bash
+#!/bin/bash
+set -e
+npm install --silent
+exec node server.js
+```
+
+All API requirements are defined in `PRD.md`. Read it carefully and implement accordingly.
