@@ -445,12 +445,13 @@ endpoints:
 ```
 
 **Design principles:**
-- **Testability-completeness (value-level principle, overrides convenience).** The scaffold owes the test layer a reachable path to every state it declares. Walk every state in your state machines and ask: *"can a test reach this from empty-DB using only the endpoints I've listed?"* If a state is gated by wall-clock time, a background sweep, or an external event, you MUST include the test-driving endpoint that makes it reachable — e.g., `POST /_clock/advance` for any time-gated transition (`now() >= X`), `POST /_sweep/run` for any automatic sweep, `POST /_events/emit` for any external-event trigger. Declaring behavior without also declaring the API surface needed to exercise it is an **incomplete contract** — downstream tests will be forced to skip, and skips are forbidden by the unit-test-generator. A scaffold is judged not only by what behavior it specifies, but by whether every specified behavior can be *reached, observed, and asserted* through the declared API.
-- URL structure reflects entity topology (nested for hierarchical, flat for peer)
-- Include action endpoints (e.g., `/activate`, `/cancel`, `/approve`) — not just CRUD
-- Mutation endpoints accept optional `version?` for OCC, unless resource is immutable
-- Not every entity needs full CRUD — immutable resources may only have create + read
-- Consider whether list endpoints need filtering/sorting parameters
+- **Testability-completeness (value-level principle, overrides convenience).** The scaffold owes the test layer a reachable path to every state it declares. Walk every state in your state machines and ask: *"can a test reach this from empty-DB using only the endpoints I've listed?"* This principle is **operationally enforced** at §1.8 generation time via the `setup_api_calls:` cross-check (see §1.8 per-instance contract item 3): if any difficulty-design instance's precondition cannot be reached by an ordered chain of §1.5 endpoint calls, return here and reshape §1.5 per this **priority ladder**, in order:
+
+  1. **Compose existing endpoints first.** Many "missing" capabilities are already reachable via composition of §1.5 calls already declared — the gap was in the search, not the surface. Try this first.
+  2. **Add a general business endpoint.** When no chain of existing endpoints reaches the precondition, add an endpoint that fits the domain's real-world admin/operator surface — e.g., `POST /members/{id}/wallet/adjustments` rather than `POST /_seed/wallet`. A business endpoint serves both the test and any real-world admin tool, and keeps the API contract honest about which operations actually exist in production.
+  3. **Add a custom test-driving endpoint (last resort).** When no plausible business endpoint exists for the operation (e.g., advancing the system clock, firing a synthetic webhook, injecting a no-show strike history), declare one under the `/_<name>` namespace (`POST /_clock/advance`, `POST /_events/emit`, `POST /_inject/...`). Declare it in §1.5 like any other endpoint — path, method, role, inputs, side effects. The leading underscore marks it as outside the public business surface but inside the official scaffold contract; downstream skills (PRD-, unit-test-, and implementation-generator) treat it as a first-class declared endpoint, not a back-door.
+
+  Silently weakening the §1.8 setup or papering over the gap is forbidden.
 
 **Endpoint pattern variety:**
 
@@ -532,10 +533,13 @@ scaffold_difficulty_design:
           <ONE falsifiable sentence pinning what structurally distinguishes this instance,
           naming the specific distinction §0.5 requires of this rule_id.>
         test_recipe:
-          setup:                               # minimal DB + clock state from empty DB
+          setup:                               # natural-language description of the precondition state (entities, statuses, balances, clock position)
             - "<precondition 1>"
-          trigger:                             # API call(s) or clock advance(s)
-            - "<endpoint invocation 1>"
+          setup_api_calls:                     # ordered chain of §1.5 endpoint calls that drives empty-DB → setup state above; each line is a literal §1.5 invocation
+            - "POST /<path> {<payload>} as <Role>"
+            - "POST /<path> {<payload>} as <Role>"
+          trigger:                             # the API call(s) under test — the actual behavior being measured
+            - "POST /<path> {<payload>} as <Role>"
           assert:                              # one pinned observable outcome per line
             - "<comparison or invariant 1>"
       - name: <instance_2_lower_snake_case>
@@ -551,11 +555,12 @@ scaffold_difficulty_design:
 
 **Per-instance contract:**
 1. Every `grounds:` entry MUST resolve to a declared element in §1.1–§1.6. A grounds entry naming a missing calculation, transition, validation, field, or race is a dangling claim — remove it or add the grounding.
-2. `test_recipe.setup + trigger + assert` together MUST reproduce the scenario from empty-DB state using only endpoints declared in §1.5. No wall-clock waits; time-gated setups use the clock-advance endpoint §1.5 already provides.
-3. `distinguishing_aspect` MUST be falsifiable — one sentence the test can turn into a concrete assertion, naming the specific distinction §0.5 requires of this `rule_id` (different entity domain, different error-category pair, etc.). No hedging ("may differ", "could vary").
-4. `name` MUST be unique across the whole `scaffold_difficulty_design` and stable across regenerations (tests cite it in their docstrings for audit).
-5. `assert:` entries MUST cite exact field names and literal values where possible (e.g., `Order.delivery_fee != Assignment.final_delivery_fee`; `Customer.wallet_balance unchanged after assignment creation`), not paraphrases.
-6. **Any `assert:` line referencing a numeric value derived from a formula MUST be a literal the scaffold author actually computed by code.** Pin the inputs in `setup:`, execute the relevant `calculations[].formula` as code (a short Python snippet against the formula and its `constants:`), and write the resulting literal into the assertion — e.g., `Order.delivery_fee == 5.40`, NOT `Order.delivery_fee == round(3.00 + ceil(2.0)*1.20 + 0, 2)` and NOT a rough estimate. Unresolved formulas, estimates, and "let the test-generator compute it" all propagate arithmetic errors into broken tests whose wrong expected value silently agrees with a wrong implementation. When in doubt, execute the formula.
+2. `test_recipe.setup + setup_api_calls + trigger + assert` together MUST reproduce the scenario from empty-DB state using only endpoints declared in §1.5. No wall-clock waits; time-gated setups use the clock-advance endpoint §1.5 already provides.
+3. **`setup_api_calls:` is mandatory and operationalises §1.5's testability-completeness audit.** Write the ordered sequence of API invocations that drives the system from empty-DB into the state described by `setup:`. Each entry MUST be a literal invocation of an endpoint declared in §1.5 — path, method, role-bearing header, and payload shape exactly as §1.5 specifies. **If no chain of §1.5 endpoints reaches the precondition, you have exactly two remedies: (a) return to §1.5 and add the missing endpoint, then re-derive the chain; or (b) revise this §1.8 instance so its precondition becomes reachable via the existing surface.** Silently omitting `setup_api_calls:`, leaving entries vague (e.g., `"create a member with wallet_credit_cents=500"` instead of the concrete POST chain that produces that balance), or papering over the gap with prose are all forbidden — the chain must be directly executable by the downstream unit-test-generator.
+4. `distinguishing_aspect` MUST be falsifiable — one sentence the test can turn into a concrete assertion, naming the specific distinction §0.5 requires of this `rule_id` (different entity domain, different error-category pair, etc.). No hedging ("may differ", "could vary").
+5. `name` MUST be unique across the whole `scaffold_difficulty_design` and stable across regenerations (tests cite it in their docstrings for audit).
+6. `assert:` entries MUST cite exact field names and literal values where possible (e.g., `Order.delivery_fee != Assignment.final_delivery_fee`; `Customer.wallet_balance unchanged after assignment creation`), not paraphrases.
+7. **Any `assert:` line referencing a numeric value derived from a formula MUST be a literal the scaffold author actually computed by code.** Pin the inputs in `setup:`, execute the relevant `calculations[].formula` as code (a short Python snippet against the formula and its `constants:`), and write the resulting literal into the assertion — e.g., `Order.delivery_fee == 5.40`, NOT `Order.delivery_fee == round(3.00 + ceil(2.0)*1.20 + 0, 2)` and NOT a rough estimate. Unresolved formulas, estimates, and "let the test-generator compute it" all propagate arithmetic errors into broken tests whose wrong expected value silently agrees with a wrong implementation. When in doubt, execute the formula.
 
 ---
 
@@ -590,6 +595,13 @@ Each declaration in the scaffold is an edge; self-consistency means both ends re
 - [ ] **No random fields in business decisions — use `created_at`, never `id`, as fallback** — Random properties, especially UUID/random `id`, MUST NOT participate in any selector, ranking, tie-break, allocation order, batch-processing order, cascade order, conflict-resolution rule, or chronological replay order that affects response data or persisted state. This prohibition includes fallback ordering, final tie-breaks, and "deterministic" last resorts. If a precise common-field fallback is required, use `created_at ASC`; never use `id`. Any scaffold that uses UUID/random `id` for observable decision-making fails this checklist.
 - [ ] **Cross-entity reference resolvability** — Any precondition or side-effect that references another entity as "a linked X", "a related X", "the associated X", or "the corresponding X" MUST name the foreign-key path or pin the query selector. "A linked WorkOrder is in UNDER_REVIEW" without declaring `WorkOrder.related_order_id == Order.id` forces downstream generators to invent the link.
 - [ ] **Computation determinism** — Order-sensitive calculations MUST pin both sort key and tie-break. Multi-step rounding MUST pin the rounding order. Fields referenced inside `formula:` MUST be unambiguous — use the exact field name (`credit_balance_cents`), not paraphrases ("the customer's credit") that could resolve to either a provisional or a finalized field.
+
+**Test-recipe ↔ endpoint compatibility (§1.8 `setup_api_calls` + `trigger:` ↔ §1.5):**
+
+- [ ] Each `setup_api_calls` or `trigger:` line resolves to a §1.5 endpoint — path, method, and role match exactly.
+- [ ] Each line's payload conforms to that endpoint's `input:` schema (no unknown fields, no missing required fields, types match).
+- [ ] Running `setup_api_calls` end-to-end actually produces the precondition described in `setup:` — every entity, status, balance, and clock position the `setup:` lines pin is the post-chain state, not a wish.
+- [ ] No `setup_api_calls` or `trigger:` is empty or placeholder prose. If `setup_api_calls` genuinely cannot be written, reshape §1.5 per the priority ladder (compose → business → test-driving) rather than papering over.
 
 **Difficulty (audit — the spec lives at §0.5):**
 - [ ] Every §0.5 rule (1–9) is satisfied by §1.1–§1.7, honoring its differentiation clause, and mirrored in `SCAFFOLD_DIFFICULTY_DESIGN.yaml` with ≥2 instances per rule (≥18 instances total)

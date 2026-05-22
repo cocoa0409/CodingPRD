@@ -4,11 +4,12 @@ description: >
   Generate a complete REST API server implementation from a PRD benchmark task.
   Each task lives under tasks/<task_name>/ and contains workspace/PRD.md (natural
   language requirements), SCAFFOLD.yaml (structured entity/state-machine/calculation
-  definitions), and workspace/INSTRUCTION.md (build constraints including Dockerfile
-  requirements). The skill produces a fully working codebase in
-  workspace/implementation/ — source code, Dockerfile, and all dependencies — that
-  passes the benchmark's automated test suite. Use this skill whenever the user
-  wants to implement, build, or code a PRD benchmark task, or asks to generate
+  definitions), and workspace/INSTRUCTION.md (development-quality guidance). The
+  skill produces a fully working codebase in workspace/implementation/ — source code,
+  a start.sh launcher, and all dependencies — that passes the benchmark's automated
+  test suite (driven by `prd-bench-local-run --isolation per-test-server`, which
+  restarts the server before each test via `start.sh`). Use this skill whenever the
+  user wants to implement, build, or code a PRD benchmark task, or asks to generate
   an implementation from a PRD and scaffold. Also trigger when the user mentions
   "implement the e_commerce task", "build the API from PRD", "generate code for
   this benchmark", or similar requests referencing PRD-to-code generation.
@@ -27,8 +28,8 @@ tasks/<task_name>/
 ├── SCAFFOLD.yaml              # Structured spec: entities, state machines, calculations, validations, endpoints, errors, RBAC
 ├── workspace/
 │   ├── PRD.md                 # Natural language requirements document
-│   ├── INSTRUCTION.md         # Build constraints (Dockerfile, port, etc.)
-│   └── implementation/        # YOUR OUTPUT GOES HERE
+│   ├── INSTRUCTION.md         # Development-quality guidance (PRD-faithful, incremental, self-tested, modular)
+│   └── implementation/        # YOUR OUTPUT GOES HERE (source code + start.sh)
 ```
 
 ## How to Use This Skill
@@ -37,7 +38,7 @@ tasks/<task_name>/
 
 Read them in this order — each layer adds context the next one needs:
 
-1. **`workspace/INSTRUCTION.md`** — Short. Tells you what to produce (Dockerfile + source code in `./implementation/`) and the hard constraints (listen on `PORT` env var, bind `0.0.0.0`, respond within 60s of container start).
+1. **`workspace/INSTRUCTION.md`** — Short. Describes the development-quality bar (PRD-faithful, minimum runnable skeleton first, deepen one rule at a time, self-tests gating progress, strict modularisation). It does **not** name the runtime artifacts — those are mandated by this skill: produce `./implementation/start.sh` plus source code, listen on the `PORT` env var (default `10000`), bind `0.0.0.0`, and respond to HTTP within 60 seconds of `start.sh` launching. The test harness is `prd-bench-local-run --isolation per-test-server`, which means **the server process will be killed and re-launched via `start.sh` before every pytest test** — your implementation must therefore boot cleanly from a fresh process with no carry-over state from the previous run.
 
 2. **`SCAFFOLD.yaml`** — The structured backbone. Contains:
    - `entities` — Every data model, its fields, types, sources (input/computed/system), and parent relationships
@@ -57,12 +58,12 @@ Read them in this order — each layer adds context the next one needs:
 
 Before writing code, decide on:
 
-- **Language & framework**: Always use **Python + Flask**. This is the mandated stack for all benchmark implementations — it produces correct behavior, is easy to reason about, and the Dockerfile is minimal.
+- **Language & framework**: Always use **Python + Flask**. This is the mandated stack for all benchmark implementations — it produces correct behavior, is easy to reason about, and the launcher (`start.sh`) is minimal.
 - **Data storage**: In-memory is fine (and recommended). These benchmarks test API correctness, not database durability. Use dictionaries/maps keyed by ID.
 - **Code organization**: Group by concern. Follow this layout:
   ```
   implementation/
-  ├── Dockerfile
+  ├── start.sh           # Launcher script (executable, reads $PORT, runs app.py in foreground)
   ├── requirements.txt
   ├── app.py              # Entry point, error handlers, route registration
   ├── db.py               # In-memory data store
@@ -159,22 +160,33 @@ These are the things that differentiate a passing implementation from a failing 
 
 **Nested resource ownership** — For scoped resources, verify the resource belongs to the parent in the URL path.
 
-### Step 5: Build the Dockerfile
+### Step 5: Write start.sh
 
-Use a Python base image. Follow the constraints from INSTRUCTION.md:
+The test harness (`prd-bench-local-run --isolation per-test-server`) spawns the server as a subprocess by running `bash start.sh` with the implementation directory as the working directory, then HTTP-pings it until it responds. **Before every individual pytest test, that subprocess is killed and `start.sh` is invoked again** — so the script must be a fast, deterministic, foreground launcher.
 
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-CMD ["python", "app.py"]
+Place `start.sh` at `./implementation/start.sh`. Minimal Python + Flask launcher:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+# The test runner sets PORT; default to 10000 if invoked standalone.
+exec python app.py
 ```
 
-- Server listens on `PORT` env var (default 10000)
-- Bind to `0.0.0.0`
-- Respond within 60 seconds of container start
+And in `app.py`:
+
+```python
+import os
+app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+```
+
+Hard requirements:
+
+- `start.sh` must run in the **foreground** (use `exec` so signals propagate; do not background with `&` or `nohup`).
+- The server must listen on `0.0.0.0:$PORT`, where `PORT` is taken from the environment (the runner sets it; default to `10000` if unset).
+- The server must accept HTTP within 60 seconds of `start.sh` launching.
+- Boot must be **stateless**: per-test-server isolation kills the process between tests, so any in-memory state from a previous run is gone. Do not rely on cross-restart caches or sidecar files; rebuild whatever you need from scratch on every boot.
+- Do not write to stdout/stderr at a rate that fills the runner's pipe buffer — log sparingly.
 
 ### Common Pitfalls to Avoid
 
@@ -193,8 +205,9 @@ CMD ["python", "app.py"]
 
 Before declaring done, verify:
 
-- [ ] `implementation/Dockerfile` exists and follows INSTRUCTION.md constraints
-- [ ] Server starts and listens on PORT env var, bound to 0.0.0.0
+- [ ] `implementation/start.sh` exists, is a foreground bash launcher, and uses `exec` to hand off to the server process
+- [ ] Server starts and listens on `PORT` env var (default 10000), bound to `0.0.0.0`
+- [ ] Boot is stateless — no reliance on artifacts from a previous run, since `prd-bench-local-run --isolation per-test-server` restarts the process before every test
 - [ ] All endpoints from the endpoint table are implemented
 - [ ] Response envelope matches the scaffold's `response_envelope` exactly — correct field names for metadata, type discriminator, data wrapper, and error body
 - [ ] Auth middleware validates the exact headers defined in the scaffold's auth `validations[]` — not hardcoded defaults

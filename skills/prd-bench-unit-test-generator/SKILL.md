@@ -228,7 +228,7 @@ Gaps surfaced this way feed back to `prd-bench-doc-generator`'s Zero-Silence Rul
 ### Other testing principles
 
 - **Boundary precision** — for every numeric threshold, test X-1, X, X+1.
-- **Data isolation** — every test creates its own entities; no shared mutable state.
+- **Data isolation** — every test creates its own entities; no shared mutable state. **The test harness kills the API server process and re-launches it via `start.sh` before every individual pytest test.** Each test therefore starts against an empty database — no entities, no state, nothing carried over from a previous test. Every fixture, factory, and setup helper MUST build its preconditions from scratch using only PRD-declared endpoints.
 - **Domain language** — file / class / function names use PRD terminology, not scaffold table references.
 
 ---
@@ -561,7 +561,7 @@ Before the general scaffold walk in §2.1, consume `SCAFFOLD_DIFFICULTY_DESIGN.y
 
 1. **Read `grounds:`** — these point into §1.1–§1.6 of the scaffold, identifying the underlying rule(s) the instance exercises.
 2. **Locate the PRD prose** that states those underlying rules. PRD-First still applies: each generated test cites the PRD sentence for its underlying rule, not the difficulty-design entry itself.
-3. **Translate `test_recipe.setup`** into fixture setup — reuse helpers from `test_helpers/fixtures.py` where possible; add new ones to `fixtures.py` when the recipe demands state the current fixtures cannot build (e.g., "restaurant with trailing_30d_gross at 9500", "rider with 80 deliveries and 0.02 late ratio", "two assignments eligible for route merge").
+3. **Translate `test_recipe.setup_api_calls`** into fixture setup. This field is the canonical source — a literal, ordered chain of §1.5 endpoint invocations that drives empty-DB into the precondition. Read each line and translate it directly into the corresponding `ApiClient` method call in the fixture. The natural-language `test_recipe.setup` lines are human-readable annotations describing what the chain achieves (use them for fixture naming, docstrings, and review comments); the canonical source for *how* to achieve it is `setup_api_calls`. Reuse helpers from `test_helpers/fixtures.py` when the same chain prefix shows up across multiple instances (e.g., "Member registered + Subscription activated + clock advanced past current_period_end"); extract it into a named composite and have multiple tests import the same helper. Please follow the `test_recipe.setup_api_calls` instructions exactly.
 4. **Translate `test_recipe.trigger`** into `ApiClient` method calls.
 5. **Translate each line of `test_recipe.assert`** into a pytest assertion pinned to PRD-exact field names.
 6. **Tag the test's docstring** with `# difficulty: <rule_id>/<instance.name>` so the coverage check in §Completeness can audit which instance each test satisfies.
@@ -570,7 +570,7 @@ Before the general scaffold walk in §2.1, consume `SCAFFOLD_DIFFICULTY_DESIGN.y
 
 **Coverage target: 100% of instances.** Every `scaffold_difficulty_design[*].instances[*]` entry must be covered by at least TWO generated test (or escalated under the bucket above). Zero instances may be silently dropped.
 
-**What changes in Stage 1 as a consequence:** when drafting `test_helpers/fixtures.py`, pre-scan `SCAFFOLD_DIFFICULTY_DESIGN.yaml`'s `scaffold_difficulty_design` entries for `test_recipe.setup` lines that demand non-trivial composite state, and add the corresponding composite fixture up-front (e.g., `setup_restaurant_near_tier_boundary`, `setup_rider_with_bonus_tier`, `setup_mergeable_assignment_pair`). Stage 2 tests should import these helpers by name, not re-invent setup inline.
+**What changes in Stage 1 as a consequence:** when drafting `test_helpers/fixtures.py`, pre-scan `SCAFFOLD_DIFFICULTY_DESIGN.yaml`'s `scaffold_difficulty_design` entries for `test_recipe.setup_api_calls` chains that demand non-trivial composite state (anything beyond a single POST), and add the corresponding composite fixture up-front (e.g., `setup_restaurant_near_tier_boundary`, `setup_rider_with_bonus_tier`, `setup_mergeable_assignment_pair`). Stage 2 tests should import these helpers by name, not re-invent the chain inline.
 
 ### 2.1 Extract Every Testable Claim
 
