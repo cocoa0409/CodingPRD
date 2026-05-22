@@ -6,6 +6,7 @@ Reads configuration from environment variables set by the runner:
   _PRD_BENCH_API_URL          - server URL to check
   _PRD_BENCH_START_COMMAND    - command to restart server if crashed
   _PRD_BENCH_SKIP_LIFECYCLE   - "true" to disable checks
+  _PRD_BENCH_ISOLATION        - "per-test-server" to restart before each test
 
 Mirrors the pattern of checking server health before each test to prevent cascade failures.
 """
@@ -23,6 +24,7 @@ from loguru import logger
 _api_url = os.environ.get("_PRD_BENCH_API_URL", "http://localhost:10000")
 _start_command = os.environ.get("_PRD_BENCH_START_COMMAND", "")
 _skip = os.environ.get("_PRD_BENCH_SKIP_LIFECYCLE", "false") == "true"
+_isolation = os.environ.get("_PRD_BENCH_ISOLATION", "none")
 
 
 def _parse_command(command: str) -> tuple[str, str]:
@@ -89,6 +91,15 @@ def pytest_runtest_setup(item):
     """Before each test: check server liveness, restart if needed."""
     if _skip:
         return
+
+    if _isolation == "per-test-server":
+        logger.info(f"Restarting API server before {item.nodeid}")
+        if _restart_server():
+            return
+        pytest.fail(
+            f"API server at {_api_url} could not be restarted before {item.nodeid}.",
+            pytrace=False,
+        )
 
     try:
         requests.get(_api_url, timeout=0.5)

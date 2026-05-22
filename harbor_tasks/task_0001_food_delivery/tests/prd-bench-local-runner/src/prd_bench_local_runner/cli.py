@@ -49,6 +49,15 @@ def main():
         help="Skip server start/stop (server already running externally)",
     )
     parser.add_argument(
+        "--isolation",
+        default="none",
+        choices=["none", "per-test-server"],
+        help=(
+            "Isolation mode. 'per-test-server' restarts the API server before "
+            "each pytest test while keeping one pytest process (default: none)"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -62,6 +71,8 @@ def main():
 
     if not args.skip_lifecycle and not args.start_command:
         parser.error("--start-command is required unless --skip-lifecycle is set")
+    if args.skip_lifecycle and args.isolation != "none":
+        parser.error("--isolation requires lifecycle management; do not use it with --skip-lifecycle")
 
     runner = BenchmarkRunner(
         start_command=args.start_command,
@@ -71,6 +82,7 @@ def main():
         per_test_timeout=args.test_timeout,
         results_file=args.results_file,
         skip_lifecycle=args.skip_lifecycle,
+        isolation=args.isolation,
     )
 
     results = runner.run()

@@ -26,6 +26,7 @@ class TestExecutor:
         results_file: Optional[str] = None,
         skip_lifecycle: bool = False,
         start_command: Optional[str] = None,
+        isolation: str = "none",
     ):
         self.test_dir = os.path.abspath(test_dir)
         self.api_url = api_url
@@ -33,6 +34,7 @@ class TestExecutor:
         self.results_file = results_file
         self.skip_lifecycle = skip_lifecycle
         self.start_command = start_command or ""
+        self.isolation = isolation
 
     def run(self) -> BenchmarkResults:
         """Run pytest and return structured results."""
@@ -97,6 +99,7 @@ class TestExecutor:
         env["_PRD_BENCH_API_URL"] = self.api_url
         env["_PRD_BENCH_START_COMMAND"] = self.start_command
         env["_PRD_BENCH_SKIP_LIFECYCLE"] = "true" if self.skip_lifecycle else "false"
+        env["_PRD_BENCH_ISOLATION"] = self.isolation
 
         # Add paths to PYTHONPATH:
         # 1. prd_bench_local_runner package (for pytest_plugin + testing utilities)
