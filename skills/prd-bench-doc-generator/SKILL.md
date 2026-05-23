@@ -218,6 +218,8 @@ Generate a summary table from the scaffold's `errors[]`. Core principle: **the t
 
 Three non-negotiable contracts. Each has a fixed procedure and a required PASS report. A PRD that fails any one is not ready regardless of prose quality. Contracts 1 and 3 catch missing identifiers and path leaks mechanically; Contract 2 catches missing behaviors — the hardest and most consequential failure mode.
 
+**Hard Contracts Reports are emitted in the final summary message, NOT into PRD.md or ANY sibling file.** PRD.md must end at §5 Error Code Catalogue with no audit footer, no "## Hard Contract Reports" section, and no contract-report code blocks. The three PASS reports below are returned by the doc-generator subagent in its closing summary message to the orchestrator — they live in the agent transcript only.
+
 ### Contract 1: Field-Name Coverage
 
 **Why it matters.** The model under test only sees the PRD. A field name present in scaffold but absent from PRD forces the implementer to guess the JSON key, silently breaking the hidden test contract (implementer writes `vaccine_type`, tests expect `vaccine_name`). Field omissions are the single highest-impact failure mode — one missing name can cascade to >60% of tests failing.

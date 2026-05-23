@@ -144,11 +144,14 @@ Read the skill at {project_root}/skills/prd-bench-unit-test-generator/SKILL.md t
 - {task_dir}/SCAFFOLD_CORNER_DESIGN.yaml      (breadth test index — §1.9; §2.1 queue B)
 - {task_dir}/workspace/PRD.md                 (the contract under test)
 
-Generate complete test infrastructure in {task_dir}/test_helpers/ and test cases in {task_dir}/test_suite/. Both layers are part of the test artifact and both must be PRD-faithful:
-  - test_suite/: assertions must match PRD rules verbatim (exact error_ids, exact field names, exact state transitions, exact calculation formulas with correct precision).
-  - test_helpers/: fixtures, factories, and per-role header builders must construct preconditions that the PRD permits the request to be issued under. Concretely: if PRD requires ownership (e.g., "the acting restaurant must be the one that owns the order"), the role-header helper must mint an X-User-ID that resolves to the actual owner id, not a shared constant that would fail any ownership check regardless of implementation. If PRD declares a payload schema, factories must emit that exact schema.
+Generate complete test infrastructure in {task_dir}/test_helpers/ and test cases in {task_dir}/test_suite/.
 
-A fixture that forces the implementation to drop a PRD-required check in order to pass is a test bug the generator has the first opportunity to prevent.
+**Design-index-only contract.** The two design indices ARE the only test source. Every test you emit translates exactly one non-stub instance from §1.8 (queue A) or §1.9 (queue B); walking SCAFFOLD.yaml directly to invent baseline / smoke / RBAC / listing / pagination / common-field tests is forbidden. Every test's docstring MUST end with one line of the form:
+  Design: Difficulty/<rule_id>/<instance.name>      (queue A)
+  Design: Corner/<section>/<instance.name>          (queue B)
+copied verbatim from the source yaml's `name:`. Untagged tests, dual-tagged tests, or tags pointing to non-existent instances are Stage 2 failures.
+
+If an instance fails the PRD-first two-condition filter (no verbatim PRD coverage OR PRD does not uniquely-derive the asserted outcome), SKIP the instance — do not weaken, do not mark skip/xfail, do not emit a placeholder. Gaps stay gaps.
 ```
 
 ### Step 6: Generate Implementation (subagent)
