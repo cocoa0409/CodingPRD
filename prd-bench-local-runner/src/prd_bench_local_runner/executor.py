@@ -26,6 +26,7 @@ class TestExecutor:
         results_file: Optional[str] = None,
         skip_lifecycle: bool = False,
         start_command: Optional[str] = None,
+        isolation: str = "none",
     ):
         self.test_dir = os.path.abspath(test_dir)
         self.api_url = api_url
@@ -33,6 +34,7 @@ class TestExecutor:
         self.results_file = results_file
         self.skip_lifecycle = skip_lifecycle
         self.start_command = start_command or ""
+        self.isolation = isolation
 
     def run(self) -> BenchmarkResults:
         """Run pytest and return structured results."""
@@ -97,18 +99,23 @@ class TestExecutor:
         env["_PRD_BENCH_API_URL"] = self.api_url
         env["_PRD_BENCH_START_COMMAND"] = self.start_command
         env["_PRD_BENCH_SKIP_LIFECYCLE"] = "true" if self.skip_lifecycle else "false"
+        env["_PRD_BENCH_ISOLATION"] = self.isolation
 
         # Add paths to PYTHONPATH:
         # 1. prd_bench_local_runner package (for pytest_plugin + testing utilities)
         # 2. Parent of test_dir (so `from test_helpers import ...` works)
+        #
+        # Compare against the colon-split list, not raw substring, otherwise
+        # "/tests" gets silently dropped when "/tests/prd-bench-local-runner/src"
+        # is already present.
         extra_paths = [
             str(Path(__file__).parent.parent),          # prd_bench_local_runner src
             str(Path(self.test_dir).parent.resolve()),  # parent of test_suite (contains test_helpers)
         ]
-        python_path = env.get("PYTHONPATH", "")
+        existing = env.get("PYTHONPATH", "").split(":") if env.get("PYTHONPATH") else []
         for p in extra_paths:
-            if p not in python_path:
-                python_path = f"{p}:{python_path}" if python_path else p
-        env["PYTHONPATH"] = python_path
+            if p not in existing:
+                existing.insert(0, p)
+        env["PYTHONPATH"] = ":".join(existing)
 
         return env

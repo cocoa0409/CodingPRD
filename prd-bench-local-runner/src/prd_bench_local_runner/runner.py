@@ -27,6 +27,7 @@ class BenchmarkRunner:
         per_test_timeout: int = 10,
         results_file: Optional[str] = None,
         skip_lifecycle: bool = False,
+        isolation: str = "none",
     ):
         self.start_command = start_command
         self.test_dir = test_dir
@@ -35,9 +36,14 @@ class BenchmarkRunner:
         self.per_test_timeout = per_test_timeout
         self.results_file = results_file
         self.skip_lifecycle = skip_lifecycle
+        self.isolation = isolation
 
         if not skip_lifecycle and not start_command:
             raise ValueError("start_command is required unless skip_lifecycle=True")
+        if skip_lifecycle and isolation != "none":
+            raise ValueError("isolation requires lifecycle management")
+        if isolation != "none" and not start_command:
+            raise ValueError("start_command is required when isolation is enabled")
 
     def run(self) -> BenchmarkResults:
         """Run the full benchmark: start server → run tests → stop server → return results."""
@@ -62,6 +68,7 @@ class BenchmarkRunner:
                 results_file=self.results_file,
                 skip_lifecycle=self.skip_lifecycle,
                 start_command=self.start_command,
+                isolation=self.isolation,
             )
             results = executor.run()
 
