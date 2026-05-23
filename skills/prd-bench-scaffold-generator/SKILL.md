@@ -535,28 +535,82 @@ scaffold_difficulty_design:
         test_recipe:
           setup:                               # natural-language description of the precondition state (entities, statuses, balances, clock position)
             - "<precondition 1>"
-          setup_api_calls:                     # ordered chain of §1.5 endpoint calls that drives empty-DB → setup state above; each line is a literal §1.5 invocation
-            - "POST /<path> {<payload>} as <Role>"
-            - "POST /<path> {<payload>} as <Role>"
-          trigger:                             # the API call(s) under test — the actual behavior being measured
-            - "POST /<path> {<payload>} as <Role>"
-          assert:                              # one pinned observable outcome per line
+          setup_api_calls:                     # ordered chain of §1.5 endpoint calls that drives empty-DB → setup state above; each list entry is a STRUCTURED call object (not a prose string), so every placeholder traces back to a concrete `captures:` produced by an earlier call
+            - call: "POST /<path>"             # method + path; path-templated ids reference earlier captures via ${var}
+              payload: { field: <literal_or_${var}>, ... }   # field values are LITERALS the author pins UNLESS the value can only come from a prior call's response, in which case ${var} references a captures binding from an earlier line
+              as: <RoleName>                   # X-User-Role header, exactly as declared in §1.7
+              as_user_id: <literal_or_${var}>  # X-User-ID header; OMIT for opaque roles when the test does not pin an audit id; REQUIRED for entity_backed roles where ownership matters (e.g., Member acting on own resource → as_user_id: ${m_ca_id})
+              captures: { <var_name>: <jsonpath> }  # bindings extracted from this call's response envelope (e.g., `m_ca_id: $.data.id`, `tok_ca: $.data.verification_token`); name MUST be unique within this instance; OMIT the whole key when nothing later needs the response
+            - call: "POST /<path>"
+              payload: { ... }
+              as: <RoleName>
+          trigger:                             # the API call(s) under test — same structured form as setup_api_calls; captures permitted when later trigger steps or asserts reference the response
+            - call: "POST /<path>"
+              payload: { ... }
+              as: <RoleName>
+              as_user_id: <literal_or_${var}>
+              captures: { <var_name>: <jsonpath> }
+          assert:                              # one pinned observable outcome per line; field references may use ${var} bound earlier
             - "<comparison or invariant 1>"
       - name: <instance_2_lower_snake_case>
         grounds: [<refs>]
         distinguishing_aspect: "<…>"
-        test_recipe: { setup: [...], trigger: [...], assert: [...] }
+        test_recipe: { setup: [...], setup_api_calls: [...], trigger: [...], assert: [...] }
   - rule_id: combinatorial_formula
     instances: [ <one or more, per §0.5 minimum> ]
   # … seven more rule_id blocks, each meeting its own §0.5 minimum …
 ```
+
+**Worked example of the structured form** (this is the format every instance MUST emit):
+
+```yaml
+setup_api_calls:
+  - call: "POST /subscription-plans"
+    payload: { tier: "PLUS", monthly_fee_cents: 6000, included_class_credits: 8, pt_discount_pct: 0.25 }
+    as: PlatformAdmin
+    captures: { plus_plan_id: $.data.id }
+  - call: "POST /stores"
+    payload: { name: "CA Store", state_code: "CA", capacity: 100 }
+    as: PlatformAdmin
+    captures: { store_ca_id: $.data.id }
+  - call: "POST /_clock/advance"
+    payload: { to_iso8601: "2026-06-01T00:00:00Z" }
+    as: PlatformAdmin
+  - call: "POST /members/register"
+    payload: { email: "m_ca@x.com", password: "p", full_name: "M CA", state_code: "CA", plan_id: "${plus_plan_id}", home_store_id: "${store_ca_id}", coupon_code: "FLAT10" }
+    as: Anonymous
+    captures: { m_ca_id: $.data.id, sub_ca_id: $.data.subscription_id, tok_ca: $.data.verification_token }
+  - call: "POST /_payments/simulate"
+    payload: { subscription_id: "${sub_ca_id}", outcome: "SUCCEEDED" }
+    as: PlatformAdmin
+  - call: "POST /members/${m_ca_id}/verify"
+    payload: { verification_token: "${tok_ca}" }
+    as: Anonymous
+
+trigger:
+  - call: "POST /members/${m_ca_id}/cancel"
+    payload: { refund_destination: "WALLET" }
+    as: Member
+    as_user_id: "${m_ca_id}"
+
+assert:
+  - "Member.${m_ca_id}.wallet_credit_cents == 2733"
+  - "Member.${m_ca_id}.status == CANCELLED_PENDING"
+```
+
+Two things this form mechanically enforces:
+
+1. **Every `${var}` traces back to a `captures:` line earlier in the same instance.** If `${plus_plan_id}` appears in any `payload:` / `as_user_id:` / path template but no earlier `captures:` binds it, the scaffold has a hole that demands action via the §1.5 priority ladder (compose → business → test-driving). Bare placeholder strings like `<plus_plan_id>` smuggled into prose can no longer hide an absent producing endpoint.
+2. **Every captured field is declared in §1.5.** If `captures: { tok_ca: $.data.verification_token }` references `verification_token` but the §1.5 register endpoint's `output:` does not list that field, the scaffold has under-specified its response shape — return to §1.5 and add the field (or, if PRD truly doesn't surface it, add a test-driving endpoint to fetch it).
 
 **Instance counts**: §0.5 is authoritative. Quick reference — every rule has the same minimum: **≥ 2 instances → ≥ 18 instances total**, counted as `- name:` entries nested under `instances:`. A scaffold with 9 `rule_id`s each carrying a single instance = 9 instances = FAIL.
 
 **Per-instance contract:**
 1. Every `grounds:` entry MUST resolve to a declared element in §1.1–§1.6. A grounds entry naming a missing calculation, transition, validation, field, or race is a dangling claim — remove it or add the grounding.
 2. `test_recipe.setup + setup_api_calls + trigger + assert` together MUST reproduce the scenario from empty-DB state using only endpoints declared in §1.5. No wall-clock waits; time-gated setups use the clock-advance endpoint §1.5 already provides.
-3. **`setup_api_calls:` is mandatory and operationalises §1.5's testability-completeness audit.** Write the ordered sequence of API invocations that drives the system from empty-DB into the state described by `setup:`. Each entry MUST be a literal invocation of an endpoint declared in §1.5 — path, method, role-bearing header, and payload shape exactly as §1.5 specifies. **If no chain of §1.5 endpoints reaches the precondition, you have exactly two remedies: (a) return to §1.5 and add the missing endpoint, then re-derive the chain; or (b) revise this §1.8 instance so its precondition becomes reachable via the existing surface.** Silently omitting `setup_api_calls:`, leaving entries vague (e.g., `"create a member with wallet_credit_cents=500"` instead of the concrete POST chain that produces that balance), or papering over the gap with prose are all forbidden — the chain must be directly executable by the downstream unit-test-generator.
+3. **`setup_api_calls:` is mandatory, structured, and operationalises §1.5's testability-completeness audit.** Write the ordered sequence of API invocations that drives the system from empty-DB into the state described by `setup:`. Each entry MUST be a structured call object with the keys shown in the schema (`call`, `payload`, `as`, optional `as_user_id`, optional `captures`) — not a prose string. Each `call` MUST resolve to an endpoint declared in §1.5 (path, method, role exactly as §1.5 specifies); each `payload:` field MUST conform to that endpoint's `input:` schema. **Placeholder discipline:** every `${var}` referenced in any `payload:`, `as_user_id:`, or path template MUST be bound by a `captures:` block on an earlier line of the same instance. An unbound `${var}` is a missing-endpoint signal — handle it via this priority ladder, exactly as §1.5 prescribes: **(a) compose existing endpoints first; (b) return to §1.5 and add a general business endpoint, then re-derive the chain; (c) add a test-driving endpoint under `/_<name>` as last resort;** Silently omitting `setup_api_calls:`, leaving prose strings instead of structured calls, leaving entries vague (e.g., `"create a member with wallet_credit_cents=500"` instead of the concrete POST chain that produces that balance), or smuggling unbound `${var}` placeholders into payloads are all forbidden — the chain must be directly executable by the downstream unit-test-generator.
+3a. **Literal-vs-placeholder discipline inside `payload:`.** A `payload:` field value MUST be a literal whenever the scaffold author can determine it at writing time — `state_code: "CA"`, `monthly_fee_cents: 6000`, `to_iso8601: "2026-06-01T00:00:00Z"`, enum members, fixed coupon codes, fixed dates. **The `${var}` form is reserved for values that can only come from a prior call's response**: server-minted ids, server-stamped timestamps, server-issued tokens. Pushing computable literals into placeholders ("let the test-generator figure it out") is the symmetric failure mode to leaving asserts as `round(...)` expressions (contract item 7) — both propagate "unresolved" downstream and produce broken tests whose wrong fixture silently agrees with a wrong implementation. When in doubt, write the literal.
+3b. **`captures:` MUST reference fields declared in §1.5's `output:` for that endpoint.** A capture like `captures: { tok_ca: $.data.verification_token }` is a claim that the §1.5 register endpoint exposes `verification_token` in its response. If §1.5 does not declare that field, either (a) return to §1.5 and add it to the endpoint's `output:`, or (b) add a separate read endpoint that surfaces it, or (c) add a test-driving endpoint that fetches it. Capturing an undeclared field is the same class of failure as referring to an undeclared endpoint — it forces downstream skills (PRD-, unit-test-, implementation-generator) to invent the contract.
 4. `distinguishing_aspect` MUST be falsifiable — one sentence the test can turn into a concrete assertion, naming the specific distinction §0.5 requires of this `rule_id` (different entity domain, different error-category pair, etc.). No hedging ("may differ", "could vary").
 5. `name` MUST be unique across the whole `scaffold_difficulty_design` and stable across regenerations (tests cite it in their docstrings for audit).
 6. `assert:` entries MUST cite exact field names and literal values where possible (e.g., `Order.delivery_fee != Assignment.final_delivery_fee`; `Customer.wallet_balance unchanged after assignment creation`), not paraphrases.
@@ -598,10 +652,14 @@ Each declaration in the scaffold is an edge; self-consistency means both ends re
 
 **Test-recipe ↔ endpoint compatibility (§1.8 `setup_api_calls` + `trigger:` ↔ §1.5):**
 
-- [ ] Each `setup_api_calls` or `trigger:` line resolves to a §1.5 endpoint — path, method, and role match exactly.
-- [ ] Each line's payload conforms to that endpoint's `input:` schema (no unknown fields, no missing required fields, types match).
+- [ ] Every `setup_api_calls` and `trigger:` entry is a STRUCTURED call object (keys: `call`, `payload`, `as`, optional `as_user_id`, optional `captures`).
+- [ ] Each `call:` resolves to a §1.5 endpoint — path, method, and `as:` role match exactly.
+- [ ] Each `payload:` conforms to that endpoint's `input:` schema (no unknown fields, no missing required fields, types match).
+- [ ] **Placeholder closure** — every `${var}` referenced in any `payload:`, `as_user_id:`, or path template is bound by a `captures:` block on an earlier line of the same instance. Zero unbound placeholders across the whole `scaffold_difficulty_design`. An unbound `${var}` means §1.5 is missing a producing endpoint — fix via the priority ladder (compose → business → test-driving), do not paper over.
+- [ ] **Captures resolve to §1.5 `output:` fields** — every JSONPath in `captures:` (e.g., `$.data.verification_token`) names a field that the called endpoint actually declares in its `output:`. Capturing an undeclared field is forbidden; declare the field in §1.5 or add a different endpoint that exposes it.
+- [ ] **Literal-vs-placeholder discipline** — `payload:` fields that the scaffold author can determine at writing time (state codes, fixed amounts, ISO timestamps, enum members, fixed coupon codes) are LITERALS; `${var}` is used ONLY for values that can only come from a prior call's response (server-minted ids, server-stamped timestamps, server-issued tokens).
 - [ ] Running `setup_api_calls` end-to-end actually produces the precondition described in `setup:` — every entity, status, balance, and clock position the `setup:` lines pin is the post-chain state, not a wish.
-- [ ] No `setup_api_calls` or `trigger:` is empty or placeholder prose. If `setup_api_calls` genuinely cannot be written, reshape §1.5 per the priority ladder (compose → business → test-driving) rather than papering over.
+- [ ] No `setup_api_calls` or `trigger:` is empty or placeholder prose. If `setup_api_calls` genuinely cannot be written without an unbound `${var}`, reshape §1.5 per the priority ladder (compose → business → test-driving) rather than papering over.
 
 **Difficulty (audit — the spec lives at §0.5):**
 - [ ] Every §0.5 rule (1–9) is satisfied by §1.1–§1.7, honoring its differentiation clause, and mirrored in `SCAFFOLD_DIFFICULTY_DESIGN.yaml` with ≥2 instances per rule (≥18 instances total)
