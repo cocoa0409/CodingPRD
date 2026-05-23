@@ -17,7 +17,7 @@ User provides two things:
 
 ### Output
 
-Two YAML files written into the user-specified directory, in this order:
+Three YAML files written into the user-specified directory, in this order:
 
 **1. `SCAFFOLD.yaml`** — §1.0 through §1.7 plus preamble keys:
 
@@ -36,9 +36,11 @@ errors:                      # §1.6: Error Code Catalog
 roles:                       # §1.7: RBAC Matrix
 ```
 
-**2. `SCAFFOLD_DIFFICULTY_DESIGN.yaml`** — single top-level key `scaffold_difficulty_design:` (§1.8: Test Targeting Index — summary of §1.1–§1.7 cross-referenced per Difficulty rule).
+**2. `SCAFFOLD_DIFFICULTY_DESIGN.yaml`** — single top-level key `scaffold_difficulty_design:` (§1.8: Test Targeting Index — sampled cross-reference of §1.1–§1.7 per Difficulty rule; 2 instances per rule).
 
-Do NOT emit `scaffold_difficulty_design:` as a top-level key inside `SCAFFOLD.yaml` — it lives only in the second file.
+**3. `SCAFFOLD_CORNER_DESIGN.yaml`** — single top-level key `scaffold_corner_design:` (§1.9: enumerative coverage of every other testable claim the scaffold's §1.1–§1.7 surface declares, beyond §0.5's nine Difficulty Rules).
+
+Do NOT emit `scaffold_difficulty_design:` or `scaffold_corner_design:` as top-level keys inside `SCAFFOLD.yaml` — they live only in their respective files.
 
 For completed examples, see the `examples/` directory. These examples are format and structure references only; they are NOT normative and may lag behind the current rules in this skill. If an example conflicts with any instruction, hard constraint, or checklist item in this file, the skill text wins and the generated scaffold MUST satisfy the current skill exactly. For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tables-template.yaml).
 
@@ -57,7 +59,8 @@ For completed examples, see the `examples/` directory. These examples are format
 - [ ] 1.6: Error Code Catalog
 - [ ] 1.7: RBAC Matrix
 - [ ] 1.8: Scaffold Difficulty Design (Test Targeting Index) → destination file `SCAFFOLD_DIFFICULTY_DESIGN.yaml`
-- [ ] Final: Quality + Diversity check (§Quality Checklist) across both files
+- [ ] 1.9: Scaffold Corner Design (Coverage Index for Non-Difficulty Tests) → destination file `SCAFFOLD_CORNER_DESIGN.yaml`
+- [ ] Final: Quality + Diversity check (§Quality Checklist) across all three files
 ```
 
 ---
@@ -608,13 +611,61 @@ Two things this form mechanically enforces:
 **Per-instance contract:**
 1. Every `grounds:` entry MUST resolve to a declared element in §1.1–§1.6. A grounds entry naming a missing calculation, transition, validation, field, or race is a dangling claim — remove it or add the grounding.
 2. `test_recipe.setup + setup_api_calls + trigger + assert` together MUST reproduce the scenario from empty-DB state using only endpoints declared in §1.5. No wall-clock waits; time-gated setups use the clock-advance endpoint §1.5 already provides.
-3. **`setup_api_calls:` is mandatory, structured, and operationalises §1.5's testability-completeness audit.** Write the ordered sequence of API invocations that drives the system from empty-DB into the state described by `setup:`. Each entry MUST be a structured call object with the keys shown in the schema (`call`, `payload`, `as`, optional `as_user_id`, optional `captures`) — not a prose string. Each `call` MUST resolve to an endpoint declared in §1.5 (path, method, role exactly as §1.5 specifies); each `payload:` field MUST conform to that endpoint's `input:` schema. **Placeholder discipline:** every `${var}` referenced in any `payload:`, `as_user_id:`, or path template MUST be bound by a `captures:` block on an earlier line of the same instance. An unbound `${var}` is a missing-endpoint signal — handle it via this priority ladder, exactly as §1.5 prescribes: **(a) compose existing endpoints first; (b) return to §1.5 and add a general business endpoint, then re-derive the chain; (c) add a test-driving endpoint under `/_<name>` as last resort;** Silently omitting `setup_api_calls:`, leaving prose strings instead of structured calls, leaving entries vague (e.g., `"create a member with wallet_credit_cents=500"` instead of the concrete POST chain that produces that balance), or smuggling unbound `${var}` placeholders into payloads are all forbidden — the chain must be directly executable by the downstream unit-test-generator.
+3. **`setup_api_calls:` is mandatory, structured, and operationalises §1.5's testability-completeness audit.** Write the ordered sequence of API invocations that drives the system from empty-DB into the state described by `setup:`. Each entry MUST be a structured call object with the keys shown in the schema (`call`, `payload`, `as`, optional `as_user_id`, optional `captures`) — not a prose string. Each `call` MUST resolve to an endpoint declared in §1.5 (path, method, role exactly as §1.5 specifies); each `payload:` field MUST conform to that endpoint's `input:` schema. **Placeholder discipline:** every `${var}` referenced in any `payload:`, `as_user_id:`, or path template MUST be bound by a `captures:` block on an earlier line of the same instance. An unbound `${var}` is a missing-endpoint signal — handle it via the §1.5 priority ladder (fallback priority, NOT a sequence to execute — stop at the first rung that resolves the gap): **(1) compose existing endpoints first; (2) only if (1) fails, return to §1.5 and add a general business endpoint, then re-derive the chain; (3) only as last resort, when (1) and (2) both fail, add a test-driving endpoint under `/_<name>`.** Silently omitting `setup_api_calls:`, leaving prose strings instead of structured calls, leaving entries vague (e.g., `"create a member with wallet_credit_cents=500"` instead of the concrete POST chain that produces that balance), or smuggling unbound `${var}` placeholders into payloads are all forbidden — the chain must be directly executable by the downstream unit-test-generator.
 3a. **Literal-vs-placeholder discipline inside `payload:`.** A `payload:` field value MUST be a literal whenever the scaffold author can determine it at writing time — `state_code: "CA"`, `monthly_fee_cents: 6000`, `to_iso8601: "2026-06-01T00:00:00Z"`, enum members, fixed coupon codes, fixed dates. **The `${var}` form is reserved for values that can only come from a prior call's response**: server-minted ids, server-stamped timestamps, server-issued tokens. Pushing computable literals into placeholders ("let the test-generator figure it out") is the symmetric failure mode to leaving asserts as `round(...)` expressions (contract item 7) — both propagate "unresolved" downstream and produce broken tests whose wrong fixture silently agrees with a wrong implementation. When in doubt, write the literal.
 3b. **`captures:` MUST reference fields declared in §1.5's `output:` for that endpoint.** A capture like `captures: { tok_ca: $.data.verification_token }` is a claim that the §1.5 register endpoint exposes `verification_token` in its response. If §1.5 does not declare that field, either (a) return to §1.5 and add it to the endpoint's `output:`, or (b) add a separate read endpoint that surfaces it, or (c) add a test-driving endpoint that fetches it. Capturing an undeclared field is the same class of failure as referring to an undeclared endpoint — it forces downstream skills (PRD-, unit-test-, implementation-generator) to invent the contract.
 4. `distinguishing_aspect` MUST be falsifiable — one sentence the test can turn into a concrete assertion, naming the specific distinction §0.5 requires of this `rule_id` (different entity domain, different error-category pair, etc.). No hedging ("may differ", "could vary").
 5. `name` MUST be unique across the whole `scaffold_difficulty_design` and stable across regenerations (tests cite it in their docstrings for audit).
 6. `assert:` entries MUST cite exact field names and literal values where possible (e.g., `Order.delivery_fee != Assignment.final_delivery_fee`; `Customer.wallet_balance unchanged after assignment creation`), not paraphrases.
 7. **Any `assert:` line referencing a numeric value derived from a formula MUST be a literal the scaffold author actually computed by code.** Pin the inputs in `setup:`, execute the relevant `calculations[].formula` as code (a short Python snippet against the formula and its `constants:`), and write the resulting literal into the assertion — e.g., `Order.delivery_fee == 5.40`, NOT `Order.delivery_fee == round(3.00 + ceil(2.0)*1.20 + 0, 2)` and NOT a rough estimate. Unresolved formulas, estimates, and "let the test-generator compute it" all propagate arithmetic errors into broken tests whose wrong expected value silently agrees with a wrong implementation. When in doubt, execute the formula.
+
+### 1.9 Scaffold Corner Design
+
+**Output**: a separate file `SCAFFOLD_CORNER_DESIGN.yaml` sibling to `SCAFFOLD.yaml`, with `scaffold_corner_design:` as its single top-level key.
+
+**Scope**: enumerate every testable claim the scaffold's §1.1–§1.7 surface declares that §1.8 does not already cover (required-field validation, state-machine invalid-from rejection, RBAC denial, FK integrity, response envelope, computed-field correctness, cross-entity cascade, OCC stale-version conflict, etc.). §1.8 is the depth probe (9 hard reasoning rules × 2 instances); §1.9 is the breadth probe.
+
+**Core value**: §1.9 generation IS a §1.5 audit pass. Same gates as §1.8 — `setup_api_calls` reachability, literal lock, §1.5 priority ladder. §1.9 is breadth, not a weaker tier.
+
+**Taxonomy**: read `references/claim-extraction-guide.md` (sibling to this SKILL.md) first. The guide's nine sections (Entities / State Machines / Calculations / Validations / Endpoints / Errors / RBAC / Cross-Cutting Complexity Layers / Consistency Model) ARE §1.9's `section:` values; the per-section claim-type rows ARE §1.9's `claim_type:` values. Do not invent additional categories or `claim_type:` names.
+
+**Coverage target**: the walk is a *vehicle* for iterating §1.5 against `setup_api_calls` — not an end in itself. As you traverse the guide row-by-row against this scaffold's §1.1–§1.7 surface and author each corner instance (error_id triggers, invalid-from rejections, RBAC denials, FK integrity, response envelope, etc.), the act of writing its `setup_api_calls` chain forces §1.5 to be challenged: every precondition the chain needs must be producible by composing §1.5 calls; every gap triggers the priority ladder. The output is two-way — an enumerated set of corner instances AND a §1.5 surface provably capable of driving empty-DB into each instance's precondition (**test-state reachability**, guaranteed). What makes §1.9 valuable is this iteration, not the enumeration count. Skip non-applicable rows without ceremony; emit `excluded_because:` stubs when §1.8 already covers the corner.
+
+**Schema:**
+
+```yaml
+scaffold_corner_design:
+  - section: state_machines
+    instances:
+      - name: cancel_booking_from_already_cancelled_returns_invalid_state
+        claim_type: invalid_transition                      # from claim-extraction-guide's per-section table
+        grounds: [state_machines.Booking.transitions.CANCELLED_to_CANCELLED]
+        distinguishing_aspect: "Booking already CANCELLED — second cancel must fail with ERR_INVALID_STATE; no side effects fire."
+        test_recipe:
+          setup: ["<precondition prose>"]
+          setup_api_calls: [ <structured calls; same form as §1.8> ]
+          trigger: [ <structured call> ]
+          assert: ["<one observable per line, literal values>"]
+
+      - name: error_subscription_inactive_on_create_booking   # already exercised by §1.8 → stub
+        claim_type: violation_to_error
+        grounds: [errors[ERR_SUBSCRIPTION_INACTIVE]]
+        excluded_because:
+          difficulty_instance: cross_entity_state_dependency / booking_requires_subscription_active_or_grace
+          rationale: "Asserted as the failure path of the named §1.8 instance."
+        # NO test_recipe.
+```
+
+**Per-instance contract**: same seven-point contract as §1.8 (clauses 1–7) — grounds resolvability; `setup_api_calls` structured form with placeholder closure, literal-vs-placeholder discipline, captures-resolve-to-§1.5-`output:`; `distinguishing_aspect` falsifiability; `name` uniqueness; `assert:` specificity with exact field names and literal values; formula-derived asserts pre-computed as literals. `name` MUST be unique across the union of `scaffold_difficulty_design` and `scaffold_corner_design`.
+
+**`excluded_because:` stubs**: when a corner is already covered by a §1.8 instance, emit a stub (`name` + `claim_type` + `grounds` + `excluded_because: { difficulty_instance, rationale }`); `test_recipe` is forbidden. The cited `difficulty_instance` MUST exist by `name` in `SCAFFOLD_DIFFICULTY_DESIGN.yaml`.
+
+**§1.5 linkage — same priority ladder as §1.8.** When a corner instance's `setup_api_calls` hits an unreachable precondition (unbound `${var}`, `captures:` referring to a field §1.5 doesn't declare, or a setup state no chain of §1.5 calls can produce), try the ladder in order and **stop at the first rung that resolves the gap** — this is fallback priority, NOT a sequence to execute:
+1. **Compose existing endpoints** — re-search §1.5 for a chain you missed; many "missing" capabilities are already reachable via composition.
+2. **Only if (1) fails** — return to §1.5 and add a general business endpoint that fits the domain's real-world admin/operator surface, then re-derive the chain.
+3. **Only as last resort, when (1) and (2) both fail** — add a `/_<name>` test-driving endpoint to §1.5.
+
+Reshape §1.5 first, then re-derive the chain. Weakening the corner, papering over with prose, or marking it `excluded_because:` when no §1.8 instance covers it are forbidden — treat §1.9 generation as a §1.5 audit pass.
 
 ---
 
@@ -634,8 +685,8 @@ Before finalizing the YAML:
 - [ ] Side effect chains are complete (if A→B→C, all three steps are documented)
 - [ ] Every non-idempotent operation that can race has a `concurrency_rules` entry with required `error_id` and `http_status`
 - [ ] Every error code referenced in `concurrency_rules` also appears in §1.6 Error Catalog
-- [ ] File split honored: `scaffold_difficulty_design:` appears only as the top-level key of `SCAFFOLD_DIFFICULTY_DESIGN.yaml`, and never inside `SCAFFOLD.yaml`
-- [ ] Every `scaffold_difficulty_design[*].instances[*].grounds[*]` reference resolves to a declared element in `SCAFFOLD.yaml`'s §1.1–§1.6
+- [ ] File split honored: `scaffold_difficulty_design:` appears only as the top-level key of `SCAFFOLD_DIFFICULTY_DESIGN.yaml`, `scaffold_corner_design:` appears only as the top-level key of `SCAFFOLD_CORNER_DESIGN.yaml`, and neither appears inside `SCAFFOLD.yaml`
+- [ ] Every `instances[*].grounds[*]` reference (in either `scaffold_difficulty_design` or `scaffold_corner_design`) resolves to a declared element in `SCAFFOLD.yaml`'s §1.1–§1.7
 
 **Self-Consistency:**
 
@@ -650,12 +701,12 @@ Each declaration in the scaffold is an edge; self-consistency means both ends re
 - [ ] **Cross-entity reference resolvability** — Any precondition or side-effect that references another entity as "a linked X", "a related X", "the associated X", or "the corresponding X" MUST name the foreign-key path or pin the query selector. "A linked WorkOrder is in UNDER_REVIEW" without declaring `WorkOrder.related_order_id == Order.id` forces downstream generators to invent the link.
 - [ ] **Computation determinism** — Order-sensitive calculations MUST pin both sort key and tie-break. Multi-step rounding MUST pin the rounding order. Fields referenced inside `formula:` MUST be unambiguous — use the exact field name (`credit_balance_cents`), not paraphrases ("the customer's credit") that could resolve to either a provisional or a finalized field.
 
-**Test-recipe ↔ endpoint compatibility (§1.8 `setup_api_calls` + `trigger:` ↔ §1.5):**
+**Test-recipe ↔ endpoint compatibility — applies to every `test_recipe` in BOTH `scaffold_difficulty_design` (§1.8) AND `scaffold_corner_design` (§1.9), audited against §1.5.**
 
 - [ ] Every `setup_api_calls` and `trigger:` entry is a STRUCTURED call object (keys: `call`, `payload`, `as`, optional `as_user_id`, optional `captures`).
 - [ ] Each `call:` resolves to a §1.5 endpoint — path, method, and `as:` role match exactly.
 - [ ] Each `payload:` conforms to that endpoint's `input:` schema (no unknown fields, no missing required fields, types match).
-- [ ] **Placeholder closure** — every `${var}` referenced in any `payload:`, `as_user_id:`, or path template is bound by a `captures:` block on an earlier line of the same instance. Zero unbound placeholders across the whole `scaffold_difficulty_design`. An unbound `${var}` means §1.5 is missing a producing endpoint — fix via the priority ladder (compose → business → test-driving), do not paper over.
+- [ ] **Placeholder closure** — every `${var}` referenced in any `payload:`, `as_user_id:`, or path template is bound by a `captures:` block on an earlier line of the same instance. Zero unbound placeholders across both `scaffold_difficulty_design` and `scaffold_corner_design`. An unbound `${var}` means §1.5 is missing a producing endpoint — fix via the priority ladder (compose → business → test-driving), do not paper over.
 - [ ] **Captures resolve to §1.5 `output:` fields** — every JSONPath in `captures:` (e.g., `$.data.verification_token`) names a field that the called endpoint actually declares in its `output:`. Capturing an undeclared field is forbidden; declare the field in §1.5 or add a different endpoint that exposes it.
 - [ ] **Literal-vs-placeholder discipline** — `payload:` fields that the scaffold author can determine at writing time (state codes, fixed amounts, ISO timestamps, enum members, fixed coupon codes) are LITERALS; `${var}` is used ONLY for values that can only come from a prior call's response (server-minted ids, server-stamped timestamps, server-issued tokens).
 - [ ] Running `setup_api_calls` end-to-end actually produces the precondition described in `setup:` — every entity, status, balance, and clock position the `setup:` lines pin is the post-chain state, not a wish.

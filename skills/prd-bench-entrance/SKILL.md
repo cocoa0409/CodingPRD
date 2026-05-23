@@ -29,14 +29,14 @@ Scenario Description
 Step 1: Create task directory (bash, no subagent)
     │
     ▼
-Step 2: Subagent → prd-bench-scaffold-generator → SCAFFOLD.yaml + SCAFFOLD_DIFFICULTY_DESIGN.yaml
+Step 2: Subagent → prd-bench-scaffold-generator → SCAFFOLD.yaml + SCAFFOLD_DIFFICULTY_DESIGN.yaml + SCAFFOLD_CORNER_DESIGN.yaml
     │
     ▼
 Step 3: Copy INSTRUCTION.md (bash, no subagent)
     │
     ▼
 Step 4: Subagent → prd-bench-doc-generator → PRD.md
-        (reads SCAFFOLD.yaml only; SCAFFOLD_DIFFICULTY_DESIGN.yaml is withheld to prevent test-answer leakage into PRD)
+        (reads SCAFFOLD.yaml only; BOTH SCAFFOLD_DIFFICULTY_DESIGN.yaml and SCAFFOLD_CORNER_DESIGN.yaml are withheld to prevent test-answer leakage into PRD)
     │
     ▼
     ┌───────────────────────────────────────────┬───────────────────────────────────────────┐
@@ -70,7 +70,7 @@ Agent({
 })
 ```
 
-**Concurrency**: Steps 2 → 4 are strictly sequential (the PRD depends on the scaffold). Steps 5 and 6 have no mutual dependency — they both read only SCAFFOLD.yaml + PRD.md (and INSTRUCTION.md for Step 6) — and MUST be launched concurrently. Concurrency on Claude Code requires a **single assistant message with two Agent tool uses**; two Agent calls across separate messages run sequentially. Besides throughput, concurrent launch gives physical isolation: Step 6's impl-gen subagent cannot read `test_suite/` because the directory does not yet exist when it starts.
+**Concurrency**: Steps 2 → 4 are strictly sequential (the PRD depends on the scaffold). Steps 5 and 6 have no mutual dependency — Step 5 reads SCAFFOLD.yaml + SCAFFOLD_DIFFICULTY_DESIGN.yaml + SCAFFOLD_CORNER_DESIGN.yaml + PRD.md; Step 6 reads SCAFFOLD.yaml + PRD.md + INSTRUCTION.md — and they MUST be launched concurrently. Concurrency on Claude Code requires a **single assistant message with two Agent tool uses**; two Agent calls across separate messages run sequentially. Besides throughput, concurrent launch gives physical isolation: Step 6's impl-gen subagent cannot read `test_suite/` because the directory does not yet exist when it starts.
 
 ## Execution Steps
 
@@ -104,14 +104,15 @@ Read the skill at {project_root}/skills/prd-bench-scaffold-generator/SKILL.md to
 Scenario description (use verbatim, do not modify):
 {scenario}
 
-Output files (both required):
-- {task_dir}/SCAFFOLD.yaml                    (§1.0–§1.7; no scaffold_difficulty_design key)
-- {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml  (single top-level key scaffold_difficulty_design)
+Output files (all three required):
+- {task_dir}/SCAFFOLD.yaml                    (§1.0–§1.7; neither scaffold_difficulty_design nor scaffold_corner_design key)
+- {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml  (single top-level key scaffold_difficulty_design — §1.8)
+- {task_dir}/SCAFFOLD_CORNER_DESIGN.yaml      (single top-level key scaffold_corner_design — §1.9)
 
-Hard constraint — DO NOT look at any sibling task under {project_root}/tasks/ (no ls, glob, grep, or read of other task_*/ directories, their SCAFFOLD.yaml, SCAFFOLD_DIFFICULTY_DESIGN.yaml, PRD.md, tests, or implementation). Generate the scaffold purely from the scenario description above plus the scaffold-generator skill's own specification. Peeking at existing tasks biases the output toward prior designs and defeats the purpose of a fresh scaffold.
+Hard constraint — DO NOT look at any sibling task under {project_root}/tasks/ (no ls, glob, grep, or read of other task_*/ directories, their SCAFFOLD.yaml, SCAFFOLD_DIFFICULTY_DESIGN.yaml, SCAFFOLD_CORNER_DESIGN.yaml, PRD.md, tests, or implementation). Generate the scaffold purely from the scenario description above plus the scaffold-generator skill's own specification. Peeking at existing tasks biases the output toward prior designs and defeats the purpose of a fresh scaffold.
 ```
 
-After the subagent completes, verify BOTH `SCAFFOLD.yaml` and `SCAFFOLD_DIFFICULTY_DESIGN.yaml` exist in `{task_dir}/`.
+After the subagent completes, verify all three — `SCAFFOLD.yaml`, `SCAFFOLD_DIFFICULTY_DESIGN.yaml`, and `SCAFFOLD_CORNER_DESIGN.yaml` — exist in `{task_dir}/`.
 
 ### Step 3: Copy Shared Files (bash, no subagent)
 
@@ -129,7 +130,7 @@ Read the skill at {project_root}/skills/prd-bench-doc-generator/SKILL.md to unde
 Input:  {task_dir}/SCAFFOLD.yaml
 Output: {task_dir}/workspace/PRD.md
 
-Hard constraint — DO NOT read {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml. That file is the test-targeting index; it is deliberately withheld from PRD generation so its worked example numbers and test_recipe asserts cannot leak into the PRD prose the implementer will read. Do not open it, grep it, or reference its contents in any way.
+Hard constraint — DO NOT read EITHER `{task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml` OR `{task_dir}/SCAFFOLD_CORNER_DESIGN.yaml`. Both files are test-targeting indices (§1.8 depth, §1.9 breadth); they are deliberately withheld from PRD generation so their worked example numbers and `test_recipe` asserts cannot leak into the PRD prose the implementer will read. Do not open them, grep them, or reference their contents in any way.
 ```
 
 ### Step 5: Generate Unit Tests (subagent)
@@ -137,9 +138,10 @@ Hard constraint — DO NOT read {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml. That
 Spawn a subagent with this prompt:
 
 ```
-Read the skill at {project_root}/skills/prd-bench-unit-test-generator/SKILL.md to understand the full generation specification. Then read all three inputs:
+Read the skill at {project_root}/skills/prd-bench-unit-test-generator/SKILL.md to understand the full generation specification. Then read all four inputs:
 - {task_dir}/SCAFFOLD.yaml                    (scaffold §1.1–§1.7)
-- {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml  (test-targeting index — priority queue for §2.1.A)
+- {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml  (depth test index — §1.8; §2.1 queue A)
+- {task_dir}/SCAFFOLD_CORNER_DESIGN.yaml      (breadth test index — §1.9; §2.1 queue B)
 - {task_dir}/workspace/PRD.md                 (the contract under test)
 
 Generate complete test infrastructure in {task_dir}/test_helpers/ and test cases in {task_dir}/test_suite/. Both layers are part of the test artifact and both must be PRD-faithful:
@@ -348,7 +350,8 @@ When complete, the task directory will contain:
 ```
 tasks/{task_name}/
 ├── SCAFFOLD.yaml                          # Structured specification (§1.1–§1.7)
-├── SCAFFOLD_DIFFICULTY_DESIGN.yaml        # Test-targeting index (withheld from PRD gen)
+├── SCAFFOLD_DIFFICULTY_DESIGN.yaml        # Depth test index — §1.8 (withheld from PRD gen)
+├── SCAFFOLD_CORNER_DESIGN.yaml            # Breadth test index — §1.9 (withheld from PRD gen)
 ├── test_helpers/                          # Test infrastructure
 │   ├── __init__.py
 │   ├── types.py
