@@ -16,15 +16,20 @@
 #   2. translate runner's results.json -> Harbor's reward.json shape
 #
 # Tunables (env, with defaults):
-#   PORT=10000            server port (passed to start.sh via env)
 #   STARTUP_TIMEOUT=60    seconds to wait for the server to respond
 #   PER_TEST_TIMEOUT=10   pytest --timeout=<n> per test
+#   ISOLATION=per-test-server
+#                         restart the API server before each pytest test
+#
+# The server port is auto-picked by prd-bench-local-run from
+# ~/.cache/prd-bench-local-runner/ports.tsv and released on exit. start.sh
+# receives it via $PORT (injected into the subprocess env by the runner).
 
 set -uo pipefail
 
-PORT="${PORT:-10000}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-60}"
 PER_TEST_TIMEOUT="${PER_TEST_TIMEOUT:-10}"
+ISOLATION="${ISOLATION:-per-test-server}"
 
 # Harbor bind-mounts /logs/{agent,verifier} → trial_dir/{agent,verifier}, so
 # anything we write here lands in the trial output. Everything else in the
@@ -48,12 +53,12 @@ echo "[verifier] installing prd-bench-local-runner + pytest deps"
 pip install --quiet -e /tests/prd-bench-local-runner pytest pytest-timeout
 
 echo "[verifier] handing off to prd-bench-local-run"
-PORT="$PORT" prd-bench-local-run \
+prd-bench-local-run \
   --start-command "cd /app/implementation && bash start.sh" \
   --test-dir       /tests/test_suite \
-  --api-url        "http://localhost:${PORT}" \
   --timeout        "$STARTUP_TIMEOUT" \
   --test-timeout   "$PER_TEST_TIMEOUT" \
+  --isolation      "$ISOLATION" \
   --results-file   "$RESULTS_JSON" \
   || true   # don't propagate non-zero exit; we translate it via reward.json
 

@@ -1,4 +1,4 @@
-# `harbor_tasks/_lib/` — shared Harbor task scaffolding
+# `harbor_utils/` — shared Harbor task scaffolding
 
 This directory holds the **reusable** pieces that every Harbor task in
 `harbor_tasks/` consumes. Per-task directories should be as thin as possible.
@@ -6,7 +6,7 @@ This directory holds the **reusable** pieces that every Harbor task in
 ## Layout
 
 ```
-_lib/
+harbor_utils/
 ├── prepare.sh                       # single-task hydrator: vendors shared + task assets
 ├── prepare-all.sh                   # bulk hydrator: iterate every tasks/task_*/
 └── shared/
@@ -22,22 +22,22 @@ _lib/
         └── solve.sh                 # oracle: copy reference impl into /app/implementation
 ```
 
-## How a Harbor task uses `_lib/`
+## How a Harbor task uses `harbor_utils/`
 
 Nothing under `harbor_tasks/<task-name>/` is committed — the repo-root
 `.gitignore` rule `harbor_tasks/task_*/` excludes the whole tree. The
 two config files Harbor expects (`task.toml`, `README.md`) are written
-from default templates in `_lib/prepare.sh` the first time you hydrate.
+from default templates in `harbor_utils/prepare.sh` the first time you hydrate.
 
 Adding a new task is purely a `tasks/<name>/` exercise. To use it through
 Harbor, hydrate:
 
 ```bash
 # single task — directory auto-created if missing
-bash harbor_tasks/_lib/prepare.sh harbor_tasks/<task-name>/
+bash harbor_utils/prepare.sh harbor_tasks/<task-name>/
 
 # every tasks/task_*/ at once
-bash harbor_tasks/_lib/prepare-all.sh
+bash harbor_utils/prepare-all.sh
 ```
 
 Subsequent runs are non-destructive for `task.toml` / `README.md` (so manual
@@ -46,16 +46,16 @@ sources of truth.
 
 The hydrator copies / vendors:
 
-- `instruction.md`                    ← `_lib/shared/agent/instruction.md`
-- `environment/Dockerfile`            ← `_lib/shared/environment/Dockerfile`
+- `instruction.md`                    ← `harbor_utils/shared/agent/instruction.md`
+- `environment/Dockerfile`            ← `harbor_utils/shared/environment/Dockerfile`
 - `environment/INSTRUCTION.md`        ← source task `workspace/INSTRUCTION.md`
 - `environment/PRD.md`                ← source task `workspace/PRD.md`
-- `tests/test.sh`                     ← `_lib/shared/tests/test.sh`
-- `tests/results_to_reward.py`        ← `_lib/shared/tests/results_to_reward.py`
+- `tests/test.sh`                     ← `harbor_utils/shared/tests/test.sh`
+- `tests/results_to_reward.py`        ← `harbor_utils/shared/tests/results_to_reward.py`
 - `tests/test_suite/`                 ← source task `test_suite/`
 - `tests/test_helpers/`               ← source task `test_helpers/`
 - `tests/prd-bench-local-runner/`     ← repo root `prd-bench-local-runner/`
-- `solution/solve.sh`                 ← `_lib/shared/solution/solve.sh`
+- `solution/solve.sh`                 ← `harbor_utils/shared/solution/solve.sh`
 - `solution/implementation/`          ← source task `workspace/implementation/`
 
 ## The agent contract

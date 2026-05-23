@@ -6,12 +6,12 @@
 #  作用
 #  ----
 #  扫描 <repo>/tasks/task_*/，对每个任务在 <repo>/harbor_tasks/<task>/ 下
-#  做一次完整 hydrate（必要时 mkdir，然后调 _lib/prepare.sh）。
+#  做一次完整 hydrate（必要时 mkdir，然后调 harbor_utils/prepare.sh）。
 #  适合"一次性把整个仓库的任务全转成 Harbor 格式"。
 #
 #  用法
 #  ----
-#      bash harbor_tasks/_lib/prepare-all.sh
+#      bash harbor_utils/prepare-all.sh
 #
 #  约定
 #  ----
@@ -24,7 +24,7 @@
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$LIB_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$LIB_DIR/.." && pwd)"
 TASKS_DIR="$REPO_ROOT/tasks"
 HARBOR_DIR="$REPO_ROOT/harbor_tasks"
 

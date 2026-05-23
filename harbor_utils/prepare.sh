@@ -10,26 +10,26 @@
 #
 #  2 个配置文件 task.toml / README.md 在缺失时按默认模板自动生成（已存在则
 #  不动，保留 timeout 等手调值）。整个 harbor_tasks/task_*/ 在仓库根的
-#  .gitignore 里被整目录忽略，所以这些文件都不进 git —— 永远以 _lib/ 和
-#  tasks/ 为唯一真源，跑一遍 prepare.sh / prepare-all.sh 就能完全重建。
+#  .gitignore 里被整目录忽略，所以这些文件都不进 git —— 永远以 harbor_utils/
+#  和 tasks/ 为唯一真源，跑一遍 prepare.sh / prepare-all.sh 就能完全重建。
 #
 #  剩余所有运行时文件从 3 个来源拷进去：
 #
-#      来源 A: harbor_tasks/_lib/shared/          (通用模板，跨任务共享)
+#      来源 A: harbor_utils/shared/               (通用模板，跨任务共享)
 #      来源 B: tasks/<原任务>/                    (任务专属内容，由 task.toml 里
 #                                                  [metadata].source_task 指定)
 #      来源 C: prd-bench-local-runner/            (测试时 pytest 依赖的 Python 包)
 #
 #  拷出来的内容全部在任务目录的 .gitignore 里 —— git 不跟踪，每次 prepare.sh
-#  跑一遍重新生成，永远以 _lib/ 和原任务为唯一真源。
+#  跑一遍重新生成，永远以 harbor_utils/ 和原任务为唯一真源。
 #
 #  使用方式
 #  --------
 #  单任务：
-#      bash harbor_tasks/_lib/prepare.sh harbor_tasks/<task-name>/
+#      bash harbor_utils/prepare.sh harbor_tasks/<task-name>/
 #
 #  批量（所有 tasks/task_*/ 一次过转成 harbor_tasks/）：
-#      bash harbor_tasks/_lib/prepare-all.sh
+#      bash harbor_utils/prepare-all.sh
 #
 #  即把任务目录的绝对/相对路径当参数传进来，剩下的全靠脚本里的约定推断。
 #
@@ -37,7 +37,7 @@
 #  ----
 #  - 任务目录里必须有 task.toml，且 [metadata].source_task 指向 tasks/<原任务名>
 #  - harbor 任务名 == 原任务名（basename 相同）—— 这就是 source_task 的唯一真源
-#  - 仓库根 = 这个脚本上两级 (harbor_tasks/_lib/../../)
+#  - 仓库根 = 这个脚本上一级 (harbor_utils/../)
 #  - prd-bench-local-runner/ 永远在仓库根
 #  - host 上只要有 bash + rsync（不依赖 python / tomllib）
 # =============================================================================
@@ -58,14 +58,14 @@ fi
 # 转成绝对路径，免得后面 cp/rsync 时被相对路径坑
 HARBOR_TASK_DIR="$(cd "$HARBOR_TASK_DIR" && pwd)"
 
-# 这个脚本自己的所在目录（= harbor_tasks/_lib/）
+# 这个脚本自己的所在目录（= harbor_utils/）
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 通用模板根目录（= harbor_tasks/_lib/shared/）
+# 通用模板根目录（= harbor_utils/shared/）
 SHARED_DIR="$LIB_DIR/shared"
 
-# 仓库根（= harbor_tasks/_lib/ 的上两级）
-REPO_ROOT="$(cd "$LIB_DIR/../.." && pwd)"
+# 仓库根（= harbor_utils/ 的上一级）
+REPO_ROOT="$(cd "$LIB_DIR/.." && pwd)"
 
 # 测试框架包的源头（永远在仓库根）
 LOCAL_RUNNER_DIR="$REPO_ROOT/prd-bench-local-runner"
@@ -118,7 +118,7 @@ if [[ ! -f "$HARBOR_TASK_DIR/README.md" ]]; then
 ## Run oracle
 
 \`\`\`bash
-harbor run -p harbor_tasks/$TASK_NAME -a oracle
+harbor run -p harbor_tasks/$TASK_NAME -a oracle -n 8 -k 8
 \`\`\`
 
 ## Run test
@@ -159,7 +159,7 @@ fi
 
 echo ">> preparing $(basename "$HARBOR_TASK_DIR")"
 echo "   source:  $SOURCE_TASK"
-echo "   shared:  harbor_tasks/_lib/shared/"
+echo "   shared:  harbor_utils/shared/"
 echo "   runner:  prd-bench-local-runner/"
 
 
@@ -188,7 +188,7 @@ RSYNC=(rsync -a --delete
 #
 # Harbor 起 trial 时读 instruction.md 当 agent 的 prompt 注入。我们用一份
 # 共享的通用模板（讲方法论、指引模型去读 /app/INSTRUCTION.md 和 /app/PRD.md），
-# 跨所有任务复用，单一真源在 _lib/shared/agent/instruction.md。
+# 跨所有任务复用，单一真源在 harbor_utils/shared/agent/instruction.md。
 # -----------------------------------------------------------------------------
 
 cp "$SHARED_DIR/agent/instruction.md" "$HARBOR_TASK_DIR/instruction.md"
@@ -202,8 +202,8 @@ cp "$SHARED_DIR/agent/instruction.md" "$HARBOR_TASK_DIR/instruction.md"
 # `COPY . /app/`，所以 environment/ 里的 INSTRUCTION.md 和 PRD.md 会被一起
 # 拷进容器的 /app/，agent 进去就能读到。
 #
-#   environment/Dockerfile     ← 通用模板 (_lib)
-#   environment/.dockerignore  ← 通用模板 (_lib)
+#   environment/Dockerfile     ← 通用模板 (harbor_utils)
+#   environment/.dockerignore  ← 通用模板 (harbor_utils)
 #   environment/INSTRUCTION.md ← 任务专属 (原任务的 workspace/)
 #   environment/PRD.md         ← 任务专属 (原任务的 workspace/)
 # -----------------------------------------------------------------------------
@@ -221,8 +221,8 @@ cp "$SOURCE_TASK_DIR/workspace/PRD.md"         "$HARBOR_TASK_DIR/environment/PRD
 #
 # Harbor 在评测阶段会把 tests/ 整个挂到容器的 /tests，然后跑 tests/test.sh。
 #
-#   tests/test.sh                ← 通用模板 (_lib)：调 prd-bench-local-run → 转 reward
-#   tests/results_to_reward.py   ← 通用模板 (_lib)：local-runner 的 results.json → Harbor reward.json
+#   tests/test.sh                ← 通用模板 (harbor_utils)：调 prd-bench-local-run → 转 reward
+#   tests/results_to_reward.py   ← 通用模板 (harbor_utils)：local-runner 的 results.json → Harbor reward.json
 #   tests/test_suite/            ← 任务专属 (原任务)：12 个 pytest 模块
 #   tests/test_helpers/          ← 任务专属 (原任务)：API client / fixtures / 等
 #   tests/prd-bench-local-runner/← 仓库根的测试框架包 (test_helpers 依赖它)
@@ -246,7 +246,7 @@ chmod +x "$HARBOR_TASK_DIR/tests/test.sh"
 # 实现搬到 /app/implementation/。用来冒烟测：跑一遍 oracle，如果 reward=1.0
 # 说明评测链路通了；reward<1.0 说明 test.sh / 参考实现自己有问题。
 #
-#   solution/solve.sh        ← 通用模板 (_lib)：cp /solution/implementation/* /app/
+#   solution/solve.sh        ← 通用模板 (harbor_utils)：cp /solution/implementation/* /app/
 #   solution/implementation/ ← 任务专属 (原任务的 workspace/implementation/)
 # -----------------------------------------------------------------------------
 
