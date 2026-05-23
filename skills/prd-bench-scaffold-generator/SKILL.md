@@ -17,7 +17,7 @@ User provides two things:
 
 ### Output
 
-Two YAML files written into the user-specified directory, in this order:
+Three YAML files written into the user-specified directory, in this order:
 
 **1. `SCAFFOLD.yaml`** — §1.0 through §1.7 plus preamble keys:
 
@@ -36,11 +36,13 @@ errors:                      # §1.6: Error Code Catalog
 roles:                       # §1.7: RBAC Matrix
 ```
 
-**2. `SCAFFOLD_DIFFICULTY_DESIGN.yaml`** — single top-level key `scaffold_difficulty_design:` (§1.8: Test Targeting Index — summary of §1.1–§1.7 cross-referenced per Difficulty rule).
+**2. `SCAFFOLD_DIFFICULTY_DESIGN.yaml`** — single top-level key `scaffold_difficulty_design:` (§1.8: Test Targeting Index — sampled cross-reference of §1.1–§1.7 per Difficulty rule; 2 instances per rule).
 
-Do NOT emit `scaffold_difficulty_design:` as a top-level key inside `SCAFFOLD.yaml` — it lives only in the second file.
+**3. `SCAFFOLD_CORNER_DESIGN.yaml`** — single top-level key `scaffold_corner_design:` (§1.9: enumerative coverage of every other testable claim the scaffold's §1.1–§1.7 surface declares, beyond §0.5's nine Difficulty Rules).
 
-For completed examples, see the `examples/` directory. For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tables-template.yaml).
+Do NOT emit `scaffold_difficulty_design:` or `scaffold_corner_design:` as top-level keys inside `SCAFFOLD.yaml` — they live only in their respective files.
+
+For completed examples, see the `examples/` directory. These examples are format and structure references only; they are NOT normative and may lag behind the current rules in this skill. If an example conflicts with any instruction, hard constraint, or checklist item in this file, the skill text wins and the generated scaffold MUST satisfy the current skill exactly. For a blank template, see [examples/seed-tables-template.yaml](examples/seed-tables-template.yaml).
 
 ## Generation Checklist
 
@@ -57,7 +59,8 @@ For completed examples, see the `examples/` directory. For a blank template, see
 - [ ] 1.6: Error Code Catalog
 - [ ] 1.7: RBAC Matrix
 - [ ] 1.8: Scaffold Difficulty Design (Test Targeting Index) → destination file `SCAFFOLD_DIFFICULTY_DESIGN.yaml`
-- [ ] Final: Quality + Diversity check (§Quality Checklist) across both files
+- [ ] 1.9: Scaffold Corner Design (Coverage Index for Non-Difficulty Tests) → destination file `SCAFFOLD_CORNER_DESIGN.yaml`
+- [ ] Final: Quality + Diversity check (§Quality Checklist) across all three files
 ```
 
 ---
@@ -255,7 +258,7 @@ entities:
 - Entity count is bounded below by §0.4 (≥6 entities, ≥12 endpoints). If the scenario is too small to naturally reach that floor, expand scope — add subsidiary workflows, auxiliary entities, or cross-cutting concerns — rather than ship an under-specified benchmark. Do not inflate above what the scenario supports either; pick the Advanced vs Expert band per §0.4, and remember: difficulty comes from how tightly the entities you have interact, not from how many you list.
 - At least one entity with computed fields that derive from cross-entity data
 - Field names must be explicit — downstream PRD will reference them in prose
-- `common_fields: true` expands to four fields on the entity: `id` (**server-minted UUID with no type prefix** — e.g., `"8a3e1c0b-2f4d-4a91-9c8b-12e7b6a0f1d2"`, NOT `"ord_8a3e1c0b-…"`), `created_at` (ISO 8601 UTC, three fractional digits), `updated_at` (same format, refreshed on every mutation including cascaded side effects), `version` (integer, starts at `1`, increments by one on every mutation). When `common_fields: false`, the entity carries only `id` and `created_at` — use this for immutable or append-only resources (event logs, pairings, ledger entries, configuration snapshots).
+- `common_fields: true` expands to four fields on the entity: `id` (**server-minted UUID with no type prefix** — e.g., `"8a3e1c0b-2f4d-4a91-9c8b-12e7b6a0f1d2"`, NOT `"ord_8a3e1c0b-…"`; identity only, strictly forbidden in selector/ranking/tie-break/fallback decisions), `created_at` (ISO 8601 UTC, three fractional digits; use this instead of `id` when a common-field fallback is required), `updated_at` (same format, refreshed on every mutation including cascaded side effects), `version` (integer, starts at `1`, increments by one on every mutation). When `common_fields: false`, the entity carries only `id` and `created_at` with the same rule: `id` identifies resources but MUST NOT decide observable business results.
 - Consider whether the entity is a **resource** (has lifecycle), **event** (append-only log), or **configuration** (rarely changes)
 
 **Topology patterns:**
@@ -389,6 +392,9 @@ calculations:
 - **Order sensitivity** — processing the same items in different orders yields different results
 - **Boundary precision** — exact behavior at threshold boundaries (does 6000 trigger, or 6001?)
 
+**No random fields in business decisions — use `created_at`, never `id`, as fallback (mandatory):**
+Any selector, ranking, tie-break, allocation order, batch-processing order, cascade order, conflict-resolution rule, or chronological replay order that can change an observable API result MUST NOT use random properties as decision inputs. UUID/random `id` values are strictly forbidden in business decisions, even as a precision fallback or final tie-break. When a precise fallback over common fields is needed, use `created_at`, never `id`. Random identifiers may identify resources in paths and foreign keys, but they MUST NEVER decide winners, processing order, rounding remainders, or side-effect order. A scaffold that uses UUID/random `id` for observable decision-making MUST be rejected.
+
 ### 1.4 Validation Rules Table (Ordered by Priority)
 
 ```yaml
@@ -442,12 +448,13 @@ endpoints:
 ```
 
 **Design principles:**
-- **Testability-completeness (value-level principle, overrides convenience).** The scaffold owes the test layer a reachable path to every state it declares. Walk every state in your state machines and ask: *"can a test reach this from empty-DB using only the endpoints I've listed?"* If a state is gated by wall-clock time, a background sweep, or an external event, you MUST include the test-driving endpoint that makes it reachable — e.g., `POST /_clock/advance` for any time-gated transition (`now() >= X`), `POST /_sweep/run` for any automatic sweep, `POST /_events/emit` for any external-event trigger. Declaring behavior without also declaring the API surface needed to exercise it is an **incomplete contract** — downstream tests will be forced to skip, and skips are forbidden by the unit-test-generator. A scaffold is judged not only by what behavior it specifies, but by whether every specified behavior can be *reached, observed, and asserted* through the declared API.
-- URL structure reflects entity topology (nested for hierarchical, flat for peer)
-- Include action endpoints (e.g., `/activate`, `/cancel`, `/approve`) — not just CRUD
-- Mutation endpoints accept optional `version?` for OCC, unless resource is immutable
-- Not every entity needs full CRUD — immutable resources may only have create + read
-- Consider whether list endpoints need filtering/sorting parameters
+- **Testability-completeness (value-level principle, overrides convenience).** The scaffold owes the test layer a reachable path to every state it declares. Walk every state in your state machines and ask: *"can a test reach this from empty-DB using only the endpoints I've listed?"* This principle is **operationally enforced** at §1.8 generation time via the `setup_api_calls:` cross-check (see §1.8 per-instance contract item 3): if any difficulty-design instance's precondition cannot be reached by an ordered chain of §1.5 endpoint calls, return here and reshape §1.5 per this **priority ladder**, in order:
+
+  1. **Compose existing endpoints first.** Many "missing" capabilities are already reachable via composition of §1.5 calls already declared — the gap was in the search, not the surface. Try this first.
+  2. **Add a general business endpoint.** When no chain of existing endpoints reaches the precondition, add an endpoint that fits the domain's real-world admin/operator surface — e.g., `POST /members/{id}/wallet/adjustments` rather than `POST /_seed/wallet`. A business endpoint serves both the test and any real-world admin tool, and keeps the API contract honest about which operations actually exist in production.
+  3. **Add a custom test-driving endpoint (last resort).** When no plausible business endpoint exists for the operation (e.g., advancing the system clock, firing a synthetic webhook, injecting a no-show strike history), declare one under the `/_<name>` namespace (`POST /_clock/advance`, `POST /_events/emit`, `POST /_inject/...`). Declare it in §1.5 like any other endpoint — path, method, role, inputs, side effects. The leading underscore marks it as outside the public business surface but inside the official scaffold contract; downstream skills (PRD-, unit-test-, and implementation-generator) treat it as a first-class declared endpoint, not a back-door.
+
+  Silently weakening the §1.8 setup or papering over the gap is forbidden.
 
 **Endpoint pattern variety:**
 
@@ -529,30 +536,136 @@ scaffold_difficulty_design:
           <ONE falsifiable sentence pinning what structurally distinguishes this instance,
           naming the specific distinction §0.5 requires of this rule_id.>
         test_recipe:
-          setup:                               # minimal DB + clock state from empty DB
+          setup:                               # natural-language description of the precondition state (entities, statuses, balances, clock position)
             - "<precondition 1>"
-          trigger:                             # API call(s) or clock advance(s)
-            - "<endpoint invocation 1>"
-          assert:                              # one pinned observable outcome per line
+          setup_api_calls:                     # ordered chain of §1.5 endpoint calls that drives empty-DB → setup state above; each list entry is a STRUCTURED call object (not a prose string), so every placeholder traces back to a concrete `captures:` produced by an earlier call
+            - call: "POST /<path>"             # method + path; path-templated ids reference earlier captures via ${var}
+              payload: { field: <literal_or_${var}>, ... }   # field values are LITERALS the author pins UNLESS the value can only come from a prior call's response, in which case ${var} references a captures binding from an earlier line
+              as: <RoleName>                   # X-User-Role header, exactly as declared in §1.7
+              as_user_id: <literal_or_${var}>  # X-User-ID header; OMIT for opaque roles when the test does not pin an audit id; REQUIRED for entity_backed roles where ownership matters (e.g., Member acting on own resource → as_user_id: ${m_ca_id})
+              captures: { <var_name>: <jsonpath> }  # bindings extracted from this call's response envelope (e.g., `m_ca_id: $.data.id`, `tok_ca: $.data.verification_token`); name MUST be unique within this instance; OMIT the whole key when nothing later needs the response
+            - call: "POST /<path>"
+              payload: { ... }
+              as: <RoleName>
+          trigger:                             # the API call(s) under test — same structured form as setup_api_calls; captures permitted when later trigger steps or asserts reference the response
+            - call: "POST /<path>"
+              payload: { ... }
+              as: <RoleName>
+              as_user_id: <literal_or_${var}>
+              captures: { <var_name>: <jsonpath> }
+          assert:                              # one pinned observable outcome per line; field references may use ${var} bound earlier
             - "<comparison or invariant 1>"
       - name: <instance_2_lower_snake_case>
         grounds: [<refs>]
         distinguishing_aspect: "<…>"
-        test_recipe: { setup: [...], trigger: [...], assert: [...] }
+        test_recipe: { setup: [...], setup_api_calls: [...], trigger: [...], assert: [...] }
   - rule_id: combinatorial_formula
     instances: [ <one or more, per §0.5 minimum> ]
   # … seven more rule_id blocks, each meeting its own §0.5 minimum …
 ```
 
+**Worked example of the structured form** (this is the format every instance MUST emit):
+
+```yaml
+setup_api_calls:
+  - call: "POST /subscription-plans"
+    payload: { tier: "PLUS", monthly_fee_cents: 6000, included_class_credits: 8, pt_discount_pct: 0.25 }
+    as: PlatformAdmin
+    captures: { plus_plan_id: $.data.id }
+  - call: "POST /stores"
+    payload: { name: "CA Store", state_code: "CA", capacity: 100 }
+    as: PlatformAdmin
+    captures: { store_ca_id: $.data.id }
+  - call: "POST /_clock/advance"
+    payload: { to_iso8601: "2026-06-01T00:00:00Z" }
+    as: PlatformAdmin
+  - call: "POST /members/register"
+    payload: { email: "m_ca@x.com", password: "p", full_name: "M CA", state_code: "CA", plan_id: "${plus_plan_id}", home_store_id: "${store_ca_id}", coupon_code: "FLAT10" }
+    as: Anonymous
+    captures: { m_ca_id: $.data.id, sub_ca_id: $.data.subscription_id, tok_ca: $.data.verification_token }
+  - call: "POST /_payments/simulate"
+    payload: { subscription_id: "${sub_ca_id}", outcome: "SUCCEEDED" }
+    as: PlatformAdmin
+  - call: "POST /members/${m_ca_id}/verify"
+    payload: { verification_token: "${tok_ca}" }
+    as: Anonymous
+
+trigger:
+  - call: "POST /members/${m_ca_id}/cancel"
+    payload: { refund_destination: "WALLET" }
+    as: Member
+    as_user_id: "${m_ca_id}"
+
+assert:
+  - "Member.${m_ca_id}.wallet_credit_cents == 2733"
+  - "Member.${m_ca_id}.status == CANCELLED_PENDING"
+```
+
+Two things this form mechanically enforces:
+
+1. **Every `${var}` traces back to a `captures:` line earlier in the same instance.** If `${plus_plan_id}` appears in any `payload:` / `as_user_id:` / path template but no earlier `captures:` binds it, the scaffold has a hole that demands action via the §1.5 priority ladder (compose → business → test-driving). Bare placeholder strings like `<plus_plan_id>` smuggled into prose can no longer hide an absent producing endpoint.
+2. **Every captured field is declared in §1.5.** If `captures: { tok_ca: $.data.verification_token }` references `verification_token` but the §1.5 register endpoint's `output:` does not list that field, the scaffold has under-specified its response shape — return to §1.5 and add the field (or, if PRD truly doesn't surface it, add a test-driving endpoint to fetch it).
+
 **Instance counts**: §0.5 is authoritative. Quick reference — every rule has the same minimum: **≥ 2 instances → ≥ 18 instances total**, counted as `- name:` entries nested under `instances:`. A scaffold with 9 `rule_id`s each carrying a single instance = 9 instances = FAIL.
 
 **Per-instance contract:**
 1. Every `grounds:` entry MUST resolve to a declared element in §1.1–§1.6. A grounds entry naming a missing calculation, transition, validation, field, or race is a dangling claim — remove it or add the grounding.
-2. `test_recipe.setup + trigger + assert` together MUST reproduce the scenario from empty-DB state using only endpoints declared in §1.5. No wall-clock waits; time-gated setups use the clock-advance endpoint §1.5 already provides.
-3. `distinguishing_aspect` MUST be falsifiable — one sentence the test can turn into a concrete assertion, naming the specific distinction §0.5 requires of this `rule_id` (different entity domain, different error-category pair, etc.). No hedging ("may differ", "could vary").
-4. `name` MUST be unique across the whole `scaffold_difficulty_design` and stable across regenerations (tests cite it in their docstrings for audit).
-5. `assert:` entries MUST cite exact field names and literal values where possible (e.g., `Order.delivery_fee != Assignment.final_delivery_fee`; `Customer.wallet_balance unchanged after assignment creation`), not paraphrases.
-6. **Any `assert:` line referencing a numeric value derived from a formula MUST be a literal the scaffold author actually computed by code.** Pin the inputs in `setup:`, execute the relevant `calculations[].formula` as code (a short Python snippet against the formula and its `constants:`), and write the resulting literal into the assertion — e.g., `Order.delivery_fee == 5.40`, NOT `Order.delivery_fee == round(3.00 + ceil(2.0)*1.20 + 0, 2)` and NOT a rough estimate. Unresolved formulas, estimates, and "let the test-generator compute it" all propagate arithmetic errors into broken tests whose wrong expected value silently agrees with a wrong implementation. When in doubt, execute the formula.
+2. `test_recipe.setup + setup_api_calls + trigger + assert` together MUST reproduce the scenario from empty-DB state using only endpoints declared in §1.5. No wall-clock waits; time-gated setups use the clock-advance endpoint §1.5 already provides.
+3. **`setup_api_calls:` is mandatory, structured, and operationalises §1.5's testability-completeness audit.** Write the ordered sequence of API invocations that drives the system from empty-DB into the state described by `setup:`. Each entry MUST be a structured call object with the keys shown in the schema (`call`, `payload`, `as`, optional `as_user_id`, optional `captures`) — not a prose string. Each `call` MUST resolve to an endpoint declared in §1.5 (path, method, role exactly as §1.5 specifies); each `payload:` field MUST conform to that endpoint's `input:` schema. **Placeholder discipline:** every `${var}` referenced in any `payload:`, `as_user_id:`, or path template MUST be bound by a `captures:` block on an earlier line of the same instance. An unbound `${var}` is a missing-endpoint signal — handle it via the §1.5 priority ladder (fallback priority, NOT a sequence to execute — stop at the first rung that resolves the gap): **(1) compose existing endpoints first; (2) only if (1) fails, return to §1.5 and add a general business endpoint, then re-derive the chain; (3) only as last resort, when (1) and (2) both fail, add a test-driving endpoint under `/_<name>`.** Silently omitting `setup_api_calls:`, leaving prose strings instead of structured calls, leaving entries vague (e.g., `"create a member with wallet_credit_cents=500"` instead of the concrete POST chain that produces that balance), or smuggling unbound `${var}` placeholders into payloads are all forbidden — the chain must be directly executable by the downstream unit-test-generator.
+3a. **Literal-vs-placeholder discipline inside `payload:`.** A `payload:` field value MUST be a literal whenever the scaffold author can determine it at writing time — `state_code: "CA"`, `monthly_fee_cents: 6000`, `to_iso8601: "2026-06-01T00:00:00Z"`, enum members, fixed coupon codes, fixed dates. **The `${var}` form is reserved for values that can only come from a prior call's response**: server-minted ids, server-stamped timestamps, server-issued tokens. Pushing computable literals into placeholders ("let the test-generator figure it out") is the symmetric failure mode to leaving asserts as `round(...)` expressions (contract item 7) — both propagate "unresolved" downstream and produce broken tests whose wrong fixture silently agrees with a wrong implementation. When in doubt, write the literal.
+3b. **`captures:` MUST reference fields declared in §1.5's `output:` for that endpoint.** A capture like `captures: { tok_ca: $.data.verification_token }` is a claim that the §1.5 register endpoint exposes `verification_token` in its response. If §1.5 does not declare that field, either (a) return to §1.5 and add it to the endpoint's `output:`, or (b) add a separate read endpoint that surfaces it, or (c) add a test-driving endpoint that fetches it. Capturing an undeclared field is the same class of failure as referring to an undeclared endpoint — it forces downstream skills (PRD-, unit-test-, implementation-generator) to invent the contract.
+4. `distinguishing_aspect` MUST be falsifiable — one sentence the test can turn into a concrete assertion, naming the specific distinction §0.5 requires of this `rule_id` (different entity domain, different error-category pair, etc.). No hedging ("may differ", "could vary").
+5. `name` MUST be unique across the whole `scaffold_difficulty_design` and stable across regenerations (tests cite it in their docstrings for audit).
+6. `assert:` entries MUST cite exact field names and literal values where possible (e.g., `Order.delivery_fee != Assignment.final_delivery_fee`; `Customer.wallet_balance unchanged after assignment creation`), not paraphrases.
+7. **Any `assert:` line referencing a numeric value derived from a formula MUST be a literal the scaffold author actually computed by code.** Pin the inputs in `setup:`, execute the relevant `calculations[].formula` as code (a short Python snippet against the formula and its `constants:`), and write the resulting literal into the assertion — e.g., `Order.delivery_fee == 5.40`, NOT `Order.delivery_fee == round(3.00 + ceil(2.0)*1.20 + 0, 2)` and NOT a rough estimate. Unresolved formulas, estimates, and "let the test-generator compute it" all propagate arithmetic errors into broken tests whose wrong expected value silently agrees with a wrong implementation. When in doubt, execute the formula.
+
+### 1.9 Scaffold Corner Design
+
+**Output**: a separate file `SCAFFOLD_CORNER_DESIGN.yaml` sibling to `SCAFFOLD.yaml`, with `scaffold_corner_design:` as its single top-level key.
+
+**Scope**: enumerate every testable claim the scaffold's §1.1–§1.7 surface declares that §1.8 does not already cover (required-field validation, state-machine invalid-from rejection, RBAC denial, FK integrity, response envelope, computed-field correctness, cross-entity cascade, OCC stale-version conflict, etc.). §1.8 is the depth probe (9 hard reasoning rules × 2 instances); §1.9 is the breadth probe.
+
+**Core value**: §1.9 generation IS a §1.5 audit pass. Same gates as §1.8 — `setup_api_calls` reachability, literal lock, §1.5 priority ladder. §1.9 is breadth, not a weaker tier.
+
+**Taxonomy**: read `references/claim-extraction-guide.md` (sibling to this SKILL.md) first. The guide's nine sections (Entities / State Machines / Calculations / Validations / Endpoints / Errors / RBAC / Cross-Cutting Complexity Layers / Consistency Model) ARE §1.9's `section:` values; the per-section claim-type rows ARE §1.9's `claim_type:` values. Do not invent additional categories or `claim_type:` names.
+
+**Coverage target**: the walk is a *vehicle* for iterating §1.5 against `setup_api_calls` — not an end in itself. As you traverse the guide row-by-row against this scaffold's §1.1–§1.7 surface and author each corner instance (error_id triggers, invalid-from rejections, RBAC denials, FK integrity, response envelope, etc.), the act of writing its `setup_api_calls` chain forces §1.5 to be challenged: every precondition the chain needs must be producible by composing §1.5 calls; every gap triggers the priority ladder. The output is two-way — an enumerated set of corner instances AND a §1.5 surface provably capable of driving empty-DB into each instance's precondition (**test-state reachability**, guaranteed). What makes §1.9 valuable is this iteration, not the enumeration count. Skip non-applicable rows without ceremony; emit `excluded_because:` stubs when §1.8 already covers the corner.
+
+**Schema:**
+
+```yaml
+scaffold_corner_design:
+  - section: state_machines
+    instances:
+      - name: cancel_booking_from_already_cancelled_returns_invalid_state
+        claim_type: invalid_transition                      # from claim-extraction-guide's per-section table
+        grounds: [state_machines.Booking.transitions.CANCELLED_to_CANCELLED]
+        distinguishing_aspect: "Booking already CANCELLED — second cancel must fail with ERR_INVALID_STATE; no side effects fire."
+        test_recipe:
+          setup: ["<precondition prose>"]
+          setup_api_calls: [ <structured calls; same form as §1.8> ]
+          trigger: [ <structured call> ]
+          assert: ["<one observable per line, literal values>"]
+
+      - name: error_subscription_inactive_on_create_booking   # already exercised by §1.8 → stub
+        claim_type: violation_to_error
+        grounds: [errors[ERR_SUBSCRIPTION_INACTIVE]]
+        excluded_because:
+          difficulty_instance: cross_entity_state_dependency / booking_requires_subscription_active_or_grace
+          rationale: "Asserted as the failure path of the named §1.8 instance."
+        # NO test_recipe.
+```
+
+**Per-instance contract**: same seven-point contract as §1.8 (clauses 1–7) — grounds resolvability; `setup_api_calls` structured form with placeholder closure, literal-vs-placeholder discipline, captures-resolve-to-§1.5-`output:`; `distinguishing_aspect` falsifiability; `name` uniqueness; `assert:` specificity with exact field names and literal values; formula-derived asserts pre-computed as literals. `name` MUST be unique across the union of `scaffold_difficulty_design` and `scaffold_corner_design`.
+
+**`excluded_because:` stubs**: when a corner is already covered by a §1.8 instance, emit a stub (`name` + `claim_type` + `grounds` + `excluded_because: { difficulty_instance, rationale }`); `test_recipe` is forbidden. The cited `difficulty_instance` MUST exist by `name` in `SCAFFOLD_DIFFICULTY_DESIGN.yaml`.
+
+**§1.5 linkage — same priority ladder as §1.8.** When a corner instance's `setup_api_calls` hits an unreachable precondition (unbound `${var}`, `captures:` referring to a field §1.5 doesn't declare, or a setup state no chain of §1.5 calls can produce), try the ladder in order and **stop at the first rung that resolves the gap** — this is fallback priority, NOT a sequence to execute:
+1. **Compose existing endpoints** — re-search §1.5 for a chain you missed; many "missing" capabilities are already reachable via composition.
+2. **Only if (1) fails** — return to §1.5 and add a general business endpoint that fits the domain's real-world admin/operator surface, then re-derive the chain.
+3. **Only as last resort, when (1) and (2) both fail** — add a `/_<name>` test-driving endpoint to §1.5.
+
+Reshape §1.5 first, then re-derive the chain. Weakening the corner, papering over with prose, or marking it `excluded_because:` when no §1.8 instance covers it are forbidden — treat §1.9 generation as a §1.5 audit pass.
 
 ---
 
@@ -572,8 +685,8 @@ Before finalizing the YAML:
 - [ ] Side effect chains are complete (if A→B→C, all three steps are documented)
 - [ ] Every non-idempotent operation that can race has a `concurrency_rules` entry with required `error_id` and `http_status`
 - [ ] Every error code referenced in `concurrency_rules` also appears in §1.6 Error Catalog
-- [ ] File split honored: `scaffold_difficulty_design:` appears only as the top-level key of `SCAFFOLD_DIFFICULTY_DESIGN.yaml`, and never inside `SCAFFOLD.yaml`
-- [ ] Every `scaffold_difficulty_design[*].instances[*].grounds[*]` reference resolves to a declared element in `SCAFFOLD.yaml`'s §1.1–§1.6
+- [ ] File split honored: `scaffold_difficulty_design:` appears only as the top-level key of `SCAFFOLD_DIFFICULTY_DESIGN.yaml`, `scaffold_corner_design:` appears only as the top-level key of `SCAFFOLD_CORNER_DESIGN.yaml`, and neither appears inside `SCAFFOLD.yaml`
+- [ ] Every `instances[*].grounds[*]` reference (in either `scaffold_difficulty_design` or `scaffold_corner_design`) resolves to a declared element in `SCAFFOLD.yaml`'s §1.1–§1.7
 
 **Self-Consistency:**
 
@@ -584,8 +697,20 @@ Each declaration in the scaffold is an edge; self-consistency means both ends re
 - [ ] **Aggregate selection precision** — Every aggregation (`sum of`, `count of`, `max over`, `latest N`) MUST pin three elements: (a) source entity with explicit status filter, (b) time or index window with inclusive/exclusive boundary, (c) tie-break rule when the result is order-sensitive. "Sum of Fine.amount for subject whose settlement_status flipped PENDING→SETTLED" omits which PENDING fines enter the sweep and is insufficient.
 - [ ] **No fuzzy adjectives in constraint scopes** — Uniqueness constraints, filter clauses, precondition prose, and selector criteria MUST NOT use adjectives like "active", "valid", "live", "open", "current" as a stand-in for a status filter, nor "best", "next", "preferred", "top", "highest-ranked", "best-ranked" as a stand-in for a ranking rule. Write the enum set explicitly (`status IN {ACTIVE, SUSPENDED}`, not "active restaurants") and pin the ranking expression explicitly (sort key + tie-break, not "best available rider").
 - [ ] **Selector determinism** — Whenever the scaffold's prose resolves to "which entity" or "which entities" by description rather than by an explicit id supplied in the request (any field in any table — state_machines, calculations, validations, endpoints, concurrency_rules), the logic MUST pin: (a) the eligibility filter defining the candidate set as an explicit enum/predicate over entity fields; (b) the ranking expression (sort key, also over entity fields); (c) the tie-break rule when the ranking expression ties; (d) the fallback when the candidate set is empty (error_id or deferred-queue behavior). "Best X" / "next Y" / "the preferred Z" without these four elements is under-specified which leading to ambiguity.
+- [ ] **No random fields in business decisions — use `created_at`, never `id`, as fallback** — Random properties, especially UUID/random `id`, MUST NOT participate in any selector, ranking, tie-break, allocation order, batch-processing order, cascade order, conflict-resolution rule, or chronological replay order that affects response data or persisted state. This prohibition includes fallback ordering, final tie-breaks, and "deterministic" last resorts. If a precise common-field fallback is required, use `created_at ASC`; never use `id`. Any scaffold that uses UUID/random `id` for observable decision-making fails this checklist.
 - [ ] **Cross-entity reference resolvability** — Any precondition or side-effect that references another entity as "a linked X", "a related X", "the associated X", or "the corresponding X" MUST name the foreign-key path or pin the query selector. "A linked WorkOrder is in UNDER_REVIEW" without declaring `WorkOrder.related_order_id == Order.id` forces downstream generators to invent the link.
 - [ ] **Computation determinism** — Order-sensitive calculations MUST pin both sort key and tie-break. Multi-step rounding MUST pin the rounding order. Fields referenced inside `formula:` MUST be unambiguous — use the exact field name (`credit_balance_cents`), not paraphrases ("the customer's credit") that could resolve to either a provisional or a finalized field.
+
+**Test-recipe ↔ endpoint compatibility — applies to every `test_recipe` in BOTH `scaffold_difficulty_design` (§1.8) AND `scaffold_corner_design` (§1.9), audited against §1.5.**
+
+- [ ] Every `setup_api_calls` and `trigger:` entry is a STRUCTURED call object (keys: `call`, `payload`, `as`, optional `as_user_id`, optional `captures`).
+- [ ] Each `call:` resolves to a §1.5 endpoint — path, method, and `as:` role match exactly.
+- [ ] Each `payload:` conforms to that endpoint's `input:` schema (no unknown fields, no missing required fields, types match).
+- [ ] **Placeholder closure** — every `${var}` referenced in any `payload:`, `as_user_id:`, or path template is bound by a `captures:` block on an earlier line of the same instance. Zero unbound placeholders across both `scaffold_difficulty_design` and `scaffold_corner_design`. An unbound `${var}` means §1.5 is missing a producing endpoint — fix via the priority ladder (compose → business → test-driving), do not paper over.
+- [ ] **Captures resolve to §1.5 `output:` fields** — every JSONPath in `captures:` (e.g., `$.data.verification_token`) names a field that the called endpoint actually declares in its `output:`. Capturing an undeclared field is forbidden; declare the field in §1.5 or add a different endpoint that exposes it.
+- [ ] **Literal-vs-placeholder discipline** — `payload:` fields that the scaffold author can determine at writing time (state codes, fixed amounts, ISO timestamps, enum members, fixed coupon codes) are LITERALS; `${var}` is used ONLY for values that can only come from a prior call's response (server-minted ids, server-stamped timestamps, server-issued tokens).
+- [ ] Running `setup_api_calls` end-to-end actually produces the precondition described in `setup:` — every entity, status, balance, and clock position the `setup:` lines pin is the post-chain state, not a wish.
+- [ ] No `setup_api_calls` or `trigger:` is empty or placeholder prose. If `setup_api_calls` genuinely cannot be written without an unbound `${var}`, reshape §1.5 per the priority ladder (compose → business → test-driving) rather than papering over.
 
 **Difficulty (audit — the spec lives at §0.5):**
 - [ ] Every §0.5 rule (1–9) is satisfied by §1.1–§1.7, honoring its differentiation clause, and mirrored in `SCAFFOLD_DIFFICULTY_DESIGN.yaml` with ≥2 instances per rule (≥18 instances total)

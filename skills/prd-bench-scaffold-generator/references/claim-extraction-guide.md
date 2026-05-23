@@ -1,7 +1,10 @@
 # Claim Extraction Guide
 
-Comprehensive tables for extracting every testable claim from a scaffold. This is the reference
-for Stage 2, Step 2.1 of the SKILL.md generation process.
+Comprehensive tables for extracting every testable claim from a scaffold. This is the taxonomy
+reference for §1.9 (Scaffold Corner Design) — see SKILL.md §1.9 for how each row below becomes
+a `section:` / `claim_type:` pair in `SCAFFOLD_CORNER_DESIGN.yaml`. The guide enumerates
+*kinds* of claims; §1.9 generation walks this guide against the current scaffold's §1.1–§1.7
+to emit an instance per applicable row.
 
 ## Table of Contents
 
@@ -81,8 +84,6 @@ For **side effect patterns** (inspect each transition's `side_effects`):
 | Ledger sync | State change → ancestor's derived field updated; before/after reconcile |
 | Compensation | Undo transition → all original side effects reversed; no drift |
 | Conditional cascade | Side effect applied only when child is in specific state |
-
-> **PRD-First**: The scaffold may list side effects at higher precision than the PRD. Test only what the PRD specifies — if the PRD is vague where the scaffold is precise, the test must not hard-code the scaffold's specifics.
 
 ---
 
@@ -185,19 +186,15 @@ For **role model patterns** (`complexity_profile.role_model`):
 | `delegated_authority` | Delegation grant works; delegated permission expires/revocable; delegatee can act |
 | Segregation of duties | Same user cannot do step A and step B (if `X-User-ID` tracked) |
 
-> **PRD-First**: These role model claims apply only if the PRD describes the pattern. The scaffold's `role_model` is designer intent; the PRD's endpoint table is the implementation contract.
-
 ---
 
 ## From Cross-Cutting Complexity Layers
 
-> **PRD-First**: Use these layers as a checklist to find PRD claims you might have missed, not as an independent requirements source. If the PRD is silent on a layer, skip it.
-
-Inspect `complexity_profile.complexity_layers` and generate claims for each active layer that the PRD describes:
+Inspect `complexity_profile.complexity_layers` and generate claims for each active layer:
 
 | Layer | Claims to generate |
 |---|---|
-| `optimistic_concurrency` | Stale version write → conflict error; correct version → success; version increments on every write. **Does NOT imply race-condition tests** — only generate race tests if the PRD explicitly defines concurrent-operation outcomes (e.g., "only one succeeds", uniqueness constraints on creation). |
+| `optimistic_concurrency` | Stale version write → conflict error; correct version → success; version increments on every write. **Does NOT imply race-condition tests** — generate race tests only when the scaffold declares the concurrent-operation outcome in `concurrency_rules` (§1.2.1) with an explicit `error_id` and `serialization` clause (e.g., "only one succeeds", uniqueness constraints on creation). |
 | `cascading_side_effects` | N-level chain verified end-to-end; ordering sensitivity tested; partial failure handled |
 | `dual_variant_calculation` | Both variants produce expected results; delta on switch is correct |
 | `soft_delete` | Soft-deleted entity excluded from lists (default); included when filter specified; references still valid |
