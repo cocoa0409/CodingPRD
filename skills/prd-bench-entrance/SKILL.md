@@ -4,11 +4,12 @@ description: >
   Core orchestration entry point for the PRD benchmark pipeline. Given a scenario
   description, this skill drives the entire end-to-end flow: create task directory,
   generate scaffold YAML, generate PRD document, generate unit tests, generate
-  Python/Flask implementation, run Docker-based tests, and iterate until all tests
-  pass. Use this skill whenever the user wants to create a new PRD benchmark task
-  from a scenario, run the full benchmark pipeline, or says things like "create a
-  new benchmark for X", "generate a full task from this scenario", "run the PRD
-  bench pipeline", or "build a new task end to end".
+  Python/Flask implementation, run tests under `prd-bench-local-run --isolation
+  per-test-server` (server restarts before every pytest test), and iterate until
+  all tests pass. Use this skill whenever the user wants to create a new PRD
+  benchmark task from a scenario, run the full benchmark pipeline, or says things
+  like "create a new benchmark for X", "generate a full task from this scenario",
+  "run the PRD bench pipeline", or "build a new task end to end".
 ---
 
 # PRD Benchmark Entrance — End-to-End Pipeline Orchestrator
@@ -28,25 +29,25 @@ Scenario Description
 Step 1: Create task directory (bash, no subagent)
     │
     ▼
-Step 2: Subagent → prd-bench-scaffold-generator → SCAFFOLD.yaml + SCAFFOLD_DIFFICULTY_DESIGN.yaml
+Step 2: Subagent → prd-bench-scaffold-generator → SCAFFOLD.yaml + SCAFFOLD_DIFFICULTY_DESIGN.yaml + SCAFFOLD_CORNER_DESIGN.yaml
     │
     ▼
-Step 3: Copy Dockerfile.test + INSTRUCTION.md (bash, no subagent)
+Step 3: Copy INSTRUCTION.md (bash, no subagent)
     │
     ▼
 Step 4: Subagent → prd-bench-doc-generator → PRD.md
-        (reads SCAFFOLD.yaml only; SCAFFOLD_DIFFICULTY_DESIGN.yaml is withheld to prevent test-answer leakage into PRD)
+        (reads SCAFFOLD.yaml only; BOTH SCAFFOLD_DIFFICULTY_DESIGN.yaml and SCAFFOLD_CORNER_DESIGN.yaml are withheld to prevent test-answer leakage into PRD)
     │
     ▼
     ┌───────────────────────────────────────────┬───────────────────────────────────────────┐
     ▼ (concurrent — single assistant message)   ▼
 Step 5: Subagent → prd-bench-unit-test-generator  Step 6: Subagent → prd-bench-implementation-generator
-        → test_helpers/ + test_suite/                    → implementation/
+        → test_helpers/ + test_suite/                    → implementation/ (incl. start.sh)
         (reads SCAFFOLD + DIFFICULTY + PRD)              (reads SCAFFOLD + PRD + INSTRUCTION)
     │                                           │
     └───────────────────────┬───────────────────┘
                             ▼
-Step 7: One long-lived subagent owns the loop { docker test → diagnose → fix → rerun → ... → PASS }
+Step 7: One long-lived subagent owns the loop { prd-bench-local-run --isolation per-test-server → diagnose → fix → rerun → ... → PASS }
 ```
 
 ## Context Isolation Strategy
@@ -69,11 +70,11 @@ Agent({
 })
 ```
 
-**Concurrency**: Steps 2 → 4 are strictly sequential (the PRD depends on the scaffold). Steps 5 and 6 have no mutual dependency — they both read only SCAFFOLD.yaml + PRD.md (and INSTRUCTION.md for Step 6) — and MUST be launched concurrently. Concurrency on Claude Code requires a **single assistant message with two Agent tool uses**; two Agent calls across separate messages run sequentially. Besides throughput, concurrent launch gives physical isolation: Step 6's impl-gen subagent cannot read `test_suite/` because the directory does not yet exist when it starts.
+**Concurrency**: Steps 2 → 4 are strictly sequential (the PRD depends on the scaffold). Steps 5 and 6 have no mutual dependency — Step 5 reads SCAFFOLD.yaml + SCAFFOLD_DIFFICULTY_DESIGN.yaml + SCAFFOLD_CORNER_DESIGN.yaml + PRD.md; Step 6 reads SCAFFOLD.yaml + PRD.md + INSTRUCTION.md — and they MUST be launched concurrently. Concurrency on Claude Code requires a **single assistant message with two Agent tool uses**; two Agent calls across separate messages run sequentially. Besides throughput, concurrent launch gives physical isolation: Step 6's impl-gen subagent cannot read `test_suite/` because the directory does not yet exist when it starts.
 
 ## Execution Steps
 
-All paths below are relative to the project root (the directory containing `tasks/`, `skills/`, `prd-bench-docker-runner/`, etc.).
+All paths below are relative to the project root (the directory containing `tasks/`, `skills/`, etc.).
 
 ### Step 1: Create Task Directory (bash, no subagent)
 
@@ -103,19 +104,19 @@ Read the skill at {project_root}/skills/prd-bench-scaffold-generator/SKILL.md to
 Scenario description (use verbatim, do not modify):
 {scenario}
 
-Output files (both required):
-- {task_dir}/SCAFFOLD.yaml                    (§1.0–§1.7; no scaffold_difficulty_design key)
-- {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml  (single top-level key scaffold_difficulty_design)
+Output files (all three required):
+- {task_dir}/SCAFFOLD.yaml                    (§1.0–§1.7; neither scaffold_difficulty_design nor scaffold_corner_design key)
+- {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml  (single top-level key scaffold_difficulty_design — §1.8)
+- {task_dir}/SCAFFOLD_CORNER_DESIGN.yaml      (single top-level key scaffold_corner_design — §1.9)
 
-Hard constraint — DO NOT look at any sibling task under {project_root}/tasks/ (no ls, glob, grep, or read of other task_*/ directories, their SCAFFOLD.yaml, SCAFFOLD_DIFFICULTY_DESIGN.yaml, PRD.md, tests, or implementation). Generate the scaffold purely from the scenario description above plus the scaffold-generator skill's own specification. Peeking at existing tasks biases the output toward prior designs and defeats the purpose of a fresh scaffold.
+Hard constraint — DO NOT look at any sibling task under {project_root}/tasks/ (no ls, glob, grep, or read of other task_*/ directories, their SCAFFOLD.yaml, SCAFFOLD_DIFFICULTY_DESIGN.yaml, SCAFFOLD_CORNER_DESIGN.yaml, PRD.md, tests, or implementation). Generate the scaffold purely from the scenario description above plus the scaffold-generator skill's own specification. Peeking at existing tasks biases the output toward prior designs and defeats the purpose of a fresh scaffold.
 ```
 
-After the subagent completes, verify BOTH `SCAFFOLD.yaml` and `SCAFFOLD_DIFFICULTY_DESIGN.yaml` exist in `{task_dir}/`.
+After the subagent completes, verify all three — `SCAFFOLD.yaml`, `SCAFFOLD_DIFFICULTY_DESIGN.yaml`, and `SCAFFOLD_CORNER_DESIGN.yaml` — exist in `{task_dir}/`.
 
 ### Step 3: Copy Shared Files (bash, no subagent)
 
 ```bash
-cp ./Dockerfile.test ./tasks/{task_name}/Dockerfile.test
 cp ./INSTRUCTION.md ./tasks/{task_name}/workspace/INSTRUCTION.md
 ```
 
@@ -129,7 +130,7 @@ Read the skill at {project_root}/skills/prd-bench-doc-generator/SKILL.md to unde
 Input:  {task_dir}/SCAFFOLD.yaml
 Output: {task_dir}/workspace/PRD.md
 
-Hard constraint — DO NOT read {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml. That file is the test-targeting index; it is deliberately withheld from PRD generation so its worked example numbers and test_recipe asserts cannot leak into the PRD prose the implementer will read. Do not open it, grep it, or reference its contents in any way.
+Hard constraint — DO NOT read EITHER `{task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml` OR `{task_dir}/SCAFFOLD_CORNER_DESIGN.yaml`. Both files are test-targeting indices (§1.8 depth, §1.9 breadth); they are deliberately withheld from PRD generation so their worked example numbers and `test_recipe` asserts cannot leak into the PRD prose the implementer will read. Do not open them, grep them, or reference their contents in any way.
 ```
 
 ### Step 5: Generate Unit Tests (subagent)
@@ -137,16 +138,20 @@ Hard constraint — DO NOT read {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml. That
 Spawn a subagent with this prompt:
 
 ```
-Read the skill at {project_root}/skills/prd-bench-unit-test-generator/SKILL.md to understand the full generation specification. Then read all three inputs:
+Read the skill at {project_root}/skills/prd-bench-unit-test-generator/SKILL.md to understand the full generation specification. Then read all four inputs:
 - {task_dir}/SCAFFOLD.yaml                    (scaffold §1.1–§1.7)
-- {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml  (test-targeting index — priority queue for §2.1.A)
+- {task_dir}/SCAFFOLD_DIFFICULTY_DESIGN.yaml  (depth test index — §1.8; §2.1 queue A)
+- {task_dir}/SCAFFOLD_CORNER_DESIGN.yaml      (breadth test index — §1.9; §2.1 queue B)
 - {task_dir}/workspace/PRD.md                 (the contract under test)
 
-Generate complete test infrastructure in {task_dir}/test_helpers/ and test cases in {task_dir}/test_suite/. Both layers are part of the test artifact and both must be PRD-faithful:
-  - test_suite/: assertions must match PRD rules verbatim (exact error_ids, exact field names, exact state transitions, exact calculation formulas with correct precision).
-  - test_helpers/: fixtures, factories, and per-role header builders must construct preconditions that the PRD permits the request to be issued under. Concretely: if PRD requires ownership (e.g., "the acting restaurant must be the one that owns the order"), the role-header helper must mint an X-User-ID that resolves to the actual owner id, not a shared constant that would fail any ownership check regardless of implementation. If PRD declares a payload schema, factories must emit that exact schema.
+Generate complete test infrastructure in {task_dir}/test_helpers/ and test cases in {task_dir}/test_suite/.
 
-A fixture that forces the implementation to drop a PRD-required check in order to pass is a test bug the generator has the first opportunity to prevent.
+**Design-index-only contract.** The two design indices ARE the only test source. Every test you emit translates exactly one non-stub instance from §1.8 (queue A) or §1.9 (queue B); walking SCAFFOLD.yaml directly to invent baseline / smoke / RBAC / listing / pagination / common-field tests is forbidden. Every test's docstring MUST end with one line of the form:
+  Design: Difficulty/<rule_id>/<instance.name>      (queue A)
+  Design: Corner/<section>/<instance.name>          (queue B)
+copied verbatim from the source yaml's `name:`. Untagged tests, dual-tagged tests, or tags pointing to non-existent instances are Stage 2 failures.
+
+If an instance fails the PRD-first two-condition filter (no verbatim PRD coverage OR PRD does not uniquely-derive the asserted outcome), SKIP the instance — do not weaken, do not mark skip/xfail, do not emit a placeholder. Gaps stay gaps.
 ```
 
 ### Step 6: Generate Implementation (subagent)
@@ -159,7 +164,7 @@ Read the skill at {project_root}/skills/prd-bench-implementation-generator/SKILL
 - {task_dir}/SCAFFOLD.yaml
 - {task_dir}/workspace/PRD.md
 
-Generate a complete Python + Flask implementation with well-orgnized folder and file structure in {task_dir}/workspace/implementation/ including a Dockerfile.
+Generate a complete Python + Flask implementation in {task_dir}/workspace/implementation/ including a `start.sh` launcher. The implementation must boot cleanly from a fresh process on every invocation — the test harness uses `prd-bench-local-run --isolation per-test-server`, which kills and re-launches the server via `start.sh` before every individual pytest test.
 ```
 
 ### Step 7: Run Tests and Iterate
@@ -182,15 +187,22 @@ You are a PRD benchmark diagnostic expert. Your job is to iterate tests + fixes 
 Iteration step (you run this yourself each round):
 
 ```bash
-prd-bench-docker-run \
-  --task-dir {task_dir} \
-  --impl-dir {task_dir}/workspace/implementation \
-  --results-file {task_dir}/workspace/implementation/results.json
+prd-bench-local-run \
+  --start-command "cd {task_dir}/workspace/implementation && bash start.sh" \
+  --test-dir       {task_dir}/test_suite \
+  --isolation      per-test-server \
+  --timeout        60 \
+  --test-timeout   10 \
+  --results-file   {task_dir}/workspace/implementation/results.json
 ```
 
-Then read `{task_dir}/workspace/implementation/results.json`. Extract `passed`, `total`, `failed`, `skipped`.
-- If `passed == total` (i.e. `failed == 0 AND skipped == 0`) → **exit** with a summary report (see the Summary block at the end of this prompt).
-- Otherwise → apply the diagnostic protocol below to every failing AND every skipped test, make the fixes, rerun, and repeat. No iteration cap.
+The `--isolation per-test-server` flag kills and re-launches the API server (via `start.sh`) before every individual pytest test. This means there is no carry-over state between tests, so any "passes only because of state from a previous test" effect is gone — but it also means startup latency multiplies by test count (expect several minutes of pure boot time for a suite of 100+ tests). Plan timeouts on the outer command accordingly.
+
+Do not pass `--api-url`. With it omitted, the runner asks the OS for a free ephemeral port, claims it in a file-locked registry (`~/.cache/prd-bench-local-runner/ports.tsv`, serialized via `fcntl.flock`), and exports that port as the `PORT` environment variable that `start.sh` sees. This makes it safe to run multiple end-to-end pipelines concurrently on the same host (e.g., bootstrapping several scenarios in parallel) without port collisions.
+
+Then read `{task_dir}/workspace/implementation/results.json`. Extract `passed`, `total`, `failed`.
+- If `passed == total` → **exit** with a summary report (see the Summary block at the end of this prompt).
+- Otherwise → apply the diagnostic protocol below to every failing test, make the fixes, rerun the command above, and repeat. No iteration cap.
 
 The benchmark's contract is: implementers read PRD.md only, never SCAFFOLD.yaml. Both layers of the test artifact must therefore trace to PRD prose:
   - `test_suite/` — the assertion must match a rule stated verbatim in PRD.
@@ -282,13 +294,14 @@ Cardinal rules:
 - DELETE a test when STEP 1a finds PRD silent on the asserted rule.
 - DELETE a test when STEP 1b finds PRD does not uniquely determine the asserted outcome (the two-reader experiment produces divergent implementations).
 - Never delete a test because it is "strict", "brittle", or "hard to pass". The deletion criterion is PRD coverage + unique derivability, not difficulty.
-- NEVER weaken an assertion to make implementation pass. Downgrading an `error_id` check to an HTTP-status check, replacing a boundary test with an approximate one, or adding `pytest.mark.skip` / `@pytest.mark.xfail` / inline `pytest.skip(...)` calls are all forbidden. (Exception: relaxing an exact-error assertion to `validate_error_is_one_of([...])` IS permitted when PRD only names a member of the set, not the specific choice — this is a coverage correction, not a hack.)
-- TREAT SKIPPED AS FAILED. A skipped test means the asserted scenario was unreachable under the test's setup — that is a unique-derivability failure, not a pass. Run STEP 1 against it: either the scenario is reachable under a PRD-faithful setup (rewrite the fixture/setup so it actually executes the assertion), or the scenario contradicts PRD (DELETE the test). Inline `pytest.skip(...)` guards inside test bodies must be removed in either branch.
+- NEVER weaken an assertion to make implementation pass. Downgrading an `error_id` check to an HTTP-status check, replacing a boundary test with an approximate one, or adding `pytest.mark.skip` / `@pytest.mark.xfail` are all forbidden. (Exception: relaxing an exact-error assertion to `validate_error_is_one_of([...])` IS permitted when PRD only names a member of the set, not the specific choice — this is a coverage correction, not a hack.)
 - NEVER remove or weaken an implementation check that PRD requires in order to accommodate a test fixture that violates the PRD precondition. If a PRD-required check (ownership, state gate, role scoping, referential integrity) rejects requests the tests issue, and the reason is that test_helpers constructed the request with a precondition PRD forbids (e.g., shared X-User-ID across distinct resource owners), the fixture is the bug — fix test_helpers in STEP 2, do not strip the check from the implementation.
+- NEVER add an endpoint, response field, side effect, header, or capability to `implementation/` that does NOT trace to a verbatim PRD sentence, even if doing so makes failing tests pass.
+- NEVER seed, preload, register, or hardcode any entity data in `implementation/` at startup. The implementation encodes the *system* (state machines, calculations, validations, endpoints); it never owns *data*. Every entity any test needs is constructed by the test (or its fixtures, acting as an API client) via declared endpoints. Storage MUST be in-memory only (Python dicts / maps keyed by id) — no SQLite file, no JSON dump on disk, no `/tmp` cache, no external persistence — so that `start.sh` re-invocation by the per-test-server isolation wipes every byte of state and guarantees a fresh boot. 
 - TRIAGE HINT: when ≥5 failing tests share the same setup error (e.g., the same "Setup step failed" trace, the same 4xx from the same helper call), treat test_helpers as the first suspect before attributing to implementation. A common upstream fixture bug routinely masquerades as many independent implementation bugs.
 - When in doubt about STEP 1, produce both: (i) the verbatim PRD quote that states the rule, and (ii) the two divergent PRD-faithful implementations that would and would not pass the test. If you cannot produce (i) or you CAN produce (ii), the test goes.
 - Every deletion must be accompanied by a one-line note in the summary (see below) naming the test, the silence/collapse pattern, and the scaffold rule that drove the test's generation. These notes aggregate into feedback for doc-generator (Zero-Silence Rule violations) and for unit-test-generator (unique-derivability misses).
-- After every batch of fixes, re-run `prd-bench-docker-run` and re-read `results.json` before making any further interpretation decisions. Do not batch multiple interpretation decisions without a verification run in between.
+- After every batch of fixes, re-run `prd-bench-local-run` (with the same flags as above) and re-read `results.json` before making any further interpretation decisions. Do not batch multiple interpretation decisions without a verification run in between.
 
 Summary (emit when exiting at `passed == total`):
 - Iterations run.
@@ -297,7 +310,7 @@ Summary (emit when exiting at `passed == total`):
 - Fixes applied to `implementation/` (which file, which function, one-line why).
 ```
 
-The orchestrator does not need to inspect failures itself — the subagent owns all of that, including the docker run, the results parsing, and the decision whether to continue. The orchestrator just waits for the subagent to exit.
+The orchestrator does not need to inspect failures itself — the subagent owns all of that, including the local-run invocation, the results parsing, and the decision whether to continue. The orchestrator just waits for the subagent to exit.
 
 ## Key Principles
 
@@ -312,6 +325,7 @@ The orchestrator does not need to inspect failures itself — the subagent owns 
 
 3. **Hacking tests is forbidden. Deleting PRD-uncovered or PRD-ambiguous tests is required. Repairing PRD-inconsistent fixtures is also required.** These look similar but are distinct:
    - **Forbidden (test hacking):** deleting a test because it's "too strict", changing an expected value to match current implementation output, downgrading an `error_id` check to a generic HTTP-status check, adding `@pytest.mark.skip`/`@pytest.mark.xfail` to dodge a failure, weakening a boundary test to an approximate one. **Also forbidden:** stripping a PRD-required check from the implementation because the current test fixtures can't satisfy it — that is implementation-hacking to fit a broken fixture.
+   - **Forbidden (implementation hacking):** adding an endpoint, response field, side effect, header, or capability to `implementation/` that does NOT trace to a verbatim PRD sentence, even if doing so makes failing tests pass. **Equally forbidden: seeding, preloading, or hardcoding any entity data in `implementation/` at startup.** The implementation encodes the system; tests build all state via API calls. If tests depend on a server-side capability or seeded state PRD does not declare, the bug lives in `test_helpers/` (or upstream in the scaffold) — fix it there, never paper over with implementation back-doors.
    - **Required (PRD alignment — assertion level):** deleting a test whose asserted rule either (a) has no verbatim PRD coverage, or (b) has PRD coverage but PRD does not uniquely determine the asserted outcome — i.e., a faithful PRD-only implementer could produce a different but still-consistent implementation that the test would fail on. See Step 7's STEP 1a/1b.
    - **Required (PRD alignment — fixture/helper level):** editing `test_helpers/` when a fixture, factory, or role-header helper constructs a precondition inconsistent with PRD (e.g., shared X-User-ID across owners PRD requires to be distinct, wrong entity status before a transition, missing required relationship, payload shape that doesn't match PRD's declared schema). This is STEP 2 of the fix-cycle protocol. See Step 7's STEP 2.
 
@@ -328,7 +342,7 @@ The orchestrator does not need to inspect failures itself — the subagent owns 
 
 5. **Implementation uses Python + Flask.** All generated implementations use the mandated Python + Flask stack with in-memory storage.
 
-6. **Docker isolation is required for testing.** Always use `prd-bench-docker-run` (not the local runner) for the test/iterate loop, because it mirrors the real evaluation environment.
+6. **Per-test-server isolation is required for testing.** Always use `prd-bench-local-run --isolation per-test-server` for the test/iterate loop. The harness kills and re-launches the API server (via `start.sh`) before every individual pytest test, so any test that passes only because of state left over by a previous test will surface as a real failure here — exactly the kind of bug the iteration loop needs to see and either fix in the implementation or correct in `test_helpers/`.
 
 7. **Context isolation via subagents.** Each generation step runs in its own fresh subagent. The iteration loop (Step 7) runs in a **single long-lived** subagent that retains context across cycles — one sub-conversation that owns the run-diagnose-fix-rerun loop, rather than a fresh subagent per round (which would waste tokens re-reading the domain). The orchestrator stays lightweight — it only tracks file paths and pass/fail exits, never loads generated file contents into its own context.
 
@@ -339,8 +353,8 @@ When complete, the task directory will contain:
 ```
 tasks/{task_name}/
 ├── SCAFFOLD.yaml                          # Structured specification (§1.1–§1.7)
-├── SCAFFOLD_DIFFICULTY_DESIGN.yaml        # Test-targeting index (withheld from PRD gen)
-├── Dockerfile.test                        # Test container definition
+├── SCAFFOLD_DIFFICULTY_DESIGN.yaml        # Depth test index — §1.8 (withheld from PRD gen)
+├── SCAFFOLD_CORNER_DESIGN.yaml            # Breadth test index — §1.9 (withheld from PRD gen)
 ├── test_helpers/                          # Test infrastructure
 │   ├── __init__.py
 │   ├── types.py
@@ -355,10 +369,10 @@ tasks/{task_name}/
 │   ├── conftest.py
 │   └── test_*.py
 └── workspace/
-    ├── INSTRUCTION.md                     # Build constraints
+    ├── INSTRUCTION.md                     # Build contract (start.sh + PORT/0.0.0.0/foreground; evaluator runs `bash start.sh`)
     ├── PRD.md                             # Natural language requirements
     └── implementation/                    # Working Python/Flask server
-        ├── Dockerfile
+        ├── start.sh                       # Foreground launcher (reads $PORT, binds 0.0.0.0)
         ├── requirements.txt
         ├── app.py
         ├── ...

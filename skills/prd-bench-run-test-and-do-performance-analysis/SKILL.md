@@ -1,10 +1,14 @@
 ---
 name: prd-bench-run-test-and-do-performance-analysis
 description: |
-  Run Docker-based tests against a PRD benchmark implementation and produce a concise root-cause analysis.
-  Given a workspace directory that contains `implementation/`, this skill executes `prd-bench-docker-run`,
-  collects `results.json`, cross-references failures against the test helpers (factories, assertions, fixtures)
-  and the PRD, then writes `PERFORMANCE_ANA.md` into the workspace.
+  Run tests against a PRD benchmark implementation under per-test-server isolation and produce a concise
+  root-cause analysis. Given a workspace directory that contains `implementation/`, this skill executes
+  `prd-bench-local-run --isolation per-test-server` (which restarts the API server via `start.sh` before
+  every pytest test), collects `results.json`, cross-references failures against the test helpers
+  (factories, assertions, fixtures) and the PRD, then writes `PERFORMANCE_ANA.md` into the workspace.
+  Each invocation auto-allocates its own free TCP port via the runner's file-locked port registry, so
+  multiple instances of this skill can run concurrently on the same host against different workspaces
+  without port collisions.
 
   Trigger when: the user asks to "test and analyze", "run tests and diagnose", "evaluate an implementation",
   "generate performance analysis", or provides a workspace path and wants to know why tests fail.
@@ -20,10 +24,9 @@ tasks/<task_name>/
 ├── workspace/                  # or workspace-<variant>/
 │   ├── INSTRUCTION.md
 │   ├── PRD.md                  # the spec the model was given (source of truth)
-│   └── implementation/         # the code under test
+│   └── implementation/         # the code under test (must contain start.sh)
 ├── test_helpers/               # factories, assertions, fixtures, constants
-├── test_suite/                 # pytest modules
-└── Dockerfile.test
+└── test_suite/                 # pytest modules
 ```
 
 The workspace path the user gives you is the `workspace/` (or `workspace-<variant>/`) directory.
@@ -33,14 +36,21 @@ The workspace path the user gives you is the `workspace/` (or `workspace-<varian
 Derive the **task directory** (parent of the workspace) and run:
 
 ```bash
-prd-bench-docker-run \
-  --task-dir <task_dir> \
-  --impl-dir <workspace>/implementation \
-  --results-file <workspace>/results.json \
-  --log-level INFO
+prd-bench-local-run \
+  --start-command "cd <workspace>/implementation && bash start.sh" \
+  --test-dir       <task_dir>/test_suite \
+  --isolation      per-test-server \
+  --timeout        60 \
+  --test-timeout   10 \
+  --results-file   <workspace>/results.json \
+  --log-level      INFO
 ```
 
-Use a 10-minute timeout. If the build or tests fail catastrophically (exit before producing `results.json`), report the build/startup error and stop.
+The `--isolation per-test-server` flag kills and re-launches the server (via `start.sh`) before every individual pytest test, so the implementation must boot cleanly from a fresh process — there is no carry-over state between tests, and any failure that depends on shared state is a real bug, not a fixture artifact.
+
+**Do not pass `--api-url`.** With it omitted, the runner asks the OS for a free ephemeral port, claims it in a file-locked registry (`~/.cache/prd-bench-local-runner/ports.tsv`, serialized via `fcntl.flock`), and exports that port as the `PORT` environment variable that `start.sh` sees. Multiple concurrent `prd-bench-local-run` invocations on the same host therefore coexist without colliding on a single fixed port. Pin a port via `--api-url` only when external tooling needs to know it up front — and accept that doing so re-introduces the collision risk this skill's concurrency story depends on.
+
+Use a 10-minute outer timeout for the whole command (per-test-server restarts add startup latency multiplied by test count — at ~3-5s startup × 100+ tests, expect several minutes of pure boot time). If startup or tests fail catastrophically (exit before producing `results.json`), report the startup error and stop.
 
 ## Step 2: Collect Evidence
 

@@ -4,11 +4,12 @@ description: >
   Generate a complete REST API server implementation from a PRD benchmark task.
   Each task lives under tasks/<task_name>/ and contains workspace/PRD.md (natural
   language requirements), SCAFFOLD.yaml (structured entity/state-machine/calculation
-  definitions), and workspace/INSTRUCTION.md (build constraints including Dockerfile
-  requirements). The skill produces a fully working codebase in
-  workspace/implementation/ — source code, Dockerfile, and all dependencies — that
-  passes the benchmark's automated test suite. Use this skill whenever the user
-  wants to implement, build, or code a PRD benchmark task, or asks to generate
+  definitions), and workspace/INSTRUCTION.md (build contract: produce ./implementation/start.sh + source code; PORT/0.0.0.0/foreground; evaluator runs `bash start.sh`). The
+  skill produces a fully working codebase in workspace/implementation/ — source code,
+  a start.sh launcher, and all dependencies — that passes the benchmark's automated
+  test suite (driven by `prd-bench-local-run --isolation per-test-server`, which
+  restarts the server before each test via `start.sh`). Use this skill whenever the
+  user wants to implement, build, or code a PRD benchmark task, or asks to generate
   an implementation from a PRD and scaffold. Also trigger when the user mentions
   "implement the e_commerce task", "build the API from PRD", "generate code for
   this benchmark", or similar requests referencing PRD-to-code generation.
@@ -27,8 +28,8 @@ tasks/<task_name>/
 ├── SCAFFOLD.yaml              # Structured spec: entities, state machines, calculations, validations, endpoints, errors, RBAC
 ├── workspace/
 │   ├── PRD.md                 # Natural language requirements document
-│   ├── INSTRUCTION.md         # Build constraints (Dockerfile, port, etc.)
-│   └── implementation/        # YOUR OUTPUT GOES HERE
+│   ├── INSTRUCTION.md         # Build contract: produce ./implementation/start.sh + source code; PORT/0.0.0.0/foreground; evaluator runs `bash start.sh`
+│   └── implementation/        # YOUR OUTPUT GOES HERE (source code + start.sh)
 ```
 
 ## How to Use This Skill
@@ -37,7 +38,7 @@ tasks/<task_name>/
 
 Read them in this order — each layer adds context the next one needs:
 
-1. **`workspace/INSTRUCTION.md`** — Short. Tells you what to produce (Dockerfile + source code in `./implementation/`) and the hard constraints (listen on `PORT` env var, bind `0.0.0.0`, respond within 60s of container start).
+1. **`workspace/INSTRUCTION.md`** — Short. The build contract any evaluator (us or third parties) reads. You must produce `./implementation/start.sh` + source code; `start.sh` installs dependencies and runs the server in the foreground (use `exec` so signals propagate), listens on the `PORT` env var (default `10000`), binds `0.0.0.0`, and responds to HTTP within 60 seconds of being invoked. The evaluator's entire contract is `bash start.sh` from `./implementation/` — no Dockerfile, no other entrypoint. INSTRUCTION.md imposes **no language restriction** (its examples show Python/Flask and Node.js/Express), but **this skill mandates Python + Flask** for benchmark consistency (see Step 2). Beyond INSTRUCTION's contract, the test harness adds one extra constraint: `prd-bench-local-run --isolation per-test-server` kills and re-launches the server via `start.sh` before every pytest test, so your implementation must boot cleanly from a fresh process with no carry-over state from the previous run.
 
 2. **`SCAFFOLD.yaml`** — The structured backbone. Contains:
    - `entities` — Every data model, its fields, types, sources (input/computed/system), and parent relationships
@@ -57,9 +58,27 @@ Read them in this order — each layer adds context the next one needs:
 
 Before writing code, decide on:
 
-- **Language & framework**: Always use **Python + Flask**. This is the mandated stack for all benchmark implementations — it produces correct behavior, is easy to reason about, and the Dockerfile is minimal.
-- **Data storage**: In-memory is fine (and recommended). These benchmarks test API correctness, not database durability. Use dictionaries/maps keyed by ID.
-- **Code organization**: Ensure the code is strictly modularized — split by concern (entry point, data store, error definitions, response helpers, auth/middleware, per-resource routes, business-logic services) so no single file accumulates unrelated responsibilities. The exact filenames and directory layout are up to you; pick names that match the entities and concerns in the scaffold.
+- **Language & framework**: Always use **Python + Flask**. This is the mandated stack for all benchmark implementations — it produces correct behavior, is easy to reason about, and the launcher (`start.sh`) is minimal.
+- **Data storage**: In-memory is fine (and recommended). These benchmarks test API correctness, not database durability. Use dictionaries/maps keyed by ID. **The store starts empty on every boot — the implementation MUST NOT seed, preload, register, or hardcode any entities at startup.** Every entity any test needs is constructed by the test itself via the declared API surface (see scaffold §1.5 endpoint table + §1.8 `setup_api_calls`). If you find yourself writing a `seed_*()` function, calling it from `app.py` startup, or populating `db.stores = {<concrete records>}` at module load, stop — that operation belongs in a scaffold-declared endpoint, not in implementation startup. If no declared endpoint produces the required state, that is a scaffold-generator gap to escalate, never a license to seed in implementation.
+- **Code organization**: Group by concern. Follow this layout:
+  ```
+  implementation/
+  ├── start.sh           # Launcher script (executable, reads $PORT, runs app.py in foreground)
+  ├── requirements.txt
+  ├── app.py              # Entry point, error handlers, route registration
+  ├── db.py               # In-memory data store
+  ├── errors.py           # Error classes and error ID constants
+  ├── response.py         # Standard response envelope helpers
+  ├── middleware.py        # Auth header extraction, role checking
+  ├── routes/             # One file per resource group
+  │   ├── shops.py
+  │   ├── products.py
+  │   └── ...
+  └── services/           # Business logic, calculations, state transitions
+      ├── shop.py
+      ├── discount.py
+      └── ...
+  ```
 
 ### Step 3: Implement — Follow This Priority Order
 
@@ -141,22 +160,25 @@ These are the things that differentiate a passing implementation from a failing 
 
 **Nested resource ownership** — For scoped resources, verify the resource belongs to the parent in the URL path.
 
-### Step 5: Build the Dockerfile
+### Step 5: Write start.sh
 
-Use a Python base image. Follow the constraints from INSTRUCTION.md:
+INSTRUCTION.md owns the hard contract: `./implementation/start.sh` installs dependencies and runs the server in the foreground (`exec`), `0.0.0.0:$PORT` (default 10000), HTTP ready within 60s. Honor it verbatim.
 
-```dockerfile
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-CMD ["python", "app.py"]
+Given the skill's Python + Flask stack, the minimal `start.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+pip install -q -r requirements.txt
+exec python app.py
 ```
 
-- Server listens on `PORT` env var (default 10000)
-- Bind to `0.0.0.0`
-- Respond within 60 seconds of container start
+And in `app.py`:
+
+```python
+import os
+app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+```
 
 ### Common Pitfalls to Avoid
 
@@ -175,8 +197,9 @@ CMD ["python", "app.py"]
 
 Before declaring done, verify:
 
-- [ ] `implementation/Dockerfile` exists and follows INSTRUCTION.md constraints
-- [ ] Server starts and listens on PORT env var, bound to 0.0.0.0
+- [ ] `implementation/start.sh` exists, is a foreground bash launcher, and uses `exec` to hand off to the server process
+- [ ] Server starts and listens on `PORT` env var (default 10000), bound to `0.0.0.0`
+- [ ] **No entity seeding at startup** — `app.py` and module-init code MUST NOT populate `db.*` dicts, call any `seed_*()` helper, or otherwise inject entities at boot. The store starts empty; tests build all preconditions via the declared API surface.
 - [ ] All endpoints from the endpoint table are implemented
 - [ ] Response envelope matches the scaffold's `response_envelope` exactly — correct field names for metadata, type discriminator, data wrapper, and error body
 - [ ] Auth middleware validates the exact headers defined in the scaffold's auth `validations[]` — not hardcoded defaults
