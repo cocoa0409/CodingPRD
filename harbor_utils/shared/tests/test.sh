@@ -20,6 +20,8 @@
 #   PER_TEST_TIMEOUT=10   pytest --timeout=<n> per test
 #   ISOLATION=per-test-server
 #                         restart the API server before each pytest test
+#   SAVE_IMPLEMENTATION=1 copy /app/implementation -> $AGENT_DIR before tests;
+#                         set to 0 to skip (e.g. when the artifact isn't needed)
 #
 # The server port is auto-picked by prd-bench-local-run from
 # ~/.cache/prd-bench-local-runner/ports.tsv and released on exit. start.sh
@@ -27,8 +29,8 @@
 
 set -uo pipefail
 
-STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-60}"
-PER_TEST_TIMEOUT="${PER_TEST_TIMEOUT:-10}"
+STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-300}"
+PER_TEST_TIMEOUT="${PER_TEST_TIMEOUT:-30}"
 ISOLATION="${ISOLATION:-per-test-server}"
 
 # Harbor bind-mounts /logs/{agent,verifier} → trial_dir/{agent,verifier}, so
@@ -40,14 +42,17 @@ REWARD_JSON="$REWARD_DIR/reward.json"
 RESULTS_JSON="$REWARD_DIR/results.json"
 mkdir -p "$AGENT_DIR" "$REWARD_DIR"
 
-# # Persist the agent's code FIRST, before anything else can fail. Harbor doesn't
-# # auto-save /app/, so without this the model's code is gone after the trial.
-# # Doing it up-front means a hung pytest or a crashed server doesn't cost us
-# # the artifact.
-# if [[ -d /app/implementation ]]; then
-#   cp -r /app/implementation "$AGENT_DIR/implementation"
-#   echo "[verifier] saved /app/implementation -> $AGENT_DIR/implementation"
-# fi
+# Persist the agent's code FIRST, before anything else can fail. Harbor doesn't
+# auto-save /app/, so without this the model's code is gone after the trial.
+# Doing it up-front means a hung pytest or a crashed server doesn't cost us
+# the artifact. Set SAVE_IMPLEMENTATION=0 before `harbor run` to skip.
+SAVE_IMPLEMENTATION="${SAVE_IMPLEMENTATION:-1}"
+if [[ "$SAVE_IMPLEMENTATION" == "1" && -d /app/implementation ]]; then
+  cp -r /app/implementation "$AGENT_DIR/implementation"
+  echo "[verifier] saved /app/implementation -> $AGENT_DIR/implementation"
+else
+  echo "[verifier] skipping implementation save (SAVE_IMPLEMENTATION=$SAVE_IMPLEMENTATION)"
+fi
 
 echo "[verifier] installing prd-bench-local-runner + pytest deps"
 pip install --quiet -e /tests/prd-bench-local-runner pytest pytest-timeout

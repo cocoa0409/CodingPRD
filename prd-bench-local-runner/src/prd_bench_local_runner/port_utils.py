@@ -37,15 +37,33 @@ def is_port_in_use(port: int) -> bool:
 
 def kill_port(port: int) -> None:
     """
-    Kill any process listening on the given TCP port.
-    Tries lsof first, falls back to fuser, then ss+kill.
-    Swallows errors — best-effort cleanup.
+    Kill any process LISTENING on the given TCP port.
+
+    Strictly filtered to the LISTEN-state socket so we never SIGKILL a
+    process that merely holds a client-side connection to this port. Without
+    the filter, the client end of an HTTP keep-alive connection looks
+    identical to the server end in `lsof -i:<port>` output, and a naive
+    `xargs kill -9` would take down the client (e.g. the pytest process
+    that just made the request) along with the server. This matters for any
+    server framework that defaults to HTTP/1.1 keep-alive — Node/Express,
+    Go net/http, FastAPI/uvicorn, Spring Boot, etc. — and is invisible for
+    frameworks that close connections per-request (Flask/Werkzeug dev
+    server), which is why the bug only surfaces for some implementations.
+
+    Best-effort; swallows errors. `fuser -k <port>/tcp` is deliberately not
+    used as a fallback because it has no LISTEN-state filter and would
+    re-introduce the same bug on Linux systems without lsof.
     """
+    # Use a sh idiom (capture-then-test) instead of `xargs -r` so the
+    # command behaves the same under GNU xargs (Linux) and BSD xargs (macOS).
     commands = [
-        # Linux/macOS with lsof
-        f"lsof -ti:{port} | xargs kill -9 2>/dev/null || true",
-        # Linux with fuser
-        f"fuser -k {port}/tcp 2>/dev/null || true",
+        # Primary: lsof with explicit TCP state filter. Works on Linux and macOS.
+        f"pids=$(lsof -ti:{port} -sTCP:LISTEN 2>/dev/null); "
+        f"[ -n \"$pids\" ] && kill -9 $pids 2>/dev/null; true",
+        # Linux fallback: ss -l limits to listening sockets by definition.
+        f"pids=$(ss -H -ltnp 'sport = :{port}' 2>/dev/null "
+        f"| grep -oE 'pid=[0-9]+' | cut -d= -f2); "
+        f"[ -n \"$pids\" ] && kill -9 $pids 2>/dev/null; true",
     ]
 
     for cmd in commands:

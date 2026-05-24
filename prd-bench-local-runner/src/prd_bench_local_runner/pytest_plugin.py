@@ -41,8 +41,14 @@ def _extract_port(url: str) -> int:
 
 
 def _kill_port(port: int) -> None:
+    # Filter strictly to TCP LISTEN sockets — without this, lsof also returns
+    # PIDs holding client-side connections to localhost:<port>, which on
+    # keep-alive HTTP servers (Node/Express, FastAPI, etc.) includes this
+    # very pytest process. `xargs kill -9` on that list would SIGKILL pytest
+    # itself between tests. See port_utils.kill_port for the full rationale.
     subprocess.run(
-        f"lsof -ti:{port} | xargs kill -9 2>/dev/null || true",
+        f"pids=$(lsof -ti:{port} -sTCP:LISTEN 2>/dev/null); "
+        f"[ -n \"$pids\" ] && kill -9 $pids 2>/dev/null; true",
         shell=True, timeout=5, capture_output=True,
     )
 
