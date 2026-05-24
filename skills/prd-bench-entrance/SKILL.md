@@ -184,25 +184,29 @@ After Steps 5 and 6 complete, spawn **ONE long-lived fix subagent** that owns th
 ```
 You are a PRD benchmark diagnostic expert. Your job is to iterate tests + fixes in {task_dir} until every test passes. You own the loop: run tests, read results, diagnose failures, fix, rerun, repeat.
 
-Iteration step (you run this yourself each round):
+Iteration step (you run this yourself each round): parallel 8-round stability sweep — all 8 rounds are launched concurrently in the background and joined with `wait`. There is no early-exit; every round runs to completion.
+
+**Why 8 parallel rounds per iteration**: some implementation and test bugs are timing-sensitive (concurrency races whose server-side detection window closes before the racing request arrives; fixture ordering that happens to align on the first attempt; default-port collisions that only fire when another test is mid-flight). A single passing round can be a lucky round. The 8-round sweep surfaces flakiness in-iteration so a flaky bug cannot escape masquerading as a "fix". 
 
 ```bash
-prd-bench-local-run \
-  --start-command "cd {task_dir}/workspace/implementation && bash start.sh" \
-  --test-dir       {task_dir}/test_suite \
-  --isolation      per-test-server \
-  --timeout        60 \
-  --test-timeout   10 \
-  --results-file   {task_dir}/workspace/implementation/results.json
+rm -f {task_dir}/workspace/implementation/results.*.json
+for i in 1 2 3 4 5 6 7 8; do
+  prd-bench-local-run \
+    --start-command "cd {task_dir}/workspace/implementation && bash start.sh" \
+    --test-dir       {task_dir}/test_suite \
+    --isolation      per-test-server \
+    --timeout        120 \
+    --test-timeout   30 \
+    --results-file   {task_dir}/workspace/implementation/results.${i}.json &
+done
+wait
 ```
 
-The `--isolation per-test-server` flag kills and re-launches the API server (via `start.sh`) before every individual pytest test. This means there is no carry-over state between tests, so any "passes only because of state from a previous test" effect is gone — but it also means startup latency multiplies by test count (expect several minutes of pure boot time for a suite of 100+ tests). Plan timeouts on the outer command accordingly.
+`--isolation per-test-server` restarts the server via `start.sh` before every pytest test, so per-test boot latency × test count drives each round's wall time. With 8 rounds running concurrently, total wall time stays ~1 × that figure but peak CPU/memory load is ~8×; plan the outer timeout for a single round, not the sum. Omit `--api-url`: the runner claims a free port per round via `~/.cache/prd-bench-local-runner/ports.tsv` (`fcntl.flock`) and exports it as `$PORT`, so the 8 concurrent runs (and any other pipelines on the same host) don't collide.
 
-Do not pass `--api-url`. With it omitted, the runner asks the OS for a free ephemeral port, claims it in a file-locked registry (`~/.cache/prd-bench-local-runner/ports.tsv`, serialized via `fcntl.flock`), and exports that port as the `PORT` environment variable that `start.sh` sees. This makes it safe to run multiple end-to-end pipelines concurrently on the same host (e.g., bootstrapping several scenarios in parallel) without port collisions.
-
-Then read `{task_dir}/workspace/implementation/results.json`. Extract `passed`, `total`, `failed`.
-- If `passed == total` → **exit** with a summary report (see the Summary block at the end of this prompt).
-- Otherwise → apply the diagnostic protocol below to every failing test, make the fixes, rerun the command above, and repeat. No iteration cap.
+After `wait` returns, read all 8 `results.${i}.json` files (i = 1..8 — every round ran to completion).
+- All 8 rounds have `passed == total` → **exit** with the Summary block at the end of this prompt.
+- Otherwise → take the **union** of failing tests across all 8 rounds (a test that failed in round 3 but passed in round 1 still counts as a failure — that IS the flakiness signal), apply the diagnostic protocol below, fix, rerun the sweep. No iteration cap.
 
 The benchmark's contract is: implementers read PRD.md only, never SCAFFOLD.yaml. Both layers of the test artifact must therefore trace to PRD prose:
   - `test_suite/` — the assertion must match a rule stated verbatim in PRD.
@@ -214,9 +218,7 @@ Diagnostic protocol — follow IN ORDER for each failing test:
 
 STEP 0: READ FAILURE DETAIL
 
-  Read {task_dir}/workspace/implementation/results.json for the failure detail of every failing test — tracebacks, the request URL/headers/payload actually sent, the response body actually received, and which assertion tripped. This is ground truth. Do not attribute blame to PRD, tests, or implementation until you have seen what the test actually observed vs. expected.
-
-  Subsequent STEPs operate only on the set of failing tests identified here. Do not re-open passing tests.
+  Read every `results.${i}.json` from the most recent sweep (i = 1..8 — all 8 parallel rounds completed). For each test failing in ANY round, extract the failure detail (traceback, request URL/headers/payload, response body, tripped assertion) from the round(s) it failed in. Tests passing in some rounds but failing in others are flakiness and count as failures. Subsequent STEPs operate only on the union set identified here.
 
 STEP 1: PRD COVERAGE + UNIQUE-DERIVABILITY CHECK
 
@@ -301,9 +303,9 @@ Cardinal rules:
 - TRIAGE HINT: when ≥5 failing tests share the same setup error (e.g., the same "Setup step failed" trace, the same 4xx from the same helper call), treat test_helpers as the first suspect before attributing to implementation. A common upstream fixture bug routinely masquerades as many independent implementation bugs.
 - When in doubt about STEP 1, produce both: (i) the verbatim PRD quote that states the rule, and (ii) the two divergent PRD-faithful implementations that would and would not pass the test. If you cannot produce (i) or you CAN produce (ii), the test goes.
 - Every deletion must be accompanied by a one-line note in the summary (see below) naming the test, the silence/collapse pattern, and the scaffold rule that drove the test's generation. These notes aggregate into feedback for doc-generator (Zero-Silence Rule violations) and for unit-test-generator (unique-derivability misses).
-- After every batch of fixes, re-run `prd-bench-local-run` (with the same flags as above) and re-read `results.json` before making any further interpretation decisions. Do not batch multiple interpretation decisions without a verification run in between.
+- After every batch of fixes, re-run the full 8-round parallel sweep above before making any further interpretation decisions. A fix only counts when all 8 parallel rounds pass.
 
-Summary (emit when exiting at `passed == total`):
+Summary (emit when exiting after a clean 8-round parallel sweep):
 - Iterations run.
 - Tests deleted (with PRD-silence category per cardinal rule above).
 - Fixes applied to `test_helpers/` (which file, which fixture/factory/assertion, one-line why).
@@ -376,5 +378,5 @@ tasks/{task_name}/
         ├── requirements.txt
         ├── app.py
         ├── ...
-        └── results.json                   # Test results (all passing)
+        └── results.{1..8}.json            # Per-round results from the final 8-round stability sweep (all passing)
 ```
