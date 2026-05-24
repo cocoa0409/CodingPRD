@@ -60,6 +60,7 @@ For completed examples, see the `examples/` directory. These examples are format
 - [ ] 1.7: RBAC Matrix
 - [ ] 1.8: Scaffold Difficulty Design (Test Targeting Index) → destination file `SCAFFOLD_DIFFICULTY_DESIGN.yaml`
 - [ ] 1.9: Scaffold Corner Design (Coverage Index for Non-Difficulty Tests) → destination file `SCAFFOLD_CORNER_DESIGN.yaml`
+- [ ] Setup-chain rule replay across BOTH §1.8 and §1.9 — for every `test_recipe.setup_api_calls` AND `test_recipe.trigger:` chain in BOTH design files, replay each call against the scaffold's own §1.2 / §1.4 / §1.6 (call-by-call: every call's preconditions hold given prior-call cumulative state) AND replay the chain's side-effects forward (end-state: every adjective/cardinality in `setup:` is a consequence of the chain, not a wish). Both design files are test prototypes the unit-test-generator transcribes verbatim — an inconsistency here lands as a broken fixture. See §Quality Checklist → "Test-recipe ↔ endpoint compatibility" for the two replay items.
 - [ ] Final: Quality + Diversity check (§Quality Checklist) across all three files
 ```
 
@@ -95,7 +96,7 @@ These are independent difficulty dimensions that can be **layered onto any arche
 
 | Layer | What it adds | Difficulty mechanism |
 |-------|-------------|---------------------|
-| **Optimistic concurrency** | Version-based conflict detection | Stale-data races, retry semantics. OCC alone only covers version-field conflicts on PATCH/PUT. If the scenario also has race-condition constraints (e.g., "at most one delivery per order"), define them explicitly in `concurrency_rules` (see §1.2.1). |
+| **Optimistic concurrency** | Version-based conflict detection on a parent entity's `version` field | Stale-data conflicts on UPDATE and on CREATE-with-supersede patterns. **OCC on the parent's `version` is the only sanctioned mechanism this benchmark uses to resolve write-write conflicts** — see §1.2.1. Other write-write conflicts are NOT concurrency rules; they reduce to state preconditions and belong in §1.2 or §1.4. |
 | **Cascading side effects** | One mutation triggers chain of dependent updates | N-level propagation, ordering sensitivity, partial failure |
 | **Dual-variant calculation** | Same inputs, two valid algorithms, different outputs | Provisional vs final, optimistic vs pessimistic, estimate vs actual |
 | **Rate / threshold triggers** | Behavior changes at configurable breakpoints | Boundary precision (>= vs >), cumulative vs instantaneous, threshold reset |
@@ -313,41 +314,78 @@ state_machines:
 
 ### 1.2.1 Concurrency Rules
 
-Every scaffold must define explicit concurrency rules for operations where concurrent execution could produce data integrity issues. Version-based OCC alone only detects stale writes — it does not specify what happens when two non-idempotent operations race (e.g., two riders assigned to the same order, or confirm vs cancel on the same resource).
+This section is intentionally narrow. Most write-write conflicts that *look* like races are actually state preconditions in disguise — a second sequential request observes a field changed by the first and is rejected by the existing state-machine or validation logic. Those do not belong here.
 
-Each rule uses this schema:
+**Mandatory filter — apply BEFORE writing any entry:**
+
+> *"If the second request is sent strictly after the first request fully completes (sequential, not parallel), can the second request be rejected because it observes a state field that the first request changed?"*
+
+- **Yes** → NOT a concurrency rule. The behavior is fully covered by a state precondition. Capture it in `state_machines` (as a transition `preconditions:` clause) or in `validations` (`category: state`). Use a domain-specific error such as `ERR_INVALID_STATE`, `ERR_ALREADY_TERMINAL`, `ERR_LOAN_ALREADY_CONSOLIDATED`. **Do NOT write a `concurrency_rules` entry for it.**
+
+- **No** (the second sequential request sees identical state and would itself legitimately succeed under the natural product semantics) → True race. The canonical case is CREATE-with-supersede — e.g., creating a new RepaymentPlan when the product spec allows the new plan to legitimately supersede the prior one. Only true races may appear in `concurrency_rules`.
+
+**True races MUST be resolved via OCC on the parent entity's `version`.** No other mechanism is permitted — wall-clock windows, server-side locks, "first-writer-wins" tie-breakers, and any framing that depends on requests overlapping in time are all forbidden, because none of them yield a deterministic black-box test. OCC reduces the race to a stale-version check that can be triggered by two strictly sequential requests.
+
+Schema:
 
 ```yaml
 concurrency_rules:
-  - scenario: "<human-readable race condition>"
-    guarantee: "<what the serialization guarantees>"
-    error_id: ERR_XXX              # required — the loser's error_id
-    http_status: 4xx               # required
-    serialization: "<optional — tie-breaker rule (e.g., first-writer-wins on field X)>"
+  - rule_id: <kebab-case-id>              # stable handle; §1.8/§1.9 grounds use this id
+    parent_entity: EntityName              # the entity whose `version` OCC checks
+    write_endpoint: "POST /path"            # the endpoint the rule guards
+    occ_field: "expected_<parent>_version"   # required request-body field name
+    description: |
+      <One sentence: what the loser tried to do and why the system rejects
+      it. State the rule in OCC terms (stale version), NOT in terms of
+      simultaneous requests, parallel dispatch, or race winners/losers.>
+    error_id: ERR_XXX                        # the loser's error_id
+    http_status: 412                         # 412 Precondition Failed for OCC mismatch
 ```
 
-`error_id` and `http_status` are always required structured fields — downstream skills (doc-generator Pass B, test generator) read them by key and do not parse them out of `guarantee` prose.
+**Hard constraints — every entry MUST satisfy ALL of:**
 
-**Examples:**
+1. The `parent_entity` has `common_fields: true` in §1.1 (which supplies the `version` integer field starting at 1, incremented on every mutation).
+2. The `write_endpoint` in §1.5 lists `expected_<parent>_version` as a required field in its `input:` AND lists "increments `<parent_entity>.version` by 1" in its `side_effects:`. The endpoint must give the OCC check something to observe, and must advance the version on success so the next stale request fails.
+
+**Forbidden vocabulary anywhere in the scaffold** (not just in this section):
+
+- "simultaneously", "at the same time", "concurrently submitted", "in parallel"
+- "first-writer-wins", "race winner", "race loser", "the race in which..."
+- "two clients race to...", "two requests arriving together"
+
+If you cannot describe a rule without these words, it has not passed the filter — re-classify into `state_machines` or `validations`.
+
+**Example — REJECTED (state precondition pretending to be a race):**
 
 ```yaml
+# WRONG — belongs in state_machines preconditions, not concurrency_rules
 concurrency_rules:
-  - scenario: "Two riders assigned to the same order simultaneously"
-    guarantee: "At most one delivery per order; second assignment rejected"
-    error_id: ERR_DELIVERY_ALREADY_ASSIGNED
-    http_status: 409
-    serialization: "First-writer-wins on assignment creation"
-
-  - scenario: "Restaurant confirms order while customer cancels simultaneously"
-    guarantee: "Exactly one operation succeeds; loser is rejected"
+  - scenario: "Two LoanServicers simultaneously declare DEFAULT on the same Loan"
     error_id: ERR_INVALID_STATE
-    http_status: 409
-    serialization: "First-writer-wins on order status"
+    serialization: "First-writer-wins on Loan.status"
 ```
 
-All error codes referenced here must also appear in the Error Catalog (§1.6).
+A second sequential `DEFAULT_DECLARATION` observes `loan.status == DEFAULT` (set by the first request) and is rejected by the existing state-machine precondition `loan.status == REPAYMENT`. Fully covered — no entry needed.
 
-**Consistency with §1.2 and §1.4:** If a single race scenario can legitimately produce more than one loser error (e.g., `ERR_INVALID_STATE` when the status already advanced vs. `ERR_HAS_DEPENDENCIES` when a dependent exists), split it into multiple `concurrency_rules` entries — one per possible loser error — rather than packing alternatives into a single `guarantee`. Downstream tests assert exactly one `error_id` per rule.
+**Example — ACCEPTED (true race, OCC-resolved):**
+
+```yaml
+concurrency_rules:
+  - rule_id: plan-create-stale-loan
+    parent_entity: Loan
+    write_endpoint: "POST /repayment-plans"
+    occ_field: "expected_loan_version"
+    description: |
+      Creating a RepaymentPlan against a Loan whose version has advanced
+      since the client last observed it is rejected. This captures the
+      case where another writer has just created a plan (which legitimately
+      supersedes the prior under §3.4) and the current writer's view of
+      the loan is therefore stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+```
+
+The corresponding test: client reads `loan.version: 5`, creates plan A successfully (`loan.version` advances to 6), then sends a second create still carrying `expected_loan_version: 5` — deterministically rejected with 412. Two strictly sequential requests; zero parallelism.
 
 ### 1.3 Calculation Rules Table
 
@@ -426,7 +464,7 @@ The ordering within business rules is domain-specific. In a hospital system, saf
 
 | Pattern | Description | Difficulty |
 |---------|-------------|-----------|
-| Priority ordering | Two checks fail simultaneously — which error wins? | Medium |
+| Priority ordering | A single request fails multiple checks — which error_id wins? | Medium |
 | Cascading validation | Check A depends on result of check B | Medium |
 | Cross-entity validation | Validity depends on state of a different entity | High |
 | Temporal validation | Valid now but would create future conflict | High |
@@ -531,7 +569,7 @@ scaffold_difficulty_design:
         grounds:                               # refs into §1.1–§1.6; every ref MUST resolve
           - calculations.<name>                # or: state_machines.<Entity>.<FROM>_to_<TO>
           - validations[priority=<N>]          # or: entities.<Entity>.fields.<name>
-          - concurrency_rules[<scenario-keyword>]
+          - concurrency_rules[<rule_id>]                # the kebab-case id from §1.2.1
         distinguishing_aspect: |
           <ONE falsifiable sentence pinning what structurally distinguishes this instance,
           naming the specific distinction §0.5 requires of this rule_id.>
@@ -683,8 +721,9 @@ Before finalizing the YAML:
 - [ ] Every role in the RBAC matrix declares an `identity:` field, either `entity_backed:<EntityName>` pointing to a persisted entity, or `opaque` for purely operational roles
 - [ ] All automatic/system-triggered transitions are captured
 - [ ] Side effect chains are complete (if A→B→C, all three steps are documented)
-- [ ] Every non-idempotent operation that can race has a `concurrency_rules` entry with required `error_id` and `http_status`
-- [ ] Every error code referenced in `concurrency_rules` also appears in §1.6 Error Catalog
+- [ ] Every `concurrency_rules` entry passes §1.2.1's serial-observability filter; others moved to `state_machines` or `validations`
+- [ ] Each `concurrency_rules.write_endpoint` takes `expected_<parent>_version` as required input and bumps `<parent>.version` in its side effects
+- [ ] No "simultaneously" / "first-writer-wins" / "race winner" / "in parallel" vocabulary anywhere in the scaffold
 - [ ] File split honored: `scaffold_difficulty_design:` appears only as the top-level key of `SCAFFOLD_DIFFICULTY_DESIGN.yaml`, `scaffold_corner_design:` appears only as the top-level key of `SCAFFOLD_CORNER_DESIGN.yaml`, and neither appears inside `SCAFFOLD.yaml`
 - [ ] Every `instances[*].grounds[*]` reference (in either `scaffold_difficulty_design` or `scaffold_corner_design`) resolves to a declared element in `SCAFFOLD.yaml`'s §1.1–§1.7
 
@@ -703,13 +742,16 @@ Each declaration in the scaffold is an edge; self-consistency means both ends re
 
 **Test-recipe ↔ endpoint compatibility — applies to every `test_recipe` in BOTH `scaffold_difficulty_design` (§1.8) AND `scaffold_corner_design` (§1.9), audited against §1.5.**
 
+§1.8 and §1.9 are transcribed verbatim into pytest fixtures by the downstream unit-test-generator — not re-derived from §1.1–§1.7. A chain that violates this same scaffold's own §1.1–§1.7 declarations therefore lands as a broken fixture which the PRD-faithful implementation correctly rejects, and the test fails for the wrong reason. Run the two replay checks below on every instance in BOTH files.
+
 - [ ] Every `setup_api_calls` and `trigger:` entry is a STRUCTURED call object (keys: `call`, `payload`, `as`, optional `as_user_id`, optional `captures`).
 - [ ] Each `call:` resolves to a §1.5 endpoint — path, method, and `as:` role match exactly.
 - [ ] Each `payload:` conforms to that endpoint's `input:` schema (no unknown fields, no missing required fields, types match).
 - [ ] **Placeholder closure** — every `${var}` referenced in any `payload:`, `as_user_id:`, or path template is bound by a `captures:` block on an earlier line of the same instance. Zero unbound placeholders across both `scaffold_difficulty_design` and `scaffold_corner_design`. An unbound `${var}` means §1.5 is missing a producing endpoint — fix via the priority ladder (compose → business → test-driving), do not paper over.
 - [ ] **Captures resolve to §1.5 `output:` fields** — every JSONPath in `captures:` (e.g., `$.data.verification_token`) names a field that the called endpoint actually declares in its `output:`. Capturing an undeclared field is forbidden; declare the field in §1.5 or add a different endpoint that exposes it.
 - [ ] **Literal-vs-placeholder discipline** — `payload:` fields that the scaffold author can determine at writing time (state codes, fixed amounts, ISO timestamps, enum members, fixed coupon codes) are LITERALS; `${var}` is used ONLY for values that can only come from a prior call's response (server-minted ids, server-stamped timestamps, server-issued tokens).
-- [ ] Running `setup_api_calls` end-to-end actually produces the precondition described in `setup:` — every entity, status, balance, and clock position the `setup:` lines pin is the post-chain state, not a wish.
+- [ ] **Call-by-call rule replay** — for every call in `setup_api_calls` AND `trigger:` (both §1.8 and §1.9), the cumulative state from prior calls must satisfy the §1.2 transition's `from:` and `preconditions:`, every §1.4 row whose `applies_to:` covers this endpoint, and every §1.6 `error.condition:`. Fix by reordering/inserting prior calls, or by restructuring the design to observe the property from a reachable state; do not weaken §1.2/§1.4 to fit a broken chain.
+- [ ] **End-state replay including side-effects** — every adjective and cardinality in `setup:` must be a consequence of executing the chain, not a wish on top. Replay each call's `side_effects:` forward — cascades, derived-field recomputes, counter/posture updates, §1.3 calculation outputs — and confirm the resulting state matches every claim in `setup:`.
 - [ ] No `setup_api_calls` or `trigger:` is empty or placeholder prose. If `setup_api_calls` genuinely cannot be written without an unbound `${var}`, reshape §1.5 per the priority ladder (compose → business → test-driving) rather than papering over.
 
 **Difficulty (audit — the spec lives at §0.5):**
