@@ -50,7 +50,7 @@ Must be precisely defined:
 - **Auth headers**: Exact names `X-User-ID` and `X-User-Role`
 - **Status code rules**: 201 for new resource creation, 200 for modifications
 - **Precision rules**: Decimal places and rounding method — derived from `calculations[].precision`
-- **OCC mechanism**: `version` field behavior (omit to skip check, mismatch yields the OCC error id the scaffold declares in `errors[]` — commonly `ERR_STALE_DATA` or `ERR_VERSION_CONFLICT`; use the exact id the scaffold nominates, do not invent)
+- **OCC mechanism**: For each `concurrency_rules` entry, the named `write_endpoint` requires `expected_<parent>_version` as a non-optional input field. If the value does not match the parent entity's current `version`, the request is rejected with the rule's declared `error_id` and `http_status` (use the exact id and status the scaffold nominates; do not invent). Endpoints not listed in any `concurrency_rules` entry do not take a version field.
 - **Sort order**: List endpoints default to `created_at` ascending
 - **Role enumeration**: Exact spelling of all role names — from `roles[].name`
 - **State enumeration values**: Exact strings for every state — from `state_machines[].initial_state`, `terminal_states`, and all `transitions[].from`/`to`
@@ -85,7 +85,7 @@ Bi-directional requirements:
 
 ### Business Logic (scattered across subsections — but every rule still present)
 
-§3 is the **scattering zone** — the benchmark's discriminating factor, where LLMs must piece together complete implementations from narrative spread across subsection boundaries. Fields, calculations, thresholds, transitions, relationships, validation conditions, concurrency loser `error_id`s: all live in whichever subsection makes business-narrative sense rather than in one concentrated spec block. **Scattering governs layout, not content** — every rule must still be findable, and a rule without a natural home goes into the closest §2 or §3 subsection as a standalone sentence. See §3 Section Generation Rule below for how this looks in practice; **Contract 2: Rule Coverage** catches rules that "got lost" during the prose rewrite.
+§3 is the **scattering zone** — the benchmark's discriminating factor, where LLMs must piece together complete implementations from narrative spread across subsection boundaries. Fields, calculations, thresholds, transitions, relationships, validation conditions, OCC stale-version rejection rules: all live in whichever subsection makes business-narrative sense rather than in one concentrated spec block. **Scattering governs layout, not content** — every rule must still be findable, and a rule without a natural home goes into the closest §2 or §3 subsection as a standalone sentence. See §3 Section Generation Rule below for how this looks in practice; **Contract 2: Rule Coverage** catches rules that "got lost" during the prose rewrite.
 
 ---
 
@@ -174,7 +174,7 @@ The following topics **must be covered** (but organization is free — merge rel
 - **Nested resource retrieval**: Left-to-right path parameter validation — derived from the URL hierarchy in `endpoints[].path`
 - **Common resource properties**: `id` (UUID, no type prefix), `created_at`/`updated_at` (ISO 8601 UTC with 3 fractional digits), `version` (integer) semantics. Entities with `common_fields: false` in the scaffold carry only `id` and `created_at` — both `updated_at` and `version` are absent; say so explicitly for those entities.
 - **Precision and rounding**: From `calculations[].precision` — state "2 decimal places" and "round half up" (or whatever the scaffold specifies)
-- **Optimistic Concurrency Control**: `version` is optional in request body; mismatch yields the OCC error id the scaffold declares in `errors[]` (do not invent a name); omit to skip the check — derived from endpoints accepting `version?` input
+- **Optimistic Concurrency Control**: For each `concurrency_rules` entry, the named `write_endpoint` requires `expected_<parent>_version` as a non-optional input field. A mismatch with the parent entity's current `version` yields the rule's declared `error_id` (use the exact id, do not invent). Endpoints not listed in any `concurrency_rules` entry do not take a version field.
 - **Domain-specific cross-cutting rules**: Ledger principles, safety protocols, resource utilization rules, capacity constraints, etc. — the specific topics depend entirely on the domain's `calculations` and `validations`
 
 ### §3. Business Logic & Workflows (Scattering Zone)
@@ -197,7 +197,7 @@ This is the **core section** of the PRD, and the scattering zone where informati
 **Hard contracts enforced by the "Hard Contracts" section below:**
 
 - **Field-name coverage (Contract 1)** — every `entities[].fields[].name` and every `endpoints[].request_body`/`query_params`/`path_params` identifier must appear verbatim in backticks somewhere in the PRD. No field lists or schema tables — names reach the reader through narrative.
-- **Rule coverage (Contract 2)** — state-transition preconditions and side-effects, calculation formulas, validation conditions paired with their `error_id`, concurrency losers, and validation priority orderings must all surface in prose.
+- **Rule coverage (Contract 2)** — state-transition preconditions and side-effects, calculation formulas, validation conditions paired with their `error_id`, OCC stale-version rejection rules, and validation priority orderings must all surface in prose.
 - **§3 path purity (Contract 3)** — no HTTP methods or URL paths appear in §3 backticks; endpoints are named via state-transition framing, role + action verb, or capability description. HTTP contract lives only in §4's endpoint table.
 
 **Style minima in §3:** state values appear as exact UPPERCASE strings in narrative (`PENDING_REVIEW`, `ACTIVE`, state-transition pairs like `ASSIGNED → EN_ROUTE_TO_PICKUP`). Error IDs are mentioned naturally (e.g., *"rejected with `ERR_XXX`"*) — trigger conditions live near the workflow they guard, not in a concentrated block. See `example-prd.md` §3 for the target style: no endpoint paths anywhere across its seven subsections, state-pair disambiguation (`ACTIVE → FINAL_REVIEW_PENDING → COMPLETED`) as the bridge back to §4.
@@ -255,7 +255,7 @@ If status is not PASS, repair the missing names and re-run.
 
 ### Contract 2: Rule Coverage
 
-**Why it matters.** Contract 1 catches missing identifiers. Contract 2 catches missing *behaviors* — scaffold entries where the name is present but the specification attached to it (a default, a side-effect cascade, a priority ordering, a concurrency loser `error_id`, a sibling branch) is silent. A PRD that passes Contract 1 can still fail here: a name without its rule is the same as not naming it at all, because the test suite asserts the rule.
+**Why it matters.** Contract 1 catches missing identifiers. Contract 2 catches missing *behaviors* — scaffold entries where the name is present but the specification attached to it (a default, a side-effect cascade, a priority ordering, an OCC stale-version rejection rule, a sibling branch) is silent. A PRD that passes Contract 1 can still fail here: a name without its rule is the same as not naming it at all, because the test suite asserts the rule.
 
 The governing question for every scaffold entry is not *"is its identifier mentioned?"* but *"does the PRD prose uniquely determine the scaffold's specification for this entry?"*
 
@@ -270,12 +270,12 @@ State the relative priority in prose. Text order is not enough — readers treat
 > ✗ Silent: "Approval enforces four independent checks: self-approval, stale-animal, stale-adopter, animal-not-available."
 > ✓ Explicit: "Approval enforces these four checks, evaluated in order — compliance holds first (so a mid-flight hold surfaces as `ERR_COMPLIANCE_HOLD_ACTIVE` rather than being masked by a later check), then animal availability, then self-approval, then the two stale-version checks."
 
-**2. `concurrency_rules[].error_id` — the specific error returned by the loser.**
+**2. `concurrency_rules[]` — OCC stale-version rejection on the named `write_endpoint`.**
 
-For every entry, name (a) the racing operations, (b) the serialization guarantee, and (c) the exact `error_id` the loser receives. "Exactly one wins" is insufficient — tests assert the loser's `error_id`.
+Each entry's prose MUST express (a) the `write_endpoint`, (b) that the request requires the `occ_field` (e.g. `expected_loan_version`) carrying the client's last observed `version` of the `parent_entity`, (c) that a mismatch with the parent entity's current `version` is rejected, and (d) the exact `error_id` and `http_status` the rejection carries. Frame the rule purely in OCC / stale-version terms; do NOT write "simultaneously", "first-writer-wins", "race winner / loser", "two requests arriving together", or any framing that depends on requests overlapping in time.
 
-> ✗ Silent: "Two simultaneous voids on the same invoice serialize to exactly one winner."
-> ✓ Explicit: "Two simultaneous voids on the same invoice serialize to exactly one winner; the loser receives `ERR_INVOICE_HAS_PAYMENTS` if payments arrived between the two attempts, or `ERR_INVALID_STATE` if the invoice has already transitioned out of `ISSUED`."
+> ✗ Silent: "Creating a `RepaymentPlan` requires the loan's current version."
+> ✓ Explicit: "A `POST /repayment-plans` request must carry `expected_loan_version` matching the target loan's current `version`. If another writer has advanced the loan's version since the client last read it, the create is rejected with `ERR_STALE_LOAN_VERSION` (HTTP 412), preventing the client from overwriting a plan it has not observed."
 
 **3. Cross-entity side effects — secondary effects, not just the primary one.**
 
@@ -313,7 +313,7 @@ When scaffold contains sibling transitions out of the same `from` state, paralle
 ```
 Rule coverage check:
 - validations[] with priority: A checked, A expressed in prose, 0 missing
-- concurrency_rules[] with error_id: B checked, B expressed, 0 missing
+- concurrency_rules[] OCC rejections: B checked, B expressed (write_endpoint + expected_<parent>_version + error_id all named), 0 missing
 - state_machines[].transitions: C checked, C fully expressed, 0 missing
 - calculations[]: D checked, D fully expressed, 0 missing
 - validations[] conditions: E checked, E matchable to error_id in prose, 0 missing

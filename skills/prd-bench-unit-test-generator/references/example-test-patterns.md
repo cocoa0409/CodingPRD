@@ -826,27 +826,30 @@ def test_mass_assignment_ignored(api, role_a_headers):
     assert entity["status"] == "INITIAL_STATE"
 ```
 
-## 2.9 Concurrency (OCC Only — Race Tests Are PRD-Driven)
+## 2.9 Concurrency (OCC Stale-Version)
 
-Concurrency tests cover **only** what the PRD explicitly defines. The standard patterns are
-optimistic concurrency control (version conflict detection) and any uniqueness constraints
-the PRD specifies.
+Every `concurrency_rules` entry in the scaffold is an OCC rule with a `write_endpoint`, an
+`occ_field` (named `expected_<parent>_version`), an `error_id`, and an `http_status` (412
+Precondition Failed). The test arranges a state where the client's `expected_<parent>_version`
+is stale relative to the parent entity's current `version`, calls `write_endpoint`, and
+asserts the rule's exact `error_id`.
 
-**Do NOT generate race-condition tests (concurrent state transitions, duplicate resource
-creation races, etc.) unless the PRD explicitly defines the expected outcome** — e.g.,
-"only one delivery may be assigned per order" or "exactly one of confirm/cancel must win."
-The `run_race` and `assert_exactly_one_succeeds` utilities exist in the framework for
-scaffolds whose PRD does define such behavior, but they are not standard patterns to apply
-by default.
+The canonical sequential form is below. A `run_race` form (both requests submitted with the
+same initially-fresh expected version) is also acceptable — OCC's version check at commit
+time makes either form deterministic.
 
 ```python
 def test_stale_version_rejected(api, role_a_headers):
-    """OCC claim: Update with stale version → ERR_STALE_DATA."""
+    """OCC: write with stale parent version → rule's error_id."""
     entity = validate_success(api.create_{entity}(..., role_a_headers), 201)
     stale_version = entity["version"]
-    api.activate(entity["id"], role_a_headers)  # increments version
-    res = api.update(entity["id"], {"version": stale_version}, role_a_headers)
-    validate_error(res, "ERR_STALE_DATA", expected_status=409)
+    api.activate(entity["id"], role_a_headers)  # advances entity.version
+    res = api.update(
+        entity["id"],
+        {"expected_{entity}_version": stale_version, ...},
+        role_a_headers,
+    )
+    validate_error(res, "ERR_STALE_{ENTITY}_VERSION", expected_status=412)
 ```
 
 ## 2.10 End-to-End Integration

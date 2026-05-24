@@ -219,7 +219,7 @@ Before generating a test derived from any of these scaffold features, search PRD
 | Skip category | Scaffold source | When PRD is silent |
 |---|---|---|
 | `validation-priority` | `validations[].priority` | Do NOT test "error A fires before error B". Test each validation in an isolated scenario where only one can fail. |
-| `concurrency-error_id` | `concurrency_rules[].error_id` | Use `assert_exactly_one_succeeds` / `assert_race_outcome(1,1)`. Do NOT assert a specific loser `error_id`. |
+| `concurrency-occ` | `concurrency_rules[]` (each entry is an OCC rule with `write_endpoint`, `occ_field`, `error_id`) | Generate as an OCC stale-version test asserting the rule's exact `error_id` (sequential or `run_race` form — OCC's version check at commit time makes either deterministic). If PRD does not state both the `expected_<parent>_version` requirement and the rejection `error_id`, SKIP. |
 | `cross-entity-cascade` | `endpoints[].side_effects` spanning entities | Test primary effect only. Omit secondary (e.g., the `animal.version` bump from hold creation). |
 | `applies_to-scope` | `validations[].applies_to` endpoint list | Generate tests only for endpoints PRD prose explicitly covers — not the scaffold's broader list. |
 | `computed-field` | Scaffold declares computed field; PRD mentions it only inside a formula | Do NOT assert field presence/value on response (a reader could correctly omit it from the serializer). |

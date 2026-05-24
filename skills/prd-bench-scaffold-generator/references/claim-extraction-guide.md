@@ -194,7 +194,7 @@ Inspect `complexity_profile.complexity_layers` and generate claims for each acti
 
 | Layer | Claims to generate |
 |---|---|
-| `optimistic_concurrency` | Stale version write → conflict error; correct version → success; version increments on every write. **Does NOT imply race-condition tests** — generate race tests only when the scaffold declares the concurrent-operation outcome in `concurrency_rules` (§1.2.1) with an explicit `error_id` and `serialization` clause (e.g., "only one succeeds", uniqueness constraints on creation). |
+| `optimistic_concurrency` | Stale `expected_<parent>_version` → rule's `error_id` (412); correct version → success; `version` increments on every write. Each `concurrency_rules` entry in §1.2.1 maps to an OCC stale-version test using its declared `write_endpoint` and `occ_field`. |
 | `cascading_side_effects` | N-level chain verified end-to-end; ordering sensitivity tested; partial failure handled |
 | `dual_variant_calculation` | Both variants produce expected results; delta on switch is correct |
 | `soft_delete` | Soft-deleted entity excluded from lists (default); included when filter specified; references still valid |

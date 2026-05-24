@@ -37,8 +37,8 @@ Python / Flask:
 ```bash
 #!/bin/bash
 set -e
-pip install -q -r requirements.txt
-exec python app.py
+python3 -m pip install -q -r requirements.txt
+exec python3 app.py
 ```
 
 Node.js / Express:
