@@ -21,15 +21,13 @@ over §1.1 entities ↔ §1.5 endpoints.
                            Cascades silently bump parent.version between create
                            and the OCC call, so literals go stale — see SKILL.md
                            §1.8 per-instance contract item 3c.
-  (f) FK reverse-reachability — every entity field declared with a description
-                           matching `^FK -> <Parent>.id` has at least one GET
-                           endpoint in §1.5 that lets a client discover the
-                           child(ren) given the parent's id. Either sub-resource
-                           form (`GET /<parent-collection>/{id}/<child-segment>`
-                           with `output: <Child>` or `<Child>[]`) or filtered
-                           list form (`GET /<child-collection>` with the FK
-                           field declared as `<fk_field>?` in `input:`). See
-                           SKILL.md §1.5 FK reverse-reachability principle.
+  (f) FK reverse-reachability — every entity field whose description matches
+                           `^FK -> <Parent>.id` has a GET in §1.5 that finds
+                           the child from parent.id, in either sub-resource
+                           form (`GET /<parent>/{id}/<segment>`) or filtered-
+                           list form (`GET /<children>` with `<fk_field>?` in
+                           `input:`); both return `<Child>[]` (1:1 returns
+                           an array of 0–1). See SKILL.md §1.5.
 
 Usage:
   scaffold_lint.py <task_dir>
@@ -708,20 +706,10 @@ def derive_entity_collection_segments(
 def lint_fk_reverse_reachability(
     scaffold: dict, endpoints: list[Endpoint]
 ) -> list[Violation]:
-    """Check (f): every FK declared in §1.1 has a reverse-reachability GET
-    endpoint in §1.5.
-
-    Two endpoint forms satisfy the rule:
-      1. Sub-resource: `GET /<parent-collection>/{id}/<child-segment>` with
-         `output: <Child>` (1:1) or `output: <Child>[]` (1:N).
-      2. Filtered list: `GET /<child-collection>` returning `<Child>[]`
-         with the FK field declared in `input:` (required or optional).
-
-    The "child carries the FK to parent" convention from §1.1 means the
-    child→parent direction is trivially walkable (read child, look at
-    `parent_id`); this check enforces that the parent→child direction is
-    also explicitly walkable, closing the FK graph so cascade-created
-    resources cannot become dangling pointers."""
+    """Check (f): every FK in §1.1 has a reverse-reachability GET in §1.5,
+    in sub-resource form (`GET /<parent>/{id}/<segment>` returning <Child>
+    or <Child>[]) or filtered-list form (`GET /<children>` with <fk_field>
+    in `input:`)."""
     api_prefix = str(scaffold.get("api_prefix", "")).strip()
     prefix = api_prefix.rstrip("/")
     fks = extract_fks(scaffold)
@@ -741,7 +729,7 @@ def lint_fk_reverse_reachability(
                     continue
                 if not ep.path_template.startswith(parent_prefix_path):
                     continue
-                if ep.output_entity == child:
+                if ep.output_entity == child and ep.output_is_list:
                     sub_resource_ok = True
                     break
 
@@ -762,37 +750,13 @@ def lint_fk_reverse_reachability(
         if sub_resource_ok or filtered_list_ok:
             continue
 
+        parent_path = f"{prefix}/{parent_seg}" if parent_seg else f"<prefix>/<{parent}-collection>"
+        child_path = f"{prefix}/{child_seg}" if child_seg else f"<prefix>/<{child}-collection>"
         detail_lines = [
-            f"FK `{child}.{fk_field} -> {parent}.id` has no reverse-reachability "
-            f"GET endpoint in §1.5. Given a `{parent}.id`, a PRD-only reader "
-            f"cannot discover the associated {child}(s) through any declared "
-            f"endpoint, leaving the new {child} as a dangling pointer.",
-            "Add one of:",
+            f"FK `{child}.{fk_field} -> {parent}.id` has no reverse-reachability GET in §1.5. Add either:",
+            f"  - Sub-resource: `GET {parent_path}/{{id}}/<segment>` returning `output: {child}[]`.",
+            f"  - Filtered list: `GET {child_path}` with `{fk_field}?` in `input:` returning `output: {child}[]`.",
         ]
-        if parent_seg:
-            detail_lines.append(
-                f"  - Sub-resource: `GET {prefix}/{parent_seg}/{{id}}/<segment>` "
-                f"returning `output: {child}` (1:1) or `output: {child}[]` (1:N)."
-            )
-        else:
-            detail_lines.append(
-                f"  - Sub-resource: `GET <prefix>/<{parent}-collection>/{{id}}"
-                f"/<segment>` returning `output: {child}` or `output: {child}[]` "
-                f"(note: could not infer {parent}'s collection segment from §1.5; "
-                f"ensure `GET <prefix>/<{parent}-collection>/{{id}}` is declared)."
-            )
-        if child_seg:
-            detail_lines.append(
-                f"  - Filtered list: `GET {prefix}/{child_seg}` declaring "
-                f"`{fk_field}?` in `input:` and returning `output: {child}[]`."
-            )
-        else:
-            detail_lines.append(
-                f"  - Filtered list: `GET <prefix>/<{child}-collection>` "
-                f"declaring `{fk_field}?` in `input:` returning "
-                f"`output: {child}[]` (note: could not infer {child}'s "
-                f"collection segment from §1.5)."
-            )
         violations.append(
             Violation(
                 rule="(f) FK_REVERSE_UNREACHABLE",
