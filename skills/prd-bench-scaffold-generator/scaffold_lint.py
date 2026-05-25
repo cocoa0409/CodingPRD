@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-scaffold_lint.py — Validates that every call in §1.8 (SCAFFOLD_DIFFICULTY_DESIGN.yaml)
-and §1.9 (SCAFFOLD_CORNER_DESIGN.yaml) setup_api_calls / trigger chains conforms
-to the §1.5 endpoint table declared in SCAFFOLD.yaml.
+scaffold_lint.py — Validates that SCAFFOLD.yaml + §1.8 (SCAFFOLD_DIFFICULTY_DESIGN.yaml)
++ §1.9 (SCAFFOLD_CORNER_DESIGN.yaml) form a self-consistent design package.
 
-Five fatal checks per call:
+Six fatal checks. (a)–(e) run per call in §1.8/§1.9 setup_api_calls / trigger
+chains against the §1.5 endpoint table. (f) is a scaffold-level integrity check
+over §1.1 entities ↔ §1.5 endpoints.
+
   (a) endpoint declared — (method, path-template) matches a §1.5 entry
   (b) role allowed      — call's `as:` value is in endpoint.roles
   (c) payload shape     — payload keys are a subset of endpoint.input (with `?`
@@ -19,6 +21,15 @@ Five fatal checks per call:
                            Cascades silently bump parent.version between create
                            and the OCC call, so literals go stale — see SKILL.md
                            §1.8 per-instance contract item 3c.
+  (f) FK reverse-reachability — every entity field declared with a description
+                           matching `^FK -> <Parent>.id` has at least one GET
+                           endpoint in §1.5 that lets a client discover the
+                           child(ren) given the parent's id. Either sub-resource
+                           form (`GET /<parent-collection>/{id}/<child-segment>`
+                           with `output: <Child>` or `<Child>[]`) or filtered
+                           list form (`GET /<child-collection>` with the FK
+                           field declared as `<fk_field>?` in `input:`). See
+                           SKILL.md §1.5 FK reverse-reachability principle.
 
 Usage:
   scaffold_lint.py <task_dir>
@@ -273,6 +284,11 @@ _NEGATIVE_TRIGGER_JSONPATHS = {"$.data.error_id", "$.data.message"}
 # placeholder reference somewhere in the value.
 _OCC_VERSION_KEY_RE = re.compile(r"^expected_.+_version$")
 _PLACEHOLDER_IN_VALUE_RE = re.compile(r"\$\{[^}]+\}")
+
+# Foreign-key declarations live in entity field descriptions and MUST follow
+# the canonical `FK -> <Entity>.id[; <annotations>]` prefix (SKILL.md §1.1).
+# The regex captures the parent entity name for the reverse-reachability check.
+_FK_DESC_RE = re.compile(r"^\s*FK\s*->\s*([A-Za-z_][A-Za-z0-9_]*)\.id\b")
 
 
 # Instance-name patterns that strongly indicate a negative test (intentional
@@ -633,6 +649,165 @@ def lint_call(
 
 
 # ---------------------------------------------------------------------------
+# Check (f): FK reverse-reachability — scaffold-level
+# ---------------------------------------------------------------------------
+
+
+def extract_fks(scaffold: dict) -> list[tuple[str, str, str]]:
+    """Walk §1.1 entities and pull every (child_entity, fk_field, parent_entity)
+    triple. An FK is any field whose `description:` matches the canonical
+    `^FK -> <Parent>.id\\b` prefix (SKILL.md §1.1)."""
+    out: list[tuple[str, str, str]] = []
+    for ent in scaffold.get("entities", []) or []:
+        if not isinstance(ent, dict):
+            continue
+        child = str(ent.get("name", "")).strip()
+        if not child:
+            continue
+        for f in ent.get("fields", []) or []:
+            if not isinstance(f, dict):
+                continue
+            desc = str(f.get("description", ""))
+            m = _FK_DESC_RE.match(desc)
+            if not m:
+                continue
+            field_name = str(f.get("name", "")).strip()
+            parent = m.group(1)
+            if field_name and parent:
+                out.append((child, field_name, parent))
+    return out
+
+
+def derive_entity_collection_segments(
+    endpoints: list[Endpoint], api_prefix: str
+) -> dict[str, str]:
+    """Infer each entity's URL collection segment from §1.5.
+
+    Heuristic: a 'single-resource GET' is a GET endpoint whose path is
+    `<api_prefix>/<segment>/{id}` (exactly two segments under the prefix,
+    the second being a templated id) and whose `output_entity` is the
+    entity name (non-list). The `<segment>` is taken as that entity's
+    canonical collection name. Only the first matching segment wins."""
+    out: dict[str, str] = {}
+    prefix = api_prefix.rstrip("/")
+    for ep in endpoints:
+        if ep.method != "GET":
+            continue
+        if ep.output_is_list or not ep.output_entity:
+            continue
+        path = ep.path_template.rstrip("/")
+        if not path.startswith(prefix + "/"):
+            continue
+        rest = path[len(prefix) + 1:]
+        parts = rest.split("/")
+        if len(parts) == 2 and _PLACEHOLDER_SEG_RE.match(parts[1]):
+            out.setdefault(ep.output_entity, parts[0])
+    return out
+
+
+def lint_fk_reverse_reachability(
+    scaffold: dict, endpoints: list[Endpoint]
+) -> list[Violation]:
+    """Check (f): every FK declared in §1.1 has a reverse-reachability GET
+    endpoint in §1.5.
+
+    Two endpoint forms satisfy the rule:
+      1. Sub-resource: `GET /<parent-collection>/{id}/<child-segment>` with
+         `output: <Child>` (1:1) or `output: <Child>[]` (1:N).
+      2. Filtered list: `GET /<child-collection>` returning `<Child>[]`
+         with the FK field declared in `input:` (required or optional).
+
+    The "child carries the FK to parent" convention from §1.1 means the
+    child→parent direction is trivially walkable (read child, look at
+    `parent_id`); this check enforces that the parent→child direction is
+    also explicitly walkable, closing the FK graph so cascade-created
+    resources cannot become dangling pointers."""
+    api_prefix = str(scaffold.get("api_prefix", "")).strip()
+    prefix = api_prefix.rstrip("/")
+    fks = extract_fks(scaffold)
+    if not fks:
+        return []
+    segs = derive_entity_collection_segments(endpoints, api_prefix)
+    violations: list[Violation] = []
+    for child, fk_field, parent in fks:
+        parent_seg = segs.get(parent)
+        child_seg = segs.get(child)
+
+        sub_resource_ok = False
+        if parent_seg:
+            parent_prefix_path = f"{prefix}/{parent_seg}/{{id}}/"
+            for ep in endpoints:
+                if ep.method != "GET":
+                    continue
+                if not ep.path_template.startswith(parent_prefix_path):
+                    continue
+                if ep.output_entity == child:
+                    sub_resource_ok = True
+                    break
+
+        filtered_list_ok = False
+        if child_seg:
+            child_list_path = f"{prefix}/{child_seg}"
+            for ep in endpoints:
+                if ep.method != "GET":
+                    continue
+                if ep.path_template.rstrip("/") != child_list_path:
+                    continue
+                if not (ep.output_entity == child and ep.output_is_list):
+                    continue
+                if fk_field in (ep.required_inputs | ep.optional_inputs):
+                    filtered_list_ok = True
+                    break
+
+        if sub_resource_ok or filtered_list_ok:
+            continue
+
+        detail_lines = [
+            f"FK `{child}.{fk_field} -> {parent}.id` has no reverse-reachability "
+            f"GET endpoint in §1.5. Given a `{parent}.id`, a PRD-only reader "
+            f"cannot discover the associated {child}(s) through any declared "
+            f"endpoint, leaving the new {child} as a dangling pointer.",
+            "Add one of:",
+        ]
+        if parent_seg:
+            detail_lines.append(
+                f"  - Sub-resource: `GET {prefix}/{parent_seg}/{{id}}/<segment>` "
+                f"returning `output: {child}` (1:1) or `output: {child}[]` (1:N)."
+            )
+        else:
+            detail_lines.append(
+                f"  - Sub-resource: `GET <prefix>/<{parent}-collection>/{{id}}"
+                f"/<segment>` returning `output: {child}` or `output: {child}[]` "
+                f"(note: could not infer {parent}'s collection segment from §1.5; "
+                f"ensure `GET <prefix>/<{parent}-collection>/{{id}}` is declared)."
+            )
+        if child_seg:
+            detail_lines.append(
+                f"  - Filtered list: `GET {prefix}/{child_seg}` declaring "
+                f"`{fk_field}?` in `input:` and returning `output: {child}[]`."
+            )
+        else:
+            detail_lines.append(
+                f"  - Filtered list: `GET <prefix>/<{child}-collection>` "
+                f"declaring `{fk_field}?` in `input:` returning "
+                f"`output: {child}[]` (note: could not infer {child}'s "
+                f"collection segment from §1.5)."
+            )
+        violations.append(
+            Violation(
+                rule="(f) FK_REVERSE_UNREACHABLE",
+                file_label="SCAFFOLD",
+                rule_or_section="§1.1↔§1.5 FK reverse-reachability",
+                instance_name=f"{child}.{fk_field} -> {parent}",
+                location=f"entities[name={child}].fields[name={fk_field}]",
+                call_str="(scaffold-level check, no call)",
+                detail="\n".join(detail_lines),
+            )
+        )
+    return violations
+
+
+# ---------------------------------------------------------------------------
 # CLI / IO
 # ---------------------------------------------------------------------------
 
@@ -692,7 +867,10 @@ def _render_text(
     lines.append(f"  Calls scanned (§1.8+§1.9):  {stats['n_calls']}")
     lines.append("")
     if not violations:
-        lines.append("VERDICT: clean lint — all calls conform to §1.5.")
+        lines.append(
+            "VERDICT: clean lint — all §1.8/§1.9 calls conform to §1.5 "
+            "and all §1.1 FKs have reverse-reachability in §1.5."
+        )
         return "\n".join(lines)
 
     by_rule: dict[str, int] = {}
@@ -762,6 +940,10 @@ def main() -> int:
     for site in walk_design(corner_design, "§1.9", "scaffold_corner_design"):
         n_calls += 1
         violations.extend(lint_call(site, endpoints, entity_fields))
+
+    # (f) Scaffold-level FK reverse-reachability check — runs once across
+    #     §1.1 entities vs §1.5 endpoints, independent of §1.8/§1.9 calls.
+    violations.extend(lint_fk_reverse_reachability(scaffold, endpoints))
 
     stats = {
         "n_endpoints": len(endpoints),
