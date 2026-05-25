@@ -4,7 +4,7 @@ scaffold_lint.py — Validates that every call in §1.8 (SCAFFOLD_DIFFICULTY_DES
 and §1.9 (SCAFFOLD_CORNER_DESIGN.yaml) setup_api_calls / trigger chains conforms
 to the §1.5 endpoint table declared in SCAFFOLD.yaml.
 
-Four fatal checks per call:
+Five fatal checks per call:
   (a) endpoint declared — (method, path-template) matches a §1.5 entry
   (b) role allowed      — call's `as:` value is in endpoint.roles
   (c) payload shape     — payload keys are a subset of endpoint.input (with `?`
@@ -13,6 +13,12 @@ Four fatal checks per call:
                            field declared on the endpoint's output entity in §1.1
                            (error-envelope fields `$.data.error_id` and
                            `$.data.message` are always valid per §1.0)
+  (e) OCC version is dynamic — every payload field matching `expected_*_version`
+                           is a `${var}` placeholder (or expression containing
+                           one), never a hardcoded integer / numeric string.
+                           Cascades silently bump parent.version between create
+                           and the OCC call, so literals go stale — see SKILL.md
+                           §1.8 per-instance contract item 3c.
 
 Usage:
   scaffold_lint.py <task_dir>
@@ -260,6 +266,15 @@ _CAPTURE_LIST_RE = re.compile(
 )
 _NEGATIVE_TRIGGER_JSONPATHS = {"$.data.error_id", "$.data.message"}
 
+# OCC version fields in payload MUST be `${var}` (or expression containing one),
+# never a literal — see SKILL.md §1.8 per-instance contract item 3c. The key
+# pattern matches `expected_<parent>_version` for any parent name declared in
+# §1.7's concurrency_rules; the value pattern requires at least one `${...}`
+# placeholder reference somewhere in the value.
+_OCC_VERSION_KEY_RE = re.compile(r"^expected_.+_version$")
+_PLACEHOLDER_IN_VALUE_RE = re.compile(r"\$\{[^}]+\}")
+
+
 # Instance-name patterns that strongly indicate a negative test (intentional
 # violation of role/payload constraints to verify rejection).
 _NEGATIVE_NAME_RE = re.compile(
@@ -457,6 +472,41 @@ def lint_call(
             )
         )
         return vs  # downstream checks need a matched endpoint
+
+    # (e) OCC version fields in payload MUST be dynamic.
+    #     Applies universally (positive AND negative tests). A negative test
+    #     that wants to provoke ERR_STALE_VERSION should still use an expression
+    #     like `${w_v_pre_seat} - 1`, not a bare literal — bare literals collide
+    #     with whatever value the running implementation actually holds, which
+    #     undermines the test's polarity.
+    payload_for_occ = call.get("payload")
+    if isinstance(payload_for_occ, dict):
+        for key, val in payload_for_occ.items():
+            if not _OCC_VERSION_KEY_RE.match(str(key)):
+                continue
+            if isinstance(val, str) and _PLACEHOLDER_IN_VALUE_RE.search(val):
+                continue
+            vs.append(
+                Violation(
+                    rule="(e) expected_*_version must be a ${var}, not a literal",
+                    file_label=site.file_label,
+                    rule_or_section=site.rule_or_section,
+                    instance_name=site.instance_name,
+                    location=site.location,
+                    call_str=call_str,
+                    detail=(
+                        f"`{key}: {val!r}` is a hardcoded value. OCC version "
+                        f"fields can only originate from a server response — "
+                        f"add `captures: {{ <pname>_v: $.data.version }}` on a "
+                        f"prior call against the parent (or on the parent's "
+                        f"create response when the chain is cascade-free), "
+                        f"then write `{key}: ${{<pname>_v}}`. Even a literal "
+                        f"that 'looks right' silently goes stale once any §1.3 "
+                        f"transition or §1.7 cascade bumps the parent's version "
+                        f"between its creation and this call."
+                    ),
+                )
+            )
 
     # (b)+(c) are skipped for negative-test triggers — the test is verifying the
     # endpoint REJECTS this exact payload/role combination; flagging it would be
