@@ -72,6 +72,20 @@ Agent({
 
 **Concurrency**: Steps 2 → 4 are strictly sequential (the PRD depends on the scaffold). Steps 5 and 6 have no mutual dependency — Step 5 reads SCAFFOLD.yaml + SCAFFOLD_DIFFICULTY_DESIGN.yaml + SCAFFOLD_CORNER_DESIGN.yaml + PRD.md; Step 6 reads SCAFFOLD.yaml + PRD.md + INSTRUCTION.md — and they MUST be launched concurrently. Concurrency on Claude Code requires a **single assistant message with two Agent tool uses**; two Agent calls across separate messages run sequentially. Besides throughput, concurrent launch gives physical isolation: Step 6's impl-gen subagent cannot read `test_suite/` because the directory does not yet exist when it starts.
 
+## Worklog
+
+After every step completes (bash block or subagent), the orchestrator MUST append a record to `{task_dir}/worklog.md` before starting the next step. This is orchestrator-owned — write directly with the Write/Edit tool, no subagent. Use append; never overwrite earlier entries.
+
+Format per entry:
+
+```
+## Step N: {short title} — {ISO-8601 UTC timestamp}
+
+{verbatim summary returned by the subagent, OR a one-line note for bash-only steps}
+```
+
+For Steps 2, 4, 5, 6, 7 paste the subagent's returned summary **verbatim** — do not paraphrase or trim. The subagent's context is discarded on exit, so `worklog.md` is the only durable trace of what each generation step reported (coverage audits, design adjudications, fix history, deletion notes). For Steps 1 and 3 (bash-only) write one line stating what was created or copied. If Step 7 exits cleanly on the first sweep, its summary still goes in (the "0 iterations / 0 deletions / 0 fixes" record is itself meaningful evidence).
+
 ## Execution Steps
 
 All paths below are relative to the project root (the directory containing `tasks/`, `skills/`, etc.).
@@ -357,6 +371,7 @@ tasks/{task_name}/
 ├── SCAFFOLD.yaml                          # Structured specification (§1.1–§1.7)
 ├── SCAFFOLD_DIFFICULTY_DESIGN.yaml        # Depth test index — §1.8 (withheld from PRD gen)
 ├── SCAFFOLD_CORNER_DESIGN.yaml            # Breadth test index — §1.9 (withheld from PRD gen)
+├── worklog.md                             # Append-only per-step record (orchestrator-written summaries)
 ├── test_helpers/                          # Test infrastructure
 │   ├── __init__.py
 │   ├── types.py
