@@ -59,22 +59,16 @@ for i in "${!TASKS[@]}"; do
 
   mkdir -p "$harbor_task"
 
-  # 每个任务的详细输出收到临时 log；失败时再 dump，免得 179 任务把屏幕刷爆。
-  log="$(mktemp)"
-  printf "[%3d/%d] %-55s " "$((i+1))" "$total" "$task_name"
+  printf "[%3d/%d] %s\n" "$((i+1))" "$total" "$task_name"
 
-  if bash "$LIB_DIR/prepare.sh" "$harbor_task" >"$log" 2>&1; then
-    echo "ok"
+  if bash "$LIB_DIR/prepare.sh" "$harbor_task"; then
+    echo "         -> ok"
     ok=$((ok+1))
   else
-    echo "FAILED"
+    echo "         -> FAILED"
     fail=$((fail+1))
     failed+=("$task_name")
-    echo "---- $task_name prepare log ----" >&2
-    cat "$log" >&2
-    echo "---- end log ----" >&2
   fi
-  rm -f "$log"
 done
 
 echo

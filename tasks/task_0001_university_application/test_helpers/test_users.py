@@ -1,62 +1,47 @@
-"""Pre-built role headers.
+"""Pre-built role headers for every role in the PRD.
 
-Per PRD §2.1, two roles bind to persisted entities (entity_backed):
-  - Applicant — X-User-ID is the Applicant.id; ownership-gated calls
-    MUST use make_applicant_headers(applicant_id).
-  - Recommender — X-User-ID is the Recommender.id; ownership-gated calls
-    MUST use make_recommender_headers(recommender_id).
+The Applicant role's identity is `entity_backed:Applicant` — for ownership-gated
+calls, fixtures MUST call `make_applicant_headers(applicant_id)` with the actual
+Applicant.id rather than using the shared constant. The shared constant is a
+fallback for non-ownership tests only (e.g., GET catalogue endpoints).
 
-The other three roles are opaque (AdmissionsOfficer, FinancialAidOfficer,
-PlatformAdmin) — a shared constant suffices because the server does not
-compare X-User-ID against any persisted entity.
+AdmissionsOfficer, FinancialAidOfficer, and PlatformAdmin carry `identity: opaque` —
+X-User-ID is recorded but never compared to any entity id, so a shared constant
+is canonical for these roles.
 """
 from prd_bench_local_runner.testing import build_user_headers
 
 
+# Shared constants — safe for opaque roles, and for non-ownership-gated tests.
 TEST_USERS = {
-    # Opaque roles — canonical shared form.
-    "admissions_officer_headers": build_user_headers(
-        "test-admissions-officer-1", "AdmissionsOfficer"),
-    "financial_aid_officer_headers": build_user_headers(
-        "test-fa-officer-1", "FinancialAidOfficer"),
-    "platform_admin_headers": build_user_headers(
-        "test-platform-admin-1", "PlatformAdmin"),
-
-    # Entity-backed roles — fallback constants for non-ownership tests
-    # (e.g., ERR_FORBIDDEN_ROLE checks that don't actually touch an owned
-    # resource). Fixtures that create real Applicants or Recommenders
-    # MUST use the make_*_headers() builders below instead.
+    # entity_backed role: shared constant is a fallback for non-ownership tests only.
     "applicant_headers": build_user_headers("test-applicant-1", "Applicant"),
-    "recommender_headers": build_user_headers("test-recommender-1", "Recommender"),
+    # opaque roles: shared constants are canonical.
+    "admissions_headers": build_user_headers("test-admissions-1", "AdmissionsOfficer"),
+    "financial_aid_headers": build_user_headers("test-financial-aid-1", "FinancialAidOfficer"),
+    "platform_admin_headers": build_user_headers("test-platform-admin-1", "PlatformAdmin"),
+    # Anonymous (no auth headers required, but provided for explicit anonymous calls)
+    "anonymous_headers": {},
 }
 
 
 def make_applicant_headers(applicant_id: str) -> dict:
-    """Build Applicant headers bound to a specific Applicant.id.
-
-    Use this whenever the call exercises ownership of an Applicant-owned
-    resource (Application, EssaySubmission, RecommendationLetter request,
-    FinancialAidProfile).
+    """For Applicant role (entity_backed:Applicant). Pass the actual Applicant.id
+    as user_id whenever the call is ownership-gated (applicant-scoped endpoints).
     """
     return build_user_headers(applicant_id, "Applicant")
 
 
-def make_recommender_headers(recommender_id: str) -> dict:
-    """Build Recommender headers bound to a specific Recommender.id.
-
-    Use this whenever the call exercises ownership of a RecommendationLetter
-    (start/submit).
-    """
-    return build_user_headers(recommender_id, "Recommender")
+def make_admissions_headers(opaque_id: str = "test-admissions-1") -> dict:
+    """For AdmissionsOfficer role (identity: opaque). X-User-ID is opaque."""
+    return build_user_headers(opaque_id, "AdmissionsOfficer")
 
 
-def admissions_headers() -> dict:
-    return TEST_USERS["admissions_officer_headers"]
+def make_financial_aid_headers(opaque_id: str = "test-financial-aid-1") -> dict:
+    """For FinancialAidOfficer role (identity: opaque)."""
+    return build_user_headers(opaque_id, "FinancialAidOfficer")
 
 
-def fa_officer_headers() -> dict:
-    return TEST_USERS["financial_aid_officer_headers"]
-
-
-def admin_headers() -> dict:
-    return TEST_USERS["platform_admin_headers"]
+def make_platform_admin_headers(opaque_id: str = "test-platform-admin-1") -> dict:
+    """For PlatformAdmin role (identity: opaque)."""
+    return build_user_headers(opaque_id, "PlatformAdmin")

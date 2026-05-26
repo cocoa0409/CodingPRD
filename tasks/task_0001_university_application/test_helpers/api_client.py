@@ -1,154 +1,149 @@
-"""API client: one method per endpoint defined in the PRD (§4).
-
-Subclasses the framework's GenericApiClient, which provides the _request()
-implementation and envelope handling.
-
-Per PRD §2 all endpoint paths are mounted under the `/api` prefix.
-"""
+"""API client: one method per endpoint defined in the PRD."""
 from prd_bench_local_runner.testing import GenericApiClient
 
 
 class ApiClient(GenericApiClient):
-    # --- Applicants ---
-    def register_applicant(self, payload, headers=None):
-        return self._request("POST", "/api/applicants/register", payload, headers or {})
+    # ── Applicants ──────────────────────────────────────────────────
+    def create_applicant(self, payload, headers=None):
+        return self._request("POST", "/applicants", payload, headers)
 
     def get_applicant(self, applicant_id, headers):
-        return self._request("GET", f"/api/applicants/{applicant_id}", headers=headers)
+        return self._request("GET", f"/applicants/{applicant_id}", headers=headers)
 
-    def patch_applicant(self, applicant_id, payload, headers):
-        return self._request("PATCH", f"/api/applicants/{applicant_id}", payload, headers)
+    def update_applicant(self, applicant_id, payload, headers):
+        return self._request("PATCH", f"/applicants/{applicant_id}", payload, headers)
 
-    # --- Recommenders ---
-    def create_recommender(self, payload, headers):
-        return self._request("POST", "/api/recommenders", payload, headers)
+    def list_applicants(self, headers, params=None):
+        return self._request("GET", "/applicants", headers=headers, params=params)
 
-    def get_recommender(self, recommender_id, headers):
-        return self._request("GET", f"/api/recommenders/{recommender_id}", headers=headers)
-
-    def accept_recommender(self, recommender_id, headers=None):
-        return self._request("POST", f"/api/recommenders/{recommender_id}/accept",
-                             {}, headers or {})
-
-    def decline_recommender(self, recommender_id, headers=None):
-        return self._request("POST", f"/api/recommenders/{recommender_id}/decline",
-                             {}, headers or {})
-
-    # --- Schools ---
+    # ── Schools ─────────────────────────────────────────────────────
     def create_school(self, payload, headers):
-        return self._request("POST", "/api/schools", payload, headers)
+        return self._request("POST", "/schools", payload, headers)
 
     def get_school(self, school_id, headers):
-        return self._request("GET", f"/api/schools/{school_id}", headers=headers)
+        return self._request("GET", f"/schools/{school_id}", headers=headers)
 
     def list_schools(self, headers, params=None):
-        return self._request("GET", "/api/schools", headers=headers, params=params)
+        return self._request("GET", "/schools", headers=headers, params=params)
 
-    def get_school_yield_report(self, school_id, headers):
-        return self._request("GET", f"/api/schools/{school_id}/yield-report",
-                             headers=headers)
-
-    # --- Applications ---
+    # ── Applications ────────────────────────────────────────────────
     def create_application(self, payload, headers):
-        return self._request("POST", "/api/applications", payload, headers)
+        return self._request("POST", "/applications", payload, headers)
 
-    def get_application(self, application_id, headers, params=None):
-        return self._request("GET", f"/api/applications/{application_id}",
-                             headers=headers, params=params)
+    def get_application(self, application_id, headers):
+        return self._request("GET", f"/applications/{application_id}", headers=headers)
 
     def list_applications(self, headers, params=None):
-        return self._request("GET", "/api/applications", headers=headers, params=params)
+        return self._request("GET", "/applications", headers=headers, params=params)
 
     def submit_application(self, application_id, headers):
-        return self._request("POST", f"/api/applications/{application_id}/submit",
-                             {}, headers)
+        return self._request("POST", f"/applications/{application_id}/submit", {}, headers)
 
     def withdraw_application(self, application_id, headers):
-        return self._request("POST", f"/api/applications/{application_id}/withdraw",
-                             {}, headers)
+        return self._request("POST", f"/applications/{application_id}/withdraw", {}, headers)
 
-    def start_review_application(self, application_id, headers):
-        return self._request("POST", f"/api/applications/{application_id}/start-review",
-                             {}, headers)
+    def begin_review_application(self, application_id, headers):
+        return self._request("POST", f"/applications/{application_id}/begin-review", {}, headers)
 
-    def decide_application(self, application_id, payload, headers):
-        return self._request("POST", f"/api/applications/{application_id}/decide",
-                             payload, headers)
-
-    def accept_offer(self, application_id, headers):
-        return self._request("POST", f"/api/applications/{application_id}/accept-offer",
-                             {}, headers)
-
-    def decline_offer(self, application_id, headers):
-        return self._request("POST", f"/api/applications/{application_id}/decline-offer",
-                             {}, headers)
-
-    def revoke_enrollment(self, application_id, headers):
-        return self._request("POST", f"/api/applications/{application_id}/revoke-enrollment",
-                             {}, headers)
-
-    # --- Essays ---
-    def create_essay(self, payload, headers):
-        return self._request("POST", "/api/essay-submissions", payload, headers)
-
-    def patch_essay(self, essay_id, payload, headers):
-        return self._request("PATCH", f"/api/essay-submissions/{essay_id}",
-                             payload, headers)
-
-    # --- Recommendation Letters ---
-    def create_letter(self, payload, headers):
-        return self._request("POST", "/api/recommendation-letters", payload, headers)
-
-    def start_letter(self, letter_id, headers):
-        return self._request("POST", f"/api/recommendation-letters/{letter_id}/start",
-                             {}, headers)
-
-    def submit_letter(self, letter_id, payload, headers):
-        return self._request("POST", f"/api/recommendation-letters/{letter_id}/submit",
-                             payload, headers)
-
-    def waive_letter(self, letter_id, headers):
-        return self._request("POST", f"/api/recommendation-letters/{letter_id}/waive",
-                             {}, headers)
-
-    # --- Financial Aid ---
-    def create_financial_aid_profile(self, payload, headers):
-        return self._request("POST", "/api/financial-aid-profiles", payload, headers)
-
-    def submit_financial_aid_profile(self, profile_id, headers):
+    def admit_application(self, application_id, expected_application_version, headers):
         return self._request(
-            "POST",
-            f"/api/financial-aid-profiles/{profile_id}/submit",
-            {},
-            headers,
+            "POST", f"/applications/{application_id}/admit",
+            {"expected_application_version": expected_application_version}, headers,
         )
 
+    def waitlist_application(self, application_id, headers):
+        return self._request("POST", f"/applications/{application_id}/waitlist", {}, headers)
+
+    def deny_application(self, application_id, headers):
+        return self._request("POST", f"/applications/{application_id}/deny", {}, headers)
+
+    def enroll_application(self, application_id, headers):
+        return self._request("POST", f"/applications/{application_id}/enroll", {}, headers)
+
+    def decline_application(self, application_id, headers):
+        return self._request("POST", f"/applications/{application_id}/decline", {}, headers)
+
+    # ── Essays ──────────────────────────────────────────────────────
+    def create_essay(self, payload, headers):
+        return self._request("POST", "/essays", payload, headers)
+
+    def update_essay(self, essay_id, payload, headers):
+        return self._request("PATCH", f"/essays/{essay_id}", payload, headers)
+
+    def get_essay(self, essay_id, headers):
+        return self._request("GET", f"/essays/{essay_id}", headers=headers)
+
+    def list_essays(self, headers, params=None):
+        return self._request("GET", "/essays", headers=headers, params=params)
+
+    # ── RecommendationRequests ─────────────────────────────────────
+    def create_recommendation_request(self, payload, headers):
+        return self._request("POST", "/recommendation-requests", payload, headers)
+
+    def submit_recommendation_request(self, request_id, rating, headers):
+        return self._request(
+            "POST", f"/recommendation-requests/{request_id}/submit",
+            {"rating": rating}, headers,
+        )
+
+    def waive_recommendation_request(self, request_id, headers):
+        return self._request("POST", f"/recommendation-requests/{request_id}/waive", {}, headers)
+
+    def get_recommendation_request(self, request_id, headers):
+        return self._request("GET", f"/recommendation-requests/{request_id}", headers=headers)
+
+    def list_recommendation_requests(self, headers, params=None):
+        return self._request("GET", "/recommendation-requests", headers=headers, params=params)
+
+    # ── FinancialAidProfile ────────────────────────────────────────
+    def create_financial_aid_profile(self, payload, headers):
+        return self._request("POST", "/financial-aid-profiles", payload, headers)
+
     def get_financial_aid_profile(self, profile_id, headers):
-        return self._request("GET", f"/api/financial-aid-profiles/{profile_id}",
-                             headers=headers)
+        return self._request("GET", f"/financial-aid-profiles/{profile_id}", headers=headers)
 
-    def create_aid_offer(self, payload, headers):
-        return self._request("POST", "/api/aid-offers", payload, headers)
+    def list_financial_aid_profiles(self, headers, params=None):
+        return self._request("GET", "/financial-aid-profiles", headers=headers, params=params)
 
-    def patch_aid_offer(self, offer_id, payload, headers):
-        return self._request("PATCH", f"/api/aid-offers/{offer_id}", payload, headers)
+    def update_financial_aid_profile(self, profile_id, payload, headers):
+        return self._request("PATCH", f"/financial-aid-profiles/{profile_id}", payload, headers)
 
-    def get_aid_offer(self, offer_id, headers):
-        return self._request("GET", f"/api/aid-offers/{offer_id}", headers=headers)
+    # ── AidPackage ─────────────────────────────────────────────────
+    def create_aid_package(self, payload, headers):
+        return self._request("POST", "/aid-packages", payload, headers)
 
-    # --- Yield Management ---
-    def run_yield(self, cycle_id, headers):
-        return self._request("POST", f"/api/admission-cycles/{cycle_id}/run-yield",
-                             {}, headers)
+    def finalize_aid_package(self, package_id, headers):
+        return self._request("POST", f"/aid-packages/{package_id}/finalize", {}, headers)
 
-    def get_admission_cycle(self, cycle_id, headers):
-        return self._request("GET", f"/api/admission-cycles/{cycle_id}",
-                             headers=headers)
+    def get_aid_package(self, package_id, headers):
+        return self._request("GET", f"/aid-packages/{package_id}", headers=headers)
 
-    # --- Test clock ---
-    def advance_clock(self, to_iso8601, headers):
-        return self._request("POST", "/api/_clock/advance",
-                             {"to_iso8601": to_iso8601}, headers)
+    def list_aid_packages(self, headers, params=None):
+        return self._request("GET", "/aid-packages", headers=headers, params=params)
+
+    # ── Waitlist ────────────────────────────────────────────────────
+    def list_school_waitlist(self, school_id, headers, params=None):
+        return self._request(
+            "GET", f"/schools/{school_id}/waitlist", headers=headers, params=params,
+        )
+
+    def get_waitlist_entry(self, entry_id, headers):
+        return self._request("GET", f"/waitlist-entries/{entry_id}", headers=headers)
+
+    def list_waitlist_entries(self, headers, params=None):
+        return self._request("GET", "/waitlist-entries", headers=headers, params=params)
+
+    def promote_waitlist(self, school_id, headers):
+        return self._request("POST", f"/schools/{school_id}/waitlist/promote", {}, headers)
+
+    # ── Clock ───────────────────────────────────────────────────────
+    def set_clock(self, to_iso8601, headers=None):
+        return self._request(
+            "POST", "/_clock/set_current_utc", {"to_iso8601": to_iso8601}, headers,
+        )
+
+    def get_clock(self, headers):
+        return self._request("GET", "/_clock", headers=headers)
 
 
 api_client = ApiClient()

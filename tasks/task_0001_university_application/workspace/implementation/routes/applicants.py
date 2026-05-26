@@ -1,141 +1,147 @@
-"""Applicant routes."""
+"""Applicant endpoints."""
+from __future__ import annotations
 
-from flask import Blueprint, request
+import re
+from flask import Blueprint, request, g
 
 import db
-import errors
-import response as resp
-import util
-from middleware import require_auth
-from routes._helpers import get_json_body, require_field, optional_field
-from services import applicants as applicants_service
-from services.serializers import serialize_applicant
-
+from errors import (
+    APIError, ERR_INVALID_REQUEST, ERR_NOT_FOUND, ERR_PROFILE_LOCKED,
+    ERR_FORBIDDEN_OWNER_MISMATCH,
+)
+from middleware import auth_required
+from response import ok_object, ok_array
+from routes._helpers import parse_pagination, paginate, get_body, require_fields, order_by_created_at
+from services import calculations
+from services.common import new_common_fields, touch
 
 bp = Blueprint("applicants", __name__)
 
-
-# --------------------------------------------------------------------------- #
-# Validation
-# --------------------------------------------------------------------------- #
-
-def _validate_gpa(value):
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'gpa' must be a number.")
-    if value < 0.0 or value > 4.0:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'gpa' must be in 0.0..4.0 inclusive.")
-    return float(value)
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+RESIDENCY_VALS = {"IN_STATE", "OUT_OF_STATE", "INTERNATIONAL"}
 
 
-def _validate_sat(value):
-    if value is None:
+def _validate_gpa(v):
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        raise APIError(ERR_INVALID_REQUEST, 400, "gpa_unweighted must be a number")
+    fv = float(v)
+    if fv < 0.0 or fv > 4.00:
+        raise APIError(ERR_INVALID_REQUEST, 400, "gpa_unweighted out of range")
+    return fv
+
+
+def _validate_sat(v):
+    if v is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int):
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'sat_total' must be an integer or null.")
-    if value < 400 or value > 1600:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'sat_total' must be in 400..1600 inclusive.")
-    return value
+    if not isinstance(v, int) or isinstance(v, bool):
+        raise APIError(ERR_INVALID_REQUEST, 400, "sat_total must be an integer or null")
+    if v < 400 or v > 1600:
+        raise APIError(ERR_INVALID_REQUEST, 400, "sat_total out of range")
+    return v
 
 
-# --------------------------------------------------------------------------- #
-# POST /applicants/register (public)
-# --------------------------------------------------------------------------- #
+def _validate_residency(v):
+    if v not in RESIDENCY_VALS:
+        raise APIError(ERR_INVALID_REQUEST, 400, "residency invalid")
+    return v
 
-@bp.route("/applicants/register", methods=["POST"])
-@require_auth(["Anonymous"])
-def register_applicant():
-    body = get_json_body()
-    email = require_field(body, "email", kind="string")
-    full_name = require_field(body, "full_name", kind="string")
-    gpa = body.get("gpa")
-    if gpa is None:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'gpa' is required.")
-    gpa = _validate_gpa(gpa)
-    sat_total = _validate_sat(body.get("sat_total"))
 
-    if not email.strip():
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'email' must not be empty.")
-    if not full_name.strip():
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'full_name' must not be empty.")
+@bp.post("/applicants")
+def create_applicant():
+    # Anonymous endpoint
+    auth_required({"Anonymous"}, allow_anonymous=True)()
+    body = get_body()
+    require_fields(body, ["email", "full_name", "gpa_unweighted", "residency"])
+    email = body["email"]
+    if not isinstance(email, str) or not EMAIL_RE.match(email):
+        raise APIError(ERR_INVALID_REQUEST, 400, "Invalid email format")
+    email = email.lower()
+    # uniqueness
+    for a in db.applicants.values():
+        if a["email"] == email:
+            raise APIError(ERR_INVALID_REQUEST, 400, "email already registered")
+    full_name = body["full_name"]
+    if not isinstance(full_name, str) or not full_name:
+        raise APIError(ERR_INVALID_REQUEST, 400, "full_name must be non-empty string")
+    gpa = _validate_gpa(body["gpa_unweighted"])
+    sat = _validate_sat(body.get("sat_total"))
+    residency = _validate_residency(body["residency"])
 
-    email_normalized = email.strip().lower()
-
-    # Uniqueness check
-    for existing in db.applicants.values():
-        if existing["email"] == email_normalized:
-            errors.raise_error(errors.ERR_DUPLICATE_RESOURCE,
-                               "An applicant with this email already exists.")
-
-    row = {
-        "email": email_normalized,
+    common = new_common_fields()
+    applicant = {
+        **common,
+        "email": email,
         "full_name": full_name,
-        "gpa": gpa,
-        "sat_total": sat_total,
+        "gpa_unweighted": gpa,
+        "sat_total": sat,
+        "residency": residency,
         "profile_status": "DRAFT",
+        "submitted_application_count": 0,
     }
-    util.stamp_create(row)
-    db.applicants[row["id"]] = row
-    # Newly created applicant has no recommenders, so it stays DRAFT.
-    return resp.success_object(serialize_applicant(row), http_status=201)
+    db.applicants[applicant["id"]] = applicant
+    return ok_object(applicant, http_status=201)
 
 
-# --------------------------------------------------------------------------- #
-# GET /applicants/{id}
-# --------------------------------------------------------------------------- #
-
-@bp.route("/applicants/<applicant_id>", methods=["GET"])
-@require_auth(["Applicant", "PlatformAdmin"])
-def get_applicant(applicant_id):
-    row = db.applicants.get(applicant_id)
-    if row is None:
-        errors.raise_error(errors.ERR_RESOURCE_NOT_FOUND,
-                           "Applicant not found.")
-    # Ownership for Applicant role
-    role = request.headers.get("X-User-Role")
-    user_id = request.headers.get("X-User-ID")
-    if role == "Applicant" and user_id != applicant_id:
-        errors.raise_error(errors.ERR_NOT_RESOURCE_OWNER,
-                           "Applicant can only read their own profile.")
-    return resp.success_object(serialize_applicant(row))
+@bp.get("/applicants/<aid>")
+def read_applicant(aid):
+    auth_required({"Applicant", "AdmissionsOfficer", "FinancialAidOfficer", "PlatformAdmin"})()
+    applicant = db.applicants.get(aid)
+    if applicant is None:
+        raise APIError(ERR_NOT_FOUND, 404, "Applicant not found")
+    return ok_object(applicant)
 
 
-# --------------------------------------------------------------------------- #
-# PATCH /applicants/{id} (owner only)
-# --------------------------------------------------------------------------- #
+@bp.patch("/applicants/<aid>")
+def update_applicant(aid):
+    auth_required({"Applicant"})()
+    applicant = db.applicants.get(aid)
+    if applicant is None:
+        raise APIError(ERR_NOT_FOUND, 404, "Applicant not found")
+    # ownership
+    if g.user_id != aid:
+        raise APIError(ERR_FORBIDDEN_OWNER_MISMATCH, 403, "Caller does not own this resource")
+    body = get_body()
 
-@bp.route("/applicants/<applicant_id>", methods=["PATCH"])
-@require_auth(["Applicant"])
-def patch_applicant(applicant_id):
-    row = db.applicants.get(applicant_id)
-    if row is None:
-        errors.raise_error(errors.ERR_RESOURCE_NOT_FOUND,
-                           "Applicant not found.")
-    user_id = request.headers.get("X-User-ID")
-    if user_id != applicant_id:
-        errors.raise_error(errors.ERR_NOT_RESOURCE_OWNER,
-                           "Applicants can only update their own profile.")
+    locked = applicant["profile_status"] == "LOCKED"
+    score_recompute = False
 
-    body = get_json_body()
     if "full_name" in body:
-        if not isinstance(body["full_name"], str) or not body["full_name"].strip():
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Field 'full_name' must be a non-empty string.")
-        row["full_name"] = body["full_name"]
-    if "gpa" in body:
-        if body["gpa"] is None:
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Field 'gpa' cannot be null.")
-        row["gpa"] = _validate_gpa(body["gpa"])
+        if not isinstance(body["full_name"], str) or not body["full_name"]:
+            raise APIError(ERR_INVALID_REQUEST, 400, "full_name must be non-empty string")
+        applicant["full_name"] = body["full_name"]
+    if "gpa_unweighted" in body:
+        if locked:
+            raise APIError(ERR_PROFILE_LOCKED, 409, "Profile is LOCKED")
+        v = _validate_gpa(body["gpa_unweighted"])
+        if v != applicant["gpa_unweighted"]:
+            applicant["gpa_unweighted"] = v
+            score_recompute = True
     if "sat_total" in body:
-        row["sat_total"] = _validate_sat(body["sat_total"])
+        if locked:
+            raise APIError(ERR_PROFILE_LOCKED, 409, "Profile is LOCKED")
+        v = _validate_sat(body["sat_total"])
+        if v != applicant["sat_total"]:
+            applicant["sat_total"] = v
+            score_recompute = True
+    if "residency" in body:
+        if locked:
+            raise APIError(ERR_PROFILE_LOCKED, 409, "Profile is LOCKED")
+        applicant["residency"] = _validate_residency(body["residency"])
+    touch(applicant)
+    if score_recompute:
+        for app in db.applications.values():
+            if app["applicant_id"] == aid and app["status"] in {"SUBMITTED", "UNDER_REVIEW"}:
+                calculations.recompute_application_composite(app)
+    return ok_object(applicant)
 
-    util.stamp_update(row)
-    applicants_service.recompute_profile_status(applicant_id)
-    return resp.success_object(serialize_applicant(row))
+
+@bp.get("/applicants")
+def list_applicants():
+    auth_required({"AdmissionsOfficer", "FinancialAidOfficer", "PlatformAdmin"})()
+    residency = request.args.get("residency")
+    limit, offset = parse_pagination()
+    items = [a for a in db.applicants.values()
+             if residency is None or a["residency"] == residency]
+    items = order_by_created_at(items)
+    page, total = paginate(items, limit, offset)
+    return ok_array(page, limit, offset, total)

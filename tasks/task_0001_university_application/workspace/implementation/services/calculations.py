@@ -1,131 +1,164 @@
-"""Calculation rules from SCAFFOLD §1.3."""
+"""§1.3 calculation rules.
+
+All money is in integer USD cents. All round-half-up is via Decimal with
+ROUND_HALF_UP. Composite uses per-component rounding before summation.
+"""
+from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Optional
 
 import db
 
 
-# --------------------------------------------------------------------------- #
-# demonstrated_need_calc
-# --------------------------------------------------------------------------- #
+# Constants
+SHELTER_PER_PERSON_CENTS = 800000
+INCOME_ASSESSMENT_RATE = Decimal("0.22")
+ASSET_ASSESSMENT_RATE = Decimal("0.05")
 
-def compute_demonstrated_need(aid_offer_row, fa_profile_row):
-    """Integer-cents result.
+WEIGHT_GPA = Decimal("0.40")
+WEIGHT_SAT = Decimal("0.20")
+WEIGHT_ESSAY = Decimal("0.15")
+WEIGHT_REC = Decimal("0.25")
+NULL_SAT_NEUTRAL = Decimal("50.00")
 
-    aid_offer_row['variant'] selects the applicable EFC:
-      FEDERAL       -> fa_profile_row['fafsa_efc_cents']
-      INSTITUTIONAL -> fa_profile_row['css_efc_cents']
+ON_TARGET_THRESHOLD = Decimal("0.85")
+OVER_TARGET_THRESHOLD = Decimal("1.00")
+
+
+def _round_half_up_int(value: Decimal) -> int:
+    """Round a Decimal to the nearest integer using round-half-up."""
+    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _round_half_up_2dp(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+# ---------------------------------------------------------------- efc_calc
+def efc_calc(profile_type: str, household_income_cents: int, household_size: int,
+             declared_assets_cents: int) -> int:
+    """Expected Family Contribution.
+
+    Rounding order pinned: income component first, asset component second,
+    sum of two already-rounded integers is final.
     """
-    if aid_offer_row["variant"] == "FEDERAL":
-        applicable_efc = fa_profile_row["fafsa_efc_cents"]
-    else:
-        applicable_efc = fa_profile_row.get("css_efc_cents")
-    if applicable_efc is None:
-        applicable_efc = 0
-    return max(0, aid_offer_row["cost_of_attendance_cents"] - applicable_efc)
-
-
-def compute_net_price(aid_offer_row):
-    """Integer-cents result, floored at 0."""
-    return max(
-        0,
-        aid_offer_row["cost_of_attendance_cents"]
-        - aid_offer_row["grant_cents"]
-        - aid_offer_row["loan_cents"]
-        - aid_offer_row["work_study_cents"],
+    shelter = SHELTER_PER_PERSON_CENTS * household_size
+    adjusted_income = max(0, household_income_cents - shelter)
+    # base = round_half_up(adjusted_income * 0.22)
+    base = _round_half_up_int(Decimal(adjusted_income) * INCOME_ASSESSMENT_RATE)
+    if profile_type == "FAFSA":
+        return base
+    # CSS_PROFILE
+    asset_contrib = _round_half_up_int(
+        Decimal(declared_assets_cents) * ASSET_ASSESSMENT_RATE
     )
+    return base + asset_contrib
 
 
-# --------------------------------------------------------------------------- #
-# applicant_admission_probability_score
-# --------------------------------------------------------------------------- #
+# ---------------------------------------------------------------- composite_score_calc
+def composite_score_calc(application: dict) -> Optional[Decimal]:
+    """Compute Application.composite_score per §1.3.
 
-# Per PRD §3.5 the score is the integer sum of four components, with
-# rounding/flooring/capping applied at the per-component step before summation.
+    Returns a Decimal with two decimals (or None if applicant doesn't exist).
+    The caller persists this as a number; we return a Decimal so the route
+    layer can serialize to a JSON number via float() or string-formatting.
+    """
+    applicant = db.applicants.get(application["applicant_id"])
+    if applicant is None:
+        return None
 
-PROVISIONAL_LETTER_STATUSES = frozenset({"REQUESTED", "IN_PROGRESS", "SUBMITTED"})
-FINAL_LETTER_STATUSES = frozenset({"SUBMITTED"})
+    # gpa_normalized = round_half_up(gpa / 4.00 * 100, 2)
+    gpa = Decimal(str(applicant["gpa_unweighted"]))
+    gpa_normalized = _round_half_up_2dp(gpa / Decimal("4.00") * Decimal("100"))
 
-
-def _round_half_up_int(value) -> int:
-    """Apply ROUND_HALF_UP to a real value, returning a Python int."""
-    quantized = Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    return int(quantized)
-
-
-def compute_admission_probability_score(application_row, variant: str) -> int:
-    applicant = db.applicants.get(application_row["applicant_id"])
-
-    # GPA component: round_half_up(gpa * 10), then cap at 40
-    gpa_value = applicant["gpa"] if applicant else 0
-    gpa_real = Decimal(str(gpa_value)) * Decimal("10")
-    gpa_component = min(40, _round_half_up_int(gpa_real))
-
-    # SAT component: floor((sat_total - 400) / 40), capped at 30; 0 if null
-    sat_total = applicant.get("sat_total") if applicant else None
+    # sat_normalized
+    sat_total = applicant.get("sat_total")
     if sat_total is None:
-        sat_component = 0
+        sat_normalized = NULL_SAT_NEUTRAL
     else:
-        sat_component = min(30, (int(sat_total) - 400) // 40)
+        sat_normalized = _round_half_up_2dp(
+            (Decimal(sat_total) - Decimal("400")) / Decimal("1200") * Decimal("100")
+        )
 
-    # Plan bonus
-    plan = application_row["plan"]
-    if plan == "EARLY_DECISION":
-        plan_bonus = 15
-    elif plan == "EARLY_ACTION":
-        plan_bonus = 8
-    elif plan == "ROLLING":
-        plan_bonus = 5
-    else:
-        plan_bonus = 0
-
-    # Letters factor: 5 * qualifying letter count, capped at 15
-    if variant == "FINAL":
-        statuses = FINAL_LETTER_STATUSES
-    else:
-        statuses = PROVISIONAL_LETTER_STATUSES
-    letter_count = 0
-    for letter in db.recommendation_letters.values():
-        if letter["application_id"] == application_row["id"] and letter["status"] in statuses:
-            letter_count += 1
-    letters_factor = min(15, 5 * letter_count)
-
-    score = gpa_component + sat_component + plan_bonus + letters_factor
-    # Score is naturally bounded 0..100 by the per-component caps but guard
-    # against negative or out-of-range values just in case.
-    return max(0, min(100, int(score)))
-
-
-def default_score_variant(application_status: str) -> str:
-    """Default variant when ?score_variant is not supplied (PRD §3.4)."""
-    if application_status in ("DRAFT", "SUBMITTED"):
-        return "PROVISIONAL"
-    return "FINAL"
-
-
-# --------------------------------------------------------------------------- #
-# school_yield_rate
-# --------------------------------------------------------------------------- #
-
-ADMITTED_STATUSES_FOR_YIELD = frozenset({"ADMITTED", "ENROLLED", "DECLINED_OFFER"})
-
-
-def compute_yield_rate(school_id: str):
-    """Return (yield_rate or None, admitted_count, enrolled_count)."""
-    admitted = 0
-    enrolled = 0
-    for app in db.applications.values():
-        if app["school_id"] != school_id:
-            continue
-        if app["status"] in ADMITTED_STATUSES_FOR_YIELD:
-            admitted += 1
-            if app["status"] == "ENROLLED":
-                enrolled += 1
-    if admitted == 0:
-        return None, 0, 0
-    rate = (Decimal(enrolled) / Decimal(admitted)).quantize(
-        Decimal("0.0001"), rounding=ROUND_HALF_UP
+    # essay_count: completed essays for this application
+    essay_count = sum(
+        1
+        for e in db.essays.values()
+        if e["application_id"] == application["id"] and e["completed"] is True
     )
-    # Return as float for JSON friendliness; the four-decimal-place precision
-    # is preserved by Decimal.quantize above.
-    return float(rate), admitted, enrolled
+    essay_score = min(Decimal("100.00"), Decimal(essay_count) * Decimal("20.00"))
+
+    # rec_avg_rating: SUBMITTED recommendation requests for (applicant_id, school_id)
+    matching = [
+        r
+        for r in db.recommendation_requests.values()
+        if r["applicant_id"] == application["applicant_id"]
+        and r["school_id"] == application["school_id"]
+        and r["status"] == "SUBMITTED"
+    ]
+    if matching:
+        total = sum(r["rating"] for r in matching)
+        rec_avg_rating = Decimal(total) / Decimal(len(matching))
+    else:
+        rec_avg_rating = Decimal("0")
+    rec_score = _round_half_up_2dp(rec_avg_rating / Decimal("5.00") * Decimal("100"))
+
+    # Per-component round then sum
+    gpa_term = _round_half_up_2dp(gpa_normalized * WEIGHT_GPA)
+    sat_term = _round_half_up_2dp(sat_normalized * WEIGHT_SAT)
+    essay_term = _round_half_up_2dp(essay_score * WEIGHT_ESSAY)
+    rec_term = _round_half_up_2dp(rec_score * WEIGHT_REC)
+
+    composite = _round_half_up_2dp(gpa_term + sat_term + essay_term + rec_term)
+    return composite
+
+
+def composite_score_as_number(application: dict):
+    """Return composite as a float for JSON or None if not computable."""
+    d = composite_score_calc(application)
+    if d is None:
+        return None
+    return float(d)
+
+
+# ---------------------------------------------------------------- net_cost_calc
+def net_cost_calc(aid_package: dict) -> int:
+    application = db.applications[aid_package["application_id"]]
+    school = db.schools[application["school_id"]]
+    applicant = db.applicants[application["applicant_id"]]
+    residency = applicant["residency"]
+    if residency == "IN_STATE":
+        tuition = school["in_state_tuition_cents"]
+    elif residency == "OUT_OF_STATE":
+        tuition = school["out_of_state_tuition_cents"]
+    else:
+        tuition = school["international_tuition_cents"]
+    total_award = aid_package["grant_cents"] + aid_package["loan_cents"] + aid_package["work_study_cents"]
+    return tuition - total_award
+
+
+# ---------------------------------------------------------------- yield_posture_calc
+def yield_posture_calc(school: dict) -> str:
+    admitted = Decimal(school["admitted_count"])
+    enrolled = Decimal(school["enrolled_count"])
+    yield_rate = Decimal(str(school["assumed_yield_rate"]))
+    target = Decimal(school["target_class_size"])
+    projected = _round_half_up_int(admitted * yield_rate + enrolled)
+    # ratio compared as float-ish with >=; use Decimal for fidelity
+    ratio = Decimal(projected) / target
+    if ratio >= OVER_TARGET_THRESHOLD:
+        return "OVER_TARGET"
+    if ratio >= ON_TARGET_THRESHOLD:
+        return "ON_TARGET"
+    return "OPEN"
+
+
+def recompute_yield_posture(school: dict):
+    school["yield_posture"] = yield_posture_calc(school)
+
+
+def recompute_application_composite(application: dict):
+    """Update application.composite_score in place."""
+    score = composite_score_as_number(application)
+    application["composite_score"] = score

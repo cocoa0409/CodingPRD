@@ -213,6 +213,12 @@ cp "$SHARED_DIR/environment/Dockerfile"    "$HARBOR_TASK_DIR/environment/Dockerf
 cp "$SHARED_DIR/environment/.dockerignore" "$HARBOR_TASK_DIR/environment/.dockerignore"
 cp "$SOURCE_TASK_DIR/workspace/INSTRUCTION.md" "$HARBOR_TASK_DIR/environment/INSTRUCTION.md"
 cp "$SOURCE_TASK_DIR/workspace/PRD.md"         "$HARBOR_TASK_DIR/environment/PRD.md"
+if [[ -f "$SOURCE_TASK_DIR/workspace/PRD_FINALIZED.md" ]]; then
+  cp "$SOURCE_TASK_DIR/workspace/PRD_FINALIZED.md" "$HARBOR_TASK_DIR/environment/PRD.md"
+  echo ">> PRD_FINALIZED.md found, overriding PRD.md with finalized version"
+else
+  echo ">> PRD_FINALIZED.md not found, using PRD.md as-is"
+fi
 
 
 # -----------------------------------------------------------------------------

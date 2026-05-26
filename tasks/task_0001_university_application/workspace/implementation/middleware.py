@@ -1,93 +1,50 @@
-"""Auth and RBAC middleware.
+"""Auth header extraction and role checking."""
+from __future__ import annotations
 
-Auth headers per PRD §2.1:
-  - X-User-ID  (acting principal id)
-  - X-User-Role (one of: Applicant, Recommender, AdmissionsOfficer,
-                 FinancialAidOfficer, PlatformAdmin)
+from typing import Optional
+from flask import request, g
 
-The validation priority ordering is fixed by PRD §2.6:
-  1. ERR_MISSING_AUTH_HEADERS
-  2. ERR_UNKNOWN_ROLE
-  3. ERR_FORBIDDEN_ROLE
-  4. (subsequent priorities are handled inside route bodies)
-"""
+from errors import APIError, ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED
 
-from functools import wraps
-
-from flask import request
-
-import errors
+ALLOWED_ROLES = {"Applicant", "AdmissionsOfficer", "FinancialAidOfficer", "PlatformAdmin"}
+ANON_ROLE = "Anonymous"
 
 
-KNOWN_ROLES = frozenset({
-    "Applicant",
-    "Recommender",
-    "AdmissionsOfficer",
-    "FinancialAidOfficer",
-    "PlatformAdmin",
-})
+def auth_required(allowed_roles, allow_anonymous: bool = False):
+    """Decorator/helper. allowed_roles: iterable of role names that can call this endpoint.
 
-
-def get_principal():
-    """Return (role, user_id) extracted from headers.
-
-    Returns (None, None) when either header is missing.
-    Does NOT raise; raising is the caller's responsibility based on whether the
-    endpoint is public or protected.
+    If allow_anonymous=True, the endpoint accepts a request without X-User-* headers.
     """
-    role = request.headers.get("X-User-Role")
-    user_id = request.headers.get("X-User-ID")
-    if not role or not user_id:
-        return None, None
-    return role, user_id
+    allowed_set = set(allowed_roles)
+
+    def _check():
+        role = request.headers.get("X-User-Role")
+        user_id = request.headers.get("X-User-ID")
+        if allow_anonymous and role is None and user_id is None:
+            g.user_role = ANON_ROLE
+            g.user_id = None
+            if ANON_ROLE in allowed_set:
+                return
+            raise APIError(ERR_UNAUTHORIZED, 403, "Role not permitted")
+        # Both headers must be present
+        if not role or not user_id:
+            raise APIError(ERR_UNAUTHENTICATED, 401, "Missing auth headers")
+        # role must be in allowed enumeration (or Anonymous if endpoint allows it)
+        if role not in ALLOWED_ROLES and role != ANON_ROLE:
+            raise APIError(ERR_UNAUTHENTICATED, 401, "Invalid role")
+        if role == ANON_ROLE and not allow_anonymous:
+            raise APIError(ERR_UNAUTHORIZED, 403, "Role not permitted")
+        g.user_role = role
+        g.user_id = user_id
+        if role not in allowed_set and not (role == ANON_ROLE and ANON_ROLE in allowed_set):
+            raise APIError(ERR_UNAUTHORIZED, 403, "Role not permitted")
+
+    return _check
 
 
-def require_auth(allowed_roles):
-    """Decorator factory.
+def current_role() -> Optional[str]:
+    return getattr(g, "user_role", None)
 
-    allowed_roles: iterable of role names permitted to invoke this endpoint.
-        If the iterable contains "Anonymous", the endpoint is public — no
-        headers are required and no role check is performed; ownership checks
-        and body validation still apply downstream.
-    """
-    allowed = frozenset(allowed_roles)
-    is_public = "Anonymous" in allowed
 
-    def deco(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            role = request.headers.get("X-User-Role")
-            user_id = request.headers.get("X-User-ID")
-
-            if is_public:
-                # Public endpoint: accept any request, including ones with no
-                # headers at all. Pass through; the handler doesn't depend on
-                # principal identity.
-                return func(*args, **kwargs)
-
-            # 1) ERR_MISSING_AUTH_HEADERS (priority 1)
-            if not role or not user_id:
-                errors.raise_error(
-                    errors.ERR_MISSING_AUTH_HEADERS,
-                    "Both X-User-Role and X-User-ID headers are required.",
-                )
-
-            # 2) ERR_UNKNOWN_ROLE (priority 2)
-            if role not in KNOWN_ROLES:
-                errors.raise_error(
-                    errors.ERR_UNKNOWN_ROLE,
-                    f"Unknown role: {role!r}.",
-                )
-
-            # 3) ERR_FORBIDDEN_ROLE (priority 3)
-            if role not in allowed:
-                errors.raise_error(
-                    errors.ERR_FORBIDDEN_ROLE,
-                    f"Role {role!r} is not permitted to call this endpoint.",
-                )
-
-            return func(*args, **kwargs)
-
-        return wrapper
-
-    return deco
+def current_user_id() -> Optional[str]:
+    return getattr(g, "user_id", None)

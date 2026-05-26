@@ -1,71 +1,55 @@
-"""Response envelope helpers.
+"""Response envelope helpers, per PRD §2.2."""
+from __future__ import annotations
 
-The envelope structure is defined by SCAFFOLD.yaml's response_envelope section
-and PRD §2.2. Success responses use response_type "object" or "array" and place
-the resource under "data". Error responses use response_type "error" and place
-{error_id, message} under "data".
-"""
-
-import random
-import string
-from datetime import datetime, timezone
-
+from typing import Any, Optional
 from flask import jsonify
 
-
-def _format_iso_now() -> str:
-    """ISO 8601 UTC instant with three fractional digits, terminated by 'Z'."""
-    now = datetime.now(timezone.utc)
-    # Truncate microseconds to milliseconds (three fractional digits)
-    millis = now.microsecond // 1000
-    return now.strftime("%Y-%m-%dT%H:%M:%S") + f".{millis:03d}Z"
+from db import new_request_id, now_iso
 
 
-def _new_request_id() -> str:
-    suffix = "".join(
-        random.choices(string.ascii_uppercase + string.digits, k=20)
-    )
-    return f"req_{suffix}"
-
-
-def _base_meta():
-    return {
-        "api_request_id": _new_request_id(),
-        "api_request_timestamp": _format_iso_now(),
+def _meta(extra: Optional[dict] = None) -> dict:
+    m = {
+        "api_request_id": new_request_id(),
+        "api_request_timestamp": now_iso(),
     }
+    if extra:
+        m.update(extra)
+    return m
 
 
-def success_object(data, http_status: int = 200):
+def ok_object(data: Any, http_status: int = 200):
     body = {
-        "meta": _base_meta(),
+        "meta": _meta(),
         "response_type": "object",
         "data": data,
     }
     return jsonify(body), http_status
 
 
-def success_array(data_list, *, limit: int, offset: int, total_count: int,
-                  http_status: int = 200):
-    meta = _base_meta()
-    meta["limit"] = limit
-    meta["offset"] = offset
-    meta["total_count"] = total_count
-    meta["has_more"] = (offset + len(data_list)) < total_count
+def ok_array(items: list, limit: int, offset: int, total_count: int, http_status: int = 200):
+    has_more = (offset + len(items)) < total_count
     body = {
-        "meta": meta,
+        "meta": _meta(
+            {
+                "limit": limit,
+                "offset": offset,
+                "total_count": total_count,
+                "has_more": has_more,
+            }
+        ),
         "response_type": "array",
-        "data": data_list,
+        "data": items,
     }
     return jsonify(body), http_status
 
 
-def error_response(error_id: str, http_status: int, message: str):
+def error_response(error_id: str, message: str, http_status: int):
     body = {
-        "meta": _base_meta(),
+        "meta": _meta(),
         "response_type": "error",
         "data": {
             "error_id": error_id,
-            "message": message or error_id,
+            "message": message,
         },
     }
     return jsonify(body), http_status

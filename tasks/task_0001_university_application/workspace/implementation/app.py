@@ -1,88 +1,64 @@
-"""University Application Platform — Flask entry point.
+"""University Application API — Flask entry point.
 
-All routes are mounted under the /api prefix described in PRD §2.
-The store starts empty on every boot; no seeding is performed.
+Boots with empty in-memory stores. The test harness restarts this process
+before every test, so there is no carry-over state.
 """
+from __future__ import annotations
 
 import os
 import sys
-import logging
-import traceback
 
 from flask import Flask
+from werkzeug.exceptions import HTTPException
 
-import errors
-import response as resp
-from routes.admission_cycles import bp as admission_cycles_bp
+from errors import APIError, ERR_INVALID_REQUEST, ERR_NOT_FOUND
+from response import error_response
+
 from routes.applicants import bp as applicants_bp
-from routes.applications import bp as applications_bp
-from routes.clock import bp as clock_bp
-from routes.essays import bp as essays_bp
-from routes.financial_aid import bp as financial_aid_bp
-from routes.letters import bp as letters_bp
-from routes.recommenders import bp as recommenders_bp
 from routes.schools import bp as schools_bp
+from routes.applications import bp as applications_bp
+from routes.essays import bp as essays_bp
+from routes.recommendations import bp as recommendations_bp
+from routes.financial_aid import bp as financial_aid_bp
+from routes.waitlist import bp as waitlist_bp
+from routes.clock import bp as clock_bp
 
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    app.config["JSON_SORT_KEYS"] = False
 
-    # Mount every blueprint under /api
-    for bp in (
-        applicants_bp,
-        recommenders_bp,
-        schools_bp,
-        applications_bp,
-        essays_bp,
-        letters_bp,
-        financial_aid_bp,
-        admission_cycles_bp,
-        clock_bp,
-    ):
-        app.register_blueprint(bp, url_prefix="/api")
+    app.register_blueprint(applicants_bp)
+    app.register_blueprint(schools_bp)
+    app.register_blueprint(applications_bp)
+    app.register_blueprint(essays_bp)
+    app.register_blueprint(recommendations_bp)
+    app.register_blueprint(financial_aid_bp)
+    app.register_blueprint(waitlist_bp)
+    app.register_blueprint(clock_bp)
 
-    # ------------------------------------------------------------------ #
-    # Error handlers
-    # ------------------------------------------------------------------ #
-
-    @app.errorhandler(errors.APIError)
-    def handle_api_error(exc):
-        return resp.error_response(exc.error_id, exc.http_status, exc.message)
+    @app.errorhandler(APIError)
+    def _handle_api_error(e: APIError):
+        return error_response(e.error_id, e.message, e.http_status)
 
     @app.errorhandler(404)
-    def handle_not_found(_exc):
-        # Path didn't match any registered route. Per PRD §2.5 unknown path
-        # segments resolve to ERR_RESOURCE_NOT_FOUND (404).
-        return resp.error_response(
-            errors.ERR_RESOURCE_NOT_FOUND, 404,
-            "The requested path does not match any route.",
-        )
+    def _not_found(e):
+        return error_response(ERR_NOT_FOUND, "Route not found", 404)
 
     @app.errorhandler(405)
-    def handle_method_not_allowed(_exc):
-        return resp.error_response(
-            errors.ERR_RESOURCE_NOT_FOUND, 404,
-            "Method not allowed on this path.",
-        )
+    def _method_not_allowed(e):
+        return error_response(ERR_NOT_FOUND, "Method not allowed", 404)
 
     @app.errorhandler(400)
-    def handle_bad_request(_exc):
-        return resp.error_response(
-            errors.ERR_INVALID_REQUEST, 422,
-            "The request payload was not well-formed.",
-        )
+    def _bad_request(e):
+        return error_response(ERR_INVALID_REQUEST, str(e), 400)
 
     @app.errorhandler(Exception)
-    def handle_unexpected(exc):
-        # Re-raise APIError so the dedicated handler picks it up
-        if isinstance(exc, errors.APIError):
-            return handle_api_error(exc)
-        traceback.print_exception(type(exc), exc, exc.__traceback__)
-        return resp.error_response(
-            errors.ERR_INVALID_REQUEST, 422,
-            "An unexpected error occurred while processing the request.",
-        )
+    def _internal(e):
+        if isinstance(e, HTTPException):
+            return error_response(ERR_INVALID_REQUEST, e.description or str(e), e.code or 500)
+        # Log to stderr so the test harness can see it
+        print(f"Unhandled error: {type(e).__name__}: {e}", file=sys.stderr)
+        return error_response("ERR_INTERNAL", f"Internal error: {e}", 500)
 
     return app
 
@@ -92,9 +68,4 @@ app = create_app()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    # Use Flask's built-in server. threaded=False keeps the in-memory store
-    # accessible from a single thread; the harness restarts the server before
-    # every test, so concurrency stress isn't a concern here.
-    # Suppress Flask's default request log to keep stdout clean.
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
-    app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)

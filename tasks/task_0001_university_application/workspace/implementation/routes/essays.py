@@ -1,107 +1,148 @@
-"""Essay submission routes."""
+"""Essay endpoints."""
+from __future__ import annotations
 
-from flask import Blueprint, request
+import re
+from flask import Blueprint, request, g
 
 import db
-import errors
-import response as resp
-import util
-from middleware import require_auth
-from routes._helpers import get_json_body, require_field
-from services.serializers import serialize_essay
-
+from errors import (
+    APIError, ERR_INVALID_REQUEST, ERR_NOT_FOUND,
+    ERR_FORBIDDEN_OWNER_MISMATCH, ERR_WORD_COUNT_MISMATCH,
+)
+from middleware import auth_required
+from response import ok_object, ok_array
+from routes._helpers import (
+    parse_pagination, paginate, get_body, require_fields, order_by_created_at,
+)
+from services import calculations
+from services.common import new_common_fields, touch
 
 bp = Blueprint("essays", __name__)
 
-
-def _count_words(body: str) -> int:
-    return len(body.split())  # whitespace-separated tokens per scaffold §1.1
+WORD_RE = re.compile(r"\S+")
 
 
-# --------------------------------------------------------------------------- #
-# POST /essay-submissions  (Applicant)
-# --------------------------------------------------------------------------- #
+def _word_count(text: str) -> int:
+    return len(WORD_RE.findall(text))
 
-@bp.route("/essay-submissions", methods=["POST"])
-@require_auth(["Applicant"])
+
+def _check_word_count(declared: int, text: str):
+    actual = _word_count(text)
+    if abs(declared - actual) > 5:
+        raise APIError(ERR_WORD_COUNT_MISMATCH, 422,
+                       f"Declared word_count {declared} differs from server count {actual} by more than 5")
+
+
+@bp.post("/essays")
 def create_essay():
-    body = get_json_body()
-    application_id = require_field(body, "application_id", kind="string")
-    prompt_code = require_field(body, "prompt_code", kind="string")
-    essay_body = require_field(body, "body", kind="string")
+    auth_required({"Applicant"})()
+    body = get_body()
+    require_fields(body, ["application_id", "prompt_code", "word_count", "text"])
+    app_id = body["application_id"]
+    app = db.applications.get(app_id)
+    if app is None:
+        raise APIError(ERR_NOT_FOUND, 404, "Application not found")
+    if g.user_id != app["applicant_id"]:
+        raise APIError(ERR_FORBIDDEN_OWNER_MISMATCH, 403, "Caller does not own this application")
+    prompt_code = body["prompt_code"]
+    if not isinstance(prompt_code, str) or not prompt_code:
+        raise APIError(ERR_INVALID_REQUEST, 400, "prompt_code must be non-empty string")
+    # unique within application
+    for e in db.essays.values():
+        if e["application_id"] == app_id and e["prompt_code"] == prompt_code:
+            raise APIError(ERR_INVALID_REQUEST, 400, "prompt_code must be unique within application")
+    wc = body["word_count"]
+    if not isinstance(wc, int) or isinstance(wc, bool) or wc < 1 or wc > 650:
+        raise APIError(ERR_INVALID_REQUEST, 400, "word_count out of range")
+    text = body["text"]
+    if not isinstance(text, str):
+        raise APIError(ERR_INVALID_REQUEST, 400, "text must be string")
+    _check_word_count(wc, text)
+    completed = body.get("completed", False)
+    if not isinstance(completed, bool):
+        raise APIError(ERR_INVALID_REQUEST, 400, "completed must be boolean")
 
-    # FK resolution
-    application = db.applications.get(application_id)
-    if application is None:
-        errors.raise_error(errors.ERR_FK_NOT_FOUND, "Application not found.")
-
-    # Ownership
-    user_id = request.headers.get("X-User-ID")
-    if application["applicant_id"] != user_id:
-        errors.raise_error(errors.ERR_NOT_RESOURCE_OWNER,
-                           "Applicants can only create essays for their own applications.")
-
-    # Uniqueness: one essay per application
-    for existing in db.essay_submissions.values():
-        if existing["application_id"] == application_id:
-            errors.raise_error(errors.ERR_DUPLICATE_RESOURCE,
-                               "An essay already exists for this application.")
-
-    word_count = _count_words(essay_body)
-    if not (1 <= word_count <= 650):
-        errors.raise_error(errors.ERR_ESSAY_WORD_COUNT_OUT_OF_RANGE,
-                           "Essay word_count must be in 1..650 inclusive.")
-
-    row = {
-        "application_id": application_id,
+    common = new_common_fields()
+    essay = {
+        **common,
+        "application_id": app_id,
         "prompt_code": prompt_code,
-        "body": essay_body,
-        "word_count": word_count,
-        "locked": False,
+        "word_count": wc,
+        "text": text,
+        "completed": completed,
     }
-    util.stamp_create(row)
-    db.essay_submissions[row["id"]] = row
-    return resp.success_object(serialize_essay(row), http_status=201)
+    db.essays[essay["id"]] = essay
+    # recompute if parent app in SUBMITTED / UNDER_REVIEW
+    if app["status"] in {"SUBMITTED", "UNDER_REVIEW"}:
+        calculations.recompute_application_composite(app)
+    return ok_object(essay, http_status=201)
 
 
-# --------------------------------------------------------------------------- #
-# PATCH /essay-submissions/{id}  (Applicant)
-# --------------------------------------------------------------------------- #
+@bp.patch("/essays/<eid>")
+def update_essay(eid):
+    auth_required({"Applicant"})()
+    essay = db.essays.get(eid)
+    if essay is None:
+        raise APIError(ERR_NOT_FOUND, 404, "Essay not found")
+    app = db.applications.get(essay["application_id"])
+    if g.user_id != app["applicant_id"]:
+        raise APIError(ERR_FORBIDDEN_OWNER_MISMATCH, 403, "Caller does not own this essay")
+    body = get_body()
+    new_wc = essay["word_count"]
+    new_text = essay["text"]
+    new_completed = essay["completed"]
+    if "word_count" in body:
+        v = body["word_count"]
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1 or v > 650:
+            raise APIError(ERR_INVALID_REQUEST, 400, "word_count out of range")
+        new_wc = v
+    if "text" in body:
+        if not isinstance(body["text"], str):
+            raise APIError(ERR_INVALID_REQUEST, 400, "text must be string")
+        new_text = body["text"]
+    if "completed" in body:
+        if not isinstance(body["completed"], bool):
+            raise APIError(ERR_INVALID_REQUEST, 400, "completed must be boolean")
+        new_completed = body["completed"]
+    # word count check if either changed
+    if "word_count" in body or "text" in body:
+        _check_word_count(new_wc, new_text)
+    essay["word_count"] = new_wc
+    essay["text"] = new_text
+    essay["completed"] = new_completed
+    touch(essay)
+    if app["status"] in {"SUBMITTED", "UNDER_REVIEW"}:
+        calculations.recompute_application_composite(app)
+    return ok_object(essay)
 
-@bp.route("/essay-submissions/<essay_id>", methods=["PATCH"])
-@require_auth(["Applicant"])
-def patch_essay(essay_id):
-    row = db.essay_submissions.get(essay_id)
-    if row is None:
-        errors.raise_error(errors.ERR_RESOURCE_NOT_FOUND, "Essay not found.")
 
-    # Ownership via application
-    application = db.applications.get(row["application_id"])
-    user_id = request.headers.get("X-User-ID")
-    if application is None or application["applicant_id"] != user_id:
-        errors.raise_error(errors.ERR_NOT_RESOURCE_OWNER,
-                           "Applicants can only edit essays for their own applications.")
+@bp.get("/essays/<eid>")
+def read_essay(eid):
+    auth_required({"Applicant", "AdmissionsOfficer", "PlatformAdmin"})()
+    essay = db.essays.get(eid)
+    if essay is None:
+        raise APIError(ERR_NOT_FOUND, 404, "Essay not found")
+    if g.user_role == "Applicant":
+        app = db.applications.get(essay["application_id"])
+        if app and g.user_id != app["applicant_id"]:
+            raise APIError(ERR_FORBIDDEN_OWNER_MISMATCH, 403, "Caller does not own this essay")
+    return ok_object(essay)
 
-    # State: only while locked == false
-    if row["locked"]:
-        errors.raise_error(errors.ERR_INVALID_STATE,
-                           "Essay is locked; the application has already been submitted.")
 
-    body = get_json_body()
-    if "prompt_code" in body:
-        if not isinstance(body["prompt_code"], str):
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Field 'prompt_code' must be a string.")
-        row["prompt_code"] = body["prompt_code"]
-    if "body" in body:
-        if not isinstance(body["body"], str):
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Field 'body' must be a string.")
-        row["body"] = body["body"]
-        row["word_count"] = _count_words(body["body"])
-        if not (1 <= row["word_count"] <= 650):
-            errors.raise_error(errors.ERR_ESSAY_WORD_COUNT_OUT_OF_RANGE,
-                               "Essay word_count must be in 1..650 inclusive.")
-
-    util.stamp_update(row)
-    return resp.success_object(serialize_essay(row))
+@bp.get("/essays")
+def list_essays():
+    auth_required({"Applicant", "AdmissionsOfficer", "PlatformAdmin"})()
+    application_id = request.args.get("application_id")
+    limit, offset = parse_pagination()
+    items = []
+    for e in db.essays.values():
+        if application_id and e["application_id"] != application_id:
+            continue
+        if g.user_role == "Applicant":
+            app = db.applications.get(e["application_id"])
+            if not app or app["applicant_id"] != g.user_id:
+                continue
+        items.append(e)
+    items = order_by_created_at(items)
+    page, total = paginate(items, limit, offset)
+    return ok_array(page, limit, offset, total)

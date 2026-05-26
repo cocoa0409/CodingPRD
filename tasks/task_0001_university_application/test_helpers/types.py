@@ -1,30 +1,13 @@
-"""Domain types: entity TypedDicts, status enums, role enum.
-
-All entities in this PRD carry id + created_at + updated_at + version
-(PRD §2.4: "All nine of these entities additionally expose an updated_at
-timestamp and an integer version field").
-"""
+"""Domain types: entity TypedDicts, status enums, role enum."""
 from enum import Enum
 from typing import TypedDict, Optional
 
 
-# --- Status enums (per §3 lifecycle descriptions) -----------------------
+# ─── Status enums ──────────────────────────────────────────────────────────
 
 class ApplicantProfileStatus(str, Enum):
     DRAFT = "DRAFT"
-    READY = "READY"
-
-
-class RecommenderInviteStatus(str, Enum):
-    INVITED = "INVITED"
-    ACCEPTED = "ACCEPTED"
-    DECLINED = "DECLINED"
-
-
-class SchoolPosture(str, Enum):
-    OPEN = "OPEN"
-    AT_TARGET = "AT_TARGET"
-    OVER_TARGET = "OVER_TARGET"
+    LOCKED = "LOCKED"
 
 
 class ApplicationStatus(str, Enum):
@@ -34,173 +17,178 @@ class ApplicationStatus(str, Enum):
     ADMITTED = "ADMITTED"
     WAITLISTED = "WAITLISTED"
     DENIED = "DENIED"
-    DEFERRED = "DEFERRED"
-    WITHDRAWN = "WITHDRAWN"
     ENROLLED = "ENROLLED"
-    DECLINED_OFFER = "DECLINED_OFFER"
+    DECLINED = "DECLINED"
+    WITHDRAWN = "WITHDRAWN"
 
 
-class ApplicationPlan(str, Enum):
+class AdmissionTrack(str, Enum):
     EARLY_DECISION = "EARLY_DECISION"
     EARLY_ACTION = "EARLY_ACTION"
     REGULAR = "REGULAR"
     ROLLING = "ROLLING"
 
 
-class RecommendationLetterStatus(str, Enum):
-    REQUESTED = "REQUESTED"
-    IN_PROGRESS = "IN_PROGRESS"
+class Residency(str, Enum):
+    IN_STATE = "IN_STATE"
+    OUT_OF_STATE = "OUT_OF_STATE"
+    INTERNATIONAL = "INTERNATIONAL"
+
+
+class YieldPosture(str, Enum):
+    OPEN = "OPEN"
+    ON_TARGET = "ON_TARGET"
+    OVER_TARGET = "OVER_TARGET"
+
+
+class RecommendationStatus(str, Enum):
+    INVITED = "INVITED"
     SUBMITTED = "SUBMITTED"
     WAIVED = "WAIVED"
 
 
-class FinancialAidProfileStatus(str, Enum):
+class AidPackageStatus(str, Enum):
     DRAFT = "DRAFT"
-    SUBMITTED = "SUBMITTED"
+    FINALIZED = "FINALIZED"
+    REVOKED = "REVOKED"
 
 
-class AidOfferVariant(str, Enum):
-    FEDERAL = "FEDERAL"
-    INSTITUTIONAL = "INSTITUTIONAL"
+class WaitlistEntryStatus(str, Enum):
+    PENDING = "PENDING"
+    PROMOTED = "PROMOTED"
+    RELEASED = "RELEASED"
 
 
-class RecommenderRelationship(str, Enum):
-    TEACHER = "TEACHER"
-    COUNSELOR = "COUNSELOR"
-    OTHER = "OTHER"
+class ProfileType(str, Enum):
+    FAFSA = "FAFSA"
+    CSS_PROFILE = "CSS_PROFILE"
 
 
 class UserRole(str, Enum):
     APPLICANT = "Applicant"
-    RECOMMENDER = "Recommender"
     ADMISSIONS_OFFICER = "AdmissionsOfficer"
     FINANCIAL_AID_OFFICER = "FinancialAidOfficer"
     PLATFORM_ADMIN = "PlatformAdmin"
+    ANONYMOUS = "Anonymous"
 
 
-class DecisionType(str, Enum):
-    ADMIT = "ADMIT"
-    WAITLIST = "WAITLIST"
-    DENY = "DENY"
-    DEFER = "DEFER"
+# ─── Entity TypedDicts (common_fields: true → id+created_at+updated_at+version) ──
 
-
-# --- Entity TypedDicts ---------------------------------------------------
-
-class Applicant(TypedDict, total=False):
+class Applicant(TypedDict):
     id: str
     email: str
     full_name: str
-    gpa: float
+    gpa_unweighted: float
     sat_total: Optional[int]
+    residency: str
     profile_status: str
+    submitted_application_count: int
     created_at: str
     updated_at: str
     version: int
 
 
-class Recommender(TypedDict, total=False):
-    id: str
-    applicant_id: str
-    email: str
-    full_name: str
-    relationship: str
-    invite_status: str
-    created_at: str
-    updated_at: str
-    version: int
-
-
-class School(TypedDict, total=False):
+class School(TypedDict):
     id: str
     name: str
+    state_code: str
+    admission_track: str
+    deadline_iso: str
+    decision_release_iso: str
     target_class_size: int
-    ed_deadline_iso: str
-    ea_deadline_iso: str
-    rd_deadline_iso: str
-    rolling_open: bool
-    requires_css_profile: bool
-    confirmed_enrollment_count: int
-    posture: str
+    assumed_yield_rate: float
+    in_state_tuition_cents: int
+    out_of_state_tuition_cents: int
+    international_tuition_cents: int
+    admitted_count: int
+    enrolled_count: int
+    declined_count: int
+    denied_count: int
+    yield_posture: str
     created_at: str
     updated_at: str
     version: int
 
 
-class Application(TypedDict, total=False):
+class Application(TypedDict):
     id: str
     applicant_id: str
     school_id: str
-    plan: str
     status: str
+    admission_track_snapshot: Optional[str]
     submitted_at: Optional[str]
     decision_at: Optional[str]
-    waitlist_rank: Optional[int]
-    waitlist_added_at: Optional[str]
-    admission_probability_score: int
+    enrollment_decision_at: Optional[str]
+    composite_score: Optional[float]
     created_at: str
     updated_at: str
     version: int
 
 
-class EssaySubmission(TypedDict, total=False):
+class Essay(TypedDict):
     id: str
     application_id: str
     prompt_code: str
-    body: str
     word_count: int
-    locked: bool
+    text: str
+    completed: bool
     created_at: str
     updated_at: str
     version: int
 
 
-class RecommendationLetter(TypedDict, total=False):
-    id: str
-    application_id: str
-    recommender_id: str
-    status: str
-    body: Optional[str]
-    submitted_at: Optional[str]
-    created_at: str
-    updated_at: str
-    version: int
-
-
-class FinancialAidProfile(TypedDict, total=False):
+class RecommendationRequest(TypedDict):
     id: str
     applicant_id: str
-    fafsa_efc_cents: int
-    css_efc_cents: Optional[int]
-    family_income_cents: int
+    school_id: str
+    recommender_email: str
     status: str
+    submitted_at: Optional[str]
+    rating: Optional[int]
     created_at: str
     updated_at: str
     version: int
 
 
-class AidOffer(TypedDict, total=False):
+class FinancialAidProfile(TypedDict):
+    id: str
+    applicant_id: str
+    profile_type: str
+    household_income_cents: int
+    household_size: int
+    declared_assets_cents: int
+    expected_family_contribution_cents: int
+    created_at: str
+    updated_at: str
+    version: int
+
+
+class AidPackage(TypedDict):
     id: str
     application_id: str
-    cost_of_attendance_cents: int
-    variant: str
-    demonstrated_need_cents: int
+    status: str
     grant_cents: int
     loan_cents: int
     work_study_cents: int
-    net_price_cents: int
+    net_cost_cents: Optional[int]
     created_at: str
     updated_at: str
     version: int
 
 
-class AdmissionCycle(TypedDict, total=False):
+class WaitlistEntry(TypedDict):
     id: str
-    school_id: str
-    clock_iso: str
-    last_yield_run_at: Optional[str]
-    yield_run_count: int
-    cooldown_ms: int
+    application_id: str
+    rank: int
+    status: str
+    promoted_at: Optional[str]
     created_at: str
     updated_at: str
     version: int
+
+
+# common_fields: false — SystemClock omits updated_at/version (PRD §2.4)
+class SystemClock(TypedDict):
+    id: str
+    current_utc: str
+    created_at: str

@@ -1,36 +1,51 @@
-"""Pytest fixtures exposing test_helpers infrastructure.
-
-Server lifecycle (start, readiness, restart between tests) is managed by
-prd-bench-local-runner; conftest just wires test_helpers into pytest.
-"""
+"""Pytest fixtures exposing test_helpers infrastructure."""
 import pytest
-
 from test_helpers import (
-    api_client, ApiClient, TEST_USERS,
-    admissions_headers as _admissions_headers,
-    fa_officer_headers as _fa_headers,
-    admin_headers as _admin_headers,
+    api_client,
+    ApiClient,
+    TEST_USERS,
+    make_applicant_headers,
+    make_admissions_headers,
+    make_financial_aid_headers,
+    make_platform_admin_headers,
 )
 
 
 @pytest.fixture(scope="session")
 def api() -> ApiClient:
-    """Session-scoped API client. Server lifecycle is the runner's job."""
+    """Session-scoped API client. Server lifecycle managed by prd-bench-local-runner."""
     return api_client
 
 
-# --- Opaque-role header fixtures ----------------------------------------
-
 @pytest.fixture
-def admin_headers():
-    return _admin_headers()
-
-
-@pytest.fixture
-def admissions_officer_headers():
-    return _admissions_headers()
+def applicant_headers():
+    """Shared Applicant header constant. Use ONLY for non-ownership-gated calls.
+    For ownership-gated calls, build per-applicant headers with make_applicant_headers(id).
+    """
+    return TEST_USERS["applicant_headers"]
 
 
 @pytest.fixture
-def fa_officer_headers():
-    return _fa_headers()
+def admissions_headers():
+    return TEST_USERS["admissions_headers"]
+
+
+@pytest.fixture
+def financial_aid_headers():
+    return TEST_USERS["financial_aid_headers"]
+
+
+@pytest.fixture
+def platform_admin_headers():
+    return TEST_USERS["platform_admin_headers"]
+
+
+@pytest.fixture
+def headers_factory():
+    """Factory exposing builder functions so tests can mint per-entity headers."""
+    return {
+        "applicant": make_applicant_headers,
+        "admissions": make_admissions_headers,
+        "financial_aid": make_financial_aid_headers,
+        "platform_admin": make_platform_admin_headers,
+    }

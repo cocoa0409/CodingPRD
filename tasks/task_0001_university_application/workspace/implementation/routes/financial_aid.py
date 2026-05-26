@@ -1,315 +1,202 @@
-"""Financial aid profile and aid offer routes."""
+"""FinancialAidProfile + AidPackage endpoints."""
+from __future__ import annotations
 
-from flask import Blueprint, request
+from flask import Blueprint, request, g
 
 import db
-import errors
-import response as resp
-import util
-from middleware import require_auth
-from routes._helpers import get_json_body, optional_field, require_field
-from services import calculations
-from services.serializers import serialize_aid_offer, serialize_fa_profile
-
+from errors import (
+    APIError, ERR_INVALID_REQUEST, ERR_NOT_FOUND, ERR_FORBIDDEN_OWNER_MISMATCH,
+    ERR_FAFSA_DISALLOWS_ASSETS,
+)
+from middleware import auth_required
+from response import ok_object, ok_array
+from routes._helpers import (
+    parse_pagination, paginate, get_body, require_fields, order_by_created_at,
+)
+from services import calculations, state_machines
+from services.common import new_common_fields, touch
 
 bp = Blueprint("financial_aid", __name__)
 
+PROFILE_TYPES = {"FAFSA", "CSS_PROFILE"}
 
-VALID_AID_VARIANTS = frozenset({"FEDERAL", "INSTITUTIONAL"})
+
+def _is_int_nn(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
-# --------------------------------------------------------------------------- #
-# POST /financial-aid-profiles (Applicant)
-# --------------------------------------------------------------------------- #
-
-@bp.route("/financial-aid-profiles", methods=["POST"])
-@require_auth(["Applicant"])
-def create_fa_profile():
-    body = get_json_body()
-    applicant_id = require_field(body, "applicant_id", kind="string")
-    fafsa = require_field(body, "fafsa_efc_cents", kind="integer")
-    family = require_field(body, "family_income_cents", kind="integer")
-    css = optional_field(body, "css_efc_cents", kind="integer", default=None)
-
-    applicant = db.applicants.get(applicant_id)
-    if applicant is None:
-        errors.raise_error(errors.ERR_FK_NOT_FOUND, "Applicant not found.")
-
-    user_id = request.headers.get("X-User-ID")
-    if user_id != applicant_id:
-        errors.raise_error(errors.ERR_NOT_RESOURCE_OWNER,
-                           "Applicants can only create their own financial aid profile.")
-
-    if fafsa < 0:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'fafsa_efc_cents' must be >= 0.")
-    if family < 0:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'family_income_cents' must be >= 0.")
-    if css is not None and css < 0:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'css_efc_cents' must be >= 0 or null.")
-
-    # Uniqueness per applicant
-    for existing in db.financial_aid_profiles.values():
-        if existing["applicant_id"] == applicant_id:
-            errors.raise_error(errors.ERR_DUPLICATE_RESOURCE,
-                               "Applicant already has a financial aid profile.")
-
-    row = {
+# --------------------------- FinancialAidProfile ---------------------------
+@bp.post("/financial-aid-profiles")
+def create_fap():
+    auth_required({"Applicant"})()
+    body = get_body()
+    require_fields(body, ["applicant_id", "profile_type", "household_income_cents", "household_size"])
+    applicant_id = body["applicant_id"]
+    if applicant_id not in db.applicants:
+        raise APIError(ERR_NOT_FOUND, 404, "Applicant not found")
+    if g.user_id != applicant_id:
+        raise APIError(ERR_FORBIDDEN_OWNER_MISMATCH, 403, "Caller does not own this applicant")
+    # uniqueness: one fap per applicant
+    for p in db.financial_aid_profiles.values():
+        if p["applicant_id"] == applicant_id:
+            raise APIError(ERR_INVALID_REQUEST, 400, "FinancialAidProfile already exists for applicant")
+    profile_type = body["profile_type"]
+    if profile_type not in PROFILE_TYPES:
+        raise APIError(ERR_INVALID_REQUEST, 400, "profile_type invalid")
+    hic = body["household_income_cents"]
+    if not _is_int_nn(hic):
+        raise APIError(ERR_INVALID_REQUEST, 400, "household_income_cents must be non-negative integer")
+    hsz = body["household_size"]
+    if not isinstance(hsz, int) or isinstance(hsz, bool) or hsz < 1 or hsz > 20:
+        raise APIError(ERR_INVALID_REQUEST, 400, "household_size out of range")
+    da = body.get("declared_assets_cents", 0)
+    if not _is_int_nn(da):
+        raise APIError(ERR_INVALID_REQUEST, 400, "declared_assets_cents must be non-negative integer")
+    if profile_type == "FAFSA" and da != 0:
+        raise APIError(ERR_FAFSA_DISALLOWS_ASSETS, 422, "FAFSA disallows declared_assets_cents > 0")
+    efc = calculations.efc_calc(profile_type, hic, hsz, da)
+    common = new_common_fields()
+    fap = {
+        **common,
         "applicant_id": applicant_id,
-        "fafsa_efc_cents": fafsa,
-        "css_efc_cents": css,
-        "family_income_cents": family,
-        "status": "DRAFT",
+        "profile_type": profile_type,
+        "household_income_cents": hic,
+        "household_size": hsz,
+        "declared_assets_cents": da,
+        "expected_family_contribution_cents": efc,
     }
-    util.stamp_create(row)
-    db.financial_aid_profiles[row["id"]] = row
-    return resp.success_object(serialize_fa_profile(row), http_status=201)
+    db.financial_aid_profiles[fap["id"]] = fap
+    return ok_object(fap, http_status=201)
 
 
-# --------------------------------------------------------------------------- #
-# POST /financial-aid-profiles/{id}/submit (Applicant)
-# --------------------------------------------------------------------------- #
-
-@bp.route("/financial-aid-profiles/<profile_id>/submit", methods=["POST"])
-@require_auth(["Applicant"])
-def submit_fa_profile(profile_id):
-    row = db.financial_aid_profiles.get(profile_id)
-    if row is None:
-        errors.raise_error(errors.ERR_RESOURCE_NOT_FOUND, "Profile not found.")
-
-    user_id = request.headers.get("X-User-ID")
-    if row["applicant_id"] != user_id:
-        errors.raise_error(errors.ERR_NOT_RESOURCE_OWNER,
-                           "Applicants can only submit their own financial aid profile.")
-
-    if row["status"] != "DRAFT":
-        errors.raise_error(errors.ERR_INVALID_STATE,
-                           "Profile is not in DRAFT state.")
-    if row.get("fafsa_efc_cents") is None or row.get("family_income_cents") is None:
-        errors.raise_error(errors.ERR_INVALID_STATE,
-                           "Profile is missing required fields.")
-
-    row["status"] = "SUBMITTED"
-    util.stamp_update(row)
-    return resp.success_object(serialize_fa_profile(row))
+@bp.get("/financial-aid-profiles/<pid>")
+def read_fap(pid):
+    auth_required({"Applicant", "FinancialAidOfficer", "PlatformAdmin"})()
+    fap = db.financial_aid_profiles.get(pid)
+    if fap is None:
+        raise APIError(ERR_NOT_FOUND, 404, "FinancialAidProfile not found")
+    if g.user_role == "Applicant" and g.user_id != fap["applicant_id"]:
+        raise APIError(ERR_FORBIDDEN_OWNER_MISMATCH, 403, "Caller does not own this profile")
+    return ok_object(fap)
 
 
-# --------------------------------------------------------------------------- #
-# GET /financial-aid-profiles/{id}
-# --------------------------------------------------------------------------- #
-
-@bp.route("/financial-aid-profiles/<profile_id>", methods=["GET"])
-@require_auth(["Applicant", "FinancialAidOfficer", "PlatformAdmin"])
-def get_fa_profile(profile_id):
-    row = db.financial_aid_profiles.get(profile_id)
-    if row is None:
-        errors.raise_error(errors.ERR_RESOURCE_NOT_FOUND, "Profile not found.")
-
-    role = request.headers.get("X-User-Role")
-    user_id = request.headers.get("X-User-ID")
-    if role == "Applicant" and row["applicant_id"] != user_id:
-        errors.raise_error(errors.ERR_NOT_RESOURCE_OWNER,
-                           "Applicants can only read their own financial aid profile.")
-    return resp.success_object(serialize_fa_profile(row))
+@bp.get("/financial-aid-profiles")
+def list_fap():
+    auth_required({"Applicant", "FinancialAidOfficer", "PlatformAdmin"})()
+    applicant_id = request.args.get("applicant_id")
+    limit, offset = parse_pagination()
+    items = []
+    for p in db.financial_aid_profiles.values():
+        if applicant_id and p["applicant_id"] != applicant_id:
+            continue
+        if g.user_role == "Applicant" and p["applicant_id"] != g.user_id:
+            continue
+        items.append(p)
+    items = order_by_created_at(items)
+    page, total = paginate(items, limit, offset)
+    return ok_array(page, limit, offset, total)
 
 
-# --------------------------------------------------------------------------- #
-# Aid offer helpers
-# --------------------------------------------------------------------------- #
+@bp.patch("/financial-aid-profiles/<pid>")
+def update_fap(pid):
+    auth_required({"Applicant"})()
+    fap = db.financial_aid_profiles.get(pid)
+    if fap is None:
+        raise APIError(ERR_NOT_FOUND, 404, "FinancialAidProfile not found")
+    if g.user_id != fap["applicant_id"]:
+        raise APIError(ERR_FORBIDDEN_OWNER_MISMATCH, 403, "Caller does not own this profile")
+    body = get_body()
+    if "household_income_cents" in body:
+        v = body["household_income_cents"]
+        if not _is_int_nn(v):
+            raise APIError(ERR_INVALID_REQUEST, 400, "household_income_cents must be non-negative integer")
+        fap["household_income_cents"] = v
+    if "household_size" in body:
+        v = body["household_size"]
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1 or v > 20:
+            raise APIError(ERR_INVALID_REQUEST, 400, "household_size out of range")
+        fap["household_size"] = v
+    if "declared_assets_cents" in body:
+        v = body["declared_assets_cents"]
+        if not _is_int_nn(v):
+            raise APIError(ERR_INVALID_REQUEST, 400, "declared_assets_cents must be non-negative integer")
+        if fap["profile_type"] == "FAFSA" and v != 0:
+            raise APIError(ERR_FAFSA_DISALLOWS_ASSETS, 422, "FAFSA disallows declared_assets_cents > 0")
+        fap["declared_assets_cents"] = v
+    fap["expected_family_contribution_cents"] = calculations.efc_calc(
+        fap["profile_type"], fap["household_income_cents"], fap["household_size"], fap["declared_assets_cents"]
+    )
+    touch(fap)
+    return ok_object(fap)
 
-def _resolve_fa_profile_for_application(application):
-    """Find the SUBMITTED FinancialAidProfile for the application's applicant."""
-    for profile in db.financial_aid_profiles.values():
-        if profile["applicant_id"] == application["applicant_id"]:
-            return profile
-    return None
 
-
-def _check_institutional_eligibility(application, variant):
-    if variant != "INSTITUTIONAL":
-        return
-    school = db.schools.get(application["school_id"])
-    if school is None or not school.get("requires_css_profile"):
-        errors.raise_error(
-            errors.ERR_INSTITUTIONAL_VARIANT_INELIGIBLE,
-            "INSTITUTIONAL variant requires School.requires_css_profile=true.",
-        )
-    profile = _resolve_fa_profile_for_application(application)
-    if profile is None or profile.get("css_efc_cents") is None:
-        errors.raise_error(
-            errors.ERR_INSTITUTIONAL_VARIANT_INELIGIBLE,
-            "INSTITUTIONAL variant requires a non-null css_efc_cents on the applicant's profile.",
-        )
-
-
-# --------------------------------------------------------------------------- #
-# POST /aid-offers (FinancialAidOfficer)
-# --------------------------------------------------------------------------- #
-
-@bp.route("/aid-offers", methods=["POST"])
-@require_auth(["FinancialAidOfficer"])
-def create_aid_offer():
-    body = get_json_body()
-    application_id = require_field(body, "application_id", kind="string")
-    coa = require_field(body, "cost_of_attendance_cents", kind="integer")
-    variant = require_field(body, "variant", kind="string")
-    grant = require_field(body, "grant_cents", kind="integer")
-    loan = require_field(body, "loan_cents", kind="integer")
-    work_study = require_field(body, "work_study_cents", kind="integer")
-    expected_version = require_field(body, "expected_application_version", kind="integer")
-
-    application = db.applications.get(application_id)
-    if application is None:
-        errors.raise_error(errors.ERR_FK_NOT_FOUND, "Application not found.")
-
-    if variant not in VALID_AID_VARIANTS:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           f"Field 'variant' must be one of {sorted(VALID_AID_VARIANTS)}.")
-    if coa < 0 or grant < 0 or loan < 0 or work_study < 0:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Monetary fields must be >= 0.")
-
-    # Uniqueness: one aid offer per application
-    for existing in db.aid_offers.values():
-        if existing["application_id"] == application_id:
-            errors.raise_error(errors.ERR_DUPLICATE_RESOURCE,
-                               "An aid offer already exists for this application.")
-
-    # Priority 9: OCC check
-    if expected_version != application["version"]:
-        errors.raise_error(errors.ERR_STALE_APPLICATION_VERSION,
-                           "Provided expected_application_version is stale.")
-
-    # Priority 10: from-state check — application must be ADMITTED
-    if application["status"] != "ADMITTED":
-        errors.raise_error(errors.ERR_INVALID_STATE,
-                           "Aid offer requires an ADMITTED application.")
-
-    # Priority 16: INSTITUTIONAL variant eligibility
-    _check_institutional_eligibility(application, variant)
-
-    # Resolve the FA profile (must be SUBMITTED to be used for demonstrated need)
-    profile = _resolve_fa_profile_for_application(application)
-    if profile is None or profile["status"] != "SUBMITTED":
-        # Demonstrated-need computation per §3.6 requires a SUBMITTED profile.
-        # Treat absence/draft as INVALID_STATE so the officer corrects it.
-        errors.raise_error(errors.ERR_INVALID_STATE,
-                           "Applicant has no SUBMITTED financial aid profile.")
-
-    pending = {
+# --------------------------- AidPackage ---------------------------
+@bp.post("/aid-packages")
+def create_aid_package():
+    auth_required({"FinancialAidOfficer"})()
+    body = get_body()
+    require_fields(body, ["application_id", "grant_cents", "loan_cents", "work_study_cents"])
+    application_id = body["application_id"]
+    if application_id not in db.applications:
+        raise APIError(ERR_NOT_FOUND, 404, "Application not found")
+    # uniqueness
+    for ap in db.aid_packages.values():
+        if ap["application_id"] == application_id:
+            raise APIError(ERR_INVALID_REQUEST, 400, "AidPackage already exists for application")
+    for k in ("grant_cents", "loan_cents", "work_study_cents"):
+        if not _is_int_nn(body[k]):
+            raise APIError(ERR_INVALID_REQUEST, 400, f"{k} must be non-negative integer")
+    common = new_common_fields()
+    ap = {
+        **common,
         "application_id": application_id,
-        "cost_of_attendance_cents": coa,
-        "variant": variant,
-        "grant_cents": grant,
-        "loan_cents": loan,
-        "work_study_cents": work_study,
+        "status": "DRAFT",
+        "grant_cents": body["grant_cents"],
+        "loan_cents": body["loan_cents"],
+        "work_study_cents": body["work_study_cents"],
+        "net_cost_cents": None,
     }
-    demonstrated_need = calculations.compute_demonstrated_need(pending, profile)
-
-    # Priority 17: grant cap
-    if grant > demonstrated_need:
-        errors.raise_error(errors.ERR_GRANT_EXCEEDS_NEED,
-                           "Grant exceeds demonstrated_need_cents.")
-
-    pending["demonstrated_need_cents"] = demonstrated_need
-    pending["net_price_cents"] = calculations.compute_net_price(pending)
-    util.stamp_create(pending)
-    db.aid_offers[pending["id"]] = pending
-
-    # Side effect: parent Application.version += 1
-    util.stamp_update(application)
-
-    return resp.success_object(serialize_aid_offer(pending), http_status=201)
+    db.aid_packages[ap["id"]] = ap
+    return ok_object(ap, http_status=201)
 
 
-# --------------------------------------------------------------------------- #
-# PATCH /aid-offers/{id} (FinancialAidOfficer)
-# --------------------------------------------------------------------------- #
-
-@bp.route("/aid-offers/<offer_id>", methods=["PATCH"])
-@require_auth(["FinancialAidOfficer"])
-def patch_aid_offer(offer_id):
-    row = db.aid_offers.get(offer_id)
-    if row is None:
-        errors.raise_error(errors.ERR_RESOURCE_NOT_FOUND, "Aid offer not found.")
-
-    body = get_json_body()
-    pending = dict(row)
-    if "grant_cents" in body:
-        if not isinstance(body["grant_cents"], int) or isinstance(body["grant_cents"], bool):
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Field 'grant_cents' must be an integer.")
-        if body["grant_cents"] < 0:
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Field 'grant_cents' must be >= 0.")
-        pending["grant_cents"] = body["grant_cents"]
-    if "loan_cents" in body:
-        if not isinstance(body["loan_cents"], int) or isinstance(body["loan_cents"], bool):
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Field 'loan_cents' must be an integer.")
-        if body["loan_cents"] < 0:
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Field 'loan_cents' must be >= 0.")
-        pending["loan_cents"] = body["loan_cents"]
-    if "work_study_cents" in body:
-        if not isinstance(body["work_study_cents"], int) or isinstance(body["work_study_cents"], bool):
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Field 'work_study_cents' must be an integer.")
-        if body["work_study_cents"] < 0:
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Field 'work_study_cents' must be >= 0.")
-        pending["work_study_cents"] = body["work_study_cents"]
-
-    application = db.applications.get(row["application_id"])
-    if application is None:
-        errors.raise_error(errors.ERR_INVALID_STATE,
-                           "Owning application not found.")
-
-    # Priority 16: re-check INSTITUTIONAL eligibility (variant didn't change but
-    # the school/profile state might have)
-    _check_institutional_eligibility(application, pending["variant"])
-
-    profile = _resolve_fa_profile_for_application(application)
-    if profile is None or profile["status"] != "SUBMITTED":
-        errors.raise_error(errors.ERR_INVALID_STATE,
-                           "Applicant has no SUBMITTED financial aid profile.")
-    pending["demonstrated_need_cents"] = calculations.compute_demonstrated_need(pending, profile)
-
-    # Priority 17: grant cap
-    if pending["grant_cents"] > pending["demonstrated_need_cents"]:
-        errors.raise_error(errors.ERR_GRANT_EXCEEDS_NEED,
-                           "Grant exceeds demonstrated_need_cents.")
-
-    pending["net_price_cents"] = calculations.compute_net_price(pending)
-
-    # Persist changes
-    row["grant_cents"] = pending["grant_cents"]
-    row["loan_cents"] = pending["loan_cents"]
-    row["work_study_cents"] = pending["work_study_cents"]
-    row["demonstrated_need_cents"] = pending["demonstrated_need_cents"]
-    row["net_price_cents"] = pending["net_price_cents"]
-    util.stamp_update(row)
-    return resp.success_object(serialize_aid_offer(row))
+@bp.post("/aid-packages/<aid>/finalize")
+def finalize_aid(aid):
+    auth_required({"FinancialAidOfficer"})()
+    ap = db.aid_packages.get(aid)
+    if ap is None:
+        raise APIError(ERR_NOT_FOUND, 404, "AidPackage not found")
+    state_machines.aid_finalize(ap)
+    return ok_object(ap)
 
 
-# --------------------------------------------------------------------------- #
-# GET /aid-offers/{id}
-# --------------------------------------------------------------------------- #
+@bp.get("/aid-packages/<aid>")
+def read_aid_package(aid):
+    auth_required({"Applicant", "FinancialAidOfficer", "PlatformAdmin"})()
+    ap = db.aid_packages.get(aid)
+    if ap is None:
+        raise APIError(ERR_NOT_FOUND, 404, "AidPackage not found")
+    if g.user_role == "Applicant":
+        app = db.applications.get(ap["application_id"])
+        if not app or app["applicant_id"] != g.user_id:
+            raise APIError(ERR_FORBIDDEN_OWNER_MISMATCH, 403, "Caller does not own this aid package")
+    return ok_object(ap)
 
-@bp.route("/aid-offers/<offer_id>", methods=["GET"])
-@require_auth(["Applicant", "FinancialAidOfficer", "PlatformAdmin"])
-def get_aid_offer(offer_id):
-    row = db.aid_offers.get(offer_id)
-    if row is None:
-        errors.raise_error(errors.ERR_RESOURCE_NOT_FOUND, "Aid offer not found.")
 
-    role = request.headers.get("X-User-Role")
-    user_id = request.headers.get("X-User-ID")
-    if role == "Applicant":
-        application = db.applications.get(row["application_id"])
-        if application is None or application["applicant_id"] != user_id:
-            errors.raise_error(errors.ERR_NOT_RESOURCE_OWNER,
-                               "Applicants can only read aid offers on their own applications.")
-    return resp.success_object(serialize_aid_offer(row))
+@bp.get("/aid-packages")
+def list_aid_packages():
+    auth_required({"Applicant", "FinancialAidOfficer", "PlatformAdmin"})()
+    application_id = request.args.get("application_id")
+    limit, offset = parse_pagination()
+    items = []
+    for ap in db.aid_packages.values():
+        if application_id and ap["application_id"] != application_id:
+            continue
+        if g.user_role == "Applicant":
+            app = db.applications.get(ap["application_id"])
+            if not app or app["applicant_id"] != g.user_id:
+                continue
+        items.append(ap)
+    items = order_by_created_at(items)
+    page, total = paginate(items, limit, offset)
+    return ok_array(page, limit, offset, total)

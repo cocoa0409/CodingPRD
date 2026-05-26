@@ -48,6 +48,11 @@ Step 5: Subagent → prd-bench-unit-test-generator  Step 6: Subagent → prd-ben
     └───────────────────────┬───────────────────┘
                             ▼
 Step 7: One long-lived subagent owns the loop { prd-bench-local-run --isolation per-test-server → diagnose → fix → rerun → ... → PASS }
+    │
+    ▼
+Step 8: Subagent → PRD finalizer → PRD_FINALIZED.md
+        (reads PRD + implementation + tests; scaffold/worklog withheld; Step 7 diff inlined)
+        (skipped if Step 7 had 0 iterations / 0 deletions / 0 fixes)
 ```
 
 ## Context Isolation Strategy
@@ -328,6 +333,39 @@ Summary (emit when exiting after a clean 8-round parallel sweep):
 
 The orchestrator does not need to inspect failures itself — the subagent owns all of that, including the local-run invocation, the results parsing, and the decision whether to continue. The orchestrator just waits for the subagent to exit.
 
+### Step 8: Finalize PRD — align documentation to implementation (subagent)
+
+Step 7's revisions, deletions and assertion-weakenings mark the places where `PRD.md` does not uniquely determine a behavior the implementation has already chosen. Step 8 patches those spots, producing `workspace/PRD_FINALIZED.md` — a MINIMAL diff over `PRD.md` such that a fresh implementer reading `PRD_FINALIZED.md` alone produces a code base behaviorally equivalent to `workspace/implementation/`.
+
+**Skip condition.** If Step 7 exited on the first 8-round sweep with 0 deletions, 0 `test_suite/` fixes, 0 `test_helpers/` fixes, and 0 `implementation/` fixes — i.e. zero iterations beyond the baseline — then `PRD.md` already determined every behavior the implementation exhibits, and Step 8 is skipped. Do not spawn the subagent in this case.
+
+**Step 7 hand-off.** Before spawning, the orchestrator extracts the Step 7 entry from `worklog.md` (deletions, `test_suite/` fixes, `test_helpers/` fixes, `implementation/` fixes) and inlines it verbatim as `<step_7_diff>` in the prompt below. The diff is the focus list — the subagent uses it to target known PRD silences rather than scanning the whole document.
+
+**Subagent prompt:**
+
+```
+Produce {task_dir}/workspace/PRD_FINALIZED.md — a minimal patch of {task_dir}/workspace/PRD.md that pins every place where the implementation makes a concrete behavioral choice that PRD does not uniquely determine or implementation used a different logic than the PRD. Goal: a fresh implementer reading PRD_FINALIZED.md alone produces a code base behaviorally equivalent to {task_dir}/workspace/implementation/.
+
+You may read workspace: PRD.md, implementation/, test_helpers/, test_suite/, INSTRUCTION.md.
+You MUST NOT read: SCAFFOLD*.yaml, worklog.md.
+
+Implementation is the alignment target. Tests are NOT — Step 7 has already weakened or deleted assertions that PRD did not pin, so test_suite/ is sometimes laxer than implementation/. Treat test files only as auxiliary evidence of where Step 7 found PRD ambiguity; align PRD_FINALIZED to what implementation/ actually does.
+
+<step_7_diff>
+{verbatim Step 7 worklog entry: deletions, test_suite fixes, test_helpers fixes, implementation fixes}
+</step_7_diff>
+
+Method:
+
+0. `cp {task_dir}/workspace/PRD.md {task_dir}/workspace/PRD_FINALIZED.md`. Edit only PRD_FINALIZED.md.
+1. For each <step_7_diff> item: locate the matching behavior in implementation/. Patch PRD_FINALIZED.md only when impl pinned a choice PRD left open — not every item is a PRD silence (some are pure fixture bugs).
+2. Where PRD already determines behavior, keep prose verbatim; elsewhere insert or revise inline to match impl, change as little as possible. No new sections. Never invent behavior the impl does not exhibit.
+
+Summary on exit:
+- PRD.md vs PRD_FINALIZED.md line counts and %-delta.
+- One bullet per change: `{PRD section} — {insert|revise} — {what changed} — {impl file:line}`.
+```
+
 ## Key Principles
 
 1. **PRD.md is the contract; SCAFFOLD.yaml is the generator index.** Every implementation behavior must trace to PRD prose. Every test artifact — the assertion in `test_suite/` AND the fixture, factory, or role-header helper in `test_helpers/` that sets up the call — must trace to PRD prose. The scaffold exists to *drive generation* — it is not a contract the implementer can read. When test and scaffold agree but PRD is silent, **the PRD wins**: delete the test. When PRD and scaffold disagree on semantics (threshold boundaries, error names, state names), that is a bug in the doc-generator skill — report it rather than silently favoring one side, but if you must proceed, favor PRD.
@@ -387,7 +425,8 @@ tasks/{task_name}/
 │   └── test_*.py
 └── workspace/
     ├── INSTRUCTION.md                     # Build contract (start.sh + PORT/0.0.0.0/foreground; evaluator runs `bash start.sh`)
-    ├── PRD.md                             # Natural language requirements
+    ├── PRD.md                             # Natural language requirements (input to Steps 5/6)
+    ├── PRD_FINALIZED.md                   # Minimal patch of PRD.md pinning every impl-resolved ambiguity (Step 8 output)
     └── implementation/                    # Working Python/Flask server
         ├── start.sh                       # Foreground launcher (reads $PORT, binds 0.0.0.0)
         ├── requirements.txt

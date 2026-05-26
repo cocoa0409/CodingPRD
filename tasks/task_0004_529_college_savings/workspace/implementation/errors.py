@@ -1,0 +1,62 @@
+"""Domain error class and error id constants.
+
+Each ApiError carries an error_id (machine-readable token from the PRD/scaffold
+error catalogue), an HTTP status, and a human-readable message. The Flask
+error handler in app.py converts these to the standard error envelope.
+"""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id: str, http_status: int, message: str = ""):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Error ID constants (mirroring §1.6 / §5 of the scaffold + PRD).
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+ERR_FORBIDDEN = "ERR_FORBIDDEN"
+ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+ERR_NOT_FOUND = "ERR_NOT_FOUND"
+ERR_REFERENCED_NOT_FOUND = "ERR_REFERENCED_NOT_FOUND"
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+ERR_INVALID_STATE = "ERR_INVALID_STATE"
+ERR_STALE_ACCOUNT_VERSION = "ERR_STALE_ACCOUNT_VERSION"
+ERR_BENEFICIARY_NOT_FAMILY_MEMBER = "ERR_BENEFICIARY_NOT_FAMILY_MEMBER"
+ERR_INSUFFICIENT_BALANCE = "ERR_INSUFFICIENT_BALANCE"
+ERR_REVISION_LIMIT_EXCEEDED = "ERR_REVISION_LIMIT_EXCEEDED"
+ERR_REVERSE_WINDOW_CLOSED = "ERR_REVERSE_WINDOW_CLOSED"
+ERR_UNSUPPORTED_STATE_CODE = "ERR_UNSUPPORTED_STATE_CODE"
+ERR_EMAIL_TAKEN = "ERR_EMAIL_TAKEN"
+ERR_FORM_ALREADY_EXISTS = "ERR_FORM_ALREADY_EXISTS"
+ERR_INCENTIVE_ALREADY_EXISTS = "ERR_INCENTIVE_ALREADY_EXISTS"
+ERR_FORM_PREMATURE_ISSUANCE = "ERR_FORM_PREMATURE_ISSUANCE"
+ERR_FORM_CORRECTION_WINDOW_CLOSED = "ERR_FORM_CORRECTION_WINDOW_CLOSED"
+
+
+HTTP_STATUS = {
+    ERR_UNAUTHENTICATED: 401,
+    ERR_FORBIDDEN: 403,
+    ERR_SEGREGATION_OF_DUTIES: 403,
+    ERR_NOT_FOUND: 404,
+    ERR_REFERENCED_NOT_FOUND: 404,
+    ERR_INVALID_REQUEST: 400,
+    ERR_INVALID_STATE: 409,
+    ERR_STALE_ACCOUNT_VERSION: 412,
+    ERR_BENEFICIARY_NOT_FAMILY_MEMBER: 422,
+    ERR_INSUFFICIENT_BALANCE: 422,
+    ERR_REVISION_LIMIT_EXCEEDED: 409,
+    ERR_REVERSE_WINDOW_CLOSED: 409,
+    ERR_UNSUPPORTED_STATE_CODE: 422,
+    ERR_EMAIL_TAKEN: 409,
+    ERR_FORM_ALREADY_EXISTS: 409,
+    ERR_INCENTIVE_ALREADY_EXISTS: 409,
+    ERR_FORM_PREMATURE_ISSUANCE: 422,
+    ERR_FORM_CORRECTION_WINDOW_CLOSED: 422,
+}
+
+
+def err(error_id: str, message: str = "") -> ApiError:
+    """Build an ApiError using the canonical HTTP status for this error_id."""
+    return ApiError(error_id, HTTP_STATUS[error_id], message or error_id)

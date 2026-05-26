@@ -1,132 +1,51 @@
-"""Helpers shared by route modules: request parsing, pagination, ownership."""
+"""Shared route helpers: pagination parsing, body validation, ownership check."""
+from __future__ import annotations
 
+from typing import Any, Optional
 from flask import request
 
-import errors
+from errors import APIError, ERR_INVALID_REQUEST, ERR_FORBIDDEN_OWNER_MISMATCH
 
 
-# --------------------------------------------------------------------------- #
-# Request body
-# --------------------------------------------------------------------------- #
-
-def get_json_body() -> dict:
-    """Return the request JSON body as a dict (empty dict if absent).
-
-    A request with a body that fails to parse as JSON is rejected with
-    ERR_INVALID_REQUEST. A request with no body returns an empty dict.
-    """
-    raw = request.get_data(cache=True)
-    if not raw:
-        return {}
+def parse_pagination():
+    limit = request.args.get("limit", "10")
+    offset = request.args.get("offset", "0")
     try:
-        body = request.get_json(force=True, silent=False)
-    except Exception:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Request body is not valid JSON.")
+        limit_i = int(limit)
+        offset_i = int(offset)
+    except (TypeError, ValueError):
+        raise APIError(ERR_INVALID_REQUEST, 400, "limit/offset must be integers")
+    if limit_i < 1 or limit_i > 100:
+        raise APIError(ERR_INVALID_REQUEST, 400, "limit must be in [1,100]")
+    if offset_i < 0:
+        raise APIError(ERR_INVALID_REQUEST, 400, "offset must be >= 0")
+    return limit_i, offset_i
+
+
+def paginate(items: list, limit: int, offset: int):
+    total = len(items)
+    return items[offset:offset + limit], total
+
+
+def get_body() -> dict:
+    body = request.get_json(silent=True)
     if body is None:
         return {}
     if not isinstance(body, dict):
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Request body must be a JSON object.")
+        raise APIError(ERR_INVALID_REQUEST, 400, "Body must be a JSON object")
     return body
 
 
-# --------------------------------------------------------------------------- #
-# Type-checked field extraction
-# --------------------------------------------------------------------------- #
-
-_MISSING = object()
-
-
-def require_field(body, name, *, kind, msg=None):
-    if name not in body or body[name] is None:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           msg or f"Field {name!r} is required.")
-    return check_type(body[name], kind, name)
+def require_fields(body: dict, fields):
+    for f in fields:
+        if f not in body or body[f] is None:
+            raise APIError(ERR_INVALID_REQUEST, 400, f"Missing required field: {f}")
 
 
-def optional_field(body, name, *, kind, default=None, allow_null=True):
-    if name not in body:
-        return default
-    value = body[name]
-    if value is None:
-        if allow_null:
-            return None
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           f"Field {name!r} cannot be null.")
-    return check_type(value, kind, name)
+def assert_owner(applicant_id: str, caller_role: str, caller_user_id: str):
+    if caller_role == "Applicant" and caller_user_id != applicant_id:
+        raise APIError(ERR_FORBIDDEN_OWNER_MISMATCH, 403, "Caller does not own this resource")
 
 
-def check_type(value, kind, name):
-    if kind == "string":
-        if not isinstance(value, str):
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               f"Field {name!r} must be a string.")
-        return value
-    if kind == "integer":
-        # Reject booleans — Python bool is a subclass of int, but a boolean is
-        # not a legitimate integer here.
-        if isinstance(value, bool) or not isinstance(value, int):
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               f"Field {name!r} must be an integer.")
-        return value
-    if kind == "number":
-        if isinstance(value, bool):
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               f"Field {name!r} must be a number.")
-        if not isinstance(value, (int, float)):
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               f"Field {name!r} must be a number.")
-        return value
-    if kind == "boolean":
-        if not isinstance(value, bool):
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               f"Field {name!r} must be a boolean.")
-        return value
-    return value
-
-
-# --------------------------------------------------------------------------- #
-# Pagination
-# --------------------------------------------------------------------------- #
-
-def parse_pagination():
-    """Return (limit, offset) from query string, applying PRD §2.3 defaults.
-
-    limit default 10, min 1, max 100.
-    offset default 0, min 0.
-    """
-    raw_limit = request.args.get("limit")
-    raw_offset = request.args.get("offset")
-
-    if raw_limit is None or raw_limit == "":
-        limit = 10
-    else:
-        try:
-            limit = int(raw_limit)
-        except (TypeError, ValueError):
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Query parameter 'limit' must be an integer.")
-        if limit < 1 or limit > 100:
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Query parameter 'limit' must be in 1..100.")
-
-    if raw_offset is None or raw_offset == "":
-        offset = 0
-    else:
-        try:
-            offset = int(raw_offset)
-        except (TypeError, ValueError):
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Query parameter 'offset' must be an integer.")
-        if offset < 0:
-            errors.raise_error(errors.ERR_INVALID_REQUEST,
-                               "Query parameter 'offset' must be >= 0.")
-
-    return limit, offset
-
-
-def paginate(items, limit, offset):
-    """Slice the (already-sorted) list into a page; return (page, total)."""
-    total = len(items)
-    return items[offset:offset + limit], total
+def order_by_created_at(items: list) -> list:
+    return sorted(items, key=lambda x: x["created_at"])

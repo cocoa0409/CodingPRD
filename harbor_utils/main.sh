@@ -22,6 +22,12 @@
 set -euo pipefail
 
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$LIB_DIR/.." && pwd)"
+HARBOR_DIR="$REPO_ROOT/harbor_tasks"
+
+echo ">>> step 0/2: clearing $HARBOR_DIR/"
+rm -rf "$HARBOR_DIR"
+mkdir -p "$HARBOR_DIR"
 
 echo ">>> step 1/2: hydrating tasks (prepare-all.sh)"
 bash "$LIB_DIR/prepare-all.sh"

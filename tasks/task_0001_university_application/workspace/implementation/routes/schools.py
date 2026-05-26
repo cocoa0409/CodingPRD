@@ -1,157 +1,107 @@
-"""School and yield-report routes."""
+"""School endpoints."""
+from __future__ import annotations
 
-from flask import Blueprint
+from flask import Blueprint, request
 
 import db
-import errors
-import response as resp
-import util
-from middleware import require_auth
-from routes._helpers import (
-    get_json_body,
-    optional_field,
-    parse_pagination,
-    paginate,
-    require_field,
-)
-from services import calculations
-from services.serializers import serialize_school
-
+from errors import APIError, ERR_INVALID_REQUEST, ERR_NOT_FOUND
+from middleware import auth_required
+from response import ok_object, ok_array
+from routes._helpers import parse_pagination, paginate, get_body, require_fields, order_by_created_at
+from services.common import new_common_fields
 
 bp = Blueprint("schools", __name__)
 
+TRACK_VALS = {"EARLY_DECISION", "EARLY_ACTION", "REGULAR", "ROLLING"}
 
-# --------------------------------------------------------------------------- #
-# POST /schools (PlatformAdmin)
-# --------------------------------------------------------------------------- #
 
-@bp.route("/schools", methods=["POST"])
-@require_auth(["PlatformAdmin"])
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+@bp.post("/schools")
 def create_school():
-    body = get_json_body()
-    name = require_field(body, "name", kind="string")
-    target_class_size = require_field(body, "target_class_size", kind="integer")
-    ed_str = require_field(body, "ed_deadline_iso", kind="string")
-    ea_str = require_field(body, "ea_deadline_iso", kind="string")
-    rd_str = require_field(body, "rd_deadline_iso", kind="string")
-    rolling_open = optional_field(body, "rolling_open", kind="boolean", default=False)
-    requires_css = optional_field(body, "requires_css_profile", kind="boolean", default=False)
-    cooldown_ms = optional_field(body, "cooldown_ms", kind="integer", default=86_400_000)
+    auth_required({"PlatformAdmin"})()
+    body = get_body()
+    require_fields(body, [
+        "name", "state_code", "admission_track", "deadline_iso",
+        "decision_release_iso", "target_class_size", "assumed_yield_rate",
+        "in_state_tuition_cents", "out_of_state_tuition_cents", "international_tuition_cents",
+    ])
+    if not isinstance(body["name"], str) or not body["name"]:
+        raise APIError(ERR_INVALID_REQUEST, 400, "name must be non-empty string")
+    for s in db.schools.values():
+        if s["name"] == body["name"]:
+            raise APIError(ERR_INVALID_REQUEST, 400, "School name already exists")
+    state_code = body["state_code"]
+    if not isinstance(state_code, str):
+        raise APIError(ERR_INVALID_REQUEST, 400, "state_code must be string")
+    track = body["admission_track"]
+    if track not in TRACK_VALS:
+        raise APIError(ERR_INVALID_REQUEST, 400, "admission_track invalid")
+    deadline = body["deadline_iso"]
+    decision_release = body["decision_release_iso"]
+    if not isinstance(deadline, str) or not isinstance(decision_release, str):
+        raise APIError(ERR_INVALID_REQUEST, 400, "deadline_iso/decision_release_iso must be strings")
+    if not decision_release > deadline:
+        raise APIError(ERR_INVALID_REQUEST, 400, "decision_release_iso must be > deadline_iso")
+    tcs = body["target_class_size"]
+    if not _is_int(tcs) or tcs < 1 or tcs > 10000:
+        raise APIError(ERR_INVALID_REQUEST, 400, "target_class_size out of range")
+    yr = body["assumed_yield_rate"]
+    if not isinstance(yr, (int, float)) or isinstance(yr, bool):
+        raise APIError(ERR_INVALID_REQUEST, 400, "assumed_yield_rate must be number")
+    yr = float(yr)
+    if yr < 0.05 or yr > 1.00:
+        raise APIError(ERR_INVALID_REQUEST, 400, "assumed_yield_rate out of range")
+    in_t = body["in_state_tuition_cents"]
+    out_t = body["out_of_state_tuition_cents"]
+    intl_t = body["international_tuition_cents"]
+    for label, v in [("in_state", in_t), ("out_of_state", out_t), ("international", intl_t)]:
+        if not _is_int(v) or v < 0:
+            raise APIError(ERR_INVALID_REQUEST, 400, f"{label}_tuition_cents must be non-negative integer")
+    if not (in_t <= out_t <= intl_t):
+        raise APIError(ERR_INVALID_REQUEST, 400, "tuition tiers must satisfy in_state <= out_of_state <= international")
 
-    if not name.strip():
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'name' must not be empty.")
-    if target_class_size < 1:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'target_class_size' must be >= 1.")
-    if cooldown_ms is None or cooldown_ms < 0:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Field 'cooldown_ms' must be >= 0.")
-
-    ed_dt = util.parse_iso(ed_str)
-    ea_dt = util.parse_iso(ea_str)
-    rd_dt = util.parse_iso(rd_str)
-    if ed_dt is None or ea_dt is None or rd_dt is None:
-        errors.raise_error(errors.ERR_INVALID_REQUEST,
-                           "Deadline fields must be valid ISO 8601 timestamps.")
-
-    # Uniqueness check on school name
-    for existing in db.schools.values():
-        if existing["name"] == name:
-            errors.raise_error(errors.ERR_DUPLICATE_RESOURCE,
-                               "A school with this name already exists.")
-
-    # Priority 21: deadline ordering — strict
-    if not (ed_dt < ea_dt < rd_dt):
-        errors.raise_error(errors.ERR_SCHOOL_DEADLINE_ORDER,
-                           "Deadlines must satisfy strict ed < ea < rd ordering.")
-
-    row = {
-        "name": name,
-        "target_class_size": target_class_size,
-        "ed_deadline_iso": ed_dt,
-        "ea_deadline_iso": ea_dt,
-        "rd_deadline_iso": rd_dt,
-        "rolling_open": bool(rolling_open),
-        "requires_css_profile": bool(requires_css),
-        "confirmed_enrollment_count": 0,
-        "posture": "OPEN",
+    common = new_common_fields()
+    school = {
+        **common,
+        "name": body["name"],
+        "state_code": state_code,
+        "admission_track": track,
+        "deadline_iso": deadline,
+        "decision_release_iso": decision_release,
+        "target_class_size": tcs,
+        "assumed_yield_rate": yr,
+        "in_state_tuition_cents": in_t,
+        "out_of_state_tuition_cents": out_t,
+        "international_tuition_cents": intl_t,
+        "admitted_count": 0,
+        "enrolled_count": 0,
+        "declined_count": 0,
+        "denied_count": 0,
+        "yield_posture": "OPEN",
     }
-    util.stamp_create(row)
-    db.schools[row["id"]] = row
-
-    # Create companion AdmissionCycle. Per PRD §3.3 the cycle is the 1:1
-    # companion of the school; the cycle row carries its own server-minted
-    # UUID identifier (§2.4), and PRD offers no separate discovery path for
-    # the cycle id, so we mint the cycle's id to equal the school's id —
-    # consistent with the "companion" framing and accessible to clients that
-    # only hold the school id.
-    cycle = {
-        "id": row["id"],
-        "school_id": row["id"],
-        "clock_iso": row["created_at"],
-        "last_yield_run_at": None,
-        "yield_run_count": 0,
-        "cooldown_ms": int(cooldown_ms),
-    }
-    util.stamp_create(cycle)
-    db.admission_cycles[cycle["id"]] = cycle
-
-    return resp.success_object(serialize_school(row), http_status=201)
+    db.schools[school["id"]] = school
+    return ok_object(school, http_status=201)
 
 
-# --------------------------------------------------------------------------- #
-# GET /schools/{id}
-# --------------------------------------------------------------------------- #
-
-@bp.route("/schools/<school_id>", methods=["GET"])
-@require_auth(["Applicant", "AdmissionsOfficer", "FinancialAidOfficer", "PlatformAdmin"])
-def get_school(school_id):
-    row = db.schools.get(school_id)
-    if row is None:
-        errors.raise_error(errors.ERR_RESOURCE_NOT_FOUND, "School not found.")
-    return resp.success_object(serialize_school(row))
+@bp.get("/schools/<sid>")
+def read_school(sid):
+    auth_required({"Applicant", "AdmissionsOfficer", "FinancialAidOfficer", "PlatformAdmin"})()
+    s = db.schools.get(sid)
+    if s is None:
+        raise APIError(ERR_NOT_FOUND, 404, "School not found")
+    return ok_object(s)
 
 
-# --------------------------------------------------------------------------- #
-# GET /schools
-# --------------------------------------------------------------------------- #
-
-@bp.route("/schools", methods=["GET"])
-@require_auth(["Applicant", "AdmissionsOfficer", "FinancialAidOfficer", "PlatformAdmin"])
+@bp.get("/schools")
 def list_schools():
+    auth_required({"Applicant", "AdmissionsOfficer", "FinancialAidOfficer", "PlatformAdmin"})()
+    track = request.args.get("admission_track")
     limit, offset = parse_pagination()
-    rows = sorted(db.schools.values(), key=lambda r: r["created_at"])
-    page, total = paginate(rows, limit, offset)
-    return resp.success_array(
-        [serialize_school(r) for r in page],
-        limit=limit, offset=offset, total_count=total,
-    )
-
-
-# --------------------------------------------------------------------------- #
-# GET /schools/{id}/yield-report
-# --------------------------------------------------------------------------- #
-
-@bp.route("/schools/<school_id>/yield-report", methods=["GET"])
-@require_auth(["AdmissionsOfficer", "PlatformAdmin"])
-def yield_report(school_id):
-    row = db.schools.get(school_id)
-    if row is None:
-        errors.raise_error(errors.ERR_RESOURCE_NOT_FOUND, "School not found.")
-
-    yield_rate, admitted_count, enrolled_count = calculations.compute_yield_rate(school_id)
-    waitlist_depth = sum(
-        1 for a in db.applications.values()
-        if a["school_id"] == school_id and a["status"] == "WAITLISTED"
-    )
-
-    payload = {
-        "school_id": school_id,
-        "yield_rate": yield_rate,
-        "confirmed_enrollment_count": row["confirmed_enrollment_count"],
-        "admitted_count": admitted_count,
-        "enrolled_count": enrolled_count,
-        "waitlist_depth": waitlist_depth,
-    }
-    return resp.success_object(payload)
+    items = [s for s in db.schools.values()
+             if track is None or s["admission_track"] == track]
+    items = order_by_created_at(items)
+    page, total = paginate(items, limit, offset)
+    return ok_array(page, limit, offset, total)
