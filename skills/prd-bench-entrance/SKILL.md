@@ -52,7 +52,12 @@ Step 7: One long-lived subagent owns the loop { prd-bench-local-run --isolation 
     ▼
 Step 8: Subagent → PRD finalizer → PRD_FINALIZED.md
         (reads PRD + implementation + tests; scaffold/worklog withheld; Step 7 diff inlined)
-        (skipped if Step 7 had 0 iterations / 0 deletions / 0 fixes)
+        (skipped if Step 7 had 0 implementation/ fixes)
+    │
+    ▼
+Step 9: Subagent → PRD completeness scan → PRD_COMPLETED.md
+        (full PRD-vs-implementation/ scan; reads PRD_FINALIZED.md if present else PRD.md;
+         eliminates residual ambiguity + mismatch; always runs)
 ```
 
 ## Context Isolation Strategy
@@ -335,7 +340,7 @@ The orchestrator does not need to inspect failures itself — the subagent owns 
 
 ### Step 8: Finalize PRD — align documentation to implementation (subagent)
 
-Step 7's revisions, deletions and assertion-weakenings mark the places where `PRD.md` does not uniquely determine a behavior the implementation has already chosen. Step 8 patches those spots, producing `workspace/PRD_FINALIZED.md` — a MINIMAL diff over `PRD.md` such that a fresh implementer reading `PRD_FINALIZED.md` alone produces a code base behaviorally equivalent to `workspace/implementation/`.
+Step 7's revisions, deletions and assertion-weakenings mark the places where `PRD.md` does not uniquely determine a behavior the implementation has already chosen, or mismatch between current implementation and `PRD.md`. Step 8 patches those spots, producing `workspace/PRD_FINALIZED.md` — a MINIMAL diff over `PRD.md` based on `<step_7_diff>` such that a fresh implementer reading `PRD_FINALIZED.md` alone produces a code base behaviorally equivalent to `workspace/implementation/`.
 
 **Skip condition.** If Step 7 exited on the first 8-round sweep with 0 deletions, 0 `test_suite/` fixes, 0 `test_helpers/` fixes, and 0 `implementation/` fixes — i.e. zero iterations beyond the baseline — then `PRD.md` already determined every behavior the implementation exhibits, and Step 8 is skipped. Do not spawn the subagent in this case.
 
@@ -346,10 +351,12 @@ Step 7's revisions, deletions and assertion-weakenings mark the places where `PR
 ```
 Produce {task_dir}/workspace/PRD_FINALIZED.md — a minimal patch of {task_dir}/workspace/PRD.md that pins every place where the implementation makes a concrete behavioral choice that PRD does not uniquely determine or implementation used a different logic than the PRD. Goal: a fresh implementer reading PRD_FINALIZED.md alone produces a code base behaviorally equivalent to {task_dir}/workspace/implementation/.
 
+**HARD SCOPE — read this before anything else: every PRD edit you make must trace to a specific fix which reveal PRD-silence or PRD-mismatch with current `implementation/` — `implementation/` fix, test deletions, `test_suite/`/`test_helpers/` fixes - listed in `<step_7_diff>`. Nothing else.**
+
 You may read workspace: PRD.md, implementation/, test_helpers/, test_suite/, INSTRUCTION.md.
 You MUST NOT read: SCAFFOLD*.yaml, worklog.md.
 
-Implementation is the alignment target. Tests are NOT — Step 7 has already weakened or deleted assertions that PRD did not pin, so test_suite/ is sometimes laxer than implementation/. Treat test files only as auxiliary evidence of where Step 7 found PRD ambiguity; align PRD_FINALIZED to what implementation/ actually does.
+Implementation is the alignment target. Tests are NOT — Step 7 has already weakened or deleted assertions that PRD did not pin, so test_suite/ is sometimes laxer than implementation/. Treat test files only as auxiliary evidence of where Step 7 found PRD ambiguity or mismatch; align `PRD_FINALIZED.md` to what implementation/ actually does.
 
 <step_7_diff>
 {verbatim Step 7 worklog entry: deletions, test_suite fixes, test_helpers fixes, implementation fixes}
@@ -358,12 +365,45 @@ Implementation is the alignment target. Tests are NOT — Step 7 has already wea
 Method:
 
 0. `cp {task_dir}/workspace/PRD.md {task_dir}/workspace/PRD_FINALIZED.md`. Edit only PRD_FINALIZED.md.
-1. For each <step_7_diff> item: locate the matching behavior in implementation/. Patch PRD_FINALIZED.md only when impl pinned a choice PRD left open — not every item is a PRD silence (some are pure fixture bugs).
+1. For each <step_7_diff> item: locate the matching behavior in implementation/. Patch PRD_FINALIZED.md only when impl pinned a choice PRD left open — not every item is a PRD silence (some are pure fixture bugs), or impl mismatch with PRD.md.
 2. Where PRD already determines behavior, keep prose verbatim; elsewhere insert or revise inline to match impl, change as little as possible. No new sections. Never invent behavior the impl does not exhibit.
 
 Summary on exit:
 - PRD.md vs PRD_FINALIZED.md line counts and %-delta.
 - One bullet per change: `{PRD section} — {insert|revise} — {what changed} — {impl file:line}`.
+```
+
+### Step 9: Complete PRD — eliminate residual ambiguity and mismatch (subagent)
+
+**Purpose.** Step 8 only patches PRD at sites Step 7's fixes touched. Many PRD silences impl resolved at generation time — without ever producing a Step 7 failure signal because the test suite did not assert them, or because impl's chosen interpretation happened to align with what the test asserted — remain. Step 9 closes this gap with a full PRD-vs-`implementation/` scan, producing `workspace/PRD_COMPLETED.md` — a minimal patch such that every behavior in `implementation/` traces to a PRD sentence with no residual ambiguity or mismatch.
+
+**Input.** Start from `workspace/PRD_FINALIZED.md` if Step 8 produced it; otherwise from `workspace/PRD.md`.
+
+**No skip.** Step 9 always runs — the scan itself is the only way to confirm completeness.
+
+**Subagent prompt:**
+
+```
+Produce {task_dir}/workspace/PRD_COMPLETED.md — a minimal patch over the latest PRD, such that wherever PRD prose admits multiple valid interpretations, it is revised to pin the one `implementation/` actually adopted. Goal: zero remaining PRD silence or mismatch versus implementation/.
+
+You may read: PRD.md, PRD_FINALIZED.md (if present), implementation/, test_helpers/, test_suite/, INSTRUCTION.md.
+You MUST NOT read: SCAFFOLD*.yaml, worklog.md.
+
+Implementation is the alignment target. Tests are NOT — Step 7 has already weakened or deleted assertions that PRD did not pin; treat tests only as auxiliary cross-reference, never as authority.
+
+Method:
+
+0. If `{task_dir}/workspace/PRD_FINALIZED.md` exists, `cp PRD_FINALIZED.md PRD_COMPLETED.md`; otherwise `cp PRD.md PRD_COMPLETED.md`. Edit only PRD_COMPLETED.md.
+1. Walk implementation/ exhaustively — every endpoint, state machine transition, calculation formula, validation rule, error response, default value, side effect, response field shape, ordering rule. For each impl behavior, locate the corresponding PRD passage and classify:
+   - PRD already pins this behavior uniquely → no change.
+   - PRD is silent (ambiguity) → insert minimal inline prose pinning what impl does.
+   - PRD describes a different behavior (mismatch) → revise inline to match impl.
+2. Change as little as possible: prefer in-paragraph inserts/revisions over new paragraphs; never add new sections; never invent behavior impl does not exhibit.
+
+Summary on exit:
+- Source file (PRD_FINALIZED.md or PRD.md) vs PRD_COMPLETED.md line counts and char-delta.
+- Counts: ambiguity-pins, mismatch-revisions.
+- One bullet per change: `{PRD section} — {insert|revise} — {ambiguity|mismatch} — {what changed} — {impl file:line}`.
 ```
 
 ## Key Principles
@@ -426,7 +466,8 @@ tasks/{task_name}/
 └── workspace/
     ├── INSTRUCTION.md                     # Build contract (start.sh + PORT/0.0.0.0/foreground; evaluator runs `bash start.sh`)
     ├── PRD.md                             # Natural language requirements (input to Steps 5/6)
-    ├── PRD_FINALIZED.md                   # Minimal patch of PRD.md pinning every impl-resolved ambiguity (Step 8 output)
+    ├── PRD_FINALIZED.md                   # Minimal patch of PRD.md at Step 7 `implementation/` fix sites (Step 8 output; absent if Step 8 skipped)
+    ├── PRD_COMPLETED.md                # Minimal patch over PRD_FINALIZED.md (or PRD.md) eliminating residual ambiguity + mismatch via full impl scan (Step 9 output)
     └── implementation/                    # Working Python/Flask server
         ├── start.sh                       # Foreground launcher (reads $PORT, binds 0.0.0.0)
         ├── requirements.txt

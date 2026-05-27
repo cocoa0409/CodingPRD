@@ -1,0 +1,39 @@
+"""Domain thresholds — numeric constants from PRD calculations and validations."""
+
+# Tier-credit accrual thresholds (PRD §3.3).
+PLATINUM_THRESHOLD = 15000
+DIAMOND_THRESHOLD = 75000
+SEVEN_STARS_THRESHOLD = 150000
+
+# Tier-credit game-type multipliers (PRD §3.3).
+GAME_TYPE_MULT_SLOTS = 1.0
+GAME_TYPE_MULT_TABLES = 2.0
+GAME_TYPE_MULT_POKER = 1.5
+
+# Tier-credit tier multipliers (PRD §3.3).
+TIER_MULT_GOLD = 1.00
+TIER_MULT_PLATINUM = 1.25
+TIER_MULT_DIAMOND = 1.50
+TIER_MULT_SEVEN_STARS = 2.00
+
+# Comp-room rate discounts (PRD §3.6).
+DISCOUNT_GOLD = 0.10
+DISCOUNT_PLATINUM = 0.40
+DISCOUNT_DIAMOND = 0.70
+DISCOUNT_SEVEN_STARS = 1.00
+
+# Market-segment band multipliers (PRD §3.6).
+MARKET_VEGAS_STRIP = 1.20
+MARKET_REGIONAL = 1.00
+MARKET_INTERNATIONAL = 1.10
+
+# Velocity-monitor thresholds in cents (PRD §3.4).
+VELOCITY_FLAG_THRESHOLD_CENTS = 500_000
+VELOCITY_SUSPEND_THRESHOLD_CENTS = 1_500_000
+VELOCITY_WINDOW_SECONDS = 3600
+
+# Regulatory & operational caps.
+SESSION_LOSS_CAP_CENTS = 100_000_000
+EXCLUSION_MIN_PERIOD_DAYS = 365
+PROPERTY_OCCUPANCY_CAP = 20
+VELOCITY_CLEAR_QUIET_HOURS = 24

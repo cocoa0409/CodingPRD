@@ -1,0 +1,268 @@
+# Mortgage Servicing API — Product Requirements Document
+
+## 1. Introduction
+
+This document specifies the product requirements for the Mortgage Servicing API, a back-office system that manages the entire post-origination lifecycle of residential mortgages. The system books originated loans, posts borrower remittances against a regulatorily-ordered payment waterfall, runs the annual escrow analysis that drives tax and insurance disbursement schedules, processes Private Mortgage Insurance removal under federal Homeowners Protection Act thresholds, and walks delinquent loans through forbearance, HAMP-style mandatory mediation, and — where unavoidable — foreclosure sale.
+
+Servicing is a domain in which a single arithmetic mistake at posting time is repaid with a regulatory complaint six months later, and in which the ordering of cascades between a Loan, its EscrowAccount, its ForeclosureCase, and the MediationSession underneath it is the difference between cure and sale. The API is therefore built around two ideas: (1) every monetary value is integer cents with a fixed rounding rule pinned per calculation variant, and (2) every state advance fires its dependent side effects atomically, with optimistic concurrency control guarding the cross-aggregate writes where a stale view would otherwise destroy a borrower's standing.
+
+Three distinct operators interact with the system: servicing staff who run day-to-day operations, compliance reviewers who hold sole authority over PMI removal decisions, and the borrowers themselves who may post their own payments and submit PMI removal requests for loans they own.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the API must carry two mandatory headers: `X-User-ID`, identifying the acting principal, and `X-User-Role`, identifying their role. The system recognizes exactly three roles, spelled `LoanServicer`, `ComplianceOfficer`, and `Borrower`. A request that omits either header is rejected with `ERR_UNAUTHENTICATED`; a request whose role is not permitted for the endpoint it targets is rejected with `ERR_UNAUTHORIZED`.
+
+When `X-User-Role` is `LoanServicer`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server may record it for audit purposes but does not compare it to any entity's `id`. The same opaque-identifier treatment applies when `X-User-Role` is `ComplianceOfficer`: the header is the reviewer's operator identifier and is not compared to any entity row. When `X-User-Role` is `Borrower`, `X-User-ID` is the `id` of the acting `Borrower` row, and ownership checks on any resource that ultimately references a `Borrower` compare the resource's borrower foreign-key chain to `X-User-ID`. Concretely, a `Borrower` may read and act on a `Loan` only when the loan's `borrower_id` equals `X-User-ID`; the borrower may read and act on `Payment`, `EscrowAccount`, `EscrowDisbursement`, `EscrowAnalysis`, `ForbearancePlan`, `ForeclosureCase`, `MediationSession`, and `PMIRemovalRequest` rows only when the chain of foreign keys from the row back to its parent loan resolves to a loan whose `borrower_id` equals `X-User-ID`. Any mismatch is rejected with `ERR_UNAUTHORIZED`.
+
+The role split is enforced strictly. `LoanServicer` operators originate loans, post payments on behalf of borrowers, manage forbearance and foreclosure workflows, schedule escrow disbursements, and run escrow analyses. A `ComplianceOfficer` is the sole role authorized to record a decision on a PMI removal request; the role is otherwise read-only across loans and payments and may not originate, foreclose, or post payments. A `Borrower` may post payments only against their own loan, may submit a PMI removal request only for their own loan, and may read only the loan-scoped resources tied to that loan. Both `LoanServicer` and `ComplianceOfficer` may create borrower rows and may drive the simulated clock.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints accept two optional query parameters. The `limit` parameter caps the number of items returned in a single page; it defaults to 10, with a minimum of 1 and a maximum of 100. The `offset` parameter specifies the number of items to skip and defaults to 0.
+
+Unless an endpoint explicitly states otherwise, list endpoints return resources sorted by `created_at` ascending — the oldest record first.
+
+The response envelope's `meta` object on list responses includes `limit`, `offset`, `total_count`, and `has_more`, where `total_count` reports the size of the unpaginated result set and `has_more` is true when additional pages remain.
+
+### 2.4. Common Resource Properties and the Simulated Clock
+
+Every persisted resource carries a server-minted `id` formatted as a UUID with no type prefix — clients never construct ids and never see a domain-flavored prefix. Most resources also carry three additional system-managed fields: `created_at` is an ISO 8601 UTC timestamp with three fractional digits set at insertion time; `updated_at` is an ISO 8601 UTC timestamp with three fractional digits refreshed on every mutation to the resource, including mutations driven by cascades from a parent or sibling row; and `version` is an integer initialized to 1 at insertion and incremented by 1 on every mutation.
+
+One entity in the system, `Payment`, is treated as immutable after insertion. Payment rows carry only `id` and `created_at`; they have no `updated_at` and no `version`. Once posted, the payment's `allocation`, `status`, and `posted_at` are fixed values of the historical event that produced them.
+
+All other entities — `Borrower`, `Loan`, `EscrowAccount`, `EscrowDisbursement`, `EscrowAnalysis`, `ForbearancePlan`, `ForeclosureCase`, `MediationSession`, and `PMIRemovalRequest` — carry the full quartet (`id`, `created_at`, `updated_at`, `version`).
+
+Because servicing decisions depend on the passage of real time (grace periods, sale notice windows, mediation notice windows, the trailing-12-month payment-history window), the system exposes a deterministic test-driving capability that sets the simulated current UTC time to a supplied `to_iso8601` instant. Setting the clock causes the system to fire every auto-transition whose preconditions newly hold: any Loan whose `days_past_due` now exceeds the grace period transitions to `DELINQUENT`; any `SCHEDULED` `EscrowDisbursement` whose `scheduled_for` is now in the past either pays or fails against the escrow balance; and any `ForeclosureCase` in `SALE_SCHEDULED` whose `sale_date` is now in the past transitions to `COMPLETED`. The clock-advance capability also recomputes `days_past_due` on every loan. The clock-advance capability is the only endpoint exempt from the `ERR_UNAUTHENTICATED` check on missing headers.
+
+### 2.5. Hierarchical Consistency and Cascades
+
+Servicing workflows are intrinsically cross-aggregate: a payment that retires a loan must cancel the escrow disbursements scheduled for that loan; activating a forbearance plan must move the loan to `FORBEARANCE`; recording a successful mediation modification must update the loan's scheduled monthly principal-and-interest and reinstate it. Every such cascade is atomic with the operation that triggered it. When a cascade mutates a parent or sibling entity, that entity's `updated_at` is refreshed and its `version` is incremented by 1, exactly as if a direct write had occurred. In particular, any operation that changes a loan's status, balance, escrow installment, or PMI status increments `Loan.version`; any operation that changes an escrow account's balance increments `EscrowAccount.version`; and any operation that changes a foreclosure case's status, sale date, or cure amount increments `ForeclosureCase.version`.
+
+### 2.6. Nested Resource Retrieval
+
+Several endpoints carry multiple path identifiers — for example, a route that reads a mediation session under a foreclosure case under a loan. For such requests the system validates the path identifiers strictly left-to-right. The first identifier that does not resolve to an existing row causes the request to be rejected with `ERR_RESOURCE_NOT_FOUND`. After every path identifier resolves, foreign-key references inside the request body — `borrower_id`, `loan_id`, `escrow_account_id`, `foreclosure_case_id` — are resolved next; any unresolved body reference is rejected with `ERR_FK_NOT_FOUND`. Only after all referential checks pass does the system evaluate state-transition preconditions and business rules.
+
+### 2.7. Monetary Values, Precision, and Rounding
+
+Every monetary value in the system is stored and exposed as integer cents, with a `_cents` suffix on the field name. There are no fractional cents anywhere in the persisted model and no floating-point dollars on the wire. Interest rates are likewise integer values: an annual rate is carried in basis points (so 600 means 6.00% per year, and 8000 means 80.00% loan-to-value).
+
+Rounding is pinned per calculation variant. The amortization schedule computes the scheduled monthly principal-and-interest using a single round-half-up at the final monthly figure, never on the intermediate compound-interest factor. The payment-posting waterfall performs a single round-half-up at the final allocation step, and any partial-cent remainder from rounding flows into the escrow allocation rather than into principal or interest. The forecast variant of escrow analysis uses round-half-up on the monthly figure; the actual-trailing-12 variant uses ceiling-to-the-nearest-cent on the monthly figure (deliberately conservative). The required-low-point figure inside an escrow analysis uses round-half-up. The foreclosure cure-amount aggregation rounds half-up per term. The forbearance deferral total is integer cents that, once pinned at activation, is never recomputed.
+
+### 2.8. Optimistic Concurrency Control
+
+Two cross-aggregate writes carry explicit optimistic concurrency control because a stale view of the parent would either invalidate the rationale for the write or destroy a balance the parent depends on.
+
+Filing foreclosure against a loan is one such write. A request to file foreclosure must carry the field `expected_loan_version`, an integer equal to the client's last observed `version` of the target loan. If another writer has advanced the loan's version since the client last read it — for example, by posting a payment that legitimately cured the delinquency — the create is rejected with `ERR_STALE_VERSION` and HTTP 412. The rejection is framed in terms of the parent's version having advanced, not in terms of two requests arriving together. Filing foreclosure is the only write that takes `expected_loan_version`; no other endpoint accepts a version field on the loan.
+
+Running an annual escrow analysis is the other such write. A request to run an escrow analysis must carry the field `expected_escrow_account_version`, an integer equal to the client's last observed `version` of the target escrow account. If another writer has advanced the escrow account's version since the client last read it — for example, by paying out a scheduled disbursement that changed the balance — the analysis is rejected with `ERR_STALE_VERSION` and HTTP 412, because the projected low-point input would be computed from a stale balance. Running an escrow analysis is the only write that takes `expected_escrow_account_version`; no other endpoint accepts a version field on the escrow account.
+
+Endpoints that are not named in either of the above rules do not take a version field; their requests neither carry nor are checked against an `expected_*_version`.
+
+### 2.9. Validation Priority
+
+When an incoming request could fail more than one validation, the system applies the checks in a strict priority order so the error returned is always the most fundamental violation rather than an artifact of evaluation order. Authentication runs first: a request missing `X-User-Role` or `X-User-ID` is rejected with `ERR_UNAUTHENTICATED` before anything else (with the simulated-clock endpoint being the sole exception, since the clock-advance is not gated on headers). Authorization runs second: a role not permitted for the endpoint is rejected with `ERR_UNAUTHORIZED`. Path-parameter existence runs third (left-to-right), producing `ERR_RESOURCE_NOT_FOUND`. Body-referenced foreign keys (`loan_id`, `escrow_account_id`, `foreclosure_case_id`, `borrower_id`) are resolved fourth, producing `ERR_FK_NOT_FOUND`. State-transition admissibility is evaluated fifth, producing `ERR_INVALID_STATE` when the resource is not in a state from which the requested transition is permitted. The optimistic concurrency check is evaluated sixth on the two endpoints that require it, producing `ERR_STALE_VERSION`. Business-safety rules — the HAMP mediation gate and the mediation-notice window — are evaluated seventh and eighth respectively. Business-constraint rules covering the forbearance window come ninth. The escrow-disbursement temporal rule comes tenth. The cushion-cap rule comes eleventh. The amount-positivity rule comes twelfth. The two PMI-eligibility rules — loan-to-value too high before payment-history-not-clean — come thirteenth and fourteenth. Generic request-shape validation (required input fields present and well-typed) sits last at priority fifteen with `ERR_INVALID_REQUEST`; this last bucket is the catch-all for malformed payloads that did not trigger any earlier check.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Onboarding: Borrowers, Loans, and Origination Math
+
+A servicing relationship begins with a `Borrower` row capturing a unique `email`, the borrower's legal `full_name`, and `ssn_last4` — the last four digits of the social security number used purely as an identity-reference field and never as the basis for any business decision. Borrowers are written by either a `LoanServicer` or a `ComplianceOfficer`.
+
+A loan is originated by a `LoanServicer` who supplies the linking `borrower_id`, the `origination_date` on which funds were advanced, the `original_principal_cents` borrowed, the `original_property_value_cents` appraised at origination, the annual `interest_rate_bps`, the original amortization `term_months`, and the monthly `pmi_monthly_cents` premium. The loan creation request may also carry `current_appraised_value_cents`; when omitted, the system seeds the current appraised value with the original property value. The `origination_date`, `original_principal_cents`, and `original_property_value_cents` are immutable after the create.
+
+At loan creation the server computes the scheduled monthly principal-and-interest using the standard fixed-rate amortization. First the monthly rate as a fraction is derived by dividing the annual rate in basis points by ten thousand and then by twelve; call that rate r and the term in months n and the original principal P. The scheduled monthly principal-and-interest in cents is then P multiplied by r multiplied by one-plus-r raised to the n, divided by one-plus-r raised to the n minus one, with the final result rounded half-up to a whole number of cents. The intermediate compound-interest factor is never itself rounded. The edge case of a zero monthly rate (where the closed-form has a division-by-zero) is handled by reducing the formula to the original principal divided by the number of months, rounded half-up to a whole number of cents. The computed value is recorded as `scheduled_monthly_pi_cents` and is immutable thereafter, except that a successful mediation modification may reset it to the agreed `modification_pi_cents`.
+
+Immediately after origination the loan's `principal_balance_cents` is set to `original_principal_cents`, the `accrued_interest_cents` is set to zero, the `next_due_date` is set to thirty calendar days after the `origination_date`, the lifecycle `status` is set to `CURRENT`, and the loan's `version` is set to 1. The loan's `last_payment_posted_at` is initially null. The PMI lifecycle is initialized on the basis of the loan-to-value ratio at origination: when the loan-to-value computed from `original_principal_cents` against `original_property_value_cents` is at or above 80.00%, `pmi_required` is true and `pmi_status` is `ACTIVE`; otherwise `pmi_required` is false and `pmi_status` is `NOT_APPLICABLE`. The other PMI-status values — `REMOVAL_PENDING`, `REMOVED`, `AUTO_TERMINATED` — are reached through the PMI removal workflow described later. The derived `days_past_due` field is recomputed on every payment posting and every advance of the simulated clock and equals the number of days the simulated current UTC time is past the `next_due_date` (zero when the loan is current). The `escrow_monthly_cents` field is zero until an escrow account is created against the loan, at which point it is initialized; thereafter only the annual escrow analysis updates it. The `total_monthly_payment_cents` is the sum of `scheduled_monthly_pi_cents` and `escrow_monthly_cents` and is refreshed whenever the escrow installment changes.
+
+### 3.2. Posting a Payment: The Waterfall
+
+Borrowers remit funds against their loan, and a payment posting is the single most frequent operation in the system. A posting carries `amount_cents` (the borrower's remittance), a `received_at` wall-clock timestamp recording when the funds arrived, and an optional `posting_strategy` enum that selects the allocation algorithm. The posting strategy defaults to `STANDARD_WATERFALL` when omitted and may otherwise be `PRINCIPAL_CURTAILMENT`. The system rejects a remittance whose `amount_cents` is not strictly positive with `ERR_INVALID_AMOUNT`.
+
+Under the `STANDARD_WATERFALL` strategy the regulatory order is: first satisfy `accrued_interest_cents`; second satisfy the principal portion of the oldest unpaid installment, reducing `principal_balance_cents`; third top up the escrow installment by `escrow_monthly_cents` to bring escrow current for the period; fourth satisfy the PMI premium for the installment, `pmi_monthly_cents`; fifth pay outstanding late fees, latest-posted-first. After those five buckets, any residual amount that is less than one full installment short of the next-due posts to the payment's `suspense_cents` bucket; any residual that is at least a full installment posts as additional principal curtailment. Rounding occurs once at the very end of the waterfall: the round-half-up is applied at the final allocation step, and any partial-cent rounding remainder is added into the escrow allocation rather than into interest or principal. A late fee, when assessed by the system, is five percent of the scheduled principal-and-interest installment (five hundred basis points of `scheduled_monthly_pi_cents`).
+
+Under the `PRINCIPAL_CURTAILMENT` strategy, two additional preconditions must be true: the loan must be in `CURRENT` status, and the `amount_cents` must strictly exceed the loan's `total_monthly_payment_cents`. When these hold, the algorithm first applies the standard installment through interest, principal, escrow, and PMI (skipping the late-fees step because a `CURRENT` loan has no outstanding late fees), then routes the surplus over the installment directly to additional principal, with no suspense bucket. The two variants therefore differ only in how the surplus over a full installment is treated: surplus goes to `suspense_cents` under `STANDARD_WATERFALL`, and surplus goes to principal under `PRINCIPAL_CURTAILMENT`.
+
+The result of a posting is a `Payment` row whose `allocation` object captures the breakdown across six buckets — `interest_cents`, `principal_cents`, `escrow_cents`, `pmi_cents`, `late_fee_cents`, and `suspense_cents` — and whose `status` is `POSTED` when at least one full installment cleared and `SUSPENSE` when the remittance landed entirely in the suspense bucket because it was less than what was needed to advance the installment. The `posted_at` timestamp records when the server applied the allocation. The `REVERSED` status is reserved for payments that the system has unwound; the API has no public reversal endpoint, and Payment rows are otherwise immutable after creation (no `updated_at`, no `version`).
+
+After the allocation is applied, the loan's `principal_balance_cents` is decremented by the principal allocation, `accrued_interest_cents` is decremented by the interest allocation, `last_payment_posted_at` is set to the current server timestamp, `next_due_date` advances by one calendar month for each fully-cured installment satisfied by the posting, and `days_past_due` is recomputed against the simulated current UTC time. The associated escrow account's `balance_cents` is incremented by the escrow portion of the allocation, and the escrow account's `version` is incremented when that escrow portion was non-zero. The loan's `version` is incremented on every posting.
+
+When the loan was in `DELINQUENT` status and the allocation drives `days_past_due` to zero, the loan transitions to `CURRENT` and the next due date advances accordingly. When the loan was in `REINSTATED` status and the first post-reinstatement payment posts cleanly with `days_past_due` zero after the allocation, the loan transitions to `CURRENT`. When the remittance is at least the sum of `principal_balance_cents`, `accrued_interest_cents`, and any outstanding fees — fully retiring the obligation — and the loan was in `CURRENT` status, the loan transitions to `PAID_OFF` (a terminal state), the loan's `pmi_status` is set to `AUTO_TERMINATED`, and every `EscrowDisbursement` still in `SCHEDULED` status for this loan's escrow account is cascaded to `CANCELLED` so no further outflows fire against an account whose loan no longer exists in a serviceable form.
+
+### 3.3. Delinquency, the Grace Period, and the DELINQUENT State
+
+The delinquency boundary is fifteen days. When the simulated current UTC time is set to an instant more than fifteen days past a loan's `next_due_date` and no payment has posted to cure the past-due amount, the loan auto-transitions from `CURRENT` to `DELINQUENT` and its `version` is incremented. The transition is fired by the clock-advance capability, not by any borrower-initiated request, and it fires on every loan that newly satisfies the precondition when the clock moves forward.
+
+Once a loan is `DELINQUENT`, three exits exist. The first is back to `CURRENT` via a payment whose allocation drives `days_past_due` to zero, as described above. The second is to `FORBEARANCE` via the activation of an associated forbearance plan. The third is to `FORECLOSURE` once `days_past_due` reaches the foreclosure threshold of one hundred and twenty days.
+
+### 3.4. Forbearance: Proposing, Activating, Completing, Terminating
+
+A forbearance plan is a temporary reduction in the borrower's monthly obligation, with the difference between the scheduled total payment and the reduced payment deferred to be repaid later. A plan is proposed by a `LoanServicer` against a delinquent loan and carries `start_date`, `end_date`, and `reduced_payment_cents`. The reduced payment may be zero. The plan begins life in `PROPOSED` status.
+
+The window validation enforces that the `end_date` strictly exceeds the `start_date` and that the duration of the window does not exceed twelve months — specifically, the difference in days between `end_date` and `start_date` must be at most three hundred and sixty days. A plan that violates either bound is rejected with `ERR_FORBEARANCE_WINDOW_EXCEEDED`.
+
+Activation transitions the plan from `PROPOSED` to `ACTIVE`, transitions the loan to `FORBEARANCE`, and pins the plan's `deferred_total_cents` for the entire window. Activation may only proceed against a loan that is in `DELINQUENT` or `FORECLOSURE` status. The pinned deferral is computed from the loan's `total_monthly_payment_cents` at activation time and from the plan's `reduced_payment_cents`: the deferred-per-month is the maximum of zero and the total monthly payment minus the reduced payment; the number of months in the window is computed inclusively from the start and end months by taking the end year minus the start year times twelve, plus the end month minus the start month, plus one; and the deferred total is the deferred-per-month multiplied by that month count. The pinned value is integer cents and is never recomputed thereafter.
+
+A plan in `ACTIVE` status moves to `COMPLETED` once the simulated current UTC time has reached or passed the `end_date`, at which point the loan transitions to `REINSTATED` and the loan's `next_due_date` is advanced to thirty days after the current UTC time. The plan may instead be terminated early, in which case it moves to `TERMINATED_EARLY` and the loan reverts to `DELINQUENT`. Both terminal exits increment the loan's `version`. The plan's terminal states are `COMPLETED` and `TERMINATED_EARLY`.
+
+### 3.5. Foreclosure Filing and HAMP-Style Mandatory Mediation
+
+Foreclosure may only be filed against a loan that is `DELINQUENT`, whose `days_past_due` is at least one hundred and twenty, and that has no `ACTIVE` forbearance plan attached. The filing request carries `expected_loan_version` and is rejected with `ERR_STALE_VERSION` if the loan's version has advanced since the client last observed it (as described in §2.8) — for example, when another writer has just posted a payment that legitimately cured the delinquency and therefore invalidated the foreclosure rationale.
+
+A successful filing creates a `ForeclosureCase` whose `loan_id` ties it to the loan, whose `initiated_at` is set by the system, and whose `cure_amount_cents` is pinned per the cure calculation described below. The case is created in `FILED` and the system immediately auto-transitions it to `MEDIATION_REQUIRED` to express the HAMP-style mandatory mediation policy: every foreclosure must offer the borrower a mediation hearing before a sale can be scheduled. The loan's `status` becomes `FORECLOSURE` and its `version` is incremented; the foreclosure case's `version` is incremented through the auto-transition into `MEDIATION_REQUIRED`.
+
+The cure amount is the dollar figure the borrower must produce to reinstate the loan. It is the sum of four terms: the principal arrears (computed as the number of months past due multiplied by the loan's `scheduled_monthly_pi_cents`, where the number of months past due is `days_past_due` divided by thirty), plus the `accrued_interest_cents`, plus the sum of any outstanding late fees, plus a flat foreclosure-cost surcharge of two hundred and fifty thousand cents (two thousand five hundred dollars). The principal arrears figure is deliberately distinct from `principal_balance_cents`: it counts only the missed scheduled principal-and-interest from past installments, not the entire remaining balance. Rounding is half-up per term. The cure amount is recomputed and refreshed on entry to each of the case states `FILED`, `MEDIATION_REQUIRED`, `IN_MEDIATION`, `MEDIATION_FAILED`, and `SALE_SCHEDULED`, and is also recomputed on read of the case so a fetch always reports a current figure.
+
+A `LoanServicer` schedules a mediation session against a case in `MEDIATION_REQUIRED` by supplying a `scheduled_for` instant. Mediation must be noticed at least fourteen days ahead: the `scheduled_for` must be at or after the simulated current UTC time plus fourteen days, and a violation is rejected with `ERR_NOTICE_PERIOD_VIOLATED`. Scheduling moves the case into `IN_MEDIATION` and creates a `MediationSession` row whose `outcome` is initialized to `PENDING` and whose `foreclosure_case_id` ties it to the case.
+
+The mediator records the outcome by submitting an `outcome` value and, when relevant, a `modification_pi_cents` value. When the outcome is `MODIFICATION_AGREED`, the case transitions to `COMPLETED`, the loan's `scheduled_monthly_pi_cents` is replaced by the supplied `modification_pi_cents` (which is required in this branch), and the loan transitions to `REINSTATED`. When the outcome is `FORBEARANCE_AGREED`, the case transitions to `COMPLETED`, the server creates an `ACTIVE` `ForbearancePlan` for the loan, and the loan transitions to `FORBEARANCE`. When the outcome is `NO_AGREEMENT`, the case transitions to `MEDIATION_FAILED` and the loan remains in `FORECLOSURE`. The fourth admissible outcome value, `PENDING`, is the initial value at creation and is never recorded as a terminal outcome through this endpoint. Every outcome-recording write increments the case's `version`; the two outcomes that move the loan also increment the loan's `version`.
+
+A case in `MEDIATION_FAILED` may be advanced to `SALE_SCHEDULED` only after a sale-notice window of thirty days: the supplied `sale_date` must be at or after the simulated current UTC time plus thirty days. A request to schedule a sale that violates either the mediation-completion gate or the thirty-day notice window is rejected with `ERR_MEDIATION_REQUIRED`. Once the case is `SALE_SCHEDULED`, advancing the simulated clock to or past the `sale_date` auto-transitions the case to `COMPLETED`; in this terminal branch the loan remains in `FORECLOSURE`, which is the terminal Loan status in this benchmark.
+
+A case may be withdrawn at any non-terminal stage of the mediation/sale pipeline — specifically while the case is in any of `MEDIATION_REQUIRED`, `IN_MEDIATION`, `MEDIATION_FAILED`, or `SALE_SCHEDULED` — moving the case to `WITHDRAWN` and the loan back to `REINSTATED`. Both the case's `version` and the loan's `version` are incremented on withdrawal. The case's terminal states are `COMPLETED` and `WITHDRAWN`.
+
+### 3.6. The Escrow Account and Disbursement Lifecycle
+
+Every loan that requires escrow management is paired with an `EscrowAccount` via the loan's `loan_id` (the relationship is one-to-one). The escrow account is created by a `LoanServicer` who supplies the projected `annual_tax_cents`, the projected `annual_insurance_cents`, and optionally `cushion_months` — the permitted cushion in months — which defaults to two. The Federal RESPA cap on the cushion is two months; the system rejects any value outside the inclusive range zero to two with `ERR_CUSHION_OVERLIMIT`, and the same cap is enforced on subsequent updates of the cushion field.
+
+The escrow account is created with `balance_cents` of zero, with `shortage_cents` and `surplus_cents` both zero (these are populated by the first analysis), and as a side effect of escrow-account creation the loan's `escrow_monthly_cents` is initialized to the round-half-up of the sum of `annual_tax_cents` and `annual_insurance_cents` divided by twelve, the loan's `total_monthly_payment_cents` is recomputed to include the new escrow installment, and the loan's `version` is incremented.
+
+A `LoanServicer` schedules tax and insurance outflows by creating `EscrowDisbursement` rows tied to the account via `escrow_account_id`. Each row specifies a `kind` of `TAX` or `INSURANCE`, an `amount_cents` to be disbursed, and a `scheduled_for` instant indicating when the disbursement should fire. The `scheduled_for` must be in the future — strictly greater than the simulated current UTC time — and a violation is rejected with `ERR_DISBURSEMENT_IN_PAST`. The row is created in `SCHEDULED` status with `failure_reason` defaulting to `NONE` and `paid_at` null.
+
+A scheduled disbursement resolves automatically when the simulated clock advances. When the simulated current UTC time reaches or passes the `scheduled_for`, the system evaluates the escrow account's `balance_cents`: if the balance is at least the disbursement's `amount_cents`, the disbursement transitions to `PAID`, its `paid_at` is set to the current UTC time, the account's `balance_cents` is reduced by the disbursement amount, and the account's `version` is incremented. If the balance is strictly less than the disbursement amount, the disbursement transitions to `FAILED`, its `failure_reason` is set to `INSUFFICIENT_FUNDS`, the balance is left untouched, and the account's `version` is still incremented to record that the disbursement was evaluated. A scheduled disbursement may instead be cancelled explicitly by a `LoanServicer`, moving it to `CANCELLED`, or cancelled implicitly as a cascade from a loan reaching `PAID_OFF`. The terminal statuses are `PAID`, `FAILED`, and `CANCELLED`.
+
+### 3.7. The Annual Escrow Analysis
+
+The annual escrow analysis recomputes the borrower's monthly escrow installment so that the projected low point of the escrow balance over the next twelve months meets a permitted cushion. The analysis is run by a `LoanServicer` who supplies an `as_of_date` (the analysis anniversary), a `variant` selecting one of two algorithms, and `expected_escrow_account_version` to guard against a stale view of the account (see §2.8). The analysis is rejected with `ERR_STALE_VERSION` and HTTP 412 if the account's version has advanced since the client last observed it — typically because another writer has paid out a scheduled disbursement that legitimately changed the balance, in which case the client's projected-low-point inputs would have been computed against a stale balance.
+
+Under the `ACTUAL_TRAILING_12` variant, used at the loan's annual review when the trailing twelve months of `PAID` disbursements form a representative sample, the system sums the `amount_cents` of every `EscrowDisbursement` row tied to this account whose `status` is `PAID` and whose `paid_at` falls in the half-open window from one year before the `as_of_date` (exclusive) to the `as_of_date` (inclusive). The new monthly escrow installment is the ceiling-to-the-nearest-cent of that total divided by twelve. The projected low point over the next twelve months is simulated month-by-month using the new monthly figure as the inflow and replaying the trailing-twelve-month `PAID` pattern as the outflows. The deliberate ceiling rounding produces a conservatively higher monthly figure than `FORECAST_NEXT_12` would for identical inputs.
+
+Under the `FORECAST_NEXT_12` variant, used during initial escrow setup or after a tax or insurance bill change, the system sums the account's `annual_tax_cents` and `annual_insurance_cents` and divides by twelve, rounding half-up to a whole number of cents, to obtain the new monthly installment. The projected low point is simulated month-by-month using the new monthly figure as the inflow and using the still-`SCHEDULED` disbursement rows (their `kind`, `amount_cents`, and `scheduled_for`) as the outflows over the next twelve months. The forecast variant produces a leaner monthly figure than the actual-trailing variant for identical inputs because of the half-up rounding versus ceiling-to-cent.
+
+In both variants, the required low point is the round-half-up of the account's `cushion_months` multiplied by the sum of `annual_tax_cents` and `annual_insurance_cents`, divided by twelve. The `shortage_cents` is the maximum of zero and the required low point minus the projected low point. The `surplus_cents` is the maximum of zero and the projected low point minus the required low point. When the shortage is strictly positive, the new monthly figure is then incremented by the ceiling of the shortage divided by twelve so the next twelve months of inflows close the gap.
+
+Each analysis is persisted as an `EscrowAnalysis` row carrying its `loan_id`, the `as_of_date`, the `variant`, the computed `projected_low_point_cents`, the computed `required_low_point_cents`, the resulting `shortage_cents` and `surplus_cents`, and the resulting `new_escrow_monthly_cents`. As side effects the escrow account's `shortage_cents` and `surplus_cents` are refreshed to mirror the most-recent-analysis figures, the loan's `escrow_monthly_cents` is replaced with `new_escrow_monthly_cents`, the loan's `total_monthly_payment_cents` is recomputed, both the loan's and the escrow account's `version` are incremented, and `updated_at` is refreshed on each.
+
+### 3.8. The PMI Removal Lifecycle
+
+Private Mortgage Insurance is required while the loan-to-value ratio is at or above eighty percent. The borrower may submit a removal request and the compliance team decides it. A borrower or a loan-servicing operator submits a `PMIRemovalRequest` by supplying the `loan_id` and optionally an `appraisal_value_cents` reflecting a new appraisal the borrower has paid for. The system rejects a request whose `appraisal_value_cents` is not strictly positive with `ERR_INVALID_AMOUNT`. The submission timestamp is recorded as `requested_at`. The request is created in `PENDING` status with `denial_reason` initialized to `NONE`, the loan's `pmi_status` is moved to `REMOVAL_PENDING`, and the request's `computed_ltv_bps` is pinned at submission time per the eligibility computation.
+
+The eligibility computation is performed against a single baseline value: when the request supplied `appraisal_value_cents`, that is the baseline; otherwise the loan's `original_property_value_cents` is the baseline. The loan-to-value in basis points is the round-half-up of the loan's `principal_balance_cents` multiplied by ten thousand and divided by the baseline (so a value of seven thousand nine hundred and fifty means seventy-nine point five-zero percent). Two eligibility paths exist. The borrower-requested path requires the loan-to-value in basis points to be strictly less than eight thousand (less than eighty percent) and additionally requires a clean payment history over the trailing twelve months. The automatic-termination path, reflecting the Federal HPA threshold, requires the loan-to-value in basis points to be strictly less than seven thousand eight hundred (less than seventy-eight percent) and applies unconditionally regardless of payment history. The clean-payment-history check over the trailing twelve months is satisfied when there is no `Payment` row whose `status` is `SUSPENSE` in that window and there is no day in the trailing twelve months on which the loan's `days_past_due` exceeded thirty.
+
+A `ComplianceOfficer` records a decision on a pending request, at which point the system re-runs the eligibility computation and sets the request's `status` to either `APPROVED` or `DENIED`. The denial reason follows a strict first-match precedence: a loan whose `status` is not in the set `CURRENT` or `REINSTATED` yields `IN_DELINQUENCY`; otherwise a loan-to-value in basis points at or above eight thousand yields `LTV_TOO_HIGH`; otherwise a payment history that is not clean yields `PAYMENT_HISTORY_NOT_CLEAN`. The first matching condition wins and the request is denied with that reason; only if all three conditions fail to match is the request approved. The two LTV-failure and history-failure denials surface to the caller as `ERR_PMI_NOT_ELIGIBLE_LTV` and `ERR_PMI_NOT_ELIGIBLE_HISTORY` respectively. On approval, the loan's `pmi_required` is set to false, the loan's `pmi_status` is set to `REMOVED`, the loan's `total_monthly_payment_cents` is recomputed to drop the PMI premium, and the loan's `version` is incremented. On denial, the request's `denial_reason` is set per the precedence, the loan's `pmi_status` is reverted from `REMOVAL_PENDING` back to `ACTIVE`, and the loan's `version` is incremented. The terminal request statuses are `APPROVED` and `DENIED`. The remaining `pmi_status` value `AUTO_TERMINATED` is reached only through the cascade from a loan reaching `PAID_OFF` (see §3.2). Decision is permitted only on a request still in `PENDING`; a decision request against a request already in a terminal status is rejected with `ERR_INVALID_STATE`.
+
+## 4. Endpoint Definitions
+
+Operations that create a new resource (such as originating a loan or scheduling a disbursement) return HTTP `201 Created`. Operations that modify an existing resource (such as activating a forbearance plan, deciding a PMI removal request, or recording a mediation outcome) return HTTP `200 OK`. List and read endpoints likewise return `200 OK`. Path identifiers are validated left-to-right and may produce `ERR_RESOURCE_NOT_FOUND`; body foreign-key references are validated after path resolution and may produce `ERR_FK_NOT_FOUND`.
+
+| Method | Path                                                  | Description                                                                          | Authorized Role(s)                              |
+| ------ | ----------------------------------------------------- | ------------------------------------------------------------------------------------ | ----------------------------------------------- |
+| POST   | `/borrowers`                                          | Create a borrower.                                                                   | LoanServicer, ComplianceOfficer                 |
+| GET    | `/borrowers/{id}`                                     | Read a borrower.                                                                     | LoanServicer, ComplianceOfficer, Borrower       |
+| GET    | `/borrowers/{id}/loans`                               | List loans for a borrower.                                                           | LoanServicer, ComplianceOfficer, Borrower       |
+| POST   | `/loans`                                              | Originate a loan; server computes the scheduled monthly P&I.                         | LoanServicer                                    |
+| GET    | `/loans/{id}`                                         | Read a loan, including derived fields.                                               | LoanServicer, ComplianceOfficer, Borrower       |
+| GET    | `/loans`                                              | List loans with optional filters.                                                    | LoanServicer, ComplianceOfficer                 |
+| POST   | `/loans/{id}/payments`                                | Post a payment to a loan and run the waterfall.                                      | LoanServicer, Borrower                          |
+| GET    | `/loans/{id}/payments`                                | List payments for a loan.                                                            | LoanServicer, ComplianceOfficer, Borrower       |
+| POST   | `/loans/{id}/foreclosure`                             | File foreclosure on a delinquent loan (OCC-guarded).                                 | LoanServicer                                    |
+| GET    | `/loans/{id}/foreclosure-cases`                       | List foreclosure cases for a loan.                                                   | LoanServicer, ComplianceOfficer, Borrower       |
+| POST   | `/loans/{id}/forbearance-plans`                       | Propose a forbearance plan for a delinquent loan.                                    | LoanServicer                                    |
+| GET    | `/loans/{id}/forbearance-plans`                       | List forbearance plans for a loan.                                                   | LoanServicer, ComplianceOfficer, Borrower       |
+| POST   | `/forbearance-plans/{id}/activate`                    | Activate a proposed forbearance plan.                                                | LoanServicer                                    |
+| POST   | `/forbearance-plans/{id}/complete`                    | Complete a forbearance plan at or after its end_date.                                | LoanServicer                                    |
+| POST   | `/forbearance-plans/{id}/terminate`                   | Terminate an active forbearance plan early.                                          | LoanServicer                                    |
+| GET    | `/forbearance-plans/{id}`                             | Read a forbearance plan.                                                             | LoanServicer, ComplianceOfficer, Borrower       |
+| POST   | `/escrow-accounts`                                    | Create an escrow account bound to a loan (1:1).                                      | LoanServicer                                    |
+| GET    | `/escrow-accounts/{id}`                               | Read an escrow account.                                                              | LoanServicer, ComplianceOfficer, Borrower       |
+| GET    | `/escrow-accounts`                                    | List escrow accounts (optionally filtered by loan).                                  | LoanServicer, ComplianceOfficer                 |
+| POST   | `/escrow-accounts/{id}/disbursements`                 | Schedule a tax or insurance disbursement.                                            | LoanServicer                                    |
+| GET    | `/escrow-accounts/{id}/disbursements`                 | List disbursements for an escrow account.                                            | LoanServicer, ComplianceOfficer, Borrower       |
+| GET    | `/escrow-disbursements/{id}`                          | Read a disbursement.                                                                 | LoanServicer, ComplianceOfficer, Borrower       |
+| POST   | `/escrow-disbursements/{id}/cancel`                   | Cancel a scheduled disbursement.                                                     | LoanServicer                                    |
+| POST   | `/escrow-accounts/{id}/analyses`                      | Run an escrow analysis (OCC-guarded).                                                | LoanServicer                                    |
+| GET    | `/escrow-accounts/{id}/analyses`                      | List analyses for an escrow account.                                                 | LoanServicer, ComplianceOfficer, Borrower       |
+| GET    | `/escrow-analyses`                                    | List escrow analyses (optionally filtered by loan_id).                               | LoanServicer, ComplianceOfficer, Borrower       |
+| GET    | `/escrow-analyses/{id}`                               | Read a single escrow analysis.                                                       | LoanServicer, ComplianceOfficer, Borrower       |
+| POST   | `/pmi-removal-requests`                               | Submit a PMI removal request.                                                        | LoanServicer, Borrower                          |
+| GET    | `/pmi-removal-requests`                               | List PMI removal requests (optionally by loan_id or status).                         | LoanServicer, ComplianceOfficer, Borrower       |
+| GET    | `/pmi-removal-requests/{id}`                          | Read a PMI removal request.                                                          | LoanServicer, ComplianceOfficer, Borrower       |
+| POST   | `/pmi-removal-requests/{id}/decide`                   | Compliance decision on a pending PMI removal request.                                | ComplianceOfficer                               |
+| GET    | `/foreclosure-cases/{id}`                             | Read a foreclosure case (refreshes cure_amount_cents).                               | LoanServicer, ComplianceOfficer, Borrower       |
+| POST   | `/foreclosure-cases/{id}/mediation-sessions`          | Schedule a HAMP-style pre-foreclosure mediation session.                             | LoanServicer                                    |
+| GET    | `/foreclosure-cases/{id}/mediation-sessions`          | List mediation sessions for a foreclosure case.                                      | LoanServicer, ComplianceOfficer, Borrower       |
+| GET    | `/mediation-sessions/{id}`                            | Read a mediation session.                                                            | LoanServicer, ComplianceOfficer, Borrower       |
+| POST   | `/mediation-sessions/{id}/record-outcome`             | Record the outcome of a mediation session.                                           | LoanServicer                                    |
+| POST   | `/foreclosure-cases/{id}/schedule-sale`               | Schedule the foreclosure sale (only after MEDIATION_FAILED).                         | LoanServicer                                    |
+| POST   | `/foreclosure-cases/{id}/withdraw`                    | Withdraw the foreclosure.                                                            | LoanServicer                                    |
+| POST   | `/_clock/set_current_utc`                             | Set the simulated current UTC time; fires deterministic auto-transitions.            | LoanServicer, ComplianceOfficer                 |
+
+## 5. Error Code Catalogue
+
+| Error ID                          | HTTP Status Code |
+| --------------------------------- | ---------------- |
+| `ERR_UNAUTHENTICATED`             | 401              |
+| `ERR_UNAUTHORIZED`                | 403              |
+| `ERR_RESOURCE_NOT_FOUND`          | 404              |
+| `ERR_FK_NOT_FOUND`                | 404              |
+| `ERR_INVALID_STATE`               | 409              |
+| `ERR_STALE_VERSION`               | 412              |
+| `ERR_MEDIATION_REQUIRED`          | 422              |
+| `ERR_NOTICE_PERIOD_VIOLATED`      | 422              |
+| `ERR_FORBEARANCE_WINDOW_EXCEEDED` | 422              |
+| `ERR_DISBURSEMENT_IN_PAST`        | 422              |
+| `ERR_CUSHION_OVERLIMIT`           | 422              |
+| `ERR_INVALID_AMOUNT`              | 422              |
+| `ERR_PMI_NOT_ELIGIBLE_LTV`        | 422              |
+| `ERR_PMI_NOT_ELIGIBLE_HISTORY`    | 422              |
+| `ERR_INVALID_REQUEST`             | 400              |

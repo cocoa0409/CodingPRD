@@ -1,0 +1,1423 @@
+scenario: "Multi-State Payroll & Tax Withholding: W-4 pre-fill, federal/state/local income tax, FICA/Medicare additional tax, overtime/double/retro pay tax forms, Garnishment orders, monthly employer remittance."
+domain_name: multistate-payroll-tax
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+    - derived_field_reconciliation
+
+  entity_topology: hybrid
+  state_machine_shape: branching   # PaycheckRun branching with revert; W4Form cyclic; Remittance compound
+  relationship_patterns:
+    - one_to_many        # PaycheckRun -> Paycheck; Paycheck -> GarnishmentDeduction; Employee -> W4Form
+    - cross_aggregate    # GarnishmentDeduction references both Paycheck and GarnishmentOrder
+    - self_referential   # W4Form.supersedes_w4_id -> W4Form
+  role_model: segregation_of_duties
+  consistency_model: immediate
+
+# =========================================================================
+# §1.0 — Response Envelope (FIXED, EMIT VERBATIM)
+# =========================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =========================================================================
+# §1.1 — Entity-Relationship Table
+# =========================================================================
+entities:
+  - name: Employee
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: Employee legal name
+      - name: work_state_code
+        type: enum
+        source: input
+        description: Two-letter state code where work is performed (drives state income tax)
+        constraints: "IN {CA, NY, TX, WA}"
+      - name: residence_state_code
+        type: enum
+        source: input
+        description: Two-letter state code of residence (drives reciprocity edge cases for state withholding)
+        constraints: "IN {CA, NY, TX, WA}"
+      - name: locality_code
+        type: enum
+        source: input
+        description: Local jurisdiction code; NONE if no local tax
+        constraints: "IN {NONE, NYC, SF}"
+        default: NONE
+      - name: status
+        type: enum
+        source: system
+        description: Employee employment status
+        constraints: "IN {ACTIVE, ON_LEAVE, TERMINATED}"
+        default: ACTIVE
+      - name: ytd_wages_cents
+        type: integer
+        source: computed
+        description: Cumulative paid gross wages for current calendar year; recomputed when a Paycheck transitions to PAID and reversed when a Paycheck transitions to VOID
+        default: 0
+      - name: ytd_fed_withheld_cents
+        type: integer
+        source: computed
+        description: Cumulative federal income tax withheld for current calendar year; mirrors ytd_wages_cents update rule
+        default: 0
+      - name: ytd_ss_wages_cents
+        type: integer
+        source: computed
+        description: Cumulative wages subject to Social Security; capped contribution-side at SS_WAGE_BASE_CENTS per §1.3 fica_ss_calc
+        default: 0
+      - name: ytd_medicare_wages_cents
+        type: integer
+        source: computed
+        description: Cumulative wages subject to Medicare; uncapped, used to detect ADDL_MEDICARE_THRESHOLD_CENTS crossing per §1.3 medicare_addl_calc
+        default: 0
+
+  - name: W4Form
+    parent: null
+    common_fields: true
+    fields:
+      - name: employee_id
+        type: string
+        source: input
+        description: FK -> Employee.id; the employee this W-4 belongs to
+      - name: tax_year
+        type: integer
+        source: input
+        description: Four-digit calendar year this W-4 covers
+        constraints: "tax_year IN {2025, 2026}"
+      - name: filing_status
+        type: enum
+        source: input
+        description: IRS filing status driving the federal bracket table selection
+        constraints: "IN {SINGLE, MARRIED_JOINT, HEAD_OF_HOUSEHOLD}"
+      - name: dependents_amount_cents
+        type: integer
+        source: input
+        description: Step-3 dependents credit in cents
+        default: 0
+      - name: other_income_cents
+        type: integer
+        source: input
+        description: Step-4(a) other income in cents
+        default: 0
+      - name: deductions_cents
+        type: integer
+        source: input
+        description: Step-4(b) deductions in cents
+        default: 0
+      - name: extra_withholding_cents
+        type: integer
+        source: input
+        description: Step-4(c) extra per-paycheck withholding in cents
+        default: 0
+      - name: supersedes_w4_id
+        type: string
+        source: input
+        description: FK -> W4Form.id; the prior FILED W-4 this amendment replaces. NULL on the first W-4 of a tax year.
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: Lifecycle of this specific W-4 form
+        constraints: "IN {DRAFT, FILED, SUPERSEDED}"
+        default: DRAFT
+      - name: filed_at
+        type: datetime
+        source: system
+        description: ISO 8601 UTC timestamp when status transitioned DRAFT -> FILED; null until then
+        default: null
+
+  - name: PaycheckRun
+    parent: null
+    common_fields: true
+    fields:
+      - name: pay_period_start
+        type: datetime
+        source: input
+        description: ISO 8601 UTC; inclusive lower bound of this pay period
+      - name: pay_period_end
+        type: datetime
+        source: input
+        description: ISO 8601 UTC; inclusive upper bound of this pay period
+      - name: pay_date
+        type: datetime
+        source: input
+        description: ISO 8601 UTC date wages are disbursed; drives the remittance period_month bucket
+      - name: prepared_by_user_id
+        type: string
+        source: system
+        description: Opaque operator id of the PayrollPreparer who created the run (X-User-ID at POST /paycheck-runs)
+      - name: approved_by_user_id
+        type: string
+        source: system
+        description: Opaque operator id of the PayrollApprover who approved the run; segregation-of-duties forbids prepared_by_user_id == approved_by_user_id
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: Lifecycle of the paycheck run
+        constraints: "IN {DRAFT, APPROVED, PAID, VOID}"
+        default: DRAFT
+      - name: total_gross_cents
+        type: integer
+        source: computed
+        description: Sum of child Paycheck.gross_wages_cents for paychecks in this run; recomputed on Paycheck create/update/void
+        default: 0
+
+  - name: Paycheck
+    parent: PaycheckRun
+    common_fields: true
+    fields:
+      - name: paycheck_run_id
+        type: string
+        source: input
+        description: FK -> PaycheckRun.id; parent run
+      - name: employee_id
+        type: string
+        source: input
+        description: FK -> Employee.id; the wage recipient
+      - name: pay_type
+        type: enum
+        source: input
+        description: Pay form for this paycheck; drives supplemental-wage withholding rules
+        constraints: "IN {REGULAR, OVERTIME, DOUBLE, RETRO}"
+      - name: regular_hours_e2
+        type: integer
+        source: input
+        description: Regular hours worked, scaled by 100 (e.g. 40.00 hours -> 4000). REGULAR pay_type only.
+        default: 0
+      - name: overtime_hours_e2
+        type: integer
+        source: input
+        description: Overtime hours, scaled by 100; OVERTIME pay_type only
+        default: 0
+      - name: double_hours_e2
+        type: integer
+        source: input
+        description: Double-time hours, scaled by 100; DOUBLE pay_type only
+        default: 0
+      - name: retro_amount_cents
+        type: integer
+        source: input
+        description: Retroactive flat amount in cents; RETRO pay_type only
+        default: 0
+      - name: hourly_rate_cents
+        type: integer
+        source: input
+        description: Hourly rate in cents (applies to REGULAR/OVERTIME/DOUBLE)
+        default: 0
+      - name: gross_wages_cents
+        type: integer
+        source: computed
+        description: Output of §1.3 gross_wages_calc
+        default: 0
+      - name: fed_withheld_cents
+        type: integer
+        source: computed
+        description: Provisional federal withholding (output of §1.3 federal_withholding_provisional); reconciled to federal_withholding_reconciled on the final pay-period paycheck of the calendar year
+        default: 0
+      - name: state_withheld_cents
+        type: integer
+        source: computed
+        description: Output of §1.3 state_local_withholding for work_state_code
+        default: 0
+      - name: local_withheld_cents
+        type: integer
+        source: computed
+        description: Output of §1.3 state_local_withholding for locality_code (NYC/SF); 0 when Employee.locality_code == NONE
+        default: 0
+      - name: ss_withheld_cents
+        type: integer
+        source: computed
+        description: Output of §1.3 fica_ss_calc; floors at 0 when YTD SS wages already at SS_WAGE_BASE_CENTS
+        default: 0
+      - name: medicare_withheld_cents
+        type: integer
+        source: computed
+        description: Base Medicare 1.45% (output of §1.3 medicare_base_calc)
+        default: 0
+      - name: addl_medicare_cents
+        type: integer
+        source: computed
+        description: Additional Medicare 0.9% on YTD medicare wages above ADDL_MEDICARE_THRESHOLD_CENTS (output of §1.3 medicare_addl_calc)
+        default: 0
+      - name: garnishment_total_cents
+        type: integer
+        source: computed
+        description: Sum of child GarnishmentDeduction.amount_cents; output of §1.3 garnishment_waterfall
+        default: 0
+      - name: net_pay_cents
+        type: integer
+        source: computed
+        description: gross_wages_cents - (fed + state + local + ss + medicare + addl_medicare + garnishment_total) ; floors at 0
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Paycheck lifecycle; bubbles to PaycheckRun via §1.2 compound rules
+        constraints: "IN {PENDING, PAID, VOID}"
+        default: PENDING
+
+  - name: GarnishmentOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: employee_id
+        type: string
+        source: input
+        description: FK -> Employee.id; the employee whose wages are garnished
+      - name: order_type
+        type: enum
+        source: input
+        description: Federal priority class; CHILD_SUPPORT outranks IRS_LEVY outranks STUDENT_LOAN outranks CREDITOR
+        constraints: "IN {CHILD_SUPPORT, IRS_LEVY, STUDENT_LOAN, CREDITOR}"
+      - name: priority_rank
+        type: integer
+        source: computed
+        description: Numeric rank for §1.3 garnishment_waterfall; 1=CHILD_SUPPORT, 2=IRS_LEVY, 3=STUDENT_LOAN, 4=CREDITOR. Pinned by order_type at creation.
+      - name: weekly_cap_cents
+        type: integer
+        source: input
+        description: Maximum cents deductible per pay week for THIS order (e.g. 25000 = $250.00)
+      - name: original_balance_cents
+        type: integer
+        source: input
+        description: Total amount the order requires
+      - name: balance_remaining_cents
+        type: integer
+        source: computed
+        description: original_balance_cents minus sum of GarnishmentDeduction.amount_cents for this order on Paychecks in status PAID
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Garnishment lifecycle
+        constraints: "IN {ACTIVE, SATISFIED, RELEASED, SUSPENDED}"
+        default: ACTIVE
+      - name: served_on
+        type: datetime
+        source: input
+        description: ISO 8601 UTC date the order was served on the employer; pinned for chronological_replay tie-break in §1.3 garnishment_waterfall (earlier served_on wins within same order_type)
+
+  - name: GarnishmentDeduction
+    parent: Paycheck
+    common_fields: false
+    fields:
+      - name: paycheck_id
+        type: string
+        source: input
+        description: FK -> Paycheck.id; the paycheck this deduction was taken from
+      - name: garnishment_order_id
+        type: string
+        source: input
+        description: FK -> GarnishmentOrder.id; the order being satisfied
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: Dollar amount deducted toward this order on this paycheck (output of §1.3 garnishment_waterfall)
+      - name: applied_at
+        type: datetime
+        source: system
+        description: ISO 8601 UTC at the time the parent Paycheck transitioned PENDING -> PAID
+
+  - name: Remittance
+    parent: null
+    common_fields: true
+    fields:
+      - name: period_month
+        type: string
+        source: input
+        description: Calendar month bucket as YYYY-MM; the §1.3 remittance_accrual aggregator groups paid paychecks by this bucket using Paycheck.parent_run.pay_date
+        constraints: "matches ^\\d{4}-(0[1-9]|1[0-2])$"
+      - name: jurisdiction
+        type: string
+        source: input
+        description: Tax authority; one of FEDERAL, STATE:CA, STATE:NY, STATE:TX, STATE:WA, LOCAL:NYC, LOCAL:SF
+        constraints: "IN {FEDERAL, STATE:CA, STATE:NY, STATE:TX, STATE:WA, LOCAL:NYC, LOCAL:SF}"
+      - name: tax_type
+        type: enum
+        source: input
+        description: Which withholding bucket this remittance covers
+        constraints: "IN {FED_INCOME, FICA_EMPLOYEE, STATE_INCOME, LOCAL_INCOME}"
+      - name: accrued_cents
+        type: integer
+        source: computed
+        description: Provisional accrual — sum of relevant Paycheck withholding fields for status==PAID in the period_month (output of §1.3 remittance_accrual provisional variant)
+        default: 0
+      - name: reconciled_cents
+        type: integer
+        source: computed
+        description: Final reconciled liability — recomputed after all paychecks in the month reach PAID and a CLOSE_PERIOD transition fires (output of §1.3 remittance_accrual reconciled variant). Differs from accrued_cents when a Paycheck is VOIDed during the month.
+        default: 0
+      - name: paid_cents
+        type: integer
+        source: input
+        description: Cents actually transmitted to the jurisdiction at REMIT
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Remittance lifecycle
+        constraints: "IN {ACCRUING, RECONCILED, REMITTED}"
+        default: ACCRUING
+
+  - name: TaxRateTable
+    parent: null
+    common_fields: false
+    fields:
+      - name: jurisdiction
+        type: string
+        source: input
+        description: Matches Remittance.jurisdiction; identifies which authority's brackets apply
+      - name: tax_year
+        type: integer
+        source: input
+        description: Calendar year the brackets apply to
+      - name: filing_status
+        type: enum
+        source: input
+        description: Federal-only field; STATE:* and LOCAL:* rows use SINGLE
+        constraints: "IN {SINGLE, MARRIED_JOINT, HEAD_OF_HOUSEHOLD}"
+      - name: brackets_json
+        type: array
+        source: input
+        description: Ordered list of [{lower_cents, upper_cents_or_null, rate_basis_points}]; rate_basis_points = percentage * 100 (so 2200 = 22.00%)
+      - name: supplemental_flat_basis_points
+        type: integer
+        source: input
+        description: Flat supplemental withholding rate for OVERTIME/DOUBLE/RETRO pay types (e.g. 2200 = 22.00% federal supplemental)
+
+# =========================================================================
+# §1.2 — State Machine Table
+# =========================================================================
+state_machines:
+  - entity: W4Form
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: DRAFT
+        to: FILED
+        trigger: "POST /w4-forms/{id}/file"
+        actor: HRClerk
+        preconditions:
+          - "W4Form.status == DRAFT"
+          - "Employee.${employee_id}.status IN {ACTIVE, ON_LEAVE}"
+          - "filing_status is set"
+        side_effects:
+          - "W4Form.status -> FILED"
+          - "W4Form.filed_at = NOW_UTC"
+          - "If supersedes_w4_id is set: prior W4Form.status -> SUPERSEDED (cascade hop 1)"
+          - "Any Paycheck in status PENDING for employee_id with parent PaycheckRun.status == DRAFT has fed_withheld_cents recomputed (cascade hop 2; §1.3 federal_withholding_provisional)"
+      - from: FILED
+        to: SUPERSEDED
+        trigger: "system: another W4Form whose supersedes_w4_id == this.id transitions DRAFT -> FILED"
+        actor: system
+        preconditions: ["this W4Form.status == FILED"]
+        side_effects: ["W4Form.status -> SUPERSEDED"]
+        note: "Cyclic shape — an employee may amend (file again with supersedes_w4_id), so the active W-4 cycles DRAFT->FILED->SUPERSEDED across years"
+
+  - entity: PaycheckRun
+    initial_state: DRAFT
+    terminal_states: [VOID]
+    transitions:
+      - from: DRAFT
+        to: APPROVED
+        trigger: "POST /paycheck-runs/{id}/approve"
+        actor: PayrollApprover
+        preconditions:
+          - "PaycheckRun.status == DRAFT"
+          - "X-User-ID != PaycheckRun.prepared_by_user_id (segregation of duties)"
+          - "PaycheckRun has >= 1 child Paycheck"
+          - "Every child Paycheck has pay_type matching its hours fields (REGULAR has regular_hours_e2 > 0, OVERTIME has overtime_hours_e2 > 0, DOUBLE has double_hours_e2 > 0, RETRO has retro_amount_cents > 0)"
+        side_effects:
+          - "PaycheckRun.status -> APPROVED"
+          - "PaycheckRun.approved_by_user_id = X-User-ID"
+      - from: APPROVED
+        to: DRAFT
+        trigger: "POST /paycheck-runs/{id}/reject"
+        actor: PayrollApprover
+        preconditions: ["PaycheckRun.status == APPROVED"]
+        side_effects:
+          - "PaycheckRun.status -> DRAFT"
+          - "PaycheckRun.approved_by_user_id -> null"
+        note: "Branching with revert — APPROVED can either advance to PAID or fall back to DRAFT for correction"
+      - from: APPROVED
+        to: PAID
+        trigger: "POST /paycheck-runs/{id}/pay"
+        actor: PayrollApprover
+        preconditions:
+          - "PaycheckRun.status == APPROVED"
+          - "Every child Paycheck.status == PENDING"
+        side_effects:
+          - "PaycheckRun.status -> PAID"
+          - "If request.is_year_end_run == true: for each child Paycheck, REPLACE Paycheck.fed_withheld_cents with the §1.3 federal_withholding_reconciled variant output BEFORE applying the YTD increments (the reconciled formula uses pre-payment YTD as the baseline). When request.is_year_end_run is false/omitted, fed_withheld_cents stays at the provisional value set at /paychecks creation."
+          - "For each child Paycheck: Paycheck.status -> PAID (cascade hop 1)"
+          - "For each child Paycheck: Employee.ytd_wages_cents += gross_wages_cents; ytd_fed_withheld_cents += fed_withheld_cents (post-reconciliation if applicable); ytd_ss_wages_cents += min(gross_wages_cents, SS_WAGE_BASE_CENTS - prior ytd_ss_wages_cents); ytd_medicare_wages_cents += gross_wages_cents (cascade hop 2 on Employee)"
+          - "For each GarnishmentDeduction d on each child Paycheck: GarnishmentOrder.${d.garnishment_order_id}.balance_remaining_cents -= d.amount_cents; if reaches 0, GarnishmentOrder.status -> SATISFIED (cascade hop 3 on GarnishmentOrder)"
+          - "For each tax bucket on each child Paycheck: Remittance.accrued_cents += that bucket's value for the (period_month, jurisdiction, tax_type) tuple, creating the Remittance row if missing (cascade hop 4 on Remittance, status remains ACCRUING)"
+      - from: PAID
+        to: VOID
+        trigger: "POST /paycheck-runs/{id}/void"
+        actor: PayrollApprover
+        preconditions:
+          - "PaycheckRun.status == PAID"
+          - "No Remittance with this run's pay_date.period_month is in status REMITTED for any jurisdiction"
+        side_effects:
+          - "PaycheckRun.status -> VOID"
+          - "For each child Paycheck: Paycheck.status -> VOID (cascade hop 1)"
+          - "For each child Paycheck: reverse the YTD increments on Employee (cascade hop 2 on Employee, conserved-quantity invariant — see §1.3 compensating_invariant)"
+          - "For each GarnishmentDeduction d: GarnishmentOrder.${d.garnishment_order_id}.balance_remaining_cents += d.amount_cents; if status was SATISFIED, revert to ACTIVE (cascade hop 3 on GarnishmentOrder)"
+          - "Remittance.accrued_cents reversed by each tax-bucket amount (cascade hop 4 on Remittance)"
+
+  - entity: Paycheck
+    initial_state: PENDING
+    terminal_states: [VOID]
+    transitions:
+      - from: PENDING
+        to: PAID
+        trigger: "system: parent PaycheckRun transitions APPROVED -> PAID"
+        actor: system
+        preconditions: ["Paycheck.status == PENDING"]
+        side_effects:
+          - "Paycheck.status -> PAID"
+          - "Each GarnishmentDeduction child's applied_at stamped with NOW_UTC"
+      - from: PAID
+        to: VOID
+        trigger: "system: parent PaycheckRun transitions PAID -> VOID"
+        actor: system
+        preconditions: ["Paycheck.status == PAID"]
+        side_effects: ["Paycheck.status -> VOID"]
+
+  - entity: GarnishmentOrder
+    initial_state: ACTIVE
+    terminal_states: [RELEASED]
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /garnishment-orders/{id}/suspend"
+        actor: PayrollApprover
+        preconditions: ["GarnishmentOrder.status == ACTIVE"]
+        side_effects:
+          - "GarnishmentOrder.status -> SUSPENDED"
+          - "Order will be skipped by §1.3 garnishment_waterfall on subsequent Paychecks until reactivated"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /garnishment-orders/{id}/reactivate"
+        actor: PayrollApprover
+        preconditions: ["GarnishmentOrder.status == SUSPENDED"]
+        side_effects: ["GarnishmentOrder.status -> ACTIVE"]
+      - from: ACTIVE
+        to: SATISFIED
+        trigger: "system: a Paycheck containing a GarnishmentDeduction d for this order transitions PENDING -> PAID and the resulting balance_remaining_cents reaches 0"
+        actor: system
+        preconditions: ["GarnishmentOrder.status == ACTIVE", "post-debit balance_remaining_cents == 0"]
+        side_effects: ["GarnishmentOrder.status -> SATISFIED"]
+      - from: SATISFIED
+        to: ACTIVE
+        trigger: "system: a Paycheck transition PAID -> VOID raises this order's balance_remaining_cents above 0"
+        actor: system
+        preconditions: ["GarnishmentOrder.status == SATISFIED"]
+        side_effects: ["GarnishmentOrder.status -> ACTIVE"]
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /garnishment-orders/{id}/release"
+        actor: ComplianceOfficer
+        preconditions: ["GarnishmentOrder.status IN {ACTIVE, SATISFIED, SUSPENDED}"]
+        side_effects: ["GarnishmentOrder.status -> RELEASED"]
+        note: "RELEASED is a court-ordered terminal release; distinct from auto-SATISFIED when balance hits 0"
+
+  - entity: Remittance
+    initial_state: ACCRUING
+    terminal_states: [REMITTED]
+    transitions:
+      - from: ACCRUING
+        to: RECONCILED
+        trigger: "POST /remittances/{id}/close-period"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Remittance.status == ACCRUING"
+          - "Every PaycheckRun whose pay_date.period_month equals Remittance.period_month is in status PAID or VOID (no APPROVED/DRAFT runs may leak into a closed month)"
+          - "Compound check: no Paycheck.status == PENDING exists with parent_run.pay_date.period_month == this.period_month"
+        side_effects:
+          - "Remittance.status -> RECONCILED"
+          - "Remittance.reconciled_cents = output of §1.3 remittance_accrual reconciled variant"
+      - from: RECONCILED
+        to: REMITTED
+        trigger: "POST /remittances/{id}/remit"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Remittance.status == RECONCILED"
+          - "request.paid_cents > 0"
+          - "request.expected_remittance_version == Remittance.version (OCC, see §1.2.1)"
+        side_effects:
+          - "Remittance.status -> REMITTED"
+          - "Remittance.paid_cents = request.paid_cents"
+          - "Increments Remittance.version by 1"
+
+# =========================================================================
+# §1.2.1 — Concurrency Rules (OCC only)
+# =========================================================================
+concurrency_rules:
+  - rule_id: remit-stale-remittance-version
+    parent_entity: Remittance
+    write_endpoint: "POST /remittances/{id}/remit"
+    occ_field: "expected_remittance_version"
+    description: |
+      Marking a Remittance as REMITTED with a paid_cents amount is rejected when
+      the client's expected_remittance_version does not match the server's
+      current Remittance.version. Cascades from late-arriving Paycheck PAID/VOID
+      transitions during ACCRUING can bump Remittance.version (via §1.3
+      remittance_accrual side effects); a client that read the row before such
+      a cascade and submits the prior version observes a stale view and is
+      rejected with ERR_STALE_VERSION.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =========================================================================
+# §1.3 — Calculation Rules Table
+# =========================================================================
+calculations:
+  - name: gross_wages_calc
+    trigger: "On POST /paychecks (paycheck create); idempotent on PATCH /paychecks/{id}"
+    algorithm: aggregation
+    formula: |
+      # All amounts in cents; hours fields are scaled by 100 (regular_hours_e2 = hours * 100)
+      if pay_type == REGULAR:
+        gross = (regular_hours_e2 * hourly_rate_cents) // 100
+      elif pay_type == OVERTIME:
+        # overtime multiplier = 1.5
+        gross = (overtime_hours_e2 * hourly_rate_cents * 3) // 200
+      elif pay_type == DOUBLE:
+        # double-time multiplier = 2.0
+        gross = (double_hours_e2 * hourly_rate_cents * 2) // 100
+      elif pay_type == RETRO:
+        gross = retro_amount_cents
+      return gross
+    input_set: "Single Paycheck row's input fields; no aggregation across rows"
+    constants: {}
+    precision: "integer cents; integer floor division at each step (// 100 is floor)"
+    variants: []
+
+  - name: federal_withholding_provisional
+    trigger: "On POST /paychecks (paycheck create) and on Paycheck recompute when the employee's FILED W4Form changes (cascade hop 2 from W4Form DRAFT->FILED transition)"
+    algorithm: forward_looking
+    formula: |
+      # Provisional variant: per-paycheck percentage method.
+      # 1) Determine effective W-4: the FILED W4Form for this Employee and tax_year matching the paycheck's pay_date year, with the most recent filed_at (tie-break created_at ASC).
+      # 2) Project annual_wages = (gross_wages_cents of THIS paycheck) * PAY_PERIODS_PER_YEAR (= 26 biweekly).
+      # 3) adjusted_annual = annual_wages + w4.other_income_cents - w4.deductions_cents - STANDARD_DEDUCTION_CENTS[w4.filing_status]
+      # 4) Apply percentage-method federal brackets from TaxRateTable (jurisdiction=FEDERAL, tax_year=pay_date_year, filing_status=w4.filing_status):
+      #    annual_tax_cents = sum_over_brackets(min(adjusted_annual, upper) - lower) * rate_bp / 10000  for each bracket where adjusted_annual > lower
+      # 5) per_pay_tax = annual_tax_cents // PAY_PERIODS_PER_YEAR
+      # 6) per_pay_tax -= (w4.dependents_amount_cents // PAY_PERIODS_PER_YEAR)
+      # 7) per_pay_tax += w4.extra_withholding_cents
+      # 8) For OVERTIME/DOUBLE/RETRO pay_types: replace steps 2-6 with the supplemental flat-rate path:
+      #      supplemental_tax = gross_wages_cents * TaxRateTable[FEDERAL].supplemental_flat_basis_points // 10000
+      #      per_pay_tax = supplemental_tax + w4.extra_withholding_cents
+      # 9) Floor at 0.
+      return max(0, per_pay_tax)
+    input_set: "This Paycheck's gross_wages_cents + the employee's currently-FILED W4Form for the paycheck's pay_date.tax_year + TaxRateTable rows for jurisdiction=FEDERAL"
+    constants:
+      PAY_PERIODS_PER_YEAR: 26
+      STANDARD_DEDUCTION_CENTS:
+        SINGLE: 1460000
+        MARRIED_JOINT: 2920000
+        HEAD_OF_HOUSEHOLD: 2190000
+    precision: "All arithmetic in integer cents; floor division (//) at each step; rounding order is fixed: (a) compute annual_tax_cents using floor division per bracket, then sum; (b) floor-divide by PAY_PERIODS_PER_YEAR; (c) floor result at 0"
+    variants:
+      - name: provisional
+        when: "Paycheck.status == PENDING (set at POST /paychecks creation); also persists through PAID when the /pay request payload had is_year_end_run==false or omitted"
+        difference: "Per-paycheck percentage method as above"
+      - name: reconciled
+        when: "The /paycheck-runs/{id}/pay request payload carries is_year_end_run == true; the run's child Paychecks are re-withheld using the reconciled variant BEFORE YTD updates apply (single, deterministic flag — no implicit year-end detection)"
+        difference: |
+          Reconciled variant — recompute the YEAR's total federal liability and back-out prior withholdings.
+          annual_wages_actual = Employee.ytd_wages_cents BEFORE this paycheck + gross_wages_cents of this paycheck
+          adjusted_annual = annual_wages_actual + w4.other_income_cents - w4.deductions_cents - STANDARD_DEDUCTION_CENTS[filing_status]
+          annual_tax_actual = bracket-summed tax on adjusted_annual (same bracket math as provisional step 4)
+          annual_tax_actual -= w4.dependents_amount_cents
+          annual_tax_actual += w4.extra_withholding_cents * PAY_PERIODS_PER_YEAR
+          fed_withheld_cents = max(0, annual_tax_actual - Employee.ytd_fed_withheld_cents)
+          # Identical inputs to provisional but produces different output by exact-bracket aggregation
+          # rather than per-paycheck annualization.
+
+  - name: fica_ss_calc
+    trigger: "On POST /paychecks; on Paycheck recompute"
+    algorithm: threshold
+    formula: |
+      remaining_capacity = max(0, SS_WAGE_BASE_CENTS - Employee.ytd_ss_wages_cents)
+      taxable_this_paycheck = min(gross_wages_cents, remaining_capacity)
+      ss_withheld_cents = taxable_this_paycheck * SS_RATE_BASIS_POINTS // 10000
+      return ss_withheld_cents
+    input_set: "This Paycheck's gross_wages_cents + Employee.ytd_ss_wages_cents at time of computation"
+    constants:
+      SS_WAGE_BASE_CENTS: 16860000   # $168,600.00 (2025 SSA limit)
+      SS_RATE_BASIS_POINTS: 620      # 6.20%
+    precision: "Integer cents, floor division; SS_WAGE_BASE_CENTS is a strict cap — when Employee.ytd_ss_wages_cents >= SS_WAGE_BASE_CENTS, ss_withheld_cents == 0"
+    variants: []
+
+  - name: medicare_base_calc
+    trigger: "On POST /paychecks; on Paycheck recompute"
+    algorithm: aggregation
+    formula: |
+      medicare_withheld_cents = gross_wages_cents * MEDICARE_RATE_BASIS_POINTS // 10000
+      return medicare_withheld_cents
+    input_set: "This Paycheck's gross_wages_cents"
+    constants:
+      MEDICARE_RATE_BASIS_POINTS: 145   # 1.45%
+    precision: "Integer cents, floor division"
+    variants: []
+
+  - name: medicare_addl_calc
+    trigger: "On POST /paychecks; on Paycheck recompute"
+    algorithm: threshold
+    formula: |
+      # Additional Medicare tax — 0.9% on wages above ADDL_MEDICARE_THRESHOLD_CENTS YTD.
+      prior_ytd = Employee.ytd_medicare_wages_cents
+      new_ytd = prior_ytd + gross_wages_cents
+      taxable_above_threshold = max(0, new_ytd - ADDL_MEDICARE_THRESHOLD_CENTS) - max(0, prior_ytd - ADDL_MEDICARE_THRESHOLD_CENTS)
+      addl_medicare_cents = taxable_above_threshold * ADDL_MEDICARE_RATE_BASIS_POINTS // 10000
+      return addl_medicare_cents
+    input_set: "This Paycheck's gross_wages_cents + Employee.ytd_medicare_wages_cents"
+    constants:
+      ADDL_MEDICARE_THRESHOLD_CENTS: 20000000   # $200,000.00 YTD (single filer rule applied uniformly per employer's per-employee responsibility)
+      ADDL_MEDICARE_RATE_BASIS_POINTS: 90      # 0.90%
+    precision: "Integer cents; boundary semantics — strictly ABOVE the threshold (a paycheck that pushes YTD from $199,999.99 to exactly $200,000.00 contributes 0 cents of additional Medicare; pushing to $200,000.01 contributes 0 cents on the threshold dollar and 0.9% on the $0.01 fraction floored to 0). Tested at exact boundaries in §1.8 boundary_precision_check."
+    variants: []
+
+  - name: state_local_withholding
+    trigger: "On POST /paychecks; on Paycheck recompute"
+    algorithm: tiered_pricing
+    formula: |
+      # Two passes: one over jurisdiction=STATE:<Employee.work_state_code>, one over jurisdiction=LOCAL:<Employee.locality_code> (skipped if locality_code==NONE).
+      # TX and WA have no state income tax: TaxRateTable returns an empty brackets_json and state_withheld_cents=0.
+      # For OVERTIME/DOUBLE/RETRO pay_types: use supplemental_flat_basis_points instead of brackets.
+      for (jurisdiction, target_field) in [(STATE_jurisdiction, state_withheld_cents), (LOCAL_jurisdiction, local_withheld_cents)]:
+        table = TaxRateTable[jurisdiction, pay_date.year, SINGLE]
+        if not table or table.brackets_json is empty:
+          target_field = 0
+          continue
+        if pay_type in {REGULAR}:
+          per_pay_tax = bracket_sum(gross_wages_cents, table.brackets_json)
+        else:
+          per_pay_tax = gross_wages_cents * table.supplemental_flat_basis_points // 10000
+        target_field = max(0, per_pay_tax)
+    input_set: "This Paycheck's gross_wages_cents + Employee.work_state_code, Employee.locality_code + TaxRateTable rows"
+    constants:
+      STATE_JURISDICTIONS_WITH_NO_INCOME_TAX: ["STATE:TX", "STATE:WA"]
+    precision: "Integer cents, floor division"
+    variants: []
+
+  - name: garnishment_waterfall
+    trigger: "On POST /paychecks (after gross + tax withholding computed); recomputed on Paycheck PATCH"
+    algorithm: waterfall_allocation
+    formula: |
+      # CRITICAL ROUNDING ORDER (mode b of combinatorial): the per-order rounding order is FIXED and pinned —
+      # we round PER-ORDER FIRST, then sum the rounded per-order amounts. Reversing the order
+      # (sum-then-round) produces different cents at boundaries; the scaffold pins per-order rounding.
+      #
+      # CRITICAL EVALUATION ORDER (mode c of combinatorial): disposable_earnings depends on tax withholdings,
+      # and the cap-per-paycheck depends on disposable_earnings, yet the per-order amount depends on the cap.
+      # The pinned evaluation order is: (1) compute disposable_earnings, (2) compute paycheck_cap, (3) iterate
+      # orders by priority_rank then served_on ASC, (4) per-order amount = min(weekly_cap_cents, balance_remaining_cents, remaining_paycheck_cap),
+      # (5) floor-divide for proportionality when ties cap out. Reordering changes results.
+      disposable_earnings = gross_wages_cents - (fed_withheld_cents + state_withheld_cents + local_withheld_cents + ss_withheld_cents + medicare_withheld_cents + addl_medicare_cents)
+      paycheck_cap = disposable_earnings * CCPA_MAX_BASIS_POINTS // 10000  # CCPA 25% / 50% / 60% / 65% limit; we use 25% blanket cap for CREDITOR-only; 50% when CHILD_SUPPORT present (no arrears modeled)
+      candidate_orders = sorted(
+        [g for g in GarnishmentOrder where g.employee_id == this.employee_id and g.status == ACTIVE],
+        key = (priority_rank ASC, served_on ASC, created_at ASC)
+      )
+      remaining = paycheck_cap
+      deductions = []
+      for g in candidate_orders:
+        if remaining <= 0:
+          break
+        per_order = min(g.weekly_cap_cents, g.balance_remaining_cents, remaining)
+        if per_order > 0:
+          deductions.append(GarnishmentDeduction(garnishment_order_id=g.id, amount_cents=per_order))
+          remaining -= per_order
+      garnishment_total_cents = sum(d.amount_cents for d in deductions)
+    input_set: "Active GarnishmentOrders for this Employee + this Paycheck's post-tax withholdings"
+    constants:
+      CCPA_MAX_BASIS_POINTS_CREDITOR_ONLY: 2500    # 25.00% when no CHILD_SUPPORT order is active
+      CCPA_MAX_BASIS_POINTS_WITH_CHILD_SUPPORT: 5000  # 50.00% when at least one CHILD_SUPPORT order is ACTIVE
+      CCPA_MAX_BASIS_POINTS: 5000   # Convenience alias — server picks BETWEEN the two based on whether any CHILD_SUPPORT order is ACTIVE for the employee at compute time
+    precision: "Integer cents, floor division; ROUND-PER-ORDER-THEN-SUM (NOT sum-then-round). Tie-break order is (priority_rank ASC, served_on ASC, created_at ASC); never use id."
+    variants: []
+
+  - name: remittance_accrual
+    trigger: "Provisional variant runs on every Paycheck PENDING->PAID side effect; reconciled variant runs on Remittance ACCRUING->RECONCILED transition (close-period)"
+    algorithm: aggregation
+    formula: |
+      # Group by (period_month derived from parent PaycheckRun.pay_date, jurisdiction, tax_type).
+      # PROVISIONAL: incremental update. When a Paycheck p transitions PENDING -> PAID,
+      # for each tax bucket b in {FED_INCOME, FICA_EMPLOYEE, STATE_INCOME, LOCAL_INCOME} on p:
+      #   key = (period_month=p.parent_run.pay_date[:7], jurisdiction=<derived>, tax_type=b)
+      #   Remittance[key].accrued_cents += p[<b_field>]
+      # On Paycheck PAID -> VOID: reverse the same way (subtraction).
+      #
+      # RECONCILED: full recompute over the closed period.
+      # For Remittance r with status ACCRUING and the close-period precondition met:
+      #   r.reconciled_cents = sum over Paychecks p where:
+      #     p.status == PAID
+      #     AND p.parent_run.pay_date[:7] == r.period_month
+      #     AND jurisdiction-and-bucket match r.jurisdiction & r.tax_type
+      #   of p[<bucket_field>]
+      # When NO VOIDs occurred during the month, accrued_cents == reconciled_cents.
+      # When ANY VOID occurred, the provisional incremental updates may have drifted (e.g.
+      # if a void is later reversed and re-PAID, the running totals can differ from the
+      # ground-truth scan), so reconciled_cents is the authoritative number; the difference
+      # is exposed as Remittance.accrued_cents - Remittance.reconciled_cents.
+    input_set:
+      provisional: "Incrementally updated from each Paycheck PAID/VOID transition; included filter = Paycheck.status == PAID"
+      reconciled: "Full re-aggregation; included filter = Paycheck.status == PAID AND parent_run.pay_date[:7] == r.period_month; ordering by created_at ASC for deterministic accumulator replay; tie-break by created_at ASC (NEVER id)"
+    constants: {}
+    precision: "Integer cents; aggregation is exact (no rounding step) since input fields are already integer cents"
+    variants:
+      - name: provisional
+        when: "Remittance.status == ACCRUING; updated incrementally from Paycheck transitions"
+        difference: "Running accumulator over PAID Paychecks. Susceptible to drift if a series of PAID/VOID/PAID cycles fires."
+      - name: reconciled
+        when: "Remittance.status == ACCRUING -> RECONCILED via close-period"
+        difference: "Full re-scan over Paycheck.status==PAID in the period_month, producing reconciled_cents authoritative value"
+
+# =========================================================================
+# §1.4 — Validation Rules Table (Ordered by Priority)
+# =========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role header is present AND is a recognized role from §1.7"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "The role identified by X-User-Role is permitted to call this endpoint per §1.5 + §1.7"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "Every entity id referenced in the URL path exists (e.g., /paycheck-runs/{id} -> PaycheckRun.id; /paychecks/{id} -> Paycheck.id), validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all path-id endpoints"
+
+  - priority: 4
+    category: existence
+    check: "Every FK in the request body resolves (employee_id -> Employee.id; paycheck_run_id -> PaycheckRun.id; garnishment_order_id -> GarnishmentOrder.id; supersedes_w4_id -> W4Form.id when non-null)"
+    error_id: ERR_FK_NOT_FOUND
+    http_status: 404
+    applies_to: "all POST/PATCH that take FK fields"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which the requested transition is allowed (per §1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /paycheck-runs/{id}/approve, POST /paycheck-runs/{id}/reject, POST /paycheck-runs/{id}/pay, POST /paycheck-runs/{id}/void, POST /w4-forms/{id}/file, POST /garnishment-orders/{id}/suspend, POST /garnishment-orders/{id}/reactivate, POST /garnishment-orders/{id}/release, POST /remittances/{id}/close-period, POST /remittances/{id}/remit"
+
+  - priority: 6
+    category: state
+    check: "Employee.status IN {ACTIVE, ON_LEAVE} when filing a W4Form or attaching a Paycheck to the employee in a DRAFT run; TERMINATED is rejected"
+    error_id: ERR_EMPLOYEE_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /w4-forms, POST /paychecks, POST /w4-forms/{id}/file"
+
+  - priority: 7
+    category: business_safety
+    check: "Segregation of duties — POST /paycheck-runs/{id}/approve rejects when X-User-ID == PaycheckRun.prepared_by_user_id"
+    error_id: ERR_SOD_VIOLATION
+    http_status: 403
+    applies_to: "POST /paycheck-runs/{id}/approve"
+
+  - priority: 8
+    category: business_safety
+    check: "POST /garnishment-orders rejects a CHILD_SUPPORT order whose weekly_cap_cents alone would exceed CCPA_MAX_BASIS_POINTS_WITH_CHILD_SUPPORT (50%) of the employee's most recent PAID Paycheck.gross_wages_cents (regulatory safety — prevents over-garnishment at intake)"
+    error_id: ERR_GARNISHMENT_EXCEEDS_CCPA
+    http_status: 422
+    applies_to: "POST /garnishment-orders"
+
+  - priority: 9
+    category: business_referential
+    check: "POST /paychecks rejects a Paycheck whose Employee has no FILED W4Form for the parent run's pay_date.tax_year"
+    error_id: ERR_NO_W4_ON_FILE
+    http_status: 422
+    applies_to: "POST /paychecks"
+
+  - priority: 10
+    category: business_referential
+    check: "POST /w4-forms whose supersedes_w4_id is non-null requires that prior W4Form.status == FILED AND prior W4Form.employee_id == this.employee_id AND prior W4Form.tax_year == this.tax_year"
+    error_id: ERR_SUPERSEDE_TARGET_INVALID
+    http_status: 422
+    applies_to: "POST /w4-forms, POST /w4-forms/{id}/file"
+
+  - priority: 11
+    category: business_temporal
+    check: "POST /paycheck-runs rejects when (pay_period_start, pay_period_end) overlaps any non-VOID PaycheckRun's interval [pay_period_start, pay_period_end] (closed-closed, NO buffer) that already contains a Paycheck for any of the to-be-added employees. Interval semantics: closed-closed, point overlap counts (start == prior.end is a conflict)."
+    error_id: ERR_PAY_PERIOD_OVERLAP
+    http_status: 422
+    applies_to: "POST /paycheck-runs, POST /paychecks"
+
+  - priority: 12
+    category: business_temporal
+    check: "POST /garnishment-orders aggregate-capacity check: sum of weekly_cap_cents over ACTIVE GarnishmentOrders for this Employee + this order's weekly_cap_cents <= CCPA_MAX_BASIS_POINTS-derived capacity (aggregate, not point overlap — distinct interval semantics from priority 11)"
+    error_id: ERR_GARNISHMENT_AGGREGATE_CAP
+    http_status: 422
+    applies_to: "POST /garnishment-orders"
+
+  - priority: 13
+    category: business_fiscal
+    check: "POST /remittances/{id}/remit rejects when paid_cents != reconciled_cents (employer must remit the reconciled amount exactly; partial remittance is not allowed)"
+    error_id: ERR_REMITTANCE_AMOUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /remittances/{id}/remit"
+
+  - priority: 14
+    category: business_fiscal
+    check: "PaycheckRun close-period precondition (priority drops below state) — Remittance.close-period rejects when any PaycheckRun overlapping this period_month is in status DRAFT or APPROVED"
+    error_id: ERR_OPEN_RUN_BLOCKS_CLOSE
+    http_status: 409
+    applies_to: "POST /remittances/{id}/close-period"
+
+  - priority: 15
+    category: business_constraint
+    check: "OCC stale version — request payload's expected_remittance_version must equal current Remittance.version on POST /remittances/{id}/remit"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /remittances/{id}/remit"
+
+  - priority: 16
+    category: business_constraint
+    check: "Required input fields present and well-typed for the endpoint"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST/PATCH"
+
+# =========================================================================
+# §1.5 — API Endpoint Table
+# =========================================================================
+endpoints:
+  # ---------- Employee ----------
+  - method: POST
+    path: "/employees"
+    description: "Register a new employee"
+    roles: [HRClerk, PlatformAdmin]
+    code: 201
+    input: [full_name, work_state_code, residence_state_code, "locality_code?"]
+    output: Employee
+    side_effects: ["Employee row created with status=ACTIVE and all YTD fields initialized to 0"]
+
+  - method: GET
+    path: "/employees/{id}"
+    description: "Retrieve an employee"
+    roles: [HRClerk, PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Employee
+    side_effects: []
+
+  - method: GET
+    path: "/employees"
+    description: "List employees with pagination"
+    roles: [HRClerk, PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "status?", "work_state_code?"]
+    output: Employee[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/employees/{id}/status"
+    description: "Update Employee.status (e.g., ACTIVE -> TERMINATED)"
+    roles: [HRClerk, PlatformAdmin]
+    code: 200
+    input: [status]
+    output: Employee
+    side_effects: ["Employee.status updated; Paychecks attached to DRAFT runs after this point will fail validation priority 6"]
+
+  # ---------- W4Form ----------
+  - method: POST
+    path: "/w4-forms"
+    description: "Create a W-4 form in DRAFT (pre-fill with defaults)"
+    roles: [HRClerk, PayrollPreparer]
+    code: 201
+    input: [employee_id, tax_year, filing_status, "dependents_amount_cents?", "other_income_cents?", "deductions_cents?", "extra_withholding_cents?", "supersedes_w4_id?"]
+    output: W4Form
+    side_effects: ["W4Form row created with status=DRAFT, filed_at=null"]
+
+  - method: POST
+    path: "/w4-forms/{id}/file"
+    description: "File the W-4 (DRAFT -> FILED)"
+    roles: [HRClerk, PayrollPreparer]
+    code: 200
+    input: []
+    output: W4Form
+    side_effects:
+      - "W4Form.status -> FILED, filed_at = NOW_UTC"
+      - "If supersedes_w4_id is set: prior W4Form.status -> SUPERSEDED"
+      - "Any Paycheck PENDING for this employee in any DRAFT PaycheckRun: federal_withheld_cents recomputed per §1.3 federal_withholding_provisional"
+
+  - method: GET
+    path: "/w4-forms/{id}"
+    description: "Retrieve a W-4 form"
+    roles: [HRClerk, PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: []
+    output: W4Form
+    side_effects: []
+
+  - method: GET
+    path: "/w4-forms"
+    description: "List W-4 forms; supports employee_id filter (reverse-reachability GET for Employee->W4Form FK)"
+    roles: [HRClerk, PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "employee_id?", "tax_year?", "status?", "supersedes_w4_id?"]
+    output: W4Form[]
+    side_effects: []
+
+  # ---------- PaycheckRun ----------
+  - method: POST
+    path: "/paycheck-runs"
+    description: "Create a paycheck run (DRAFT)"
+    roles: [PayrollPreparer]
+    code: 201
+    input: [pay_period_start, pay_period_end, pay_date]
+    output: PaycheckRun
+    side_effects: ["PaycheckRun row created with status=DRAFT, prepared_by_user_id=X-User-ID, total_gross_cents=0"]
+
+  - method: POST
+    path: "/paycheck-runs/{id}/approve"
+    description: "Approve a DRAFT run (segregation of duties enforced)"
+    roles: [PayrollApprover]
+    code: 200
+    input: []
+    output: PaycheckRun
+    side_effects: ["PaycheckRun.status -> APPROVED; PaycheckRun.approved_by_user_id = X-User-ID"]
+
+  - method: POST
+    path: "/paycheck-runs/{id}/reject"
+    description: "Revert APPROVED -> DRAFT for correction"
+    roles: [PayrollApprover]
+    code: 200
+    input: []
+    output: PaycheckRun
+    side_effects: ["PaycheckRun.status -> DRAFT; PaycheckRun.approved_by_user_id -> null"]
+
+  - method: POST
+    path: "/paycheck-runs/{id}/pay"
+    description: "Mark APPROVED run as PAID; triggers cascades (Paycheck PENDING->PAID, Employee YTD update, GarnishmentOrder debit, Remittance accrual). When is_year_end_run==true, fed_withheld_cents is re-computed using the §1.3 federal_withholding_reconciled variant first."
+    roles: [PayrollApprover]
+    code: 200
+    input: ["is_year_end_run?"]
+    output: PaycheckRun
+    side_effects:
+      - "PaycheckRun.status -> PAID"
+      - "If is_year_end_run==true: child Paychecks fed_withheld_cents replaced with reconciled variant output"
+      - "All child Paychecks: status PENDING -> PAID"
+      - "Employee.ytd_* fields updated for each affected employee"
+      - "GarnishmentOrder.balance_remaining_cents decremented per GarnishmentDeduction; status -> SATISFIED if reaches 0"
+      - "Remittance.accrued_cents updated for (period_month, jurisdiction, tax_type) tuples; rows created if missing"
+
+  - method: POST
+    path: "/paycheck-runs/{id}/void"
+    description: "Reverse a PAID run (compensating action)"
+    roles: [PayrollApprover, ComplianceOfficer]
+    code: 200
+    input: []
+    output: PaycheckRun
+    side_effects:
+      - "PaycheckRun.status -> VOID"
+      - "All child Paychecks: status PAID -> VOID"
+      - "Employee.ytd_* reversed"
+      - "GarnishmentOrder.balance_remaining_cents restored; SATISFIED -> ACTIVE if applicable"
+      - "Remittance.accrued_cents reversed"
+
+  - method: GET
+    path: "/paycheck-runs/{id}"
+    description: "Retrieve a paycheck run"
+    roles: [PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: []
+    output: PaycheckRun
+    side_effects: []
+
+  - method: GET
+    path: "/paycheck-runs"
+    description: "List paycheck runs"
+    roles: [PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "status?", "pay_date_from?", "pay_date_to?"]
+    output: PaycheckRun[]
+    side_effects: []
+
+  # ---------- Paycheck ----------
+  - method: POST
+    path: "/paychecks"
+    description: "Create a Paycheck under a DRAFT PaycheckRun; triggers gross_wages_calc + all withholding calcs + garnishment_waterfall"
+    roles: [PayrollPreparer]
+    code: 201
+    input: [paycheck_run_id, employee_id, pay_type, "regular_hours_e2?", "overtime_hours_e2?", "double_hours_e2?", "retro_amount_cents?", "hourly_rate_cents?"]
+    output: Paycheck
+    side_effects:
+      - "Paycheck row created with status=PENDING"
+      - "gross_wages_cents = output of §1.3 gross_wages_calc"
+      - "fed_withheld_cents = output of §1.3 federal_withholding_provisional"
+      - "state_withheld_cents, local_withheld_cents = output of §1.3 state_local_withholding"
+      - "ss_withheld_cents = output of §1.3 fica_ss_calc"
+      - "medicare_withheld_cents = output of §1.3 medicare_base_calc"
+      - "addl_medicare_cents = output of §1.3 medicare_addl_calc"
+      - "GarnishmentDeduction children created and garnishment_total_cents set per §1.3 garnishment_waterfall"
+      - "net_pay_cents = gross_wages_cents - sum(withholdings) - garnishment_total_cents (floored at 0)"
+      - "PaycheckRun.total_gross_cents += this paycheck's gross_wages_cents"
+
+  - method: GET
+    path: "/paychecks/{id}"
+    description: "Retrieve a paycheck"
+    roles: [PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin, HRClerk]
+    code: 200
+    input: []
+    output: Paycheck
+    side_effects: []
+
+  - method: GET
+    path: "/paycheck-runs/{id}/paychecks"
+    description: "List Paychecks under a PaycheckRun (sub-resource FK reverse-reachability for Paycheck.paycheck_run_id)"
+    roles: [PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Paycheck[]
+    side_effects: []
+
+  - method: GET
+    path: "/paychecks"
+    description: "List paychecks with filters (reverse-reachability for Paycheck.employee_id via employee_id filter)"
+    roles: [PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin, HRClerk]
+    code: 200
+    input: ["limit?", "offset?", "employee_id?", "paycheck_run_id?", "status?", "pay_type?"]
+    output: Paycheck[]
+    side_effects: []
+
+  # ---------- GarnishmentOrder ----------
+  - method: POST
+    path: "/garnishment-orders"
+    description: "Register a garnishment order on an Employee"
+    roles: [ComplianceOfficer]
+    code: 201
+    input: [employee_id, order_type, weekly_cap_cents, original_balance_cents, served_on]
+    output: GarnishmentOrder
+    side_effects:
+      - "GarnishmentOrder row created with status=ACTIVE"
+      - "priority_rank pinned: 1=CHILD_SUPPORT, 2=IRS_LEVY, 3=STUDENT_LOAN, 4=CREDITOR"
+      - "balance_remaining_cents = original_balance_cents"
+
+  - method: POST
+    path: "/garnishment-orders/{id}/suspend"
+    description: "Suspend a garnishment order"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: GarnishmentOrder
+    side_effects: ["GarnishmentOrder.status -> SUSPENDED"]
+
+  - method: POST
+    path: "/garnishment-orders/{id}/reactivate"
+    description: "Reactivate a SUSPENDED garnishment order"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: GarnishmentOrder
+    side_effects: ["GarnishmentOrder.status -> ACTIVE"]
+
+  - method: POST
+    path: "/garnishment-orders/{id}/release"
+    description: "Release a garnishment order (court-ordered terminal)"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: GarnishmentOrder
+    side_effects: ["GarnishmentOrder.status -> RELEASED"]
+
+  - method: GET
+    path: "/garnishment-orders/{id}"
+    description: "Retrieve a garnishment order"
+    roles: [PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin, HRClerk]
+    code: 200
+    input: []
+    output: GarnishmentOrder
+    side_effects: []
+
+  - method: GET
+    path: "/garnishment-orders"
+    description: "List garnishment orders (reverse-reachability for GarnishmentOrder.employee_id via employee_id filter)"
+    roles: [PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin, HRClerk]
+    code: 200
+    input: ["limit?", "offset?", "employee_id?", "status?", "order_type?"]
+    output: GarnishmentOrder[]
+    side_effects: []
+
+  - method: GET
+    path: "/garnishment-deductions/{id}"
+    description: "Retrieve a single GarnishmentDeduction (single-resource GET so the lint can derive its collection segment for FK reverse-reachability)"
+    roles: [PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin, HRClerk]
+    code: 200
+    input: []
+    output: GarnishmentDeduction
+    side_effects: []
+
+  - method: GET
+    path: "/paychecks/{id}/garnishment-deductions"
+    description: "List GarnishmentDeductions under a Paycheck (sub-resource FK reverse-reachability for GarnishmentDeduction.paycheck_id)"
+    roles: [PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin, HRClerk]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: GarnishmentDeduction[]
+    side_effects: []
+
+  - method: GET
+    path: "/garnishment-deductions"
+    description: "List GarnishmentDeductions (reverse-reachability for GarnishmentDeduction.garnishment_order_id via filter)"
+    roles: [PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin, HRClerk]
+    code: 200
+    input: ["limit?", "offset?", "garnishment_order_id?", "paycheck_id?"]
+    output: GarnishmentDeduction[]
+    side_effects: []
+
+  # ---------- Remittance ----------
+  - method: GET
+    path: "/remittances/{id}"
+    description: "Retrieve a remittance row (includes version for OCC reads)"
+    roles: [PayrollApprover, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Remittance
+    side_effects: []
+
+  - method: GET
+    path: "/remittances"
+    description: "List remittances; filters by period_month / jurisdiction / tax_type / status"
+    roles: [PayrollApprover, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "period_month?", "jurisdiction?", "tax_type?", "status?"]
+    output: Remittance[]
+    side_effects: []
+
+  - method: POST
+    path: "/remittances/{id}/close-period"
+    description: "Close the accrual period for a Remittance (ACCRUING -> RECONCILED)"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Remittance
+    side_effects:
+      - "Remittance.status -> RECONCILED"
+      - "Remittance.reconciled_cents computed per §1.3 remittance_accrual reconciled variant (full re-scan)"
+      - "Remittance.version incremented by 1"
+
+  - method: POST
+    path: "/remittances/{id}/remit"
+    description: "Mark a reconciled Remittance as REMITTED with paid_cents (OCC-guarded)"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: [paid_cents, expected_remittance_version]
+    output: Remittance
+    side_effects:
+      - "Remittance.status -> REMITTED"
+      - "Remittance.paid_cents = request.paid_cents"
+      - "Remittance.version incremented by 1"
+
+  # ---------- TaxRateTable ----------
+  - method: POST
+    path: "/tax-rate-tables"
+    description: "Insert or replace a tax-rate-table row (configuration data)"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [jurisdiction, tax_year, filing_status, brackets_json, supplemental_flat_basis_points]
+    output: TaxRateTable
+    side_effects: ["TaxRateTable row created"]
+
+  - method: GET
+    path: "/tax-rate-tables"
+    description: "List tax-rate-table rows"
+    roles: [HRClerk, PayrollPreparer, PayrollApprover, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "jurisdiction?", "tax_year?", "filing_status?"]
+    output: TaxRateTable[]
+    side_effects: []
+
+  # ---------- Test-driving endpoints (under /_<name>) ----------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving endpoint: set the server's NOW_UTC clock for time-sensitive transitions"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["NOW_UTC = to_iso8601 for all subsequent transitions"]
+
+  - method: POST
+    path: "/_employees/{id}/set_ytd"
+    description: "Test-driving endpoint: directly seed an Employee's YTD wage / tax fields to a target value, bypassing the natural Paycheck cascade. Required to reach §1.8 boundary_precision_check states near $200,000 YTD without authoring 26 paychecks."
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["ytd_wages_cents?", "ytd_fed_withheld_cents?", "ytd_ss_wages_cents?", "ytd_medicare_wages_cents?"]
+    output: Employee
+    side_effects: ["The named YTD fields on the Employee are overwritten with the request values; updated_at refreshed; version incremented"]
+
+# =========================================================================
+# §1.6 — Error Code Catalog
+# =========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role header missing or unrecognized"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Role not permitted for endpoint per §1.5+§1.7"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Path id does not resolve to an entity"
+  - id: ERR_FK_NOT_FOUND
+    http: 404
+    condition: "FK in request body does not resolve"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource is not in a state from which the requested transition is allowed"
+  - id: ERR_EMPLOYEE_NOT_ACTIVE
+    http: 409
+    condition: "Operation requires Employee.status IN {ACTIVE, ON_LEAVE} but the employee is TERMINATED"
+  - id: ERR_SOD_VIOLATION
+    http: 403
+    condition: "X-User-ID at /approve matches PaycheckRun.prepared_by_user_id (segregation-of-duties)"
+  - id: ERR_GARNISHMENT_EXCEEDS_CCPA
+    http: 422
+    condition: "Single CHILD_SUPPORT garnishment weekly_cap exceeds CCPA 50% cap on the employee's most recent PAID Paycheck"
+  - id: ERR_NO_W4_ON_FILE
+    http: 422
+    condition: "POST /paychecks but the Employee has no FILED W4Form for the parent run's pay_date.tax_year"
+  - id: ERR_SUPERSEDE_TARGET_INVALID
+    http: 422
+    condition: "supersedes_w4_id references a W-4 not in FILED status, wrong employee, or wrong tax_year"
+  - id: ERR_PAY_PERIOD_OVERLAP
+    http: 422
+    condition: "Pay period [start,end] (closed-closed) collides with an existing non-VOID PaycheckRun for at least one of the affected employees"
+  - id: ERR_GARNISHMENT_AGGREGATE_CAP
+    http: 422
+    condition: "Sum of weekly caps over ACTIVE garnishments + new order's weekly_cap exceeds CCPA aggregate capacity"
+  - id: ERR_REMITTANCE_AMOUNT_MISMATCH
+    http: 422
+    condition: "POST /remittances/{id}/remit paid_cents != reconciled_cents"
+  - id: ERR_OPEN_RUN_BLOCKS_CLOSE
+    http: 409
+    condition: "POST /remittances/{id}/close-period and an overlapping PaycheckRun is still DRAFT or APPROVED"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "OCC expected_remittance_version != current Remittance.version"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Required field missing, wrong type, or out-of-range enum value"
+
+# =========================================================================
+# §1.7 — RBAC Matrix
+# =========================================================================
+roles:
+  - name: HRClerk
+    description: "Manages employees and W-4 forms; cannot prepare or approve paycheck runs"
+    identity: opaque
+    exclusive_operations:
+      - "PATCH /employees/{id}/status (shared with PlatformAdmin)"
+    shared_operations:
+      - "POST /employees, GET /employees, GET /employees/{id}"
+      - "POST /w4-forms, POST /w4-forms/{id}/file, GET /w4-forms, GET /w4-forms/{id}"
+      - "GET /paychecks, GET /paychecks/{id}"
+      - "GET /garnishment-orders, GET /garnishment-orders/{id}, GET /garnishment-deductions, GET /paychecks/{id}/garnishment-deductions"
+      - "GET /tax-rate-tables"
+
+  - name: PayrollPreparer
+    description: "Creates paycheck runs and paychecks; segregation-of-duties forbids approving own runs"
+    identity: opaque
+    exclusive_operations:
+      - "POST /paycheck-runs"
+      - "POST /paychecks"
+    shared_operations:
+      - "POST /w4-forms (with HRClerk)"
+      - "GET /paycheck-runs, GET /paycheck-runs/{id}, GET /paycheck-runs/{id}/paychecks"
+      - "GET /paychecks, GET /paychecks/{id}"
+      - "GET /employees, GET /employees/{id}"
+      - "GET /w4-forms, GET /w4-forms/{id}"
+      - "GET /garnishment-orders, GET /garnishment-orders/{id}, GET /garnishment-deductions, GET /paychecks/{id}/garnishment-deductions"
+      - "GET /tax-rate-tables"
+
+  - name: PayrollApprover
+    description: "Approves, rejects, pays, and voids paycheck runs; SoD enforces approver != preparer"
+    identity: opaque
+    exclusive_operations:
+      - "POST /paycheck-runs/{id}/approve"
+      - "POST /paycheck-runs/{id}/reject"
+      - "POST /paycheck-runs/{id}/pay"
+    shared_operations:
+      - "POST /paycheck-runs/{id}/void (shared with ComplianceOfficer)"
+      - "GET /paycheck-runs, GET /paycheck-runs/{id}, GET /paycheck-runs/{id}/paychecks"
+      - "GET /paychecks, GET /paychecks/{id}"
+      - "GET /employees, GET /employees/{id}"
+      - "GET /w4-forms, GET /w4-forms/{id}"
+      - "GET /garnishment-orders, GET /garnishment-orders/{id}, GET /garnishment-deductions, GET /paychecks/{id}/garnishment-deductions"
+      - "GET /remittances, GET /remittances/{id}"
+      - "GET /tax-rate-tables"
+
+  - name: ComplianceOfficer
+    description: "Owns garnishment orders, remittance close/remit, and emergency voids"
+    identity: opaque
+    exclusive_operations:
+      - "POST /garnishment-orders"
+      - "POST /garnishment-orders/{id}/suspend"
+      - "POST /garnishment-orders/{id}/reactivate"
+      - "POST /garnishment-orders/{id}/release"
+      - "POST /remittances/{id}/close-period"
+      - "POST /remittances/{id}/remit"
+    shared_operations:
+      - "POST /paycheck-runs/{id}/void (shared with PayrollApprover)"
+      - "GET /remittances, GET /remittances/{id}"
+      - "GET /garnishment-orders, GET /garnishment-orders/{id}, GET /garnishment-deductions, GET /paychecks/{id}/garnishment-deductions"
+      - "GET /paycheck-runs, GET /paycheck-runs/{id}, GET /paycheck-runs/{id}/paychecks"
+      - "GET /paychecks, GET /paychecks/{id}"
+      - "GET /employees, GET /employees/{id}"
+      - "GET /w4-forms, GET /w4-forms/{id}"
+      - "GET /tax-rate-tables"
+
+  - name: PlatformAdmin
+    description: "Operational override: seeds tax-rate tables, advances the test clock, seeds YTD baselines for boundary tests, and reads everything"
+    identity: opaque
+    exclusive_operations:
+      - "POST /tax-rate-tables"
+      - "POST /_clock/set_current_utc"
+      - "POST /_employees/{id}/set_ytd"
+    shared_operations:
+      - "POST /employees (with HRClerk)"
+      - "PATCH /employees/{id}/status (with HRClerk)"
+      - "GET /employees, GET /employees/{id}"
+      - "GET /w4-forms, GET /w4-forms/{id}"
+      - "GET /paycheck-runs, GET /paycheck-runs/{id}, GET /paycheck-runs/{id}/paychecks"
+      - "GET /paychecks, GET /paychecks/{id}"
+      - "GET /garnishment-orders, GET /garnishment-orders/{id}, GET /garnishment-deductions, GET /paychecks/{id}/garnishment-deductions"
+      - "GET /remittances, GET /remittances/{id}"
+      - "GET /tax-rate-tables"

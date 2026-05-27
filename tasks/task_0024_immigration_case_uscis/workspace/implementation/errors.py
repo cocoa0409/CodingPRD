@@ -1,0 +1,29 @@
+"""Domain error classes and error_id constants (scaffold §1.6)."""
+
+
+class APIError(Exception):
+    def __init__(self, error_id: str, http_status: int, message: str = ""):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# error_id constants — verbatim from scaffold §1.6
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+ERR_INVALID_ROLE = "ERR_INVALID_ROLE"
+ERR_FORBIDDEN = "ERR_FORBIDDEN"
+ERR_OWNERSHIP_VIOLATION = "ERR_OWNERSHIP_VIOLATION"
+ERR_NOT_FOUND = "ERR_NOT_FOUND"
+ERR_REFERENCED_NOT_FOUND = "ERR_REFERENCED_NOT_FOUND"
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+ERR_INVALID_STATE = "ERR_INVALID_STATE"
+ERR_ALREADY_TERMINAL = "ERR_ALREADY_TERMINAL"
+ERR_CASE_TYPE_NOT_APPLICABLE = "ERR_CASE_TYPE_NOT_APPLICABLE"
+ERR_RFE_CAP_EXCEEDED = "ERR_RFE_CAP_EXCEEDED"
+ERR_VISA_RETROGRESSED = "ERR_VISA_RETROGRESSED"
+ERR_APPT_TOO_SOON = "ERR_APPT_TOO_SOON"
+ERR_APPT_OVERLAP_SAME_CASE = "ERR_APPT_OVERLAP_SAME_CASE"
+ERR_ASC_SLOT_TAKEN = "ERR_ASC_SLOT_TAKEN"
+ERR_RFE_DEADLINE_PASSED = "ERR_RFE_DEADLINE_PASSED"
+ERR_STALE_VERSION = "ERR_STALE_VERSION"

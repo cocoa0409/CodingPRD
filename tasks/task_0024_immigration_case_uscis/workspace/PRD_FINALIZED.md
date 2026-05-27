@@ -1,0 +1,260 @@
+# USCIS Case Management API — Product Requirements Document
+
+## 1. Introduction
+
+Immigration adjudication at U.S. Citizenship and Immigration Services rests on a small number of forms — chiefly the family petition (I-130), adjustment of status (I-485), employment authorization (I-765), and travel document (I-131) — but the workflow surrounding each is heterogeneous and unforgiving. A petition that misses a Request for Evidence (RFE) deadline by a single calendar day must be abandoned. An adjustment-of-status interview that is scheduled in a month where the priority date has retrogressed against the published Visa Bulletin is not a valid scheduling action, and an approval issued in such a month is itself invalid. Service Centers must mint receipt numbers in a fixed format that callers and downstream systems can parse. Officers carry a portfolio of cases whose mix shifts daily as RFEs are issued and answered, biometrics windows open and close, and clocks march forward against statutory deadlines.
+
+This document specifies a Case Management API that captures that workflow end to end. The system tracks applicants, attorneys of record under G-28, the cases they file, the Application Support Center biometrics that I-485/I-765/I-131 filings require, the RFE rounds an officer may issue, the AOS interview that I-485 cases must clear, the per-month Visa Bulletin entries that gate I-485 progression, and an append-only event log per case. The implementation is built to be exercised by automated tests, so deadline arithmetic is driven by a server-controlled logical clock, not the wall clock, and an operational sweep endpoint exists to expire RFEs deterministically once that clock has advanced past their deadlines.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines system-wide rules that apply uniformly across the API. The API surface is mounted under `/uscis`.
+
+### 2.1. User and Role-Based Access Control
+
+Every request other than the two self-registration endpoints must carry two HTTP headers: `X-User-ID`, identifying the acting user, and `X-User-Role`, declaring the role under which the caller is acting. The system recognises exactly five role names — `Anonymous`, `Applicant`, `Attorney`, `Officer`, and `FieldOfficeAdmin` — and any value outside this set is rejected with `ERR_INVALID_ROLE`. If either header is missing on a protected endpoint, the request is rejected with `ERR_UNAUTHENTICATED`. If the role is recognised but is not in the called endpoint's authorised set, the request is rejected with `ERR_FORBIDDEN`.
+
+The five roles split into two identity classes. The `Anonymous` role is an opaque, unauthenticated identity used solely for the two self-registration endpoints (one for applicants, one for attorneys); the server does not compare its `X-User-ID` to any persisted record. The `Applicant` role is entity-backed: when `X-User-Role` is `Applicant`, `X-User-ID` must be the `id` of the acting `Applicant`, and ownership checks on any case being mutated compare the case's `applicant_id` to `X-User-ID`. The `Attorney` role is likewise entity-backed: when `X-User-Role` is `Attorney`, `X-User-ID` must be the `id` of the acting `Attorney`, and ownership checks compare the case's `attorney_id` to `X-User-ID`. The `Officer` role is an opaque operator identifier not tied to any persisted entity; the server records it on `Case.assigned_officer_id` at filing time but does not compare it to any entity's `id`. The `FieldOfficeAdmin` role is likewise opaque and is reserved for operational endpoints — publishing visa bulletin entries, reading per-officer workload, advancing the logical clock for tests, and running the RFE deadline sweep.
+
+When an applicant or attorney attempts to act on a case that is not their own (for an applicant, a case whose `applicant_id` does not match `X-User-ID`; for an attorney, a case whose `attorney_id` does not match), the request is rejected with `ERR_OWNERSHIP_VIOLATION`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+List endpoints accept two query parameters. The `limit` parameter caps the number of items returned: it defaults to 10, with a minimum of 1 and a maximum of 100. The `offset` parameter is the number of leading items to skip and defaults to 0. List endpoints sort their results by `created_at` in ascending order unless explicitly stated otherwise. The `meta` envelope of every list response carries the resolved `limit` and `offset` values, the `total_count` of items matching the filter, and the `has_more` boolean.
+
+### 2.4. Common Resource Properties
+
+Every primary entity in the system — `Applicant`, `Attorney`, `Case`, `BiometricsAppointment`, `RFE`, and `InterviewAppointment` — carries the same four system-managed fields:
+
+- `id` (string): a server-minted UUID with no type prefix.
+- `created_at` (string): an ISO 8601 UTC timestamp with three fractional digits, recording when the resource was first created.
+- `updated_at` (string): an ISO 8601 UTC timestamp with the same format, refreshed on every mutation of the resource.
+- `version` (integer): a monotonically increasing counter that starts at 1 on creation and increments by exactly one on every mutation. It is the basis for the optimistic concurrency control described in §2.10.
+
+Two entities do not follow this convention. A `VisaBulletinEntry` is treated as an immutable published record once stored, and a `CaseEvent` is an immutable audit row appended to a case's event log; both carry `id` and `created_at` but do not expose `updated_at` and have no `version`. The `ClockState` is a singleton record (with `id` fixed at `clock`) used only as a server-controlled "now"; it likewise has no `updated_at` and no `version`.
+
+### 2.5. Logical Clock and Deadline Mathematics
+
+The server does not consult wall-clock time when evaluating temporal preconditions. Instead, every deadline computation, every "appointment must be at least seven days in the future" check, and every Visa Bulletin month resolution reads `ClockState.current_utc` — the singleton ISO 8601 UTC timestamp that the server treats as "now". An administrator-only test-driving capability accepts a `to_iso8601` value and overwrites `ClockState.current_utc`, allowing tests to advance the logical clock across deadlines, biometrics windows, and bulletin months without sleeping.
+
+Calendar arithmetic in this system is whole-day: when a deadline is computed as a date plus a number of days, the result is an ISO date with no time component, and date comparisons throughout the system are whole-day. Where strictness matters, the contract is stated explicitly with the §3 rules that depend on it (RFE deadline boundary, visa availability comparison).
+
+### 2.6. Receipt Number Format
+
+The `receipt_number` minted at filing time is a 13-character identifier with a fixed shape: a three-letter service-center prefix, followed by a two-digit year, followed by a three-digit day-of-year, followed by a five-digit sequence number. The permitted service-center prefixes are exactly the set `NBC`, `MSC`, `SRC`, `EAC`, `WAC`, `LIN`, `YSC`, `NSC`, `VSC`, and `TSC`; concretely, every minted `receipt_number` matches the regular expression `^(NBC|MSC|SRC|EAC|WAC|LIN|YSC|NSC|VSC|TSC)\d{10}$`. Receipt numbers are unique across the system. Applicant `alien_number` values follow the analogous shape `A` followed by nine digits (matching `^A\d{9}$`) and are likewise unique, as is each applicant `email` and each attorney `bar_number`.
+
+### 2.7. Cascading Mutations and Hierarchical Consistency
+
+A `Case` is the root of an audit-trailed aggregate. Several operations on a child resource — completing a biometrics appointment, completing an interview, responding to an RFE, marking a biometrics or interview no-show, sweeping an RFE past its deadline — both mutate the child and cascade to the parent `Case`. Every cascade that mutates a `Case` refreshes the case's `updated_at` and increments the case's `version` by one, and the same operation appends one or more rows to the case's event log via `CaseEvent` (see §3.7). Where a transition has both a child-level and a parent-level side effect, the two are part of the same logical mutation: the implementation must treat them atomically so that a successful child status change is always accompanied by the parent cascade and the corresponding event-log append.
+
+### 2.8. Nested Resource Retrieval
+
+When an endpoint's path carries more than one resource identifier, the server validates them in left-to-right order and returns `ERR_NOT_FOUND` (HTTP 404) for the first identifier that does not resolve. Foreign keys carried in the request body are validated after the path: a body-supplied identifier that does not resolve yields `ERR_REFERENCED_NOT_FOUND` (HTTP 404).
+
+### 2.9. Monetary Precision
+
+All monetary values are recorded in whole cents as integers. The single calculated monetary field in the system — `filing_fee_cents` on a `Case` — is the result of a "subtotal then discount then round" sequence; rounding is performed half-up to the nearest whole cent, and is applied exactly once to the final value. See §3.2 for the full filing-fee derivation.
+
+### 2.10. Optimistic Concurrency Control
+
+Two write endpoints require the client to pin the version of the parent `Case` that the request was prepared against. Both endpoints take `expected_case_version` as a non-optional input field carrying the client's last observed `Case.version`. If the value does not equal the case's current `version`, the request is rejected with `ERR_STALE_VERSION` (HTTP 412); no state is mutated.
+
+The first such endpoint is the officer's final-decision capability on a case. The intended scenario this guards against is the one where another writer has issued an RFE (legitimately advancing the case from `UNDER_REVIEW` to `RFE_PENDING` per §3.5) while the deciding officer was preparing a decision: the officer's `expected_case_version` no longer matches the case's current `version`, and the decision is rejected rather than silently overwriting a state the officer did not observe. Note that in this specific race the case has also moved out of the deciding-source state (`UNDER_REVIEW`) into `RFE_PENDING`, so by the priority order in §2.11 the rejection surfaces as `ERR_INVALID_STATE` rather than `ERR_STALE_VERSION`; the OCC pin is the second line of defence that fires when no earlier check (state, ownership, etc.) does.
+
+The second is the applicant's RFE-response capability. The scenario this guards against is the one where the field office has run the deadline sweep (legitimately expiring a separate, time-bound RFE on the same case per §3.6) since the applicant last read the case: the applicant's `expected_case_version` no longer matches, and the response is rejected rather than landing against a stale view of the case.
+
+No other endpoint accepts a version field. Endpoints that mutate child resources but do not require an OCC pin (for example, scheduling biometrics, completing biometrics, marking a no-show, or rescheduling) do not take `expected_case_version`.
+
+### 2.11. Validation Ordering
+
+When a single request would trigger several validation failures, the server returns exactly one error and selects the one with the highest priority. The relative priority, from highest to lowest, is: presence of the auth headers (`ERR_UNAUTHENTICATED`), recognition of the role name (`ERR_INVALID_ROLE`), authorisation of that role for the endpoint (`ERR_FORBIDDEN`), path-templated resource existence (`ERR_NOT_FOUND`), body-supplied foreign-key resolvability (`ERR_REFERENCED_NOT_FOUND`), case ownership (`ERR_OWNERSHIP_VIOLATION`), source-state correctness for the requested transition (`ERR_INVALID_STATE`), terminal-state preclusion (`ERR_ALREADY_TERMINAL`), case-type applicability (`ERR_CASE_TYPE_NOT_APPLICABLE`), the RFE round cap (`ERR_RFE_CAP_EXCEEDED`), visa availability for I-485 (`ERR_VISA_RETROGRESSED`), the seven-day appointment lead requirement (`ERR_APPT_TOO_SOON`), the same-case appointment-overlap rule (`ERR_APPT_OVERLAP_SAME_CASE`), the ASC location point-instant capacity rule (`ERR_ASC_SLOT_TAKEN`), the RFE submission-deadline strictness rule (`ERR_RFE_DEADLINE_PASSED`), the OCC stale-version rule (`ERR_STALE_VERSION`), and finally, the request shape (`ERR_INVALID_REQUEST`).
+
+In particular this means that auth failures always mask any downstream business failure, an unknown path id always masks an ownership mismatch, a wrong source state always masks a case-type or visa-retrogression issue, and the OCC stale-version check is evaluated late: if the same request would have failed a state check or an appointment-overlap check, the client sees that more specific error rather than `ERR_STALE_VERSION`. The two self-registration endpoints — applicant and attorney — are the only operations exempt from the auth-presence and role-recognition checks.
+
+### 2.12. Status Code Conventions
+
+Operations that create a brand-new resource (e.g., creating a draft case, scheduling a fresh biometrics appointment, issuing a new RFE, scheduling an interview, publishing a visa bulletin entry, registering an applicant or attorney) return `201 Created`. Operations that modify an existing resource — including the case lifecycle transitions reached via `file`, `advance-review`, `decide`, and `respond`, and the biometrics/interview status changes — return `200 OK`.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Actors, Onboarding, and the Anatomy of a Case
+
+The system has five role identities (§2.1) but only two persisted user entities. An applicant is created via the self-registration endpoint, which accepts the applicant's `alien_number`, `full_name`, `date_of_birth`, `country_of_chargeability`, and `email`. The `alien_number` is the canonical A-Number identifier and is unique across applicants; the `email` is likewise unique, and the `country_of_chargeability` is constrained to one of `WORLDWIDE`, `CHINA`, `INDIA`, `MEXICO`, or `PHILIPPINES` — the five buckets the Visa Bulletin partitions priority dates by. An attorney is created via its own self-registration endpoint with the attorney's `bar_number`, `full_name`, and `firm_name`; the `bar_number` is unique. No `X-User-Role` or `X-User-ID` is required to call either self-registration endpoint, but every other endpoint requires both.
+
+A `Case` is created in `DRAFT` status by an applicant or attorney. The creation payload carries the principal `applicant_id`, an optional `attorney_id` (which is set when an attorney files a G-28 representation and is nullable when the applicant is self-represented), the `case_type` — one of `I-130`, `I-485`, `I-765`, or `I-131` — and a `preference_category` drawn from `F1`, `F2A`, `F2B`, `F3`, `F4`, or `IR`. The `preference_category` is required when `case_type` is `I-130`. For non-`I-130` case types it is optional: when omitted, the case stores `preference_category = null`; when supplied, the value is validated against the enum and stored verbatim on the case (this is how an `I-485` case acquires the `preference_category` referenced by the visa-availability gate in §3.5). At creation time the case carries no `receipt_number`, no `file_date`, no `priority_date`, no `filing_fee_cents`, and no `assigned_officer_id`; these are server-stamped at the filing transition described in §3.2. The case's `rfe_round_count` is initialised to 0.
+
+### 3.2. Filing a Case: From DRAFT to FILED
+
+An applicant (acting on their own case) or an attorney (acting on a represented case) advances a case from `DRAFT` to `FILED`. The preconditions are that the case is in `DRAFT`, that `case_type` is set, that the referenced applicant exists, and that if `case_type` is `I-130` then `preference_category` is one of `F1`, `F2A`, `F2B`, `F3`, `F4`, or `IR`. On a successful transition, the server performs several side effects in a single logical step. It mints the `receipt_number` in the format described in §2.6. It stamps `file_date` to the calendar-date portion of `ClockState.current_utc` (the first ten characters of the ISO 8601 timestamp). It stamps `priority_date` equal to `file_date` — for the case types in scope (`I-130`, `I-485`, `I-765`, `I-131`) there is no separate labor-certification date and the two are identical. It recomputes the applicant's `is_under_14` flag against the new `file_date`: `is_under_14` is true exactly when the applicant's age in completed years at `file_date`, derived from `date_of_birth`, is strictly less than 14. It assigns an officer from the server's officer pool in round-robin order, writing the opaque officer identifier into `assigned_officer_id`. It computes and stamps `filing_fee_cents` as described below. It appends a `CaseEvent` of type `STATUS_CHANGE` with `from_status` `DRAFT` and `to_status` `FILED`, a `CaseEvent` of type `FEE_ASSESSED` with the computed fee in its `payload_json`, and a `CaseEvent` of type `OFFICER_ASSIGNED` with the assigned officer identifier in its `payload_json`. Finally it increments `Case.version` by one.
+
+The filing fee is derived from the case type, a flat biometrics surcharge that depends on whether biometrics are required, and a child discount that applies only to a specific configuration. The base fee in whole cents is fixed per case type: an `I-130` is 56,000 cents (560 dollars), an `I-485` is 142,000 cents (1,420 dollars), an `I-765` is 41,000 cents (410 dollars), and an `I-131` is 63,000 cents (630 dollars). A biometrics surcharge of 8,500 cents (85 dollars) is added when the case type is `I-485`, `I-765`, or `I-131`; the `I-130` case type skips biometrics in this scope (see §3.3) and therefore carries no surcharge. The subtotal is the sum of the base fee and the surcharge. When the case type is `I-485` and the applicant's `is_under_14` flag is true at the file date, a child discount of 25 percent is applied to that subtotal — that is, the subtotal is multiplied by 0.75 — and the result is rounded half-up to a whole-cent integer; this rounding is applied exactly once, to the discounted value, and not separately to the base and surcharge components. In every other configuration, no discount applies and the fee equals the subtotal (already a whole-cent integer).
+
+### 3.3. Biometrics: I-485, I-765, and I-131 Cases
+
+Biometrics are required for `I-485`, `I-765`, and `I-131` cases and are skipped entirely for `I-130` cases. After filing, an officer schedules a biometrics appointment by supplying a `scheduled_at` instant and an `asc_location_code` naming the Application Support Center. The case must currently be in `FILED`; the request is rejected with `ERR_CASE_TYPE_NOT_APPLICABLE` when applied to an `I-130` case. The `scheduled_at` value must be at least seven days after `ClockState.current_utc`; otherwise the request is rejected with `ERR_APPT_TOO_SOON`. A new biometrics appointment must not collide with any other `SCHEDULED` biometrics appointment on the same case under a half-open 60-minute interval rule: an appointment occupies the interval that starts at its `scheduled_at` and ends 60 minutes later, the interval is closed at the start and open at the end, two intervals collide if they overlap geometrically anywhere except a back-to-back boundary where one ends exactly when the next starts (which counts as no collision), and any geometric intersection under this rule is rejected with `ERR_APPT_OVERLAP_SAME_CASE`. Independently, at any single ASC location identified by `asc_location_code`, the server enforces a per-instant capacity of exactly one for `SCHEDULED` biometrics appointments: two appointments at the same location whose `scheduled_at` instants are equal collide regardless of duration, and the second is rejected with `ERR_ASC_SLOT_TAKEN`. (This second rule is a point-instant collision rule, not a window-overlap rule.) On a successful schedule, a new `BiometricsAppointment` is created with `status` `SCHEDULED` and a `case_id` foreign key to its parent case, the parent case's `status` advances from `FILED` to `BIOMETRICS_SCHEDULED`, a `STATUS_CHANGE` event is appended with the corresponding `from_status` and `to_status`, and the case's `version` increments by one.
+
+An officer completes a biometrics appointment by transitioning the appointment from `SCHEDULED` to `COMPLETED`. The transition requires that the appointment is in `SCHEDULED`, that `ClockState.current_utc` is at or after the appointment's `scheduled_at` (i.e., the moment of the appointment has been reached on the logical clock), and that the parent case is currently in `BIOMETRICS_SCHEDULED`. The side effects are: setting the appointment's `status` to `COMPLETED`, cascading the parent case to `BIOMETRICS_COMPLETED`, appending a `CaseEvent` of type `BIOMETRICS_COMPLETED`, appending a `STATUS_CHANGE` event from `BIOMETRICS_SCHEDULED` to `BIOMETRICS_COMPLETED`, and incrementing `Case.version` by one.
+
+A scheduled biometrics appointment that has not been honoured can be marked as a no-show. The officer may issue the mark-no-show capability only when the appointment is in `SCHEDULED` and `ClockState.current_utc` is at or after the appointment's `scheduled_at` plus 24 hours (the grace window). The appointment's `status` is set to `NO_SHOW` (a terminal state for the appointment), the parent case cascades to the terminal `ABANDONED` status, a `STATUS_CHANGE` event is appended capturing the transition from `BIOMETRICS_SCHEDULED` to `ABANDONED`, and `Case.version` increments by one.
+
+A scheduled biometrics appointment can be rescheduled by an officer. The current appointment must be in `SCHEDULED`, and the supplied `new_scheduled_at` must be at least seven days after `ClockState.current_utc` (rejected with `ERR_APPT_TOO_SOON` otherwise); the new appointment is also subject to the same-case overlap rule and the ASC location point-instant capacity rule (using the supplied `new_asc_location_code`). The current appointment's `status` becomes `RESCHEDULED`, and a fresh `BiometricsAppointment` is created in `SCHEDULED` for the same `case_id` with the new instant and the new location. The parent case's status remains `BIOMETRICS_SCHEDULED`. A `STATUS_CHANGE` event is appended whose `from_status` and `to_status` are both `BIOMETRICS_SCHEDULED` and whose `payload_json` records the rescheduled-from and rescheduled-to instants, and `Case.version` increments by one.
+
+After biometrics are completed, an officer advances the case from `BIOMETRICS_COMPLETED` to `UNDER_REVIEW` via the advance-review capability. The only precondition is that the case is in `BIOMETRICS_COMPLETED`. The case's status becomes `UNDER_REVIEW`, a `STATUS_CHANGE` event is appended, and `Case.version` increments by one. The same advance-review capability also covers the `I-130` branch: when `case_type` is `I-130` and biometrics are skipped, an officer advances the case directly from `FILED` to `UNDER_REVIEW`; this branch requires that the case is in `FILED` and `case_type` is `I-130`, and rejects with `ERR_CASE_TYPE_NOT_APPLICABLE` if the case type is anything other than `I-130` or `BIOMETRICS_COMPLETED` is not the source state. Both branches append a `STATUS_CHANGE` event and increment `Case.version` by one.
+
+### 3.4. The Visa Bulletin
+
+A `FieldOfficeAdmin` publishes Visa Bulletin entries one at a time. Each entry carries a `bulletin_month` formatted as `YYYY-MM` (e.g., `2026-06`), a `preference_category` (one of `F1`, `F2A`, `F2B`, `F3`, `F4`, `IR`), a `country` (the chargeability bucket: one of `WORLDWIDE`, `CHINA`, `INDIA`, `MEXICO`, or `PHILIPPINES`), a `chart_type` (either `FINAL_ACTION` or `FILING_DATE`), and a `cutoff_date` that is either an ISO date or the literal string `CURRENT`. The combination of `bulletin_month`, `preference_category`, `country`, and `chart_type` is unique across entries — there is exactly one entry per (category, country, chart_type) per month.
+
+The system computes visa availability on demand from these entries. The evaluation month is the first seven characters of `ClockState.current_utc` — for example, `2026-06`. To resolve availability for a given case, the server selects the entry whose `bulletin_month` equals the evaluation month and whose other key columns match the case's `preference_category`, the applicant's `country_of_chargeability`, and the requested `chart_type`. If no entry exists for that month, the server falls back to the most recent prior month that has an entry for the same (category, country, chart_type), comparing months by lexicographic ordering of the `YYYY-MM` string. If no entry exists for any prior month either, the result is `RETROGRESSED` (visa unavailable). When an entry is found, the comparison is: if its `cutoff_date` equals `CURRENT`, the result is `CURRENT`; otherwise the result is `CURRENT` precisely when the case's `priority_date` is strictly less than the entry's `cutoff_date`, and `RETROGRESSED` otherwise. The strict inequality matters: if the priority date equals the cutoff date exactly, the result is `RETROGRESSED`, not `CURRENT`.
+
+Two chart-type variants govern when this availability calculation is consulted. The `FINAL_ACTION` variant is the operative one for the I-485 scheduling and approval gates described in §3.7: it reads only entries with `chart_type` `FINAL_ACTION`, and a result of `CURRENT` means the case is eligible to advance toward interview and final approval. The `FILING_DATE` variant is advisory and is exposed through the visa-availability read described below: it reads only entries with `chart_type` `FILING_DATE`, and a result of `CURRENT` under this chart means only that the case may file an I-485 — it does not authorise interview scheduling or approval. Importantly, for the same `(priority_date, preference_category, country, evaluation_month)` tuple the two variants can disagree (for example, `FILING_DATE` may be `CURRENT` while `FINAL_ACTION` is `RETROGRESSED`) when the bulletin's filing-date cutoff falls later than its final-action cutoff. The advisory read on a case returns both, in a single response carrying `final_action`, `filing_date`, and the `evaluation_month` used for the lookup.
+
+### 3.5. Adjudication: UNDER_REVIEW, RFEs, and the Interview Path
+
+Once a case is `UNDER_REVIEW` it sits with the assigned officer for adjudication. From this state the officer has three branches available, depending on case type and circumstances: issuing a Request for Evidence, scheduling an AOS interview (I-485 only), or deciding the case directly (I-130, I-765, and I-131 only).
+
+When an officer issues a Request for Evidence, the case must currently be in `UNDER_REVIEW` and its `rfe_round_count` must be strictly less than 2 — the system caps the number of RFE rounds per case at exactly 2, and a third attempt is rejected with `ERR_RFE_CAP_EXCEEDED`. The officer supplies `evidence_items_requested`, an array of strings naming the evidence categories being requested; the array length must be at least 1 (one or more items requested). On success, a new `RFE` is created with `status` `ISSUED`, an `issued_at` stamped to `ClockState.current_utc`, a `case_id` foreign key to the parent case, and a `response_deadline` computed as described in §3.6. The case's `rfe_round_count` increments by one, the case's `status` advances from `UNDER_REVIEW` to `RFE_PENDING`, a `CaseEvent` of type `RFE_ISSUED` is appended (its `payload_json` carrying the RFE identifier and the computed deadline), a `STATUS_CHANGE` event is appended capturing `from_status` `UNDER_REVIEW` and `to_status` `RFE_PENDING`, and `Case.version` increments by one.
+
+When an officer schedules an AOS interview, several conditions must hold simultaneously. The case must currently be in `UNDER_REVIEW`. Its `case_type` must be `I-485` — interviews in this scope apply only to adjustment-of-status filings, and any other case type is rejected with `ERR_CASE_TYPE_NOT_APPLICABLE`. There must be no open RFE on the case: every `RFE` belonging to the case must already be in either `RESPONDED` or `EXPIRED`. The supplied `scheduled_at` must be at least seven days after `ClockState.current_utc`. And the cross-aggregate visa availability gate must be satisfied: for an I-485 case whose `preference_category` is set, visa availability under the `FINAL_ACTION` chart at the evaluation month derived from `scheduled_at` must be `CURRENT` — concretely, the case's `priority_date` is strictly less than the `cutoff_date` of the corresponding `VisaBulletinEntry` for the applicant's `country_of_chargeability`, or that `cutoff_date` equals the literal `CURRENT`. A retrogressed bulletin month is rejected with `ERR_VISA_RETROGRESSED`. The interview is also subject to the same per-case half-open 60-minute appointment-overlap rule that governs biometrics, applied to interview appointments for the same case; a collision is rejected with `ERR_APPT_OVERLAP_SAME_CASE`. On success, a new `InterviewAppointment` is created in `SCHEDULED` with the supplied `scheduled_at` and `field_office_code`, the case's `status` becomes `INTERVIEW_SCHEDULED`, a `STATUS_CHANGE` event is appended, and `Case.version` increments by one.
+
+When an officer decides a case directly from `UNDER_REVIEW`, the case must be in `UNDER_REVIEW`, the `case_type` must be `I-130`, `I-765`, or `I-131` (an `I-485` case must route through the interview path), there must be no open RFE on the case, the `decision` field in the payload must be either `APPROVE` or `DENY`, and the `expected_case_version` must equal the case's current `version`. On an `APPROVE` decision the case's `status` becomes the terminal `APPROVED`; on a `DENY` decision it becomes the terminal `DENIED`. In either case a `STATUS_CHANGE` event is appended and `Case.version` increments by one.
+
+### 3.6. RFE Lifecycle: Issuance, Response, and the Deadline Sweep
+
+An RFE has its own three-state lifecycle: `ISSUED`, `RESPONDED`, and `EXPIRED`, with both `RESPONDED` and `EXPIRED` terminal. The deadline computation, the response capability, and the sweep that expires unanswered RFEs are at the core of the case management system's compliance dimension.
+
+The `response_deadline` stamped at issuance is exactly 87 calendar days after `issued_at`. Concretely, the server takes the calendar-date portion of `issued_at`, adds 87 whole calendar days, and snaps the result to a date (dropping any time component). The boundary check at submission is strict: a response submitted when `ClockState.current_utc` is strictly less than `response_deadline` is accepted; a response submitted when `ClockState.current_utc` is at or after `response_deadline` is rejected with `ERR_RFE_DEADLINE_PASSED`. Equality counts as late.
+
+When an applicant (or the attorney representing the case) submits an RFE response, the system requires that the RFE is in `ISSUED`, that `ClockState.current_utc` is strictly less than the RFE's `response_deadline`, that the parent case is currently in `RFE_PENDING`, that the acting `Applicant` is the case's principal (i.e., `X-User-ID` equals `Case.applicant_id` when the role is `Applicant`), that `expected_case_version` equals the case's current `version`, and that the payload includes `response_summary`. On success, the RFE's `status` becomes `RESPONDED`, its `responded_at` is stamped to `ClockState.current_utc`, the parent case's `status` cascades back to `UNDER_REVIEW` (a back-edge in the case lifecycle — and importantly, `rfe_round_count` is not reset), a `CaseEvent` of type `RFE_RESPONDED` is appended with the RFE's identifier in its `payload_json`, a `STATUS_CHANGE` event is appended capturing `from_status` `RFE_PENDING` and `to_status` `UNDER_REVIEW`, and `Case.version` increments by one.
+
+When the logical clock advances past an RFE's `response_deadline` and the applicant has not yet responded, the RFE must be expired. The system exposes a `FieldOfficeAdmin` ops-sweep capability that walks every open RFE and, for each one whose `status` is still `ISSUED` and whose `response_deadline` is at or before `ClockState.current_utc`, expires the RFE and abandons its parent case in a single logical step. The RFE's `status` is set to the terminal `EXPIRED`, the parent case's `status` cascades to the terminal `ABANDONED`, a `CaseEvent` of type `RFE_EXPIRED` is appended carrying the RFE identifier, a `STATUS_CHANGE` event is appended capturing `from_status` `RFE_PENDING` and `to_status` `ABANDONED`, and `Case.version` increments by one. The sweep returns a small summary of how many RFEs were expired and how many cases were abandoned in the run, carried as `expired_rfe_count` and `abandoned_case_count`.
+
+### 3.7. Interview, Decision, and Reopen
+
+An interview is completed by the officer once the appointment's `scheduled_at` has been reached on the logical clock. The officer supplies `decision_after_interview`, which must be one of `APPROVE`, `DENY`, or `NEEDS_REVIEW`. The transition requires that the interview is currently in `SCHEDULED`, that `ClockState.current_utc` is at or after `scheduled_at`, and that the parent case is currently in `INTERVIEW_SCHEDULED`. The interview's `status` becomes `COMPLETED`, `decision_after_interview` is stamped on the appointment, the parent case cascades to `INTERVIEW_COMPLETED`, a `CaseEvent` of type `INTERVIEW_COMPLETED` is appended with the recorded decision in its `payload_json`, a `STATUS_CHANGE` event is appended capturing `from_status` `INTERVIEW_SCHEDULED` and `to_status` `INTERVIEW_COMPLETED`, and `Case.version` increments by one.
+
+An interview that is not honoured can be marked as a no-show. The mark-no-show capability requires that the appointment is in `SCHEDULED` and `ClockState.current_utc` is at or after `scheduled_at` plus 24 hours. The appointment's `status` becomes `NO_SHOW` (terminal for the appointment), the parent case cascades to the terminal `ABANDONED`, a `STATUS_CHANGE` event is appended capturing `from_status` `INTERVIEW_SCHEDULED` and `to_status` `ABANDONED`, and `Case.version` increments by one.
+
+From `INTERVIEW_COMPLETED`, the officer issues a final decision through the same decide capability used at §3.5, branching on `decision_after_interview` and the supplied `decision`. To approve the case, the latest `InterviewAppointment.decision_after_interview` must be `APPROVE`, the supplied `decision` must be `APPROVE`, `expected_case_version` must equal the case's current `version`, and — critically — for an `I-485` case the visa availability under the `FINAL_ACTION` chart must still be `CURRENT` at the evaluation month derived from `ClockState.current_utc` at the moment of decision; a retrogression that occurred between the interview's completion and the officer's approval is rejected with `ERR_VISA_RETROGRESSED`. On success the case's `status` becomes the terminal `APPROVED`, a `STATUS_CHANGE` event is appended from `INTERVIEW_COMPLETED` to `APPROVED`, and `Case.version` increments by one. To deny the case, the supplied `decision` must be `DENY`, `expected_case_version` must match, and the case's `status` becomes the terminal `DENIED`, with a `STATUS_CHANGE` event from `INTERVIEW_COMPLETED` to `DENIED` and `Case.version` increments by one. To reopen the case for further adjudication, the latest interview's `decision_after_interview` must be `NEEDS_REVIEW`, the supplied `decision` must be `REOPEN`, `expected_case_version` must match, and the case's `status` cascades back to `UNDER_REVIEW` along a revision back-edge, with a `STATUS_CHANGE` event from `INTERVIEW_COMPLETED` to `UNDER_REVIEW` and `Case.version` increments by one.
+
+Every state-changing operation on a case appends one or more rows to the case's append-only event log. A `CaseEvent` carries the parent `case_id`, an `event_type` drawn from the set `STATUS_CHANGE`, `RFE_ISSUED`, `RFE_RESPONDED`, `RFE_EXPIRED`, `BIOMETRICS_COMPLETED`, `INTERVIEW_COMPLETED`, `FEE_ASSESSED`, `OFFICER_ASSIGNED`, and `VISA_AVAILABILITY_CHECK`, a `payload_json` object carrying any structured information specific to the event kind (for example, an `RFE_ISSUED` event records the RFE identifier and the computed deadline; an `OFFICER_ASSIGNED` event records the assigned officer identifier; a `FEE_ASSESSED` event records the computed fee in cents), and an `occurred_at` ISO 8601 UTC timestamp. For `STATUS_CHANGE` events the `from_status` and `to_status` columns are populated with the prior and new case status; for all other event types these two columns are left null.
+
+### 3.8. Officer Workload
+
+A `FieldOfficeAdmin` can read a single officer's workload through a dedicated read. The system computes two values from one shared pool of cases — every `Case` whose `assigned_officer_id` equals the requested officer identifier and whose `status` is not one of the terminal states `APPROVED`, `DENIED`, or `ABANDONED`. The response carries the requested `officer_id`, a `workload_score` computed under the weighted-complexity variant, and a `case_count` computed under the flat-count variant.
+
+The weighted-complexity variant — the operative workload number — computes a score for each case in the pool and sums those scores. Each case contributes a per-status weight multiplied by an age multiplier. The per-status weights are: a case in `FILED` contributes a weight of 1, a case in `BIOMETRICS_SCHEDULED` contributes 2, a case in `BIOMETRICS_COMPLETED` contributes 3, a case in `UNDER_REVIEW` contributes 4, a case in `RFE_PENDING` contributes 2 (the clock is on the applicant, not the officer, so an open RFE is a lighter touch), a case in `INTERVIEW_SCHEDULED` contributes 5, and a case in `INTERVIEW_COMPLETED` also contributes 5. The age multiplier is one plus the smaller of two values: the case's age in whole days (computed as the difference between the calendar-date portion of `ClockState.current_utc` and the case's `file_date`) divided by 365, and the cap of 1.0. In other words, a freshly filed case carries a multiplier of exactly 1.0, a case one year old or older carries a multiplier of exactly 2.0, and a case in between carries a multiplier on the closed interval from 1.0 to 2.0. The contribution of each case is its status weight multiplied by its multiplier. The `workload_score` is the sum of every case's contribution, rounded half-up to two decimal places. The rounding is applied exactly once to the final sum — never per case — to avoid accumulated rounding drift.
+
+The flat-count variant — exposed as `case_count` — is the number of cases in the same pool. It ignores status weights and age multipliers entirely, returning an integer count. For an officer with even a single case in a status whose weight is not 1 or whose age is greater than zero, the two variants will differ by construction.
+
+## 4. Endpoint Definitions
+
+Operations that create a brand-new resource return `201 Created`; operations that modify an existing resource (including the case lifecycle transitions and the biometrics, interview, and RFE status changes that they cascade) return `200 OK`. List endpoints page their results with the `limit` and `offset` query parameters described in §2.3.
+
+| Method | Path                                            | Description                                                                                                     | Authorized Role(s)                                          |
+| ------ | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| POST   | `/uscis/applicants/register`                    | Self-register a new applicant; no auth required.                                                                | Anonymous                                                   |
+| POST   | `/uscis/attorneys/register`                     | Self-register a new attorney; no auth required.                                                                 | Anonymous                                                   |
+| GET    | `/uscis/applicants/{id}`                        | Get an applicant.                                                                                               | Applicant, Attorney, Officer, FieldOfficeAdmin              |
+| GET    | `/uscis/attorneys/{id}`                         | Get an attorney.                                                                                                | Applicant, Attorney, Officer, FieldOfficeAdmin              |
+| POST   | `/uscis/cases`                                  | Create a DRAFT case (no fees, no receipt yet).                                                                  | Applicant, Attorney                                         |
+| GET    | `/uscis/cases/{id}`                             | Get a case.                                                                                                     | Applicant, Attorney, Officer, FieldOfficeAdmin              |
+| GET    | `/uscis/cases`                                  | List cases with filters.                                                                                        | Officer, FieldOfficeAdmin                                   |
+| POST   | `/uscis/cases/{id}/file`                        | Submit a DRAFT case for processing.                                                                             | Applicant, Attorney                                         |
+| POST   | `/uscis/cases/{id}/biometrics`                  | Schedule biometrics for the case.                                                                               | Officer                                                     |
+| GET    | `/uscis/cases/{id}/biometrics`                  | List biometrics appointments for a case.                                                                        | Applicant, Attorney, Officer, FieldOfficeAdmin              |
+| GET    | `/uscis/biometrics/{id}`                        | Get a biometrics appointment.                                                                                   | Applicant, Attorney, Officer, FieldOfficeAdmin              |
+| POST   | `/uscis/biometrics/{id}/complete`               | Mark biometrics complete (cascades parent case to BIOMETRICS_COMPLETED).                                        | Officer                                                     |
+| POST   | `/uscis/biometrics/{id}/reschedule`             | Reschedule biometrics to a new time and/or location.                                                            | Officer                                                     |
+| POST   | `/uscis/biometrics/{id}/mark-no-show`           | Mark biometrics no-show after the grace window (cascades parent case to ABANDONED).                             | Officer                                                     |
+| POST   | `/uscis/cases/{id}/advance-review`              | Advance an I-130 case (no biometrics) or post-biometrics case to UNDER_REVIEW.                                  | Officer                                                     |
+| POST   | `/uscis/cases/{id}/rfes`                        | Issue an RFE on the case.                                                                                       | Officer                                                     |
+| GET    | `/uscis/cases/{id}/rfes`                        | List RFEs for a case.                                                                                           | Applicant, Attorney, Officer, FieldOfficeAdmin              |
+| GET    | `/uscis/rfes/{id}`                              | Get an RFE.                                                                                                     | Applicant, Attorney, Officer, FieldOfficeAdmin              |
+| POST   | `/uscis/rfes/{id}/respond`                      | Submit the applicant's RFE response (cascades parent case to UNDER_REVIEW).                                     | Applicant, Attorney                                         |
+| POST   | `/uscis/cases/{id}/interviews`                  | Schedule an AOS interview (I-485 only).                                                                         | Officer                                                     |
+| GET    | `/uscis/cases/{id}/interviews`                  | List interviews for a case.                                                                                     | Applicant, Attorney, Officer, FieldOfficeAdmin              |
+| GET    | `/uscis/interviews/{id}`                        | Get an interview.                                                                                               | Applicant, Attorney, Officer, FieldOfficeAdmin              |
+| POST   | `/uscis/interviews/{id}/complete`               | Officer marks the interview completed with a decision (cascades parent case to INTERVIEW_COMPLETED).            | Officer                                                     |
+| POST   | `/uscis/interviews/{id}/mark-no-show`           | Mark interview no-show after the grace window (cascades parent case to ABANDONED).                              | Officer                                                     |
+| POST   | `/uscis/cases/{id}/decide`                      | Officer issues final decision (APPROVE / DENY) or reopens after interview (REOPEN).                             | Officer                                                     |
+| GET    | `/uscis/cases/{id}/events`                      | List CaseEvent rows for a case.                                                                                 | Applicant, Attorney, Officer, FieldOfficeAdmin              |
+| GET    | `/uscis/cases/{id}/visa-availability`           | Advisory read of visa availability under both FINAL_ACTION and FILING_DATE charts at the current clock month.   | Applicant, Attorney, Officer, FieldOfficeAdmin              |
+| POST   | `/uscis/visa-bulletin`                          | Publish a visa bulletin entry.                                                                                  | FieldOfficeAdmin                                            |
+| GET    | `/uscis/visa-bulletin`                          | List visa bulletin entries with filters.                                                                        | Applicant, Attorney, Officer, FieldOfficeAdmin              |
+| GET    | `/uscis/officers/{officer_id}/workload`         | Get a single officer's workload score and active case count.                                                    | FieldOfficeAdmin                                            |
+| POST   | `/uscis/_clock/set_current_utc`                 | Test-driving: set the logical clock's `current_utc`.                                                            | FieldOfficeAdmin                                            |
+| POST   | `/uscis/_ops/sweep-rfe-deadlines`               | Test-driving: expire any RFE whose deadline is breached and abandon its parent case.                            | FieldOfficeAdmin                                            |
+
+## 5. Error Code Catalogue
+
+| Error ID                          | HTTP Status Code     |
+| --------------------------------- | -------------------- |
+| `ERR_UNAUTHENTICATED`             | 401 Unauthorized     |
+| `ERR_INVALID_ROLE`                | 401 Unauthorized     |
+| `ERR_FORBIDDEN`                   | 403 Forbidden        |
+| `ERR_OWNERSHIP_VIOLATION`         | 403 Forbidden        |
+| `ERR_NOT_FOUND`                   | 404 Not Found        |
+| `ERR_REFERENCED_NOT_FOUND`        | 404 Not Found        |
+| `ERR_INVALID_REQUEST`             | 400 Bad Request      |
+| `ERR_INVALID_STATE`               | 409 Conflict         |
+| `ERR_ALREADY_TERMINAL`            | 409 Conflict         |
+| `ERR_CASE_TYPE_NOT_APPLICABLE`    | 422 Unprocessable    |
+| `ERR_RFE_CAP_EXCEEDED`            | 422 Unprocessable    |
+| `ERR_VISA_RETROGRESSED`           | 422 Unprocessable    |
+| `ERR_APPT_TOO_SOON`               | 422 Unprocessable    |
+| `ERR_APPT_OVERLAP_SAME_CASE`      | 409 Conflict         |
+| `ERR_ASC_SLOT_TAKEN`              | 409 Conflict         |
+| `ERR_RFE_DEADLINE_PASSED`         | 422 Unprocessable    |
+| `ERR_STALE_VERSION`               | 412 Precondition Failed |
