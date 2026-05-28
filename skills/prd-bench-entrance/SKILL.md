@@ -353,6 +353,10 @@ Produce {task_dir}/workspace/PRD_FINALIZED.md — a minimal patch of {task_dir}/
 
 **HARD SCOPE — read this before anything else: every PRD edit you make must trace to a specific fix which reveal PRD-silence or PRD-mismatch with current `implementation/` — `implementation/` fix, test deletions, `test_suite/`/`test_helpers/` fixes - listed in `<step_7_diff>`. Nothing else.**
 
+**NO-NEW-MISMATCH RULE.** Step 8's edit **scope** is locally bounded to `<step_7_diff>` items, but Step 8's edit **perspective is global**. Each edit's wording must remain consistent with the entire current implementation, including paths Step 7 never exercised. Wording that accidentally narrows, redefines, reorders, or excludes behavior the implementation exhibits anywhere off the Step 7 site becomes a brand-new mismatch that Step 9 must undo.
+
+Before committing each edit, you MUST enumerate every code path in `implementation/` logically related to the edit's subject — not just the Step 7 site, but every callsite, branch, helper, cascade, and parallel endpoint that touches the same field/entity/operation — and confirm your proposed wording is consistent with all of them. If any enumerated path would be mis-described, revise the wording (widen, soften, re-scope) before committing. The search is triggered by the edit itself, not by any keyword in it; every edit gets the search regardless of how innocuous it looks. When in doubt, prefer under-determined wording — a looser PRD is recoverable in Step 9; a false universal claim is indistinguishable from a genuine PRD/impl divergence.
+
 You may read workspace: PRD.md, implementation/, test_helpers/, test_suite/, INSTRUCTION.md.
 You MUST NOT read: SCAFFOLD*.yaml, worklog.md.
 
@@ -367,10 +371,12 @@ Method:
 0. `cp {task_dir}/workspace/PRD.md {task_dir}/workspace/PRD_FINALIZED.md`. Edit only PRD_FINALIZED.md.
 1. For each <step_7_diff> item: locate the matching behavior in implementation/. Patch PRD_FINALIZED.md only when impl pinned a choice PRD left open — not every item is a PRD silence (some are pure fixture bugs), or impl mismatch with PRD.md.
 2. Where PRD already determines behavior, keep prose verbatim; elsewhere insert or revise inline to match impl, change as little as possible. No new sections. Never invent behavior the impl does not exhibit.
+3. **Apply the NO-NEW-MISMATCH RULE before committing each edit, every time.** Identify the edit's subject; enumerate every impl path that touches that subject (not only the Step 7 site); confirm your proposed wording is consistent with all of them. If any enumerated path would be mis-described, revise — widen, soften, or re-scope the wording — before committing. The pre-edit search is mandatory regardless of how innocuous the wording looks; it is the edit itself, not any keyword in the edit, that triggers it.
 
 Summary on exit:
 - PRD.md vs PRD_FINALIZED.md line counts and %-delta.
 - One bullet per change: `{PRD section} — {insert|revise} — {what changed} — {impl file:line}`.
+- Per-edit pre-edit search log: for each edit, list (a) the subject identified, (b) the impl paths enumerated and read/grepped, (c) the wording adjustment made (if any) to keep all enumerated paths consistent with the new sentence. An empty (c) is fine — but (a) and (b) are mandatory for every edit, even ones that look obvious.
 ```
 
 ### Step 9: Complete PRD — eliminate residual ambiguity and mismatch (subagent)
@@ -386,7 +392,7 @@ Summary on exit:
 ```
 Produce {task_dir}/workspace/PRD_COMPLETED.md — a minimal patch over the latest PRD, such that wherever PRD prose admits multiple valid interpretations, it is revised to pin the one `implementation/` actually adopted. Goal: zero remaining PRD silence or mismatch versus implementation/.
 
-You may read: PRD.md, PRD_FINALIZED.md (if present), implementation/, test_helpers/, test_suite/, INSTRUCTION.md.
+You may read: PRD_FINALIZED.md (if present，otherwise PRD.md), implementation/, test_helpers/, test_suite/, INSTRUCTION.md.
 You MUST NOT read: SCAFFOLD*.yaml, worklog.md.
 
 Implementation is the alignment target. Tests are NOT — Step 7 has already weakened or deleted assertions that PRD did not pin; treat tests only as auxiliary cross-reference, never as authority.

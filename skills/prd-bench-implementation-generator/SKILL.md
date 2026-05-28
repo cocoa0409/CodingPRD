@@ -49,7 +49,7 @@ Read them in this order — each layer adds context the next one needs:
    - `errors` — Complete error catalog with IDs, HTTP codes, and trigger conditions
    - `roles` — RBAC matrix listing exclusive and shared operations per role
 
-3. **`workspace/PRD.md`** — The natural language requirements. This is the authoritative spec for behavior, edge cases, and business logic nuances that the SCAFFOLD encodes structurally. When in doubt about intent, the PRD's prose wins. Pay special attention to:
+3. **`workspace/PRD.md` — the literal contract.** Every behavioral claim its prose makes (orderings, boundary words, declared freedoms, defaults, precedence) must show up literally in code. PRD wins unconditionally over `SCAFFOLD.yaml` on any disagreement — including over `validations[].priority` numbers and `state_machines[].preconditions` order. Do not "reconcile", "symmetrize", or "fill in" PRD prose for engineering convenience; that is a fidelity bug whether tests catch it or not. Pay special attention to:
    - Section 2 (Global Specs): response envelope format, pagination, common fields, monetary precision, optimistic concurrency, cascade rules
    - Section 3 (Business Logic): the detailed workflows, especially calculation examples with concrete numbers
    - Sections 4-5: endpoint table and error catalog for cross-referencing
@@ -181,6 +181,8 @@ app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
 ```
 
 ### Common Pitfalls to Avoid
+
+0. **PRD-prose infidelity** — Silent fidelity bugs the test suite cannot detect. Every comparator, ordering, default, freedom-vs-deterministic branch, and error precedence in your code must trace to a sentence in `PRD.md`. When PRD prose and scaffold structure disagree, write the PRD version.
 
 1. **Hardcoding structural names** — The #1 cause of test failures. Auth header names, response envelope field names, pagination parameter names, OCC field names, error IDs — ALL of these must be read from the scaffold and PRD, never assumed. If you find yourself typing `X-User-ID`, `meta`, `response_type`, `data`, `limit`, `offset`, `version`, or `ERR_STALE_DATA` without having verified these are the exact names in this scaffold, STOP and re-read the scaffold.
 2. **Floating point arithmetic for money** — Always use `from decimal import Decimal, ROUND_HALF_UP`. Never use `float`. `0.1 + 0.2 != 0.3` in IEEE 754.
