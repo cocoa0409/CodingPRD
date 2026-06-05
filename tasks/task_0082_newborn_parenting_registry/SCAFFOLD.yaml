@@ -1,0 +1,1926 @@
+scenario: "82. Newborn / Parenting Registry: hospital pre-registration, breastfeeding consultation, NICU escalation, discharge bag, nurse follow-up, insurance dependent addition (30-day SEP), birth certificate filing, SSN application"
+domain_name: newborn-parenting-registry
+api_prefix: ""   # flat topology: resources are top-level collections (/newborns, /nicu-beds, /government-filings, ...) with no shared path prefix
+
+# ---------------------------------------------------------------------------
+# Complexity profile (§0.1–§0.4) — Expert band
+# ---------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: workflow_orchestration
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - cascading_side_effects
+    - rate_threshold_triggers          # 30-day SEP window, filing-deadline grace clocks
+    - dual_variant_calculation         # SEP deadline (calendar vs business-day) + discharge-readiness scoring
+    - optimistic_concurrency           # NICU bed claim supersede on Newborn.version
+
+  entity_topology: hybrid
+  # PreRegistration is the aggregate root; Newborn hangs off it; the post-birth
+  # workflow artifacts (LactationConsult, NicuStay, DischargeBag, FollowUpTask,
+  # filings) are flat FK-linked peers off Newborn. NICU beds are a shared pool
+  # competed for across newborns (cross-aggregate).
+
+  state_machine_shape: branching
+  # PreRegistration is a guarded linear admit pipeline; Newborn forks at birth:
+  # the DISCHARGE_READY decision depends on whether a NicuStay is open
+  # (branch A: routine room-out → discharge) vs (branch B: NICU escalation →
+  # NICU course → step-down → discharge). DischargeBag + FollowUpTask + the
+  # three filings each carry their own non-linear lifecycles (revert / parallel).
+
+  relationship_patterns:
+    - one_to_many                      # PreRegistration → Newborn (multiples), Newborn → FollowUpTask
+    - cross_aggregate                  # NicuStay competes for a shared NicuBed pool
+    - polymorphic                      # GovernmentFiling.filing_type ∈ {BIRTH_CERTIFICATE, SSN_APPLICATION}
+
+  role_model: peer_roles
+  # IntakeClerk owns pre-registration; AttendingNurse owns the clinical lifecycle
+  # (birth, lactation, discharge bag, follow-up); Neonatologist owns NICU; the
+  # BenefitsCoordinator owns the SEP dependent-add; VitalRecordsOfficer owns the
+  # government filings. RegistrySupervisor is the operational override/opaque role.
+
+  consistency_model: immediate
+
+# ---------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — verbatim)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: PreRegistration
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, identity only; never used in business decisions."
+      - name: mother_full_name
+        type: string
+        source: input
+        description: "Expectant parent legal name."
+      - name: mother_dob
+        type: string
+        source: input
+        description: "Expectant parent date of birth, ISO 8601 date (YYYY-MM-DD)."
+      - name: due_date
+        type: string
+        source: input
+        description: "Estimated due date, ISO 8601 date. Used to gate ADMITTED window."
+      - name: payer_policy_id
+        type: string
+        source: input
+        description: "FK -> InsurancePolicy.id; the mother's coverage under which the newborn dependent is added."
+      - name: planned_delivery_facility
+        type: string
+        source: input
+        description: "Free-text hospital/facility name."
+      - name: birth_plan_flags
+        type: object
+        source: input
+        description: "Map of birth-plan preferences, e.g. {breastfeeding_intent: true, cord_blood_bank: false}."
+        default: "{}"
+      - name: status
+        type: enum
+        source: system
+        description: "Pre-registration lifecycle state."
+        default: DRAFT
+        constraints: "one of DRAFT, SUBMITTED, ADMITTED, BIRTH_RECORDED, CLOSED, CANCELLED"
+      - name: admitted_at
+        type: datetime
+        source: system
+        description: "Server clock at admission; null until ADMITTED."
+        default: "null"
+      - name: newborn_count
+        type: integer
+        source: computed
+        description: "Count of Newborn rows whose pre_registration_id == this.id (any status). Drives multiples handling."
+        default: 0
+
+  - name: InsurancePolicy
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, identity only."
+      - name: carrier_name
+        type: string
+        source: input
+        description: "Insurance carrier name."
+      - name: subscriber_name
+        type: string
+        source: input
+        description: "Policy subscriber (the parent) legal name."
+      - name: plan_type
+        type: enum
+        source: input
+        description: "Coverage market; gates SEP deadline variant."
+        constraints: "one of EMPLOYER_GROUP, MARKETPLACE, MEDICAID"
+      - name: coverage_effective_date
+        type: string
+        source: input
+        description: "ISO 8601 date the policy became effective."
+      - name: dependent_slots_max
+        type: integer
+        source: input
+        description: "Maximum number of dependents addable to this policy."
+        constraints: ">= 1"
+      - name: dependents_added_count
+        type: integer
+        source: computed
+        description: "Count of DependentEnrollment rows whose policy_id == this.id and status == ENROLLED."
+        default: 0
+
+  - name: Newborn
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, identity only; never decides clinical/billing outcomes."
+      - name: pre_registration_id
+        type: string
+        source: input
+        description: "FK -> PreRegistration.id; the admission this birth was recorded under."
+      - name: birth_datetime
+        type: datetime
+        source: input
+        description: "Recorded moment of birth (server stores as given ISO 8601 UTC); anchors SEP and filing clocks."
+      - name: birth_sequence
+        type: integer
+        source: input
+        description: "1 for singleton/first of multiples, 2 for second, etc.; unique within a PreRegistration."
+        constraints: ">= 1"
+      - name: weight_grams
+        type: integer
+        source: input
+        description: "Birth weight in grams; drives NICU clinical-criteria gate and discharge-readiness score."
+        constraints: ">= 200"
+      - name: gestational_age_weeks
+        type: integer
+        source: input
+        description: "Completed weeks of gestation; < 35 forces NICU eligibility."
+        constraints: "between 20 and 45"
+      - name: apgar_5min
+        type: integer
+        source: input
+        description: "5-minute APGAR score 0-10; <= 6 forces NICU eligibility."
+        constraints: "between 0 and 10"
+      - name: legal_name
+        type: string
+        source: input
+        description: "Newborn legal name once assigned; required before any GovernmentFiling submit."
+        default: "null"
+      - name: clinical_status
+        type: enum
+        source: system
+        description: "Where the newborn is in the care pathway."
+        default: BORN
+        constraints: "one of BORN, ROOMING_IN, NICU_ADMITTED, STEP_DOWN, DISCHARGE_READY, DISCHARGED"
+      - name: care_location
+        type: enum
+        source: system
+        description: "Physical unit; derived alongside clinical_status."
+        default: WELL_BABY_NURSERY
+        constraints: "one of WELL_BABY_NURSERY, MOTHER_ROOM, NICU, STEP_DOWN_UNIT, RELEASED"
+      - name: discharge_readiness_score
+        type: number
+        source: computed
+        description: "0-100 readiness index computed from weight, feeding evidence, NICU clearance, and filing posture. See calc compute_discharge_readiness."
+        default: 0
+      - name: discharged_at
+        type: datetime
+        source: system
+        description: "Server clock at discharge; null until DISCHARGED."
+        default: "null"
+
+  - name: LactationConsult
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, identity only."
+      - name: newborn_id
+        type: string
+        source: input
+        description: "FK -> Newborn.id; the infant assessed."
+      - name: consult_datetime
+        type: datetime
+        source: input
+        description: "Scheduled/recorded consult time (ISO 8601 UTC)."
+      - name: latch_score
+        type: integer
+        source: input
+        description: "LATCH assessment 0-10 recorded at the consult; >= 7 marks adequate feeding."
+        constraints: "between 0 and 10"
+        default: "null"
+      - name: status
+        type: enum
+        source: system
+        description: "Consult lifecycle."
+        default: SCHEDULED
+        constraints: "one of SCHEDULED, COMPLETED, FEEDING_AT_RISK, CANCELLED"
+      - name: feeding_adequate
+        type: boolean
+        source: computed
+        description: "true when status == COMPLETED and latch_score >= 7. Feeds discharge-readiness score."
+        default: false
+
+  - name: NicuBed
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, identity only; never used to pick which bed wins a claim."
+      - name: bed_label
+        type: string
+        source: input
+        description: "Human-readable bed identifier, unique within the unit."
+      - name: acuity_level
+        type: enum
+        source: input
+        description: "Bed capability tier; a stay's required level must be <= the bed level."
+        constraints: "one of LEVEL_2, LEVEL_3, LEVEL_4 (ordinal: LEVEL_2 < LEVEL_3 < LEVEL_4)"
+      - name: occupancy_status
+        type: enum
+        source: system
+        description: "Whether the bed currently holds an open NicuStay."
+        default: VACANT
+        constraints: "one of VACANT, OCCUPIED, OUT_OF_SERVICE"
+      - name: current_stay_id
+        type: string
+        source: system
+        description: "Denormalized back-pointer to the open NicuStay.id occupying this bed (null when VACANT/OUT_OF_SERVICE). Not a navigational FK — the bed->stay relationship is discovered via GET /nicu-beds/{id}/nicu-stays; this field is a convenience cache kept consistent with NicuStay.nicu_bed_id."
+        default: "null"
+
+  - name: NicuStay
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, identity only."
+      - name: newborn_id
+        type: string
+        source: input
+        description: "FK -> Newborn.id; the escalated infant."
+      - name: nicu_bed_id
+        type: string
+        source: system
+        description: "FK -> NicuBed.id; the bed assigned by the server's selector, or null while PENDING_BED."
+        default: "null"
+      - name: required_level
+        type: enum
+        source: input
+        description: "Clinical acuity the stay requires; selector restricts candidate beds to acuity_level >= this."
+        constraints: "one of LEVEL_2, LEVEL_3, LEVEL_4"
+      - name: admitted_at
+        type: datetime
+        source: input
+        description: "Escalation timestamp (ISO 8601 UTC); start of the occupation interval."
+      - name: discharged_at
+        type: datetime
+        source: input
+        description: "End of occupation interval (ISO 8601 UTC); set at step-down/release, null while open."
+        default: "null"
+      - name: status
+        type: enum
+        source: system
+        description: "Stay lifecycle."
+        default: PENDING_BED
+        constraints: "one of PENDING_BED, ACTIVE, STEPPED_DOWN, CLOSED, CANCELLED"
+
+  - name: DischargeBag
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, identity only."
+      - name: newborn_id
+        type: string
+        source: input
+        description: "FK -> Newborn.id; at most one ISSUED bag per newborn."
+      - name: line_items
+        type: array
+        source: input
+        description: "Array of {sku, category, qty, unit_value_cents}; category one of FORMULA, DIAPERS, EDUCATION, CARSEAT_VOUCHER, MEDICATION."
+      - name: status
+        type: enum
+        source: system
+        description: "Bag lifecycle."
+        default: DRAFT
+        constraints: "one of DRAFT, ASSEMBLED, ISSUED, RECALLED"
+      - name: total_value_cents
+        type: integer
+        source: computed
+        description: "Per-line-item rounded value summed across line_items. See calc compute_bag_value."
+        default: 0
+      - name: requires_pharmacy_signoff
+        type: boolean
+        source: computed
+        description: "true when any line_item.category == MEDICATION; gates ASSEMBLED->ISSUED."
+        default: false
+
+  - name: FollowUpTask
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, identity only."
+      - name: newborn_id
+        type: string
+        source: input
+        description: "FK -> Newborn.id; the discharged infant this nurse follow-up tracks."
+      - name: task_type
+        type: enum
+        source: input
+        description: "Kind of follow-up."
+        constraints: "one of WEIGHT_CHECK, JAUNDICE_CHECK, FEEDING_CHECK, SAFETY_CALL"
+      - name: due_at
+        type: datetime
+        source: system
+        description: "Server-computed deadline from discharge + per-type SLA. See calc compute_followup_due."
+      - name: scheduled_at
+        type: datetime
+        source: input
+        description: "When the nurse plans/attempts the contact (ISO 8601 UTC)."
+        default: "null"
+      - name: attempt_count
+        type: integer
+        source: system
+        description: "Number of recorded contact attempts; 3 consecutive misses escalates."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Task lifecycle."
+        default: OPEN
+        constraints: "one of OPEN, ATTEMPTED, COMPLETED, ESCALATED, MISSED, CANCELLED"
+
+  - name: DependentEnrollment
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, identity only."
+      - name: newborn_id
+        type: string
+        source: input
+        description: "FK -> Newborn.id; the dependent being added to coverage."
+      - name: policy_id
+        type: string
+        source: input
+        description: "FK -> InsurancePolicy.id; the policy the dependent is added under."
+      - name: requested_at
+        type: datetime
+        source: input
+        description: "When the add request was submitted (ISO 8601 UTC); compared to the SEP deadline."
+      - name: sep_deadline
+        type: datetime
+        source: computed
+        description: "Special-Enrollment-Period close instant computed from Newborn.birth_datetime + 30 days, plan-type variant. See calc compute_sep_deadline."
+      - name: status
+        type: enum
+        source: system
+        description: "Enrollment lifecycle."
+        default: PENDING
+        constraints: "one of PENDING, ENROLLED, SEP_EXPIRED, DENIED, TERMINATED"
+      - name: retroactive_effective_date
+        type: string
+        source: computed
+        description: "ISO 8601 date coverage backdates to (always the birth date) when ENROLLED within SEP; null otherwise."
+        default: "null"
+
+  - name: GovernmentFiling
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, identity only."
+      - name: newborn_id
+        type: string
+        source: input
+        description: "FK -> Newborn.id; the subject of the filing."
+      - name: filing_type
+        type: enum
+        source: input
+        description: "Polymorphic discriminator."
+        constraints: "one of BIRTH_CERTIFICATE, SSN_APPLICATION"
+      - name: filing_deadline
+        type: datetime
+        source: computed
+        description: "Statutory deadline = Newborn.birth_datetime + per-type days. See calc compute_filing_deadline."
+      - name: submitted_at
+        type: datetime
+        source: input
+        description: "When the officer transmitted the filing to the agency (ISO 8601 UTC); null until SUBMITTED."
+        default: "null"
+      - name: acknowledged_at
+        type: datetime
+        source: input
+        description: "Agency acknowledgement time; null until ACCEPTED/REJECTED."
+        default: "null"
+      - name: reference_number
+        type: string
+        source: input
+        description: "Agency-issued reference (certificate number or SSN-application receipt); required to ACCEPT."
+        default: "null"
+      - name: status
+        type: enum
+        source: system
+        description: "Filing lifecycle."
+        default: PENDING
+        constraints: "one of PENDING, SUBMITTED, ACCEPTED, REJECTED, LATE_FLAGGED, CANCELLED"
+
+  - name: AuditEvent
+    parent: null
+    common_fields: false
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, identity only."
+      - name: newborn_id
+        type: string
+        source: input
+        description: "FK -> Newborn.id; the newborn the audited action targeted (null for pre-registration-only events)."
+        default: "null"
+      - name: actor_role
+        type: string
+        source: system
+        description: "X-User-Role that performed the action."
+      - name: event_type
+        type: enum
+        source: system
+        description: "Discrete audited action."
+        constraints: "one of BIRTH_RECORDED, NICU_ESCALATED, NICU_BED_ASSIGNED, STEP_DOWN, DISCHARGED, BAG_ISSUED, DEPENDENT_ENROLLED, SEP_EXPIRED, FILING_SUBMITTED, FILING_LATE_FLAGGED, FOLLOWUP_ESCALATED"
+      - name: detail
+        type: object
+        source: system
+        description: "Snapshot payload of the triggering transition."
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: PreRegistration
+    initial_state: DRAFT
+    terminal_states: [CLOSED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /registrations/{id}/submit"
+        actor: IntakeClerk
+        preconditions:
+          - "all required input fields present (mother_full_name, mother_dob, due_date, payer_policy_id, planned_delivery_facility)"
+          - "payer_policy_id resolves to an existing InsurancePolicy"
+        side_effects:
+          - "increments PreRegistration.version by 1"
+      - from: SUBMITTED
+        to: ADMITTED
+        trigger: "POST /registrations/{id}/admit"
+        actor: IntakeClerk
+        preconditions:
+          - "current clock date is within [due_date - 21 days, due_date + 21 days] inclusive (the admit window)"
+        side_effects:
+          - "sets admitted_at = current clock"
+          - "increments PreRegistration.version by 1"
+      - from: ADMITTED
+        to: BIRTH_RECORDED
+        trigger: "POST /registrations/{id}/newborns (first birth recorded)"
+        actor: AttendingNurse
+        preconditions:
+          - "PreRegistration.status == ADMITTED"
+        side_effects:
+          - "creates a Newborn in clinical_status BORN (see Newborn machine)"
+          - "sets PreRegistration.status = BIRTH_RECORDED on the first newborn only"
+          - "recomputes PreRegistration.newborn_count"
+          - "increments PreRegistration.version by 1"
+        note: "Subsequent multiples (birth_sequence > 1) are also created via this endpoint while status == BIRTH_RECORDED; status stays BIRTH_RECORDED."
+      - from: BIRTH_RECORDED
+        to: CLOSED
+        trigger: "POST /registrations/{id}/close"
+        actor: RegistrySupervisor
+        preconditions:
+          - "every Newborn under this PreRegistration has clinical_status == DISCHARGED"
+        side_effects:
+          - "increments PreRegistration.version by 1"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /registrations/{id}/cancel"
+        actor: IntakeClerk
+        preconditions:
+          - "newborn_count == 0"
+        side_effects:
+          - "increments PreRegistration.version by 1"
+      - from: SUBMITTED
+        to: CANCELLED
+        trigger: "POST /registrations/{id}/cancel"
+        actor: IntakeClerk
+        preconditions:
+          - "newborn_count == 0"
+        side_effects:
+          - "increments PreRegistration.version by 1"
+
+  - entity: Newborn
+    initial_state: BORN
+    terminal_states: [DISCHARGED]
+    transitions:
+      - from: BORN
+        to: ROOMING_IN
+        trigger: "POST /newborns/{id}/room-in"
+        actor: AttendingNurse
+        preconditions:
+          - "Newborn.clinical_status == BORN"
+          - "the newborn does NOT meet NICU clinical criteria (gestational_age_weeks >= 35 AND apgar_5min >= 7 AND weight_grams >= 1800)"
+        side_effects:
+          - "sets care_location = MOTHER_ROOM"
+          - "increments Newborn.version by 1"
+        note: "Branch A entry — routine room-in. Newborns meeting NICU criteria are blocked here and must escalate."
+      - from: BORN
+        to: NICU_ADMITTED
+        trigger: "POST /newborns/{id}/nicu-escalate (creates NicuStay)"
+        actor: Neonatologist
+        preconditions:
+          - "Newborn.clinical_status == BORN"
+          - "Newborn meets NICU clinical criteria (gestational_age_weeks < 35 OR apgar_5min <= 6 OR weight_grams < 1800)"
+        side_effects:
+          - "creates a NicuStay in PENDING_BED, required_level from request"
+          - "runs the bed selector; on success assigns nicu_bed_id, sets NicuStay.status=ACTIVE, sets NicuBed.occupancy_status=OCCUPIED + current_stay_id; on empty pool leaves NicuStay PENDING_BED"
+          - "sets care_location = NICU"
+          - "appends AuditEvent NICU_ESCALATED (and NICU_BED_ASSIGNED when a bed is claimed)"
+          - "increments Newborn.version by 1"
+        note: "Branch B entry — cascade depth: escalate(Newborn) -> create+activate(NicuStay) -> occupy(NicuBed)."
+      - from: ROOMING_IN
+        to: NICU_ADMITTED
+        trigger: "POST /newborns/{id}/nicu-escalate"
+        actor: Neonatologist
+        preconditions:
+          - "Newborn.clinical_status == ROOMING_IN"
+        side_effects:
+          - "creates a NicuStay (PENDING_BED -> ACTIVE on bed claim) and occupies a NicuBed, same as the BORN escalation"
+          - "sets care_location = NICU"
+          - "appends AuditEvent NICU_ESCALATED"
+          - "increments Newborn.version by 1"
+        note: "Late deterioration after rooming-in."
+      - from: NICU_ADMITTED
+        to: STEP_DOWN
+        trigger: "POST /newborns/{id}/step-down"
+        actor: Neonatologist
+        preconditions:
+          - "the newborn's open NicuStay (status==ACTIVE) exists"
+        side_effects:
+          - "sets the open NicuStay.status = STEPPED_DOWN and stamps NicuStay.discharged_at = current clock"
+          - "frees the NicuBed: occupancy_status=VACANT, current_stay_id=null"
+          - "promotes the earliest-admitted waiting NicuStay (status==PENDING_BED, required_level<=freed bed acuity_level), order by NicuStay.admitted_at ASC then created_at ASC, into this bed: sets its nicu_bed_id, status=ACTIVE, occupies the bed, appends AuditEvent NICU_BED_ASSIGNED"
+          - "sets care_location = STEP_DOWN_UNIT"
+          - "appends AuditEvent STEP_DOWN"
+          - "increments Newborn.version by 1"
+        note: "Cascade: step-down(Newborn) -> free(NicuBed) -> promote(waiting NicuStay) -> activate that stay's Newborn bed link. Depth 3."
+      - from: ROOMING_IN
+        to: DISCHARGE_READY
+        trigger: "POST /newborns/{id}/mark-discharge-ready"
+        actor: AttendingNurse
+        preconditions:
+          - "Newborn.clinical_status == ROOMING_IN"
+          - "discharge_readiness_score >= 70 (recomputed at this call)"
+        side_effects:
+          - "recomputes discharge_readiness_score"
+          - "increments Newborn.version by 1"
+      - from: STEP_DOWN
+        to: DISCHARGE_READY
+        trigger: "POST /newborns/{id}/mark-discharge-ready"
+        actor: AttendingNurse
+        preconditions:
+          - "Newborn.clinical_status == STEP_DOWN"
+          - "the newborn has NO open NicuStay (no stay in PENDING_BED or ACTIVE)"
+          - "discharge_readiness_score >= 70 (recomputed at this call)"
+        side_effects:
+          - "recomputes discharge_readiness_score"
+          - "increments Newborn.version by 1"
+      - from: DISCHARGE_READY
+        to: DISCHARGED
+        trigger: "POST /newborns/{id}/discharge"
+        actor: AttendingNurse
+        preconditions:
+          - "Newborn.clinical_status == DISCHARGE_READY"
+          - "exactly one DischargeBag for this newborn is in status ISSUED"
+          - "a GovernmentFiling of filing_type BIRTH_CERTIFICATE exists in status SUBMITTED or ACCEPTED"
+        side_effects:
+          - "sets care_location = RELEASED, discharged_at = current clock"
+          - "auto-creates four FollowUpTask rows (WEIGHT_CHECK, JAUNDICE_CHECK, FEEDING_CHECK, SAFETY_CALL) in OPEN with computed due_at"
+          - "appends AuditEvent DISCHARGED"
+          - "increments Newborn.version by 1"
+        note: "Cascade: discharge(Newborn) -> spawn 4 FollowUpTasks. Guarded by sibling DischargeBag + GovernmentFiling state (cross-entity)."
+
+  - entity: LactationConsult
+    initial_state: SCHEDULED
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "POST /lactation-consults/{id}/complete"
+        actor: AttendingNurse
+        preconditions:
+          - "latch_score provided in request (0-10)"
+          - "the newborn's clinical_status != DISCHARGED"
+        side_effects:
+          - "stores latch_score, recomputes feeding_adequate (true iff latch_score >= 7)"
+          - "increments LactationConsult.version by 1"
+        note: "Parallel dimension to the Newborn clinical machine: a consult's status evolves independently of the infant's clinical_status."
+      - from: SCHEDULED
+        to: FEEDING_AT_RISK
+        trigger: "POST /lactation-consults/{id}/complete (latch_score < 7)"
+        actor: AttendingNurse
+        preconditions:
+          - "latch_score provided and latch_score < 7"
+        side_effects:
+          - "stores latch_score, feeding_adequate stays false"
+          - "auto-schedules a follow-up consult is NOT done here (nurse follow-up tasks are spawned only at discharge)"
+          - "increments LactationConsult.version by 1"
+        note: "Branch on latch_score at completion; FEEDING_AT_RISK suppresses feeding evidence in the discharge-readiness score."
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /lactation-consults/{id}/cancel"
+        actor: AttendingNurse
+        preconditions:
+          - "LactationConsult.status == SCHEDULED"
+        side_effects:
+          - "increments LactationConsult.version by 1"
+
+  - entity: NicuStay
+    initial_state: PENDING_BED
+    terminal_states: [CLOSED, CANCELLED]
+    transitions:
+      - from: PENDING_BED
+        to: ACTIVE
+        trigger: "system (bed selector at escalation or promotion on a freed bed)"
+        actor: system
+        preconditions:
+          - "a NicuBed with occupancy_status==VACANT and acuity_level >= NicuStay.required_level exists"
+        side_effects:
+          - "assigns nicu_bed_id, occupies the bed, appends AuditEvent NICU_BED_ASSIGNED"
+      - from: PENDING_BED
+        to: ACTIVE
+        trigger: "POST /nicu-beds/{id}/assign-stay (manual placement onto a specified bed)"
+        actor: Neonatologist
+        preconditions:
+          - "NicuStay.status == PENDING_BED"
+          - "the target NicuBed.occupancy_status == VACANT and acuity_level >= NicuStay.required_level"
+          - "the stay's occupation interval [admitted_at, discharged_at) does NOT overlap any prior stay interval recorded on this bed; half-open semantics, so admitted_at == a prior stay's discharged_at is permitted (adjacency allowed)"
+        side_effects:
+          - "assigns nicu_bed_id, sets NicuStay.status=ACTIVE, sets NicuBed.occupancy_status=OCCUPIED + current_stay_id, appends AuditEvent NICU_BED_ASSIGNED"
+          - "increments NicuStay.version by 1"
+        note: "Manual override of the auto-selector; the interval-overlap rule on the bed is enforced here (half-open intervals; adjacent stays OK)."
+      - from: ACTIVE
+        to: STEPPED_DOWN
+        trigger: "system (Newborn step-down)"
+        actor: system
+        preconditions:
+          - "the parent Newborn transitions NICU_ADMITTED -> STEP_DOWN"
+        side_effects:
+          - "stamps discharged_at, frees the bed (see Newborn step-down cascade)"
+      - from: STEPPED_DOWN
+        to: CLOSED
+        trigger: "system (Newborn discharge)"
+        actor: system
+        preconditions:
+          - "the parent Newborn transitions to DISCHARGED"
+        side_effects:
+          - "no further bed effects (bed already freed at step-down)"
+      - from: PENDING_BED
+        to: CANCELLED
+        trigger: "POST /nicu-stays/{id}/cancel"
+        actor: Neonatologist
+        preconditions:
+          - "NicuStay.status == PENDING_BED"
+        side_effects:
+          - "increments NicuStay.version by 1"
+        note: "Withdrawing a not-yet-bedded escalation (e.g., transferred to another hospital)."
+
+  - entity: DischargeBag
+    initial_state: DRAFT
+    terminal_states: [RECALLED]
+    transitions:
+      - from: DRAFT
+        to: ASSEMBLED
+        trigger: "POST /discharge-bags/{id}/assemble"
+        actor: AttendingNurse
+        preconditions:
+          - "line_items non-empty"
+          - "every line_item.qty >= 1"
+        side_effects:
+          - "recomputes total_value_cents and requires_pharmacy_signoff"
+          - "increments DischargeBag.version by 1"
+      - from: ASSEMBLED
+        to: ISSUED
+        trigger: "POST /discharge-bags/{id}/issue"
+        actor: AttendingNurse
+        preconditions:
+          - "DischargeBag.status == ASSEMBLED"
+          - "if requires_pharmacy_signoff then request carries pharmacy_signoff == true"
+          - "the newborn has no other DischargeBag already in status ISSUED"
+        side_effects:
+          - "appends AuditEvent BAG_ISSUED"
+          - "increments DischargeBag.version by 1"
+      - from: ISSUED
+        to: RECALLED
+        trigger: "POST /discharge-bags/{id}/recall"
+        actor: AttendingNurse
+        preconditions:
+          - "DischargeBag.status == ISSUED"
+          - "the newborn's clinical_status != DISCHARGED (cannot recall after release)"
+        side_effects:
+          - "increments DischargeBag.version by 1"
+        note: "Compensation for a premature issue; restores the no-issued-bag invariant so discharge is re-gated."
+
+  - entity: FollowUpTask
+    initial_state: OPEN
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: ATTEMPTED
+        trigger: "POST /follow-up-tasks/{id}/record-attempt"
+        actor: AttendingNurse
+        preconditions:
+          - "FollowUpTask.status == OPEN or ATTEMPTED"
+        side_effects:
+          - "increments attempt_count by 1; sets scheduled_at from request"
+          - "increments FollowUpTask.version by 1"
+        note: "Self-loop allowed on ATTEMPTED until the 3rd miss escalates."
+      - from: ATTEMPTED
+        to: ATTEMPTED
+        trigger: "POST /follow-up-tasks/{id}/record-attempt (attempt_count < 3 after increment)"
+        actor: AttendingNurse
+        preconditions:
+          - "attempt_count after increment is < 3"
+        side_effects:
+          - "increments attempt_count by 1"
+          - "increments FollowUpTask.version by 1"
+      - from: ATTEMPTED
+        to: ESCALATED
+        trigger: "POST /follow-up-tasks/{id}/record-attempt (3rd attempt)"
+        actor: AttendingNurse
+        preconditions:
+          - "attempt_count after increment == 3"
+        side_effects:
+          - "appends AuditEvent FOLLOWUP_ESCALATED"
+          - "increments FollowUpTask.version by 1"
+        note: "Cyclic record-attempt loop terminates by escalation at the 3rd miss."
+      - from: OPEN
+        to: COMPLETED
+        trigger: "POST /follow-up-tasks/{id}/complete"
+        actor: AttendingNurse
+        preconditions:
+          - "FollowUpTask.status in {OPEN, ATTEMPTED}"
+        side_effects:
+          - "increments FollowUpTask.version by 1"
+      - from: ATTEMPTED
+        to: COMPLETED
+        trigger: "POST /follow-up-tasks/{id}/complete"
+        actor: AttendingNurse
+        preconditions:
+          - "FollowUpTask.status in {OPEN, ATTEMPTED}"
+        side_effects:
+          - "increments FollowUpTask.version by 1"
+      - from: OPEN
+        to: MISSED
+        trigger: "POST /follow-up-tasks/{id}/mark-missed"
+        actor: AttendingNurse
+        preconditions:
+          - "current clock > due_at"
+          - "FollowUpTask.status in {OPEN, ATTEMPTED}"
+        side_effects:
+          - "increments FollowUpTask.version by 1"
+
+  - entity: DependentEnrollment
+    initial_state: PENDING
+    terminal_states: [SEP_EXPIRED, DENIED, TERMINATED]
+    transitions:
+      - from: PENDING
+        to: ENROLLED
+        trigger: "POST /dependent-enrollments/{id}/approve"
+        actor: BenefitsCoordinator
+        preconditions:
+          - "requested_at <= sep_deadline (within SEP)"
+          - "the parent Newborn.clinical_status != DISCHARGED is NOT required; enrollment is independent of discharge"
+          - "InsurancePolicy.dependents_added_count < dependent_slots_max"
+        side_effects:
+          - "sets retroactive_effective_date = Newborn.birth_datetime date part"
+          - "recomputes InsurancePolicy.dependents_added_count"
+          - "appends AuditEvent DEPENDENT_ENROLLED"
+          - "increments DependentEnrollment.version by 1"
+      - from: PENDING
+        to: SEP_EXPIRED
+        trigger: "POST /dependent-enrollments/{id}/expire"
+        actor: BenefitsCoordinator
+        preconditions:
+          - "requested_at > sep_deadline (the window has closed for this enrollment)"
+        side_effects:
+          - "appends AuditEvent SEP_EXPIRED"
+          - "increments DependentEnrollment.version by 1"
+        note: "Explicitly close a PENDING enrollment whose SEP window has already passed. Approve past the deadline does NOT transition here — it is rejected with ERR_SEP_WINDOW_CLOSED (validation priority 12) and the row stays PENDING."
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /dependent-enrollments/{id}/deny"
+        actor: BenefitsCoordinator
+        preconditions:
+          - "DependentEnrollment.status == PENDING"
+        side_effects:
+          - "increments DependentEnrollment.version by 1"
+      - from: ENROLLED
+        to: TERMINATED
+        trigger: "POST /dependent-enrollments/{id}/terminate"
+        actor: BenefitsCoordinator
+        preconditions:
+          - "DependentEnrollment.status == ENROLLED"
+        side_effects:
+          - "recomputes InsurancePolicy.dependents_added_count (decrements the ENROLLED count)"
+          - "increments DependentEnrollment.version by 1"
+        note: "Compensation for an erroneous enroll; the dependent slot is conserved (released back to the policy)."
+
+  - entity: GovernmentFiling
+    initial_state: PENDING
+    terminal_states: [ACCEPTED, CANCELLED]
+    transitions:
+      - from: PENDING
+        to: SUBMITTED
+        trigger: "POST /government-filings/{id}/submit"
+        actor: VitalRecordsOfficer
+        preconditions:
+          - "Newborn.legal_name is non-null"
+          - "for filing_type SSN_APPLICATION: a GovernmentFiling of filing_type BIRTH_CERTIFICATE for the same newborn is in status SUBMITTED or ACCEPTED"
+        side_effects:
+          - "sets submitted_at = current clock"
+          - "if current clock > filing_deadline then also set a LATE_FLAGGED marker path (see PENDING->LATE_FLAGGED); otherwise stays SUBMITTED"
+          - "appends AuditEvent FILING_SUBMITTED"
+          - "increments GovernmentFiling.version by 1"
+        note: "SSN application is gated on the birth certificate being at least submitted (cross-entity, same-newborn polymorphic dependency)."
+      - from: PENDING
+        to: LATE_FLAGGED
+        trigger: "POST /government-filings/{id}/submit (current clock > filing_deadline)"
+        actor: VitalRecordsOfficer
+        preconditions:
+          - "Newborn.legal_name is non-null"
+          - "current clock > filing_deadline"
+        side_effects:
+          - "sets submitted_at = current clock"
+          - "appends AuditEvent FILING_LATE_FLAGGED"
+          - "increments GovernmentFiling.version by 1"
+        note: "Late submission is recorded as LATE_FLAGGED, not SUBMITTED; LATE_FLAGGED still satisfies the SSN birth-cert gate and the discharge gate is NOT satisfied by LATE_FLAGGED (only SUBMITTED/ACCEPTED)."
+      - from: SUBMITTED
+        to: ACCEPTED
+        trigger: "POST /government-filings/{id}/acknowledge (accepted)"
+        actor: VitalRecordsOfficer
+        preconditions:
+          - "reference_number provided in request"
+        side_effects:
+          - "sets acknowledged_at = current clock, stores reference_number"
+          - "increments GovernmentFiling.version by 1"
+      - from: LATE_FLAGGED
+        to: ACCEPTED
+        trigger: "POST /government-filings/{id}/acknowledge (accepted)"
+        actor: VitalRecordsOfficer
+        preconditions:
+          - "reference_number provided in request"
+        side_effects:
+          - "sets acknowledged_at = current clock, stores reference_number"
+          - "increments GovernmentFiling.version by 1"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /government-filings/{id}/acknowledge (rejected)"
+        actor: VitalRecordsOfficer
+        preconditions:
+          - "GovernmentFiling.status in {SUBMITTED, LATE_FLAGGED}"
+        side_effects:
+          - "sets acknowledged_at = current clock"
+          - "increments GovernmentFiling.version by 1"
+      - from: REJECTED
+        to: SUBMITTED
+        trigger: "POST /government-filings/{id}/submit (resubmit)"
+        actor: VitalRecordsOfficer
+        preconditions:
+          - "GovernmentFiling.status == REJECTED"
+          - "Newborn.legal_name is non-null"
+        side_effects:
+          - "sets submitted_at = current clock"
+          - "increments GovernmentFiling.version by 1"
+        note: "Revision loop: REJECTED -> SUBMITTED makes the filing machine cyclic."
+      - from: PENDING
+        to: CANCELLED
+        trigger: "POST /government-filings/{id}/cancel"
+        actor: VitalRecordsOfficer
+        preconditions:
+          - "GovernmentFiling.status == PENDING"
+        side_effects:
+          - "increments GovernmentFiling.version by 1"
+        note: "Only a not-yet-submitted (PENDING) filing may be cancelled; once SUBMITTED/LATE_FLAGGED/ACCEPTED/REJECTED it follows the acknowledge/resubmit paths instead."
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: nicu-escalate-stale-newborn
+    parent_entity: Newborn
+    write_endpoint: "POST /newborns/{id}/nicu-escalate"
+    occ_field: "expected_newborn_version"
+    description: |
+      Escalating a Newborn to the NICU against a version that has advanced since
+      the client last observed it is rejected with a stale-version error. This
+      captures the case where another writer has already escalated the newborn
+      (creating a NicuStay that legitimately claims a scarce bed under the bed
+      selector) and the current writer's view of the newborn — and therefore of
+      whether a bed is still needed — is out of date.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: dependent-approve-stale-policy
+    parent_entity: InsurancePolicy
+    write_endpoint: "POST /dependent-enrollments/{id}/approve"
+    occ_field: "expected_policy_version"
+    description: |
+      Approving a DependentEnrollment against an InsurancePolicy whose version has
+      advanced since the client last observed it is rejected with a stale-version
+      error. This captures the case where another writer has already enrolled a
+      dependent (consuming a finite dependent slot and bumping the policy version),
+      so the current writer's belief that a slot remains free is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: compute_sep_deadline
+    trigger: "on DependentEnrollment creation (POST /dependent-enrollments) and recomputed on read"
+    algorithm: threshold
+    formula: |
+      base = Newborn.birth_datetime                       # ISO 8601 UTC instant
+      raw_deadline = base + 30 calendar days, time component preserved
+      if policy.plan_type == MARKETPLACE:
+          # variant CALENDAR: hard 30 calendar days, no roll
+          sep_deadline = raw_deadline
+      else:  # EMPLOYER_GROUP, MEDICAID
+          # variant BUSINESS_ROLL: if raw_deadline falls on Sat/Sun, roll FORWARD
+          # to 23:59:59.999Z of the next Monday; else keep raw_deadline
+          if weekday(raw_deadline) == SATURDAY: sep_deadline = next_monday at 23:59:59.999Z
+          elif weekday(raw_deadline) == SUNDAY: sep_deadline = next_monday at 23:59:59.999Z
+          else: sep_deadline = raw_deadline
+      enrollment is within SEP iff requested_at <= sep_deadline (inclusive boundary)
+    input_set: "single DependentEnrollment + its Newborn.birth_datetime + its InsurancePolicy.plan_type"
+    constants:
+      SEP_WINDOW_DAYS: 30
+      WEEKEND_ROLL_TARGET_TIME: "23:59:59.999Z"
+    precision: "datetime to milliseconds; comparison is inclusive (<=)"
+    variants:
+      - name: CALENDAR
+        when: "plan_type == MARKETPLACE"
+        difference: "hard birth + 30 calendar days; no weekend roll, deadline keeps birth time-of-day"
+      - name: BUSINESS_ROLL
+        when: "plan_type in {EMPLOYER_GROUP, MEDICAID}"
+        difference: "if birth + 30 days lands on a weekend, deadline rolls forward to next Monday 23:59:59.999Z, extending the window"
+
+  - name: compute_discharge_readiness
+    trigger: "recomputed on POST /newborns/{id}/mark-discharge-ready and on read of GET /newborns/{id}"
+    algorithm: weighted_scoring
+    formula: |
+      weight_pts =  ( 40 if weight_grams >= 2500
+                      else 25 if weight_grams >= 2000
+                      else 10 if weight_grams >= 1800
+                      else 0 )                              # tiered, non-linear in weight
+      feeding_pts = 30 if EXISTS LactationConsult L where L.newborn_id==newborn.id
+                                 and L.status==COMPLETED and L.feeding_adequate==true
+                    else 0
+      nicu_pts =    20 if newborn has NO open NicuStay (none in {PENDING_BED, ACTIVE})
+                    else 0
+      filing_pts =  10 if EXISTS GovernmentFiling F where F.filing_type==BIRTH_CERTIFICATE
+                                 and F.status in {SUBMITTED, ACCEPTED}
+                    else 0
+      discharge_readiness_score = min(100, weight_pts + feeding_pts + nicu_pts + filing_pts)
+      # Evaluation order is fixed: each *_pts term is computed independently then summed,
+      # then capped at 100. mark-discharge-ready requires score >= 70 (inclusive).
+    input_set: "the Newborn plus its LactationConsults (COMPLETED only), open NicuStays, and BIRTH_CERTIFICATE GovernmentFilings"
+    constants:
+      PASS_THRESHOLD: 70
+      WEIGHT_TIER_HIGH_G: 2500
+      WEIGHT_TIER_MID_G: 2000
+      WEIGHT_TIER_LOW_G: 1800
+    precision: "integer points; threshold comparison inclusive (>= 70)"
+
+  - name: compute_bag_value
+    trigger: "recomputed on POST /discharge-bags/{id}/assemble and on read"
+    algorithm: aggregation
+    formula: |
+      # Per-line-item rounding pinned BEFORE summation (round-then-sum), NOT sum-then-round.
+      line_value(item) = round_half_up( item.qty * item.unit_value_cents
+                                        * category_multiplier(item.category) )   # integer cents
+      category_multiplier:
+          FORMULA=1.00, DIAPERS=1.00, EDUCATION=0.00 (educational handouts are free),
+          CARSEAT_VOUCHER=1.00, MEDICATION=1.05 (handling surcharge)
+      total_value_cents = sum over line_items of line_value(item)
+      requires_pharmacy_signoff = any line_item.category == MEDICATION
+    input_set: "all line_items of the single DischargeBag"
+    constants:
+      MED_HANDLING_MULTIPLIER: 1.05
+      EDUCATION_MULTIPLIER: 0.00
+    precision: "integer cents; round_half_up applied per line item before summation"
+    variants:
+      - name: ROUND_THEN_SUM
+        when: "always — this is the PINNED, authoritative order the system uses"
+        difference: "each line_value is rounded to integer cents first, then the rounded line values are summed"
+      - name: SUM_THEN_ROUND
+        when: "the divergent (rejected) interpretation — present only to pin that the system does NOT use it"
+        difference: "raw fractional line values are summed first then rounded once; for bags with multiple half-cent lines this differs from ROUND_THEN_SUM by one or more cents"
+
+  - name: compute_filing_deadline
+    trigger: "on GovernmentFiling creation (POST /government-filings) and recomputed on read"
+    algorithm: threshold
+    formula: |
+      base = Newborn.birth_datetime
+      if filing_type == BIRTH_CERTIFICATE: filing_deadline = base + 5 calendar days
+      if filing_type == SSN_APPLICATION:   filing_deadline = base + 365 calendar days
+      late iff submitted_at > filing_deadline (strict >)
+    input_set: "single GovernmentFiling + its Newborn.birth_datetime + filing_type"
+    constants:
+      BIRTH_CERT_DAYS: 5
+      SSN_DAYS: 365
+    precision: "datetime to milliseconds; late comparison strict (>)"
+
+  - name: compute_followup_due
+    trigger: "on FollowUpTask auto-creation at Newborn discharge"
+    algorithm: threshold
+    formula: |
+      base = Newborn.discharged_at
+      due_at = base + sla_hours(task_type)
+      sla_hours: WEIGHT_CHECK=48, JAUNDICE_CHECK=72, FEEDING_CHECK=120, SAFETY_CALL=168
+      a task is MISSABLE iff current clock > due_at (strict >)
+    input_set: "the four FollowUpTasks spawned at discharge + Newborn.discharged_at"
+    constants:
+      WEIGHT_CHECK_HOURS: 48
+      JAUNDICE_CHECK_HOURS: 72
+      FEEDING_CHECK_HOURS: 120
+      SAFETY_CALL_HOURS: 168
+    precision: "datetime to milliseconds; miss comparison strict (>)"
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "the role is permitted for this operation per §1.7"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "every path id and every FK in the body resolves to an existing resource, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: existence
+    check: "request body is well-formed and all required input fields present with correct types/enums"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all
+
+  - priority: 5
+    category: state
+    check: "the target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_<parent>_version equals the current parent version on guarded writes"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /newborns/{id}/nicu-escalate, POST /dependent-enrollments/{id}/approve"
+
+  - priority: 7
+    category: business_safety
+    check: "a Newborn meeting NICU clinical criteria (gestational_age_weeks < 35 OR apgar_5min <= 6 OR weight_grams < 1800) cannot be routed to ROOMING_IN via room-in"
+    error_id: ERR_NICU_CRITERIA_MET
+    http_status: 422
+    applies_to: "POST /newborns/{id}/room-in"
+
+  - priority: 7
+    category: business_safety
+    check: "a Newborn NOT meeting NICU clinical criteria (gestational_age_weeks >= 35 AND apgar_5min >= 7 AND weight_grams >= 1800) cannot be escalated to the NICU"
+    error_id: ERR_NICU_CRITERIA_NOT_MET
+    http_status: 422
+    applies_to: "POST /newborns/{id}/nicu-escalate (from BORN)"
+
+  - priority: 8
+    category: business_safety
+    check: "a DischargeBag containing a MEDICATION line item cannot move ASSEMBLED->ISSUED without pharmacy_signoff==true in the request"
+    error_id: ERR_PHARMACY_SIGNOFF_REQUIRED
+    http_status: 422
+    applies_to: "POST /discharge-bags/{id}/issue"
+
+  - priority: 9
+    category: business_referential
+    check: "an SSN_APPLICATION filing cannot be SUBMITTED unless the same newborn's BIRTH_CERTIFICATE filing is in {SUBMITTED, LATE_FLAGGED, ACCEPTED}"
+    error_id: ERR_BIRTH_CERT_PREREQUISITE
+    http_status: 422
+    applies_to: "POST /government-filings/{id}/submit"
+
+  - priority: 10
+    category: business_referential
+    check: "a Newborn cannot DISCHARGE unless it has exactly one ISSUED DischargeBag AND a BIRTH_CERTIFICATE filing in {SUBMITTED, ACCEPTED}"
+    error_id: ERR_DISCHARGE_PREREQUISITE
+    http_status: 422
+    applies_to: "POST /newborns/{id}/discharge"
+
+  - priority: 11
+    category: business_constraint
+    check: "a GovernmentFiling cannot be SUBMITTED while Newborn.legal_name is null"
+    error_id: ERR_LEGAL_NAME_REQUIRED
+    http_status: 422
+    applies_to: "POST /government-filings/{id}/submit"
+
+  - priority: 12
+    category: business_temporal
+    check: "approving a DependentEnrollment with requested_at > sep_deadline is outside the Special Enrollment Period"
+    error_id: ERR_SEP_WINDOW_CLOSED
+    http_status: 422
+    applies_to: "POST /dependent-enrollments/{id}/approve"
+
+  - priority: 13
+    category: business_constraint
+    check: "marking discharge-ready requires the recomputed discharge_readiness_score >= 70"
+    error_id: ERR_READINESS_BELOW_THRESHOLD
+    http_status: 422
+    applies_to: "POST /newborns/{id}/mark-discharge-ready"
+
+  - priority: 14
+    category: business_constraint
+    check: "birth_sequence must be unique within a PreRegistration; a duplicate sequence is rejected"
+    error_id: ERR_DUPLICATE_BIRTH_SEQUENCE
+    http_status: 409
+    applies_to: "POST /registrations/{id}/newborns"
+
+  - priority: 15
+    category: business_constraint
+    check: "stepping a NicuStay down requires the newborn to have an ACTIVE (bedded) stay; a PENDING_BED-only newborn cannot step down"
+    error_id: ERR_NO_ACTIVE_NICU_STAY
+    http_status: 422
+    applies_to: "POST /newborns/{id}/step-down"
+
+  - priority: 16
+    category: business_fiscal
+    check: "approving a DependentEnrollment when the policy's ENROLLED dependents already equal dependent_slots_max is rejected"
+    error_id: ERR_DEPENDENT_SLOTS_EXHAUSTED
+    http_status: 422
+    applies_to: "POST /dependent-enrollments/{id}/approve"
+
+  - priority: 17
+    category: business_temporal
+    check: "manual bed placement is rejected when the stay's occupation interval [admitted_at, discharged_at) overlaps any prior stay interval on the target bed; half-open semantics — admitted_at == a prior stay's discharged_at does NOT overlap (adjacency allowed)"
+    error_id: ERR_BED_INTERVAL_OVERLAP
+    http_status: 409
+    applies_to: "POST /nicu-beds/{id}/assign-stay"
+
+  - priority: 18
+    category: business_temporal
+    check: "scheduling a LactationConsult whose consult_datetime is within CONSULT_BUFFER_MINUTES=240 (closed buffer: |new.consult_datetime - existing.consult_datetime| <= 240 minutes, both endpoints inclusive) of an existing consult for the same newborn whose status IN {SCHEDULED, COMPLETED, FEEDING_AT_RISK} is rejected"
+    error_id: ERR_CONSULT_BUFFER_CONFLICT
+    http_status: 409
+    applies_to: "POST /lactation-consults"
+
+  - priority: 19
+    category: business_temporal
+    check: "admitting a PreRegistration when the current clock date is outside the inclusive window [due_date - 21 days, due_date + 21 days] is rejected"
+    error_id: ERR_ADMIT_WINDOW_CLOSED
+    http_status: 422
+    applies_to: "POST /registrations/{id}/admit"
+
+  - priority: 20
+    category: business_constraint
+    check: "issuing a DischargeBag for a newborn that already has another DischargeBag in status ISSUED is rejected"
+    error_id: ERR_BAG_ALREADY_ISSUED
+    http_status: 409
+    applies_to: "POST /discharge-bags/{id}/issue"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # --- test-driving clock ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's current UTC clock to an arbitrary instant for deterministic temporal tests."
+    roles: [RegistrySupervisor]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock set to to_iso8601 for all subsequent now() reads"]
+
+  # --- InsurancePolicy ---
+  - method: POST
+    path: "/insurance-policies"
+    description: "Create an insurance policy."
+    roles: [BenefitsCoordinator, RegistrySupervisor]
+    code: 201
+    input: [carrier_name, subscriber_name, plan_type, coverage_effective_date, dependent_slots_max]
+    output: InsurancePolicy
+    side_effects: []
+  - method: GET
+    path: "/insurance-policies/{id}"
+    description: "Read an insurance policy (includes dependents_added_count)."
+    roles: [BenefitsCoordinator, RegistrySupervisor]
+    code: 200
+    input: []
+    output: InsurancePolicy
+    side_effects: []
+  - method: GET
+    path: "/insurance-policies/{id}/dependent-enrollments"
+    description: "List dependent enrollments under a policy (reverse-reachability for DependentEnrollment.policy_id)."
+    roles: [BenefitsCoordinator, RegistrySupervisor]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: DependentEnrollment[]
+    side_effects: []
+
+  # --- PreRegistration ---
+  - method: POST
+    path: "/registrations"
+    description: "Create a pre-registration in DRAFT."
+    roles: [IntakeClerk]
+    code: 201
+    input: [mother_full_name, mother_dob, due_date, payer_policy_id, planned_delivery_facility, "birth_plan_flags?"]
+    output: PreRegistration
+    side_effects: []
+  - method: GET
+    path: "/registrations/{id}"
+    description: "Read a pre-registration (includes newborn_count, version)."
+    roles: [IntakeClerk, AttendingNurse, RegistrySupervisor]
+    code: 200
+    input: []
+    output: PreRegistration
+    side_effects: []
+  - method: GET
+    path: "/registrations"
+    description: "List pre-registrations; filter by payer_policy_id (reverse-reachability for PreRegistration.payer_policy_id) or status."
+    roles: [IntakeClerk, RegistrySupervisor]
+    code: 200
+    input: ["payer_policy_id?", "status?", "limit?", "offset?"]
+    output: PreRegistration[]
+    side_effects: []
+  - method: POST
+    path: "/registrations/{id}/submit"
+    description: "DRAFT -> SUBMITTED."
+    roles: [IntakeClerk]
+    code: 200
+    input: []
+    output: PreRegistration
+    side_effects: ["increments PreRegistration.version"]
+  - method: POST
+    path: "/registrations/{id}/admit"
+    description: "SUBMITTED -> ADMITTED (admit-window gated)."
+    roles: [IntakeClerk]
+    code: 200
+    input: []
+    output: PreRegistration
+    side_effects: ["sets admitted_at", "increments PreRegistration.version"]
+  - method: POST
+    path: "/registrations/{id}/cancel"
+    description: "DRAFT|SUBMITTED -> CANCELLED (no newborns)."
+    roles: [IntakeClerk]
+    code: 200
+    input: []
+    output: PreRegistration
+    side_effects: ["increments PreRegistration.version"]
+  - method: POST
+    path: "/registrations/{id}/close"
+    description: "BIRTH_RECORDED -> CLOSED when all newborns DISCHARGED."
+    roles: [RegistrySupervisor]
+    code: 200
+    input: []
+    output: PreRegistration
+    side_effects: ["increments PreRegistration.version"]
+  - method: POST
+    path: "/registrations/{id}/newborns"
+    description: "Record a birth: creates a Newborn (BORN); first birth moves PreRegistration ADMITTED->BIRTH_RECORDED."
+    roles: [AttendingNurse]
+    code: 201
+    input: [birth_datetime, birth_sequence, weight_grams, gestational_age_weeks, apgar_5min, "legal_name?"]
+    output: Newborn
+    side_effects: ["creates Newborn in BORN", "first newborn sets PreRegistration.status=BIRTH_RECORDED", "recomputes PreRegistration.newborn_count", "increments PreRegistration.version"]
+  - method: GET
+    path: "/registrations/{id}/newborns"
+    description: "List newborns under a pre-registration (reverse-reachability for Newborn.pre_registration_id)."
+    roles: [AttendingNurse, Neonatologist, RegistrySupervisor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Newborn[]
+    side_effects: []
+
+  # --- Newborn ---
+  - method: GET
+    path: "/newborns/{id}"
+    description: "Read a newborn (includes computed discharge_readiness_score, clinical_status, version)."
+    roles: [AttendingNurse, Neonatologist, BenefitsCoordinator, VitalRecordsOfficer, RegistrySupervisor]
+    code: 200
+    input: []
+    output: Newborn
+    side_effects: ["recomputes discharge_readiness_score for the response"]
+  - method: PATCH
+    path: "/newborns/{id}"
+    description: "Update mutable newborn fields (legal_name) before filings/discharge."
+    roles: [AttendingNurse, VitalRecordsOfficer]
+    code: 200
+    input: ["legal_name?"]
+    output: Newborn
+    side_effects: ["increments Newborn.version"]
+  - method: POST
+    path: "/newborns/{id}/room-in"
+    description: "BORN -> ROOMING_IN (blocked if NICU criteria met)."
+    roles: [AttendingNurse]
+    code: 200
+    input: []
+    output: Newborn
+    side_effects: ["sets care_location=MOTHER_ROOM", "increments Newborn.version"]
+  - method: POST
+    path: "/newborns/{id}/nicu-escalate"
+    description: "BORN|ROOMING_IN -> NICU_ADMITTED; creates a NicuStay and runs the bed selector (OCC-guarded)."
+    roles: [Neonatologist]
+    code: 201
+    input: [required_level, admitted_at, expected_newborn_version]
+    output: NicuStay
+    side_effects: ["creates NicuStay (PENDING_BED->ACTIVE on bed claim)", "occupies a NicuBed on success", "sets care_location=NICU", "appends AuditEvent NICU_ESCALATED", "increments Newborn.version by 1"]
+  - method: POST
+    path: "/newborns/{id}/step-down"
+    description: "NICU_ADMITTED -> STEP_DOWN; frees the bed and promotes the earliest waiting stay."
+    roles: [Neonatologist]
+    code: 200
+    input: []
+    output: Newborn
+    side_effects: ["closes the open NicuStay (STEPPED_DOWN)", "frees NicuBed", "promotes earliest PENDING_BED stay onto the freed bed", "sets care_location=STEP_DOWN_UNIT", "appends AuditEvent STEP_DOWN", "increments Newborn.version"]
+  - method: POST
+    path: "/newborns/{id}/mark-discharge-ready"
+    description: "ROOMING_IN|STEP_DOWN -> DISCHARGE_READY (score >= 70)."
+    roles: [AttendingNurse]
+    code: 200
+    input: []
+    output: Newborn
+    side_effects: ["recomputes discharge_readiness_score", "increments Newborn.version"]
+  - method: POST
+    path: "/newborns/{id}/discharge"
+    description: "DISCHARGE_READY -> DISCHARGED; spawns four FollowUpTasks (gated on ISSUED bag + BIRTH_CERTIFICATE filing)."
+    roles: [AttendingNurse]
+    code: 200
+    input: []
+    output: Newborn
+    side_effects: ["sets discharged_at, care_location=RELEASED", "auto-creates 4 FollowUpTasks", "appends AuditEvent DISCHARGED", "increments Newborn.version"]
+  - method: GET
+    path: "/newborns/{id}/audit-events"
+    description: "List audit events for a newborn (reverse-reachability for AuditEvent.newborn_id)."
+    roles: [RegistrySupervisor, AttendingNurse, Neonatologist]
+    code: 200
+    input: ["event_type?", "limit?", "offset?"]
+    output: AuditEvent[]
+    side_effects: []
+
+  # --- LactationConsult ---
+  - method: POST
+    path: "/lactation-consults"
+    description: "Schedule a lactation consult for a newborn (rejected when within CONSULT_BUFFER_MINUTES of an existing non-CANCELLED consult for the same newborn)."
+    roles: [AttendingNurse]
+    code: 201
+    input: [newborn_id, consult_datetime]
+    output: LactationConsult
+    side_effects: []
+  - method: GET
+    path: "/lactation-consults/{id}"
+    description: "Read a lactation consult."
+    roles: [AttendingNurse, RegistrySupervisor]
+    code: 200
+    input: []
+    output: LactationConsult
+    side_effects: []
+  - method: GET
+    path: "/lactation-consults"
+    description: "List lactation consults; filter by newborn_id (reverse-reachability for LactationConsult.newborn_id)."
+    roles: [AttendingNurse, RegistrySupervisor]
+    code: 200
+    input: ["newborn_id?", "status?", "limit?", "offset?"]
+    output: LactationConsult[]
+    side_effects: []
+  - method: POST
+    path: "/lactation-consults/{id}/complete"
+    description: "SCHEDULED -> COMPLETED (latch>=7) or FEEDING_AT_RISK (latch<7)."
+    roles: [AttendingNurse]
+    code: 200
+    input: [latch_score]
+    output: LactationConsult
+    side_effects: ["stores latch_score, recomputes feeding_adequate", "increments LactationConsult.version"]
+  - method: POST
+    path: "/lactation-consults/{id}/cancel"
+    description: "SCHEDULED -> CANCELLED."
+    roles: [AttendingNurse]
+    code: 200
+    input: []
+    output: LactationConsult
+    side_effects: ["increments LactationConsult.version"]
+
+  # --- NicuBed ---
+  - method: POST
+    path: "/nicu-beds"
+    description: "Register a NICU bed in the shared pool."
+    roles: [Neonatologist, RegistrySupervisor]
+    code: 201
+    input: [bed_label, acuity_level]
+    output: NicuBed
+    side_effects: []
+  - method: GET
+    path: "/nicu-beds/{id}"
+    description: "Read a NICU bed (includes occupancy_status, current_stay_id)."
+    roles: [Neonatologist, RegistrySupervisor]
+    code: 200
+    input: []
+    output: NicuBed
+    side_effects: []
+  - method: GET
+    path: "/nicu-beds"
+    description: "List NICU beds; filter by occupancy_status."
+    roles: [Neonatologist, RegistrySupervisor]
+    code: 200
+    input: ["occupancy_status?", "limit?", "offset?"]
+    output: NicuBed[]
+    side_effects: []
+  - method: GET
+    path: "/nicu-beds/{id}/nicu-stays"
+    description: "List stays that have occupied this bed (reverse-reachability for NicuStay.nicu_bed_id)."
+    roles: [Neonatologist, RegistrySupervisor]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: NicuStay[]
+    side_effects: []
+  - method: POST
+    path: "/nicu-beds/{id}/assign-stay"
+    description: "Manually place a PENDING_BED stay onto this specific bed (half-open interval-overlap gated)."
+    roles: [Neonatologist]
+    code: 200
+    input: [nicu_stay_id]
+    output: NicuStay
+    side_effects: ["assigns nicu_bed_id, sets NicuStay.status=ACTIVE, occupies the bed, appends AuditEvent NICU_BED_ASSIGNED", "increments NicuStay.version"]
+
+  # --- NicuStay ---
+  - method: GET
+    path: "/nicu-stays/{id}"
+    description: "Read a NICU stay (includes status, nicu_bed_id)."
+    roles: [Neonatologist, RegistrySupervisor]
+    code: 200
+    input: []
+    output: NicuStay
+    side_effects: []
+  - method: GET
+    path: "/nicu-stays"
+    description: "List NICU stays; filter by newborn_id (reverse-reachability for NicuStay.newborn_id)."
+    roles: [Neonatologist, RegistrySupervisor]
+    code: 200
+    input: ["newborn_id?", "status?", "limit?", "offset?"]
+    output: NicuStay[]
+    side_effects: []
+  - method: POST
+    path: "/nicu-stays/{id}/cancel"
+    description: "PENDING_BED -> CANCELLED (withdraw a not-yet-bedded escalation)."
+    roles: [Neonatologist]
+    code: 200
+    input: []
+    output: NicuStay
+    side_effects: ["increments NicuStay.version"]
+
+  # --- DischargeBag ---
+  - method: POST
+    path: "/discharge-bags"
+    description: "Create a discharge bag (DRAFT) for a newborn."
+    roles: [AttendingNurse]
+    code: 201
+    input: [newborn_id, line_items]
+    output: DischargeBag
+    side_effects: []
+  - method: GET
+    path: "/discharge-bags/{id}"
+    description: "Read a discharge bag (includes total_value_cents, requires_pharmacy_signoff)."
+    roles: [AttendingNurse, RegistrySupervisor]
+    code: 200
+    input: []
+    output: DischargeBag
+    side_effects: []
+  - method: GET
+    path: "/discharge-bags"
+    description: "List discharge bags; filter by newborn_id (reverse-reachability for DischargeBag.newborn_id)."
+    roles: [AttendingNurse, RegistrySupervisor]
+    code: 200
+    input: ["newborn_id?", "status?", "limit?", "offset?"]
+    output: DischargeBag[]
+    side_effects: []
+  - method: POST
+    path: "/discharge-bags/{id}/assemble"
+    description: "DRAFT -> ASSEMBLED; recomputes value and pharmacy flag."
+    roles: [AttendingNurse]
+    code: 200
+    input: []
+    output: DischargeBag
+    side_effects: ["recomputes total_value_cents, requires_pharmacy_signoff", "increments DischargeBag.version"]
+  - method: POST
+    path: "/discharge-bags/{id}/issue"
+    description: "ASSEMBLED -> ISSUED (pharmacy_signoff gated if medication present)."
+    roles: [AttendingNurse]
+    code: 200
+    input: ["pharmacy_signoff?"]
+    output: DischargeBag
+    side_effects: ["appends AuditEvent BAG_ISSUED", "increments DischargeBag.version"]
+  - method: POST
+    path: "/discharge-bags/{id}/recall"
+    description: "ISSUED -> RECALLED (compensation; only before discharge)."
+    roles: [AttendingNurse]
+    code: 200
+    input: []
+    output: DischargeBag
+    side_effects: ["increments DischargeBag.version"]
+
+  # --- FollowUpTask ---
+  - method: GET
+    path: "/follow-up-tasks/{id}"
+    description: "Read a follow-up task."
+    roles: [AttendingNurse, RegistrySupervisor]
+    code: 200
+    input: []
+    output: FollowUpTask
+    side_effects: []
+  - method: GET
+    path: "/follow-up-tasks"
+    description: "List follow-up tasks; filter by newborn_id (reverse-reachability for FollowUpTask.newborn_id)."
+    roles: [AttendingNurse, RegistrySupervisor]
+    code: 200
+    input: ["newborn_id?", "status?", "task_type?", "limit?", "offset?"]
+    output: FollowUpTask[]
+    side_effects: []
+  - method: POST
+    path: "/follow-up-tasks/{id}/record-attempt"
+    description: "OPEN|ATTEMPTED -> ATTEMPTED; 3rd attempt -> ESCALATED."
+    roles: [AttendingNurse]
+    code: 200
+    input: ["scheduled_at?"]
+    output: FollowUpTask
+    side_effects: ["increments attempt_count", "ESCALATED + AuditEvent on 3rd attempt", "increments FollowUpTask.version"]
+  - method: POST
+    path: "/follow-up-tasks/{id}/complete"
+    description: "OPEN|ATTEMPTED -> COMPLETED."
+    roles: [AttendingNurse]
+    code: 200
+    input: []
+    output: FollowUpTask
+    side_effects: ["increments FollowUpTask.version"]
+  - method: POST
+    path: "/follow-up-tasks/{id}/mark-missed"
+    description: "OPEN|ATTEMPTED -> MISSED (clock past due_at)."
+    roles: [AttendingNurse]
+    code: 200
+    input: []
+    output: FollowUpTask
+    side_effects: ["increments FollowUpTask.version"]
+
+  # --- DependentEnrollment ---
+  - method: POST
+    path: "/dependent-enrollments"
+    description: "Create a dependent-add request (PENDING); computes sep_deadline."
+    roles: [BenefitsCoordinator]
+    code: 201
+    input: [newborn_id, policy_id, requested_at]
+    output: DependentEnrollment
+    side_effects: ["computes sep_deadline from Newborn.birth_datetime + plan-type variant"]
+  - method: GET
+    path: "/dependent-enrollments/{id}"
+    description: "Read a dependent enrollment (includes sep_deadline, retroactive_effective_date)."
+    roles: [BenefitsCoordinator, RegistrySupervisor]
+    code: 200
+    input: []
+    output: DependentEnrollment
+    side_effects: []
+  - method: GET
+    path: "/dependent-enrollments"
+    description: "List dependent enrollments; filter by newborn_id (reverse-reachability for DependentEnrollment.newborn_id)."
+    roles: [BenefitsCoordinator, RegistrySupervisor]
+    code: 200
+    input: ["newborn_id?", "policy_id?", "status?", "limit?", "offset?"]
+    output: DependentEnrollment[]
+    side_effects: []
+  - method: POST
+    path: "/dependent-enrollments/{id}/approve"
+    description: "PENDING -> ENROLLED (within SEP + slot available, OCC-guarded) or -> SEP_EXPIRED (past deadline)."
+    roles: [BenefitsCoordinator]
+    code: 200
+    input: [expected_policy_version]
+    output: DependentEnrollment
+    side_effects: ["sets retroactive_effective_date", "recomputes InsurancePolicy.dependents_added_count", "appends AuditEvent DEPENDENT_ENROLLED", "increments InsurancePolicy.version by 1"]
+  - method: POST
+    path: "/dependent-enrollments/{id}/deny"
+    description: "PENDING -> DENIED."
+    roles: [BenefitsCoordinator]
+    code: 200
+    input: []
+    output: DependentEnrollment
+    side_effects: ["increments DependentEnrollment.version"]
+  - method: POST
+    path: "/dependent-enrollments/{id}/expire"
+    description: "PENDING -> SEP_EXPIRED (explicit close after the window)."
+    roles: [BenefitsCoordinator]
+    code: 200
+    input: []
+    output: DependentEnrollment
+    side_effects: ["appends AuditEvent SEP_EXPIRED", "increments DependentEnrollment.version"]
+  - method: POST
+    path: "/dependent-enrollments/{id}/terminate"
+    description: "ENROLLED -> TERMINATED (compensation; releases the dependent slot)."
+    roles: [BenefitsCoordinator]
+    code: 200
+    input: []
+    output: DependentEnrollment
+    side_effects: ["recomputes InsurancePolicy.dependents_added_count", "increments DependentEnrollment.version"]
+
+  # --- GovernmentFiling ---
+  - method: POST
+    path: "/government-filings"
+    description: "Create a filing (PENDING) of type BIRTH_CERTIFICATE or SSN_APPLICATION; computes filing_deadline."
+    roles: [VitalRecordsOfficer]
+    code: 201
+    input: [newborn_id, filing_type]
+    output: GovernmentFiling
+    side_effects: ["computes filing_deadline from Newborn.birth_datetime + per-type days"]
+  - method: GET
+    path: "/government-filings/{id}"
+    description: "Read a filing (includes filing_deadline, status)."
+    roles: [VitalRecordsOfficer, RegistrySupervisor]
+    code: 200
+    input: []
+    output: GovernmentFiling
+    side_effects: []
+  - method: GET
+    path: "/government-filings"
+    description: "List filings; filter by newborn_id (reverse-reachability for GovernmentFiling.newborn_id)."
+    roles: [VitalRecordsOfficer, RegistrySupervisor]
+    code: 200
+    input: ["newborn_id?", "filing_type?", "status?", "limit?", "offset?"]
+    output: GovernmentFiling[]
+    side_effects: []
+  - method: POST
+    path: "/government-filings/{id}/submit"
+    description: "PENDING|REJECTED -> SUBMITTED, or PENDING -> LATE_FLAGGED when past filing_deadline."
+    roles: [VitalRecordsOfficer]
+    code: 200
+    input: []
+    output: GovernmentFiling
+    side_effects: ["sets submitted_at", "LATE_FLAGGED + AuditEvent if past deadline else SUBMITTED + AuditEvent", "increments GovernmentFiling.version"]
+  - method: POST
+    path: "/government-filings/{id}/acknowledge"
+    description: "SUBMITTED|LATE_FLAGGED -> ACCEPTED (with reference_number) or REJECTED."
+    roles: [VitalRecordsOfficer]
+    code: 200
+    input: [outcome, "reference_number?"]
+    output: GovernmentFiling
+    side_effects: ["sets acknowledged_at; stores reference_number on ACCEPTED", "increments GovernmentFiling.version"]
+  - method: POST
+    path: "/government-filings/{id}/cancel"
+    description: "PENDING -> CANCELLED (blocked if a dependent SSN filing exists)."
+    roles: [VitalRecordsOfficer]
+    code: 200
+    input: []
+    output: GovernmentFiling
+    side_effects: ["increments GovernmentFiling.version"]
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/invalid X-User-Role or X-User-ID headers"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "role not permitted for the operation per §1.7"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a path id or body FK does not resolve to an existing resource"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "malformed body, missing required field, bad type/enum, or out-of-range numeric (e.g., apgar_5min not in 0-10)"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "transition not defined from the resource's current state"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "OCC expected_<parent>_version does not match current parent version"
+  - id: ERR_NICU_CRITERIA_MET
+    http: 422
+    condition: "room-in attempted on a newborn meeting NICU clinical criteria"
+  - id: ERR_PHARMACY_SIGNOFF_REQUIRED
+    http: 422
+    condition: "issuing a medication-bearing discharge bag without pharmacy_signoff==true"
+  - id: ERR_BIRTH_CERT_PREREQUISITE
+    http: 422
+    condition: "submitting an SSN_APPLICATION before the birth-certificate filing is SUBMITTED/LATE_FLAGGED/ACCEPTED"
+  - id: ERR_DISCHARGE_PREREQUISITE
+    http: 422
+    condition: "discharging without exactly one ISSUED bag and a SUBMITTED/ACCEPTED birth-certificate filing"
+  - id: ERR_LEGAL_NAME_REQUIRED
+    http: 422
+    condition: "submitting a government filing while Newborn.legal_name is null"
+  - id: ERR_SEP_WINDOW_CLOSED
+    http: 422
+    condition: "approving a dependent enrollment with requested_at after the SEP deadline"
+  - id: ERR_READINESS_BELOW_THRESHOLD
+    http: 422
+    condition: "mark-discharge-ready with recomputed discharge_readiness_score < 70"
+  - id: ERR_DUPLICATE_BIRTH_SEQUENCE
+    http: 409
+    condition: "recording a birth with a birth_sequence already used within the PreRegistration"
+  - id: ERR_NO_ACTIVE_NICU_STAY
+    http: 422
+    condition: "step-down attempted on a newborn without an ACTIVE (bedded) NICU stay"
+  - id: ERR_DEPENDENT_SLOTS_EXHAUSTED
+    http: 422
+    condition: "approving a dependent enrollment when ENROLLED dependents == dependent_slots_max"
+  - id: ERR_NICU_CRITERIA_NOT_MET
+    http: 422
+    condition: "nicu-escalate attempted on a newborn not meeting NICU clinical criteria"
+  - id: ERR_ADMIT_WINDOW_CLOSED
+    http: 422
+    condition: "admit attempted outside [due_date - 21 days, due_date + 21 days]"
+  - id: ERR_BAG_ALREADY_ISSUED
+    http: 409
+    condition: "issuing a second discharge bag for a newborn that already has one ISSUED"
+  - id: ERR_BED_INTERVAL_OVERLAP
+    http: 409
+    condition: "manual bed placement whose [admitted_at, discharged_at) interval overlaps a prior stay interval on the target bed (half-open semantics)"
+  - id: ERR_CONSULT_BUFFER_CONFLICT
+    http: 409
+    condition: "scheduling a lactation consult within 240 minutes (closed buffer) of an existing non-cancelled consult for the same newborn"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "generic business-rule violation not covered by a more specific code"
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: IntakeClerk
+    description: "Owns pre-registration admission lifecycle (draft → submit → admit → cancel)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /registrations"
+      - "POST /registrations/{id}/submit"
+      - "POST /registrations/{id}/admit"
+      - "POST /registrations/{id}/cancel"
+    shared_operations:
+      - "GET /registrations"
+      - "GET /registrations/{id}"
+
+  - name: AttendingNurse
+    description: "Owns the newborn clinical lifecycle: birth recording, rooming-in, lactation, discharge bag, discharge, follow-up."
+    identity: opaque
+    exclusive_operations:
+      - "POST /registrations/{id}/newborns"
+      - "POST /newborns/{id}/room-in"
+      - "POST /newborns/{id}/mark-discharge-ready"
+      - "POST /newborns/{id}/discharge"
+      - "POST /lactation-consults"
+      - "POST /lactation-consults/{id}/complete"
+      - "POST /lactation-consults/{id}/cancel"
+      - "POST /discharge-bags"
+      - "POST /discharge-bags/{id}/assemble"
+      - "POST /discharge-bags/{id}/issue"
+      - "POST /discharge-bags/{id}/recall"
+      - "POST /follow-up-tasks/{id}/record-attempt"
+      - "POST /follow-up-tasks/{id}/complete"
+      - "POST /follow-up-tasks/{id}/mark-missed"
+    shared_operations:
+      - "GET /newborns/{id}"
+      - "PATCH /newborns/{id}"
+      - "GET /registrations/{id}/newborns"
+      - "GET /lactation-consults"
+      - "GET /discharge-bags"
+      - "GET /follow-up-tasks"
+      - "GET /newborns/{id}/audit-events"
+
+  - name: Neonatologist
+    description: "Owns NICU escalation, step-down, and the bed pool."
+    identity: opaque
+    exclusive_operations:
+      - "POST /newborns/{id}/nicu-escalate"
+      - "POST /newborns/{id}/step-down"
+      - "POST /nicu-stays/{id}/cancel"
+      - "POST /nicu-beds/{id}/assign-stay"
+    shared_operations:
+      - "POST /nicu-beds"
+      - "GET /nicu-beds"
+      - "GET /nicu-beds/{id}"
+      - "GET /nicu-beds/{id}/nicu-stays"
+      - "GET /nicu-stays"
+      - "GET /nicu-stays/{id}"
+      - "GET /newborns/{id}"
+      - "GET /registrations/{id}/newborns"
+      - "GET /newborns/{id}/audit-events"
+
+  - name: BenefitsCoordinator
+    description: "Owns insurance policies and the 30-day SEP dependent-add workflow."
+    identity: opaque
+    exclusive_operations:
+      - "POST /dependent-enrollments"
+      - "POST /dependent-enrollments/{id}/approve"
+      - "POST /dependent-enrollments/{id}/deny"
+      - "POST /dependent-enrollments/{id}/expire"
+      - "POST /dependent-enrollments/{id}/terminate"
+    shared_operations:
+      - "POST /insurance-policies"
+      - "GET /insurance-policies/{id}"
+      - "GET /insurance-policies/{id}/dependent-enrollments"
+      - "GET /dependent-enrollments"
+      - "GET /dependent-enrollments/{id}"
+      - "GET /newborns/{id}"
+
+  - name: VitalRecordsOfficer
+    description: "Owns birth-certificate and SSN-application government filings."
+    identity: opaque
+    exclusive_operations:
+      - "POST /government-filings"
+      - "POST /government-filings/{id}/submit"
+      - "POST /government-filings/{id}/acknowledge"
+      - "POST /government-filings/{id}/cancel"
+    shared_operations:
+      - "PATCH /newborns/{id}"
+      - "GET /government-filings"
+      - "GET /government-filings/{id}"
+      - "GET /newborns/{id}"
+
+  - name: RegistrySupervisor
+    description: "Operational override: closes pre-registrations, registers beds/policies, sets the test clock, reads everything."
+    identity: opaque
+    exclusive_operations:
+      - "POST /registrations/{id}/close"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /insurance-policies"
+      - "POST /nicu-beds"
+      - "GET /registrations"
+      - "GET /registrations/{id}"
+      - "GET /registrations/{id}/newborns"
+      - "GET /newborns/{id}"
+      - "GET /newborns/{id}/audit-events"
+      - "GET /insurance-policies/{id}"
+      - "GET /insurance-policies/{id}/dependent-enrollments"
+      - "GET /lactation-consults"
+      - "GET /lactation-consults/{id}"
+      - "GET /nicu-beds"
+      - "GET /nicu-beds/{id}"
+      - "GET /nicu-beds/{id}/nicu-stays"
+      - "GET /nicu-stays"
+      - "GET /nicu-stays/{id}"
+      - "GET /discharge-bags"
+      - "GET /discharge-bags/{id}"
+      - "GET /follow-up-tasks"
+      - "GET /follow-up-tasks/{id}"
+      - "GET /dependent-enrollments"
+      - "GET /dependent-enrollments/{id}"
+      - "GET /government-filings"
+      - "GET /government-filings/{id}"

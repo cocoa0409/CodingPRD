@@ -1,0 +1,1535 @@
+scenario: |
+  311 Citizen Service Requests: request intake/category, geolocation/jurisdiction routing,
+  SLA by service type, duplicate clustering, department work order, status notification,
+  escalation, satisfaction survey
+
+domain_name: citizen-311-service-requests
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: workflow_orchestration
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - cascading_side_effects
+    - rate_threshold_triggers
+    - derived_field_reconciliation
+    - scheduled_deferred_actions
+    - optimistic_concurrency
+
+  entity_topology: hybrid
+  # ServiceRequest is the hub: FK to ServiceCategory (config), Jurisdiction (config),
+  # Department (routed), DuplicateCluster (self-referential clustering of requests),
+  # WorkOrder (1:1 lifecycle), with append-only StatusNotification + Escalation + Survey
+  # children. Configs (SlaPolicy keyed on category+priority) are referenced by value.
+
+  state_machine_shape: branching
+  # ServiceRequest: SUBMITTED -> {TRIAGED, DUPLICATE} branching; TRIAGED -> ROUTED -> IN_PROGRESS
+  # -> RESOLVED -> CLOSED, with RESOLVED -> REOPENED -> IN_PROGRESS cycle. WorkOrder has its own
+  # cyclic reopen loop (COMPLETED -> REOPENED -> IN_PROGRESS). Escalation is branching/linear.
+
+  relationship_patterns:
+    - one_to_many        # Department -> ServiceRequest[]; DuplicateCluster -> ServiceRequest[]
+    - self_referential   # DuplicateCluster.canonical_request_id -> ServiceRequest (a request)
+    - cross_aggregate    # WorkOrder transitions gated on ServiceRequest state and vice-versa
+
+  role_model: hierarchical_override
+  # Citizen (own requests) < Agent (department work) < Dispatcher (routing/triage/escalation)
+  # < SystemAdmin (config + clock + override). SupervisorAgent reviews escalations.
+
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: ServiceCategory
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Human-readable category name (e.g., 'Pothole Repair')."
+        constraints: "unique among ServiceCategory"
+      - name: code
+        type: string
+        source: input
+        description: "Short stable code (e.g., 'POTHOLE'); unique; used in routing rules."
+        constraints: "unique; uppercase A-Z and underscore"
+      - name: default_priority
+        type: enum
+        source: input
+        description: "Default priority assigned at triage when intake does not override."
+        default: "STANDARD"
+        constraints: "one of {LOW, STANDARD, HIGH, EMERGENCY}"
+      - name: default_department_id
+        type: string
+        source: input
+        description: "FK -> Department.id; the department a request in this category routes to when no jurisdiction-specific override applies."
+      - name: requires_geolocation
+        type: boolean
+        source: input
+        description: "When true, intake of a request in this category must include lat/lng or it is rejected."
+        default: true
+      - name: active
+        type: boolean
+        source: input
+        description: "When false, new intake referencing this category is rejected; existing requests unaffected."
+        default: true
+
+  - name: Jurisdiction
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Jurisdiction name (e.g., 'District 4')."
+        constraints: "unique among Jurisdiction"
+      - name: min_lat
+        type: number
+        source: input
+        description: "Southern boundary latitude of the bounding box (inclusive)."
+      - name: max_lat
+        type: number
+        source: input
+        description: "Northern boundary latitude of the bounding box (exclusive)."
+      - name: min_lng
+        type: number
+        source: input
+        description: "Western boundary longitude of the bounding box (inclusive)."
+      - name: max_lng
+        type: number
+        source: input
+        description: "Eastern boundary longitude of the bounding box (exclusive)."
+      - name: override_department_id
+        type: string
+        source: input
+        description: "FK -> Department.id; optional. When set, requests geolocated into this jurisdiction route here instead of the category default. Null means no override."
+        default: null
+
+  - name: Department
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Department name (e.g., 'Streets & Sanitation')."
+        constraints: "unique among Department"
+      - name: open_work_order_count
+        type: integer
+        source: computed
+        description: "Count of WorkOrder rows for this department whose status IN {OPEN, IN_PROGRESS, REOPENED}. Recomputed on every WorkOrder status change touching this department."
+        default: 0
+      - name: backlog_threshold
+        type: integer
+        source: input
+        description: "open_work_order_count value at or above which the department is CONGESTED, raising the routing surcharge and auto-escalation tier for newly breached requests."
+        constraints: ">= 1"
+      - name: congested
+        type: boolean
+        source: computed
+        description: "True when open_work_order_count >= backlog_threshold. Recomputed whenever open_work_order_count changes."
+        default: false
+
+  - name: SlaPolicy
+    parent: null
+    common_fields: true
+    fields:
+      - name: category_id
+        type: string
+        source: input
+        description: "FK -> ServiceCategory.id; the category this SLA policy applies to."
+      - name: priority
+        type: enum
+        source: input
+        description: "Priority tier this policy targets; (category_id, priority) is unique."
+        constraints: "one of {LOW, STANDARD, HIGH, EMERGENCY}; unique with category_id"
+      - name: resolution_sla_hours
+        type: integer
+        source: input
+        description: "Whole hours from ROUTED until the request must reach RESOLVED before it is SLA-breached."
+        constraints: ">= 1"
+      - name: escalation_tier1_hours
+        type: integer
+        source: input
+        description: "Whole hours past the SLA deadline at which a TIER1 escalation auto-fires."
+        constraints: ">= 0"
+      - name: escalation_tier2_hours
+        type: integer
+        source: input
+        description: "Whole hours past the SLA deadline at which a TIER2 escalation auto-fires; must exceed escalation_tier1_hours."
+        constraints: "> escalation_tier1_hours"
+
+  - name: Citizen
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Citizen contact email; unique."
+        constraints: "unique among Citizen"
+      - name: full_name
+        type: string
+        source: input
+        description: "Citizen display name."
+      - name: notify_channel
+        type: enum
+        source: input
+        description: "Preferred channel recorded on each StatusNotification synthesized for this citizen."
+        default: "EMAIL"
+        constraints: "one of {EMAIL, SMS, NONE}"
+
+  - name: Agent
+    parent: null
+    common_fields: true
+    fields:
+      - name: department_id
+        type: string
+        source: input
+        description: "FK -> Department.id; the department this agent belongs to; agent may only act on WorkOrders of this department."
+      - name: full_name
+        type: string
+        source: input
+        description: "Agent display name."
+      - name: is_supervisor
+        type: boolean
+        source: input
+        description: "When true the agent may resolve TIER2 escalations and reassign work orders across this department."
+        default: false
+
+  - name: ServiceRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: citizen_id
+        type: string
+        source: input
+        description: "FK -> Citizen.id; the citizen who filed the request."
+      - name: category_id
+        type: string
+        source: input
+        description: "FK -> ServiceCategory.id; the service category selected at intake."
+      - name: description
+        type: string
+        source: input
+        description: "Free-text problem description provided by the citizen."
+      - name: lat
+        type: number
+        source: input
+        description: "Latitude of the reported issue; required when the category requires_geolocation."
+        default: null
+      - name: lng
+        type: number
+        source: input
+        description: "Longitude of the reported issue; required when the category requires_geolocation."
+        default: null
+      - name: priority
+        type: enum
+        source: computed
+        description: "Effective priority; set at triage to the intake override if supplied, else the category default_priority."
+        constraints: "one of {LOW, STANDARD, HIGH, EMERGENCY}"
+      - name: requested_priority
+        type: enum
+        source: input
+        description: "Optional citizen/dispatcher requested priority override applied at triage. Null means use category default."
+        default: null
+        constraints: "one of {LOW, STANDARD, HIGH, EMERGENCY} or null"
+      - name: jurisdiction_id
+        type: string
+        source: computed
+        description: "FK -> Jurisdiction.id; set at triage to the jurisdiction whose bounding box contains (lat,lng). Null when the request has no geolocation or no box matches."
+        default: null
+      - name: department_id
+        type: string
+        source: computed
+        description: "FK -> Department.id; set at routing to the routed department (jurisdiction override if present, else category default)."
+        default: null
+      - name: cluster_id
+        type: string
+        source: computed
+        description: "FK -> DuplicateCluster.id; set when this request is attached to a duplicate cluster as a member or as the canonical request. Null otherwise."
+        default: null
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state; see §1.2 ServiceRequest state machine."
+        default: "SUBMITTED"
+        constraints: "one of {SUBMITTED, TRIAGED, ROUTED, IN_PROGRESS, RESOLVED, REOPENED, CLOSED, DUPLICATE}"
+      - name: sla_deadline_at
+        type: datetime
+        source: computed
+        description: "Absolute UTC instant by which the request must reach RESOLVED; computed at routing as routed_at + SlaPolicy.resolution_sla_hours. Null before routing."
+        default: null
+      - name: routed_at
+        type: datetime
+        source: computed
+        description: "UTC instant the request transitioned to ROUTED; basis for sla_deadline_at. Null before routing."
+        default: null
+      - name: resolved_at
+        type: datetime
+        source: computed
+        description: "UTC instant the request first reached RESOLVED; cleared to null on REOPENED."
+        default: null
+      - name: sla_breached
+        type: boolean
+        source: computed
+        description: "True once clock_now > sla_deadline_at while status NOT IN {RESOLVED, CLOSED}; set by the SLA sweep. Stays true after the fact for breach accounting."
+        default: false
+      - name: reopen_count
+        type: integer
+        source: computed
+        description: "Number of times the request has transitioned RESOLVED -> REOPENED."
+        default: 0
+
+  - name: DuplicateCluster
+    parent: null
+    common_fields: true
+    fields:
+      - name: category_id
+        type: string
+        source: input
+        description: "FK -> ServiceCategory.id; all member requests must share this category."
+      - name: canonical_request_id
+        type: string
+        source: input
+        description: "FK -> ServiceRequest.id; the surviving request that members fold into; its status is unchanged, members become DUPLICATE."
+      - name: center_lat
+        type: number
+        source: computed
+        description: "Latitude of the canonical request at cluster creation; members must lie within CLUSTER_RADIUS_METERS of this point."
+      - name: center_lng
+        type: number
+        source: computed
+        description: "Longitude of the canonical request at cluster creation."
+      - name: member_count
+        type: integer
+        source: computed
+        description: "Count of ServiceRequest rows with cluster_id == this cluster AND status == DUPLICATE (excludes the canonical request). Recomputed on attach/detach."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Cluster lifecycle; see §1.2 DuplicateCluster state machine."
+        default: "OPEN"
+        constraints: "one of {OPEN, MERGED_CLOSED}"
+
+  - name: WorkOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: request_id
+        type: string
+        source: input
+        description: "FK -> ServiceRequest.id; the request this work order fulfills; 1:1 (a request has at most one WorkOrder)."
+        constraints: "unique among WorkOrder"
+      - name: department_id
+        type: string
+        source: computed
+        description: "FK -> Department.id; copied from the request's routed department at work-order creation; drives department backlog."
+      - name: assigned_agent_id
+        type: string
+        source: computed
+        description: "FK -> Agent.id; the agent currently assigned; null until assigned. Agent must belong to department_id."
+        default: null
+      - name: status
+        type: enum
+        source: computed
+        description: "Work order lifecycle; see §1.2 WorkOrder state machine."
+        default: "OPEN"
+        constraints: "one of {OPEN, IN_PROGRESS, COMPLETED, REOPENED, CANCELLED}"
+      - name: completion_note
+        type: string
+        source: input
+        description: "Closing note supplied when the agent completes the work order. Null until completion."
+        default: null
+
+  - name: Escalation
+    parent: null
+    common_fields: false
+    fields:
+      - name: request_id
+        type: string
+        source: input
+        description: "FK -> ServiceRequest.id; the request being escalated."
+      - name: tier
+        type: enum
+        source: computed
+        description: "Escalation severity; TIER1 auto-fires at escalation_tier1_hours past deadline, TIER2 at escalation_tier2_hours, MANUAL when raised by a dispatcher."
+        constraints: "one of {TIER1, TIER2, MANUAL}"
+      - name: reason
+        type: string
+        source: computed
+        description: "Why the escalation fired (e.g., 'SLA breached by 4h', 'manual dispatcher escalation')."
+      - name: status
+        type: enum
+        source: computed
+        description: "OPEN at creation; RESOLVED when an appropriate actor closes it; see §1.2 Escalation state machine."
+        default: "OPEN"
+        constraints: "one of {OPEN, RESOLVED}"
+      - name: resolved_by_role
+        type: string
+        source: computed
+        description: "Role string of the actor who resolved this escalation; null while OPEN."
+        default: null
+
+  - name: StatusNotification
+    parent: null
+    common_fields: false
+    fields:
+      - name: request_id
+        type: string
+        source: input
+        description: "FK -> ServiceRequest.id; the request whose status change produced this notification."
+      - name: channel
+        type: enum
+        source: computed
+        description: "Delivery channel; copied from the request's Citizen.notify_channel at synthesis time."
+        constraints: "one of {EMAIL, SMS, NONE}"
+      - name: from_status
+        type: string
+        source: computed
+        description: "ServiceRequest.status before the transition that triggered this notification."
+      - name: to_status
+        type: string
+        source: computed
+        description: "ServiceRequest.status after the transition."
+      - name: message
+        type: string
+        source: computed
+        description: "Templated human-readable body describing the transition."
+
+  - name: SatisfactionSurvey
+    parent: null
+    common_fields: true
+    fields:
+      - name: request_id
+        type: string
+        source: input
+        description: "FK -> ServiceRequest.id; the resolved request being surveyed; 1:1 (one survey per request)."
+        constraints: "unique among SatisfactionSurvey"
+      - name: status
+        type: enum
+        source: computed
+        description: "SENT at synthesis (on first RESOLVED), COMPLETED when the citizen submits a score, EXPIRED if not completed before close; see §1.2."
+        default: "SENT"
+        constraints: "one of {SENT, COMPLETED, EXPIRED}"
+      - name: score
+        type: integer
+        source: input
+        description: "Citizen rating 1..5 supplied on completion; null while SENT/EXPIRED."
+        default: null
+        constraints: "integer in [1,5] when present"
+      - name: comment
+        type: string
+        source: input
+        description: "Optional free-text feedback supplied with the score."
+        default: null
+
+  - name: ServiceWindow
+    parent: null
+    common_fields: true
+    fields:
+      - name: window_type
+        type: enum
+        source: input
+        description: "MAINTENANCE windows attach to a Department and pause routing into it; BLACKOUT windows attach to a Jurisdiction and bar routing requests geolocated into it. The type selects the overlap interval semantics (see §1.4 priorities 19-20)."
+        constraints: "one of {MAINTENANCE, BLACKOUT}"
+      - name: department_id
+        type: string
+        source: input
+        description: "FK -> Department.id; required and non-null when window_type == MAINTENANCE, must be null when BLACKOUT."
+        default: null
+      - name: jurisdiction_id
+        type: string
+        source: input
+        description: "FK -> Jurisdiction.id; required and non-null when window_type == BLACKOUT, must be null when MAINTENANCE."
+        default: null
+      - name: starts_at
+        type: datetime
+        source: input
+        description: "Inclusive start instant of the window (UTC)."
+      - name: ends_at
+        type: datetime
+        source: input
+        description: "End instant of the window (UTC); must be strictly after starts_at. Boundary inclusivity for overlap differs by window_type (see §1.4)."
+        constraints: "ends_at > starts_at"
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: ServiceRequest
+    initial_state: SUBMITTED
+    terminal_states: [CLOSED]
+    transitions:
+      - from: SUBMITTED
+        to: TRIAGED
+        trigger: "POST /service-requests/{id}/triage"
+        actor: Dispatcher
+        preconditions:
+          - "request.status == SUBMITTED"
+          - "request.category.active == true"
+          - "if category.requires_geolocation then request.lat != null AND request.lng != null"
+        side_effects:
+          - "set request.priority = requested_priority if requested_priority != null else category.default_priority"
+          - "set request.jurisdiction_id = the Jurisdiction whose box contains (lat,lng) per §1.3 jurisdiction_match (null if no geo or no match)"
+          - "synthesize a StatusNotification SUBMITTED->TRIAGED for request.citizen"
+          - "increments ServiceRequest.version by 1"
+      - from: SUBMITTED
+        to: DUPLICATE
+        trigger: "POST /duplicate-clusters/{id}/members (attach this request as a member)"
+        actor: Dispatcher
+        preconditions:
+          - "request.status == SUBMITTED"
+          - "cluster.status == OPEN"
+          - "request.category_id == cluster.category_id"
+          - "request lies within CLUSTER_RADIUS_METERS of cluster.center per §1.3 haversine_distance"
+        side_effects:
+          - "set request.cluster_id = cluster.id"
+          - "recompute cluster.member_count (DuplicateCluster.member_count calc)"
+          - "synthesize a StatusNotification SUBMITTED->DUPLICATE for request.citizen"
+          - "increments ServiceRequest.version by 1"
+      - from: TRIAGED
+        to: ROUTED
+        trigger: "POST /service-requests/{id}/route"
+        actor: Dispatcher
+        preconditions:
+          - "request.status == TRIAGED"
+          - "an SlaPolicy exists for (request.category_id, request.priority)"
+          - "the resolved routing department exists and is referenced (jurisdiction override else category default)"
+          - "no active MAINTENANCE window on the routed department contains clock_now (closed), and no active BLACKOUT window on request.jurisdiction_id contains clock_now (half-open) per §1.3 window_overlap"
+        side_effects:
+          - "set request.department_id = jurisdiction.override_department_id if request.jurisdiction_id set and that override is non-null, else category.default_department_id"
+          - "set request.routed_at = clock_now"
+          - "set request.sla_deadline_at = clock_now + SlaPolicy.resolution_sla_hours (sla_deadline calc)"
+          - "create a WorkOrder for request (status OPEN, department_id copied); increments Department.open_work_order_count then recomputes Department.congested"
+          - "synthesize a StatusNotification TRIAGED->ROUTED for request.citizen"
+          - "increments ServiceRequest.version by 1"
+      - from: ROUTED
+        to: IN_PROGRESS
+        trigger: "POST /work-orders/{id}/start (bubble-up from WorkOrder OPEN->IN_PROGRESS)"
+        actor: Agent
+        preconditions:
+          - "request.status == ROUTED"
+          - "work_order.request_id == request.id AND work_order.assigned_agent_id != null"
+        side_effects:
+          - "synthesize a StatusNotification ROUTED->IN_PROGRESS for request.citizen"
+          - "increments ServiceRequest.version by 1"
+      - from: IN_PROGRESS
+        to: RESOLVED
+        trigger: "POST /work-orders/{id}/complete (bubble-up from WorkOrder IN_PROGRESS->COMPLETED)"
+        actor: Agent
+        preconditions:
+          - "request.status == IN_PROGRESS"
+          - "work_order.request_id == request.id"
+        side_effects:
+          - "set request.resolved_at = clock_now"
+          - "synthesize a StatusNotification IN_PROGRESS->RESOLVED for request.citizen"
+          - "create a SatisfactionSurvey (status SENT) for request if none exists yet"
+          - "resolve any OPEN Escalation on request (Escalation OPEN->RESOLVED, resolved_by_role='system') — compensating side effect"
+          - "increments ServiceRequest.version by 1"
+      - from: RESOLVED
+        to: REOPENED
+        trigger: "POST /service-requests/{id}/reopen"
+        actor: Citizen
+        preconditions:
+          - "request.status == RESOLVED"
+          - "actor citizen owns request (X-User-ID == request.citizen_id)"
+          - "request.resolved_at + REOPEN_WINDOW_HOURS >= clock_now (reopen window still open)"
+        side_effects:
+          - "increment request.reopen_count by 1"
+          - "set request.resolved_at = null"
+          - "transition the request's WorkOrder COMPLETED->REOPENED then REOPENED->IN_PROGRESS bubble re-derives request (cascade); increments Department.open_work_order_count"
+          - "expire the request's SatisfactionSurvey if still SENT (SatisfactionSurvey SENT->EXPIRED)"
+          - "synthesize a StatusNotification RESOLVED->REOPENED for request.citizen"
+          - "increments ServiceRequest.version by 1"
+      - from: REOPENED
+        to: IN_PROGRESS
+        trigger: "system: WorkOrder REOPENED->IN_PROGRESS bubble-up"
+        actor: system
+        preconditions:
+          - "request.status == REOPENED"
+          - "request's WorkOrder.status == IN_PROGRESS"
+        side_effects:
+          - "synthesize a StatusNotification REOPENED->IN_PROGRESS for request.citizen"
+          - "increments ServiceRequest.version by 1"
+      - from: RESOLVED
+        to: CLOSED
+        trigger: "POST /service-requests/{id}/close"
+        actor: Dispatcher
+        preconditions:
+          - "request.status == RESOLVED"
+          - "request has no OPEN Escalation"
+        side_effects:
+          - "expire the request's SatisfactionSurvey if still SENT (SatisfactionSurvey SENT->EXPIRED)"
+          - "synthesize a StatusNotification RESOLVED->CLOSED for request.citizen"
+          - "increments ServiceRequest.version by 1"
+    note: "DUPLICATE and CLOSED carry no outbound transitions. priority/jurisdiction set at triage; department/sla at routing."
+
+  - entity: WorkOrder
+    initial_state: OPEN
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: IN_PROGRESS
+        trigger: "POST /work-orders/{id}/start"
+        actor: Agent
+        preconditions:
+          - "work_order.status == OPEN"
+          - "work_order.assigned_agent_id != null"
+          - "acting agent belongs to work_order.department_id"
+        side_effects:
+          - "bubble-up: request ROUTED->IN_PROGRESS (cross-entity)"
+          - "increments WorkOrder.version by 1"
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /work-orders/{id}/complete"
+        actor: Agent
+        preconditions:
+          - "work_order.status == IN_PROGRESS"
+          - "completion_note present in body"
+          - "acting agent == work_order.assigned_agent_id"
+        side_effects:
+          - "set work_order.completion_note"
+          - "decrement Department.open_work_order_count then recompute Department.congested"
+          - "bubble-up: request IN_PROGRESS->RESOLVED (cross-entity cascade -> survey + escalation resolve)"
+          - "increments WorkOrder.version by 1"
+      - from: COMPLETED
+        to: REOPENED
+        trigger: "system: ServiceRequest RESOLVED->REOPENED cascade"
+        actor: system
+        preconditions:
+          - "work_order.status == COMPLETED"
+        side_effects:
+          - "increment Department.open_work_order_count then recompute Department.congested"
+          - "increments WorkOrder.version by 1"
+      - from: REOPENED
+        to: IN_PROGRESS
+        trigger: "system: immediately following REOPENED (same cascade), re-activates work"
+        actor: system
+        preconditions:
+          - "work_order.status == REOPENED"
+        side_effects:
+          - "bubble-up: request REOPENED->IN_PROGRESS"
+          - "increments WorkOrder.version by 1"
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /work-orders/{id}/cancel"
+        actor: Dispatcher
+        preconditions:
+          - "work_order.status == OPEN"
+          - "the underlying request is being marked DUPLICATE or withdrawn"
+        side_effects:
+          - "decrement Department.open_work_order_count then recompute Department.congested"
+          - "increments WorkOrder.version by 1"
+    note: "Cyclic reopen loop COMPLETED->REOPENED->IN_PROGRESS. assign is a field-set action (status stays OPEN)."
+
+  - entity: DuplicateCluster
+    initial_state: OPEN
+    terminal_states: [MERGED_CLOSED]
+    transitions:
+      - from: OPEN
+        to: MERGED_CLOSED
+        trigger: "POST /duplicate-clusters/{id}/close"
+        actor: Dispatcher
+        preconditions:
+          - "cluster.status == OPEN"
+          - "the canonical request.status IN {RESOLVED, CLOSED}"
+        side_effects:
+          - "for each member ServiceRequest with status DUPLICATE: synthesize a StatusNotification DUPLICATE->CLOSED and leave it DUPLICATE (folded)"
+          - "increments DuplicateCluster.version by 1"
+    note: "Members attach via the ServiceRequest SUBMITTED->DUPLICATE transition; cluster cannot close until its canonical request is resolved/closed."
+
+  - entity: Escalation
+    initial_state: OPEN
+    terminal_states: [RESOLVED]
+    transitions:
+      - from: OPEN
+        to: RESOLVED
+        trigger: "POST /escalations/{id}/resolve OR system cascade on request RESOLVED"
+        actor: Dispatcher
+        preconditions:
+          - "escalation.status == OPEN"
+          - "if escalation.tier == TIER2 then acting agent is_supervisor OR actor role is Dispatcher/SystemAdmin"
+        side_effects:
+          - "set escalation.status = RESOLVED"
+          - "set escalation.resolved_by_role = acting role"
+    note: "Escalation has common_fields:false (id + created_at only); no version field, so it is never an OCC parent. Auto-creation handled by the SLA sweep, see §1.3."
+
+  - entity: SatisfactionSurvey
+    initial_state: SENT
+    terminal_states: [COMPLETED, EXPIRED]
+    transitions:
+      - from: SENT
+        to: COMPLETED
+        trigger: "POST /surveys/{id}/respond"
+        actor: Citizen
+        preconditions:
+          - "survey.status == SENT"
+          - "actor citizen owns the surveyed request (X-User-ID == request.citizen_id)"
+          - "score present and in [1,5]"
+        side_effects:
+          - "set survey.score, survey.comment"
+          - "increments SatisfactionSurvey.version by 1"
+      - from: SENT
+        to: EXPIRED
+        trigger: "system: request RESOLVED->REOPENED or RESOLVED->CLOSED cascade"
+        actor: system
+        preconditions:
+          - "survey.status == SENT"
+        side_effects:
+          - "increments SatisfactionSurvey.version by 1"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: cluster-create-stale-request
+    parent_entity: ServiceRequest
+    write_endpoint: "POST /duplicate-clusters"
+    occ_field: "expected_canonical_version"
+    description: |
+      Creating a DuplicateCluster naming a canonical ServiceRequest whose
+      version has advanced since the dispatcher last observed it is rejected
+      with a stale-version error. The canonical request may have legitimately
+      moved on (e.g., triaged or attached elsewhere) between the dispatcher's
+      read and this create, so the dispatcher's view is stale and the cluster
+      must not be anchored to an outdated canonical snapshot.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: workorder-assign-stale-workorder
+    parent_entity: WorkOrder
+    write_endpoint: "POST /work-orders/{id}/assign"
+    occ_field: "expected_work_order_version"
+    description: |
+      Assigning an Agent to a WorkOrder whose version has advanced since the
+      dispatcher last observed it is rejected with a stale-version error. A
+      prior assignment (which legitimately overwrites assigned_agent_id) may
+      have advanced the work order, so a dispatcher acting on a stale snapshot
+      must re-read before reassigning.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: jurisdiction_match
+    trigger: "ServiceRequest SUBMITTED->TRIAGED"
+    algorithm: aggregation
+    formula: |
+      candidates = [ j for j in Jurisdiction
+                     if j.min_lat <= request.lat < j.max_lat
+                     and j.min_lng <= request.lng < j.max_lng ]
+      if request.lat is null or request.lng is null: return null
+      if candidates is empty: return null
+      # boxes may overlap; pick the SMALLEST-AREA box (tightest jurisdiction),
+      # area = (max_lat-min_lat)*(max_lng-min_lng); tie-break created_at ASC
+      winner = min(candidates, key=lambda j: (area(j), j.created_at))
+      return winner.id
+    input_set: "all Jurisdiction rows; point membership uses half-open box [min,max) on both axes"
+    constants: {}
+    precision: "lat/lng compared as provided (number); area in degree^2, exact float compare for min, created_at ASC tie-break"
+    variants:
+      - name: smallest_box
+        when: "PINNED variant used by the system when (lat,lng) falls inside more than one overlapping jurisdiction box"
+        difference: "Selects the box with the SMALLEST area (tightest jurisdiction), tie-break created_at ASC — NOT the first-created box. With two overlapping boxes, a large outer district and a small inner one, smallest_box picks the inner; a naive first-match/largest picks a different jurisdiction_id."
+      - name: first_created_match
+        when: "the divergent (rejected) interpretation a reader might assume"
+        difference: "Would pick the earliest-created containing box regardless of size, yielding a different jurisdiction_id (and therefore a different routed department when the jurisdiction carries an override) for the same point."
+
+  - name: haversine_distance
+    trigger: "ServiceRequest SUBMITTED->DUPLICATE (attach to cluster) and DuplicateCluster creation eligibility"
+    algorithm: aggregation
+    formula: |
+      R = 6371000  # meters
+      dlat = radians(lat2 - lat1); dlng = radians(lng2 - lng1)
+      a = sin(dlat/2)^2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlng/2)^2
+      d = 2 * R * asin(min(1, sqrt(a)))
+      eligible = (d <= CLUSTER_RADIUS_METERS)   # inclusive boundary: exactly-at-radius is eligible
+    input_set: "candidate request (lat,lng) vs cluster.center (center_lat,center_lng)"
+    constants:
+      CLUSTER_RADIUS_METERS: 150
+    precision: "distance in meters, compared with <= (inclusive). No rounding of d before the comparison."
+
+  - name: sla_deadline
+    trigger: "ServiceRequest TRIAGED->ROUTED"
+    algorithm: threshold
+    formula: |
+      policy = SlaPolicy where category_id == request.category_id AND priority == request.priority
+      request.routed_at = clock_now
+      request.sla_deadline_at = clock_now + policy.resolution_sla_hours hours
+    input_set: "exactly one SlaPolicy matched by (category_id, priority); absence is ERR_NO_SLA_POLICY"
+    constants:
+      REOPEN_WINDOW_HOURS: 72
+    precision: "hours added as exact whole-hour timedelta; deadline stored to milliseconds ISO8601. REOPEN_WINDOW_HOURS is the system-wide window (in hours) during which a RESOLVED request may be reopened, measured from resolved_at; consumed by validation priority 13."
+
+  - name: sla_breach_sweep
+    trigger: "POST /_clock/advance (system SLA sweep at the new clock value)"
+    algorithm: threshold
+    formula: |
+      now = clock_now
+      for r in ServiceRequest where status IN {ROUTED, IN_PROGRESS, REOPENED} and sla_deadline_at != null:
+        if now > r.sla_deadline_at:                       # strict: at exactly the deadline NOT yet breached
+          r.sla_breached = true
+          overdue_hours = floor( (now - r.sla_deadline_at) / 3600s )
+          policy = SlaPolicy(r.category_id, r.priority)
+          # auto-escalation tiers (idempotent: do not re-create an OPEN escalation of same tier)
+          if overdue_hours >= policy.escalation_tier2_hours and no OPEN TIER2 escalation on r:
+              create Escalation(tier=TIER2, reason="SLA breached by {overdue_hours}h")
+          elif overdue_hours >= policy.escalation_tier1_hours and no OPEN escalation on r:
+              create Escalation(tier=TIER1, reason="SLA breached by {overdue_hours}h")
+      # process requests in created_at ASC order for deterministic escalation ids
+    input_set: "ServiceRequest rows in {ROUTED, IN_PROGRESS, REOPENED}; ordered created_at ASC"
+    constants: {}
+    precision: "overdue_hours = floor(seconds/3600); comparison now > deadline is strict (>)"
+    variants:
+      - name: strict_after_deadline
+        when: "PINNED variant: a request is breached only once clock_now is STRICTLY past the deadline"
+        difference: "Uses now > sla_deadline_at (strict). At the exact deadline instant (now == sla_deadline_at) the request is NOT breached and NO escalation fires."
+      - name: at_or_after_deadline
+        when: "the divergent (rejected) interpretation"
+        difference: "Would use now >= sla_deadline_at, flipping sla_breached to true and firing escalation at the exact deadline instant — one boundary tick earlier than strict_after_deadline."
+
+  - name: department_backlog
+    trigger: "any WorkOrder status change touching a department (create/start/complete/reopen/cancel)"
+    algorithm: aggregation
+    formula: |
+      open_work_order_count = count( WorkOrder
+                                     where department_id == dept.id
+                                     and status IN {OPEN, IN_PROGRESS, REOPENED} )
+      congested = (open_work_order_count >= dept.backlog_threshold)   # inclusive >=
+    input_set: "WorkOrder rows of this department with status IN {OPEN, IN_PROGRESS, REOPENED}"
+    constants: {}
+    precision: "integer count; congested uses >= (inclusive boundary)"
+
+  - name: avg_satisfaction
+    trigger: "GET /departments/{id}/satisfaction (computed read)"
+    algorithm: aggregation
+    formula: |
+      surveys = [ s for s in SatisfactionSurvey
+                  if s.status == COMPLETED
+                  and ServiceRequest(s.request_id).department_id == dept.id ]
+      if surveys is empty: return { avg_score: null, completed_count: 0 }
+      avg_score = round( sum(s.score for s in surveys) / count(surveys), 2 )   # round_half_up
+      return { avg_score, completed_count: count(surveys) }
+    input_set: "COMPLETED surveys whose request routed to this department; SENT/EXPIRED excluded"
+    constants: {}
+    precision: "2 decimal places, round_half_up; empty set yields null avg, not 0"
+    variants:
+      - name: round_half_up_mean
+        when: "PINNED variant for the satisfaction average"
+        difference: "avg_score = round_half_up(sum/count, 2). For scores {5,5,4} = 14/3 = 4.6666… -> 4.67."
+      - name: truncate_mean
+        when: "the divergent (rejected) interpretation"
+        difference: "Would truncate to 2 dp -> 4.66 for the same {5,5,4}, a different cents-level value than round_half_up."
+
+  - name: window_overlap
+    trigger: "POST /service-windows (overlap admission check) AND routing eligibility on ServiceRequest TRIAGED->ROUTED"
+    algorithm: interval_merge
+    formula: |
+      # Admission overlap check on create: a new ServiceWindow W must not collide
+      # with any existing same-scope window of the SAME window_type.
+      def collides(a, b):
+        if a.window_type == "MAINTENANCE":
+          # CLOSED-interval semantics: touching endpoints DO collide.
+          return a.starts_at <= b.ends_at and b.starts_at <= a.ends_at
+        else:  # BLACKOUT
+          # HALF-OPEN [start, end) semantics: touching endpoints do NOT collide.
+          return a.starts_at < b.ends_at and b.starts_at < a.ends_at
+      # same-scope: MAINTENANCE compares within same department_id;
+      #             BLACKOUT compares within same jurisdiction_id.
+      # Routing eligibility: a request whose routed_at instant falls inside an
+      # active window blocks routing — MAINTENANCE on the routed department
+      # (point-in-closed-interval: starts_at <= routed_at <= ends_at) or
+      # BLACKOUT on the request.jurisdiction_id
+      # (point-in-half-open: starts_at <= routed_at < ends_at).
+    input_set: "existing ServiceWindow rows of the same window_type and same scope id"
+    constants: {}
+    precision: "instants compared exactly; MAINTENANCE uses closed [<=,<=], BLACKOUT uses half-open [<=,<)"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /citizens (self-register) and POST /_clock/* (SystemAdmin only — see priority 2)"
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted to call this endpoint per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "every path/body id references an existing resource, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 4
+    category: business_referential
+    check: "acting Citizen owns the target request/survey (X-User-ID == request.citizen_id) for citizen-scoped actions"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /service-requests/{id}/reopen, POST /surveys/{id}/respond"
+
+  - priority: 5
+    category: business_referential
+    check: "acting Agent belongs to the work order's department (agent.department_id == work_order.department_id)"
+    error_id: ERR_AGENT_WRONG_DEPARTMENT
+    http_status: 403
+    applies_to: "POST /work-orders/{id}/start, POST /work-orders/{id}/complete, POST /work-orders/{id}/assign"
+
+  - priority: 6
+    category: state
+    check: "target resource is in a state from which the requested transition is defined (§1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 7
+    category: state
+    check: "OCC: expected_<parent>_version equals the parent's current version (§1.2.1)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /duplicate-clusters, POST /work-orders/{id}/assign"
+
+  - priority: 8
+    category: business_constraint
+    check: "category referenced at intake/triage is active == true"
+    error_id: ERR_CATEGORY_INACTIVE
+    http_status: 409
+    applies_to: "POST /service-requests, POST /service-requests/{id}/triage"
+
+  - priority: 9
+    category: business_constraint
+    check: "if category.requires_geolocation then lat and lng are both present"
+    error_id: ERR_GEOLOCATION_REQUIRED
+    http_status: 422
+    applies_to: "POST /service-requests, POST /service-requests/{id}/triage"
+
+  - priority: 10
+    category: business_referential
+    check: "a member request attached to a cluster shares the cluster's category_id"
+    error_id: ERR_CLUSTER_CATEGORY_MISMATCH
+    http_status: 409
+    applies_to: "POST /duplicate-clusters/{id}/members"
+
+  - priority: 11
+    category: business_constraint
+    check: "a member request lies within CLUSTER_RADIUS_METERS of the cluster center (haversine, inclusive)"
+    error_id: ERR_OUTSIDE_CLUSTER_RADIUS
+    http_status: 409
+    applies_to: "POST /duplicate-clusters/{id}/members"
+
+  - priority: 12
+    category: business_constraint
+    check: "an SlaPolicy exists for (request.category_id, request.priority) at routing time"
+    error_id: ERR_NO_SLA_POLICY
+    http_status: 409
+    applies_to: "POST /service-requests/{id}/route"
+
+  - priority: 13
+    category: business_temporal
+    check: "reopen requested within REOPEN_WINDOW_HOURS of resolved_at"
+    error_id: ERR_REOPEN_WINDOW_CLOSED
+    http_status: 409
+    applies_to: "POST /service-requests/{id}/reopen"
+
+  - priority: 14
+    category: business_constraint
+    check: "a cluster may only close when its canonical request.status IN {RESOLVED, CLOSED}"
+    error_id: ERR_CANONICAL_NOT_RESOLVED
+    http_status: 409
+    applies_to: "POST /duplicate-clusters/{id}/close"
+
+  - priority: 15
+    category: business_constraint
+    check: "a request cannot CLOSE while it has an OPEN Escalation"
+    error_id: ERR_OPEN_ESCALATION_BLOCKS_CLOSE
+    http_status: 409
+    applies_to: "POST /service-requests/{id}/close"
+
+  - priority: 16
+    category: business_constraint
+    check: "resolving a TIER2 escalation requires a supervisor agent or a Dispatcher/SystemAdmin"
+    error_id: ERR_TIER2_REQUIRES_SUPERVISOR
+    http_status: 403
+    applies_to: "POST /escalations/{id}/resolve"
+
+  - priority: 17
+    category: business_constraint
+    check: "survey score is an integer in [1,5] when responding"
+    error_id: ERR_INVALID_SCORE
+    http_status: 422
+    applies_to: "POST /surveys/{id}/respond"
+
+  - priority: 18
+    category: business_constraint
+    check: "request body conforms to endpoint input schema (required fields present, enums valid, types correct)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all"
+
+  - priority: 19
+    category: business_constraint
+    check: "ServiceWindow scope is consistent: MAINTENANCE supplies department_id and null jurisdiction_id; BLACKOUT supplies jurisdiction_id and null department_id"
+    error_id: ERR_WINDOW_SCOPE_INVALID
+    http_status: 422
+    applies_to: "POST /service-windows"
+
+  - priority: 20
+    category: business_temporal
+    check: "a new ServiceWindow must not overlap an existing same-type, same-scope window (MAINTENANCE: closed-interval, touching endpoints collide; BLACKOUT: half-open, touching endpoints allowed) per window_overlap calc"
+    error_id: ERR_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /service-windows"
+
+  - priority: 21
+    category: business_temporal
+    check: "routing is blocked when routed_at falls inside an active MAINTENANCE window on the routed department (closed) or an active BLACKOUT window on the request's jurisdiction (half-open) per window_overlap calc"
+    error_id: ERR_WINDOW_BLOCKS_ROUTING
+    http_status: 409
+    applies_to: "POST /service-requests/{id}/route"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- ServiceCategory ----
+  - method: POST
+    path: "/categories"
+    description: "Create a service category."
+    roles: [SystemAdmin]
+    code: 201
+    input: ["name", "code", "default_priority?", "default_department_id", "requires_geolocation?", "active?"]
+    output: ServiceCategory
+    side_effects: []
+  - method: GET
+    path: "/categories/{id}"
+    description: "Fetch a service category."
+    roles: [SystemAdmin, Dispatcher, Agent, Citizen]
+    code: 200
+    input: []
+    output: ServiceCategory
+    side_effects: []
+  - method: GET
+    path: "/categories"
+    description: "List service categories; filter by default_department_id."
+    roles: [SystemAdmin, Dispatcher, Agent, Citizen]
+    code: 200
+    input: ["default_department_id?", "active?", "limit?", "offset?"]
+    output: ServiceCategory[]
+    side_effects: []
+
+  # ---- Jurisdiction ----
+  - method: POST
+    path: "/jurisdictions"
+    description: "Create a jurisdiction bounding box."
+    roles: [SystemAdmin]
+    code: 201
+    input: ["name", "min_lat", "max_lat", "min_lng", "max_lng", "override_department_id?"]
+    output: Jurisdiction
+    side_effects: []
+  - method: GET
+    path: "/jurisdictions/{id}"
+    description: "Fetch a jurisdiction."
+    roles: [SystemAdmin, Dispatcher]
+    code: 200
+    input: []
+    output: Jurisdiction
+    side_effects: []
+
+  # ---- Department ----
+  - method: POST
+    path: "/departments"
+    description: "Create a department."
+    roles: [SystemAdmin]
+    code: 201
+    input: ["name", "backlog_threshold"]
+    output: Department
+    side_effects: []
+  - method: GET
+    path: "/departments/{id}"
+    description: "Fetch a department incl. computed open_work_order_count and congested."
+    roles: [SystemAdmin, Dispatcher, Agent]
+    code: 200
+    input: []
+    output: Department
+    side_effects: []
+  - method: GET
+    path: "/departments/{id}/satisfaction"
+    description: "Computed read: average satisfaction score for the department (avg_satisfaction calc)."
+    roles: [SystemAdmin, Dispatcher]
+    code: 200
+    input: []
+    output: "{ avg_score: number, completed_count: integer }"
+    side_effects: []
+  - method: GET
+    path: "/departments/{id}/jurisdictions"
+    description: "Reverse-reachability for Jurisdiction.override_department_id: jurisdictions whose override routes to this department."
+    roles: [SystemAdmin, Dispatcher]
+    code: 200
+    input: []
+    output: Jurisdiction[]
+    side_effects: []
+  - method: GET
+    path: "/departments/{id}/agents"
+    description: "Reverse-reachability for Agent.department_id: agents belonging to this department."
+    roles: [SystemAdmin, Dispatcher, Agent]
+    code: 200
+    input: []
+    output: Agent[]
+    side_effects: []
+
+  # ---- SlaPolicy ----
+  - method: POST
+    path: "/sla-policies"
+    description: "Create an SLA policy for a (category, priority)."
+    roles: [SystemAdmin]
+    code: 201
+    input: ["category_id", "priority", "resolution_sla_hours", "escalation_tier1_hours", "escalation_tier2_hours"]
+    output: SlaPolicy
+    side_effects: []
+  - method: GET
+    path: "/categories/{id}/sla-policies"
+    description: "Reverse-reachability for SlaPolicy.category_id: SLA policies defined for this category."
+    roles: [SystemAdmin, Dispatcher]
+    code: 200
+    input: []
+    output: SlaPolicy[]
+    side_effects: []
+
+  # ---- Citizen ----
+  - method: POST
+    path: "/citizens"
+    description: "Self-register a citizen (no auth)."
+    roles: [Anonymous]
+    code: 201
+    input: ["email", "full_name", "notify_channel?"]
+    output: Citizen
+    side_effects: []
+
+  # ---- Agent ----
+  - method: POST
+    path: "/agents"
+    description: "Create an agent in a department."
+    roles: [SystemAdmin]
+    code: 201
+    input: ["department_id", "full_name", "is_supervisor?"]
+    output: Agent
+    side_effects: []
+  # ---- ServiceRequest core ----
+  - method: POST
+    path: "/service-requests"
+    description: "Citizen files a service request (intake)."
+    roles: [Citizen, Dispatcher]
+    code: 201
+    input: ["citizen_id", "category_id", "description", "lat?", "lng?", "requested_priority?"]
+    output: ServiceRequest
+    side_effects: ["request created in SUBMITTED"]
+  - method: GET
+    path: "/service-requests/{id}"
+    description: "Fetch a service request."
+    roles: [SystemAdmin, Dispatcher, Agent, Citizen]
+    code: 200
+    input: []
+    output: ServiceRequest
+    side_effects: []
+  - method: GET
+    path: "/service-requests"
+    description: "List/filter service requests by citizen_id, category_id, department_id, jurisdiction_id, cluster_id, status (reverse-reachability for those FKs)."
+    roles: [SystemAdmin, Dispatcher, Agent, Citizen]
+    code: 200
+    input: ["citizen_id?", "category_id?", "department_id?", "jurisdiction_id?", "cluster_id?", "status?", "limit?", "offset?"]
+    output: ServiceRequest[]
+    side_effects: []
+  - method: POST
+    path: "/service-requests/{id}/triage"
+    description: "Triage: set priority + jurisdiction; SUBMITTED->TRIAGED."
+    roles: [Dispatcher]
+    code: 200
+    input: ["requested_priority?"]
+    output: ServiceRequest
+    side_effects: ["set priority", "set jurisdiction_id (jurisdiction_match)", "notification", "increments ServiceRequest.version by 1"]
+  - method: POST
+    path: "/service-requests/{id}/route"
+    description: "Route: resolve department, set SLA deadline, create WorkOrder; TRIAGED->ROUTED."
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: ServiceRequest
+    side_effects: ["set department_id", "set routed_at + sla_deadline_at (sla_deadline)", "create WorkOrder OPEN", "department_backlog recompute", "notification", "increments ServiceRequest.version by 1"]
+  - method: POST
+    path: "/service-requests/{id}/reopen"
+    description: "Citizen reopens a resolved request within the reopen window; RESOLVED->REOPENED (cascades to WorkOrder + survey)."
+    roles: [Citizen]
+    code: 200
+    input: []
+    output: ServiceRequest
+    side_effects: ["increment reopen_count", "clear resolved_at", "WorkOrder COMPLETED->REOPENED->IN_PROGRESS", "department_backlog recompute", "survey SENT->EXPIRED", "notification", "increments ServiceRequest.version by 1"]
+  - method: POST
+    path: "/service-requests/{id}/close"
+    description: "Close a resolved request; RESOLVED->CLOSED."
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: ServiceRequest
+    side_effects: ["survey SENT->EXPIRED", "notification", "increments ServiceRequest.version by 1"]
+  - method: GET
+    path: "/service-requests/{id}/notifications"
+    description: "Reverse-reachability for StatusNotification.request_id: list notifications for a request (append-only)."
+    roles: [SystemAdmin, Dispatcher, Citizen]
+    code: 200
+    input: []
+    output: StatusNotification[]
+    side_effects: []
+  - method: GET
+    path: "/service-requests/{id}/escalations"
+    description: "Reverse-reachability for Escalation.request_id: list escalations for a request."
+    roles: [SystemAdmin, Dispatcher, Agent]
+    code: 200
+    input: []
+    output: Escalation[]
+    side_effects: []
+
+  # ---- DuplicateCluster ----
+  - method: POST
+    path: "/duplicate-clusters"
+    description: "Create a duplicate cluster anchored to a canonical request (OCC on canonical request version)."
+    roles: [Dispatcher]
+    code: 201
+    input: ["category_id", "canonical_request_id", "expected_canonical_version"]
+    output: DuplicateCluster
+    side_effects: ["cluster OPEN; center copied from canonical request lat/lng", "increments ServiceRequest.version by 1"]
+  - method: GET
+    path: "/duplicate-clusters/{id}"
+    description: "Fetch a cluster incl. computed member_count."
+    roles: [SystemAdmin, Dispatcher]
+    code: 200
+    input: []
+    output: DuplicateCluster
+    side_effects: []
+  - method: GET
+    path: "/duplicate-clusters"
+    description: "List clusters; filter by category_id (reverse-reachability for DuplicateCluster.category_id) and canonical_request_id (reverse-reachability for DuplicateCluster.canonical_request_id)."
+    roles: [SystemAdmin, Dispatcher]
+    code: 200
+    input: ["category_id?", "canonical_request_id?", "status?", "limit?", "offset?"]
+    output: DuplicateCluster[]
+    side_effects: []
+  - method: POST
+    path: "/duplicate-clusters/{id}/members"
+    description: "Attach a SUBMITTED request to the cluster as a duplicate member; request SUBMITTED->DUPLICATE."
+    roles: [Dispatcher]
+    code: 200
+    input: ["request_id"]
+    output: ServiceRequest
+    side_effects: ["set request.cluster_id", "request->DUPLICATE", "recompute member_count", "notification", "increments ServiceRequest.version by 1"]
+  - method: POST
+    path: "/duplicate-clusters/{id}/close"
+    description: "Close a cluster once its canonical request is resolved/closed; OPEN->MERGED_CLOSED."
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: DuplicateCluster
+    side_effects: ["notify each DUPLICATE member", "increments DuplicateCluster.version by 1"]
+
+  # ---- WorkOrder ----
+  - method: GET
+    path: "/work-orders/{id}"
+    description: "Fetch a work order."
+    roles: [SystemAdmin, Dispatcher, Agent]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: []
+  - method: GET
+    path: "/work-orders"
+    description: "List work orders; filter by request_id (reverse-reachability for WorkOrder.request_id), department_id, assigned_agent_id, status."
+    roles: [SystemAdmin, Dispatcher, Agent]
+    code: 200
+    input: ["request_id?", "department_id?", "assigned_agent_id?", "status?", "limit?", "offset?"]
+    output: WorkOrder[]
+    side_effects: []
+  - method: POST
+    path: "/work-orders/{id}/assign"
+    description: "Assign an agent to a work order (field-set, status stays OPEN; OCC on work order version)."
+    roles: [Dispatcher]
+    code: 200
+    input: ["assigned_agent_id", "expected_work_order_version"]
+    output: WorkOrder
+    side_effects: ["set assigned_agent_id", "increments WorkOrder.version by 1"]
+  - method: POST
+    path: "/work-orders/{id}/start"
+    description: "Agent starts work; OPEN->IN_PROGRESS; bubbles request ROUTED->IN_PROGRESS."
+    roles: [Agent]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["request ROUTED->IN_PROGRESS", "notification", "increments WorkOrder.version by 1"]
+  - method: POST
+    path: "/work-orders/{id}/complete"
+    description: "Agent completes work; IN_PROGRESS->COMPLETED; bubbles request IN_PROGRESS->RESOLVED."
+    roles: [Agent]
+    code: 200
+    input: ["completion_note"]
+    output: WorkOrder
+    side_effects: ["set completion_note", "department_backlog recompute", "request IN_PROGRESS->RESOLVED -> survey SENT + escalation resolve", "increments WorkOrder.version by 1"]
+  - method: POST
+    path: "/work-orders/{id}/cancel"
+    description: "Dispatcher cancels an OPEN work order; OPEN->CANCELLED."
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["department_backlog recompute", "increments WorkOrder.version by 1"]
+
+  # ---- Escalation ----
+  - method: POST
+    path: "/escalations/{id}/resolve"
+    description: "Resolve an OPEN escalation; OPEN->RESOLVED (TIER2 requires supervisor/Dispatcher/SystemAdmin)."
+    roles: [Dispatcher, Agent, SystemAdmin]
+    code: 200
+    input: []
+    output: Escalation
+    side_effects: ["set resolved_by_role"]
+  - method: POST
+    path: "/escalations"
+    description: "Dispatcher manually raises a MANUAL escalation on a request."
+    roles: [Dispatcher]
+    code: 201
+    input: ["request_id"]
+    output: Escalation
+    side_effects: ["create Escalation tier=MANUAL OPEN"]
+
+  # ---- SatisfactionSurvey ----
+  - method: GET
+    path: "/surveys/{id}"
+    description: "Fetch a survey."
+    roles: [SystemAdmin, Dispatcher, Citizen]
+    code: 200
+    input: []
+    output: SatisfactionSurvey
+    side_effects: []
+  - method: GET
+    path: "/surveys"
+    description: "List surveys; filter by request_id (reverse-reachability for SatisfactionSurvey.request_id) and status."
+    roles: [SystemAdmin, Dispatcher, Citizen]
+    code: 200
+    input: ["request_id?", "status?", "limit?", "offset?"]
+    output: SatisfactionSurvey[]
+    side_effects: []
+  - method: POST
+    path: "/surveys/{id}/respond"
+    description: "Citizen submits satisfaction score; SENT->COMPLETED."
+    roles: [Citizen]
+    code: 200
+    input: ["score", "comment?"]
+    output: SatisfactionSurvey
+    side_effects: ["set score + comment", "increments SatisfactionSurvey.version by 1"]
+
+  # ---- ServiceWindow (maintenance / blackout) ----
+  - method: POST
+    path: "/service-windows"
+    description: "Create a MAINTENANCE (department) or BLACKOUT (jurisdiction) service window; rejected on overlap with a same-type, same-scope window."
+    roles: [SystemAdmin]
+    code: 201
+    input: ["window_type", "department_id?", "jurisdiction_id?", "starts_at", "ends_at"]
+    output: ServiceWindow
+    side_effects: []
+  - method: GET
+    path: "/departments/{id}/maintenance-windows"
+    description: "Reverse-reachability for ServiceWindow.department_id: MAINTENANCE windows on this department."
+    roles: [SystemAdmin, Dispatcher]
+    code: 200
+    input: []
+    output: ServiceWindow[]
+    side_effects: []
+  - method: GET
+    path: "/jurisdictions/{id}/blackout-windows"
+    description: "Reverse-reachability for ServiceWindow.jurisdiction_id: BLACKOUT windows on this jurisdiction."
+    roles: [SystemAdmin, Dispatcher]
+    code: 200
+    input: []
+    output: ServiceWindow[]
+    side_effects: []
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set"
+    description: "Set the system clock to an absolute UTC instant (test-driving)."
+    roles: [SystemAdmin]
+    code: 200
+    input: ["to_iso8601"]
+    output: "{ clock_now: datetime }"
+    side_effects: []
+  - method: POST
+    path: "/_clock/advance"
+    description: "Advance the clock by N hours and run the SLA breach sweep (sla_breach_sweep calc)."
+    roles: [SystemAdmin]
+    code: 200
+    input: ["hours"]
+    output: "{ clock_now: datetime, breached_request_ids: string[], escalations_created: integer }"
+    side_effects: ["set sla_breached on overdue requests", "auto-create TIER1/TIER2 escalations"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or X-User-ID on an authenticated endpoint."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Authenticated role is not permitted to call this endpoint per §1.7."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced resource (path id or FK body field) does not exist."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Acting Citizen is not the owner of the target request/survey."
+  - id: ERR_AGENT_WRONG_DEPARTMENT
+    http: 403
+    condition: "Acting Agent does not belong to the work order's department."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource is not in a state from which the requested transition is defined."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_<parent>_version does not match the parent entity's current version (OCC)."
+  - id: ERR_CATEGORY_INACTIVE
+    http: 409
+    condition: "Intake/triage references a category whose active == false."
+  - id: ERR_GEOLOCATION_REQUIRED
+    http: 422
+    condition: "Category requires_geolocation but lat/lng not both present."
+  - id: ERR_CLUSTER_CATEGORY_MISMATCH
+    http: 409
+    condition: "Member request category_id differs from the cluster category_id."
+  - id: ERR_OUTSIDE_CLUSTER_RADIUS
+    http: 409
+    condition: "Member request lies farther than CLUSTER_RADIUS_METERS from the cluster center."
+  - id: ERR_NO_SLA_POLICY
+    http: 409
+    condition: "No SlaPolicy exists for (request.category_id, request.priority) at routing."
+  - id: ERR_REOPEN_WINDOW_CLOSED
+    http: 409
+    condition: "Reopen requested after REOPEN_WINDOW_HOURS past resolved_at."
+  - id: ERR_CANONICAL_NOT_RESOLVED
+    http: 409
+    condition: "Cluster close attempted while canonical request is not RESOLVED/CLOSED."
+  - id: ERR_OPEN_ESCALATION_BLOCKS_CLOSE
+    http: 409
+    condition: "Request close attempted while it has an OPEN escalation."
+  - id: ERR_TIER2_REQUIRES_SUPERVISOR
+    http: 403
+    condition: "TIER2 escalation resolved by a non-supervisor Agent."
+  - id: ERR_INVALID_SCORE
+    http: 422
+    condition: "Survey response score is not an integer in [1,5]."
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Request body fails schema validation (missing required field, bad enum, wrong type, out-of-range pagination)."
+  - id: ERR_DUPLICATE_WORK_ORDER
+    http: 409
+    condition: "Routing would create a second WorkOrder for a request that already has one."
+  - id: ERR_WINDOW_SCOPE_INVALID
+    http: 422
+    condition: "ServiceWindow scope mismatched: MAINTENANCE without department_id (or with jurisdiction_id), or BLACKOUT without jurisdiction_id (or with department_id)."
+  - id: ERR_WINDOW_OVERLAP
+    http: 409
+    condition: "New ServiceWindow overlaps an existing same-type, same-scope window per window_overlap interval semantics."
+  - id: ERR_WINDOW_BLOCKS_ROUTING
+    http: 409
+    condition: "Routing blocked because routed_at falls inside an active MAINTENANCE (department) or BLACKOUT (jurisdiction) window."
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: SystemAdmin
+    description: "Platform operator: manages configuration (categories, jurisdictions, departments, SLA policies, agents) and the system clock; may override escalation resolution."
+    identity: opaque
+    exclusive_operations:
+      - "POST /categories"
+      - "POST /jurisdictions"
+      - "POST /departments"
+      - "POST /sla-policies"
+      - "POST /agents"
+      - "POST /service-windows"
+      - "POST /_clock/set"
+      - "POST /_clock/advance"
+    shared_operations:
+      - "GET /departments/{id}/satisfaction"
+      - "POST /escalations/{id}/resolve"
+      - "GET on all read endpoints"
+
+  - name: Dispatcher
+    description: "311 desk operator: triages, routes, manages duplicate clusters, assigns/cancels work orders, raises and resolves escalations."
+    identity: opaque
+    exclusive_operations:
+      - "POST /service-requests/{id}/triage"
+      - "POST /service-requests/{id}/route"
+      - "POST /service-requests/{id}/close"
+      - "POST /duplicate-clusters"
+      - "POST /duplicate-clusters/{id}/members"
+      - "POST /duplicate-clusters/{id}/close"
+      - "POST /work-orders/{id}/assign"
+      - "POST /work-orders/{id}/cancel"
+      - "POST /escalations"
+    shared_operations:
+      - "POST /service-requests (on behalf of a citizen)"
+      - "POST /escalations/{id}/resolve"
+      - "GET read endpoints"
+
+  - name: Agent
+    description: "Department field/desk worker: starts and completes work orders for their own department; may resolve TIER1 escalations (supervisors also TIER2)."
+    identity: entity_backed:Agent
+    exclusive_operations:
+      - "POST /work-orders/{id}/start"
+      - "POST /work-orders/{id}/complete"
+    shared_operations:
+      - "POST /escalations/{id}/resolve"
+      - "GET /work-orders, GET /work-orders/{id}, GET /departments/{id}, GET /service-requests*"
+
+  - name: Citizen
+    description: "Member of the public: files requests, reopens own resolved requests, responds to own satisfaction surveys."
+    identity: entity_backed:Citizen
+    exclusive_operations:
+      - "POST /service-requests/{id}/reopen"
+      - "POST /surveys/{id}/respond"
+    shared_operations:
+      - "POST /service-requests (own)"
+      - "GET own requests, notifications, surveys, categories"
+
+  - name: Anonymous
+    description: "Unauthenticated caller; may only self-register as a Citizen."
+    identity: opaque
+    exclusive_operations:
+      - "POST /citizens"
+    shared_operations: []

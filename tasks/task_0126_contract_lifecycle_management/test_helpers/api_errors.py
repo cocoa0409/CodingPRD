@@ -1,0 +1,57 @@
+"""Error IDs and HTTP status mapping for the Contract Lifecycle Management API (PRD §5).
+
+After defining the mapping it is registered with the framework so that
+validate_error() can cross-check the HTTP status code automatically.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+    ERR_CONTRACT_NOT_FOUND = "ERR_CONTRACT_NOT_FOUND"
+    ERR_RESOURCE_NOT_FOUND = "ERR_RESOURCE_NOT_FOUND"
+    ERR_REFERENCE_NOT_FOUND = "ERR_REFERENCE_NOT_FOUND"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    ERR_NO_VERSION = "ERR_NO_VERSION"
+    ERR_SELF_APPROVAL = "ERR_SELF_APPROVAL"
+    ERR_MANDATORY_CLAUSE_MISSING = "ERR_MANDATORY_CLAUSE_MISSING"
+    ERR_DEVIATION_REQUIRED = "ERR_DEVIATION_REQUIRED"
+    ERR_DEVIATION_STALE = "ERR_DEVIATION_STALE"
+    ERR_SIGNERS_INCOMPLETE = "ERR_SIGNERS_INCOMPLETE"
+    ERR_RENEWAL_NOT_DUE = "ERR_RENEWAL_NOT_DUE"
+    ERR_OPEN_BREACH = "ERR_OPEN_BREACH"
+    ERR_DUPLICATE_CLAUSE_KEY = "ERR_DUPLICATE_CLAUSE_KEY"
+    ERR_CLAUSE_IN_USE = "ERR_CLAUSE_IN_USE"
+    ERR_TEMPLATE_IN_USE = "ERR_TEMPLATE_IN_USE"
+    ERR_VALIDATION_RANGE = "ERR_VALIDATION_RANGE"
+
+
+HTTP_STATUS_CODES: dict[str, int] = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_UNAUTHORIZED: 403,
+    ApiErrorId.ERR_CONTRACT_NOT_FOUND: 404,
+    ApiErrorId.ERR_RESOURCE_NOT_FOUND: 404,
+    ApiErrorId.ERR_REFERENCE_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_REQUEST: 400,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_NO_VERSION: 409,
+    ApiErrorId.ERR_SELF_APPROVAL: 403,
+    ApiErrorId.ERR_MANDATORY_CLAUSE_MISSING: 409,
+    ApiErrorId.ERR_DEVIATION_REQUIRED: 409,
+    ApiErrorId.ERR_DEVIATION_STALE: 409,
+    ApiErrorId.ERR_SIGNERS_INCOMPLETE: 409,
+    ApiErrorId.ERR_RENEWAL_NOT_DUE: 409,
+    ApiErrorId.ERR_OPEN_BREACH: 409,
+    ApiErrorId.ERR_DUPLICATE_CLAUSE_KEY: 409,
+    ApiErrorId.ERR_CLAUSE_IN_USE: 409,
+    ApiErrorId.ERR_TEMPLATE_IN_USE: 409,
+    ApiErrorId.ERR_VALIDATION_RANGE: 422,
+}
+
+# Register with the framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

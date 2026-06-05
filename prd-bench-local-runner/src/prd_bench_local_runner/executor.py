@@ -6,6 +6,7 @@ the server URL and lifecycle management, parses JUnit XML for results.
 """
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,26 @@ from typing import Optional
 from loguru import logger
 
 from .results import BenchmarkResults
+
+
+def _absolutize_start_command(cmd: str) -> str:
+    """Resolve the ``cd <dir>`` directory in a ``cd <dir> && <command>`` start
+    command to an absolute path, against the *current* process's cwd.
+
+    This must run in the runner's main process (cwd = where the runner was
+    launched, i.e. the project root). It exists because the per-test restart
+    path in ``pytest_plugin._restart_server`` re-resolves this directory with
+    ``os.path.abspath`` inside the pytest subprocess, whose cwd has been changed
+    to ``test_dir`` (see ``run``'s ``cwd=self.test_dir``). A relative directory
+    would therefore be joined onto ``test_dir`` and point at a non-existent,
+    doubled path, so every per-test server restart fails. Absolutizing here —
+    mirroring how ``__init__`` already absolutizes ``test_dir`` — makes the
+    downstream ``abspath`` idempotent regardless of the pytest cwd. Absolute
+    inputs pass through unchanged (abspath only normalizes them)."""
+    m = re.match(r"cd\s+(\S+)\s*&&\s*(.*)", cmd)
+    if m:
+        return f"cd {os.path.abspath(m.group(1))} && {m.group(2).strip()}"
+    return cmd
 
 
 class TestExecutor:
@@ -33,7 +54,7 @@ class TestExecutor:
         self.per_test_timeout = per_test_timeout
         self.results_file = results_file
         self.skip_lifecycle = skip_lifecycle
-        self.start_command = start_command or ""
+        self.start_command = _absolutize_start_command(start_command or "")
         self.isolation = isolation
 
     def run(self) -> BenchmarkResults:

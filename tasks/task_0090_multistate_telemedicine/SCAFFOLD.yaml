@@ -1,0 +1,1349 @@
+scenario: |
+  Multi-State Telemedicine Platform: physician multi-state licensure registry, patient
+  state determination, compliance routing, electronic prescription DEA compliance,
+  insurance/self-pay routing, Interstate Compact, follow-up
+
+domain_name: multistate-telemedicine
+api_prefix: "/"
+
+# Primary archetype: Compliance / audit — every clinical action is gated by a regulatory
+# rule set (physician must be licensed where the patient is physically located at visit
+# time; controlled-substance prescriptions must satisfy DEA telehealth rules) and every
+# gating decision is recorded on an append-only ComplianceCheck log. Secondary archetype:
+# Access control matrix — the permission to conduct a visit is a function of (physician
+# licensure state-set) × (patient determined-state) × (modality) × (payer routing), a
+# context-dependent matrix rather than a static role grant.
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: access_control_matrix
+  complexity_layers:
+    - cascading_side_effects        # license suspension cascades to visits, then to prescriptions, then to claims
+    - dual_variant_calculation      # patient cost estimate (insurance vs self-pay) and licensure-coverage scoring
+    - rate_threshold_triggers       # DEA in-person-exam recency window; follow-up due window
+    - optimistic_concurrency        # CREATE-with-supersede on a Visit's active prescription set
+
+  entity_topology: graph
+  # Physician ↔ State licensure is many-to-many (StateLicense junction). Visit references
+  # both Physician and Patient (cross-aggregate). Prescription references Visit; Claim
+  # references Visit. No strict containment tree — peer entities joined by FKs and a
+  # junction table.
+
+  state_machine_shape: branching
+  # Visit forks at routing time: APPROVED_INSURANCE vs APPROVED_SELF_PAY (divergent
+  # side-effect sets per branch), and StateLicense cycles ACTIVE→SUSPENDED→ACTIVE.
+
+  relationship_patterns:
+    - one_to_many          # Physician 1—* StateLicense; Visit 1—* Prescription
+    - many_to_many         # Physician *—* State via StateLicense junction
+    - cross_aggregate      # Visit references Physician and Patient across aggregates
+
+  role_model: peer_roles
+  # Physician owns clinical actions on own visits/prescriptions; Patient owns own
+  # intake/state-attestation; LicensingBoard owns licensure registry + suspensions;
+  # ComplianceOfficer (opaque operator) owns routing overrides and claim adjudication.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — emitted verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Physician
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: physician legal name
+      - name: npi
+        type: string
+        source: input
+        description: 10-digit National Provider Identifier; unique across physicians
+        constraints: exactly 10 numeric digits; unique
+      - name: dea_number
+        type: string
+        source: input
+        description: DEA registration number; required to author controlled-substance prescriptions
+        default: null
+      - name: imlc_eligible
+        type: boolean
+        source: input
+        description: whether physician holds an Interstate Medical Licensure Compact Letter of Qualification (issued by a principal-state board), enabling expedited licensure
+        default: false
+      - name: home_state_code
+        type: string
+        source: input
+        description: two-letter principal state of license under the IMLC
+        constraints: two-letter USPS state code
+      - name: active_license_count
+        type: integer
+        source: computed
+        description: count of StateLicense rows for this physician whose status == ACTIVE; recomputed on every StateLicense status change
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: physician registry status
+        default: ACTIVE
+        constraints: one of {ACTIVE, DEACTIVATED}
+
+  - name: StateLicense
+    parent: null
+    common_fields: true
+    fields:
+      - name: physician_id
+        type: string
+        source: input
+        description: FK -> Physician.id; the physician this license belongs to
+      - name: state_code
+        type: string
+        source: input
+        description: two-letter USPS state code the license authorizes practice in
+        constraints: two-letter USPS state code
+      - name: issuance_type
+        type: enum
+        source: input
+        description: how the license was granted
+        constraints: one of {FULL, COMPACT_EXPEDITED}
+      - name: controlled_substance_authority
+        type: boolean
+        source: input
+        description: whether this state license carries a state controlled-substance registration (required, in addition to a federal DEA number, to prescribe controlled substances to a patient located in this state)
+        default: false
+      - name: effective_date
+        type: datetime
+        source: input
+        description: ISO 8601 UTC date the license becomes valid (inclusive)
+      - name: expiration_date
+        type: datetime
+        source: input
+        description: ISO 8601 UTC date the license expires (exclusive — license is invalid at and after this instant)
+      - name: status
+        type: enum
+        source: system
+        description: |
+          license lifecycle status. Note: expiry is NOT a stored status value — a license is
+          treated as expired purely by the clock (ClockState.current_utc >= expiration_date) in
+          §1.3 license_selection; the persisted status only flips via the suspend/reinstate/revoke
+          transitions in §1.2.
+        default: ACTIVE
+        constraints: one of {ACTIVE, SUSPENDED, REVOKED}
+      - name: suspension_reason
+        type: string
+        source: system
+        description: free-text reason captured when a LicensingBoard suspends the license
+        default: null
+
+  - name: Patient
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: patient legal name
+      - name: email
+        type: string
+        source: input
+        description: contact + login identity; unique across patients
+        constraints: unique
+      - name: residence_state_code
+        type: string
+        source: input
+        description: two-letter USPS state code of the patient's residence on file
+        constraints: two-letter USPS state code
+      - name: insurance_payer_id
+        type: string
+        source: input
+        description: FK -> Payer.id; the patient's insurance payer on file, or null for cash patients
+        default: null
+
+  - name: Payer
+    parent: null
+    common_fields: false
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: insurance payer / health plan name
+      - name: telehealth_parity
+        type: boolean
+        source: input
+        description: whether the payer reimburses telehealth at in-person parity rates
+        default: false
+      - name: copay_cents
+        type: integer
+        source: input
+        description: flat patient copay in cents applied per covered telehealth visit
+        constraints: integer >= 0
+      - name: covered_state_codes
+        type: array
+        source: input
+        description: list of two-letter USPS state codes in which this payer covers telehealth visits
+      - name: allowed_amount_cents
+        type: integer
+        source: input
+        description: the payer's contracted allowed amount in cents for a standard telehealth visit (the ceiling the plan recognizes)
+        constraints: integer >= 0
+
+  - name: Visit
+    parent: null
+    common_fields: true
+    fields:
+      - name: physician_id
+        type: string
+        source: input
+        description: FK -> Physician.id; the physician conducting the visit
+      - name: patient_id
+        type: string
+        source: input
+        description: FK -> Patient.id; the patient being seen
+      - name: modality
+        type: enum
+        source: input
+        description: telemedicine modality
+        constraints: one of {VIDEO, AUDIO_ONLY}
+      - name: scheduled_at
+        type: datetime
+        source: input
+        description: ISO 8601 UTC instant the visit is scheduled to occur
+      - name: determined_state_code
+        type: string
+        source: input
+        description: two-letter USPS state code where the PATIENT is physically located at visit time, as attested at intake; this — not residence — governs compliance routing
+        constraints: two-letter USPS state code
+      - name: list_fee_cents
+        type: integer
+        source: input
+        description: the platform's list (rack) clinical fee in cents for this visit type before insurance/self-pay routing
+        constraints: integer > 0
+      - name: platform_fee_cents
+        type: integer
+        source: input
+        description: the platform's technology/service fee in cents charged in addition to the clinical fee; used only by the SELF_PAY cost variant
+        constraints: integer >= 0
+        default: 0
+      - name: routing
+        type: enum
+        source: computed
+        description: payment routing branch chosen at approval; null until APPROVED
+        default: null
+        constraints: one of {INSURANCE, SELF_PAY} or null
+      - name: patient_cost_cents
+        type: integer
+        source: computed
+        description: amount the patient owes for this visit, computed at approval per the active routing branch (see §1.3 patient_cost_estimate)
+        default: null
+      - name: prescription_version
+        type: integer
+        source: system
+        description: monotonic counter of accepted prescription-set mutations on this visit; the OCC token for CREATE-with-supersede of controlled-substance prescriptions
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: visit lifecycle status
+        default: REQUESTED
+        constraints: one of {REQUESTED, COMPLIANCE_CLEARED, APPROVED_INSURANCE, APPROVED_SELF_PAY, COMPLETED, CANCELLED, VOIDED}
+
+  - name: ComplianceCheck
+    parent: null
+    common_fields: false
+    fields:
+      - name: visit_id
+        type: string
+        source: input
+        description: FK -> Visit.id; the visit this compliance evaluation was run against
+      - name: outcome
+        type: enum
+        source: system
+        description: result of the licensure/modality compliance evaluation
+        constraints: one of {CLEARED, BLOCKED, OVERRIDDEN}
+      - name: matched_license_id
+        type: string
+        source: system
+        description: FK -> StateLicense.id; the StateLicense selected as the governing license for this visit, or null when BLOCKED with no eligible license
+        default: null
+      - name: reason_code
+        type: enum
+        source: system
+        description: machine-readable basis for the outcome
+        constraints: one of {LICENSE_MATCH, NO_LICENSE_IN_STATE, LICENSE_NOT_ACTIVE, AUDIO_ONLY_NOT_PERMITTED, OFFICER_OVERRIDE}
+
+  - name: Prescription
+    parent: null
+    common_fields: true
+    fields:
+      - name: visit_id
+        type: string
+        source: input
+        description: FK -> Visit.id; the visit during which this prescription was authored
+      - name: drug_name
+        type: string
+        source: input
+        description: prescribed drug name
+      - name: dea_schedule
+        type: enum
+        source: input
+        description: DEA controlled-substance schedule, or NONE for non-controlled drugs
+        constraints: one of {NONE, II, III, IV, V}
+      - name: days_supply
+        type: integer
+        source: input
+        description: number of days the prescription covers
+        constraints: integer > 0
+      - name: status
+        type: enum
+        source: system
+        description: prescription lifecycle status
+        default: ACTIVE
+        constraints: one of {ACTIVE, SUPERSEDED, VOIDED}
+
+  - name: Claim
+    parent: null
+    common_fields: true
+    fields:
+      - name: visit_id
+        type: string
+        source: input
+        description: FK -> Visit.id; the visit this claim bills for
+      - name: payer_id
+        type: string
+        source: input
+        description: FK -> Payer.id; the payer the claim is submitted to (copied from patient at submission)
+      - name: billed_cents
+        type: integer
+        source: input
+        description: amount in cents submitted on the claim (the visit list fee)
+        constraints: integer > 0
+      - name: allowed_cents
+        type: integer
+        source: computed
+        description: adjudicated allowed amount in cents (see §1.3 claim_adjudication)
+        default: null
+      - name: plan_paid_cents
+        type: integer
+        source: computed
+        description: amount in cents the plan pays after copay
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: claim lifecycle status
+        default: SUBMITTED
+        constraints: one of {SUBMITTED, ADJUDICATED, DENIED, REVERSED}
+
+  - name: FollowUp
+    parent: null
+    common_fields: true
+    fields:
+      - name: source_visit_id
+        type: string
+        source: input
+        description: FK -> Visit.id; the completed visit that generated this follow-up
+      - name: due_at
+        type: datetime
+        source: system
+        description: ISO 8601 UTC instant by which the follow-up should occur; computed from the source visit's completion time plus the follow-up interval (see §1.3 follow_up_due)
+      - name: linked_visit_id
+        type: string
+        source: input
+        description: FK -> Visit.id; the new visit booked to satisfy this follow-up, or null while OPEN
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: follow-up lifecycle status
+        default: OPEN
+        constraints: one of {OPEN, FULFILLED, LAPSED}
+
+  - name: ClockState
+    parent: null
+    common_fields: false
+    fields:
+      - name: current_utc
+        type: datetime
+        source: system
+        description: the platform's current wall-clock instant (ISO 8601 UTC); set by the test-driving clock endpoint and read by all recency/expiry/due computations
+        default: "1970-01-01T00:00:00.000Z"
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: StateLicense
+    initial_state: ACTIVE
+    terminal_states: [REVOKED]
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /state-licenses/{id}/suspend"
+        actor: LicensingBoard
+        preconditions:
+          - "StateLicense.status == ACTIVE"
+        side_effects:
+          - "set StateLicense.suspension_reason from request body"
+          - "decrement Physician.active_license_count by 1 (recompute as count of ACTIVE StateLicense rows)"
+          - "CASCADE: every Visit with status == COMPLIANCE_CLEARED whose ComplianceCheck.matched_license_id == this StateLicense.id transitions COMPLIANCE_CLEARED -> VOIDED (its compliance clearance is no longer valid)"
+        note: "First hop of the suspension cascade chain; the Visit VOID hop itself triggers the Prescription VOID hop and the Claim REVERSED hop below."
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /state-licenses/{id}/reinstate"
+        actor: LicensingBoard
+        preconditions:
+          - "StateLicense.status == SUSPENDED"
+          - "ClockState.current_utc < StateLicense.expiration_date (license has not expired during suspension)"
+        side_effects:
+          - "clear StateLicense.suspension_reason to null"
+          - "increment Physician.active_license_count by 1 (recompute as count of ACTIVE StateLicense rows)"
+        note: "Reinstatement does NOT auto-revive VOIDED visits; those remain terminal."
+      - from: ACTIVE
+        to: REVOKED
+        trigger: "POST /state-licenses/{id}/revoke"
+        actor: LicensingBoard
+        preconditions:
+          - "StateLicense.status == ACTIVE"
+        side_effects:
+          - "decrement Physician.active_license_count by 1 (recompute as count of ACTIVE StateLicense rows)"
+      - from: SUSPENDED
+        to: REVOKED
+        trigger: "POST /state-licenses/{id}/revoke"
+        actor: LicensingBoard
+        preconditions:
+          - "StateLicense.status == SUSPENDED"
+        side_effects:
+          - "no active_license_count change (already not counted while SUSPENDED)"
+
+  - entity: Visit
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, CANCELLED, VOIDED]
+    transitions:
+      - from: REQUESTED
+        to: COMPLIANCE_CLEARED
+        trigger: "POST /visits/{id}/run-compliance"
+        actor: Physician
+        preconditions:
+          - "Visit.status == REQUESTED"
+          - "Physician.status == ACTIVE"
+          - "compliance evaluation outcome resolves to CLEARED — physician has a governing StateLicense per §1.3 license_selection AND the AUDIO_ONLY modality rule passes"
+        side_effects:
+          - "append ComplianceCheck{visit_id, outcome: CLEARED, matched_license_id: <selected StateLicense.id>, reason_code: LICENSE_MATCH}"
+        note: "A BLOCKED evaluation does NOT transition the Visit; it appends a ComplianceCheck{outcome: BLOCKED, ...} and returns the §1.4 error. See run-compliance endpoint side_effects."
+      - from: REQUESTED
+        to: COMPLIANCE_CLEARED
+        trigger: "POST /visits/{id}/override-compliance"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Visit.status == REQUESTED"
+          - "the most recent ComplianceCheck for this visit has outcome == BLOCKED (an override may only follow a recorded block)"
+        side_effects:
+          - "append ComplianceCheck{visit_id, outcome: OVERRIDDEN, matched_license_id: null, reason_code: OFFICER_OVERRIDE}"
+        note: "Branch point sibling of run-compliance — same target state, different actor and recorded reason."
+      - from: COMPLIANCE_CLEARED
+        to: APPROVED_INSURANCE
+        trigger: "POST /visits/{id}/approve"
+        actor: Physician
+        preconditions:
+          - "Visit.status == COMPLIANCE_CLEARED"
+          - "Patient.insurance_payer_id != null (the patient carries insurance; state-coverage is NOT checked at routing — it is adjudicated later on the Claim)"
+        side_effects:
+          - "set Visit.routing = INSURANCE"
+          - "compute Visit.patient_cost_cents via §1.3 patient_cost_estimate INSURANCE variant"
+          - "CASCADE: create Claim{visit_id, payer_id: Patient.insurance_payer_id, billed_cents: Visit.list_fee_cents, status: SUBMITTED} and run §1.3 claim_adjudication to pre-populate its allowed_cents and plan_paid_cents. The final coverage gate is applied at the explicit /claims/{id}/adjudicate transition, which confirms (ADJUDICATED) when the determined_state is covered or denies (DENIED, zeros) when it is not."
+        note: "INSURANCE branch — divergent side-effect set: creates a Claim. Forms one fork of the branching state machine. Routing depends only on whether the patient is insured; the determined-state coverage gate lives on the Claim adjudication, where an out-of-coverage claim is DENIED."
+      - from: COMPLIANCE_CLEARED
+        to: APPROVED_SELF_PAY
+        trigger: "POST /visits/{id}/approve"
+        actor: Physician
+        preconditions:
+          - "Visit.status == COMPLIANCE_CLEARED"
+          - "Patient.insurance_payer_id == null (the patient is cash/uninsured)"
+        side_effects:
+          - "set Visit.routing = SELF_PAY"
+          - "compute Visit.patient_cost_cents via §1.3 patient_cost_estimate SELF_PAY variant"
+        note: "SELF_PAY branch — divergent side-effect set: NO Claim is created. The other fork of the branching state machine."
+      - from: APPROVED_INSURANCE
+        to: COMPLETED
+        trigger: "POST /visits/{id}/complete"
+        actor: Physician
+        preconditions:
+          - "Visit.status == APPROVED_INSURANCE"
+        side_effects:
+          - "CASCADE: create FollowUp{source_visit_id, status: OPEN, due_at via §1.3 follow_up_due}"
+      - from: APPROVED_SELF_PAY
+        to: COMPLETED
+        trigger: "POST /visits/{id}/complete"
+        actor: Physician
+        preconditions:
+          - "Visit.status == APPROVED_SELF_PAY"
+        side_effects:
+          - "CASCADE: create FollowUp{source_visit_id, status: OPEN, due_at via §1.3 follow_up_due}"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /visits/{id}/cancel"
+        actor: Patient
+        preconditions:
+          - "Visit.status == REQUESTED"
+        side_effects: []
+      - from: COMPLIANCE_CLEARED
+        to: CANCELLED
+        trigger: "POST /visits/{id}/cancel"
+        actor: Patient
+        preconditions:
+          - "Visit.status == COMPLIANCE_CLEARED"
+        side_effects: []
+      - from: COMPLIANCE_CLEARED
+        to: VOIDED
+        trigger: "system: StateLicense suspension cascade"
+        actor: system
+        preconditions:
+          - "Visit.status == COMPLIANCE_CLEARED"
+          - "the ComplianceCheck that cleared this visit has matched_license_id == the StateLicense being suspended"
+        side_effects:
+          - "CASCADE: every Prescription with visit_id == this Visit.id whose status == ACTIVE transitions ACTIVE -> VOIDED"
+        note: "Second hop of the suspension cascade (License SUSPENDED -> Visit VOIDED). The Prescription VOID it triggers is the third hop."
+      - from: APPROVED_SELF_PAY
+        to: VOIDED
+        trigger: "system: StateLicense suspension cascade"
+        actor: system
+        preconditions:
+          - "Visit.status == APPROVED_SELF_PAY"
+          - "the ComplianceCheck that cleared this visit has matched_license_id == the StateLicense being suspended"
+        side_effects:
+          - "CASCADE: every Prescription with visit_id == this Visit.id whose status == ACTIVE transitions ACTIVE -> VOIDED"
+        note: "Self-pay approved visits void too, but carry no Claim to reverse (none was created on the self-pay branch)."
+      - from: APPROVED_INSURANCE
+        to: VOIDED
+        trigger: "system: StateLicense suspension cascade"
+        actor: system
+        preconditions:
+          - "Visit.status == APPROVED_INSURANCE"
+          - "the ComplianceCheck that cleared this visit has matched_license_id == the StateLicense being suspended"
+        side_effects:
+          - "CASCADE: every Prescription with visit_id == this Visit.id whose status == ACTIVE transitions ACTIVE -> VOIDED"
+          - "CASCADE: every Claim with visit_id == this Visit.id whose status IN {SUBMITTED, ADJUDICATED} transitions to REVERSED"
+        note: "Suspension can also reach an already-approved insurance visit; this branch additionally reverses the Claim (fourth hop). The depth-3 chain License->Visit->Prescription is captured on the COMPLIANCE_CLEARED->VOIDED branch above; this branch adds the Claim reversal as a parallel consequence of the Visit VOID hop."
+
+  - entity: Prescription
+    initial_state: ACTIVE
+    terminal_states: [SUPERSEDED, VOIDED]
+    transitions:
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "system: POST /visits/{id}/prescriptions authoring a controlled-substance rx of the same drug_name"
+        actor: system
+        preconditions:
+          - "Prescription.status == ACTIVE"
+          - "a new controlled-substance Prescription (dea_schedule != NONE) with the same drug_name is being authored on the same visit, and the OCC token matches the current Visit.prescription_version"
+        side_effects:
+          - "the new Prescription becomes the ACTIVE one; this prior Prescription -> SUPERSEDED"
+          - "increment the parent Visit.prescription_version by 1"
+        note: "The supersede that the OCC concurrency rule guards. Only same-drug controlled rx supersede; a different drug authors a new ACTIVE prescription without superseding."
+      - from: ACTIVE
+        to: VOIDED
+        trigger: "system: StateLicense suspension cascade (via Visit VOID)"
+        actor: system
+        preconditions:
+          - "Prescription.status == ACTIVE"
+          - "the parent Visit is transitioning to VOIDED in the suspension cascade"
+        side_effects: []
+        note: "Third hop of the suspension cascade. SUPERSEDED prescriptions are already terminal and are not re-touched."
+
+  - entity: Claim
+    initial_state: SUBMITTED
+    terminal_states: [DENIED, REVERSED]
+    transitions:
+      - from: SUBMITTED
+        to: ADJUDICATED
+        trigger: "POST /claims/{id}/adjudicate"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Claim.status == SUBMITTED"
+          - "the Payer.covered_state_codes contains the source Visit.determined_state_code"
+        side_effects:
+          - "recompute Claim.allowed_cents and Claim.plan_paid_cents via §1.3 claim_adjudication"
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /claims/{id}/adjudicate"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Claim.status == SUBMITTED"
+          - "the Payer.covered_state_codes does NOT contain the source Visit.determined_state_code"
+        side_effects:
+          - "set Claim.allowed_cents = 0 and Claim.plan_paid_cents = 0"
+      - from: SUBMITTED
+        to: REVERSED
+        trigger: "system: StateLicense suspension cascade (via Visit VOID)"
+        actor: system
+        preconditions:
+          - "Claim.status == SUBMITTED"
+        side_effects: []
+      - from: ADJUDICATED
+        to: REVERSED
+        trigger: "system: StateLicense suspension cascade (via Visit VOID)"
+        actor: system
+        preconditions:
+          - "Claim.status == ADJUDICATED"
+        side_effects: []
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: rx-create-stale-visit
+    parent_entity: Visit
+    write_endpoint: "POST /visits/{id}/prescriptions"
+    occ_field: "expected_visit_prescription_version"
+    description: |
+      Authoring a controlled-substance Prescription (dea_schedule != NONE) against a
+      Visit whose prescription_version has advanced since the client last observed it is
+      rejected with a stale-version error. The product allows a newly authored
+      controlled-substance prescription for the same drug to legitimately supersede the
+      prior ACTIVE one on the same visit (the prior is moved to SUPERSEDED and
+      prescription_version is bumped); a second authoring call still carrying the old
+      prescription_version therefore holds a stale view of the visit's active prescription
+      set and is rejected.
+    error_id: ERR_STALE_PRESCRIPTION_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: license_selection
+    trigger: "POST /visits/{id}/run-compliance"
+    algorithm: selector_policy
+    formula: |
+      # Select the single governing StateLicense for a Visit.
+      candidates = StateLicense rows where:
+          physician_id == Visit.physician_id
+          AND state_code == Visit.determined_state_code
+          AND status == ACTIVE
+          AND effective_date <= ClockState.current_utc
+          AND ClockState.current_utc < expiration_date        # exclusive upper bound
+      if candidates is empty:
+          if any StateLicense matches physician+state but status != ACTIVE:
+              outcome = BLOCKED, reason_code = LICENSE_NOT_ACTIVE
+          else:
+              outcome = BLOCKED, reason_code = NO_LICENSE_IN_STATE
+          matched_license_id = null
+      else:
+          # ranking: prefer FULL over COMPACT_EXPEDITED issuance; then latest effective_date;
+          # then earliest created_at as the deterministic final tie-break.
+          rank each candidate by (issuance_type == FULL ? 0 : 1) ASC,
+                                 effective_date DESC,
+                                 created_at ASC
+          selected = first candidate
+          matched_license_id = selected.id, outcome = CLEARED, reason_code = LICENSE_MATCH
+    input_set: "StateLicense rows for the visit's physician filtered to the visit's determined_state_code and ACTIVE status with the clock inside [effective_date, expiration_date)"
+    constants: {}
+    precision: "n/a (selection, not numeric)"
+    variants:
+      - name: selection
+        when: "always when run-compliance is invoked"
+        difference: "the single base behavior"
+
+  - name: patient_cost_estimate
+    trigger: "POST /visits/{id}/approve"
+    algorithm: dual_variant
+    formula: |
+      # Dual-variant: same Visit, two valid algorithms, different patient_cost_cents.
+      #
+      # INSURANCE variant (chosen when routing == INSURANCE):
+      #   allowed = min(Visit.list_fee_cents, Payer.allowed_amount_cents)
+      #   if Payer.telehealth_parity == true:
+      #       patient_cost_cents = Payer.copay_cents
+      #   else:
+      #       parity_shortfall = max(0, Visit.list_fee_cents - allowed)
+      #       patient_cost_cents = Payer.copay_cents + parity_shortfall
+      #
+      # SELF_PAY variant (chosen when routing == SELF_PAY):
+      #   Combinatorial mode (b) — ORDER-DEPENDENT nested rounding. The platform pins
+      #   ROUND-PER-COMPONENT-THEN-SUM (NOT sum-then-round):
+      #       clinical_share = round_half_up(Visit.list_fee_cents * SELF_PAY_DISCOUNT_FACTOR)
+      #       platform_share = round_half_up(Visit.platform_fee_cents * SELF_PAY_DISCOUNT_FACTOR)
+      #       patient_cost_cents = clinical_share + platform_share
+      #   (rounding each discounted component to whole cents BEFORE summing can differ by
+      #    one cent from discounting the summed fee, e.g. list 9999 + platform 9999:
+      #    per-component 7999+7999=15998 vs sum-then-round round(19998*0.80)=15998 here,
+      #    but list 25 + platform 25: per-component 20+20=40 vs round(50*0.80)=40 — the
+      #    divergence appears at .5 boundaries; the pinned order is per-component.)
+    input_set: "single Visit plus, for INSURANCE, the Patient's Payer"
+    constants:
+      SELF_PAY_DISCOUNT_FACTOR: 0.80
+    precision: "integer cents; round_half_up per component for SELF_PAY (per-component-then-sum order pinned)"
+    variants:
+      - name: insurance
+        when: "Visit.routing == INSURANCE (patient has a payer covering the determined state)"
+        difference: "cost = copay, plus the parity shortfall when the payer lacks telehealth parity"
+      - name: self_pay
+        when: "Visit.routing == SELF_PAY (no payer or payer does not cover the determined state)"
+        difference: "cost = discounted clinical fee + discounted platform fee, each rounded BEFORE summing; payer fields ignored entirely"
+
+  - name: claim_adjudication
+    trigger: "CASCADE on POST /visits/{id}/approve (INSURANCE branch); recomputed on POST /claims/{id}/adjudicate"
+    algorithm: aggregation
+    formula: |
+      # Combinatorial mode (a): >=3 inputs with nested min/max and a conditional branch.
+      allowed_cents = min(Claim.billed_cents, Payer.allowed_amount_cents)
+      if Payer.telehealth_parity == true:
+          plan_paid_cents = max(0, allowed_cents - Payer.copay_cents)
+      else:
+          # No parity: plan only pays the non-parity share — half of the allowed amount,
+          # net of copay, floored at zero.
+          plan_paid_cents = max(0, round_half_up(allowed_cents * NON_PARITY_PLAN_SHARE) - Payer.copay_cents)
+    input_set: "single Claim + its Payer; billed_cents is the source Visit.list_fee_cents"
+    constants:
+      NON_PARITY_PLAN_SHARE: 0.50
+    precision: "integer cents; round_half_up when multiplying by NON_PARITY_PLAN_SHARE; floor at 0 via max(0, ...)"
+    variants:
+      - name: parity
+        when: "Payer.telehealth_parity == true"
+        difference: "plan pays allowed minus copay"
+      - name: non_parity
+        when: "Payer.telehealth_parity == false"
+        difference: "plan pays half of allowed, then minus copay, floored at zero"
+
+  - name: dea_exam_recency
+    trigger: "POST /visits/{id}/prescriptions (when dea_schedule != NONE)"
+    algorithm: threshold
+    formula: |
+      # DEA telehealth controlled-substance rule: the physician must have a prior
+      # COMPLETED in-state visit with this patient within the recency window, OR the
+      # current visit modality must be VIDEO (audio-only cannot anchor a controlled rx).
+      #
+      # most_recent = the COMPLETED Visit with the same patient_id AND same physician_id
+      #               AND same determined_state_code, with the greatest completed_at,
+      #               where completed_at is that visit's updated_at at the time it
+      #               reached COMPLETED. Tie-break greatest completed_at then earliest
+      #               created_at.
+      # recency_ok = most_recent exists
+      #              AND (ClockState.current_utc - most_recent.completed_at) in DAYS
+      #                  <= DEA_EXAM_RECENCY_DAYS         # boundary: exactly == passes
+      # If dea_schedule == II: require recency_ok AND current modality == VIDEO.
+      # If dea_schedule in {III, IV, V}: require recency_ok OR current modality == VIDEO.
+      # NONE: rule does not apply.
+    input_set: "prior COMPLETED Visits for the same physician+patient+determined_state; the current Visit's modality; the clock"
+    constants:
+      DEA_EXAM_RECENCY_DAYS: 180
+    precision: "whole-day difference; the boundary day (delta == 180 days) satisfies the window (<=)"
+    variants:
+      - name: schedule_II
+        when: "dea_schedule == II"
+        difference: "BOTH recency window AND VIDEO modality required (strictest)"
+      - name: schedule_III_V
+        when: "dea_schedule in {III, IV, V}"
+        difference: "recency window OR VIDEO modality suffices"
+
+  - name: follow_up_due
+    trigger: "CASCADE on POST /visits/{id}/complete"
+    algorithm: threshold
+    formula: |
+      completed_at = the Visit.updated_at at the instant it reached COMPLETED
+      due_at = completed_at + FOLLOW_UP_INTERVAL_DAYS days
+    input_set: "the single completing Visit and the clock"
+    constants:
+      FOLLOW_UP_INTERVAL_DAYS: 30
+    precision: "exact day arithmetic; due_at is an ISO 8601 UTC instant"
+    variants:
+      - name: standard
+        when: "always on completion"
+        difference: "single behavior"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a declared role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /physicians, POST /patients, POST /payers, GET endpoints (public reads), POST /_clock/set"
+
+  - priority: 2
+    category: auth
+    check: "the role is permitted to invoke this endpoint per §1.7, and for entity_backed roles the X-User-ID owns the targeted resource (Physician owns the visit; Patient owns the visit)"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all role-gated endpoints"
+
+  - priority: 3
+    category: existence
+    check: "every path/body id resolves to an existing resource, validated left-to-right in the path then body FKs"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints referencing an id"
+
+  - priority: 4
+    category: business_constraint
+    check: "request body is well-formed: required fields present, enums in range, numeric constraints (npi 10 digits, days_supply > 0, list_fee_cents > 0, cents fields >= 0) satisfied"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all write endpoints"
+
+  - priority: 5
+    category: business_constraint
+    check: "uniqueness: Physician.npi unique; Patient.email unique"
+    error_id: ERR_DUPLICATE_RESOURCE
+    http_status: 409
+    applies_to: "POST /physicians, POST /patients"
+
+  - priority: 6
+    category: business_constraint
+    check: "a StateLicense with issuance_type == COMPACT_EXPEDITED may only be created for a Physician whose imlc_eligible == true and where state_code != home_state_code (the compact issues expedited licenses in states OTHER than the principal state)"
+    error_id: ERR_COMPACT_INELIGIBLE
+    http_status: 422
+    applies_to: "POST /physicians/{id}/state-licenses"
+
+  - priority: 7
+    category: business_temporal
+    check: |
+      License-period overlap (resource = StateLicense; HALF-OPEN interval semantics on
+      [effective_date, expiration_date)). A new license for the same (physician_id,
+      state_code) whose [effective_date, expiration_date) overlaps that of any existing
+      non-REVOKED StateLicense for the same physician+state is rejected. Overlap test:
+      new.effective_date < existing.expiration_date AND existing.effective_date <
+      new.expiration_date. ADJACENCY IS ALLOWED — new.effective_date ==
+      existing.expiration_date does NOT overlap (the half-open intervals share only the
+      excluded endpoint), so consecutive non-overlapping terms in the same state are valid.
+    error_id: ERR_LICENSE_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /physicians/{id}/state-licenses"
+
+  - priority: 8
+    category: business_temporal
+    check: |
+      Visit slot buffer conflict (resource = Visit; POINT-PLUS-SYMMETRIC-BUFFER interval
+      semantics — a fundamentally different geometry from the half-open license interval).
+      A new Visit collides with any existing non-terminal Visit (status NOT IN {CANCELLED,
+      VOIDED, COMPLETED}) for the same physician_id whose scheduled_at is within
+      VISIT_BUFFER_MINUTES of the new visit's scheduled_at, i.e.
+      abs(new.scheduled_at - existing.scheduled_at) < VISIT_BUFFER_MINUTES minutes. The
+      buffer is the EXCLUSIVE boundary — a gap of exactly VISIT_BUFFER_MINUTES does NOT
+      conflict (the two slots abut). VISIT_BUFFER_MINUTES = 30.
+    error_id: ERR_VISIT_SLOT_CONFLICT
+    http_status: 409
+    applies_to: "POST /visits"
+
+  - priority: 9
+    category: state
+    check: "the target resource is in a state from which the requested transition is defined in §1.2; additionally, POST /visits/{id}/prescriptions requires the visit's status IN {COMPLIANCE_CLEARED, APPROVED_INSURANCE, APPROVED_SELF_PAY} (a prescription may only be authored on a cleared or approved, non-terminal visit)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints and POST /visits/{id}/prescriptions"
+
+  - priority: 10
+    category: business_safety
+    check: "DEA in-person/modality compliance for controlled-substance prescriptions (§1.3 dea_exam_recency) — schedule II requires recency AND video; III-V require recency OR video"
+    error_id: ERR_DEA_EXAM_REQUIRED
+    http_status: 422
+    applies_to: "POST /visits/{id}/prescriptions"
+
+  - priority: 11
+    category: business_safety
+    check: "the prescribing physician must carry a DEA number (Physician.dea_number != null) AND the governing StateLicense (ComplianceCheck.matched_license_id) must have controlled_substance_authority == true, to author a controlled-substance prescription (dea_schedule != NONE)"
+    error_id: ERR_NO_CONTROLLED_AUTHORITY
+    http_status: 422
+    applies_to: "POST /visits/{id}/prescriptions"
+
+  - priority: 12
+    category: business_safety
+    check: "an AUDIO_ONLY visit cannot be compliance-cleared (audio-only telehealth is not a permitted modality for an initial cleared visit in this platform); resolves compliance outcome to BLOCKED / AUDIO_ONLY_NOT_PERMITTED"
+    error_id: ERR_MODALITY_NOT_PERMITTED
+    http_status: 422
+    applies_to: "POST /visits/{id}/run-compliance"
+
+  - priority: 13
+    category: business_referential
+    check: "the physician has a governing StateLicense in the visit's determined_state_code (§1.3 license_selection yields a candidate)"
+    error_id: ERR_NO_LICENSE_IN_STATE
+    http_status: 422
+    applies_to: "POST /visits/{id}/run-compliance"
+
+  - priority: 14
+    category: business_temporal
+    check: "the OCC token expected_visit_prescription_version equals the current Visit.prescription_version (controlled-substance supersede CREATE)"
+    error_id: ERR_STALE_PRESCRIPTION_VERSION
+    http_status: 412
+    applies_to: "POST /visits/{id}/prescriptions"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Physician registry ----
+  - method: POST
+    path: "/physicians"
+    description: "register a physician"
+    roles: [Anonymous]
+    code: 201
+    input: [full_name, npi, "dea_number?", "imlc_eligible?", home_state_code]
+    output: Physician
+    side_effects: ["Physician.status = ACTIVE", "active_license_count = 0"]
+
+  - method: GET
+    path: "/physicians/{id}"
+    description: "fetch a physician"
+    roles: [Anonymous, Physician, LicensingBoard, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Physician
+
+  - method: GET
+    path: "/physicians"
+    description: "list physicians"
+    roles: [Anonymous, LicensingBoard, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Physician[]
+
+  - method: POST
+    path: "/physicians/{id}/deactivate"
+    description: "deactivate a physician registry record"
+    roles: [LicensingBoard]
+    code: 200
+    input: []
+    output: Physician
+    side_effects: ["Physician.status = DEACTIVATED"]
+
+  # ---- State licenses (junction) ----
+  - method: POST
+    path: "/physicians/{id}/state-licenses"
+    description: "issue a state license to a physician (FULL or COMPACT_EXPEDITED)"
+    roles: [LicensingBoard]
+    code: 201
+    input: [state_code, issuance_type, "controlled_substance_authority?", effective_date, expiration_date]
+    output: StateLicense
+    side_effects: ["StateLicense.status = ACTIVE", "recompute Physician.active_license_count"]
+
+  - method: GET
+    path: "/physicians/{id}/state-licenses"
+    description: "list a physician's state licenses (reverse-reachability for StateLicense.physician_id)"
+    roles: [Anonymous, Physician, LicensingBoard, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: StateLicense[]
+
+  - method: GET
+    path: "/state-licenses/{id}"
+    description: "fetch a state license"
+    roles: [Anonymous, Physician, LicensingBoard, ComplianceOfficer]
+    code: 200
+    input: []
+    output: StateLicense
+
+  - method: POST
+    path: "/state-licenses/{id}/suspend"
+    description: "suspend a state license; cascades to clear-but-not-yet-completed and approved visits"
+    roles: [LicensingBoard]
+    code: 200
+    input: [suspension_reason]
+    output: StateLicense
+    side_effects:
+      - "StateLicense.status = SUSPENDED"
+      - "recompute Physician.active_license_count"
+      - "CASCADE Visit COMPLIANCE_CLEARED/APPROVED_INSURANCE -> VOIDED -> Prescription ACTIVE -> VOIDED -> Claim SUBMITTED/ADJUDICATED -> REVERSED"
+
+  - method: POST
+    path: "/state-licenses/{id}/reinstate"
+    description: "reinstate a suspended license"
+    roles: [LicensingBoard]
+    code: 200
+    input: []
+    output: StateLicense
+    side_effects: ["StateLicense.status = ACTIVE", "recompute Physician.active_license_count"]
+
+  - method: POST
+    path: "/state-licenses/{id}/revoke"
+    description: "revoke a state license (terminal)"
+    roles: [LicensingBoard]
+    code: 200
+    input: []
+    output: StateLicense
+    side_effects: ["StateLicense.status = REVOKED", "recompute Physician.active_license_count if was ACTIVE"]
+
+  # ---- Patients ----
+  - method: POST
+    path: "/patients"
+    description: "register a patient"
+    roles: [Anonymous]
+    code: 201
+    input: [full_name, email, residence_state_code, "insurance_payer_id?"]
+    output: Patient
+
+  - method: GET
+    path: "/patients/{id}"
+    description: "fetch a patient"
+    roles: [Anonymous, Patient, Physician, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Patient
+
+  - method: GET
+    path: "/patients"
+    description: "list patients (filtered-list reverse-reachability for Patient.insurance_payer_id)"
+    roles: [Anonymous, ComplianceOfficer]
+    code: 200
+    input: ["insurance_payer_id?", "limit?", "offset?"]
+    output: Patient[]
+
+  # ---- Payers ----
+  - method: POST
+    path: "/payers"
+    description: "register an insurance payer"
+    roles: [Anonymous, ComplianceOfficer]
+    code: 201
+    input: [name, "telehealth_parity?", copay_cents, covered_state_codes, allowed_amount_cents]
+    output: Payer
+
+  - method: GET
+    path: "/payers/{id}"
+    description: "fetch a payer"
+    roles: [Anonymous, Patient, Physician, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Payer
+
+  # ---- Visits ----
+  - method: POST
+    path: "/visits"
+    description: "request a telemedicine visit"
+    roles: [Patient]
+    code: 201
+    input: [physician_id, patient_id, modality, scheduled_at, determined_state_code, list_fee_cents, "platform_fee_cents?"]
+    output: Visit
+    side_effects: ["Visit.status = REQUESTED", "Visit.prescription_version = 0"]
+
+  - method: GET
+    path: "/visits/{id}"
+    description: "fetch a visit"
+    roles: [Patient, Physician, LicensingBoard, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Visit
+
+  - method: GET
+    path: "/visits"
+    description: "list visits filtered by physician_id and/or patient_id (filtered-list reverse-reachability for Visit.physician_id and Visit.patient_id)"
+    roles: [Physician, Patient, LicensingBoard, ComplianceOfficer]
+    code: 200
+    input: ["physician_id?", "patient_id?", "limit?", "offset?"]
+    output: Visit[]
+
+  - method: POST
+    path: "/visits/{id}/run-compliance"
+    description: "run licensure + modality compliance; clears or records a block"
+    roles: [Physician]
+    code: 200
+    input: []
+    output: Visit
+    side_effects:
+      - "append ComplianceCheck (CLEARED on success; BLOCKED with reason_code on failure)"
+      - "on CLEARED: Visit REQUESTED -> COMPLIANCE_CLEARED"
+
+  - method: POST
+    path: "/visits/{id}/override-compliance"
+    description: "compliance-officer override of a recorded BLOCKED check"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Visit
+    side_effects:
+      - "append ComplianceCheck{outcome: OVERRIDDEN, reason_code: OFFICER_OVERRIDE}"
+      - "Visit REQUESTED -> COMPLIANCE_CLEARED"
+
+  - method: POST
+    path: "/visits/{id}/approve"
+    description: "approve a cleared visit; routes to insurance or self-pay and computes patient cost"
+    roles: [Physician]
+    code: 200
+    input: []
+    output: Visit
+    side_effects:
+      - "set Visit.routing and Visit.patient_cost_cents (§1.3 patient_cost_estimate)"
+      - "INSURANCE branch: CASCADE create Claim and adjudicate it"
+
+  - method: POST
+    path: "/visits/{id}/complete"
+    description: "mark an approved visit completed"
+    roles: [Physician]
+    code: 200
+    input: []
+    output: Visit
+    side_effects: ["CASCADE create FollowUp (due_at via §1.3 follow_up_due)"]
+
+  - method: POST
+    path: "/visits/{id}/cancel"
+    description: "patient cancels a not-yet-approved visit"
+    roles: [Patient]
+    code: 200
+    input: []
+    output: Visit
+    side_effects: ["Visit -> CANCELLED"]
+
+  - method: GET
+    path: "/visits/{id}/compliance-checks"
+    description: "list compliance checks recorded for a visit (reverse-reachability for ComplianceCheck.visit_id)"
+    roles: [Physician, LicensingBoard, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ComplianceCheck[]
+
+  - method: GET
+    path: "/state-licenses/{id}/compliance-checks"
+    description: "list compliance checks whose governing license is this StateLicense (reverse-reachability for ComplianceCheck.matched_license_id)"
+    roles: [LicensingBoard, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ComplianceCheck[]
+
+  # ---- Prescriptions ----
+  - method: POST
+    path: "/visits/{id}/prescriptions"
+    description: "author a prescription on a cleared/approved visit; controlled substances require OCC + DEA compliance"
+    roles: [Physician]
+    code: 201
+    input: [drug_name, dea_schedule, days_supply, "expected_visit_prescription_version?"]
+    output: Prescription
+    side_effects:
+      - "Prescription.status = ACTIVE"
+      - "for a controlled-substance rx superseding a prior ACTIVE rx of the same drug_name: prior -> SUPERSEDED, increment Visit.prescription_version by 1"
+
+  - method: GET
+    path: "/visits/{id}/prescriptions"
+    description: "list prescriptions authored on a visit (reverse-reachability for Prescription.visit_id)"
+    roles: [Physician, Patient, LicensingBoard, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Prescription[]
+
+  - method: GET
+    path: "/prescriptions/{id}"
+    description: "fetch a prescription"
+    roles: [Physician, Patient, LicensingBoard, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Prescription
+
+  # ---- Claims ----
+  - method: GET
+    path: "/visits/{id}/claims"
+    description: "list claims for a visit (reverse-reachability for Claim.visit_id)"
+    roles: [Physician, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Claim[]
+
+  - method: GET
+    path: "/claims/{id}"
+    description: "fetch a claim"
+    roles: [Physician, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Claim
+
+  - method: GET
+    path: "/claims"
+    description: "list claims filtered by payer_id (filtered-list reverse-reachability for Claim.payer_id)"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: ["payer_id?", "limit?", "offset?"]
+    output: Claim[]
+
+  - method: POST
+    path: "/claims/{id}/adjudicate"
+    description: "adjudicate a submitted claim (allowed/plan-paid or deny)"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["recompute allowed_cents/plan_paid_cents (§1.3 claim_adjudication) or DENY with zeros"]
+
+  # ---- Follow-ups ----
+  - method: GET
+    path: "/visits/{id}/follow-ups"
+    description: "list follow-ups generated by a visit (reverse-reachability for FollowUp.source_visit_id)"
+    roles: [Physician, Patient, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: FollowUp[]
+
+  - method: GET
+    path: "/follow-ups/{id}"
+    description: "fetch a follow-up"
+    roles: [Physician, Patient, ComplianceOfficer]
+    code: 200
+    input: []
+    output: FollowUp
+
+  - method: GET
+    path: "/follow-ups"
+    description: "list follow-ups filtered by linked_visit_id (filtered-list reverse-reachability for FollowUp.linked_visit_id)"
+    roles: [Physician, Patient, ComplianceOfficer]
+    code: 200
+    input: ["linked_visit_id?", "limit?", "offset?"]
+    output: FollowUp[]
+
+  - method: POST
+    path: "/follow-ups/{id}/fulfill"
+    description: "link a new visit to an open follow-up, marking it FULFILLED"
+    roles: [Physician]
+    code: 200
+    input: [linked_visit_id]
+    output: FollowUp
+    side_effects: ["FollowUp.status = FULFILLED", "set FollowUp.linked_visit_id"]
+
+  - method: POST
+    path: "/follow-ups/{id}/lapse"
+    description: "mark an open follow-up lapsed when the clock has passed its due_at"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: FollowUp
+    side_effects: ["FollowUp.status = LAPSED (only when ClockState.current_utc >= due_at)"]
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set"
+    description: "test-driving endpoint: set the platform current UTC instant"
+    roles: [Anonymous, ComplianceOfficer]
+    code: 200
+    input: [current_utc]
+    output: ClockState
+
+  - method: GET
+    path: "/_clock"
+    description: "read the platform current UTC instant"
+    roles: [Anonymous, Physician, Patient, LicensingBoard, ComplianceOfficer]
+    code: 200
+    input: []
+    output: ClockState
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/invalid X-User-Role or X-User-ID on a protected endpoint"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "role not permitted for this operation, or entity_backed actor does not own the targeted resource"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced physician/license/patient/payer/visit/prescription/claim/follow-up id does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "malformed body: missing required field, enum out of range, or numeric constraint violated (e.g., npi not 10 digits, days_supply <= 0, list_fee_cents <= 0, negative cents)"
+  - id: ERR_DUPLICATE_RESOURCE
+    http: 409
+    condition: "uniqueness violation: duplicate npi or duplicate patient email"
+  - id: ERR_COMPACT_INELIGIBLE
+    http: 422
+    condition: "COMPACT_EXPEDITED license requested for a non-imlc-eligible physician, or for the physician's own home_state_code"
+  - id: ERR_LICENSE_PERIOD_OVERLAP
+    http: 409
+    condition: "new StateLicense [effective_date, expiration_date) overlaps an existing non-REVOKED license for the same physician+state (half-open semantics; adjacency at the shared endpoint does not overlap)"
+  - id: ERR_VISIT_SLOT_CONFLICT
+    http: 409
+    condition: "new Visit.scheduled_at is within VISIT_BUFFER_MINUTES (30, exclusive) of an existing non-terminal visit for the same physician (point-plus-buffer semantics)"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested transition is not defined from the resource's current state"
+  - id: ERR_DEA_EXAM_REQUIRED
+    http: 422
+    condition: "controlled-substance prescription fails the DEA exam-recency/modality rule (§1.3 dea_exam_recency)"
+  - id: ERR_NO_CONTROLLED_AUTHORITY
+    http: 422
+    condition: "controlled-substance prescription attempted without a physician DEA number or without controlled_substance_authority on the governing StateLicense"
+  - id: ERR_MODALITY_NOT_PERMITTED
+    http: 422
+    condition: "AUDIO_ONLY visit cannot be compliance-cleared"
+  - id: ERR_NO_LICENSE_IN_STATE
+    http: 422
+    condition: "physician has no governing ACTIVE StateLicense in the visit's determined_state_code (covers both NO_LICENSE_IN_STATE and LICENSE_NOT_ACTIVE compliance reason codes)"
+  - id: ERR_STALE_PRESCRIPTION_VERSION
+    http: 412
+    condition: "expected_visit_prescription_version does not match the current Visit.prescription_version on a controlled-substance supersede create"
+  - id: ERR_PAGINATION_INVALID
+    http: 422
+    condition: "limit outside [1,100] or offset < 0"
+  - id: ERR_NOT_DUE
+    http: 409
+    condition: "attempt to lapse a follow-up before ClockState.current_utc >= due_at"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Anonymous
+    description: "unauthenticated caller; may self-register physicians/patients/payers and read public resources"
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /physicians"
+      - "POST /patients"
+      - "POST /payers"
+      - "GET reads of physicians, state-licenses, patients, payers"
+      - "POST /_clock/set"
+      - "GET /_clock"
+
+  - name: Physician
+    description: "the clinician; conducts compliance, approval, completion, prescribing, follow-up fulfillment on visits they own"
+    identity: "entity_backed:Physician"
+    exclusive_operations:
+      - "POST /visits/{id}/run-compliance"
+      - "POST /visits/{id}/approve"
+      - "POST /visits/{id}/complete"
+      - "POST /visits/{id}/prescriptions"
+      - "POST /follow-ups/{id}/fulfill"
+    shared_operations:
+      - "GET visits/prescriptions/claims/follow-ups they are party to"
+
+  - name: Patient
+    description: "the care recipient; requests and cancels visits they own"
+    identity: "entity_backed:Patient"
+    exclusive_operations:
+      - "POST /visits"
+      - "POST /visits/{id}/cancel"
+    shared_operations:
+      - "GET their own visits/prescriptions/follow-ups"
+
+  - name: LicensingBoard
+    description: "state medical board; manages the licensure registry and suspensions/revocations"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /physicians/{id}/state-licenses"
+      - "POST /physicians/{id}/deactivate"
+      - "POST /state-licenses/{id}/suspend"
+      - "POST /state-licenses/{id}/reinstate"
+      - "POST /state-licenses/{id}/revoke"
+    shared_operations:
+      - "GET reads of physicians, licenses, visits"
+
+  - name: ComplianceOfficer
+    description: "platform compliance operator; overrides blocked compliance, adjudicates claims, manages follow-up lapsing and the clock"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /visits/{id}/override-compliance"
+      - "POST /claims/{id}/adjudicate"
+      - "POST /follow-ups/{id}/lapse"
+    shared_operations:
+      - "POST /payers"
+      - "POST /_clock/set"
+      - "GET reads across all resources"

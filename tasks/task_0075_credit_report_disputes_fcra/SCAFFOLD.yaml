@@ -1,0 +1,1245 @@
+# =============================================================================
+# Task 0075 — Credit Report Disputes (FCRA)
+# Difficulty band: Expert (§0.4)
+# =============================================================================
+
+scenario: |
+  75. Credit Report Disputes (FCRA): consumer dispute, credit bureau 30-day
+  investigation deadline, information furnisher reverification, consumer
+  notification, Reage, regulatory complaint (CFPB), Lock/Freeze
+
+domain_name: credit-report-disputes-fcra
+api_prefix: ""   # flat multi-root topology: peer collections (/consumers, /tradelines, /disputes, …) live at the API root
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: workflow_orchestration
+  complexity_layers:
+    - scheduled_deferred_actions      # 30-day investigation deadline driven by a settable clock
+    - cascading_side_effects          # dispute resolution -> tradeline correction -> file recompute -> notification
+    - optimistic_concurrency          # OCC on CreditFile.version for freeze + dispute creation races
+    - rate_threshold_triggers         # deadline boundary (day 30 inclusive vs day 31), 7-year purge window
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys; no deep URL nesting. Consumer, CreditFile,
+  # Tradeline, Furnisher, Dispute, ReverificationRequest, etc. are addressed at top
+  # level and reference each other via FK fields in the body.
+
+  state_machine_shape: cyclic
+  # Dispute supports REVERIFYING -> (consumer supplies new evidence) -> REOPENED ->
+  # REVERIFYING revision loops; ReverificationRequest is branching fork-join.
+
+  relationship_patterns:
+    - one_to_many        # CreditFile has many Tradelines; Dispute has many ReverificationRequests
+    - cross_aggregate    # Dispute references Tradeline + CreditFile + Furnisher across aggregates
+    - polymorphic        # Notification.subject references Dispute | SecurityFreeze | RegulatoryComplaint by type+id
+
+  role_model: peer_roles
+  # Consumer owns disputes/freezes on own file; Furnisher owns reverification responses
+  # for own tradelines; CreditBureau (opaque) runs investigations; Regulator (opaque, CFPB)
+  # owns complaint adjudication.
+
+  consistency_model: immediate
+  # All cascades (tradeline correction, file recompute, notification minting, version
+  # bumps) complete atomically inside the triggering request.
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Consumer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Consumer email (login identity)" }
+      - { name: full_name, type: string, source: input, description: "Consumer full legal name" }
+      - { name: ssn_last4, type: string, source: input, description: "Last 4 digits of SSN", constraints: "exactly 4 numeric chars" }
+      - { name: status, type: enum, source: system, description: "ACTIVE — consumers are always ACTIVE in this model; set on registration", default: "ACTIVE", constraints: "ACTIVE" }
+
+  - name: Furnisher
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Information furnisher (data furnisher) name" }
+      - { name: furnisher_type, type: enum, source: input, description: "BANK | CARD_ISSUER | COLLECTION_AGENCY | LENDER", constraints: "BANK | CARD_ISSUER | COLLECTION_AGENCY | LENDER" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | SUSPENDED — SUSPENDED furnishers auto-fail reverification", default: "ACTIVE", constraints: "ACTIVE | SUSPENDED" }
+      - { name: open_reverification_count, type: integer, source: computed, description: "Count of ReverificationRequest in PENDING for this furnisher", default: 0 }
+
+  - name: CreditFile
+    parent: null
+    common_fields: true
+    fields:
+      - { name: consumer_id, type: string, source: input, description: "FK -> Consumer.id" }
+      - { name: bureau_code, type: enum, source: input, description: "EQUIFAX | EXPERIAN | TRANSUNION", constraints: "EQUIFAX | EXPERIAN | TRANSUNION" }
+      - { name: protection_state, type: enum, source: computed, description: "OPEN | LOCKED | FROZEN — derived posture gating new tradeline pulls and dispute creation; see calculations.file_protection_state", default: "OPEN", constraints: "OPEN | LOCKED | FROZEN" }
+      - { name: open_dispute_count, type: integer, source: computed, description: "Count of Dispute in non-terminal states (FILED, INVESTIGATING, REVERIFYING, REOPENED) on this file", default: 0 }
+      - { name: tradeline_count, type: integer, source: computed, description: "Count of Tradeline in non-terminal states (REPORTING, DISPUTED, CORRECTED) on this file", default: 0 }
+
+  - name: Tradeline
+    parent: null
+    common_fields: true
+    fields:
+      - { name: credit_file_id, type: string, source: input, description: "FK -> CreditFile.id" }
+      - { name: furnisher_id, type: string, source: input, description: "FK -> Furnisher.id" }
+      - { name: account_type, type: enum, source: input, description: "REVOLVING | INSTALLMENT | COLLECTION", constraints: "REVOLVING | INSTALLMENT | COLLECTION" }
+      - { name: balance_cents, type: integer, source: input, description: "Reported balance in cents", constraints: ">= 0" }
+      - { name: date_of_first_delinquency, type: datetime, source: input, description: "DOFD — anchors the 7-year FCRA purge window; ISO 8601 date" }
+      - { name: reported_delinquency_date, type: datetime, source: input, description: "Currently reported delinquency date; equals DOFD unless re-aged", constraints: "must be >= date_of_first_delinquency on create" }
+      - { name: status, type: enum, source: system, description: "REPORTING -> DISPUTED -> {CORRECTED | VERIFIED | DELETED}; CORRECTED/VERIFIED reopenable to DISPUTED", default: "REPORTING", constraints: "REPORTING | DISPUTED | CORRECTED | VERIFIED | DELETED" }
+      - { name: reage_violation, type: boolean, source: computed, description: "True when reported_delinquency_date > date_of_first_delinquency (illegal re-aging); see calculations.reage_violation_flag", default: false }
+      - { name: purge_due_at, type: datetime, source: computed, description: "DOFD + 7 years + 180 days; tradeline must be purged on/after this instant; see calculations.purge_due_at" }
+
+  - name: Dispute
+    parent: null
+    common_fields: true
+    fields:
+      - { name: credit_file_id, type: string, source: input, description: "FK -> CreditFile.id" }
+      - { name: tradeline_id, type: string, source: input, description: "FK -> Tradeline.id" }
+      - { name: consumer_id, type: string, source: system, description: "FK -> Consumer.id; copied from credit_file.consumer_id at creation" }
+      - { name: dispute_reason, type: enum, source: input, description: "NOT_MINE | INACCURATE_BALANCE | ILLEGAL_REAGE | PAID_IN_FULL | IDENTITY_THEFT", constraints: "NOT_MINE | INACCURATE_BALANCE | ILLEGAL_REAGE | PAID_IN_FULL | IDENTITY_THEFT" }
+      - { name: clock_mode, type: enum, source: input, description: "CALENDAR | EXPEDITED — selects deadline variant; see calculations.investigation_deadline", default: "CALENDAR", constraints: "CALENDAR | EXPEDITED" }
+      - { name: filed_at, type: datetime, source: system, description: "Server clock instant the dispute entered FILED" }
+      - { name: deadline_at, type: datetime, source: computed, description: "Investigation deadline; see calculations.investigation_deadline" }
+      - { name: priority_score, type: integer, source: computed, description: "Triage score 0..100; see calculations.dispute_priority_score" }
+      - { name: reopen_count, type: integer, source: system, description: "Number of REOPENED cycles; starts 0, +1 per reopen", default: 0 }
+      - { name: status, type: enum, source: system, description: "FILED -> INVESTIGATING -> REVERIFYING -> {RESOLVED_DELETE | RESOLVED_CORRECT | RESOLVED_VERIFY}; REVERIFYING -> REOPENED -> REVERIFYING (cycle); any non-terminal -> AUTO_DELETED on deadline breach", default: "FILED", constraints: "FILED | INVESTIGATING | REVERIFYING | REOPENED | RESOLVED_DELETE | RESOLVED_CORRECT | RESOLVED_VERIFY | AUTO_DELETED" }
+      - { name: outcome_reason, type: enum, source: system, description: "Set on resolution: FURNISHER_DELETED | FURNISHER_CORRECTED | FURNISHER_VERIFIED | DEADLINE_BREACH | null", default: null, constraints: "FURNISHER_DELETED | FURNISHER_CORRECTED | FURNISHER_VERIFIED | DEADLINE_BREACH" }
+
+  - name: ReverificationRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: dispute_id, type: string, source: input, description: "FK -> Dispute.id" }
+      - { name: furnisher_id, type: string, source: input, description: "FK -> Furnisher.id" }
+      - { name: response_type, type: enum, source: system, description: "Furnisher response: DELETE | MODIFY | VERIFY | null (pending)", default: null, constraints: "DELETE | MODIFY | VERIFY" }
+      - { name: corrected_balance_cents, type: integer, source: input, description: "New balance supplied with a MODIFY response; null otherwise", constraints: ">= 0" }
+      - { name: status, type: enum, source: system, description: "PENDING -> {RESPONDED | EXPIRED}; PENDING -> CANCELLED when dispute reopens", default: "PENDING", constraints: "PENDING | RESPONDED | EXPIRED | CANCELLED" }
+
+  - name: SecurityFreeze
+    parent: null
+    common_fields: true
+    fields:
+      - { name: credit_file_id, type: string, source: input, description: "FK -> CreditFile.id" }
+      - { name: freeze_type, type: enum, source: input, description: "LOCK | FREEZE — LOCK is consumer-toggled convenience; FREEZE is statutory and blocks new tradelines", constraints: "LOCK | FREEZE" }
+      - { name: effective_at, type: datetime, source: input, description: "Half-open interval start [effective_at, expires_at); ISO 8601" }
+      - { name: expires_at, type: datetime, source: input, description: "Interval end (exclusive); null means open-ended (no expiry)" }
+      - { name: status, type: enum, source: system, description: "ACTIVE -> LIFTED; ACTIVE only while clock within [effective_at, expires_at)", default: "ACTIVE", constraints: "ACTIVE | LIFTED" }
+
+  - name: RegulatoryComplaint
+    parent: null
+    common_fields: true
+    fields:
+      - { name: dispute_id, type: string, source: input, description: "FK -> Dispute.id" }
+      - { name: consumer_id, type: string, source: system, description: "FK -> Consumer.id; copied from dispute.consumer_id" }
+      - { name: agency, type: enum, source: input, description: "CFPB | STATE_AG", default: "CFPB", constraints: "CFPB | STATE_AG" }
+      - { name: narrative, type: string, source: input, description: "Consumer complaint narrative" }
+      - { name: status, type: enum, source: system, description: "SUBMITTED -> UNDER_REVIEW -> {UPHELD | DISMISSED}", default: "SUBMITTED", constraints: "SUBMITTED | UNDER_REVIEW | UPHELD | DISMISSED" }
+
+  - name: Notification
+    parent: null
+    common_fields: false   # append-only event log: id + created_at only, immutable
+    fields:
+      - { name: credit_file_id, type: string, source: system, description: "FK -> CreditFile.id" }
+      - { name: subject_type, type: enum, source: system, description: "DISPUTE | SECURITY_FREEZE | REGULATORY_COMPLAINT | TRADELINE", constraints: "DISPUTE | SECURITY_FREEZE | REGULATORY_COMPLAINT | TRADELINE" }
+      - { name: subject_id, type: string, source: system, description: "FK -> {subject_type entity}.id; polymorphic reference resolved by subject_type" }
+      - { name: event_code, type: enum, source: system, description: "DISPUTE_FILED | DISPUTE_RESOLVED | DISPUTE_AUTO_DELETED | TRADELINE_CORRECTED | TRADELINE_DELETED | FREEZE_PLACED | FREEZE_LIFTED | COMPLAINT_SUBMITTED | COMPLAINT_ADJUDICATED", constraints: "see enum list" }
+      - { name: dispatched_at, type: datetime, source: system, description: "Server clock instant the notification was minted" }
+
+  - name: ReageEvent
+    parent: null
+    common_fields: false   # append-only audit record: id + created_at only
+    fields:
+      - { name: tradeline_id, type: string, source: system, description: "FK -> Tradeline.id" }
+      - { name: prior_delinquency_date, type: datetime, source: system, description: "reported_delinquency_date before the change" }
+      - { name: new_delinquency_date, type: datetime, source: system, description: "reported_delinquency_date after the change" }
+      - { name: was_violation, type: boolean, source: system, description: "True if new_delinquency_date > date_of_first_delinquency at time of event" }
+      - { name: source_dispute_id, type: string, source: system, description: "FK -> Dispute.id; the dispute whose reverification triggered this re-age, or null for direct furnisher edits" }
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Dispute
+    initial_state: FILED
+    terminal_states: [RESOLVED_DELETE, RESOLVED_CORRECT, RESOLVED_VERIFY, AUTO_DELETED]
+    transitions:
+      - from: FILED
+        to: INVESTIGATING
+        trigger: "POST /disputes/{disputeId}/open-investigation"
+        actor: CreditBureau
+        preconditions:
+          - "dispute.status == FILED"
+          - "Parent CreditFile.protection_state != FROZEN (ERR_FILE_FROZEN)"
+          - "Server clock <= dispute.deadline_at (else AUTO_DELETED path applies, ERR_DEADLINE_BREACHED)"
+        side_effects:
+          - "No tradeline change; CreditFile.open_dispute_count unchanged (still non-terminal)"
+
+      - from: INVESTIGATING
+        to: REVERIFYING
+        trigger: "POST /reverification-requests"
+        actor: CreditBureau
+        preconditions:
+          - "dispute.status == INVESTIGATING"
+          - "Target Furnisher.status == ACTIVE (ERR_FURNISHER_SUSPENDED)"
+          - "Server clock <= dispute.deadline_at (ERR_DEADLINE_BREACHED)"
+        side_effects:
+          - "Create ReverificationRequest in PENDING for (dispute, tradeline.furnisher_id)"
+          - "Furnisher.open_reverification_count += 1"
+
+      - from: REVERIFYING
+        to: RESOLVED_DELETE
+        trigger: "POST /reverification-requests/{reverificationId}/respond (response_type=DELETE)"
+        actor: Furnisher
+        preconditions:
+          - "dispute.status == REVERIFYING"
+          - "The reverification_request.status == PENDING"
+          - "Acting Furnisher.id == reverification_request.furnisher_id (ERR_NOT_RESOURCE_OWNER)"
+          - "Server clock <= dispute.deadline_at (ERR_DEADLINE_BREACHED)"
+        side_effects:
+          - "reverification_request.status -> RESPONDED, response_type=DELETE"
+          - "Furnisher.open_reverification_count -= 1"
+          - "dispute.outcome_reason = FURNISHER_DELETED"
+          - "CASCADE depth-3: Tradeline.status -> DELETED; then CreditFile.tradeline_count recomputed (-1) and CreditFile.open_dispute_count recomputed (-1); then a Notification(event_code=TRADELINE_DELETED) and a Notification(event_code=DISPUTE_RESOLVED) are minted on the file"
+          - "CreditFile.version += 1"
+
+      - from: REVERIFYING
+        to: RESOLVED_CORRECT
+        trigger: "POST /reverification-requests/{reverificationId}/respond (response_type=MODIFY)"
+        actor: Furnisher
+        preconditions:
+          - "dispute.status == REVERIFYING"
+          - "The reverification_request.status == PENDING"
+          - "Acting Furnisher.id == reverification_request.furnisher_id (ERR_NOT_RESOURCE_OWNER)"
+          - "reverification_request.corrected_balance_cents present and >= 0 (ERR_MISSING_CORRECTED_BALANCE)"
+          - "Server clock <= dispute.deadline_at (ERR_DEADLINE_BREACHED)"
+        side_effects:
+          - "reverification_request.status -> RESPONDED, response_type=MODIFY"
+          - "Furnisher.open_reverification_count -= 1"
+          - "dispute.outcome_reason = FURNISHER_CORRECTED"
+          - "CASCADE depth-3: Tradeline.balance_cents = corrected_balance_cents AND Tradeline.status -> CORRECTED; then CreditFile.tradeline_count recomputed and open_dispute_count recomputed (-1); then a Notification(event_code=TRADELINE_CORRECTED) is minted"
+          - "CreditFile.version += 1"
+
+      - from: REVERIFYING
+        to: RESOLVED_VERIFY
+        trigger: "POST /reverification-requests/{reverificationId}/respond (response_type=VERIFY)"
+        actor: Furnisher
+        preconditions:
+          - "dispute.status == REVERIFYING"
+          - "The reverification_request.status == PENDING"
+          - "Acting Furnisher.id == reverification_request.furnisher_id (ERR_NOT_RESOURCE_OWNER)"
+          - "Server clock <= dispute.deadline_at (ERR_DEADLINE_BREACHED)"
+        side_effects:
+          - "reverification_request.status -> RESPONDED, response_type=VERIFY"
+          - "Furnisher.open_reverification_count -= 1"
+          - "dispute.outcome_reason = FURNISHER_VERIFIED"
+          - "Tradeline.status -> VERIFIED (balance unchanged)"
+          - "CreditFile.open_dispute_count recomputed (-1); a Notification(event_code=DISPUTE_RESOLVED) is minted"
+          - "CreditFile.version += 1"
+
+      - from: REVERIFYING
+        to: REOPENED
+        trigger: "POST /disputes/{disputeId}/reopen"
+        actor: Consumer
+        preconditions:
+          - "dispute.status == REVERIFYING"
+          - "Acting Consumer.id == dispute.consumer_id (ERR_NOT_RESOURCE_OWNER)"
+          - "dispute.reopen_count < 2 (ERR_REOPEN_LIMIT_REACHED)"
+          - "Server clock <= dispute.deadline_at (ERR_DEADLINE_BREACHED)"
+        side_effects:
+          - "dispute.reopen_count += 1"
+          - "Any PENDING ReverificationRequest for this dispute -> CANCELLED; Furnisher.open_reverification_count -= 1 per cancelled request"
+          - "Tradeline.status stays DISPUTED"
+
+      - from: REOPENED
+        to: REVERIFYING
+        trigger: "POST /reverification-requests"
+        actor: CreditBureau
+        preconditions:
+          - "dispute.status == REOPENED"
+          - "Target Furnisher.status == ACTIVE (ERR_FURNISHER_SUSPENDED)"
+          - "Server clock <= dispute.deadline_at (ERR_DEADLINE_BREACHED)"
+        side_effects:
+          - "Create a fresh ReverificationRequest in PENDING"
+          - "Furnisher.open_reverification_count += 1"
+
+      - from: FILED
+        to: AUTO_DELETED
+        trigger: "POST /_clock/advance (system sweep) — fires when clock crosses deadline_at"
+        actor: system
+        preconditions:
+          - "Server clock > dispute.deadline_at"
+          - "dispute.status in {FILED, INVESTIGATING, REVERIFYING, REOPENED}"
+        side_effects:
+          - "dispute.outcome_reason = DEADLINE_BREACH"
+          - "CASCADE depth-3: Tradeline.status -> DELETED (FCRA mandates deletion on unresolved 30-day breach); then CreditFile.tradeline_count and open_dispute_count recomputed; then Notification(event_code=DISPUTE_AUTO_DELETED) and Notification(event_code=TRADELINE_DELETED) minted"
+          - "Any PENDING ReverificationRequest -> EXPIRED; Furnisher.open_reverification_count decremented per request"
+          - "CreditFile.version += 1"
+
+      - from: INVESTIGATING
+        to: AUTO_DELETED
+        trigger: "POST /_clock/advance (system sweep)"
+        actor: system
+        preconditions:
+          - "Server clock > dispute.deadline_at"
+        side_effects:
+          - "Same cascade as FILED -> AUTO_DELETED"
+
+      - from: REVERIFYING
+        to: AUTO_DELETED
+        trigger: "POST /_clock/advance (system sweep)"
+        actor: system
+        preconditions:
+          - "Server clock > dispute.deadline_at"
+        side_effects:
+          - "Same cascade as FILED -> AUTO_DELETED, plus PENDING reverifications -> EXPIRED"
+
+      - from: REOPENED
+        to: AUTO_DELETED
+        trigger: "POST /_clock/advance (system sweep)"
+        actor: system
+        preconditions:
+          - "Server clock > dispute.deadline_at"
+        side_effects:
+          - "Same cascade as REVERIFYING -> AUTO_DELETED"
+
+  - entity: Tradeline
+    initial_state: REPORTING
+    terminal_states: [DELETED]
+    transitions:
+      - from: REPORTING
+        to: DISPUTED
+        trigger: "POST /disputes (dispute creation references this tradeline)"
+        actor: Consumer
+        preconditions:
+          - "tradeline.status == REPORTING (ERR_TRADELINE_NOT_DISPUTABLE)"
+          - "No other non-terminal Dispute already references this tradeline (ERR_DUPLICATE_DISPUTE)"
+          - "No non-terminal same-reason Dispute on the same credit file has an overlapping [filed_at, deadline_at) window (ERR_OVERLAPPING_INVESTIGATION)"
+        side_effects:
+          - "CreditFile.open_dispute_count += 1"
+
+      - from: DISPUTED
+        to: CORRECTED
+        trigger: "Cascade from Dispute REVERIFYING -> RESOLVED_CORRECT"
+        actor: system
+        preconditions:
+          - "Triggering reverification_request.response_type == MODIFY"
+        side_effects:
+          - "balance_cents replaced with corrected_balance_cents"
+          - "If corrected reported_delinquency_date supplied and > DOFD, a ReageEvent is appended and reage_violation recomputed"
+
+      - from: DISPUTED
+        to: VERIFIED
+        trigger: "Cascade from Dispute REVERIFYING -> RESOLVED_VERIFY"
+        actor: system
+        preconditions:
+          - "Triggering reverification_request.response_type == VERIFY"
+        side_effects:
+          - "balance_cents unchanged"
+
+      - from: DISPUTED
+        to: DELETED
+        trigger: "Cascade from Dispute -> RESOLVED_DELETE or -> AUTO_DELETED"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "CreditFile.tradeline_count recomputed (-1)"
+          - "Notification(event_code=TRADELINE_DELETED) minted"
+
+      - from: CORRECTED
+        to: DISPUTED
+        trigger: "POST /disputes (a new dispute on a previously corrected tradeline)"
+        actor: Consumer
+        preconditions:
+          - "No non-terminal Dispute references this tradeline"
+        side_effects:
+          - "CreditFile.open_dispute_count += 1"
+
+      - from: VERIFIED
+        to: DISPUTED
+        trigger: "POST /disputes (re-dispute of a verified tradeline)"
+        actor: Consumer
+        preconditions:
+          - "No non-terminal Dispute references this tradeline"
+        side_effects:
+          - "CreditFile.open_dispute_count += 1"
+
+  - entity: ReverificationRequest
+    initial_state: PENDING
+    terminal_states: [RESPONDED, EXPIRED, CANCELLED]
+    transitions:
+      - from: PENDING
+        to: RESPONDED
+        trigger: "POST /reverification-requests/{reverificationId}/respond"
+        actor: Furnisher
+        preconditions:
+          - "request.status == PENDING (ERR_INVALID_STATE)"
+          - "Acting Furnisher.id == request.furnisher_id (ERR_NOT_RESOURCE_OWNER)"
+          - "Server clock <= parent dispute.deadline_at (ERR_DEADLINE_BREACHED)"
+        side_effects:
+          - "Branch on response_type: DELETE/MODIFY/VERIFY drive distinct Dispute resolutions (see Dispute transitions) — fork-join: all three branches converge on a terminal dispute"
+
+      - from: PENDING
+        to: EXPIRED
+        trigger: "POST /_clock/advance (system sweep on deadline breach)"
+        actor: system
+        preconditions:
+          - "Server clock > parent dispute.deadline_at"
+        side_effects:
+          - "Furnisher.open_reverification_count -= 1"
+
+      - from: PENDING
+        to: CANCELLED
+        trigger: "Cascade from Dispute REVERIFYING -> REOPENED"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Furnisher.open_reverification_count -= 1"
+
+  - entity: SecurityFreeze
+    initial_state: ACTIVE
+    terminal_states: [LIFTED]
+    transitions:
+      - from: ACTIVE
+        to: LIFTED
+        trigger: "POST /security-freezes/{freezeId}/lift"
+        actor: Consumer
+        preconditions:
+          - "freeze.status == ACTIVE (ERR_INVALID_STATE)"
+          - "Acting Consumer.id == parent CreditFile.consumer_id (ERR_NOT_RESOURCE_OWNER)"
+        side_effects:
+          - "CreditFile.protection_state recomputed (see calculations.file_protection_state)"
+          - "CreditFile.version += 1"
+          - "Notification(event_code=FREEZE_LIFTED) minted"
+
+  - entity: RegulatoryComplaint
+    initial_state: SUBMITTED
+    terminal_states: [UPHELD, DISMISSED]
+    transitions:
+      - from: SUBMITTED
+        to: UNDER_REVIEW
+        trigger: "POST /regulatory-complaints/{complaintId}/review"
+        actor: Regulator
+        preconditions:
+          - "complaint.status == SUBMITTED (ERR_INVALID_STATE)"
+        side_effects: []
+
+      - from: UNDER_REVIEW
+        to: UPHELD
+        trigger: "POST /regulatory-complaints/{complaintId}/adjudicate (decision=UPHOLD)"
+        actor: Regulator
+        preconditions:
+          - "complaint.status == UNDER_REVIEW (ERR_INVALID_STATE)"
+          - "Referenced Dispute.status in {AUTO_DELETED, RESOLVED_VERIFY} (ERR_COMPLAINT_PREMATURE) — a complaint can only be upheld once the underlying dispute reached a contestable terminal state"
+        side_effects:
+          - "Notification(event_code=COMPLAINT_ADJUDICATED) minted"
+
+      - from: UNDER_REVIEW
+        to: DISMISSED
+        trigger: "POST /regulatory-complaints/{complaintId}/adjudicate (decision=DISMISS)"
+        actor: Regulator
+        preconditions:
+          - "complaint.status == UNDER_REVIEW (ERR_INVALID_STATE)"
+        side_effects:
+          - "Notification(event_code=COMPLAINT_ADJUDICATED) minted"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: freeze-place-stale-file
+    parent_entity: CreditFile
+    write_endpoint: "POST /security-freezes"
+    occ_field: "expected_credit_file_version"
+    description: |
+      Placing a SecurityFreeze against a CreditFile whose version has advanced
+      since the client last observed it is rejected as a stale-version write.
+      This captures the case where another writer has already placed a FREEZE
+      that legitimately supersedes the protection posture the current writer
+      planned around, so the current writer's view of the file is stale.
+    error_id: ERR_STALE_FILE_VERSION
+    http_status: 412
+
+  - rule_id: dispute-create-stale-file
+    parent_entity: CreditFile
+    write_endpoint: "POST /disputes"
+    occ_field: "expected_credit_file_version"
+    description: |
+      Creating a Dispute against a CreditFile whose version has advanced since
+      the client last observed it is rejected. A concurrently placed FREEZE (or
+      a prior dispute's resolution cascade) bumps the file version and may flip
+      protection_state to FROZEN; the stale-version check ensures the dispute is
+      filed only against the file state the consumer actually observed.
+    error_id: ERR_STALE_FILE_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: investigation_deadline
+    trigger: "Dispute creation (FILED); value frozen at filed_at, never recomputed on reopen"
+    algorithm: threshold
+    formula: |
+      base = dispute.filed_at  (a UTC instant)
+      if dispute.clock_mode == CALENDAR:
+        deadline_at = base + 30 days   # FCRA §611 standard 30 calendar days
+      elif dispute.clock_mode == EXPEDITED:
+        # Reinvestigation triggered by a CFPB-referred complaint: 15 business days.
+        # Business days = Mon..Fri; advance 15 weekdays from the calendar date of base,
+        # skipping Sat/Sun. Time-of-day component of base is preserved.
+        d = base
+        added = 0
+        while added < 15:
+          d = d + 1 day
+          if weekday(d) not in {SATURDAY, SUNDAY}:
+            added += 1
+        deadline_at = d
+      # Boundary: a transition request at server_clock == deadline_at is IN TIME
+      # (deadline is inclusive, <=). server_clock == deadline_at + 1 microsecond breaches.
+    input_set: "single Dispute row; clock_mode pinned at creation"
+    constants:
+      CALENDAR_DAYS: 30
+      EXPEDITED_BUSINESS_DAYS: 15
+    precision: "instant arithmetic to the microsecond; deadline inclusive (<=)"
+    variants:
+      - name: calendar_30
+        when: "clock_mode == CALENDAR"
+        difference: "30 calendar days added, weekends counted"
+      - name: expedited_15_business
+        when: "clock_mode == EXPEDITED"
+        difference: "15 business days added, Sat/Sun skipped — same inputs, different instant"
+
+  - name: purge_due_at
+    trigger: "Tradeline creation and on every reported_delinquency_date change"
+    algorithm: threshold
+    formula: |
+      # FCRA §605(a): obsolete adverse info must be purged 7 years + 180 days
+      # after the Date of First Delinquency. Anchored to DOFD, NOT to the
+      # (possibly re-aged) reported_delinquency_date — re-aging cannot extend purge.
+      purge_due_at = date_of_first_delinquency + (7 * 365) days + 180 days
+      # 7 years modeled as 7*365 = 2555 days (leap days ignored by spec), then +180.
+    input_set: "single Tradeline; uses DOFD only"
+    constants:
+      YEARS_DAYS: 2555     # 7 * 365
+      PLUS_DAYS: 180
+    precision: "date arithmetic in whole days"
+
+  - name: reage_violation_flag
+    trigger: "Tradeline creation and on every reported_delinquency_date change (incl. furnisher MODIFY cascade)"
+    algorithm: threshold
+    formula: |
+      reage_violation = (reported_delinquency_date > date_of_first_delinquency)
+      # Re-aging = moving the reported delinquency date FORWARD past the true DOFD,
+      # illegally resetting the 7-year clock. Boundary: equal dates => false (legal);
+      # reported strictly greater => true (violation).
+    input_set: "single Tradeline"
+    precision: "exact date comparison; equality is NOT a violation"
+
+  - name: dispute_priority_score
+    trigger: "Dispute creation (FILED); recomputed on reopen"
+    algorithm: weighted_scoring
+    formula: |
+      # Non-linear triage score, clamped to [0, 100]. >=3 inputs, conditional
+      # branches on entity state and a nested min/max.
+      reason_weight = { IDENTITY_THEFT: 50, ILLEGAL_REAGE: 40,
+                        NOT_MINE: 35, INACCURATE_BALANCE: 20, PAID_IN_FULL: 15 }[dispute.dispute_reason]
+      reage_bonus   = 25 if tradeline.reage_violation else 0
+      # Larger balances are more urgent but capped; integer floor division.
+      balance_factor = min(20, tradeline.balance_cents // 50000)   # +1 per $500, cap 20
+      reopen_penalty = 10 * dispute.reopen_count                   # de-prioritize churned disputes
+      raw = reason_weight + reage_bonus + balance_factor - reopen_penalty
+      priority_score = max(0, min(100, raw))
+    input_set: "Dispute.dispute_reason, Dispute.reopen_count, linked Tradeline.reage_violation, linked Tradeline.balance_cents"
+    constants:
+      BALANCE_CENTS_PER_POINT: 50000
+      BALANCE_POINT_CAP: 20
+      REAGE_BONUS: 25
+      REOPEN_PENALTY_PER_CYCLE: 10
+    precision: "integer; floor division; clamp [0,100]"
+
+  - name: file_protection_state
+    trigger: "any SecurityFreeze create/lift; evaluated against the current server clock"
+    algorithm: aggregation
+    formula: |
+      # Posture derived from the set of SecurityFreezes whose half-open interval
+      # [effective_at, expires_at) currently contains the server clock AND status==ACTIVE.
+      active = { f in SecurityFreeze where f.credit_file_id == file.id
+                 and f.status == ACTIVE
+                 and f.effective_at <= server_clock
+                 and (f.expires_at is null or server_clock < f.expires_at) }
+      if any f in active with freeze_type == FREEZE:
+        protection_state = FROZEN
+      elif any f in active with freeze_type == LOCK:
+        protection_state = LOCKED
+      else:
+        protection_state = OPEN
+      # FREEZE dominates LOCK. FROZEN blocks new dispute creation and investigation open.
+    input_set: "all SecurityFreeze rows for the file, filtered by ACTIVE status and clock-in-interval"
+    precision: "half-open interval membership; FREEZE strictly dominates LOCK"
+
+  - name: open_counts_recompute
+    trigger: "any Dispute or Tradeline state change on the file"
+    algorithm: aggregation
+    formula: |
+      open_dispute_count = count(Dispute d where d.credit_file_id == file.id
+                                 and d.status in {FILED, INVESTIGATING, REVERIFYING, REOPENED})
+      tradeline_count    = count(Tradeline t where t.credit_file_id == file.id
+                                 and t.status in {REPORTING, DISPUTED, CORRECTED, VERIFIED})
+      # DELETED tradelines and terminal disputes are excluded.
+    input_set: "all Dispute and Tradeline rows for the file with the listed status filters"
+    precision: "integer counts"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed on every non-public endpoint"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /consumers, POST /furnishers, POST /credit-files create-time public endpoints"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all role-gated endpoints"
+
+  - priority: 2.5
+    category: business_constraint
+    check: "Request body is well-formed: all required input fields present, enum members valid, numeric types correct (e.g., balance_cents integer >= 0). Pagination limit/offset within [1,100]/[>=0] is checked separately (ERR_PAGINATION_RANGE)."
+    error_id: ERR_VALIDATION
+    http_status: 422
+    applies_to: "all mutating endpoints with an input body; GET list endpoints use ERR_PAGINATION_RANGE for limit/offset"
+
+  - priority: 3
+    category: existence
+    check: "All path and FK-referenced resources exist, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 4
+    category: business_referential
+    check: "Acting entity_backed user owns the target resource (Consumer owns file/dispute/freeze; Furnisher owns reverification)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /disputes, /disputes/{id}/reopen, /security-freezes, /security-freezes/{id}/lift, /reverification-requests/{id}/respond"
+
+  - priority: 5
+    category: state
+    check: "Optimistic concurrency: expected_credit_file_version matches CreditFile.version"
+    error_id: ERR_STALE_FILE_VERSION
+    http_status: 412
+    applies_to: "POST /security-freezes, POST /disputes"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 7
+    category: business_temporal
+    check: "Server clock <= parent dispute.deadline_at for any investigation-advancing action"
+    error_id: ERR_DEADLINE_BREACHED
+    http_status: 409
+    applies_to: "POST /disputes/{id}/open-investigation, POST /reverification-requests, POST /reverification-requests/{id}/respond, POST /disputes/{id}/reopen"
+
+  - priority: 8
+    category: business_safety
+    check: "Parent CreditFile.protection_state != FROZEN for dispute creation and investigation open"
+    error_id: ERR_FILE_FROZEN
+    http_status: 409
+    applies_to: "POST /disputes, POST /disputes/{id}/open-investigation"
+
+  - priority: 9
+    category: business_safety
+    check: "Target Furnisher.status == ACTIVE when issuing a reverification to it"
+    error_id: ERR_FURNISHER_SUSPENDED
+    http_status: 409
+    applies_to: "POST /reverification-requests"
+
+  - priority: 10
+    category: business_constraint
+    check: "Tradeline is in a disputable status (REPORTING, CORRECTED, or VERIFIED) for a new dispute"
+    error_id: ERR_TRADELINE_NOT_DISPUTABLE
+    http_status: 409
+    applies_to: "POST /disputes"
+
+  - priority: 11
+    category: business_constraint
+    check: "No other non-terminal Dispute already references the target tradeline"
+    error_id: ERR_DUPLICATE_DISPUTE
+    http_status: 409
+    applies_to: "POST /disputes"
+
+  - priority: 11.5
+    category: business_temporal
+    check: |
+      Aggregate investigation-window overlap on the SAME credit file: a new dispute
+      whose investigation window [filed_at, deadline_at) overlaps the window of any
+      EXISTING non-terminal dispute (status in {FILED, INVESTIGATING, REVERIFYING,
+      REOPENED}) on the same credit_file that carries the SAME dispute_reason is
+      rejected. Interval semantics here are AGGREGATE-per-(credit_file, dispute_reason)
+      with a closed-open window and zero buffer: two windows overlap iff
+      new.filed_at < existing.deadline_at AND existing.filed_at < new.deadline_at.
+      Distinct from SecurityFreeze's pairwise single-resource overlap.
+    error_id: ERR_OVERLAPPING_INVESTIGATION
+    http_status: 409
+    applies_to: "POST /disputes"
+
+  - priority: 12
+    category: business_constraint
+    check: "dispute.reopen_count < 2 before a reopen"
+    error_id: ERR_REOPEN_LIMIT_REACHED
+    http_status: 409
+    applies_to: "POST /disputes/{id}/reopen"
+
+  - priority: 13
+    category: business_constraint
+    check: "A MODIFY reverification response supplies corrected_balance_cents >= 0"
+    error_id: ERR_MISSING_CORRECTED_BALANCE
+    http_status: 422
+    applies_to: "POST /reverification-requests/{id}/respond"
+
+  - priority: 14
+    category: business_temporal
+    check: "A new SecurityFreeze interval must not overlap an existing ACTIVE freeze of the SAME freeze_type on the file (half-open [effective_at, expires_at); abutting endpoints do not overlap)"
+    error_id: ERR_FREEZE_OVERLAP
+    http_status: 409
+    applies_to: "POST /security-freezes"
+
+  - priority: 15
+    category: business_constraint
+    check: "Referenced Dispute is in {AUTO_DELETED, RESOLVED_VERIFY} before a complaint may be upheld"
+    error_id: ERR_COMPLAINT_PREMATURE
+    http_status: 409
+    applies_to: "POST /regulatory-complaints/{id}/adjudicate"
+
+  - priority: 16
+    category: business_constraint
+    check: "reported_delinquency_date >= date_of_first_delinquency on tradeline create"
+    error_id: ERR_INVALID_DELINQUENCY_DATE
+    http_status: 422
+    applies_to: "POST /tradelines"
+
+  - priority: 17
+    category: business_constraint
+    check: "adjudicate decision is one of {UPHOLD, DISMISS}"
+    error_id: ERR_INVALID_DECISION
+    http_status: 422
+    applies_to: "POST /regulatory-complaints/{id}/adjudicate"
+
+  - priority: 18
+    category: business_constraint
+    check: "Pagination limit in [1,100] and offset >= 0 on list endpoints"
+    error_id: ERR_PAGINATION_RANGE
+    http_status: 422
+    applies_to: "all GET list endpoints"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Consumer ----
+  - method: POST
+    path: "/consumers"
+    description: "Register a consumer"
+    roles: [Anonymous]
+    code: 201
+    input: [email, full_name, ssn_last4]
+    output: Consumer
+    side_effects: ["status=ACTIVE"]
+
+  - method: GET
+    path: "/consumers/{consumerId}"
+    description: "Get a consumer"
+    roles: [Consumer, CreditBureau, Regulator]
+    code: 200
+    input: []
+    output: Consumer
+    side_effects: []
+
+  # ---- Furnisher ----
+  - method: POST
+    path: "/furnishers"
+    description: "Register an information furnisher"
+    roles: [Anonymous]
+    code: 201
+    input: [name, furnisher_type]
+    output: Furnisher
+    side_effects: ["status=ACTIVE, open_reverification_count=0"]
+
+  - method: GET
+    path: "/furnishers/{furnisherId}"
+    description: "Get a furnisher"
+    roles: [Furnisher, CreditBureau, Regulator]
+    code: 200
+    input: []
+    output: Furnisher
+    side_effects: []
+
+  - method: POST
+    path: "/furnishers/{furnisherId}/suspend"
+    description: "Suspend a furnisher (compliance action)"
+    roles: [CreditBureau]
+    code: 200
+    input: []
+    output: Furnisher
+    side_effects: ["status=SUSPENDED"]
+
+  # ---- CreditFile ----
+  - method: POST
+    path: "/credit-files"
+    description: "Open a credit file for a consumer at a bureau"
+    roles: [CreditBureau]
+    code: 201
+    input: [consumer_id, bureau_code]
+    output: CreditFile
+    side_effects: ["protection_state=OPEN, open_dispute_count=0, tradeline_count=0, version=1"]
+
+  - method: GET
+    path: "/credit-files/{creditFileId}"
+    description: "Get a credit file (with derived posture and counts)"
+    roles: [Consumer, CreditBureau, Regulator]
+    code: 200
+    input: []
+    output: CreditFile
+    side_effects: ["protection_state recomputed against current clock"]
+
+  - method: GET
+    path: "/credit-files"
+    description: "List credit files, filterable by consumer"
+    roles: [CreditBureau, Regulator]
+    code: 200
+    input: ["consumer_id?", "limit?", "offset?"]
+    output: CreditFile[]
+    side_effects: []
+
+  - method: GET
+    path: "/credit-files/{creditFileId}/tradelines"
+    description: "List tradelines on a credit file (reverse-reachability for Tradeline.credit_file_id)"
+    roles: [Consumer, CreditBureau, Regulator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Tradeline[]
+    side_effects: []
+
+  - method: GET
+    path: "/credit-files/{creditFileId}/disputes"
+    description: "List disputes on a credit file (reverse-reachability for Dispute.credit_file_id)"
+    roles: [Consumer, CreditBureau, Regulator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Dispute[]
+    side_effects: []
+
+  - method: GET
+    path: "/credit-files/{creditFileId}/security-freezes"
+    description: "List security freezes on a credit file (reverse-reachability for SecurityFreeze.credit_file_id)"
+    roles: [Consumer, CreditBureau, Regulator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: SecurityFreeze[]
+    side_effects: []
+
+  - method: GET
+    path: "/credit-files/{creditFileId}/notifications"
+    description: "List notifications for a credit file (reverse-reachability for Notification.credit_file_id)"
+    roles: [Consumer, CreditBureau, Regulator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Notification[]
+    side_effects: []
+
+  # ---- Tradeline ----
+  - method: POST
+    path: "/tradelines"
+    description: "Furnisher reports a tradeline onto a credit file"
+    roles: [Furnisher, CreditBureau]
+    code: 201
+    input: [credit_file_id, furnisher_id, account_type, balance_cents, date_of_first_delinquency, reported_delinquency_date]
+    output: Tradeline
+    side_effects: ["status=REPORTING", "purge_due_at computed", "reage_violation computed", "CreditFile.tradeline_count recomputed"]
+
+  - method: GET
+    path: "/tradelines/{tradelineId}"
+    description: "Get a tradeline"
+    roles: [Consumer, Furnisher, CreditBureau, Regulator]
+    code: 200
+    input: []
+    output: Tradeline
+    side_effects: []
+
+  - method: GET
+    path: "/tradelines"
+    description: "List tradelines, filterable by furnisher (reverse-reachability for Tradeline.furnisher_id)"
+    roles: [Furnisher, CreditBureau, Regulator]
+    code: 200
+    input: ["furnisher_id?", "credit_file_id?", "limit?", "offset?"]
+    output: Tradeline[]
+    side_effects: []
+
+  - method: GET
+    path: "/tradelines/{tradelineId}/reage-events"
+    description: "List re-age audit events for a tradeline (reverse-reachability for ReageEvent.tradeline_id)"
+    roles: [Consumer, Furnisher, CreditBureau, Regulator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ReageEvent[]
+    side_effects: []
+
+  - method: POST
+    path: "/tradelines/{tradelineId}/reage"
+    description: "Furnisher directly edits the reported delinquency date (re-age action; flags violation)"
+    roles: [Furnisher]
+    code: 200
+    input: [reported_delinquency_date]
+    output: Tradeline
+    side_effects: ["reage_violation recomputed", "purge_due_at unchanged (anchored to DOFD)", "ReageEvent appended (source_dispute_id=null)"]
+
+  # ---- Dispute ----
+  - method: POST
+    path: "/disputes"
+    description: "Consumer files a dispute against a tradeline"
+    roles: [Consumer]
+    code: 201
+    input: [credit_file_id, tradeline_id, dispute_reason, "clock_mode?", expected_credit_file_version]
+    output: Dispute
+    side_effects:
+      - "status=FILED, filed_at=server clock"
+      - "deadline_at computed; priority_score computed"
+      - "Tradeline.status REPORTING|CORRECTED|VERIFIED -> DISPUTED"
+      - "CreditFile.open_dispute_count recomputed"
+      - "Notification(event_code=DISPUTE_FILED) minted"
+      - "increments CreditFile.version by 1"
+
+  - method: GET
+    path: "/disputes/{disputeId}"
+    description: "Get a dispute"
+    roles: [Consumer, CreditBureau, Furnisher, Regulator]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: []
+
+  - method: GET
+    path: "/disputes"
+    description: "List disputes, filterable by tradeline or consumer (reverse-reachability for Dispute.tradeline_id, Dispute.consumer_id)"
+    roles: [Consumer, CreditBureau, Regulator]
+    code: 200
+    input: ["tradeline_id?", "consumer_id?", "credit_file_id?", "limit?", "offset?"]
+    output: Dispute[]
+    side_effects: []
+
+  - method: POST
+    path: "/disputes/{disputeId}/open-investigation"
+    description: "Bureau opens the 30-day reinvestigation"
+    roles: [CreditBureau]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["status FILED -> INVESTIGATING"]
+
+  - method: GET
+    path: "/disputes/{disputeId}/reage-events"
+    description: "List re-age events triggered by this dispute (reverse-reachability for ReageEvent.source_dispute_id)"
+    roles: [Consumer, CreditBureau, Furnisher, Regulator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ReageEvent[]
+    side_effects: []
+
+  - method: POST
+    path: "/disputes/{disputeId}/reopen"
+    description: "Consumer reopens a dispute with new evidence (cyclic)"
+    roles: [Consumer]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["status REVERIFYING -> REOPENED", "reopen_count += 1", "priority_score recomputed", "PENDING reverifications -> CANCELLED"]
+
+  # ---- ReverificationRequest ----
+  - method: POST
+    path: "/reverification-requests"
+    description: "Bureau dispatches reverification to the furnisher (INVESTIGATING|REOPENED -> REVERIFYING)"
+    roles: [CreditBureau]
+    code: 201
+    input: [dispute_id, furnisher_id]
+    output: ReverificationRequest
+    side_effects: ["request status=PENDING", "Dispute -> REVERIFYING", "Furnisher.open_reverification_count += 1"]
+
+  - method: GET
+    path: "/reverification-requests/{reverificationId}"
+    description: "Get a reverification request"
+    roles: [Consumer, CreditBureau, Furnisher, Regulator]
+    code: 200
+    input: []
+    output: ReverificationRequest
+    side_effects: []
+
+  - method: GET
+    path: "/reverification-requests"
+    description: "List reverification requests, filterable by dispute or furnisher (reverse-reachability for dispute_id, furnisher_id)"
+    roles: [CreditBureau, Furnisher, Regulator]
+    code: 200
+    input: ["dispute_id?", "furnisher_id?", "limit?", "offset?"]
+    output: ReverificationRequest[]
+    side_effects: []
+
+  - method: POST
+    path: "/reverification-requests/{reverificationId}/respond"
+    description: "Furnisher responds DELETE/MODIFY/VERIFY (fork-join driving dispute resolution + cascade)"
+    roles: [Furnisher]
+    code: 200
+    input: [response_type, "corrected_balance_cents?", "corrected_delinquency_date?"]
+    output: ReverificationRequest
+    side_effects:
+      - "request status PENDING -> RESPONDED"
+      - "Furnisher.open_reverification_count -= 1"
+      - "Dispute resolves per response_type; Tradeline cascades to DELETED/CORRECTED/VERIFIED"
+      - "CreditFile counts recomputed; Notification(s) minted; CreditFile.version += 1"
+
+  # ---- SecurityFreeze ----
+  - method: POST
+    path: "/security-freezes"
+    description: "Consumer places a Lock or Freeze on a credit file"
+    roles: [Consumer]
+    code: 201
+    input: [credit_file_id, freeze_type, effective_at, "expires_at?", expected_credit_file_version]
+    output: SecurityFreeze
+    side_effects:
+      - "status=ACTIVE"
+      - "CreditFile.protection_state recomputed"
+      - "Notification(event_code=FREEZE_PLACED) minted"
+      - "increments CreditFile.version by 1"
+
+  - method: GET
+    path: "/security-freezes/{freezeId}"
+    description: "Get a security freeze"
+    roles: [Consumer, CreditBureau, Regulator]
+    code: 200
+    input: []
+    output: SecurityFreeze
+    side_effects: []
+
+  - method: GET
+    path: "/security-freezes"
+    description: "List security freezes, filterable by credit file (reverse-reachability for SecurityFreeze.credit_file_id)"
+    roles: [Consumer, CreditBureau, Regulator]
+    code: 200
+    input: ["credit_file_id?", "limit?", "offset?"]
+    output: SecurityFreeze[]
+    side_effects: []
+
+  - method: POST
+    path: "/security-freezes/{freezeId}/lift"
+    description: "Consumer lifts a freeze/lock"
+    roles: [Consumer]
+    code: 200
+    input: []
+    output: SecurityFreeze
+    side_effects: ["status ACTIVE -> LIFTED", "CreditFile.protection_state recomputed", "CreditFile.version += 1", "Notification(event_code=FREEZE_LIFTED) minted"]
+
+  # ---- RegulatoryComplaint ----
+  - method: POST
+    path: "/regulatory-complaints"
+    description: "Consumer files a CFPB / State AG complaint about a dispute"
+    roles: [Consumer]
+    code: 201
+    input: [dispute_id, "agency?", narrative]
+    output: RegulatoryComplaint
+    side_effects: ["status=SUBMITTED", "Notification(event_code=COMPLAINT_SUBMITTED) minted"]
+
+  - method: GET
+    path: "/regulatory-complaints/{complaintId}"
+    description: "Get a regulatory complaint"
+    roles: [Consumer, Regulator, CreditBureau]
+    code: 200
+    input: []
+    output: RegulatoryComplaint
+    side_effects: []
+
+  - method: GET
+    path: "/regulatory-complaints"
+    description: "List regulatory complaints, filterable by dispute or consumer (reverse-reachability for dispute_id, consumer_id)"
+    roles: [Regulator, CreditBureau, Consumer]
+    code: 200
+    input: ["dispute_id?", "consumer_id?", "limit?", "offset?"]
+    output: RegulatoryComplaint[]
+    side_effects: []
+
+  - method: POST
+    path: "/regulatory-complaints/{complaintId}/review"
+    description: "Regulator moves complaint to UNDER_REVIEW"
+    roles: [Regulator]
+    code: 200
+    input: []
+    output: RegulatoryComplaint
+    side_effects: ["status SUBMITTED -> UNDER_REVIEW"]
+
+  - method: POST
+    path: "/regulatory-complaints/{complaintId}/adjudicate"
+    description: "Regulator upholds or dismisses a complaint"
+    roles: [Regulator]
+    code: 200
+    input: [decision]
+    output: RegulatoryComplaint
+    side_effects: ["status UNDER_REVIEW -> UPHELD|DISMISSED", "Notification(event_code=COMPLAINT_ADJUDICATED) minted"]
+
+  # ---- Notification (read) ----
+  - method: GET
+    path: "/notifications/{notificationId}"
+    description: "Get a single notification"
+    roles: [Consumer, CreditBureau, Regulator]
+    code: 200
+    input: []
+    output: Notification
+    side_effects: []
+
+  - method: GET
+    path: "/notifications"
+    description: "List notifications, filterable by credit file (reverse-reachability for Notification.credit_file_id)"
+    roles: [Consumer, CreditBureau, Regulator]
+    code: 200
+    input: ["credit_file_id?", "subject_id?", "limit?", "offset?"]
+    output: Notification[]
+    side_effects: []
+
+  - method: GET
+    path: "/reage-events/{reageEventId}"
+    description: "Get a single re-age event"
+    roles: [Consumer, Furnisher, CreditBureau, Regulator]
+    code: 200
+    input: []
+    output: ReageEvent
+    side_effects: []
+
+  - method: GET
+    path: "/reage-events"
+    description: "List re-age events, filterable by tradeline or source dispute (reverse-reachability for ReageEvent.tradeline_id and ReageEvent.source_dispute_id)"
+    roles: [Consumer, Furnisher, CreditBureau, Regulator]
+    code: 200
+    input: ["tradeline_id?", "source_dispute_id?", "limit?", "offset?"]
+    output: ReageEvent[]
+    side_effects: []
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set"
+    description: "Set the server clock to an absolute instant (test-driving)"
+    roles: [CreditBureau]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock set; does NOT run the deadline sweep"]
+
+  - method: POST
+    path: "/_clock/advance"
+    description: "Advance the server clock to an instant AND run the deadline sweep (auto-deletes breached disputes, expires reverifications)"
+    roles: [CreditBureau]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects:
+      - "server clock advanced"
+      - "every non-terminal Dispute with clock > deadline_at -> AUTO_DELETED with full cascade (tradeline DELETED, counts recomputed, notifications minted, PENDING reverifications EXPIRED, CreditFile.version += 1)"
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing or malformed X-User-Role / X-User-ID headers" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Acting role not permitted for this operation" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path or FK-referenced resource does not exist" }
+  - { id: ERR_NOT_RESOURCE_OWNER, http: 403, condition: "entity_backed user does not own the target resource" }
+  - { id: ERR_VALIDATION, http: 422, condition: "Malformed body, missing required field, or bad enum/type" }
+  - { id: ERR_INVALID_DELINQUENCY_DATE, http: 422, condition: "reported_delinquency_date < date_of_first_delinquency on tradeline create" }
+  - { id: ERR_STALE_FILE_VERSION, http: 412, condition: "expected_credit_file_version does not match CreditFile.version" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a state from which the requested transition is defined" }
+  - { id: ERR_DEADLINE_BREACHED, http: 409, condition: "Server clock past the dispute investigation deadline for an advancing action" }
+  - { id: ERR_FILE_FROZEN, http: 409, condition: "CreditFile.protection_state == FROZEN blocks dispute creation / investigation open" }
+  - { id: ERR_FURNISHER_SUSPENDED, http: 409, condition: "Reverification dispatched to a SUSPENDED furnisher" }
+  - { id: ERR_TRADELINE_NOT_DISPUTABLE, http: 409, condition: "Tradeline not in REPORTING/CORRECTED/VERIFIED for a new dispute (e.g., DELETED or already DISPUTED)" }
+  - { id: ERR_DUPLICATE_DISPUTE, http: 409, condition: "A non-terminal Dispute already references this tradeline" }
+  - { id: ERR_OVERLAPPING_INVESTIGATION, http: 409, condition: "New dispute's investigation window overlaps a non-terminal same-reason dispute's window on the same credit file" }
+  - { id: ERR_REOPEN_LIMIT_REACHED, http: 409, condition: "dispute.reopen_count already == 2" }
+  - { id: ERR_MISSING_CORRECTED_BALANCE, http: 422, condition: "MODIFY reverification response without corrected_balance_cents >= 0" }
+  - { id: ERR_FREEZE_OVERLAP, http: 409, condition: "New freeze interval overlaps an existing ACTIVE freeze of the same freeze_type" }
+  - { id: ERR_COMPLAINT_PREMATURE, http: 409, condition: "Adjudicate UPHOLD while referenced Dispute not in {AUTO_DELETED, RESOLVED_VERIFY}" }
+  - { id: ERR_INVALID_DECISION, http: 422, condition: "adjudicate decision not in {UPHOLD, DISMISS}" }
+  - { id: ERR_PAGINATION_RANGE, http: 422, condition: "limit/offset outside permitted range" }
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Anonymous
+    description: "Unauthenticated registration surface only"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /consumers — register consumer"
+      - "POST /furnishers — register furnisher"
+    shared_operations: []
+
+  - name: Consumer
+    description: "Acts as a persisted Consumer; owns disputes, freezes, complaints on own file"
+    identity: "entity_backed:Consumer"
+    exclusive_operations:
+      - "POST /disputes — file dispute on own file"
+      - "POST /disputes/{id}/reopen — reopen own dispute"
+      - "POST /security-freezes — place lock/freeze on own file"
+      - "POST /security-freezes/{id}/lift — lift own freeze"
+      - "POST /regulatory-complaints — file CFPB complaint on own dispute"
+    shared_operations:
+      - "GET reads on own consumer, credit-files, tradelines, disputes, freezes, complaints, notifications, reage-events"
+
+  - name: Furnisher
+    description: "Acts as a persisted Furnisher; reports tradelines and answers reverifications for own tradelines"
+    identity: "entity_backed:Furnisher"
+    exclusive_operations:
+      - "POST /tradelines — report tradeline (shared with CreditBureau)"
+      - "POST /tradelines/{id}/reage — directly re-age a reported tradeline"
+      - "POST /reverification-requests/{id}/respond — respond to own reverification"
+    shared_operations:
+      - "GET reads on own furnisher, tradelines, reverification-requests, disputes, reage-events"
+
+  - name: CreditBureau
+    description: "Operational bureau identity (opaque); opens files, runs investigations, dispatches reverifications, drives the clock"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /credit-files — open credit file"
+      - "POST /disputes/{id}/open-investigation — open 30-day investigation"
+      - "POST /reverification-requests — dispatch reverification"
+      - "POST /furnishers/{id}/suspend — suspend furnisher"
+      - "POST /_clock/set — set server clock"
+      - "POST /_clock/advance — advance clock + run deadline sweep"
+    shared_operations:
+      - "POST /tradelines — report tradeline (shared with Furnisher)"
+      - "GET reads across files, tradelines, disputes, reverifications, freezes, complaints, notifications"
+
+  - name: Regulator
+    description: "CFPB / State AG operational identity (opaque); adjudicates regulatory complaints"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /regulatory-complaints/{id}/review — move complaint to UNDER_REVIEW"
+      - "POST /regulatory-complaints/{id}/adjudicate — uphold or dismiss"
+    shared_operations:
+      - "GET reads across files, disputes, complaints, reverifications, notifications"

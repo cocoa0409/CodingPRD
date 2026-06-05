@@ -1,0 +1,37 @@
+"""Error IDs and HTTP status mapping (PRD §5)."""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_DUPLICATE = "ERR_DUPLICATE"
+    ERR_DISCLOSURE_NOT_ACCEPTED = "ERR_DISCLOSURE_NOT_ACCEPTED"
+    ERR_SETTLEMENT_HOLD_ACTIVE = "ERR_SETTLEMENT_HOLD_ACTIVE"
+    ERR_NOT_DELINQUENT = "ERR_NOT_DELINQUENT"
+    ERR_LOAN_HAS_PAYMENTS = "ERR_LOAN_HAS_PAYMENTS"
+    ERR_INSUFFICIENT_CREDIT = "ERR_INSUFFICIENT_CREDIT"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_REQUEST: 422,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_DUPLICATE: 409,
+    ApiErrorId.ERR_DISCLOSURE_NOT_ACCEPTED: 409,
+    ApiErrorId.ERR_SETTLEMENT_HOLD_ACTIVE: 409,
+    ApiErrorId.ERR_NOT_DELINQUENT: 409,
+    ApiErrorId.ERR_LOAN_HAS_PAYMENTS: 409,
+    ApiErrorId.ERR_INSUFFICIENT_CREDIT: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

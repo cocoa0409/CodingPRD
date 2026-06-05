@@ -1,0 +1,1236 @@
+scenario: |
+  Home Warranty Service: contract packages, covered items, Service Fee/Trip Charge,
+  technician dispatch, return visit guarantee, renewal reminder, Co-pay sharing,
+  Pre-existing exclusion.
+
+domain_name: home-warranty-service
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - dual_variant_calculation       # provisional estimate vs final co-pay
+    - cascading_side_effects          # claim resolve → contract counters → renewal eligibility
+    - rate_threshold_triggers         # return-visit window (days), co-pay cap (dollars)
+    - scheduled_deferred_actions      # renewal reminder at T-30 days
+    - optimistic_concurrency          # OCC on Contract.version for renewal vs claim races
+  entity_topology: flat
+  state_machine_shape: cyclic         # ClaimTicket cycles through REOPEN on return visit
+  relationship_patterns:
+    - one_to_many                     # Contract -> CoveredItem, Contract -> ClaimTicket
+    - cross_aggregate                 # ClaimTicket.covered_item_id references CoveredItem
+  role_model: peer_roles              # Customer, Technician, Dispatcher peer (PlatformAdmin override)
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+
+  - name: ContractPackage
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: "Public package code (e.g., BASIC, PLUS, PREMIUM); unique."
+        constraints: "unique; uppercase A-Z 3..16 chars"
+      - name: name
+        type: string
+        source: input
+        description: "Display name of the package."
+      - name: annual_premium_cents
+        type: integer
+        source: input
+        description: "Annual premium in USD cents charged on activation/renewal."
+        constraints: ">= 0"
+      - name: service_fee_cents
+        type: integer
+        source: input
+        description: "Trip Charge (Service Fee) per dispatch in USD cents."
+        constraints: ">= 0"
+      - name: copay_cap_cents
+        type: integer
+        source: input
+        description: "Per-claim repair-cost cap (cents) up to which the warranty pays 100%. Above the cap, Co-pay sharing applies — see §1.3 final_copay."
+        constraints: ">= 0"
+      - name: copay_share_pct
+        type: number
+        source: input
+        description: "Customer co-pay percentage applied to the repair-cost portion ABOVE copay_cap_cents. Stored as decimal in [0, 1]."
+        constraints: "0 <= x <= 1"
+      - name: return_visit_window_days
+        type: integer
+        source: input
+        description: "Number of days from a Dispatch COMPLETED timestamp during which the same covered_item is eligible for a free return visit (no new Service Fee)."
+        constraints: ">= 0"
+      - name: max_covered_items
+        type: integer
+        source: input
+        description: "Maximum number of CoveredItems a Contract on this package may register."
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle of the package."
+        default: "ACTIVE"
+        constraints: "ACTIVE | RETIRED"
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Login identifier."
+        constraints: "unique; email format"
+      - name: full_name
+        type: string
+        source: input
+        description: "Customer full name."
+      - name: home_address
+        type: string
+        source: input
+        description: "Service address."
+
+  - name: Contract
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the holder of the contract."
+      - name: package_id
+        type: string
+        source: input
+        description: "FK -> ContractPackage.id; package the contract is purchased on. Pinned at activation; renewal_pending may carry a new package_id_pending."
+      - name: status
+        type: enum
+        source: system
+        description: "Contract lifecycle state — see §1.2 Contract state machine."
+        default: "PENDING_PAYMENT"
+        constraints: "PENDING_PAYMENT | ACTIVE | EXPIRING_SOON | EXPIRED | CANCELLED | RENEWED"
+      - name: coverage_start_utc
+        type: datetime
+        source: system
+        description: "When ACTIVE began. Stamped on transition PENDING_PAYMENT -> ACTIVE."
+      - name: coverage_end_utc
+        type: datetime
+        source: system
+        description: "Exclusive end of coverage window. Set to coverage_start_utc + 365 days."
+      - name: renewal_reminder_sent_at
+        type: datetime
+        source: system
+        description: "Set when the renewal reminder fires (clock_now >= coverage_end_utc - 30 days while status == ACTIVE). Null until then."
+        default: null
+      - name: claims_in_period_count
+        type: integer
+        source: computed
+        description: "Count of ClaimTickets on this contract whose status IN {RESOLVED, REJECTED, ASSESSED, DISPATCHED, SUBMITTED} that were created on or after coverage_start_utc and strictly before coverage_end_utc. Recomputed on every ClaimTicket transition that affects status."
+        default: 0
+      - name: total_paid_out_cents
+        type: integer
+        source: computed
+        description: "Cumulative warranty-paid portion (repair_cost_cents - final_copay_cents) over RESOLVED claims on this contract in [coverage_start_utc, coverage_end_utc). Recomputed on each RESOLVED transition."
+        default: 0
+      - name: annual_premium_due_cents
+        type: integer
+        source: computed
+        description: "Premium owed for this contract's coverage year. Stamped at activation (= ContractPackage.annual_premium_cents) for first-time contracts; stamped at successor creation per §1.3 renewal_premium (which may apply an early-renewal discount). Immutable thereafter."
+        default: 0
+
+  - name: CoveredItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> Contract.id; the contract that covers this item."
+      - name: category
+        type: enum
+        source: input
+        description: "Item category."
+        constraints: "HVAC | WATER_HEATER | REFRIGERATOR | DISHWASHER | WASHER | DRYER | OVEN"
+      - name: brand
+        type: string
+        source: input
+        description: "Brand/manufacturer."
+      - name: model
+        type: string
+        source: input
+        description: "Model identifier."
+      - name: install_year
+        type: integer
+        source: input
+        description: "Year the item was installed at the property."
+        constraints: "1900 <= x <= current_year"
+      - name: pre_existing_flag
+        type: boolean
+        source: input
+        description: "If true at registration, the item is excluded from coverage — any claim against it is rejected with ERR_PRE_EXISTING_EXCLUDED. Pinned at registration; immutable thereafter."
+        default: false
+      - name: last_dispatch_completed_utc
+        type: datetime
+        source: computed
+        description: "Server-stamped timestamp of the most recent Dispatch on this item that reached COMPLETED. Null until first COMPLETED. Used to evaluate the return-visit window."
+        default: null
+      - name: last_dispatch_id
+        type: string
+        source: computed
+        description: "FK -> Dispatch.id; id of the Dispatch whose completion stamped last_dispatch_completed_utc. Null until first COMPLETED."
+        default: null
+
+  - name: ClaimTicket
+    parent: null
+    common_fields: true
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> Contract.id; the contract under which the claim is filed."
+      - name: covered_item_id
+        type: string
+        source: input
+        description: "FK -> CoveredItem.id; the item being claimed against. Must belong to contract_id."
+      - name: issue_summary
+        type: string
+        source: input
+        description: "Customer-provided description of the problem."
+      - name: status
+        type: enum
+        source: system
+        description: "Claim lifecycle — see §1.2 ClaimTicket state machine."
+        default: "SUBMITTED"
+        constraints: "SUBMITTED | ASSESSED | DISPATCHED | RESOLVED | REJECTED"
+      - name: is_return_visit
+        type: boolean
+        source: computed
+        description: "True iff at the moment the claim was DISPATCHED, the covered_item's last_dispatch_completed_utc was non-null AND clock_now < last_dispatch_completed_utc + return_visit_window_days. A return-visit claim waives the Service Fee — see §1.3 service_fee_charged."
+        default: false
+      - name: prior_dispatch_id
+        type: string
+        source: computed
+        description: "FK -> Dispatch.id; if is_return_visit is true, the id of the original Dispatch whose return-visit window covered this claim (= covered_item.last_dispatch_id at DISPATCH time). Null when is_return_visit is false."
+        default: null
+      - name: rejection_reason
+        type: enum
+        source: system
+        description: "Set on transition to REJECTED. Captures the assessor's rejection ground."
+        default: null
+        constraints: "PRE_EXISTING_EXCLUDED | OUT_OF_COVERAGE | NOT_COVERED_CATEGORY | null"
+      - name: repair_cost_cents
+        type: integer
+        source: input
+        description: "Estimated/actual repair cost in cents. Provisional at ASSESSED (estimate), finalized at RESOLVED (actual). The provisional_copay calculation uses the value at ASSESSED; final_copay uses the value at RESOLVED — see §1.3."
+        default: 0
+        constraints: ">= 0"
+      - name: provisional_copay_cents
+        type: integer
+        source: computed
+        description: "Customer's provisional co-pay, computed at ASSESSED from the provisional repair_cost_cents. See §1.3 provisional_copay."
+        default: 0
+      - name: final_copay_cents
+        type: integer
+        source: computed
+        description: "Customer's final co-pay, computed at RESOLVED from the final repair_cost_cents and (if applicable) waived Service Fee. See §1.3 final_copay."
+        default: 0
+      - name: service_fee_charged_cents
+        type: integer
+        source: computed
+        description: "Service Fee (Trip Charge) component included in the claim's customer charge. 0 when is_return_visit == true; equals ContractPackage.service_fee_cents otherwise. Pinned at DISPATCHED."
+        default: 0
+
+  - name: Dispatch
+    parent: null
+    common_fields: true
+    fields:
+      - name: claim_id
+        type: string
+        source: input
+        description: "FK -> ClaimTicket.id; the claim this dispatch services."
+      - name: technician_id
+        type: string
+        source: input
+        description: "Opaque technician identifier assigned by the Dispatcher. Stored as the value the Dispatcher chose; the server does not link this to a Customer or Contract entity."
+      - name: scheduled_utc
+        type: datetime
+        source: input
+        description: "Scheduled visit time."
+      - name: status
+        type: enum
+        source: system
+        description: "Dispatch lifecycle — see §1.2 Dispatch state machine."
+        default: "SCHEDULED"
+        constraints: "SCHEDULED | IN_PROGRESS | COMPLETED | RETURN_NEEDED"
+      - name: completed_utc
+        type: datetime
+        source: system
+        description: "Stamped on transition IN_PROGRESS -> COMPLETED. Null otherwise."
+        default: null
+
+  - name: RenewalReminder
+    parent: null
+    common_fields: false
+    fields:
+      - name: contract_id
+        type: string
+        source: system
+        description: "FK -> Contract.id; the contract this reminder was sent for."
+      - name: sent_utc
+        type: datetime
+        source: system
+        description: "Server clock at the moment the reminder fired (equals Contract.renewal_reminder_sent_at)."
+      - name: days_to_expiry
+        type: integer
+        source: system
+        description: "floor((Contract.coverage_end_utc - sent_utc).total_seconds / 86400). Pinned at firing."
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+
+  - entity: Contract
+    initial_state: PENDING_PAYMENT
+    terminal_states: [EXPIRED, CANCELLED, RENEWED]
+    transitions:
+      - from: PENDING_PAYMENT
+        to: ACTIVE
+        trigger: "POST /contracts/{id}/activate"
+        actor: PlatformAdmin
+        preconditions:
+          - "Contract.status == PENDING_PAYMENT"
+          - "ContractPackage referenced by package_id has status == ACTIVE"
+        side_effects:
+          - "Stamp coverage_start_utc = server clock_now"
+          - "Stamp coverage_end_utc = coverage_start_utc + 365 days"
+          - "Stamp annual_premium_due_cents (if not already stamped by /renew side-effect) = ContractPackage.annual_premium_cents"
+          - "increments Contract.version by 1"
+
+      - from: ACTIVE
+        to: EXPIRING_SOON
+        trigger: "system: tick checkpoint when clock_now >= coverage_end_utc - 30 days"
+        actor: system
+        preconditions:
+          - "Contract.status == ACTIVE"
+          - "clock_now >= coverage_end_utc - 30 days"
+          - "clock_now < coverage_end_utc"
+        side_effects:
+          - "Stamp renewal_reminder_sent_at = clock_now"
+          - "Insert RenewalReminder row with days_to_expiry = floor((coverage_end_utc - clock_now)/86400)"
+          - "increments Contract.version by 1"
+        note: "Auto-transition fired by POST /_clock/tick (system actor). Only fires once per contract — guarded by renewal_reminder_sent_at IS NULL."
+
+      - from: EXPIRING_SOON
+        to: RENEWED
+        trigger: "POST /contracts/{id}/renew"
+        actor: Customer
+        preconditions:
+          - "Contract.status == EXPIRING_SOON"
+          - "expected_contract_version matches Contract.version (OCC)"
+          - "Referenced new_package_id (if provided) has ContractPackage.status == ACTIVE"
+        side_effects:
+          - "Create a new Contract (id distinct) with status PENDING_PAYMENT, customer_id and package_id (default to current package_id if new_package_id omitted)"
+          - "Compute and stamp the successor Contract's annual_premium_due_cents per §1.3 renewal_premium"
+          - "Stamp original Contract.status = RENEWED"
+          - "increments Contract.version by 1 on the original Contract"
+        note: "RENEWED is terminal on the original; the successor Contract starts the cycle anew."
+
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system: tick checkpoint when clock_now >= coverage_end_utc"
+        actor: system
+        preconditions:
+          - "Contract.status IN {ACTIVE, EXPIRING_SOON}"
+          - "clock_now >= coverage_end_utc"
+        side_effects:
+          - "increments Contract.version by 1"
+
+      - from: EXPIRING_SOON
+        to: EXPIRED
+        trigger: "system: tick checkpoint when clock_now >= coverage_end_utc"
+        actor: system
+        preconditions:
+          - "Contract.status == EXPIRING_SOON"
+          - "clock_now >= coverage_end_utc"
+        side_effects:
+          - "increments Contract.version by 1"
+
+      - from: PENDING_PAYMENT
+        to: CANCELLED
+        trigger: "POST /contracts/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "Contract.status == PENDING_PAYMENT"
+        side_effects:
+          - "increments Contract.version by 1"
+
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /contracts/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "Contract.status == ACTIVE"
+          - "No ClaimTicket on this contract has status IN {SUBMITTED, ASSESSED, DISPATCHED}"
+        side_effects:
+          - "increments Contract.version by 1"
+
+  - entity: ClaimTicket
+    initial_state: SUBMITTED
+    terminal_states: [RESOLVED, REJECTED]
+    transitions:
+      - from: SUBMITTED
+        to: ASSESSED
+        trigger: "POST /claims/{id}/assess"
+        actor: Dispatcher
+        preconditions:
+          - "ClaimTicket.status == SUBMITTED"
+          - "CoveredItem.pre_existing_flag == false (else assessor must reject — see SUBMITTED->REJECTED)"
+          - "Contract.status IN {ACTIVE, EXPIRING_SOON}"
+          - "repair_cost_cents > 0 in request body"
+        side_effects:
+          - "Set ClaimTicket.repair_cost_cents = request.estimated_repair_cost_cents"
+          - "Compute and stamp ClaimTicket.provisional_copay_cents per §1.3 provisional_copay"
+
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /claims/{id}/reject"
+        actor: Dispatcher
+        preconditions:
+          - "ClaimTicket.status == SUBMITTED"
+          - "Request body rejection_reason IN {PRE_EXISTING_EXCLUDED, OUT_OF_COVERAGE, NOT_COVERED_CATEGORY}"
+        side_effects:
+          - "Stamp ClaimTicket.rejection_reason"
+          - "Recompute Contract.claims_in_period_count"
+
+      - from: ASSESSED
+        to: DISPATCHED
+        trigger: "POST /claims/{id}/dispatch"
+        actor: Dispatcher
+        preconditions:
+          - "ClaimTicket.status == ASSESSED"
+          - "Request body technician_id is non-empty"
+          - "Request body scheduled_utc is in the future (>= clock_now)"
+        side_effects:
+          - "Create Dispatch row (status SCHEDULED) with claim_id, technician_id, scheduled_utc"
+          - "Evaluate is_return_visit per §1.3 is_return_visit; pin ClaimTicket.is_return_visit, prior_dispatch_id"
+          - "Pin ClaimTicket.service_fee_charged_cents per §1.3 service_fee_charged"
+
+      - from: DISPATCHED
+        to: RESOLVED
+        trigger: "POST /claims/{id}/resolve"
+        actor: Dispatcher
+        preconditions:
+          - "ClaimTicket.status == DISPATCHED"
+          - "The Dispatch row linked by Dispatch.claim_id == this claim.id has status == COMPLETED"
+          - "Request body actual_repair_cost_cents > 0"
+        side_effects:
+          - "Update ClaimTicket.repair_cost_cents = request.actual_repair_cost_cents"
+          - "Compute and stamp ClaimTicket.final_copay_cents per §1.3 final_copay"
+          - "Recompute Contract.total_paid_out_cents (add repair_cost_cents - final_copay_cents)"
+          - "Recompute Contract.claims_in_period_count"
+
+      - from: DISPATCHED
+        to: ASSESSED
+        trigger: "POST /claims/{id}/reopen"
+        actor: Dispatcher
+        preconditions:
+          - "ClaimTicket.status == DISPATCHED"
+          - "The Dispatch row linked by Dispatch.claim_id == this claim.id has status == RETURN_NEEDED"
+        side_effects:
+          - "Reset ClaimTicket.provisional_copay_cents to 0 pending re-assessment"
+        note: "Cyclic edge — same claim returns to ASSESSED so a follow-up dispatch can be created without opening a new ClaimTicket. Side-effect chain continues: a new /dispatch on this claim will evaluate is_return_visit against the now-stamped covered_item.last_dispatch_completed_utc."
+
+  - entity: Dispatch
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, RETURN_NEEDED]
+    transitions:
+      - from: SCHEDULED
+        to: IN_PROGRESS
+        trigger: "POST /dispatches/{id}/start"
+        actor: Technician
+        preconditions:
+          - "Dispatch.status == SCHEDULED"
+          - "clock_now >= Dispatch.scheduled_utc"
+        side_effects: []
+
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /dispatches/{id}/complete"
+        actor: Technician
+        preconditions:
+          - "Dispatch.status == IN_PROGRESS"
+        side_effects:
+          - "Stamp Dispatch.completed_utc = clock_now"
+          - "Update parent CoveredItem.last_dispatch_completed_utc = clock_now"
+          - "Update parent CoveredItem.last_dispatch_id = Dispatch.id"
+        note: "Cascade depth 3: dispatch_complete -> CoveredItem update -> NEXT claim's is_return_visit pinning at DISPATCHED uses the updated CoveredItem.last_dispatch_completed_utc."
+
+      - from: IN_PROGRESS
+        to: RETURN_NEEDED
+        trigger: "POST /dispatches/{id}/mark-return-needed"
+        actor: Technician
+        preconditions:
+          - "Dispatch.status == IN_PROGRESS"
+        side_effects: []
+        note: "Drives the cyclic edge ClaimTicket: DISPATCHED -> ASSESSED on /claims/{id}/reopen."
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: contract-renew-stale-version
+    parent_entity: Contract
+    write_endpoint: "POST /contracts/{id}/renew"
+    occ_field: "expected_contract_version"
+    description: |
+      Renewing a Contract whose version has advanced since the client last
+      observed it is rejected. This captures the case where the system
+      auto-transitioned the contract (e.g., into EXPIRED via a clock tick)
+      between the client reading EXPIRING_SOON and submitting renewal, so
+      the prior view of the contract is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+
+  - name: provisional_copay
+    trigger: "ClaimTicket transition SUBMITTED -> ASSESSED (POST /claims/{id}/assess)"
+    algorithm: threshold
+    formula: |
+      # Inputs:
+      #   R = ClaimTicket.repair_cost_cents (provisional, from assess request)
+      #   C = ContractPackage.copay_cap_cents (resolved via Contract.package_id)
+      #   P = ContractPackage.copay_share_pct (decimal in [0, 1])
+      # Provisional co-pay assumes the Service Fee WILL be charged (because at
+      # ASSESSED time, is_return_visit has not yet been evaluated — that pin
+      # happens at DISPATCHED).
+      excess = max(0, R - C)
+      copay_above_cap = round_half_up(excess * P)            # cents, integer
+      provisional_copay_cents = copay_above_cap + ContractPackage.service_fee_cents
+    input_set: "Resolved at ASSESSED. Reads ContractPackage via Contract.package_id."
+    constants: {}
+    precision: "Integer cents; round_half_up at the multiplication step; no further rounding."
+    variants:
+      - name: under_cap
+        when: "R <= C"
+        difference: "copay_above_cap = 0; provisional_copay_cents = ContractPackage.service_fee_cents only."
+      - name: over_cap
+        when: "R > C"
+        difference: "copay_above_cap = round_half_up((R - C) * P); added to service_fee."
+
+  - name: final_copay
+    trigger: "ClaimTicket transition DISPATCHED -> RESOLVED (POST /claims/{id}/resolve)"
+    algorithm: threshold
+    formula: |
+      # Inputs:
+      #   R = ClaimTicket.repair_cost_cents (final actual, from resolve request)
+      #   C = ContractPackage.copay_cap_cents
+      #   P = ContractPackage.copay_share_pct
+      #   SF = ClaimTicket.service_fee_charged_cents (pinned at DISPATCHED;
+      #        0 when is_return_visit, else ContractPackage.service_fee_cents)
+      excess = max(0, R - C)
+      copay_above_cap = round_half_up(excess * P)
+      final_copay_cents = copay_above_cap + SF
+    input_set: "Resolved at RESOLVED. Uses SF pinned at DISPATCHED (NOT recomputed from current package config)."
+    constants: {}
+    precision: "Integer cents; round_half_up at the multiplication step; no further rounding."
+    variants:
+      - name: first_visit_under_cap
+        when: "is_return_visit == false AND R <= C"
+        difference: "final = SF (= package.service_fee_cents); customer pays only the Trip Charge."
+      - name: first_visit_over_cap
+        when: "is_return_visit == false AND R > C"
+        difference: "final = SF + round_half_up((R - C) * P)."
+      - name: return_visit_under_cap
+        when: "is_return_visit == true AND R <= C"
+        difference: "final = 0; Service Fee waived AND no co-pay sharing triggered."
+      - name: return_visit_over_cap
+        when: "is_return_visit == true AND R > C"
+        difference: "final = round_half_up((R - C) * P); Service Fee waived but co-pay sharing still applies."
+
+  - name: is_return_visit
+    trigger: "ClaimTicket transition ASSESSED -> DISPATCHED (POST /claims/{id}/dispatch)"
+    algorithm: threshold
+    formula: |
+      # Inputs:
+      #   L = CoveredItem.last_dispatch_completed_utc (may be null)
+      #   W = ContractPackage.return_visit_window_days (resolved via Contract.package_id)
+      #   T = server clock_now at /dispatch
+      if L is None:
+        is_return_visit = false
+      elif T < L + W * 86400 seconds:                 # STRICTLY less than → boundary precision
+        is_return_visit = true
+      else:
+        is_return_visit = false
+      # Tie-break: exact equality T == L + W*86400 evaluates to FALSE (window closed).
+    input_set: "Resolved at DISPATCHED. Reads CoveredItem state and ContractPackage config."
+    constants: {}
+    precision: "Datetime comparison at 1-second granularity."
+    variants:
+      - name: no_prior_completion
+        when: "L is None"
+        difference: "Result is unconditionally false."
+      - name: inside_window
+        when: "L is not None AND T < L + W*86400 (strict)"
+        difference: "Result is true; ClaimTicket.prior_dispatch_id pinned to CoveredItem.last_dispatch_id."
+
+  - name: service_fee_charged
+    trigger: "ClaimTicket transition ASSESSED -> DISPATCHED (POST /claims/{id}/dispatch); fires immediately after is_return_visit pinning."
+    algorithm: threshold
+    formula: |
+      if ClaimTicket.is_return_visit == true:
+        service_fee_charged_cents = 0
+      else:
+        service_fee_charged_cents = ContractPackage.service_fee_cents
+    input_set: "Reads ClaimTicket.is_return_visit and ContractPackage.service_fee_cents."
+    constants: {}
+    precision: "Integer cents."
+    variants: []
+
+  - name: renewal_premium
+    trigger: "Contract transition EXPIRING_SOON -> RENEWED (POST /contracts/{id}/renew). Computed and stored on the SUCCESSOR contract row as its annual_premium_due_cents."
+    algorithm: tiered_pricing
+    formula: |
+      # Inputs:
+      #   P = ContractPackage.annual_premium_cents (resolved via successor.package_id)
+      #   D = days remaining = floor((Contract.coverage_end_utc - clock_now).total_seconds / 86400),
+      #       computed against the ORIGINAL contract's coverage_end_utc (NOT the successor's, which is unset).
+      #   N_items = count of CoveredItems on the ORIGINAL contract (regardless of pre_existing_flag)
+      #   ITEM_SURCHARGE_PCT_PER_ITEM = 0.02 (2% of P per item above the first)
+      #
+      # Pricing tiers on D (boundary precision matters):
+      #   - early_renewal: D >= 15   → base_after_discount = P - round_half_up(P * 0.10)
+      #   - at_expiry:     D <= 14   → base_after_discount = P
+      #
+      # Per-item surcharge (mode (b) — rounding order is PINNED):
+      #   extra_items = max(0, N_items - 1)
+      #   # Per-item rounding order: COMPUTE per-item surcharge cents, ROUND_HALF_UP each,
+      #   # THEN sum. Do NOT sum first and round once.
+      #   per_item_cents = round_half_up(P * 0.02)
+      #   surcharge_total = per_item_cents * extra_items
+      #
+      # Final:
+      #   renewal_premium_cents = base_after_discount + surcharge_total
+    input_set: "Resolved at renew. Reads ContractPackage.annual_premium_cents via successor.package_id; uses original Contract.coverage_end_utc; counts CoveredItems where contract_id == original Contract.id (all statuses)."
+    constants:
+      EARLY_RENEWAL_DAYS_THRESHOLD: 14
+      EARLY_RENEWAL_DISCOUNT_PCT: 0.10
+      ITEM_SURCHARGE_PCT_PER_ITEM: 0.02
+    precision: |
+      Integer cents. Discount rounding: round_half_up on (P * 0.10).
+      Surcharge rounding ORDER (mode (b), pinned): round_half_up per item FIRST,
+      then multiply by extra_items. The alternative ("compute total surcharge as
+      P*0.02*extra_items then round once") is REJECTED — implementations using
+      it diverge by up to extra_items-1 cents.
+    variants:
+      - name: early_renewal
+        when: "D >= 15"
+        difference: "Applies 10% discount: base_after_discount = P - round_half_up(P * 0.10)."
+      - name: at_expiry
+        when: "D <= 14"
+        difference: "No discount: base_after_discount = P."
+
+  - name: contract_payout_aggregate
+    trigger: "ClaimTicket transition DISPATCHED -> RESOLVED (POST /claims/{id}/resolve); also recomputed on REJECTED."
+    algorithm: aggregation
+    formula: |
+      # Aggregation source: ClaimTickets where contract_id == Contract.id
+      #                    AND status == RESOLVED
+      #                    AND created_at >= Contract.coverage_start_utc
+      #                    AND created_at <  Contract.coverage_end_utc
+      # Order: ascending by created_at then ascending by ClaimTicket.id (tie-break by id is forbidden per skill rule
+      #        — actual tie-break is created_at ASC; if two ClaimTickets share created_at to the second, processing
+      #        order is created_at ASC, but the resulting sum is order-invariant since sums commute).
+      total_paid_out_cents = sum(ct.repair_cost_cents - ct.final_copay_cents for ct in qualifying_claims)
+      claims_in_period_count = count of ClaimTickets where contract_id == Contract.id
+                                AND status IN {SUBMITTED, ASSESSED, DISPATCHED, RESOLVED, REJECTED}
+                                AND created_at >= Contract.coverage_start_utc
+                                AND created_at <  Contract.coverage_end_utc
+    input_set: "Filtered by contract_id, status, and the half-open interval [coverage_start_utc, coverage_end_utc)."
+    constants: {}
+    precision: "Integer cents."
+    variants: []
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and non-empty"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /customers (register)"
+
+  - priority: 2
+    category: auth
+    check: "Role permitted for this operation per §1.7 RBAC matrix"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "Path-templated ids resolve to a row, left-to-right (e.g., /contracts/{cid}/... then /claims/{tid}/... — cid first, tid second)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all GET/POST against {id}-templated paths"
+
+  - priority: 4
+    category: existence
+    check: "FK fields in payload reference existing rows (customer_id, package_id, contract_id, covered_item_id, claim_id)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /contracts, POST /covered-items, POST /claims, POST /dispatches"
+
+  - priority: 5
+    category: business_referential
+    check: "Cross-aggregate consistency: ClaimTicket.covered_item_id must reference a CoveredItem whose contract_id == ClaimTicket.contract_id"
+    error_id: ERR_ITEM_NOT_ON_CONTRACT
+    http_status: 422
+    applies_to: "POST /claims"
+
+  - priority: 6
+    category: state
+    check: "Entity is in a valid state for the requested transition (per §1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints (activate, cancel, renew, assess, dispatch, resolve, reopen, reject, start, complete, mark-return-needed)"
+
+  - priority: 7
+    category: business_safety
+    check: "Pre-existing exclusion: a CoveredItem.pre_existing_flag == true cannot be assessed for coverage. POST /claims/{id}/assess against such an item is rejected; only the /reject path with rejection_reason == PRE_EXISTING_EXCLUDED is permitted."
+    error_id: ERR_PRE_EXISTING_EXCLUDED
+    http_status: 422
+    applies_to: "POST /claims/{id}/assess"
+
+  - priority: 8
+    category: business_temporal
+    check: "Coverage window: ClaimTicket creation requires clock_now in [Contract.coverage_start_utc, Contract.coverage_end_utc) AND Contract.status IN {ACTIVE, EXPIRING_SOON}"
+    error_id: ERR_OUT_OF_COVERAGE
+    http_status: 422
+    applies_to: "POST /claims"
+
+  - priority: 9
+    category: business_constraint
+    check: "Capacity: a Contract may not register more than ContractPackage.max_covered_items CoveredItems"
+    error_id: ERR_ITEM_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /covered-items"
+
+  - priority: 10
+    category: business_temporal
+    check: "Dispatch.scheduled_utc must be >= clock_now at the moment /claims/{id}/dispatch is called"
+    error_id: ERR_SCHEDULED_IN_PAST
+    http_status: 422
+    applies_to: "POST /claims/{id}/dispatch"
+
+  - priority: 11
+    category: business_constraint
+    check: "Technician buffer: no Dispatch row with the same technician_id and status IN {SCHEDULED, IN_PROGRESS} may have scheduled_utc within a ±60-minute buffer (i.e., |existing.scheduled_utc - new.scheduled_utc| < 3600 seconds, STRICTLY less than). Exact 3600-second gap is permitted."
+    error_id: ERR_TECHNICIAN_DOUBLE_BOOKED
+    http_status: 422
+    applies_to: "POST /claims/{id}/dispatch"
+
+  - priority: 12
+    category: business_constraint
+    check: "Contract.cancel from ACTIVE is rejected when any ClaimTicket on the contract has status IN {SUBMITTED, ASSESSED, DISPATCHED}"
+    error_id: ERR_OPEN_CLAIMS_BLOCK_CANCEL
+    http_status: 422
+    applies_to: "POST /contracts/{id}/cancel"
+
+  - priority: 13
+    category: business_fiscal
+    check: "Optimistic concurrency: expected_contract_version in renewal payload must equal Contract.version. Stale → reject."
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /contracts/{id}/renew"
+
+  - priority: 14
+    category: business_constraint
+    check: "Request body shape: required fields present, types valid, enums in declared set, numeric values respect declared bounds"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST endpoints"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+
+  # ---- ContractPackage ----
+  - method: POST
+    path: "/contract-packages"
+    description: "Create a ContractPackage (catalog item)."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [code, name, annual_premium_cents, service_fee_cents, copay_cap_cents, copay_share_pct, return_visit_window_days, max_covered_items]
+    output: ContractPackage
+    side_effects:
+      - "ContractPackage.status defaults to ACTIVE"
+
+  - method: GET
+    path: "/contract-packages"
+    description: "List ContractPackages."
+    roles: [PlatformAdmin, Customer, Dispatcher]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: ContractPackage[]
+    side_effects: []
+
+  - method: GET
+    path: "/contract-packages/{id}"
+    description: "Get a ContractPackage by id."
+    roles: [PlatformAdmin, Customer, Dispatcher]
+    code: 200
+    input: []
+    output: ContractPackage
+    side_effects: []
+
+  - method: POST
+    path: "/contract-packages/{id}/retire"
+    description: "Retire a ContractPackage (status -> RETIRED). New contracts on this package are blocked."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: ContractPackage
+    side_effects:
+      - "ContractPackage.status -> RETIRED"
+
+  # ---- Customer ----
+  - method: POST
+    path: "/customers"
+    description: "Register a Customer. Public endpoint."
+    roles: [Anonymous]
+    code: 201
+    input: [email, full_name, home_address]
+    output: Customer
+    side_effects: []
+
+  - method: GET
+    path: "/customers/{id}"
+    description: "Get a Customer by id."
+    roles: [PlatformAdmin, Customer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  # ---- Contract ----
+  - method: POST
+    path: "/contracts"
+    description: "Create a Contract in PENDING_PAYMENT for a (customer_id, package_id) pair."
+    roles: [Customer, PlatformAdmin]
+    code: 201
+    input: [customer_id, package_id]
+    output: Contract
+    side_effects:
+      - "Contract.status = PENDING_PAYMENT"
+      - "Contract.version = 1"
+
+  - method: GET
+    path: "/contracts/{id}"
+    description: "Get a Contract by id, including computed claims_in_period_count and total_paid_out_cents."
+    roles: [PlatformAdmin, Customer, Dispatcher]
+    code: 200
+    input: []
+    output: Contract
+    side_effects: []
+
+  - method: GET
+    path: "/contracts"
+    description: "List Contracts; supports filtering by customer_id, package_id, and status."
+    roles: [PlatformAdmin, Customer, Dispatcher]
+    code: 200
+    input: ["limit?", "offset?", "customer_id?", "package_id?", "status?"]
+    output: Contract[]
+    side_effects: []
+
+  - method: POST
+    path: "/contracts/{id}/activate"
+    description: "Activate a Contract (PENDING_PAYMENT -> ACTIVE)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Contract
+    side_effects:
+      - "Stamp coverage_start_utc and coverage_end_utc (start + 365d)"
+      - "Stamp annual_premium_due_cents (if zero) = ContractPackage.annual_premium_cents"
+      - "increments Contract.version by 1"
+
+  - method: POST
+    path: "/contracts/{id}/renew"
+    description: "Renew a Contract from EXPIRING_SOON. Creates a successor Contract (PENDING_PAYMENT) and marks the original RENEWED. OCC-guarded. The response is the successor Contract (note: response output entity is the new row, so its annual_premium_due_cents reflects the renewal_premium calc)."
+    roles: [Customer, PlatformAdmin]
+    code: 201
+    input: [expected_contract_version, "new_package_id?"]
+    output: Contract
+    side_effects:
+      - "Original Contract.status -> RENEWED"
+      - "increments Contract.version by 1 on the original Contract"
+      - "Create successor Contract (status PENDING_PAYMENT, version 1) and stamp its annual_premium_due_cents per §1.3 renewal_premium"
+
+  - method: POST
+    path: "/contracts/{id}/cancel"
+    description: "Cancel a Contract. Permitted from PENDING_PAYMENT or ACTIVE (latter requires no open claims)."
+    roles: [Customer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Contract
+    side_effects:
+      - "Contract.status -> CANCELLED"
+      - "increments Contract.version by 1"
+
+  # ---- CoveredItem ----
+  - method: POST
+    path: "/covered-items"
+    description: "Register a CoveredItem on a Contract. Pre-existing flag is pinned here and is immutable thereafter."
+    roles: [Customer, PlatformAdmin]
+    code: 201
+    input: [contract_id, category, brand, model, install_year, "pre_existing_flag?"]
+    output: CoveredItem
+    side_effects:
+      - "pre_existing_flag defaults to false if omitted"
+
+  - method: GET
+    path: "/covered-items/{id}"
+    description: "Get a CoveredItem."
+    roles: [PlatformAdmin, Customer, Dispatcher]
+    code: 200
+    input: []
+    output: CoveredItem
+    side_effects: []
+
+  - method: GET
+    path: "/covered-items"
+    description: "List CoveredItems; supports contract_id and last_dispatch_id filters (FK reverse-reachability for Contract -> CoveredItem and Dispatch -> CoveredItem.last_dispatch_id)."
+    roles: [PlatformAdmin, Customer, Dispatcher]
+    code: 200
+    input: ["limit?", "offset?", "contract_id?", "last_dispatch_id?"]
+    output: CoveredItem[]
+    side_effects: []
+
+  # ---- ClaimTicket ----
+  - method: POST
+    path: "/claims"
+    description: "File a ClaimTicket against a CoveredItem on a Contract."
+    roles: [Customer, PlatformAdmin]
+    code: 201
+    input: [contract_id, covered_item_id, issue_summary]
+    output: ClaimTicket
+    side_effects:
+      - "ClaimTicket.status = SUBMITTED"
+      - "Increment Contract.claims_in_period_count"
+
+  - method: GET
+    path: "/claims/{id}"
+    description: "Get a ClaimTicket by id."
+    roles: [PlatformAdmin, Customer, Dispatcher]
+    code: 200
+    input: []
+    output: ClaimTicket
+    side_effects: []
+
+  - method: GET
+    path: "/claims"
+    description: "List ClaimTickets; supports contract_id, covered_item_id, prior_dispatch_id filters (FK reverse-reachability)."
+    roles: [PlatformAdmin, Customer, Dispatcher]
+    code: 200
+    input: ["limit?", "offset?", "contract_id?", "covered_item_id?", "prior_dispatch_id?", "status?"]
+    output: ClaimTicket[]
+    side_effects: []
+
+  - method: POST
+    path: "/claims/{id}/assess"
+    description: "Assess a SUBMITTED claim (-> ASSESSED). Computes provisional co-pay."
+    roles: [Dispatcher, PlatformAdmin]
+    code: 200
+    input: [estimated_repair_cost_cents]
+    output: ClaimTicket
+    side_effects:
+      - "Set ClaimTicket.repair_cost_cents = estimated_repair_cost_cents"
+      - "Compute and stamp ClaimTicket.provisional_copay_cents"
+
+  - method: POST
+    path: "/claims/{id}/reject"
+    description: "Reject a SUBMITTED claim with a reason (-> REJECTED)."
+    roles: [Dispatcher, PlatformAdmin]
+    code: 200
+    input: [rejection_reason]
+    output: ClaimTicket
+    side_effects:
+      - "Stamp ClaimTicket.rejection_reason"
+
+  - method: POST
+    path: "/claims/{id}/dispatch"
+    description: "Dispatch an ASSESSED claim (-> DISPATCHED). Creates a Dispatch row, pins is_return_visit, prior_dispatch_id, service_fee_charged_cents."
+    roles: [Dispatcher, PlatformAdmin]
+    code: 200
+    input: [technician_id, scheduled_utc]
+    output: ClaimTicket
+    side_effects:
+      - "Create Dispatch (status SCHEDULED)"
+      - "Evaluate is_return_visit per §1.3; pin ClaimTicket.is_return_visit and prior_dispatch_id"
+      - "Pin ClaimTicket.service_fee_charged_cents per §1.3"
+
+  - method: POST
+    path: "/claims/{id}/resolve"
+    description: "Resolve a DISPATCHED claim (-> RESOLVED). Requires the linked Dispatch to be COMPLETED. Computes final co-pay; updates Contract aggregate."
+    roles: [Dispatcher, PlatformAdmin]
+    code: 200
+    input: [actual_repair_cost_cents]
+    output: ClaimTicket
+    side_effects:
+      - "Update ClaimTicket.repair_cost_cents = actual_repair_cost_cents"
+      - "Compute and stamp ClaimTicket.final_copay_cents"
+      - "Recompute Contract.total_paid_out_cents and Contract.claims_in_period_count"
+
+  - method: POST
+    path: "/claims/{id}/reopen"
+    description: "Reopen a DISPATCHED claim whose Dispatch is in RETURN_NEEDED (-> ASSESSED). Enables a follow-up dispatch under the same claim."
+    roles: [Dispatcher, PlatformAdmin]
+    code: 200
+    input: []
+    output: ClaimTicket
+    side_effects:
+      - "Reset ClaimTicket.provisional_copay_cents to 0"
+
+  # ---- Dispatch ----
+  - method: GET
+    path: "/dispatches/{id}"
+    description: "Get a Dispatch by id."
+    roles: [PlatformAdmin, Dispatcher, Technician]
+    code: 200
+    input: []
+    output: Dispatch
+    side_effects: []
+
+  - method: GET
+    path: "/dispatches"
+    description: "List Dispatches; supports claim_id filter (FK reverse-reachability for ClaimTicket -> Dispatch)."
+    roles: [PlatformAdmin, Dispatcher, Technician]
+    code: 200
+    input: ["limit?", "offset?", "claim_id?", "status?"]
+    output: Dispatch[]
+    side_effects: []
+
+  - method: POST
+    path: "/dispatches/{id}/start"
+    description: "Technician marks a SCHEDULED dispatch IN_PROGRESS."
+    roles: [Technician, PlatformAdmin]
+    code: 200
+    input: []
+    output: Dispatch
+    side_effects: []
+
+  - method: POST
+    path: "/dispatches/{id}/complete"
+    description: "Technician completes an IN_PROGRESS dispatch (-> COMPLETED). Stamps Dispatch.completed_utc and updates parent CoveredItem.last_dispatch_completed_utc / last_dispatch_id."
+    roles: [Technician, PlatformAdmin]
+    code: 200
+    input: []
+    output: Dispatch
+    side_effects:
+      - "Stamp Dispatch.completed_utc"
+      - "Update CoveredItem.last_dispatch_completed_utc and last_dispatch_id"
+
+  - method: POST
+    path: "/dispatches/{id}/mark-return-needed"
+    description: "Technician marks an IN_PROGRESS dispatch RETURN_NEEDED. Enables ClaimTicket /reopen."
+    roles: [Technician, PlatformAdmin]
+    code: 200
+    input: []
+    output: Dispatch
+    side_effects: []
+
+  # ---- RenewalReminder ----
+  - method: GET
+    path: "/contracts/{id}/renewal-reminders"
+    description: "List RenewalReminder events under a Contract (FK reverse-reachability for Contract -> RenewalReminder)."
+    roles: [PlatformAdmin, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RenewalReminder[]
+    side_effects: []
+
+  # ---- Test-driving endpoints (/_<name>) ----
+  - method: POST
+    path: "/_clock/set"
+    description: "Test-driving endpoint. Sets the server's logical clock to the given UTC timestamp. Does not auto-trigger any state transitions; pair with /_clock/tick to advance time and fire scheduled transitions."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: datetime }"
+    side_effects:
+      - "Sets server.clock_now to to_iso8601"
+
+  - method: POST
+    path: "/_clock/tick"
+    description: "Test-driving endpoint. Scans all Contracts in {ACTIVE, EXPIRING_SOON} and fires the auto-transitions (ACTIVE -> EXPIRING_SOON when clock_now >= coverage_end_utc - 30d; ACTIVE/EXPIRING_SOON -> EXPIRED when clock_now >= coverage_end_utc), each transition writing a RenewalReminder where applicable."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: "{ transitions_fired: integer, reminders_emitted: integer }"
+    side_effects:
+      - "Fires Contract auto-transitions"
+      - "Emits RenewalReminder rows"
+      - "Increments Contract.version per fired transition"
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role or X-User-ID header missing or empty on a protected endpoint."
+
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Caller's role is not in the endpoint's roles list."
+
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Path id or FK in payload does not resolve to a row."
+
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Required field missing, type mismatch, enum out of set, or numeric out of bounds."
+
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target entity not in a state that permits the requested transition (per §1.2)."
+
+  - id: ERR_ITEM_NOT_ON_CONTRACT
+    http: 422
+    condition: "POST /claims with covered_item_id whose CoveredItem.contract_id != request.contract_id."
+
+  - id: ERR_OUT_OF_COVERAGE
+    http: 422
+    condition: "Claim filed when Contract not in {ACTIVE, EXPIRING_SOON} or clock_now outside [coverage_start_utc, coverage_end_utc)."
+
+  - id: ERR_PRE_EXISTING_EXCLUDED
+    http: 422
+    condition: "POST /claims/{id}/assess against a CoveredItem with pre_existing_flag == true."
+
+  - id: ERR_ITEM_LIMIT_EXCEEDED
+    http: 422
+    condition: "POST /covered-items would push Contract's CoveredItem count above ContractPackage.max_covered_items."
+
+  - id: ERR_SCHEDULED_IN_PAST
+    http: 422
+    condition: "POST /claims/{id}/dispatch with scheduled_utc < clock_now."
+
+  - id: ERR_TECHNICIAN_DOUBLE_BOOKED
+    http: 422
+    condition: "POST /claims/{id}/dispatch where the requested technician_id has another Dispatch in {SCHEDULED, IN_PROGRESS} within a ±60-minute window of the requested scheduled_utc (strictly less than 3600 seconds)."
+
+  - id: ERR_OPEN_CLAIMS_BLOCK_CANCEL
+    http: 422
+    condition: "POST /contracts/{id}/cancel from ACTIVE while any ClaimTicket on the contract is in {SUBMITTED, ASSESSED, DISPATCHED}."
+
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "POST /contracts/{id}/renew with expected_contract_version != Contract.version."
+
+  - id: ERR_PACKAGE_RETIRED
+    http: 422
+    condition: "POST /contracts (or /contracts/{id}/renew with new_package_id) against a ContractPackage in status RETIRED."
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+
+  - name: Anonymous
+    description: "Unauthenticated caller. Permitted only to register a Customer."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /customers"
+    shared_operations: []
+
+  - name: Customer
+    description: "End-user holding contracts and filing claims. X-User-ID equals the acting Customer.id; ownership is enforced server-side (the acting Customer must equal Contract.customer_id for write operations on that contract and its covered items / claims)."
+    identity: "entity_backed:Customer"
+    exclusive_operations: []
+    shared_operations:
+      - "GET /customers/{id} (own only)"
+      - "POST /contracts (as own customer_id)"
+      - "GET /contracts/{id} (own only)"
+      - "GET /contracts (filtered to own customer_id)"
+      - "POST /contracts/{id}/renew (own only)"
+      - "POST /contracts/{id}/cancel (own only)"
+      - "POST /covered-items (on own contracts)"
+      - "GET /covered-items/{id} (on own contracts)"
+      - "GET /covered-items (own contracts)"
+      - "POST /claims (on own contracts)"
+      - "GET /claims/{id} (own only)"
+      - "GET /claims (filtered to own contracts)"
+      - "GET /contract-packages, GET /contract-packages/{id}"
+      - "GET /contracts/{id}/renewal-reminders (own contracts)"
+
+  - name: Dispatcher
+    description: "Operational role that assesses claims, dispatches technicians, and resolves claims. Cannot file claims on behalf of customers."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /claims/{id}/assess"
+      - "POST /claims/{id}/reject"
+      - "POST /claims/{id}/dispatch"
+      - "POST /claims/{id}/resolve"
+      - "POST /claims/{id}/reopen"
+    shared_operations:
+      - "GET /contracts/{id}, GET /contracts"
+      - "GET /covered-items/{id}, GET /covered-items"
+      - "GET /claims/{id}, GET /claims"
+      - "GET /dispatches/{id}, GET /dispatches"
+      - "GET /contract-packages, GET /contract-packages/{id}"
+
+  - name: Technician
+    description: "Field worker who starts, completes, or flags return-needed on dispatches. Operates only on dispatches it has been assigned to via Dispatch.technician_id."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /dispatches/{id}/start"
+      - "POST /dispatches/{id}/complete"
+      - "POST /dispatches/{id}/mark-return-needed"
+    shared_operations:
+      - "GET /dispatches/{id}, GET /dispatches"
+
+  - name: PlatformAdmin
+    description: "Operational override. Catalog management plus the ability to drive any state transition. Acts via opaque operator id."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /contract-packages"
+      - "POST /contract-packages/{id}/retire"
+      - "POST /contracts/{id}/activate"
+      - "POST /_clock/set"
+      - "POST /_clock/tick"
+    shared_operations:
+      - "POST /contracts, GET /contracts/{id}, GET /contracts"
+      - "POST /contracts/{id}/renew, POST /contracts/{id}/cancel"
+      - "POST /covered-items, GET /covered-items/{id}, GET /covered-items"
+      - "POST /claims, GET /claims/{id}, GET /claims"
+      - "POST /claims/{id}/assess, /reject, /dispatch, /resolve, /reopen"
+      - "GET /dispatches/{id}, GET /dispatches"
+      - "POST /dispatches/{id}/start, /complete, /mark-return-needed"
+      - "GET /contract-packages, GET /contract-packages/{id}"
+      - "GET /contracts/{id}/renewal-reminders"
+      - "GET /customers/{id}"

@@ -1,0 +1,1663 @@
+scenario: "Construction Project & Change Orders: schedule of values, AIA G702/G703 pay application, retainage, change order/RFI/submittal log, subcontractor commitment, conditional/unconditional lien waiver, punch list, retention release"
+domain_name: construction-change-orders
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - dual_variant_calculation        # G703 "this period" billing vs cumulative completion-to-date
+    - cascading_side_effects          # change order approval -> SOV line edits -> contract-sum/retainage recompute
+    - derived_field_reconciliation    # project.revised_contract_sum, balance_to_finish, retainage_held
+    - optimistic_concurrency          # CREATE-with-supersede pay application against a stale project version
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (project_id, sov_line_id, pay_app_id). No deep URL nesting;
+  # children are created via flat collections carrying explicit FK fields in the body.
+
+  state_machine_shape: branching
+  # PayApplication and ChangeOrder both fork (approve / reject / revise), with divergent side-effect
+  # sets per branch; LienWaiver/PunchListItem add cyclic + compound shapes on other entities.
+
+  relationship_patterns:
+    - one_to_many        # Project 1..* SovLine, PayApplication, ChangeOrder, Rfi, Submittal, ...
+    - cross_aggregate    # LienWaiver references a PayApplication; PayAppLine references both a PayApplication and a SovLine
+
+  role_model: segregation_of_duties
+  # A Contractor submits; an Architect certifies/approves; the same opaque user MUST NOT both
+  # submit and certify the same pay application. Owner releases retention.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: Project
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: Project display name.
+        constraints: non-empty
+      - name: owner_user_id
+        type: string
+        source: input
+        description: Opaque operator id of the Owner who created the project (audit only; not an entity id).
+      - name: original_contract_sum_cents
+        type: integer
+        source: input
+        description: Baseline contract sum in cents at award, before any change orders.
+        constraints: ">= 0"
+      - name: default_retainage_pct
+        type: number
+        source: input
+        description: Retainage rate withheld on completed work, as a fraction (e.g. 0.10 for 10%). Stored on the project and copied onto each SovLine at creation.
+        default: 0.10
+        constraints: "0 <= default_retainage_pct <= 0.20"
+      - name: revised_contract_sum_cents
+        type: integer
+        source: computed
+        description: "Computed: original_contract_sum_cents + sum of change_order_amount_cents over ChangeOrder rows with status==APPROVED for this project. Recomputed on every CO approval/reversal."
+      - name: total_completed_and_stored_cents
+        type: integer
+        source: computed
+        description: "Computed: sum over SovLine of (work_completed_to_date_cents + materials_stored_cents) for this project, reflecting the most recently CERTIFIED PayApplication's lines."
+      - name: retainage_held_cents
+        type: integer
+        source: computed
+        description: "Computed: sum over SovLine of retainage_withheld_to_date_cents for this project. Reduced when retention is released."
+      - name: status
+        type: enum
+        source: system
+        description: Project lifecycle state.
+        default: ACTIVE
+        constraints: "ACTIVE, SUBSTANTIALLY_COMPLETE, CLOSED"
+
+  - name: SovLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: project_id
+        type: string
+        source: input
+        description: "FK -> Project.id; the project this schedule-of-values line belongs to."
+      - name: item_no
+        type: string
+        source: input
+        description: Schedule-of-values line item number (G703 column A). Unique per project.
+        constraints: unique within project_id
+      - name: description
+        type: string
+        source: input
+        description: Work description for this line (G703 column B).
+      - name: scheduled_value_cents
+        type: integer
+        source: input
+        description: Scheduled value for this line (G703 column C). Sum across non-deleted lines must equal the project's revised_contract_sum_cents.
+        constraints: "> 0"
+      - name: retainage_pct
+        type: number
+        source: system
+        description: Retainage fraction applied to this line. Initialized from Project.default_retainage_pct at creation; may be overridden by a change order line edit.
+        default: 0.10
+      - name: work_completed_to_date_cents
+        type: integer
+        source: computed
+        description: "Computed: cumulative work completed for this line (G703 columns D+E) as of the most recently CERTIFIED PayApplication. 0 until first certification."
+        default: 0
+      - name: materials_stored_cents
+        type: integer
+        source: computed
+        description: "Computed: materials presently stored for this line (G703 column F) as of the most recently CERTIFIED PayApplication."
+        default: 0
+      - name: retainage_withheld_to_date_cents
+        type: integer
+        source: computed
+        description: "Computed: cumulative retainage withheld on this line through the most recently CERTIFIED PayApplication, net of any retention released."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Line lifecycle.
+        default: ACTIVE
+        constraints: "ACTIVE, DELETED"
+
+  - name: ChangeOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: project_id
+        type: string
+        source: input
+        description: "FK -> Project.id; the project whose contract sum this change order modifies."
+      - name: co_number
+        type: string
+        source: input
+        description: Change order number, unique within the project.
+        constraints: unique within project_id
+      - name: change_order_amount_cents
+        type: integer
+        source: input
+        description: Net dollar change to the contract sum (may be negative for a deductive change order).
+      - name: line_edits
+        type: array
+        source: input
+        description: "Array of {action: ADD|ADJUST, item_no, description?, scheduled_value_delta_cents, retainage_pct?}. On approval, applied to SovLines: ADD creates a new line at scheduled_value_delta_cents; ADJUST adds the delta to the named existing line's scheduled_value_cents."
+      - name: status
+        type: enum
+        source: system
+        description: Change order workflow state.
+        default: DRAFT
+        constraints: "DRAFT, SUBMITTED, APPROVED, REJECTED"
+      - name: submitted_by_user_id
+        type: string
+        source: system
+        description: Opaque operator id of the Contractor who submitted the CO.
+      - name: approved_by_user_id
+        type: string
+        source: system
+        description: Opaque operator id of the Owner who approved the CO (audit only).
+
+  - name: PayApplication
+    parent: null
+    common_fields: true
+    fields:
+      - name: project_id
+        type: string
+        source: input
+        description: "FK -> Project.id; the project this G702/G703 pay application bills against."
+      - name: application_number
+        type: integer
+        source: input
+        description: Sequential pay-application number (G702). Must be exactly one greater than the highest application_number on a non-REJECTED PayApplication for the project (1 for the first).
+        constraints: ">= 1, sequential per project"
+      - name: period_from
+        type: datetime
+        source: input
+        description: Period-start date of this application's billing window (G702). The billing window is the half-open interval [period_from, period_to); it must not overlap any non-REJECTED application's window for the same project. Adjacent windows (this.period_from == prior.period_to) are allowed.
+      - name: period_to
+        type: datetime
+        source: input
+        description: Period-ending date of this application's billing window (G702). Must be strictly later than period_from and strictly later than the period_to of the prior non-REJECTED application.
+      - name: expected_project_version
+        type: integer
+        source: input
+        description: Project.version the client observed; OCC guard for supersede-on-create. Not persisted.
+      - name: total_completed_and_stored_cents
+        type: integer
+        source: computed
+        description: "Computed (G702 line 4): sum over this app's PayAppLines of (work_completed_this_period_cents + work_completed_previous_cents + materials_stored_cents)."
+      - name: total_retainage_cents
+        type: integer
+        source: computed
+        description: "Computed (G702 line 5): sum over this app's PayAppLines of line_retainage_cents."
+      - name: current_payment_due_cents
+        type: integer
+        source: computed
+        description: "Computed (G702 line 6 minus line 8 prior-certificates): total_completed_and_stored_cents - total_retainage_cents - sum of current_payment_due_cents over prior CERTIFIED apps for this project."
+      - name: status
+        type: enum
+        source: system
+        description: Pay-application workflow state.
+        default: DRAFT
+        constraints: "DRAFT, SUBMITTED, CERTIFIED, REJECTED"
+      - name: submitted_by_user_id
+        type: string
+        source: system
+        description: Opaque operator id of the Contractor who submitted this application.
+      - name: certified_by_user_id
+        type: string
+        source: system
+        description: Opaque operator id of the Architect who certified this application (audit; must differ from submitted_by_user_id).
+
+  - name: PayAppLine
+    parent: null
+    common_fields: false
+    fields:
+      - name: pay_app_id
+        type: string
+        source: input
+        description: "FK -> PayApplication.id; the pay application this billing line belongs to."
+      - name: sov_line_id
+        type: string
+        source: input
+        description: "FK -> SovLine.id; the schedule-of-values line being billed."
+      - name: work_completed_this_period_cents
+        type: integer
+        source: input
+        description: Work completed this billing period for the line (G703 column E increment).
+        constraints: ">= 0"
+      - name: materials_stored_cents
+        type: integer
+        source: input
+        description: Value of materials presently stored, not yet incorporated (G703 column F).
+        default: 0
+        constraints: ">= 0"
+      - name: work_completed_previous_cents
+        type: integer
+        source: computed
+        description: "Computed: the linked SovLine.work_completed_to_date_cents as of the prior CERTIFIED application (G703 column D). 0 if none."
+      - name: line_retainage_cents
+        type: integer
+        source: computed
+        description: "Computed: retainage withheld on this line this application = round_half_up(retainage_pct * (work_completed_this_period_cents + work_completed_previous_cents + materials_stored_cents)) using the linked SovLine.retainage_pct."
+
+  - name: SubcontractorCommitment
+    parent: null
+    common_fields: true
+    fields:
+      - name: project_id
+        type: string
+        source: input
+        description: "FK -> Project.id; the project this subcontract commitment is under."
+      - name: subcontractor_name
+        type: string
+        source: input
+        description: Name of the committed subcontractor.
+      - name: committed_amount_cents
+        type: integer
+        source: input
+        description: Subcontract value committed.
+        constraints: "> 0"
+      - name: invoiced_to_date_cents
+        type: integer
+        source: computed
+        description: "Computed: cumulative amount invoiced against this commitment via approved RetentionRelease and lien-waiver activity; never exceeds committed_amount_cents."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Commitment state.
+        default: OPEN
+        constraints: "OPEN, CLOSED"
+
+  - name: Rfi
+    parent: null
+    common_fields: true
+    fields:
+      - name: project_id
+        type: string
+        source: input
+        description: "FK -> Project.id; the project this request-for-information is logged under."
+      - name: subject
+        type: string
+        source: input
+        description: RFI subject line.
+      - name: question
+        type: string
+        source: input
+        description: The question posed to the design team.
+      - name: ball_in_court
+        type: enum
+        source: system
+        description: Which party currently owes a response.
+        default: ARCHITECT
+        constraints: "ARCHITECT, CONTRACTOR"
+      - name: status
+        type: enum
+        source: system
+        description: RFI lifecycle.
+        default: OPEN
+        constraints: "OPEN, ANSWERED, CLOSED"
+      - name: answer
+        type: string
+        source: system
+        description: Architect's response text; set when answered.
+
+  - name: Submittal
+    parent: null
+    common_fields: true
+    fields:
+      - name: project_id
+        type: string
+        source: input
+        description: "FK -> Project.id; the project this submittal is logged under."
+      - name: spec_section
+        type: string
+        source: input
+        description: CSI spec section for the submittal (e.g. "03 30 00").
+      - name: title
+        type: string
+        source: input
+        description: Submittal title.
+      - name: revision
+        type: integer
+        source: system
+        description: Revision counter; starts at 0, increments by 1 each time the submittal is revised and resubmitted after rejection.
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Submittal review state.
+        default: PENDING
+        constraints: "PENDING, APPROVED, APPROVED_AS_NOTED, REVISE_AND_RESUBMIT, CLOSED"
+
+  - name: LienWaiver
+    parent: null
+    common_fields: true
+    fields:
+      - name: project_id
+        type: string
+        source: input
+        description: "FK -> Project.id; the project this lien waiver is recorded against."
+      - name: pay_app_id
+        type: string
+        source: input
+        description: "FK -> PayApplication.id; the pay application whose payment this waiver corresponds to. The application must be CERTIFIED."
+      - name: waiver_type
+        type: enum
+        source: input
+        description: AIA waiver category.
+        constraints: "CONDITIONAL_PROGRESS, UNCONDITIONAL_PROGRESS, CONDITIONAL_FINAL, UNCONDITIONAL_FINAL"
+      - name: through_date
+        type: datetime
+        source: input
+        description: Effective-through date; must equal the linked PayApplication.period_to.
+      - name: amount_cents
+        type: integer
+        source: input
+        description: Waiver amount; must equal the linked PayApplication.current_payment_due_cents.
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: Waiver effectiveness.
+        default: PENDING
+        constraints: "PENDING, EFFECTIVE, VOID"
+
+  - name: PunchListItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: project_id
+        type: string
+        source: input
+        description: "FK -> Project.id; the project this punch item belongs to."
+      - name: location
+        type: string
+        source: input
+        description: Physical location of the deficiency.
+      - name: description
+        type: string
+        source: input
+        description: Deficiency description.
+      - name: severity
+        type: enum
+        source: input
+        description: Punch item severity.
+        default: MINOR
+        constraints: "MINOR, MAJOR"
+      - name: status
+        type: enum
+        source: system
+        description: Punch item lifecycle.
+        default: OPEN
+        constraints: "OPEN, READY_FOR_REVIEW, VERIFIED, REOPENED"
+
+  - name: InspectionWindow
+    parent: null
+    common_fields: true
+    fields:
+      - name: project_id
+        type: string
+        source: input
+        description: "FK -> Project.id; the project on whose site this inspection is scheduled."
+      - name: inspector_name
+        type: string
+        source: input
+        description: Name of the inspector booked for the window.
+      - name: scheduled_start
+        type: datetime
+        source: input
+        description: Closed-interval start of the on-site inspection slot. The slot is the CLOSED interval [scheduled_start, scheduled_end]; the server requires a buffer of buffer_minutes between any two non-CANCELLED slots on the same project (back-to-back, gap < buffer, is rejected).
+      - name: scheduled_end
+        type: datetime
+        source: input
+        description: Closed-interval end of the inspection slot; must be strictly after scheduled_start.
+      - name: buffer_minutes
+        type: integer
+        source: input
+        description: Required clearance, in minutes, between this slot's interval and any other non-CANCELLED slot on the same project. Two slots conflict when the gap between them is strictly less than buffer_minutes.
+        default: 30
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: Inspection slot lifecycle.
+        default: BOOKED
+        constraints: "BOOKED, COMPLETED, CANCELLED"
+
+  - name: RetentionRelease
+    parent: null
+    common_fields: true
+    fields:
+      - name: project_id
+        type: string
+        source: input
+        description: "FK -> Project.id; the project whose retainage is being released."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: Requested retention release amount; must be <= Project.retainage_held_cents at approval.
+        constraints: "> 0"
+      - name: expected_project_version
+        type: integer
+        source: input
+        description: Project.version the client observed; OCC guard for supersede-on-create. Not persisted.
+      - name: status
+        type: enum
+        source: system
+        description: Release workflow.
+        default: REQUESTED
+        constraints: "REQUESTED, APPROVED, REJECTED"
+      - name: approved_by_user_id
+        type: string
+        source: system
+        description: Opaque operator id of the Owner who approved the release (audit only).
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  - entity: Project
+    initial_state: ACTIVE
+    terminal_states: [CLOSED]
+    transitions:
+      - from: ACTIVE
+        to: SUBSTANTIALLY_COMPLETE
+        trigger: "POST /projects/{id}/substantial-completion"
+        actor: Architect
+        preconditions:
+          - "Every PunchListItem for the project is in status VERIFIED (none OPEN, READY_FOR_REVIEW, or REOPENED). If zero punch items exist, the precondition is satisfied vacuously."
+          - "At least one PayApplication for the project is CERTIFIED."
+        side_effects:
+          - "Sets Project.status = SUBSTANTIALLY_COMPLETE."
+          - "increments Project.version by 1."
+      - from: SUBSTANTIALLY_COMPLETE
+        to: CLOSED
+        trigger: "POST /projects/{id}/close"
+        actor: Owner
+        preconditions:
+          - "Project.retainage_held_cents == 0 (all retention released)."
+          - "Every SubcontractorCommitment for the project is CLOSED."
+        side_effects:
+          - "Sets Project.status = CLOSED."
+          - "increments Project.version by 1."
+
+  - entity: ChangeOrder
+    initial_state: DRAFT
+    terminal_states: [APPROVED, REJECTED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /change-orders/{id}/submit"
+        actor: Contractor
+        preconditions:
+          - "ChangeOrder.status == DRAFT."
+          - "Parent Project.status == ACTIVE."
+        side_effects:
+          - "Sets ChangeOrder.status = SUBMITTED."
+          - "Records ChangeOrder.submitted_by_user_id = X-User-ID."
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /change-orders/{id}/approve"
+        actor: Owner
+        preconditions:
+          - "ChangeOrder.status == SUBMITTED."
+          - "Parent Project.status == ACTIVE."
+          - "Request carries expected_project_version equal to Project.version."
+          - "Every ADJUST line_edit names an existing ACTIVE SovLine in this project; every ADD line_edit's item_no is not already used by an ACTIVE SovLine."
+          - "sum(scheduled_value_delta_cents over line_edits) == change_order_amount_cents."
+        side_effects:
+          - "Sets ChangeOrder.status = APPROVED; records approved_by_user_id = X-User-ID."
+          - "Applies line_edits: each ADD creates a new ACTIVE SovLine (retainage_pct defaulting to Project.default_retainage_pct unless overridden); each ADJUST adds scheduled_value_delta_cents to the named SovLine.scheduled_value_cents (cascade A->B)."
+          - "Recomputes Project.revised_contract_sum_cents = original_contract_sum_cents + sum of change_order_amount_cents over APPROVED ChangeOrders (cascade B->C: SovLine edit forces project derived-sum recompute)."
+          - "increments Project.version by 1."
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /change-orders/{id}/reject"
+        actor: Owner
+        preconditions:
+          - "ChangeOrder.status == SUBMITTED."
+        side_effects:
+          - "Sets ChangeOrder.status = REJECTED. No SovLine or Project mutation."
+
+  - entity: PayApplication
+    initial_state: DRAFT
+    terminal_states: [CERTIFIED, REJECTED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /pay-applications/{id}/submit"
+        actor: Contractor
+        preconditions:
+          - "PayApplication.status == DRAFT."
+          - "At least one PayAppLine exists for this application."
+          - "For every PayAppLine, (work_completed_previous_cents + work_completed_this_period_cents + materials_stored_cents) <= linked SovLine.scheduled_value_cents (no overbilling)."
+        side_effects:
+          - "Sets PayApplication.status = SUBMITTED; records submitted_by_user_id = X-User-ID."
+          - "Recomputes PayApplication.total_completed_and_stored_cents, total_retainage_cents, current_payment_due_cents (G702 lines 4/5/6)."
+      - from: SUBMITTED
+        to: CERTIFIED
+        trigger: "POST /pay-applications/{id}/certify"
+        actor: Architect
+        preconditions:
+          - "PayApplication.status == SUBMITTED."
+          - "X-User-ID != PayApplication.submitted_by_user_id (segregation of duties)."
+          - "No Rfi for the project is OPEN with ball_in_court == ARCHITECT (architect must clear its own court before certifying)."
+        side_effects:
+          - "Sets PayApplication.status = CERTIFIED; records certified_by_user_id = X-User-ID."
+          - "For each PayAppLine, writes back to its SovLine: work_completed_to_date_cents = work_completed_previous_cents + work_completed_this_period_cents; materials_stored_cents = line materials_stored_cents; retainage_withheld_to_date_cents += line_retainage_cents (cascade: PayApp certify -> SovLine ledger sync)."
+          - "Recomputes Project.total_completed_and_stored_cents and Project.retainage_held_cents from SovLines (cascade -> Project derived fields)."
+          - "increments Project.version by 1."
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /pay-applications/{id}/reject"
+        actor: Architect
+        preconditions:
+          - "PayApplication.status == SUBMITTED."
+          - "X-User-ID != PayApplication.submitted_by_user_id (segregation of duties)."
+        side_effects:
+          - "Sets PayApplication.status = REJECTED. No SovLine or Project ledger mutation; the application_number it consumed is freed (next app reuses it because sequencing counts non-REJECTED apps only)."
+
+  - entity: LienWaiver
+    initial_state: PENDING
+    terminal_states: [VOID]
+    transitions:
+      - from: PENDING
+        to: EFFECTIVE
+        trigger: "POST /lien-waivers/{id}/notarize"
+        actor: Contractor
+        preconditions:
+          - "LienWaiver.status == PENDING."
+          - "For an UNCONDITIONAL_PROGRESS or UNCONDITIONAL_FINAL waiver, a RetentionRelease... no: the linked PayApplication.current_payment_due_cents has been paid — modeled here as: at least one CERTIFIED PayApplication exists whose current_payment_due_cents == this waiver's amount_cents."
+        side_effects:
+          - "Sets LienWaiver.status = EFFECTIVE."
+          - "For UNCONDITIONAL_PROGRESS/UNCONDITIONAL_FINAL only: increments matching SubcontractorCommitment.invoiced_to_date_cents (selector pinned in §1.3 commitment_invoice_sweep)."
+      - from: PENDING
+        to: VOID
+        trigger: "POST /lien-waivers/{id}/void"
+        actor: Owner
+        preconditions:
+          - "LienWaiver.status == PENDING."
+        side_effects:
+          - "Sets LienWaiver.status = VOID."
+
+  - entity: PunchListItem
+    initial_state: OPEN
+    terminal_states: []
+    transitions:
+      - from: OPEN
+        to: READY_FOR_REVIEW
+        trigger: "POST /punch-items/{id}/ready"
+        actor: Contractor
+        preconditions:
+          - "PunchListItem.status == OPEN or REOPENED."
+        side_effects:
+          - "Sets PunchListItem.status = READY_FOR_REVIEW."
+      - from: REOPENED
+        to: READY_FOR_REVIEW
+        trigger: "POST /punch-items/{id}/ready"
+        actor: Contractor
+        preconditions:
+          - "PunchListItem.status == OPEN or REOPENED."
+        side_effects:
+          - "Sets PunchListItem.status = READY_FOR_REVIEW."
+      - from: READY_FOR_REVIEW
+        to: VERIFIED
+        trigger: "POST /punch-items/{id}/verify"
+        actor: Architect
+        preconditions:
+          - "PunchListItem.status == READY_FOR_REVIEW."
+        side_effects:
+          - "Sets PunchListItem.status = VERIFIED."
+      - from: READY_FOR_REVIEW
+        to: REOPENED
+        trigger: "POST /punch-items/{id}/reopen"
+        actor: Architect
+        preconditions:
+          - "PunchListItem.status == READY_FOR_REVIEW or VERIFIED."
+        side_effects:
+          - "Sets PunchListItem.status = REOPENED (cyclic: READY_FOR_REVIEW -> REOPENED -> READY_FOR_REVIEW)."
+      - from: VERIFIED
+        to: REOPENED
+        trigger: "POST /punch-items/{id}/reopen"
+        actor: Architect
+        preconditions:
+          - "PunchListItem.status == READY_FOR_REVIEW or VERIFIED."
+        side_effects:
+          - "Sets PunchListItem.status = REOPENED; if Project.status == SUBSTANTIALLY_COMPLETE, this does NOT revert the project (substantial completion is sticky)."
+
+  - entity: Submittal
+    initial_state: PENDING
+    terminal_states: [CLOSED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /submittals/{id}/review"
+        actor: Architect
+        preconditions:
+          - "Submittal.status == PENDING."
+          - "Request body decision == APPROVED."
+        side_effects:
+          - "Sets Submittal.status = APPROVED."
+      - from: PENDING
+        to: APPROVED_AS_NOTED
+        trigger: "POST /submittals/{id}/review"
+        actor: Architect
+        preconditions:
+          - "Submittal.status == PENDING."
+          - "Request body decision == APPROVED_AS_NOTED."
+        side_effects:
+          - "Sets Submittal.status = APPROVED_AS_NOTED."
+      - from: PENDING
+        to: REVISE_AND_RESUBMIT
+        trigger: "POST /submittals/{id}/review"
+        actor: Architect
+        preconditions:
+          - "Submittal.status == PENDING."
+          - "Request body decision == REVISE_AND_RESUBMIT."
+        side_effects:
+          - "Sets Submittal.status = REVISE_AND_RESUBMIT."
+      - from: REVISE_AND_RESUBMIT
+        to: PENDING
+        trigger: "POST /submittals/{id}/resubmit"
+        actor: Contractor
+        preconditions:
+          - "Submittal.status == REVISE_AND_RESUBMIT."
+        side_effects:
+          - "Sets Submittal.status = PENDING; increments Submittal.revision by 1 (cyclic revision loop)."
+      - from: APPROVED
+        to: CLOSED
+        trigger: "POST /submittals/{id}/close"
+        actor: Architect
+        preconditions:
+          - "Submittal.status == APPROVED or APPROVED_AS_NOTED."
+        side_effects:
+          - "Sets Submittal.status = CLOSED."
+      - from: APPROVED_AS_NOTED
+        to: CLOSED
+        trigger: "POST /submittals/{id}/close"
+        actor: Architect
+        preconditions:
+          - "Submittal.status == APPROVED or APPROVED_AS_NOTED."
+        side_effects:
+          - "Sets Submittal.status = CLOSED."
+
+  - entity: Rfi
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: ANSWERED
+        trigger: "POST /rfis/{id}/answer"
+        actor: Architect
+        preconditions:
+          - "Rfi.status == OPEN."
+        side_effects:
+          - "Sets Rfi.status = ANSWERED; sets ball_in_court = CONTRACTOR; stores answer text."
+      - from: ANSWERED
+        to: CLOSED
+        trigger: "POST /rfis/{id}/close"
+        actor: Contractor
+        preconditions:
+          - "Rfi.status == ANSWERED."
+        side_effects:
+          - "Sets Rfi.status = CLOSED."
+
+  - entity: RetentionRelease
+    initial_state: REQUESTED
+    terminal_states: [APPROVED, REJECTED]
+    transitions:
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /retention-releases/{id}/approve"
+        actor: Owner
+        preconditions:
+          - "RetentionRelease.status == REQUESTED."
+          - "Parent Project.status IN {ACTIVE, SUBSTANTIALLY_COMPLETE}."
+          - "Request carries expected_project_version equal to Project.version."
+          - "amount_cents <= Project.retainage_held_cents."
+        side_effects:
+          - "Sets RetentionRelease.status = APPROVED; records approved_by_user_id = X-User-ID."
+          - "Reduces SovLines' retainage_withheld_to_date_cents by amount_cents using waterfall_release ordering (§1.3); recomputes Project.retainage_held_cents (cascade: release -> SovLine retainage drawdown -> Project derived field)."
+          - "increments Project.version by 1."
+      - from: REQUESTED
+        to: REJECTED
+        trigger: "POST /retention-releases/{id}/reject"
+        actor: Owner
+        preconditions:
+          - "RetentionRelease.status == REQUESTED."
+        side_effects:
+          - "Sets RetentionRelease.status = REJECTED. No ledger mutation."
+
+  - entity: SubcontractorCommitment
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /subcontractor-commitments/{id}/close"
+        actor: Contractor
+        preconditions:
+          - "SubcontractorCommitment.status == OPEN."
+          - "invoiced_to_date_cents == committed_amount_cents (fully invoiced)."
+        side_effects:
+          - "Sets SubcontractorCommitment.status = CLOSED."
+
+  - entity: InspectionWindow
+    initial_state: BOOKED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: BOOKED
+        to: COMPLETED
+        trigger: "POST /inspection-windows/{id}/complete"
+        actor: Architect
+        preconditions:
+          - "InspectionWindow.status == BOOKED."
+        side_effects:
+          - "Sets InspectionWindow.status = COMPLETED."
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /inspection-windows/{id}/cancel"
+        actor: Contractor
+        preconditions:
+          - "InspectionWindow.status == BOOKED."
+        side_effects:
+          - "Sets InspectionWindow.status = CANCELLED; the freed interval no longer participates in buffer-overlap checks for future bookings."
+
+# ===========================================================================
+# §1.2.1 Concurrency Rules
+# ===========================================================================
+concurrency_rules:
+  - rule_id: payapp-create-stale-project
+    parent_entity: Project
+    write_endpoint: "POST /pay-applications"
+    occ_field: "expected_project_version"
+    description: |
+      Creating a PayApplication against a Project whose version has advanced
+      since the client last observed it is rejected. A pay application is
+      computed against the schedule of values and revised contract sum as the
+      client last read them; if a ChangeOrder approval, a prior certification,
+      or a retention release has since bumped Project.version, the SOV baseline
+      this draft would supersede is stale and the create is rejected on the
+      version check.
+    error_id: ERR_STALE_PROJECT_VERSION
+    http_status: 412
+
+  - rule_id: retention-release-create-stale-project
+    parent_entity: Project
+    write_endpoint: "POST /retention-releases"
+    occ_field: "expected_project_version"
+    description: |
+      Creating a RetentionRelease against a Project whose version has advanced
+      since the client last observed it is rejected. The requested release
+      amount is sized against retainage_held_cents as the client last read it;
+      if a certification or another approved release has since changed the held
+      retainage (bumping Project.version), the request is rejected on the stale
+      version check rather than drawing down an out-of-date balance.
+    error_id: ERR_STALE_PROJECT_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: g703_line_retainage
+    trigger: "POST /pay-applications/{id}/submit (recompute of each PayAppLine.line_retainage_cents) and on PayAppLine creation preview"
+    algorithm: aggregation
+    formula: |
+      # Per PayAppLine, using the linked SovLine.retainage_pct:
+      billed_this_app = work_completed_previous_cents
+                      + work_completed_this_period_cents
+                      + materials_stored_cents
+      line_retainage_cents = round_half_up(SovLine.retainage_pct * billed_this_app)
+      # Rounding order is PINNED: round PER LINE first, then sum across lines for
+      # the G702 line-5 total. (Round-then-sum, NOT sum-then-round.)
+    input_set: "All PayAppLines belonging to this PayApplication. work_completed_previous_cents is read from the linked SovLine.work_completed_to_date_cents as of the most recently CERTIFIED prior application."
+    constants: {}
+    precision: "round_half_up at the cent level, per line, then integer-sum"
+    variants:
+      - name: progress_retainage
+        when: "Project still ACTIVE; ordinary progress billing."
+        difference: "Full retainage_pct applied to billed_this_app."
+      - name: stored_materials_only
+        when: "A line bills only materials_stored_cents with zero work_completed_this_period_cents."
+        difference: "billed_this_app still includes work_completed_previous_cents; retainage is taken on the full cumulative billed amount, not just the period increment."
+
+  - name: g702_current_payment_due
+    trigger: "POST /pay-applications/{id}/submit"
+    algorithm: aggregation
+    formula: |
+      # G702 lines 4, 5, 6, 8:
+      total_completed_and_stored_cents = sum over lines of
+          (work_completed_previous_cents + work_completed_this_period_cents + materials_stored_cents)
+      total_retainage_cents = sum over lines of line_retainage_cents   # round-per-line then sum
+      prior_certificates_cents = sum of current_payment_due_cents over PayApplications
+          for this project with status==CERTIFIED (excludes REJECTED, DRAFT, SUBMITTED)
+      current_payment_due_cents = total_completed_and_stored_cents
+          - total_retainage_cents - prior_certificates_cents
+    input_set: "This application's PayAppLines for the period totals; prior CERTIFIED applications for the project for line-8 less-previous-certificates."
+    constants: {}
+    precision: "integer cents; intermediate per-line retainage already rounded by g703_line_retainage"
+    variants:
+      - name: first_application
+        when: "No prior CERTIFIED application exists for the project."
+        difference: "prior_certificates_cents == 0; current_payment_due equals net (completed+stored - retainage)."
+      - name: subsequent_application
+        when: "One or more prior CERTIFIED applications exist."
+        difference: "prior_certificates_cents subtracts the running sum of previously certified current_payment_due amounts (chronological less-previous-certificates draw)."
+
+  - name: revised_contract_sum
+    trigger: "POST /change-orders/{id}/approve and POST /pay-applications (read-time consistency)"
+    algorithm: aggregation
+    formula: |
+      revised_contract_sum_cents = original_contract_sum_cents
+          + sum of change_order_amount_cents over ChangeOrders
+            for this project with status==APPROVED
+      # Invariant pinned by change_order_sum_invariant: after a CO approval,
+      # sum over ACTIVE SovLine.scheduled_value_cents == revised_contract_sum_cents.
+    input_set: "ChangeOrders for the project with status==APPROVED (excludes DRAFT, SUBMITTED, REJECTED)."
+    constants: {}
+    precision: "integer cents, exact"
+    variants:
+      - name: deductive_change
+        when: "A change order's change_order_amount_cents is negative."
+        difference: "revised_contract_sum_cents decreases; an ADJUST line_edit with negative delta reduces a SovLine.scheduled_value_cents (which must stay > 0)."
+
+  - name: retention_release_waterfall
+    trigger: "POST /retention-releases/{id}/approve"
+    algorithm: waterfall_allocation
+    formula: |
+      # Distribute amount_cents across ACTIVE SovLines that carry
+      # retainage_withheld_to_date_cents > 0, in ascending (item_no, created_at) order.
+      remaining = amount_cents
+      for line in ACTIVE SovLines with retainage_withheld_to_date_cents > 0,
+          ordered by (item_no ASC, created_at ASC):
+        take = min(remaining, line.retainage_withheld_to_date_cents)
+        line.retainage_withheld_to_date_cents -= take
+        remaining -= take
+        if remaining == 0: break
+      # Precondition guarantees amount_cents <= Project.retainage_held_cents, so
+      # remaining always reaches 0; no overflow bucket needed.
+      Project.retainage_held_cents = sum over ACTIVE SovLines of retainage_withheld_to_date_cents
+    input_set: "ACTIVE SovLines for the project with retainage_withheld_to_date_cents > 0."
+    constants: {}
+    precision: "integer cents; no rounding (pure subtraction)"
+    variants:
+      - name: partial_release
+        when: "amount_cents < Project.retainage_held_cents."
+        difference: "Only the lowest item_no lines are drawn down until amount is exhausted; higher item_no lines keep their retainage."
+      - name: full_release
+        when: "amount_cents == Project.retainage_held_cents."
+        difference: "Every ACTIVE SovLine's retainage_withheld_to_date_cents goes to 0; Project.retainage_held_cents becomes 0 (enables project close)."
+
+  - name: commitment_invoice_sweep
+    trigger: "POST /lien-waivers/{id}/notarize for UNCONDITIONAL_PROGRESS / UNCONDITIONAL_FINAL waivers"
+    algorithm: aggregation
+    formula: |
+      # Select the single SubcontractorCommitment to credit:
+      #   eligibility: status == OPEN AND invoiced_to_date_cents < committed_amount_cents
+      #   ranking:     (committed_amount_cents - invoiced_to_date_cents) DESC  (largest remaining balance first)
+      #   tie-break:   created_at ASC
+      #   fallback:    if no eligible commitment, no commitment is credited (waiver still becomes EFFECTIVE)
+      credit = min(waiver.amount_cents,
+                   commitment.committed_amount_cents - commitment.invoiced_to_date_cents)
+      commitment.invoiced_to_date_cents += credit
+    input_set: "OPEN SubcontractorCommitments for the project with remaining balance > 0."
+    constants: {}
+    precision: "integer cents, exact"
+    variants:
+      - name: conditional_waiver_no_sweep
+        when: "waiver_type is CONDITIONAL_PROGRESS or CONDITIONAL_FINAL."
+        difference: "No commitment credit occurs on notarize; conditional waivers do not move the invoiced ledger."
+
+# ===========================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to invoke this endpoint per §1.7 RBAC."
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "All path/body-referenced resources (project_id, sov_line_id, pay_app_id, change-order id, etc.) exist; validated left-to-right."
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: business_referential
+    check: "Body FK targets belong to the same project as the parent resource (e.g., PayAppLine.sov_line_id's SovLine.project_id == PayApplication.project_id; LienWaiver.pay_app_id's project matches LienWaiver.project_id)."
+    error_id: ERR_CROSS_PROJECT_REFERENCE
+    http_status: 422
+    applies_to: "POST /pay-app-lines, POST /lien-waivers"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined (per §1.2)."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 6
+    category: business_safety
+    check: "Segregation of duties: the user certifying or rejecting a PayApplication MUST NOT equal its submitted_by_user_id."
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 409
+    applies_to: "POST /pay-applications/{id}/certify, POST /pay-applications/{id}/reject"
+
+  - priority: 7
+    category: business_temporal
+    check: "PayApplication.application_number is exactly highest_non_rejected + 1 (or 1 if none); period_to strictly later than the prior non-REJECTED application's period_to and strictly later than this application's period_from."
+    error_id: ERR_NONSEQUENTIAL_APPLICATION
+    http_status: 422
+    applies_to: "POST /pay-applications"
+
+  - priority: 8
+    category: business_temporal
+    check: "Billing-window overlap: the half-open interval [period_from, period_to) of a new PayApplication must not overlap the window of any non-REJECTED PayApplication for the same project. Intervals [a,b) and [c,d) overlap iff a < d AND c < b; adjacency (new.period_from == prior.period_to) does NOT overlap and is allowed."
+    error_id: ERR_BILLING_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /pay-applications"
+
+  - priority: 9
+    category: business_temporal
+    check: "Inspection buffer overlap: a new InspectionWindow's CLOSED interval [scheduled_start, scheduled_end] must clear every non-CANCELLED InspectionWindow on the same project by at least buffer_minutes. Two slots conflict iff the gap between their closed intervals is strictly less than buffer_minutes (back-to-back, gap 0 < buffer, is rejected; this differs from pay-app windows where adjacency is allowed)."
+    error_id: ERR_INSPECTION_BUFFER_CONFLICT
+    http_status: 409
+    applies_to: "POST /inspection-windows"
+
+  - priority: 10
+    category: business_constraint
+    check: "On CO approval, every ADD line_edit's item_no is unique among ACTIVE SovLines; on SovLine create, item_no unique within project."
+    error_id: ERR_DUPLICATE_ITEM_NO
+    http_status: 409
+    applies_to: "POST /sov-lines, POST /change-orders/{id}/approve"
+
+  - priority: 11
+    category: business_constraint
+    check: "On CO approval, sum(scheduled_value_delta_cents over line_edits) == change_order_amount_cents."
+    error_id: ERR_LINE_EDITS_UNBALANCED
+    http_status: 422
+    applies_to: "POST /change-orders/{id}/approve"
+
+  - priority: 12
+    category: business_fiscal
+    check: "No overbilling: for every PayAppLine, (work_completed_previous_cents + work_completed_this_period_cents + materials_stored_cents) <= linked SovLine.scheduled_value_cents."
+    error_id: ERR_OVERBILLING
+    http_status: 422
+    applies_to: "POST /pay-applications/{id}/submit"
+
+  - priority: 13
+    category: business_fiscal
+    check: "RetentionRelease.amount_cents <= Project.retainage_held_cents at approval time."
+    error_id: ERR_RELEASE_EXCEEDS_HELD
+    http_status: 422
+    applies_to: "POST /retention-releases/{id}/approve"
+
+  - priority: 14
+    category: business_fiscal
+    check: "LienWaiver.amount_cents == linked PayApplication.current_payment_due_cents AND through_date == linked PayApplication.period_to."
+    error_id: ERR_WAIVER_MISMATCH
+    http_status: 422
+    applies_to: "POST /lien-waivers"
+
+  - priority: 15
+    category: business_constraint
+    check: "Linked PayApplication for a LienWaiver must be CERTIFIED."
+    error_id: ERR_PAYAPP_NOT_CERTIFIED
+    http_status: 409
+    applies_to: "POST /lien-waivers"
+
+  - priority: 16
+    category: business_constraint
+    check: "OCC: expected_project_version equals current Project.version on supersede-on-create endpoints."
+    error_id: ERR_STALE_PROJECT_VERSION
+    http_status: 412
+    applies_to: "POST /pay-applications, POST /retention-releases"
+
+  - priority: 17
+    category: business_constraint
+    check: "Field-level: required fields present, enums in range, integer/number types and sign constraints (scheduled_value_cents > 0, retainage fractions in range, amounts >= 0, scheduled_end > scheduled_start)."
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # ---- Project ----
+  - method: POST
+    path: "/projects"
+    description: Create a construction project with an original contract sum and default retainage.
+    roles: [Owner]
+    code: 201
+    input: [name, owner_user_id, original_contract_sum_cents, "default_retainage_pct?"]
+    output: Project
+    side_effects: ["Project created ACTIVE; revised_contract_sum_cents = original_contract_sum_cents; derived ledger fields 0; version=1."]
+  - method: GET
+    path: "/projects/{id}"
+    description: Fetch a project including computed ledger fields.
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: []
+    output: Project
+    side_effects: []
+  - method: GET
+    path: "/projects"
+    description: List projects (paginated).
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: Project[]
+    side_effects: []
+  - method: POST
+    path: "/projects/{id}/substantial-completion"
+    description: Mark a project substantially complete (architect), gated on punch list and a certified pay app.
+    roles: [Architect]
+    code: 200
+    input: []
+    output: Project
+    side_effects: ["status -> SUBSTANTIALLY_COMPLETE; version+1."]
+  - method: POST
+    path: "/projects/{id}/close"
+    description: Close out a substantially-complete project once retention released and commitments closed.
+    roles: [Owner]
+    code: 200
+    input: []
+    output: Project
+    side_effects: ["status -> CLOSED; version+1."]
+
+  # ---- SovLine ----
+  - method: POST
+    path: "/sov-lines"
+    description: Add a schedule-of-values line to a project (G703 row).
+    roles: [Contractor]
+    code: 201
+    input: [project_id, item_no, description, scheduled_value_cents]
+    output: SovLine
+    side_effects: ["SovLine ACTIVE; retainage_pct copied from Project.default_retainage_pct; computed billing fields 0."]
+  - method: GET
+    path: "/sov-lines/{id}"
+    description: Fetch a single schedule-of-values line.
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: []
+    output: SovLine
+    side_effects: []
+  - method: GET
+    path: "/sov-lines"
+    description: List schedule-of-values lines, filterable by project_id (FK reverse-reachability for SovLine.project_id).
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: ["project_id?", "status?", "limit?", "offset?"]
+    output: SovLine[]
+    side_effects: []
+
+  # ---- ChangeOrder ----
+  - method: POST
+    path: "/change-orders"
+    description: Draft a change order with a net amount and a set of SOV line edits.
+    roles: [Contractor]
+    code: 201
+    input: [project_id, co_number, change_order_amount_cents, line_edits]
+    output: ChangeOrder
+    side_effects: ["ChangeOrder DRAFT."]
+  - method: GET
+    path: "/change-orders/{id}"
+    description: Fetch a change order.
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: []
+    output: ChangeOrder
+    side_effects: []
+  - method: GET
+    path: "/change-orders"
+    description: List change orders, filterable by project_id (FK reverse-reachability for ChangeOrder.project_id).
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: ["project_id?", "status?", "limit?", "offset?"]
+    output: ChangeOrder[]
+    side_effects: []
+  - method: POST
+    path: "/change-orders/{id}/submit"
+    description: Contractor submits a draft change order for owner approval.
+    roles: [Contractor]
+    code: 200
+    input: []
+    output: ChangeOrder
+    side_effects: ["status DRAFT->SUBMITTED; submitted_by_user_id recorded."]
+  - method: POST
+    path: "/change-orders/{id}/approve"
+    description: Owner approves a submitted change order; applies line edits and recomputes contract sum.
+    roles: [Owner]
+    code: 200
+    input: [expected_project_version]
+    output: ChangeOrder
+    side_effects: ["status->APPROVED; SovLines added/adjusted; Project.revised_contract_sum_cents recomputed; Project.version+1."]
+  - method: POST
+    path: "/change-orders/{id}/reject"
+    description: Owner rejects a submitted change order; no ledger change.
+    roles: [Owner]
+    code: 200
+    input: []
+    output: ChangeOrder
+    side_effects: ["status->REJECTED."]
+
+  # ---- PayApplication + PayAppLine ----
+  - method: POST
+    path: "/pay-applications"
+    description: Create a G702/G703 pay application draft against a project (supersede-on-create, OCC-guarded).
+    roles: [Contractor]
+    code: 201
+    input: [project_id, application_number, period_from, period_to, expected_project_version]
+    output: PayApplication
+    side_effects: ["PayApplication DRAFT; OCC checks expected_project_version against Project.version."]
+  - method: GET
+    path: "/pay-applications/{id}"
+    description: Fetch a pay application with G702 totals.
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: []
+    output: PayApplication
+    side_effects: []
+  - method: GET
+    path: "/pay-applications"
+    description: List pay applications, filterable by project_id (FK reverse-reachability for PayApplication.project_id).
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: ["project_id?", "status?", "limit?", "offset?"]
+    output: PayApplication[]
+    side_effects: []
+  - method: POST
+    path: "/pay-app-lines"
+    description: Add a G703 billing line to a DRAFT pay application for one SOV line.
+    roles: [Contractor]
+    code: 201
+    input: [pay_app_id, sov_line_id, work_completed_this_period_cents, "materials_stored_cents?"]
+    output: PayAppLine
+    side_effects: ["PayAppLine created; work_completed_previous_cents snapshotted from SovLine; line_retainage_cents computed."]
+  - method: GET
+    path: "/pay-app-lines/{id}"
+    description: Fetch a single G703 pay-app line.
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: []
+    output: PayAppLine
+    side_effects: []
+  - method: GET
+    path: "/pay-app-lines"
+    description: List pay-app lines, filterable by pay_app_id and sov_line_id (FK reverse-reachability for both FKs).
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: ["pay_app_id?", "sov_line_id?", "limit?", "offset?"]
+    output: PayAppLine[]
+    side_effects: []
+  - method: POST
+    path: "/pay-applications/{id}/submit"
+    description: Contractor submits a pay application; computes G702 totals and enforces no-overbilling.
+    roles: [Contractor]
+    code: 200
+    input: []
+    output: PayApplication
+    side_effects: ["status->SUBMITTED; totals 4/5/6 computed; submitted_by_user_id recorded."]
+  - method: POST
+    path: "/pay-applications/{id}/certify"
+    description: Architect certifies a submitted pay application; writes SOV ledger and project derived fields.
+    roles: [Architect]
+    code: 200
+    input: []
+    output: PayApplication
+    side_effects: ["status->CERTIFIED; SovLine work/retainage ledger updated; Project derived fields recomputed; Project.version+1; certified_by_user_id recorded."]
+  - method: POST
+    path: "/pay-applications/{id}/reject"
+    description: Architect rejects a submitted pay application; frees its application_number.
+    roles: [Architect]
+    code: 200
+    input: []
+    output: PayApplication
+    side_effects: ["status->REJECTED; no ledger mutation."]
+
+  # ---- SubcontractorCommitment ----
+  - method: POST
+    path: "/subcontractor-commitments"
+    description: Record a subcontractor commitment under a project.
+    roles: [Contractor]
+    code: 201
+    input: [project_id, subcontractor_name, committed_amount_cents]
+    output: SubcontractorCommitment
+    side_effects: ["Commitment OPEN; invoiced_to_date_cents=0."]
+  - method: GET
+    path: "/subcontractor-commitments/{id}"
+    description: Fetch a subcontractor commitment.
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: []
+    output: SubcontractorCommitment
+    side_effects: []
+  - method: GET
+    path: "/subcontractor-commitments"
+    description: List commitments, filterable by project_id (FK reverse-reachability for SubcontractorCommitment.project_id).
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: ["project_id?", "status?", "limit?", "offset?"]
+    output: SubcontractorCommitment[]
+    side_effects: []
+  - method: POST
+    path: "/subcontractor-commitments/{id}/close"
+    description: Close a fully-invoiced subcontractor commitment.
+    roles: [Contractor]
+    code: 200
+    input: []
+    output: SubcontractorCommitment
+    side_effects: ["status OPEN->CLOSED."]
+
+  # ---- Rfi ----
+  - method: POST
+    path: "/rfis"
+    description: Log a request for information against a project.
+    roles: [Contractor]
+    code: 201
+    input: [project_id, subject, question]
+    output: Rfi
+    side_effects: ["Rfi OPEN; ball_in_court=ARCHITECT."]
+  - method: GET
+    path: "/rfis"
+    description: List RFIs, filterable by project_id (FK reverse-reachability for Rfi.project_id).
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: ["project_id?", "status?", "ball_in_court?", "limit?", "offset?"]
+    output: Rfi[]
+    side_effects: []
+  - method: GET
+    path: "/rfis/{id}"
+    description: Fetch a single RFI.
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: []
+    output: Rfi
+    side_effects: []
+  - method: POST
+    path: "/rfis/{id}/answer"
+    description: Architect answers an open RFI; passes ball to contractor.
+    roles: [Architect]
+    code: 200
+    input: [answer]
+    output: Rfi
+    side_effects: ["status OPEN->ANSWERED; ball_in_court=CONTRACTOR; answer stored."]
+  - method: POST
+    path: "/rfis/{id}/close"
+    description: Contractor closes an answered RFI.
+    roles: [Contractor]
+    code: 200
+    input: []
+    output: Rfi
+    side_effects: ["status ANSWERED->CLOSED."]
+
+  # ---- Submittal ----
+  - method: POST
+    path: "/submittals"
+    description: Log a submittal against a project.
+    roles: [Contractor]
+    code: 201
+    input: [project_id, spec_section, title]
+    output: Submittal
+    side_effects: ["Submittal PENDING; revision=0."]
+  - method: GET
+    path: "/submittals"
+    description: List submittals, filterable by project_id (FK reverse-reachability for Submittal.project_id).
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: ["project_id?", "status?", "limit?", "offset?"]
+    output: Submittal[]
+    side_effects: []
+  - method: GET
+    path: "/submittals/{id}"
+    description: Fetch a submittal.
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: []
+    output: Submittal
+    side_effects: []
+  - method: POST
+    path: "/submittals/{id}/review"
+    description: Architect reviews a pending submittal with a decision.
+    roles: [Architect]
+    code: 200
+    input: [decision]
+    output: Submittal
+    side_effects: ["status PENDING -> {APPROVED|APPROVED_AS_NOTED|REVISE_AND_RESUBMIT} per decision."]
+  - method: POST
+    path: "/submittals/{id}/resubmit"
+    description: Contractor resubmits a revise-and-resubmit submittal; bumps revision.
+    roles: [Contractor]
+    code: 200
+    input: []
+    output: Submittal
+    side_effects: ["status REVISE_AND_RESUBMIT->PENDING; revision+1."]
+  - method: POST
+    path: "/submittals/{id}/close"
+    description: Architect closes an approved submittal.
+    roles: [Architect]
+    code: 200
+    input: []
+    output: Submittal
+    side_effects: ["status {APPROVED|APPROVED_AS_NOTED}->CLOSED."]
+
+  # ---- LienWaiver ----
+  - method: POST
+    path: "/lien-waivers"
+    description: Record a conditional/unconditional, progress/final lien waiver tied to a certified pay application.
+    roles: [Contractor]
+    code: 201
+    input: [project_id, pay_app_id, waiver_type, through_date, amount_cents]
+    output: LienWaiver
+    side_effects: ["LienWaiver PENDING; validates against linked CERTIFIED PayApplication."]
+  - method: GET
+    path: "/lien-waivers"
+    description: List lien waivers, filterable by project_id and pay_app_id (FK reverse-reachability for both FKs).
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: ["project_id?", "pay_app_id?", "status?", "limit?", "offset?"]
+    output: LienWaiver[]
+    side_effects: []
+  - method: GET
+    path: "/lien-waivers/{id}"
+    description: Fetch a lien waiver.
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: []
+    output: LienWaiver
+    side_effects: []
+  - method: POST
+    path: "/lien-waivers/{id}/notarize"
+    description: Make a pending lien waiver effective; unconditional waivers sweep a subcontractor commitment.
+    roles: [Contractor]
+    code: 200
+    input: []
+    output: LienWaiver
+    side_effects: ["status PENDING->EFFECTIVE; for unconditional waivers, credits selected SubcontractorCommitment.invoiced_to_date_cents."]
+  - method: POST
+    path: "/lien-waivers/{id}/void"
+    description: Owner voids a pending lien waiver.
+    roles: [Owner]
+    code: 200
+    input: []
+    output: LienWaiver
+    side_effects: ["status PENDING->VOID."]
+
+  # ---- PunchListItem ----
+  - method: POST
+    path: "/punch-items"
+    description: Create a punch list item on a project.
+    roles: [Architect]
+    code: 201
+    input: [project_id, location, description, "severity?"]
+    output: PunchListItem
+    side_effects: ["PunchListItem OPEN."]
+  - method: GET
+    path: "/punch-items"
+    description: List punch items, filterable by project_id (FK reverse-reachability for PunchListItem.project_id).
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: ["project_id?", "status?", "limit?", "offset?"]
+    output: PunchListItem[]
+    side_effects: []
+  - method: GET
+    path: "/punch-items/{id}"
+    description: Fetch a punch item.
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: []
+    output: PunchListItem
+    side_effects: []
+  - method: POST
+    path: "/punch-items/{id}/ready"
+    description: Contractor marks a punch item ready for review.
+    roles: [Contractor]
+    code: 200
+    input: []
+    output: PunchListItem
+    side_effects: ["status {OPEN|REOPENED}->READY_FOR_REVIEW."]
+  - method: POST
+    path: "/punch-items/{id}/verify"
+    description: Architect verifies a punch item ready for review.
+    roles: [Architect]
+    code: 200
+    input: []
+    output: PunchListItem
+    side_effects: ["status READY_FOR_REVIEW->VERIFIED."]
+  - method: POST
+    path: "/punch-items/{id}/reopen"
+    description: Architect reopens a punch item (cyclic).
+    roles: [Architect]
+    code: 200
+    input: []
+    output: PunchListItem
+    side_effects: ["status {READY_FOR_REVIEW|VERIFIED}->REOPENED."]
+
+  # ---- InspectionWindow ----
+  - method: POST
+    path: "/inspection-windows"
+    description: Book an on-site inspection slot; rejects bookings within buffer_minutes of an existing non-CANCELLED slot.
+    roles: [Contractor]
+    code: 201
+    input: [project_id, inspector_name, scheduled_start, scheduled_end, "buffer_minutes?"]
+    output: InspectionWindow
+    side_effects: ["InspectionWindow BOOKED; buffer-overlap check against non-CANCELLED slots on the project."]
+  - method: GET
+    path: "/inspection-windows"
+    description: List inspection windows, filterable by project_id (FK reverse-reachability for InspectionWindow.project_id).
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: ["project_id?", "status?", "limit?", "offset?"]
+    output: InspectionWindow[]
+    side_effects: []
+  - method: GET
+    path: "/inspection-windows/{id}"
+    description: Fetch an inspection window.
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: []
+    output: InspectionWindow
+    side_effects: []
+  - method: POST
+    path: "/inspection-windows/{id}/complete"
+    description: Architect marks an inspection slot completed.
+    roles: [Architect]
+    code: 200
+    input: []
+    output: InspectionWindow
+    side_effects: ["status BOOKED->COMPLETED."]
+  - method: POST
+    path: "/inspection-windows/{id}/cancel"
+    description: Contractor cancels a booked inspection slot, freeing its interval.
+    roles: [Contractor]
+    code: 200
+    input: []
+    output: InspectionWindow
+    side_effects: ["status BOOKED->CANCELLED; interval no longer blocks future bookings."]
+
+  # ---- RetentionRelease ----
+  - method: POST
+    path: "/retention-releases"
+    description: Request a retention release on a project (supersede-on-create, OCC-guarded).
+    roles: [Contractor]
+    code: 201
+    input: [project_id, amount_cents, expected_project_version]
+    output: RetentionRelease
+    side_effects: ["RetentionRelease REQUESTED; OCC checks expected_project_version against Project.version."]
+  - method: GET
+    path: "/retention-releases"
+    description: List retention releases, filterable by project_id (FK reverse-reachability for RetentionRelease.project_id).
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: ["project_id?", "status?", "limit?", "offset?"]
+    output: RetentionRelease[]
+    side_effects: []
+  - method: GET
+    path: "/retention-releases/{id}"
+    description: Fetch a retention release.
+    roles: [Owner, Contractor, Architect]
+    code: 200
+    input: []
+    output: RetentionRelease
+    side_effects: []
+  - method: POST
+    path: "/retention-releases/{id}/approve"
+    description: Owner approves a retention release; draws down SOV retainage via waterfall.
+    roles: [Owner]
+    code: 200
+    input: [expected_project_version]
+    output: RetentionRelease
+    side_effects: ["status->APPROVED; SovLine retainage drawn down by waterfall; Project.retainage_held_cents recomputed; Project.version+1."]
+  - method: POST
+    path: "/retention-releases/{id}/reject"
+    description: Owner rejects a retention release.
+    roles: [Owner]
+    code: 200
+    input: []
+    output: RetentionRelease
+    side_effects: ["status->REJECTED."]
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for this endpoint per RBAC."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced resource (project, sov line, pay app, change order, etc.) does not exist."
+  - id: ERR_CROSS_PROJECT_REFERENCE
+    http: 422
+    condition: "A body FK points to a resource in a different project than the parent (e.g., PayAppLine.sov_line_id not in the pay app's project; lien waiver pay_app_id in a different project)."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not defined from the target resource's current state."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 409
+    condition: "Same opaque user attempts to certify/reject a pay application they submitted."
+  - id: ERR_NONSEQUENTIAL_APPLICATION
+    http: 422
+    condition: "application_number not exactly highest_non_rejected+1, or period_to not strictly after period_from / the prior non-REJECTED application's period_to."
+  - id: ERR_BILLING_PERIOD_OVERLAP
+    http: 409
+    condition: "A new pay application's half-open billing window [period_from, period_to) overlaps a non-REJECTED application's window on the same project."
+  - id: ERR_INSPECTION_BUFFER_CONFLICT
+    http: 409
+    condition: "A new inspection window's closed interval is within buffer_minutes of a non-CANCELLED window on the same project."
+  - id: ERR_DUPLICATE_ITEM_NO
+    http: 409
+    condition: "item_no collides with an existing ACTIVE SovLine in the project (on create or CO ADD)."
+  - id: ERR_LINE_EDITS_UNBALANCED
+    http: 422
+    condition: "Sum of change-order line_edit deltas != change_order_amount_cents."
+  - id: ERR_OVERBILLING
+    http: 422
+    condition: "A pay-app line bills more than its SOV line's scheduled value (previous+this+stored > scheduled)."
+  - id: ERR_RELEASE_EXCEEDS_HELD
+    http: 422
+    condition: "Retention release amount exceeds Project.retainage_held_cents."
+  - id: ERR_WAIVER_MISMATCH
+    http: 422
+    condition: "Lien waiver amount_cents or through_date does not match the linked pay application's current_payment_due_cents / period_to."
+  - id: ERR_PAYAPP_NOT_CERTIFIED
+    http: 409
+    condition: "Lien waiver references a pay application that is not CERTIFIED."
+  - id: ERR_STALE_PROJECT_VERSION
+    http: 412
+    condition: "expected_project_version does not match current Project.version on a supersede-on-create endpoint."
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Missing required field, bad enum, type/sign violation, or out-of-range numeric (e.g. scheduled_value_cents <= 0, retainage fraction out of range)."
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: Owner
+    description: Project owner / their representative; creates projects, approves change orders, voids waivers, approves retention releases, closes the project.
+    identity: opaque
+    exclusive_operations:
+      - "POST /projects"
+      - "POST /projects/{id}/close"
+      - "POST /change-orders/{id}/approve"
+      - "POST /change-orders/{id}/reject"
+      - "POST /lien-waivers/{id}/void"
+      - "POST /retention-releases/{id}/approve"
+      - "POST /retention-releases/{id}/reject"
+    shared_operations:
+      - "GET (all read endpoints)"
+
+  - name: Contractor
+    description: General contractor; builds the SOV, drafts/submits change orders and pay applications, records commitments/RFIs/submittals/waivers/punch-readiness, requests retention release.
+    identity: opaque
+    exclusive_operations:
+      - "POST /sov-lines"
+      - "POST /change-orders"
+      - "POST /change-orders/{id}/submit"
+      - "POST /pay-applications"
+      - "POST /pay-app-lines"
+      - "POST /pay-applications/{id}/submit"
+      - "POST /subcontractor-commitments"
+      - "POST /subcontractor-commitments/{id}/close"
+      - "POST /rfis"
+      - "POST /rfis/{id}/close"
+      - "POST /submittals"
+      - "POST /submittals/{id}/resubmit"
+      - "POST /lien-waivers"
+      - "POST /lien-waivers/{id}/notarize"
+      - "POST /punch-items/{id}/ready"
+      - "POST /inspection-windows"
+      - "POST /inspection-windows/{id}/cancel"
+      - "POST /retention-releases"
+    shared_operations:
+      - "GET (all read endpoints)"
+
+  - name: Architect
+    description: Architect / design professional; certifies/rejects pay applications, answers RFIs, reviews/closes submittals, creates and verifies/reopens punch items, marks substantial completion.
+    identity: opaque
+    exclusive_operations:
+      - "POST /pay-applications/{id}/certify"
+      - "POST /pay-applications/{id}/reject"
+      - "POST /projects/{id}/substantial-completion"
+      - "POST /rfis/{id}/answer"
+      - "POST /submittals/{id}/review"
+      - "POST /submittals/{id}/close"
+      - "POST /punch-items"
+      - "POST /punch-items/{id}/verify"
+      - "POST /punch-items/{id}/reopen"
+      - "POST /inspection-windows/{id}/complete"
+    shared_operations:
+      - "GET (all read endpoints)"

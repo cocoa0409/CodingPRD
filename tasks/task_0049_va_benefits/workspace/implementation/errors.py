@@ -1,0 +1,31 @@
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Error catalog (id -> http status) per PRD §5 / SCAFFOLD §1.6.
+# Verbatim from the PRD §5 error table.
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_FORBIDDEN = ("ERR_FORBIDDEN", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_INVALID_REQUEST = ("ERR_INVALID_REQUEST", 422)
+ERR_DUPLICATE_FILE_NUMBER = ("ERR_DUPLICATE_FILE_NUMBER", 409)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_STALE_VERSION = ("ERR_STALE_VERSION", 412)
+ERR_CLAIM_HAS_NO_CONDITIONS = ("ERR_CLAIM_HAS_NO_CONDITIONS", 409)
+ERR_CONDITION_UNRATED = ("ERR_CONDITION_UNRATED", 409)
+ERR_APPEAL_EXHAUSTED = ("ERR_APPEAL_EXHAUSTED", 409)
+ERR_NO_GI_BILL_ELIGIBILITY = ("ERR_NO_GI_BILL_ELIGIBILITY", 409)
+ERR_ENROLLMENT_OVERLAP = ("ERR_ENROLLMENT_OVERLAP", 409)
+ERR_YELLOW_RIBBON_UNAVAILABLE = ("ERR_YELLOW_RIBBON_UNAVAILABLE", 409)
+ERR_VOC_REHAB_INELIGIBLE = ("ERR_VOC_REHAB_INELIGIBLE", 409)
+ERR_ENTITLEMENT_EXHAUSTED = ("ERR_ENTITLEMENT_EXHAUSTED", 409)
+ERR_NO_COMPENSABLE_RATING = ("ERR_NO_COMPENSABLE_RATING", 409)
+
+
+def err(code_tuple, message=None):
+    eid, status = code_tuple
+    return ApiError(eid, status, message)

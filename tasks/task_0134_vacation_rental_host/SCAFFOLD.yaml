@@ -1,0 +1,1718 @@
+scenario: "Vacation Rental Host (Airbnb-style): multi-channel calendar sync, dynamic nightly pricing, cleaning/pet fee, minimum-night/gap rules, security deposit/damage claim, guest screening, payout schedule, cancellation tiers"
+domain_name: "vacation-rental-host"
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: "Temporal windowing"
+  secondary_archetype: "Pricing engine"
+  complexity_layers:
+    - "Dual-variant calculation"     # cancellation refund (provisional quote vs final) and payout (estimate vs actual)
+    - "Cascading side effects"       # cancel booking -> release block -> reverse payout -> close deposit -> void claim
+    - "Optimistic concurrency"       # CREATE-with-supersede of a CalendarBlock against a stale Listing.calendar_version
+    - "Rate / threshold triggers"    # cancellation-tier lead-time breakpoints; min-night / gap-night thresholds
+
+  entity_topology: graph
+  # Listing is the hub; Booking links Guest + Listing + CalendarBlock; Payout/SecurityDeposit/
+  # DamageClaim/ScreeningResult hang off Booking via FK; ImportedReservation links ChannelConnection
+  # -> CalendarBlock. Cross-aggregate FK references rather than a single nesting tree.
+
+  state_machine_shape: branching
+  # Booking forks at SCREENING (APPROVED vs DECLINED) and carries a revision cycle
+  # (SCREENING -> REQUESTED on host info-request); DamageClaim carries a dispute cycle.
+
+  relationship_patterns:
+    - one_to_many        # Listing -> RatePlan, Listing -> ChannelConnection, Listing -> CalendarBlock, Listing -> Booking
+    - cross_aggregate    # Booking -> Guest, Booking -> CalendarBlock; Payout -> Booking; DamageClaim -> SecurityDeposit
+    - polymorphic        # CalendarBlock.source distinguishes BOOKING / MANUAL / IMPORTED origins
+
+  role_model: peer_roles
+  # Host owns Listings/RatePlans/Channels and reviews screenings/claims; Guest owns own Bookings
+  # and files disputes; PlatformAdmin (opaque) runs sync jobs, payout release, and clock control.
+
+  consistency_model: immediate
+  # Every cascade (cancel chain, claim settlement, payout reversal) is atomic within its request.
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: Host
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Host login / contact email"
+        constraints: "unique, non-empty"
+      - name: display_name
+        type: string
+        source: input
+        description: "Host public name"
+      - name: payout_method
+        type: enum
+        source: input
+        description: "Where host payouts are sent"
+        default: "BANK_TRANSFER"
+        constraints: "one of {BANK_TRANSFER, PAYPAL}"
+
+  - name: Guest
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Guest contact email"
+        constraints: "unique, non-empty"
+      - name: full_name
+        type: string
+        source: input
+        description: "Guest legal name"
+      - name: govt_id_verified
+        type: boolean
+        source: input
+        description: "Whether the guest completed government-ID verification"
+        default: false
+      - name: prior_cancellations
+        type: integer
+        source: input
+        description: "Count of guest-initiated cancellations in trailing 12 months, used by screening"
+        default: 0
+        constraints: ">= 0"
+      - name: chargeback_flag
+        type: boolean
+        source: input
+        description: "Whether the guest has an unresolved payment chargeback on file"
+        default: false
+      - name: risk_score
+        type: number
+        source: computed
+        description: "Computed weighted screening risk score; recomputed by guest_risk_score on each screening run (see §1.3)"
+        constraints: "0.00..100.00, 2 decimals"
+
+  - name: Listing
+    parent: null
+    common_fields: true
+    fields:
+      - name: host_id
+        type: string
+        source: input
+        description: "FK -> Host.id; owning host"
+      - name: title
+        type: string
+        source: input
+        description: "Listing title"
+      - name: base_nightly_rate_cents
+        type: integer
+        source: input
+        description: "Default nightly rate in cents before rate-plan multipliers"
+        constraints: "> 0"
+      - name: cleaning_fee_cents
+        type: integer
+        source: input
+        description: "Flat cleaning fee added once per booking"
+        constraints: ">= 0"
+      - name: pet_fee_cents
+        type: integer
+        source: input
+        description: "Flat fee added once per booking when pets_count > 0"
+        constraints: ">= 0"
+        default: 0
+      - name: tax_rate_bps
+        type: integer
+        source: input
+        description: "Occupancy tax rate in basis points applied to (nightly subtotal + fees)"
+        constraints: "0..2000"
+        default: 0
+      - name: min_nights
+        type: integer
+        source: input
+        description: "Minimum stay length; a booking's nights must be >= min_nights"
+        constraints: ">= 1"
+        default: 1
+      - name: gap_nights
+        type: integer
+        source: input
+        description: "Required turnaround buffer (nights) between any two ACTIVE CalendarBlocks on this listing"
+        constraints: ">= 0"
+        default: 0
+      - name: cancellation_tier
+        type: enum
+        source: input
+        description: "Refund policy tier governing cancellation_refund (see §1.3)"
+        default: "MODERATE"
+        constraints: "one of {FLEXIBLE, MODERATE, STRICT}"
+      - name: security_deposit_cents
+        type: integer
+        source: input
+        description: "Refundable deposit authorized per confirmed booking"
+        constraints: ">= 0"
+        default: 0
+      - name: platform_commission_bps
+        type: integer
+        source: input
+        description: "Platform commission in basis points withheld from the host payout"
+        constraints: "0..3000"
+        default: 1500
+      - name: payout_delay_days
+        type: integer
+        source: input
+        description: "Days after checkout before a payout becomes RELEASE-eligible"
+        constraints: ">= 0"
+        default: 1
+      - name: calendar_version
+        type: integer
+        source: system
+        description: "OCC counter advanced on every ACTIVE CalendarBlock create/release on this listing; distinct from the common version field"
+        default: 1
+      - name: status
+        type: enum
+        source: system
+        description: "Listing availability state (see §1.2)"
+        default: "DRAFT"
+        constraints: "one of {DRAFT, LISTED, SNOOZED}"
+
+  - name: RatePlan
+    parent: Listing
+    common_fields: true
+    fields:
+      - name: listing_id
+        type: string
+        source: input
+        description: "FK -> Listing.id; listing this seasonal rate window applies to"
+      - name: label
+        type: string
+        source: input
+        description: "Human label e.g. PEAK_SUMMER"
+      - name: window_start
+        type: datetime
+        source: input
+        description: "Inclusive first date this plan applies (date, closed interval)"
+      - name: window_end
+        type: datetime
+        source: input
+        description: "Inclusive last date this plan applies (date, closed interval)"
+      - name: seasonal_multiplier_bps
+        type: integer
+        source: input
+        description: "Seasonal multiplier in basis points applied to base_nightly_rate (10000 = 1.0x)"
+        constraints: "1..50000"
+      - name: weekend_multiplier_bps
+        type: integer
+        source: input
+        description: "Additional multiplier in basis points for Fri/Sat nights (10000 = 1.0x)"
+        constraints: "1..50000"
+        default: 10000
+
+  - name: ChannelConnection
+    parent: Listing
+    common_fields: true
+    fields:
+      - name: listing_id
+        type: string
+        source: input
+        description: "FK -> Listing.id; listing whose calendar this channel mirrors"
+      - name: channel
+        type: enum
+        source: input
+        description: "External channel identity"
+        constraints: "one of {AIRBNB, VRBO, BOOKINGCOM, DIRECT}"
+      - name: status
+        type: enum
+        source: system
+        description: "Connection sync state (see §1.2)"
+        default: "DISCONNECTED"
+        constraints: "one of {DISCONNECTED, CONNECTED, SYNCING, ERROR}"
+      - name: pending_sync_count
+        type: integer
+        source: computed
+        description: "Number of local calendar changes not yet pushed to the channel; bumped by CalendarBlock create/release side effects, cleared on SYNC completion"
+        default: 0
+        constraints: ">= 0"
+      - name: last_synced_at
+        type: datetime
+        source: system
+        description: "Timestamp of last successful sync; null until first sync"
+
+  - name: CalendarBlock
+    parent: Listing
+    common_fields: true
+    fields:
+      - name: listing_id
+        type: string
+        source: input
+        description: "FK -> Listing.id; listing whose calendar this interval occupies"
+      - name: source
+        type: enum
+        source: input
+        description: "Origin of the block (polymorphic)"
+        constraints: "one of {BOOKING, MANUAL, IMPORTED}"
+      - name: start_date
+        type: datetime
+        source: input
+        description: "Check-in date; interval is half-open [start_date, end_date)"
+      - name: end_date
+        type: datetime
+        source: input
+        description: "Check-out date (exclusive); end_date > start_date"
+      - name: status
+        type: enum
+        source: system
+        description: "Block lifecycle (see §1.2)"
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, RELEASED}"
+
+  - name: ScreeningResult
+    parent: Booking
+    common_fields: true
+    fields:
+      - name: booking_id
+        type: string
+        source: input
+        description: "FK -> Booking.id; booking request being screened"
+      - name: guest_id
+        type: string
+        source: input
+        description: "FK -> Guest.id; guest under screening"
+      - name: computed_risk_score
+        type: number
+        source: computed
+        description: "Snapshot of guest_risk_score at screening time (see §1.3)"
+        constraints: "0.00..100.00, 2 decimals"
+      - name: status
+        type: enum
+        source: system
+        description: "Screening outcome (see §1.2)"
+        default: "PENDING"
+        constraints: "one of {PENDING, PASSED, FAILED}"
+      - name: failure_reason
+        type: enum
+        source: computed
+        description: "Set when status=FAILED; the dominant disqualifier"
+        constraints: "one of {NONE, ID_UNVERIFIED, CHARGEBACK, RISK_THRESHOLD}"
+        default: "NONE"
+
+  - name: Booking
+    parent: null
+    common_fields: true
+    fields:
+      - name: listing_id
+        type: string
+        source: input
+        description: "FK -> Listing.id; booked listing"
+      - name: guest_id
+        type: string
+        source: input
+        description: "FK -> Guest.id; booking guest"
+      - name: calendar_block_id
+        type: string
+        source: system
+        description: "FK -> CalendarBlock.id; the ACTIVE block reserved for this booking (created on request); null after the block is RELEASED"
+      - name: check_in
+        type: datetime
+        source: input
+        description: "Check-in date"
+      - name: check_out
+        type: datetime
+        source: input
+        description: "Check-out date (exclusive); must be > check_in"
+      - name: nights
+        type: integer
+        source: computed
+        description: "Day count = (check_out - check_in) in nights; must be >= listing.min_nights"
+        constraints: ">= 1"
+      - name: pets_count
+        type: integer
+        source: input
+        description: "Number of pets; triggers pet_fee when > 0"
+        default: 0
+        constraints: ">= 0"
+      - name: nightly_subtotal_cents
+        type: integer
+        source: computed
+        description: "Sum of per-night priced rates; output of nightly_pricing (see §1.3)"
+      - name: fees_cents
+        type: integer
+        source: computed
+        description: "cleaning_fee + (pet_fee if pets) ; component of booking_total"
+      - name: tax_cents
+        type: integer
+        source: computed
+        description: "Occupancy tax; component of booking_total"
+      - name: total_cents
+        type: integer
+        source: computed
+        description: "Guest grand total; output of booking_total (see §1.3)"
+      - name: cancellation_tier_snapshot
+        type: enum
+        source: system
+        description: "Copy of listing.cancellation_tier taken at request time so refunds are stable if the listing later changes tier"
+        constraints: "one of {FLEXIBLE, MODERATE, STRICT}"
+      - name: refund_cents
+        type: integer
+        source: computed
+        description: "Final settled guest refund; output of cancellation_refund FINAL variant (see §1.3); 0 until cancelled"
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Booking lifecycle (see §1.2)"
+        default: "REQUESTED"
+        constraints: "one of {REQUESTED, SCREENING, APPROVED, DECLINED, CONFIRMED, IN_STAY, COMPLETED, CANCELLED}"
+
+  - name: SecurityDeposit
+    parent: Booking
+    common_fields: true
+    fields:
+      - name: booking_id
+        type: string
+        source: input
+        description: "FK -> Booking.id; booking this deposit secures"
+      - name: authorized_cents
+        type: integer
+        source: system
+        description: "Amount authorized at confirmation = listing.security_deposit_cents snapshot"
+        constraints: ">= 0"
+      - name: held_cents
+        type: integer
+        source: computed
+        description: "Currently held amount; reduced as approved DamageClaims debit it (see §1.3 damage_claim_settlement)"
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "Deposit lifecycle (see §1.2)"
+        default: "AUTHORIZED"
+        constraints: "one of {AUTHORIZED, CLAIM_OPEN, SETTLED, RELEASED}"
+
+  - name: DamageClaim
+    parent: SecurityDeposit
+    common_fields: true
+    fields:
+      - name: security_deposit_id
+        type: string
+        source: input
+        description: "FK -> SecurityDeposit.id; deposit this claim draws against"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Amount the host claims for damages"
+        constraints: "> 0"
+      - name: approved_cents
+        type: integer
+        source: computed
+        description: "Amount actually approved against the deposit; output of damage_claim_settlement (see §1.3)"
+        default: 0
+        constraints: ">= 0"
+      - name: reason
+        type: string
+        source: input
+        description: "Host description of the damage"
+      - name: status
+        type: enum
+        source: system
+        description: "Claim lifecycle (see §1.2)"
+        default: "FILED"
+        constraints: "one of {FILED, UNDER_REVIEW, APPROVED, DISPUTED, DENIED, VOID}"
+
+  - name: Payout
+    parent: Booking
+    common_fields: true
+    fields:
+      - name: booking_id
+        type: string
+        source: input
+        description: "FK -> Booking.id; booking this payout settles"
+      - name: host_id
+        type: string
+        source: input
+        description: "FK -> Host.id; payout recipient"
+      - name: estimated_cents
+        type: integer
+        source: computed
+        description: "Host net estimated at confirmation; output of payout_amount ESTIMATE variant (see §1.3)"
+        constraints: ">= 0"
+      - name: actual_cents
+        type: integer
+        source: computed
+        description: "Host net at release after deposit deductions; output of payout_amount ACTUAL variant (see §1.3); 0 until RELEASED"
+        default: 0
+        constraints: ">= 0"
+      - name: release_after
+        type: datetime
+        source: system
+        description: "Earliest UTC instant the payout may be RELEASED = checkout + listing.payout_delay_days"
+      - name: status
+        type: enum
+        source: system
+        description: "Payout lifecycle (see §1.2)"
+        default: "SCHEDULED"
+        constraints: "one of {SCHEDULED, HELD, RELEASED, PAID, REVERSED}"
+
+  - name: ImportedReservation
+    parent: ChannelConnection
+    common_fields: true
+    fields:
+      - name: channel_connection_id
+        type: string
+        source: input
+        description: "FK -> ChannelConnection.id; channel the reservation arrived on"
+      - name: calendar_block_id
+        type: string
+        source: system
+        description: "FK -> CalendarBlock.id; the IMPORTED block synthesized for this reservation; null if the import was rejected for overlap"
+      - name: external_ref
+        type: string
+        source: input
+        description: "Opaque reservation id from the external channel"
+        constraints: "unique per channel_connection_id"
+      - name: start_date
+        type: datetime
+        source: input
+        description: "Imported check-in date"
+      - name: end_date
+        type: datetime
+        source: input
+        description: "Imported check-out date (exclusive); end_date > start_date"
+      - name: import_status
+        type: enum
+        source: system
+        description: "Whether the import produced a block or was rejected"
+        default: "ACCEPTED"
+        constraints: "one of {ACCEPTED, REJECTED_OVERLAP}"
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  - entity: Listing
+    initial_state: DRAFT
+    terminal_states: []
+    transitions:
+      - from: DRAFT
+        to: LISTED
+        trigger: "POST /listings/{id}/publish"
+        actor: Host
+        preconditions:
+          - "listing has >= 1 RatePlan whose [window_start, window_end] coverage is non-empty"
+          - "acting Host owns the listing"
+        side_effects:
+          - "status -> LISTED"
+          - "increments Listing.version by 1"
+      - from: LISTED
+        to: SNOOZED
+        trigger: "POST /listings/{id}/snooze"
+        actor: Host
+        preconditions: ["acting Host owns the listing"]
+        side_effects:
+          - "status -> SNOOZED (rejects new booking requests but keeps existing bookings)"
+          - "increments Listing.version by 1"
+      - from: SNOOZED
+        to: LISTED
+        trigger: "POST /listings/{id}/publish"
+        actor: Host
+        preconditions: ["acting Host owns the listing"]
+        side_effects:
+          - "status -> LISTED"
+          - "increments Listing.version by 1"
+
+  - entity: Booking
+    initial_state: REQUESTED
+    terminal_states: [DECLINED, COMPLETED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: SCREENING
+        trigger: "POST /bookings/{id}/screen"
+        actor: Host
+        preconditions:
+          - "acting Host owns booking.listing_id"
+          - "booking.status == REQUESTED"
+        side_effects:
+          - "create ScreeningResult(booking_id, guest_id) in PENDING, then run guest_risk_score and resolve to PASSED/FAILED per §1.3"
+          - "ScreeningResult.computed_risk_score := guest_risk_score(guest)"
+          - "status -> SCREENING"
+          - "increments Booking.version by 1"
+      - from: SCREENING
+        to: REQUESTED
+        trigger: "POST /bookings/{id}/request-info"
+        actor: Host
+        note: "Revision cycle: host bounces the request back for more guest info; the prior ScreeningResult is VOIDed."
+        preconditions:
+          - "acting Host owns booking.listing_id"
+          - "booking.status == SCREENING"
+        side_effects:
+          - "the booking's latest ScreeningResult.status -> FAILED is NOT set; instead it is discarded (status stays, a fresh screen re-creates one)"
+          - "status -> REQUESTED"
+          - "increments Booking.version by 1"
+      - from: SCREENING
+        to: APPROVED
+        trigger: "POST /bookings/{id}/approve"
+        actor: Host
+        preconditions:
+          - "acting Host owns booking.listing_id"
+          - "booking.status == SCREENING"
+          - "the booking's latest ScreeningResult.status == PASSED (cross-entity, see §1.7 / Rule 7)"
+        side_effects:
+          - "status -> APPROVED"
+          - "increments Booking.version by 1"
+      - from: SCREENING
+        to: DECLINED
+        trigger: "POST /bookings/{id}/decline"
+        actor: Host
+        preconditions:
+          - "acting Host owns booking.listing_id"
+          - "booking.status == SCREENING"
+        side_effects:
+          - "RELEASE booking.calendar_block (CalendarBlock.status -> RELEASED); booking.calendar_block_id -> null"
+          - "advance Listing.calendar_version by 1; bump each CONNECTED/ERROR ChannelConnection.pending_sync_count by 1 (cascade)"
+          - "status -> DECLINED"
+          - "increments Booking.version by 1"
+      - from: APPROVED
+        to: CONFIRMED
+        trigger: "POST /bookings/{id}/confirm"
+        actor: Guest
+        preconditions:
+          - "acting Guest == booking.guest_id"
+          - "booking.status == APPROVED"
+          - "booking.calendar_block.status == ACTIVE"
+        side_effects:
+          - "create SecurityDeposit(booking_id, authorized_cents := listing.security_deposit_cents) in AUTHORIZED"
+          - "create Payout(booking_id, host_id) in SCHEDULED; estimated_cents := payout_amount ESTIMATE variant; release_after := check_out + listing.payout_delay_days (cascade: confirm -> Payout created -> release_after scheduled)"
+          - "status -> CONFIRMED"
+          - "increments Booking.version by 1"
+      - from: CONFIRMED
+        to: IN_STAY
+        trigger: "POST /_clock/set_current_utc (system auto-transition when current_utc >= check_in) OR POST /bookings/{id}/check-in"
+        actor: system
+        preconditions: ["current_utc >= booking.check_in", "booking.status == CONFIRMED"]
+        side_effects:
+          - "status -> IN_STAY"
+          - "increments Booking.version by 1"
+      - from: IN_STAY
+        to: COMPLETED
+        trigger: "POST /bookings/{id}/complete"
+        actor: Host
+        preconditions:
+          - "acting Host owns booking.listing_id"
+          - "booking.status == IN_STAY"
+          - "current_utc >= booking.check_out"
+        side_effects:
+          - "if SecurityDeposit has no open DamageClaim, SecurityDeposit.status -> RELEASED and held_cents -> 0"
+          - "status -> COMPLETED"
+          - "increments Booking.version by 1"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /bookings/{id}/cancel"
+        actor: Guest
+        preconditions: ["acting Guest == booking.guest_id", "booking.status == REQUESTED"]
+        side_effects:
+          - "RELEASE booking.calendar_block; advance Listing.calendar_version; bump CONNECTED/ERROR channel pending_sync_count (cascade)"
+          - "refund_cents := cancellation_refund FINAL variant (full refund — nothing charged yet)"
+          - "status -> CANCELLED"
+          - "increments Booking.version by 1"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /bookings/{id}/cancel"
+        actor: Guest
+        note: "Primary cancel cascade (Rule 4 depth-4, Rule 9 conserved quantities)."
+        preconditions: ["acting Guest == booking.guest_id", "booking.status == CONFIRMED"]
+        side_effects:
+          - "refund_cents := cancellation_refund FINAL variant (tier + lead-time, see §1.3)"
+          - "RELEASE booking.calendar_block (CalendarBlock.status -> RELEASED); booking.calendar_block_id -> null"
+          - "advance Listing.calendar_version by 1; bump each CONNECTED/ERROR ChannelConnection.pending_sync_count by 1 (cascade hop)"
+          - "Payout.status -> REVERSED, actual_cents -> 0 (cascade hop caused by the cancel)"
+          - "the Payout reversal closes the SecurityDeposit: SecurityDeposit.status -> RELEASED, held_cents -> 0 (cascade hop caused by reversal)"
+          - "closing the deposit VOIDs any non-terminal DamageClaim on it: DamageClaim.status -> VOID, approved_cents -> 0 (cascade hop caused by deposit closure)"
+          - "status -> CANCELLED"
+          - "increments Booking.version by 1"
+
+  - entity: ScreeningResult
+    initial_state: PENDING
+    terminal_states: [PASSED, FAILED]
+    transitions:
+      - from: PENDING
+        to: PASSED
+        trigger: "system: resolved inside POST /bookings/{id}/screen"
+        actor: system
+        preconditions:
+          - "guest.govt_id_verified == true"
+          - "guest.chargeback_flag == false"
+          - "guest_risk_score(guest) < RISK_THRESHOLD (see §1.3)"
+        side_effects: ["status -> PASSED", "failure_reason -> NONE"]
+      - from: PENDING
+        to: FAILED
+        trigger: "system: resolved inside POST /bookings/{id}/screen"
+        actor: system
+        preconditions: ["any PASSED precondition is violated"]
+        side_effects:
+          - "status -> FAILED"
+          - "failure_reason -> dominant disqualifier by fixed precedence ID_UNVERIFIED > CHARGEBACK > RISK_THRESHOLD"
+
+  - entity: ChannelConnection
+    initial_state: DISCONNECTED
+    terminal_states: []
+    transitions:
+      - from: DISCONNECTED
+        to: CONNECTED
+        trigger: "POST /channel-connections/{id}/connect"
+        actor: Host
+        preconditions: ["acting Host owns the parent listing"]
+        side_effects: ["status -> CONNECTED", "increments ChannelConnection.version by 1"]
+      - from: CONNECTED
+        to: SYNCING
+        trigger: "POST /channel-connections/{id}/sync"
+        actor: PlatformAdmin
+        preconditions: ["status == CONNECTED"]
+        side_effects: ["status -> SYNCING", "increments ChannelConnection.version by 1"]
+      - from: SYNCING
+        to: CONNECTED
+        trigger: "POST /channel-connections/{id}/sync-complete"
+        actor: PlatformAdmin
+        note: "Cycle: CONNECTED -> SYNCING -> CONNECTED on every sync round."
+        preconditions: ["status == SYNCING"]
+        side_effects:
+          - "pending_sync_count -> 0"
+          - "last_synced_at -> current_utc"
+          - "status -> CONNECTED"
+          - "increments ChannelConnection.version by 1"
+      - from: SYNCING
+        to: ERROR
+        trigger: "POST /channel-connections/{id}/sync-fail"
+        actor: PlatformAdmin
+        preconditions: ["status == SYNCING"]
+        side_effects: ["status -> ERROR (pending_sync_count preserved)", "increments ChannelConnection.version by 1"]
+      - from: ERROR
+        to: CONNECTED
+        trigger: "POST /channel-connections/{id}/connect"
+        actor: Host
+        preconditions: ["status == ERROR", "acting Host owns the parent listing"]
+        side_effects: ["status -> CONNECTED", "increments ChannelConnection.version by 1"]
+
+  - entity: CalendarBlock
+    initial_state: ACTIVE
+    terminal_states: [RELEASED]
+    transitions:
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /listings/{id}/calendar-blocks/{block_id}/release (manual) OR cascaded from booking decline/cancel"
+        actor: Host | system
+        preconditions: ["block.status == ACTIVE", "if source==BOOKING the release is only allowed via the booking cascade, not the manual endpoint"]
+        side_effects:
+          - "status -> RELEASED"
+          - "advance Listing.calendar_version by 1; bump each CONNECTED/ERROR ChannelConnection.pending_sync_count by 1 (cascade)"
+          - "increments CalendarBlock.version by 1"
+
+  - entity: SecurityDeposit
+    initial_state: AUTHORIZED
+    terminal_states: [SETTLED, RELEASED]
+    transitions:
+      - from: AUTHORIZED
+        to: CLAIM_OPEN
+        trigger: "POST /security-deposits/{id}/claims (file a DamageClaim)"
+        actor: Host
+        preconditions: ["deposit.status == AUTHORIZED", "acting Host owns the booking's listing", "booking.status IN {IN_STAY, COMPLETED}"]
+        side_effects: ["status -> CLAIM_OPEN", "increments SecurityDeposit.version by 1"]
+      - from: CLAIM_OPEN
+        to: SETTLED
+        trigger: "system: resolved when the open DamageClaim reaches APPROVED or DENIED"
+        actor: system
+        preconditions: ["no DamageClaim on this deposit in {FILED, UNDER_REVIEW, DISPUTED}"]
+        side_effects:
+          - "held_cents := authorized_cents - sum(approved_cents of APPROVED claims) (damage_claim_settlement, see §1.3)"
+          - "status -> SETTLED"
+          - "increments SecurityDeposit.version by 1"
+      - from: AUTHORIZED
+        to: RELEASED
+        trigger: "system: cascaded from booking complete (no claim) or booking cancel"
+        actor: system
+        preconditions: ["no open DamageClaim"]
+        side_effects: ["held_cents -> 0", "status -> RELEASED", "increments SecurityDeposit.version by 1"]
+
+  - entity: DamageClaim
+    initial_state: FILED
+    terminal_states: [APPROVED, DENIED, VOID]
+    transitions:
+      - from: FILED
+        to: UNDER_REVIEW
+        trigger: "POST /damage-claims/{id}/review"
+        actor: PlatformAdmin
+        preconditions: ["claim.status == FILED"]
+        side_effects: ["status -> UNDER_REVIEW", "increments DamageClaim.version by 1"]
+      - from: UNDER_REVIEW
+        to: APPROVED
+        trigger: "POST /damage-claims/{id}/approve"
+        actor: PlatformAdmin
+        preconditions: ["claim.status == UNDER_REVIEW"]
+        side_effects:
+          - "approved_cents := min(amount_cents, deposit.authorized_cents - sum(approved_cents of already-APPROVED sibling claims)) (damage_claim_settlement waterfall, see §1.3)"
+          - "SecurityDeposit.held_cents -= approved_cents (cascade: claim approve -> deposit debited)"
+          - "if no other non-terminal claim on the deposit, SecurityDeposit.status -> SETTLED (cascade hop)"
+          - "status -> APPROVED"
+          - "increments DamageClaim.version by 1"
+      - from: UNDER_REVIEW
+        to: DISPUTED
+        trigger: "POST /damage-claims/{id}/dispute"
+        actor: Guest
+        note: "Dispute cycle (non-linear): guest contests; claim returns to review."
+        preconditions: ["claim.status == UNDER_REVIEW", "acting Guest == booking.guest_id"]
+        side_effects: ["status -> DISPUTED", "increments DamageClaim.version by 1"]
+      - from: APPROVED
+        to: DISPUTED
+        trigger: "POST /damage-claims/{id}/dispute"
+        actor: Guest
+        note: "Guest contests an already-APPROVED claim; the prior held_cents debit is NOT yet reversed here — reversal happens only on a subsequent DENY (the compensating action, Rule 9 deposit-conservation)."
+        preconditions: ["claim.status == APPROVED", "acting Guest == booking.guest_id"]
+        side_effects:
+          - "status -> DISPUTED"
+          - "SecurityDeposit re-opens: SecurityDeposit.status -> CLAIM_OPEN (a disputed claim is non-terminal again)"
+          - "increments DamageClaim.version by 1"
+      - from: DISPUTED
+        to: UNDER_REVIEW
+        trigger: "POST /damage-claims/{id}/review"
+        actor: PlatformAdmin
+        preconditions: ["claim.status == DISPUTED"]
+        side_effects: ["status -> UNDER_REVIEW", "increments DamageClaim.version by 1"]
+      - from: UNDER_REVIEW
+        to: DENIED
+        trigger: "POST /damage-claims/{id}/deny"
+        actor: PlatformAdmin
+        note: "DENY is the compensating action for an earlier APPROVE: it restores any prior debit so the deposit balance is conserved (Rule 9). A claim that was never approved (approved_cents already 0) leaves the deposit untouched."
+        preconditions: ["claim.status == UNDER_REVIEW"]
+        side_effects:
+          - "if approved_cents > 0 (claim had been APPROVED before a dispute): SecurityDeposit.held_cents += approved_cents (compensating restore of the earlier debit)"
+          - "approved_cents -> 0"
+          - "if no other non-terminal claim on the deposit, SecurityDeposit.status -> SETTLED (cascade hop)"
+          - "status -> DENIED"
+          - "increments DamageClaim.version by 1"
+
+  - entity: Payout
+    initial_state: SCHEDULED
+    terminal_states: [PAID, REVERSED]
+    transitions:
+      - from: SCHEDULED
+        to: HELD
+        trigger: "POST /payouts/{id}/hold"
+        actor: PlatformAdmin
+        preconditions: ["payout.status == SCHEDULED", "booking's SecurityDeposit has a DamageClaim in {FILED, UNDER_REVIEW, DISPUTED}"]
+        side_effects: ["status -> HELD", "increments Payout.version by 1"]
+      - from: HELD
+        to: SCHEDULED
+        trigger: "POST /payouts/{id}/unhold"
+        actor: PlatformAdmin
+        preconditions: ["payout.status == HELD", "no DamageClaim on the deposit in {FILED, UNDER_REVIEW, DISPUTED}"]
+        side_effects: ["status -> SCHEDULED", "increments Payout.version by 1"]
+      - from: SCHEDULED
+        to: RELEASED
+        trigger: "POST /payouts/{id}/release"
+        actor: PlatformAdmin
+        note: "Cross-entity gate (Rule 7): blocked while any DamageClaim on the deposit is UNDER_REVIEW."
+        preconditions:
+          - "payout.status == SCHEDULED"
+          - "current_utc >= payout.release_after"
+          - "no DamageClaim on the booking's SecurityDeposit in {FILED, UNDER_REVIEW, DISPUTED} (cross-entity, see §1.7 / Rule 7)"
+        side_effects:
+          - "actual_cents := payout_amount ACTUAL variant (gross - commission - sum approved_cents of APPROVED claims, see §1.3)"
+          - "status -> RELEASED"
+          - "increments Payout.version by 1"
+      - from: RELEASED
+        to: PAID
+        trigger: "POST /payouts/{id}/mark-paid"
+        actor: PlatformAdmin
+        preconditions: ["payout.status == RELEASED"]
+        side_effects: ["status -> PAID", "increments Payout.version by 1"]
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: calendar-block-create-stale-listing
+    parent_entity: Listing
+    write_endpoint: "POST /listings/{id}/calendar-blocks"
+    occ_field: "expected_listing_calendar_version"
+    description: |
+      Creating a MANUAL CalendarBlock against a Listing whose calendar_version
+      has advanced since the client last observed it is rejected. This captures
+      the case where another writer has already created or released an ACTIVE
+      block on the same listing (legitimately changing what dates are free), so
+      the current writer's view of the calendar is stale and its new block could
+      land on a now-occupied range. Resolved by comparing the request's
+      expected_listing_calendar_version against the live Listing.calendar_version.
+    error_id: ERR_STALE_CALENDAR_VERSION
+    http_status: 412
+
+  - rule_id: booking-request-stale-listing
+    parent_entity: Listing
+    write_endpoint: "POST /bookings"
+    occ_field: "expected_listing_calendar_version"
+    description: |
+      Creating a Booking (which synthesizes a BOOKING-source CalendarBlock)
+      against a Listing whose calendar_version has advanced since the client
+      last read availability is rejected. Another block create/release has moved
+      the calendar forward, so the guest's availability view is stale. Resolved
+      by comparing expected_listing_calendar_version against the live
+      Listing.calendar_version.
+    error_id: ERR_STALE_CALENDAR_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: nightly_pricing
+    trigger: "On POST /bookings (writes Booking.nightly_subtotal_cents) and on GET /listings/{id}/quote"
+    algorithm: weighted_scoring
+    formula: |
+      # Combinatorial mode (a): >=3 inputs, non-linear per-night multiplier selection.
+      # Iterate each night N in [check_in, check_out) (half-open; checkout night NOT charged):
+      subtotal = 0
+      for each date D in nights:
+        plan = the RatePlan on the listing whose [window_start, window_end] (closed, inclusive)
+               contains D; if multiple match -> reject at booking time (see ERR_RATE_PLAN_OVERLAP);
+               if none match -> use seasonal_multiplier_bps = 10000 (1.0x) and weekend = 10000
+        sm  = plan.seasonal_multiplier_bps  (or 10000 if no plan)
+        wm  = (D is Friday or Saturday) ? plan.weekend_multiplier_bps : 10000  (or 10000 if no plan)
+        # per-night price rounded to whole cents BEFORE summing (rounding order pinned in booking_total)
+        night_price = round_half_up( base_nightly_rate_cents * sm/10000 * wm/10000 )
+        subtotal += night_price
+      nightly_subtotal_cents = subtotal
+    input_set: "All dates D with check_in <= D < check_out (half-open); checkout date excluded."
+    constants:
+      BPS_DENOMINATOR: 10000
+      WEEKEND_DAYS: ["FRIDAY", "SATURDAY"]
+    precision: "per-night rounded to integer cents, round_half_up, then summed"
+
+  - name: booking_total
+    trigger: "On POST /bookings (writes Booking.fees_cents, tax_cents, total_cents)"
+    algorithm: aggregation
+    formula: |
+      # Combinatorial mode (b): rounding order is pinned. nightly_subtotal is the
+      # ALREADY-rounded-per-night sum from nightly_pricing (round per-line then sum).
+      # Tax is computed on the (already-summed) taxable base, then rounded ONCE.
+      fees_cents = listing.cleaning_fee_cents + (pets_count > 0 ? listing.pet_fee_cents : 0)
+      taxable_base = nightly_subtotal_cents + fees_cents
+      tax_cents = round_half_up( taxable_base * listing.tax_rate_bps / 10000 )   # single rounding, AFTER summing
+      total_cents = nightly_subtotal_cents + fees_cents + tax_cents
+    input_set: "Single booking; fields from its listing snapshot."
+    constants:
+      BPS_DENOMINATOR: 10000
+    precision: "tax rounded once round_half_up after summing the taxable base; total is exact integer addition"
+
+  - name: cancellation_refund
+    trigger: "On POST /bookings/{id}/cancel (FINAL variant writes Booking.refund_cents); FINAL also returned by POST /bookings/{id}/cancel; PROVISIONAL returned by GET /bookings/{id}/cancellation-quote"
+    algorithm: threshold
+    formula: |
+      # Dual-variant calc on the BOOKING domain. Refundable base = nightly_subtotal_cents + tax_cents
+      # (cleaning/pet fees are non-refundable once CONFIRMED). lead_hours = hours between current_utc
+      # and check_in (>= 0; if check_in already passed, lead_hours = 0).
+      refundable_base = nightly_subtotal_cents + tax_cents
+      tier = cancellation_tier_snapshot
+      pct = refund_pct(tier, lead_hours):   # thresholds use >= ; boundary precision (Rule 6)
+        FLEXIBLE: lead_hours >= 24  -> 100 ; else 0
+        MODERATE: lead_hours >= 120 -> 100 ; lead_hours >= 24 -> 50 ; else 0
+        STRICT:   lead_hours >= 168 -> 50  ; else 0
+      refund_cents = round_half_up( refundable_base * pct / 100 )
+    input_set: "Single booking; lead_hours derived from clock."
+    constants:
+      FLEXIBLE_FULL_HOURS: 24
+      MODERATE_FULL_HOURS: 120
+      MODERATE_HALF_HOURS: 24
+      STRICT_HALF_HOURS: 168
+    precision: "round_half_up to integer cents"
+    variants:
+      - name: PROVISIONAL
+        when: "GET /bookings/{id}/cancellation-quote — a what-if at the current clock; does not mutate the booking"
+        difference: "Returns the refund the guest WOULD receive if they cancelled now; Booking.refund_cents is NOT written."
+      - name: FINAL
+        when: "POST /bookings/{id}/cancel — committed at the actual cancel instant"
+        difference: "Writes Booking.refund_cents; uses lead_hours measured at the cancel instant, which may sit in a different tier band than an earlier PROVISIONAL quote -> different number for identical booking data."
+
+  - name: payout_amount
+    trigger: "ESTIMATE on POST /bookings/{id}/confirm (writes Payout.estimated_cents); ACTUAL on POST /payouts/{id}/release (writes Payout.actual_cents)"
+    algorithm: aggregation
+    formula: |
+      # Dual-variant calc on the PAYOUT domain (different entity domain from cancellation_refund).
+      gross = booking.nightly_subtotal_cents + booking.fees_cents   # tax is remitted, excluded from host gross
+      commission = round_half_up( gross * listing.platform_commission_bps / 10000 )
+      ESTIMATE: estimated_cents = gross - commission                 # no deposit deductions known yet
+      ACTUAL:   deductions = sum(approved_cents of DamageClaims on the deposit in status APPROVED)
+                actual_cents = max(0, gross - commission - deductions)
+    input_set: "Single booking + its SecurityDeposit's APPROVED DamageClaims (ACTUAL only)."
+    constants:
+      BPS_DENOMINATOR: 10000
+    precision: "commission rounded once round_half_up; subtraction exact integer; floored at 0"
+    variants:
+      - name: ESTIMATE
+        when: "booking confirmation, before any stay/claim"
+        difference: "Ignores deposit deductions (none can exist yet); written to estimated_cents."
+      - name: ACTUAL
+        when: "payout release, after stay and any claim settlement"
+        difference: "Subtracts APPROVED DamageClaim deductions, floored at 0; written to actual_cents and may be < estimated_cents."
+
+  - name: guest_risk_score
+    trigger: "On POST /bookings/{id}/screen (snapshot to ScreeningResult.computed_risk_score and Guest.risk_score)"
+    algorithm: weighted_scoring
+    formula: |
+      # Weighted screening score on the GUEST domain. Higher = riskier.
+      score = 0
+      score += guest.prior_cancellations * CANCEL_WEIGHT
+      score += guest.chargeback_flag ? CHARGEBACK_WEIGHT : 0
+      score += guest.govt_id_verified ? 0 : UNVERIFIED_WEIGHT
+      score = min(100, score)
+      risk_score = round_half_up(score)   # to 2 decimals; here integral weights -> integer-valued
+    input_set: "Single guest's screening attributes."
+    constants:
+      CANCEL_WEIGHT: 15
+      CHARGEBACK_WEIGHT: 60
+      UNVERIFIED_WEIGHT: 40
+      RISK_THRESHOLD: 50      # ScreeningResult PASSES only if risk_score < 50 (strict <) AND id verified AND no chargeback
+    precision: "round_half_up to 2 decimals; capped at 100.00"
+
+  - name: damage_claim_settlement
+    trigger: "On POST /damage-claims/{id}/approve (writes DamageClaim.approved_cents and debits SecurityDeposit.held_cents)"
+    algorithm: waterfall_allocation
+    formula: |
+      # Waterfall over a finite deposit pool, ordered by claim created_at ASC (never by id).
+      # remaining = authorized_cents - sum(approved_cents of sibling claims already APPROVED, ordered created_at ASC)
+      remaining = deposit.authorized_cents - sum_already_approved
+      approved_cents = min( claim.amount_cents, max(0, remaining) )
+      deposit.held_cents = deposit.authorized_cents - (sum_already_approved + approved_cents)
+    input_set: "DamageClaims on one SecurityDeposit; only APPROVED siblings consume the pool; tie-break created_at ASC."
+    constants: {}
+    precision: "integer cents; no rounding (inputs are integer cents)"
+
+# ===========================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /hosts, POST /guests, POST /_clock/set_current_utc"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for the operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all role-restricted endpoints"
+
+  - priority: 3
+    category: existence
+    check: "Every path-referenced resource exists (validated left-to-right)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids"
+
+  - priority: 4
+    category: business_referential
+    check: "Body foreign keys (listing_id, guest_id, security_deposit_id, channel_connection_id, booking_id) reference existing resources"
+    error_id: ERR_FK_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /listings, POST /bookings, POST /security-deposits/{id}/claims, POST /listings/{id}/calendar-blocks"
+
+  - priority: 5
+    category: auth
+    check: "Acting entity_backed user owns the resource (Host owns listing; Guest is booking.guest_id)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "ownership-scoped Host/Guest operations"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined (§1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 7
+    category: business_constraint
+    check: "Listing.status == LISTED when creating a booking request (SNOOZED/DRAFT reject)"
+    error_id: ERR_LISTING_NOT_BOOKABLE
+    http_status: 409
+    applies_to: "POST /bookings"
+
+  - priority: 8
+    category: business_safety
+    check: "Guest screening must PASS before approval; a booking whose latest ScreeningResult.status != PASSED cannot be APPROVED (Rule 5 pair: business_safety vs business_constraint)"
+    error_id: ERR_SCREENING_NOT_PASSED
+    http_status: 409
+    applies_to: "POST /bookings/{id}/approve"
+
+  - priority: 9
+    category: business_temporal
+    check: "check_out strictly after check_in, and dates are valid ISO dates; for calendar blocks end_date > start_date"
+    error_id: ERR_INVALID_DATE_RANGE
+    http_status: 422
+    applies_to: "POST /bookings, POST /listings/{id}/calendar-blocks, POST /rate-plans, POST /channel-connections/{id}/imported-reservations"
+
+  - priority: 10
+    category: business_constraint
+    check: "nights (check_out - check_in) >= listing.min_nights (boundary: >=, Rule 6)"
+    error_id: ERR_MIN_NIGHTS
+    http_status: 422
+    applies_to: "POST /bookings"
+
+  - priority: 11
+    category: business_temporal
+    check: "Requested [check_in, check_out) does not overlap any ACTIVE CalendarBlock on the listing, AND honors the gap_nights turnaround buffer on both sides (Rule 8 half-open + buffer)"
+    error_id: ERR_DATES_UNAVAILABLE
+    http_status: 409
+    applies_to: "POST /bookings, POST /listings/{id}/calendar-blocks, POST /channel-connections/{id}/imported-reservations"
+
+  - priority: 12
+    category: business_temporal
+    check: "A new RatePlan's [window_start, window_end] (closed, inclusive) must not overlap an existing RatePlan window on the same listing (Rule 8 closed-interval, no buffer)"
+    error_id: ERR_RATE_PLAN_OVERLAP
+    http_status: 409
+    applies_to: "POST /rate-plans"
+
+  - priority: 13
+    category: business_fiscal
+    check: "A DamageClaim.amount_cents must be > 0 and the deposit must have authorized_cents > 0"
+    error_id: ERR_INVALID_CLAIM_AMOUNT
+    http_status: 422
+    applies_to: "POST /security-deposits/{id}/claims"
+
+  - priority: 14
+    category: business_temporal
+    check: "Payout release requires current_utc >= release_after (Rule 5 pair vs Rule 7 cross-entity gate)"
+    error_id: ERR_PAYOUT_NOT_DUE
+    http_status: 409
+    applies_to: "POST /payouts/{id}/release"
+
+  - priority: 15
+    category: state
+    check: "OCC: expected_listing_calendar_version must equal the live Listing.calendar_version (§1.2.1)"
+    error_id: ERR_STALE_CALENDAR_VERSION
+    http_status: 412
+    applies_to: "POST /bookings, POST /listings/{id}/calendar-blocks"
+
+  - priority: 16
+    category: business_constraint
+    check: "Request body required fields present and correctly typed; unknown enum values rejected"
+    error_id: ERR_VALIDATION
+    http_status: 422
+    applies_to: "all POST/PATCH endpoints"
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # ---- Hosts & Guests (identity entities) ----
+  - method: POST
+    path: "/hosts"
+    description: "Register a host"
+    roles: [Anonymous]
+    code: 201
+    input: [email, display_name, "payout_method?"]
+    output: Host
+    side_effects: ["create Host in default state"]
+  - method: GET
+    path: "/hosts/{id}"
+    description: "Fetch a host"
+    roles: [Host, PlatformAdmin]
+    code: 200
+    input: []
+    output: Host
+    side_effects: []
+  - method: POST
+    path: "/guests"
+    description: "Register a guest (screening attributes supplied at creation)"
+    roles: [Anonymous]
+    code: 201
+    input: [email, full_name, "govt_id_verified?", "prior_cancellations?", "chargeback_flag?"]
+    output: Guest
+    side_effects: ["create Guest; risk_score remains uncomputed until first screening"]
+  - method: GET
+    path: "/guests/{id}"
+    description: "Fetch a guest (includes computed risk_score)"
+    roles: [Guest, Host, PlatformAdmin]
+    code: 200
+    input: []
+    output: Guest
+    side_effects: []
+
+  # ---- Listings ----
+  - method: POST
+    path: "/listings"
+    description: "Create a listing (DRAFT)"
+    roles: [Host]
+    code: 201
+    input: [host_id, title, base_nightly_rate_cents, cleaning_fee_cents, "pet_fee_cents?", "tax_rate_bps?", "min_nights?", "gap_nights?", "cancellation_tier?", "security_deposit_cents?", "platform_commission_bps?", "payout_delay_days?"]
+    output: Listing
+    side_effects: ["create Listing in DRAFT; calendar_version := 1"]
+  - method: GET
+    path: "/listings/{id}"
+    description: "Fetch a listing (single-resource GET — defines the listings collection segment)"
+    roles: [Host, Guest, PlatformAdmin]
+    code: 200
+    input: []
+    output: Listing
+    side_effects: []
+  - method: GET
+    path: "/listings"
+    description: "List listings, optionally filtered by host_id"
+    roles: [Host, Guest, PlatformAdmin]
+    code: 200
+    input: ["host_id?", "limit?", "offset?"]
+    output: Listing[]
+    side_effects: []
+  - method: POST
+    path: "/listings/{id}/publish"
+    description: "Publish (DRAFT->LISTED) or un-snooze (SNOOZED->LISTED)"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Listing
+    side_effects: ["status -> LISTED", "increments Listing.version"]
+  - method: POST
+    path: "/listings/{id}/snooze"
+    description: "Snooze a listing (LISTED->SNOOZED)"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Listing
+    side_effects: ["status -> SNOOZED", "increments Listing.version"]
+  - method: GET
+    path: "/listings/{id}/quote"
+    description: "Computed read: nightly_pricing + booking_total preview for a date range (does not create anything)"
+    roles: [Host, Guest, PlatformAdmin]
+    code: 200
+    input: [check_in, check_out, "pets_count?"]
+    output: "{ nightly_subtotal_cents: integer, fees_cents: integer, tax_cents: integer, total_cents: integer }"
+    side_effects: []
+
+  # ---- Rate plans (Listing children) ----
+  - method: POST
+    path: "/rate-plans"
+    description: "Create a seasonal rate plan for a listing"
+    roles: [Host]
+    code: 201
+    input: [listing_id, label, window_start, window_end, seasonal_multiplier_bps, "weekend_multiplier_bps?"]
+    output: RatePlan
+    side_effects: ["create RatePlan after closed-interval overlap check (ERR_RATE_PLAN_OVERLAP)"]
+  - method: GET
+    path: "/rate-plans/{id}"
+    description: "Fetch a rate plan (single-resource GET — defines rate-plans collection segment)"
+    roles: [Host, Guest, PlatformAdmin]
+    code: 200
+    input: []
+    output: RatePlan
+    side_effects: []
+  - method: GET
+    path: "/rate-plans"
+    description: "List rate plans, filterable by listing_id (FK reverse-reachability for RatePlan.listing_id)"
+    roles: [Host, Guest, PlatformAdmin]
+    code: 200
+    input: ["listing_id?", "limit?", "offset?"]
+    output: RatePlan[]
+    side_effects: []
+
+  # ---- Calendar blocks (Listing children) ----
+  - method: POST
+    path: "/listings/{id}/calendar-blocks"
+    description: "Create a MANUAL host block (OCC-guarded on Listing.calendar_version)"
+    roles: [Host]
+    code: 201
+    input: [source, start_date, end_date, expected_listing_calendar_version]
+    output: CalendarBlock
+    side_effects: ["overlap + gap check", "create ACTIVE CalendarBlock", "advance Listing.calendar_version by 1", "increments Listing.version by 1", "bump CONNECTED/ERROR ChannelConnection.pending_sync_count by 1 (cascade)"]
+  - method: GET
+    path: "/calendar-blocks/{id}"
+    description: "Fetch a calendar block (single-resource GET — defines calendar-blocks collection segment)"
+    roles: [Host, Guest, PlatformAdmin]
+    code: 200
+    input: []
+    output: CalendarBlock
+    side_effects: []
+  - method: GET
+    path: "/listings/{id}/calendar-blocks"
+    description: "List a listing's calendar blocks (FK reverse-reachability for CalendarBlock.listing_id)"
+    roles: [Host, Guest, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: CalendarBlock[]
+    side_effects: []
+  - method: POST
+    path: "/listings/{id}/calendar-blocks/{block_id}/release"
+    description: "Release a MANUAL block (ACTIVE->RELEASED); BOOKING-source blocks reject (released via cancel cascade only)"
+    roles: [Host]
+    code: 200
+    input: []
+    output: CalendarBlock
+    side_effects: ["status -> RELEASED", "advance Listing.calendar_version by 1", "bump CONNECTED/ERROR channel pending_sync_count (cascade)", "increments CalendarBlock.version"]
+
+  # ---- Channel connections (Listing children) ----
+  - method: POST
+    path: "/channel-connections"
+    description: "Create a channel connection (DISCONNECTED)"
+    roles: [Host]
+    code: 201
+    input: [listing_id, channel]
+    output: ChannelConnection
+    side_effects: ["create ChannelConnection in DISCONNECTED"]
+  - method: GET
+    path: "/channel-connections/{id}"
+    description: "Fetch a channel connection (single-resource GET — defines channel-connections segment)"
+    roles: [Host, PlatformAdmin]
+    code: 200
+    input: []
+    output: ChannelConnection
+    side_effects: []
+  - method: GET
+    path: "/channel-connections"
+    description: "List channel connections, filterable by listing_id (FK reverse-reachability for ChannelConnection.listing_id)"
+    roles: [Host, PlatformAdmin]
+    code: 200
+    input: ["listing_id?", "limit?", "offset?"]
+    output: ChannelConnection[]
+    side_effects: []
+  - method: POST
+    path: "/channel-connections/{id}/connect"
+    description: "Connect (DISCONNECTED->CONNECTED) or recover (ERROR->CONNECTED)"
+    roles: [Host]
+    code: 200
+    input: []
+    output: ChannelConnection
+    side_effects: ["status -> CONNECTED", "increments ChannelConnection.version"]
+  - method: POST
+    path: "/channel-connections/{id}/sync"
+    description: "Begin a sync round (CONNECTED->SYNCING)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: ChannelConnection
+    side_effects: ["status -> SYNCING", "increments ChannelConnection.version"]
+  - method: POST
+    path: "/channel-connections/{id}/sync-complete"
+    description: "Finish a sync round (SYNCING->CONNECTED); clears pending_sync_count"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: ChannelConnection
+    side_effects: ["pending_sync_count -> 0", "last_synced_at -> current_utc", "status -> CONNECTED", "increments ChannelConnection.version"]
+  - method: POST
+    path: "/channel-connections/{id}/sync-fail"
+    description: "Fail a sync round (SYNCING->ERROR); preserves pending_sync_count"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: ChannelConnection
+    side_effects: ["status -> ERROR", "increments ChannelConnection.version"]
+  - method: POST
+    path: "/channel-connections/{id}/imported-reservations"
+    description: "Import an external reservation; synthesizes an IMPORTED CalendarBlock or REJECTS on overlap"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [external_ref, start_date, end_date]
+    output: ImportedReservation
+    side_effects: ["if no overlap & gap-clear: create IMPORTED CalendarBlock (ACTIVE), set import_status=ACCEPTED, calendar_block_id, advance Listing.calendar_version, bump other channels' pending_sync_count (cascade); else import_status=REJECTED_OVERLAP, calendar_block_id=null"]
+  - method: GET
+    path: "/imported-reservations/{id}"
+    description: "Fetch an imported reservation (single-resource GET — defines imported-reservations segment)"
+    roles: [Host, PlatformAdmin]
+    code: 200
+    input: []
+    output: ImportedReservation
+    side_effects: []
+  - method: GET
+    path: "/channel-connections/{id}/imported-reservations"
+    description: "List a channel's imported reservations (FK reverse-reachability for ImportedReservation.channel_connection_id)"
+    roles: [Host, PlatformAdmin]
+    code: 200
+    input: ["import_status?", "limit?", "offset?"]
+    output: ImportedReservation[]
+    side_effects: []
+  - method: GET
+    path: "/imported-reservations"
+    description: "List imported reservations, filterable by channel_connection_id or calendar_block_id (FK reverse-reachability for ImportedReservation.calendar_block_id)"
+    roles: [Host, PlatformAdmin]
+    code: 200
+    input: ["channel_connection_id?", "calendar_block_id?", "import_status?", "limit?", "offset?"]
+    output: ImportedReservation[]
+    side_effects: []
+
+  # ---- Bookings ----
+  - method: POST
+    path: "/bookings"
+    description: "Create a booking request; runs nightly_pricing + booking_total, reserves a BOOKING CalendarBlock (OCC-guarded)"
+    roles: [Guest]
+    code: 201
+    input: [listing_id, guest_id, check_in, check_out, "pets_count?", expected_listing_calendar_version]
+    output: Booking
+    side_effects: ["validate listing bookable, dates, min_nights, overlap+gap, OCC", "create ACTIVE BOOKING CalendarBlock; set calendar_block_id", "advance Listing.calendar_version by 1; bump CONNECTED/ERROR channel pending_sync_count (cascade)", "compute nightly_subtotal_cents/fees_cents/tax_cents/total_cents; snapshot cancellation_tier_snapshot", "status := REQUESTED"]
+  - method: GET
+    path: "/bookings/{id}"
+    description: "Fetch a booking (single-resource GET — defines bookings collection segment)"
+    roles: [Guest, Host, PlatformAdmin]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: []
+  - method: GET
+    path: "/bookings"
+    description: "List bookings, filterable by listing_id, guest_id, or calendar_block_id (FK reverse-reachability for Booking.listing_id, Booking.guest_id, Booking.calendar_block_id)"
+    roles: [Guest, Host, PlatformAdmin]
+    code: 200
+    input: ["listing_id?", "guest_id?", "calendar_block_id?", "status?", "limit?", "offset?"]
+    output: Booking[]
+    side_effects: []
+  - method: POST
+    path: "/bookings/{id}/screen"
+    description: "Host screens the request (REQUESTED->SCREENING); creates+resolves ScreeningResult"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: ["create ScreeningResult, run guest_risk_score, resolve PASSED/FAILED", "status -> SCREENING", "increments Booking.version"]
+  - method: POST
+    path: "/bookings/{id}/request-info"
+    description: "Host bounces back for more info (SCREENING->REQUESTED); discards latest ScreeningResult"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: ["discard latest ScreeningResult", "status -> REQUESTED", "increments Booking.version"]
+  - method: POST
+    path: "/bookings/{id}/approve"
+    description: "Host approves (SCREENING->APPROVED); requires latest ScreeningResult PASSED"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: ["status -> APPROVED", "increments Booking.version"]
+  - method: POST
+    path: "/bookings/{id}/decline"
+    description: "Host declines (SCREENING->DECLINED); releases the booking's CalendarBlock"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: ["RELEASE booking CalendarBlock; calendar_block_id->null", "advance Listing.calendar_version; bump channels (cascade)", "status -> DECLINED", "increments Booking.version"]
+  - method: POST
+    path: "/bookings/{id}/confirm"
+    description: "Guest confirms (APPROVED->CONFIRMED); creates SecurityDeposit + Payout"
+    roles: [Guest]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: ["create SecurityDeposit (AUTHORIZED)", "create Payout (SCHEDULED), estimated_cents := payout_amount ESTIMATE, release_after := check_out + payout_delay_days", "status -> CONFIRMED", "increments Booking.version"]
+  - method: POST
+    path: "/bookings/{id}/check-in"
+    description: "Mark stay started (CONFIRMED->IN_STAY); requires current_utc >= check_in"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: ["status -> IN_STAY", "increments Booking.version"]
+  - method: POST
+    path: "/bookings/{id}/complete"
+    description: "Host completes stay (IN_STAY->COMPLETED); releases deposit if no open claim"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: ["if no open DamageClaim: SecurityDeposit -> RELEASED, held_cents->0", "status -> COMPLETED", "increments Booking.version"]
+  - method: GET
+    path: "/bookings/{id}/cancellation-quote"
+    description: "Computed read: PROVISIONAL cancellation_refund what-if at current clock (no mutation)"
+    roles: [Guest, Host, PlatformAdmin]
+    code: 200
+    input: []
+    output: "{ refund_cents: integer, applied_pct: integer, lead_hours: integer }"
+    side_effects: []
+  - method: POST
+    path: "/bookings/{id}/cancel"
+    description: "Guest cancels (REQUESTED|CONFIRMED -> CANCELLED); FINAL refund + full cancel cascade"
+    roles: [Guest]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: ["refund_cents := cancellation_refund FINAL", "RELEASE CalendarBlock; advance calendar_version; bump channels (cascade)", "if CONFIRMED: Payout -> REVERSED -> SecurityDeposit RELEASED -> VOID open DamageClaim (cascade chain)", "status -> CANCELLED", "increments Booking.version"]
+  - method: GET
+    path: "/bookings/{id}/screening-results"
+    description: "List screening results for a booking (FK reverse-reachability for ScreeningResult.booking_id)"
+    roles: [Guest, Host, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ScreeningResult[]
+    side_effects: []
+  - method: GET
+    path: "/screening-results/{id}"
+    description: "Fetch a screening result (single-resource GET — defines screening-results collection segment)"
+    roles: [Guest, Host, PlatformAdmin]
+    code: 200
+    input: []
+    output: ScreeningResult
+    side_effects: []
+  - method: GET
+    path: "/screening-results"
+    description: "List screening results, filterable by booking_id or guest_id (FK reverse-reachability for ScreeningResult.guest_id and .booking_id)"
+    roles: [Guest, Host, PlatformAdmin]
+    code: 200
+    input: ["booking_id?", "guest_id?", "status?", "limit?", "offset?"]
+    output: ScreeningResult[]
+    side_effects: []
+
+  # ---- Security deposits & damage claims ----
+  - method: GET
+    path: "/security-deposits/{id}"
+    description: "Fetch a security deposit (single-resource GET — defines security-deposits segment)"
+    roles: [Guest, Host, PlatformAdmin]
+    code: 200
+    input: []
+    output: SecurityDeposit
+    side_effects: []
+  - method: GET
+    path: "/bookings/{id}/security-deposits"
+    description: "List a booking's security deposit (FK reverse-reachability for SecurityDeposit.booking_id)"
+    roles: [Guest, Host, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: SecurityDeposit[]
+    side_effects: []
+  - method: POST
+    path: "/security-deposits/{id}/claims"
+    description: "Host files a DamageClaim against a deposit (AUTHORIZED->CLAIM_OPEN)"
+    roles: [Host]
+    code: 201
+    input: [security_deposit_id, amount_cents, reason]
+    output: DamageClaim
+    side_effects: ["create DamageClaim (FILED)", "SecurityDeposit.status -> CLAIM_OPEN", "increments SecurityDeposit.version"]
+  - method: GET
+    path: "/damage-claims/{id}"
+    description: "Fetch a damage claim (single-resource GET — defines damage-claims segment)"
+    roles: [Guest, Host, PlatformAdmin]
+    code: 200
+    input: []
+    output: DamageClaim
+    side_effects: []
+  - method: GET
+    path: "/security-deposits/{id}/claims"
+    description: "List a deposit's damage claims (FK reverse-reachability for DamageClaim.security_deposit_id)"
+    roles: [Guest, Host, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: DamageClaim[]
+    side_effects: []
+  - method: POST
+    path: "/damage-claims/{id}/review"
+    description: "Admin moves claim to review (FILED->UNDER_REVIEW or DISPUTED->UNDER_REVIEW)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: DamageClaim
+    side_effects: ["status -> UNDER_REVIEW", "increments DamageClaim.version"]
+  - method: POST
+    path: "/damage-claims/{id}/approve"
+    description: "Admin approves (UNDER_REVIEW->APPROVED); waterfall debit of deposit"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: DamageClaim
+    side_effects: ["approved_cents := damage_claim_settlement", "SecurityDeposit.held_cents -= approved_cents", "if no other open claim: SecurityDeposit -> SETTLED", "status -> APPROVED", "increments DamageClaim.version"]
+  - method: POST
+    path: "/damage-claims/{id}/deny"
+    description: "Admin denies (UNDER_REVIEW->DENIED); restores any prior debit (compensating action)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: DamageClaim
+    side_effects: ["if approved_cents > 0: SecurityDeposit.held_cents += approved_cents (restore prior debit)", "approved_cents -> 0", "if no other open claim: SecurityDeposit -> SETTLED", "status -> DENIED", "increments DamageClaim.version"]
+  - method: POST
+    path: "/damage-claims/{id}/dispute"
+    description: "Guest disputes (UNDER_REVIEW->DISPUTED, or APPROVED->DISPUTED to reopen); dispute cycle back to review"
+    roles: [Guest]
+    code: 200
+    input: []
+    output: DamageClaim
+    side_effects: ["status -> DISPUTED", "if was APPROVED: SecurityDeposit -> CLAIM_OPEN (reopened)", "increments DamageClaim.version"]
+
+  # ---- Payouts ----
+  - method: GET
+    path: "/payouts/{id}"
+    description: "Fetch a payout (single-resource GET — defines payouts segment)"
+    roles: [Host, PlatformAdmin]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: []
+  - method: GET
+    path: "/bookings/{id}/payouts"
+    description: "List a booking's payout (FK reverse-reachability for Payout.booking_id)"
+    roles: [Host, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Payout[]
+    side_effects: []
+  - method: GET
+    path: "/payouts"
+    description: "List payouts, filterable by host_id (FK reverse-reachability for Payout.host_id)"
+    roles: [Host, PlatformAdmin]
+    code: 200
+    input: ["host_id?", "status?", "limit?", "offset?"]
+    output: Payout[]
+    side_effects: []
+  - method: POST
+    path: "/payouts/{id}/hold"
+    description: "Admin holds a scheduled payout (SCHEDULED->HELD) when a claim is open"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: ["status -> HELD", "increments Payout.version"]
+  - method: POST
+    path: "/payouts/{id}/unhold"
+    description: "Admin releases a hold (HELD->SCHEDULED) once claims resolved"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: ["status -> SCHEDULED", "increments Payout.version"]
+  - method: POST
+    path: "/payouts/{id}/release"
+    description: "Admin releases a due payout (SCHEDULED->RELEASED); cross-entity claim gate"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: ["actual_cents := payout_amount ACTUAL", "status -> RELEASED", "increments Payout.version"]
+  - method: POST
+    path: "/payouts/{id}/mark-paid"
+    description: "Admin marks released payout as paid (RELEASED->PAID)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: ["status -> PAID", "increments Payout.version"]
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving: set the server clock; auto-advances CONFIRMED bookings to IN_STAY when current_utc >= check_in"
+    roles: [PlatformAdmin, Anonymous]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: datetime }"
+    side_effects: ["set server clock", "auto-transition CONFIRMED bookings whose check_in <= current_utc to IN_STAY"]
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing or malformed X-User-Role / X-User-ID headers on a protected endpoint"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Authenticated role is not permitted for this operation per §1.7"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Acting Host does not own the listing, or acting Guest is not booking.guest_id"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Path-referenced resource id does not exist"
+  - id: ERR_FK_NOT_FOUND
+    http: 404
+    condition: "A body foreign key references a non-existent resource"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition is not defined from the resource's current state"
+  - id: ERR_LISTING_NOT_BOOKABLE
+    http: 409
+    condition: "Booking requested against a listing whose status is not LISTED"
+  - id: ERR_SCREENING_NOT_PASSED
+    http: 409
+    condition: "Approve attempted while the booking's latest ScreeningResult.status != PASSED"
+  - id: ERR_INVALID_DATE_RANGE
+    http: 422
+    condition: "check_out <= check_in, end_date <= start_date, or malformed date"
+  - id: ERR_MIN_NIGHTS
+    http: 422
+    condition: "Booking nights < listing.min_nights"
+  - id: ERR_DATES_UNAVAILABLE
+    http: 409
+    condition: "Requested interval overlaps an ACTIVE CalendarBlock or violates the gap_nights turnaround buffer"
+  - id: ERR_RATE_PLAN_OVERLAP
+    http: 409
+    condition: "New RatePlan window overlaps an existing RatePlan window (closed intervals) on the same listing"
+  - id: ERR_INVALID_CLAIM_AMOUNT
+    http: 422
+    condition: "DamageClaim.amount_cents <= 0 or the deposit's authorized_cents is 0"
+  - id: ERR_PAYOUT_NOT_DUE
+    http: 409
+    condition: "Payout release attempted before current_utc >= release_after"
+  - id: ERR_CLAIM_BLOCKS_PAYOUT
+    http: 409
+    condition: "Payout release attempted while a DamageClaim on the deposit is in {FILED, UNDER_REVIEW, DISPUTED}"
+  - id: ERR_STALE_CALENDAR_VERSION
+    http: 412
+    condition: "expected_listing_calendar_version != live Listing.calendar_version"
+  - id: ERR_RELEASE_BOOKING_BLOCK
+    http: 409
+    condition: "Manual release attempted on a BOOKING-source CalendarBlock (must go through cancel/decline)"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "Missing required field, wrong type, or invalid enum value in request body"
+  - id: ERR_DUPLICATE_EXTERNAL_REF
+    http: 409
+    condition: "An ImportedReservation with the same external_ref already exists on the channel connection"
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: Host
+    description: "Owns listings, rate plans, channels, calendar blocks; screens/approves/declines bookings; files damage claims"
+    identity: "entity_backed:Host"
+    exclusive_operations:
+      - "POST /listings, POST /rate-plans, POST /channel-connections"
+      - "POST /listings/{id}/publish, /snooze"
+      - "POST /listings/{id}/calendar-blocks, .../release"
+      - "POST /channel-connections/{id}/connect"
+      - "POST /bookings/{id}/screen, /request-info, /approve, /decline, /check-in, /complete"
+      - "POST /security-deposits/{id}/claims"
+    shared_operations:
+      - "GET reads on owned listings/bookings/deposits/claims/payouts; GET /listings/{id}/quote; GET /bookings/{id}/cancellation-quote"
+
+  - name: Guest
+    description: "Registers, requests bookings, confirms, cancels, disputes damage claims"
+    identity: "entity_backed:Guest"
+    exclusive_operations:
+      - "POST /bookings"
+      - "POST /bookings/{id}/confirm, /cancel"
+      - "POST /damage-claims/{id}/dispute"
+    shared_operations:
+      - "GET reads on own bookings/deposits/claims; GET /listings, /listings/{id}, /listings/{id}/quote; GET /bookings/{id}/cancellation-quote"
+
+  - name: PlatformAdmin
+    description: "Operational role: runs channel sync, imports reservations, reviews/approves/denies claims, manages payouts, controls clock"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /channel-connections/{id}/sync, /sync-complete, /sync-fail"
+      - "POST /channel-connections/{id}/imported-reservations"
+      - "POST /damage-claims/{id}/review, /approve, /deny"
+      - "POST /payouts/{id}/hold, /unhold, /release, /mark-paid"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "GET reads across all resources"
+
+  - name: Anonymous
+    description: "Unauthenticated caller; may only register and (for test driving) set the clock"
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /hosts, POST /guests, POST /_clock/set_current_utc"

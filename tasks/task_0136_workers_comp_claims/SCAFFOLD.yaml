@@ -1,0 +1,1646 @@
+scenario: |
+  Workers' Compensation Claims: injury report (FROI/SROI EDI), wage replacement
+  (TTD/PPD), MMI/impairment rating, return-to-work light duty, medical-only vs
+  lost-time, experience mod (EMR), reserve setting, IME
+
+domain_name: workers-comp-claims
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: Ledger reconciliation
+  secondary_archetype: Compliance / audit
+  complexity_layers:
+    - Dual-variant calculation
+    - Cascading side effects
+    - Rate / threshold triggers
+    - Derived field reconciliation
+
+  entity_topology: flat
+  # Peer entities (Employer, Policy, Worker, Claim, ...) linked by foreign keys.
+  # No nesting in URL paths beyond a single sub-resource reverse-reachability GET.
+
+  state_machine_shape: cyclic
+  # Claim has a revision loop (CLOSED -> REOPENED -> LOST_TIME) and InjuryReport
+  # has an EDI ack/reject cycle; ReturnToWorkOffer forks (ACCEPT/DECLINE).
+
+  relationship_patterns:
+    - one_to_many        # Employer -> Policy -> Claim; Claim -> BenefitPayment
+    - cross_aggregate    # ExperienceModEntry reads losses across an Employer's Claims
+
+  role_model: segregation_of_duties
+  # A ClaimsAdjuster who set a reserve cannot also approve the IME report that
+  # closes the same claim's impairment dispute; the MedicalReviewer owns clinical
+  # determinations; the Employer owns RTW offers; PlatformAdmin is opaque operator.
+
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Employer
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: Registered employer legal name.
+      - name: state_code
+        type: string
+        source: input
+        description: Two-letter jurisdiction of the employer (governing comp law).
+        constraints: ISO 3166-2 two-letter US state code.
+      - name: open_claim_count
+        type: integer
+        source: computed
+        default: 0
+        description: |
+          Conserved count: number of this employer's Claims in a non-terminal
+          state (status NOT IN {CLOSED}). Incremented when a Claim is opened or
+          reopened; decremented when a Claim transitions to CLOSED. Recomputed on
+          every Claim lifecycle transition.
+      - name: current_emr
+        type: number
+        source: computed
+        default: 1.00
+        description: |
+          Most recently posted ExperienceModEntry.mod_factor for this employer
+          (latest by ExperienceModEntry.created_at ASC, last wins). 1.00 until the
+          first entry is posted. Clamped to [0.75, 2.00].
+
+  - name: Policy
+    parent: null
+    common_fields: true
+    fields:
+      - name: employer_id
+        type: string
+        source: input
+        description: FK -> Employer.id; the employer this policy insures.
+      - name: policy_number
+        type: string
+        source: input
+        description: Carrier policy number.
+        constraints: Unique across all Policy rows.
+      - name: manual_premium_cents
+        type: integer
+        source: input
+        description: Manual (pre-experience-mod) annual premium in integer cents.
+        constraints: ">= 0"
+      - name: effective_date
+        type: datetime
+        source: input
+        description: Policy coverage start (ISO 8601 UTC).
+      - name: expiration_date
+        type: datetime
+        source: input
+        description: Policy coverage end (ISO 8601 UTC), exclusive.
+      - name: modified_premium_cents
+        type: integer
+        source: computed
+        default: 0
+        description: |
+          manual_premium_cents * Employer.current_emr, rounded HALF_UP to whole
+          cents. Recomputed whenever a new ExperienceModEntry is posted for the
+          owning employer.
+
+  - name: Worker
+    parent: null
+    common_fields: true
+    fields:
+      - name: employer_id
+        type: string
+        source: input
+        description: FK -> Employer.id; the employing employer.
+      - name: full_name
+        type: string
+        source: input
+        description: Injured worker full name.
+      - name: gross_wages_cents
+        type: integer
+        source: input
+        description: Total gross wages in cents over the wage base window.
+        constraints: ">= 0"
+      - name: weeks_worked
+        type: integer
+        source: input
+        description: Number of weeks over which gross_wages_cents were earned.
+        constraints: ">= 1, <= 52"
+      - name: average_weekly_wage_cents
+        type: integer
+        source: computed
+        default: 0
+        description: |
+          AWW in cents = round_half_up(gross_wages_cents / weeks_worked). Computed
+          at Worker creation; immutable thereafter (wage statement does not mutate
+          the worker, it supersedes via WageStatement).
+
+  - name: Claim
+    parent: null
+    common_fields: true
+    fields:
+      - name: policy_id
+        type: string
+        source: input
+        description: FK -> Policy.id; the policy covering this claim.
+      - name: worker_id
+        type: string
+        source: input
+        description: FK -> Worker.id; the injured worker.
+      - name: status
+        type: enum
+        source: system
+        default: REPORTED
+        description: Claim lifecycle state.
+        constraints: "REPORTED | MEDICAL_ONLY | LOST_TIME | MMI | CLOSED | REOPENED | DENIED"
+      - name: claim_class
+        type: enum
+        source: system
+        default: UNCLASSIFIED
+        description: |
+          Medical-only vs lost-time classification. Set MEDICAL_ONLY when accepted
+          with no disability period; set LOST_TIME when a BenefitPayment of
+          benefit_type TTD/TPD is first posted (cascade from claim).
+        constraints: "UNCLASSIFIED | MEDICAL_ONLY | LOST_TIME"
+      - name: disability_days
+        type: integer
+        source: input
+        default: 0
+        description: |
+          Total calendar days the worker is/was off work for this injury, supplied
+          when the claim is accepted into LOST_TIME. Drives the chronological
+          indemnity-paid ledger waiting-period logic.
+        constraints: ">= 0"
+      - name: date_of_injury
+        type: datetime
+        source: input
+        description: Date of injury (ISO 8601 UTC); used for statute-of-limitations.
+      - name: denial_reason
+        type: string
+        source: system
+        default: null
+        description: Free-text reason recorded when the claim is DENIED.
+
+  - name: InjuryReport
+    parent: null
+    common_fields: true
+    fields:
+      - name: claim_id
+        type: string
+        source: input
+        description: FK -> Claim.id; the claim this EDI report documents.
+      - name: report_kind
+        type: enum
+        source: input
+        description: EDI report kind — FROI (first) or SROI (subsequent).
+        constraints: "FROI | SROI"
+      - name: maintenance_type_code
+        type: string
+        source: input
+        description: |
+          EDI Maintenance Type Code (MTC). FROI uses 00 (original); SROI uses one
+          of IP (initial payment), CB (change benefit), SX (suspension), FN (final).
+        constraints: "FROI -> {00}; SROI -> {IP, CB, SX, FN}"
+      - name: edi_status
+        type: enum
+        source: system
+        default: DRAFT
+        description: EDI transmission lifecycle state.
+        constraints: "DRAFT | TRANSMITTED | ACKNOWLEDGED | REJECTED"
+      - name: rejection_code
+        type: string
+        source: system
+        default: null
+        description: TR (transaction reject) code recorded when the report is REJECTED.
+
+  - name: WageStatement
+    parent: null
+    common_fields: false
+    fields:
+      - name: claim_id
+        type: string
+        source: input
+        description: FK -> Claim.id; the claim whose benefit rate this statement fixes.
+      - name: average_weekly_wage_cents
+        type: integer
+        source: input
+        description: Verified AWW in cents (may correct the worker's computed AWW).
+        constraints: ">= 0"
+      - name: ttd_weekly_rate_cents
+        type: integer
+        source: computed
+        default: 0
+        description: |
+          Computed TTD weekly compensation rate in cents (see calc ttd_weekly_rate).
+          Append-only: a new WageStatement supersedes prior ones for the claim.
+
+  - name: BenefitPayment
+    parent: null
+    common_fields: true
+    fields:
+      - name: claim_id
+        type: string
+        source: input
+        description: FK -> Claim.id; the claim being paid.
+      - name: benefit_type
+        type: enum
+        source: input
+        description: Indemnity benefit kind.
+        constraints: "TTD | TPD | PPD"
+      - name: light_duty_weekly_cents
+        type: integer
+        source: input
+        default: 0
+        description: |
+          Worker's light-duty weekly earnings in cents; required when benefit_type
+          is TPD, ignored otherwise.
+        constraints: ">= 0"
+      - name: impairment_rating_id
+        type: string
+        source: input
+        default: null
+        description: |
+          FK -> ImpairmentRating.id; required when benefit_type is PPD, links the
+          award to the finalized rating. Null for TTD/TPD.
+      - name: amount_cents
+        type: integer
+        source: computed
+        default: 0
+        description: |
+          Computed indemnity amount in cents for this payment (see calc
+          indemnity_payment_amount). Drawn down from the claim's indemnity reserve.
+      - name: status
+        type: enum
+        source: system
+        default: POSTED
+        description: Payment lifecycle.
+        constraints: "POSTED | VOIDED"
+
+  - name: ImpairmentRating
+    parent: null
+    common_fields: true
+    fields:
+      - name: claim_id
+        type: string
+        source: input
+        description: FK -> Claim.id; the claim at MMI.
+      - name: whole_body_pct
+        type: number
+        source: input
+        description: Whole-person impairment percentage assigned by the rater.
+        constraints: ">= 0, <= 100"
+      - name: rater_role
+        type: enum
+        source: input
+        description: Who issued the rating — treating physician or IME examiner.
+        constraints: "TREATING | IME"
+      - name: status
+        type: enum
+        source: system
+        default: PROPOSED
+        description: Rating dispute lifecycle.
+        constraints: "PROPOSED | DISPUTED | FINALIZED"
+      - name: finalized_pct
+        type: number
+        source: system
+        default: null
+        description: |
+          The impairment percentage that controls the PPD award once FINALIZED.
+          Equals whole_body_pct of the controlling rating after dispute resolution.
+
+  - name: ReturnToWorkOffer
+    parent: null
+    common_fields: true
+    fields:
+      - name: claim_id
+        type: string
+        source: input
+        description: FK -> Claim.id; the claim the offer pertains to.
+      - name: light_duty_weekly_cents
+        type: integer
+        source: input
+        description: Offered light-duty weekly wage in cents.
+        constraints: ">= 0"
+      - name: start_date
+        type: datetime
+        source: input
+        description: Offered light-duty start date (ISO 8601 UTC).
+      - name: end_date
+        type: datetime
+        source: input
+        description: Offered light-duty end date (ISO 8601 UTC), exclusive.
+      - name: status
+        type: enum
+        source: system
+        default: OFFERED
+        description: Offer lifecycle.
+        constraints: "OFFERED | ACCEPTED | DECLINED | EXPIRED"
+
+  - name: Reserve
+    parent: null
+    common_fields: true
+    fields:
+      - name: claim_id
+        type: string
+        source: input
+        description: FK -> Claim.id; the claim this reserve belongs to (one per claim).
+        constraints: Unique across Reserve rows (one Reserve per Claim).
+      - name: severity_tier
+        type: enum
+        source: input
+        description: Medical severity tier driving the medical reserve estimate.
+        constraints: "MINOR | MODERATE | SEVERE"
+      - name: projected_weeks
+        type: integer
+        source: input
+        description: Adjuster's projected indemnity duration in weeks (forward-looking).
+        constraints: ">= 0"
+      - name: indemnity_reserve_cents
+        type: integer
+        source: computed
+        default: 0
+        description: |
+          Forward-looking outstanding indemnity reserve in cents (see calc
+          indemnity_reserve_forward). Drawn down as BenefitPayments post.
+      - name: medical_reserve_cents
+        type: integer
+        source: computed
+        default: 0
+        description: |
+          Forward-looking outstanding medical reserve in cents from severity_tier
+          table. Drawn down as medical payments post.
+      - name: indemnity_paid_cents
+        type: integer
+        source: computed
+        default: 0
+        description: Cumulative indemnity paid in cents (chronological ledger).
+      - name: medical_paid_cents
+        type: integer
+        source: computed
+        default: 0
+        description: Cumulative medical paid in cents.
+      - name: total_incurred_cents
+        type: integer
+        source: computed
+        default: 0
+        description: |
+          Conserved quantity: indemnity_reserve_cents + medical_reserve_cents +
+          indemnity_paid_cents + medical_paid_cents. Invariant across any
+          payment-plus-drawdown pair (see calc reserve_total_incurred).
+
+  - name: IMEOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: claim_id
+        type: string
+        source: input
+        description: FK -> Claim.id; the claim under independent examination.
+      - name: scheduled_start
+        type: datetime
+        source: input
+        description: IME appointment window start (ISO 8601 UTC).
+      - name: scheduled_end
+        type: datetime
+        source: input
+        description: IME appointment window end (ISO 8601 UTC), exclusive.
+      - name: examiner_name
+        type: string
+        source: input
+        description: Independent examiner full name.
+      - name: status
+        type: enum
+        source: system
+        default: SCHEDULED
+        description: IME lifecycle.
+        constraints: "SCHEDULED | COMPLETED | NO_SHOW | CANCELLED"
+
+  - name: ExperienceModEntry
+    parent: null
+    common_fields: true
+    fields:
+      - name: employer_id
+        type: string
+        source: input
+        description: FK -> Employer.id; the rated employer.
+      - name: rating_year
+        type: integer
+        source: input
+        description: Experience rating period year.
+        constraints: Unique per (employer_id, rating_year).
+      - name: weighting_factor
+        type: number
+        source: input
+        description: NCCI credibility weighting W applied to excess losses.
+        constraints: ">= 0, <= 1"
+      - name: ballast_cents
+        type: integer
+        source: input
+        description: NCCI ballast value B in cents (stabilizes small-employer mods).
+        constraints: ">= 0"
+      - name: expected_primary_cents
+        type: integer
+        source: input
+        description: Expected primary losses in cents (E_p).
+        constraints: ">= 1"
+      - name: expected_excess_cents
+        type: integer
+        source: input
+        description: Expected excess losses in cents (E_e).
+        constraints: ">= 0"
+      - name: mod_factor
+        type: number
+        source: computed
+        default: 1.00
+        description: |
+          Experience modification factor (EMR) computed from the employer's
+          actual primary/excess losses vs expected (see calc experience_mod).
+          Clamped to [0.75, 2.00].
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Claim
+    initial_state: REPORTED
+    terminal_states: [CLOSED, DENIED]
+    transitions:
+      - from: REPORTED
+        to: MEDICAL_ONLY
+        trigger: "POST /claims/{id}/accept with disability_days == 0"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "claim.status == REPORTED"
+          - "an InjuryReport with report_kind FROI exists for this claim and edi_status == ACKNOWLEDGED"
+          - "disability_days field on the claim == 0"
+        side_effects:
+          - "set claim.claim_class = MEDICAL_ONLY"
+          - "increment Employer.open_claim_count by 1 (claim becomes an open active claim)"
+      - from: REPORTED
+        to: LOST_TIME
+        trigger: "POST /claims/{id}/accept with disability_days > 0"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "claim.status == REPORTED"
+          - "an InjuryReport with report_kind FROI exists for this claim and edi_status == ACKNOWLEDGED"
+          - "a Reserve row exists for this claim"
+          - "disability_days field on the claim > 0"
+        side_effects:
+          - "increment Employer.open_claim_count by 1"
+          - "note: claim_class stays UNCLASSIFIED until the first TTD/TPD BenefitPayment posts, which flips it to LOST_TIME"
+      - from: REPORTED
+        to: DENIED
+        trigger: "POST /claims/{id}/deny"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "claim.status == REPORTED"
+        side_effects:
+          - "set claim.denial_reason from request"
+          - "set claim.status = DENIED (terminal)"
+      - from: LOST_TIME
+        to: MMI
+        trigger: "POST /impairment-ratings then POST /impairment-ratings/{id}/finalize"
+        actor: MedicalReviewer
+        preconditions:
+          - "claim.status == LOST_TIME"
+          - "the ImpairmentRating being finalized has status == PROPOSED or DISPUTED and belongs to this claim"
+        side_effects:
+          - "set ImpairmentRating.status = FINALIZED and ImpairmentRating.finalized_pct = controlling whole_body_pct"
+          - "set claim.status = MMI"
+      - from: MMI
+        to: CLOSED
+        trigger: "POST /claims/{id}/close"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "claim.status == MMI"
+          - "the claim's Reserve has indemnity_reserve_cents == 0 (all projected indemnity drawn down or written off)"
+          - "no IMEOrder for this claim is in status SCHEDULED"
+        side_effects:
+          - "set claim.status = CLOSED (terminal)"
+          - "decrement Employer.open_claim_count by 1"
+          - "set the claim's Reserve.medical_reserve_cents = 0 (write off remaining medical reserve into total_incurred via paid? no — see note)"
+          - "note: closing writes off remaining indemnity_reserve only as a precondition=0; medical reserve write-off is a separate explicit drawdown"
+      - from: MEDICAL_ONLY
+        to: CLOSED
+        trigger: "POST /claims/{id}/close"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "claim.status == MEDICAL_ONLY"
+          - "no IMEOrder for this claim is in status SCHEDULED"
+        side_effects:
+          - "set claim.status = CLOSED (terminal)"
+          - "decrement Employer.open_claim_count by 1"
+      - from: CLOSED
+        to: REOPENED
+        trigger: "POST /claims/{id}/reopen"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "claim.status == CLOSED"
+          - "the reopen is within the statutory reopening window: now < date_of_injury + REOPEN_LIMIT_DAYS"
+        side_effects:
+          - "set claim.status = REOPENED"
+          - "increment Employer.open_claim_count by 1 (conserves the count decremented at close)"
+      - from: REOPENED
+        to: LOST_TIME
+        trigger: "POST /claims/{id}/accept with disability_days > 0"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "claim.status == REOPENED"
+          - "a Reserve row exists for this claim"
+        side_effects:
+          - "set claim.status = LOST_TIME"
+        note: "Reopened claims re-enter the lost-time pipeline without re-counting the open_claim_count (already incremented on reopen)."
+
+  - entity: InjuryReport
+    initial_state: DRAFT
+    terminal_states: [ACKNOWLEDGED]
+    transitions:
+      - from: DRAFT
+        to: TRANSMITTED
+        trigger: "POST /injury-reports/{id}/transmit"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "report.edi_status == DRAFT"
+          - "for SROI reports: an InjuryReport with report_kind FROI and edi_status ACKNOWLEDGED already exists for the same claim (FROI must precede SROI)"
+        side_effects:
+          - "set report.edi_status = TRANSMITTED"
+      - from: TRANSMITTED
+        to: ACKNOWLEDGED
+        trigger: "POST /injury-reports/{id}/ack"
+        actor: PlatformAdmin
+        preconditions:
+          - "report.edi_status == TRANSMITTED"
+        side_effects:
+          - "set report.edi_status = ACKNOWLEDGED (terminal)"
+      - from: TRANSMITTED
+        to: REJECTED
+        trigger: "POST /injury-reports/{id}/reject"
+        actor: PlatformAdmin
+        preconditions:
+          - "report.edi_status == TRANSMITTED"
+        side_effects:
+          - "set report.edi_status = REJECTED and report.rejection_code from request"
+      - from: REJECTED
+        to: TRANSMITTED
+        trigger: "POST /injury-reports/{id}/transmit"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "report.edi_status == REJECTED"
+          - "for SROI reports: a FROI for the same claim is ACKNOWLEDGED"
+        side_effects:
+          - "set report.edi_status = TRANSMITTED"
+        note: "EDI correction loop — a rejected report may be re-transmitted (cyclic)."
+
+  - entity: ImpairmentRating
+    initial_state: PROPOSED
+    terminal_states: [FINALIZED]
+    transitions:
+      - from: PROPOSED
+        to: DISPUTED
+        trigger: "POST /impairment-ratings/{id}/dispute"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "rating.status == PROPOSED"
+          - "rating.rater_role == TREATING"
+        side_effects:
+          - "set rating.status = DISPUTED"
+          - "cascade: create an IMEOrder (status SCHEDULED) for the same claim to resolve the dispute, with scheduled_start = current server time (now) and scheduled_end = now + 1 day, and examiner_name = 'PENDING_ASSIGNMENT' — so the dispute-resolution IME is immediately completable (now >= scheduled_start holds at creation)"
+      - from: DISPUTED
+        to: FINALIZED
+        trigger: "POST /impairment-ratings/{id}/finalize"
+        actor: MedicalReviewer
+        preconditions:
+          - "rating.status == DISPUTED"
+          - "an IMEOrder for this claim is in status COMPLETED (the dispute has been examined)"
+        side_effects:
+          - "set rating.status = FINALIZED, rating.finalized_pct = whole_body_pct"
+          - "cascade: set claim.status = MMI"
+      - from: PROPOSED
+        to: FINALIZED
+        trigger: "POST /impairment-ratings/{id}/finalize"
+        actor: MedicalReviewer
+        preconditions:
+          - "rating.status == PROPOSED"
+          - "rating.rater_role == IME (an IME-issued rating needs no dispute round)"
+        side_effects:
+          - "set rating.status = FINALIZED, rating.finalized_pct = whole_body_pct"
+          - "cascade: set claim.status = MMI"
+
+  - entity: ReturnToWorkOffer
+    initial_state: OFFERED
+    terminal_states: [ACCEPTED, DECLINED, EXPIRED]
+    transitions:
+      - from: OFFERED
+        to: ACCEPTED
+        trigger: "POST /rtw-offers/{id}/accept"
+        actor: Employer
+        preconditions:
+          - "offer.status == OFFERED"
+          - "the offer's claim is in status LOST_TIME"
+          - "now < offer.start_date (acceptance must precede the light-duty start)"
+        side_effects:
+          - "set offer.status = ACCEPTED"
+          - "note: subsequent TPD BenefitPayments use offer.light_duty_weekly_cents as the wage offset"
+      - from: OFFERED
+        to: DECLINED
+        trigger: "POST /rtw-offers/{id}/decline"
+        actor: Employer
+        preconditions:
+          - "offer.status == OFFERED"
+        side_effects:
+          - "set offer.status = DECLINED"
+      - from: OFFERED
+        to: EXPIRED
+        trigger: "POST /_clock/set_current_utc advancing now to >= offer.start_date while offer still OFFERED, then any read"
+        actor: system
+        preconditions:
+          - "offer.status == OFFERED"
+          - "now >= offer.start_date"
+        side_effects:
+          - "set offer.status = EXPIRED"
+
+  - entity: IMEOrder
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, NO_SHOW, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "POST /ime-orders/{id}/complete"
+        actor: MedicalReviewer
+        preconditions:
+          - "ime.status == SCHEDULED"
+          - "now >= ime.scheduled_start"
+        side_effects:
+          - "set ime.status = COMPLETED"
+      - from: SCHEDULED
+        to: NO_SHOW
+        trigger: "POST /ime-orders/{id}/no-show"
+        actor: MedicalReviewer
+        preconditions:
+          - "ime.status == SCHEDULED"
+          - "now >= ime.scheduled_end"
+        side_effects:
+          - "set ime.status = NO_SHOW"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /ime-orders/{id}/cancel"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "ime.status == SCHEDULED"
+        side_effects:
+          - "set ime.status = CANCELLED"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: wage-statement-create-stale-claim
+    parent_entity: Claim
+    write_endpoint: "POST /wage-statements"
+    occ_field: "expected_claim_version"
+    description: |
+      Creating a WageStatement against a Claim whose version has advanced since
+      the client last observed it is rejected for stale version. A new
+      WageStatement legitimately supersedes the prior one as the controlling
+      benefit-rate basis for the claim, so a writer holding a stale view of the
+      claim (e.g., another writer already posted a superseding statement and
+      advanced the claim) must re-read before writing.
+    error_id: ERR_STALE_CLAIM_VERSION
+    http_status: 412
+
+  - rule_id: reserve-update-stale-claim
+    parent_entity: Claim
+    write_endpoint: "POST /claims/{id}/reserve-adjustments"
+    occ_field: "expected_claim_version"
+    description: |
+      Posting a reserve adjustment against a Claim whose version has advanced
+      since the client last read it is rejected for stale version. A reserve
+      re-projection legitimately supersedes the prior outstanding figures; a
+      writer whose claim view is stale (another adjustment or a payment has since
+      mutated the claim) must re-read before re-projecting.
+    error_id: ERR_STALE_CLAIM_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: average_weekly_wage
+    trigger: "On Worker creation (POST /workers)"
+    algorithm: aggregation
+    formula: |
+      average_weekly_wage_cents = round_half_up(gross_wages_cents / weeks_worked)
+    input_set: "The single Worker's gross_wages_cents and weeks_worked input fields."
+    constants: {}
+    precision: "integer cents, round_half_up at the final division"
+
+  - name: ttd_weekly_rate
+    trigger: "On WageStatement creation (POST /wage-statements)"
+    algorithm: threshold
+    formula: |
+      raw_cents      = round_half_up(average_weekly_wage_cents * TTD_RATE)
+      cap_cents      = round_half_up(SAWW_CENTS * MAX_COMP_PCT)
+      capped_cents   = min(raw_cents, cap_cents)
+      ttd_weekly_rate_cents = max(capped_cents, MIN_TTD_CENTS)
+    input_set: "The WageStatement's average_weekly_wage_cents (which may correct the Worker's computed AWW)."
+    constants:
+      TTD_RATE: 0.6667
+      SAWW_CENTS: 120000
+      MAX_COMP_PCT: 1.00
+      MIN_TTD_CENTS: 15000
+    precision: "integer cents, round_half_up; cap applied before floor"
+    variants:
+      - name: at_or_above_cap
+        when: "average_weekly_wage_cents * TTD_RATE >= SAWW_CENTS"
+        difference: "rate pinned to SAWW_CENTS (high earner); raw rate discarded."
+      - name: below_statutory_floor
+        when: "average_weekly_wage_cents * TTD_RATE < MIN_TTD_CENTS"
+        difference: "rate floored to MIN_TTD_CENTS regardless of computed raw rate."
+
+  - name: indemnity_payment_amount
+    trigger: "On BenefitPayment creation (POST /benefit-payments), keyed on benefit_type"
+    algorithm: threshold
+    formula: |
+      # Resolve the controlling weekly rate from the latest WageStatement for the claim
+      weekly = latest WageStatement(claim_id).ttd_weekly_rate_cents   # by created_at ASC, last wins
+      if benefit_type == TTD:
+        daily = round_half_up(weekly / 7)
+        if   claim.disability_days <= WAITING_DAYS:                  amount = 0
+        elif claim.disability_days <  RETRO_DAYS:                    compensable = claim.disability_days - WAITING_DAYS
+        else:                                                         compensable = claim.disability_days   # retroactive: waiting period now paid
+        amount_cents = round_half_up(daily * compensable)
+      elif benefit_type == TPD:
+        loss_weekly = average_weekly_wage_cents(claim) - light_duty_weekly_cents
+        if loss_weekly <= 0: amount_cents = 0
+        else: amount_cents = min(round_half_up(loss_weekly * TPD_RATE), weekly)   # capped at TTD weekly rate
+      elif benefit_type == PPD:
+        weeks = ImpairmentRating(impairment_rating_id).finalized_pct * PPD_WEEKS_PER_PCT
+        amount_cents = round_half_up(weeks * weekly)
+    input_set: |
+      Latest WageStatement.ttd_weekly_rate_cents for the claim; claim.disability_days;
+      the FINALIZED ImpairmentRating.finalized_pct for PPD; the BenefitPayment's
+      light_duty_weekly_cents for TPD.
+    constants:
+      WAITING_DAYS: 7
+      RETRO_DAYS: 14
+      TPD_RATE: 0.6667
+      PPD_WEEKS_PER_PCT: 3.0
+    precision: "integer cents, round_half_up per branch"
+    variants:
+      - name: ttd_within_waiting_no_retro
+        when: "WAITING_DAYS < disability_days < RETRO_DAYS"
+        difference: "only (disability_days - 7) days are compensable; waiting period unpaid."
+      - name: ttd_retroactive
+        when: "disability_days >= RETRO_DAYS"
+        difference: "all disability_days are compensable; the 7-day waiting period is paid retroactively."
+
+  - name: indemnity_reserve_forward
+    trigger: "On Reserve creation (POST /reserves) and on reserve-adjustment (POST /claims/{id}/reserve-adjustments)"
+    algorithm: forward_looking
+    formula: |
+      # weekly = latest WageStatement(claim_id).ttd_weekly_rate_cents by created_at ASC,
+      # last wins; if NO WageStatement exists for the claim yet, weekly = 0 (the indemnity
+      # reserve is purely medical until a wage statement fixes the rate).
+      weekly = latest WageStatement(claim_id).ttd_weekly_rate_cents OR 0 if none exists
+      indemnity_reserve_cents = round_half_up(weekly * projected_weeks)
+      medical_reserve_cents   = MED_TIER[severity_tier]
+    input_set: "Latest WageStatement.ttd_weekly_rate_cents (0 if no statement yet); Reserve.projected_weeks; Reserve.severity_tier."
+    constants:
+      MED_TIER_MINOR_CENTS: 250000
+      MED_TIER_MODERATE_CENTS: 1500000
+      MED_TIER_SEVERE_CENTS: 7500000
+    precision: "integer cents"
+    variants:
+      - name: forward_projection
+        when: "reserve is being set or re-projected"
+        difference: "Projects the FULL expected indemnity exposure over projected_weeks at the weekly rate, ignoring the waiting-period reduction the chronological paid-ledger applies."
+      - name: chronological_paid
+        when: "compared against indemnity_payment_amount actually paid"
+        difference: "The paid ledger (indemnity_payment_amount) deducts the 7-day waiting period; the forward reserve does not. The two diverge by the waiting-period amount for the same disability span."
+
+  - name: reserve_total_incurred
+    trigger: "On every Reserve mutation (creation, reserve-adjustment, BenefitPayment post/void, medical payment)"
+    algorithm: aggregation
+    formula: |
+      total_incurred_cents = indemnity_reserve_cents + medical_reserve_cents
+                           + indemnity_paid_cents + medical_paid_cents
+      # Invariant on a payment+drawdown pair: a BenefitPayment of P (TTD/TPD/PPD)
+      #   indemnity_paid_cents     += P
+      #   indemnity_reserve_cents  -= P     (floored at 0; any shortfall raises reserve first)
+      # => total_incurred_cents unchanged.
+    input_set: "The claim's single Reserve row fields."
+    constants: {}
+    precision: "integer cents"
+
+  - name: experience_mod
+    trigger: "On ExperienceModEntry creation (POST /experience-mods)"
+    algorithm: weighted_scoring
+    formula: |
+      # actual losses are summed across the employer's Claims' Reserve.total_incurred_cents,
+      # split into primary (first PRIMARY_SPLIT_CENTS per claim) and excess (remainder).
+      Ap = sum over employer's Claims of min(claim.Reserve.total_incurred_cents, PRIMARY_SPLIT_CENTS)
+      Ae = sum over employer's Claims of max(claim.Reserve.total_incurred_cents - PRIMARY_SPLIT_CENTS, 0)
+      Ep = expected_primary_cents
+      Ee = expected_excess_cents
+      W  = weighting_factor
+      B  = ballast_cents
+      numerator   = Ap + (W * Ae) + ((1 - W) * Ee) + B
+      denominator = Ep + (W * Ee) + ((1 - W) * Ee) + B
+      raw_mod     = numerator / denominator
+      mod_factor  = clamp(round_half_up(raw_mod, 2), 0.75, 2.00)
+    input_set: |
+      Sum of Reserve.total_incurred_cents over the employer's Claims whose status
+      != DENIED (DENIED claims contribute no losses); the entry's expected/weighting/
+      ballast inputs.
+    constants:
+      PRIMARY_SPLIT_CENTS: 1700000
+      MOD_FLOOR: 0.75
+      MOD_CEILING: 2.00
+    precision: "mod_factor: 2 decimal places, round_half_up; clamp applied after rounding"
+    variants:
+      - name: debit_mod
+        when: "actual losses exceed expected -> raw_mod > 1.00"
+        difference: "employer pays a surcharge; modified_premium_cents > manual_premium_cents."
+      - name: credit_mod
+        when: "actual losses below expected -> raw_mod < 1.00"
+        difference: "employer earns a credit; modified_premium_cents < manual_premium_cents."
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "The acting role is permitted to perform this operation per the RBAC matrix."
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: |
+      Segregation of duties: the ClaimsAdjuster (X-User-ID) who created the claim's
+      Reserve MUST NOT be the MedicalReviewer who finalizes an ImpairmentRating on
+      the same claim, and the same X-User-ID MUST NOT both set a reserve and complete
+      the IMEOrder for that claim.
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /impairment-ratings/{id}/finalize, POST /ime-orders/{id}/complete"
+
+  - priority: 4
+    category: existence
+    check: "Every path id and every FK in the body references an existing resource (validated left-to-right)."
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6
+    category: business_referential
+    check: |
+      EDI sequencing: a SROI InjuryReport cannot be transmitted before a FROI for
+      the same claim has been ACKNOWLEDGED.
+    error_id: ERR_FROI_NOT_ACKNOWLEDGED
+    http_status: 409
+    applies_to: "POST /injury-reports/{id}/transmit"
+
+  - priority: 7
+    category: business_referential
+    check: |
+      MTC validity: report_kind FROI requires maintenance_type_code 00; report_kind
+      SROI requires one of {IP, CB, SX, FN}.
+    error_id: ERR_INVALID_MTC
+    http_status: 422
+    applies_to: "POST /injury-reports"
+
+  - priority: 8
+    category: business_safety
+    check: |
+      A claim cannot be accepted into LOST_TIME unless its FROI is ACKNOWLEDGED;
+      a PPD BenefitPayment requires a FINALIZED ImpairmentRating (impairment_rating_id
+      must reference a rating whose status == FINALIZED).
+    error_id: ERR_RATING_NOT_FINALIZED
+    http_status: 409
+    applies_to: "POST /benefit-payments"
+
+  - priority: 9
+    category: business_temporal
+    check: |
+      Statute of limitations: a claim cannot be created (POST /claims) more than
+      SOL_DAYS after date_of_injury; a CLOSED claim cannot be reopened after
+      REOPEN_LIMIT_DAYS past date_of_injury.
+    error_id: ERR_STATUTE_EXPIRED
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/reopen"
+
+  - priority: 10
+    category: business_temporal
+    check: |
+      IME scheduling overlap: an IMEOrder window [scheduled_start, scheduled_end)
+      must not overlap another non-terminal IMEOrder for the SAME claim (closed
+      half-open intervals; touching endpoints do not overlap).
+    error_id: ERR_IME_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /ime-orders"
+
+  - priority: 11
+    category: business_temporal
+    check: |
+      RTW light-duty overlap: a ReturnToWorkOffer window [start_date, end_date)
+      must not overlap an ACCEPTED ReturnToWorkOffer for the same claim, where a
+      BUFFER_DAYS gap is required between consecutive light-duty assignments
+      (an offer starting within BUFFER_DAYS of a prior accepted offer's end_date
+      conflicts).
+    error_id: ERR_RTW_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /rtw-offers"
+
+  - priority: 12
+    category: business_constraint
+    check: |
+      Uniqueness: at most one Reserve per Claim; at most one ExperienceModEntry
+      per (employer_id, rating_year); Policy.policy_number is globally unique.
+    error_id: ERR_DUPLICATE_RESOURCE
+    http_status: 409
+    applies_to: "POST /reserves, POST /experience-mods, POST /policies"
+
+  - priority: 13
+    category: business_fiscal
+    check: |
+      A BenefitPayment cannot draw down more indemnity than is reserved: a payment
+      whose amount_cents would exceed the claim's Reserve.indemnity_reserve_cents
+      is rejected (would-exceed boundary).
+    error_id: ERR_RESERVE_INSUFFICIENT
+    http_status: 422
+    applies_to: "POST /benefit-payments"
+
+  - priority: 14
+    category: business_constraint
+    check: |
+      Field-shape: required fields present and well-typed; benefit_type TPD requires
+      light_duty_weekly_cents; benefit_type PPD requires impairment_rating_id;
+      whole_body_pct in [0,100]; weighting_factor in [0,1]; enum members valid.
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Employer ----
+  - method: POST
+    path: "/employers"
+    description: "Register an employer."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [legal_name, state_code]
+    output: Employer
+    side_effects: ["open_claim_count initialized to 0; current_emr initialized to 1.00"]
+
+  - method: GET
+    path: "/employers/{id}"
+    description: "Fetch an employer (includes computed open_claim_count, current_emr)."
+    roles: [PlatformAdmin, ClaimsAdjuster, MedicalReviewer, Employer]
+    code: 200
+    input: []
+    output: Employer
+    side_effects: []
+
+  - method: GET
+    path: "/employers/{id}/policies"
+    description: "List policies for an employer (FK reverse-reachability for Policy.employer_id)."
+    roles: [PlatformAdmin, ClaimsAdjuster, Employer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Policy[]
+    side_effects: []
+
+  - method: GET
+    path: "/employers/{id}/workers"
+    description: "List workers for an employer (FK reverse-reachability for Worker.employer_id)."
+    roles: [PlatformAdmin, ClaimsAdjuster, Employer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Worker[]
+    side_effects: []
+
+  - method: GET
+    path: "/employers/{id}/experience-mods"
+    description: "List experience-mod entries for an employer (FK reverse-reachability for ExperienceModEntry.employer_id)."
+    roles: [PlatformAdmin, ClaimsAdjuster, Employer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ExperienceModEntry[]
+    side_effects: []
+
+  # ---- Policy ----
+  - method: POST
+    path: "/policies"
+    description: "Create a workers-comp policy for an employer."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [employer_id, policy_number, manual_premium_cents, effective_date, expiration_date]
+    output: Policy
+    side_effects: ["modified_premium_cents computed = manual_premium_cents * Employer.current_emr"]
+
+  - method: GET
+    path: "/policies/{id}"
+    description: "Fetch a policy (includes computed modified_premium_cents)."
+    roles: [PlatformAdmin, ClaimsAdjuster, Employer]
+    code: 200
+    input: []
+    output: Policy
+    side_effects: []
+
+  # ---- Worker ----
+  - method: POST
+    path: "/workers"
+    description: "Register an injured-or-coverable worker; computes AWW."
+    roles: [PlatformAdmin, Employer]
+    code: 201
+    input: [employer_id, full_name, gross_wages_cents, weeks_worked]
+    output: Worker
+    side_effects: ["average_weekly_wage_cents computed (calc average_weekly_wage)"]
+
+  - method: GET
+    path: "/workers/{id}"
+    description: "Fetch a worker."
+    roles: [PlatformAdmin, ClaimsAdjuster, MedicalReviewer, Employer]
+    code: 200
+    input: []
+    output: Worker
+    side_effects: []
+
+  # ---- Claim ----
+  - method: POST
+    path: "/claims"
+    description: "Open a claim (REPORTED) against a policy and worker."
+    roles: [ClaimsAdjuster, Employer]
+    code: 201
+    input: [policy_id, worker_id, date_of_injury, "disability_days?"]
+    output: Claim
+    side_effects: ["status set to REPORTED; statute-of-limitations checked against date_of_injury"]
+
+  - method: GET
+    path: "/claims/{id}"
+    description: "Fetch a claim."
+    roles: [PlatformAdmin, ClaimsAdjuster, MedicalReviewer, Employer]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: []
+
+  - method: GET
+    path: "/claims"
+    description: "List claims, filterable by policy and worker (FK reverse-reachability for Claim.policy_id and Claim.worker_id)."
+    roles: [PlatformAdmin, ClaimsAdjuster, MedicalReviewer, Employer]
+    code: 200
+    input: ["policy_id?", "worker_id?", "limit?", "offset?"]
+    output: Claim[]
+    side_effects: []
+
+  - method: POST
+    path: "/claims/{id}/accept"
+    description: "Accept a REPORTED/REOPENED claim into MEDICAL_ONLY (disability_days==0) or LOST_TIME (disability_days>0)."
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: ["disability_days?"]
+    output: Claim
+    side_effects:
+      - "MEDICAL_ONLY: set claim_class=MEDICAL_ONLY; increment Employer.open_claim_count"
+      - "LOST_TIME: increment Employer.open_claim_count (claim_class flips to LOST_TIME on first TTD/TPD payment)"
+
+  - method: POST
+    path: "/claims/{id}/deny"
+    description: "Deny a REPORTED claim (terminal)."
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: [denial_reason]
+    output: Claim
+    side_effects: ["status set to DENIED; denial_reason recorded"]
+
+  - method: POST
+    path: "/claims/{id}/close"
+    description: "Close a MEDICAL_ONLY or MMI claim (terminal)."
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: []
+    output: Claim
+    side_effects:
+      - "status set to CLOSED; decrement Employer.open_claim_count"
+      - "MMI close requires Reserve.indemnity_reserve_cents == 0 and no SCHEDULED IMEOrder"
+
+  - method: POST
+    path: "/claims/{id}/reopen"
+    description: "Reopen a CLOSED claim within the statutory window."
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["status set to REOPENED; increment Employer.open_claim_count (conserves the close decrement)"]
+
+  - method: POST
+    path: "/claims/{id}/reserve-adjustments"
+    description: "Re-project the claim's Reserve (OCC-guarded on the claim version)."
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: [projected_weeks, severity_tier, expected_claim_version]
+    output: Reserve
+    side_effects:
+      - "recompute Reserve.indemnity_reserve_cents and medical_reserve_cents (calc indemnity_reserve_forward)"
+      - "recompute Reserve.total_incurred_cents (calc reserve_total_incurred)"
+      - "increments Claim.version by 1"
+
+  # ---- InjuryReport (FROI/SROI EDI) ----
+  - method: POST
+    path: "/injury-reports"
+    description: "Create a FROI or SROI EDI report (DRAFT) for a claim."
+    roles: [ClaimsAdjuster]
+    code: 201
+    input: [claim_id, report_kind, maintenance_type_code]
+    output: InjuryReport
+    side_effects: ["edi_status set to DRAFT; MTC validated against report_kind"]
+
+  - method: GET
+    path: "/injury-reports/{id}"
+    description: "Fetch an injury report."
+    roles: [PlatformAdmin, ClaimsAdjuster, MedicalReviewer]
+    code: 200
+    input: []
+    output: InjuryReport
+    side_effects: []
+
+  - method: GET
+    path: "/claims/{id}/injury-reports"
+    description: "List a claim's injury reports (FK reverse-reachability for InjuryReport.claim_id)."
+    roles: [PlatformAdmin, ClaimsAdjuster, MedicalReviewer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: InjuryReport[]
+    side_effects: []
+
+  - method: POST
+    path: "/injury-reports/{id}/transmit"
+    description: "Transmit a DRAFT or REJECTED report (EDI), enforcing FROI-before-SROI."
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: []
+    output: InjuryReport
+    side_effects: ["edi_status set to TRANSMITTED"]
+
+  - method: POST
+    path: "/injury-reports/{id}/ack"
+    description: "Acknowledge a TRANSMITTED report (EDI carrier ack)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: InjuryReport
+    side_effects: ["edi_status set to ACKNOWLEDGED (terminal)"]
+
+  - method: POST
+    path: "/injury-reports/{id}/reject"
+    description: "Reject a TRANSMITTED report (EDI TR reject)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [rejection_code]
+    output: InjuryReport
+    side_effects: ["edi_status set to REJECTED; rejection_code recorded"]
+
+  # ---- WageStatement ----
+  - method: POST
+    path: "/wage-statements"
+    description: "File a verified wage statement that fixes the claim's TTD weekly rate (supersedes prior; OCC-guarded on claim version)."
+    roles: [ClaimsAdjuster]
+    code: 201
+    input: [claim_id, average_weekly_wage_cents, expected_claim_version]
+    output: WageStatement
+    side_effects:
+      - "ttd_weekly_rate_cents computed (calc ttd_weekly_rate)"
+      - "increments Claim.version by 1"
+
+  - method: GET
+    path: "/claims/{id}/wage-statements"
+    description: "List a claim's wage statements (FK reverse-reachability for WageStatement.claim_id)."
+    roles: [PlatformAdmin, ClaimsAdjuster]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WageStatement[]
+    side_effects: []
+
+  # ---- Reserve ----
+  - method: POST
+    path: "/reserves"
+    description: "Set the claim's reserve (one per claim); computes forward-looking indemnity and medical reserves."
+    roles: [ClaimsAdjuster]
+    code: 201
+    input: [claim_id, severity_tier, projected_weeks]
+    output: Reserve
+    side_effects:
+      - "indemnity_reserve_cents, medical_reserve_cents computed (calc indemnity_reserve_forward)"
+      - "total_incurred_cents computed (calc reserve_total_incurred)"
+
+  - method: GET
+    path: "/reserves/{id}"
+    description: "Fetch a reserve."
+    roles: [PlatformAdmin, ClaimsAdjuster]
+    code: 200
+    input: []
+    output: Reserve
+    side_effects: []
+
+  - method: GET
+    path: "/claims/{id}/reserves"
+    description: "List the claim's reserve (FK reverse-reachability for Reserve.claim_id; array of 0–1)."
+    roles: [PlatformAdmin, ClaimsAdjuster]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Reserve[]
+    side_effects: []
+
+  - method: POST
+    path: "/reserves/{id}/medical-payments"
+    description: "Post a medical payment against the reserve (draws down medical_reserve_cents)."
+    roles: [ClaimsAdjuster]
+    code: 201
+    input: [amount_cents]
+    output: Reserve
+    side_effects:
+      - "medical_paid_cents += amount_cents; medical_reserve_cents -= amount_cents (floored at 0)"
+      - "total_incurred_cents recomputed (invariant preserved, calc reserve_total_incurred)"
+
+  # ---- BenefitPayment ----
+  - method: POST
+    path: "/benefit-payments"
+    description: "Post a TTD/TPD/PPD indemnity payment; computes amount and draws down the indemnity reserve."
+    roles: [ClaimsAdjuster]
+    code: 201
+    input: [claim_id, benefit_type, "light_duty_weekly_cents?", "impairment_rating_id?"]
+    output: BenefitPayment
+    side_effects:
+      - "amount_cents computed (calc indemnity_payment_amount)"
+      - "Reserve.indemnity_paid_cents += amount_cents; Reserve.indemnity_reserve_cents -= amount_cents (floored at 0)"
+      - "first TTD/TPD payment flips claim.claim_class to LOST_TIME"
+      - "total_incurred_cents recomputed (invariant, calc reserve_total_incurred)"
+
+  - method: GET
+    path: "/benefit-payments/{id}"
+    description: "Fetch a benefit payment."
+    roles: [PlatformAdmin, ClaimsAdjuster]
+    code: 200
+    input: []
+    output: BenefitPayment
+    side_effects: []
+
+  - method: GET
+    path: "/claims/{id}/benefit-payments"
+    description: "List a claim's benefit payments (FK reverse-reachability for BenefitPayment.claim_id)."
+    roles: [PlatformAdmin, ClaimsAdjuster]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: BenefitPayment[]
+    side_effects: []
+
+  - method: GET
+    path: "/benefit-payments"
+    description: "List benefit payments, filterable by claim and impairment rating (FK reverse-reachability for BenefitPayment.impairment_rating_id and claim_id)."
+    roles: [PlatformAdmin, ClaimsAdjuster]
+    code: 200
+    input: ["claim_id?", "impairment_rating_id?", "limit?", "offset?"]
+    output: BenefitPayment[]
+    side_effects: []
+
+  - method: POST
+    path: "/benefit-payments/{id}/void"
+    description: "Void a POSTED benefit payment; compensating reversal restores the indemnity reserve."
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: []
+    output: BenefitPayment
+    side_effects:
+      - "status set to VOIDED"
+      - "Reserve.indemnity_paid_cents -= amount_cents; Reserve.indemnity_reserve_cents += amount_cents"
+      - "total_incurred_cents recomputed (invariant preserved)"
+
+  # ---- ImpairmentRating (MMI) ----
+  - method: POST
+    path: "/impairment-ratings"
+    description: "Record an MMI impairment rating (PROPOSED) for a claim."
+    roles: [MedicalReviewer]
+    code: 201
+    input: [claim_id, whole_body_pct, rater_role]
+    output: ImpairmentRating
+    side_effects: ["status set to PROPOSED"]
+
+  - method: GET
+    path: "/impairment-ratings/{id}"
+    description: "Fetch an impairment rating."
+    roles: [PlatformAdmin, ClaimsAdjuster, MedicalReviewer]
+    code: 200
+    input: []
+    output: ImpairmentRating
+    side_effects: []
+
+  - method: GET
+    path: "/claims/{id}/impairment-ratings"
+    description: "List a claim's impairment ratings (FK reverse-reachability for ImpairmentRating.claim_id)."
+    roles: [PlatformAdmin, ClaimsAdjuster, MedicalReviewer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ImpairmentRating[]
+    side_effects: []
+
+  - method: POST
+    path: "/impairment-ratings/{id}/dispute"
+    description: "Dispute a PROPOSED treating-physician rating; cascades an IMEOrder."
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: []
+    output: ImpairmentRating
+    side_effects:
+      - "status set to DISPUTED"
+      - "cascade: create an IMEOrder (SCHEDULED) for the same claim with scheduled_start=now, scheduled_end=now+1day, examiner_name='PENDING_ASSIGNMENT'"
+
+  - method: POST
+    path: "/impairment-ratings/{id}/finalize"
+    description: "Finalize a rating; sets finalized_pct and cascades claim to MMI."
+    roles: [MedicalReviewer]
+    code: 200
+    input: []
+    output: ImpairmentRating
+    side_effects:
+      - "status set to FINALIZED; finalized_pct = whole_body_pct"
+      - "cascade: set claim.status = MMI"
+
+  # ---- ReturnToWorkOffer ----
+  - method: POST
+    path: "/rtw-offers"
+    description: "Create a light-duty return-to-work offer for a LOST_TIME claim."
+    roles: [Employer]
+    code: 201
+    input: [claim_id, light_duty_weekly_cents, start_date, end_date]
+    output: ReturnToWorkOffer
+    side_effects: ["status set to OFFERED; RTW window overlap checked"]
+
+  - method: GET
+    path: "/rtw-offers/{id}"
+    description: "Fetch a return-to-work offer."
+    roles: [PlatformAdmin, ClaimsAdjuster, Employer]
+    code: 200
+    input: []
+    output: ReturnToWorkOffer
+    side_effects: []
+
+  - method: GET
+    path: "/claims/{id}/rtw-offers"
+    description: "List a claim's RTW offers (FK reverse-reachability for ReturnToWorkOffer.claim_id)."
+    roles: [PlatformAdmin, ClaimsAdjuster, Employer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ReturnToWorkOffer[]
+    side_effects: []
+
+  - method: POST
+    path: "/rtw-offers/{id}/accept"
+    description: "Accept an OFFERED light-duty offer (before its start_date)."
+    roles: [Employer]
+    code: 200
+    input: []
+    output: ReturnToWorkOffer
+    side_effects: ["status set to ACCEPTED"]
+
+  - method: POST
+    path: "/rtw-offers/{id}/decline"
+    description: "Decline an OFFERED light-duty offer."
+    roles: [Employer]
+    code: 200
+    input: []
+    output: ReturnToWorkOffer
+    side_effects: ["status set to DECLINED"]
+
+  # ---- IMEOrder ----
+  - method: POST
+    path: "/ime-orders"
+    description: "Schedule an Independent Medical Examination for a claim."
+    roles: [ClaimsAdjuster]
+    code: 201
+    input: [claim_id, scheduled_start, scheduled_end, examiner_name]
+    output: IMEOrder
+    side_effects: ["status set to SCHEDULED; IME window overlap checked"]
+
+  - method: GET
+    path: "/ime-orders/{id}"
+    description: "Fetch an IME order."
+    roles: [PlatformAdmin, ClaimsAdjuster, MedicalReviewer]
+    code: 200
+    input: []
+    output: IMEOrder
+    side_effects: []
+
+  - method: GET
+    path: "/claims/{id}/ime-orders"
+    description: "List a claim's IME orders (FK reverse-reachability for IMEOrder.claim_id)."
+    roles: [PlatformAdmin, ClaimsAdjuster, MedicalReviewer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: IMEOrder[]
+    side_effects: []
+
+  - method: POST
+    path: "/ime-orders/{id}/complete"
+    description: "Mark a SCHEDULED IME COMPLETED (segregation-of-duties enforced)."
+    roles: [MedicalReviewer]
+    code: 200
+    input: []
+    output: IMEOrder
+    side_effects: ["status set to COMPLETED"]
+
+  - method: POST
+    path: "/ime-orders/{id}/no-show"
+    description: "Mark a SCHEDULED IME NO_SHOW after its window end."
+    roles: [MedicalReviewer]
+    code: 200
+    input: []
+    output: IMEOrder
+    side_effects: ["status set to NO_SHOW"]
+
+  - method: POST
+    path: "/ime-orders/{id}/cancel"
+    description: "Cancel a SCHEDULED IME."
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: []
+    output: IMEOrder
+    side_effects: ["status set to CANCELLED"]
+
+  # ---- ExperienceModEntry (EMR) ----
+  - method: POST
+    path: "/experience-mods"
+    description: "Post an experience-rating entry; computes the employer EMR and re-rates policies."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [employer_id, rating_year, weighting_factor, ballast_cents, expected_primary_cents, expected_excess_cents]
+    output: ExperienceModEntry
+    side_effects:
+      - "mod_factor computed (calc experience_mod)"
+      - "set Employer.current_emr = mod_factor"
+      - "recompute modified_premium_cents on every Policy of the employer"
+
+  - method: GET
+    path: "/experience-mods/{id}"
+    description: "Fetch an experience-mod entry."
+    roles: [PlatformAdmin, Employer]
+    code: 200
+    input: []
+    output: ExperienceModEntry
+    side_effects: []
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's notion of current UTC time (test-driving)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server 'now' set to to_iso8601; OFFERED offers and time-gated checks evaluate against it"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID headers."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Acting role not permitted for this operation."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "Same X-User-ID attempts two duties that must be segregated on one claim (set reserve then finalize rating / complete IME)."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced path id or body FK does not resolve."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not defined from the resource's current state."
+  - id: ERR_FROI_NOT_ACKNOWLEDGED
+    http: 409
+    condition: "SROI transmit attempted before the claim's FROI is ACKNOWLEDGED."
+  - id: ERR_INVALID_MTC
+    http: 422
+    condition: "Maintenance type code does not match report_kind (FROI->00; SROI->{IP,CB,SX,FN})."
+  - id: ERR_RATING_NOT_FINALIZED
+    http: 409
+    condition: "PPD benefit payment references a rating that is not FINALIZED, or LOST_TIME accept without an ACKNOWLEDGED FROI."
+  - id: ERR_STATUTE_EXPIRED
+    http: 422
+    condition: "Claim created past SOL_DAYS, or reopen past REOPEN_LIMIT_DAYS, from date_of_injury."
+  - id: ERR_IME_WINDOW_CONFLICT
+    http: 409
+    condition: "IME window overlaps another non-terminal IME for the same claim (half-open intervals)."
+  - id: ERR_RTW_WINDOW_CONFLICT
+    http: 409
+    condition: "RTW offer window overlaps an ACCEPTED offer for the same claim within the required buffer gap."
+  - id: ERR_DUPLICATE_RESOURCE
+    http: 409
+    condition: "Second Reserve for a claim, duplicate (employer_id,rating_year) mod entry, or duplicate policy_number."
+  - id: ERR_RESERVE_INSUFFICIENT
+    http: 422
+    condition: "Benefit payment amount would exceed the claim's outstanding indemnity_reserve_cents."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing/malformed required field, bad enum, out-of-range value, or conditionally-required field absent."
+  - id: ERR_STALE_CLAIM_VERSION
+    http: 412
+    condition: "expected_claim_version does not match the claim's current version (OCC) on wage-statement or reserve-adjustment writes."
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Operational carrier admin: onboards employers/policies, runs EDI ack/reject, posts experience mods."
+    identity: opaque
+    exclusive_operations:
+      - "POST /employers"
+      - "POST /policies"
+      - "POST /injury-reports/{id}/ack"
+      - "POST /injury-reports/{id}/reject"
+      - "POST /experience-mods"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "GET endpoints (read access across resources)"
+      - "POST /workers"
+
+  - name: ClaimsAdjuster
+    description: "Owns claim lifecycle, reserves, EDI report drafting/transmit, benefit payments, IME scheduling."
+    identity: opaque
+    exclusive_operations:
+      - "POST /claims/{id}/accept"
+      - "POST /claims/{id}/deny"
+      - "POST /claims/{id}/close"
+      - "POST /claims/{id}/reopen"
+      - "POST /claims/{id}/reserve-adjustments"
+      - "POST /injury-reports"
+      - "POST /injury-reports/{id}/transmit"
+      - "POST /wage-statements"
+      - "POST /reserves"
+      - "POST /reserves/{id}/medical-payments"
+      - "POST /benefit-payments"
+      - "POST /benefit-payments/{id}/void"
+      - "POST /impairment-ratings/{id}/dispute"
+      - "POST /ime-orders"
+      - "POST /ime-orders/{id}/cancel"
+    shared_operations:
+      - "POST /claims"
+      - "GET endpoints (read access across resources)"
+
+  - name: MedicalReviewer
+    description: "Owns clinical determinations: impairment ratings, finalization, IME completion/no-show."
+    identity: opaque
+    exclusive_operations:
+      - "POST /impairment-ratings"
+      - "POST /impairment-ratings/{id}/finalize"
+      - "POST /ime-orders/{id}/complete"
+      - "POST /ime-orders/{id}/no-show"
+    shared_operations:
+      - "GET endpoints (read access across resources)"
+
+  - name: Employer
+    description: "The insured employer: registers workers, opens claims, makes light-duty RTW offers."
+    identity: "entity_backed:Employer"
+    exclusive_operations:
+      - "POST /rtw-offers"
+      - "POST /rtw-offers/{id}/accept"
+      - "POST /rtw-offers/{id}/decline"
+    shared_operations:
+      - "POST /workers"
+      - "POST /claims"
+      - "GET endpoints scoped to the employer's own resources"

@@ -1,0 +1,72 @@
+"""Error catalog and the ApiError exception type.
+
+Every error_id / http_status pair comes straight from PRD §5 (the error
+catalogue) and SCAFFOLD §1.6. Nothing here is invented.
+"""
+
+
+class ApiError(Exception):
+    """An error carrying the scaffold-defined error_id, message and HTTP status."""
+
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# --- Error id constants (PRD §5 / SCAFFOLD §1.6) ---------------------------
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+ERR_NOT_FOUND = "ERR_NOT_FOUND"
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+ERR_INVALID_STATE = "ERR_INVALID_STATE"
+ERR_STALE_VERSION = "ERR_STALE_VERSION"
+ERR_DUPLICATE = "ERR_DUPLICATE"
+ERR_LICENSE_NOT_ACTIVE = "ERR_LICENSE_NOT_ACTIVE"
+ERR_NOT_APPOINTED = "ERR_NOT_APPOINTED"
+ERR_CARRIER_NOT_ACTIVE = "ERR_CARRIER_NOT_ACTIVE"
+ERR_INVALID_DATE_RANGE = "ERR_INVALID_DATE_RANGE"
+ERR_PRODUCER_INACTIVE = "ERR_PRODUCER_INACTIVE"
+ERR_SPLIT_OVER_ALLOCATED = "ERR_SPLIT_OVER_ALLOCATED"
+ERR_CANCEL_OUT_OF_TERM = "ERR_CANCEL_OUT_OF_TERM"
+ERR_REINSTATE_NOT_ALLOWED = "ERR_REINSTATE_NOT_ALLOWED"
+ERR_RENEWAL_WINDOW_CLOSED = "ERR_RENEWAL_WINDOW_CLOSED"
+ERR_DUPLICATE_RENEWAL_TASK = "ERR_DUPLICATE_RENEWAL_TASK"
+ERR_TRUST_MINIMUM_BREACH = "ERR_TRUST_MINIMUM_BREACH"
+ERR_NOTHING_PAYABLE = "ERR_NOTHING_PAYABLE"
+ERR_VALIDATION_PERIOD_NOT_ENDED = "ERR_VALIDATION_PERIOD_NOT_ENDED"
+ERR_LICENSE_OVERLAP = "ERR_LICENSE_OVERLAP"
+ERR_RENEWAL_TERM_NOT_ADJACENT = "ERR_RENEWAL_TERM_NOT_ADJACENT"
+
+
+# Maps every error id to its HTTP status, so call sites can raise with just the id.
+_HTTP = {
+    ERR_UNAUTHENTICATED: 401,
+    ERR_UNAUTHORIZED: 403,
+    ERR_NOT_FOUND: 404,
+    ERR_INVALID_REQUEST: 400,
+    ERR_INVALID_STATE: 409,
+    ERR_STALE_VERSION: 412,
+    ERR_DUPLICATE: 409,
+    ERR_LICENSE_NOT_ACTIVE: 422,
+    ERR_NOT_APPOINTED: 422,
+    ERR_CARRIER_NOT_ACTIVE: 422,
+    ERR_INVALID_DATE_RANGE: 422,
+    ERR_PRODUCER_INACTIVE: 422,
+    ERR_SPLIT_OVER_ALLOCATED: 422,
+    ERR_CANCEL_OUT_OF_TERM: 422,
+    ERR_REINSTATE_NOT_ALLOWED: 422,
+    ERR_RENEWAL_WINDOW_CLOSED: 422,
+    ERR_DUPLICATE_RENEWAL_TASK: 409,
+    ERR_TRUST_MINIMUM_BREACH: 422,
+    ERR_NOTHING_PAYABLE: 422,
+    ERR_VALIDATION_PERIOD_NOT_ENDED: 422,
+    ERR_LICENSE_OVERLAP: 409,
+    ERR_RENEWAL_TERM_NOT_ADJACENT: 422,
+}
+
+
+def err(error_id, message=None):
+    """Build an ApiError from a known error_id, looking up its HTTP status."""
+    return ApiError(error_id, _HTTP[error_id], message)

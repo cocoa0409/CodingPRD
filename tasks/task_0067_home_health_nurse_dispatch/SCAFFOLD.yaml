@@ -1,0 +1,1596 @@
+scenario: "Home Health Nurse Dispatch: order source (OASIS assessment), nurse/PT/OT/SLP visits, HHA companion hours, mileage, Medicare 60-day episode, recertification, PDGM payment"
+domain_name: "home-health-nurse-dispatch"
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: "Ledger reconciliation"
+  secondary_archetype: "Temporal windowing"
+  complexity_layers:
+    - "Dual-variant calculation"
+    - "Cascading side effects"
+    - "Optimistic concurrency"
+    - "Rate / threshold triggers"
+
+  entity_topology: hybrid
+  # Episode is the central resource (tree root for PlanOfCare, Visit, CompanionShift, RecertRequest,
+  # PaymentLedger, EpisodeEvent); Patient/Clinician/OASISAssessment/PdgmRateConfig are flat peers
+  # referenced by FK. Mix of nested sub-resources and flat FK references.
+
+  state_machine_shape: branching
+  # Episode is branching with revert + cycle (recert loop); Visit is branching fork-join
+  # (completed-vs-missed divergent side effects); RecertRequest is cyclic (revision loop);
+  # MileageClaim is branching (approve/reject).
+
+  relationship_patterns:
+    - one_to_many        # Episode -> Visit, Episode -> CompanionShift, Episode -> EpisodeEvent
+    - cross_aggregate    # Visit references Clinician (peer aggregate); Episode references OASISAssessment
+    - self_referential   # Episode.prior_episode_id references the preceding Episode (recert chain)
+
+  role_model: peer_roles
+  # IntakeCoordinator (orders/OASIS/episode), Clinician (visits they are assigned), Scheduler
+  # (dispatch/companion/mileage), BillingManager (PDGM finalize/ledger), ComplianceOfficer
+  # (recert approval). Different roles own different resource types.
+
+  consistency_model: immediate
+  # All mutations atomic per request; OCC on Episode.version resolves the one true race
+  # (creating a superseding PlanOfCare against a stale Episode view).
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: Patient
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Patient legal name"
+      - name: medicare_id
+        type: string
+        source: input
+        description: "Medicare beneficiary identifier; unique across all patients"
+        constraints: "unique; non-empty"
+      - name: home_zip
+        type: string
+        source: input
+        description: "5-digit ZIP of the patient residence; used for mileage tier"
+        constraints: "exactly 5 digits"
+      - name: home_lat
+        type: number
+        source: input
+        description: "Latitude of residence; used for visit mileage straight-line distance"
+      - name: home_lon
+        type: number
+        source: input
+        description: "Longitude of residence; used for visit mileage straight-line distance"
+      - name: status
+        type: enum
+        source: system
+        description: "ACTIVE | DISCHARGED"
+        default: "ACTIVE"
+        constraints: "enum[ACTIVE, DISCHARGED]"
+      - name: open_episode_id
+        type: string
+        source: computed
+        description: "id of the patient's currently non-terminal Episode, or null. Derived: the single Episode for this patient whose status is in {DRAFT, ACTIVE, RECERT_PENDING}."
+
+  - name: Clinician
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Clinician name"
+      - name: discipline
+        type: enum
+        source: input
+        description: "RN | PT | OT | SLP | HHA"
+        constraints: "enum[RN, PT, OT, SLP, HHA]"
+      - name: license_active
+        type: boolean
+        source: input
+        description: "Whether the clinician currently holds an active license"
+        default: true
+      - name: base_lat
+        type: number
+        source: input
+        description: "Latitude of clinician home base; mileage origin"
+      - name: base_lon
+        type: number
+        source: input
+        description: "Longitude of clinician home base; mileage origin"
+      - name: weekly_visit_cap
+        type: integer
+        source: input
+        description: "Max number of CONFIRMED/COMPLETED visits this clinician may hold in any ISO week (Mon-Sun)"
+        default: 40
+        constraints: ">= 1"
+
+  - name: OASISAssessment
+    parent: null
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; the assessed patient"
+      - name: clinician_id
+        type: string
+        source: input
+        description: "FK -> Clinician.id; the RN who performed the assessment"
+      - name: assessment_type
+        type: enum
+        source: input
+        description: "START_OF_CARE | RECERTIFICATION; SOC opens a new episode, RECERT extends one"
+        constraints: "enum[START_OF_CARE, RECERTIFICATION]"
+      - name: assessment_date
+        type: datetime
+        source: input
+        description: "Date the OASIS was performed; used as the episode start anchor"
+      - name: clinical_group
+        type: enum
+        source: input
+        description: "PDGM clinical group: MMTA_OTHER | WOUND | NEURO_REHAB | COMPLEX_NURSING | MS_REHAB"
+        constraints: "enum[MMTA_OTHER, WOUND, NEURO_REHAB, COMPLEX_NURSING, MS_REHAB]"
+      - name: functional_level
+        type: enum
+        source: input
+        description: "PDGM functional impairment level: LOW | MEDIUM | HIGH"
+        constraints: "enum[LOW, MEDIUM, HIGH]"
+      - name: comorbidity_count
+        type: integer
+        source: input
+        description: "Count of qualifying secondary diagnoses; drives comorbidity adjustment tier"
+        constraints: ">= 0"
+      - name: locked
+        type: boolean
+        source: system
+        description: "True once consumed by an episode create/recert; a locked OASIS cannot seed another episode"
+        default: false
+
+  - name: PdgmRateConfig
+    parent: null
+    common_fields: false
+    fields:
+      - name: clinical_group
+        type: enum
+        source: input
+        description: "Clinical group this rate row applies to"
+        constraints: "enum[MMTA_OTHER, WOUND, NEURO_REHAB, COMPLEX_NURSING, MS_REHAB]"
+      - name: base_30day_rate
+        type: number
+        source: input
+        description: "Base PDGM payment for a 30-day period in this clinical group, in dollars"
+        constraints: "> 0"
+      - name: functional_weight_low
+        type: number
+        source: input
+        description: "Case-mix multiplier when functional_level=LOW"
+      - name: functional_weight_medium
+        type: number
+        source: input
+        description: "Case-mix multiplier when functional_level=MEDIUM"
+      - name: functional_weight_high
+        type: number
+        source: input
+        description: "Case-mix multiplier when functional_level=HIGH"
+      - name: lupa_threshold
+        type: integer
+        source: input
+        description: "Billable-visit count below which an episode in this clinical group pays LUPA per-visit instead of full PDGM"
+        constraints: ">= 1"
+      - name: active
+        type: boolean
+        source: input
+        description: "Only one active config row per clinical_group may exist; the active row is used at finalize time"
+        default: true
+
+  - name: Episode
+    parent: null
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; the patient under care"
+      - name: soc_oasis_id
+        type: string
+        source: input
+        description: "FK -> OASISAssessment.id; the START_OF_CARE assessment that opened this episode"
+      - name: prior_episode_id
+        type: string
+        source: input
+        description: "FK -> Episode.id; the immediately preceding episode in a recert chain, or null for the first"
+      - name: clinical_group
+        type: enum
+        source: computed
+        description: "Copied from the governing OASIS at create/recert; the PDGM clinical group used for payment"
+      - name: functional_level
+        type: enum
+        source: computed
+        description: "Copied from the governing OASIS at create/recert"
+      - name: status
+        type: enum
+        source: system
+        description: "DRAFT | ACTIVE | RECERT_PENDING | DISCHARGED | CANCELLED"
+        default: "DRAFT"
+        constraints: "enum[DRAFT, ACTIVE, RECERT_PENDING, DISCHARGED, CANCELLED]"
+      - name: cert_start
+        type: datetime
+        source: computed
+        description: "First day of the 60-day certification window (= governing OASIS assessment_date)"
+      - name: cert_end
+        type: datetime
+        source: computed
+        description: "Last day (inclusive) of the 60-day window = cert_start + 59 days"
+      - name: lupa_threshold
+        type: integer
+        source: computed
+        description: "Per-episode LUPA visit-count threshold copied from the active PdgmRateConfig at create; if total billable visits < this, episode pays per-visit instead of full PDGM"
+      - name: provisional_payment
+        type: number
+        source: computed
+        description: "Forward-looking estimated PDGM payment using planned visits; recomputed on plan changes"
+        default: 0
+      - name: final_payment
+        type: number
+        source: computed
+        description: "Chronological actual PDGM payment computed at finalize from COMPLETED visits only; 0 until finalized"
+        default: 0
+      - name: total_mileage_reimbursed
+        type: number
+        source: computed
+        description: "Running sum of APPROVED MileageClaim.reimbursement across this episode's visits"
+        default: 0
+      - name: companion_hours_used
+        type: number
+        source: computed
+        description: "Running sum of DELIVERED CompanionShift hours for this episode"
+        default: 0
+
+  - name: PlanOfCare
+    parent: Episode
+    common_fields: true
+    fields:
+      - name: episode_id
+        type: string
+        source: input
+        description: "FK -> Episode.id; the episode this plan governs"
+      - name: planned_rn_visits
+        type: integer
+        source: input
+        description: "Number of RN visits the physician ordered"
+        constraints: ">= 0"
+      - name: planned_pt_visits
+        type: integer
+        source: input
+        description: "Number of PT visits ordered"
+        constraints: ">= 0"
+      - name: planned_ot_visits
+        type: integer
+        source: input
+        description: "Number of OT visits ordered"
+        constraints: ">= 0"
+      - name: planned_slp_visits
+        type: integer
+        source: input
+        description: "Number of SLP visits ordered"
+        constraints: ">= 0"
+      - name: companion_hours_authorized
+        type: number
+        source: input
+        description: "Authorized HHA companion hours for the episode"
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "ACTIVE | SUPERSEDED; only one ACTIVE plan per episode at a time"
+        default: "ACTIVE"
+        constraints: "enum[ACTIVE, SUPERSEDED]"
+
+  - name: Visit
+    parent: Episode
+    common_fields: true
+    fields:
+      - name: episode_id
+        type: string
+        source: input
+        description: "FK -> Episode.id; the episode being served"
+      - name: clinician_id
+        type: string
+        source: input
+        description: "FK -> Clinician.id; the assigned visiting clinician"
+      - name: discipline
+        type: enum
+        source: input
+        description: "RN | PT | OT | SLP; the discipline this visit bills under (must match clinician.discipline)"
+        constraints: "enum[RN, PT, OT, SLP]"
+      - name: scheduled_start
+        type: datetime
+        source: input
+        description: "Visit window start (inclusive)"
+      - name: scheduled_end
+        type: datetime
+        source: input
+        description: "Visit window end (exclusive); half-open interval [start, end)"
+      - name: status
+        type: enum
+        source: system
+        description: "SCHEDULED | CONFIRMED | COMPLETED | MISSED | CANCELLED"
+        default: "SCHEDULED"
+        constraints: "enum[SCHEDULED, CONFIRMED, COMPLETED, MISSED, CANCELLED]"
+      - name: billable
+        type: boolean
+        source: computed
+        description: "True only when status=COMPLETED; counts toward LUPA threshold and final payment"
+        default: false
+
+  - name: CompanionShift
+    parent: Episode
+    common_fields: true
+    fields:
+      - name: episode_id
+        type: string
+        source: input
+        description: "FK -> Episode.id; the episode the HHA companion serves"
+      - name: clinician_id
+        type: string
+        source: input
+        description: "FK -> Clinician.id; must reference a clinician whose discipline is HHA"
+      - name: shift_start
+        type: datetime
+        source: input
+        description: "Companion shift start (inclusive)"
+      - name: shift_end
+        type: datetime
+        source: input
+        description: "Companion shift end (exclusive); half-open [start, end)"
+      - name: hours
+        type: number
+        source: computed
+        description: "Duration in hours = (shift_end - shift_start); decimal hours rounded to 2 places"
+      - name: status
+        type: enum
+        source: system
+        description: "BOOKED | DELIVERED | CANCELLED"
+        default: "BOOKED"
+        constraints: "enum[BOOKED, DELIVERED, CANCELLED]"
+
+  - name: MileageClaim
+    parent: Visit
+    common_fields: true
+    fields:
+      - name: visit_id
+        type: string
+        source: input
+        description: "FK -> Visit.id; the completed visit this mileage is claimed against"
+      - name: claimed_miles
+        type: number
+        source: input
+        description: "Miles the clinician asserts they drove (round trip)"
+        constraints: ">= 0"
+      - name: computed_miles
+        type: number
+        source: computed
+        description: "System straight-line round-trip miles from clinician base to patient home"
+      - name: reimbursable_miles
+        type: number
+        source: computed
+        description: "min(claimed_miles, computed_miles * OVERCLAIM_TOLERANCE) after free-tier deduction"
+      - name: reimbursement
+        type: number
+        source: computed
+        description: "Dollar reimbursement for this claim using tiered per-mile rates"
+      - name: status
+        type: enum
+        source: system
+        description: "PENDING | APPROVED | REJECTED"
+        default: "PENDING"
+        constraints: "enum[PENDING, APPROVED, REJECTED]"
+
+  - name: RecertRequest
+    parent: Episode
+    common_fields: true
+    fields:
+      - name: episode_id
+        type: string
+        source: input
+        description: "FK -> Episode.id; the episode being recertified"
+      - name: recert_oasis_id
+        type: string
+        source: input
+        description: "FK -> OASISAssessment.id; the RECERTIFICATION assessment supporting the request"
+      - name: status
+        type: enum
+        source: system
+        description: "SUBMITTED | RETURNED | APPROVED | DENIED"
+        default: "SUBMITTED"
+        constraints: "enum[SUBMITTED, RETURNED, APPROVED, DENIED]"
+      - name: revision_count
+        type: integer
+        source: system
+        description: "Number of times this request was RETURNED for revision then resubmitted"
+        default: 0
+      - name: review_note
+        type: string
+        source: input
+        description: "ComplianceOfficer note on return/approve/deny"
+
+  - name: PaymentLedger
+    parent: Episode
+    common_fields: true
+    fields:
+      - name: episode_id
+        type: string
+        source: input
+        description: "FK -> Episode.id; the finalized episode this ledger row settles"
+      - name: payment_basis
+        type: enum
+        source: computed
+        description: "FULL_PDGM | LUPA_PER_VISIT; which payment algorithm produced the amount"
+        constraints: "enum[FULL_PDGM, LUPA_PER_VISIT]"
+      - name: gross_pdgm
+        type: number
+        source: computed
+        description: "Case-mix-adjusted PDGM amount before mileage/companion offsets"
+      - name: mileage_offset
+        type: number
+        source: computed
+        description: "Total approved mileage reimbursement folded into the settlement"
+      - name: companion_offset
+        type: number
+        source: computed
+        description: "Companion-hour cost folded into the settlement"
+      - name: net_settlement
+        type: number
+        source: computed
+        description: "Final net amount = gross_pdgm + mileage_offset + companion_offset"
+      - name: reversed
+        type: boolean
+        source: system
+        description: "True if this ledger row was reversed by a discharge-reopen compensation"
+        default: false
+
+  - name: EpisodeEvent
+    parent: Episode
+    common_fields: false
+    fields:
+      - name: episode_id
+        type: string
+        source: input
+        description: "FK -> Episode.id; the episode this audit event belongs to"
+      - name: event_type
+        type: enum
+        source: system
+        description: "ACTIVATED | PLAN_SUPERSEDED | VISIT_COMPLETED | VISIT_MISSED | RECERT_APPROVED | FINALIZED | LEDGER_REVERSED | DISCHARGED | CANCELLED"
+        constraints: "enum[ACTIVATED, PLAN_SUPERSEDED, VISIT_COMPLETED, VISIT_MISSED, RECERT_APPROVED, FINALIZED, LEDGER_REVERSED, DISCHARGED, CANCELLED]"
+      - name: detail
+        type: string
+        source: system
+        description: "Human-readable description of the event"
+      - name: occurred_at
+        type: datetime
+        source: system
+        description: "Server clock timestamp when the event was appended"
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  - entity: Episode
+    initial_state: DRAFT
+    terminal_states: [DISCHARGED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /episodes/{id}/activate"
+        actor: IntakeCoordinator
+        preconditions:
+          - "Episode has exactly one ACTIVE PlanOfCare"
+          - "soc_oasis_id references an OASISAssessment with assessment_type=START_OF_CARE"
+          - "the patient has no other non-terminal Episode (open_episode_id must be this episode)"
+        side_effects:
+          - "append EpisodeEvent(event_type=ACTIVATED)"
+          - "recompute Episode.provisional_payment from the ACTIVE plan (forward-looking)"
+          - "increments Episode.version by 1"
+        note: "Activation is the gate that allows Visit scheduling against the episode."
+      - from: ACTIVE
+        to: RECERT_PENDING
+        trigger: "POST /episodes/{id}/recert-requests (creates RecertRequest)"
+        actor: IntakeCoordinator
+        preconditions:
+          - "current server clock date is within 14 days of cert_end (recert window open)"
+          - "recert_oasis references an OASISAssessment with assessment_type=RECERTIFICATION for the same patient"
+        side_effects:
+          - "create RecertRequest(status=SUBMITTED)"
+          - "increments Episode.version by 1"
+        note: "Episode stays RECERT_PENDING until the request is APPROVED (forward) or DENIED (revert)."
+      - from: RECERT_PENDING
+        to: ACTIVE
+        trigger: "POST /recert-requests/{id}/deny"
+        actor: ComplianceOfficer
+        preconditions:
+          - "RecertRequest.status=SUBMITTED"
+        side_effects:
+          - "set RecertRequest.status=DENIED"
+          - "Episode returns to ACTIVE under the original cert window (no extension)"
+          - "increments Episode.version by 1"
+        note: "Revert edge: denial returns the episode to ACTIVE without extending cert_end."
+      - from: RECERT_PENDING
+        to: ACTIVE
+        trigger: "POST /recert-requests/{id}/approve"
+        actor: ComplianceOfficer
+        preconditions:
+          - "RecertRequest.status=SUBMITTED"
+          - "recert_oasis is locked=false"
+        side_effects:
+          - "set RecertRequest.status=APPROVED and lock the recert OASIS"
+          - "extend cert_end by 60 days (cert_end = old cert_end + 60); cert_start unchanged"
+          - "copy clinical_group and functional_level from the recert OASIS onto the episode"
+          - "recompute lupa_threshold from the active PdgmRateConfig for the new clinical_group"
+          - "append EpisodeEvent(event_type=RECERT_APPROVED)"
+          - "increments Episode.version by 1"
+        note: "Cycle: ACTIVE -> RECERT_PENDING -> ACTIVE; episode may be recertified repeatedly."
+      - from: ACTIVE
+        to: DISCHARGED
+        trigger: "POST /episodes/{id}/finalize"
+        actor: BillingManager
+        preconditions:
+          - "no Visit on this episode is in SCHEDULED or CONFIRMED status (all visits terminal)"
+          - "Episode has no SUBMITTED RecertRequest"
+        side_effects:
+          - "compute final_payment chronologically from COMPLETED visits (see calc: final_pdgm_settlement)"
+          - "create PaymentLedger row with payment_basis, gross_pdgm, mileage_offset, companion_offset, net_settlement"
+          - "append EpisodeEvent(event_type=FINALIZED) then EpisodeEvent(event_type=DISCHARGED)"
+          - "set Patient.status=DISCHARGED if no other non-terminal episode exists"
+          - "increments Episode.version by 1"
+        note: "Branch endpoint: finalize both settles payment AND discharges."
+      - from: DISCHARGED
+        to: ACTIVE
+        trigger: "POST /episodes/{id}/reopen"
+        actor: BillingManager
+        preconditions:
+          - "Episode has a non-reversed PaymentLedger row"
+          - "reopen requested within REOPEN_WINDOW_DAYS of the finalize event"
+        side_effects:
+          - "set the episode's PaymentLedger.reversed=true (compensation; net_settlement conceptually backed out)"
+          - "reset Episode.final_payment=0"
+          - "append EpisodeEvent(event_type=LEDGER_REVERSED)"
+          - "restore Patient.status=ACTIVE"
+          - "increments Episode.version by 1"
+        note: "Compensating transition: reopen reverses the settlement ledger to restore the conserved payable balance."
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /episodes/{id}/cancel"
+        actor: IntakeCoordinator
+        preconditions:
+          - "Episode.status=DRAFT"
+        side_effects:
+          - "cascade: set every ACTIVE PlanOfCare on this episode to SUPERSEDED"
+          - "unlock soc_oasis_id (set OASISAssessment.locked=false) so it can seed a corrected episode"
+          - "append EpisodeEvent(event_type=CANCELLED)"
+          - "increments Episode.version by 1"
+
+  - entity: Visit
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, MISSED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: CONFIRMED
+        trigger: "POST /visits/{id}/confirm"
+        actor: Clinician
+        preconditions:
+          - "acting clinician is the assigned clinician_id"
+          - "parent Episode.status=ACTIVE"
+          - "clinician.license_active=true"
+        side_effects:
+          - "increments Visit.version by 1"
+        note: "Confirmation reserves the clinician's weekly capacity slot."
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /visits/{id}/cancel"
+        actor: Scheduler
+        preconditions:
+          - "Visit.status in {SCHEDULED, CONFIRMED}"
+        side_effects:
+          - "release the clinician weekly-cap slot"
+          - "increments Visit.version by 1"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /visits/{id}/cancel"
+        actor: Scheduler
+        preconditions:
+          - "Visit.status in {SCHEDULED, CONFIRMED}"
+        side_effects:
+          - "release the clinician weekly-cap slot"
+          - "increments Visit.version by 1"
+      - from: CONFIRMED
+        to: COMPLETED
+        trigger: "POST /visits/{id}/complete"
+        actor: Clinician
+        preconditions:
+          - "acting clinician is the assigned clinician_id"
+          - "parent Episode.status=ACTIVE"
+          - "scheduled_end <= current server clock (visit window has elapsed)"
+        side_effects:
+          - "set billable=true"
+          - "recompute Episode.provisional_payment to reflect the now-completed visit"
+          - "append EpisodeEvent(event_type=VISIT_COMPLETED)"
+          - "increments Visit.version by 1"
+        note: "Fork branch A: completed visits count toward LUPA and final payment."
+      - from: CONFIRMED
+        to: MISSED
+        trigger: "POST /visits/{id}/mark-missed"
+        actor: Scheduler
+        preconditions:
+          - "scheduled_end <= current server clock"
+        side_effects:
+          - "set billable=false"
+          - "release the clinician weekly-cap slot"
+          - "append EpisodeEvent(event_type=VISIT_MISSED)"
+          - "increments Visit.version by 1"
+        note: "Fork branch B: missed visits free capacity and never bill (divergent side-effect set from COMPLETED)."
+
+  - entity: CompanionShift
+    initial_state: BOOKED
+    terminal_states: [DELIVERED, CANCELLED]
+    transitions:
+      - from: BOOKED
+        to: DELIVERED
+        trigger: "POST /companion-shifts/{id}/deliver"
+        actor: Scheduler
+        preconditions:
+          - "parent Episode.status=ACTIVE"
+          - "shift_end <= current server clock"
+          - "delivering would not push Episode.companion_hours_used above the ACTIVE plan's companion_hours_authorized"
+        side_effects:
+          - "add this shift's hours to Episode.companion_hours_used"
+          - "increments CompanionShift.version by 1"
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /companion-shifts/{id}/cancel"
+        actor: Scheduler
+        preconditions:
+          - "CompanionShift.status=BOOKED"
+        side_effects:
+          - "increments CompanionShift.version by 1"
+
+  - entity: MileageClaim
+    initial_state: PENDING
+    terminal_states: [APPROVED, REJECTED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /mileage-claims/{id}/approve"
+        actor: BillingManager
+        preconditions:
+          - "parent Visit.status=COMPLETED"
+          - "claimed_miles <= computed_miles * OVERCLAIM_TOLERANCE"
+        side_effects:
+          - "compute reimbursable_miles and reimbursement (tiered)"
+          - "add reimbursement to Episode.total_mileage_reimbursed"
+          - "increments MileageClaim.version by 1"
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /mileage-claims/{id}/reject"
+        actor: BillingManager
+        preconditions:
+          - "MileageClaim.status=PENDING"
+        side_effects:
+          - "reimbursement set to 0"
+          - "increments MileageClaim.version by 1"
+
+  - entity: RecertRequest
+    initial_state: SUBMITTED
+    terminal_states: [APPROVED, DENIED]
+    transitions:
+      - from: SUBMITTED
+        to: RETURNED
+        trigger: "POST /recert-requests/{id}/return"
+        actor: ComplianceOfficer
+        preconditions:
+          - "RecertRequest.status=SUBMITTED"
+        side_effects:
+          - "store review_note"
+          - "increments RecertRequest.version by 1"
+        note: "Cycle entry: returned for revision."
+      - from: RETURNED
+        to: SUBMITTED
+        trigger: "POST /recert-requests/{id}/resubmit"
+        actor: IntakeCoordinator
+        preconditions:
+          - "RecertRequest.status=RETURNED"
+        side_effects:
+          - "increment revision_count by 1"
+          - "increments RecertRequest.version by 1"
+        note: "Cycle: SUBMITTED -> RETURNED -> SUBMITTED; revision loop bounded by MAX_RECERT_REVISIONS."
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /recert-requests/{id}/approve"
+        actor: ComplianceOfficer
+        preconditions:
+          - "RecertRequest.status=SUBMITTED"
+          - "recert_oasis locked=false"
+        side_effects:
+          - "drive parent Episode RECERT_PENDING -> ACTIVE with cert extension (see Episode machine)"
+          - "increments RecertRequest.version by 1"
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /recert-requests/{id}/deny"
+        actor: ComplianceOfficer
+        preconditions:
+          - "RecertRequest.status=SUBMITTED"
+        side_effects:
+          - "drive parent Episode RECERT_PENDING -> ACTIVE without extension (see Episode machine)"
+          - "increments RecertRequest.version by 1"
+
+concurrency_rules:
+  - rule_id: plan-create-stale-episode
+    parent_entity: Episode
+    write_endpoint: "POST /episodes/{id}/plans-of-care"
+    occ_field: "expected_episode_version"
+    description: |
+      Creating a new PlanOfCare against an Episode whose version has advanced
+      since the client last observed it is rejected; the new plan would
+      legitimately supersede the prior ACTIVE plan, but the client's view of
+      the episode is stale (another plan was already created and superseded it).
+    error_id: ERR_STALE_EPISODE_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: provisional_pdgm_estimate
+    trigger: "On Episode activation, on PlanOfCare create/supersede, and on Visit completion"
+    algorithm: forward_looking
+    formula: |
+      planned_total = plan.planned_rn_visits + plan.planned_pt_visits
+                    + plan.planned_ot_visits + plan.planned_slp_visits
+      fw = functional_weight for episode.functional_level from active PdgmRateConfig(clinical_group)
+      # comorbidity_multiplier: count==0 -> NONE(1.00); 1<=count<=2 -> LOW(1.06); count>=3 -> HIGH(1.18)
+      cm = COMORBIDITY_NONE_MULT if soc_oasis.comorbidity_count == 0 else (COMORBIDITY_LOW_MULT if soc_oasis.comorbidity_count <= 2 else COMORBIDITY_HIGH_MULT)
+      case_mix = base_30day_rate * fw * cm
+      # forward-looking: assume ALL planned visits will be delivered, so LUPA never applies
+      if planned_total >= lupa_threshold:
+          provisional_payment = round(case_mix * 2, 2)   # two 30-day periods in a 60-day episode
+      else:
+          provisional_payment = round(PER_VISIT_RATE * planned_total, 2)
+    input_set: "The single ACTIVE PlanOfCare's planned counts (intended future visits), regardless of how many visits actually exist or their status."
+    constants:
+      PER_VISIT_RATE: 165.00
+      COMORBIDITY_NONE_MULT: 1.00
+      COMORBIDITY_LOW_MULT: 1.06
+      COMORBIDITY_HIGH_MULT: 1.18
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: forward_looking_provisional
+        when: "Before finalize; reflects intended care"
+        difference: "Uses planned_* counts and assumes full delivery; LUPA assessed against the plan, not actuals."
+
+  - name: final_pdgm_settlement
+    trigger: "On POST /episodes/{id}/finalize"
+    algorithm: chronological
+    formula: |
+      # chronological: walk only COMPLETED visits in scheduled_start order (created_at tie-break)
+      billable_visits = [v for v in episode.visits if v.status == COMPLETED]
+      n = len(billable_visits)
+      fw = functional_weight for episode.functional_level from active PdgmRateConfig(clinical_group)
+      # same comorbidity tier mapping as provisional_pdgm_estimate
+      cm = 1.00 if soc_oasis.comorbidity_count == 0 else (1.06 if soc_oasis.comorbidity_count <= 2 else 1.18)
+      case_mix = base_30day_rate * fw * cm
+      if n < lupa_threshold:
+          payment_basis = LUPA_PER_VISIT
+          gross_pdgm = round(PER_VISIT_RATE * n, 2)        # Low Utilization Payment Adjustment
+      else:
+          payment_basis = FULL_PDGM
+          gross_pdgm = round(case_mix * 2, 2)
+      # companion_offset comes from companion_cost_offset (DELIVERED shifts, round-per-shift then sum)
+      net_settlement = gross_pdgm + episode.total_mileage_reimbursed + companion_offset
+      final_payment = net_settlement
+    input_set: "ONLY visits with status=COMPLETED at finalize time, processed in chronological scheduled_start order; SCHEDULED/CONFIRMED/MISSED/CANCELLED excluded."
+    constants:
+      PER_VISIT_RATE: 165.00
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: chronological_actual
+        when: "At finalize"
+        difference: "Uses actual COMPLETED visit count; LUPA applies when actuals fall short even if the plan met the threshold (diverges from provisional for the same episode)."
+
+  - name: mileage_reimbursement_tiered
+    trigger: "On POST /mileage-claims/{id}/approve"
+    algorithm: tiered_pricing
+    formula: |
+      # combinatorial mode (a): >=3 inputs, nested min and tiered-rate selection
+      computed_miles = haversine(clinician.base_lat, clinician.base_lon,
+                                 patient.home_lat, patient.home_lon) * 2   # round trip
+      capped = min(claimed_miles, round(computed_miles * OVERCLAIM_TOLERANCE, 2))
+      billable = max(0, capped - FREE_TIER_MILES)     # first FREE_TIER_MILES not reimbursed
+      reimbursable_miles = billable
+      # tiered marginal rates on the post-free-tier miles
+      tier1 = min(billable, TIER1_CAP)
+      tier2 = max(0, billable - TIER1_CAP)
+      reimbursement = round(tier1 * TIER1_RATE + tier2 * TIER2_RATE, 2)
+    input_set: "A single APPROVED-bound MileageClaim with its parent Visit's clinician base and the episode patient's home coordinates."
+    constants:
+      OVERCLAIM_TOLERANCE: 1.10
+      FREE_TIER_MILES: 5.0
+      TIER1_CAP: 20.0
+      TIER1_RATE: 0.67
+      TIER2_RATE: 0.50
+    precision: "2 decimal places, round_half_up"
+
+  - name: companion_cost_offset
+    trigger: "Computed at finalize as part of final_pdgm_settlement; depends on per-shift rounding"
+    algorithm: aggregation
+    formula: |
+      # combinatorial mode (b): rounding order is pinned. Round EACH shift's cost to cents,
+      # THEN sum — NOT sum-of-hours then multiply (the two orders differ in cents).
+      per_shift_costs = []
+      for s in episode.companion_shifts where s.status == DELIVERED:
+          per_shift_costs.append( round(s.hours * COMPANION_HOURLY_RATE, 2) )   # round per line item
+      companion_offset = sum(per_shift_costs)
+      # NOTE: companion_offset is a positive payable amount added to gross_pdgm.
+    input_set: "All DELIVERED CompanionShift rows on the episode; each shift's hours = round((shift_end-shift_start)/3600s, 2)."
+    constants:
+      COMPANION_HOURLY_RATE: 24.05
+    precision: "2 decimal places per shift, then integer-cent summation (round per-line-item then sum)"
+
+  - name: weekly_capacity_check
+    trigger: "On Visit confirm and on Visit schedule create against a clinician"
+    algorithm: aggregation
+    formula: |
+      iso_week = ISO week (Mon 00:00 UTC .. next Mon 00:00 UTC) containing visit.scheduled_start
+      held = count of Visits for this clinician_id whose status in {CONFIRMED, COMPLETED}
+             and whose scheduled_start falls in iso_week (excluding the visit under test)
+      reject if held + 1 > clinician.weekly_visit_cap
+    input_set: "Visits for one clinician within one ISO week; only CONFIRMED and COMPLETED occupy a slot."
+    constants:
+      WEEK_START_DOW: "MONDAY"
+    precision: "integer counts"
+
+# ===========================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for the operation per §1.7 RBAC matrix"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: auth
+    check: "For Clinician-owned actions (visit confirm/complete), X-User-ID equals the visit's clinician_id"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /visits/{id}/confirm, POST /visits/{id}/complete"
+  - priority: 4
+    category: existence
+    check: "Every path/body referenced resource exists, validated left-to-right in the path"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 5
+    category: state
+    check: "Target resource is in a state permitting this transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 6
+    category: state
+    check: "Parent Episode is ACTIVE when scheduling/confirming/completing a Visit or delivering a CompanionShift"
+    error_id: ERR_EPISODE_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /episodes/{id}/visits, POST /visits/{id}/confirm, POST /visits/{id}/complete, POST /episodes/{id}/companion-shifts, POST /companion-shifts/{id}/deliver"
+  - priority: 7
+    category: business_safety
+    check: "Assigned clinician's license_active=true before confirming a visit"
+    error_id: ERR_LICENSE_INACTIVE
+    http_status: 422
+    applies_to: "POST /visits/{id}/confirm"
+  - priority: 8
+    category: business_safety
+    check: "Visit discipline matches the assigned clinician's discipline; companion shifts require an HHA clinician"
+    error_id: ERR_DISCIPLINE_MISMATCH
+    http_status: 422
+    applies_to: "POST /episodes/{id}/visits, POST /episodes/{id}/companion-shifts"
+  - priority: 9
+    category: business_referential
+    check: "On episode create, soc_oasis is START_OF_CARE, belongs to the same patient, and is not locked"
+    error_id: ERR_OASIS_INVALID
+    http_status: 422
+    applies_to: "POST /episodes"
+  - priority: 10
+    category: business_referential
+    check: "On recert request, recert_oasis is RECERTIFICATION for the same patient and not locked"
+    error_id: ERR_RECERT_OASIS_INVALID
+    http_status: 422
+    applies_to: "POST /episodes/{id}/recert-requests"
+  - priority: 11
+    category: business_temporal
+    check: "Recert request is created only within RECERT_WINDOW_DAYS before cert_end"
+    error_id: ERR_RECERT_WINDOW_CLOSED
+    http_status: 422
+    applies_to: "POST /episodes/{id}/recert-requests"
+  - priority: 12
+    category: business_temporal
+    check: "Visit scheduled_start/scheduled_end fall within [cert_start, cert_end] of the episode and start < end"
+    error_id: ERR_VISIT_OUT_OF_CERT_WINDOW
+    http_status: 422
+    applies_to: "POST /episodes/{id}/visits"
+  - priority: 13
+    category: business_temporal
+    check: "New Visit interval [scheduled_start, scheduled_end) does not overlap any non-terminal Visit for the same clinician (half-open; touching endpoints allowed)"
+    error_id: ERR_CLINICIAN_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /episodes/{id}/visits"
+  - priority: 14
+    category: business_temporal
+    check: "New CompanionShift interval does not overlap any non-terminal CompanionShift for the same patient's episode AND honors a 30-minute travel buffer between adjacent shifts of the same HHA"
+    error_id: ERR_COMPANION_SHIFT_CONFLICT
+    http_status: 409
+    applies_to: "POST /episodes/{id}/companion-shifts"
+  - priority: 15
+    category: business_constraint
+    check: "Confirming/scheduling a visit does not exceed the clinician's weekly_visit_cap for the visit's ISO week"
+    error_id: ERR_WEEKLY_CAP_EXCEEDED
+    http_status: 422
+    applies_to: "POST /visits/{id}/confirm, POST /episodes/{id}/visits"
+  - priority: 16
+    category: business_constraint
+    check: "Episode has exactly one ACTIVE PlanOfCare before activation; recert revisions do not exceed MAX_RECERT_REVISIONS"
+    error_id: ERR_PLAN_REQUIRED
+    http_status: 422
+    applies_to: "POST /episodes/{id}/activate"
+  - priority: 17
+    category: business_constraint
+    check: "Resubmitting a RETURNED recert when revision_count already equals MAX_RECERT_REVISIONS is rejected"
+    error_id: ERR_MAX_REVISIONS_EXCEEDED
+    http_status: 422
+    applies_to: "POST /recert-requests/{id}/resubmit"
+  - priority: 18
+    category: business_fiscal
+    check: "Mileage claim claimed_miles must not exceed computed_miles * OVERCLAIM_TOLERANCE at approval"
+    error_id: ERR_MILEAGE_OVERCLAIM
+    http_status: 422
+    applies_to: "POST /mileage-claims/{id}/approve"
+  - priority: 19
+    category: business_fiscal
+    check: "Delivering a CompanionShift must not push companion_hours_used above companion_hours_authorized"
+    error_id: ERR_COMPANION_HOURS_EXCEEDED
+    http_status: 422
+    applies_to: "POST /companion-shifts/{id}/deliver"
+  - priority: 20
+    category: business_constraint
+    check: "Finalize requires every Visit terminal (no SCHEDULED/CONFIRMED) and no SUBMITTED RecertRequest"
+    error_id: ERR_EPISODE_NOT_SETTLEABLE
+    http_status: 409
+    applies_to: "POST /episodes/{id}/finalize"
+  - priority: 21
+    category: business_constraint
+    check: "A patient may have at most one non-terminal Episode at a time"
+    error_id: ERR_PATIENT_HAS_OPEN_EPISODE
+    http_status: 409
+    applies_to: "POST /episodes"
+  - priority: 22
+    category: state
+    check: "OCC: expected_episode_version must equal current Episode.version on plan create"
+    error_id: ERR_STALE_EPISODE_VERSION
+    http_status: 412
+    applies_to: "POST /episodes/{id}/plans-of-care"
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # ---- Patient ----
+  - method: POST
+    path: "/patients"
+    description: "Create a patient"
+    roles: [IntakeCoordinator]
+    code: 201
+    input: [full_name, medicare_id, home_zip, home_lat, home_lon]
+    output: Patient
+    side_effects: ["create Patient(status=ACTIVE)"]
+  - method: GET
+    path: "/patients/{id}"
+    description: "Fetch a patient (open_episode_id computed)"
+    roles: [IntakeCoordinator, Scheduler, BillingManager, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Patient
+    side_effects: []
+  - method: GET
+    path: "/patients/{id}/episodes"
+    description: "List episodes for a patient (reverse-reachability for Episode.patient_id)"
+    roles: [IntakeCoordinator, Scheduler, BillingManager, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Episode[]
+    side_effects: []
+
+  # ---- Clinician ----
+  - method: POST
+    path: "/clinicians"
+    description: "Create a clinician"
+    roles: [Scheduler]
+    code: 201
+    input: [full_name, discipline, "license_active?", base_lat, base_lon, "weekly_visit_cap?"]
+    output: Clinician
+    side_effects: ["create Clinician"]
+  - method: GET
+    path: "/clinicians/{id}"
+    description: "Fetch a clinician"
+    roles: [Scheduler, IntakeCoordinator, BillingManager]
+    code: 200
+    input: []
+    output: Clinician
+    side_effects: []
+  - method: PATCH
+    path: "/clinicians/{id}"
+    description: "Update clinician license_active or weekly_visit_cap"
+    roles: [Scheduler]
+    code: 200
+    input: ["license_active?", "weekly_visit_cap?"]
+    output: Clinician
+    side_effects: ["increments Clinician.version by 1"]
+  - method: GET
+    path: "/clinicians/{id}/visits"
+    description: "List visits assigned to a clinician (reverse-reachability for Visit.clinician_id and CompanionShift.clinician_id via filter)"
+    roles: [Scheduler, Clinician, BillingManager]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Visit[]
+    side_effects: []
+
+  # ---- OASIS ----
+  - method: POST
+    path: "/oasis-assessments"
+    description: "Record an OASIS assessment (SOC or recert order source)"
+    roles: [IntakeCoordinator]
+    code: 201
+    input: [patient_id, clinician_id, assessment_type, assessment_date, clinical_group, functional_level, comorbidity_count]
+    output: OASISAssessment
+    side_effects: ["create OASISAssessment(locked=false)"]
+  - method: GET
+    path: "/oasis-assessments"
+    description: "List OASIS assessments, filterable by patient or clinician (reverse-reachability for OASISAssessment.patient_id and .clinician_id)"
+    roles: [IntakeCoordinator, ComplianceOfficer]
+    code: 200
+    input: ["patient_id?", "clinician_id?", "limit?", "offset?"]
+    output: OASISAssessment[]
+    side_effects: []
+  - method: GET
+    path: "/oasis-assessments/{id}"
+    description: "Fetch a single OASIS assessment"
+    roles: [IntakeCoordinator, ComplianceOfficer]
+    code: 200
+    input: []
+    output: OASISAssessment
+    side_effects: []
+  - method: GET
+    path: "/oasis-assessments/{id}/recert-requests"
+    description: "List recert requests citing this OASIS (reverse-reachability for RecertRequest.recert_oasis_id)"
+    roles: [IntakeCoordinator, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RecertRequest[]
+    side_effects: []
+
+  # ---- PDGM rate config ----
+  - method: POST
+    path: "/pdgm-rate-configs"
+    description: "Create a PDGM rate config row for a clinical group"
+    roles: [BillingManager]
+    code: 201
+    input: [clinical_group, base_30day_rate, functional_weight_low, functional_weight_medium, functional_weight_high, lupa_threshold, active]
+    output: PdgmRateConfig
+    side_effects: ["create PdgmRateConfig"]
+  - method: GET
+    path: "/pdgm-rate-configs"
+    description: "List PDGM rate configs, filterable by clinical_group"
+    roles: [BillingManager, IntakeCoordinator]
+    code: 200
+    input: ["clinical_group?", "active?", "limit?", "offset?"]
+    output: PdgmRateConfig[]
+    side_effects: []
+
+  # ---- Episode ----
+  - method: POST
+    path: "/episodes"
+    description: "Open a 60-day episode from a START_OF_CARE OASIS"
+    roles: [IntakeCoordinator]
+    code: 201
+    input: [patient_id, soc_oasis_id, "prior_episode_id?"]
+    output: Episode
+    side_effects:
+      - "create Episode(status=DRAFT)"
+      - "copy clinical_group/functional_level from soc_oasis; set cert_start=assessment_date, cert_end=cert_start+59d"
+      - "copy lupa_threshold from active PdgmRateConfig(clinical_group)"
+      - "lock soc_oasis (locked=true)"
+  - method: GET
+    path: "/episodes"
+    description: "List episodes, filterable by patient, SOC OASIS, or prior episode (reverse-reachability for Episode.patient_id, Episode.soc_oasis_id, Episode.prior_episode_id)"
+    roles: [IntakeCoordinator, Scheduler, BillingManager, ComplianceOfficer]
+    code: 200
+    input: ["patient_id?", "soc_oasis_id?", "prior_episode_id?", "limit?", "offset?"]
+    output: Episode[]
+    side_effects: []
+  - method: GET
+    path: "/episodes/{id}"
+    description: "Fetch an episode with computed payment/mileage/companion fields"
+    roles: [IntakeCoordinator, Scheduler, BillingManager, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Episode
+    side_effects: []
+  - method: POST
+    path: "/episodes/{id}/activate"
+    description: "Activate a DRAFT episode (requires one ACTIVE plan)"
+    roles: [IntakeCoordinator]
+    code: 200
+    input: []
+    output: Episode
+    side_effects:
+      - "Episode DRAFT->ACTIVE"
+      - "recompute provisional_payment"
+      - "append EpisodeEvent(ACTIVATED)"
+      - "increments Episode.version by 1"
+  - method: POST
+    path: "/episodes/{id}/cancel"
+    description: "Cancel a DRAFT episode; supersede plans and unlock SOC OASIS"
+    roles: [IntakeCoordinator]
+    code: 200
+    input: []
+    output: Episode
+    side_effects:
+      - "Episode DRAFT->CANCELLED"
+      - "cascade SUPERSEDE all ACTIVE plans; unlock soc_oasis"
+      - "append EpisodeEvent(CANCELLED)"
+      - "increments Episode.version by 1"
+  - method: POST
+    path: "/episodes/{id}/finalize"
+    description: "Settle PDGM payment and discharge (FULL_PDGM vs LUPA)"
+    roles: [BillingManager]
+    code: 200
+    input: []
+    output: Episode
+    side_effects:
+      - "compute final_payment via final_pdgm_settlement"
+      - "create PaymentLedger row"
+      - "Episode ACTIVE->DISCHARGED; set Patient.status=DISCHARGED if no other open episode"
+      - "append EpisodeEvent(FINALIZED), EpisodeEvent(DISCHARGED)"
+      - "increments Episode.version by 1"
+  - method: POST
+    path: "/episodes/{id}/reopen"
+    description: "Reopen a discharged episode within window; reverse the settlement ledger"
+    roles: [BillingManager]
+    code: 200
+    input: []
+    output: Episode
+    side_effects:
+      - "Episode DISCHARGED->ACTIVE"
+      - "PaymentLedger.reversed=true; reset final_payment=0; restore Patient.status=ACTIVE"
+      - "append EpisodeEvent(LEDGER_REVERSED)"
+      - "increments Episode.version by 1"
+  - method: GET
+    path: "/episodes/{id}/summary"
+    description: "Computed read: provisional vs final payment, mileage, companion totals, current basis"
+    roles: [BillingManager, IntakeCoordinator]
+    code: 200
+    input: []
+    output: Episode
+    side_effects: []
+  - method: GET
+    path: "/episodes/{id}/events"
+    description: "List EpisodeEvent audit log (reverse-reachability for EpisodeEvent.episode_id)"
+    roles: [BillingManager, IntakeCoordinator, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: EpisodeEvent[]
+    side_effects: []
+
+  # ---- PlanOfCare ----
+  - method: POST
+    path: "/episodes/{id}/plans-of-care"
+    description: "Create a PlanOfCare; supersedes the prior ACTIVE plan (OCC on episode version)"
+    roles: [IntakeCoordinator]
+    code: 201
+    input: [planned_rn_visits, planned_pt_visits, planned_ot_visits, planned_slp_visits, companion_hours_authorized, expected_episode_version]
+    output: PlanOfCare
+    side_effects:
+      - "set prior ACTIVE plan (if any) to SUPERSEDED; append EpisodeEvent(PLAN_SUPERSEDED)"
+      - "create PlanOfCare(status=ACTIVE)"
+      - "recompute Episode.provisional_payment"
+      - "increments Episode.version by 1"
+  - method: GET
+    path: "/episodes/{id}/plans-of-care"
+    description: "List plans of care for an episode (reverse-reachability for PlanOfCare.episode_id)"
+    roles: [IntakeCoordinator, BillingManager]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: PlanOfCare[]
+    side_effects: []
+
+  # ---- Visit ----
+  - method: POST
+    path: "/episodes/{id}/visits"
+    description: "Schedule a discipline visit against an ACTIVE episode"
+    roles: [Scheduler]
+    code: 201
+    input: [clinician_id, discipline, scheduled_start, scheduled_end]
+    output: Visit
+    side_effects: ["create Visit(status=SCHEDULED)"]
+  - method: GET
+    path: "/episodes/{id}/visits"
+    description: "List visits for an episode (reverse-reachability for Visit.episode_id)"
+    roles: [Scheduler, BillingManager, IntakeCoordinator]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Visit[]
+    side_effects: []
+  - method: GET
+    path: "/visits/{id}"
+    description: "Fetch a visit"
+    roles: [Scheduler, Clinician, BillingManager]
+    code: 200
+    input: []
+    output: Visit
+    side_effects: []
+  - method: POST
+    path: "/visits/{id}/confirm"
+    description: "Clinician confirms an assigned visit (reserves weekly slot)"
+    roles: [Clinician]
+    code: 200
+    input: []
+    output: Visit
+    side_effects: ["Visit SCHEDULED->CONFIRMED", "increments Visit.version by 1"]
+  - method: POST
+    path: "/visits/{id}/complete"
+    description: "Clinician completes a confirmed visit (becomes billable)"
+    roles: [Clinician]
+    code: 200
+    input: []
+    output: Visit
+    side_effects:
+      - "Visit CONFIRMED->COMPLETED; set billable=true"
+      - "recompute Episode.provisional_payment; append EpisodeEvent(VISIT_COMPLETED)"
+      - "increments Visit.version by 1"
+  - method: POST
+    path: "/visits/{id}/mark-missed"
+    description: "Mark a confirmed visit missed (frees capacity, never bills)"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: Visit
+    side_effects:
+      - "Visit CONFIRMED->MISSED; release weekly-cap slot; append EpisodeEvent(VISIT_MISSED)"
+      - "increments Visit.version by 1"
+  - method: POST
+    path: "/visits/{id}/cancel"
+    description: "Cancel a scheduled or confirmed visit"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: Visit
+    side_effects: ["Visit ->CANCELLED; release weekly-cap slot", "increments Visit.version by 1"]
+
+  # ---- CompanionShift ----
+  - method: POST
+    path: "/episodes/{id}/companion-shifts"
+    description: "Book an HHA companion shift against an ACTIVE episode"
+    roles: [Scheduler]
+    code: 201
+    input: [clinician_id, shift_start, shift_end]
+    output: CompanionShift
+    side_effects: ["create CompanionShift(status=BOOKED); compute hours"]
+  - method: GET
+    path: "/episodes/{id}/companion-shifts"
+    description: "List companion shifts for an episode (reverse-reachability for CompanionShift.episode_id)"
+    roles: [Scheduler, BillingManager]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: CompanionShift[]
+    side_effects: []
+  - method: GET
+    path: "/clinicians/{id}/companion-shifts"
+    description: "List companion shifts assigned to an HHA clinician (reverse-reachability for CompanionShift.clinician_id)"
+    roles: [Scheduler, BillingManager]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: CompanionShift[]
+    side_effects: []
+  - method: POST
+    path: "/companion-shifts/{id}/deliver"
+    description: "Mark a companion shift delivered (adds to companion_hours_used)"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: CompanionShift
+    side_effects: ["CompanionShift BOOKED->DELIVERED; add hours to Episode.companion_hours_used", "increments CompanionShift.version by 1"]
+  - method: POST
+    path: "/companion-shifts/{id}/cancel"
+    description: "Cancel a booked companion shift"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: CompanionShift
+    side_effects: ["CompanionShift BOOKED->CANCELLED", "increments CompanionShift.version by 1"]
+
+  # ---- MileageClaim ----
+  - method: POST
+    path: "/visits/{id}/mileage-claims"
+    description: "File a mileage claim against a completed visit"
+    roles: [Clinician, Scheduler]
+    code: 201
+    input: [claimed_miles]
+    output: MileageClaim
+    side_effects: ["create MileageClaim(status=PENDING); compute computed_miles"]
+  - method: GET
+    path: "/visits/{id}/mileage-claims"
+    description: "List mileage claims for a visit (reverse-reachability for MileageClaim.visit_id)"
+    roles: [BillingManager, Scheduler, Clinician]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: MileageClaim[]
+    side_effects: []
+  - method: POST
+    path: "/mileage-claims/{id}/approve"
+    description: "Approve a mileage claim (tiered reimbursement, overclaim check)"
+    roles: [BillingManager]
+    code: 200
+    input: []
+    output: MileageClaim
+    side_effects: ["MileageClaim PENDING->APPROVED; compute reimbursement; add to Episode.total_mileage_reimbursed", "increments MileageClaim.version by 1"]
+  - method: POST
+    path: "/mileage-claims/{id}/reject"
+    description: "Reject a mileage claim"
+    roles: [BillingManager]
+    code: 200
+    input: []
+    output: MileageClaim
+    side_effects: ["MileageClaim PENDING->REJECTED; reimbursement=0", "increments MileageClaim.version by 1"]
+
+  # ---- RecertRequest ----
+  - method: POST
+    path: "/episodes/{id}/recert-requests"
+    description: "Submit a recertification request (episode -> RECERT_PENDING)"
+    roles: [IntakeCoordinator]
+    code: 201
+    input: [recert_oasis_id]
+    output: RecertRequest
+    side_effects: ["create RecertRequest(SUBMITTED); Episode ACTIVE->RECERT_PENDING", "increments Episode.version by 1"]
+  - method: GET
+    path: "/episodes/{id}/recert-requests"
+    description: "List recert requests for an episode (reverse-reachability for RecertRequest.episode_id and .recert_oasis_id)"
+    roles: [IntakeCoordinator, ComplianceOfficer]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: RecertRequest[]
+    side_effects: []
+  - method: POST
+    path: "/recert-requests/{id}/return"
+    description: "ComplianceOfficer returns a recert request for revision"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: [review_note]
+    output: RecertRequest
+    side_effects: ["RecertRequest SUBMITTED->RETURNED", "increments RecertRequest.version by 1"]
+  - method: POST
+    path: "/recert-requests/{id}/resubmit"
+    description: "IntakeCoordinator resubmits a returned recert request"
+    roles: [IntakeCoordinator]
+    code: 200
+    input: []
+    output: RecertRequest
+    side_effects: ["RecertRequest RETURNED->SUBMITTED; revision_count+1", "increments RecertRequest.version by 1"]
+  - method: POST
+    path: "/recert-requests/{id}/approve"
+    description: "Approve recert: extend cert window 60 days, recompute LUPA, episode back to ACTIVE"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: RecertRequest
+    side_effects:
+      - "RecertRequest SUBMITTED->APPROVED; lock recert_oasis"
+      - "Episode RECERT_PENDING->ACTIVE; cert_end += 60d; copy clinical_group/functional_level; recompute lupa_threshold"
+      - "append EpisodeEvent(RECERT_APPROVED); increments Episode.version by 1"
+      - "increments RecertRequest.version by 1"
+  - method: POST
+    path: "/recert-requests/{id}/deny"
+    description: "Deny recert: episode returns to ACTIVE with no extension"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: [review_note]
+    output: RecertRequest
+    side_effects:
+      - "RecertRequest SUBMITTED->DENIED; Episode RECERT_PENDING->ACTIVE (no extension)"
+      - "increments Episode.version by 1; increments RecertRequest.version by 1"
+  - method: GET
+    path: "/episodes/{id}/payment-ledger"
+    description: "List PaymentLedger rows for an episode (reverse-reachability for PaymentLedger.episode_id)"
+    roles: [BillingManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PaymentLedger[]
+    side_effects: []
+
+  # ---- Test-driving clock control ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-only: set the server's current UTC clock to a fixed timestamp"
+    roles: [BillingManager, IntakeCoordinator, Scheduler, ComplianceOfficer]
+    code: 200
+    input: [now_utc]
+    output: null
+    side_effects: ["set server clock used by temporal validations and visit-window checks"]
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for the operation"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Clinician acting on a visit they are not assigned to"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced resource does not exist"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource not in a state allowing the requested transition"
+  - id: ERR_EPISODE_NOT_ACTIVE
+    http: 409
+    condition: "Visit/companion operation attempted while parent Episode is not ACTIVE"
+  - id: ERR_LICENSE_INACTIVE
+    http: 422
+    condition: "Confirming a visit for a clinician whose license_active=false"
+  - id: ERR_DISCIPLINE_MISMATCH
+    http: 422
+    condition: "Visit discipline does not match clinician discipline, or companion shift assigned to a non-HHA clinician"
+  - id: ERR_OASIS_INVALID
+    http: 422
+    condition: "SOC OASIS wrong type, wrong patient, or already locked"
+  - id: ERR_RECERT_OASIS_INVALID
+    http: 422
+    condition: "Recert OASIS wrong type, wrong patient, or already locked"
+  - id: ERR_RECERT_WINDOW_CLOSED
+    http: 422
+    condition: "Recert request outside the RECERT_WINDOW_DAYS before cert_end"
+  - id: ERR_VISIT_OUT_OF_CERT_WINDOW
+    http: 422
+    condition: "Visit interval falls outside [cert_start, cert_end] or start>=end"
+  - id: ERR_CLINICIAN_DOUBLE_BOOKED
+    http: 409
+    condition: "Visit interval overlaps another non-terminal visit for the same clinician"
+  - id: ERR_COMPANION_SHIFT_CONFLICT
+    http: 409
+    condition: "Companion shift overlaps another shift or violates the 30-minute travel buffer for the HHA"
+  - id: ERR_WEEKLY_CAP_EXCEEDED
+    http: 422
+    condition: "Confirming/scheduling would exceed the clinician's weekly_visit_cap for the ISO week"
+  - id: ERR_PLAN_REQUIRED
+    http: 422
+    condition: "Activating an episode that has no single ACTIVE PlanOfCare"
+  - id: ERR_MAX_REVISIONS_EXCEEDED
+    http: 422
+    condition: "Resubmitting a recert when revision_count already equals MAX_RECERT_REVISIONS"
+  - id: ERR_MILEAGE_OVERCLAIM
+    http: 422
+    condition: "claimed_miles exceeds computed_miles * OVERCLAIM_TOLERANCE at approval"
+  - id: ERR_COMPANION_HOURS_EXCEEDED
+    http: 422
+    condition: "Delivering a shift would push companion_hours_used above companion_hours_authorized"
+  - id: ERR_EPISODE_NOT_SETTLEABLE
+    http: 409
+    condition: "Finalize attempted with non-terminal visits or a SUBMITTED recert request"
+  - id: ERR_PATIENT_HAS_OPEN_EPISODE
+    http: 409
+    condition: "Creating an episode for a patient who already has a non-terminal episode"
+  - id: ERR_STALE_EPISODE_VERSION
+    http: 412
+    condition: "expected_episode_version does not match current Episode.version on plan create"
+  - id: ERR_REOPEN_WINDOW_CLOSED
+    http: 422
+    condition: "Reopen attempted beyond REOPEN_WINDOW_DAYS after finalize"
+  - id: ERR_VALIDATION
+    http: 400
+    condition: "Malformed body, missing required field, or value outside declared constraints"
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: IntakeCoordinator
+    description: "Owns patient intake, OASIS recording, episode open/activate/cancel, plans of care, recert submission/resubmission"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /patients"
+      - "POST /oasis-assessments"
+      - "POST /episodes"
+      - "POST /episodes/{id}/activate"
+      - "POST /episodes/{id}/cancel"
+      - "POST /episodes/{id}/plans-of-care"
+      - "POST /episodes/{id}/recert-requests"
+      - "POST /recert-requests/{id}/resubmit"
+    shared_operations:
+      - "GET /patients/{id}"
+      - "GET /episodes/{id}"
+      - "GET /episodes/{id}/summary"
+      - "POST /_clock/set_current_utc"
+  - name: Scheduler
+    description: "Owns clinician roster, visit scheduling, companion shifts, mileage filing, visit cancel/miss"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /clinicians"
+      - "PATCH /clinicians/{id}"
+      - "POST /episodes/{id}/visits"
+      - "POST /episodes/{id}/companion-shifts"
+      - "POST /companion-shifts/{id}/deliver"
+      - "POST /companion-shifts/{id}/cancel"
+      - "POST /visits/{id}/mark-missed"
+      - "POST /visits/{id}/cancel"
+    shared_operations:
+      - "POST /visits/{id}/mileage-claims"
+      - "GET /clinicians/{id}/visits"
+      - "POST /_clock/set_current_utc"
+  - name: Clinician
+    description: "Field clinician; confirms and completes only their own assigned visits, files mileage"
+    identity: "entity_backed:Clinician"
+    exclusive_operations:
+      - "POST /visits/{id}/confirm"
+      - "POST /visits/{id}/complete"
+    shared_operations:
+      - "POST /visits/{id}/mileage-claims"
+      - "GET /visits/{id}"
+      - "GET /clinicians/{id}/visits"
+  - name: BillingManager
+    description: "Owns PDGM rate config, finalize/reopen settlement, mileage approval/rejection, payment ledger"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pdgm-rate-configs"
+      - "POST /episodes/{id}/finalize"
+      - "POST /episodes/{id}/reopen"
+      - "POST /mileage-claims/{id}/approve"
+      - "POST /mileage-claims/{id}/reject"
+      - "GET /episodes/{id}/payment-ledger"
+    shared_operations:
+      - "GET /episodes/{id}"
+      - "GET /episodes/{id}/summary"
+      - "POST /_clock/set_current_utc"
+  - name: ComplianceOfficer
+    description: "Reviews recert requests: return, approve (extend cert), or deny"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /recert-requests/{id}/return"
+      - "POST /recert-requests/{id}/approve"
+      - "POST /recert-requests/{id}/deny"
+    shared_operations:
+      - "GET /episodes/{id}/recert-requests"
+      - "GET /oasis-assessments"
+      - "POST /_clock/set_current_utc"

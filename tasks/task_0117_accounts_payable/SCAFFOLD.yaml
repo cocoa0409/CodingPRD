@@ -1,0 +1,1515 @@
+scenario: "Accounts Payable Automation: OCR invoice capture, PO/non-PO coding, approval workflow/threshold, 2/3-way match exception, duplicate detection, payment run (ACH/check/card), early-pay discount, 1099 vendor, accrual"
+domain_name: accounts-payable-automation
+api_prefix: /ap
+
+complexity_profile:
+  primary_archetype: Workflow orchestration
+  secondary_archetype: Ledger reconciliation
+  complexity_layers:
+    - Dual-variant calculation
+    - Cascading side effects
+    - Rate / threshold triggers
+    - Optimistic concurrency
+    - Derived field reconciliation
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (Vendor, PurchaseOrder, Invoice, PaymentBatch …);
+  # no deep URL nesting — children carry FK fields and are discovered via filtered-list GETs.
+
+  state_machine_shape: branching
+  # Invoice carries a cyclic revision loop (CODING_REVIEW -> CAPTURED on reject);
+  # MatchException branches RESOLVE vs WRITE_OFF vs ESCALATE with divergent side-effects;
+  # PaymentBatch is linear with a VOID revert; Payment evolves a parallel settlement axis.
+
+  relationship_patterns:
+    - one_to_many        # Vendor -> Invoice; PurchaseOrder -> GoodsReceipt; Invoice -> InvoiceLine
+    - cross_aggregate    # Invoice references PurchaseOrder; Payment references Invoice; Accrual references PurchaseOrder
+
+  role_model: segregation_of_duties
+  # The user who codes an invoice cannot approve it; the user who approves cannot release the
+  # payment batch containing it. Enforced via X-User-ID tracking on coded_by / approved_by.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: Vendor
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: Vendor legal name.
+      - name: payment_method
+        type: enum
+        source: input
+        description: "Default disbursement rail. constraints: one of ACH, CHECK, CARD."
+        constraints: "enum: ACH | CHECK | CARD"
+      - name: is_1099
+        type: boolean
+        source: input
+        description: Whether this vendor is a reportable 1099 vendor.
+        default: false
+      - name: tax_id
+        type: string
+        source: input
+        description: "Vendor TIN. Required when is_1099 is true; otherwise optional."
+      - name: early_pay_terms_pct
+        type: number
+        source: input
+        description: "Early-payment discount percentage (e.g. 0.02 for 2%) offered by this vendor; 0 when none."
+        default: 0
+      - name: early_pay_window_days
+        type: integer
+        source: input
+        description: "Number of days from invoice_date within which paying earns early_pay_terms_pct; 0 when no discount."
+        default: 0
+      - name: net_terms_days
+        type: integer
+        source: input
+        description: "Net payment term in days from invoice_date used to derive due_date."
+        default: 30
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle status. constraints: ACTIVE | ON_HOLD."
+        default: ACTIVE
+        constraints: "enum: ACTIVE | ON_HOLD"
+      - name: ytd_1099_paid_cents
+        type: integer
+        source: computed
+        description: "Sum of Payment.amount_cents across all SETTLED payments to this vendor in the current year; recomputed on every payment settlement. 0 for non-1099 vendors is still maintained."
+        default: 0
+
+  - name: GLAccount
+    parent: null
+    common_fields: false
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: "GL account code (e.g. '5000'); unique across GLAccounts."
+        constraints: "unique"
+      - name: name
+        type: string
+        source: input
+        description: General-ledger account name.
+      - name: is_postable
+        type: boolean
+        source: input
+        description: "Whether invoice/accrual lines may post to this account; non-postable accounts are roll-up parents."
+        default: true
+
+  - name: PurchaseOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: vendor_id
+        type: string
+        source: input
+        description: "FK -> Vendor.id; the vendor this PO is raised against."
+      - name: gl_account_code
+        type: string
+        source: input
+        description: "GL account code all matched lines of invoices against this PO default-code to; must reference a postable GLAccount."
+      - name: ordered_amount_cents
+        type: integer
+        source: input
+        description: "Total ordered value in cents."
+        constraints: ">= 1"
+      - name: received_amount_cents
+        type: integer
+        source: computed
+        description: "Sum of GoodsReceipt.received_amount_cents across this PO's POSTED goods receipts; recomputed on each receipt post."
+        default: 0
+      - name: matched_amount_cents
+        type: integer
+        source: computed
+        description: "Sum of Invoice.total_amount_cents across this PO's invoices in {MATCHED, APPROVED, SCHEDULED, PAID}; recomputed on each invoice match/approve/pay."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "constraints: OPEN | CLOSED. CLOSED when matched_amount_cents >= ordered_amount_cents."
+        default: OPEN
+        constraints: "enum: OPEN | CLOSED"
+
+  - name: GoodsReceipt
+    parent: null
+    common_fields: true
+    fields:
+      - name: po_id
+        type: string
+        source: input
+        description: "FK -> PurchaseOrder.id; the PO these goods were received against."
+      - name: received_amount_cents
+        type: integer
+        source: input
+        description: "Value of goods received in cents."
+        constraints: ">= 1"
+      - name: received_date
+        type: datetime
+        source: input
+        description: "Start of the delivery window (ISO 8601 date)."
+      - name: coverage_days
+        type: integer
+        source: input
+        description: "Length in days of the delivery coverage window; the receipt occupies the half-open interval [received_date, received_date + coverage_days)."
+        constraints: ">= 1"
+        default: 1
+      - name: status
+        type: enum
+        source: system
+        description: "constraints: DRAFT | POSTED."
+        default: DRAFT
+        constraints: "enum: DRAFT | POSTED"
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: vendor_id
+        type: string
+        source: input
+        description: "FK -> Vendor.id; the vendor that issued this invoice."
+      - name: po_id
+        type: string
+        source: input
+        description: "FK -> PurchaseOrder.id; the PO this invoice bills against. Null for non-PO invoices."
+      - name: invoice_number
+        type: string
+        source: input
+        description: "Vendor-supplied invoice number; unique per vendor (vendor_id + invoice_number) — basis of duplicate detection."
+      - name: invoice_date
+        type: datetime
+        source: input
+        description: "Date on the invoice (ISO 8601); drives due_date and early-pay window."
+      - name: ocr_confidence
+        type: number
+        source: input
+        description: "OCR capture confidence 0.0–1.0; below CONFIDENCE_FLOOR forces manual CODING_REVIEW."
+        default: 1.0
+      - name: total_amount_cents
+        type: integer
+        source: computed
+        description: "Sum of this invoice's InvoiceLine.amount_cents; recomputed whenever a line is added."
+        default: 0
+      - name: match_type
+        type: enum
+        source: system
+        description: "constraints: TWO_WAY | THREE_WAY | NON_PO. THREE_WAY when po_id set and PO has >=1 POSTED GoodsReceipt; TWO_WAY when po_id set and none; NON_PO when po_id null."
+        constraints: "enum: TWO_WAY | THREE_WAY | NON_PO"
+      - name: variance_cents
+        type: integer
+        source: computed
+        description: "Match variance in cents computed at match time; see calculations.match_variance. 0 until matched."
+        default: 0
+      - name: due_date
+        type: datetime
+        source: computed
+        description: "invoice_date + Vendor.net_terms_days (ISO 8601); set at creation."
+      - name: discount_deadline
+        type: datetime
+        source: computed
+        description: "invoice_date + Vendor.early_pay_window_days (ISO 8601); null when vendor offers no discount."
+      - name: coded_by
+        type: string
+        source: system
+        description: "X-User-ID of the APClerk who coded (added the final line bringing the invoice out of CAPTURED). Null until coded."
+      - name: approved_by
+        type: string
+        source: system
+        description: "X-User-ID of the Approver who approved this invoice. Null until approved."
+      - name: status
+        type: enum
+        source: system
+        description: "constraints: CAPTURED | CODING_REVIEW | MATCHED | PENDING_APPROVAL | APPROVED | SCHEDULED | PAID | REJECTED."
+        default: CAPTURED
+        constraints: "enum: CAPTURED | CODING_REVIEW | MATCHED | PENDING_APPROVAL | APPROVED | SCHEDULED | PAID | REJECTED"
+
+  - name: InvoiceLine
+    parent: Invoice
+    common_fields: true
+    fields:
+      - name: invoice_id
+        type: string
+        source: input
+        description: "FK -> Invoice.id; the invoice this line belongs to."
+      - name: gl_account_code
+        type: string
+        source: input
+        description: "GL account code this line is coded to; must reference a postable GLAccount."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Line amount in cents."
+        constraints: ">= 1"
+      - name: description
+        type: string
+        source: input
+        description: Line description.
+
+  - name: MatchException
+    parent: null
+    common_fields: true
+    fields:
+      - name: invoice_id
+        type: string
+        source: input
+        description: "FK -> Invoice.id; the invoice whose match produced this exception."
+      - name: reason
+        type: enum
+        source: system
+        description: "constraints: PRICE_VARIANCE | QTY_VARIANCE. Set at exception creation: TWO_WAY breach -> PRICE_VARIANCE; THREE_WAY breach -> QTY_VARIANCE."
+        constraints: "enum: PRICE_VARIANCE | QTY_VARIANCE"
+      - name: variance_cents
+        type: integer
+        source: system
+        description: "The variance amount that breached tolerance, copied from Invoice.variance_cents at creation."
+      - name: resolution
+        type: enum
+        source: system
+        description: "constraints: PENDING | RESOLVED | WRITTEN_OFF | ESCALATED."
+        default: PENDING
+        constraints: "enum: PENDING | RESOLVED | WRITTEN_OFF | ESCALATED"
+      - name: resolved_by
+        type: string
+        source: system
+        description: "X-User-ID of the actor who set a terminal resolution. Null while PENDING."
+
+  - name: ApprovalRoute
+    parent: null
+    common_fields: false
+    fields:
+      - name: min_amount_cents
+        type: integer
+        source: input
+        description: "Inclusive lower bound (cents) of invoice total this tier covers."
+        constraints: ">= 0"
+      - name: max_amount_cents
+        type: integer
+        source: input
+        description: "Exclusive upper bound (cents); use a large sentinel for the top tier. Tiers must not overlap."
+      - name: required_levels
+        type: integer
+        source: input
+        description: "Number of sequential Approver sign-offs an invoice in this tier requires."
+        constraints: ">= 1"
+
+  - name: ApprovalStep
+    parent: null
+    common_fields: true
+    fields:
+      - name: invoice_id
+        type: string
+        source: input
+        description: "FK -> Invoice.id; the invoice this approval step belongs to."
+      - name: level
+        type: integer
+        source: system
+        description: "1-based sequential level; level N can be acted on only after level N-1 is APPROVED."
+      - name: status
+        type: enum
+        source: system
+        description: "constraints: PENDING | APPROVED | REJECTED."
+        default: PENDING
+        constraints: "enum: PENDING | APPROVED | REJECTED"
+      - name: acted_by
+        type: string
+        source: system
+        description: "X-User-ID of the Approver who acted on this step. Null while PENDING."
+
+  - name: PaymentBatch
+    parent: null
+    common_fields: true
+    fields:
+      - name: payment_method
+        type: enum
+        source: input
+        description: "Disbursement rail for this run. constraints: ACH | CHECK | CARD. Only invoices whose vendor uses this method may be added."
+        constraints: "enum: ACH | CHECK | CARD"
+      - name: run_date
+        type: datetime
+        source: input
+        description: "Effective disbursement date (ISO 8601); discount eligibility of each member invoice is evaluated against this date."
+      - name: total_disbursed_cents
+        type: integer
+        source: computed
+        description: "Sum over member Payments of net_amount_cents; recomputed on add/remove and frozen at RELEASED."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "constraints: BUILDING | RELEASED | SETTLED | VOID."
+        default: BUILDING
+        constraints: "enum: BUILDING | RELEASED | SETTLED | VOID"
+      - name: released_by
+        type: string
+        source: system
+        description: "X-User-ID of the APManager who released this batch. Null until RELEASED."
+
+  - name: Payment
+    parent: null
+    common_fields: true
+    fields:
+      - name: batch_id
+        type: string
+        source: input
+        description: "FK -> PaymentBatch.id; the run this payment belongs to."
+      - name: invoice_id
+        type: string
+        source: input
+        description: "FK -> Invoice.id; the invoice being paid by this payment."
+      - name: gross_amount_cents
+        type: integer
+        source: computed
+        description: "Copied from Invoice.total_amount_cents when the payment is added to a batch."
+        default: 0
+      - name: discount_taken_cents
+        type: integer
+        source: computed
+        description: "Early-pay discount applied; see calculations.early_pay_discount. 0 when run_date is past discount_deadline."
+        default: 0
+      - name: net_amount_cents
+        type: integer
+        source: computed
+        description: "gross_amount_cents - discount_taken_cents."
+        default: 0
+      - name: settlement_status
+        type: enum
+        source: system
+        description: "Parallel axis tracking funds movement. constraints: PENDING | SETTLED | RETURNED."
+        default: PENDING
+        constraints: "enum: PENDING | SETTLED | RETURNED"
+
+  - name: Accrual
+    parent: null
+    common_fields: true
+    fields:
+      - name: po_id
+        type: string
+        source: input
+        description: "FK -> PurchaseOrder.id; the PO this period-end accrual estimates unbilled receipts for."
+      - name: period_label
+        type: string
+        source: input
+        description: "Accounting period label (e.g. '2026-05')."
+      - name: period_start
+        type: datetime
+        source: input
+        description: "Inclusive start of the accrual period (ISO 8601 date); the accrual occupies the closed interval [period_start, period_end]."
+      - name: period_end
+        type: datetime
+        source: input
+        description: "Inclusive end of the accrual period (ISO 8601 date); period_end >= period_start required."
+      - name: estimated_cents
+        type: integer
+        source: computed
+        description: "Estimated accrual at booking; see calculations.accrual_amount variant ESTIMATE."
+        default: 0
+      - name: final_cents
+        type: integer
+        source: computed
+        description: "Final accrual at reversal/settlement; see calculations.accrual_amount variant FINAL. 0 until reversed."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "constraints: BOOKED | REVERSED."
+        default: BOOKED
+        constraints: "enum: BOOKED | REVERSED"
+
+  - name: AuditEvent
+    parent: null
+    common_fields: false
+    fields:
+      - name: invoice_id
+        type: string
+        source: input
+        description: "FK -> Invoice.id; the invoice this audit entry concerns."
+      - name: event_type
+        type: string
+        source: system
+        description: "Machine event label (e.g. 'CODED', 'APPROVED', 'PAID')."
+      - name: actor_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the actor that produced the event."
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: Invoice
+    initial_state: CAPTURED
+    terminal_states: [REJECTED]
+    transitions:
+      - from: CAPTURED
+        to: CODING_REVIEW
+        trigger: "POST /ap/invoices (system, at creation when ocr_confidence < CONFIDENCE_FLOOR)"
+        actor: system
+        preconditions: ["ocr_confidence < CONFIDENCE_FLOOR (0.80)"]
+        side_effects: ["status set to CODING_REVIEW instead of CAPTURED"]
+        note: "Low-confidence OCR forces manual review before any coding may finalize."
+      - from: CAPTURED
+        to: MATCHED
+        trigger: "POST /ap/invoices/{id}/code"
+        actor: APClerk
+        preconditions:
+          - "invoice has >=1 InvoiceLine and total_amount_cents > 0"
+          - "ocr_confidence >= CONFIDENCE_FLOOR"
+          - "no other Invoice exists with same vendor_id + invoice_number (duplicate detection)"
+        side_effects:
+          - "compute match_type from po_id and PO receipts"
+          - "compute variance_cents via calculations.match_variance"
+          - "set coded_by = X-User-ID"
+          - "if variance within tolerance: status -> MATCHED; recompute PurchaseOrder.matched_amount_cents (ledger sync); possibly close PO"
+          - "if variance breaches tolerance: a MatchException is created (PENDING) with reason PRICE_VARIANCE for TWO_WAY or QTY_VARIANCE for THREE_WAY, variance_cents copied from the invoice, and status -> CODING_REVIEW instead"
+          - "append AuditEvent CODED"
+        note: "Branching: in-tolerance -> MATCHED; out-of-tolerance -> CODING_REVIEW with an exception."
+      - from: CODING_REVIEW
+        to: MATCHED
+        trigger: "POST /ap/invoices/{id}/code"
+        actor: APClerk
+        preconditions:
+          - "all MatchException rows for this invoice have resolution != PENDING"
+          - "invoice has >=1 InvoiceLine and total_amount_cents > 0"
+          - "no other Invoice exists with same vendor_id + invoice_number"
+        side_effects:
+          - "recompute match_type and variance_cents"
+          - "set coded_by = X-User-ID"
+          - "status -> MATCHED; recompute PurchaseOrder.matched_amount_cents; possibly close PO"
+          - "append AuditEvent CODED"
+        note: "Revision loop closes once all exceptions are non-PENDING."
+      - from: MATCHED
+        to: PENDING_APPROVAL
+        trigger: "POST /ap/invoices/{id}/submit-approval"
+        actor: APClerk
+        preconditions: ["status == MATCHED"]
+        side_effects:
+          - "determine tier via calculations.approval_tier; create required_levels ApprovalStep rows (level 1..N) all PENDING"
+          - "status -> PENDING_APPROVAL"
+          - "append AuditEvent SUBMITTED"
+      - from: PENDING_APPROVAL
+        to: APPROVED
+        trigger: "POST /ap/invoices/{id}/approve (system bubble-up when final level approved)"
+        actor: system
+        preconditions: ["all ApprovalStep rows for this invoice are APPROVED"]
+        side_effects:
+          - "set approved_by = X-User-ID of the final approving Approver"
+          - "status -> APPROVED"
+          - "append AuditEvent APPROVED"
+        note: "Bubble-up: parent auto-transitions when the last child ApprovalStep flips to APPROVED."
+      - from: PENDING_APPROVAL
+        to: REJECTED
+        trigger: "POST /ap/approval-steps/{id}/reject"
+        actor: Approver
+        preconditions: ["the targeted ApprovalStep is PENDING and is the lowest-level PENDING step"]
+        side_effects:
+          - "targeted ApprovalStep -> REJECTED"
+          - "all higher-level PENDING ApprovalStep rows for the invoice -> REJECTED (cascade down)"
+          - "Invoice status -> REJECTED"
+          - "decrement PurchaseOrder.matched_amount_cents by this invoice's total (compensation / ledger sync); re-open PO if it had closed"
+          - "append AuditEvent REJECTED"
+        note: "Compensation: reversing the match-time ledger debit keeps matched_amount conserved."
+      - from: CODING_REVIEW
+        to: REJECTED
+        trigger: "POST /ap/invoices/{id}/reject"
+        actor: APClerk
+        preconditions: ["status == CODING_REVIEW"]
+        side_effects: ["status -> REJECTED", "append AuditEvent REJECTED"]
+      - from: APPROVED
+        to: SCHEDULED
+        trigger: "POST /ap/payment-batches/{id}/payments (Payment added)"
+        actor: APManager
+        preconditions: ["status == APPROVED", "vendor.status == ACTIVE"]
+        side_effects:
+          - "create Payment (gross/discount/net computed)"
+          - "Invoice status -> SCHEDULED"
+          - "recompute PaymentBatch.total_disbursed_cents"
+          - "append AuditEvent SCHEDULED"
+      - from: SCHEDULED
+        to: PAID
+        trigger: "POST /ap/payment-batches/{id}/release (bubble-up to each member invoice)"
+        actor: APManager
+        preconditions: ["parent PaymentBatch transitions BUILDING -> RELEASED"]
+        side_effects:
+          - "Invoice status -> PAID"
+          - "append AuditEvent PAID"
+      - from: SCHEDULED
+        to: APPROVED
+        trigger: "DELETE /ap/payments/{id} (Payment removed before release)"
+        actor: APManager
+        preconditions: ["parent PaymentBatch.status == BUILDING"]
+        side_effects:
+          - "delete Payment; recompute PaymentBatch.total_disbursed_cents"
+          - "Invoice status -> APPROVED (revert)"
+          - "append AuditEvent UNSCHEDULED"
+      - from: PAID
+        to: APPROVED
+        trigger: "POST /ap/payment-batches/{id}/void (cascade to member invoices)"
+        actor: APManager
+        preconditions: ["parent PaymentBatch.status == RELEASED (not yet SETTLED)"]
+        side_effects:
+          - "Invoice status -> APPROVED (compensation)"
+          - "Payment.settlement_status stays PENDING; payment deleted on void"
+          - "append AuditEvent PAYMENT_VOIDED"
+
+  - entity: ApprovalStep
+    initial_state: PENDING
+    terminal_states: [APPROVED, REJECTED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /ap/approval-steps/{id}/approve"
+        actor: Approver
+        preconditions:
+          - "this step is the lowest-level PENDING step for its invoice"
+          - "parent Invoice.status == PENDING_APPROVAL"
+        side_effects:
+          - "status -> APPROVED; set acted_by = X-User-ID"
+          - "if this is the highest level: Invoice PENDING_APPROVAL -> APPROVED (bubble-up), set Invoice.approved_by, append AuditEvent APPROVED"
+        note: "Bubble-up to the parent invoice happens only when the final level approves."
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /ap/approval-steps/{id}/reject"
+        actor: Approver
+        preconditions:
+          - "this step is the lowest-level PENDING step for its invoice"
+          - "parent Invoice.status == PENDING_APPROVAL"
+        side_effects:
+          - "status -> REJECTED; set acted_by = X-User-ID"
+          - "all higher-level PENDING ApprovalStep rows for the invoice -> REJECTED (cascade)"
+          - "Invoice -> REJECTED; decrement PurchaseOrder.matched_amount_cents (compensation); re-open PO if closed"
+
+  - entity: MatchException
+    initial_state: PENDING
+    terminal_states: [RESOLVED, WRITTEN_OFF, ESCALATED]
+    transitions:
+      - from: PENDING
+        to: RESOLVED
+        trigger: "POST /ap/match-exceptions/{id}/resolve"
+        actor: APClerk
+        preconditions: ["resolution == PENDING", "Invoice still in CODING_REVIEW"]
+        side_effects:
+          - "resolution -> RESOLVED; set resolved_by = X-User-ID"
+          - "append AuditEvent EXCEPTION_RESOLVED"
+        note: "RESOLVED keeps the original variance on the invoice (clerk accepted it)."
+      - from: PENDING
+        to: WRITTEN_OFF
+        trigger: "POST /ap/match-exceptions/{id}/write-off"
+        actor: APClerk
+        preconditions:
+          - "resolution == PENDING"
+          - "variance_cents <= WRITEOFF_CEILING_CENTS (5000)"
+        side_effects:
+          - "resolution -> WRITTEN_OFF; set resolved_by = X-User-ID"
+          - "adjust the linked Invoice.variance_cents to 0 (the write-off absorbs the variance)"
+          - "append AuditEvent EXCEPTION_WRITTEN_OFF"
+        note: "Branch with divergent side-effect: zeroes the invoice variance, unlike RESOLVED."
+      - from: PENDING
+        to: ESCALATED
+        trigger: "POST /ap/match-exceptions/{id}/escalate"
+        actor: APClerk
+        preconditions: ["resolution == PENDING", "variance_cents > WRITEOFF_CEILING_CENTS (5000)"]
+        side_effects:
+          - "resolution -> ESCALATED; set resolved_by = X-User-ID"
+          - "append AuditEvent EXCEPTION_ESCALATED"
+        note: "Branch: large variances must be escalated rather than written off."
+
+  - entity: PaymentBatch
+    initial_state: BUILDING
+    terminal_states: [SETTLED, VOID]
+    transitions:
+      - from: BUILDING
+        to: RELEASED
+        trigger: "POST /ap/payment-batches/{id}/release"
+        actor: APManager
+        preconditions:
+          - "expected_paymentbatch_version matches current PaymentBatch.version"
+          - "batch has >=1 Payment"
+          - "no member Payment's invoice was coded_by OR approved_by the releasing X-User-ID (segregation of duties)"
+        side_effects:
+          - "set released_by = X-User-ID"
+          - "freeze total_disbursed_cents"
+          - "status -> RELEASED"
+          - "each member Payment's Invoice SCHEDULED -> PAID (bubble-up cascade)"
+          - "increments PaymentBatch.version by 1"
+      - from: RELEASED
+        to: SETTLED
+        trigger: "POST /ap/payment-batches/{id}/settle"
+        actor: APManager
+        preconditions: ["status == RELEASED"]
+        side_effects:
+          - "each member Payment.settlement_status PENDING -> SETTLED (cascade down)"
+          - "for each SETTLED payment to a vendor, recompute Vendor.ytd_1099_paid_cents (ledger sync)"
+          - "status -> SETTLED"
+      - from: RELEASED
+        to: VOID
+        trigger: "POST /ap/payment-batches/{id}/void"
+        actor: APManager
+        preconditions: ["status == RELEASED"]
+        side_effects:
+          - "each member Payment's Invoice PAID -> APPROVED (cascade compensation)"
+          - "delete all member Payments; total_disbursed_cents -> 0"
+          - "status -> VOID"
+        note: "Void reverses the release before any funds settled."
+
+  - entity: Payment
+    initial_state: PENDING
+    terminal_states: [SETTLED, RETURNED]
+    transitions:
+      - from: PENDING
+        to: SETTLED
+        trigger: "POST /ap/payment-batches/{id}/settle (cascade from parent batch)"
+        actor: system
+        preconditions: ["parent PaymentBatch transitions RELEASED -> SETTLED"]
+        side_effects:
+          - "settlement_status -> SETTLED"
+          - "recompute Vendor.ytd_1099_paid_cents by adding net_amount_cents"
+      - from: SETTLED
+        to: RETURNED
+        trigger: "POST /ap/payments/{id}/return"
+        actor: APManager
+        preconditions: ["settlement_status == SETTLED", "parent PaymentBatch.status == SETTLED"]
+        side_effects:
+          - "settlement_status -> RETURNED"
+          - "Invoice PAID -> APPROVED (compensation)"
+          - "recompute Vendor.ytd_1099_paid_cents by subtracting net_amount_cents (conservation)"
+          - "append AuditEvent PAYMENT_RETURNED"
+        note: "Parallel axis: settlement_status evolves independently of the Invoice lifecycle axis."
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: batch-release-stale-batch
+    parent_entity: PaymentBatch
+    write_endpoint: "POST /ap/payment-batches/{id}/release"
+    occ_field: "expected_paymentbatch_version"
+    description: |
+      Releasing a PaymentBatch whose version has advanced since the client last
+      observed it is rejected. This captures the case where another writer has
+      already added or removed a Payment (each mutation bumps the batch version
+      and changes total_disbursed_cents), so the releaser's view of the batch
+      contents and total is stale and the release would disburse a different
+      amount than the client believes.
+    error_id: ERR_STALE_BATCH_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: match_variance
+    trigger: "POST /ap/invoices/{id}/code (invoice match)"
+    algorithm: threshold
+    formula: |
+      # Variance basis depends on match_type (dual interpretation pinned here).
+      if match_type == NON_PO:
+          variance_cents = 0                      # nothing to match against
+      elif match_type == TWO_WAY:
+          # 2-way: invoice billed vs PO ordered
+          variance_cents = total_amount_cents - PurchaseOrder.ordered_amount_cents
+      elif match_type == THREE_WAY:
+          # 3-way: invoice billed vs goods RECEIVED (received governs, not ordered)
+          variance_cents = total_amount_cents - PurchaseOrder.received_amount_cents
+      # Tolerance test (boundary precision: strictly greater than tolerance breaches).
+      tolerance_cents = max(
+          ABS_TOLERANCE_CENTS,
+          round_half_up(PurchaseOrder.ordered_amount_cents * PCT_TOLERANCE)
+      )
+      breaches = abs(variance_cents) > tolerance_cents
+    input_set: "The single invoice being coded plus its PO's ordered_amount_cents and (for THREE_WAY) received_amount_cents from POSTED GoodsReceipts only."
+    constants:
+      ABS_TOLERANCE_CENTS: 1000
+      PCT_TOLERANCE: 0.02
+      CONFIDENCE_FLOOR: 0.80
+      WRITEOFF_CEILING_CENTS: 5000
+    precision: "integer cents; tolerance pct rounded half-up to nearest cent"
+    variants:
+      - name: TWO_WAY
+        when: "po_id set, PO has zero POSTED GoodsReceipts"
+        difference: "variance measured against ordered_amount_cents"
+      - name: THREE_WAY
+        when: "po_id set, PO has >=1 POSTED GoodsReceipt"
+        difference: "variance measured against received_amount_cents — the received basis can differ from ordered, producing a different variance for identical invoice data"
+
+  - name: early_pay_discount
+    trigger: "POST /ap/payment-batches/{id}/payments (Payment added) and re-evaluated on release"
+    algorithm: threshold
+    formula: |
+      # Discount eligibility keyed on the batch run_date vs the invoice discount_deadline.
+      if Vendor.early_pay_terms_pct == 0 or Invoice.discount_deadline is null:
+          discount_taken_cents = 0
+      elif run_date <= Invoice.discount_deadline:          # boundary: ON the deadline still earns it
+          raw = Invoice.total_amount_cents * Vendor.early_pay_terms_pct
+          discount_taken_cents = round_half_up(raw)        # round the single product to cents
+      else:
+          discount_taken_cents = 0
+      net_amount_cents = gross_amount_cents - discount_taken_cents
+    input_set: "One Payment: its Invoice.total_amount_cents and discount_deadline, the parent batch run_date, and the Vendor.early_pay_terms_pct."
+    constants: {}
+    precision: "round_half_up to nearest cent; discount = round(total * pct), THEN subtract — not per-line"
+    variants:
+      - name: WITHIN_WINDOW
+        when: "run_date <= discount_deadline"
+        difference: "discount applied"
+      - name: PAST_WINDOW
+        when: "run_date > discount_deadline"
+        difference: "no discount; net == gross"
+
+  - name: accrual_amount
+    trigger: "POST /ap/accruals (ESTIMATE) and POST /ap/accruals/{id}/reverse (FINAL)"
+    algorithm: forward_looking
+    formula: |
+      # ESTIMATE (forward-looking at period close): unbilled receipts =
+      # value received but not yet billed by an invoice.
+      estimated_cents = max(0,
+          PurchaseOrder.received_amount_cents - PurchaseOrder.matched_amount_cents)
+      # FINAL (chronological true-up at reversal): actual unbilled gap recomputed
+      # from the SAME fields at reversal time, which may have moved as invoices matched.
+      final_cents = max(0,
+          PurchaseOrder.received_amount_cents - PurchaseOrder.matched_amount_cents)
+    input_set: "ESTIMATE includes received and matched amounts as of booking; FINAL recomputes from the same two fields as of reversal — divergence arises when invoices match between booking and reversal."
+    constants: {}
+    precision: "integer cents"
+    variants:
+      - name: ESTIMATE
+        when: "POST /ap/accruals — booked at period close on a forward-looking basis"
+        difference: "uses received/matched amounts at booking time"
+      - name: FINAL
+        when: "POST /ap/accruals/{id}/reverse — chronological true-up"
+        difference: "recomputes from received/matched amounts at reversal time; differs from ESTIMATE when matching occurred in between"
+
+  - name: approval_tier
+    trigger: "POST /ap/invoices/{id}/submit-approval"
+    algorithm: tiered_pricing
+    formula: |
+      # Select the ApprovalRoute tier whose [min_amount_cents, max_amount_cents)
+      # half-open interval contains the invoice total. Tiers are disjoint.
+      total = Invoice.total_amount_cents
+      tier = the ApprovalRoute where min_amount_cents <= total < max_amount_cents
+      required_levels = tier.required_levels
+      # Create ApprovalStep level 1..required_levels, all PENDING.
+    input_set: "Invoice.total_amount_cents and the full ApprovalRoute tier table."
+    constants: {}
+    precision: "integer cents; half-open interval [min, max)"
+    variants:
+      - name: SINGLE_LEVEL
+        when: "total falls in a tier with required_levels == 1"
+        difference: "one ApprovalStep created"
+      - name: MULTI_LEVEL
+        when: "total falls in a tier with required_levels >= 2"
+        difference: "sequential ApprovalSteps; level N gated on level N-1 APPROVED"
+
+  - name: batch_total
+    trigger: "POST /ap/payment-batches/{id}/payments and DELETE /ap/payments/{id}"
+    algorithm: aggregation
+    formula: |
+      # Sum member Payments' already-rounded net_amount_cents. Each net is rounded
+      # once at payment-add time (per early_pay_discount); the batch sums those
+      # rounded integers — sum-of-rounded, NOT round-of-sum.
+      total_disbursed_cents = sum(
+          p.net_amount_cents for p in Payment
+          where p.batch_id == batch.id
+      )
+    input_set: "All Payments whose batch_id == this batch (no status filter — every member counts while BUILDING)."
+    constants: {}
+    precision: "integer cents; sum of per-payment rounded net amounts (rounding already applied upstream)"
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (Ordered by Priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this operation per §1.7"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: existence
+    check: "Every path/body-referenced resource exists, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+  - priority: 4
+    category: business_constraint
+    check: "Request body has all required fields with valid types/enums"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which the requested transition is allowed"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 6
+    category: business_referential
+    check: "is_1099 vendor must supply a non-empty tax_id at creation"
+    error_id: ERR_TAX_ID_REQUIRED
+    http_status: 422
+    applies_to: "POST /ap/vendors"
+  - priority: 7
+    category: business_referential
+    check: "Coding an invoice when another Invoice with identical vendor_id + invoice_number already exists"
+    error_id: ERR_DUPLICATE_INVOICE
+    http_status: 409
+    applies_to: "POST /ap/invoices/{id}/code"
+  - priority: 8
+    category: business_referential
+    check: "InvoiceLine.gl_account_code (and PO gl_account_code) must reference a GLAccount with is_postable == true"
+    error_id: ERR_GL_ACCOUNT_NOT_POSTABLE
+    http_status: 422
+    applies_to: "POST /ap/invoices/{id}/lines, POST /ap/purchase-orders"
+  - priority: 9
+    category: business_safety
+    check: "Segregation of duties: the X-User-ID releasing a batch must not equal coded_by or approved_by of any member invoice"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /ap/payment-batches/{id}/release"
+  - priority: 10
+    category: business_constraint
+    check: "Payment may only be added to a batch whose payment_method equals the invoice vendor's payment_method"
+    error_id: ERR_PAYMENT_METHOD_MISMATCH
+    http_status: 422
+    applies_to: "POST /ap/payment-batches/{id}/payments"
+  - priority: 11
+    category: business_safety
+    check: "Adding a Payment for a vendor whose status == ON_HOLD is forbidden"
+    error_id: ERR_VENDOR_ON_HOLD
+    http_status: 409
+    applies_to: "POST /ap/payment-batches/{id}/payments"
+  - priority: 12
+    category: business_constraint
+    check: "An invoice may be in at most one Payment across all non-VOID batches (no double-pay)"
+    error_id: ERR_INVOICE_ALREADY_SCHEDULED
+    http_status: 409
+    applies_to: "POST /ap/payment-batches/{id}/payments"
+  - priority: 13
+    category: business_constraint
+    check: "write-off only allowed when variance_cents <= WRITEOFF_CEILING_CENTS (5000)"
+    error_id: ERR_WRITEOFF_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /ap/match-exceptions/{id}/write-off"
+  - priority: 14
+    category: business_constraint
+    check: "escalate only allowed when variance_cents > WRITEOFF_CEILING_CENTS (5000); at or below the ceiling it must be written off, not escalated"
+    error_id: ERR_ESCALATE_BELOW_CEILING
+    http_status: 422
+    applies_to: "POST /ap/match-exceptions/{id}/escalate"
+  - priority: 15
+    category: business_constraint
+    check: "Submitting for approval requires all of the invoice's MatchExceptions to be non-PENDING"
+    error_id: ERR_EXCEPTION_UNRESOLVED
+    http_status: 409
+    applies_to: "POST /ap/invoices/{id}/code, POST /ap/invoices/{id}/submit-approval"
+  - priority: 16
+    category: business_constraint
+    check: "An ApprovalStep may be acted on only if it is the lowest-level PENDING step for its invoice"
+    error_id: ERR_APPROVAL_OUT_OF_ORDER
+    http_status: 409
+    applies_to: "POST /ap/approval-steps/{id}/approve, POST /ap/approval-steps/{id}/reject"
+  - priority: 17
+    category: business_constraint
+    check: "Releasing a PaymentBatch that has zero member Payments is forbidden"
+    error_id: ERR_BATCH_EMPTY
+    http_status: 409
+    applies_to: "POST /ap/payment-batches/{id}/release"
+  - priority: 18
+    category: business_fiscal
+    check: "OCC: expected_paymentbatch_version must equal the batch's current version on release"
+    error_id: ERR_STALE_BATCH_VERSION
+    http_status: 412
+    applies_to: "POST /ap/payment-batches/{id}/release"
+  - priority: 19
+    category: business_constraint
+    check: "No ApprovalRoute tier matches the invoice total (gap in tier table)"
+    error_id: ERR_NO_APPROVAL_ROUTE
+    http_status: 422
+    applies_to: "POST /ap/invoices/{id}/submit-approval"
+  - priority: 20
+    category: business_constraint
+    check: "Posting a GoodsReceipt against a CLOSED PurchaseOrder is forbidden"
+    error_id: ERR_PO_CLOSED
+    http_status: 409
+    applies_to: "POST /ap/goods-receipts/{id}/post"
+  - priority: 21
+    category: business_temporal
+    check: "Posting a GoodsReceipt whose half-open coverage window [received_date, received_date + coverage_days) overlaps any already-POSTED GoodsReceipt window on the same PO. Adjacency (one window's end equals the next window's start) is allowed because the interval is half-open."
+    error_id: ERR_RECEIPT_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /ap/goods-receipts/{id}/post"
+  - priority: 22
+    category: business_temporal
+    check: "Booking an Accrual whose closed period interval [period_start, period_end] overlaps any existing BOOKED Accrual on the same PO. Because the interval is closed, sharing a single endpoint date counts as an overlap (no adjacency allowed)."
+    error_id: ERR_ACCRUAL_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /ap/accruals"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # ---- Vendor ----
+  - method: POST
+    path: "/ap/vendors"
+    description: "Create a vendor."
+    roles: [APManager]
+    code: 201
+    input: [legal_name, payment_method, "is_1099?", "tax_id?", "early_pay_terms_pct?", "early_pay_window_days?", "net_terms_days?"]
+    output: Vendor
+    side_effects: ["status defaults ACTIVE; ytd_1099_paid_cents defaults 0"]
+  - method: GET
+    path: "/ap/vendors/{id}"
+    description: "Fetch a vendor."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: Vendor
+    side_effects: []
+  - method: POST
+    path: "/ap/vendors/{id}/hold"
+    description: "Place a vendor ON_HOLD (or release hold)."
+    roles: [APManager]
+    code: 200
+    input: [on_hold]
+    output: Vendor
+    side_effects: ["status -> ON_HOLD when on_hold true, ACTIVE when false"]
+
+  # ---- GLAccount ----
+  - method: POST
+    path: "/ap/gl-accounts"
+    description: "Create a GL account."
+    roles: [APManager]
+    code: 201
+    input: [code, name, "is_postable?"]
+    output: GLAccount
+    side_effects: []
+
+  # ---- PurchaseOrder ----
+  - method: POST
+    path: "/ap/purchase-orders"
+    description: "Raise a purchase order against a vendor."
+    roles: [APManager]
+    code: 201
+    input: [vendor_id, gl_account_code, ordered_amount_cents]
+    output: PurchaseOrder
+    side_effects: ["status OPEN; received_amount_cents=0; matched_amount_cents=0"]
+  - method: GET
+    path: "/ap/purchase-orders/{id}"
+    description: "Fetch a purchase order with computed received/matched amounts."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: PurchaseOrder
+    side_effects: []
+  - method: GET
+    path: "/ap/purchase-orders"
+    description: "List purchase orders; filter by vendor_id."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: ["limit?", "offset?", "vendor_id?"]
+    output: PurchaseOrder[]
+    side_effects: []
+  - method: GET
+    path: "/ap/purchase-orders/{id}/goods-receipts"
+    description: "List goods receipts for this PO (FK reverse-reachability for GoodsReceipt.po_id)."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: GoodsReceipt[]
+    side_effects: []
+  - method: GET
+    path: "/ap/purchase-orders/{id}/accruals"
+    description: "List accruals booked for this PO (FK reverse-reachability for Accrual.po_id)."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: Accrual[]
+    side_effects: []
+  - method: GET
+    path: "/ap/purchase-orders/{id}/invoices"
+    description: "List invoices billed against this PO (FK reverse-reachability for Invoice.po_id)."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: Invoice[]
+    side_effects: []
+
+  # ---- GoodsReceipt ----
+  - method: POST
+    path: "/ap/goods-receipts"
+    description: "Record a goods receipt (DRAFT) against a PO."
+    roles: [APClerk, APManager]
+    code: 201
+    input: [po_id, received_amount_cents, received_date, "coverage_days?"]
+    output: GoodsReceipt
+    side_effects: ["status DRAFT"]
+  - method: POST
+    path: "/ap/goods-receipts/{id}/post"
+    description: "Post a goods receipt; updates PO received_amount_cents."
+    roles: [APClerk, APManager]
+    code: 200
+    input: []
+    output: GoodsReceipt
+    side_effects: ["status -> POSTED; recompute PurchaseOrder.received_amount_cents (ledger sync)"]
+  - method: GET
+    path: "/ap/goods-receipts/{id}"
+    description: "Fetch a goods receipt."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: GoodsReceipt
+    side_effects: []
+
+  # ---- Invoice ----
+  - method: POST
+    path: "/ap/invoices"
+    description: "Capture an invoice (OCR). Low ocr_confidence forces CODING_REVIEW."
+    roles: [APClerk, APManager]
+    code: 201
+    input: [vendor_id, "po_id?", invoice_number, invoice_date, "ocr_confidence?"]
+    output: Invoice
+    side_effects:
+      - "compute match_type, due_date, discount_deadline"
+      - "status CAPTURED, or CODING_REVIEW when ocr_confidence < CONFIDENCE_FLOOR"
+  - method: GET
+    path: "/ap/invoices/{id}"
+    description: "Fetch an invoice with computed totals and variance."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+  - method: GET
+    path: "/ap/invoices"
+    description: "List invoices; filter by vendor_id, po_id, or status."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: ["limit?", "offset?", "vendor_id?", "po_id?", "status?"]
+    output: Invoice[]
+    side_effects: []
+  - method: POST
+    path: "/ap/invoices/{id}/lines"
+    description: "Add a coding line to an invoice; recomputes total_amount_cents."
+    roles: [APClerk]
+    code: 201
+    input: [gl_account_code, amount_cents, "description?"]
+    output: InvoiceLine
+    side_effects: ["recompute Invoice.total_amount_cents"]
+  - method: GET
+    path: "/ap/invoices/{id}/lines"
+    description: "List an invoice's coding lines (FK reverse-reachability for InvoiceLine.invoice_id)."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: InvoiceLine[]
+    side_effects: []
+  - method: POST
+    path: "/ap/invoices/{id}/code"
+    description: "Run the match and finalize coding; MATCHED or, on tolerance breach, raises a MatchException."
+    roles: [APClerk]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects:
+      - "compute match_type and variance_cents"
+      - "duplicate detection on vendor_id + invoice_number"
+      - "set coded_by = X-User-ID"
+      - "in tolerance -> MATCHED + recompute PurchaseOrder.matched_amount_cents; breach -> create MatchException, status CODING_REVIEW"
+      - "append AuditEvent CODED"
+  - method: POST
+    path: "/ap/invoices/{id}/submit-approval"
+    description: "Submit a MATCHED invoice for approval; builds the tiered ApprovalStep chain."
+    roles: [APClerk]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects:
+      - "select ApprovalRoute tier via calculations.approval_tier"
+      - "create required_levels PENDING ApprovalStep rows"
+      - "status -> PENDING_APPROVAL"
+  - method: POST
+    path: "/ap/invoices/{id}/reject"
+    description: "Reject an invoice still in CODING_REVIEW."
+    roles: [APClerk]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["status -> REJECTED; append AuditEvent REJECTED"]
+  - method: GET
+    path: "/ap/invoices/{id}/audit-events"
+    description: "List audit events for an invoice (FK reverse-reachability for AuditEvent.invoice_id)."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: AuditEvent[]
+    side_effects: []
+  - method: GET
+    path: "/ap/invoices/{id}/match-exceptions"
+    description: "List match exceptions for an invoice (FK reverse-reachability for MatchException.invoice_id)."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: MatchException[]
+    side_effects: []
+  - method: GET
+    path: "/ap/invoices/{id}/approval-steps"
+    description: "List approval steps for an invoice (FK reverse-reachability for ApprovalStep.invoice_id)."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: ApprovalStep[]
+    side_effects: []
+
+  # ---- MatchException ----
+  - method: GET
+    path: "/ap/match-exceptions/{id}"
+    description: "Fetch a match exception."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: MatchException
+    side_effects: []
+  - method: POST
+    path: "/ap/match-exceptions/{id}/resolve"
+    description: "Accept the variance and resolve the exception."
+    roles: [APClerk]
+    code: 200
+    input: []
+    output: MatchException
+    side_effects: ["resolution -> RESOLVED; set resolved_by"]
+  - method: POST
+    path: "/ap/match-exceptions/{id}/write-off"
+    description: "Write off a small variance; zeroes Invoice.variance_cents."
+    roles: [APClerk]
+    code: 200
+    input: []
+    output: MatchException
+    side_effects: ["resolution -> WRITTEN_OFF; Invoice.variance_cents -> 0; set resolved_by"]
+  - method: POST
+    path: "/ap/match-exceptions/{id}/escalate"
+    description: "Escalate a large variance."
+    roles: [APClerk]
+    code: 200
+    input: []
+    output: MatchException
+    side_effects: ["resolution -> ESCALATED; set resolved_by"]
+
+  # ---- ApprovalRoute / ApprovalStep ----
+  - method: POST
+    path: "/ap/approval-routes"
+    description: "Define an approval tier."
+    roles: [APManager]
+    code: 201
+    input: [min_amount_cents, max_amount_cents, required_levels]
+    output: ApprovalRoute
+    side_effects: []
+  - method: GET
+    path: "/ap/approval-steps/{id}"
+    description: "Fetch an approval step."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: ApprovalStep
+    side_effects: []
+  - method: POST
+    path: "/ap/approval-steps/{id}/approve"
+    description: "Approve the lowest-level pending step; final approval bubbles the invoice to APPROVED."
+    roles: [Approver]
+    code: 200
+    input: []
+    output: ApprovalStep
+    side_effects:
+      - "step -> APPROVED; set acted_by = X-User-ID"
+      - "if last level: Invoice -> APPROVED, set approved_by, append AuditEvent APPROVED"
+  - method: POST
+    path: "/ap/approval-steps/{id}/reject"
+    description: "Reject the lowest-level pending step; cascades to invoice REJECTED."
+    roles: [Approver]
+    code: 200
+    input: []
+    output: ApprovalStep
+    side_effects:
+      - "step -> REJECTED; higher PENDING steps -> REJECTED (cascade)"
+      - "Invoice -> REJECTED; decrement PurchaseOrder.matched_amount_cents (compensation); re-open PO if closed"
+
+  # ---- PaymentBatch / Payment ----
+  - method: POST
+    path: "/ap/payment-batches"
+    description: "Open a payment run for a rail."
+    roles: [APManager]
+    code: 201
+    input: [payment_method, run_date]
+    output: PaymentBatch
+    side_effects: ["status BUILDING; total_disbursed_cents 0"]
+  - method: GET
+    path: "/ap/payment-batches/{id}"
+    description: "Fetch a payment batch."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: PaymentBatch
+    side_effects: []
+  - method: POST
+    path: "/ap/payment-batches/{id}/payments"
+    description: "Add an APPROVED invoice to the run as a Payment; computes discount/net and schedules the invoice."
+    roles: [APManager]
+    code: 201
+    input: [invoice_id]
+    output: Payment
+    side_effects:
+      - "compute gross/discount/net via calculations.early_pay_discount"
+      - "Invoice APPROVED -> SCHEDULED"
+      - "recompute PaymentBatch.total_disbursed_cents; increments PaymentBatch.version by 1"
+  - method: GET
+    path: "/ap/payment-batches/{id}/payments"
+    description: "List payments in a batch (FK reverse-reachability for Payment.batch_id)."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: Payment[]
+    side_effects: []
+  - method: POST
+    path: "/ap/payment-batches/{id}/release"
+    description: "Release the run (OCC + segregation of duties); bubbles member invoices to PAID."
+    roles: [APManager]
+    code: 200
+    input: [expected_paymentbatch_version]
+    output: PaymentBatch
+    side_effects:
+      - "status -> RELEASED; freeze total; set released_by"
+      - "each member Invoice SCHEDULED -> PAID (bubble-up)"
+      - "increments PaymentBatch.version by 1"
+  - method: POST
+    path: "/ap/payment-batches/{id}/settle"
+    description: "Settle a released run; cascades payment settlement and 1099 YTD recompute."
+    roles: [APManager]
+    code: 200
+    input: []
+    output: PaymentBatch
+    side_effects:
+      - "each Payment.settlement_status -> SETTLED"
+      - "recompute Vendor.ytd_1099_paid_cents (ledger sync)"
+      - "status -> SETTLED"
+  - method: POST
+    path: "/ap/payment-batches/{id}/void"
+    description: "Void a released-but-unsettled run; reverses invoices and deletes payments."
+    roles: [APManager]
+    code: 200
+    input: []
+    output: PaymentBatch
+    side_effects:
+      - "each member Invoice PAID -> APPROVED (cascade compensation)"
+      - "delete member Payments; total_disbursed_cents -> 0; status -> VOID"
+  - method: GET
+    path: "/ap/payments/{id}"
+    description: "Fetch a payment."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+  - method: GET
+    path: "/ap/payments"
+    description: "List payments; filter by invoice_id."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: ["limit?", "offset?", "invoice_id?"]
+    output: Payment[]
+    side_effects: []
+  - method: DELETE
+    path: "/ap/payments/{id}"
+    description: "Remove a payment from a BUILDING batch; reverts the invoice to APPROVED."
+    roles: [APManager]
+    code: 200
+    input: []
+    output: Payment
+    side_effects:
+      - "delete Payment; Invoice SCHEDULED -> APPROVED; recompute batch total; increments PaymentBatch.version by 1"
+  - method: POST
+    path: "/ap/payments/{id}/return"
+    description: "Mark a settled payment as returned; reverses the invoice and 1099 YTD."
+    roles: [APManager]
+    code: 200
+    input: []
+    output: Payment
+    side_effects:
+      - "settlement_status -> RETURNED; Invoice PAID -> APPROVED; subtract net from Vendor.ytd_1099_paid_cents"
+
+  # ---- Accrual ----
+  - method: POST
+    path: "/ap/accruals"
+    description: "Book a period-end accrual estimate for unbilled receipts on a PO."
+    roles: [APManager]
+    code: 201
+    input: [po_id, period_label, period_start, period_end]
+    output: Accrual
+    side_effects: ["compute estimated_cents via calculations.accrual_amount ESTIMATE; status BOOKED"]
+  - method: GET
+    path: "/ap/accruals/{id}"
+    description: "Fetch an accrual."
+    roles: [APManager, APClerk, Approver, Auditor]
+    code: 200
+    input: []
+    output: Accrual
+    side_effects: []
+  - method: POST
+    path: "/ap/accruals/{id}/reverse"
+    description: "Reverse an accrual with a final true-up."
+    roles: [APManager]
+    code: 200
+    input: []
+    output: Accrual
+    side_effects: ["compute final_cents via calculations.accrual_amount FINAL; status -> REVERSED"]
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID headers, or unknown role."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Acting role not permitted for this operation."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced resource does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required body field, bad type, or invalid enum value."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Resource not in a state permitting the requested transition."
+  - id: ERR_TAX_ID_REQUIRED
+    http: 422
+    condition: "Creating a vendor with is_1099 true but no tax_id."
+  - id: ERR_DUPLICATE_INVOICE
+    http: 409
+    condition: "Coding an invoice whose vendor_id + invoice_number collides with an existing invoice."
+  - id: ERR_GL_ACCOUNT_NOT_POSTABLE
+    http: 422
+    condition: "A line or PO codes to a GLAccount that is missing or not postable."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "Releaser X-User-ID coded or approved a member invoice of the batch."
+  - id: ERR_PAYMENT_METHOD_MISMATCH
+    http: 422
+    condition: "Invoice vendor's payment_method differs from the batch payment_method."
+  - id: ERR_VENDOR_ON_HOLD
+    http: 409
+    condition: "Adding a payment for a vendor whose status is ON_HOLD."
+  - id: ERR_INVOICE_ALREADY_SCHEDULED
+    http: 409
+    condition: "Invoice already has a payment in a non-VOID batch."
+  - id: ERR_WRITEOFF_LIMIT_EXCEEDED
+    http: 422
+    condition: "Write-off attempted on a variance above WRITEOFF_CEILING_CENTS."
+  - id: ERR_EXCEPTION_UNRESOLVED
+    http: 409
+    condition: "Coding/submitting an invoice with a PENDING MatchException."
+  - id: ERR_APPROVAL_OUT_OF_ORDER
+    http: 409
+    condition: "Acting on an approval step that is not the lowest-level pending step."
+  - id: ERR_STALE_BATCH_VERSION
+    http: 412
+    condition: "expected_paymentbatch_version does not equal the batch's current version on release."
+  - id: ERR_NO_APPROVAL_ROUTE
+    http: 422
+    condition: "No ApprovalRoute tier covers the invoice total."
+  - id: ERR_PO_CLOSED
+    http: 409
+    condition: "Posting a goods receipt against a CLOSED purchase order."
+  - id: ERR_ESCALATE_BELOW_CEILING
+    http: 422
+    condition: "Escalating a variance at or below WRITEOFF_CEILING_CENTS (must be written off, not escalated)."
+  - id: ERR_BATCH_EMPTY
+    http: 409
+    condition: "Releasing a batch with zero payments."
+  - id: ERR_RECEIPT_WINDOW_OVERLAP
+    http: 409
+    condition: "A posted goods-receipt half-open coverage window overlaps another POSTED receipt window on the same PO."
+  - id: ERR_ACCRUAL_PERIOD_OVERLAP
+    http: 409
+    condition: "An accrual's closed period interval overlaps an existing BOOKED accrual on the same PO."
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: APManager
+    description: "Accounts-payable manager: owns vendors, POs, payment runs, accruals; releases/settles/voids batches."
+    identity: opaque
+    exclusive_operations:
+      - "POST /ap/vendors"
+      - "POST /ap/vendors/{id}/hold"
+      - "POST /ap/gl-accounts"
+      - "POST /ap/purchase-orders"
+      - "POST /ap/approval-routes"
+      - "POST /ap/payment-batches"
+      - "POST /ap/payment-batches/{id}/payments"
+      - "POST /ap/payment-batches/{id}/release"
+      - "POST /ap/payment-batches/{id}/settle"
+      - "POST /ap/payment-batches/{id}/void"
+      - "DELETE /ap/payments/{id}"
+      - "POST /ap/payments/{id}/return"
+      - "POST /ap/accruals"
+      - "POST /ap/accruals/{id}/reverse"
+    shared_operations:
+      - "POST /ap/goods-receipts"
+      - "POST /ap/goods-receipts/{id}/post"
+      - "POST /ap/invoices"
+      - "all GET reads"
+  - name: APClerk
+    description: "AP clerk: captures and codes invoices, manages exceptions, submits for approval. Cannot approve or release."
+    identity: opaque
+    exclusive_operations:
+      - "POST /ap/invoices/{id}/lines"
+      - "POST /ap/invoices/{id}/code"
+      - "POST /ap/invoices/{id}/submit-approval"
+      - "POST /ap/invoices/{id}/reject"
+      - "POST /ap/match-exceptions/{id}/resolve"
+      - "POST /ap/match-exceptions/{id}/write-off"
+      - "POST /ap/match-exceptions/{id}/escalate"
+    shared_operations:
+      - "POST /ap/goods-receipts"
+      - "POST /ap/goods-receipts/{id}/post"
+      - "POST /ap/invoices"
+      - "all GET reads"
+  - name: Approver
+    description: "Approver: acts on approval steps. Cannot code or release (segregation of duties)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /ap/approval-steps/{id}/approve"
+      - "POST /ap/approval-steps/{id}/reject"
+    shared_operations:
+      - "all GET reads"
+  - name: Auditor
+    description: "Read-only auditor across the entire AP surface."
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "all GET reads"

@@ -1,0 +1,1466 @@
+scenario: "Life Insurance Underwriting: application/paramed exam, risk class (Preferred/Standard/Table), MIB/Rx check, build chart, contestability period, beneficiary/contingent, policy loan/cash value, lapse/reinstatement"
+domain_name: life-insurance-underwriting
+api_prefix: /
+# Flat multi-root topology: Products, Applicants, Underwriters, Applications and
+# Policies are peer top-level collections, so the common API prefix is the root.
+
+# ---------------------------------------------------------------------------
+# Complexity profile
+# ---------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - dual_variant_calculation       # provisional (tentative-offer) vs final (issue) premium
+    - cascading_side_effects         # application decision -> policy -> cash-value ledger -> premium schedule
+    - rate_threshold_triggers        # build-chart debits, contestability window, lapse grace boundary
+    - derived_field_reconciliation   # net cash value, available loan value, accumulated debits
+    - optimistic_concurrency         # OCC on Application.version and Policy.version for true CREATE-with-supersede races
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys; no nested-ownership URL trees beyond
+  # one level. Application is the hub; ParamedExam / MIBCheck / RiskAssessment /
+  # Policy reference it by FK. Policy is a secondary hub for Beneficiary /
+  # PolicyLoan / PremiumPayment / CashValueEntry.
+
+  state_machine_shape: branching
+  # Application: DRAFT -> SUBMITTED -> {EXAM_PENDING, DECLINED} -> UNDER_REVIEW
+  #   -> {APPROVED_OFFER, POSTPONED, DECLINED}; APPROVED_OFFER -> {ISSUED, EXPIRED}
+  #   with a revision loop UNDER_REVIEW -> EXAM_PENDING (re-order paramed).
+  # Policy carries a parallel pair of independent dimensions
+  #   (lifecycle: IN_FORCE/GRACE/LAPSED/REINSTATED/TERMINATED  ×
+  #    contestability: CONTESTABLE/INCONTESTABLE).
+
+  relationship_patterns:
+    - one_to_many        # Application has many ParamedExam/MIBCheck; Policy has many Beneficiary/PremiumPayment/PolicyLoan/CashValueEntry
+    - cross_aggregate    # Policy transitions depend on Application state; PolicyLoan availability depends on CashValueEntry aggregate
+
+  role_model: segregation_of_duties
+  # The Underwriter who orders the paramed exam on an Application MUST NOT be the
+  # Underwriter who renders the final approval decision on the same Application.
+
+  consistency_model: immediate
+
+# ---------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: "Human-readable product code, e.g. TERM20. Unique."
+        constraints: "unique across Products; non-empty"
+      - name: base_annual_rate_per_thousand_cents
+        type: integer
+        source: input
+        description: "Base annual premium in cents per $1,000 of face amount at Standard risk class, before build-chart and risk-class multipliers."
+        constraints: ">= 1"
+      - name: max_face_amount_cents
+        type: integer
+        source: input
+        description: "Maximum face amount (death benefit) this product will issue, in cents."
+        constraints: ">= 100000"
+      - name: cash_value_accrual_rate_bps
+        type: integer
+        source: input
+        description: "Annual cash-value accrual rate in basis points applied to cumulative premium paid; used by accrue_cash_value."
+        constraints: ">= 0 and <= 10000"
+      - name: contestability_months
+        type: integer
+        source: input
+        description: "Length of the contestability period in whole months from policy issue."
+        default: 24
+        constraints: ">= 1"
+      - name: grace_period_days
+        type: integer
+        source: input
+        description: "Number of days after a missed premium due date before the policy lapses."
+        default: 31
+        constraints: ">= 1"
+      - name: max_loan_to_cash_value_pct
+        type: integer
+        source: input
+        description: "Maximum policy-loan principal as a whole-number percentage of net cash value."
+        default: 90
+        constraints: ">= 1 and <= 100"
+      - name: exam_validity_days
+        type: integer
+        source: input
+        description: "How many days a ParamedExam remains valid from its exam_date. A new COMPLETED exam whose validity interval overlaps an existing COMPLETED exam's interval on the same application is redundant and rejected (see §1.4 / check_exam_overlap)."
+        default: 180
+        constraints: ">= 1"
+
+  - name: Applicant
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Proposed insured's legal name."
+        constraints: "non-empty"
+      - name: date_of_birth
+        type: string
+        source: input
+        description: "ISO 8601 date (YYYY-MM-DD) of the proposed insured."
+        constraints: "valid date in the past"
+      - name: sex
+        type: enum
+        source: input
+        description: "Biological sex used for rate-table lookup."
+        constraints: "one of {MALE, FEMALE}"
+      - name: tobacco_use
+        type: boolean
+        source: input
+        description: "Whether the proposed insured has used tobacco in the last 12 months."
+      - name: email
+        type: string
+        source: input
+        description: "Contact email; unique across Applicants."
+        constraints: "unique; non-empty"
+
+  - name: Application
+    parent: null
+    common_fields: true
+    fields:
+      - name: applicant_id
+        type: string
+        source: input
+        description: "FK -> Applicant.id; the proposed insured."
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; product applied for."
+      - name: ordering_underwriter_id
+        type: string
+        source: system
+        description: "FK -> Underwriter.id; the Underwriter who ordered the paramed exam (SUBMITTED->EXAM_PENDING). Null until the exam is ordered. Pinned for the segregation-of-duties check at decision time."
+        default: null
+      - name: deciding_underwriter_id
+        type: string
+        source: system
+        description: "FK -> Underwriter.id; the Underwriter who rendered the final decision. Null until a decision transition fires."
+        default: null
+      - name: requested_face_amount_cents
+        type: integer
+        source: input
+        description: "Face amount (death benefit) requested, in cents."
+        constraints: ">= 100000"
+      - name: status
+        type: enum
+        source: system
+        description: "Underwriting lifecycle state. See §1.2."
+        default: DRAFT
+        constraints: "one of {DRAFT, SUBMITTED, EXAM_PENDING, UNDER_REVIEW, APPROVED_OFFER, POSTPONED, DECLINED, ISSUED, EXPIRED}"
+      - name: offer_expires_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC instant after which an APPROVED_OFFER auto-expires. Set when status enters APPROVED_OFFER; null otherwise."
+        default: null
+      - name: provisional_annual_premium_cents
+        type: integer
+        source: computed
+        description: "Provisional annual premium computed at SUBMITTED from declared inputs (pre-exam), via compute_premium variant=provisional. Null until SUBMITTED."
+        default: null
+      - name: final_annual_premium_cents
+        type: integer
+        source: computed
+        description: "Final annual premium computed at APPROVED_OFFER from the RiskAssessment, via compute_premium variant=final. Null until APPROVED_OFFER."
+        default: null
+
+  - name: ParamedExam
+    parent: null
+    common_fields: true
+    fields:
+      - name: application_id
+        type: string
+        source: input
+        description: "FK -> Application.id; the application this exam belongs to."
+      - name: height_inches
+        type: integer
+        source: input
+        description: "Measured height in whole inches; build-chart row key."
+        constraints: ">= 48 and <= 84"
+      - name: weight_pounds
+        type: integer
+        source: input
+        description: "Measured weight in whole pounds; build-chart column key."
+        constraints: ">= 60 and <= 500"
+      - name: systolic_bp
+        type: integer
+        source: input
+        description: "Systolic blood pressure (mmHg); feeds blood-pressure debit band."
+        constraints: ">= 70 and <= 260"
+      - name: exam_date
+        type: string
+        source: input
+        description: "ISO 8601 date (YYYY-MM-DD) the exam was performed. Start of the exam validity interval [exam_date, exam_date + Product.exam_validity_days). Closed-start / open-end."
+        constraints: "valid date"
+      - name: status
+        type: enum
+        source: system
+        description: "Exam lifecycle. See §1.2."
+        default: ORDERED
+        constraints: "one of {ORDERED, COMPLETED, CANCELLED}"
+
+  - name: MIBCheck
+    parent: null
+    common_fields: false
+    fields:
+      - name: application_id
+        type: string
+        source: input
+        description: "FK -> Application.id; the application this check covers."
+      - name: mib_hit
+        type: boolean
+        source: input
+        description: "Whether the Medical Information Bureau returned a coded impairment hit."
+      - name: rx_flag_count
+        type: integer
+        source: input
+        description: "Number of flagged prescriptions returned by the Rx database check."
+        constraints: ">= 0"
+      - name: result
+        type: enum
+        source: computed
+        description: "Derived disposition of this check: CLEAR when not mib_hit and rx_flag_count == 0; FLAGGED otherwise. Drives the postpone/decline gate at review."
+        constraints: "one of {CLEAR, FLAGGED}"
+
+  - name: RiskAssessment
+    parent: null
+    common_fields: true
+    fields:
+      - name: application_id
+        type: string
+        source: input
+        description: "FK -> Application.id; the application being rated."
+      - name: build_debits
+        type: integer
+        source: computed
+        description: "Total build-chart debit points from the COMPLETED ParamedExam (BMI band) plus blood-pressure band; see classify_risk."
+        default: 0
+      - name: total_debits
+        type: integer
+        source: computed
+        description: "build_debits plus impairment debits from MIB/Rx (TOBACCO and FLAGGED MIBCheck). Drives risk_class."
+        default: 0
+      - name: risk_class
+        type: enum
+        source: computed
+        description: "Assigned risk class from total_debits via classify_risk. PREFERRED, STANDARD, or TABLE_{1..8}."
+        constraints: "one of {PREFERRED, STANDARD, TABLE_1, TABLE_2, TABLE_3, TABLE_4, TABLE_5, TABLE_6, TABLE_7, TABLE_8}"
+      - name: table_rating
+        type: integer
+        source: computed
+        description: "Numeric table rating 0 (PREFERRED/STANDARD) through 8; equals N for TABLE_N. Feeds the final premium multiplier."
+        default: 0
+      - name: finalized
+        type: boolean
+        source: system
+        description: "True once this assessment has been locked into an APPROVED_OFFER decision; locked assessments are immutable."
+        default: false
+
+  - name: Policy
+    parent: null
+    common_fields: true
+    fields:
+      - name: application_id
+        type: string
+        source: input
+        description: "FK -> Application.id; the application that produced this policy. Exactly one Policy per ISSUED Application."
+      - name: face_amount_cents
+        type: integer
+        source: system
+        description: "Death benefit in cents, copied from the Application's requested_face_amount_cents at issue."
+      - name: annual_premium_cents
+        type: integer
+        source: system
+        description: "Annual premium in cents, copied from Application.final_annual_premium_cents at issue."
+      - name: issue_date
+        type: string
+        source: system
+        description: "ISO 8601 date the policy was issued; the contestability clock starts here."
+      - name: lifecycle_status
+        type: enum
+        source: system
+        description: "Premium/funding lifecycle dimension. Evolves independently of contestability_status. See §1.2."
+        default: IN_FORCE
+        constraints: "one of {IN_FORCE, GRACE, LAPSED, REINSTATED, TERMINATED}"
+      - name: contestability_status
+        type: enum
+        source: system
+        description: "Contestability dimension. Evolves independently of lifecycle_status; flips to INCONTESTABLE once the contestability window elapses. See §1.2."
+        default: CONTESTABLE
+        constraints: "one of {CONTESTABLE, INCONTESTABLE}"
+      - name: next_premium_due_date
+        type: string
+        source: system
+        description: "ISO 8601 date the next annual premium is due. Advances by one year on each accepted premium payment."
+      - name: cumulative_premium_paid_cents
+        type: integer
+        source: system
+        description: "Running sum of accepted premium payments in cents; basis for cash-value accrual."
+        default: 0
+      - name: gross_cash_value_cents
+        type: integer
+        source: computed
+        description: "Accrued gross cash value in cents from accrue_cash_value (sum of CashValueEntry.amount_cents)."
+        default: 0
+      - name: outstanding_loan_principal_cents
+        type: integer
+        source: system
+        description: "Sum of principal of all ACTIVE PolicyLoans against this policy, in cents."
+        default: 0
+      - name: net_cash_value_cents
+        type: integer
+        source: computed
+        description: "gross_cash_value_cents minus outstanding_loan_principal_cents; floored at 0. Reconciled on every cash-value or loan mutation."
+        default: 0
+
+  - name: Beneficiary
+    parent: null
+    common_fields: true
+    fields:
+      - name: policy_id
+        type: string
+        source: input
+        description: "FK -> Policy.id; the policy this beneficiary is named on."
+      - name: full_name
+        type: string
+        source: input
+        description: "Beneficiary legal name."
+        constraints: "non-empty"
+      - name: designation
+        type: enum
+        source: input
+        description: "PRIMARY or CONTINGENT. Contingent benefits only when no PRIMARY remains."
+        constraints: "one of {PRIMARY, CONTINGENT}"
+      - name: share_pct
+        type: integer
+        source: input
+        description: "Whole-number percentage share within this beneficiary's designation tier."
+        constraints: ">= 1 and <= 100"
+
+  - name: PremiumPayment
+    parent: null
+    common_fields: false
+    fields:
+      - name: policy_id
+        type: string
+        source: input
+        description: "FK -> Policy.id; the policy being paid."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Payment amount in cents. Must equal the policy's annual_premium_cents to be accepted as an on-cycle payment."
+        constraints: ">= 1"
+      - name: paid_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC instant the payment was recorded (server clock)."
+      - name: applied_to_due_date
+        type: string
+        source: system
+        description: "The next_premium_due_date this payment satisfied, captured before advancing the cycle."
+      - name: coverage_period_start
+        type: string
+        source: system
+        description: "ISO 8601 date; start (inclusive) of the half-open coverage interval [coverage_period_start, coverage_period_end) this payment funds. Equals applied_to_due_date."
+      - name: coverage_period_end
+        type: string
+        source: system
+        description: "ISO 8601 date; end (exclusive) of the half-open coverage interval. Equals coverage_period_start + 1 year. A payment whose coverage interval overlaps an existing payment's interval on the same policy is rejected (half-open: a period starting exactly where the prior ends does NOT overlap)."
+
+  - name: PolicyLoan
+    parent: null
+    common_fields: true
+    fields:
+      - name: policy_id
+        type: string
+        source: input
+        description: "FK -> Policy.id; the policy borrowed against."
+      - name: principal_cents
+        type: integer
+        source: input
+        description: "Requested loan principal in cents."
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: system
+        description: "Loan lifecycle. See §1.2."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, REPAID}"
+      - name: expected_policy_version
+        type: integer
+        source: input
+        description: "OCC guard: the Policy.version the client last observed. Rejected with ERR_STALE_POLICY_VERSION (412) if it no longer matches."
+
+  - name: CashValueEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: policy_id
+        type: string
+        source: input
+        description: "FK -> Policy.id; the policy whose cash value this entry accrues."
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Cash value accrued by this entry in cents (positive on premium accrual, negative on a reversal)."
+      - name: reason
+        type: enum
+        source: system
+        description: "Why this entry was created."
+        constraints: "one of {PREMIUM_ACCRUAL, LOAN_REVERSAL, LAPSE_FORFEIT}"
+
+  - name: Underwriter
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Underwriter's name."
+        constraints: "non-empty"
+      - name: license_id
+        type: string
+        source: input
+        description: "Regulatory license identifier; unique across Underwriters."
+        constraints: "unique; non-empty"
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: Application
+    initial_state: DRAFT
+    terminal_states: [ISSUED, DECLINED, EXPIRED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /applications/{id}/submit"
+        actor: Underwriter
+        preconditions:
+          - "Application.status == DRAFT"
+          - "referenced Applicant and Product exist"
+          - "requested_face_amount_cents <= Product.max_face_amount_cents"
+        side_effects:
+          - "compute_premium runs variant=provisional; sets Application.provisional_annual_premium_cents"
+          - "increments Application.version by 1"
+      - from: SUBMITTED
+        to: EXAM_PENDING
+        trigger: "POST /applications/{id}/order-exam"
+        actor: Underwriter
+        preconditions:
+          - "Application.status == SUBMITTED"
+        side_effects:
+          - "sets Application.ordering_underwriter_id = acting Underwriter's id (pins segregation-of-duties subject)"
+          - "increments Application.version by 1"
+        note: "Moves the application into EXAM_PENDING; the actual ParamedExam is attached via POST /applications/{id}/paramed-exams while in EXAM_PENDING."
+      - from: SUBMITTED
+        to: DECLINED
+        trigger: "POST /applications/{id}/decline"
+        actor: Underwriter
+        preconditions:
+          - "Application.status == SUBMITTED"
+        side_effects:
+          - "sets Application.deciding_underwriter_id = acting Underwriter's id"
+          - "increments Application.version by 1"
+      - from: EXAM_PENDING
+        to: UNDER_REVIEW
+        trigger: "POST /applications/{id}/begin-review"
+        actor: Underwriter
+        preconditions:
+          - "Application.status == EXAM_PENDING"
+          - "at least one ParamedExam for this application is in COMPLETED status"
+          - "at least one MIBCheck exists for this application"
+        side_effects:
+          - "classify_risk runs; creates/refreshes the RiskAssessment (build_debits, total_debits, risk_class, table_rating)"
+          - "increments Application.version by 1"
+      - from: UNDER_REVIEW
+        to: EXAM_PENDING
+        trigger: "POST /applications/{id}/order-exam"
+        actor: Underwriter
+        preconditions:
+          - "Application.status == UNDER_REVIEW"
+        side_effects:
+          - "sets Application.ordering_underwriter_id = acting Underwriter's id (revision loop: re-order paramed for clarification)"
+          - "increments Application.version by 1"
+        note: "Cyclic/revision edge — UNDER_REVIEW can fall back to EXAM_PENDING to re-collect evidence; a fresh ParamedExam is attached via POST /applications/{id}/paramed-exams."
+      - from: UNDER_REVIEW
+        to: APPROVED_OFFER
+        trigger: "POST /applications/{id}/approve"
+        actor: Underwriter
+        preconditions:
+          - "Application.status == UNDER_REVIEW"
+          - "a RiskAssessment exists with risk_class not in {TABLE_7, TABLE_8} (those auto-route to POSTPONED/DECLINED)"
+          - "every MIBCheck for this application has result == CLEAR"
+          - "acting Underwriter.id != Application.ordering_underwriter_id (segregation of duties)"
+          - "expected_application_version matches Application.version"
+        side_effects:
+          - "compute_premium runs variant=final; sets Application.final_annual_premium_cents from the RiskAssessment"
+          - "sets RiskAssessment.finalized = true (locks the assessment)"
+          - "sets Application.deciding_underwriter_id = acting Underwriter's id"
+          - "sets Application.offer_expires_at = clock_now + 30 days"
+          - "increments Application.version by 1"
+      - from: UNDER_REVIEW
+        to: POSTPONED
+        trigger: "POST /applications/{id}/postpone"
+        actor: Underwriter
+        preconditions:
+          - "Application.status == UNDER_REVIEW"
+          - "acting Underwriter.id != Application.ordering_underwriter_id (segregation of duties)"
+        side_effects:
+          - "sets Application.deciding_underwriter_id = acting Underwriter's id"
+          - "increments Application.version by 1"
+      - from: UNDER_REVIEW
+        to: DECLINED
+        trigger: "POST /applications/{id}/decline"
+        actor: Underwriter
+        preconditions:
+          - "Application.status == UNDER_REVIEW"
+          - "acting Underwriter.id != Application.ordering_underwriter_id (segregation of duties)"
+        side_effects:
+          - "sets Application.deciding_underwriter_id = acting Underwriter's id"
+          - "increments Application.version by 1"
+      - from: POSTPONED
+        to: UNDER_REVIEW
+        trigger: "POST /applications/{id}/begin-review"
+        actor: Underwriter
+        preconditions:
+          - "Application.status == POSTPONED"
+          - "at least one ParamedExam for this application is in COMPLETED status"
+        side_effects:
+          - "classify_risk re-runs; refreshes the RiskAssessment"
+          - "increments Application.version by 1"
+        note: "Postponed cases can be revisited after new evidence."
+      - from: APPROVED_OFFER
+        to: ISSUED
+        trigger: "POST /applications/{id}/issue"
+        actor: Underwriter
+        preconditions:
+          - "Application.status == APPROVED_OFFER"
+          - "clock_now <= Application.offer_expires_at"
+          - "expected_application_version matches Application.version"
+        side_effects:
+          - "creates a Policy in lifecycle_status=IN_FORCE, contestability_status=CONTESTABLE (cascade depth-3 origin: Application->Policy->CashValueEntry->Policy.gross_cash_value)"
+          - "Policy.face_amount_cents := Application.requested_face_amount_cents; Policy.annual_premium_cents := Application.final_annual_premium_cents"
+          - "Policy.issue_date := clock_now date; next_premium_due_date := issue_date + 1 year"
+          - "creates a CashValueEntry(reason=PREMIUM_ACCRUAL) for the first year's accrual which triggers accrue_cash_value -> recompute Policy.gross_cash_value_cents -> reconcile_net_cash_value"
+          - "increments Application.version by 1"
+      - from: APPROVED_OFFER
+        to: EXPIRED
+        trigger: "POST /_clock/set_current_utc (clock advances past offer_expires_at) or POST /applications/{id}/issue after expiry"
+        actor: system
+        preconditions:
+          - "Application.status == APPROVED_OFFER"
+          - "clock_now > Application.offer_expires_at"
+        side_effects:
+          - "increments Application.version by 1"
+        note: "Auto-expiry is observed lazily: any read or issue attempt after offer_expires_at treats the offer as EXPIRED."
+
+  - entity: ParamedExam
+    initial_state: ORDERED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: ORDERED
+        to: COMPLETED
+        trigger: "POST /paramed-exams/{id}/complete"
+        actor: Underwriter
+        preconditions:
+          - "ParamedExam.status == ORDERED"
+          - "height_inches, weight_pounds, systolic_bp, exam_date all present"
+          - "check_exam_overlap passes: this exam's validity interval does not overlap any already-COMPLETED exam on the same application (closed-interval, adjacency allowed)"
+        side_effects:
+          - "increments ParamedExam.version by 1"
+      - from: ORDERED
+        to: CANCELLED
+        trigger: "POST /paramed-exams/{id}/cancel"
+        actor: Underwriter
+        preconditions:
+          - "ParamedExam.status == ORDERED"
+        side_effects:
+          - "increments ParamedExam.version by 1"
+
+  - entity: Policy
+    initial_state: IN_FORCE
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: IN_FORCE
+        to: GRACE
+        trigger: "POST /_clock/set_current_utc (clock passes next_premium_due_date) — observed lazily on read or payment attempt"
+        actor: system
+        preconditions:
+          - "Policy.lifecycle_status == IN_FORCE"
+          - "clock_now date > Policy.next_premium_due_date"
+        side_effects:
+          - "increments Policy.version by 1"
+        note: "Grace begins the day after the due date; lapse occurs grace_period_days later."
+      - from: GRACE
+        to: IN_FORCE
+        trigger: "POST /policies/{id}/premium-payments"
+        actor: PolicyOwner
+        preconditions:
+          - "Policy.lifecycle_status == GRACE"
+          - "clock_now date <= next_premium_due_date + Product.grace_period_days"
+          - "PremiumPayment.amount_cents == Policy.annual_premium_cents"
+          - "check_coverage_overlap passes: the payment's coverage interval does not overlap an existing PremiumPayment interval (half-open)"
+        side_effects:
+          - "records PremiumPayment with coverage_period_start (default next_premium_due_date), coverage_period_end=start+1yr; advances next_premium_due_date by 1 year when coverage_period_start == next_premium_due_date; adds amount to cumulative_premium_paid_cents"
+          - "accrue_cash_value runs -> new CashValueEntry(PREMIUM_ACCRUAL) -> recompute gross_cash_value_cents -> reconcile_net_cash_value (cascade depth-3)"
+          - "increments Policy.version by 1"
+      - from: IN_FORCE
+        to: IN_FORCE
+        trigger: "POST /policies/{id}/premium-payments"
+        actor: PolicyOwner
+        preconditions:
+          - "Policy.lifecycle_status == IN_FORCE"
+          - "PremiumPayment.amount_cents == Policy.annual_premium_cents"
+          - "check_coverage_overlap passes: the payment's coverage interval does not overlap an existing PremiumPayment interval (half-open)"
+        side_effects:
+          - "records PremiumPayment with coverage_period_start (default next_premium_due_date), coverage_period_end=start+1yr; advances next_premium_due_date by 1 year when coverage_period_start == next_premium_due_date; adds amount to cumulative_premium_paid_cents"
+          - "accrue_cash_value runs -> new CashValueEntry(PREMIUM_ACCRUAL) -> recompute gross_cash_value_cents -> reconcile_net_cash_value (cascade depth-3)"
+          - "increments Policy.version by 1"
+        note: "On-cycle annual payment (or explicit pre-payment of a future anniversary) while still in force."
+      - from: GRACE
+        to: LAPSED
+        trigger: "POST /_clock/set_current_utc (clock passes next_premium_due_date + grace_period_days) — observed lazily"
+        actor: system
+        preconditions:
+          - "Policy.lifecycle_status == GRACE"
+          - "clock_now date > next_premium_due_date + Product.grace_period_days"
+        side_effects:
+          - "creates a CashValueEntry(reason=LAPSE_FORFEIT, amount_cents = -gross_cash_value_cents) zeroing gross cash value (cascade: -> recompute gross_cash_value_cents -> reconcile_net_cash_value)"
+          - "increments Policy.version by 1"
+      - from: LAPSED
+        to: REINSTATED
+        trigger: "POST /policies/{id}/reinstate"
+        actor: PolicyOwner
+        preconditions:
+          - "Policy.lifecycle_status == LAPSED"
+          - "clock_now date <= issue_date + 3 years (reinstatement window)"
+          - "the reinstatement request carries all overdue annual premiums (back_premium_count == whole years from applied due date through clock_now)"
+        side_effects:
+          - "records PremiumPayment(s); advances next_premium_due_date to the first future anniversary; adds to cumulative_premium_paid_cents"
+          - "accrue_cash_value runs for the reinstated premiums -> CashValueEntry(PREMIUM_ACCRUAL) -> recompute gross_cash_value_cents -> reconcile_net_cash_value"
+          - "RESETS contestability: contestability_status := CONTESTABLE and a fresh contestability window begins from the reinstatement date"
+          - "increments Policy.version by 1"
+        note: "Reinstatement restarts the contestability clock (new 2-year window) — distinct from the original issue clock."
+      - from: LAPSED
+        to: TERMINATED
+        trigger: "POST /_clock/set_current_utc (clock passes issue_date + 3 years) — observed lazily"
+        actor: system
+        preconditions:
+          - "Policy.lifecycle_status == LAPSED"
+          - "clock_now date > issue_date + 3 years"
+        side_effects:
+          - "increments Policy.version by 1"
+
+  # Parallel contestability dimension on the SAME Policy row, evolving
+  # independently of lifecycle_status.
+  - entity: Policy
+    initial_state: CONTESTABLE
+    terminal_states: [INCONTESTABLE]
+    transitions:
+      - from: CONTESTABLE
+        to: INCONTESTABLE
+        trigger: "POST /_clock/set_current_utc (clock passes issue_date + Product.contestability_months) — observed lazily on read"
+        actor: system
+        preconditions:
+          - "Policy.contestability_status == CONTESTABLE"
+          - "clock_now date >= issue_date + Product.contestability_months months (the contestability window has elapsed)"
+        side_effects:
+          - "sets Policy.contestability_status = INCONTESTABLE"
+          - "increments Policy.version by 1"
+        note: "Independent of lifecycle_status; a REINSTATED policy resets this back to CONTESTABLE with a fresh window from the reinstatement date."
+
+  - entity: PolicyLoan
+    initial_state: ACTIVE
+    terminal_states: [REPAID]
+    transitions:
+      - from: ACTIVE
+        to: REPAID
+        trigger: "POST /policy-loans/{id}/repay"
+        actor: PolicyOwner
+        preconditions:
+          - "PolicyLoan.status == ACTIVE"
+        side_effects:
+          - "subtracts principal_cents from Policy.outstanding_loan_principal_cents; reconcile_net_cash_value (compensating action — restores net cash value to pre-loan value)"
+          - "increments Policy.version by 1"
+          - "increments PolicyLoan.version by 1"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules (OCC on parent version)
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: loan-create-stale-policy
+    parent_entity: Policy
+    write_endpoint: "POST /policies/{id}/policy-loans"
+    occ_field: "expected_policy_version"
+    description: |
+      Creating a PolicyLoan against a Policy whose version has advanced since
+      the client last observed it is rejected. This captures the case where
+      another writer has already drawn a loan (which legitimately reduces the
+      available loan value under the max_loan_to_cash_value cap) and the
+      current writer's view of the policy — and thus its available loan value
+      — is therefore stale.
+    error_id: ERR_STALE_POLICY_VERSION
+    http_status: 412
+  - rule_id: approve-stale-application
+    parent_entity: Application
+    write_endpoint: "POST /applications/{id}/approve"
+    occ_field: "expected_application_version"
+    description: |
+      Approving an Application whose version has advanced since the client
+      last observed it is rejected. This captures the case where another
+      underwriter has already re-ordered a paramed exam (legitimately moving
+      the application back to EXAM_PENDING and refreshing the RiskAssessment),
+      so the approving underwriter's view of the risk assessment is stale.
+    error_id: ERR_STALE_APPLICATION_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: compute_premium
+    trigger: "Application SUBMITTED (variant=provisional) and UNDER_REVIEW->APPROVED_OFFER (variant=final)"
+    algorithm: weighted_scoring
+    formula: |
+      # All money in integer cents. Evaluation order is PINNED:
+      #   step 1: thousands = requested_face_amount_cents / 100000   (face / $1,000, integer cents -> thousands)
+      #   step 2: base = Product.base_annual_rate_per_thousand_cents * thousands
+      #   step 3: tobacco_mult_milli = 1500 if Applicant.tobacco_use else 1000   (1.5x / 1.0x in milli-units)
+      #   step 4: class_mult_milli   (depends on variant — see variants)
+      #   step 5: combine multiplicatively in a PINNED order to avoid rounding drift:
+      #             after_tobacco = round_half_up(base * tobacco_mult_milli / 1000)
+      #             premium       = round_half_up(after_tobacco * class_mult_milli / 1000)
+      #   round_half_up applied ONCE per multiply step, in the order above
+      #   (round-per-step, NOT round-at-end — this order is pinned).
+      thousands = requested_face_amount_cents // 100000
+      base = base_annual_rate_per_thousand_cents * thousands
+      tobacco_mult_milli = 1500 if tobacco_use else 1000
+      after_tobacco = round_half_up(base * tobacco_mult_milli / 1000)
+      premium = round_half_up(after_tobacco * class_mult_milli / 1000)
+    input_set: "The single Application's requested_face_amount_cents, its Product's base_annual_rate_per_thousand_cents, the Applicant's tobacco_use, and (variant=final) the finalized RiskAssessment.table_rating."
+    constants:
+      TOBACCO_MULT_MILLI: 1500
+      NON_TOBACCO_MULT_MILLI: 1000
+      PROVISIONAL_CLASS_MULT_MILLI: 1000   # provisional assumes STANDARD (no exam yet)
+      TABLE_STEP_MILLI: 250                 # each table rating step adds 25% over STANDARD
+      PREFERRED_CLASS_MULT_MILLI: 850       # PREFERRED = 0.85x STANDARD (final only)
+    precision: "integer cents, round_half_up applied once per multiply step in the pinned order"
+    variants:
+      - name: provisional
+        when: "Application SUBMITTED, before any exam/risk assessment exists"
+        difference: "class_mult_milli = PROVISIONAL_CLASS_MULT_MILLI (1000, i.e. assume STANDARD); ignores RiskAssessment (none exists yet)."
+      - name: final
+        when: "UNDER_REVIEW -> APPROVED_OFFER, after the RiskAssessment is finalized"
+        difference: |
+          class_mult_milli derived from RiskAssessment.risk_class:
+            PREFERRED -> 850
+            STANDARD  -> 1000
+            TABLE_N   -> 1000 + N * 250   (N = table_rating, 1..6 reachable at approve; 7/8 never approved)
+          So the same face amount + tobacco flag yields a DIFFERENT premium than provisional
+          whenever the assessed class is not STANDARD.
+
+  - name: classify_risk
+    trigger: "Application EXAM_PENDING->UNDER_REVIEW and POSTPONED->UNDER_REVIEW (begin-review)"
+    algorithm: threshold
+    formula: |
+      # Build debits from the most-recently-COMPLETED ParamedExam for the application
+      # (tie-break: created_at ASC, then the later created_at wins as 'most recent';
+      #  if two share created_at, the one with the larger created_at string — they cannot,
+      #  created_at is unique per row). Concretely: select the COMPLETED exam with the
+      #  MAX created_at.
+      bmi = round_half_up(weight_pounds * 703000 / (height_inches * height_inches)) / 1000
+      # BMI band -> build debits:
+      #   bmi <= 27.5            -> 0
+      #   27.5 <  bmi <= 32.0    -> 50
+      #   32.0 <  bmi <= 37.0    -> 100
+      #   bmi >  37.0            -> 200
+      # Blood-pressure band -> bp debits:
+      #   systolic_bp <= 135     -> 0
+      #   135 < systolic_bp <=150-> 50
+      #   systolic_bp > 150      -> 100
+      build_debits = bmi_band_debits + bp_band_debits
+      # Impairment debits:
+      #   + 50 if Applicant.tobacco_use
+      #   + 75 if ANY MIBCheck for this application has result == FLAGGED
+      total_debits = build_debits + tobacco_debits + mib_debits
+      # total_debits -> risk_class / table_rating (threshold, lower-bound inclusive):
+      #   total_debits <  50          -> PREFERRED   (table_rating 0)
+      #   50  <= total_debits <  100  -> STANDARD    (table_rating 0)
+      #   100 <= total_debits         -> TABLE_N where N = floor((total_debits - 100) / 50) + 1, capped at 8
+    input_set: "The COMPLETED ParamedExam with MAX created_at for the application; the Applicant.tobacco_use; all MIBCheck rows for the application (FLAGGED if any)."
+    constants:
+      BMI_BAND_1_MAX: 27.5
+      BMI_BAND_2_MAX: 32.0
+      BMI_BAND_3_MAX: 37.0
+      BMI_BAND_DEBITS: [0, 50, 100, 200]
+      BP_BAND_1_MAX: 135
+      BP_BAND_2_MAX: 150
+      BP_BAND_DEBITS: [0, 50, 100]
+      TOBACCO_DEBITS: 50
+      MIB_FLAGGED_DEBITS: 75
+      PREFERRED_MAX_DEBITS: 50      # < 50 inclusive-of-0 .. exclusive-of-50
+      STANDARD_MAX_DEBITS: 100
+      TABLE_STEP_DEBITS: 50
+      TABLE_CAP: 8
+    precision: "BMI rounded to 3 decimals via integer milli-arithmetic; debits are integers; band edges are LOWER-bound inclusive (>= cutoff moves up)"
+    variants:
+      - name: build_only
+        when: "no MIBCheck is FLAGGED and tobacco_use is false"
+        difference: "total_debits == build_debits (impairment debits both zero)."
+      - name: impaired
+        when: "tobacco_use true and/or a FLAGGED MIBCheck exists"
+        difference: "adds TOBACCO_DEBITS and/or MIB_FLAGGED_DEBITS on top of build_debits, which can push the same build into a higher table rating."
+
+  - name: accrue_cash_value
+    trigger: "Policy issue (first accrual) and each accepted PremiumPayment (IN_FORCE/GRACE/REINSTATED); reversal on LAPSE_FORFEIT"
+    algorithm: aggregation
+    formula: |
+      # Per-accrual increment, computed at the moment a premium is accepted:
+      #   increment = round_half_up(cumulative_premium_paid_cents * Product.cash_value_accrual_rate_bps / 10000)
+      # where cumulative_premium_paid_cents is the value AFTER adding the current
+      # payment. A CashValueEntry(amount_cents = increment, reason = PREMIUM_ACCRUAL)
+      # is appended. gross_cash_value_cents is the SUM of all CashValueEntry.amount_cents
+      # for the policy (PREMIUM_ACCRUAL positive, LAPSE_FORFEIT negative).
+      gross_cash_value_cents = sum(CashValueEntry.amount_cents for this policy)
+    input_set: "All CashValueEntry rows for the policy. cumulative_premium_paid_cents is the basis; rate is Product.cash_value_accrual_rate_bps."
+    constants:
+      BPS_DENOMINATOR: 10000
+    precision: "integer cents, round_half_up on each increment; gross is an exact integer sum"
+    variants:
+      - name: accrual
+        when: "premium accepted (issue or payment)"
+        difference: "appends a positive PREMIUM_ACCRUAL entry."
+      - name: forfeit
+        when: "GRACE->LAPSED"
+        difference: "appends a negative LAPSE_FORFEIT entry equal to -gross_cash_value_cents, zeroing gross cash value."
+
+  - name: reconcile_net_cash_value
+    trigger: "any change to gross_cash_value_cents or outstanding_loan_principal_cents (cash-value accrual, loan draw, loan repay, lapse forfeit)"
+    algorithm: aggregation
+    formula: |
+      outstanding_loan_principal_cents = sum(PolicyLoan.principal_cents
+                                             for loans where status == ACTIVE on this policy)
+      net_cash_value_cents = max(0, gross_cash_value_cents - outstanding_loan_principal_cents)
+    input_set: "gross_cash_value_cents (from accrue_cash_value) and all ACTIVE PolicyLoan.principal_cents for the policy."
+    constants:
+      NET_FLOOR_CENTS: 0
+    precision: "integer cents; floored at 0"
+
+  - name: check_exam_overlap
+    trigger: "POST /paramed-exams/{id}/complete (before COMPLETED)"
+    algorithm: interval_merge
+    formula: |
+      # Closed-start / open-end intervals, with CLOSED-interval overlap semantics
+      # using the ADJACENCY-ALLOWED rule: two exam validity intervals
+      #   A = [a_start, a_start + V)   B = [b_start, b_start + V)   (V = exam_validity_days)
+      # overlap iff a_start < b_end AND b_start < a_end, where end dates are
+      # treated as EXCLUSIVE. Intervals that merely touch (a_end == b_start) do
+      # NOT overlap. The exam being completed is rejected with ERR_EXAM_WINDOW_OVERLAP
+      # if its interval overlaps ANY already-COMPLETED exam on the same application.
+      candidate = [exam_date, exam_date + exam_validity_days)   # open end
+      reject if exists COMPLETED exam E (same application_id) with
+        candidate.start < E.end AND E.start < candidate.end
+    input_set: "All COMPLETED ParamedExam rows for the same application_id, compared against the exam being completed."
+    constants:
+      ADJACENCY: "allowed (touching endpoints do not overlap)"
+    precision: "whole-day date arithmetic; end date exclusive"
+
+  - name: check_coverage_overlap
+    trigger: "POST /policies/{id}/premium-payments and POST /policies/{id}/reinstate"
+    algorithm: interval_merge
+    formula: |
+      # Half-open coverage intervals on a Policy:
+      #   new.coverage_period_start = request.coverage_period_start (defaults to the
+      #     policy's current next_premium_due_date when the field is omitted),
+      #   new.coverage_period_end   = new.coverage_period_start + 1 year.
+      # HALF-OPEN overlap semantics: two intervals overlap iff
+      #   new.start < existing.end AND existing.start < new.end.
+      # On-cycle payments (start == next_premium_due_date) ABUT the prior period
+      # (new.start == prior.end) and do NOT overlap; abutment is allowed. A payment
+      # whose coverage interval overlaps an existing PremiumPayment coverage interval
+      # for the same policy — e.g. an explicit re-payment of an already-funded
+      # anniversary — is rejected with ERR_COVERAGE_PERIOD_OVERLAP.
+      reject if exists PremiumPayment P (same policy_id) with
+        new.coverage_period_start < P.coverage_period_end AND
+        P.coverage_period_start < new.coverage_period_end
+    input_set: "All PremiumPayment rows for the same policy_id, compared against the new payment's coverage interval (from coverage_period_start or the default next_premium_due_date)."
+    constants:
+      COVERAGE_LENGTH: "1 year"
+    precision: "whole-day date arithmetic; end date exclusive (half-open)"
+
+  - name: available_loan_value
+    trigger: "POST /policies/{id}/policy-loans (loan eligibility gate)"
+    algorithm: threshold
+    formula: |
+      # Maximum NEW principal a loan request may draw:
+      cap = round_half_up(gross_cash_value_cents * Product.max_loan_to_cash_value_pct / 100)
+      available = max(0, cap - outstanding_loan_principal_cents)
+      # A request with principal_cents > available is rejected with ERR_LOAN_EXCEEDS_VALUE.
+      # principal_cents == available is allowed (boundary: <= available passes).
+    input_set: "gross_cash_value_cents, outstanding_loan_principal_cents, Product.max_loan_to_cash_value_pct."
+    constants:
+      PCT_DENOMINATOR: 100
+    precision: "integer cents, round_half_up on the cap; boundary is <= available (inclusive)"
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role header present and one of the declared roles; X-User-ID present for entity-backed roles"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to call this endpoint per the §1.7 RBAC matrix"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: existence
+    check: "Every resource referenced in the path exists, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+  - priority: 4
+    category: existence
+    check: "Every FK in the body (applicant_id, product_id, application_id, policy_id) references an existing row"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /applications, POST /applications/{id}/paramed-exams, POST /applications/{id}/mib-checks, POST /policies/{id}/beneficiaries, POST /policies/{id}/policy-loans"
+  - priority: 5
+    category: business_constraint
+    check: "Required body fields present and well-typed; enum values in declared sets; integers within declared ranges"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all
+  - priority: 6
+    category: business_constraint
+    check: "Applicant.email unique on create; Product.code unique on create; Underwriter.license_id unique on create"
+    error_id: ERR_DUPLICATE_VALUE
+    http_status: 409
+    applies_to: "POST /applicants, POST /products, POST /underwriters"
+  - priority: 7
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 8
+    category: business_referential
+    check: "begin-review requires a COMPLETED ParamedExam and at least one MIBCheck for the application"
+    error_id: ERR_EVIDENCE_INCOMPLETE
+    http_status: 409
+    applies_to: "POST /applications/{id}/begin-review"
+  - priority: 9
+    category: business_safety
+    check: "Segregation of duties: at approve/postpone/decline from UNDER_REVIEW, acting Underwriter.id MUST NOT equal Application.ordering_underwriter_id"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /applications/{id}/approve, POST /applications/{id}/postpone, POST /applications/{id}/decline"
+  - priority: 10
+    category: business_safety
+    check: "approve is blocked when the RiskAssessment.risk_class is TABLE_7 or TABLE_8 (uninsurable band) or any MIBCheck.result == FLAGGED"
+    error_id: ERR_UNINSURABLE_RISK
+    http_status: 409
+    applies_to: "POST /applications/{id}/approve"
+  - priority: 11
+    category: business_temporal
+    check: "issue requires clock_now <= Application.offer_expires_at; a lapsed offer cannot be issued"
+    error_id: ERR_OFFER_EXPIRED
+    http_status: 409
+    applies_to: "POST /applications/{id}/issue"
+  - priority: 12
+    category: business_temporal
+    check: "reinstate requires clock_now date <= issue_date + 3 years (reinstatement window open)"
+    error_id: ERR_REINSTATEMENT_WINDOW_CLOSED
+    http_status: 409
+    applies_to: "POST /policies/{id}/reinstate"
+  - priority: 13
+    category: business_constraint
+    check: "PremiumPayment.amount_cents must equal Policy.annual_premium_cents (exact on-cycle amount)"
+    error_id: ERR_PREMIUM_AMOUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /policies/{id}/premium-payments"
+  - priority: 13.5
+    category: business_temporal
+    check: "check_coverage_overlap: the new payment's half-open coverage interval must not overlap an existing PremiumPayment interval on the policy"
+    error_id: ERR_COVERAGE_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /policies/{id}/premium-payments, POST /policies/{id}/reinstate"
+  - priority: 8.5
+    category: business_temporal
+    check: "check_exam_overlap: the exam being COMPLETED must not have a validity interval overlapping any already-COMPLETED exam on the same application (closed-interval, adjacency allowed)"
+    error_id: ERR_EXAM_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /paramed-exams/{id}/complete"
+  - priority: 14
+    category: business_constraint
+    check: "Sum of PRIMARY Beneficiary.share_pct for a policy must equal 100 after the operation; same for CONTINGENT tier if any contingent exists"
+    error_id: ERR_BENEFICIARY_SHARE_INVALID
+    http_status: 422
+    applies_to: "POST /policies/{id}/beneficiaries, DELETE /beneficiaries/{id}"
+  - priority: 15
+    category: business_fiscal
+    check: "PolicyLoan.principal_cents must be <= available_loan_value (max_loan_to_cash_value_pct of gross minus outstanding)"
+    error_id: ERR_LOAN_EXCEEDS_VALUE
+    http_status: 409
+    applies_to: "POST /policies/{id}/policy-loans"
+  - priority: 16
+    category: business_fiscal
+    check: "Application.requested_face_amount_cents must be <= Product.max_face_amount_cents"
+    error_id: ERR_FACE_EXCEEDS_PRODUCT_MAX
+    http_status: 409
+    applies_to: "POST /applications, POST /applications/{id}/submit"
+  - priority: 17
+    category: state
+    check: "OCC: expected_application_version / expected_policy_version must match the parent's current version"
+    error_id: ERR_STALE_VERSION_GENERIC
+    http_status: 412
+    applies_to: "POST /applications/{id}/approve, POST /policies/{id}/policy-loans"
+    note: "Specialized to ERR_STALE_APPLICATION_VERSION / ERR_STALE_POLICY_VERSION per §1.2.1; this row pins priority ordering."
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # --- Products (configuration) ---
+  - method: POST
+    path: "/products"
+    description: "Create a product (rate table + policy parameters)."
+    roles: [Admin]
+    code: 201
+    input: [code, base_annual_rate_per_thousand_cents, max_face_amount_cents, cash_value_accrual_rate_bps, "contestability_months?", "grace_period_days?", "max_loan_to_cash_value_pct?", "exam_validity_days?"]
+    output: Product
+    side_effects: ["creates Product"]
+  - method: GET
+    path: "/products/{id}"
+    description: "Fetch a product."
+    roles: [Admin, Underwriter]
+    code: 200
+    input: []
+    output: Product
+    side_effects: []
+
+  # --- Underwriters ---
+  - method: POST
+    path: "/underwriters"
+    description: "Register an underwriter."
+    roles: [Admin]
+    code: 201
+    input: [name, license_id]
+    output: Underwriter
+    side_effects: ["creates Underwriter"]
+  - method: GET
+    path: "/underwriters/{id}"
+    description: "Fetch an underwriter."
+    roles: [Admin, Underwriter]
+    code: 200
+    input: []
+    output: Underwriter
+    side_effects: []
+
+  # --- Applicants ---
+  - method: POST
+    path: "/applicants"
+    description: "Create an applicant (proposed insured)."
+    roles: [Admin, Underwriter]
+    code: 201
+    input: [full_name, date_of_birth, sex, tobacco_use, email]
+    output: Applicant
+    side_effects: ["creates Applicant"]
+  - method: GET
+    path: "/applicants/{id}"
+    description: "Fetch an applicant."
+    roles: [Admin, Underwriter]
+    code: 200
+    input: []
+    output: Applicant
+    side_effects: []
+
+  # --- Applications (hub) ---
+  - method: POST
+    path: "/applications"
+    description: "Create a DRAFT application."
+    roles: [Underwriter]
+    code: 201
+    input: [applicant_id, product_id, requested_face_amount_cents]
+    output: Application
+    side_effects: ["creates Application in DRAFT", "validates face <= Product.max_face_amount_cents"]
+  - method: GET
+    path: "/applications/{id}"
+    description: "Fetch an application; lazily reflects APPROVED_OFFER->EXPIRED on read."
+    roles: [Admin, Underwriter]
+    code: 200
+    input: []
+    output: Application
+    side_effects: ["lazy auto-expiry of APPROVED_OFFER past offer_expires_at"]
+  - method: GET
+    path: "/applications"
+    description: "List applications with pagination; optional filter by applicant_id, product_id, ordering_underwriter_id, or deciding_underwriter_id."
+    roles: [Admin, Underwriter]
+    code: 200
+    input: ["applicant_id?", "product_id?", "ordering_underwriter_id?", "deciding_underwriter_id?", "limit?", "offset?"]
+    output: Application[]
+    side_effects: []
+  - method: POST
+    path: "/applications/{id}/submit"
+    description: "DRAFT -> SUBMITTED; computes provisional premium."
+    roles: [Underwriter]
+    code: 200
+    input: []
+    output: Application
+    side_effects: ["compute_premium variant=provisional", "increments Application.version"]
+  - method: POST
+    path: "/applications/{id}/order-exam"
+    description: "SUBMITTED->EXAM_PENDING or UNDER_REVIEW->EXAM_PENDING (revision loop); creates an ORDERED ParamedExam; pins ordering_underwriter_id."
+    roles: [Underwriter]
+    code: 200
+    input: []
+    output: Application
+    side_effects: ["creates ParamedExam(ORDERED)", "sets ordering_underwriter_id", "increments Application.version"]
+  - method: POST
+    path: "/applications/{id}/begin-review"
+    description: "EXAM_PENDING->UNDER_REVIEW or POSTPONED->UNDER_REVIEW; runs classify_risk."
+    roles: [Underwriter]
+    code: 200
+    input: []
+    output: Application
+    side_effects: ["classify_risk", "creates/refreshes RiskAssessment", "increments Application.version"]
+  - method: POST
+    path: "/applications/{id}/approve"
+    description: "UNDER_REVIEW->APPROVED_OFFER; computes final premium; OCC-guarded; segregation-of-duties enforced."
+    roles: [Underwriter]
+    code: 200
+    input: [expected_application_version]
+    output: Application
+    side_effects: ["compute_premium variant=final", "locks RiskAssessment.finalized=true", "sets offer_expires_at", "sets deciding_underwriter_id", "increments Application.version by 1"]
+  - method: POST
+    path: "/applications/{id}/postpone"
+    description: "UNDER_REVIEW->POSTPONED; segregation-of-duties enforced."
+    roles: [Underwriter]
+    code: 200
+    input: []
+    output: Application
+    side_effects: ["sets deciding_underwriter_id", "increments Application.version"]
+  - method: POST
+    path: "/applications/{id}/decline"
+    description: "SUBMITTED->DECLINED or UNDER_REVIEW->DECLINED; segregation-of-duties enforced from UNDER_REVIEW."
+    roles: [Underwriter]
+    code: 200
+    input: []
+    output: Application
+    side_effects: ["sets deciding_underwriter_id", "increments Application.version"]
+  - method: POST
+    path: "/applications/{id}/issue"
+    description: "APPROVED_OFFER->ISSUED; creates Policy; OCC-guarded; rejects if offer expired."
+    roles: [Underwriter]
+    code: 201
+    input: [expected_application_version]
+    output: Policy
+    side_effects: ["creates Policy(IN_FORCE, CONTESTABLE)", "first CashValueEntry accrual cascade", "increments Application.version"]
+
+  # --- ParamedExams (FK reverse-reachability for Application) ---
+  - method: POST
+    path: "/applications/{id}/paramed-exams"
+    description: "Directly create a ParamedExam for an application with its measurements; used to attach a scheduled exam (and to seed exams in tests). Created in ORDERED."
+    roles: [Underwriter]
+    code: 201
+    input: [height_inches, weight_pounds, systolic_bp, exam_date]
+    output: ParamedExam
+    side_effects: ["creates ParamedExam(ORDERED) linked to application with measurements and exam_date attached"]
+  - method: GET
+    path: "/applications/{id}/paramed-exams"
+    description: "List ParamedExams for an application (FK reverse-reachability)."
+    roles: [Admin, Underwriter]
+    code: 200
+    input: []
+    output: ParamedExam[]
+    side_effects: []
+  - method: GET
+    path: "/paramed-exams/{id}"
+    description: "Fetch a paramed exam."
+    roles: [Admin, Underwriter]
+    code: 200
+    input: []
+    output: ParamedExam
+    side_effects: []
+  - method: POST
+    path: "/paramed-exams/{id}/complete"
+    description: "ORDERED->COMPLETED."
+    roles: [Underwriter]
+    code: 200
+    input: []
+    output: ParamedExam
+    side_effects: ["increments ParamedExam.version"]
+  - method: POST
+    path: "/paramed-exams/{id}/cancel"
+    description: "ORDERED->CANCELLED."
+    roles: [Underwriter]
+    code: 200
+    input: []
+    output: ParamedExam
+    side_effects: ["increments ParamedExam.version"]
+
+  # --- MIBChecks (FK reverse-reachability for Application) ---
+  - method: POST
+    path: "/applications/{id}/mib-checks"
+    description: "Record an MIB/Rx check result for an application; result computed (CLEAR/FLAGGED)."
+    roles: [Underwriter]
+    code: 201
+    input: [mib_hit, rx_flag_count]
+    output: MIBCheck
+    side_effects: ["creates MIBCheck", "computes result"]
+  - method: GET
+    path: "/applications/{id}/mib-checks"
+    description: "List MIBChecks for an application (FK reverse-reachability)."
+    roles: [Admin, Underwriter]
+    code: 200
+    input: []
+    output: MIBCheck[]
+    side_effects: []
+
+  # --- RiskAssessment (FK reverse-reachability for Application) ---
+  - method: GET
+    path: "/applications/{id}/risk-assessment"
+    description: "List the RiskAssessment(s) for an application (0 or 1; FK reverse-reachability)."
+    roles: [Admin, Underwriter]
+    code: 200
+    input: []
+    output: RiskAssessment[]
+    side_effects: []
+
+  # --- Policies (secondary hub; FK reverse-reachability for Application) ---
+  - method: GET
+    path: "/policies/{id}"
+    description: "Fetch a policy; lazily reflects lifecycle (GRACE/LAPSED/TERMINATED) and contestability (INCONTESTABLE) transitions on read."
+    roles: [Admin, Underwriter, PolicyOwner]
+    code: 200
+    input: []
+    output: Policy
+    side_effects: ["lazy lifecycle/contestability auto-transitions per clock"]
+  - method: GET
+    path: "/applications/{id}/policies"
+    description: "List the Policy(ies) for an application (0 or 1; FK reverse-reachability)."
+    roles: [Admin, Underwriter]
+    code: 200
+    input: []
+    output: Policy[]
+    side_effects: []
+  - method: POST
+    path: "/policies/{id}/premium-payments"
+    description: "Record an annual premium payment (IN_FORCE or GRACE); accrues cash value. Funds the coverage interval [coverage_period_start, +1yr); coverage_period_start defaults to the policy's current next_premium_due_date (on-cycle). A holder may pre-pay a future anniversary by supplying coverage_period_start explicitly. Rejected if that interval overlaps an existing payment's interval."
+    roles: [PolicyOwner]
+    code: 201
+    input: [amount_cents, "coverage_period_start?"]
+    output: PremiumPayment
+    side_effects: ["records PremiumPayment for the coverage interval", "advances next_premium_due_date by 1 year when coverage_period_start == next_premium_due_date (on-cycle)", "accrue_cash_value cascade", "GRACE->IN_FORCE if applicable", "increments Policy.version"]
+  - method: GET
+    path: "/policies/{id}/premium-payments"
+    description: "List premium payments for a policy (FK reverse-reachability)."
+    roles: [Admin, Underwriter, PolicyOwner]
+    code: 200
+    input: []
+    output: PremiumPayment[]
+    side_effects: []
+  - method: POST
+    path: "/policies/{id}/reinstate"
+    description: "LAPSED->REINSTATED; requires back premiums; resets contestability."
+    roles: [PolicyOwner]
+    code: 200
+    input: [back_premium_count]
+    output: Policy
+    side_effects: ["records back premiums", "accrue_cash_value", "resets contestability to CONTESTABLE", "increments Policy.version"]
+  - method: POST
+    path: "/policies/{id}/beneficiaries"
+    description: "Add a beneficiary (PRIMARY/CONTINGENT) to a policy; tier shares must sum to 100."
+    roles: [PolicyOwner]
+    code: 201
+    input: [full_name, designation, share_pct]
+    output: Beneficiary
+    side_effects: ["creates Beneficiary", "validates tier share sum == 100"]
+  - method: GET
+    path: "/policies/{id}/beneficiaries"
+    description: "List beneficiaries for a policy (FK reverse-reachability)."
+    roles: [Admin, Underwriter, PolicyOwner]
+    code: 200
+    input: []
+    output: Beneficiary[]
+    side_effects: []
+  - method: DELETE
+    path: "/beneficiaries/{id}"
+    description: "Remove a beneficiary; remaining tier shares must still sum to 100 (or tier becomes empty)."
+    roles: [PolicyOwner]
+    code: 200
+    input: []
+    output: Beneficiary
+    side_effects: ["deletes Beneficiary", "re-validates tier share sum"]
+  - method: POST
+    path: "/policies/{id}/policy-loans"
+    description: "Draw a policy loan against net cash value; OCC-guarded on Policy.version; capped by available_loan_value."
+    roles: [PolicyOwner]
+    code: 201
+    input: [principal_cents, expected_policy_version]
+    output: PolicyLoan
+    side_effects: ["creates PolicyLoan(ACTIVE)", "adds to outstanding_loan_principal_cents", "reconcile_net_cash_value", "increments Policy.version"]
+  - method: GET
+    path: "/policies/{id}/policy-loans"
+    description: "List policy loans for a policy (FK reverse-reachability)."
+    roles: [Admin, Underwriter, PolicyOwner]
+    code: 200
+    input: []
+    output: PolicyLoan[]
+    side_effects: []
+  - method: POST
+    path: "/policy-loans/{id}/repay"
+    description: "ACTIVE->REPAID; compensating action restores net cash value."
+    roles: [PolicyOwner]
+    code: 200
+    input: []
+    output: PolicyLoan
+    side_effects: ["subtracts from outstanding_loan_principal_cents", "reconcile_net_cash_value", "increments Policy.version"]
+  - method: GET
+    path: "/policies/{id}/cash-value-entries"
+    description: "List cash-value ledger entries for a policy (FK reverse-reachability)."
+    roles: [Admin, Underwriter, PolicyOwner]
+    code: 200
+    input: []
+    output: CashValueEntry[]
+    side_effects: []
+
+  # --- Test-driving clock ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "(Test) set the server's current UTC instant; drives lazy auto-transitions (offer expiry, grace, lapse, termination, contestability)."
+    roles: [Admin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["advances server clock; subsequent reads observe time-based transitions"]
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role, or missing X-User-ID for an entity-backed role."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Acting role not permitted for this endpoint per the RBAC matrix."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A path-referenced resource does not exist."
+  - id: ERR_REFERENCE_NOT_FOUND
+    http: 404
+    condition: "A foreign-key field in the request body references a non-existent row."
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Missing required field, bad type, out-of-range integer, or enum value outside its declared set."
+  - id: ERR_DUPLICATE_VALUE
+    http: 409
+    condition: "Unique constraint violated (Applicant.email, Product.code, Underwriter.license_id)."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition is not defined from the resource's current state."
+  - id: ERR_EVIDENCE_INCOMPLETE
+    http: 409
+    condition: "begin-review without a COMPLETED ParamedExam and at least one MIBCheck."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "Acting underwriter equals the ordering underwriter at approve/postpone/decline from UNDER_REVIEW."
+  - id: ERR_UNINSURABLE_RISK
+    http: 409
+    condition: "approve attempted with risk_class in {TABLE_7, TABLE_8} or any FLAGGED MIBCheck."
+  - id: ERR_OFFER_EXPIRED
+    http: 409
+    condition: "issue attempted after Application.offer_expires_at."
+  - id: ERR_REINSTATEMENT_WINDOW_CLOSED
+    http: 409
+    condition: "reinstate attempted after issue_date + 3 years."
+  - id: ERR_PREMIUM_AMOUNT_MISMATCH
+    http: 422
+    condition: "PremiumPayment.amount_cents != Policy.annual_premium_cents."
+  - id: ERR_BENEFICIARY_SHARE_INVALID
+    http: 422
+    condition: "PRIMARY (or CONTINGENT) beneficiary share_pct does not sum to 100 after the operation."
+  - id: ERR_LOAN_EXCEEDS_VALUE
+    http: 409
+    condition: "PolicyLoan.principal_cents exceeds available_loan_value."
+  - id: ERR_FACE_EXCEEDS_PRODUCT_MAX
+    http: 409
+    condition: "requested_face_amount_cents exceeds Product.max_face_amount_cents."
+  - id: ERR_STALE_APPLICATION_VERSION
+    http: 412
+    condition: "expected_application_version does not match Application.version at approve."
+  - id: ERR_STALE_POLICY_VERSION
+    http: 412
+    condition: "expected_policy_version does not match Policy.version at loan draw."
+  - id: ERR_BACK_PREMIUM_INSUFFICIENT
+    http: 422
+    condition: "reinstate back_premium_count does not cover all overdue annual premiums from applied due date through clock_now."
+  - id: ERR_EXAM_WINDOW_OVERLAP
+    http: 409
+    condition: "completing a ParamedExam whose validity interval overlaps an already-COMPLETED exam on the same application."
+  - id: ERR_COVERAGE_PERIOD_OVERLAP
+    http: 409
+    condition: "a premium payment whose half-open coverage interval overlaps an existing PremiumPayment interval for the policy."
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: Admin
+    description: "Operational administrator: configures products, registers underwriters/applicants, drives the test clock."
+    identity: opaque
+    exclusive_operations:
+      - "POST /products"
+      - "POST /underwriters"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /applicants"
+      - "GET reads on products, underwriters, applicants, applications, exams, mib-checks, risk-assessment, policies and their sub-resources"
+  - name: Underwriter
+    description: "Reviews applications, orders/cancels/completes exams, records MIB checks, renders decisions, issues policies. Subject to segregation of duties (orderer != decider)."
+    identity: "entity_backed:Underwriter"
+    exclusive_operations:
+      - "POST /applications and /applications/{id}/{submit,order-exam,begin-review,approve,postpone,decline,issue}"
+      - "POST /applications/{id}/paramed-exams, POST /applications/{id}/mib-checks"
+      - "POST /paramed-exams/{id}/{complete,cancel}"
+    shared_operations:
+      - "POST /applicants"
+      - "GET reads across applications, exams, mib-checks, risk-assessment, policies and their sub-resources"
+  - name: PolicyOwner
+    description: "The proposed insured / policyholder. Acts on their issued Policy: pays premiums, reinstates, manages beneficiaries, draws/repays loans. Identity is the Applicant behind the policy."
+    identity: "entity_backed:Applicant"
+    exclusive_operations:
+      - "POST /policies/{id}/premium-payments"
+      - "POST /policies/{id}/reinstate"
+      - "POST /policies/{id}/beneficiaries, DELETE /beneficiaries/{id}"
+      - "POST /policies/{id}/policy-loans, POST /policy-loans/{id}/repay"
+    shared_operations:
+      - "GET reads on their own Policy and its sub-resources (premium-payments, beneficiaries, policy-loans, cash-value-entries)"

@@ -1,0 +1,1400 @@
+scenario: "Lawn / Snow Removal Subscription Service: service route, weather trigger (snow >2 inches auto-dispatch), seasonal contract, equipment rotation, customer preferences (grass height/fertilization), end-of-season billing, Skip Service"
+domain_name: "lawn-snow-subscription"
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: workflow_orchestration
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - rate_threshold_triggers          # snow > 2.0 inches auto-dispatch; wear-score >= 100 maintenance-due
+    - cascading_side_effects           # weather reading -> route dispatch -> visit -> equipment wear -> maintenance freeze
+    - dual_variant_calculation         # provisional vs finalized billing; estimated vs actual equipment wear
+    - optimistic_concurrency           # equipment rotation supersede via OCC on Equipment.version
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys; no deep URL nesting. Routes, crews,
+  # equipment, contracts, properties are peers wired by FK.
+
+  state_machine_shape: branching
+  # ServiceVisit forks SCHEDULED -> {DISPATCHED, SKIPPED} -> ... with divergent
+  # side-effect sets; SkipRequest has approve/reject branch with revert.
+
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate
+
+  role_model: peer_roles
+  # Customer owns contracts/preferences/skips; DispatchManager owns routes/weather/
+  # dispatch; CrewLead owns crew execution; PlatformAdmin operational superset.
+
+  consistency_model: immediate
+
+# ===========================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# ===========================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Login identity; unique across customers"
+        constraints: "unique, non-empty"
+      - name: full_name
+        type: string
+        source: input
+        description: "Customer display name"
+      - name: service_zip
+        type: string
+        source: input
+        description: "5-digit service area ZIP; pins which WeatherReading region applies"
+        constraints: "5 digits"
+      - name: wallet_credit_cents
+        type: integer
+        source: computed
+        description: "Accumulated skip/proration credits in cents; debited against the SeasonInvoice at finalization"
+        default: 0
+
+  - name: ServiceContract
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the owning customer"
+      - name: property_id
+        type: string
+        source: input
+        description: "FK -> ServiceProperty.id; the property serviced under this contract"
+      - name: season
+        type: enum
+        source: input
+        description: "Contract season"
+        constraints: "one of {WINTER, SUMMER}"
+      - name: contract_price_cents
+        type: integer
+        source: input
+        description: "Flat seasonal base fee in cents"
+        constraints: ">= 0"
+      - name: term_months
+        type: integer
+        source: input
+        description: "Number of months the seasonal contract spans; used for proration baseline"
+        constraints: ">= 1"
+      - name: prepaid_deposit_cents
+        type: integer
+        source: input
+        description: "Amount prepaid at signing; subtracted last when SeasonInvoice is finalized"
+        default: 0
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: computed
+        description: "Contract lifecycle state"
+        constraints: "one of {DRAFT, ACTIVE, SUSPENDED, CLOSED}"
+        default: DRAFT
+      - name: accrued_balance_cents
+        type: integer
+        source: computed
+        description: "Provisional running balance (base + accrued surcharges - credits) recomputed on every visit completion and skip approval; NOT the finalized figure"
+        default: 0
+
+  - name: ServiceProperty
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; owner of the property"
+      - name: address
+        type: string
+        source: input
+        description: "Street address of the serviced property"
+      - name: lawn_area_sqft
+        type: integer
+        source: input
+        description: "Lawn size in square feet; drives base service minutes"
+        constraints: "> 0"
+      - name: zip
+        type: string
+        source: input
+        description: "5-digit property ZIP; matched against WeatherReading.region_zip for auto-dispatch"
+        constraints: "5 digits"
+
+  - name: CustomerPreference
+    parent: null
+    common_fields: true
+    fields:
+      - name: property_id
+        type: string
+        source: input
+        description: "FK -> ServiceProperty.id; the property these preferences apply to"
+      - name: grass_height_mm
+        type: integer
+        source: input
+        description: "Requested cut height in millimetres for LAWN visits"
+        constraints: "between 20 and 120 inclusive"
+      - name: fertilization_enabled
+        type: boolean
+        source: input
+        description: "When true, LAWN visits also perform fertilization and accrue the fertilization add-on"
+        default: false
+      - name: snow_opt_out
+        type: boolean
+        source: input
+        description: "When true, this property is excluded from snow auto-dispatch even when threshold is crossed"
+        default: false
+
+  - name: Crew
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Crew display name"
+      - name: home_route_id
+        type: string
+        source: input
+        description: "FK -> ServiceRoute.id; the route this crew is assigned to service"
+      - name: status
+        type: enum
+        source: computed
+        description: "Crew availability"
+        constraints: "one of {AVAILABLE, ON_DISPATCH, OFF_DUTY}"
+        default: AVAILABLE
+
+  - name: ServiceRoute
+    parent: null
+    common_fields: true
+    fields:
+      - name: region_zip
+        type: string
+        source: input
+        description: "5-digit ZIP this route covers; WeatherReading for this ZIP triggers route dispatch"
+        constraints: "5 digits"
+      - name: daily_capacity_minutes
+        type: integer
+        source: input
+        description: "Maximum crew-minutes the route can absorb in one dispatch before overtime tier applies"
+        constraints: "> 0"
+      - name: status
+        type: enum
+        source: computed
+        description: "Route operational posture"
+        constraints: "one of {OPEN, DISPATCHED, CLOSED}"
+        default: OPEN
+      - name: last_dispatch_load_minutes
+        type: integer
+        source: computed
+        description: "Total crew-minutes computed for the most recent dispatch sweep across active RouteStops"
+        default: 0
+
+  - name: RouteStop
+    parent: null
+    common_fields: true
+    fields:
+      - name: route_id
+        type: string
+        source: input
+        description: "FK -> ServiceRoute.id; the route this stop belongs to"
+      - name: property_id
+        type: string
+        source: input
+        description: "FK -> ServiceProperty.id; the property visited at this stop"
+      - name: sequence
+        type: integer
+        source: input
+        description: "Visit order within the route; lower runs first. Tie-break for dispatch ordering"
+        constraints: ">= 1"
+      - name: base_service_minutes
+        type: integer
+        source: input
+        description: "Baseline service minutes for this stop before snow-depth multiplier and travel"
+        constraints: "> 0"
+      - name: travel_minutes
+        type: integer
+        source: input
+        description: "Fixed travel minutes added to this stop's load"
+        default: 0
+        constraints: ">= 0"
+      - name: active
+        type: boolean
+        source: computed
+        description: "Whether the stop is included in dispatch sweeps; flips false when the underlying contract is SUSPENDED or CLOSED"
+        default: true
+
+  - name: Equipment
+    parent: null
+    common_fields: true
+    fields:
+      - name: asset_tag
+        type: string
+        source: input
+        description: "Equipment asset identifier; unique"
+        constraints: "unique, non-empty"
+      - name: equipment_type
+        type: enum
+        source: input
+        description: "Kind of equipment"
+        constraints: "one of {PLOW, MOWER, SPREADER}"
+      - name: assigned_route_id
+        type: string
+        source: input
+        description: "FK -> ServiceRoute.id; route this equipment is currently rotated onto (nullable until first rotation)"
+        default: null
+      - name: cumulative_runtime_hours
+        type: number
+        source: computed
+        description: "Total runtime hours accumulated across all completed visits using this equipment"
+        default: 0
+      - name: runtime_at_last_service_hours
+        type: number
+        source: computed
+        description: "cumulative_runtime_hours snapshot at the last maintenance reset; baseline for wear scoring"
+        default: 0
+      - name: dispatch_count_since_service
+        type: integer
+        source: computed
+        description: "Number of completed dispatches since the last maintenance reset"
+        default: 0
+      - name: age_months
+        type: integer
+        source: input
+        description: "Equipment age in months; weighted into the wear score"
+        constraints: ">= 0"
+      - name: wear_score
+        type: integer
+        source: computed
+        description: "Weighted wear metric; recomputed on every visit completion and equipment rotation. >= 100 forces MAINTENANCE_DUE"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Equipment availability"
+        constraints: "one of {IDLE, IN_SERVICE, MAINTENANCE_DUE, UNDER_MAINTENANCE}"
+        default: IDLE
+
+  - name: WeatherReading
+    parent: null
+    common_fields: false
+    fields:
+      - name: region_zip
+        type: string
+        source: input
+        description: "5-digit ZIP the reading covers; matched against ServiceRoute.region_zip"
+        constraints: "5 digits"
+      - name: snow_depth_in
+        type: number
+        source: input
+        description: "Measured snow depth in inches; > 2.0 crosses the auto-dispatch threshold"
+        constraints: ">= 0"
+      - name: observed_at
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC observation timestamp"
+      - name: processed
+        type: boolean
+        source: computed
+        description: "Whether this reading has already been evaluated for auto-dispatch; prevents double dispatch"
+        default: false
+
+  - name: ServiceVisit
+    parent: null
+    common_fields: true
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> ServiceContract.id; the contract this visit bills against"
+      - name: route_stop_id
+        type: string
+        source: input
+        description: "FK -> RouteStop.id; the stop serviced by this visit"
+      - name: equipment_id
+        type: string
+        source: input
+        description: "FK -> Equipment.id; the equipment dispatched for this visit (null until DISPATCHED)"
+        default: null
+      - name: service_type
+        type: enum
+        source: input
+        description: "Kind of service performed"
+        constraints: "one of {LAWN, SNOW, FERTILIZATION}"
+      - name: snow_depth_in
+        type: number
+        source: input
+        description: "Snow depth recorded at dispatch for SNOW visits; drives the snow surcharge"
+        default: 0
+        constraints: ">= 0"
+      - name: runtime_hours
+        type: number
+        source: input
+        description: "Equipment runtime hours consumed by this visit; added to Equipment.cumulative_runtime_hours on completion"
+        default: 0
+        constraints: ">= 0"
+      - name: surcharge_cents
+        type: integer
+        source: computed
+        description: "Line surcharge computed at completion (snow surcharge and/or fertilization add-on)"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Visit lifecycle state"
+        constraints: "one of {SCHEDULED, DISPATCHED, COMPLETED, SKIPPED, CANCELLED}"
+        default: SCHEDULED
+
+  - name: SkipRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: visit_id
+        type: string
+        source: input
+        description: "FK -> ServiceVisit.id; the scheduled visit the customer wants to skip"
+      - name: reason
+        type: string
+        source: input
+        description: "Customer-supplied reason for skipping"
+      - name: credit_cents
+        type: integer
+        source: computed
+        description: "Credit granted on approval; flat skip credit for SNOW visits, prorated daily credit for LAWN visits"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Skip request lifecycle"
+        constraints: "one of {PENDING, APPROVED, REJECTED}"
+        default: PENDING
+
+  - name: SeasonInvoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> ServiceContract.id; the contract being closed out and billed"
+      - name: subtotal_cents
+        type: integer
+        source: computed
+        description: "Finalized chronological subtotal: base + completed-visit surcharges - approved skip credits"
+        default: 0
+      - name: tax_cents
+        type: integer
+        source: computed
+        description: "Tax computed once on the finalized subtotal (sum-then-round order)"
+        default: 0
+      - name: total_due_cents
+        type: integer
+        source: computed
+        description: "subtotal_cents + tax_cents - wallet_credit applied - prepaid_deposit_cents (floored at 0)"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Invoice lifecycle"
+        constraints: "one of {ISSUED, PAID, VOID}"
+        default: ISSUED
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  - entity: ServiceContract
+    initial_state: DRAFT
+    terminal_states: [CLOSED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /contracts/{id}/activate"
+        actor: Customer
+        preconditions:
+          - "contract.status == DRAFT"
+          - "referenced ServiceProperty exists and ServiceProperty.customer_id == contract.customer_id"
+        side_effects:
+          - "set ServiceContract.status = ACTIVE"
+          - "set accrued_balance_cents = contract_price_cents"
+          - "increments ServiceContract.version by 1"
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /contracts/{id}/suspend"
+        actor: DispatchManager
+        preconditions:
+          - "contract.status == ACTIVE"
+        side_effects:
+          - "set ServiceContract.status = SUSPENDED"
+          - "CASCADE: every RouteStop whose property_id == contract.property_id flips active = false (removed from future dispatch sweeps)"
+          - "increments ServiceContract.version by 1"
+        note: "cross-entity cascade contract -> route stops"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /contracts/{id}/activate"
+        actor: Customer
+        preconditions:
+          - "contract.status == SUSPENDED"
+        side_effects:
+          - "set ServiceContract.status = ACTIVE"
+          - "CASCADE: every RouteStop whose property_id == contract.property_id flips active = true"
+          - "increments ServiceContract.version by 1"
+        note: "revert path SUSPENDED->ACTIVE makes this a cyclic-capable branch"
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /contracts/{id}/close-season"
+        actor: DispatchManager
+        preconditions:
+          - "contract.status == ACTIVE"
+          - "no ServiceVisit for this contract is in DISPATCHED state"
+        side_effects:
+          - "set ServiceContract.status = CLOSED"
+          - "CASCADE step 1: synthesize a SeasonInvoice for this contract (finalized chronological billing, calculation final_season_invoice)"
+          - "CASCADE step 2: the new SeasonInvoice debits Customer.wallet_credit_cents by min(wallet_credit_cents, subtotal+tax) — that debit mutates the Customer row"
+          - "increments ServiceContract.version by 1"
+        note: "depth>=3 cascade: close-season -> SeasonInvoice created -> Customer.wallet_credit_cents debited"
+
+  - entity: ServiceVisit
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, SKIPPED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: DISPATCHED
+        trigger: "POST /weather-readings/{id}/process (auto) or POST /visits/{id}/dispatch (manual)"
+        actor: DispatchManager
+        preconditions:
+          - "visit.status == SCHEDULED"
+          - "the RouteStop's owning ServiceContract.status == ACTIVE"
+          - "an Equipment with assigned_route_id == stop.route_id and status IN {IDLE, IN_SERVICE} exists (selector: lowest wear_score, tie-break created_at ASC)"
+        side_effects:
+          - "set ServiceVisit.status = DISPATCHED"
+          - "set ServiceVisit.equipment_id = selected Equipment.id"
+          - "set selected Equipment.status = IN_SERVICE"
+          - "set Crew (home_route_id == stop.route_id) status = ON_DISPATCH"
+        note: "branch point SCHEDULED -> {DISPATCHED, SKIPPED, CANCELLED}"
+      - from: DISPATCHED
+        to: COMPLETED
+        trigger: "POST /visits/{id}/complete"
+        actor: CrewLead
+        preconditions:
+          - "visit.status == DISPATCHED"
+          - "visit.equipment_id is set and that Equipment.status == IN_SERVICE"
+        side_effects:
+          - "compute ServiceVisit.surcharge_cents via calculation visit_surcharge"
+          - "set ServiceVisit.status = COMPLETED"
+          - "CASCADE step A: Equipment.cumulative_runtime_hours += visit.runtime_hours; Equipment.dispatch_count_since_service += 1; recompute Equipment.wear_score via calculation equipment_wear_score (actual variant)"
+          - "CASCADE step B: if recomputed Equipment.wear_score >= 100 then Equipment.status = MAINTENANCE_DUE else Equipment.status = IDLE"
+          - "ServiceContract.accrued_balance_cents += surcharge_cents (provisional balance recompute)"
+        note: "depth>=3 cascade: complete -> equipment wear recompute -> equipment status flips MAINTENANCE_DUE"
+      - from: SCHEDULED
+        to: SKIPPED
+        trigger: "POST /skip-requests/{id}/approve"
+        actor: DispatchManager
+        preconditions:
+          - "visit.status == SCHEDULED"
+          - "a SkipRequest for this visit is in PENDING state"
+        side_effects:
+          - "set ServiceVisit.status = SKIPPED"
+          - "compute SkipRequest.credit_cents via calculation skip_credit"
+          - "set SkipRequest.status = APPROVED"
+          - "Customer.wallet_credit_cents += SkipRequest.credit_cents"
+          - "ServiceContract.accrued_balance_cents -= SkipRequest.credit_cents"
+        note: "approve branch with credit grant"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /visits/{id}/cancel"
+        actor: DispatchManager
+        preconditions:
+          - "visit.status == SCHEDULED"
+        side_effects:
+          - "set ServiceVisit.status = CANCELLED"
+
+  - entity: SkipRequest
+    initial_state: PENDING
+    terminal_states: [APPROVED, REJECTED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /skip-requests/{id}/approve"
+        actor: DispatchManager
+        preconditions:
+          - "skip.status == PENDING"
+          - "the referenced ServiceVisit.status == SCHEDULED"
+        side_effects:
+          - "set SkipRequest.status = APPROVED (drives the ServiceVisit SCHEDULED->SKIPPED transition and credit grant above)"
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /skip-requests/{id}/reject"
+        actor: DispatchManager
+        preconditions:
+          - "skip.status == PENDING"
+        side_effects:
+          - "set SkipRequest.status = REJECTED"
+          - "no credit granted; referenced ServiceVisit remains SCHEDULED"
+
+  - entity: Equipment
+    initial_state: IDLE
+    terminal_states: []
+    transitions:
+      - from: IDLE
+        to: IN_SERVICE
+        trigger: "system: visit dispatch selects this equipment"
+        actor: system
+        preconditions:
+          - "equipment.status == IDLE"
+          - "equipment.assigned_route_id == dispatching stop's route_id"
+        side_effects:
+          - "set Equipment.status = IN_SERVICE"
+      - from: MAINTENANCE_DUE
+        to: UNDER_MAINTENANCE
+        trigger: "POST /equipment/{id}/start-maintenance"
+        actor: DispatchManager
+        preconditions:
+          - "equipment.status == MAINTENANCE_DUE"
+        side_effects:
+          - "set Equipment.status = UNDER_MAINTENANCE"
+      - from: UNDER_MAINTENANCE
+        to: IDLE
+        trigger: "POST /equipment/{id}/complete-maintenance"
+        actor: DispatchManager
+        preconditions:
+          - "equipment.status == UNDER_MAINTENANCE"
+        side_effects:
+          - "set Equipment.runtime_at_last_service_hours = cumulative_runtime_hours"
+          - "set Equipment.dispatch_count_since_service = 0"
+          - "recompute Equipment.wear_score (now reset to baseline) via calculation equipment_wear_score"
+          - "set Equipment.status = IDLE"
+        note: "maintenance reset is the decay/reset event for wear scoring"
+      - from: IN_SERVICE
+        to: IDLE
+        trigger: "system: visit completion with post-completion wear_score < 100"
+        actor: system
+        preconditions:
+          - "equipment.status == IN_SERVICE"
+        side_effects:
+          - "set Equipment.status = IDLE"
+      - from: IN_SERVICE
+        to: MAINTENANCE_DUE
+        trigger: "system: visit completion with post-completion wear_score >= 100"
+        actor: system
+        preconditions:
+          - "equipment.status == IN_SERVICE"
+        side_effects:
+          - "set Equipment.status = MAINTENANCE_DUE"
+
+  - entity: ServiceRoute
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: DISPATCHED
+        trigger: "POST /weather-readings/{id}/process"
+        actor: DispatchManager
+        preconditions:
+          - "route.status == OPEN"
+          - "an unprocessed WeatherReading with region_zip == route.region_zip and snow_depth_in > 2.0 exists"
+        side_effects:
+          - "compute ServiceRoute.last_dispatch_load_minutes via calculation route_dispatch_load over active RouteStops"
+          - "for each active RouteStop on the route whose property is NOT snow_opt_out: create a SNOW ServiceVisit and transition it SCHEDULED->DISPATCHED"
+          - "set WeatherReading.processed = true"
+          - "set ServiceRoute.status = DISPATCHED"
+        note: "weather-trigger fan-out; per-stop visit creation"
+      - from: DISPATCHED
+        to: OPEN
+        trigger: "POST /routes/{id}/reopen"
+        actor: DispatchManager
+        preconditions:
+          - "route.status == DISPATCHED"
+          - "no ServiceVisit on this route is in DISPATCHED state"
+        side_effects:
+          - "set ServiceRoute.status = OPEN"
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /routes/{id}/close"
+        actor: DispatchManager
+        preconditions:
+          - "route.status == OPEN"
+        side_effects:
+          - "set ServiceRoute.status = CLOSED"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: equipment-rotate-stale-version
+    parent_entity: Equipment
+    write_endpoint: "POST /equipment/{id}/rotate"
+    occ_field: "expected_equipment_version"
+    description: |
+      Rotating an Equipment onto a different route when its version has advanced
+      since the client last observed it is rejected on the stale-version check.
+      This captures the case where a prior rotation (or a visit-completion wear
+      recompute) has already mutated the Equipment row, so the current client's
+      view of which route the asset sits on is stale and its rotation would
+      overwrite the newer assignment.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: final_season_invoice
+    trigger: "ServiceContract ACTIVE->CLOSED (POST /contracts/{id}/close-season)"
+    algorithm: chronological
+    formula: |
+      # Chronological replay of COMPLETED ServiceVisits for this contract,
+      # ordered by ServiceVisit.created_at ASC (tie-break: created_at then
+      # id is NEVER used for ordering — created_at uniqueness assumed by clock).
+      running = contract.contract_price_cents
+      for v in completed_visits_ordered_by_created_at_asc:
+          running += v.surcharge_cents           # already finalized per-visit
+      running -= sum(s.credit_cents for s in approved_skip_requests_for_contract)
+      subtotal_cents = running
+      tax_cents = round_half_up(subtotal_cents * TAX_PCT)     # sum-then-round
+      wallet_applied = min(customer.wallet_credit_cents, subtotal_cents + tax_cents)
+      total_due_cents = max(0, subtotal_cents + tax_cents - wallet_applied - contract.prepaid_deposit_cents)
+    input_set: "ServiceVisit rows for this contract with status == COMPLETED (SKIPPED/CANCELLED/SCHEDULED/DISPATCHED excluded); SkipRequest rows for this contract with status == APPROVED"
+    constants:
+      TAX_PCT: 0.07
+    precision: "integer cents, round_half_up; tax rounded ONCE on the subtotal (sum-then-round), never per-line"
+    variants:
+      - name: provisional
+        when: "read live during the season via ServiceContract.accrued_balance_cents"
+        difference: "incrementally accumulated on each visit completion / skip approval without a final tax pass and without wallet/deposit application; can diverge from the finalized subtotal when visits were completed out of created_at order or a skip was approved after a later visit completed"
+      - name: finalized
+        when: "computed once at ACTIVE->CLOSED, written onto SeasonInvoice"
+        difference: "full chronological replay from scratch over COMPLETED visits + tax + wallet + deposit; authoritative figure"
+
+  - name: equipment_wear_score
+    trigger: "ServiceVisit DISPATCHED->COMPLETED (actual); Equipment rotate/maintenance recompute"
+    algorithm: weighted_scoring
+    formula: |
+      hours_since   = Equipment.cumulative_runtime_hours - Equipment.runtime_at_last_service_hours
+      dispatch_since = Equipment.dispatch_count_since_service
+      wear_score = round_half_up(
+          W_HOURS    * hours_since
+        + W_DISPATCH * dispatch_since
+        + W_AGE      * Equipment.age_months )
+    input_set: "single Equipment row; hours_since derived from its own cumulative vs last-service snapshot"
+    constants:
+      W_HOURS: 2.0
+      W_DISPATCH: 5.0
+      W_AGE: 0.5
+      MAINTENANCE_THRESHOLD: 100
+    precision: "integer score, round_half_up"
+    variants:
+      - name: actual
+        when: "recomputed on DISPATCHED->COMPLETED after cumulative_runtime_hours and dispatch_count_since_service have been incremented"
+        difference: "uses post-increment counters; this is the value compared against MAINTENANCE_THRESHOLD to flip status"
+      - name: estimated
+        when: "read via GET /equipment/{id}/wear-estimate before completing an in-flight DISPATCHED visit"
+        difference: "adds the in-flight DISPATCHED visit's projected runtime_hours and +1 dispatch BEFORE completion, forecasting the post-completion score; never written to Equipment.wear_score"
+
+  - name: route_dispatch_load
+    trigger: "ServiceRoute OPEN->DISPATCHED (weather process)"
+    algorithm: aggregation
+    formula: |
+      # Sum over ACTIVE RouteStops on the route whose property is NOT snow_opt_out.
+      # Per-stop minutes are nonlinear in snow depth (tiered multiplier), then
+      # an overtime tier applies to the route total.
+      def stop_minutes(stop, depth):
+          if depth <= 0:      mult = 1.0
+          elif depth < 4.0:   mult = 1.5
+          else:               mult = 2.0
+          return round_half_up(stop.base_service_minutes * mult) + stop.travel_minutes
+      raw = sum(stop_minutes(s, reading.snow_depth_in)
+                for s in active_stops_not_opted_out
+                ordered by s.sequence ASC, tie-break s.created_at ASC)
+      if raw > route.daily_capacity_minutes:
+          # overtime tier: minutes beyond capacity count 1.5x
+          load = route.daily_capacity_minutes + round_half_up((raw - route.daily_capacity_minutes) * OVERTIME_MULT)
+      else:
+          load = raw
+      last_dispatch_load_minutes = load
+    input_set: "RouteStop rows with route_id == route.id, active == true, and property.snow_opt_out == false"
+    constants:
+      OVERTIME_MULT: 1.5
+      DEPTH_TIER_LOW: 4.0
+    precision: "integer minutes, round_half_up applied per-stop before summing, then once on the overtime overage"
+
+  - name: visit_surcharge
+    trigger: "ServiceVisit DISPATCHED->COMPLETED (POST /visits/{id}/complete)"
+    algorithm: threshold
+    formula: |
+      surcharge = 0
+      if visit.service_type == 'SNOW':
+          over_inches = visit.snow_depth_in - SNOW_BASELINE_IN     # 2.0 baseline
+          if over_inches > 0:
+              surcharge += floor(over_inches) * SNOW_RATE_CENTS     # whole inches over baseline
+      if visit.service_type == 'FERTILIZATION' or (visit.service_type == 'LAWN' and property_preference.fertilization_enabled):
+          surcharge += FERT_ADDON_CENTS
+    input_set: "single ServiceVisit row plus the CustomerPreference for its property (fertilization_enabled flag)"
+    constants:
+      SNOW_BASELINE_IN: 2.0
+      SNOW_RATE_CENTS: 500
+      FERT_ADDON_CENTS: 2500
+    precision: "integer cents; snow surcharge uses floor of whole inches over the 2.0 baseline (a 2.0 reading yields 0)"
+
+  - name: skip_credit
+    trigger: "SkipRequest PENDING->APPROVED (POST /skip-requests/{id}/approve)"
+    algorithm: threshold
+    formula: |
+      visit = referenced ServiceVisit
+      if visit.service_type == 'SNOW':
+          credit = SNOW_SKIP_CREDIT_CENTS                  # flat
+      else:  # LAWN or FERTILIZATION
+          # prorated daily credit: monthly equivalent of the seasonal base,
+          # divided across DAYS_IN_BILLING_MONTH, rounded PER DAY then multiplied.
+          monthly = contract.contract_price_cents / contract.term_months
+          daily = round_half_up(monthly / DAYS_IN_BILLING_MONTH)   # round per-day FIRST
+          credit = daily * LAWN_SKIP_DAYS                          # one skip == LAWN_SKIP_DAYS days
+    input_set: "single SkipRequest + its ServiceVisit + the owning ServiceContract (for proration base)"
+    constants:
+      SNOW_SKIP_CREDIT_CENTS: 1500
+      DAYS_IN_BILLING_MONTH: 30
+      LAWN_SKIP_DAYS: 3
+    precision: "integer cents; LAWN proration rounds the daily rate to the cent BEFORE multiplying by LAWN_SKIP_DAYS (round-per-day, NOT sum-then-round)"
+
+# ===========================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: auth
+    check: "for entity_backed Customer operations on owned resources, X-User-ID equals the resource's customer_id (directly or via property/contract chain)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Customer-owned contract/property/preference/skip operations"
+  - priority: 4
+    category: existence
+    check: "every path/body-referenced resource exists, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with an id in the path or an FK in the body"
+  - priority: 5
+    category: business_constraint
+    check: "request body required fields present and well-typed; enum values legal; numeric range constraints (e.g. grass_height_mm 20..120) honored"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all write endpoints"
+  - priority: 6
+    category: business_constraint
+    check: "Customer.email unique on create; Equipment.asset_tag unique on create"
+    error_id: ERR_DUPLICATE_RESOURCE
+    http_status: 409
+    applies_to: "POST /customers, POST /equipment"
+  - priority: 7
+    category: state
+    check: "target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 8
+    category: business_referential
+    check: "RouteStop.property_id must reference a ServiceProperty owned by the same customer as the route's contracts; a ServiceVisit's contract and route_stop must reference the same property"
+    error_id: ERR_PROPERTY_MISMATCH
+    http_status: 409
+    applies_to: "POST /route-stops, POST /visits"
+  - priority: 9
+    category: state
+    check: "dispatch requires the RouteStop's owning ServiceContract.status == ACTIVE (cross-entity)"
+    error_id: ERR_CONTRACT_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /visits/{id}/dispatch, POST /weather-readings/{id}/process"
+  - priority: 10
+    category: business_safety
+    check: "dispatch must select an Equipment on the route whose status IN {IDLE, IN_SERVICE}; if none available -> reject (a MAINTENANCE_DUE/UNDER_MAINTENANCE-only pool blocks dispatch)"
+    error_id: ERR_NO_EQUIPMENT_AVAILABLE
+    http_status: 409
+    applies_to: "POST /visits/{id}/dispatch, POST /weather-readings/{id}/process"
+  - priority: 11
+    category: business_safety
+    check: "completing a visit requires its selected Equipment.status == IN_SERVICE (not MAINTENANCE_DUE pulled mid-flight)"
+    error_id: ERR_EQUIPMENT_NOT_READY
+    http_status: 409
+    applies_to: "POST /visits/{id}/complete"
+  - priority: 12
+    category: business_temporal
+    check: "a WeatherReading may be processed for dispatch at most once (processed == false)"
+    error_id: ERR_READING_ALREADY_PROCESSED
+    http_status: 409
+    applies_to: "POST /weather-readings/{id}/process"
+  - priority: 13
+    category: business_constraint
+    check: "snow auto-dispatch requires snow_depth_in > 2.0; a reading at or below 2.0 produces no dispatch"
+    error_id: ERR_SNOW_THRESHOLD_NOT_MET
+    http_status: 409
+    applies_to: "POST /weather-readings/{id}/process"
+  - priority: 14
+    category: business_constraint
+    check: "close-season requires no ServiceVisit on the contract is in DISPATCHED state"
+    error_id: ERR_OPEN_DISPATCH_EXISTS
+    http_status: 409
+    applies_to: "POST /contracts/{id}/close-season"
+  - priority: 15
+    category: business_fiscal
+    check: "OCC stale version on equipment rotation: expected_equipment_version must equal current Equipment.version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /equipment/{id}/rotate"
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # ---- Customer ----
+  - method: POST
+    path: "/customers"
+    description: "Register a customer"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [email, full_name, service_zip]
+    output: Customer
+    side_effects: ["create Customer with wallet_credit_cents = 0"]
+  - method: GET
+    path: "/customers/{id}"
+    description: "Fetch a customer"
+    roles: [PlatformAdmin, Customer, DispatchManager]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  # ---- ServiceProperty ----
+  - method: POST
+    path: "/properties"
+    description: "Create a property for a customer"
+    roles: [PlatformAdmin, Customer]
+    code: 201
+    input: [customer_id, address, lawn_area_sqft, zip]
+    output: ServiceProperty
+    side_effects: []
+  - method: GET
+    path: "/properties/{id}"
+    description: "Fetch a property"
+    roles: [PlatformAdmin, Customer, DispatchManager]
+    code: 200
+    input: []
+    output: ServiceProperty
+    side_effects: []
+  - method: GET
+    path: "/properties"
+    description: "List properties, filterable by owner"
+    roles: [PlatformAdmin, Customer, DispatchManager]
+    code: 200
+    input: ["customer_id?", "limit?", "offset?"]
+    output: ServiceProperty[]
+    side_effects: []
+
+  # ---- CustomerPreference ----
+  - method: POST
+    path: "/preferences"
+    description: "Set preferences for a property"
+    roles: [PlatformAdmin, Customer]
+    code: 201
+    input: [property_id, grass_height_mm, "fertilization_enabled?", "snow_opt_out?"]
+    output: CustomerPreference
+    side_effects: []
+  - method: GET
+    path: "/preferences/{id}"
+    description: "Fetch a preference record"
+    roles: [PlatformAdmin, Customer, DispatchManager]
+    code: 200
+    input: []
+    output: CustomerPreference
+    side_effects: []
+  - method: GET
+    path: "/preferences"
+    description: "List preferences, filterable by property"
+    roles: [PlatformAdmin, Customer, DispatchManager]
+    code: 200
+    input: ["property_id?", "limit?", "offset?"]
+    output: CustomerPreference[]
+    side_effects: []
+
+  # ---- ServiceContract ----
+  - method: POST
+    path: "/contracts"
+    description: "Create a seasonal contract (DRAFT)"
+    roles: [PlatformAdmin, Customer]
+    code: 201
+    input: [customer_id, property_id, season, contract_price_cents, term_months, "prepaid_deposit_cents?"]
+    output: ServiceContract
+    side_effects: ["create ServiceContract in DRAFT with accrued_balance_cents = 0"]
+  - method: GET
+    path: "/contracts/{id}"
+    description: "Fetch a contract"
+    roles: [PlatformAdmin, Customer, DispatchManager]
+    code: 200
+    input: []
+    output: ServiceContract
+    side_effects: []
+  - method: GET
+    path: "/contracts"
+    description: "List contracts, filterable by owner or property"
+    roles: [PlatformAdmin, Customer, DispatchManager]
+    code: 200
+    input: ["customer_id?", "property_id?", "limit?", "offset?"]
+    output: ServiceContract[]
+    side_effects: []
+  - method: POST
+    path: "/contracts/{id}/activate"
+    description: "Activate a DRAFT or reactivate a SUSPENDED contract"
+    roles: [Customer, PlatformAdmin]
+    code: 200
+    input: []
+    output: ServiceContract
+    side_effects: ["status -> ACTIVE", "DRAFT->ACTIVE sets accrued_balance_cents = contract_price_cents", "SUSPENDED->ACTIVE re-activates RouteStops for the property", "increments ServiceContract.version by 1"]
+  - method: POST
+    path: "/contracts/{id}/suspend"
+    description: "Suspend an ACTIVE contract"
+    roles: [DispatchManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: ServiceContract
+    side_effects: ["status -> SUSPENDED", "CASCADE: RouteStops for the property flip active=false", "increments ServiceContract.version by 1"]
+  - method: POST
+    path: "/contracts/{id}/close-season"
+    description: "Close out the season; finalizes billing into a SeasonInvoice"
+    roles: [DispatchManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: ServiceContract
+    side_effects: ["status -> CLOSED", "CASCADE: create SeasonInvoice (final_season_invoice)", "CASCADE: SeasonInvoice debits Customer.wallet_credit_cents", "increments ServiceContract.version by 1"]
+  - method: GET
+    path: "/contracts/{id}/invoices"
+    description: "List SeasonInvoices for a contract (reverse-reachability for SeasonInvoice.contract_id)"
+    roles: [PlatformAdmin, Customer, DispatchManager]
+    code: 200
+    input: []
+    output: SeasonInvoice[]
+    side_effects: []
+  - method: GET
+    path: "/contracts/{id}/visits"
+    description: "List ServiceVisits for a contract (reverse-reachability for ServiceVisit.contract_id)"
+    roles: [PlatformAdmin, Customer, DispatchManager, CrewLead]
+    code: 200
+    input: []
+    output: ServiceVisit[]
+    side_effects: []
+
+  # ---- ServiceRoute ----
+  - method: POST
+    path: "/routes"
+    description: "Create a service route"
+    roles: [PlatformAdmin, DispatchManager]
+    code: 201
+    input: [region_zip, daily_capacity_minutes]
+    output: ServiceRoute
+    side_effects: []
+  - method: GET
+    path: "/routes/{id}"
+    description: "Fetch a route"
+    roles: [PlatformAdmin, DispatchManager, CrewLead]
+    code: 200
+    input: []
+    output: ServiceRoute
+    side_effects: []
+  - method: POST
+    path: "/routes/{id}/reopen"
+    description: "Reopen a DISPATCHED route"
+    roles: [DispatchManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: ServiceRoute
+    side_effects: ["status -> OPEN"]
+  - method: POST
+    path: "/routes/{id}/close"
+    description: "Close an OPEN route"
+    roles: [DispatchManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: ServiceRoute
+    side_effects: ["status -> CLOSED"]
+  - method: GET
+    path: "/routes/{id}/stops"
+    description: "List RouteStops on a route (reverse-reachability for RouteStop.route_id)"
+    roles: [PlatformAdmin, DispatchManager, CrewLead]
+    code: 200
+    input: []
+    output: RouteStop[]
+    side_effects: []
+  - method: GET
+    path: "/routes/{id}/crews"
+    description: "List Crews homed on a route (reverse-reachability for Crew.home_route_id)"
+    roles: [PlatformAdmin, DispatchManager, CrewLead]
+    code: 200
+    input: []
+    output: Crew[]
+    side_effects: []
+  - method: GET
+    path: "/routes/{id}/equipment"
+    description: "List Equipment assigned to a route (reverse-reachability for Equipment.assigned_route_id)"
+    roles: [PlatformAdmin, DispatchManager, CrewLead]
+    code: 200
+    input: []
+    output: Equipment[]
+    side_effects: []
+
+  # ---- RouteStop ----
+  - method: POST
+    path: "/route-stops"
+    description: "Add a stop (property) to a route"
+    roles: [PlatformAdmin, DispatchManager]
+    code: 201
+    input: [route_id, property_id, sequence, base_service_minutes, "travel_minutes?"]
+    output: RouteStop
+    side_effects: ["create RouteStop with active = true"]
+  - method: GET
+    path: "/route-stops/{id}"
+    description: "Fetch a route stop"
+    roles: [PlatformAdmin, DispatchManager, CrewLead]
+    code: 200
+    input: []
+    output: RouteStop
+    side_effects: []
+  - method: GET
+    path: "/route-stops"
+    description: "List route stops, filterable by property"
+    roles: [PlatformAdmin, DispatchManager, CrewLead]
+    code: 200
+    input: ["property_id?", "limit?", "offset?"]
+    output: RouteStop[]
+    side_effects: []
+
+  # ---- Crew ----
+  - method: POST
+    path: "/crews"
+    description: "Create a crew homed on a route"
+    roles: [PlatformAdmin, DispatchManager]
+    code: 201
+    input: [name, home_route_id]
+    output: Crew
+    side_effects: []
+  - method: GET
+    path: "/crews/{id}"
+    description: "Fetch a crew"
+    roles: [PlatformAdmin, DispatchManager, CrewLead]
+    code: 200
+    input: []
+    output: Crew
+    side_effects: []
+
+  # ---- Equipment ----
+  - method: POST
+    path: "/equipment"
+    description: "Register an equipment asset"
+    roles: [PlatformAdmin, DispatchManager]
+    code: 201
+    input: [asset_tag, equipment_type, age_months, "assigned_route_id?"]
+    output: Equipment
+    side_effects: ["create Equipment in IDLE with wear_score = 0"]
+  - method: GET
+    path: "/equipment/{id}"
+    description: "Fetch an equipment asset"
+    roles: [PlatformAdmin, DispatchManager, CrewLead]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: []
+  - method: GET
+    path: "/equipment"
+    description: "List equipment, filterable by assigned route"
+    roles: [PlatformAdmin, DispatchManager, CrewLead]
+    code: 200
+    input: ["assigned_route_id?", "limit?", "offset?"]
+    output: Equipment[]
+    side_effects: []
+  - method: POST
+    path: "/equipment/{id}/rotate"
+    description: "Rotate equipment onto a different route (OCC-guarded)"
+    roles: [DispatchManager, PlatformAdmin]
+    code: 200
+    input: [assigned_route_id, expected_equipment_version]
+    output: Equipment
+    side_effects: ["set assigned_route_id", "recompute wear_score", "increments Equipment.version by 1"]
+  - method: POST
+    path: "/equipment/{id}/start-maintenance"
+    description: "Begin maintenance on a MAINTENANCE_DUE asset"
+    roles: [DispatchManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: ["status -> UNDER_MAINTENANCE"]
+  - method: POST
+    path: "/equipment/{id}/complete-maintenance"
+    description: "Finish maintenance; reset wear baseline"
+    roles: [DispatchManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: ["status -> IDLE", "runtime_at_last_service_hours = cumulative_runtime_hours", "dispatch_count_since_service = 0", "recompute wear_score"]
+  - method: GET
+    path: "/equipment/{id}/wear-estimate"
+    description: "Computed read: estimated post-completion wear for the equipment's in-flight DISPATCHED visit"
+    roles: [PlatformAdmin, DispatchManager, CrewLead]
+    code: 200
+    input: []
+    output: "{ equipment_id: string, estimated_wear_score: integer, actual_wear_score: integer }"
+    side_effects: []
+
+  # ---- WeatherReading ----
+  - method: POST
+    path: "/weather-readings"
+    description: "Record a weather observation"
+    roles: [PlatformAdmin, DispatchManager]
+    code: 201
+    input: [region_zip, snow_depth_in, observed_at]
+    output: WeatherReading
+    side_effects: ["create WeatherReading with processed = false"]
+  - method: GET
+    path: "/weather-readings/{id}"
+    description: "Fetch a weather reading"
+    roles: [PlatformAdmin, DispatchManager]
+    code: 200
+    input: []
+    output: WeatherReading
+    side_effects: []
+  - method: POST
+    path: "/weather-readings/{id}/process"
+    description: "Evaluate a reading for snow auto-dispatch across matching routes"
+    roles: [DispatchManager, PlatformAdmin]
+    code: 200
+    input: [route_id]
+    output: ServiceRoute
+    side_effects: ["if snow_depth_in > 2.0 and route OPEN: compute route_dispatch_load, fan-out SNOW visits per non-opted-out active stop, mark reading processed, route -> DISPATCHED"]
+
+  # ---- ServiceVisit ----
+  - method: POST
+    path: "/visits"
+    description: "Schedule a (LAWN/FERTILIZATION) visit against a contract+stop"
+    roles: [PlatformAdmin, DispatchManager]
+    code: 201
+    input: [contract_id, route_stop_id, service_type, "snow_depth_in?", "runtime_hours?"]
+    output: ServiceVisit
+    side_effects: ["create ServiceVisit in SCHEDULED"]
+  - method: GET
+    path: "/visits/{id}"
+    description: "Fetch a visit"
+    roles: [PlatformAdmin, DispatchManager, CrewLead, Customer]
+    code: 200
+    input: []
+    output: ServiceVisit
+    side_effects: []
+  - method: GET
+    path: "/visits"
+    description: "List visits, filterable by route stop or equipment (reverse-reachability for ServiceVisit.route_stop_id and ServiceVisit.equipment_id)"
+    roles: [PlatformAdmin, DispatchManager, CrewLead]
+    code: 200
+    input: ["route_stop_id?", "equipment_id?", "contract_id?", "limit?", "offset?"]
+    output: ServiceVisit[]
+    side_effects: []
+  - method: POST
+    path: "/visits/{id}/dispatch"
+    description: "Manually dispatch a SCHEDULED visit (selects equipment by lowest wear_score)"
+    roles: [DispatchManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: ServiceVisit
+    side_effects: ["status -> DISPATCHED", "select & assign Equipment (lowest wear_score, tie-break created_at ASC)", "Equipment -> IN_SERVICE", "Crew -> ON_DISPATCH"]
+  - method: POST
+    path: "/visits/{id}/complete"
+    description: "Complete a DISPATCHED visit"
+    roles: [CrewLead, PlatformAdmin]
+    code: 200
+    input: ["runtime_hours?"]
+    output: ServiceVisit
+    side_effects: ["compute surcharge_cents (visit_surcharge)", "status -> COMPLETED", "Equipment cumulative_runtime_hours/dispatch_count incremented, wear recompute, status flip", "ServiceContract.accrued_balance_cents += surcharge_cents"]
+  - method: POST
+    path: "/visits/{id}/cancel"
+    description: "Cancel a SCHEDULED visit"
+    roles: [DispatchManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: ServiceVisit
+    side_effects: ["status -> CANCELLED"]
+
+  # ---- SkipRequest ----
+  - method: POST
+    path: "/skip-requests"
+    description: "Customer requests to skip a scheduled visit"
+    roles: [Customer, PlatformAdmin]
+    code: 201
+    input: [visit_id, reason]
+    output: SkipRequest
+    side_effects: ["create SkipRequest in PENDING"]
+  - method: GET
+    path: "/skip-requests/{id}"
+    description: "Fetch a skip request"
+    roles: [PlatformAdmin, DispatchManager, Customer]
+    code: 200
+    input: []
+    output: SkipRequest
+    side_effects: []
+  - method: GET
+    path: "/skip-requests"
+    description: "List skip requests, filterable by visit"
+    roles: [PlatformAdmin, DispatchManager, Customer]
+    code: 200
+    input: ["visit_id?", "limit?", "offset?"]
+    output: SkipRequest[]
+    side_effects: []
+  - method: POST
+    path: "/skip-requests/{id}/approve"
+    description: "Approve a PENDING skip; grants credit and skips the visit"
+    roles: [DispatchManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: SkipRequest
+    side_effects: ["SkipRequest -> APPROVED", "compute credit_cents (skip_credit)", "ServiceVisit -> SKIPPED", "Customer.wallet_credit_cents += credit_cents", "ServiceContract.accrued_balance_cents -= credit_cents"]
+  - method: POST
+    path: "/skip-requests/{id}/reject"
+    description: "Reject a PENDING skip"
+    roles: [DispatchManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: SkipRequest
+    side_effects: ["SkipRequest -> REJECTED"]
+
+  # ---- SeasonInvoice ----
+  - method: GET
+    path: "/invoices/{id}"
+    description: "Fetch a season invoice"
+    roles: [PlatformAdmin, Customer, DispatchManager]
+    code: 200
+    input: []
+    output: SeasonInvoice
+    side_effects: []
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/invalid X-User-Role or X-User-ID headers, or unknown role"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "acting role not permitted for this operation"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Customer acting on a resource they do not own"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "referenced resource does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "missing/malformed field, illegal enum, or numeric range violation (e.g. grass_height_mm out of 20..120)"
+  - id: ERR_DUPLICATE_RESOURCE
+    http: 409
+    condition: "Customer.email or Equipment.asset_tag already exists"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "transition not defined from the resource's current state"
+  - id: ERR_PROPERTY_MISMATCH
+    http: 409
+    condition: "route stop / visit references a property inconsistent with the route or contract"
+  - id: ERR_CONTRACT_NOT_ACTIVE
+    http: 409
+    condition: "dispatch attempted while the owning contract is not ACTIVE"
+  - id: ERR_NO_EQUIPMENT_AVAILABLE
+    http: 409
+    condition: "no Equipment on the route with status IN {IDLE, IN_SERVICE} to dispatch"
+  - id: ERR_EQUIPMENT_NOT_READY
+    http: 409
+    condition: "completing a visit whose selected equipment is no longer IN_SERVICE"
+  - id: ERR_READING_ALREADY_PROCESSED
+    http: 409
+    condition: "weather reading already processed for dispatch"
+  - id: ERR_SNOW_THRESHOLD_NOT_MET
+    http: 409
+    condition: "weather process invoked but snow_depth_in <= 2.0"
+  - id: ERR_OPEN_DISPATCH_EXISTS
+    http: 409
+    condition: "close-season attempted while a visit on the contract is DISPATCHED"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_equipment_version does not match current Equipment.version on rotate"
+  - id: ERR_VALIDATION_RANGE
+    http: 422
+    condition: "snow_depth_in or runtime_hours negative, or other numeric field below its declared floor"
+  - id: ERR_NO_SKIPPABLE_VISIT
+    http: 409
+    condition: "skip request created against a visit not in SCHEDULED state"
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Operational superuser; can perform any operation for setup and override"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /customers"
+    shared_operations:
+      - "all property/preference/contract/route/stop/crew/equipment/weather/visit/skip operations"
+  - name: Customer
+    description: "End customer; owns their properties, preferences, contracts, and skip requests"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /skip-requests"
+      - "POST /contracts/{id}/activate"
+    shared_operations:
+      - "POST /properties"
+      - "POST /preferences"
+      - "POST /contracts"
+      - "GET own contracts/properties/preferences/visits/invoices/skip-requests"
+  - name: DispatchManager
+    description: "Operations dispatcher; owns routes, weather processing, dispatch, skip approval, suspension and season close"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /weather-readings/{id}/process"
+      - "POST /contracts/{id}/suspend"
+      - "POST /contracts/{id}/close-season"
+      - "POST /skip-requests/{id}/approve"
+      - "POST /skip-requests/{id}/reject"
+      - "POST /visits/{id}/dispatch"
+      - "POST /visits/{id}/cancel"
+      - "POST /equipment/{id}/rotate"
+      - "POST /routes/{id}/reopen"
+      - "POST /routes/{id}/close"
+    shared_operations:
+      - "POST /routes, POST /route-stops, POST /crews, POST /equipment, POST /weather-readings, POST /visits"
+      - "GET read endpoints"
+  - name: CrewLead
+    description: "Field crew lead; completes dispatched visits"
+    identity: "entity_backed:Crew"
+    exclusive_operations:
+      - "POST /visits/{id}/complete"
+    shared_operations:
+      - "GET routes/stops/crews/equipment/visits"

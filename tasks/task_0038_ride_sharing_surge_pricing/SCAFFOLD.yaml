@@ -1,0 +1,960 @@
+# =============================================================================
+# Ride-Sharing Dynamic Surge Pricing — benchmark seed tables (v1)
+# §1.0–§1.7 only. §1.8 lives in SCAFFOLD_DIFFICULTY_DESIGN.yaml,
+# §1.9 lives in SCAFFOLD_CORNER_DESIGN.yaml.
+# =============================================================================
+
+scenario: "Ride-Sharing Dynamic Surge Pricing: geo-grid, supply-demand ratio, multiplier cap, driver Quest bonus, rush hour, airport queue, Heat Map, dispute refund"
+
+domain_name: ride-sharing-surge-pricing
+api_prefix: /
+
+# -----------------------------------------------------------------------------
+# Complexity profile
+# -----------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: Pricing engine
+  secondary_archetype: Quota / allocation
+  complexity_layers:
+    - Rate / threshold triggers          # surge breakpoints on supply/demand ratio
+    - Cascading side effects             # trip lifecycle bumps zone counters → re-snapshots surge
+    - Optimistic concurrency             # OCC on Zone.version when publishing a surge snapshot
+    - Derived field reconciliation       # zone supply/demand counters, Quest progress
+
+  entity_topology: flat
+  # Zones are top-level; Drivers, Riders, Trips, AirportQueueEntry, Quest, Dispute
+  # reference Zone / each other by FK with no URL nesting beyond /zones/{id}/...
+  state_machine_shape: branching
+  # Trip forks REQUESTED -> {MATCHED, EXPIRED}; MATCHED -> {ENROUTE..COMPLETED, CANCELLED}
+  # with divergent side-effect sets per branch. AirportQueue + Dispute add revert/branch.
+
+  relationship_patterns:
+    - one_to_many        # Zone has many Trips, Drivers (current_zone), AirportQueueEntry
+    - cross_aggregate    # Trip references Rider + Driver + pickup Zone across boundaries
+
+  role_model: peer_roles
+  # Rider owns their Trips/Disputes; Driver owns their Quest/queue entry; Dispatcher
+  # (opaque operator) publishes surge snapshots, runs the dispatch tick, resolves disputes.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Zone
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: name, type: string, source: input, description: "Geo-grid cell label, e.g. 'Downtown-A1'" }
+      - { name: grid_code, type: string, source: input, description: "Unique geo-grid cell code, e.g. 'A1'", constraints: "unique across all Zones; uppercase letter + digit" }
+      - { name: is_airport, type: boolean, source: input, default: false, description: "True for airport zones, which use FIFO queue dispatch instead of nearest-driver" }
+      - { name: base_fare_cents, type: integer, source: input, description: "Base fare in cents charged before any surge multiplier", constraints: ">= 100" }
+      - { name: open_demand_count, type: integer, source: computed, description: "Count of Trips in this pickup Zone with status REQUESTED (open ride requests). Starts at 0." }
+      - { name: available_supply_count, type: integer, source: computed, description: "Count of Drivers whose current_zone_id == this Zone.id and status == AVAILABLE. Starts at 0." }
+      - { name: current_multiplier, type: number, source: computed, description: "Surge multiplier from the latest published SurgeSnapshot for this Zone; 1.00 until first snapshot. 2 decimals.", default: 1.00 }
+      - { name: heat_level, type: enum, source: computed, description: "COOL | WARM | HOT | BLAZING — Heat Map bucket derived from current_multiplier", default: COOL }
+
+  - name: Driver
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Driver name" }
+      - { name: home_zone_id, type: string, source: input, description: "FK -> Zone.id; the Zone the driver registered in" }
+      - { name: current_zone_id, type: string, source: system, description: "FK -> Zone.id; the Zone the driver is currently positioned in; initialized to home_zone_id" }
+      - { name: status, type: enum, source: system, description: "OFFLINE | AVAILABLE | ON_TRIP — AVAILABLE drivers count toward zone supply", default: OFFLINE }
+      - { name: active_trip_id, type: string, source: system, required: false, description: "FK -> Trip.id; the Trip the driver is currently servicing, null when not ON_TRIP" }
+
+  - name: Rider
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Rider name" }
+      - { name: wallet_balance_cents, type: integer, source: input, default: 0, description: "Prepaid wallet balance in cents", constraints: ">= 0" }
+      - { name: home_zone_id, type: string, source: input, description: "FK -> Zone.id; rider's default pickup Zone" }
+
+  - name: SurgeSnapshot
+    parent: null
+    common_fields: false   # immutable event log row: only id + created_at
+    fields:
+      - { name: zone_id, type: string, source: input, description: "FK -> Zone.id; the Zone this surge snapshot prices" }
+      - { name: observed_demand, type: integer, source: input, description: "open_demand_count captured by the dispatcher at publish time", constraints: ">= 0" }
+      - { name: observed_supply, type: integer, source: input, description: "available_supply_count captured by the dispatcher at publish time", constraints: ">= 0" }
+      - { name: is_rush_hour, type: boolean, source: input, default: false, description: "True if the dispatcher flags this window as rush hour (adds a rush surcharge step)" }
+      - { name: effective_from, type: datetime, source: input, description: "ISO8601 UTC start of the pricing window this snapshot governs (inclusive)" }
+      - { name: effective_to, type: datetime, source: input, description: "ISO8601 UTC end of the pricing window (exclusive). Must be > effective_from." }
+      - { name: ratio, type: number, source: computed, description: "Demand-to-supply ratio used to derive the multiplier; see calc surge_multiplier. 2 decimals." }
+      - { name: multiplier, type: number, source: computed, description: "Final surge multiplier after rush-hour step and cap; written to Zone.current_multiplier on publish. 2 decimals." }
+      - { name: capped, type: boolean, source: computed, description: "True if the raw multiplier was clamped down by the MULTIPLIER_CAP" }
+
+  - name: Trip
+    parent: null
+    common_fields: true
+    fields:
+      - { name: rider_id, type: string, source: input, description: "FK -> Rider.id; the rider who requested the trip" }
+      - { name: pickup_zone_id, type: string, source: input, description: "FK -> Zone.id; pickup geo-grid cell, drives demand counters and quoted surge" }
+      - { name: dropoff_zone_id, type: string, source: input, description: "FK -> Zone.id; destination geo-grid cell" }
+      - { name: driver_id, type: string, source: system, required: false, description: "FK -> Driver.id; assigned on MATCH, null while REQUESTED" }
+      - { name: status, type: enum, source: system, description: "REQUESTED | MATCHED | ENROUTE | COMPLETED | CANCELLED | EXPIRED", default: REQUESTED }
+      - { name: quoted_multiplier, type: number, source: computed, description: "Zone.current_multiplier frozen at request time; the surge the rider is quoted. 2 decimals." }
+      - { name: quoted_base_fare_cents, type: integer, source: computed, description: "pickup Zone.base_fare_cents frozen at request time" }
+      - { name: final_fare_cents, type: integer, source: computed, description: "Fare charged on COMPLETED; see calc trip_final_fare. 0 until COMPLETED." }
+      - { name: driver_payout_cents, type: integer, source: computed, description: "Driver earnings for this trip on COMPLETED; see calc driver_payout. 0 until COMPLETED." }
+      - { name: refunded_cents, type: integer, source: computed, description: "Amount refunded to rider wallet if a Dispute is upheld; 0 otherwise.", default: 0 }
+
+  - name: AirportQueueEntry
+    parent: null
+    common_fields: true
+    fields:
+      - { name: zone_id, type: string, source: input, description: "FK -> Zone.id; must be an airport Zone (is_airport == true)" }
+      - { name: driver_id, type: string, source: input, description: "FK -> Driver.id; the queued driver" }
+      - { name: position, type: integer, source: computed, description: "1-based FIFO position among WAITING entries in the same airport Zone, ordered by joined_at ASC then created_at ASC" }
+      - { name: joined_at, type: datetime, source: system, description: "Timestamp the driver joined the queue; FIFO sort key" }
+      - { name: status, type: enum, source: system, description: "WAITING | DISPATCHED | WITHDRAWN", default: WAITING }
+
+  - name: Quest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: driver_id, type: string, source: input, description: "FK -> Driver.id; the driver this Quest belongs to" }
+      - { name: target_trips, type: integer, source: input, description: "Number of COMPLETED trips required to earn the bonus", constraints: ">= 1" }
+      - { name: bonus_cents, type: integer, source: input, description: "Flat bonus paid out when target_trips is reached", constraints: ">= 0" }
+      - { name: window_start, type: datetime, source: input, description: "ISO8601 UTC start of the Quest's eligibility window (inclusive)" }
+      - { name: window_end, type: datetime, source: input, description: "ISO8601 UTC end of the eligibility window (inclusive). Must be >= window_start." }
+      - { name: completed_trips, type: integer, source: computed, description: "Count of this driver's COMPLETED trips credited to the Quest since creation. Starts at 0.", default: 0 }
+      - { name: status, type: enum, source: system, description: "ACTIVE | EARNED | EXPIRED", default: ACTIVE }
+      - { name: paid_out_cents, type: integer, source: computed, description: "bonus_cents once EARNED, else 0", default: 0 }
+
+  - name: Dispute
+    parent: null
+    common_fields: true
+    fields:
+      - { name: trip_id, type: string, source: input, description: "FK -> Trip.id; the completed trip being disputed" }
+      - { name: rider_id, type: string, source: system, description: "FK -> Rider.id; copied from the disputed Trip.rider_id" }
+      - { name: reason, type: enum, source: input, description: "OVERCHARGED | DRIVER_NO_SHOW | ROUTE_ERROR" }
+      - { name: requested_refund_cents, type: integer, source: input, description: "Amount the rider claims should be refunded", constraints: ">= 1" }
+      - { name: status, type: enum, source: system, description: "OPEN | UPHELD | REJECTED", default: OPEN }
+      - { name: refund_cents, type: integer, source: computed, description: "Actual refund applied to rider wallet on UPHELD; see calc dispute_refund. 0 until UPHELD." }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Driver
+    initial_state: OFFLINE
+    terminal_states: []
+    transitions:
+      - from: OFFLINE
+        to: AVAILABLE
+        trigger: "POST /drivers/{id}/go-online"
+        actor: Driver
+        preconditions: ["driver has no active_trip_id"]
+        side_effects:
+          - "Driver.current_zone_id Zone.available_supply_count incremented by 1"
+      - from: AVAILABLE
+        to: OFFLINE
+        trigger: "POST /drivers/{id}/go-offline"
+        actor: Driver
+        preconditions: []
+        side_effects:
+          - "Driver.current_zone_id Zone.available_supply_count decremented by 1 (floor 0)"
+          - "any WAITING AirportQueueEntry for this driver -> WITHDRAWN; remaining WAITING entries in that airport Zone re-sequence position by joined_at ASC"
+      - from: AVAILABLE
+        to: ON_TRIP
+        trigger: "system (dispatch match) — see Trip REQUESTED->MATCHED"
+        actor: system
+        preconditions: ["Driver.status == AVAILABLE"]
+        side_effects:
+          - "Driver.active_trip_id set to matched Trip.id"
+          - "Driver.current_zone_id Zone.available_supply_count decremented by 1 (floor 0)"
+      - from: ON_TRIP
+        to: AVAILABLE
+        trigger: "system (trip COMPLETED) — see Trip ENROUTE->COMPLETED"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Driver.active_trip_id cleared"
+          - "Driver.current_zone_id set to the completed Trip.dropoff_zone_id"
+          - "new Driver.current_zone_id Zone.available_supply_count incremented by 1"
+
+  - entity: Trip
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, CANCELLED, EXPIRED]
+    transitions:
+      - from: REQUESTED
+        to: MATCHED
+        trigger: "POST /_dispatch/tick"
+        actor: Dispatcher
+        preconditions:
+          - "at least one candidate Driver exists for the pickup Zone (see selector in note)"
+        side_effects:
+          - "Trip.driver_id set to selected Driver.id"
+          - "selected Driver AVAILABLE->ON_TRIP (cascade: that transition decrements the driver's current_zone Zone.available_supply_count)"
+          - "pickup Zone.open_demand_count decremented by 1 (floor 0)"
+          - "for an airport pickup Zone, the dispatched driver's WAITING AirportQueueEntry -> DISPATCHED and remaining WAITING entries re-sequence position"
+        note: |
+          Candidate selection. Non-airport pickup Zone: candidate set = Drivers with
+          status == AVAILABLE AND current_zone_id == Trip.pickup_zone_id; rank by
+          created_at ASC (earliest-registered first); tie-break created_at ASC then,
+          only if still tied, the lexicographically smallest grid_code is irrelevant —
+          created_at is unique enough; empty candidate set -> Trip stays REQUESTED (no error,
+          tick skips it). Airport pickup Zone (is_airport == true): candidate set = Drivers
+          with a WAITING AirportQueueEntry in that Zone; rank strictly FIFO by
+          AirportQueueEntry.joined_at ASC, tie-break created_at ASC; empty -> Trip stays REQUESTED.
+      - from: REQUESTED
+        to: EXPIRED
+        trigger: "POST /trips/{id}/expire"
+        actor: Dispatcher
+        preconditions: ["Trip.status == REQUESTED"]
+        side_effects:
+          - "pickup Zone.open_demand_count decremented by 1 (floor 0)"
+      - from: MATCHED
+        to: ENROUTE
+        trigger: "POST /trips/{id}/start"
+        actor: Driver
+        preconditions: ["Trip.status == MATCHED", "acting Driver.id == Trip.driver_id"]
+        side_effects: []
+      - from: ENROUTE
+        to: COMPLETED
+        trigger: "POST /trips/{id}/complete"
+        actor: Driver
+        preconditions: ["Trip.status == ENROUTE", "acting Driver.id == Trip.driver_id"]
+        side_effects:
+          - "Trip.final_fare_cents computed (calc trip_final_fare)"
+          - "Trip.driver_payout_cents computed (calc driver_payout)"
+          - "Rider.wallet_balance_cents decremented by Trip.final_fare_cents"
+          - "assigned Driver ON_TRIP->AVAILABLE (cascade: driver relocates to dropoff Zone and that Zone.available_supply_count increments)"
+          - "if the driver has an ACTIVE Quest: Quest.completed_trips incremented by 1; if it then reaches target_trips, Quest ACTIVE->EARNED (cascade: Quest.paid_out_cents set to bonus_cents)"
+      - from: MATCHED
+        to: CANCELLED
+        trigger: "POST /trips/{id}/cancel"
+        actor: Rider
+        preconditions: ["Trip.status == MATCHED", "acting Rider.id == Trip.rider_id"]
+        side_effects:
+          - "assigned Driver ON_TRIP->AVAILABLE (cascade: driver stays in current pickup-side Zone, that Zone.available_supply_count increments)"
+          - "no fare charged; Trip.final_fare_cents stays 0"
+
+  - entity: Quest
+    initial_state: ACTIVE
+    terminal_states: [EARNED, EXPIRED]
+    transitions:
+      - from: ACTIVE
+        to: EARNED
+        trigger: "system (Trip ENROUTE->COMPLETED brings completed_trips to target_trips)"
+        actor: system
+        preconditions: ["Quest.completed_trips >= Quest.target_trips after the increment"]
+        side_effects:
+          - "Quest.paid_out_cents set to Quest.bonus_cents"
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /quests/{id}/expire"
+        actor: Dispatcher
+        preconditions: ["Quest.status == ACTIVE"]
+        side_effects:
+          - "Quest.paid_out_cents stays 0"
+
+  - entity: Dispute
+    initial_state: OPEN
+    terminal_states: [UPHELD, REJECTED]
+    transitions:
+      - from: OPEN
+        to: UPHELD
+        trigger: "POST /disputes/{id}/resolve  (decision=UPHELD)"
+        actor: Dispatcher
+        preconditions:
+          - "Dispute.status == OPEN"
+          - "the disputed Trip.status == COMPLETED"
+        side_effects:
+          - "Dispute.refund_cents computed (calc dispute_refund)"
+          - "Rider.wallet_balance_cents incremented by Dispute.refund_cents"
+          - "disputed Trip.refunded_cents incremented by Dispute.refund_cents (cascade onto the Trip ledger field)"
+      - from: OPEN
+        to: REJECTED
+        trigger: "POST /disputes/{id}/resolve  (decision=REJECTED)"
+        actor: Dispatcher
+        preconditions: ["Dispute.status == OPEN"]
+        side_effects:
+          - "Dispute.refund_cents stays 0; no wallet change"
+
+  - entity: AirportQueueEntry
+    initial_state: WAITING
+    terminal_states: [DISPATCHED, WITHDRAWN]
+    transitions:
+      - from: WAITING
+        to: WITHDRAWN
+        trigger: "POST /airport-queue/{id}/withdraw"
+        actor: Driver
+        preconditions: ["AirportQueueEntry.status == WAITING", "acting Driver.id == AirportQueueEntry.driver_id"]
+        side_effects:
+          - "remaining WAITING entries in the same airport Zone re-sequence position by joined_at ASC, tie-break created_at ASC"
+      - from: WAITING
+        to: DISPATCHED
+        trigger: "system (dispatch match selects this driver for an airport pickup) — see Trip REQUESTED->MATCHED"
+        actor: system
+        preconditions: ["AirportQueueEntry.status == WAITING"]
+        side_effects:
+          - "remaining WAITING entries in the same airport Zone re-sequence position by joined_at ASC, tie-break created_at ASC"
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: snapshot-publish-stale-zone
+    parent_entity: Zone
+    write_endpoint: "POST /zones/{id}/surge-snapshots"
+    occ_field: "expected_zone_version"
+    description: |
+      Publishing a new SurgeSnapshot recomputes and overwrites the Zone's
+      current_multiplier and heat_level (a legitimate supersede of the prior
+      snapshot). A publish carrying an expected_zone_version that no longer
+      matches the Zone's current version is rejected: the Zone has advanced
+      since the dispatcher last observed it (e.g. a trip lifecycle event bumped
+      its demand/supply counters), so this snapshot would price stale conditions.
+    error_id: ERR_STALE_ZONE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: surge_multiplier
+    trigger: "POST /zones/{id}/surge-snapshots (publish a SurgeSnapshot)"
+    algorithm: threshold
+    formula: |
+      # Step 1 — supply-demand ratio (pin division order; supply floored at 1 to avoid div-by-zero)
+      effective_supply = max(observed_supply, 1)
+      ratio = round(observed_demand / effective_supply, 2)        # round to 2 dp BEFORE banding
+
+      # Step 2 — band the ROUNDED ratio into a raw multiplier (threshold bands, lower-inclusive)
+      if ratio < 1.00:        raw = 1.00
+      elif ratio < 2.00:      raw = 1.50      # 1.00 <= ratio < 2.00
+      elif ratio < 3.00:      raw = 2.00      # 2.00 <= ratio < 3.00
+      else:                   raw = 2.50      # ratio >= 3.00
+
+      # Step 3 — rush-hour additive step applied to the banded raw (NOT to the ratio)
+      if is_rush_hour:        raw = raw + RUSH_HOUR_STEP
+
+      # Step 4 — clamp to cap; record whether the clamp bit
+      multiplier = min(raw, MULTIPLIER_CAP)
+      capped = raw > MULTIPLIER_CAP
+
+      # On publish: write multiplier -> Zone.current_multiplier, derive Zone.heat_level (calc heat_level)
+    input_set: "observed_demand and observed_supply are the values supplied in the publish body (the dispatcher's captured snapshot of open_demand_count / available_supply_count); is_rush_hour from the body."
+    constants:
+      RUSH_HOUR_STEP: 0.50
+      MULTIPLIER_CAP: 2.50
+    precision: "ratio and multiplier to 2 decimals, round_half_up; band comparison uses the rounded ratio"
+    variants:
+      - name: standard_window
+        when: "is_rush_hour == false"
+        difference: "raw banded multiplier used directly, then capped"
+      - name: rush_window
+        when: "is_rush_hour == true"
+        difference: "RUSH_HOUR_STEP added to the banded raw before the cap; a band that was already 2.50 plus the step would reach 3.00 but is clamped back to the 2.50 cap (capped=true)"
+
+  - name: heat_level
+    trigger: "POST /zones/{id}/surge-snapshots (after surge_multiplier writes Zone.current_multiplier)"
+    algorithm: threshold
+    formula: |
+      m = Zone.current_multiplier   # the multiplier just published
+      if m < 1.25:        heat_level = COOL       # m < 1.25
+      elif m < 1.75:      heat_level = WARM        # 1.25 <= m < 1.75
+      elif m < 2.50:      heat_level = HOT         # 1.75 <= m < 2.50
+      else:               heat_level = BLAZING     # m >= 2.50
+    input_set: "Zone.current_multiplier as just written by surge_multiplier"
+    constants:
+      COOL_MAX_EXCLUSIVE: 1.25
+      WARM_MAX_EXCLUSIVE: 1.75
+      HOT_MAX_EXCLUSIVE: 2.50
+    precision: "compare the 2-decimal multiplier; bands are lower-inclusive / upper-exclusive"
+
+  - name: trip_final_fare
+    trigger: "POST /trips/{id}/complete (Trip ENROUTE->COMPLETED)"
+    algorithm: tiered_pricing
+    formula: |
+      # Fare uses the multiplier FROZEN at request time (quoted_multiplier), NOT live Zone surge.
+      surged = round(quoted_base_fare_cents * quoted_multiplier)   # round_half_up to whole cents
+      # Booking fee is a flat per-trip add-on applied AFTER surge multiplication.
+      final_fare_cents = surged + BOOKING_FEE_CENTS
+    input_set: "Trip.quoted_base_fare_cents and Trip.quoted_multiplier, both frozen at request time"
+    constants:
+      BOOKING_FEE_CENTS: 150
+    precision: "round_half_up to whole cents at the surge step; booking fee added as an exact integer afterward"
+    variants:
+      - name: surge_then_fee
+        when: "always (pinned order)"
+        difference: "multiply base by surge and round to cents FIRST, then add the flat booking fee; the alternative (add fee then multiply) is explicitly NOT used"
+
+  - name: driver_payout
+    trigger: "POST /trips/{id}/complete (Trip ENROUTE->COMPLETED)"
+    algorithm: weighted_scoring
+    formula: |
+      # Driver keeps a share of the SURGED fare only (booking fee is the platform's, never shared).
+      surged = round(quoted_base_fare_cents * quoted_multiplier)   # same surged value as trip_final_fare
+      driver_payout_cents = round(surged * DRIVER_SHARE)           # round_half_up to whole cents
+      # Quest bonus is NOT folded into driver_payout_cents; it is tracked separately as Quest.paid_out_cents.
+    input_set: "Trip.quoted_base_fare_cents and Trip.quoted_multiplier (frozen at request time)"
+    constants:
+      DRIVER_SHARE: 0.80
+    precision: "round_half_up to whole cents; payout is computed on the surged fare BEFORE the booking fee"
+    variants:
+      - name: payout_excludes_fee
+        when: "always"
+        difference: "payout share applies to the surged fare excluding BOOKING_FEE_CENTS; folding the booking fee into the payable base is the divergent wrong reading and is NOT used"
+
+  - name: dispute_refund
+    trigger: "POST /disputes/{id}/resolve (decision=UPHELD)"
+    algorithm: aggregation
+    formula: |
+      # Net amount the rider has actually paid so far on this trip.
+      net_paid = Trip.final_fare_cents - Trip.refunded_cents      # refunded_cents = prior upheld refunds
+      # Refund is capped at the lesser of what was requested and what remains paid.
+      refund_cents = min(requested_refund_cents, net_paid)
+      # net_paid floored at 0; if a prior dispute already refunded everything, refund_cents = 0
+      if net_paid <= 0: refund_cents = 0
+    input_set: "Dispute.requested_refund_cents; the disputed Trip.final_fare_cents and current Trip.refunded_cents (sum of prior UPHELD refunds on the same Trip, ordered by Dispute.created_at ASC as they are applied)"
+    constants: {}
+    precision: "integer cents; no rounding"
+    variants:
+      - name: bounded_by_remaining
+        when: "always"
+        difference: "refund is min(requested, final_fare - already_refunded); a second upheld dispute on a trip whose fare is already fully refunded yields 0, not a second full refund"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role header present and is one of Rider, Driver, Dispatcher"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /zones, POST /riders, POST /drivers when made by Dispatcher onboarding"
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this endpoint per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "every path/body referenced resource exists (Zone, Driver, Rider, Trip, Quest, Dispute, AirportQueueEntry), validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 4
+    category: auth
+    check: "for entity_backed roles acting on owned resources, X-User-ID equals the resource's owner FK (Rider.id == Trip.rider_id; Driver.id == Trip.driver_id; Driver.id == AirportQueueEntry.driver_id)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /trips/{id}/start, /complete, /cancel; POST /airport-queue/{id}/withdraw"
+
+  - priority: 5
+    category: state
+    check: "target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 6
+    category: business_constraint
+    check: "Zone.grid_code is unique across all Zones"
+    error_id: ERR_DUPLICATE_GRID_CODE
+    http_status: 409
+    applies_to: "POST /zones"
+
+  - priority: 7
+    category: business_constraint
+    check: "AirportQueueEntry may only be created against a Zone with is_airport == true"
+    error_id: ERR_NOT_AIRPORT_ZONE
+    http_status: 422
+    applies_to: "POST /airport-queue"
+
+  - priority: 65
+    category: business_temporal
+    check: |
+      SurgeSnapshot window overlap (half-open [effective_from, effective_to), adjacency allowed):
+      a new snapshot for a Zone is rejected if its [effective_from, effective_to) interval overlaps
+      any existing snapshot's interval for the SAME zone_id. Two intervals overlap iff
+      new.effective_from < existing.effective_to AND existing.effective_from < new.effective_to.
+      Touching at a boundary (new.effective_from == existing.effective_to) does NOT overlap.
+    error_id: ERR_SNAPSHOT_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /zones/{id}/surge-snapshots"
+
+  - priority: 66
+    category: business_temporal
+    check: |
+      Quest window overlap (closed [window_start, window_end] with a 0-length gap forbidden, i.e.
+      adjacency NOT allowed): a new Quest for a Driver is rejected if its [window_start, window_end]
+      interval overlaps OR touches any existing ACTIVE/EARNED Quest's interval for the SAME driver_id.
+      Conflict iff new.window_start <= existing.window_end AND existing.window_start <= new.window_end.
+      Unlike the snapshot rule, boundary contact (new.window_start == existing.window_end) DOES conflict.
+    error_id: ERR_QUEST_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /quests"
+
+  - priority: 8
+    category: business_constraint
+    check: "a Driver may have at most one WAITING AirportQueueEntry across all airport Zones at a time"
+    error_id: ERR_ALREADY_QUEUED
+    http_status: 409
+    applies_to: "POST /airport-queue"
+
+  - priority: 9
+    category: business_constraint
+    check: "a Driver joining an airport queue must have status == AVAILABLE"
+    error_id: ERR_DRIVER_NOT_AVAILABLE
+    http_status: 422
+    applies_to: "POST /airport-queue"
+
+  - priority: 10
+    category: business_referential
+    check: "a Dispute may only be opened against a Trip whose status == COMPLETED"
+    error_id: ERR_TRIP_NOT_COMPLETED
+    http_status: 422
+    applies_to: "POST /disputes"
+
+  - priority: 11
+    category: business_constraint
+    check: "Dispute.requested_refund_cents must be >= 1"
+    error_id: ERR_INVALID_REFUND_AMOUNT
+    http_status: 422
+    applies_to: "POST /disputes"
+
+  - priority: 12
+    category: business_fiscal
+    check: "on Trip complete, Rider.wallet_balance_cents must be >= computed final_fare_cents"
+    error_id: ERR_INSUFFICIENT_WALLET
+    http_status: 402
+    applies_to: "POST /trips/{id}/complete"
+
+  - priority: 13
+    category: business_temporal
+    check: "OCC: expected_zone_version must equal the Zone's current version on surge-snapshot publish"
+    error_id: ERR_STALE_ZONE_VERSION
+    http_status: 412
+    applies_to: "POST /zones/{id}/surge-snapshots"
+
+  - priority: 14
+    category: business_constraint
+    check: "request body field validation: required fields present, enums in range, integers within declared constraints (base_fare_cents >= 100, target_trips >= 1, observed_* >= 0)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all create/publish endpoints"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Zones -------------------------------------------------------------
+  - method: POST
+    path: "/zones"
+    description: "Create a geo-grid Zone"
+    roles: [Dispatcher]
+    code: 201
+    input: ["name", "grid_code", "is_airport?", "base_fare_cents"]
+    output: Zone
+    side_effects: ["open_demand_count, available_supply_count init 0; current_multiplier 1.00; heat_level COOL"]
+  - method: GET
+    path: "/zones/{id}"
+    description: "Fetch a Zone with live demand/supply counters and current surge"
+    roles: [Dispatcher, Rider, Driver]
+    code: 200
+    input: []
+    output: Zone
+    side_effects: []
+  - method: GET
+    path: "/zones"
+    description: "List Zones (Heat Map feed). Filterable; paginated."
+    roles: [Dispatcher, Rider, Driver]
+    code: 200
+    input: ["is_airport?", "heat_level?", "limit?", "offset?"]
+    output: Zone[]
+    side_effects: []
+  - method: POST
+    path: "/zones/{id}/surge-snapshots"
+    description: "Dispatcher publishes a SurgeSnapshot; recomputes Zone.current_multiplier + heat_level under OCC"
+    roles: [Dispatcher]
+    code: 201
+    input: ["observed_demand", "observed_supply", "is_rush_hour?", "effective_from", "effective_to", "expected_zone_version"]
+    output: SurgeSnapshot
+    side_effects:
+      - "computes ratio, multiplier, capped (calc surge_multiplier)"
+      - "writes Zone.current_multiplier and Zone.heat_level (calc heat_level)"
+      - "increments Zone.version by 1"
+  - method: GET
+    path: "/zones/{id}/surge-snapshots"
+    description: "List SurgeSnapshots for a Zone (reverse-reachability for SurgeSnapshot.zone_id), newest first by created_at DESC"
+    roles: [Dispatcher, Rider, Driver]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: SurgeSnapshot[]
+    side_effects: []
+  - method: GET
+    path: "/zones/{id}/trips"
+    description: "List Trips whose pickup_zone_id == this Zone (reverse-reachability for Trip.pickup_zone_id)"
+    roles: [Dispatcher]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Trip[]
+    side_effects: []
+  - method: GET
+    path: "/zones/{id}/drivers"
+    description: "List Drivers whose home_zone_id == this Zone (reverse-reachability for Driver.home_zone_id)"
+    roles: [Dispatcher]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Driver[]
+    side_effects: []
+  - method: GET
+    path: "/zones/{id}/airport-queue"
+    description: "List AirportQueueEntry for this airport Zone (reverse-reachability for AirportQueueEntry.zone_id), WAITING ordered by position ASC"
+    roles: [Dispatcher, Driver]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: AirportQueueEntry[]
+    side_effects: []
+
+  # ---- Riders ------------------------------------------------------------
+  - method: POST
+    path: "/riders"
+    description: "Onboard a Rider"
+    roles: [Dispatcher]
+    code: 201
+    input: ["name", "home_zone_id", "wallet_balance_cents?"]
+    output: Rider
+    side_effects: []
+  - method: GET
+    path: "/riders/{id}"
+    description: "Fetch a Rider"
+    roles: [Dispatcher, Rider]
+    code: 200
+    input: []
+    output: Rider
+    side_effects: []
+  - method: GET
+    path: "/riders"
+    description: "List Riders; filter by home_zone_id (reverse-reachability for Rider.home_zone_id)"
+    roles: [Dispatcher]
+    code: 200
+    input: ["home_zone_id?", "limit?", "offset?"]
+    output: Rider[]
+    side_effects: []
+  - method: POST
+    path: "/riders/{id}/wallet/credit"
+    description: "Top up a Rider's wallet (admin/operator surface for funding)"
+    roles: [Dispatcher]
+    code: 200
+    input: [amount_cents]
+    output: Rider
+    side_effects: ["Rider.wallet_balance_cents incremented by amount_cents; increments Rider.version by 1"]
+
+  # ---- Drivers -----------------------------------------------------------
+  - method: POST
+    path: "/drivers"
+    description: "Onboard a Driver in a home Zone; current_zone_id init to home_zone_id"
+    roles: [Dispatcher]
+    code: 201
+    input: [name, home_zone_id]
+    output: Driver
+    side_effects: ["status init OFFLINE; current_zone_id = home_zone_id"]
+  - method: GET
+    path: "/drivers/{id}"
+    description: "Fetch a Driver"
+    roles: [Dispatcher, Driver]
+    code: 200
+    input: []
+    output: Driver
+    side_effects: []
+  - method: GET
+    path: "/drivers"
+    description: "List Drivers; filter by home_zone_id, current_zone_id, active_trip_id, status (reverse-reachability for Driver.home_zone_id, Driver.current_zone_id, Driver.active_trip_id)"
+    roles: [Dispatcher]
+    code: 200
+    input: ["home_zone_id?", "current_zone_id?", "active_trip_id?", "status?", "limit?", "offset?"]
+    output: Driver[]
+    side_effects: []
+  - method: POST
+    path: "/drivers/{id}/go-online"
+    description: "Driver goes AVAILABLE in their current Zone"
+    roles: [Driver]
+    code: 200
+    input: []
+    output: Driver
+    side_effects: ["current_zone Zone.available_supply_count +1; Driver OFFLINE->AVAILABLE"]
+  - method: POST
+    path: "/drivers/{id}/go-offline"
+    description: "Driver goes OFFLINE; withdraws any WAITING airport queue entry"
+    roles: [Driver]
+    code: 200
+    input: []
+    output: Driver
+    side_effects: ["current_zone Zone.available_supply_count -1 (floor 0); WAITING AirportQueueEntry -> WITHDRAWN; queue re-sequences"]
+
+  # ---- Trips -------------------------------------------------------------
+  - method: POST
+    path: "/trips"
+    description: "Rider requests a trip; freezes quoted surge from the pickup Zone and bumps demand"
+    roles: [Rider]
+    code: 201
+    input: [rider_id, pickup_zone_id, dropoff_zone_id]
+    output: Trip
+    side_effects:
+      - "Trip.quoted_multiplier = pickup Zone.current_multiplier (frozen)"
+      - "Trip.quoted_base_fare_cents = pickup Zone.base_fare_cents (frozen)"
+      - "pickup Zone.open_demand_count incremented by 1"
+      - "status REQUESTED"
+  - method: GET
+    path: "/trips/{id}"
+    description: "Fetch a Trip"
+    roles: [Dispatcher, Rider, Driver]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: []
+  - method: GET
+    path: "/trips"
+    description: "List Trips; filter by rider_id, driver_id, pickup_zone_id, or dropoff_zone_id (reverse-reachability for Trip.rider_id, Trip.driver_id, Trip.dropoff_zone_id)"
+    roles: [Dispatcher, Rider, Driver]
+    code: 200
+    input: ["rider_id?", "driver_id?", "pickup_zone_id?", "dropoff_zone_id?", "status?", "limit?", "offset?"]
+    output: Trip[]
+    side_effects: []
+  - method: POST
+    path: "/trips/{id}/start"
+    description: "Assigned driver starts the matched trip (MATCHED->ENROUTE)"
+    roles: [Driver]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: []
+  - method: POST
+    path: "/trips/{id}/complete"
+    description: "Assigned driver completes the trip (ENROUTE->COMPLETED); charges fare, pays driver, credits Quest"
+    roles: [Driver]
+    code: 200
+    input: []
+    output: Trip
+    side_effects:
+      - "computes final_fare_cents (calc trip_final_fare) and driver_payout_cents (calc driver_payout)"
+      - "Rider.wallet_balance_cents -= final_fare_cents"
+      - "Driver ON_TRIP->AVAILABLE, relocates to dropoff Zone (supply cascade)"
+      - "ACTIVE Quest.completed_trips +1; may cascade Quest ACTIVE->EARNED"
+  - method: POST
+    path: "/trips/{id}/cancel"
+    description: "Rider cancels a matched trip (MATCHED->CANCELLED); releases driver, no charge"
+    roles: [Rider]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: ["assigned Driver ON_TRIP->AVAILABLE; no fare charged"]
+  - method: POST
+    path: "/trips/{id}/expire"
+    description: "Dispatcher expires an unmatched REQUESTED trip (REQUESTED->EXPIRED); releases demand"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: ["pickup Zone.open_demand_count -1 (floor 0)"]
+
+  # ---- Dispatch tick -----------------------------------------------------
+  - method: POST
+    path: "/_dispatch/tick"
+    description: "Test-driving dispatch epoch: matches each REQUESTED trip to a candidate driver per §1.2 selector; airport zones dispatch FIFO"
+    roles: [Dispatcher]
+    code: 200
+    input: ["zone_id?"]
+    output: "{ matched_trip_ids: string[], matched_count: integer }"
+    side_effects:
+      - "for each matchable REQUESTED Trip: Trip REQUESTED->MATCHED with full cascade (driver ON_TRIP, supply -1, demand -1, airport queue DISPATCHED + re-sequence)"
+    note: "If zone_id supplied, restrict to trips with that pickup_zone_id; else all Zones. Trips processed by Trip.created_at ASC."
+
+  # ---- Airport queue -----------------------------------------------------
+  - method: POST
+    path: "/airport-queue"
+    description: "Driver joins an airport Zone FIFO queue"
+    roles: [Driver]
+    code: 201
+    input: [zone_id, driver_id]
+    output: AirportQueueEntry
+    side_effects: ["joined_at stamped; position computed FIFO; status WAITING"]
+  - method: GET
+    path: "/airport-queue/{id}"
+    description: "Fetch an AirportQueueEntry"
+    roles: [Dispatcher, Driver]
+    code: 200
+    input: []
+    output: AirportQueueEntry
+    side_effects: []
+  - method: GET
+    path: "/airport-queue"
+    description: "List AirportQueueEntry; filter by zone_id or driver_id (reverse-reachability for AirportQueueEntry.zone_id and AirportQueueEntry.driver_id)"
+    roles: [Dispatcher, Driver]
+    code: 200
+    input: ["zone_id?", "driver_id?", "status?", "limit?", "offset?"]
+    output: AirportQueueEntry[]
+    side_effects: []
+  - method: POST
+    path: "/airport-queue/{id}/withdraw"
+    description: "Driver withdraws from the airport queue (WAITING->WITHDRAWN); re-sequences remaining"
+    roles: [Driver]
+    code: 200
+    input: []
+    output: AirportQueueEntry
+    side_effects: ["remaining WAITING entries re-sequence position"]
+
+  # ---- Quests ------------------------------------------------------------
+  - method: POST
+    path: "/quests"
+    description: "Dispatcher creates a driver Quest bonus"
+    roles: [Dispatcher]
+    code: 201
+    input: [driver_id, target_trips, bonus_cents, window_start, window_end]
+    output: Quest
+    side_effects: ["status ACTIVE; completed_trips 0; paid_out_cents 0"]
+  - method: GET
+    path: "/quests/{id}"
+    description: "Fetch a Quest"
+    roles: [Dispatcher, Driver]
+    code: 200
+    input: []
+    output: Quest
+    side_effects: []
+  - method: GET
+    path: "/quests"
+    description: "List Quests; filter by driver_id (reverse-reachability for Quest.driver_id)"
+    roles: [Dispatcher, Driver]
+    code: 200
+    input: ["driver_id?", "status?", "limit?", "offset?"]
+    output: Quest[]
+    side_effects: []
+  - method: POST
+    path: "/quests/{id}/expire"
+    description: "Dispatcher expires an ACTIVE Quest (ACTIVE->EXPIRED)"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: Quest
+    side_effects: ["paid_out_cents stays 0"]
+
+  # ---- Disputes ----------------------------------------------------------
+  - method: POST
+    path: "/disputes"
+    description: "Rider opens a Dispute against a COMPLETED trip"
+    roles: [Rider]
+    code: 201
+    input: [trip_id, reason, requested_refund_cents]
+    output: Dispute
+    side_effects: ["rider_id copied from Trip.rider_id; status OPEN"]
+  - method: GET
+    path: "/disputes/{id}"
+    description: "Fetch a Dispute"
+    roles: [Dispatcher, Rider]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: []
+  - method: GET
+    path: "/disputes"
+    description: "List Disputes; filter by trip_id or rider_id (reverse-reachability for Dispute.trip_id and Dispute.rider_id)"
+    roles: [Dispatcher, Rider]
+    code: 200
+    input: ["trip_id?", "rider_id?", "status?", "limit?", "offset?"]
+    output: Dispute[]
+    side_effects: []
+  - method: POST
+    path: "/disputes/{id}/resolve"
+    description: "Dispatcher resolves a Dispute (OPEN->UPHELD or REJECTED); upheld refunds rider wallet"
+    roles: [Dispatcher]
+    code: 200
+    input: [decision]
+    output: Dispute
+    side_effects:
+      - "UPHELD: computes refund_cents (calc dispute_refund), Rider.wallet_balance_cents += refund_cents, Trip.refunded_cents += refund_cents"
+      - "REJECTED: no change"
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "X-User-Role missing or not a known role" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "acting role not permitted for this endpoint" }
+  - { id: ERR_NOT_RESOURCE_OWNER, http: 403, condition: "entity-backed actor's X-User-ID does not match the resource's owner FK" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "referenced Zone/Driver/Rider/Trip/Quest/Dispute/AirportQueueEntry does not exist" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "requested transition not defined from the resource's current state" }
+  - { id: ERR_DUPLICATE_GRID_CODE, http: 409, condition: "a Zone with the same grid_code already exists" }
+  - { id: ERR_NOT_AIRPORT_ZONE, http: 422, condition: "airport-queue join targets a Zone with is_airport == false" }
+  - { id: ERR_ALREADY_QUEUED, http: 409, condition: "driver already has a WAITING AirportQueueEntry" }
+  - { id: ERR_DRIVER_NOT_AVAILABLE, http: 422, condition: "driver joining airport queue is not AVAILABLE" }
+  - { id: ERR_TRIP_NOT_COMPLETED, http: 422, condition: "dispute opened against a Trip that is not COMPLETED" }
+  - { id: ERR_INVALID_REFUND_AMOUNT, http: 422, condition: "requested_refund_cents < 1" }
+  - { id: ERR_INSUFFICIENT_WALLET, http: 402, condition: "rider wallet balance < computed final_fare_cents on trip complete" }
+  - { id: ERR_STALE_ZONE_VERSION, http: 412, condition: "expected_zone_version != Zone.version on surge-snapshot publish" }
+  - { id: ERR_SNAPSHOT_WINDOW_OVERLAP, http: 409, condition: "new SurgeSnapshot [effective_from, effective_to) overlaps an existing snapshot for the same zone (half-open, adjacency allowed)" }
+  - { id: ERR_QUEST_WINDOW_OVERLAP, http: 409, condition: "new Quest [window_start, window_end] overlaps or touches an existing ACTIVE/EARNED Quest for the same driver (closed, adjacency forbidden)" }
+  - { id: ERR_INVALID_REQUEST, http: 422, condition: "missing required field, bad enum, or numeric constraint violation in request body" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Dispatcher
+    description: "Platform operator: creates zones/riders/drivers/quests, publishes surge snapshots, runs the dispatch tick, expires trips/quests, resolves disputes"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /zones"
+      - "POST /zones/{id}/surge-snapshots"
+      - "POST /riders"
+      - "POST /riders/{id}/wallet/credit"
+      - "POST /drivers"
+      - "POST /quests"
+      - "POST /quests/{id}/expire"
+      - "POST /trips/{id}/expire"
+      - "POST /_dispatch/tick"
+      - "POST /disputes/{id}/resolve"
+    shared_operations:
+      - "GET (all read endpoints)"
+
+  - name: Rider
+    description: "Books trips, cancels matched trips, opens disputes"
+    identity: "entity_backed:Rider"
+    exclusive_operations:
+      - "POST /trips"
+      - "POST /trips/{id}/cancel"
+      - "POST /disputes"
+    shared_operations:
+      - "GET /zones, GET /zones/{id}, GET /zones/{id}/surge-snapshots"
+      - "GET /trips, GET /trips/{id}"
+      - "GET /riders/{id}, GET /disputes, GET /disputes/{id}"
+
+  - name: Driver
+    description: "Goes online/offline, joins/leaves airport queues, starts and completes assigned trips"
+    identity: "entity_backed:Driver"
+    exclusive_operations:
+      - "POST /drivers/{id}/go-online"
+      - "POST /drivers/{id}/go-offline"
+      - "POST /airport-queue"
+      - "POST /airport-queue/{id}/withdraw"
+      - "POST /trips/{id}/start"
+      - "POST /trips/{id}/complete"
+    shared_operations:
+      - "GET /zones, GET /zones/{id}, GET /zones/{id}/surge-snapshots, GET /zones/{id}/airport-queue"
+      - "GET /trips, GET /trips/{id}, GET /drivers/{id}"
+      - "GET /quests, GET /quests/{id}, GET /airport-queue/{id}"

@@ -89,7 +89,7 @@ After every step completes (bash block or subagent), the orchestrator MUST appen
 Format per entry:
 
 ```
-## Step N: {short title} — {ISO-8601 UTC timestamp}
+## Step N: {short title} — {ISO-8601 UTC timestamp in format `YYYY-MM-DDTHH:mm:ss.sssZ`}
 
 {verbatim summary returned by the subagent, OR a one-line note for bash-only steps}
 ```

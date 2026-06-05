@@ -1,0 +1,1566 @@
+scenario: "Micromobility Scooter/Bike Share: vehicle fleet/battery state, geofence (no-ride/slow/no-park), trip start/end/pause, unlock + per-minute pricing, rebalancing/swap task, low-income plan, bad-parking fine, MDS city reporting"
+domain_name: micromobility-scooter-share
+api_prefix: "/api"
+
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: temporal_windowing
+  complexity_layers:
+    - dual_variant_calculation
+    - cascading_side_effects
+    - optimistic_concurrency
+    - rate_threshold_triggers
+
+  entity_topology: flat
+  # Peer entities (Vehicle, Rider, Trip, Fine, RebalancingTask, MDSReport) linked
+  # by foreign keys, not URL nesting. Only TripSegment and WalletTransaction are
+  # nested children (event logs under their owning resource).
+
+  state_machine_shape: cyclic
+  # Trip has an ACTIVE<->PAUSED loop; Fine has a PENDING<->DISPUTED loop with a
+  # DISPUTED->{WAIVED, PENDING} branch. Vehicle and RebalancingTask are linear
+  # with reverts.
+
+  relationship_patterns:
+    - one_to_many        # Rider 1:N Trip; Trip 1:N TripSegment; Rider 1:N WalletTransaction
+    - flat_with_references  # Trip->Vehicle, Trip->Zone, Fine->Trip, Task->Vehicle/Technician
+    - cross_aggregate    # Trip end debits Rider.wallet across aggregate boundary
+
+  role_model: peer_roles
+  # Rider owns trips/fines/applications; Technician owns rebalancing tasks;
+  # CityRegulator owns MDS reports (read + finalize); PlatformAdmin configures
+  # plans/zones/vehicles and adjudicates fines/applications.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Plan
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: enum
+        source: input
+        description: "Pricing plan code"
+        constraints: "one of {STANDARD, LOW_INCOME}; unique across Plan"
+      - name: unlock_fee_cents
+        type: integer
+        source: input
+        description: "Flat fee charged at trip start (added to fare)"
+        constraints: ">= 0"
+      - name: per_minute_cents
+        type: integer
+        source: input
+        description: "Per-billable-minute rate in cents"
+        constraints: ">= 0"
+      - name: daily_cap_cents
+        type: integer
+        source: input
+        description: "Maximum total fare per single trip in cents (unlock + minutes capped to this); 0 means uncapped"
+        constraints: ">= 0"
+      - name: slow_zone_discount_pct
+        type: number
+        source: input
+        description: "Fraction (0..1) by which per-minute charge is reduced for minutes ridden inside a SLOW zone"
+        constraints: ">= 0 and <= 1"
+        default: 0
+      - name: active
+        type: boolean
+        source: input
+        description: "Whether riders may currently be assigned this plan"
+        default: true
+
+  - name: Zone
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Human-readable geofence name"
+      - name: zone_type
+        type: enum
+        source: input
+        description: "Geofence behavior class"
+        constraints: "one of {RIDE_OK, SLOW, NO_RIDE, NO_PARK}"
+      - name: priority
+        type: integer
+        source: input
+        description: "Overlap resolution rank; when a point falls in multiple zones the LOWEST priority integer wins (ties broken by created_at ASC)"
+        constraints: ">= 1"
+      - name: max_speed_kph
+        type: integer
+        source: input
+        description: "Enforced speed ceiling; only meaningful for SLOW zones, null otherwise"
+        default: null
+
+  - name: Vehicle
+    parent: null
+    common_fields: true
+    fields:
+      - name: vehicle_type
+        type: enum
+        source: input
+        description: "Fleet vehicle kind"
+        constraints: "one of {SCOOTER, EBIKE}"
+      - name: qr_code
+        type: string
+        source: input
+        description: "Unique scannable unlock code"
+        constraints: "unique across Vehicle"
+      - name: battery_pct
+        type: integer
+        source: input
+        description: "Current battery state of charge, 0..100"
+        constraints: ">= 0 and <= 100"
+        default: 100
+      - name: current_zone_id
+        type: string
+        source: input
+        description: "FK -> Zone.id; the geofence the vehicle is currently parked/located in"
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state machine value"
+        constraints: "one of {AVAILABLE, RESERVED, IN_USE, LOW_BATTERY, MAINTENANCE, RETIRED}"
+        default: AVAILABLE
+
+  - name: Rider
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Unique login identifier"
+        constraints: "unique across Rider"
+      - name: full_name
+        type: string
+        source: input
+        description: "Rider display name"
+      - name: plan_id
+        type: string
+        source: input
+        description: "FK -> Plan.id; the rider's current pricing plan"
+      - name: wallet_balance_cents
+        type: integer
+        source: computed
+        description: "Prepaid wallet balance in cents; debited on trip charge and fine settlement, credited on top-up and refund"
+        default: 0
+      - name: outstanding_fine_cents
+        type: integer
+        source: computed
+        description: "Sum of Fine.amount_cents for this rider whose settlement_status == PENDING"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Account state machine value"
+        constraints: "one of {ACTIVE, SUSPENDED}"
+        default: ACTIVE
+
+  - name: Trip
+    parent: null
+    common_fields: true
+    fields:
+      - name: rider_id
+        type: string
+        source: input
+        description: "FK -> Rider.id; the rider who unlocked the vehicle"
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the vehicle unlocked for this trip"
+      - name: start_zone_id
+        type: string
+        source: computed
+        description: "FK -> Zone.id; zone the vehicle was in at unlock (copied from Vehicle.current_zone_id)"
+      - name: end_zone_id
+        type: string
+        source: computed
+        description: "FK -> Zone.id; zone supplied at trip end where the vehicle was parked; null until ended"
+        default: null
+      - name: status
+        type: enum
+        source: computed
+        description: "Trip state machine value"
+        constraints: "one of {ACTIVE, PAUSED, COMPLETED, CANCELLED}"
+        default: ACTIVE
+      - name: started_at
+        type: datetime
+        source: system
+        description: "Server clock at unlock"
+      - name: ended_at
+        type: datetime
+        source: system
+        description: "Server clock at trip end; null until ended"
+        default: null
+      - name: estimated_fare_cents
+        type: integer
+        source: computed
+        description: "Provisional forward-looking fare computed at unlock (trip_provisional_fare); informational only"
+        default: 0
+      - name: final_fare_cents
+        type: integer
+        source: computed
+        description: "Final chronological fare computed at end (trip_final_fare); the amount actually charged"
+        default: 0
+      - name: billable_minutes
+        type: integer
+        source: computed
+        description: "Total billable minutes after excluding paused intervals (per trip_billable_minutes)"
+        default: 0
+
+  - name: TripSegment
+    parent: Trip
+    common_fields: false
+    fields:
+      - name: trip_id
+        type: string
+        source: system
+        description: "FK -> Trip.id; owning trip"
+      - name: segment_type
+        type: enum
+        source: system
+        description: "RIDE segments are billable; PAUSE segments are not"
+        constraints: "one of {RIDE, PAUSE}"
+      - name: zone_id
+        type: string
+        source: system
+        description: "FK -> Zone.id; geofence in effect for this segment (drives SLOW-zone discount on RIDE segments)"
+      - name: started_at
+        type: datetime
+        source: system
+        description: "Segment start clock"
+      - name: ended_at
+        type: datetime
+        source: system
+        description: "Segment end clock; null while the segment is the trip's open segment"
+        default: null
+      - name: duration_seconds
+        type: integer
+        source: computed
+        description: "ended_at - started_at in whole seconds; 0 while open"
+        default: 0
+
+  - name: Technician
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Field technician display name"
+      - name: depot_zone_id
+        type: string
+        source: input
+        description: "FK -> Zone.id; the zone this technician is based out of"
+      - name: on_shift
+        type: boolean
+        source: input
+        description: "Whether the technician may currently be assigned tasks"
+        default: true
+
+  - name: RebalancingTask
+    parent: null
+    common_fields: true
+    fields:
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the vehicle to be moved or battery-swapped"
+      - name: technician_id
+        type: string
+        source: input
+        description: "FK -> Technician.id; assigned technician; null until assigned"
+        default: null
+      - name: task_type
+        type: enum
+        source: input
+        description: "MOVE relocates the vehicle to a target zone; SWAP replaces the battery in place"
+        constraints: "one of {MOVE, SWAP}"
+      - name: target_zone_id
+        type: string
+        source: input
+        description: "FK -> Zone.id; destination zone for a MOVE task; null for SWAP"
+        default: null
+      - name: window_start
+        type: datetime
+        source: input
+        description: "Scheduled start of the technician's on-site window"
+      - name: window_end
+        type: datetime
+        source: input
+        description: "Scheduled end of the technician's on-site window; must be after window_start"
+      - name: status
+        type: enum
+        source: computed
+        description: "Task state machine value"
+        constraints: "one of {OPEN, ASSIGNED, COMPLETED, CANCELLED}"
+        default: OPEN
+
+  - name: Fine
+    parent: null
+    common_fields: true
+    fields:
+      - name: rider_id
+        type: string
+        source: system
+        description: "FK -> Rider.id; the fined rider (copied from the trip's rider)"
+      - name: trip_id
+        type: string
+        source: system
+        description: "FK -> Trip.id; the trip whose end triggered the fine"
+      - name: reason
+        type: enum
+        source: system
+        description: "Why the fine was issued"
+        constraints: "one of {BAD_PARKING_NO_PARK, BAD_PARKING_OUT_OF_ZONE}"
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "Penalty amount (per fine_amount calc); reduced for LOW_INCOME riders"
+        default: 0
+      - name: settlement_status
+        type: enum
+        source: computed
+        description: "Fine resolution state machine value"
+        constraints: "one of {PENDING, SETTLED, DISPUTED, WAIVED}"
+        default: PENDING
+
+  - name: LowIncomeApplication
+    parent: null
+    common_fields: true
+    fields:
+      - name: rider_id
+        type: string
+        source: input
+        description: "FK -> Rider.id; the applicant"
+      - name: household_size
+        type: integer
+        source: input
+        description: "Number of people in the household"
+        constraints: ">= 1"
+      - name: annual_income_cents
+        type: integer
+        source: input
+        description: "Declared annual household income in cents"
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: computed
+        description: "Application review state machine value"
+        constraints: "one of {SUBMITTED, APPROVED, REJECTED}"
+        default: SUBMITTED
+
+  - name: WalletTransaction
+    parent: Rider
+    common_fields: false
+    fields:
+      - name: rider_id
+        type: string
+        source: system
+        description: "FK -> Rider.id; the wallet owner"
+      - name: trip_id
+        type: string
+        source: system
+        description: "FK -> Trip.id; the trip this transaction relates to; null for non-trip transactions"
+        default: null
+      - name: fine_id
+        type: string
+        source: system
+        description: "FK -> Fine.id; the fine this transaction relates to; null for non-fine transactions"
+        default: null
+      - name: txn_type
+        type: enum
+        source: system
+        description: "Ledger entry kind"
+        constraints: "one of {TOPUP, TRIP_CHARGE, TRIP_REFUND, FINE_CHARGE, FINE_REFUND}"
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Signed amount: positive credits the wallet (TOPUP, TRIP_REFUND, FINE_REFUND), negative debits it (TRIP_CHARGE, FINE_CHARGE)"
+
+  - name: MDSReport
+    parent: null
+    common_fields: true
+    fields:
+      - name: window_start
+        type: datetime
+        source: input
+        description: "Inclusive start of the reporting window (UTC)"
+      - name: window_end
+        type: datetime
+        source: input
+        description: "Exclusive end of the reporting window (UTC); must be after window_start"
+      - name: trip_count
+        type: integer
+        source: computed
+        description: "Count of Trips whose started_at falls in [window_start, window_end) (per mds_trip_count)"
+        default: 0
+      - name: total_billable_minutes
+        type: integer
+        source: computed
+        description: "Sum of billable_minutes over the trips counted in this window"
+        default: 0
+      - name: avg_available_vehicles
+        type: number
+        source: computed
+        description: "Time-weighted average number of AVAILABLE vehicles across the window (per mds_avg_availability)"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Report lifecycle state machine value"
+        constraints: "one of {DRAFT, FINALIZED}"
+        default: DRAFT
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Vehicle
+    initial_state: AVAILABLE
+    terminal_states: [RETIRED]
+    transitions:
+      - from: AVAILABLE
+        to: RESERVED
+        trigger: "POST /trips (unlock) — interim reservation"
+        actor: Rider
+        preconditions:
+          - "Vehicle.status == AVAILABLE"
+          - "Vehicle.battery_pct >= MIN_START_BATTERY_PCT (20)"
+          - "Vehicle.current_zone resolves to a RIDE_OK or SLOW zone (NOT NO_RIDE)"
+        side_effects:
+          - "immediately followed by RESERVED -> IN_USE within the same POST /trips call"
+        note: "RESERVED is a transient internal state during the unlock transaction; the trip is created in ACTIVE."
+      - from: RESERVED
+        to: IN_USE
+        trigger: "POST /trips (unlock) — same call, after Trip row created"
+        actor: system
+        preconditions: ["a Trip row was created ACTIVE for this vehicle"]
+        side_effects:
+          - "Vehicle.status := IN_USE"
+      - from: IN_USE
+        to: AVAILABLE
+        trigger: "POST /trips/{id}/end — vehicle parked in a legal RIDE_OK/SLOW zone with battery_pct >= MIN_START_BATTERY_PCT"
+        actor: Rider
+        preconditions: ["the ending trip's resolved end zone is RIDE_OK or SLOW", "Vehicle.battery_pct >= MIN_START_BATTERY_PCT (20)"]
+        side_effects:
+          - "Vehicle.current_zone_id := Trip.end_zone_id"
+          - "Vehicle.status := AVAILABLE"
+      - from: IN_USE
+        to: LOW_BATTERY
+        trigger: "POST /trips/{id}/end — vehicle parked legally but battery_pct < MIN_START_BATTERY_PCT (20)"
+        actor: Rider
+        preconditions: ["the ending trip's resolved end zone is RIDE_OK or SLOW", "Vehicle.battery_pct < MIN_START_BATTERY_PCT (20)"]
+        side_effects:
+          - "Vehicle.current_zone_id := Trip.end_zone_id"
+          - "Vehicle.status := LOW_BATTERY"
+          - "CASCADE: create a RebalancingTask {vehicle_id, task_type: SWAP, target_zone_id: null, technician_id: null, status: OPEN, window_start := now, window_end := now + AUTO_SWAP_WINDOW_SECONDS (3600)} for this vehicle (transitive_cascade depth-2 link 2); this auto-create does NOT bump Vehicle.version"
+      - from: LOW_BATTERY
+        to: AVAILABLE
+        trigger: "POST /rebalancing-tasks/{id}/complete — SWAP task completed"
+        actor: Technician
+        preconditions: ["the task is task_type SWAP and references this vehicle"]
+        side_effects:
+          - "Vehicle.battery_pct := 100"
+          - "Vehicle.status := AVAILABLE"
+      - from: AVAILABLE
+        to: AVAILABLE
+        trigger: "POST /rebalancing-tasks/{id}/complete — MOVE task completed"
+        actor: Technician
+        preconditions: ["the task is task_type MOVE and references this vehicle", "Vehicle.status == AVAILABLE"]
+        side_effects:
+          - "Vehicle.current_zone_id := RebalancingTask.target_zone_id"
+        note: "MOVE relocates an available vehicle; status is unchanged."
+      - from: AVAILABLE
+        to: MAINTENANCE
+        trigger: "POST /vehicles/{id}/maintenance"
+        actor: PlatformAdmin
+        preconditions: ["Vehicle.status IN {AVAILABLE, LOW_BATTERY}"]
+        side_effects: ["Vehicle.status := MAINTENANCE"]
+      - from: MAINTENANCE
+        to: AVAILABLE
+        trigger: "POST /vehicles/{id}/return-to-service"
+        actor: PlatformAdmin
+        preconditions: ["Vehicle.status == MAINTENANCE", "Vehicle.battery_pct >= MIN_START_BATTERY_PCT (20)"]
+        side_effects: ["Vehicle.status := AVAILABLE"]
+      - from: MAINTENANCE
+        to: RETIRED
+        trigger: "POST /vehicles/{id}/retire"
+        actor: PlatformAdmin
+        preconditions: ["Vehicle.status == MAINTENANCE"]
+        side_effects: ["Vehicle.status := RETIRED"]
+
+  - entity: Trip
+    initial_state: ACTIVE
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: PAUSED
+        trigger: "POST /trips/{id}/pause"
+        actor: Rider
+        preconditions: ["Trip.status == ACTIVE"]
+        side_effects:
+          - "close the open RIDE TripSegment (set ended_at, duration_seconds)"
+          - "open a new PAUSE TripSegment with started_at := now"
+      - from: PAUSED
+        to: ACTIVE
+        trigger: "POST /trips/{id}/resume"
+        actor: Rider
+        preconditions: ["Trip.status == PAUSED"]
+        side_effects:
+          - "close the open PAUSE TripSegment (set ended_at, duration_seconds)"
+          - "open a new RIDE TripSegment with started_at := now, zone_id := Vehicle.current_zone_id"
+        note: "Cyclic: ACTIVE<->PAUSED may repeat any number of times (non_linear_state_machine)."
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "POST /trips/{id}/end"
+        actor: Rider
+        preconditions:
+          - "Trip.status == ACTIVE"
+          - "the resolved end zone is NOT NO_RIDE"
+          - "Rider.status == ACTIVE"
+        side_effects:
+          - "close the open RIDE TripSegment"
+          - "Trip.ended_at := now; Trip.end_zone_id := resolved end zone"
+          - "compute Trip.billable_minutes (trip_billable_minutes) then Trip.final_fare_cents (trip_final_fare)"
+          - "CASCADE link1: debit wallet — create WalletTransaction {txn_type: TRIP_CHARGE, amount_cents: -final_fare_cents}; Rider.wallet_balance_cents -= final_fare_cents"
+          - "CASCADE link2: if resolved end zone is NO_PARK -> create Fine {reason: BAD_PARKING_NO_PARK, settlement_status: PENDING} (transitive_cascade depth-3 link2)"
+          - "CASCADE link3: the new Fine's creation debits wallet — create WalletTransaction {txn_type: FINE_CHARGE, amount_cents: -Fine.amount_cents}; Rider.wallet_balance_cents -= Fine.amount_cents; Rider.outstanding_fine_cents += Fine.amount_cents (transitive_cascade depth-3 link3)"
+          - "Vehicle transition IN_USE -> AVAILABLE or IN_USE -> LOW_BATTERY per Vehicle state machine"
+        note: "End is allowed in a NO_PARK zone (the trip completes) but a fine is raised; end is forbidden in a NO_RIDE zone."
+      - from: PAUSED
+        to: COMPLETED
+        trigger: "POST /trips/{id}/end (from paused)"
+        actor: Rider
+        preconditions:
+          - "Trip.status == PAUSED"
+          - "the resolved end zone is NOT NO_RIDE"
+          - "Rider.status == ACTIVE"
+        side_effects:
+          - "close the open PAUSE TripSegment"
+          - "same charge/fine/vehicle cascade as the ACTIVE->COMPLETED transition"
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /trips/{id}/cancel — abort within GRACE_SECONDS (120) of start with no movement"
+        actor: Rider
+        preconditions:
+          - "Trip.status == ACTIVE"
+          - "(now - Trip.started_at) <= GRACE_SECONDS (120)"
+        side_effects:
+          - "close all open segments; Trip.final_fare_cents := 0; billable_minutes := 0"
+          - "Vehicle.status := AVAILABLE (no zone change)"
+        note: "No charge is created for a cancelled trip."
+
+  - entity: Fine
+    initial_state: PENDING
+    terminal_states: [SETTLED, WAIVED]
+    transitions:
+      - from: PENDING
+        to: SETTLED
+        trigger: "POST /fines/{id}/settle"
+        actor: Rider
+        preconditions: ["Fine.settlement_status == PENDING", "Rider.wallet_balance_cents >= Fine.amount_cents"]
+        side_effects:
+          - "Rider.outstanding_fine_cents -= Fine.amount_cents"
+        note: "The FINE_CHARGE wallet debit already happened at fine creation; settle clears the outstanding flag only."
+      - from: PENDING
+        to: DISPUTED
+        trigger: "POST /fines/{id}/dispute"
+        actor: Rider
+        preconditions: ["Fine.settlement_status == PENDING"]
+        side_effects: []
+      - from: DISPUTED
+        to: PENDING
+        trigger: "POST /fines/{id}/reject-dispute"
+        actor: PlatformAdmin
+        preconditions: ["Fine.settlement_status == DISPUTED"]
+        side_effects: []
+        note: "Cyclic: PENDING<->DISPUTED loop (non_linear_state_machine)."
+      - from: DISPUTED
+        to: WAIVED
+        trigger: "POST /fines/{id}/waive"
+        actor: PlatformAdmin
+        preconditions: ["Fine.settlement_status == DISPUTED"]
+        side_effects:
+          - "COMPENSATION: create WalletTransaction {txn_type: FINE_REFUND, amount_cents: +Fine.amount_cents}; Rider.wallet_balance_cents += Fine.amount_cents"
+          - "Rider.outstanding_fine_cents -= Fine.amount_cents"
+        note: "Branch: DISPUTED -> {WAIVED, PENDING} with divergent side-effect sets (non_linear_state_machine, branching)."
+
+  - entity: RebalancingTask
+    initial_state: OPEN
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: ASSIGNED
+        trigger: "POST /rebalancing-tasks/{id}/assign"
+        actor: PlatformAdmin
+        preconditions:
+          - "RebalancingTask.status == OPEN"
+          - "the named Technician.on_shift == true"
+          - "the technician's [window_start, window_end] closed interval (plus TASK_BUFFER_SECONDS=600 on each side) does not overlap any other ASSIGNED task for the same technician (resource_temporal_overlap, buffered closed intervals)"
+        side_effects:
+          - "RebalancingTask.technician_id := named technician"
+          - "RebalancingTask.status := ASSIGNED"
+      - from: ASSIGNED
+        to: OPEN
+        trigger: "POST /rebalancing-tasks/{id}/unassign"
+        actor: PlatformAdmin
+        preconditions: ["RebalancingTask.status == ASSIGNED"]
+        side_effects: ["RebalancingTask.technician_id := null", "RebalancingTask.status := OPEN"]
+      - from: ASSIGNED
+        to: COMPLETED
+        trigger: "POST /rebalancing-tasks/{id}/complete"
+        actor: Technician
+        preconditions:
+          - "RebalancingTask.status == ASSIGNED"
+          - "the acting technician is RebalancingTask.technician_id"
+          - "for SWAP: Vehicle.status == LOW_BATTERY; for MOVE: Vehicle.status == AVAILABLE"
+        side_effects:
+          - "for SWAP: Vehicle IN LOW_BATTERY -> AVAILABLE and Vehicle.battery_pct := 100"
+          - "for MOVE: Vehicle.current_zone_id := RebalancingTask.target_zone_id"
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /rebalancing-tasks/{id}/cancel"
+        actor: PlatformAdmin
+        preconditions: ["RebalancingTask.status == OPEN"]
+        side_effects: []
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "POST /rebalancing-tasks/{id}/cancel"
+        actor: PlatformAdmin
+        preconditions: ["RebalancingTask.status == ASSIGNED"]
+        side_effects: ["RebalancingTask.technician_id := null"]
+
+  - entity: LowIncomeApplication
+    initial_state: SUBMITTED
+    terminal_states: [APPROVED, REJECTED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /low-income-applications/{id}/approve"
+        actor: PlatformAdmin
+        preconditions:
+          - "LowIncomeApplication.status == SUBMITTED"
+          - "annual_income_cents <= INCOME_CEILING_PER_PERSON_CENTS (3000000) * household_size"
+        side_effects: []
+        note: "Approval is a precondition for the rider switching to a LOW_INCOME plan (cross_entity_state_dependency Rider<-Application)."
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /low-income-applications/{id}/reject"
+        actor: PlatformAdmin
+        preconditions: ["LowIncomeApplication.status == SUBMITTED"]
+        side_effects: []
+
+  - entity: MDSReport
+    initial_state: DRAFT
+    terminal_states: [FINALIZED]
+    transitions:
+      - from: DRAFT
+        to: FINALIZED
+        trigger: "POST /mds-reports/{id}/finalize"
+        actor: CityRegulator
+        preconditions: ["MDSReport.status == DRAFT"]
+        side_effects:
+          - "freeze trip_count, total_billable_minutes, avg_available_vehicles at their current computed values"
+
+  - entity: Rider
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /riders/{id}/suspend"
+        actor: PlatformAdmin
+        preconditions: ["Rider.status == ACTIVE"]
+        side_effects: []
+        note: "A SUSPENDED rider cannot start trips (cross_entity_state_dependency Trip<-Rider)."
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /riders/{id}/reinstate"
+        actor: PlatformAdmin
+        preconditions: ["Rider.status == SUSPENDED", "Rider.outstanding_fine_cents == 0"]
+        side_effects: []
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: task-create-stale-vehicle
+    parent_entity: Vehicle
+    write_endpoint: "POST /rebalancing-tasks"
+    occ_field: "expected_vehicle_version"
+    description: |
+      Creating a RebalancingTask against a Vehicle whose version has advanced
+      since the client last observed it is rejected as a stale-version write.
+      This captures the case where the vehicle's lifecycle already moved on
+      (e.g., the vehicle was sent to MAINTENANCE or a prior SWAP task was
+      created which legitimately supersedes the operator's intent) and the
+      current creator's view of the vehicle is therefore out of date.
+    error_id: ERR_STALE_VEHICLE_VERSION
+    http_status: 412
+
+  - rule_id: plan-switch-stale-rider
+    parent_entity: Rider
+    write_endpoint: "POST /riders/{id}/change-plan"
+    occ_field: "expected_rider_version"
+    description: |
+      Switching a Rider's plan when the rider's version has advanced since the
+      client last read it is rejected as a stale-version write. This captures
+      the case where another writer already changed the plan (which supersedes
+      the prior plan assignment) and the current writer's view is stale.
+    error_id: ERR_STALE_RIDER_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: trip_billable_minutes
+    trigger: "On POST /trips/{id}/end, before fare computation"
+    algorithm: aggregation
+    formula: |
+      # Sum whole seconds across RIDE segments only (PAUSE segments excluded),
+      # THEN convert to minutes. Rounding order is PINNED: sum-seconds-then-ceil,
+      # NOT ceil-each-segment-then-sum (the two differ at sub-minute boundaries).
+      ride_seconds = sum(seg.duration_seconds for seg in trip.segments if seg.segment_type == "RIDE")
+      billable_minutes = ceil(ride_seconds / 60)   # 0 seconds => 0 minutes
+    input_set: "All TripSegment rows for the trip with segment_type == RIDE and ended_at != null"
+    constants:
+      SECONDS_PER_MINUTE: 60
+    precision: "whole minutes, ceil after summing seconds"
+    variants: []
+
+  - name: trip_final_fare
+    trigger: "On POST /trips/{id}/end, after trip_billable_minutes"
+    algorithm: tiered_pricing
+    formula: |
+      # >= 3 inputs (unlock_fee, per_minute, billable_minutes, slow_zone share,
+      # daily_cap) with nested min and a conditional branch on SLOW share.
+      plan = rider.plan
+      # Each RIDE segment carries a zone_id (the vehicle's zone at the time the
+      # segment opened). Split billable minutes into SLOW vs non-SLOW by whether
+      # each RIDE segment's zone_id resolves to a SLOW zone. Apply the same
+      # sum-seconds-then-ceil rule independently to each bucket:
+      slow_minutes    = ceil(sum(seg.duration_seconds for RIDE seg where seg.zone_id resolves to a SLOW zone) / 60)
+      normal_minutes  = ceil(sum(seg.duration_seconds for RIDE seg where seg.zone_id does NOT resolve to a SLOW zone) / 60)
+      normal_charge   = normal_minutes * plan.per_minute_cents
+      slow_charge     = round_half_up(slow_minutes * plan.per_minute_cents * (1 - plan.slow_zone_discount_pct))
+      gross           = plan.unlock_fee_cents + normal_charge + slow_charge
+      final_fare_cents = gross if plan.daily_cap_cents == 0 else min(gross, plan.daily_cap_cents)
+      # Note: because a vehicle does not relocate mid-trip, every RIDE segment of
+      # a single trip shares the vehicle's start zone, so in practice one bucket
+      # is empty (trip is wholly-SLOW or wholly-normal); the split is written
+      # generally so the slow/normal branch and rounding order are unambiguous.
+    input_set: "The trip's RIDE segments (each tagged with the vehicle's zone) and the rider's current Plan"
+    constants: {}
+    precision: "integer cents; slow_charge rounded half-up before summing into gross"
+    variants:
+      - name: standard_fare
+        when: "rider.plan.code == STANDARD"
+        difference: "uses STANDARD plan rates and (typically) a higher or zero daily cap"
+      - name: low_income_fare
+        when: "rider.plan.code == LOW_INCOME"
+        difference: "uses LOW_INCOME plan rates and a lower daily cap, so identical minutes yield a lower fare"
+
+  - name: trip_provisional_fare
+    trigger: "On POST /trips (unlock), forward-looking estimate"
+    algorithm: forward_looking
+    formula: |
+      # Forward-looking estimate at unlock: assumes a projected ride of
+      # PROJECTED_TRIP_MINUTES at the plan's per-minute rate with NO slow-zone
+      # discount and NO pauses. Diverges from trip_final_fare for the same trip
+      # because final replays actual segments chronologically.
+      estimated_fare_cents = plan.unlock_fee_cents + PROJECTED_TRIP_MINUTES * plan.per_minute_cents
+      estimated_fare_cents = estimated_fare_cents if plan.daily_cap_cents == 0 else min(estimated_fare_cents, plan.daily_cap_cents)
+    input_set: "The rider's current Plan only (no segments exist yet)"
+    constants:
+      PROJECTED_TRIP_MINUTES: 15
+    precision: "integer cents"
+    variants:
+      - name: provisional
+        when: "computed at unlock from a projected duration"
+        difference: "ignores actual ridden minutes, pauses, and slow-zone discount"
+      - name: final
+        when: "computed at end from actual RIDE segments"
+        difference: "uses real billable minutes and slow-zone discount; almost always differs from provisional"
+
+  - name: fine_amount
+    trigger: "On the Trip->COMPLETED cascade when the end zone is NO_PARK"
+    algorithm: threshold
+    formula: |
+      # Circular-looking dependency pinned by evaluation order: the LOW_INCOME
+      # reduction is keyed off whether the rider currently holds a LOW_INCOME
+      # plan, which itself can only have been set via an approved application.
+      base = BASE_PARKING_FINE_CENTS
+      amount_cents = round_half_up(base * (1 - LOW_INCOME_FINE_DISCOUNT_PCT)) if rider.plan.code == "LOW_INCOME" else base
+    input_set: "The fined rider's current Plan code"
+    constants:
+      BASE_PARKING_FINE_CENTS: 2500
+      LOW_INCOME_FINE_DISCOUNT_PCT: 0.40
+    precision: "integer cents, round_half_up"
+    variants:
+      - name: standard_fine
+        when: "rider.plan.code != LOW_INCOME"
+        difference: "full BASE_PARKING_FINE_CENTS"
+      - name: low_income_fine
+        when: "rider.plan.code == LOW_INCOME"
+        difference: "40% reduction; risk/penalty scoring on the Rider domain (distinct from trip cost accounting)"
+
+  - name: mds_trip_count
+    trigger: "On GET /mds-reports/{id} (recomputed while DRAFT) and frozen on finalize"
+    algorithm: aggregation
+    formula: |
+      # Half-open window [window_start, window_end): a trip enters the count iff
+      # window_start <= trip.started_at < window_end. Boundary is PINNED half-open.
+      trip_count = count(Trip where started_at >= window_start and started_at < window_end and status in {COMPLETED})
+      total_billable_minutes = sum(Trip.billable_minutes for those trips)
+    input_set: "All Trips with status COMPLETED whose started_at is in the half-open window"
+    constants: {}
+    precision: "integer counts and minutes"
+    variants: []
+
+  - name: mds_avg_availability
+    trigger: "On GET /mds-reports/{id} (recomputed while DRAFT) and frozen on finalize"
+    algorithm: weighted_scoring
+    formula: |
+      # Time-weighted availability across the window. Distinct from a naive
+      # snapshot (count AVAILABLE at window_end). We pin the time-weighted form:
+      # integrate the AVAILABLE-vehicle count over the window using vehicle
+      # status-change events (every status mutation stamps updated_at), divide
+      # by total window seconds. With no status changes in-window the value is
+      # simply the AVAILABLE count held throughout the window.
+      avg_available_vehicles = round_half_up(
+        (sum over status-intervals i in window: available_count(i) * seconds(i)) / window_seconds, 2)
+    input_set: "Vehicle status timeline (updated_at events) intersected with the window"
+    constants: {}
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: time_weighted
+        when: "the FINALIZED reported value"
+        difference: "integrates availability over the window"
+      - name: snapshot
+        when: "a naive end-of-window reading"
+        difference: "counts AVAILABLE only at window_end; differs from time_weighted when status changed mid-window"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except endpoints whose roles include Anonymous"
+  - priority: 2
+    category: auth
+    check: "the X-User-Role is permitted to call this endpoint per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: auth
+    check: "for entity_backed roles, the acting X-User-ID owns the targeted resource (e.g., Rider acting on own trip/fine/application)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "trip/fine/low-income-application rider-owned actions"
+  - priority: 4
+    category: existence
+    check: "every resource named in the path exists (validated left-to-right)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all path-parameterized endpoints"
+  - priority: 5
+    category: existence
+    check: "every foreign-key id in the request body references an existing resource"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /trips, POST /rebalancing-tasks, POST /riders, POST /low-income-applications, POST /riders/{id}/change-plan"
+  - priority: 6
+    category: state
+    check: "the target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 7
+    category: business_safety
+    check: "a trip may not START on a vehicle whose resolved current zone is NO_RIDE"
+    error_id: ERR_START_IN_NO_RIDE_ZONE
+    http_status: 422
+    applies_to: "POST /trips"
+  - priority: 8
+    category: business_safety
+    check: "a trip may not END in a NO_RIDE zone (the rider must walk the vehicle out first)"
+    error_id: ERR_END_IN_NO_RIDE_ZONE
+    http_status: 422
+    applies_to: "POST /trips/{id}/end"
+  - priority: 9
+    category: business_safety
+    check: "a trip may not START on a vehicle whose battery_pct < MIN_START_BATTERY_PCT (20)"
+    error_id: ERR_BATTERY_TOO_LOW
+    http_status: 422
+    applies_to: "POST /trips"
+  - priority: 10
+    category: business_constraint
+    check: "a vehicle already IN_USE / RESERVED cannot be unlocked again (no overlapping active trip on the same vehicle; half-open occupancy)"
+    error_id: ERR_VEHICLE_NOT_AVAILABLE
+    http_status: 409
+    applies_to: "POST /trips"
+  - priority: 11
+    category: business_constraint
+    check: "an OPEN task cannot be ASSIGNED to a technician whose buffered window [window_start-600s, window_end+600s] overlaps another ASSIGNED task for that technician"
+    error_id: ERR_TECH_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /rebalancing-tasks/{id}/assign"
+  - priority: 12
+    category: business_constraint
+    check: "a rider may only switch to a LOW_INCOME plan if they have a LowIncomeApplication in status APPROVED"
+    error_id: ERR_NO_APPROVED_APPLICATION
+    http_status: 422
+    applies_to: "POST /riders/{id}/change-plan"
+  - priority: 13
+    category: business_temporal
+    check: "window_end must be strictly after window_start (RebalancingTask and MDSReport)"
+    error_id: ERR_INVALID_WINDOW
+    http_status: 422
+    applies_to: "POST /rebalancing-tasks, POST /mds-reports"
+  - priority: 14
+    category: business_fiscal
+    check: "a PENDING fine may only be settled when wallet_balance_cents >= Fine.amount_cents"
+    error_id: ERR_INSUFFICIENT_WALLET
+    http_status: 422
+    applies_to: "POST /fines/{id}/settle"
+  - priority: 15
+    category: business_constraint
+    check: "request body field-level validation: required fields present, enum members valid, numeric ranges satisfied"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST/PATCH"
+  - priority: 16
+    category: state
+    check: "OCC: expected_<parent>_version must equal the parent's current version"
+    error_id: ERR_STALE_VEHICLE_VERSION
+    http_status: 412
+    applies_to: "POST /rebalancing-tasks, POST /riders/{id}/change-plan"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Plan ----
+  - method: POST
+    path: "/api/plans"
+    description: "Create a pricing plan"
+    roles: [PlatformAdmin]
+    code: 201
+    input: ["code", "unlock_fee_cents", "per_minute_cents", "daily_cap_cents", "slow_zone_discount_pct?", "active?"]
+    output: Plan
+    side_effects: []
+  - method: GET
+    path: "/api/plans/{id}"
+    description: "Fetch a plan"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: []
+    output: Plan
+    side_effects: []
+  - method: GET
+    path: "/api/plans"
+    description: "List plans"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: ["code?", "limit?", "offset?"]
+    output: Plan[]
+    side_effects: []
+
+  # ---- Zone ----
+  - method: POST
+    path: "/api/zones"
+    description: "Create a geofence zone"
+    roles: [PlatformAdmin]
+    code: 201
+    input: ["name", "zone_type", "priority", "max_speed_kph?"]
+    output: Zone
+    side_effects: []
+  - method: GET
+    path: "/api/zones/{id}"
+    description: "Fetch a zone"
+    roles: [PlatformAdmin, Rider, Technician]
+    code: 200
+    input: []
+    output: Zone
+    side_effects: []
+  - method: GET
+    path: "/api/zones"
+    description: "List zones"
+    roles: [PlatformAdmin, Rider, Technician]
+    code: 200
+    input: ["zone_type?", "limit?", "offset?"]
+    output: Zone[]
+    side_effects: []
+
+  # ---- Vehicle ----
+  - method: POST
+    path: "/api/vehicles"
+    description: "Register a fleet vehicle"
+    roles: [PlatformAdmin]
+    code: 201
+    input: ["vehicle_type", "qr_code", "battery_pct?", "current_zone_id"]
+    output: Vehicle
+    side_effects: []
+  - method: GET
+    path: "/api/vehicles/{id}"
+    description: "Fetch a vehicle"
+    roles: [PlatformAdmin, Rider, Technician]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: []
+  - method: GET
+    path: "/api/vehicles"
+    description: "List vehicles; filter by status or current zone (reverse-reachability for Vehicle.current_zone_id -> Zone)"
+    roles: [PlatformAdmin, Rider, Technician]
+    code: 200
+    input: ["status?", "current_zone_id?", "limit?", "offset?"]
+    output: Vehicle[]
+    side_effects: []
+  - method: POST
+    path: "/api/vehicles/{id}/maintenance"
+    description: "Send a vehicle to maintenance"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: ["Vehicle.status := MAINTENANCE; Vehicle.version += 1"]
+  - method: POST
+    path: "/api/vehicles/{id}/return-to-service"
+    description: "Return a maintained vehicle to service"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: ["Vehicle.status := AVAILABLE; Vehicle.version += 1"]
+  - method: POST
+    path: "/api/vehicles/{id}/retire"
+    description: "Permanently retire a vehicle"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: ["Vehicle.status := RETIRED; Vehicle.version += 1"]
+
+  # ---- Rider ----
+  - method: POST
+    path: "/api/riders"
+    description: "Register a rider on a plan"
+    roles: [Anonymous]
+    code: 201
+    input: [email, full_name, plan_id]
+    output: Rider
+    side_effects: []
+  - method: GET
+    path: "/api/riders/{id}"
+    description: "Fetch a rider"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: []
+    output: Rider
+    side_effects: []
+  - method: GET
+    path: "/api/riders"
+    description: "List riders; filter by plan (reverse-reachability for Rider.plan_id -> Plan)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["plan_id?", "status?", "limit?", "offset?"]
+    output: Rider[]
+    side_effects: []
+  - method: POST
+    path: "/api/riders/{id}/topup"
+    description: "Top up a rider's prepaid wallet"
+    roles: [Rider, PlatformAdmin]
+    code: 201
+    input: [amount_cents]
+    output: WalletTransaction
+    side_effects: ["create WalletTransaction {txn_type: TOPUP, amount_cents: +amount_cents}; Rider.wallet_balance_cents += amount_cents; Rider.version += 1"]
+  - method: POST
+    path: "/api/riders/{id}/change-plan"
+    description: "Switch the rider's plan; switching to LOW_INCOME requires an APPROVED application; OCC-guarded"
+    roles: [Rider, PlatformAdmin]
+    code: 200
+    input: [plan_id, expected_rider_version]
+    output: Rider
+    side_effects: ["Rider.plan_id := plan_id; Rider.version += 1"]
+  - method: POST
+    path: "/api/riders/{id}/suspend"
+    description: "Suspend a rider account"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Rider
+    side_effects: ["Rider.status := SUSPENDED; Rider.version += 1"]
+  - method: POST
+    path: "/api/riders/{id}/reinstate"
+    description: "Reinstate a suspended rider (requires zero outstanding fines)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Rider
+    side_effects: ["Rider.status := ACTIVE; Rider.version += 1"]
+  - method: GET
+    path: "/api/riders/{id}/wallet-transactions"
+    description: "List a rider's wallet ledger (reverse-reachability for WalletTransaction.rider_id -> Rider)"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WalletTransaction[]
+    side_effects: []
+
+  # ---- WalletTransaction (flat ledger reads) ----
+  - method: GET
+    path: "/api/wallet-transactions/{id}"
+    description: "Fetch a single wallet transaction"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: []
+    output: WalletTransaction
+    side_effects: []
+  - method: GET
+    path: "/api/wallet-transactions"
+    description: "List wallet transactions; filter by rider, trip, or fine (reverse-reachability for WalletTransaction.rider_id, WalletTransaction.trip_id, WalletTransaction.fine_id)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["rider_id?", "trip_id?", "fine_id?", "txn_type?", "limit?", "offset?"]
+    output: WalletTransaction[]
+    side_effects: []
+
+  # ---- Trip ----
+  - method: POST
+    path: "/api/trips"
+    description: "Unlock a vehicle and start a trip"
+    roles: [Rider]
+    code: 201
+    input: [rider_id, vehicle_id]
+    output: Trip
+    side_effects:
+      - "open initial RIDE TripSegment; Vehicle AVAILABLE->RESERVED->IN_USE"
+      - "Trip.estimated_fare_cents := trip_provisional_fare"
+  - method: GET
+    path: "/api/trips/{id}"
+    description: "Fetch a trip"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: []
+  - method: GET
+    path: "/api/trips"
+    description: "List trips; filter by rider, vehicle, or zone (reverse-reachability for Trip.rider_id, Trip.vehicle_id, Trip.start_zone_id, Trip.end_zone_id)"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: ["rider_id?", "vehicle_id?", "start_zone_id?", "end_zone_id?", "status?", "limit?", "offset?"]
+    output: Trip[]
+    side_effects: []
+  - method: GET
+    path: "/api/trips/{id}/segments"
+    description: "List a trip's segments (reverse-reachability for TripSegment.trip_id -> Trip)"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TripSegment[]
+    side_effects: []
+  - method: GET
+    path: "/api/trip-segments/{id}"
+    description: "Fetch a single trip segment"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: []
+    output: TripSegment
+    side_effects: []
+  - method: GET
+    path: "/api/trip-segments"
+    description: "List trip segments; filter by trip or zone (reverse-reachability for TripSegment.trip_id -> Trip and TripSegment.zone_id -> Zone)"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: ["trip_id?", "zone_id?", "segment_type?", "limit?", "offset?"]
+    output: TripSegment[]
+    side_effects: []
+  - method: POST
+    path: "/api/trips/{id}/pause"
+    description: "Pause an active trip"
+    roles: [Rider]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: ["close open RIDE segment; open PAUSE segment"]
+  - method: POST
+    path: "/api/trips/{id}/resume"
+    description: "Resume a paused trip"
+    roles: [Rider]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: ["close open PAUSE segment; open new RIDE segment at vehicle's current zone"]
+  - method: POST
+    path: "/api/trips/{id}/end"
+    description: "End a trip; supply the parking zone"
+    roles: [Rider]
+    code: 200
+    input: [end_zone_id]
+    output: Trip
+    side_effects:
+      - "close open segment; compute billable_minutes and final_fare_cents"
+      - "CASCADE: TRIP_CHARGE wallet debit; if NO_PARK -> create Fine + FINE_CHARGE debit; Vehicle IN_USE->AVAILABLE or ->LOW_BATTERY (LOW_BATTERY auto-creates SWAP task)"
+  - method: POST
+    path: "/api/trips/{id}/cancel"
+    description: "Cancel a trip within the grace window"
+    roles: [Rider]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: ["Trip.final_fare_cents := 0; Vehicle IN_USE->AVAILABLE; no charge"]
+
+  # ---- Technician ----
+  - method: POST
+    path: "/api/technicians"
+    description: "Register a field technician"
+    roles: [PlatformAdmin]
+    code: 201
+    input: ["name", "depot_zone_id", "on_shift?"]
+    output: Technician
+    side_effects: []
+  - method: GET
+    path: "/api/technicians/{id}"
+    description: "Fetch a technician"
+    roles: [PlatformAdmin, Technician]
+    code: 200
+    input: []
+    output: Technician
+    side_effects: []
+  - method: GET
+    path: "/api/technicians"
+    description: "List technicians; filter by depot zone (reverse-reachability for Technician.depot_zone_id -> Zone)"
+    roles: [PlatformAdmin, Technician]
+    code: 200
+    input: ["depot_zone_id?", "on_shift?", "limit?", "offset?"]
+    output: Technician[]
+    side_effects: []
+
+  # ---- RebalancingTask ----
+  - method: POST
+    path: "/api/rebalancing-tasks"
+    description: "Create a rebalancing (MOVE) or battery (SWAP) task; OCC-guarded on the vehicle"
+    roles: [PlatformAdmin]
+    code: 201
+    input: ["vehicle_id", "task_type", "target_zone_id?", "window_start", "window_end", "expected_vehicle_version"]
+    output: RebalancingTask
+    side_effects: ["Vehicle.version += 1"]
+  - method: GET
+    path: "/api/rebalancing-tasks/{id}"
+    description: "Fetch a rebalancing task"
+    roles: [PlatformAdmin, Technician]
+    code: 200
+    input: []
+    output: RebalancingTask
+    side_effects: []
+  - method: GET
+    path: "/api/rebalancing-tasks"
+    description: "List tasks; filter by vehicle, technician, or target zone (reverse-reachability for RebalancingTask.vehicle_id, RebalancingTask.technician_id, RebalancingTask.target_zone_id)"
+    roles: [PlatformAdmin, Technician]
+    code: 200
+    input: ["vehicle_id?", "technician_id?", "target_zone_id?", "status?", "limit?", "offset?"]
+    output: RebalancingTask[]
+    side_effects: []
+  - method: POST
+    path: "/api/rebalancing-tasks/{id}/assign"
+    description: "Assign a task to a technician (buffered window-overlap check)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [technician_id]
+    output: RebalancingTask
+    side_effects: ["RebalancingTask.technician_id := technician_id; status := ASSIGNED"]
+  - method: POST
+    path: "/api/rebalancing-tasks/{id}/unassign"
+    description: "Release a task back to OPEN"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: RebalancingTask
+    side_effects: ["RebalancingTask.technician_id := null; status := OPEN"]
+  - method: POST
+    path: "/api/rebalancing-tasks/{id}/complete"
+    description: "Mark a task complete; SWAP recharges + revives vehicle, MOVE relocates it"
+    roles: [Technician]
+    code: 200
+    input: []
+    output: RebalancingTask
+    side_effects: ["for SWAP: Vehicle LOW_BATTERY->AVAILABLE, battery_pct:=100; for MOVE: Vehicle.current_zone_id := target_zone_id"]
+  - method: POST
+    path: "/api/rebalancing-tasks/{id}/cancel"
+    description: "Cancel an open or assigned task"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: RebalancingTask
+    side_effects: []
+
+  # ---- Fine ----
+  - method: GET
+    path: "/api/fines/{id}"
+    description: "Fetch a fine"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: []
+    output: Fine
+    side_effects: []
+  - method: GET
+    path: "/api/fines"
+    description: "List fines; filter by rider or trip (reverse-reachability for Fine.rider_id, Fine.trip_id)"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: ["rider_id?", "trip_id?", "settlement_status?", "limit?", "offset?"]
+    output: Fine[]
+    side_effects: []
+  - method: POST
+    path: "/api/fines/{id}/settle"
+    description: "Settle a pending fine (clears the outstanding flag)"
+    roles: [Rider]
+    code: 200
+    input: []
+    output: Fine
+    side_effects: ["Rider.outstanding_fine_cents -= amount_cents; Rider.version += 1"]
+  - method: POST
+    path: "/api/fines/{id}/dispute"
+    description: "Dispute a pending fine"
+    roles: [Rider]
+    code: 200
+    input: []
+    output: Fine
+    side_effects: []
+  - method: POST
+    path: "/api/fines/{id}/reject-dispute"
+    description: "Reject a dispute, returning the fine to PENDING"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Fine
+    side_effects: []
+  - method: POST
+    path: "/api/fines/{id}/waive"
+    description: "Waive a disputed fine and refund the charge"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Fine
+    side_effects: ["FINE_REFUND wallet credit; Rider.wallet_balance_cents += amount_cents; Rider.outstanding_fine_cents -= amount_cents; Rider.version += 1"]
+
+  # ---- LowIncomeApplication ----
+  - method: POST
+    path: "/api/low-income-applications"
+    description: "Submit a low-income plan application"
+    roles: [Rider]
+    code: 201
+    input: [rider_id, household_size, annual_income_cents]
+    output: LowIncomeApplication
+    side_effects: []
+  - method: GET
+    path: "/api/low-income-applications/{id}"
+    description: "Fetch an application"
+    roles: [PlatformAdmin, Rider]
+    code: 200
+    input: []
+    output: LowIncomeApplication
+    side_effects: []
+  - method: GET
+    path: "/api/low-income-applications"
+    description: "List applications; filter by rider (reverse-reachability for LowIncomeApplication.rider_id -> Rider)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["rider_id?", "status?", "limit?", "offset?"]
+    output: LowIncomeApplication[]
+    side_effects: []
+  - method: POST
+    path: "/api/low-income-applications/{id}/approve"
+    description: "Approve an application (income-ceiling check)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: LowIncomeApplication
+    side_effects: []
+  - method: POST
+    path: "/api/low-income-applications/{id}/reject"
+    description: "Reject an application"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: LowIncomeApplication
+    side_effects: []
+
+  # ---- MDSReport ----
+  - method: POST
+    path: "/api/mds-reports"
+    description: "Create a draft MDS reporting window"
+    roles: [CityRegulator]
+    code: 201
+    input: [window_start, window_end]
+    output: MDSReport
+    side_effects: ["compute trip_count, total_billable_minutes, avg_available_vehicles (DRAFT)"]
+  - method: GET
+    path: "/api/mds-reports/{id}"
+    description: "Fetch an MDS report (recomputes aggregates while DRAFT)"
+    roles: [CityRegulator, PlatformAdmin]
+    code: 200
+    input: []
+    output: MDSReport
+    side_effects: ["while DRAFT: recompute trip_count, total_billable_minutes, avg_available_vehicles"]
+  - method: POST
+    path: "/api/mds-reports/{id}/finalize"
+    description: "Freeze an MDS report's aggregates"
+    roles: [CityRegulator]
+    code: 200
+    input: []
+    output: MDSReport
+    side_effects: ["freeze aggregates; status := FINALIZED"]
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/api/_clock/set_current_utc"
+    description: "Set the server's logical UTC clock (test-driving endpoint for deterministic durations and windows)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["all subsequent server-stamped timestamps (started_at, segment clocks, ended_at) use this value until changed"]
+
+  # ---- Test-driving battery setter ----
+  - method: POST
+    path: "/api/_vehicles/{id}/set_battery"
+    description: "Directly set a vehicle's battery_pct (test-driving endpoint; the scaffold does not model continuous battery drain, so tests pin the value that the trip-end LOW_BATTERY branch reads). Does not change Vehicle.status."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [battery_pct]
+    output: Vehicle
+    side_effects: ["Vehicle.battery_pct := battery_pct; does NOT bump version and does NOT change status"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing or malformed X-User-Role / X-User-ID on a protected endpoint"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "the role is not permitted to call this endpoint"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "an entity_backed rider acts on a resource they do not own"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a resource named in the path does not exist"
+  - id: ERR_REFERENCE_NOT_FOUND
+    http: 404
+    condition: "a foreign-key id in the request body does not reference an existing resource"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "the requested transition is not defined from the resource's current state"
+  - id: ERR_START_IN_NO_RIDE_ZONE
+    http: 422
+    condition: "attempt to start a trip on a vehicle whose resolved zone is NO_RIDE"
+  - id: ERR_END_IN_NO_RIDE_ZONE
+    http: 422
+    condition: "attempt to end a trip in a NO_RIDE zone"
+  - id: ERR_BATTERY_TOO_LOW
+    http: 422
+    condition: "attempt to start a trip on a vehicle with battery_pct < MIN_START_BATTERY_PCT (20)"
+  - id: ERR_VEHICLE_NOT_AVAILABLE
+    http: 409
+    condition: "attempt to unlock a vehicle not in AVAILABLE status"
+  - id: ERR_TECH_WINDOW_OVERLAP
+    http: 409
+    condition: "assigning a task whose buffered window overlaps another ASSIGNED task for the same technician"
+  - id: ERR_NO_APPROVED_APPLICATION
+    http: 422
+    condition: "switching to LOW_INCOME plan without an APPROVED LowIncomeApplication"
+  - id: ERR_INVALID_WINDOW
+    http: 422
+    condition: "window_end is not strictly after window_start"
+  - id: ERR_INSUFFICIENT_WALLET
+    http: 422
+    condition: "settling a fine when wallet_balance_cents < Fine.amount_cents"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "missing required field, invalid enum, or out-of-range numeric value"
+  - id: ERR_STALE_VEHICLE_VERSION
+    http: 412
+    condition: "expected_vehicle_version does not equal the vehicle's current version on POST /rebalancing-tasks"
+  - id: ERR_STALE_RIDER_VERSION
+    http: 412
+    condition: "expected_rider_version does not equal the rider's current version on POST /riders/{id}/change-plan"
+  - id: ERR_OUTSTANDING_FINES
+    http: 422
+    condition: "reinstating a rider whose outstanding_fine_cents != 0"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Anonymous
+    description: "Unauthenticated caller; may only self-register as a rider"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /riders (self-registration)"
+    shared_operations: []
+  - name: Rider
+    description: "An end user who unlocks vehicles, takes trips, pays fines, applies for low-income plans"
+    identity: "entity_backed:Rider"
+    exclusive_operations:
+      - "POST /trips, /trips/{id}/pause|resume|end|cancel"
+      - "POST /fines/{id}/settle, /fines/{id}/dispute"
+      - "POST /low-income-applications"
+    shared_operations:
+      - "POST /riders/{id}/topup (also PlatformAdmin)"
+      - "POST /riders/{id}/change-plan (also PlatformAdmin)"
+      - "GET reads on own riders, trips, fines, applications, wallet-transactions, plans, zones, vehicles"
+  - name: Technician
+    description: "Field operator who completes rebalancing/swap tasks"
+    identity: "entity_backed:Technician"
+    exclusive_operations:
+      - "POST /rebalancing-tasks/{id}/complete"
+    shared_operations:
+      - "GET reads on rebalancing-tasks, vehicles, zones, technicians"
+  - name: PlatformAdmin
+    description: "Operator who configures plans/zones/vehicles, manages tasks, adjudicates fines and applications, manages rider lifecycle"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /plans, /zones, /vehicles, /technicians"
+      - "POST /vehicles/{id}/maintenance|return-to-service|retire"
+      - "POST /rebalancing-tasks, /rebalancing-tasks/{id}/assign|unassign|cancel"
+      - "POST /fines/{id}/reject-dispute, /fines/{id}/waive"
+      - "POST /low-income-applications/{id}/approve|reject"
+      - "POST /riders/{id}/suspend|reinstate"
+    shared_operations:
+      - "POST /riders/{id}/topup, /riders/{id}/change-plan (also Rider)"
+      - "GET reads across all collections"
+  - name: CityRegulator
+    description: "Municipal data consumer who creates and finalizes MDS reports"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /mds-reports, /mds-reports/{id}/finalize"
+    shared_operations:
+      - "GET /mds-reports/{id}"

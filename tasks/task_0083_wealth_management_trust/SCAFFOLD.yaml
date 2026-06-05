@@ -1,0 +1,1483 @@
+scenario: "83. Wealth Management & Trust Accounting: trustee/beneficiary, revocable/irrevocable trust, distribution rules, annual K-1, trust income tax, GST generation-skipping tax, Grantor Trust"
+domain_name: wealth-management-trust
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: "Ledger reconciliation"
+  secondary_archetype: "Compliance / audit"
+  complexity_layers:
+    - "Dual-variant calculation"
+    - "Cascading side effects"
+    - "Derived field reconciliation"
+    - "Optimistic concurrency"
+
+  entity_topology: hybrid
+  # Trust is the aggregate root (hierarchical: Trust -> TrustAccount -> {Receipt, Disbursement, Distribution}),
+  # but Trustee/Beneficiary/Grantor are peer parties linked by FK, and TrusteeAppointment is a
+  # many-to-many junction between Trust and Trustee. K1/TaxFiling/GstEvent are computed satellites.
+
+  state_machine_shape: cyclic
+  # Trust carries an AMENDMENT loop (ACTIVE -> AMENDMENT_PENDING -> ACTIVE) available only to
+  # revocable trusts; TaxFiling carries a supersede loop (FILED -> AMENDED -> FILED). Distribution
+  # is branching (PROPOSED -> {APPROVED -> PAID -> REVERSED, REJECTED}). TrustAccount is compound
+  # (status derived/advanced by close + filing). Not a single linear pipeline.
+
+  relationship_patterns:
+    - one_to_many       # Trust has many TrustAccount; TrustAccount has many Receipt/Disbursement/Distribution
+    - many_to_many      # Trust <-> Trustee via TrusteeAppointment
+    - cross_aggregate   # K1 references Beneficiary + TrustAccount; GstEvent references Distribution + Beneficiary
+
+  role_model: segregation_of_duties
+  # The Trustee who PROPOSES a Distribution may not APPROVE the same Distribution (proposer != approver).
+  # Grantor / Trustee / Beneficiary are entity_backed; TrustAdmin is opaque (fiduciary back-office).
+
+  consistency_model: immediate
+  # All ledger debits, DNI recomputes, K-1 line recomputes, and version bumps land atomically in the
+  # triggering request's response.
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ============================================================================
+# §1.1 Entity-Relationship Table
+# ============================================================================
+entities:
+  - name: Grantor
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Legal name of the settlor who created the trust(s)."
+      - name: generation_level
+        type: integer
+        source: input
+        description: "Generation assignment for GST skip-person analysis; the grantor is the reference generation (0)."
+        default: 0
+        constraints: "Always 0 for a grantor; persisted for symmetry with Beneficiary.generation_level."
+      - name: gst_exemption_total_cents
+        type: integer
+        source: input
+        description: "Lifetime GST exemption pool available to this grantor, in whole cents."
+        constraints: ">= 0; default reflects the statutory lifetime amount the platform seeds."
+        default: 1399000000
+      - name: gst_exemption_remaining_cents
+        type: integer
+        source: computed
+        description: "Unallocated GST exemption = gst_exemption_total_cents - sum over this grantor's Trusts of Trust.gst_exemption_allocated_cents. Recomputed on every allocation/de-allocation."
+
+  - name: Trustee
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Legal name of the fiduciary."
+      - name: is_corporate
+        type: boolean
+        source: input
+        description: "True for a corporate/institutional trustee, false for an individual."
+        default: false
+
+  - name: Beneficiary
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Legal name of the beneficiary."
+      - name: grantor_id
+        type: string
+        source: input
+        description: "FK -> Grantor.id; the grantor relative to whom generation_level is measured."
+      - name: generation_level
+        type: integer
+        source: input
+        description: "Generation relative to the grantor (0=grantor's generation, 1=children, 2=grandchildren, ...). generation_level >= 2 marks a skip person for GST."
+        constraints: ">= 0"
+      - name: is_skip_person
+        type: boolean
+        source: computed
+        description: "Derived: true iff generation_level - Grantor.generation_level >= 2. Drives GST taxable-distribution detection."
+
+  - name: Trust
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Trust instrument name."
+      - name: grantor_id
+        type: string
+        source: input
+        description: "FK -> Grantor.id; the settlor."
+      - name: trust_type
+        type: enum
+        source: input
+        description: "REVOCABLE or IRREVOCABLE. Revocable trusts may be amended/revoked by the grantor; irrevocable trusts may not."
+        constraints: "enum: REVOCABLE, IRREVOCABLE"
+      - name: is_grantor_trust
+        type: boolean
+        source: input
+        description: "Grantor-trust election (IRC subpart E). When true, trust income tax is computed as 0 at the trust level and income/capital-gain character flows to the grantor; when false the trust is a separate taxpayer taxed under the compressed brackets."
+        default: false
+      - name: capital_gains_to_income
+        type: boolean
+        source: input
+        description: "Governing-instrument election: when true, realized capital gains are allocated to income; when false (default) they are allocated to principal."
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state. See §1.2."
+        constraints: "enum: DRAFT, FUNDED, ACTIVE, AMENDMENT_PENDING, TERMINATING, TERMINATED, REVOKED"
+        default: DRAFT
+      - name: principal_balance_cents
+        type: integer
+        source: computed
+        description: "Running principal corpus = sum of principal Receipt.amount_cents minus principal Disbursement.amount_cents minus principal-funded Distribution.amount_cents across all of this trust's TrustAccounts. Recomputed on every ledger mutation."
+      - name: income_balance_cents
+        type: integer
+        source: computed
+        description: "Running undistributed income = sum of income Receipt.amount_cents minus income Disbursement.amount_cents minus income-funded Distribution.amount_cents across all TrustAccounts. Recomputed on every ledger mutation."
+      - name: gst_exemption_allocated_cents
+        type: integer
+        source: computed
+        description: "Sum of GstExemptionAllocation.amount_cents currently allocated to this trust. Drives the trust's GST inclusion ratio."
+        default: 0
+      - name: inclusion_ratio
+        type: number
+        source: computed
+        description: "GST inclusion ratio = round(1 - (gst_exemption_allocated_cents / principal_balance_cents), 6); clamped to [0,1]. When principal_balance_cents == 0 the ratio is defined as 0."
+
+  - name: TrusteeAppointment
+    parent: Trust
+    common_fields: true
+    fields:
+      - name: trust_id
+        type: string
+        source: input
+        description: "FK -> Trust.id; the trust this appointment governs."
+      - name: trustee_id
+        type: string
+        source: input
+        description: "FK -> Trustee.id; the appointed fiduciary."
+      - name: term_start
+        type: datetime
+        source: input
+        description: "Inclusive start of the trustee's term (closed lower bound)."
+      - name: term_end
+        type: datetime
+        source: input
+        description: "Inclusive end of the trustee's term (closed upper bound). term_end > term_start."
+      - name: status
+        type: enum
+        source: system
+        description: "ACTIVE on creation; RESIGNED when the trustee steps down."
+        constraints: "enum: ACTIVE, RESIGNED"
+        default: ACTIVE
+
+  - name: TrustAccount
+    parent: Trust
+    common_fields: true
+    fields:
+      - name: trust_id
+        type: string
+        source: input
+        description: "FK -> Trust.id; the owning trust."
+      - name: tax_year
+        type: integer
+        source: input
+        description: "Calendar tax year this accounting period covers (e.g., 2025)."
+      - name: period_start
+        type: datetime
+        source: input
+        description: "Inclusive start of the accounting period (closed lower bound), [period_start, period_end)."
+      - name: period_end
+        type: datetime
+        source: input
+        description: "Exclusive end of the accounting period (open upper bound). period_end > period_start."
+      - name: status
+        type: enum
+        source: system
+        description: "OPEN -> CLOSED (no further ledger entries) -> FILED (tax return filed). See §1.2."
+        constraints: "enum: OPEN, CLOSED, FILED"
+        default: OPEN
+      - name: dni_cents
+        type: integer
+        source: computed
+        description: "Distributable Net Income for the period. See calculations.distributable_net_income. Recomputed on every Receipt/Disbursement mutation on this account."
+        default: 0
+      - name: dni_carried_out_cents
+        type: integer
+        source: computed
+        description: "Portion of DNI carried out to beneficiaries via PAID Distributions in this period = min(sum of PAID Distribution.amount_cents on this account, dni_cents). Recomputed on every Distribution PAID/REVERSED."
+        default: 0
+      - name: taxable_income_cents
+        type: integer
+        source: computed
+        description: "Trust taxable income for the period = dni_cents - dni_carried_out_cents + retained_capital_gains_cents, floored at 0. See calculations.trust_taxable_income."
+        default: 0
+
+  - name: Receipt
+    parent: TrustAccount
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> TrustAccount.id; the period this receipt posts to."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Gross amount received, in whole cents. > 0."
+        constraints: "> 0"
+      - name: receipt_kind
+        type: enum
+        source: input
+        description: "Income character of the receipt: INTEREST, DIVIDEND_ORDINARY, DIVIDEND_QUALIFIED, CAPITAL_GAIN, CONTRIBUTION. CONTRIBUTION is corpus (principal). Others are income unless re-characterized by the principal/income allocation rule."
+        constraints: "enum: INTEREST, DIVIDEND_ORDINARY, DIVIDEND_QUALIFIED, CAPITAL_GAIN, CONTRIBUTION"
+      - name: ledger_side
+        type: enum
+        source: computed
+        description: "Computed by calculations.principal_income_allocation: which sub-ledger this receipt credits (INCOME or PRINCIPAL)."
+        constraints: "enum: INCOME, PRINCIPAL"
+
+  - name: Disbursement
+    parent: TrustAccount
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> TrustAccount.id; the period this disbursement posts to."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Amount paid out as an expense, in whole cents. > 0."
+        constraints: "> 0"
+      - name: expense_kind
+        type: enum
+        source: input
+        description: "TRUSTEE_FEE, INVESTMENT_FEE, TAX_PAYMENT, ADMINISTRATIVE. Determines default ledger_side per the principal/income allocation rule."
+        constraints: "enum: TRUSTEE_FEE, INVESTMENT_FEE, TAX_PAYMENT, ADMINISTRATIVE"
+      - name: ledger_side
+        type: enum
+        source: computed
+        description: "Computed by calculations.principal_income_allocation: which sub-ledger this disbursement debits (INCOME or PRINCIPAL)."
+        constraints: "enum: INCOME, PRINCIPAL"
+      - name: is_system_generated
+        type: boolean
+        source: computed
+        description: "True when created by a cascade (e.g., the TAX_PAYMENT Disbursement spawned on TaxFiling FILED), false for trustee-entered expenses."
+        default: false
+
+  - name: Distribution
+    parent: TrustAccount
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> TrustAccount.id; the period this distribution is charged to."
+      - name: beneficiary_id
+        type: string
+        source: input
+        description: "FK -> Beneficiary.id; the recipient."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Amount distributed, in whole cents. > 0."
+        constraints: "> 0"
+      - name: distribution_kind
+        type: enum
+        source: input
+        description: "MANDATORY (required by the instrument, e.g., income beneficiary) or DISCRETIONARY (trustee discretion). MANDATORY distributions carry out DNI before DISCRETIONARY in the tier order."
+        constraints: "enum: MANDATORY, DISCRETIONARY"
+      - name: proposer_trustee_id
+        type: string
+        source: input
+        description: "FK -> Trustee.id; the trustee who proposed this distribution. Segregation of duties: this trustee may not approve the same distribution."
+      - name: approver_trustee_id
+        type: string
+        source: system
+        description: "FK -> Trustee.id; the trustee who approved this distribution (set on APPROVE). Must differ from proposer_trustee_id."
+      - name: status
+        type: enum
+        source: system
+        description: "Branching lifecycle. See §1.2."
+        constraints: "enum: PROPOSED, APPROVED, REJECTED, PAID, REVERSED"
+        default: PROPOSED
+      - name: funded_from_income_cents
+        type: integer
+        source: computed
+        description: "Portion of amount_cents charged to the income sub-ledger on PAID = min(amount_cents, trust.income_balance_cents at payment time). Remainder funded from principal."
+        default: 0
+      - name: funded_from_principal_cents
+        type: integer
+        source: computed
+        description: "amount_cents - funded_from_income_cents. The principal portion of the distribution."
+        default: 0
+      - name: dni_carried_amount_cents
+        type: integer
+        source: computed
+        description: "DNI carried out by THIS distribution after the tiered allocation in calculations.distribution_dni_carryout. Drives the beneficiary's K-1 character lines."
+        default: 0
+
+  - name: K1
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> TrustAccount.id; the period the statement covers."
+      - name: beneficiary_id
+        type: string
+        source: input
+        description: "FK -> Beneficiary.id; the recipient of the statement."
+      - name: ordinary_income_cents
+        type: integer
+        source: computed
+        description: "Ordinary-income character carried to this beneficiary. See calculations.k1_character_allocation."
+        default: 0
+      - name: qualified_dividend_cents
+        type: integer
+        source: computed
+        description: "Qualified-dividend character carried to this beneficiary."
+        default: 0
+      - name: capital_gain_cents
+        type: integer
+        source: computed
+        description: "Capital-gain character carried to this beneficiary (nonzero only when capital gains are allocated to income and distributed)."
+        default: 0
+      - name: total_carried_cents
+        type: integer
+        source: computed
+        description: "ordinary_income_cents + qualified_dividend_cents + capital_gain_cents."
+        default: 0
+
+  - name: TaxFiling
+    parent: TrustAccount
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> TrustAccount.id; the period being filed (Form 1041)."
+      - name: taxable_income_snapshot_cents
+        type: integer
+        source: system
+        description: "TrustAccount.taxable_income_cents captured at filing time."
+        default: 0
+      - name: tax_due_cents
+        type: integer
+        source: computed
+        description: "Trust income tax under the compressed brackets, or 0 for a grantor trust. See calculations.trust_income_tax."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Supersede loop. See §1.2."
+        constraints: "enum: DRAFT, FILED, AMENDED, SUPERSEDED"
+        default: DRAFT
+      - name: supersedes_filing_id
+        type: string
+        source: input
+        description: "FK -> TaxFiling.id; the prior FILED filing this amended filing supersedes (null for an original filing)."
+
+  - name: GstExemptionAllocation
+    parent: Trust
+    common_fields: true
+    fields:
+      - name: trust_id
+        type: string
+        source: input
+        description: "FK -> Trust.id; the trust receiving exemption."
+      - name: grantor_id
+        type: string
+        source: input
+        description: "FK -> Grantor.id; the grantor whose exemption pool funds this allocation."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "GST exemption allocated to the trust, in whole cents. > 0."
+        constraints: "> 0"
+      - name: status
+        type: enum
+        source: system
+        description: "ALLOCATED on creation; RELEASED when de-allocated (compensating action)."
+        constraints: "enum: ALLOCATED, RELEASED"
+        default: ALLOCATED
+
+  - name: GstEvent
+    parent: null
+    common_fields: true
+    fields:
+      - name: trust_id
+        type: string
+        source: input
+        description: "FK -> Trust.id; the transferring trust."
+      - name: beneficiary_id
+        type: string
+        source: input
+        description: "FK -> Beneficiary.id; the skip-person transferee."
+      - name: distribution_id
+        type: string
+        source: input
+        description: "FK -> Distribution.id; the taxable distribution that triggered this event (null for a taxable-termination event)."
+      - name: event_type
+        type: enum
+        source: system
+        description: "TAXABLE_DISTRIBUTION (skip-person distribution) or TAXABLE_TERMINATION (trust terminates with skip-person remainder)."
+        constraints: "enum: TAXABLE_DISTRIBUTION, TAXABLE_TERMINATION"
+      - name: taxable_amount_cents
+        type: integer
+        source: system
+        description: "The transfer amount subject to GST (the distribution amount, or the terminating principal share)."
+        default: 0
+      - name: gst_tax_cents
+        type: integer
+        source: computed
+        description: "GST tax = round_half_up(taxable_amount_cents * inclusion_ratio_snapshot * GST_RATE). See calculations.gst_tax."
+        default: 0
+      - name: inclusion_ratio_snapshot
+        type: number
+        source: system
+        description: "Trust.inclusion_ratio captured at the moment the event was generated."
+        default: 0
+
+# ============================================================================
+# §1.2 State Machine Table
+# ============================================================================
+state_machines:
+  - entity: Trust
+    initial_state: DRAFT
+    terminal_states: [TERMINATED, REVOKED]
+    transitions:
+      - from: DRAFT
+        to: FUNDED
+        trigger: "POST /trusts/{id}/fund"
+        actor: TrustAdmin
+        preconditions:
+          - "trust.status == DRAFT"
+          - "at least one TrusteeAppointment with status ACTIVE exists for this trust"
+        side_effects:
+          - "increments Trust.version by 1"
+      - from: FUNDED
+        to: ACTIVE
+        trigger: "POST /trusts/{id}/activate"
+        actor: TrustAdmin
+        preconditions:
+          - "trust.status == FUNDED"
+          - "Trust.principal_balance_cents > 0 (an initial CONTRIBUTION receipt has posted)"
+        side_effects:
+          - "increments Trust.version by 1"
+      - from: ACTIVE
+        to: AMENDMENT_PENDING
+        trigger: "POST /trusts/{id}/amendments"
+        actor: Grantor
+        preconditions:
+          - "trust.status == ACTIVE"
+          - "trust.trust_type == REVOCABLE (irrevocable trusts cannot be amended)"
+        side_effects:
+          - "increments Trust.version by 1"
+        note: "Cycle entry: a revocable trust enters amendment then returns to ACTIVE."
+      - from: AMENDMENT_PENDING
+        to: ACTIVE
+        trigger: "POST /trusts/{id}/amendments/commit"
+        actor: Grantor
+        preconditions:
+          - "trust.status == AMENDMENT_PENDING"
+        side_effects:
+          - "applies the pending capital_gains_to_income / is_grantor_trust election change to the Trust"
+          - "increments Trust.version by 1"
+        note: "Cycle return edge: ACTIVE -> AMENDMENT_PENDING -> ACTIVE."
+      - from: ACTIVE
+        to: REVOKED
+        trigger: "POST /trusts/{id}/revoke"
+        actor: Grantor
+        preconditions:
+          - "trust.status == ACTIVE"
+          - "trust.trust_type == REVOCABLE (irrevocable trusts cannot be revoked)"
+        side_effects:
+          - "all OPEN TrustAccounts on this trust transition to CLOSED"
+          - "increments Trust.version by 1"
+      - from: ACTIVE
+        to: TERMINATING
+        trigger: "POST /trusts/{id}/terminate"
+        actor: TrustAdmin
+        preconditions:
+          - "trust.status == ACTIVE"
+          - "no Distribution on any account of this trust is in PROPOSED or APPROVED (unsettled) status"
+        side_effects:
+          - "CASCADE step 1: every OPEN TrustAccount on this trust transitions to CLOSED"
+          - "increments Trust.version by 1"
+      - from: TERMINATING
+        to: TERMINATED
+        trigger: "POST /trusts/{id}/terminate/finalize"
+        actor: TrustAdmin
+        preconditions:
+          - "trust.status == TERMINATING"
+          - "every TrustAccount on this trust is in status FILED"
+        side_effects:
+          - "CASCADE step 2: for each Beneficiary with is_skip_person == true, a GstEvent of event_type TAXABLE_TERMINATION is created with taxable_amount_cents = the beneficiary's pro-rata share of Trust.principal_balance_cents (equal split across skip-person beneficiaries; remainder cents to the earliest-created skip beneficiary by created_at ASC), gst_tax computed via calculations.gst_tax"
+          - "increments Trust.version by 1"
+
+  - entity: TrustAccount
+    initial_state: OPEN
+    terminal_states: [FILED]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /accounts/{id}/close"
+        actor: TrustAdmin
+        preconditions:
+          - "account.status == OPEN"
+          - "owning Trust.status IN {ACTIVE, AMENDMENT_PENDING, TERMINATING, REVOKED}"
+        side_effects:
+          - "freezes the ledger: no further Receipt/Disbursement/Distribution may be created on this account"
+          - "recomputes dni_cents, taxable_income_cents"
+          - "increments TrustAccount.version by 1"
+      - from: CLOSED
+        to: FILED
+        trigger: "POST /accounts/{id}/filings (TaxFiling reaches FILED for this account)"
+        actor: TrustAdmin
+        preconditions:
+          - "account.status == CLOSED"
+          - "no existing TaxFiling for this account is in status FILED (an original filing not yet superseded)"
+        side_effects:
+          - "increments TrustAccount.version by 1"
+        note: "Cross-entity: account moves to FILED only when its TaxFiling transitions DRAFT->FILED (see TaxFiling)."
+
+  - entity: Distribution
+    initial_state: PROPOSED
+    terminal_states: [REJECTED, REVERSED]
+    transitions:
+      - from: PROPOSED
+        to: APPROVED
+        trigger: "POST /distributions/{id}/approve"
+        actor: Trustee
+        preconditions:
+          - "distribution.status == PROPOSED"
+          - "the approving Trustee (X-User-ID) != distribution.proposer_trustee_id (segregation of duties)"
+          - "owning TrustAccount.status == OPEN"
+        side_effects:
+          - "sets approver_trustee_id = X-User-ID"
+          - "increments Distribution.version by 1"
+      - from: PROPOSED
+        to: REJECTED
+        trigger: "POST /distributions/{id}/reject"
+        actor: Trustee
+        preconditions:
+          - "distribution.status == PROPOSED"
+        side_effects:
+          - "increments Distribution.version by 1"
+      - from: APPROVED
+        to: PAID
+        trigger: "POST /distributions/{id}/pay"
+        actor: Trustee
+        preconditions:
+          - "distribution.status == APPROVED"
+          - "owning Trust.status IN {ACTIVE, TERMINATING} (cross-entity: a TERMINATED/REVOKED trust cannot pay)"
+          - "owning TrustAccount.status == OPEN"
+          - "amount_cents <= Trust.principal_balance_cents + Trust.income_balance_cents (sufficient corpus)"
+        side_effects:
+          - "CASCADE step 1: computes funded_from_income_cents/funded_from_principal_cents and debits Trust.income_balance_cents then Trust.principal_balance_cents (income first)"
+          - "CASCADE step 2: the balance mutation triggers recompute of owning TrustAccount.dni_carried_out_cents and re-runs calculations.distribution_dni_carryout, setting dni_carried_amount_cents on every PAID Distribution of the account"
+          - "CASCADE step 3: the dni_carried_out change triggers recompute of every affected Beneficiary's K1 via calculations.k1_character_allocation"
+          - "if beneficiary.is_skip_person == true, creates a GstEvent of event_type TAXABLE_DISTRIBUTION (taxable_amount_cents = amount_cents) and computes gst_tax via calculations.gst_tax"
+          - "increments Distribution.version by 1"
+      - from: PAID
+        to: REVERSED
+        trigger: "POST /distributions/{id}/reverse"
+        actor: TrustAdmin
+        preconditions:
+          - "distribution.status == PAID"
+          - "owning TrustAccount.status == OPEN"
+        side_effects:
+          - "COMPENSATION: credits Trust.income_balance_cents by funded_from_income_cents and Trust.principal_balance_cents by funded_from_principal_cents (exact inverse of the PAID debit)"
+          - "recomputes owning TrustAccount.dni_carried_out_cents and re-runs distribution_dni_carryout over remaining PAID distributions"
+          - "recomputes affected Beneficiary K1 lines"
+          - "if a GstEvent was created on PAID, it is deleted (taxable transfer undone)"
+          - "increments Distribution.version by 1"
+
+  - entity: TaxFiling
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: DRAFT
+        to: FILED
+        trigger: "POST /filings/{id}/file"
+        actor: TrustAdmin
+        preconditions:
+          - "filing.status == DRAFT"
+          - "owning TrustAccount.status == CLOSED (cross-entity: cannot file an OPEN period)"
+        side_effects:
+          - "snapshots taxable_income_snapshot_cents from TrustAccount.taxable_income_cents and computes tax_due_cents via calculations.trust_income_tax"
+          - "CASCADE step 1: owning TrustAccount transitions CLOSED -> FILED"
+          - "CASCADE step 2: when tax_due_cents > 0, creates a system Disbursement (expense_kind TAX_PAYMENT, is_system_generated true, ledger_side PRINCIPAL) of amount_cents = tax_due_cents on the account, debiting Trust.principal_balance_cents"
+          - "increments TaxFiling.version by 1"
+      - from: FILED
+        to: AMENDED
+        trigger: "POST /filings/{id}/amend"
+        actor: TrustAdmin
+        preconditions:
+          - "filing.status == FILED"
+        side_effects:
+          - "increments TaxFiling.version by 1"
+        note: "Supersede loop entry."
+      - from: AMENDED
+        to: FILED
+        trigger: "POST /filings/{id}/refile"
+        actor: TrustAdmin
+        preconditions:
+          - "filing.status == AMENDED"
+        side_effects:
+          - "marks the prior original filing referenced by supersedes_filing_id as SUPERSEDED"
+          - "recomputes tax_due_cents via calculations.trust_income_tax on the current account snapshot"
+          - "increments TaxFiling.version by 1"
+        note: "Supersede loop return edge: FILED -> AMENDED -> FILED."
+
+  - entity: GstExemptionAllocation
+    initial_state: ALLOCATED
+    terminal_states: [RELEASED]
+    transitions:
+      - from: ALLOCATED
+        to: RELEASED
+        trigger: "DELETE /trusts/{id}/gst-exemption-allocations/{alloc_id}"
+        actor: TrustAdmin
+        preconditions:
+          - "allocation.status == ALLOCATED"
+          - "no GstEvent on the trust has consumed this exemption (Trust has no GstEvent with inclusion_ratio_snapshot computed against this allocation)"
+        side_effects:
+          - "COMPENSATION: decrements Trust.gst_exemption_allocated_cents by amount_cents, recomputes Trust.inclusion_ratio and Grantor.gst_exemption_remaining_cents (exact inverse of the allocation)"
+          - "increments Trust.version by 1"
+
+# ----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: gst-allocation-stale-trust
+    parent_entity: Trust
+    write_endpoint: "POST /trusts/{id}/gst-exemption-allocations"
+    occ_field: "expected_trust_version"
+    description: |
+      Allocating GST exemption to a Trust whose version has advanced since the
+      client last observed it is rejected with a stale-version error. A prior
+      allocation against the same trust legitimately consumes part of the shared
+      grantor exemption pool and advances Trust.version; a second allocation that
+      was computed against the pre-allocation view is therefore working from a
+      stale exemption-remaining figure and must be re-derived against the new
+      version before it can post.
+    error_id: ERR_STALE_TRUST_VERSION
+    http_status: 412
+
+# ============================================================================
+# §1.3 Calculation Rules Table
+# ============================================================================
+calculations:
+  - name: principal_income_allocation
+    trigger: "on Receipt create and Disbursement create; recomputed if the trust's capital_gains_to_income election changes on amendment commit"
+    algorithm: constraint_propagation
+    formula: |
+      # Receipt.ledger_side:
+      if receipt_kind == CONTRIBUTION:            ledger_side = PRINCIPAL
+      elif receipt_kind == CAPITAL_GAIN:
+          ledger_side = INCOME if trust.capital_gains_to_income else PRINCIPAL
+      else:  # INTEREST, DIVIDEND_ORDINARY, DIVIDEND_QUALIFIED
+          ledger_side = INCOME
+      # Disbursement.ledger_side:
+      if expense_kind == INVESTMENT_FEE:          ledger_side = PRINCIPAL
+      elif expense_kind == TAX_PAYMENT:           ledger_side = PRINCIPAL
+      elif expense_kind == TRUSTEE_FEE:           ledger_side = INCOME   # ordinary trustee fee split: charged to income by default
+      else:  # ADMINISTRATIVE
+          ledger_side = INCOME
+    input_set: "the single Receipt/Disbursement being posted; reads trust.capital_gains_to_income"
+    constants: {}
+    precision: "whole cents; ledger_side is categorical"
+    variants:
+      - name: capital_gain_to_principal
+        when: "trust.capital_gains_to_income == false (default)"
+        difference: "CAPITAL_GAIN receipts credit PRINCIPAL and are excluded from DNI"
+      - name: capital_gain_to_income
+        when: "trust.capital_gains_to_income == true (governing-instrument election)"
+        difference: "CAPITAL_GAIN receipts credit INCOME and ARE included in DNI, changing both DNI and the K-1 capital-gain line for identical receipts"
+
+  - name: distributable_net_income
+    trigger: "on Receipt/Disbursement create on an OPEN account; on account close; recomputed when capital_gains_to_income changes"
+    algorithm: aggregation
+    formula: |
+      income_receipts   = sum(Receipt.amount_cents WHERE account_id == this AND ledger_side == INCOME)
+      income_expenses   = sum(Disbursement.amount_cents WHERE account_id == this AND ledger_side == INCOME)
+      # Capital gains enter DNI ONLY when allocated to income for this trust:
+      dni_cents = max(0, income_receipts - income_expenses)
+    input_set: "all Receipt and Disbursement on this TrustAccount, filtered by computed ledger_side == INCOME; CAPITAL_GAIN receipts contribute only under the capital_gain_to_income variant"
+    constants: {}
+    precision: "whole cents, no rounding (integer arithmetic)"
+
+  - name: distribution_dni_carryout
+    trigger: "on Distribution PAID and on Distribution REVERSED (recomputed across all PAID distributions of the account)"
+    algorithm: waterfall_allocation
+    formula: |
+      # Tier order: MANDATORY distributions carry out DNI before DISCRETIONARY.
+      # Within a tier, order by created_at ASC (never by id).
+      remaining_dni = account.dni_cents
+      paid = [d for d in account.distributions if d.status == PAID]
+      ordered = sort(paid, key=(0 if d.distribution_kind==MANDATORY else 1, d.created_at ASC))
+      for d in ordered:
+          d.dni_carried_amount_cents = min(d.amount_cents, remaining_dni)
+          remaining_dni -= d.dni_carried_amount_cents
+      account.dni_carried_out_cents = account.dni_cents - remaining_dni
+    input_set: "PAID Distributions on the account; tiered MANDATORY-before-DISCRETIONARY, created_at ASC within tier"
+    constants: {}
+    precision: "whole cents; min() caps each distribution's carry-out at remaining DNI"
+
+  - name: k1_character_allocation
+    trigger: "on Distribution PAID, on Distribution REVERSED, and on account close (recompute every affected beneficiary's K1)"
+    algorithm: weighted_scoring
+    formula: |
+      total_carried = account.dni_carried_out_cents
+      if total_carried == 0: every K1 line on the account = 0; return
+      # Character pool of the carried-out DNI, in INCOME ledger:
+      ord_pool = sum(Receipt.amount_cents WHERE ledger_side==INCOME AND receipt_kind IN {INTEREST, DIVIDEND_ORDINARY})
+                 - sum(Disbursement.amount_cents WHERE ledger_side==INCOME)
+      qd_pool  = sum(Receipt.amount_cents WHERE receipt_kind == DIVIDEND_QUALIFIED AND ledger_side==INCOME)
+      cg_pool  = sum(Receipt.amount_cents WHERE receipt_kind == CAPITAL_GAIN AND ledger_side==INCOME)  # nonzero only under capital_gain_to_income
+      # Scale each character pool down to the carried-out fraction:
+      scale = total_carried / dni_cents      # carried fraction of DNI
+      char_ord = round_half_up(ord_pool * scale); char_qd = round_half_up(qd_pool * scale); char_cg = round_half_up(cg_pool * scale)
+      # Per-beneficiary share of each character, ROUND PER BENEFICIARY THEN RECONCILE:
+      for each beneficiary b with carried distributions:
+          share_b = (sum of b's dni_carried_amount_cents) / total_carried
+          K1[b].ordinary_income_cents   = round_half_up(char_ord * share_b)
+          K1[b].qualified_dividend_cents = round_half_up(char_qd * share_b)
+          K1[b].capital_gain_cents       = round_half_up(char_cg * share_b)
+      # PINNED ORDER: round each beneficiary line independently, then reconcile any
+      # residual (char_X - sum of rounded lines) by adding it to the beneficiary with
+      # the LARGEST carried share; tie-break created_at ASC. This differs from a
+      # 'sum-then-truncate' pass which would drop the residual cent.
+    input_set: "carried-out DNI, character pools (INCOME ledger), per-beneficiary carried shares"
+    constants: {}
+    precision: "round_half_up to whole cents; residual reconciled to largest-share beneficiary, created_at ASC tie-break"
+
+  - name: trust_taxable_income
+    trigger: "on account close and on Receipt/Disbursement mutation on a CLOSED-bound account; snapshotted on TaxFiling FILED"
+    algorithm: aggregation
+    formula: |
+      retained_capital_gains_cents = sum(Receipt.amount_cents WHERE ledger_side==PRINCIPAL AND receipt_kind==CAPITAL_GAIN)
+      taxable_income_cents = max(0, dni_cents - dni_carried_out_cents + retained_capital_gains_cents)
+    input_set: "account DNI, carried-out DNI, principal-side capital gains; capital gains taxed at the trust unless allocated to income and distributed out"
+    constants: {}
+    precision: "whole cents, floored at 0"
+
+  - name: trust_income_tax
+    trigger: "on TaxFiling FILED and on TaxFiling refile (AMENDED -> FILED)"
+    algorithm: tiered_pricing
+    formula: |
+      if trust.is_grantor_trust:
+          tax_due_cents = 0          # grantor-trust variant: income flows to grantor, trust pays no tax
+      else:
+          ti = taxable_income_snapshot_cents
+          tax = 0
+          tax += min(ti, B1) * R1
+          if ti > B1: tax += (min(ti, B2) - B1) * R2
+          if ti > B2: tax += (min(ti, B3) - B2) * R3
+          if ti > B3: tax += (ti - B3) * R4
+          tax_due_cents = round_half_up(tax)
+    input_set: "taxable_income_snapshot_cents; brackets are the compressed trust/estate schedule"
+    constants:
+      B1: 310000      # $3,100
+      B2: 1115000     # $11,150
+      B3: 1520000     # $15,200
+      R1: 0.10
+      R2: 0.24
+      R3: 0.35
+      R4: 0.37
+    precision: "round_half_up to whole cents"
+    variants:
+      - name: separate_taxpayer
+        when: "trust.is_grantor_trust == false"
+        difference: "trust is a separate taxpayer; tax computed under the four compressed brackets"
+      - name: grantor_trust_passthrough
+        when: "trust.is_grantor_trust == true"
+        difference: "tax_due_cents is 0 at the trust level; the identical taxable income produces a different result than the separate-taxpayer variant"
+
+  - name: gst_tax
+    trigger: "on GstEvent creation (Distribution PAID to a skip person, or TAXABLE_TERMINATION cascade)"
+    algorithm: threshold
+    formula: |
+      inclusion_ratio_snapshot = trust.inclusion_ratio   # = clamp(1 - allocated/principal, 0, 1), 6 dp
+      gst_tax_cents = round_half_up(taxable_amount_cents * inclusion_ratio_snapshot * GST_RATE)
+    input_set: "the taxable transfer amount and the trust's inclusion ratio at event time"
+    constants:
+      GST_RATE: 0.40
+    precision: "round_half_up to whole cents; inclusion_ratio carried to 6 decimal places"
+
+# ============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "the role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "every path-referenced resource exists, validated left-to-right; FK fields in the body reference existing entities"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 4
+    category: business_referential
+    check: "for entity_backed acting roles, X-User-ID matches the relevant entity (Trustee acting on a distribution must be an appointed trustee of the owning trust; Grantor acting on a trust must be Trust.grantor_id; Beneficiary reading a K1 must be K1.beneficiary_id)"
+    error_id: ERR_NOT_OWNER
+    http_status: 403
+    applies_to: "trustee/grantor/beneficiary scoped operations"
+  - priority: 5
+    category: state
+    check: "the target resource is in a state that admits this transition (state-machine from: matches)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 6
+    category: business_safety
+    check: "an IRREVOCABLE trust may not be amended or revoked (compliance: the instrument is irrevocable)"
+    error_id: ERR_TRUST_IRREVOCABLE
+    http_status: 409
+    applies_to: "POST /trusts/{id}/amendments, POST /trusts/{id}/revoke"
+  - priority: 7
+    category: business_safety
+    check: "segregation of duties: the Trustee approving a Distribution must not be its proposer_trustee_id"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 409
+    applies_to: "POST /distributions/{id}/approve"
+  - priority: 8
+    category: business_temporal
+    check: "a new TrustAccount period [period_start, period_end) must not overlap an existing account period on the same trust (half-open intervals; abutting periods with period_end == next period_start are allowed)"
+    error_id: ERR_ACCOUNT_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /trusts/{id}/accounts"
+  - priority: 9
+    category: business_temporal
+    check: "a new TrusteeAppointment [term_start, term_end] for a given (trust_id, trustee_id) seat must not overlap OR sit within TRUSTEE_GAP_DAYS (= 30 days) of an existing ACTIVE appointment for the SAME (trust_id, trustee_id) (closed intervals with a mandatory buffer gap). Distinct trustees may serve concurrently (co-trustees); the conflict is per (trust, trustee) seat."
+    error_id: ERR_TRUSTEE_TERM_CONFLICT
+    http_status: 409
+    applies_to: "POST /trusts/{id}/trustee-appointments"
+  - priority: 10
+    category: business_constraint
+    check: "a Receipt/Disbursement/Distribution may only be created on a TrustAccount in status OPEN (a CLOSED/FILED period is frozen)"
+    error_id: ERR_PERIOD_FROZEN
+    http_status: 409
+    applies_to: "POST /accounts/{id}/receipts, POST /accounts/{id}/disbursements, POST /accounts/{id}/distributions"
+  - priority: 11
+    category: business_constraint
+    check: "amount_cents > 0 on Receipt/Disbursement/Distribution; generation_level >= 0; gst exemption amount_cents > 0"
+    error_id: ERR_INVALID_AMOUNT
+    http_status: 422
+    applies_to: "create endpoints with amount fields"
+  - priority: 12
+    category: business_referential
+    check: "a GstEvent / GST exemption operation must reference a beneficiary/trust consistent with its grantor (Beneficiary.grantor_id == Trust.grantor_id for trust-scoped beneficiary operations)"
+    error_id: ERR_GRANTOR_MISMATCH
+    http_status: 409
+    applies_to: "POST /accounts/{id}/distributions, POST /trusts/{id}/gst-exemption-allocations"
+  - priority: 13
+    category: business_fiscal
+    check: "paying a Distribution requires amount_cents <= Trust.principal_balance_cents + Trust.income_balance_cents"
+    error_id: ERR_INSUFFICIENT_CORPUS
+    http_status: 409
+    applies_to: "POST /distributions/{id}/pay"
+  - priority: 14
+    category: business_fiscal
+    check: "a GST exemption allocation amount_cents must not exceed Grantor.gst_exemption_remaining_cents (the pool cannot go negative)"
+    error_id: ERR_GST_EXEMPTION_EXCEEDED
+    http_status: 409
+    applies_to: "POST /trusts/{id}/gst-exemption-allocations"
+  - priority: 15
+    category: business_constraint
+    check: "OCC: expected_trust_version must equal the current Trust.version on GST exemption allocation"
+    error_id: ERR_STALE_TRUST_VERSION
+    http_status: 412
+    applies_to: "POST /trusts/{id}/gst-exemption-allocations"
+
+# ============================================================================
+# §1.5 API Endpoint Table
+# ============================================================================
+endpoints:
+  # ---- Grantor / Trustee / Beneficiary party CRUD ----
+  - method: POST
+    path: "/grantors"
+    description: "Create a grantor (settlor)."
+    roles: [TrustAdmin]
+    code: 201
+    input: ["full_name", "generation_level?", "gst_exemption_total_cents?"]
+    output: Grantor
+    side_effects: ["initializes gst_exemption_remaining_cents = gst_exemption_total_cents"]
+  - method: GET
+    path: "/grantors/{id}"
+    description: "Fetch a grantor (includes computed gst_exemption_remaining_cents)."
+    roles: [TrustAdmin, Grantor]
+    code: 200
+    input: []
+    output: Grantor
+    side_effects: []
+  - method: POST
+    path: "/trustees"
+    description: "Register a trustee."
+    roles: [TrustAdmin]
+    code: 201
+    input: ["full_name", "is_corporate?"]
+    output: Trustee
+    side_effects: []
+  - method: GET
+    path: "/trustees/{id}"
+    description: "Fetch a trustee."
+    roles: [TrustAdmin, Trustee]
+    code: 200
+    input: []
+    output: Trustee
+    side_effects: []
+  - method: POST
+    path: "/beneficiaries"
+    description: "Create a beneficiary; is_skip_person is computed from generation_level vs the grantor."
+    roles: [TrustAdmin]
+    code: 201
+    input: [full_name, grantor_id, generation_level]
+    output: Beneficiary
+    side_effects: ["computes is_skip_person"]
+  - method: GET
+    path: "/beneficiaries/{id}"
+    description: "Fetch a beneficiary."
+    roles: [TrustAdmin, Beneficiary]
+    code: 200
+    input: []
+    output: Beneficiary
+    side_effects: []
+  - method: GET
+    path: "/beneficiaries"
+    description: "List beneficiaries; filterable by grantor_id (reverse-reachability for Beneficiary.grantor_id)."
+    roles: [TrustAdmin]
+    code: 200
+    input: ["grantor_id?", "limit?", "offset?"]
+    output: Beneficiary[]
+    side_effects: []
+
+  # ---- Trust lifecycle ----
+  - method: POST
+    path: "/trusts"
+    description: "Create a trust in DRAFT."
+    roles: [TrustAdmin]
+    code: 201
+    input: ["name", "grantor_id", "trust_type", "is_grantor_trust?", "capital_gains_to_income?"]
+    output: Trust
+    side_effects: ["initializes status=DRAFT, balances=0, version=1"]
+  - method: GET
+    path: "/trusts/{id}"
+    description: "Fetch a trust (includes computed balances and inclusion_ratio)."
+    roles: [TrustAdmin, Grantor, Trustee]
+    code: 200
+    input: []
+    output: Trust
+    side_effects: []
+  - method: GET
+    path: "/trusts"
+    description: "List trusts; filterable by grantor_id (reverse-reachability for Trust.grantor_id)."
+    roles: [TrustAdmin]
+    code: 200
+    input: ["grantor_id?", "limit?", "offset?"]
+    output: Trust[]
+    side_effects: []
+  - method: POST
+    path: "/trusts/{id}/fund"
+    description: "DRAFT -> FUNDED."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: Trust
+    side_effects: ["increments Trust.version"]
+  - method: POST
+    path: "/trusts/{id}/activate"
+    description: "FUNDED -> ACTIVE."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: Trust
+    side_effects: ["increments Trust.version"]
+  - method: POST
+    path: "/trusts/{id}/amendments"
+    description: "ACTIVE -> AMENDMENT_PENDING (revocable only). Stages an election change."
+    roles: [Grantor]
+    code: 200
+    input: ["set_capital_gains_to_income?", "set_is_grantor_trust?"]
+    output: Trust
+    side_effects: ["stages pending election; increments Trust.version"]
+  - method: POST
+    path: "/trusts/{id}/amendments/commit"
+    description: "AMENDMENT_PENDING -> ACTIVE; applies the staged election; recomputes ledger_side/DNI."
+    roles: [Grantor]
+    code: 200
+    input: []
+    output: Trust
+    side_effects: ["applies election; recomputes principal_income_allocation, DNI; increments Trust.version"]
+  - method: POST
+    path: "/trusts/{id}/revoke"
+    description: "ACTIVE -> REVOKED (revocable only)."
+    roles: [Grantor]
+    code: 200
+    input: []
+    output: Trust
+    side_effects: ["CLOSE all OPEN accounts; increments Trust.version"]
+  - method: POST
+    path: "/trusts/{id}/terminate"
+    description: "ACTIVE -> TERMINATING."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: Trust
+    side_effects: ["CASCADE: CLOSE all OPEN accounts; increments Trust.version"]
+  - method: POST
+    path: "/trusts/{id}/terminate/finalize"
+    description: "TERMINATING -> TERMINATED; spawns TAXABLE_TERMINATION GstEvents for skip beneficiaries."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: Trust
+    side_effects: ["CASCADE: create GstEvent(TAXABLE_TERMINATION) per skip beneficiary; compute gst_tax; increments Trust.version"]
+
+  # ---- Trustee appointments (Trust <-> Trustee junction) ----
+  - method: POST
+    path: "/trusts/{id}/trustee-appointments"
+    description: "Appoint a trustee over a trust for a closed term interval with buffer-gap conflict checks."
+    roles: [TrustAdmin]
+    code: 201
+    input: [trustee_id, term_start, term_end]
+    output: TrusteeAppointment
+    side_effects: ["validates ERR_TRUSTEE_TERM_CONFLICT against ACTIVE appointments"]
+  - method: GET
+    path: "/trusts/{id}/trustee-appointments"
+    description: "List trustee appointments on a trust (reverse-reachability for TrusteeAppointment.trust_id)."
+    roles: [TrustAdmin, Trustee]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TrusteeAppointment[]
+    side_effects: []
+  - method: GET
+    path: "/trustee-appointments/{id}"
+    description: "Fetch a single trustee appointment (registers the trustee-appointments collection segment)."
+    roles: [TrustAdmin, Trustee]
+    code: 200
+    input: []
+    output: TrusteeAppointment
+    side_effects: []
+  - method: GET
+    path: "/trustee-appointments"
+    description: "List trustee appointments filterable by trustee_id (reverse-reachability for TrusteeAppointment.trustee_id)."
+    roles: [TrustAdmin]
+    code: 200
+    input: ["trustee_id?", "limit?", "offset?"]
+    output: TrusteeAppointment[]
+    side_effects: []
+
+  # ---- Accounting periods + ledger ----
+  - method: POST
+    path: "/trusts/{id}/accounts"
+    description: "Open a TrustAccount (tax-year period) with half-open interval overlap checks."
+    roles: [TrustAdmin]
+    code: 201
+    input: [tax_year, period_start, period_end]
+    output: TrustAccount
+    side_effects: ["validates ERR_ACCOUNT_PERIOD_OVERLAP"]
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Fetch an account (includes computed dni_cents, dni_carried_out_cents, taxable_income_cents)."
+    roles: [TrustAdmin, Trustee]
+    code: 200
+    input: []
+    output: TrustAccount
+    side_effects: []
+  - method: GET
+    path: "/trusts/{id}/accounts"
+    description: "List accounts on a trust (reverse-reachability for TrustAccount.trust_id)."
+    roles: [TrustAdmin, Trustee]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TrustAccount[]
+    side_effects: []
+  - method: POST
+    path: "/accounts/{id}/close"
+    description: "OPEN -> CLOSED; freezes ledger; recomputes DNI and taxable income."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: TrustAccount
+    side_effects: ["recompute distributable_net_income, trust_taxable_income; increments TrustAccount.version"]
+  - method: POST
+    path: "/accounts/{id}/receipts"
+    description: "Post a receipt; ledger_side computed by principal_income_allocation; recomputes balances + DNI."
+    roles: [TrustAdmin, Trustee]
+    code: 201
+    input: [amount_cents, receipt_kind]
+    output: Receipt
+    side_effects: ["compute ledger_side; recompute Trust balances, DNI"]
+  - method: GET
+    path: "/accounts/{id}/receipts"
+    description: "List receipts on an account (reverse-reachability for Receipt.account_id)."
+    roles: [TrustAdmin, Trustee]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Receipt[]
+    side_effects: []
+  - method: POST
+    path: "/accounts/{id}/disbursements"
+    description: "Post a disbursement (expense); ledger_side computed; recomputes balances + DNI."
+    roles: [TrustAdmin, Trustee]
+    code: 201
+    input: [amount_cents, expense_kind]
+    output: Disbursement
+    side_effects: ["compute ledger_side; recompute Trust balances, DNI"]
+  - method: GET
+    path: "/accounts/{id}/disbursements"
+    description: "List disbursements on an account (reverse-reachability for Disbursement.account_id)."
+    roles: [TrustAdmin, Trustee]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Disbursement[]
+    side_effects: []
+
+  # ---- Distributions ----
+  - method: POST
+    path: "/accounts/{id}/distributions"
+    description: "Propose a distribution (PROPOSED)."
+    roles: [Trustee]
+    code: 201
+    input: [beneficiary_id, amount_cents, distribution_kind, proposer_trustee_id]
+    output: Distribution
+    side_effects: ["validates grantor match, period OPEN"]
+  - method: GET
+    path: "/distributions/{id}"
+    description: "Fetch a distribution (includes funded_from_*_cents, dni_carried_amount_cents)."
+    roles: [TrustAdmin, Trustee]
+    code: 200
+    input: []
+    output: Distribution
+    side_effects: []
+  - method: GET
+    path: "/accounts/{id}/distributions"
+    description: "List distributions on an account (reverse-reachability for Distribution.account_id)."
+    roles: [TrustAdmin, Trustee]
+    code: 200
+    input: ["beneficiary_id?", "limit?", "offset?"]
+    output: Distribution[]
+    side_effects: []
+  - method: GET
+    path: "/distributions"
+    description: "List distributions filterable by beneficiary_id (reverse-reachability for Distribution.beneficiary_id) and proposer_trustee_id (reverse-reachability for proposer/approver Trustee FKs)."
+    roles: [TrustAdmin, Trustee]
+    code: 200
+    input: ["beneficiary_id?", "proposer_trustee_id?", "approver_trustee_id?", "limit?", "offset?"]
+    output: Distribution[]
+    side_effects: []
+  - method: POST
+    path: "/distributions/{id}/approve"
+    description: "PROPOSED -> APPROVED; enforces segregation of duties."
+    roles: [Trustee]
+    code: 200
+    input: []
+    output: Distribution
+    side_effects: ["set approver_trustee_id = X-User-ID; increments Distribution.version"]
+  - method: POST
+    path: "/distributions/{id}/reject"
+    description: "PROPOSED -> REJECTED."
+    roles: [Trustee]
+    code: 200
+    input: []
+    output: Distribution
+    side_effects: ["increments Distribution.version"]
+  - method: POST
+    path: "/distributions/{id}/pay"
+    description: "APPROVED -> PAID; debits ledger (income first), recomputes DNI carry-out + K-1, may spawn a GstEvent."
+    roles: [Trustee]
+    code: 200
+    input: []
+    output: Distribution
+    side_effects: ["CASCADE: debit balances -> recompute dni_carried_out -> recompute K1; spawn GstEvent if skip; increments Distribution.version"]
+  - method: POST
+    path: "/distributions/{id}/reverse"
+    description: "PAID -> REVERSED; compensating credit, recompute DNI carry-out + K-1, delete any GstEvent."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: Distribution
+    side_effects: ["COMPENSATION: credit balances; recompute dni_carried_out, K1; delete GstEvent; increments Distribution.version"]
+
+  # ---- K-1 (computed satellite) ----
+  - method: GET
+    path: "/accounts/{id}/k1s"
+    description: "List the K-1 statements for an account (reverse-reachability for K1.account_id)."
+    roles: [TrustAdmin, Trustee]
+    code: 200
+    input: ["beneficiary_id?", "limit?", "offset?"]
+    output: K1[]
+    side_effects: []
+  - method: GET
+    path: "/k1s/{id}"
+    description: "Fetch a single K-1 statement."
+    roles: [TrustAdmin, Trustee, Beneficiary]
+    code: 200
+    input: []
+    output: K1
+    side_effects: []
+  - method: GET
+    path: "/k1s"
+    description: "List K-1s filterable by beneficiary_id (reverse-reachability for K1.beneficiary_id)."
+    roles: [TrustAdmin, Beneficiary]
+    code: 200
+    input: ["beneficiary_id?", "limit?", "offset?"]
+    output: K1[]
+    side_effects: []
+
+  # ---- Tax filings ----
+  - method: POST
+    path: "/accounts/{id}/filings"
+    description: "Create a DRAFT TaxFiling for a CLOSED account (optionally an amended filing referencing a prior one)."
+    roles: [TrustAdmin]
+    code: 201
+    input: ["supersedes_filing_id?"]
+    output: TaxFiling
+    side_effects: []
+  - method: GET
+    path: "/filings/{id}"
+    description: "Fetch a tax filing (includes tax_due_cents)."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: TaxFiling
+    side_effects: []
+  - method: GET
+    path: "/accounts/{id}/filings"
+    description: "List filings on an account (reverse-reachability for TaxFiling.account_id)."
+    roles: [TrustAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TaxFiling[]
+    side_effects: []
+  - method: GET
+    path: "/filings"
+    description: "List filings filterable by account_id and supersedes_filing_id (reverse-reachability for the self-referential TaxFiling.supersedes_filing_id)."
+    roles: [TrustAdmin]
+    code: 200
+    input: ["account_id?", "supersedes_filing_id?", "limit?", "offset?"]
+    output: TaxFiling[]
+    side_effects: []
+  - method: POST
+    path: "/filings/{id}/file"
+    description: "DRAFT -> FILED; snapshots taxable income, computes tax, cascades account to FILED and spawns a TAX_PAYMENT disbursement."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: TaxFiling
+    side_effects: ["CASCADE: compute trust_income_tax; account CLOSED->FILED; spawn TAX_PAYMENT disbursement; increments TaxFiling.version"]
+  - method: POST
+    path: "/filings/{id}/amend"
+    description: "FILED -> AMENDED."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: TaxFiling
+    side_effects: ["increments TaxFiling.version"]
+  - method: POST
+    path: "/filings/{id}/refile"
+    description: "AMENDED -> FILED; supersedes the prior filing; recomputes tax."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: TaxFiling
+    side_effects: ["mark supersedes_filing_id as SUPERSEDED; recompute trust_income_tax; increments TaxFiling.version"]
+
+  # ---- GST exemption ----
+  - method: POST
+    path: "/trusts/{id}/gst-exemption-allocations"
+    description: "Allocate GST exemption to a trust (OCC on Trust.version); recomputes inclusion_ratio and grantor remaining."
+    roles: [TrustAdmin]
+    code: 201
+    input: [grantor_id, amount_cents, expected_trust_version]
+    output: GstExemptionAllocation
+    side_effects: ["increment Trust.gst_exemption_allocated_cents; recompute inclusion_ratio, Grantor.gst_exemption_remaining_cents; increments Trust.version by 1"]
+  - method: GET
+    path: "/trusts/{id}/gst-exemption-allocations"
+    description: "List exemption allocations on a trust (reverse-reachability for GstExemptionAllocation.trust_id)."
+    roles: [TrustAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: GstExemptionAllocation[]
+    side_effects: []
+  - method: GET
+    path: "/gst-exemption-allocations/{id}"
+    description: "Fetch a single GST exemption allocation (registers the gst-exemption-allocations collection segment)."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: GstExemptionAllocation
+    side_effects: []
+  - method: GET
+    path: "/gst-exemption-allocations"
+    description: "List exemption allocations filterable by grantor_id (reverse-reachability for GstExemptionAllocation.grantor_id)."
+    roles: [TrustAdmin]
+    code: 200
+    input: ["grantor_id?", "limit?", "offset?"]
+    output: GstExemptionAllocation[]
+    side_effects: []
+  - method: DELETE
+    path: "/trusts/{id}/gst-exemption-allocations/{alloc_id}"
+    description: "Release (de-allocate) GST exemption; compensating inverse of allocation."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: GstExemptionAllocation
+    side_effects: ["COMPENSATION: decrement allocated, recompute inclusion_ratio + grantor remaining; increments Trust.version by 1"]
+
+  # ---- GST events (computed satellite) ----
+  - method: GET
+    path: "/trusts/{id}/gst-events"
+    description: "List GST events on a trust (reverse-reachability for GstEvent.trust_id)."
+    roles: [TrustAdmin]
+    code: 200
+    input: ["beneficiary_id?", "limit?", "offset?"]
+    output: GstEvent[]
+    side_effects: []
+  - method: GET
+    path: "/gst-events/{id}"
+    description: "Fetch a GST event (includes gst_tax_cents, inclusion_ratio_snapshot)."
+    roles: [TrustAdmin]
+    code: 200
+    input: []
+    output: GstEvent
+    side_effects: []
+  - method: GET
+    path: "/gst-events"
+    description: "List GST events filterable by beneficiary_id (reverse-reachability for GstEvent.beneficiary_id) and distribution_id (reverse-reachability for GstEvent.distribution_id)."
+    roles: [TrustAdmin]
+    code: 200
+    input: ["beneficiary_id?", "distribution_id?", "limit?", "offset?"]
+    output: GstEvent[]
+    side_effects: []
+
+# ============================================================================
+# §1.6 Error Code Catalog
+# ============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Authenticated role is not permitted for this operation."
+  - id: ERR_NOT_OWNER
+    http: 403
+    condition: "Entity-backed actor's X-User-ID does not match the resource's owning entity (e.g., trustee not appointed to the trust, grantor not the trust's grantor, beneficiary reading another's K-1)."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A path-referenced resource or a body FK does not exist."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource is not in a state that admits the requested transition."
+  - id: ERR_TRUST_IRREVOCABLE
+    http: 409
+    condition: "Attempt to amend or revoke an IRREVOCABLE trust."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 409
+    condition: "The trustee approving a distribution is its proposer_trustee_id."
+  - id: ERR_ACCOUNT_PERIOD_OVERLAP
+    http: 409
+    condition: "New account period [start,end) overlaps an existing period on the trust (half-open; abutting allowed)."
+  - id: ERR_TRUSTEE_TERM_CONFLICT
+    http: 409
+    condition: "New trustee term [start,end] overlaps or sits within TRUSTEE_GAP_DAYS (30 days) of an ACTIVE appointment for the SAME (trust, trustee) seat (closed intervals + buffer). Distinct trustees may serve concurrently."
+  - id: ERR_PERIOD_FROZEN
+    http: 409
+    condition: "Attempt to post a Receipt/Disbursement/Distribution to a CLOSED or FILED account."
+  - id: ERR_INVALID_AMOUNT
+    http: 422
+    condition: "amount_cents <= 0, negative generation_level, or non-positive exemption amount."
+  - id: ERR_GRANTOR_MISMATCH
+    http: 409
+    condition: "Beneficiary.grantor_id does not equal the trust's grantor on a trust-scoped beneficiary/GST operation."
+  - id: ERR_INSUFFICIENT_CORPUS
+    http: 409
+    condition: "Distribution amount exceeds Trust.principal_balance_cents + Trust.income_balance_cents."
+  - id: ERR_GST_EXEMPTION_EXCEEDED
+    http: 409
+    condition: "Requested exemption allocation exceeds Grantor.gst_exemption_remaining_cents."
+  - id: ERR_STALE_TRUST_VERSION
+    http: 412
+    condition: "expected_trust_version != current Trust.version on GST exemption allocation (OCC)."
+  - id: ERR_ALLOCATION_CONSUMED
+    http: 409
+    condition: "Attempt to release a GST exemption allocation that a GstEvent has already consumed."
+  - id: ERR_UNSETTLED_DISTRIBUTION
+    http: 409
+    condition: "Attempt to terminate a trust while a Distribution is still PROPOSED or APPROVED."
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "Malformed body: missing required field, wrong type, or invalid enum value."
+
+# ============================================================================
+# §1.7 RBAC Matrix
+# ============================================================================
+roles:
+  - name: TrustAdmin
+    description: "Fiduciary back-office operator: creates parties and trusts, manages accounting periods, files taxes, allocates GST exemption, reverses distributions, finalizes terminations."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /grantors, POST /trustees, POST /beneficiaries"
+      - "POST /trusts, POST /trusts/{id}/fund, POST /trusts/{id}/activate, POST /trusts/{id}/terminate, POST /trusts/{id}/terminate/finalize"
+      - "POST /trusts/{id}/trustee-appointments"
+      - "POST /trusts/{id}/accounts, POST /accounts/{id}/close"
+      - "POST /accounts/{id}/filings, POST /filings/{id}/file, POST /filings/{id}/amend, POST /filings/{id}/refile"
+      - "POST /trusts/{id}/gst-exemption-allocations, DELETE /trusts/{id}/gst-exemption-allocations/{alloc_id}"
+      - "POST /distributions/{id}/reverse"
+    shared_operations:
+      - "GET reads across trusts, accounts, distributions, filings, k1s, gst-events"
+      - "POST /accounts/{id}/receipts, POST /accounts/{id}/disbursements (shared with Trustee)"
+  - name: Grantor
+    description: "Settlor who created the trust; may amend/revoke a revocable trust and direct elections."
+    identity: "entity_backed:Grantor"
+    exclusive_operations:
+      - "POST /trusts/{id}/amendments, POST /trusts/{id}/amendments/commit"
+      - "POST /trusts/{id}/revoke"
+    shared_operations:
+      - "GET /trusts/{id}, GET /grantors/{id}"
+  - name: Trustee
+    description: "Appointed fiduciary who manages the trust day-to-day: posts ledger entries, proposes/approves/pays distributions."
+    identity: "entity_backed:Trustee"
+    exclusive_operations:
+      - "POST /accounts/{id}/distributions, POST /distributions/{id}/approve, POST /distributions/{id}/reject, POST /distributions/{id}/pay"
+    shared_operations:
+      - "POST /accounts/{id}/receipts, POST /accounts/{id}/disbursements (shared with TrustAdmin)"
+      - "GET reads across trusts, accounts, distributions, k1s"
+  - name: Beneficiary
+    description: "Recipient of distributions; may read own K-1 statements only."
+    identity: "entity_backed:Beneficiary"
+    exclusive_operations: []
+    shared_operations:
+      - "GET /k1s/{id} (own), GET /k1s?beneficiary_id=self, GET /beneficiaries/{id} (self)"

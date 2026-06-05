@@ -1,0 +1,29 @@
+"""Domain thresholds — numeric constants from the PRD's calculations and rules."""
+
+# Interest accrual (PRD §2.5, §3.5)
+DAY_COUNT_BASIS = 365
+BPS_SCALE = 10000
+
+# Early-closure fee tiers (PRD §3.11)
+EARLY_CLOSURE_TIER1_MIN_YEARS = 8
+EARLY_CLOSURE_TIER1_BPS = 200    # >= 8 years remaining
+EARLY_CLOSURE_TIER2_BPS = 100    # 4..7 years remaining
+EARLY_CLOSURE_TIER3_BPS = 50     # 1..3 years remaining
+# years_remaining == 0 -> no fee
+
+# Field constraints / floors (PRD §3.3, §3.1)
+CREDIT_LIMIT_FLOOR_CENTS = 100000
+CREDIT_SCORE_MIN = 300
+CREDIT_SCORE_MAX = 850
+MARGIN_BPS_MAX = 2000
+ANNUAL_FEE_DEFAULT_CENTS = 5000
+DRAW_PERIOD_YEARS_DEFAULT = 10
+REPAYMENT_PERIOD_YEARS_DEFAULT = 20
+
+# Defaults used to build standard scenarios in fixtures.
+DEFAULT_PRIME_RATE_BPS = 850
+DEFAULT_MARGIN_BPS = 150
+DEFAULT_RATE_CEILING_BPS = 1800
+DEFAULT_CREDIT_LIMIT_CENTS = 50000000
+DEFAULT_APPRAISED_VALUE_CENTS = 100000000
+DEFAULT_ANNUAL_INCOME_CENTS = 50000000

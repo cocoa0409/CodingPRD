@@ -16,6 +16,7 @@ from typing import Optional
 import requests
 from loguru import logger
 
+from ._dnsboot import inject as _inject_dnsboot
 from .port_utils import extract_port_from_url, kill_port
 
 
@@ -86,7 +87,7 @@ class ServerLifecycleManager:
             raise ServerStartError(f"Working directory does not exist: {cwd}")
 
         # Spawn the server
-        env = {**os.environ, "PORT": str(self._port)}
+        env = _inject_dnsboot({**os.environ, "PORT": str(self._port)})
         try:
             self._process = subprocess.Popen(
                 self._actual_command,
@@ -178,7 +179,7 @@ class ServerLifecycleManager:
         # Re-spawn with shorter timeout
         kill_port(self._port)
         cwd = os.path.abspath(self._directory)
-        env = {**os.environ, "PORT": str(self._port)}
+        env = _inject_dnsboot({**os.environ, "PORT": str(self._port)})
         try:
             self._process = subprocess.Popen(
                 self._actual_command,

@@ -1,0 +1,1243 @@
+scenario: "Truck ELD Electronic Log & HOS: driver identity binding, 11/14/70-Hour rules, Sleeper Berth split, Personal Conveyance, FMCSA violation reporting, Adverse Conditions exemption"
+domain_name: "truck-eld-hos"
+api_prefix: "/eld"
+
+# ---------------------------------------------------------------------------
+# Complexity profile
+# ---------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: event_sourcing
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - dual_variant_calculation        # HOS clocks with vs without Adverse Conditions exemption diverge
+    - rate_threshold_triggers         # 11h / 14h / 70h / 60-min break breakpoints, >= vs >
+    - cascading_side_effects          # appending an event recomputes clocks -> certifies/voids -> opens violations
+    - derived_field_reconciliation    # DailyLog rolling totals + Driver cycle totals derived from event stream
+
+  entity_topology: graph
+  # Driver, Vehicle, ELDDevice, DutyStatusEvent, DailyLog, HOSViolation, AdverseConditionsClaim,
+  # PersonalConveyanceSegment form a graph: events reference Driver+Vehicle+Device; logs/violations/claims
+  # reference Driver + the event(s) that produced them; PC segments reference a driving event.
+
+  state_machine_shape: parallel
+  # DutyStatusEvent carries (record_status: ACTIVE -> {INACTIVE_CHANGED, INACTIVE_ERROR}) running
+  # independently of (compliance_disposition: COMPLIANT <-> VIOLATING) on the same row; DailyLog has
+  # its own certification lifecycle; HOSViolation has its own resolve/dismiss cycle (cyclic OPEN<->...).
+
+  relationship_patterns:
+    - one_to_many        # Driver has many DutyStatusEvent / DailyLog / HOSViolation
+    - cross_aggregate    # HOSViolation references both Driver and the triggering DutyStatusEvent
+    - polymorphic        # AdverseConditionsClaim.target_day and HOSViolation.violation_type span rule families
+    - self_referential   # DutyStatusEvent.edited_from_event_id points to the event a correction supersedes
+
+  role_model: peer_roles
+  # Driver (owns own duty events), CarrierAdmin (manages fleet, certifies on behalf, files violations),
+  # SafetyOfficer (reviews/resolves violations, approves edits), opaque ELDSystem (auto-transitions).
+
+  consistency_model: immediate
+
+# ---------------------------------------------------------------------------
+# 1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# 1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: Driver
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix. Identity only; never a business decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, refreshed on every mutation including cascaded side effects."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, increments by one on every mutation. OCC token."
+      - name: license_number
+        type: string
+        source: input
+        description: "Commercial driver license number. Unique across all Drivers."
+        constraints: "non-empty; uniqueness enforced (ERR_DUPLICATE_LICENSE)"
+      - name: full_name
+        type: string
+        source: input
+        description: "Driver legal name."
+      - name: home_terminal_tz_offset_minutes
+        type: integer
+        source: input
+        description: "Minutes east of UTC for the driver's home terminal (e.g. -300 for US/Eastern standard). Defines the 24-hour boundary used for daily-log partitioning and 70h/8-day window."
+        default: 0
+        constraints: "integer in [-720, 840]"
+      - name: cycle_rule
+        type: enum
+        source: input
+        description: "Which cycle limit applies."
+        default: "SEVENTY_HOUR_8_DAY"
+        constraints: "one of {SEVENTY_HOUR_8_DAY, SIXTY_HOUR_7_DAY}"
+      - name: status
+        type: enum
+        source: system
+        description: "Driver account lifecycle."
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, DEACTIVATED}"
+      - name: pc_authorized
+        type: boolean
+        source: input
+        description: "Whether the carrier has authorized this driver to use Personal Conveyance duty status."
+        default: false
+      - name: current_duty_status
+        type: enum
+        source: computed
+        description: "Duty status of the latest ACTIVE DutyStatusEvent for this driver (chronologically last by event_time, created_at ASC tie-break). OFF_DUTY when no events exist."
+        constraints: "one of {OFF_DUTY, SLEEPER_BERTH, DRIVING, ON_DUTY_NOT_DRIVING}"
+      - name: cycle_on_duty_minutes
+        type: integer
+        source: computed
+        description: "Sum of ON_DUTY_NOT_DRIVING + DRIVING minutes across the rolling cycle window ending at the latest event_time (8 days for SEVENTY_HOUR_8_DAY, 7 days for SIXTY_HOUR_7_DAY), home-terminal-day aligned. PC and SLEEPER and OFF_DUTY excluded."
+  - name: Vehicle
+    parent: null
+    common_fields: true
+    fields:
+      - name: unit_number
+        type: string
+        source: input
+        description: "Fleet unit identifier. Unique across Vehicles."
+        constraints: "non-empty; unique (ERR_DUPLICATE_UNIT)"
+      - name: vin
+        type: string
+        source: input
+        description: "Vehicle identification number."
+      - name: status
+        type: enum
+        source: system
+        description: "Vehicle lifecycle."
+        default: "IN_SERVICE"
+        constraints: "one of {IN_SERVICE, OUT_OF_SERVICE}"
+  - name: ELDDevice
+    parent: null
+    common_fields: true
+    fields:
+      - name: serial_number
+        type: string
+        source: input
+        description: "ELD hardware serial. Unique across devices."
+        constraints: "non-empty; unique (ERR_DUPLICATE_SERIAL)"
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the vehicle this ELD is currently installed in. A vehicle may hold at most one ACTIVE device at a time."
+      - name: bound_driver_id
+        type: string
+        source: system
+        description: "FK -> Driver.id; the driver currently logged in to this device (identity binding). null when no driver is bound."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Device binding lifecycle."
+        default: "UNBOUND"
+        constraints: "one of {UNBOUND, BOUND, MALFUNCTION}"
+  - name: DutyStatusEvent
+    parent: null
+    common_fields: true
+    fields:
+      - name: driver_id
+        type: string
+        source: input
+        description: "FK -> Driver.id; the driver whose duty log this event belongs to."
+      - name: device_id
+        type: string
+        source: input
+        description: "FK -> ELDDevice.id; the ELD that recorded the event. Must be BOUND to driver_id at append time."
+      - name: vehicle_id
+        type: string
+        source: computed
+        description: "FK -> Vehicle.id; copied from the device's vehicle_id at append time (snapshot)."
+      - name: duty_status
+        type: enum
+        source: input
+        description: "The duty status this event opens."
+        constraints: "one of {OFF_DUTY, SLEEPER_BERTH, DRIVING, ON_DUTY_NOT_DRIVING}"
+      - name: special_driving_category
+        type: enum
+        source: input
+        description: "Annotation on a DRIVING or OFF_DUTY event marking it as PC or Yard Move; NONE otherwise."
+        default: "NONE"
+        constraints: "one of {NONE, PERSONAL_CONVEYANCE, YARD_MOVE}"
+      - name: event_time
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC instant the duty status began. Must be strictly greater than the prior ACTIVE event_time for the same driver (ERR_EVENT_OUT_OF_ORDER)."
+      - name: duration_minutes
+        type: integer
+        source: computed
+        description: "Whole minutes from this event's event_time to the next ACTIVE event's event_time for the same driver; null for the open (latest) event."
+      - name: record_status
+        type: enum
+        source: system
+        description: "ELD record-origin lifecycle (FMCSA record status)."
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, INACTIVE_CHANGED, INACTIVE_ERROR}"
+      - name: compliance_disposition
+        type: enum
+        source: computed
+        description: "Whether this event's interval, after the latest recompute, sits inside an HOS violation window."
+        default: "COMPLIANT"
+        constraints: "one of {COMPLIANT, VIOLATING}"
+      - name: edited_from_event_id
+        type: string
+        source: input
+        description: "FK -> DutyStatusEvent.id; when this event is a correction, the prior ACTIVE event it supersedes (which becomes INACTIVE_CHANGED). null for original records."
+        default: null
+      - name: annotation
+        type: string
+        source: input
+        description: "Free-text note required when special_driving_category != NONE or when edited_from_event_id is set."
+        default: null
+  - name: DailyLog
+    parent: null
+    common_fields: true
+    fields:
+      - name: driver_id
+        type: string
+        source: input
+        description: "FK -> Driver.id; owner of this 24-hour log."
+      - name: log_date
+        type: string
+        source: input
+        description: "Calendar date (YYYY-MM-DD) in the driver's home-terminal local time that this log covers."
+        constraints: "matches YYYY-MM-DD"
+      - name: total_driving_minutes
+        type: integer
+        source: computed
+        description: "Sum of duration_minutes for ACTIVE DRIVING events (special_driving_category == NONE) whose event_time falls in this home-terminal day."
+      - name: total_on_duty_minutes
+        type: integer
+        source: computed
+        description: "Sum of duration_minutes for ACTIVE ON_DUTY_NOT_DRIVING + DRIVING (special_driving_category == NONE) events in this day."
+      - name: total_off_duty_minutes
+        type: integer
+        source: computed
+        description: "Sum of duration_minutes for ACTIVE OFF_DUTY (any category) + SLEEPER_BERTH events in this day."
+      - name: certification_status
+        type: enum
+        source: system
+        description: "Driver certification lifecycle for the day."
+        default: "UNCERTIFIED"
+        constraints: "one of {UNCERTIFIED, CERTIFIED, RECERTIFY_REQUIRED}"
+      - name: certified_at
+        type: datetime
+        source: system
+        description: "When the driver certified this log; null until certified."
+        default: null
+  - name: HOSViolation
+    parent: null
+    common_fields: true
+    fields:
+      - name: driver_id
+        type: string
+        source: input
+        description: "FK -> Driver.id; the driver who incurred the violation."
+      - name: trigger_event_id
+        type: string
+        source: input
+        description: "FK -> DutyStatusEvent.id; the ACTIVE event whose interval first crossed the limit."
+      - name: violation_type
+        type: enum
+        source: system
+        description: "Which HOS limit was exceeded."
+        constraints: "one of {DRIVING_11H, WINDOW_14H, CYCLE_70H, BREAK_30MIN}"
+      - name: overage_minutes
+        type: integer
+        source: computed
+        description: "Minutes by which the relevant limit was exceeded at trigger time (>= 1 for an open violation)."
+      - name: status
+        type: enum
+        source: system
+        description: "Violation review lifecycle."
+        default: "OPEN"
+        constraints: "one of {OPEN, ACKNOWLEDGED, RESOLVED, DISMISSED}"
+      - name: resolution_note
+        type: string
+        source: input
+        description: "SafetyOfficer note recorded on RESOLVED or DISMISSED."
+        default: null
+  - name: AdverseConditionsClaim
+    parent: null
+    common_fields: true
+    fields:
+      - name: driver_id
+        type: string
+        source: input
+        description: "FK -> Driver.id; the driver claiming the exemption."
+      - name: log_date
+        type: string
+        source: input
+        description: "Home-terminal calendar date (YYYY-MM-DD) the exemption applies to. At most one APPROVED claim per (driver_id, log_date)."
+        constraints: "matches YYYY-MM-DD"
+      - name: reason
+        type: enum
+        source: input
+        description: "Qualifying adverse condition."
+        constraints: "one of {WEATHER, ROAD_CLOSURE, TRAFFIC_INCIDENT}"
+      - name: narrative
+        type: string
+        source: input
+        description: "Free-text explanation; required."
+        constraints: "non-empty"
+      - name: status
+        type: enum
+        source: system
+        description: "Claim review lifecycle."
+        default: "PENDING"
+        constraints: "one of {PENDING, APPROVED, REJECTED}"
+  - name: PersonalConveyanceSegment
+    parent: null
+    common_fields: false
+    fields:
+      - name: driver_id
+        type: string
+        source: input
+        description: "FK -> Driver.id; the driver who drove under PC."
+      - name: event_id
+        type: string
+        source: input
+        description: "FK -> DutyStatusEvent.id; the DRIVING-or-OFF_DUTY event annotated PERSONAL_CONVEYANCE that this segment summarizes."
+      - name: minutes_excluded
+        type: integer
+        source: computed
+        description: "duration_minutes of the event, excluded from the 11h/14h/70h clocks. Recomputed when the event's duration changes."
+
+# ===========================================================================
+# 1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  # ---- DutyStatusEvent: parallel dimensions (record_status × compliance_disposition) ----
+  - entity: DutyStatusEvent
+    initial_state: ACTIVE                # record_status dimension
+    terminal_states: [INACTIVE_CHANGED, INACTIVE_ERROR]
+    note: |
+      Two independent dimensions on the same row.
+      Dimension A (record_status): ACTIVE -> INACTIVE_CHANGED (superseded by a correction)
+                                   ACTIVE -> INACTIVE_ERROR (marked erroneous, no replacement).
+      Dimension B (compliance_disposition): COMPLIANT <-> VIOLATING, flipped by the recompute
+      after any append/edit; it evolves independently of record_status and can flip back when an
+      earlier interval is corrected. The two dimensions never gate each other.
+    transitions:
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /eld/duty-events  (append a new duty event)"
+        actor: Driver
+        preconditions:
+          - "event.driver_id exists and Driver.status == ACTIVE"
+          - "event.device_id exists, ELDDevice.status == BOUND, ELDDevice.bound_driver_id == event.driver_id"
+          - "event.event_time strictly greater than the latest ACTIVE event_time for this driver (else ERR_EVENT_OUT_OF_ORDER)"
+          - "if special_driving_category == PERSONAL_CONVEYANCE then duty_status IN {DRIVING, OFF_DUTY} AND Driver.pc_authorized == true (else ERR_PC_NOT_AUTHORIZED)"
+          - "if special_driving_category != NONE or edited_from_event_id set then annotation non-empty (else ERR_ANNOTATION_REQUIRED)"
+        side_effects:
+          - "sets prior open event's duration_minutes = (this.event_time - prior.event_time) in whole minutes"
+          - "if special_driving_category == PERSONAL_CONVEYANCE, creates a PersonalConveyanceSegment for the PRIOR event once its duration is known (see calc pc_exclusion)"
+          - "recompute_clocks runs (calc hos_clocks): refreshes Driver.current_duty_status, Driver.cycle_on_duty_minutes, and the affected DailyLog rolling totals"
+          - "any DailyLog touched whose certification_status == CERTIFIED flips to RECERTIFY_REQUIRED (cascade)"
+          - "violation_scan runs (calc violation_detection): opens HOSViolation rows for any limit crossed by this interval; sets compliance_disposition VIOLATING on offending events"
+          - "increments DutyStatusEvent.version by 1 (new row starts at version 1)"
+      - from: ACTIVE
+        to: INACTIVE_CHANGED
+        trigger: "POST /eld/duty-events with edited_from_event_id set (correction supersedes target)"
+        actor: Driver
+        preconditions:
+          - "edited_from_event_id references an ACTIVE event of the same driver (else ERR_EDIT_TARGET_INVALID)"
+          - "the correcting event passes all append preconditions above"
+        side_effects:
+          - "target event record_status -> INACTIVE_CHANGED"
+          - "recompute_clocks + violation_scan rerun over the corrected stream; compliance_disposition may flip COMPLIANT<->VIOLATING on neighbouring events"
+          - "if a previously OPEN HOSViolation's trigger interval no longer crosses its limit, that violation auto-transitions OPEN -> DISMISSED with resolution_note 'auto-dismissed: corrected'"
+          - "increments superseded event.version by 1"
+      - from: ACTIVE
+        to: INACTIVE_ERROR
+        trigger: "POST /eld/duty-events/{id}/mark-error"
+        actor: CarrierAdmin
+        preconditions:
+          - "event.record_status == ACTIVE (else ERR_INVALID_STATE)"
+          - "expected_dutystatusevent_version matches (else ERR_STALE_VERSION)"
+        side_effects:
+          - "record_status -> INACTIVE_ERROR; event removed from all clock/violation computations"
+          - "recompute_clocks + violation_scan rerun; downstream DailyLog totals and Driver clocks reconcile"
+          - "increments DutyStatusEvent.version by 1"
+  # ---- DailyLog: certification lifecycle with revert (cyclic) ----
+  - entity: DailyLog
+    initial_state: UNCERTIFIED
+    terminal_states: []
+    note: "Cyclic: CERTIFIED can be forced back to RECERTIFY_REQUIRED by a late edit, then re-certified."
+    transitions:
+      - from: UNCERTIFIED
+        to: CERTIFIED
+        trigger: "POST /eld/daily-logs/{id}/certify"
+        actor: Driver
+        preconditions:
+          - "acting Driver.id == DailyLog.driver_id (else ERR_UNAUTHORIZED)"
+          - "log_date is not in the future relative to current clock (else ERR_CANNOT_CERTIFY_FUTURE)"
+          - "no ACTIVE DutyStatusEvent for this driver/day still has duration_minutes == null when log_date < today (open events on a closed day block cert) (else ERR_OPEN_EVENT_ON_CLOSED_DAY)"
+        side_effects:
+          - "certification_status -> CERTIFIED; certified_at = current clock"
+          - "increments DailyLog.version by 1"
+      - from: RECERTIFY_REQUIRED
+        to: CERTIFIED
+        trigger: "POST /eld/daily-logs/{id}/certify"
+        actor: Driver
+        preconditions:
+          - "acting Driver.id == DailyLog.driver_id (else ERR_UNAUTHORIZED)"
+        side_effects:
+          - "certification_status -> CERTIFIED; certified_at = current clock"
+          - "increments DailyLog.version by 1"
+      - from: CERTIFIED
+        to: RECERTIFY_REQUIRED
+        trigger: "system: an append/edit/mark-error touches an ACTIVE event in this day"
+        actor: system
+        preconditions:
+          - "a recompute changed this day's totals after it was CERTIFIED"
+        side_effects:
+          - "certification_status -> RECERTIFY_REQUIRED; certified_at cleared to null"
+          - "increments DailyLog.version by 1"
+  # ---- HOSViolation: review lifecycle with revert (cyclic) ----
+  - entity: HOSViolation
+    initial_state: OPEN
+    terminal_states: [RESOLVED, DISMISSED]
+    note: "OPEN -> ACKNOWLEDGED -> OPEN allowed (re-open after ack); auto OPEN/ACKNOWLEDGED -> DISMISSED on correction."
+    transitions:
+      - from: OPEN
+        to: ACKNOWLEDGED
+        trigger: "POST /eld/hos-violations/{id}/acknowledge"
+        actor: SafetyOfficer
+        preconditions:
+          - "violation.status == OPEN (else ERR_INVALID_STATE)"
+        side_effects:
+          - "status -> ACKNOWLEDGED; increments HOSViolation.version by 1"
+      - from: ACKNOWLEDGED
+        to: OPEN
+        trigger: "POST /eld/hos-violations/{id}/reopen"
+        actor: SafetyOfficer
+        preconditions:
+          - "violation.status == ACKNOWLEDGED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "status -> OPEN; increments HOSViolation.version by 1"
+      - from: ACKNOWLEDGED
+        to: RESOLVED
+        trigger: "POST /eld/hos-violations/{id}/resolve"
+        actor: SafetyOfficer
+        preconditions:
+          - "violation.status == ACKNOWLEDGED (else ERR_INVALID_STATE)"
+          - "resolution_note non-empty (else ERR_ANNOTATION_REQUIRED)"
+        side_effects:
+          - "status -> RESOLVED; resolution_note stored; increments HOSViolation.version by 1"
+      - from: OPEN
+        to: DISMISSED
+        trigger: "system: correction made the trigger interval compliant"
+        actor: system
+        preconditions:
+          - "recompute found trigger_event interval no longer crosses violation_type limit"
+        side_effects:
+          - "status -> DISMISSED; resolution_note 'auto-dismissed: corrected'; increments HOSViolation.version by 1"
+      - from: ACKNOWLEDGED
+        to: DISMISSED
+        trigger: "system: correction made the trigger interval compliant"
+        actor: system
+        preconditions:
+          - "recompute found trigger_event interval no longer crosses violation_type limit"
+        side_effects:
+          - "status -> DISMISSED; resolution_note 'auto-dismissed: corrected'; increments HOSViolation.version by 1"
+  # ---- AdverseConditionsClaim: branching review (approve / reject) ----
+  - entity: AdverseConditionsClaim
+    initial_state: PENDING
+    terminal_states: [APPROVED, REJECTED]
+    note: "Branching fork: PENDING -> {APPROVED, REJECTED}; APPROVED branch recomputes clocks with extended limits, REJECTED branch is inert."
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /eld/adverse-claims/{id}/approve"
+        actor: SafetyOfficer
+        preconditions:
+          - "claim.status == PENDING (else ERR_INVALID_STATE)"
+          - "no other APPROVED AdverseConditionsClaim exists for (driver_id, log_date) (else ERR_DUPLICATE_ADVERSE_CLAIM)"
+        side_effects:
+          - "status -> APPROVED"
+          - "recompute_clocks + violation_scan rerun for that driver-day under the extended-limit variant (calc hos_clocks variant adverse_conditions): DRIVING_11H limit 660->780, WINDOW_14H limit 840->960"
+          - "any OPEN/ACKNOWLEDGED DRIVING_11H or WINDOW_14H violation on that day whose overage disappears under extended limits auto -> DISMISSED with note 'auto-dismissed: adverse conditions'"
+          - "increments AdverseConditionsClaim.version by 1"
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /eld/adverse-claims/{id}/reject"
+        actor: SafetyOfficer
+        preconditions:
+          - "claim.status == PENDING (else ERR_INVALID_STATE)"
+        side_effects:
+          - "status -> REJECTED; no clock change; increments AdverseConditionsClaim.version by 1"
+  # ---- ELDDevice: identity-binding lifecycle (cyclic bind/unbind) ----
+  - entity: ELDDevice
+    initial_state: UNBOUND
+    terminal_states: []
+    note: "Cyclic: UNBOUND <-> BOUND via login/logout; MALFUNCTION is a side-branch returning to UNBOUND on clear."
+    transitions:
+      - from: UNBOUND
+        to: BOUND
+        trigger: "POST /eld/devices/{id}/login"
+        actor: Driver
+        preconditions:
+          - "device.status == UNBOUND (else ERR_DEVICE_ALREADY_BOUND)"
+          - "the device's Vehicle.status == IN_SERVICE (else ERR_VEHICLE_OUT_OF_SERVICE)"
+          - "the acting Driver has no other BOUND device (else ERR_DRIVER_ALREADY_BOUND)"
+          - "Driver.status == ACTIVE"
+        side_effects:
+          - "status -> BOUND; bound_driver_id = acting driver id (identity binding)"
+          - "increments ELDDevice.version by 1"
+      - from: BOUND
+        to: UNBOUND
+        trigger: "POST /eld/devices/{id}/logout"
+        actor: Driver
+        preconditions:
+          - "device.status == BOUND and bound_driver_id == acting driver id (else ERR_UNAUTHORIZED)"
+          - "the driver's current_duty_status != DRIVING (else ERR_CANNOT_LOGOUT_WHILE_DRIVING)"
+        side_effects:
+          - "status -> UNBOUND; bound_driver_id -> null"
+          - "increments ELDDevice.version by 1"
+      - from: BOUND
+        to: MALFUNCTION
+        trigger: "POST /eld/devices/{id}/flag-malfunction"
+        actor: CarrierAdmin
+        preconditions:
+          - "device.status == BOUND (else ERR_INVALID_STATE)"
+        side_effects:
+          - "status -> MALFUNCTION (binding retained for forensic trace); increments ELDDevice.version by 1"
+      - from: MALFUNCTION
+        to: UNBOUND
+        trigger: "POST /eld/devices/{id}/clear-malfunction"
+        actor: CarrierAdmin
+        preconditions:
+          - "device.status == MALFUNCTION (else ERR_INVALID_STATE)"
+        side_effects:
+          - "status -> UNBOUND; bound_driver_id -> null; increments ELDDevice.version by 1"
+
+# ---------------------------------------------------------------------------
+# 1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: event-append-stale-driver
+    parent_entity: Driver
+    write_endpoint: "POST /eld/duty-events"
+    occ_field: "expected_driver_version"
+    description: |
+      Appending a DutyStatusEvent against a Driver whose version has advanced
+      since the client last observed it is rejected. A duty-event append legitimately
+      mutates the driver (recompute refreshes current_duty_status and
+      cycle_on_duty_minutes, bumping Driver.version); a second append still carrying
+      the pre-append version is operating on a stale view of the driver's clocks and
+      is rejected on the version check.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: adverse-claim-approve-stale-claim
+    parent_entity: AdverseConditionsClaim
+    write_endpoint: "POST /eld/adverse-claims/{id}/approve"
+    occ_field: "expected_adverseconditionsclaim_version"
+    description: |
+      Approving an AdverseConditionsClaim whose version has advanced since the
+      officer last observed it is rejected. The recompute and lifecycle bump
+      AdverseConditionsClaim.version; an approve carrying the stale version is
+      rejected on the version check before any clock recompute runs.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ===========================================================================
+# 1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: hos_clocks
+    trigger: "recompute_clocks: runs on POST /eld/duty-events (append/correct), POST /eld/duty-events/{id}/mark-error, and adverse-claim approve"
+    algorithm: projection
+    formula: |
+      # Replay the driver's ACTIVE DutyStatusEvent stream in event_time order
+      # (created_at ASC tie-break). Each event's interval = [event_time, next ACTIVE event_time);
+      # the open (latest) event has duration_minutes = null and contributes nothing yet.
+      #
+      # Classify each closed interval by (duty_status, special_driving_category):
+      #   DRIVING & NONE                 -> counts toward driving_clock AND window_clock AND cycle
+      #   ON_DUTY_NOT_DRIVING & NONE     -> counts toward window_clock AND cycle (not driving_clock)
+      #   YARD_MOVE (on DRIVING)         -> counts toward window_clock AND cycle, NOT driving_clock
+      #   PERSONAL_CONVEYANCE            -> excluded from driving_clock, window_clock, AND cycle
+      #   OFF_DUTY (NONE) / SLEEPER      -> off-duty time (do not advance window/driving/cycle)
+      #
+      # DRIVING_RESET: a qualifying off-duty break resets driving_clock and window_clock to 0.
+      #   - 10+ consecutive hours OFF_DUTY and/or SLEEPER_BERTH (>= 600 min), OR
+      #   - a valid Sleeper Berth split pairing (see sleeper_split): the LATER qualifying rest
+      #     period of the pair resets, and the paired rest periods do NOT count against the
+      #     14h window.
+      #
+      # driving_clock = running DRIVING(NONE)+YARD_MOVE minutes since the last DRIVING_RESET
+      # window_clock  = running minutes (driving + on-duty + any non-pairing off-duty) elapsed
+      #                 since the first on-duty event after the last DRIVING_RESET, i.e. the
+      #                 14h window measured as elapsed time from window start, MINUS minutes
+      #                 inside qualifying sleeper-split rest periods.
+      # break_clock   = consecutive DRIVING(NONE)+YARD_MOVE minutes since the last
+      #                 >= 30-minute non-driving interval (OFF_DUTY/SLEEPER/ON_DUTY_NOT_DRIVING).
+      #
+      # cycle_on_duty_minutes = sum of (DRIVING NONE + YARD_MOVE + ON_DUTY_NOT_DRIVING) minutes
+      #   over the rolling cycle window: events whose home-terminal calendar day is within the
+      #   last 8 days (SEVENTY_HOUR_8_DAY) or 7 days (SIXTY_HOUR_7_DAY) inclusive of the latest
+      #   event's day. PC and SLEEPER and OFF_DUTY excluded.
+    input_set: "ACTIVE DutyStatusEvent rows for the driver only; INACTIVE_CHANGED and INACTIVE_ERROR excluded entirely."
+    constants:
+      DRIVING_LIMIT_MIN: 660            # 11 hours
+      WINDOW_LIMIT_MIN: 840             # 14 hours
+      BREAK_REQUIRED_AFTER_MIN: 480     # 8 hours of driving without a 30-min break
+      BREAK_MIN_MINUTES: 30
+      RESET_OFF_DUTY_MIN: 600           # 10 hours
+      CYCLE_70_LIMIT_MIN: 4200          # 70 hours
+      CYCLE_60_LIMIT_MIN: 3600          # 60 hours
+      CYCLE_70_WINDOW_DAYS: 8
+      CYCLE_60_WINDOW_DAYS: 7
+    precision: "integer minutes; intervals truncated to whole minutes (floor) on each interval, then summed (sum-of-floored, NOT floor-of-sum)"
+    variants:
+      - name: standard
+        when: "no APPROVED AdverseConditionsClaim for the driver-day containing the interval"
+        difference: "DRIVING_LIMIT_MIN = 660, WINDOW_LIMIT_MIN = 840"
+      - name: adverse_conditions
+        when: "an APPROVED AdverseConditionsClaim exists for the home-terminal day of the interval"
+        difference: "DRIVING_LIMIT_MIN extended to 780 (13h), WINDOW_LIMIT_MIN extended to 960 (16h); BREAK and CYCLE limits unchanged. Only intervals whose home-terminal day is the claimed day use the extended limits; the cycle clock is never extended."
+  - name: violation_detection
+    trigger: "violation_scan: runs immediately after hos_clocks on every append/correct/mark-error and on adverse-claim approve"
+    algorithm: threshold
+    formula: |
+      # Walk the recomputed running clocks chronologically. For each closed interval,
+      # AFTER adding it to the relevant clock, test each limit. The FIRST interval that
+      # pushes a clock strictly past its limit is the trigger_event for that violation_type.
+      #   DRIVING_11H : driving_clock > DRIVING_LIMIT_MIN (variant-aware)
+      #   WINDOW_14H  : window_clock  > WINDOW_LIMIT_MIN  (variant-aware)
+      #   BREAK_30MIN : break_clock   > BREAK_REQUIRED_AFTER_MIN with no >=30-min break taken
+      #   CYCLE_70H   : cycle_on_duty_minutes > CYCLE_70_LIMIT_MIN (or CYCLE_60_LIMIT_MIN)
+      # overage_minutes = clock_value_after_interval - applicable_limit  (>= 1 to open a row)
+      # At most one OPEN HOSViolation per (driver_id, violation_type, DRIVING_RESET-epoch);
+      # CYCLE_70H is one OPEN per rolling cycle window. A new interval that crosses an
+      # already-open type updates overage_minutes upward but does NOT open a duplicate row.
+      # Boundary: a clock exactly EQUAL to its limit is COMPLIANT (strict >). 660 ok, 661 violates.
+    input_set: "Recomputed clocks from hos_clocks for ACTIVE events; uses the same variant selection."
+    constants:
+      OVERAGE_FLOOR: 1
+    precision: "integer minutes"
+  - name: pc_exclusion
+    trigger: "on append of the NEXT event after a PERSONAL_CONVEYANCE event (which closes the PC interval), and on any recompute that changes that event's duration"
+    algorithm: aggregation
+    formula: |
+      # For each ACTIVE DutyStatusEvent with special_driving_category == PERSONAL_CONVEYANCE
+      # and a known duration_minutes, create/refresh exactly one PersonalConveyanceSegment:
+      #   minutes_excluded = the event's duration_minutes
+      # These minutes are EXCLUDED from hos_clocks (driving/window/cycle). The sum of
+      # minutes_excluded for a driver-day is the audit total of PC time that did not
+      # advance any HOS clock. When the PC event becomes INACTIVE_* its segment is removed.
+      total_pc_excluded_for_day = sum( minutes_excluded
+                                       for segment whose event_time is in the home-terminal day
+                                       AND the event is ACTIVE )
+    input_set: "ACTIVE PERSONAL_CONVEYANCE events with non-null duration_minutes for the driver-day."
+    constants: {}
+    precision: "integer minutes"
+  - name: sleeper_split
+    trigger: "inside hos_clocks: evaluated whenever an OFF_DUTY/SLEEPER interval closes, to decide whether a 7/3 or 8/2 split pairing resets the driving/window clocks"
+    algorithm: interval_merge
+    formula: |
+      # A valid Sleeper Berth split is a pair of qualifying rest periods that TOGETHER total
+      # >= 600 minutes (10h), where:
+      #   - one period is >= 420 min (7h) and entirely SLEEPER_BERTH (the "long" rest), and
+      #   - the other period is >= 120 min (2h) and is SLEEPER_BERTH or OFF_DUTY (the "short" rest),
+      #   - i.e. a 7/3 (>=420 + >=180) or 8/2 (>=480 + >=120) pairing; generalised: long >= 420
+      #     SLEEPER, short >= 120 any-off-duty, long+short >= 600.
+      # Pairing rule: each rest period pairs with the NEAREST preceding qualifying period that
+      # has not already been paired (chronological greedy, earliest-unpaired first; created_at
+      # ASC tie-break when two candidate periods share an event_time boundary).
+      # Effect when a pair completes (at the END of the LATER period):
+      #   - driving_clock and window_clock recompute EXCLUDING the time inside BOTH paired rest
+      #     periods (the 14h window is measured as if the paired rest did not elapse), and
+      #   - the window/driving clocks are credited as reset from the end of the LATER period.
+      # A single >= 600-min OFF_DUTY/SLEEPER interval is the degenerate full reset (handled in
+      # hos_clocks DRIVING_RESET); sleeper_split handles only the multi-period case.
+    input_set: "Consecutive OFF_DUTY/SLEEPER intervals for the driver in the active driving window."
+    constants:
+      LONG_REST_MIN: 420      # 7h
+      SHORT_REST_MIN: 120     # 2h
+      PAIR_TOTAL_MIN: 600     # 10h
+    precision: "integer minutes"
+
+# ===========================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role header present and one of {Driver, CarrierAdmin, SafetyOfficer}; X-User-ID present for entity_backed Driver role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for the endpoint per §1.7 RBAC matrix"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "Every resource id in the path exists (validated left to right)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all path-parameterized endpoints"
+  - priority: 4
+    category: existence
+    check: "Every FK in the request body references an existing resource (driver_id, device_id, vehicle_id, trigger_event_id, edited_from_event_id)"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /eld/duty-events, POST /eld/devices, POST /eld/daily-logs, POST /eld/adverse-claims, POST /eld/hos-violations"
+  - priority: 5
+    category: state
+    check: "Acting Driver (entity_backed) must own the target resource: X-User-ID == resource.driver_id (events, daily-logs, claims) or == device.bound_driver_id (logout)"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "Driver-scoped mutations"
+  - priority: 6
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 7
+    category: business_referential
+    check: "On duty-event append: device is BOUND to driver_id; on login: driver has no other BOUND device"
+    error_id: ERR_DEVICE_NOT_BOUND
+    http_status: 409
+    applies_to: "POST /eld/duty-events"
+  - priority: 8
+    category: business_temporal
+    check: "event_time strictly greater than the latest ACTIVE event_time for this driver"
+    error_id: ERR_EVENT_OUT_OF_ORDER
+    http_status: 409
+    applies_to: "POST /eld/duty-events"
+  - priority: 9
+    category: business_safety
+    check: "PERSONAL_CONVEYANCE annotation only when Driver.pc_authorized == true and duty_status IN {DRIVING, OFF_DUTY}"
+    error_id: ERR_PC_NOT_AUTHORIZED
+    http_status: 422
+    applies_to: "POST /eld/duty-events"
+  - priority: 10
+    category: business_constraint
+    check: "annotation non-empty when special_driving_category != NONE or edited_from_event_id is set; narrative non-empty on adverse-claim; resolution_note non-empty on violation resolve"
+    error_id: ERR_ANNOTATION_REQUIRED
+    http_status: 422
+    applies_to: "POST /eld/duty-events, POST /eld/adverse-claims, POST /eld/hos-violations/{id}/resolve"
+  - priority: 11
+    category: business_constraint
+    check: "edited_from_event_id (when set) references an ACTIVE event of the same driver"
+    error_id: ERR_EDIT_TARGET_INVALID
+    http_status: 409
+    applies_to: "POST /eld/duty-events"
+  - priority: 12
+    category: business_constraint
+    check: "At most one APPROVED AdverseConditionsClaim per (driver_id, log_date)"
+    error_id: ERR_DUPLICATE_ADVERSE_CLAIM
+    http_status: 409
+    applies_to: "POST /eld/adverse-claims/{id}/approve"
+  - priority: 13
+    category: business_temporal
+    check: "Cannot certify a DailyLog whose log_date is in the future relative to the current clock"
+    error_id: ERR_CANNOT_CERTIFY_FUTURE
+    http_status: 409
+    applies_to: "POST /eld/daily-logs/{id}/certify"
+  - priority: 14
+    category: business_temporal
+    check: "Cannot certify a closed day (log_date < today) while an ACTIVE event in that day still has duration_minutes == null"
+    error_id: ERR_OPEN_EVENT_ON_CLOSED_DAY
+    http_status: 409
+    applies_to: "POST /eld/daily-logs/{id}/certify"
+  - priority: 15
+    category: business_safety
+    check: "Cannot logout a device while the bound driver's current_duty_status == DRIVING"
+    error_id: ERR_CANNOT_LOGOUT_WHILE_DRIVING
+    http_status: 409
+    applies_to: "POST /eld/devices/{id}/logout"
+  - priority: 16
+    category: business_constraint
+    check: "Vehicle must be IN_SERVICE to login an ELD; driver login forbidden on OUT_OF_SERVICE vehicle"
+    error_id: ERR_VEHICLE_OUT_OF_SERVICE
+    http_status: 409
+    applies_to: "POST /eld/devices/{id}/login"
+  - priority: 17
+    category: business_constraint
+    check: "Unique license_number on Driver, unit_number on Vehicle, serial_number on ELDDevice"
+    error_id: ERR_DUPLICATE_LICENSE
+    http_status: 409
+    applies_to: "POST /eld/drivers, POST /eld/vehicles, POST /eld/devices"
+  - priority: 18
+    category: state
+    check: "OCC: expected_<parent>_version equals current parent.version on guarded writes"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /eld/duty-events, POST /eld/duty-events/{id}/mark-error, POST /eld/adverse-claims/{id}/approve"
+  - priority: 19
+    category: business_constraint
+    check: "Required body fields present and well-typed; enum values within declared domain; pagination params within bounds"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all"
+
+# ===========================================================================
+# 1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # --- Driver ---
+  - method: POST
+    path: "/eld/drivers"
+    description: "Create a driver."
+    roles: [CarrierAdmin]
+    code: 201
+    input: [license_number, full_name, "home_terminal_tz_offset_minutes?", "cycle_rule?", "pc_authorized?"]
+    output: Driver
+    side_effects: ["Driver created in ACTIVE status, version 1, current_duty_status OFF_DUTY"]
+  - method: GET
+    path: "/eld/drivers/{id}"
+    description: "Fetch a driver, including computed current_duty_status and cycle_on_duty_minutes."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: []
+    output: Driver
+    side_effects: []
+  - method: GET
+    path: "/eld/drivers"
+    description: "List drivers (paginated)."
+    roles: [CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: Driver[]
+    side_effects: []
+  - method: PATCH
+    path: "/eld/drivers/{id}"
+    description: "Update mutable driver fields (pc_authorized, cycle_rule, status)."
+    roles: [CarrierAdmin]
+    code: 200
+    input: ["pc_authorized?", "cycle_rule?", "status?", expected_driver_version]
+    output: Driver
+    side_effects: ["increments Driver.version by 1"]
+  # --- Vehicle ---
+  - method: POST
+    path: "/eld/vehicles"
+    description: "Create a vehicle."
+    roles: [CarrierAdmin]
+    code: 201
+    input: [unit_number, vin]
+    output: Vehicle
+    side_effects: ["Vehicle created IN_SERVICE, version 1"]
+  - method: GET
+    path: "/eld/vehicles/{id}"
+    description: "Fetch a vehicle."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: []
+  - method: PATCH
+    path: "/eld/vehicles/{id}"
+    description: "Change vehicle service status."
+    roles: [CarrierAdmin]
+    code: 200
+    input: [status, expected_vehicle_version]
+    output: Vehicle
+    side_effects: ["increments Vehicle.version by 1"]
+  # --- ELDDevice ---
+  - method: POST
+    path: "/eld/devices"
+    description: "Register an ELD device against a vehicle."
+    roles: [CarrierAdmin]
+    code: 201
+    input: [serial_number, vehicle_id]
+    output: ELDDevice
+    side_effects: ["Device created UNBOUND, version 1"]
+  - method: GET
+    path: "/eld/devices/{id}"
+    description: "Fetch a device with binding state."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: []
+    output: ELDDevice
+    side_effects: []
+  - method: GET
+    path: "/eld/devices"
+    description: "List devices; filter by vehicle_id or bound_driver_id for FK reverse-reachability."
+    roles: [CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: ["limit?", "offset?", "vehicle_id?", "bound_driver_id?", "status?"]
+    output: ELDDevice[]
+    side_effects: []
+  - method: POST
+    path: "/eld/devices/{id}/login"
+    description: "Driver logs in to a device (identity binding)."
+    roles: [Driver]
+    code: 200
+    input: []
+    output: ELDDevice
+    side_effects: ["status UNBOUND->BOUND; bound_driver_id set; increments ELDDevice.version by 1"]
+  - method: POST
+    path: "/eld/devices/{id}/logout"
+    description: "Driver logs out of a device."
+    roles: [Driver]
+    code: 200
+    input: []
+    output: ELDDevice
+    side_effects: ["status BOUND->UNBOUND; bound_driver_id cleared; increments ELDDevice.version by 1"]
+  - method: POST
+    path: "/eld/devices/{id}/flag-malfunction"
+    description: "Mark a bound device as malfunctioning."
+    roles: [CarrierAdmin]
+    code: 200
+    input: []
+    output: ELDDevice
+    side_effects: ["status BOUND->MALFUNCTION; increments ELDDevice.version by 1"]
+  - method: POST
+    path: "/eld/devices/{id}/clear-malfunction"
+    description: "Clear a malfunction and unbind."
+    roles: [CarrierAdmin]
+    code: 200
+    input: []
+    output: ELDDevice
+    side_effects: ["status MALFUNCTION->UNBOUND; bound_driver_id cleared; increments ELDDevice.version by 1"]
+  # --- DutyStatusEvent ---
+  - method: POST
+    path: "/eld/duty-events"
+    description: "Append a duty status event (optionally a correction). Drives the HOS engine."
+    roles: [Driver]
+    code: 201
+    input: [driver_id, device_id, duty_status, event_time, "special_driving_category?", "edited_from_event_id?", "annotation?", expected_driver_version]
+    output: DutyStatusEvent
+    side_effects:
+      - "closes prior open event (sets its duration_minutes)"
+      - "recompute_clocks (calc hos_clocks): refreshes Driver.current_duty_status, Driver.cycle_on_duty_minutes, DailyLog totals"
+      - "pc_exclusion: creates PersonalConveyanceSegment for a closed PC event"
+      - "violation_scan (calc violation_detection): may open HOSViolation rows; sets compliance_disposition"
+      - "CERTIFIED DailyLogs touched flip to RECERTIFY_REQUIRED"
+      - "if edited_from_event_id set: target event -> INACTIVE_CHANGED; affected OPEN violations may auto-DISMISS"
+      - "increments Driver.version by 1; new event version 1"
+  - method: GET
+    path: "/eld/duty-events/{id}"
+    description: "Fetch one duty event with computed duration and dispositions."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: []
+    output: DutyStatusEvent
+    side_effects: []
+  - method: GET
+    path: "/eld/duty-events"
+    description: "List duty events; filter by driver_id, device_id, vehicle_id, record_status (FK reverse-reachability + edit-chain via edited_from_event_id filter)."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: ["limit?", "offset?", "driver_id?", "device_id?", "vehicle_id?", "record_status?", "edited_from_event_id?"]
+    output: DutyStatusEvent[]
+    side_effects: []
+  - method: POST
+    path: "/eld/duty-events/{id}/mark-error"
+    description: "Carrier marks an ACTIVE event as erroneous (record_status -> INACTIVE_ERROR)."
+    roles: [CarrierAdmin]
+    code: 200
+    input: [expected_dutystatusevent_version]
+    output: DutyStatusEvent
+    side_effects:
+      - "record_status -> INACTIVE_ERROR; recompute_clocks + violation_scan rerun"
+      - "DailyLog totals + Driver clocks reconcile; affected violations may auto-DISMISS"
+      - "increments DutyStatusEvent.version by 1"
+  # --- DailyLog ---
+  - method: POST
+    path: "/eld/daily-logs"
+    description: "Open (materialize) a daily log for a driver-day so totals can be tracked and certified."
+    roles: [Driver, CarrierAdmin]
+    code: 201
+    input: [driver_id, log_date]
+    output: DailyLog
+    side_effects: ["DailyLog created UNCERTIFIED; totals computed from current ACTIVE events for that home-terminal day"]
+  - method: GET
+    path: "/eld/daily-logs/{id}"
+    description: "Fetch a daily log with computed totals."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: []
+    output: DailyLog
+    side_effects: []
+  - method: GET
+    path: "/eld/daily-logs"
+    description: "List daily logs; filter by driver_id (FK reverse-reachability) and certification_status."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: ["limit?", "offset?", "driver_id?", "certification_status?", "log_date?"]
+    output: DailyLog[]
+    side_effects: []
+  - method: POST
+    path: "/eld/daily-logs/{id}/certify"
+    description: "Driver certifies a daily log."
+    roles: [Driver]
+    code: 200
+    input: []
+    output: DailyLog
+    side_effects: ["certification_status -> CERTIFIED; certified_at set; increments DailyLog.version by 1"]
+  # --- HOSViolation ---
+  - method: GET
+    path: "/eld/hos-violations/{id}"
+    description: "Fetch a violation."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: []
+    output: HOSViolation
+    side_effects: []
+  - method: GET
+    path: "/eld/hos-violations"
+    description: "FMCSA violation reporting: list violations; filter by driver_id, trigger_event_id, violation_type, status."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: ["limit?", "offset?", "driver_id?", "trigger_event_id?", "violation_type?", "status?"]
+    output: HOSViolation[]
+    side_effects: []
+  - method: POST
+    path: "/eld/hos-violations/{id}/acknowledge"
+    description: "Safety officer acknowledges an open violation."
+    roles: [SafetyOfficer]
+    code: 200
+    input: []
+    output: HOSViolation
+    side_effects: ["status OPEN->ACKNOWLEDGED; increments HOSViolation.version by 1"]
+  - method: POST
+    path: "/eld/hos-violations/{id}/reopen"
+    description: "Re-open an acknowledged violation."
+    roles: [SafetyOfficer]
+    code: 200
+    input: []
+    output: HOSViolation
+    side_effects: ["status ACKNOWLEDGED->OPEN; increments HOSViolation.version by 1"]
+  - method: POST
+    path: "/eld/hos-violations/{id}/resolve"
+    description: "Resolve an acknowledged violation with a note."
+    roles: [SafetyOfficer]
+    code: 200
+    input: [resolution_note]
+    output: HOSViolation
+    side_effects: ["status ACKNOWLEDGED->RESOLVED; resolution_note stored; increments HOSViolation.version by 1"]
+  # --- AdverseConditionsClaim ---
+  - method: POST
+    path: "/eld/adverse-claims"
+    description: "Driver files an Adverse Conditions exemption claim for a day."
+    roles: [Driver]
+    code: 201
+    input: [driver_id, log_date, reason, narrative]
+    output: AdverseConditionsClaim
+    side_effects: ["AdverseConditionsClaim created PENDING, version 1"]
+  - method: GET
+    path: "/eld/adverse-claims/{id}"
+    description: "Fetch an adverse-conditions claim."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: []
+    output: AdverseConditionsClaim
+    side_effects: []
+  - method: GET
+    path: "/eld/adverse-claims"
+    description: "List adverse-conditions claims; filter by driver_id (FK reverse-reachability) and status."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: ["limit?", "offset?", "driver_id?", "status?", "log_date?"]
+    output: AdverseConditionsClaim[]
+    side_effects: []
+  - method: POST
+    path: "/eld/adverse-claims/{id}/approve"
+    description: "Safety officer approves a claim; recomputes clocks under extended limits."
+    roles: [SafetyOfficer]
+    code: 200
+    input: [expected_adverseconditionsclaim_version]
+    output: AdverseConditionsClaim
+    side_effects:
+      - "status PENDING->APPROVED"
+      - "recompute_clocks + violation_scan rerun under adverse_conditions variant for the claimed driver-day"
+      - "DRIVING_11H / WINDOW_14H violations whose overage disappears auto -> DISMISSED"
+      - "increments AdverseConditionsClaim.version by 1; recompute bumps Driver.version"
+  - method: POST
+    path: "/eld/adverse-claims/{id}/reject"
+    description: "Safety officer rejects a claim."
+    roles: [SafetyOfficer]
+    code: 200
+    input: []
+    output: AdverseConditionsClaim
+    side_effects: ["status PENDING->REJECTED; increments AdverseConditionsClaim.version by 1"]
+  # --- PersonalConveyanceSegment (read; created as a cascade side-effect) ---
+  - method: GET
+    path: "/eld/pc-segments/{id}"
+    description: "Fetch one Personal Conveyance segment."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: []
+    output: PersonalConveyanceSegment
+    side_effects: []
+  - method: GET
+    path: "/eld/pc-segments"
+    description: "List Personal Conveyance segments; filter by driver_id and event_id (FK reverse-reachability for both FKs)."
+    roles: [Driver, CarrierAdmin, SafetyOfficer]
+    code: 200
+    input: ["limit?", "offset?", "driver_id?", "event_id?"]
+    output: PersonalConveyanceSegment[]
+    side_effects: []
+  # --- Test-driving clock control (last-resort /_ endpoint) ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving endpoint: pin the server's current UTC clock for deterministic time-gated tests (certify future check, cycle window edges)."
+    roles: [CarrierAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["sets the server clock used by certify future-check and cycle-window boundaries"]
+
+# ===========================================================================
+# 1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role, or missing X-User-ID for an entity_backed Driver call."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Role not permitted for the endpoint, or acting Driver is not the owner of the target resource."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A resource id in the path does not exist."
+  - id: ERR_REFERENCE_NOT_FOUND
+    http: 404
+    condition: "A foreign-key id in the request body does not reference an existing resource."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource is not in a state from which the requested transition is defined."
+  - id: ERR_DEVICE_NOT_BOUND
+    http: 409
+    condition: "Duty event device is not BOUND to driver_id, or binding mismatch."
+  - id: ERR_DEVICE_ALREADY_BOUND
+    http: 409
+    condition: "Login attempted on a device that is not UNBOUND."
+  - id: ERR_DRIVER_ALREADY_BOUND
+    http: 409
+    condition: "Driver attempts to login while already BOUND to another device."
+  - id: ERR_VEHICLE_OUT_OF_SERVICE
+    http: 409
+    condition: "Login attempted on a device whose vehicle is OUT_OF_SERVICE."
+  - id: ERR_EVENT_OUT_OF_ORDER
+    http: 409
+    condition: "event_time not strictly greater than the latest ACTIVE event_time for the driver."
+  - id: ERR_PC_NOT_AUTHORIZED
+    http: 422
+    condition: "PERSONAL_CONVEYANCE used without Driver.pc_authorized, or on a non-DRIVING/non-OFF_DUTY status."
+  - id: ERR_ANNOTATION_REQUIRED
+    http: 422
+    condition: "Missing required annotation/narrative/resolution_note."
+  - id: ERR_EDIT_TARGET_INVALID
+    http: 409
+    condition: "edited_from_event_id does not reference an ACTIVE event of the same driver."
+  - id: ERR_DUPLICATE_ADVERSE_CLAIM
+    http: 409
+    condition: "An APPROVED AdverseConditionsClaim already exists for (driver_id, log_date)."
+  - id: ERR_CANNOT_CERTIFY_FUTURE
+    http: 409
+    condition: "Attempt to certify a daily log whose log_date is in the future."
+  - id: ERR_OPEN_EVENT_ON_CLOSED_DAY
+    http: 409
+    condition: "Certify a past day while an ACTIVE event in that day still has null duration_minutes."
+  - id: ERR_CANNOT_LOGOUT_WHILE_DRIVING
+    http: 409
+    condition: "Logout attempted while the driver's current_duty_status is DRIVING."
+  - id: ERR_DUPLICATE_LICENSE
+    http: 409
+    condition: "license_number / unit_number / serial_number already exists."
+  - id: ERR_DUPLICATE_UNIT
+    http: 409
+    condition: "Vehicle unit_number already exists."
+  - id: ERR_DUPLICATE_SERIAL
+    http: 409
+    condition: "ELDDevice serial_number already exists."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_<parent>_version does not match the current parent version (OCC)."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing/ill-typed required field, enum out of domain, or pagination param out of bounds."
+
+# ===========================================================================
+# 1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: Driver
+    description: "A commercial driver acting on their own duty log via a bound ELD."
+    identity: "entity_backed:Driver"
+    exclusive_operations:
+      - "POST /eld/devices/{id}/login"
+      - "POST /eld/devices/{id}/logout"
+      - "POST /eld/duty-events"
+      - "POST /eld/daily-logs/{id}/certify"
+      - "POST /eld/adverse-claims"
+    shared_operations:
+      - "GET /eld/drivers/{id}"
+      - "GET /eld/vehicles/{id}"
+      - "GET /eld/devices/{id}"
+      - "GET /eld/duty-events (own)"
+      - "GET /eld/duty-events/{id}"
+      - "GET /eld/daily-logs / {id}"
+      - "GET /eld/hos-violations / {id}"
+      - "GET /eld/adverse-claims / {id}"
+      - "GET /eld/pc-segments"
+      - "POST /eld/daily-logs"
+  - name: CarrierAdmin
+    description: "Carrier back-office operator: fleet, drivers, devices, error-marking, clock control."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /eld/drivers"
+      - "PATCH /eld/drivers/{id}"
+      - "POST /eld/vehicles"
+      - "PATCH /eld/vehicles/{id}"
+      - "POST /eld/devices"
+      - "POST /eld/devices/{id}/flag-malfunction"
+      - "POST /eld/devices/{id}/clear-malfunction"
+      - "POST /eld/duty-events/{id}/mark-error"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "GET (all read endpoints)"
+      - "GET /eld/drivers"
+      - "POST /eld/daily-logs"
+  - name: SafetyOfficer
+    description: "Compliance reviewer: handles FMCSA violation lifecycle and adverse-conditions adjudication."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /eld/hos-violations/{id}/acknowledge"
+      - "POST /eld/hos-violations/{id}/reopen"
+      - "POST /eld/hos-violations/{id}/resolve"
+      - "POST /eld/adverse-claims/{id}/approve"
+      - "POST /eld/adverse-claims/{id}/reject"
+    shared_operations:
+      - "GET (all read endpoints)"
+      - "GET /eld/drivers"
+      - "GET /eld/hos-violations"
+  - name: ELDSystem
+    description: "Opaque system actor for automatic transitions (recompute-driven RECERTIFY_REQUIRED, auto-DISMISS, compliance_disposition flips). Not directly callable; documents system-triggered side effects."
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations: []

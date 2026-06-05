@@ -1,0 +1,34 @@
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Error catalog (id -> http status) per PRD §5 / SCAFFOLD §1.6.
+# Verbatim from the PRD §5 error table — exact ids, do not rename.
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_FORBIDDEN = ("ERR_FORBIDDEN", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_INVALID_REQUEST = ("ERR_INVALID_REQUEST", 400)
+ERR_CROSS_COMMUNITY_REFERENCE = ("ERR_CROSS_COMMUNITY_REFERENCE", 409)
+ERR_DUPLICATE_LOT_NUMBER = ("ERR_DUPLICATE_LOT_NUMBER", 409)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_LOT_NOT_VACANT = ("ERR_LOT_NOT_VACANT", 409)
+ERR_LOT_FROZEN = ("ERR_LOT_FROZEN", 409)
+ERR_EVICTION_IN_PROGRESS = ("ERR_EVICTION_IN_PROGRESS", 409)
+ERR_STALE_LOT_VERSION = ("ERR_STALE_LOT_VERSION", 412)
+ERR_INCREASE_TOO_SOON = ("ERR_INCREASE_TOO_SOON", 409)
+ERR_CURE_PERIOD_EXPIRED = ("ERR_CURE_PERIOD_EXPIRED", 409)
+ERR_CURE_PERIOD_ACTIVE = ("ERR_CURE_PERIOD_ACTIVE", 409)
+ERR_ARREARS_BELOW_THRESHOLD = ("ERR_ARREARS_BELOW_THRESHOLD", 409)
+ERR_ARREARS_NOT_CLEARED = ("ERR_ARREARS_NOT_CLEARED", 409)
+ERR_NO_OCCUPIED_LOTS = ("ERR_NO_OCCUPIED_LOTS", 409)
+ERR_NO_METER_READINGS = ("ERR_NO_METER_READINGS", 409)
+ERR_DUPLICATE_BALLOT = ("ERR_DUPLICATE_BALLOT", 409)
+
+
+def err(code_tuple, message=None):
+    eid, status = code_tuple
+    return ApiError(eid, status, message)

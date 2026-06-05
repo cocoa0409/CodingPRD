@@ -1,0 +1,30 @@
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Error catalog (id -> http status)
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_FORBIDDEN_ROLE = ("ERR_FORBIDDEN_ROLE", 403)
+ERR_NOT_RESOURCE_OWNER = ("ERR_NOT_RESOURCE_OWNER", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_DUPLICATE_GRID_CODE = ("ERR_DUPLICATE_GRID_CODE", 409)
+ERR_NOT_AIRPORT_ZONE = ("ERR_NOT_AIRPORT_ZONE", 422)
+ERR_ALREADY_QUEUED = ("ERR_ALREADY_QUEUED", 409)
+ERR_DRIVER_NOT_AVAILABLE = ("ERR_DRIVER_NOT_AVAILABLE", 422)
+ERR_TRIP_NOT_COMPLETED = ("ERR_TRIP_NOT_COMPLETED", 422)
+ERR_INVALID_REFUND_AMOUNT = ("ERR_INVALID_REFUND_AMOUNT", 422)
+ERR_INSUFFICIENT_WALLET = ("ERR_INSUFFICIENT_WALLET", 402)
+ERR_STALE_ZONE_VERSION = ("ERR_STALE_ZONE_VERSION", 412)
+ERR_SNAPSHOT_WINDOW_OVERLAP = ("ERR_SNAPSHOT_WINDOW_OVERLAP", 409)
+ERR_QUEST_WINDOW_OVERLAP = ("ERR_QUEST_WINDOW_OVERLAP", 409)
+ERR_INVALID_REQUEST = ("ERR_INVALID_REQUEST", 422)
+
+
+def err(code_tuple, message=None):
+    eid, status = code_tuple
+    return ApiError(eid, status, message)

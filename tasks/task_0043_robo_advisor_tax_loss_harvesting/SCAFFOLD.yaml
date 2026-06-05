@@ -1,0 +1,1077 @@
+# =============================================================================
+# Robo-Advisor Tax-Loss Harvesting — Seed Tables (SCAFFOLD.yaml, §1.0–§1.7)
+# =============================================================================
+
+scenario: |
+  Robo-Advisor Tax-Loss Harvesting: risk questionnaire, model portfolio,
+  correlation-based replacement (avoiding Wash Sale 30-day rule), quarterly
+  rebalancing, automatic reinvestment, 1099-B tax form generation, target asset
+  allocation drift threshold
+
+domain_name: robo-advisor-tax-loss-harvesting
+api_prefix: /                # flat multi-collection topology rooted at /; each entity is its own top-level collection
+
+# Top-level resource collections (flat topology, FK-linked):
+#   /accounts                — Account (client investment account)
+#   /securities              — Security (catalog: ETF/stock, asset class, correlation map)
+#   /model-portfolios        — ModelPortfolio (config: target allocation by asset class)
+#   /questionnaires          — RiskQuestionnaire (append-only scoring event per account)
+#   /tax-lots                — TaxLot (cost-basis ledger row, one per purchase tranche)
+#   /harvest-events          — HarvestEvent (a single tax-loss harvest action)
+#   /rebalance-events        — RebalanceEvent (a quarterly rebalance run)
+#   /tax-forms               — TaxForm1099B (a generated 1099-B for a tax year)
+#   /_clock                  — test-driving clock (set current UTC)
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - rate_threshold_triggers          # drift threshold crossing (>= vs >), 30-day wash-sale window edges
+    - cascading_side_effects           # harvest → realize loss → open replacement lot → reinvest cash → recompute drift
+    - dual_variant_calculation         # capital-gain lot selection: FIFO vs HIFO realize different gains/losses
+    - optimistic_concurrency           # OCC on Account.version for harvest/rebalance create-with-supersede
+
+  entity_topology: flat
+  state_machine_shape: branching
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate
+  role_model: peer_roles
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Security
+    parent: null
+    common_fields: true
+    fields:
+      - { name: ticker, type: string, source: input, description: "Unique trading symbol, e.g. VTI", constraints: "uppercase, unique across Security" }
+      - { name: asset_class, type: enum, source: input, description: "US_EQUITY | INTL_EQUITY | BOND | REIT | COMMODITY" }
+      - { name: price_cents, type: integer, source: input, description: "Current per-share price in cents", constraints: ">= 1" }
+      - { name: correlated_with, type: array, source: input, description: "Array of {ticker, correlation} objects; correlation is a float in [-1.0, 1.0] vs this security; used to pick wash-sale-safe replacements" }
+      - { name: is_active, type: boolean, source: system, description: "True until delisted; delisted securities cannot be bought", default: true }
+
+  - name: ModelPortfolio
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Model name, e.g. Aggressive Growth" }
+      - { name: min_risk_score, type: integer, source: input, description: "Inclusive lower bound of risk_score this model serves", constraints: "0..100" }
+      - { name: max_risk_score, type: integer, source: input, description: "Inclusive upper bound of risk_score this model serves", constraints: "0..100, >= min_risk_score" }
+      - { name: targets, type: array, source: input, description: "Array of {asset_class, target_pct} objects; target_pct are integers that MUST sum to exactly 100" }
+      - { name: drift_threshold_pct, type: integer, source: input, description: "Per-asset-class absolute drift (percentage points) at or above which the account is REBALANCE_DUE", constraints: ">= 1" }
+      - { name: lot_selection, type: enum, source: input, description: "FIFO | HIFO — lot-consumption order used by capital_gain_realization on partial sells", default: FIFO }
+      - { name: is_active, type: boolean, source: system, description: "False after retirement; retired models keep serving already-assigned accounts but accept no new assignments", default: true }
+
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - { name: client_email, type: string, source: input, description: "Owning client email", constraints: "unique across Account" }
+      - { name: model_portfolio_id, type: string, source: computed, description: "FK -> ModelPortfolio.id; assigned by the scored questionnaire, null until first ACCEPTED questionnaire" }
+      - { name: risk_score, type: integer, source: computed, description: "Latest ACCEPTED questionnaire score, 0..100; null until first ACCEPTED questionnaire" }
+      - { name: status, type: enum, source: system, description: "PENDING_PROFILE | ACTIVE | REBALANCE_DUE | FROZEN | CLOSED", default: PENDING_PROFILE }
+      - { name: cash_balance_cents, type: integer, source: computed, description: "Uninvested settled cash in cents; reinvestment and harvest proceeds flow through here", default: 0 }
+      - { name: invested_value_cents, type: integer, source: computed, description: "Sum over OPEN TaxLot of (quantity * Security.price_cents) for this account" }
+      - { name: total_value_cents, type: integer, source: computed, description: "cash_balance_cents + invested_value_cents" }
+      - { name: max_drift_pct, type: integer, source: computed, description: "Largest absolute per-asset-class drift in percentage points; >= model.drift_threshold_pct sets status REBALANCE_DUE", default: 0 }
+      - { name: realized_gain_cents_ytd, type: integer, source: computed, description: "Signed sum of realized_gain_cents over CLOSED TaxLot whose disposed_at falls in the current tax year; losses are negative", default: 0 }
+      - { name: wash_sale_disallowed_cents_ytd, type: integer, source: computed, description: "Sum of disallowed loss (positive cents) deferred under the wash-sale rule in the current tax year", default: 0 }
+
+  - name: RiskQuestionnaire
+    parent: null
+    common_fields: false
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; the account being profiled" }
+      - { name: horizon_years, type: integer, source: input, description: "Investment horizon in years", constraints: "0..50" }
+      - { name: loss_tolerance, type: integer, source: input, description: "Self-reported loss tolerance", constraints: "0..10" }
+      - { name: liquidity_need, type: integer, source: input, description: "Self-reported near-term liquidity need (higher = more cash needed)", constraints: "0..10" }
+      - { name: income_band, type: integer, source: input, description: "Income band code", constraints: "0..10" }
+      - { name: risk_score, type: integer, source: computed, description: "Weighted score 0..100 computed by risk_scoring; immutable once written" }
+      - { name: assigned_model_portfolio_id, type: string, source: computed, description: "FK -> ModelPortfolio.id; the model whose [min_risk_score, max_risk_score] band contains risk_score" }
+      - { name: status, type: enum, source: system, description: "SCORED | ACCEPTED | SUPERSEDED", default: SCORED }
+
+  - name: TaxLot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; owning account" }
+      - { name: security_id, type: string, source: input, description: "FK -> Security.id; the held security" }
+      - { name: quantity, type: number, source: input, description: "Shares in this lot", constraints: "> 0" }
+      - { name: cost_basis_cents, type: integer, source: input, description: "Total acquisition cost in cents for the whole lot (not per share)", constraints: ">= 1" }
+      - { name: acquired_at, type: datetime, source: system, description: "Lot open timestamp; set from the clock at creation; drives wash-sale window arithmetic" }
+      - { name: status, type: enum, source: system, description: "OPEN | CLOSED", default: OPEN }
+      - { name: market_value_cents, type: integer, source: computed, description: "round_half_up(quantity * Security.price_cents) while OPEN; 0 once CLOSED" }
+      - { name: unrealized_gain_cents, type: integer, source: computed, description: "market_value_cents - cost_basis_cents while OPEN; 0 once CLOSED" }
+      - { name: disposed_at, type: datetime, source: system, description: "Lot close timestamp; null while OPEN", default: null }
+      - { name: proceeds_cents, type: integer, source: system, description: "Sale proceeds in cents recorded at close; null while OPEN", default: null }
+      - { name: realized_gain_cents, type: integer, source: computed, description: "proceeds_cents - cost_basis_cents at close; signed; null while OPEN" }
+      - { name: wash_sale_disallowed_cents, type: integer, source: computed, description: "Portion of a realized LOSS disallowed under the wash-sale rule at close; positive cents; 0 when no disallowance", default: 0 }
+      - { name: closed_by_harvest_id, type: string, source: system, description: "FK -> HarvestEvent.id; set when this lot is closed by a harvest, else null", default: null }
+
+  - name: HarvestEvent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; the harvested account" }
+      - { name: source_lot_id, type: string, source: input, description: "FK -> TaxLot.id; the OPEN loss lot being sold" }
+      - { name: replacement_security_id, type: string, source: input, description: "FK -> Security.id; correlation-based replacement bought with the proceeds" }
+      - { name: expected_account_version, type: integer, source: input, description: "OCC: Account.version the client last observed; rejected if stale" }
+      - { name: realized_loss_cents, type: integer, source: computed, description: "Positive magnitude of the loss realized on the source lot (cost_basis - proceeds)" }
+      - { name: disallowed_loss_cents, type: integer, source: computed, description: "Loss disallowed because a wash-sale-triggering purchase exists; 0 when the replacement and window are clean" }
+      - { name: replacement_lot_id, type: string, source: system, description: "FK -> TaxLot.id; the new OPEN lot opened in the replacement security", default: null }
+      - { name: status, type: enum, source: system, description: "PROPOSED | EXECUTED | REJECTED | REVERSED", default: PROPOSED }
+
+  - name: RebalanceEvent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; the account being rebalanced" }
+      - { name: expected_account_version, type: integer, source: input, description: "OCC: Account.version the client last observed; rejected if stale" }
+      - { name: quarter_label, type: string, source: input, description: "Quarter tag, e.g. 2026-Q2; unique per account among EXECUTED rebalances", constraints: "matches YYYY-Qn" }
+      - { name: trades_count, type: integer, source: computed, description: "Number of buy/sell trades the rebalance generated to restore targets", default: 0 }
+      - { name: cash_consumed_cents, type: integer, source: computed, description: "Cash spent on buys during this rebalance", default: 0 }
+      - { name: status, type: enum, source: system, description: "PLANNED | EXECUTED | CANCELLED", default: PLANNED }
+
+  - name: TaxForm1099B
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; the account the form is generated for" }
+      - { name: tax_year, type: integer, source: input, description: "Calendar year covered by the form", constraints: "2000..2100" }
+      - { name: total_proceeds_cents, type: integer, source: computed, description: "Sum of proceeds_cents over CLOSED lots disposed in tax_year" }
+      - { name: total_cost_basis_cents, type: integer, source: computed, description: "Sum of cost_basis_cents over CLOSED lots disposed in tax_year" }
+      - { name: net_realized_gain_cents, type: integer, source: computed, description: "total_proceeds_cents - total_cost_basis_cents PLUS total wash-sale disallowed losses added back" }
+      - { name: total_wash_sale_disallowed_cents, type: integer, source: computed, description: "Sum of wash_sale_disallowed_cents over CLOSED lots disposed in tax_year" }
+      - { name: line_count, type: integer, source: computed, description: "Number of disposed lots reported (one 1099-B line per CLOSED lot in tax_year)" }
+      - { name: status, type: enum, source: system, description: "DRAFT | FINALIZED", default: DRAFT }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Account
+    initial_state: PENDING_PROFILE
+    terminal_states: [CLOSED]
+    transitions:
+      - from: PENDING_PROFILE
+        to: ACTIVE
+        trigger: "POST /questionnaires/{id}/accept"
+        actor: Advisor
+        preconditions:
+          - "Questionnaire.status == SCORED"
+          - "Questionnaire.assigned_model_portfolio_id resolves to a ModelPortfolio with is_active == true"
+        side_effects:
+          - "Account.model_portfolio_id := Questionnaire.assigned_model_portfolio_id"
+          - "Account.risk_score := Questionnaire.risk_score"
+          - "Questionnaire.status := ACCEPTED"
+          - "Account.status := ACTIVE"
+          - "increments Account.version by 1"
+
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /questionnaires/{id}/accept (re-profile)"
+        actor: Advisor
+        preconditions:
+          - "Questionnaire.status == SCORED"
+          - "Questionnaire.assigned_model_portfolio_id resolves to a ModelPortfolio with is_active == true"
+        side_effects:
+          - "Any prior ACCEPTED questionnaire for this account := SUPERSEDED"
+          - "Account.model_portfolio_id := new Questionnaire.assigned_model_portfolio_id"
+          - "Account.risk_score := new Questionnaire.risk_score"
+          - "max_drift_pct recomputed against the new model targets; if max_drift_pct >= new model.drift_threshold_pct, status := REBALANCE_DUE instead of ACTIVE"
+          - "increments Account.version by 1"
+
+      - from: ACTIVE
+        to: REBALANCE_DUE
+        trigger: "system (drift recompute after a TaxLot opens/closes or a Security price update)"
+        actor: system
+        preconditions:
+          - "Account.max_drift_pct >= Account.model_portfolio.drift_threshold_pct"
+        side_effects:
+          - "Account.status := REBALANCE_DUE"
+          - "increments Account.version by 1"
+        note: "Auto-transition; bubble-up from lot/price changes. Boundary is >= (at threshold triggers)."
+
+      - from: REBALANCE_DUE
+        to: ACTIVE
+        trigger: "POST /rebalance-events/{id}/execute"
+        actor: Advisor
+        preconditions:
+          - "RebalanceEvent.status == PLANNED"
+          - "RebalanceEvent.expected_account_version == Account.version (OCC)"
+          - "No EXECUTED RebalanceEvent already exists for this account with the same quarter_label"
+        side_effects:
+          - "Buys/sells generated to drive every asset_class drift below model.drift_threshold_pct"
+          - "Account.cash_balance_cents decreased by cash_consumed_cents (buys); proceeds from sells credited"
+          - "Account.max_drift_pct recomputed; status := ACTIVE"
+          - "RebalanceEvent.status := EXECUTED"
+          - "increments Account.version by 1"
+
+      - from: REBALANCE_DUE
+        to: REBALANCE_DUE
+        trigger: "POST /harvest-events/{id}/execute"
+        actor: Advisor
+        preconditions:
+          - "Harvest preconditions hold (see HarvestEvent machine)"
+        side_effects:
+          - "Same harvest side-effects as in ACTIVE; status stays REBALANCE_DUE because drift is unresolved"
+          - "increments Account.version by 1"
+        note: "Harvesting is permitted while REBALANCE_DUE; it does not by itself clear the drift flag."
+
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /harvest-events/{id}/execute"
+        actor: Advisor
+        preconditions:
+          - "Harvest preconditions hold (see HarvestEvent machine)"
+          - "Account.max_drift_pct < Account.model_portfolio.drift_threshold_pct after the harvest"
+        side_effects:
+          - "Cascade: source lot CLOSED → loss realized → replacement lot OPENED → cash reinvested → drift recomputed"
+          - "increments Account.version by 1"
+
+      - from: ACTIVE
+        to: FROZEN
+        trigger: "POST /accounts/{id}/freeze"
+        actor: Compliance
+        preconditions: []
+        side_effects:
+          - "Account.status := FROZEN; harvests and rebalances blocked while FROZEN"
+          - "increments Account.version by 1"
+
+      - from: REBALANCE_DUE
+        to: FROZEN
+        trigger: "POST /accounts/{id}/freeze"
+        actor: Compliance
+        preconditions: []
+        side_effects:
+          - "Account.status := FROZEN"
+          - "increments Account.version by 1"
+
+      - from: FROZEN
+        to: ACTIVE
+        trigger: "POST /accounts/{id}/unfreeze"
+        actor: Compliance
+        preconditions: []
+        side_effects:
+          - "max_drift_pct recomputed; if >= threshold status := REBALANCE_DUE else ACTIVE"
+          - "increments Account.version by 1"
+
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /accounts/{id}/close"
+        actor: Advisor
+        preconditions:
+          - "No OPEN TaxLot remains for this account (ERR_OPEN_LOTS_REMAIN)"
+        side_effects:
+          - "Account.status := CLOSED"
+          - "increments Account.version by 1"
+
+  - entity: RiskQuestionnaire
+    initial_state: SCORED
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: SCORED
+        to: ACCEPTED
+        trigger: "POST /questionnaires/{id}/accept"
+        actor: Advisor
+        preconditions:
+          - "assigned_model_portfolio_id resolves to a ModelPortfolio with is_active == true (ERR_MODEL_RETIRED)"
+        side_effects:
+          - "Drives the owning Account PENDING_PROFILE→ACTIVE or ACTIVE→ACTIVE re-profile (see Account machine)"
+      - from: ACCEPTED
+        to: SUPERSEDED
+        trigger: "system (a later questionnaire for the same account is ACCEPTED)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "No further accept allowed on a SUPERSEDED questionnaire"
+
+  - entity: HarvestEvent
+    initial_state: PROPOSED
+    terminal_states: [EXECUTED, REJECTED, REVERSED]
+    transitions:
+      - from: PROPOSED
+        to: EXECUTED
+        trigger: "POST /harvest-events/{id}/execute"
+        actor: Advisor
+        preconditions:
+          - "Owning Account.status IN {ACTIVE, REBALANCE_DUE} (FROZEN/CLOSED/PENDING_PROFILE blocked)"
+          - "expected_account_version == Account.version (OCC, ERR_STALE_ACCOUNT_VERSION)"
+          - "source_lot.status == OPEN and source_lot.account_id == account_id"
+          - "source_lot.unrealized_gain_cents < 0 (only loss lots are harvestable, ERR_NOT_A_LOSS_LOT)"
+          - "replacement_security.is_active == true (ERR_SECURITY_DELISTED)"
+          - "replacement_security_id != source_lot.security_id (ERR_SUBSTANTIALLY_IDENTICAL)"
+          - "abs(correlation(source_lot.security, replacement_security)) <= MAX_REPLACEMENT_CORRELATION else ERR_REPLACEMENT_TOO_CORRELATED"
+        side_effects:
+          - "L1: source lot CLOSED — disposed_at := clock now, proceeds_cents := source_lot.market_value_cents, realized_gain_cents := proceeds - cost_basis (negative), closed_by_harvest_id := this event"
+          - "L2: that CLOSE itself triggers the wash-sale scan — if an OPEN lot in the SAME security was acquired within +/- WASH_SALE_DAYS of disposed_at, source_lot.wash_sale_disallowed_cents := the disallowed magnitude and the surviving replacement lot's cost_basis is increased by that amount"
+          - "L3: that wash-sale recompute itself bumps Account.wash_sale_disallowed_cents_ytd and Account.realized_gain_cents_ytd (loss net of disallowance)"
+          - "replacement lot OPENED — new TaxLot in replacement_security with quantity = floor(proceeds_cents / replacement_security.price_cents) shares, cost_basis_cents := quantity * price_cents; remainder credited to Account.cash_balance_cents (automatic reinvestment)"
+          - "Account.invested_value_cents, max_drift_pct recomputed; auto-transition ACTIVE↔REBALANCE_DUE per drift"
+          - "HarvestEvent.status := EXECUTED; increments Account.version by 1"
+      - from: PROPOSED
+        to: REJECTED
+        trigger: "POST /harvest-events/{id}/reject"
+        actor: Compliance
+        preconditions: []
+        side_effects:
+          - "No ledger changes; HarvestEvent.status := REJECTED"
+      - from: EXECUTED
+        to: REVERSED
+        trigger: "POST /harvest-events/{id}/reverse"
+        actor: Compliance
+        preconditions:
+          - "Owning Account.status != CLOSED"
+        side_effects:
+          - "Compensation: replacement lot CLOSED (proceeds = its market_value), its shares' cash returned, source lot REOPENED to OPEN with disposed_at/proceeds/realized_gain cleared"
+          - "Wash-sale disallowance applied at execute is reversed: Account.wash_sale_disallowed_cents_ytd and realized_gain_cents_ytd restored to pre-harvest values; cost-basis bump on any survivor lot undone"
+          - "Invariant: account total_value_cents returns to its exact pre-harvest value (compensating_invariant)"
+          - "HarvestEvent.status := REVERSED; increments Account.version by 1"
+
+  - entity: RebalanceEvent
+    initial_state: PLANNED
+    terminal_states: [EXECUTED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: EXECUTED
+        trigger: "POST /rebalance-events/{id}/execute"
+        actor: Advisor
+        preconditions:
+          - "Owning Account.status == REBALANCE_DUE (ERR_NOT_REBALANCE_DUE)"
+          - "expected_account_version == Account.version (OCC, ERR_STALE_ACCOUNT_VERSION)"
+          - "No EXECUTED RebalanceEvent for this account shares this quarter_label (ERR_QUARTER_ALREADY_REBALANCED)"
+        side_effects:
+          - "Drives Account REBALANCE_DUE→ACTIVE (see Account machine); trades_count, cash_consumed_cents set"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /rebalance-events/{id}/cancel"
+        actor: Advisor
+        preconditions: []
+        side_effects:
+          - "No ledger changes; RebalanceEvent.status := CANCELLED"
+
+  - entity: TaxForm1099B
+    initial_state: DRAFT
+    terminal_states: [FINALIZED]
+    transitions:
+      - from: DRAFT
+        to: FINALIZED
+        trigger: "POST /tax-forms/{id}/finalize"
+        actor: Advisor
+        preconditions:
+          - "tax_year is strictly before the clock's current calendar year (ERR_TAX_YEAR_NOT_CLOSED)"
+        side_effects:
+          - "Totals frozen as a snapshot; FINALIZED forms are immutable"
+          - "TaxForm1099B.status := FINALIZED"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: harvest-create-stale-account
+    parent_entity: Account
+    write_endpoint: "POST /harvest-events"
+    occ_field: "expected_account_version"
+    description: |
+      Proposing a HarvestEvent against an Account whose version has advanced
+      since the client last observed it is rejected. This captures the case
+      where another writer has already executed a harvest or rebalance that
+      legitimately moved cash, opened/closed lots, and recomputed drift — so
+      the proposing client's view of the account (its cash, lots, and drift)
+      is stale and the new harvest must be re-derived from fresh state.
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+
+  - rule_id: rebalance-create-stale-account
+    parent_entity: Account
+    write_endpoint: "POST /rebalance-events"
+    occ_field: "expected_account_version"
+    description: |
+      Planning a RebalanceEvent against an Account whose version has advanced
+      since the client last observed it is rejected. A prior harvest or
+      rebalance has changed the holdings the rebalance plan was computed
+      against, so the stale plan would buy/sell the wrong quantities and must
+      be re-derived from the current account version.
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: risk_scoring
+    trigger: "POST /questionnaires (on create)"
+    algorithm: weighted_scoring
+    formula: |
+      raw = HORIZON_W   * min(horizon_years, 30) / 30 * 100
+          + TOLERANCE_W * (loss_tolerance / 10) * 100
+          + INCOME_W    * (income_band / 10) * 100
+          - LIQUIDITY_W * (liquidity_need / 10) * 100
+      risk_score = clamp(round_half_up(raw), 0, 100)
+      # Evaluation order is fixed: compute raw as one expression (all four terms),
+      # then round once, then clamp. Rounding each term first would drift.
+      assigned_model_portfolio_id = the ModelPortfolio (is_active == true) whose
+        [min_risk_score, max_risk_score] inclusive band contains risk_score; if
+        two active models overlap on risk_score, pick the one with the smaller
+        (max_risk_score - min_risk_score) band width; tie-break by created_at ASC.
+        If none contains risk_score → ERR_NO_MODEL_FOR_SCORE.
+    input_set: "Single questionnaire's four input fields plus the catalog of is_active ModelPortfolio bands"
+    constants:
+      HORIZON_W: 0.35
+      TOLERANCE_W: 0.35
+      INCOME_W: 0.20
+      LIQUIDITY_W: 0.10
+    precision: "round_half_up to integer; clamp to [0,100]"
+
+  - name: drift_computation
+    trigger: "TaxLot open/close, Security price update, rebalance execute, harvest execute, questionnaire accept (re-profile)"
+    algorithm: aggregation
+    formula: |
+      invested_value_cents = sum over OPEN TaxLot l of l.market_value_cents
+        where l.market_value_cents = round_half_up(l.quantity * Security[l.security_id].price_cents)
+      For each asset_class ac in model.targets:
+        actual_pct[ac] = round_half_up( 100 * (sum of OPEN-lot market_value_cents whose
+                          Security.asset_class == ac) / invested_value_cents )   # 0 if invested_value_cents == 0
+        drift[ac] = abs(actual_pct[ac] - target_pct[ac])
+      max_drift_pct = max over ac of drift[ac]   # 0 when no OPEN lots
+      Account.status becomes REBALANCE_DUE iff max_drift_pct >= model.drift_threshold_pct (BOUNDARY: >=, not >).
+    input_set: "OPEN TaxLots of the account joined to Security.price_cents and asset_class; model.targets and drift_threshold_pct"
+    constants: {}
+    precision: "percentages round_half_up to integer percentage points"
+
+  - name: capital_gain_realization
+    trigger: "TaxLot CLOSE (harvest execute, rebalance sell, account close-out sells)"
+    algorithm: chronological
+    formula: |
+      When closing a lot directly by id (harvest): realized_gain_cents = proceeds_cents - cost_basis_cents.
+      When a rebalance must SELL N shares of a security held across multiple OPEN lots,
+      lots are consumed in a PINNED order and the realized gain is the sum over consumed lots of
+      (proceeds_for_consumed_portion - cost_basis_for_consumed_portion):
+        - DEFAULT variant FIFO: consume lots by acquired_at ASC, tie-break created_at ASC.
+        - HIFO variant: consume lots by (cost_basis_cents/quantity) DESC (highest per-share basis first),
+          tie-break acquired_at ASC, then created_at ASC.
+      The two variants pick DIFFERENT lots for a partial sell and therefore realize
+      DIFFERENT realized_gain_cents on identical holdings.
+    input_set: "OPEN TaxLots of (account, security); the sell quantity; the chosen lot-selection variant on the model"
+    constants: {}
+    precision: "proceeds round_half_up to cents; gains are signed integers"
+    variants:
+      - name: FIFO
+        when: "model.lot_selection == FIFO (default when unset)"
+        difference: "Consume oldest lots first (acquired_at ASC); typically realizes larger gains in a rising market"
+      - name: HIFO
+        when: "model.lot_selection == HIFO"
+        difference: "Consume highest-cost-basis lots first; minimizes realized gain / maximizes harvested loss"
+
+  - name: wash_sale_disallowance
+    trigger: "TaxLot CLOSE at a loss (the L2 hop of a harvest execute, or a rebalance loss sell)"
+    algorithm: interval_merge
+    formula: |
+      A realized LOSS on a closing lot in Security S is disallowed to the extent a
+      'substantially identical' purchase occurred inside the wash-sale window.
+      Window: [disposed_at - WASH_SALE_DAYS days, disposed_at + WASH_SALE_DAYS days] (INCLUSIVE both ends).
+      Replacement purchase = any OTHER OPEN TaxLot in the SAME security_id S whose
+        acquired_at falls inside the window (the harvest's own replacement is in a
+        DIFFERENT, sufficiently-uncorrelated security and so never triggers this).
+      disallowed_cents = min( abs(realized_loss_cents),
+                              round_half_up( (replacement_shares / closing_shares) * abs(realized_loss_cents) ) )
+        where replacement_shares is the total shares purchased in-window in S (capped at closing_shares).
+      Side effects of disallowance: closing_lot.wash_sale_disallowed_cents = disallowed_cents;
+        the in-window replacement lot's cost_basis_cents += disallowed_cents (basis carryover);
+        net realized loss recognized this year = realized_loss_cents + disallowed_cents (loss is negative,
+        disallowance adds back toward zero).
+      Gains are never disallowed.
+    input_set: "The closing lot, its disposed_at, and all OTHER OPEN lots in the same security within the window"
+    constants:
+      WASH_SALE_DAYS: 30
+    precision: "round_half_up to cents; disallowed_cents is a non-negative integer"
+
+  - name: form_1099b_totals
+    trigger: "POST /tax-forms (on create) and recomputed until FINALIZED"
+    algorithm: aggregation
+    formula: |
+      Reportable lots = CLOSED TaxLot with account_id == form.account_id AND
+        calendar_year(disposed_at) == tax_year. One 1099-B line per reportable lot.
+      total_proceeds_cents     = sum of proceeds_cents over reportable lots
+      total_cost_basis_cents   = sum of cost_basis_cents over reportable lots
+      total_wash_sale_disallowed_cents = sum of wash_sale_disallowed_cents over reportable lots
+      net_realized_gain_cents  = (total_proceeds_cents - total_cost_basis_cents)
+                                 + total_wash_sale_disallowed_cents   # add disallowed losses back
+      line_count = count of reportable lots
+      Ordering of lines (for stable output): disposed_at ASC, tie-break created_at ASC.
+    input_set: "CLOSED TaxLots of the account whose disposed_at year == tax_year"
+    constants: {}
+    precision: "integer cents throughout"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role header present and is one of the declared roles"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Role permitted for this operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "All path/body resource ids exist (validated left-to-right); FK targets exist"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: business_constraint
+    check: "Request body well-formed: required fields present, enum members valid, numeric ranges respected (quantity > 0, prices >= 1, target_pct sum == 100)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all POST"
+
+  - priority: 5
+    category: business_constraint
+    check: "Security.ticker unique; Account.client_email unique; ModelPortfolio.targets sum to exactly 100"
+    error_id: ERR_DUPLICATE_RESOURCE
+    http_status: 409
+    applies_to: "POST /securities, POST /accounts, POST /model-portfolios"
+
+  - priority: 6
+    category: state
+    check: "Target resource in a state that permits this transition (e.g. harvest source lot OPEN, questionnaire SCORED, rebalance PLANNED, form DRAFT)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 7
+    category: state
+    check: "Account.status gate: harvest/rebalance require status IN {ACTIVE, REBALANCE_DUE}; FROZEN blocks them; CLOSED blocks all mutation"
+    error_id: ERR_ACCOUNT_NOT_OPERABLE
+    http_status: 409
+    applies_to: "POST /harvest-events, POST /harvest-events/{id}/execute, POST /rebalance-events, POST /rebalance-events/{id}/execute"
+
+  - priority: 8
+    category: business_referential
+    check: "rebalance execute requires Account.status == REBALANCE_DUE"
+    error_id: ERR_NOT_REBALANCE_DUE
+    http_status: 409
+    applies_to: "POST /rebalance-events/{id}/execute"
+
+  - priority: 9
+    category: business_safety
+    check: "Wash-sale compliance: replacement security must NOT be substantially identical to the sold security and must satisfy correlation cap"
+    error_id: ERR_REPLACEMENT_TOO_CORRELATED
+    http_status: 409
+    applies_to: "POST /harvest-events/{id}/execute"
+
+  - priority: 10
+    category: business_safety
+    check: "replacement_security_id must differ from source lot's security_id"
+    error_id: ERR_SUBSTANTIALLY_IDENTICAL
+    http_status: 409
+    applies_to: "POST /harvest-events/{id}/execute"
+
+  - priority: 11
+    category: business_constraint
+    check: "Harvest source lot must be a loss lot (unrealized_gain_cents < 0)"
+    error_id: ERR_NOT_A_LOSS_LOT
+    http_status: 409
+    applies_to: "POST /harvest-events/{id}/execute"
+
+  - priority: 12
+    category: business_constraint
+    check: "Replacement / bought security must be is_active == true"
+    error_id: ERR_SECURITY_DELISTED
+    http_status: 409
+    applies_to: "POST /harvest-events/{id}/execute"
+
+  - priority: 13
+    category: business_temporal
+    check: "1099-B finalize only after tax_year is strictly before the clock's current calendar year"
+    error_id: ERR_TAX_YEAR_NOT_CLOSED
+    http_status: 409
+    applies_to: "POST /tax-forms/{id}/finalize"
+
+  - priority: 14
+    category: business_constraint
+    check: "Quarter uniqueness: an account cannot have two EXECUTED rebalances sharing a quarter_label"
+    error_id: ERR_QUARTER_ALREADY_REBALANCED
+    http_status: 409
+    applies_to: "POST /rebalance-events/{id}/execute"
+
+  - priority: 15
+    category: business_referential
+    check: "Account close requires no OPEN TaxLot remains"
+    error_id: ERR_OPEN_LOTS_REMAIN
+    http_status: 409
+    applies_to: "POST /accounts/{id}/close"
+
+  - priority: 16
+    category: business_constraint
+    check: "Questionnaire accept requires its assigned model still is_active == true"
+    error_id: ERR_MODEL_RETIRED
+    http_status: 409
+    applies_to: "POST /questionnaires/{id}/accept"
+
+  - priority: 17
+    category: state
+    check: "OCC: expected_account_version must equal current Account.version on harvest/rebalance create"
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+    applies_to: "POST /harvest-events, POST /rebalance-events"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---------------- Security ----------------
+  - method: POST
+    path: "/securities"
+    description: "Create a tradable security in the catalog"
+    roles: [Advisor, Compliance]
+    code: 201
+    input: [ticker, asset_class, price_cents, "correlated_with?"]
+    output: Security
+    side_effects: ["is_active := true"]
+
+  - method: GET
+    path: "/securities/{id}"
+    description: "Get one security"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: []
+    output: Security
+    side_effects: []
+
+  - method: GET
+    path: "/securities"
+    description: "List securities (paginated; filter by asset_class)"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: ["asset_class?", "limit?", "offset?"]
+    output: Security[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/securities/{id}/price"
+    description: "Update a security's current price (drives drift + market values)"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: [price_cents]
+    output: Security
+    side_effects:
+      - "Security.price_cents updated"
+      - "For every Account holding OPEN lots in this security: market values, invested_value, drift recomputed; account may auto-transition ACTIVE↔REBALANCE_DUE"
+
+  - method: POST
+    path: "/securities/{id}/delist"
+    description: "Delist a security (is_active := false)"
+    roles: [Compliance]
+    code: 200
+    input: []
+    output: Security
+    side_effects: ["is_active := false; security can no longer be bought as a replacement"]
+
+  # ---------------- ModelPortfolio ----------------
+  - method: POST
+    path: "/model-portfolios"
+    description: "Create a model portfolio (target allocation, risk band, drift threshold)"
+    roles: [Advisor]
+    code: 201
+    input: [name, min_risk_score, max_risk_score, targets, drift_threshold_pct, "lot_selection?"]
+    output: ModelPortfolio
+    side_effects: ["is_active := true; targets validated to sum to 100"]
+
+  - method: GET
+    path: "/model-portfolios/{id}"
+    description: "Get one model portfolio"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: []
+    output: ModelPortfolio
+    side_effects: []
+
+  - method: GET
+    path: "/model-portfolios"
+    description: "List model portfolios (paginated)"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ModelPortfolio[]
+    side_effects: []
+
+  - method: POST
+    path: "/model-portfolios/{id}/retire"
+    description: "Retire a model (is_active := false; no new assignments)"
+    roles: [Advisor]
+    code: 200
+    input: []
+    output: ModelPortfolio
+    side_effects: ["is_active := false"]
+
+  # ---------------- Account ----------------
+  - method: POST
+    path: "/accounts"
+    description: "Open a new client account (PENDING_PROFILE until a questionnaire is accepted)"
+    roles: [Advisor]
+    code: 201
+    input: [client_email]
+    output: Account
+    side_effects: ["status := PENDING_PROFILE; cash_balance_cents := 0; version := 1"]
+
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Get one account with all computed fields"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: []
+    output: Account
+    side_effects: []
+
+  - method: GET
+    path: "/accounts"
+    description: "List accounts (paginated; filter by status, model_portfolio_id)"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: ["status?", "model_portfolio_id?", "limit?", "offset?"]
+    output: Account[]
+    side_effects: []
+
+  - method: POST
+    path: "/accounts/{id}/freeze"
+    description: "Compliance freeze (blocks harvests/rebalances)"
+    roles: [Compliance]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["status := FROZEN; version += 1"]
+
+  - method: POST
+    path: "/accounts/{id}/unfreeze"
+    description: "Lift a compliance freeze"
+    roles: [Compliance]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["status := ACTIVE or REBALANCE_DUE per recomputed drift; version += 1"]
+
+  - method: POST
+    path: "/accounts/{id}/close"
+    description: "Close an account (only with no OPEN lots)"
+    roles: [Advisor]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["status := CLOSED; version += 1"]
+
+  # ---------------- RiskQuestionnaire ----------------
+  - method: POST
+    path: "/questionnaires"
+    description: "Submit a risk questionnaire; server scores it and assigns a model band"
+    roles: [Advisor]
+    code: 201
+    input: [account_id, horizon_years, loss_tolerance, liquidity_need, income_band]
+    output: RiskQuestionnaire
+    side_effects:
+      - "risk_score computed (risk_scoring); assigned_model_portfolio_id resolved; status := SCORED"
+
+  - method: GET
+    path: "/questionnaires/{id}"
+    description: "Get one questionnaire"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: []
+    output: RiskQuestionnaire
+    side_effects: []
+
+  - method: GET
+    path: "/questionnaires"
+    description: "List questionnaires (filter by account_id, assigned_model_portfolio_id, status)"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: ["account_id?", "assigned_model_portfolio_id?", "status?", "limit?", "offset?"]
+    output: RiskQuestionnaire[]
+    side_effects: []
+
+  - method: POST
+    path: "/questionnaires/{id}/accept"
+    description: "Accept a scored questionnaire; assigns/updates the account's model and activates it"
+    roles: [Advisor]
+    code: 200
+    input: []
+    output: RiskQuestionnaire
+    side_effects:
+      - "questionnaire.status := ACCEPTED; prior ACCEPTED for the account := SUPERSEDED"
+      - "Account model/risk_score assigned; account PENDING_PROFILE→ACTIVE or ACTIVE re-profile; Account.version += 1"
+
+  # ---------------- TaxLot ----------------
+  - method: POST
+    path: "/tax-lots"
+    description: "Open a tax lot (a purchase tranche) on an account, debiting cash if available"
+    roles: [Advisor]
+    code: 201
+    input: [account_id, security_id, quantity, cost_basis_cents]
+    output: TaxLot
+    side_effects:
+      - "acquired_at := clock now; status := OPEN"
+      - "Account invested_value/drift recomputed; account may auto-transition ACTIVE↔REBALANCE_DUE; Account.version += 1"
+
+  - method: GET
+    path: "/tax-lots/{id}"
+    description: "Get one tax lot with computed gain fields"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: []
+    output: TaxLot
+    side_effects: []
+
+  - method: GET
+    path: "/tax-lots"
+    description: "List tax lots (filter by account_id, security_id, closed_by_harvest_id, status)"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: ["account_id?", "security_id?", "closed_by_harvest_id?", "status?", "limit?", "offset?"]
+    output: TaxLot[]
+    side_effects: []
+
+  # ---------------- HarvestEvent ----------------
+  - method: POST
+    path: "/harvest-events"
+    description: "Propose a tax-loss harvest (OCC-checked against the account)"
+    roles: [Advisor]
+    code: 201
+    input: [account_id, source_lot_id, replacement_security_id, expected_account_version]
+    output: HarvestEvent
+    side_effects: ["status := PROPOSED; OCC guard on Account.version"]
+
+  - method: GET
+    path: "/harvest-events/{id}"
+    description: "Get one harvest event"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: []
+    output: HarvestEvent
+    side_effects: []
+
+  - method: GET
+    path: "/harvest-events"
+    description: "List harvest events (filter by account_id, source_lot_id, replacement_security_id, replacement_lot_id, status)"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: ["account_id?", "source_lot_id?", "replacement_security_id?", "replacement_lot_id?", "status?", "limit?", "offset?"]
+    output: HarvestEvent[]
+    side_effects: []
+
+  - method: POST
+    path: "/harvest-events/{id}/execute"
+    description: "Execute a proposed harvest: close loss lot, scan wash-sale, open replacement, reinvest"
+    roles: [Advisor]
+    code: 200
+    input: []
+    output: HarvestEvent
+    side_effects:
+      - "Cascade L1→L2→L3: close source lot → wash-sale scan → ytd ledgers updated"
+      - "Replacement lot opened; remainder cash reinvested; drift recomputed; Account.version += 1"
+
+  - method: POST
+    path: "/harvest-events/{id}/reject"
+    description: "Compliance rejects a proposed harvest (no ledger change)"
+    roles: [Compliance]
+    code: 200
+    input: []
+    output: HarvestEvent
+    side_effects: ["status := REJECTED"]
+
+  - method: POST
+    path: "/harvest-events/{id}/reverse"
+    description: "Compliance reverses an executed harvest (compensating undo; restores account value)"
+    roles: [Compliance]
+    code: 200
+    input: []
+    output: HarvestEvent
+    side_effects:
+      - "Replacement lot closed, source lot reopened, ytd ledgers and basis bumps restored; total_value_cents returns to pre-harvest value; Account.version += 1"
+
+  # ---------------- RebalanceEvent ----------------
+  - method: POST
+    path: "/rebalance-events"
+    description: "Plan a quarterly rebalance (OCC-checked against the account)"
+    roles: [Advisor]
+    code: 201
+    input: [account_id, quarter_label, expected_account_version]
+    output: RebalanceEvent
+    side_effects: ["status := PLANNED; OCC guard on Account.version"]
+
+  - method: GET
+    path: "/rebalance-events/{id}"
+    description: "Get one rebalance event"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: []
+    output: RebalanceEvent
+    side_effects: []
+
+  - method: GET
+    path: "/rebalance-events"
+    description: "List rebalance events (filter by account_id, status)"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: ["account_id?", "status?", "limit?", "offset?"]
+    output: RebalanceEvent[]
+    side_effects: []
+
+  - method: POST
+    path: "/rebalance-events/{id}/execute"
+    description: "Execute a planned rebalance: trade to restore targets, clear drift"
+    roles: [Advisor]
+    code: 200
+    input: []
+    output: RebalanceEvent
+    side_effects:
+      - "Buys/sells generated; capital_gain_realization on sells; cash adjusted"
+      - "Account.max_drift_pct recomputed; status → ACTIVE; Account.version += 1; trades_count, cash_consumed_cents set"
+
+  - method: POST
+    path: "/rebalance-events/{id}/cancel"
+    description: "Cancel a planned rebalance"
+    roles: [Advisor]
+    code: 200
+    input: []
+    output: RebalanceEvent
+    side_effects: ["status := CANCELLED"]
+
+  # ---------------- TaxForm1099B ----------------
+  - method: POST
+    path: "/tax-forms"
+    description: "Generate a draft 1099-B for an account + tax year"
+    roles: [Advisor, Compliance]
+    code: 201
+    input: [account_id, tax_year]
+    output: TaxForm1099B
+    side_effects: ["form_1099b_totals computed; status := DRAFT"]
+
+  - method: GET
+    path: "/tax-forms/{id}"
+    description: "Get one 1099-B"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: []
+    output: TaxForm1099B
+    side_effects: []
+
+  - method: GET
+    path: "/tax-forms"
+    description: "List 1099-B forms (filter by account_id, tax_year, status)"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: ["account_id?", "tax_year?", "status?", "limit?", "offset?"]
+    output: TaxForm1099B[]
+    side_effects: []
+
+  - method: POST
+    path: "/tax-forms/{id}/finalize"
+    description: "Finalize a draft 1099-B (immutable snapshot; only for closed tax years)"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: []
+    output: TaxForm1099B
+    side_effects: ["totals frozen; status := FINALIZED"]
+
+  # ---------------- Test-driving clock ----------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's current UTC instant (test-driving; drives acquired_at, disposed_at, wash-sale windows, tax-year gates)"
+    roles: [Advisor, Compliance]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: datetime }
+    side_effects: ["server clock advanced/reset to to_iso8601"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "X-User-Role header missing or not a recognized role" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Role not permitted for this operation per RBAC" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "A path or body resource id does not resolve to an existing entity" }
+  - { id: ERR_INVALID_REQUEST, http: 422, condition: "Malformed body: missing required field, bad enum, out-of-range number, targets not summing to 100" }
+  - { id: ERR_DUPLICATE_RESOURCE, http: 409, condition: "Security.ticker or Account.client_email already exists" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Target resource not in a state that permits this transition" }
+  - { id: ERR_ACCOUNT_NOT_OPERABLE, http: 409, condition: "Account.status not in {ACTIVE, REBALANCE_DUE} for a harvest/rebalance (FROZEN/CLOSED/PENDING_PROFILE)" }
+  - { id: ERR_NOT_REBALANCE_DUE, http: 409, condition: "Rebalance execute attempted while Account.status != REBALANCE_DUE" }
+  - { id: ERR_STALE_ACCOUNT_VERSION, http: 412, condition: "expected_account_version does not equal the current Account.version (OCC)" }
+  - { id: ERR_NOT_A_LOSS_LOT, http: 409, condition: "Harvest source lot has unrealized_gain_cents >= 0 (not a loss)" }
+  - { id: ERR_SUBSTANTIALLY_IDENTICAL, http: 409, condition: "Replacement security_id equals the sold lot's security_id" }
+  - { id: ERR_REPLACEMENT_TOO_CORRELATED, http: 409, condition: "abs(correlation(sold, replacement)) > MAX_REPLACEMENT_CORRELATION; would be a wash-sale-equivalent substitute" }
+  - { id: ERR_SECURITY_DELISTED, http: 409, condition: "A security being bought (replacement) has is_active == false" }
+  - { id: ERR_NO_MODEL_FOR_SCORE, http: 409, condition: "No active ModelPortfolio band contains the questionnaire's risk_score" }
+  - { id: ERR_MODEL_RETIRED, http: 409, condition: "Accepting a questionnaire whose assigned model has is_active == false" }
+  - { id: ERR_QUARTER_ALREADY_REBALANCED, http: 409, condition: "An EXECUTED rebalance already exists for this account with the same quarter_label" }
+  - { id: ERR_OPEN_LOTS_REMAIN, http: 409, condition: "Account close attempted while one or more OPEN TaxLots remain" }
+  - { id: ERR_TAX_YEAR_NOT_CLOSED, http: 409, condition: "1099-B finalize attempted for a tax_year that is the current calendar year or later" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Advisor
+    description: "Manages accounts, models, questionnaires, lots, harvests, rebalances, and tax forms"
+    identity: opaque
+    exclusive_operations:
+      - "POST /model-portfolios — create model"
+      - "POST /model-portfolios/{id}/retire — retire model"
+      - "POST /accounts — open account"
+      - "POST /accounts/{id}/close — close account"
+      - "POST /questionnaires — submit questionnaire"
+      - "POST /questionnaires/{id}/accept — accept questionnaire / activate account"
+      - "POST /tax-lots — open lot"
+      - "POST /harvest-events — propose harvest"
+      - "POST /harvest-events/{id}/execute — execute harvest"
+      - "POST /rebalance-events — plan rebalance"
+      - "POST /rebalance-events/{id}/execute — execute rebalance"
+      - "POST /rebalance-events/{id}/cancel — cancel rebalance"
+      - "POST /tax-forms/{id}/finalize — finalize 1099-B (shared with Compliance)"
+    shared_operations:
+      - "POST /securities — create security (shared with Compliance)"
+      - "POST /tax-forms — generate draft 1099-B (shared with Compliance)"
+      - "POST /tax-forms/{id}/finalize — finalize 1099-B (shared with Compliance)"
+      - "POST /_clock/set_current_utc — set clock (shared)"
+      - "GET endpoints — read all resources (shared)"
+
+  - name: Compliance
+    description: "Oversight role: freezes accounts, rejects/reverses harvests, delists securities, audits"
+    identity: opaque
+    exclusive_operations:
+      - "POST /accounts/{id}/freeze — freeze account"
+      - "POST /accounts/{id}/unfreeze — unfreeze account"
+      - "POST /securities/{id}/delist — delist security"
+      - "POST /harvest-events/{id}/reject — reject proposed harvest"
+      - "POST /harvest-events/{id}/reverse — reverse executed harvest"
+    shared_operations:
+      - "POST /securities — create security (shared with Advisor)"
+      - "POST /tax-forms — generate draft 1099-B (shared with Advisor)"
+      - "POST /tax-forms/{id}/finalize — finalize 1099-B (shared with Advisor)"
+      - "POST /_clock/set_current_utc — set clock (shared)"
+      - "GET endpoints — read all resources (shared)"

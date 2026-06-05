@@ -1,0 +1,24 @@
+"""Domain thresholds and rate constants from the PRD §3 calculations."""
+
+# Provisional / final PDGM
+PER_VISIT_RATE = 165.00
+COMORBIDITY_NONE_MULT = 1.00
+COMORBIDITY_LOW_MULT = 1.06
+COMORBIDITY_HIGH_MULT = 1.18
+
+# Mileage tiered reimbursement (§3.6)
+OVERCLAIM_TOLERANCE = 1.10
+FREE_TIER_MILES = 5.0
+TIER1_CAP = 20.0
+TIER1_RATE = 0.67
+TIER2_RATE = 0.50
+
+# Companion offset (§3.8)
+COMPANION_HOURLY_RATE = 24.05
+
+# Windows (§3.7 / §3.8)
+RECERT_WINDOW_DAYS = 14
+REOPEN_WINDOW_DAYS = 30
+MAX_RECERT_REVISIONS = 3
+
+NON_EXISTENT_UUID = "00000000-0000-0000-0000-000000000000"

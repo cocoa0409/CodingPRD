@@ -1,0 +1,861 @@
+# =============================================================================
+# Scaffold: Shift Scheduling & Fair Workweek (Expert band)
+# §1.0–§1.7 only. §1.8 lives in SCAFFOLD_DIFFICULTY_DESIGN.yaml,
+# §1.9 lives in SCAFFOLD_CORNER_DESIGN.yaml.
+# =============================================================================
+
+scenario: "Shift Scheduling & Fair Workweek: shift template/demand forecast, availability/time-off, open-shift bidding/swap, predictability (clopening) pay, minor labor-law hour caps, break compliance, overtime cost guardrail, no-show"
+
+domain_name: shift-scheduling-fair-workweek
+# Flat topology: peer collections live at the API root, so the canonical
+# top-level resource path is the root itself. Reverse-reachability GETs are
+# rooted (e.g. GET /assignments?worker_id=...), matching entity_topology: flat.
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: temporal_windowing
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - optimistic_concurrency      # OCC on Shift.version for open-shift award races
+    - cascading_side_effects      # no-show / cancel cascades across Assignment -> Shift -> Ledger -> PayPeriod
+    - dual_variant_calculation    # provisional vs finalized assignment cost; minor-cap rolling vs day window
+    - rate_threshold_triggers     # OT guardrail breakpoint, minor weekly hour cap, clopening rest gap
+    - derived_field_reconciliation # PayPeriod aggregate hours/cost reconciled on every assignment mutation
+
+  entity_topology: flat
+  # Peer entities linked by FK references; Shift/Assignment/Bid/Swap reference each other
+  # and Worker/Location by id in the body, not by deep URL nesting.
+
+  state_machine_shape: cyclic
+  # SwapRequest negotiates back and forth (PROPOSED -> COUNTERED -> PROPOSED loop)
+  # and Shift cycles DRAFT -> OPEN -> ... -> OPEN on un-assign.
+
+  relationship_patterns:
+    - one_to_many       # Location -> Shift; Worker -> Assignment
+    - cross_aggregate   # Assignment references Shift and Worker across aggregates; SwapRequest references two Assignments
+
+  role_model: peer_roles
+  # Manager owns posting/awarding/approval; Worker owns own availability/time-off/bids/swaps/no-show ack.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Location
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Human-readable location name" }
+      - { name: time_zone, type: string, source: input, description: "IANA tz name, e.g. America/New_York; all shift times stored as UTC instants" }
+      - { name: predictability_pay_enabled, type: boolean, source: input, default: true, description: "When true, posting changes inside the advance-notice window accrue predictability pay" }
+      - { name: advance_notice_days, type: integer, source: input, default: 14, description: "Fair-workweek advance-notice window in days; schedule changes inside this window from the affected shift's start_utc trigger predictability pay" }
+      - { name: min_rest_hours_between_shifts, type: integer, source: input, default: 10, description: "Minimum rest gap (clopening threshold); an assignment whose worker's prior shift ends < this many hours before the new shift's start triggers clopening predictability pay" }
+      - { name: overtime_weekly_threshold_hours, type: number, source: input, default: 40, description: "Hours per pay-week beyond which overtime multiplier applies" }
+      - { name: overtime_multiplier, type: number, source: input, default: 1.5, description: "Multiplier applied to base rate on hours above overtime_weekly_threshold_hours" }
+      - { name: overtime_cost_guardrail_cents, type: integer, source: input, description: "Per-PayPeriod cap on total projected labor cost in cents; awarding/assigning that would push projected cost strictly above this is rejected unless force_over_guardrail" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE; system-initialized to ACTIVE on create (no archival flow in this scaffold), included so list/get responses carry a stable status field" }
+
+  - name: Worker
+    parent: null
+    common_fields: true
+    fields:
+      - { name: location_id, type: string, source: input, description: "FK -> Location.id; the Worker's home location" }
+      - { name: full_name, type: string, source: input, description: "Worker display name" }
+      - { name: email, type: string, source: input, description: "Unique within a Location; used as login identity" }
+      - { name: is_minor, type: boolean, source: input, default: false, description: "When true, minor labor-law hour caps apply (daily and weekly)" }
+      - { name: minor_daily_cap_hours, type: number, source: input, default: 8, description: "Max scheduled hours on any single calendar day (location-local) for a minor" }
+      - { name: minor_weekly_cap_hours, type: number, source: input, default: 18, description: "Max scheduled hours per pay-week for a minor" }
+      - { name: base_hourly_rate_cents, type: integer, source: input, description: "Base pay rate in cents per hour" }
+      - { name: no_show_strikes, type: integer, source: computed, description: "Read-only: count of NO_SHOW assignments for this worker; incremented on no-show, never decremented" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | SUSPENDED; auto-set to SUSPENDED when no_show_strikes reaches the location strike ceiling (3)" }
+
+  - name: Availability
+    parent: null
+    common_fields: true
+    fields:
+      - { name: worker_id, type: string, source: input, description: "FK -> Worker.id; the worker this availability window belongs to" }
+      - { name: kind, type: enum, source: input, description: "one of AVAILABLE or UNAVAILABLE. An UNAVAILABLE window hard-blocks assignment using closed-interval [start_utc,end_utc] semantics, so a shift touching the boundary instant collides and is blocked. An AVAILABLE window is advisory bid-eligibility only." }
+      - { name: start_utc, type: datetime, source: input, description: "Window start, ISO 8601 UTC" }
+      - { name: end_utc, type: datetime, source: input, description: "Window end, ISO 8601 UTC; must be strictly after start_utc" }
+
+  - name: TimeOffRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: worker_id, type: string, source: input, description: "FK -> Worker.id; requesting worker" }
+      - { name: start_utc, type: datetime, source: input, description: "Time-off window start, ISO 8601 UTC (half-open [start,end))" }
+      - { name: end_utc, type: datetime, source: input, description: "Time-off window end, ISO 8601 UTC; must be strictly after start_utc" }
+      - { name: reason, type: string, source: input, description: "Free-text reason" }
+      - { name: status, type: enum, source: system, default: "PENDING", description: "PENDING | APPROVED | DENIED | CANCELLED" }
+      - { name: decided_by_manager_id, type: string, source: system, description: "Opaque manager X-User-ID that approved/denied; null while PENDING" }
+
+  - name: ShiftTemplate
+    parent: null
+    common_fields: true
+    fields:
+      - { name: location_id, type: string, source: input, description: "FK -> Location.id; location this template forecasts demand for" }
+      - { name: role_name, type: string, source: input, description: "Role to staff (e.g. Cashier)" }
+      - { name: weekday, type: integer, source: input, description: "0=Monday..6=Sunday (location-local) the template recurs on" }
+      - { name: local_start_minute, type: integer, source: input, description: "Minutes after location-local midnight the shift starts (0-1439)" }
+      - { name: duration_minutes, type: integer, source: input, description: "Shift length in minutes; must be > 0" }
+      - { name: forecast_headcount, type: integer, source: input, description: "Number of workers the demand forecast wants for this slot; must be >= 1" }
+
+  - name: Shift
+    parent: null
+    common_fields: true
+    fields:
+      - { name: location_id, type: string, source: input, description: "FK -> Location.id; owning location" }
+      - { name: template_id, type: string, source: input, description: "FK -> ShiftTemplate.id; nullable; the template this shift was generated from, null for ad-hoc shifts" }
+      - { name: role_name, type: string, source: input, description: "Role required for this shift" }
+      - { name: start_utc, type: datetime, source: input, description: "Shift start instant, ISO 8601 UTC" }
+      - { name: end_utc, type: datetime, source: input, description: "Shift end instant, ISO 8601 UTC; must be strictly after start_utc" }
+      - { name: headcount_required, type: integer, source: input, description: "Number of distinct workers this shift needs; must be >= 1" }
+      - { name: headcount_filled, type: integer, source: computed, description: "Read-only: count of Assignments on this shift in status SCHEDULED, CONFIRMED, or COMPLETED" }
+      - { name: posted_utc, type: datetime, source: system, description: "Instant the shift first entered OPEN (was posted); null while DRAFT; pins the advance-notice baseline" }
+      - { name: status, type: enum, source: system, default: "DRAFT", description: "DRAFT | OPEN | FULLY_STAFFED | COMPLETED | CANCELLED" }
+      - { name: duration_hours, type: number, source: computed, description: "Read-only: (end_utc - start_utc) in hours, exact (not rounded)" }
+
+  - name: Assignment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: shift_id, type: string, source: input, description: "FK -> Shift.id; the shift being worked" }
+      - { name: worker_id, type: string, source: input, description: "FK -> Worker.id; the assigned worker" }
+      - { name: pay_period_id, type: string, source: system, description: "FK -> PayPeriod.id; the pay-period whose [start,end) contains shift.start_utc" }
+      - { name: status, type: enum, source: system, default: "SCHEDULED", description: "SCHEDULED | CONFIRMED | COMPLETED | NO_SHOW | CANCELLED" }
+      - { name: source, type: enum, source: system, default: "DIRECT", description: "DIRECT | BID | SWAP; DIRECT on POST /assignments, BID when created by an award, and re-stamped SWAP on the from_assignment when a swap is manager-approved (reassigns its worker)" }
+      - { name: clopening_flag, type: boolean, source: computed, description: "Read-only: true iff at creation the worker's nearest prior assignment ends < location.min_rest_hours_between_shifts before this shift's start_utc" }
+      - { name: provisional_cost_cents, type: integer, source: computed, description: "Read-only: estimated labor cost at scheduling time including projected overtime, in cents" }
+      - { name: finalized_cost_cents, type: integer, source: computed, description: "Read-only: actual labor cost stamped at COMPLETED, recomputed against the worker's realized pay-week hours; null until COMPLETED" }
+
+  - name: OpenShiftBid
+    parent: null
+    common_fields: true
+    fields:
+      - { name: shift_id, type: string, source: input, description: "FK -> Shift.id; the OPEN shift being bid on" }
+      - { name: worker_id, type: string, source: input, description: "FK -> Worker.id; the bidding worker" }
+      - { name: seniority_score, type: integer, source: input, default: 0, description: "Bid ranking input; higher wins; tie broken by created_at ASC" }
+      - { name: status, type: enum, source: system, default: "SUBMITTED", description: "SUBMITTED | AWARDED | REJECTED | WITHDRAWN" }
+
+  - name: SwapRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: from_assignment_id, type: string, source: input, description: "FK -> Assignment.id; the initiator's assignment being given away" }
+      - { name: to_worker_id, type: string, source: input, description: "FK -> Worker.id; the counterparty asked to take the shift" }
+      - { name: counter_assignment_id, type: string, source: input, description: "FK -> Assignment.id; nullable; when the counterparty offers their own assignment back in a two-way swap" }
+      - { name: status, type: enum, source: system, default: "PROPOSED", description: "PROPOSED | COUNTERED | ACCEPTED | MANAGER_APPROVED | REJECTED | CANCELLED" }
+      - { name: decided_by_manager_id, type: string, source: system, description: "Opaque manager X-User-ID that approved; null until MANAGER_APPROVED" }
+
+  - name: PredictabilityLedgerEntry
+    parent: null
+    common_fields: false   # append-only event; id + created_at only
+    fields:
+      - { name: worker_id, type: string, source: input, description: "FK -> Worker.id; worker owed the predictability pay" }
+      - { name: shift_id, type: string, source: input, description: "FK -> Shift.id; the shift whose change triggered the entry" }
+      - { name: pay_period_id, type: string, source: input, description: "FK -> PayPeriod.id; pay-period the entry accrues into" }
+      - { name: reason, type: enum, source: input, description: "CLOPENING | SHORT_NOTICE_POST | SHORT_NOTICE_CANCEL; the fair-workweek trigger that accrued this entry" }
+      - { name: amount_cents, type: integer, source: input, description: "Penalty amount in cents (always positive); accrues into the pay-period predictability total" }
+
+  - name: PayPeriod
+    parent: null
+    common_fields: true
+    fields:
+      - { name: location_id, type: string, source: input, description: "FK -> Location.id; owning location" }
+      - { name: start_utc, type: datetime, source: input, description: "Pay-period window start, ISO 8601 UTC; aligned to a pay-week boundary" }
+      - { name: end_utc, type: datetime, source: input, description: "Pay-period window end, ISO 8601 UTC (half-open [start,end)); must be strictly after start_utc" }
+      - { name: status, type: enum, source: system, default: "OPEN", description: "OPEN | LOCKED; LOCKED rejects further assignment mutation in this window" }
+      - { name: projected_labor_cost_cents, type: integer, source: computed, description: "Read-only: sum of provisional_cost_cents over non-terminal assignments in window + predictability ledger total; reconciled on every assignment/ledger mutation" }
+      - { name: finalized_labor_cost_cents, type: integer, source: computed, description: "Read-only: sum of finalized_cost_cents over COMPLETED assignments in window + predictability ledger total; null until LOCKED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Shift
+    initial_state: DRAFT
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: OPEN
+        trigger: "POST /locations/{locId}/shifts/{shiftId}/post"
+        actor: Manager
+        preconditions:
+          - "Shift.status == DRAFT (else ERR_INVALID_SHIFT_STATE)"
+          - "shift.end_utc > shift.start_utc (ERR_INVALID_TIME_WINDOW)"
+        side_effects:
+          - "Set posted_utc = current clock instant"
+          - "If location.predictability_pay_enabled AND (start_utc - posted_utc) < location.advance_notice_days days: this is a short-notice posting; predictability accrues only when later staffed (see Assignment SCHEDULED side-effects), not at post time"
+
+      - from: OPEN
+        to: FULLY_STAFFED
+        trigger: "system: Assignment reaches SCHEDULED and headcount_filled == headcount_required"
+        actor: system
+        preconditions:
+          - "headcount_filled (after the new assignment) == headcount_required"
+        side_effects:
+          - "Bubble-up: shift auto-transitions OPEN -> FULLY_STAFFED"
+          - "All OpenShiftBid rows on this shift still in SUBMITTED transition to REJECTED"
+
+      - from: FULLY_STAFFED
+        to: OPEN
+        trigger: "system: an Assignment on this shift leaves the filled set (CANCELLED or NO_SHOW)"
+        actor: system
+        preconditions:
+          - "headcount_filled (after the assignment leaves) < headcount_required"
+        side_effects:
+          - "Bubble-down: shift reverts FULLY_STAFFED -> OPEN so it can be re-staffed"
+
+      - from: OPEN
+        to: COMPLETED
+        trigger: "POST /locations/{locId}/shifts/{shiftId}/complete"
+        actor: Manager
+        preconditions:
+          - "Shift.status IN {OPEN, FULLY_STAFFED} (else ERR_INVALID_SHIFT_STATE)"
+          - "current clock instant >= shift.end_utc (ERR_SHIFT_NOT_ENDED)"
+        side_effects:
+          - "Each SCHEDULED or CONFIRMED Assignment on this shift -> COMPLETED (cascade down); each transition stamps finalized_cost_cents and reconciles its PayPeriod"
+
+      - from: FULLY_STAFFED
+        to: COMPLETED
+        trigger: "POST /locations/{locId}/shifts/{shiftId}/complete"
+        actor: Manager
+        preconditions:
+          - "Shift.status IN {OPEN, FULLY_STAFFED} (else ERR_INVALID_SHIFT_STATE)"
+          - "current clock instant >= shift.end_utc (ERR_SHIFT_NOT_ENDED)"
+        side_effects:
+          - "Each SCHEDULED or CONFIRMED Assignment on this shift -> COMPLETED (cascade down); each transition stamps finalized_cost_cents and reconciles its PayPeriod"
+
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /locations/{locId}/shifts/{shiftId}/cancel"
+        actor: Manager
+        preconditions:
+          - "Shift.status IN {DRAFT, OPEN, FULLY_STAFFED} (else ERR_INVALID_SHIFT_STATE)"
+        side_effects:
+          - "No assignments exist while DRAFT; nothing cascades"
+
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /locations/{locId}/shifts/{shiftId}/cancel"
+        actor: Manager
+        preconditions:
+          - "Shift.status IN {DRAFT, OPEN, FULLY_STAFFED} (else ERR_INVALID_SHIFT_STATE)"
+        side_effects:
+          - "Cascade down: every non-terminal Assignment on this shift -> CANCELLED"
+          - "Each cancelled Assignment whose worker has not yet started reconciles its PayPeriod (removes provisional cost)"
+          - "Each SUBMITTED OpenShiftBid on this shift -> REJECTED"
+          - "If predictability_pay_enabled AND shift was OPEN AND (start_utc - current clock) < advance_notice_days days: for each worker who held a now-cancelled Assignment, append PredictabilityLedgerEntry(reason=SHORT_NOTICE_CANCEL) and reconcile PayPeriod"
+
+      - from: FULLY_STAFFED
+        to: CANCELLED
+        trigger: "POST /locations/{locId}/shifts/{shiftId}/cancel"
+        actor: Manager
+        preconditions:
+          - "Shift.status IN {DRAFT, OPEN, FULLY_STAFFED} (else ERR_INVALID_SHIFT_STATE)"
+        side_effects:
+          - "Cascade down: every non-terminal Assignment on this shift -> CANCELLED"
+          - "Each SUBMITTED OpenShiftBid on this shift -> REJECTED"
+          - "If predictability_pay_enabled AND (start_utc - current clock) < advance_notice_days days: for each worker who held a now-cancelled Assignment, append PredictabilityLedgerEntry(reason=SHORT_NOTICE_CANCEL) and reconcile PayPeriod"
+
+  - entity: Assignment
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, NO_SHOW, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: CONFIRMED
+        trigger: "POST /locations/{locId}/assignments/{asgId}/confirm"
+        actor: Worker
+        preconditions:
+          - "Assignment.status == SCHEDULED (else ERR_INVALID_ASSIGNMENT_STATE)"
+          - "acting Worker owns this assignment (worker_id == X-User-ID, else ERR_UNAUTHORIZED)"
+          - "current clock instant < shift.start_utc (ERR_SHIFT_ALREADY_STARTED)"
+        side_effects:
+          - "Assignment confirmed; no cost change"
+
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "system: parent Shift completes (cascade)"
+        actor: system
+        preconditions:
+          - "parent Shift transition to COMPLETED"
+        side_effects:
+          - "Stamp finalized_cost_cents per finalize_assignment_cost calculation (realized pay-week hours)"
+          - "Reconcile PayPeriod.finalized_labor_cost_cents and projected_labor_cost_cents"
+
+      - from: CONFIRMED
+        to: COMPLETED
+        trigger: "system: parent Shift completes (cascade)"
+        actor: system
+        preconditions:
+          - "parent Shift transition to COMPLETED"
+        side_effects:
+          - "Stamp finalized_cost_cents per finalize_assignment_cost calculation (realized pay-week hours)"
+          - "Reconcile PayPeriod.finalized_labor_cost_cents and projected_labor_cost_cents"
+
+      - from: SCHEDULED
+        to: NO_SHOW
+        trigger: "POST /locations/{locId}/assignments/{asgId}/no-show"
+        actor: Manager
+        preconditions:
+          - "Assignment.status IN {SCHEDULED, CONFIRMED} (else ERR_INVALID_ASSIGNMENT_STATE)"
+          - "current clock instant >= shift.start_utc (ERR_SHIFT_NOT_STARTED)"
+        side_effects:
+          - "Cross-entity cascade: worker.no_show_strikes += 1; if it reaches 3, worker.status -> SUSPENDED"
+          - "Assignment leaves the filled set -> parent Shift may bubble-down FULLY_STAFFED -> OPEN"
+          - "Reconcile PayPeriod (remove this assignment's provisional cost)"
+
+      - from: CONFIRMED
+        to: NO_SHOW
+        trigger: "POST /locations/{locId}/assignments/{asgId}/no-show"
+        actor: Manager
+        preconditions:
+          - "Assignment.status IN {SCHEDULED, CONFIRMED} (else ERR_INVALID_ASSIGNMENT_STATE)"
+          - "current clock instant >= shift.start_utc (ERR_SHIFT_NOT_STARTED)"
+        side_effects:
+          - "Cross-entity cascade: worker.no_show_strikes += 1; if it reaches 3, worker.status -> SUSPENDED"
+          - "Assignment leaves the filled set -> parent Shift may bubble-down FULLY_STAFFED -> OPEN"
+          - "Reconcile PayPeriod (remove this assignment's provisional cost)"
+
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /locations/{locId}/assignments/{asgId}/cancel"
+        actor: Manager
+        preconditions:
+          - "Assignment.status IN {SCHEDULED, CONFIRMED} (else ERR_INVALID_ASSIGNMENT_STATE)"
+          - "PayPeriod.status == OPEN (else ERR_PAY_PERIOD_LOCKED)"
+        side_effects:
+          - "Assignment leaves the filled set -> parent Shift may bubble-down FULLY_STAFFED -> OPEN"
+          - "Reconcile PayPeriod (remove this assignment's provisional cost)"
+          - "If predictability_pay_enabled AND (shift.start_utc - current clock) < advance_notice_days days: append PredictabilityLedgerEntry(reason=SHORT_NOTICE_CANCEL); reconcile PayPeriod"
+
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /locations/{locId}/assignments/{asgId}/cancel"
+        actor: Manager
+        preconditions:
+          - "Assignment.status IN {SCHEDULED, CONFIRMED} (else ERR_INVALID_ASSIGNMENT_STATE)"
+          - "PayPeriod.status == OPEN (else ERR_PAY_PERIOD_LOCKED)"
+        side_effects:
+          - "Assignment leaves the filled set -> parent Shift may bubble-down FULLY_STAFFED -> OPEN"
+          - "Reconcile PayPeriod (remove this assignment's provisional cost)"
+          - "If predictability_pay_enabled AND (shift.start_utc - current clock) < advance_notice_days days: append PredictabilityLedgerEntry(reason=SHORT_NOTICE_CANCEL); reconcile PayPeriod"
+
+  - entity: OpenShiftBid
+    initial_state: SUBMITTED
+    terminal_states: [AWARDED, REJECTED, WITHDRAWN]
+    transitions:
+      - from: SUBMITTED
+        to: AWARDED
+        trigger: "POST /locations/{locId}/shifts/{shiftId}/award"
+        actor: Manager
+        preconditions:
+          - "Shift.status == OPEN (else ERR_INVALID_SHIFT_STATE)"
+          - "expected_shift_version matches shift.version (else ERR_STALE_SHIFT_VERSION)"
+          - "the awarded bid is the winner of bid_award_selection over SUBMITTED bids (manager may not award a non-winning bid; ERR_BID_NOT_WINNER)"
+        side_effects:
+          - "Create Assignment(source=BID, status=SCHEDULED) for the winning bid's worker — runs all SCHEDULED side-effects below incl. clopening + guardrail checks"
+          - "Winning bid -> AWARDED; increments Shift.version by 1"
+          - "If the new assignment makes headcount_filled == headcount_required: bubble-up to FULLY_STAFFED, which rejects remaining SUBMITTED bids"
+
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "system: shift FULLY_STAFFED or CANCELLED while bid still SUBMITTED"
+        actor: system
+        preconditions:
+          - "owning Shift transitioned to FULLY_STAFFED or CANCELLED"
+        side_effects:
+          - "Bid closed as REJECTED"
+
+      - from: SUBMITTED
+        to: WITHDRAWN
+        trigger: "POST /locations/{locId}/bids/{bidId}/withdraw"
+        actor: Worker
+        preconditions:
+          - "Bid.status == SUBMITTED (else ERR_INVALID_BID_STATE)"
+          - "acting Worker owns this bid (worker_id == X-User-ID, else ERR_UNAUTHORIZED)"
+        side_effects:
+          - "Bid withdrawn; no longer a candidate in bid_award_selection"
+
+  - entity: SwapRequest
+    initial_state: PROPOSED
+    terminal_states: [MANAGER_APPROVED, REJECTED, CANCELLED]
+    transitions:
+      - from: PROPOSED
+        to: COUNTERED
+        trigger: "POST /locations/{locId}/swaps/{swapId}/counter"
+        actor: Worker
+        preconditions:
+          - "SwapRequest.status == PROPOSED (else ERR_INVALID_SWAP_STATE)"
+          - "acting Worker is the to_worker (X-User-ID == to_worker_id, else ERR_UNAUTHORIZED)"
+          - "counter_assignment belongs to the acting worker and is in {SCHEDULED, CONFIRMED} (ERR_INVALID_ASSIGNMENT_STATE)"
+        side_effects:
+          - "Record counter_assignment_id; status -> COUNTERED (cyclic: initiator may re-PROPOSE)"
+
+      - from: COUNTERED
+        to: PROPOSED
+        trigger: "POST /locations/{locId}/swaps/{swapId}/repropose"
+        actor: Worker
+        preconditions:
+          - "SwapRequest.status == COUNTERED (else ERR_INVALID_SWAP_STATE)"
+          - "acting Worker is the initiator (X-User-ID == from_assignment.worker_id, else ERR_UNAUTHORIZED)"
+        side_effects:
+          - "Clear counter_assignment_id; status -> PROPOSED (revision loop continues)"
+
+      - from: PROPOSED
+        to: ACCEPTED
+        trigger: "POST /locations/{locId}/swaps/{swapId}/accept"
+        actor: Worker
+        preconditions:
+          - "SwapRequest.status IN {PROPOSED, COUNTERED} (else ERR_INVALID_SWAP_STATE)"
+          - "acting Worker is the to_worker (X-User-ID == to_worker_id, else ERR_UNAUTHORIZED)"
+        side_effects:
+          - "Status -> ACCEPTED; awaits manager approval (no assignment mutation yet)"
+
+      - from: COUNTERED
+        to: ACCEPTED
+        trigger: "POST /locations/{locId}/swaps/{swapId}/accept"
+        actor: Worker
+        preconditions:
+          - "SwapRequest.status IN {PROPOSED, COUNTERED} (else ERR_INVALID_SWAP_STATE)"
+          - "acting Worker is the initiator accepting the counter (X-User-ID == from_assignment.worker_id, else ERR_UNAUTHORIZED)"
+        side_effects:
+          - "Status -> ACCEPTED; awaits manager approval"
+
+      - from: ACCEPTED
+        to: MANAGER_APPROVED
+        trigger: "POST /locations/{locId}/swaps/{swapId}/approve"
+        actor: Manager
+        preconditions:
+          - "SwapRequest.status == ACCEPTED (else ERR_INVALID_SWAP_STATE)"
+          - "from_assignment still in {SCHEDULED, CONFIRMED} (ERR_INVALID_ASSIGNMENT_STATE)"
+          - "the receiving worker passes minor-cap and clopening hard checks for the swapped shift (ERR_MINOR_HOUR_CAP_EXCEEDED / clopening is soft and only flags)"
+        side_effects:
+          - "Cross-entity cascade: reassign from_assignment.worker_id -> to_worker_id and set from_assignment.source = SWAP; if counter present, reassign counter_assignment.worker_id -> from-worker and set its source = SWAP; recompute clopening_flag + provisional_cost_cents for each reassigned assignment; reconcile each affected PayPeriod; set decided_by_manager_id"
+
+      - from: PROPOSED
+        to: REJECTED
+        trigger: "POST /locations/{locId}/swaps/{swapId}/reject"
+        actor: Worker
+        preconditions:
+          - "SwapRequest.status IN {PROPOSED, COUNTERED, ACCEPTED} (else ERR_INVALID_SWAP_STATE)"
+          - "acting Worker is a party to the swap (ERR_UNAUTHORIZED)"
+        side_effects:
+          - "Status -> REJECTED; no assignment mutation"
+
+      - from: PROPOSED
+        to: CANCELLED
+        trigger: "POST /locations/{locId}/swaps/{swapId}/cancel"
+        actor: Worker
+        preconditions:
+          - "SwapRequest.status IN {PROPOSED, COUNTERED} (else ERR_INVALID_SWAP_STATE)"
+          - "acting Worker is the initiator (X-User-ID == from_assignment.worker_id, else ERR_UNAUTHORIZED)"
+        side_effects:
+          - "Status -> CANCELLED; no assignment mutation"
+
+  - entity: TimeOffRequest
+    initial_state: PENDING
+    terminal_states: [APPROVED, DENIED, CANCELLED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /locations/{locId}/time-off/{toId}/approve"
+        actor: Manager
+        preconditions:
+          - "TimeOffRequest.status == PENDING (else ERR_INVALID_TIME_OFF_STATE)"
+          - "no SCHEDULED/CONFIRMED Assignment for this worker overlaps [start_utc,end_utc) (ERR_TIME_OFF_CONFLICTS_ASSIGNMENT)"
+        side_effects:
+          - "Status -> APPROVED; set decided_by_manager_id; window now hard-blocks future assignment (acts like an UNAVAILABLE window)"
+
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /locations/{locId}/time-off/{toId}/deny"
+        actor: Manager
+        preconditions:
+          - "TimeOffRequest.status == PENDING (else ERR_INVALID_TIME_OFF_STATE)"
+        side_effects:
+          - "Status -> DENIED; set decided_by_manager_id"
+
+      - from: PENDING
+        to: CANCELLED
+        trigger: "POST /locations/{locId}/time-off/{toId}/cancel"
+        actor: Worker
+        preconditions:
+          - "TimeOffRequest.status == PENDING (else ERR_INVALID_TIME_OFF_STATE)"
+          - "acting Worker owns the request (X-User-ID == worker_id, else ERR_UNAUTHORIZED)"
+        side_effects:
+          - "Status -> CANCELLED"
+
+  - entity: PayPeriod
+    initial_state: OPEN
+    terminal_states: [LOCKED]
+    transitions:
+      - from: OPEN
+        to: LOCKED
+        trigger: "POST /locations/{locId}/pay-periods/{ppId}/lock"
+        actor: Manager
+        preconditions:
+          - "PayPeriod.status == OPEN (else ERR_PAY_PERIOD_LOCKED)"
+          - "every Assignment whose pay_period_id == this period is in a terminal state {COMPLETED, NO_SHOW, CANCELLED} (ERR_OPEN_ASSIGNMENTS_EXIST)"
+        side_effects:
+          - "Compute finalized_labor_cost_cents = sum of finalized_cost_cents over COMPLETED assignments in window + predictability ledger total for window"
+          - "Status -> LOCKED; further assignment cancel/award in window rejected with ERR_PAY_PERIOD_LOCKED"
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: award-stale-shift
+    parent_entity: Shift
+    write_endpoint: "POST /locations/{locId}/shifts/{shiftId}/award"
+    occ_field: "expected_shift_version"
+    description: |
+      Awarding an open shift against a Shift whose version has advanced since the
+      manager last observed it is rejected. This captures the case where another
+      award has already created an assignment that consumed the open seat (and may
+      have flipped the shift to FULLY_STAFFED), so the manager's view of the shift —
+      including which bids remain SUBMITTED — is stale. The award carries the
+      observed shift version; if it no longer matches, the write is refused.
+    error_id: ERR_STALE_SHIFT_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: provisional_assignment_cost
+    trigger: "Assignment enters SCHEDULED (POST /assignments, award of a bid, or swap reassignment)"
+    algorithm: forward_looking
+    formula: |
+      # Forward-looking: project this worker's pay-week hours INCLUDING already-scheduled
+      # non-terminal assignments in the same PayPeriod, plus this shift's hours.
+      shift_hours = (shift.end_utc - shift.start_utc) / 3600   # exact float hours
+      prior_week_hours = sum(a.shift.duration_hours
+                             for a in worker assignments
+                             where a.pay_period_id == this.pay_period_id
+                               and a.status IN {SCHEDULED, CONFIRMED}
+                               and a.id != this.id)
+      total_after = prior_week_hours + shift_hours
+      ot_threshold = location.overtime_weekly_threshold_hours
+      # straddle the OT boundary for THIS shift's hours only
+      reg_hours = clamp(ot_threshold - prior_week_hours, 0, shift_hours)
+      ot_hours  = shift_hours - reg_hours
+      base = worker.base_hourly_rate_cents
+      cost = reg_hours * base + ot_hours * base * location.overtime_multiplier
+      provisional_cost_cents = round_half_up(cost)   # to whole cents, ONE final rounding
+    input_set: "Worker's SCHEDULED+CONFIRMED assignments in the same PayPeriod (excludes NO_SHOW, CANCELLED, COMPLETED, and other pay-periods)"
+    constants: {}
+    precision: "whole cents, round_half_up; round ONCE after summing reg+ot, never per-term"
+    variants:
+      - name: provisional
+        when: "at SCHEDULED — uses projected (scheduled) pay-week hours, ordering shifts by start_utc ASC to decide which hours fall in the OT band"
+        difference: "uses still-pending scheduled hours as the OT baseline; recomputed if siblings change"
+
+  - name: finalize_assignment_cost
+    trigger: "Assignment enters COMPLETED (cascade from Shift complete)"
+    algorithm: chronological
+    formula: |
+      # Chronological: process the worker's COMPLETED assignments in the same PayPeriod
+      # in start_utc ASC order (tie-break created_at ASC), accumulating realized hours.
+      # The OT band is decided by where THIS shift's hours fall in the running accumulator.
+      running = sum(a.shift.duration_hours
+                    for a in worker COMPLETED assignments in same PayPeriod
+                    with a.shift.start_utc < this.shift.start_utc
+                       or (a.shift.start_utc == this.shift.start_utc and a.created_at < this.created_at))
+      shift_hours = this.shift.duration_hours
+      ot_threshold = location.overtime_weekly_threshold_hours
+      reg_hours = clamp(ot_threshold - running, 0, shift_hours)
+      ot_hours  = shift_hours - reg_hours
+      base = worker.base_hourly_rate_cents
+      finalized_cost_cents = round_half_up(reg_hours*base + ot_hours*base*location.overtime_multiplier)
+    input_set: "Worker's COMPLETED assignments in the same PayPeriod ONLY (NO_SHOW/CANCELLED never completed, so contribute zero realized hours — this is the divergence from provisional, which counted scheduled-but-unworked hours)"
+    constants: {}
+    precision: "whole cents, round_half_up; round ONCE after summing reg+ot"
+    variants:
+      - name: finalized
+        when: "at COMPLETED — uses realized worked hours in chronological order"
+        difference: "drops hours from assignments that ended NO_SHOW/CANCELLED, so a worker who no-showed an early shift may fall BELOW the OT threshold and finalize cheaper than the provisional estimate"
+
+  - name: minor_hour_cap_projection
+    trigger: "Before an Assignment is created (POST /assignments, bid award, swap approve) for a worker where is_minor == true"
+    algorithm: aggregation
+    formula: |
+      # Two independent caps, both must hold (combinatorial: 3 inputs, nested branch on calendar-day vs week).
+      shift_hours = (shift.end_utc - shift.start_utc)/3600
+      # Daily cap: sum SCHEDULED+CONFIRMED hours for this worker whose shift.start_utc
+      # falls on the SAME location-local calendar day as this shift, plus shift_hours.
+      day_hours = sum(a.shift.duration_hours for a in worker SCHEDULED+CONFIRMED
+                      where local_calendar_day(a.shift.start_utc) == local_calendar_day(shift.start_utc)) + shift_hours
+      # Weekly cap: same but over the PayPeriod window (pay-week).
+      week_hours = sum(a.shift.duration_hours for a in worker SCHEDULED+CONFIRMED
+                       where a.pay_period_id == this.pay_period_id) + shift_hours
+      reject if day_hours > worker.minor_daily_cap_hours      -> ERR_MINOR_HOUR_CAP_EXCEEDED
+      reject if week_hours > worker.minor_weekly_cap_hours     -> ERR_MINOR_HOUR_CAP_EXCEEDED
+    input_set: "Worker's SCHEDULED+CONFIRMED assignments; daily uses location-local calendar-day bucket, weekly uses the PayPeriod window"
+    constants: {}
+    precision: "hours compared as exact floats; strict '>' is a violation (== the cap is allowed)"
+
+  - name: clopening_rest_gap
+    trigger: "Assignment enters SCHEDULED — compute clopening_flag and, if flagged, accrue predictability pay"
+    algorithm: threshold
+    formula: |
+      # Nearest PRIOR assignment by shift end: largest a.shift.end_utc <= this.shift.start_utc
+      # among worker's SCHEDULED/CONFIRMED/COMPLETED assignments (tie-break: latest created_at).
+      prior_end = max(a.shift.end_utc for eligible prior a)   # null if none
+      if prior_end is null: clopening_flag = false
+      else:
+        gap_hours = (shift.start_utc - prior_end)/3600
+        clopening_flag = (gap_hours < location.min_rest_hours_between_shifts)   # STRICT '<'
+      if clopening_flag and location.predictability_pay_enabled:
+        append PredictabilityLedgerEntry(reason=CLOPENING, amount_cents=CLOPENING_PENALTY_CENTS)
+    input_set: "Worker's prior SCHEDULED/CONFIRMED/COMPLETED assignments with shift.end_utc <= this shift.start_utc"
+    constants:
+      CLOPENING_PENALTY_CENTS: 5000
+    precision: "gap compared as exact float hours; gap exactly == threshold is NOT clopening (strict <)"
+
+  - name: predictability_short_notice_pay
+    trigger: "Assignment SCHEDULED on a shift posted inside the advance-notice window; or short-notice cancel of a posted shift/assignment"
+    algorithm: threshold
+    formula: |
+      notice_hours = (shift.start_utc - shift.posted_utc)/3600        # for post-based accrual
+      window_hours = location.advance_notice_days * 24
+      short_notice = location.predictability_pay_enabled and (notice_hours < window_hours)   # STRICT '<'
+      # SHORT_NOTICE_POST: when staffing a shift first OPENed inside the window
+      if short_notice and reason == SHORT_NOTICE_POST:
+        amount = round_half_up(shift.duration_hours * worker.base_hourly_rate_cents * SHORT_NOTICE_POST_RATE)
+      # SHORT_NOTICE_CANCEL: when a posted shift/assignment is cancelled inside the window
+      if short_notice and reason == SHORT_NOTICE_CANCEL:
+        amount = round_half_up(shift.duration_hours * worker.base_hourly_rate_cents * SHORT_NOTICE_CANCEL_RATE)
+      append PredictabilityLedgerEntry(reason, amount_cents=amount); reconcile PayPeriod
+    input_set: "The shift's posted_utc vs start_utc; the location's advance_notice_days and rates"
+    constants:
+      SHORT_NOTICE_POST_RATE: 0.25
+      SHORT_NOTICE_CANCEL_RATE: 0.5
+    precision: "whole cents, round_half_up; notice gap strict '<' window"
+
+  - name: pay_period_projected_cost
+    trigger: "Any assignment SCHEDULED/cancel/no-show/complete, or any PredictabilityLedgerEntry append (derived-field reconciliation)"
+    algorithm: aggregation
+    formula: |
+      projected_labor_cost_cents =
+          sum(a.provisional_cost_cents for a in assignments where a.pay_period_id == pp.id
+              and a.status IN {SCHEDULED, CONFIRMED})
+        + sum(e.amount_cents for e in PredictabilityLedgerEntry where e.pay_period_id == pp.id)
+      # Overtime cost guardrail: BEFORE committing a new SCHEDULED assignment, compute the
+      # projected total AS IF the assignment were committed; if that value is strictly greater
+      # than location.overtime_cost_guardrail_cents and force_over_guardrail is not true,
+      # reject with ERR_OVERTIME_GUARDRAIL_EXCEEDED.
+    input_set: "SCHEDULED+CONFIRMED assignments in the PayPeriod window + all predictability entries in the window"
+    constants: {}
+    precision: "whole cents; comparison against guardrail uses strict '>'"
+
+  - name: bid_award_selection
+    trigger: "POST /locations/{locId}/shifts/{shiftId}/award — determines the single winning bid the manager is permitted to award"
+    algorithm: weighted_scoring
+    formula: |
+      # Eligibility filter: OpenShiftBid rows on this shift with status == SUBMITTED
+      # (AWARDED/REJECTED/WITHDRAWN excluded).
+      candidates = [b for b in shift.bids if b.status == SUBMITTED]
+      # Ranking: seniority_score DESC.
+      # Tie-break: when seniority_score ties, the earliest created_at wins (created_at ASC);
+      # id is NEVER used as a tie-break.
+      winner = max(candidates, key=lambda b: (b.seniority_score, -epoch(b.created_at)))
+      # Fallback: empty candidate set -> ERR_BID_NOT_WINNER cannot be tested (no bid to award);
+      # award of a non-winning candidate's bid_id -> ERR_BID_NOT_WINNER.
+    input_set: "OpenShiftBid rows on the shift with status == SUBMITTED"
+    constants: {}
+    precision: "integer seniority compared exactly; created_at ASC tie-break (never id)"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1,  category: auth,                check: "X-User-Role and X-User-ID headers present and well-formed", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all except POST /_clock/set_current_utc which still requires headers" }
+  - { priority: 2,  category: auth,                check: "Acting role is permitted for this endpoint per §1.7", error_id: ERR_UNAUTHORIZED, http_status: 403, applies_to: "all" }
+  - { priority: 3,  category: existence,           check: "Every path/body-referenced resource exists, validated left-to-right (Location, then Shift/Assignment/Worker/etc.)", error_id: ERR_NOT_FOUND, http_status: 404, applies_to: "all id-bearing endpoints" }
+  - { priority: 4,  category: business_constraint, check: "Request body well-formed: required fields present, enums valid, numeric ranges (durations > 0, headcount >= 1, end_utc > start_utc)", error_id: ERR_INVALID_REQUEST, http_status: 422, applies_to: "all create/update endpoints" }
+  - { priority: 5,  category: business_temporal,   check: "Time window valid: end_utc strictly after start_utc on Shift/Availability/TimeOff/PayPeriod", error_id: ERR_INVALID_TIME_WINDOW, http_status: 422, applies_to: "POST /locations/{locId}/shifts, POST /workers/{workerId}/availability, POST /workers/{workerId}/time-off, POST /locations/{locId}/pay-periods" }
+  - { priority: 6,  category: state,               check: "Target resource in a state that permits this transition (Shift/Assignment/Bid/Swap/TimeOff/PayPeriod)", error_id: ERR_INVALID_SHIFT_STATE, http_status: 409, applies_to: "all action endpoints (per-entity error id used)" }
+  - { priority: 7,  category: state,               check: "PayPeriod containing the affected shift is OPEN before any assignment cancel/award/no-show mutation", error_id: ERR_PAY_PERIOD_LOCKED, http_status: 409, applies_to: "POST /assignments, /assignments/{id}/cancel, /shifts/{id}/award" }
+  - { priority: 8,  category: state,               check: "OCC: expected_shift_version equals current Shift.version on award", error_id: ERR_STALE_SHIFT_VERSION, http_status: 412, applies_to: "POST /shifts/{id}/award" }
+  - { priority: 9,  category: business_referential,check: "Assignment/bid/swap worker belongs to the same Location as the shift; counter_assignment belongs to the to_worker", error_id: ERR_CROSS_LOCATION, http_status: 409, applies_to: "POST /assignments, POST /shifts/{id}/bids, POST /swaps, swap actions" }
+  - { priority: 10, category: business_safety,     check: "Worker is not SUSPENDED (no_show_strikes < 3) when being newly assigned/awarded/bid", error_id: ERR_WORKER_SUSPENDED, http_status: 409, applies_to: "POST /assignments, POST /shifts/{id}/award, POST /shifts/{id}/bids" }
+  - { priority: 11, category: business_safety,     check: "Worker is free for the shift, checked under two distinct interval geometries: (i) no other non-terminal Assignment for this worker overlaps the shift, treated as HALF-OPEN [start,end) so adjacency (gap == 0, end_a == start_b) is allowed; (ii) no UNAVAILABLE Availability window or APPROVED TimeOffRequest collides, treated as CLOSED [start,end] so merely touching the boundary blocks", error_id: ERR_WORKER_UNAVAILABLE, http_status: 409, applies_to: "POST /assignments, POST /shifts/{id}/award, swap approve" }
+  - { priority: 12, category: business_safety,     check: "Minor labor-law hour caps (daily + weekly) hold per minor_hour_cap_projection", error_id: ERR_MINOR_HOUR_CAP_EXCEEDED, http_status: 409, applies_to: "POST /assignments, POST /shifts/{id}/award, swap approve" }
+  - { priority: 13, category: business_constraint, check: "Shift not already at headcount_required (no over-staffing)", error_id: ERR_SHIFT_FULLY_STAFFED, http_status: 409, applies_to: "POST /assignments, POST /shifts/{id}/award" }
+  - { priority: 14, category: business_fiscal,     check: "Projected PayPeriod labor cost after this assignment does not strictly exceed overtime_cost_guardrail_cents unless force_over_guardrail==true", error_id: ERR_OVERTIME_GUARDRAIL_EXCEEDED, http_status: 409, applies_to: "POST /assignments, POST /shifts/{id}/award" }
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # Flat topology: every entity has a single-resource GET `/<collection>/{id}`
+  # (so its collection segment is derivable) and a flat list GET `/<collection>`
+  # carrying its FK filter params (reverse-reachability, filtered-list form).
+  # Mutating action endpoints are nested under /locations/{locId}/... for a
+  # natural operator surface; they do not affect FK reverse-reachability.
+
+  # ---- Location ----
+  - { method: POST, path: "/locations", description: "Create a location", roles: [Manager], code: 201, input: [name, time_zone, overtime_cost_guardrail_cents, "predictability_pay_enabled?", "advance_notice_days?", "min_rest_hours_between_shifts?", "overtime_weekly_threshold_hours?", "overtime_multiplier?"], output: Location, side_effects: [] }
+  - { method: GET,  path: "/locations/{locId}", description: "Get a location", roles: [Manager, Worker], code: 200, input: [], output: Location, side_effects: [] }
+
+  # ---- Worker ----
+  - { method: POST, path: "/locations/{locId}/workers", description: "Register a worker at a location", roles: [Manager], code: 201, input: [full_name, email, base_hourly_rate_cents, "is_minor?", "minor_daily_cap_hours?", "minor_weekly_cap_hours?"], output: Worker, side_effects: ["status=ACTIVE, no_show_strikes=0"] }
+  - { method: GET,  path: "/locations/{id}/workers", description: "List a location's workers (sub-resource reverse-reachability for Worker.location_id)", roles: [Manager, Worker], code: 200, input: ["limit?", "offset?"], output: "Worker[]", side_effects: [] }
+  - { method: GET,  path: "/workers/{workerId}", description: "Get a worker", roles: [Manager, Worker], code: 200, input: [], output: Worker, side_effects: [] }
+
+  # ---- Availability ----
+  - { method: POST, path: "/workers/{workerId}/availability", description: "Add an availability/unavailability window for a worker", roles: [Worker, Manager], code: 201, input: [kind, start_utc, end_utc], output: Availability, side_effects: [] }
+  - { method: GET,  path: "/workers/{id}/availability", description: "List a worker's availability windows (sub-resource reverse-reachability for Availability.worker_id)", roles: [Manager, Worker], code: 200, input: ["limit?", "offset?"], output: "Availability[]", side_effects: [] }
+
+  # ---- TimeOff ----
+  - { method: POST, path: "/workers/{workerId}/time-off", description: "Submit a time-off request", roles: [Worker], code: 201, input: [start_utc, end_utc, reason], output: TimeOffRequest, side_effects: ["status=PENDING"] }
+  - { method: GET,  path: "/workers/{id}/time-off", description: "List a worker's time-off requests (sub-resource reverse-reachability for TimeOffRequest.worker_id)", roles: [Manager, Worker], code: 200, input: ["limit?", "offset?"], output: "TimeOffRequest[]", side_effects: [] }
+  - { method: POST, path: "/locations/{locId}/time-off/{toId}/approve", description: "Approve a time-off request", roles: [Manager], code: 200, input: [], output: TimeOffRequest, side_effects: ["PENDING->APPROVED; sets decided_by_manager_id; window hard-blocks assignment"] }
+  - { method: POST, path: "/locations/{locId}/time-off/{toId}/deny", description: "Deny a time-off request", roles: [Manager], code: 200, input: [], output: TimeOffRequest, side_effects: ["PENDING->DENIED"] }
+  - { method: POST, path: "/locations/{locId}/time-off/{toId}/cancel", description: "Worker cancels own pending time-off request", roles: [Worker], code: 200, input: [], output: TimeOffRequest, side_effects: ["PENDING->CANCELLED"] }
+
+  # ---- ShiftTemplate + generation ----
+  - { method: POST, path: "/locations/{locId}/shift-templates", description: "Create a shift demand-forecast template", roles: [Manager], code: 201, input: [role_name, weekday, local_start_minute, duration_minutes, forecast_headcount], output: ShiftTemplate, side_effects: [] }
+  - { method: GET,  path: "/locations/{id}/shift-templates", description: "List a location's shift templates (sub-resource reverse-reachability for ShiftTemplate.location_id)", roles: [Manager, Worker], code: 200, input: ["limit?", "offset?"], output: "ShiftTemplate[]", side_effects: [] }
+  - { method: POST, path: "/locations/{locId}/shift-templates/{tplId}/generate", description: "Generate a DRAFT Shift from a template for a given local week-start date", roles: [Manager], code: 201, input: [week_start_local_date], output: Shift, side_effects: ["Creates one DRAFT Shift; start_utc/end_utc derived from template weekday+local_start_minute+duration in the location tz; headcount_required=forecast_headcount; template_id set"] }
+
+  # ---- Shift ----
+  - { method: POST, path: "/locations/{locId}/shifts", description: "Create an ad-hoc DRAFT shift", roles: [Manager], code: 201, input: [role_name, start_utc, end_utc, headcount_required, "template_id?"], output: Shift, side_effects: ["status=DRAFT"] }
+  - { method: GET,  path: "/shifts", description: "List shifts, filterable by location and template (reverse-reachability for Shift.location_id and Shift.template_id)", roles: [Manager, Worker], code: 200, input: ["location_id?", "template_id?", "limit?", "offset?"], output: "Shift[]", side_effects: [] }
+  - { method: GET,  path: "/shifts/{shiftId}", description: "Get a shift", roles: [Manager, Worker], code: 200, input: [], output: Shift, side_effects: [] }
+  - { method: POST, path: "/locations/{locId}/shifts/{shiftId}/post", description: "Post a DRAFT shift to OPEN for bidding/assignment", roles: [Manager], code: 200, input: [], output: Shift, side_effects: ["DRAFT->OPEN; stamps posted_utc"] }
+  - { method: POST, path: "/locations/{locId}/shifts/{shiftId}/cancel", description: "Cancel a shift", roles: [Manager], code: 200, input: [], output: Shift, side_effects: ["->CANCELLED; cascades assignment cancel, bid reject, short-notice predictability accrual"] }
+  - { method: POST, path: "/locations/{locId}/shifts/{shiftId}/complete", description: "Complete a shift after it ends", roles: [Manager], code: 200, input: [], output: Shift, side_effects: ["->COMPLETED; cascades assignment complete + finalized cost + pay-period reconcile"] }
+
+  # ---- Assignment (direct) ----
+  - { method: POST, path: "/locations/{locId}/assignments", description: "Directly assign a worker to an OPEN shift", roles: [Manager], code: 201, input: [shift_id, worker_id, "force_over_guardrail?"], output: Assignment, side_effects: ["status=SCHEDULED; clopening_flag + provisional_cost computed; predictability accrual; pay-period reconcile; bubble-up FULLY_STAFFED on last seat"] }
+  - { method: GET,  path: "/assignments", description: "List assignments, filterable by shift, worker, or pay-period (reverse-reachability for Assignment.shift_id/worker_id/pay_period_id)", roles: [Manager, Worker], code: 200, input: ["shift_id?", "worker_id?", "pay_period_id?", "limit?", "offset?"], output: "Assignment[]", side_effects: [] }
+  - { method: GET,  path: "/assignments/{asgId}", description: "Get an assignment", roles: [Manager, Worker], code: 200, input: [], output: Assignment, side_effects: [] }
+  - { method: POST, path: "/locations/{locId}/assignments/{asgId}/confirm", description: "Worker confirms own scheduled assignment", roles: [Worker], code: 200, input: [], output: Assignment, side_effects: ["SCHEDULED->CONFIRMED"] }
+  - { method: POST, path: "/locations/{locId}/assignments/{asgId}/cancel", description: "Manager cancels an assignment", roles: [Manager], code: 200, input: [], output: Assignment, side_effects: ["->CANCELLED; bubble-down; pay-period reconcile; short-notice predictability accrual"] }
+  - { method: POST, path: "/locations/{locId}/assignments/{asgId}/no-show", description: "Mark a started assignment as a no-show", roles: [Manager], code: 200, input: [], output: Assignment, side_effects: ["->NO_SHOW; worker strike++ (suspend at 3); bubble-down; pay-period reconcile"] }
+
+  # ---- Open-shift bidding ----
+  - { method: POST, path: "/locations/{locId}/shifts/{shiftId}/bids", description: "Worker bids on an OPEN shift", roles: [Worker], code: 201, input: ["seniority_score?"], output: OpenShiftBid, side_effects: ["status=SUBMITTED"] }
+  - { method: GET,  path: "/bids", description: "List open-shift bids, filterable by shift or worker (reverse-reachability for OpenShiftBid.shift_id/worker_id)", roles: [Manager, Worker], code: 200, input: ["shift_id?", "worker_id?", "limit?", "offset?"], output: "OpenShiftBid[]", side_effects: [] }
+  - { method: GET,  path: "/bids/{bidId}", description: "Get an open-shift bid", roles: [Manager, Worker], code: 200, input: [], output: OpenShiftBid, side_effects: [] }
+  - { method: POST, path: "/locations/{locId}/bids/{bidId}/withdraw", description: "Worker withdraws own submitted bid", roles: [Worker], code: 200, input: [], output: OpenShiftBid, side_effects: ["SUBMITTED->WITHDRAWN"] }
+  - { method: POST, path: "/locations/{locId}/shifts/{shiftId}/award", description: "Manager awards a seat on an OPEN shift to the winning bid (OCC-guarded)", roles: [Manager], code: 201, input: [bid_id, expected_shift_version, "force_over_guardrail?"], output: Assignment, side_effects: ["winning bid->AWARDED; creates Assignment(source=BID,SCHEDULED); increments Shift.version by 1; bubble-up FULLY_STAFFED rejects remaining bids"] }
+
+  # ---- Swap ----
+  - { method: POST, path: "/locations/{locId}/swaps", description: "Initiate a shift swap from one of the initiator's assignments to another worker", roles: [Worker], code: 201, input: [from_assignment_id, to_worker_id], output: SwapRequest, side_effects: ["status=PROPOSED"] }
+  - { method: GET,  path: "/swaps", description: "List swap requests, filterable by from_assignment, to_worker, or counter_assignment (reverse-reachability for SwapRequest.from_assignment_id/to_worker_id/counter_assignment_id)", roles: [Manager, Worker], code: 200, input: ["from_assignment_id?", "to_worker_id?", "counter_assignment_id?", "limit?", "offset?"], output: "SwapRequest[]", side_effects: [] }
+  - { method: GET,  path: "/swaps/{swapId}", description: "Get a swap request", roles: [Manager, Worker], code: 200, input: [], output: SwapRequest, side_effects: [] }
+  - { method: POST, path: "/locations/{locId}/swaps/{swapId}/counter", description: "Counterparty counters with their own assignment (two-way swap)", roles: [Worker], code: 200, input: [counter_assignment_id], output: SwapRequest, side_effects: ["PROPOSED->COUNTERED"] }
+  - { method: POST, path: "/locations/{locId}/swaps/{swapId}/repropose", description: "Initiator clears the counter and reproposes (revision loop)", roles: [Worker], code: 200, input: [], output: SwapRequest, side_effects: ["COUNTERED->PROPOSED"] }
+  - { method: POST, path: "/locations/{locId}/swaps/{swapId}/accept", description: "Accept the swap (awaits manager approval)", roles: [Worker], code: 200, input: [], output: SwapRequest, side_effects: ["{PROPOSED,COUNTERED}->ACCEPTED"] }
+  - { method: POST, path: "/locations/{locId}/swaps/{swapId}/reject", description: "Reject the swap", roles: [Worker], code: 200, input: [], output: SwapRequest, side_effects: ["->REJECTED"] }
+  - { method: POST, path: "/locations/{locId}/swaps/{swapId}/cancel", description: "Initiator cancels the swap", roles: [Worker], code: 200, input: [], output: SwapRequest, side_effects: ["{PROPOSED,COUNTERED}->CANCELLED"] }
+  - { method: POST, path: "/locations/{locId}/swaps/{swapId}/approve", description: "Manager approves an accepted swap, reassigning the assignments", roles: [Manager], code: 200, input: [], output: SwapRequest, side_effects: ["ACCEPTED->MANAGER_APPROVED; reassigns worker_id on from/counter assignments; recompute clopening + provisional cost; pay-period reconcile"] }
+
+  # ---- PayPeriod ----
+  - { method: POST, path: "/locations/{locId}/pay-periods", description: "Create a pay-period window for a location", roles: [Manager], code: 201, input: [start_utc, end_utc], output: PayPeriod, side_effects: ["status=OPEN"] }
+  - { method: GET,  path: "/locations/{id}/pay-periods", description: "List a location's pay-periods (sub-resource reverse-reachability for PayPeriod.location_id)", roles: [Manager, Worker], code: 200, input: ["limit?", "offset?"], output: "PayPeriod[]", side_effects: [] }
+  - { method: GET,  path: "/pay-periods/{ppId}", description: "Get a pay-period (with projected/finalized cost)", roles: [Manager, Worker], code: 200, input: [], output: PayPeriod, side_effects: [] }
+  - { method: POST, path: "/locations/{locId}/pay-periods/{ppId}/lock", description: "Lock a pay-period once all its assignments are terminal", roles: [Manager], code: 200, input: [], output: PayPeriod, side_effects: ["OPEN->LOCKED; stamps finalized_labor_cost_cents"] }
+
+  # ---- Predictability ledger (reverse-reachability for the event log) ----
+  - { method: GET,  path: "/predictability-ledger", description: "List predictability-pay ledger entries, filterable by worker, shift, or pay-period (reverse-reachability for PredictabilityLedgerEntry.worker_id/shift_id/pay_period_id)", roles: [Manager, Worker], code: 200, input: ["worker_id?", "shift_id?", "pay_period_id?", "limit?", "offset?"], output: "PredictabilityLedgerEntry[]", side_effects: [] }
+  - { method: GET,  path: "/predictability-ledger/{ledgerId}", description: "Get a predictability-pay ledger entry", roles: [Manager, Worker], code: 200, input: [], output: PredictabilityLedgerEntry, side_effects: [] }
+
+  # ---- Test-driving clock ----
+  - { method: POST, path: "/_clock/set_current_utc", description: "Set the server's current UTC instant (test-driving; all relative-time checks read this clock)", roles: [Manager], code: 200, input: [to_iso8601], output: null, side_effects: ["server clock set to the given instant"] }
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED,            http: 401, condition: "Missing/malformed X-User-Role or X-User-ID headers" }
+  - { id: ERR_UNAUTHORIZED,               http: 403, condition: "Acting role not permitted for endpoint, or worker acting on a resource it does not own" }
+  - { id: ERR_NOT_FOUND,                  http: 404, condition: "Referenced Location/Worker/Shift/Assignment/Bid/Swap/TimeOff/PayPeriod/Template does not exist" }
+  - { id: ERR_INVALID_REQUEST,            http: 422, condition: "Malformed body: missing required field, bad enum, duration <= 0, headcount < 1" }
+  - { id: ERR_INVALID_TIME_WINDOW,        http: 422, condition: "end_utc not strictly after start_utc" }
+  - { id: ERR_INVALID_SHIFT_STATE,        http: 409, condition: "Shift not in a state that permits the requested transition" }
+  - { id: ERR_INVALID_ASSIGNMENT_STATE,   http: 409, condition: "Assignment not in a state that permits the requested transition" }
+  - { id: ERR_INVALID_BID_STATE,          http: 409, condition: "Bid not in a state that permits withdraw/award" }
+  - { id: ERR_INVALID_SWAP_STATE,         http: 409, condition: "Swap not in a state that permits the requested transition" }
+  - { id: ERR_INVALID_TIME_OFF_STATE,     http: 409, condition: "Time-off request not PENDING for approve/deny/cancel" }
+  - { id: ERR_SHIFT_NOT_ENDED,            http: 409, condition: "Completing a shift before current clock >= end_utc" }
+  - { id: ERR_SHIFT_NOT_STARTED,          http: 409, condition: "Marking no-show before current clock >= shift.start_utc" }
+  - { id: ERR_SHIFT_ALREADY_STARTED,      http: 409, condition: "Worker confirms after current clock >= shift.start_utc" }
+  - { id: ERR_PAY_PERIOD_LOCKED,          http: 409, condition: "Assignment mutation (assign/cancel/award/no-show) in a LOCKED pay-period, or locking a non-OPEN period" }
+  - { id: ERR_OPEN_ASSIGNMENTS_EXIST,     http: 409, condition: "Locking a pay-period that still has non-terminal assignments" }
+  - { id: ERR_STALE_SHIFT_VERSION,        http: 412, condition: "Award carries expected_shift_version != current Shift.version (OCC)" }
+  - { id: ERR_BID_NOT_WINNER,             http: 409, condition: "Awarding a bid that is not the winner of bid_award_selection over SUBMITTED bids" }
+  - { id: ERR_CROSS_LOCATION,             http: 409, condition: "Worker/bid/swap counterparty not in the shift's Location, or counter_assignment not owned by to_worker" }
+  - { id: ERR_WORKER_SUSPENDED,           http: 409, condition: "Newly assigning/awarding/bidding a worker with status SUSPENDED (no_show_strikes >= 3)" }
+  - { id: ERR_WORKER_UNAVAILABLE,         http: 409, condition: "Shift overlaps an UNAVAILABLE window, an APPROVED time-off, or an existing non-terminal assignment for the same worker" }
+  - { id: ERR_MINOR_HOUR_CAP_EXCEEDED,    http: 409, condition: "Minor's projected daily or weekly hours would strictly exceed the cap" }
+  - { id: ERR_SHIFT_FULLY_STAFFED,        http: 409, condition: "Assigning/awarding when headcount_filled already == headcount_required" }
+  - { id: ERR_OVERTIME_GUARDRAIL_EXCEEDED,http: 409, condition: "Projected pay-period labor cost would strictly exceed guardrail and force_over_guardrail not set" }
+  - { id: ERR_TIME_OFF_CONFLICTS_ASSIGNMENT, http: 409, condition: "Approving time-off that overlaps a SCHEDULED/CONFIRMED assignment for the worker" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Manager
+    description: "Schedules and operates a location: posts/cancels/completes shifts, directly assigns, awards bids, approves swaps and time-off, marks no-shows, locks pay-periods, sets clock."
+    identity: opaque
+    exclusive_operations:
+      - "POST /locations"
+      - "POST /locations/{locId}/workers"
+      - "POST /locations/{locId}/shift-templates"
+      - "POST /locations/{locId}/shift-templates/{tplId}/generate"
+      - "POST /locations/{locId}/shifts"
+      - "POST /locations/{locId}/shifts/{shiftId}/post"
+      - "POST /locations/{locId}/shifts/{shiftId}/cancel"
+      - "POST /locations/{locId}/shifts/{shiftId}/complete"
+      - "POST /locations/{locId}/shifts/{shiftId}/award"
+      - "POST /locations/{locId}/assignments"
+      - "POST /locations/{locId}/assignments/{asgId}/cancel"
+      - "POST /locations/{locId}/assignments/{asgId}/no-show"
+      - "POST /locations/{locId}/time-off/{toId}/approve"
+      - "POST /locations/{locId}/time-off/{toId}/deny"
+      - "POST /locations/{locId}/swaps/{swapId}/approve"
+      - "POST /locations/{locId}/pay-periods"
+      - "POST /locations/{locId}/pay-periods/{ppId}/lock"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /workers/{workerId}/availability"
+      - "GET endpoints (locations, workers, shifts, assignments, bids, swaps, time-off, availability, pay-periods, predictability-ledger, templates)"
+
+  - name: Worker
+    description: "An employee; manages own availability/time-off, confirms own assignments, bids on open shifts, initiates/responds to swaps. Acts only on resources it owns."
+    identity: "entity_backed:Worker"
+    exclusive_operations:
+      - "POST /workers/{workerId}/time-off"
+      - "POST /locations/{locId}/assignments/{asgId}/confirm"
+      - "POST /locations/{locId}/shifts/{shiftId}/bids"
+      - "POST /locations/{locId}/bids/{bidId}/withdraw"
+      - "POST /locations/{locId}/swaps"
+      - "POST /locations/{locId}/swaps/{swapId}/counter"
+      - "POST /locations/{locId}/swaps/{swapId}/repropose"
+      - "POST /locations/{locId}/swaps/{swapId}/accept"
+      - "POST /locations/{locId}/swaps/{swapId}/reject"
+      - "POST /locations/{locId}/swaps/{swapId}/cancel"
+      - "POST /locations/{locId}/time-off/{toId}/cancel"
+    shared_operations:
+      - "POST /workers/{workerId}/availability"
+      - "GET endpoints (locations, workers, shifts, assignments, bids, swaps, time-off, availability, pay-periods, predictability-ledger, templates)"

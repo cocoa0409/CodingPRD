@@ -1,0 +1,1131 @@
+# =============================================================================
+# Benefits Administration & Open Enrollment — Scaffold (§1.0–§1.7)
+# Difficulty: Expert
+# =============================================================================
+
+scenario: |
+  Benefits Administration & Open Enrollment: plan/tier catalog, eligibility/waiting
+  period, life-event qualifying change, dependent verification, evidence of
+  insurability, carrier EDI feed, payroll deduction sync, ACA 1095-C, retro adjustment
+
+domain_name: benefits-open-enrollment
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: event_sourcing
+  complexity_layers:
+    - dual_variant_calculation        # prospective vs retroactive payroll deduction ledger
+    - cascading_side_effects          # life-event approval -> enrollment supersede -> deduction ledger -> EDI feed
+    - derived_field_reconciliation    # enrollment.monthly_employee_cost_cents, ledger totals, dependent counts
+    - rate_threshold_triggers         # ACA affordability boundary, EOI guaranteed-issue threshold
+    - optimistic_concurrency          # CREATE-with-supersede on Enrollment vs stale Employee version
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys; no deep nested URL paths. Employee is the
+  # hub; PlanOffering/PlanTier are a configuration catalog; Enrollment, Dependent,
+  # EOIRequest, LifeEvent, DeductionLine, CarrierFeedRecord, Form1095C, WaitingPeriod
+  # reference one another by FK.
+
+  state_machine_shape: branching
+  # Enrollment: branching with revert (DRAFT->PENDING_EOI->ACTIVE / DRAFT->ACTIVE,
+  #   ACTIVE->SUPERSEDED, PENDING_EOI->DRAFT on EOI denial).
+  # LifeEvent: branching fork-join (SUBMITTED->{APPROVED,REJECTED}->...).
+  # Dependent: cyclic verification loop (PENDING->INFO_REQUESTED->PENDING->VERIFIED).
+
+  relationship_patterns:
+    - one_to_many        # Employee -> Enrollment, Dependent, LifeEvent, DeductionLine, Form1095C
+    - flat_references    # Enrollment -> PlanTier; EOIRequest -> Enrollment; CarrierFeedRecord -> Enrollment
+    - cross_aggregate    # Enrollment transitions gated by Employee eligibility & LifeEvent state
+
+  role_model: segregation_of_duties
+  # BenefitsAdmin configures the catalog and approves life events but may NOT verify a
+  # dependent they are related to as the submitter; DependentVerifier owns verification;
+  # PayrollOfficer owns deduction sync & retro adjustments; ComplianceOfficer owns 1095-C
+  # generation. A user cannot both submit a life event and approve it.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Employee
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: full_name, type: string, source: input, description: "Employee legal name" }
+      - { name: hire_date, type: datetime, source: input, description: "ISO 8601 date the employee was hired; basis for waiting-period start" }
+      - { name: employment_type, type: enum, source: input, description: "FULL_TIME | PART_TIME | SEASONAL", constraints: "FULL_TIME | PART_TIME | SEASONAL" }
+      - { name: payroll_schedule, type: enum, source: input, description: "SEMI_MONTHLY (24 periods/yr) | BIWEEKLY (26 periods/yr)", constraints: "SEMI_MONTHLY | BIWEEKLY" }
+      - { name: monthly_household_income_cents, type: integer, source: input, description: "Self-reported monthly household income in cents; basis for ACA affordability", constraints: "non-negative integer" }
+      - { name: eligibility_status, type: enum, source: computed, default: WAITING, description: "WAITING (within waiting period) | ELIGIBLE (waiting period elapsed, open to enroll) | INELIGIBLE (employment_type==SEASONAL) | TERMINATED. Recomputed when the clock crosses the active WaitingPeriod.end_date.", constraints: "WAITING | ELIGIBLE | INELIGIBLE | TERMINATED" }
+      - { name: pay_periods_processed, type: integer, source: system, default: 0, description: "Count of payroll runs applied to this employee since hire; advances on POST /_payroll/run" }
+
+  - name: WaitingPeriod
+    parent: null
+    common_fields: true
+    fields:
+      - { name: employee_id, type: string, source: system, description: "FK -> Employee.id" }
+      - { name: window_type, type: enum, source: input, description: "INITIAL (new-hire waiting period) | REINSTATEMENT (post-leave). Different window_type rows may abut but MUST NOT overlap.", constraints: "INITIAL | REINSTATEMENT" }
+      - { name: start_date, type: datetime, source: input, description: "Half-open window start (inclusive), ISO 8601 date" }
+      - { name: end_date, type: datetime, source: input, description: "Half-open window end (EXCLUSIVE), ISO 8601 date; eligibility opens at end_date" }
+      - { name: status, type: enum, source: system, default: PENDING, description: "PENDING (clock < end_date) | ELAPSED (clock >= end_date). ELAPSED flips Employee.eligibility_status to ELIGIBLE.", constraints: "PENDING | ELAPSED" }
+
+  - name: PlanOffering
+    parent: null
+    common_fields: true
+    fields:
+      - { name: benefit_type, type: enum, source: input, description: "MEDICAL | DENTAL | VISION | VOLUNTARY_LIFE", constraints: "MEDICAL | DENTAL | VISION | VOLUNTARY_LIFE" }
+      - { name: name, type: string, source: input, description: "Display name, e.g. 'Gold PPO'" }
+      - { name: requires_eoi, type: boolean, source: input, default: false, description: "True for VOLUNTARY_LIFE offerings whose elected coverage above guaranteed issue requires Evidence of Insurability" }
+      - { name: guaranteed_issue_amount_cents, type: integer, source: input, default: 0, description: "Coverage at or below this is auto-issued; coverage above requires an approved EOIRequest. Only meaningful when requires_eoi is true.", constraints: "non-negative integer" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | ARCHIVED. ARCHIVED offerings reject new enrollments.", constraints: "ACTIVE | ARCHIVED" }
+
+  - name: PlanTier
+    parent: null
+    common_fields: true
+    fields:
+      - { name: plan_offering_id, type: string, source: input, description: "FK -> PlanOffering.id" }
+      - { name: coverage_level, type: enum, source: input, description: "EMPLOYEE_ONLY | EMPLOYEE_PLUS_SPOUSE | EMPLOYEE_PLUS_CHILDREN | EMPLOYEE_PLUS_FAMILY", constraints: "EMPLOYEE_ONLY | EMPLOYEE_PLUS_SPOUSE | EMPLOYEE_PLUS_CHILDREN | EMPLOYEE_PLUS_FAMILY" }
+      - { name: monthly_premium_cents, type: integer, source: input, description: "Total monthly premium (employer + employee) in cents", constraints: "positive integer" }
+      - { name: employer_contribution_pct, type: number, source: input, description: "Employer share of monthly_premium_cents, 0.0-1.0 (e.g. 0.70)", constraints: "0.0 <= x <= 1.0" }
+      - { name: rate_per_1000_monthly_cents, type: integer, source: input, default: 0, description: "VOLUNTARY_LIFE only: monthly premium per $1000 of coverage, in cents. Ignored for MEDICAL/DENTAL/VISION.", constraints: "non-negative integer" }
+      - { name: is_lowest_cost_self_only, type: boolean, source: input, default: false, description: "Marks the MEDICAL EMPLOYEE_ONLY tier used for ACA affordability testing; at most one per benefit_type" }
+
+  - name: Dependent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: employee_id, type: string, source: system, description: "FK -> Employee.id" }
+      - { name: relationship, type: enum, source: input, description: "SPOUSE | CHILD", constraints: "SPOUSE | CHILD" }
+      - { name: full_name, type: string, source: input, description: "Dependent legal name" }
+      - { name: date_of_birth, type: datetime, source: input, description: "ISO 8601 date" }
+      - { name: verification_status, type: enum, source: system, default: PENDING, description: "PENDING -> INFO_REQUESTED -> PENDING (cyclic) -> VERIFIED | REJECTED. Only VERIFIED dependents count toward covered_dependent_count and may be added to an enrollment.", constraints: "PENDING | INFO_REQUESTED | VERIFIED | REJECTED" }
+      - { name: verified_by_user_id, type: string, source: system, required: false, description: "X-User-ID of the DependentVerifier who set VERIFIED; null until verified" }
+
+  - name: Enrollment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: employee_id, type: string, source: system, description: "FK -> Employee.id" }
+      - { name: plan_tier_id, type: string, source: input, description: "FK -> PlanTier.id" }
+      - { name: benefit_type, type: enum, source: system, description: "Copied from the tier's PlanOffering.benefit_type at creation", constraints: "MEDICAL | DENTAL | VISION | VOLUNTARY_LIFE" }
+      - { name: coverage_amount_cents, type: integer, source: input, default: 0, description: "VOLUNTARY_LIFE elected coverage in cents; 0 for MEDICAL/DENTAL/VISION", constraints: "non-negative integer" }
+      - { name: coverage_start_date, type: datetime, source: input, description: "Closed-interval (inclusive) coverage start, ISO 8601 date" }
+      - { name: coverage_end_date, type: datetime, source: system, required: false, description: "Closed-interval (inclusive) coverage end; set when SUPERSEDED (= superseding enrollment's coverage_start_date minus one day) or null while ACTIVE" }
+      - { name: monthly_employee_cost_cents, type: integer, source: computed, description: "= monthly_premium_cents - round_half_up(monthly_premium_cents * employer_contribution_pct) for non-life; for VOLUNTARY_LIFE = round_half_up((coverage_amount_cents/100000) * rate_per_1000_monthly_cents). See calc compute_monthly_employee_cost." }
+      - { name: per_paycheck_deduction_cents, type: integer, source: computed, description: "= round_half_up(monthly_employee_cost_cents * 12 / periods_per_year) where periods_per_year is 24 (SEMI_MONTHLY) or 26 (BIWEEKLY). See calc compute_per_paycheck_deduction." }
+      - { name: covered_dependent_count, type: integer, source: computed, default: 0, description: "Count of VERIFIED Dependent rows attached to this enrollment via POST add-dependent" }
+      - { name: source_life_event_id, type: string, source: system, required: false, description: "FK -> LifeEvent.id; non-null when this enrollment was created by a life-event change" }
+      - { name: superseded_by_enrollment_id, type: string, source: system, required: false, description: "FK -> Enrollment.id; set on the old enrollment when a new one supersedes it" }
+      - { name: status, type: enum, source: system, default: DRAFT, description: "DRAFT -> PENDING_EOI -> ACTIVE | DRAFT -> ACTIVE | ACTIVE -> SUPERSEDED | PENDING_EOI -> DRAFT (EOI denied). Terminal: SUPERSEDED, CANCELLED.", constraints: "DRAFT | PENDING_EOI | ACTIVE | SUPERSEDED | CANCELLED" }
+
+  - name: LifeEvent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: employee_id, type: string, source: system, description: "FK -> Employee.id" }
+      - { name: event_type, type: enum, source: input, description: "BIRTH | MARRIAGE | DIVORCE | LOSS_OF_COVERAGE", constraints: "BIRTH | MARRIAGE | DIVORCE | LOSS_OF_COVERAGE" }
+      - { name: event_date, type: datetime, source: input, description: "ISO 8601 date the qualifying event occurred; may be in the past (drives retro adjustment)" }
+      - { name: requested_plan_tier_id, type: string, source: input, description: "FK -> PlanTier.id; the tier the employee wants to move to" }
+      - { name: requested_coverage_amount_cents, type: integer, source: input, default: 0, description: "VOLUNTARY_LIFE coverage requested; 0 otherwise", constraints: "non-negative integer" }
+      - { name: submitted_by_user_id, type: string, source: system, description: "X-User-ID of the BenefitsAdmin who submitted; an approver MUST differ from this (segregation of duties)" }
+      - { name: adjustment_mode, type: enum, source: input, description: "PROSPECTIVE (coverage change effective next unprocessed pay period) | RETROACTIVE (recompute from event_date). Selects the dual-variant deduction calc.", constraints: "PROSPECTIVE | RETROACTIVE" }
+      - { name: status, type: enum, source: system, default: SUBMITTED, description: "SUBMITTED -> {APPROVED, REJECTED}. APPROVED creates a superseding Enrollment and (if RETROACTIVE) retro DeductionLines. Terminal: APPROVED, REJECTED.", constraints: "SUBMITTED | APPROVED | REJECTED" }
+
+  - name: EOIRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: enrollment_id, type: string, source: system, description: "FK -> Enrollment.id; the PENDING_EOI enrollment awaiting evidence of insurability" }
+      - { name: excess_coverage_cents, type: integer, source: computed, description: "= enrollment.coverage_amount_cents - offering.guaranteed_issue_amount_cents (the amount requiring underwriting)" }
+      - { name: decision, type: enum, source: system, default: PENDING, description: "PENDING -> {APPROVED, DENIED}. APPROVED activates the enrollment; DENIED reverts it to DRAFT.", constraints: "PENDING | APPROVED | DENIED" }
+
+  - name: DeductionLine
+    parent: null
+    common_fields: false   # immutable ledger event: id + created_at only
+    fields:
+      - { name: enrollment_id, type: string, source: system, description: "FK -> Enrollment.id" }
+      - { name: employee_id, type: string, source: system, description: "FK -> Employee.id" }
+      - { name: pay_period_index, type: integer, source: system, description: "0-based index of the pay period this line bills" }
+      - { name: line_type, type: enum, source: system, description: "REGULAR (normal per-paycheck deduction) | RETRO_ADJUSTMENT (correction posted by a RETROACTIVE life event)", constraints: "REGULAR | RETRO_ADJUSTMENT" }
+      - { name: amount_cents, type: integer, source: system, description: "Signed cents withheld for this pay period; RETRO_ADJUSTMENT lines may be positive (additional owed) or negative (refund)" }
+
+  - name: CarrierFeedRecord
+    parent: null
+    common_fields: false   # immutable EDI event: id + created_at only
+    fields:
+      - { name: enrollment_id, type: string, source: system, description: "FK -> Enrollment.id" }
+      - { name: transaction_set, type: enum, source: system, description: "EDI 834 transaction maintenance type: ADD (new ACTIVE enrollment) | TERM (enrollment SUPERSEDED/CANCELLED) | CHANGE (coverage amount changed)", constraints: "ADD | TERM | CHANGE" }
+      - { name: reconciled_monthly_premium_cents, type: integer, source: system, description: "Carrier-side total monthly premium for this enrollment, computed round-per-line-then-sum across covered lines. See calc reconcile_carrier_premium." }
+
+  - name: Form1095C
+    parent: null
+    common_fields: true
+    fields:
+      - { name: employee_id, type: string, source: system, description: "FK -> Employee.id" }
+      - { name: tax_year, type: integer, source: input, description: "e.g. 2026" }
+      - { name: lowest_cost_monthly_premium_cents, type: integer, source: computed, description: "Employee monthly cost of the is_lowest_cost_self_only MEDICAL tier at generation time" }
+      - { name: affordability_threshold_cents, type: integer, source: computed, description: "= round_half_up(employee.monthly_household_income_cents * ACA_AFFORDABILITY_PCT). See calc compute_aca_affordability." }
+      - { name: affordability_indicator, type: enum, source: computed, description: "AFFORDABLE (lowest_cost_monthly_premium_cents <= affordability_threshold_cents) | UNAFFORDABLE (otherwise)", constraints: "AFFORDABLE | UNAFFORDABLE" }
+      - { name: status, type: enum, source: system, default: GENERATED, description: "GENERATED | FILED. FILED is terminal and immutable.", constraints: "GENERATED | FILED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Employee
+    initial_state: WAITING
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: WAITING
+        to: ELIGIBLE
+        trigger: "system event on POST /_clock/advance crossing the active WaitingPeriod.end_date"
+        actor: system
+        preconditions:
+          - "employment_type != SEASONAL"
+          - "exactly one WaitingPeriod for this employee has status PENDING and clock >= its end_date"
+        side_effects:
+          - "the crossed WaitingPeriod.status set ELAPSED"
+          - "Employee.eligibility_status set ELIGIBLE"
+          - "increments Employee.version by 1"
+        note: "SEASONAL employees never become ELIGIBLE; their eligibility_status is INELIGIBLE from creation."
+      - from: ELIGIBLE
+        to: TERMINATED
+        trigger: "POST /employees/{id}/terminate"
+        actor: BenefitsAdmin
+        preconditions:
+          - "eligibility_status == ELIGIBLE"
+        side_effects:
+          - "all ACTIVE Enrollment rows for this employee transition ACTIVE->SUPERSEDED with coverage_end_date = clock date (cascade)"
+          - "each superseded enrollment emits a CarrierFeedRecord with transaction_set TERM (cascade hop 2)"
+          - "Employee.eligibility_status set TERMINATED"
+          - "increments Employee.version by 1"
+
+  - entity: WaitingPeriod
+    initial_state: PENDING
+    terminal_states: [ELAPSED]
+    transitions:
+      - from: PENDING
+        to: ELAPSED
+        trigger: "system event on POST /_clock/advance when clock >= end_date"
+        actor: system
+        preconditions:
+          - "clock >= end_date"
+        side_effects:
+          - "bubble up: parent Employee re-evaluated -> eligibility_status ELIGIBLE if employment_type != SEASONAL"
+
+  - entity: Dependent
+    initial_state: PENDING
+    terminal_states: [VERIFIED, REJECTED]
+    transitions:
+      - from: PENDING
+        to: INFO_REQUESTED
+        trigger: "POST /dependents/{id}/request-info"
+        actor: DependentVerifier
+        preconditions:
+          - "verification_status == PENDING"
+        side_effects:
+          - "increments Dependent.version by 1"
+      - from: INFO_REQUESTED
+        to: PENDING
+        trigger: "POST /dependents/{id}/resubmit"
+        actor: BenefitsAdmin
+        preconditions:
+          - "verification_status == INFO_REQUESTED"
+        side_effects:
+          - "increments Dependent.version by 1"
+        note: "Cyclic loop: a dependent may bounce PENDING<->INFO_REQUESTED any number of rounds before resolution."
+      - from: PENDING
+        to: VERIFIED
+        trigger: "POST /dependents/{id}/verify"
+        actor: DependentVerifier
+        preconditions:
+          - "verification_status == PENDING"
+          - "the acting DependentVerifier's X-User-ID != the Employee.id who owns this dependent (segregation: an employee cannot verify their own dependent)"
+        side_effects:
+          - "verified_by_user_id set to X-User-ID"
+          - "increments Dependent.version by 1"
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /dependents/{id}/reject"
+        actor: DependentVerifier
+        preconditions:
+          - "verification_status == PENDING"
+        side_effects:
+          - "increments Dependent.version by 1"
+
+  - entity: Enrollment
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /enrollments/{id}/activate"
+        actor: BenefitsAdmin
+        preconditions:
+          - "status == DRAFT"
+          - "owning Employee.eligibility_status == ELIGIBLE (cross-entity)"
+          - "benefit_type != VOLUNTARY_LIFE OR coverage_amount_cents <= offering.guaranteed_issue_amount_cents (no EOI needed)"
+          - "no other ACTIVE Enrollment of the same benefit_type whose closed coverage interval overlaps this one"
+        side_effects:
+          - "recompute monthly_employee_cost_cents and per_paycheck_deduction_cents"
+          - "emit CarrierFeedRecord with transaction_set ADD"
+          - "increments Enrollment.version by 1"
+      - from: DRAFT
+        to: PENDING_EOI
+        trigger: "POST /enrollments/{id}/submit-eoi"
+        actor: BenefitsAdmin
+        preconditions:
+          - "status == DRAFT"
+          - "benefit_type == VOLUNTARY_LIFE AND coverage_amount_cents > offering.guaranteed_issue_amount_cents"
+        side_effects:
+          - "create EOIRequest with decision PENDING and excess_coverage_cents = coverage_amount_cents - guaranteed_issue_amount_cents"
+          - "increments Enrollment.version by 1"
+      - from: PENDING_EOI
+        to: ACTIVE
+        trigger: "system event on POST /eoi-requests/{id}/decide with decision APPROVED"
+        actor: ComplianceOfficer
+        preconditions:
+          - "status == PENDING_EOI"
+          - "the linked EOIRequest.decision is being set to APPROVED"
+        side_effects:
+          - "recompute monthly_employee_cost_cents and per_paycheck_deduction_cents"
+          - "emit CarrierFeedRecord with transaction_set ADD (cascade from EOI approval)"
+          - "increments Enrollment.version by 1"
+      - from: PENDING_EOI
+        to: DRAFT
+        trigger: "system event on POST /eoi-requests/{id}/decide with decision DENIED"
+        actor: ComplianceOfficer
+        preconditions:
+          - "status == PENDING_EOI"
+        side_effects:
+          - "increments Enrollment.version by 1"
+        note: "Compensation: EOI denial reverts the enrollment to DRAFT; no CarrierFeedRecord is emitted."
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "system event on POST /life-events/{id}/approve (when a superseding enrollment is created) or on POST /employees/{id}/terminate"
+        actor: system
+        preconditions:
+          - "status == ACTIVE"
+        side_effects:
+          - "coverage_end_date set (superseding enrollment's coverage_start_date minus one day, or termination clock date)"
+          - "superseded_by_enrollment_id set to the new enrollment id (life-event path)"
+          - "emit CarrierFeedRecord with transaction_set TERM"
+          - "increments Enrollment.version by 1"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /enrollments/{id}/cancel"
+        actor: BenefitsAdmin
+        preconditions:
+          - "status == DRAFT"
+        side_effects:
+          - "increments Enrollment.version by 1"
+
+  - entity: LifeEvent
+    initial_state: SUBMITTED
+    terminal_states: [APPROVED, REJECTED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /life-events/{id}/approve"
+        actor: BenefitsAdmin
+        preconditions:
+          - "status == SUBMITTED"
+          - "approving X-User-ID != submitted_by_user_id (segregation of duties)"
+          - "owning Employee.eligibility_status == ELIGIBLE (cross-entity)"
+          - "event_date is within 30 days of the clock date"
+        side_effects:
+          - "create a new ACTIVE Enrollment for requested_plan_tier_id with source_life_event_id set (coverage_start_date = event_date), recompute its costs (cascade hop 1)"
+          - "the prior ACTIVE Enrollment of the same benefit_type transitions ACTIVE->SUPERSEDED, coverage_end_date set, superseded_by_enrollment_id set (cascade hop 2)"
+          - "the superseded enrollment emits a CarrierFeedRecord transaction_set TERM, and the new enrollment emits a CarrierFeedRecord transaction_set ADD (cascade hop 3)"
+          - "if adjustment_mode == RETROACTIVE, post RETRO_ADJUSTMENT DeductionLines for each already-processed pay period on/after event_date (cascade hop 3, deduction ledger)"
+          - "increments LifeEvent.version by 1"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /life-events/{id}/reject"
+        actor: BenefitsAdmin
+        preconditions:
+          - "status == SUBMITTED"
+          - "rejecting X-User-ID != submitted_by_user_id (segregation of duties)"
+        side_effects:
+          - "increments LifeEvent.version by 1"
+
+  - entity: EOIRequest
+    initial_state: PENDING
+    terminal_states: [APPROVED, DENIED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /eoi-requests/{id}/decide with decision APPROVED"
+        actor: ComplianceOfficer
+        preconditions:
+          - "decision == PENDING"
+          - "linked Enrollment.status == PENDING_EOI (cross-entity)"
+        side_effects:
+          - "linked Enrollment transitions PENDING_EOI->ACTIVE (cross-entity cascade)"
+          - "increments EOIRequest.version by 1"
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /eoi-requests/{id}/decide with decision DENIED"
+        actor: ComplianceOfficer
+        preconditions:
+          - "decision == PENDING"
+          - "linked Enrollment.status == PENDING_EOI (cross-entity)"
+        side_effects:
+          - "linked Enrollment transitions PENDING_EOI->DRAFT (cross-entity compensation)"
+          - "increments EOIRequest.version by 1"
+
+  - entity: Form1095C
+    initial_state: GENERATED
+    terminal_states: [FILED]
+    transitions:
+      - from: GENERATED
+        to: FILED
+        trigger: "POST /form-1095c/{id}/file"
+        actor: ComplianceOfficer
+        preconditions:
+          - "status == GENERATED"
+        side_effects:
+          - "increments Form1095C.version by 1"
+        note: "FILED is immutable; no further mutation permitted."
+
+  - entity: PlanOffering
+    initial_state: ACTIVE
+    terminal_states: [ARCHIVED]
+    transitions:
+      - from: ACTIVE
+        to: ARCHIVED
+        trigger: "POST /plan-offerings/{id}/archive"
+        actor: BenefitsAdmin
+        preconditions:
+          - "status == ACTIVE"
+        side_effects:
+          - "status set ARCHIVED"
+          - "increments PlanOffering.version by 1"
+        note: "Once ARCHIVED, POST /employees/{id}/enrollments against any of its tiers is rejected with ERR_PLAN_ARCHIVED."
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: life-event-approve-stale-employee
+    parent_entity: Employee
+    write_endpoint: "POST /life-events/{id}/approve"
+    occ_field: "expected_employee_version"
+    description: |
+      Approving a LifeEvent supersedes the employee's current ACTIVE enrollment of
+      the same benefit_type and mints a new one. The approval must carry the version
+      of the Employee the approver last observed. If the Employee's version has
+      advanced since then (e.g. another approved life event already superseded the
+      enrollment, or a clock advance flipped eligibility), the approval is rejected
+      as stale. This captures the case where the approver's view of the employee's
+      benefit state is no longer current.
+    error_id: ERR_STALE_EMPLOYEE_VERSION
+    http_status: 412
+
+  - rule_id: enrollment-activate-stale-employee
+    parent_entity: Employee
+    write_endpoint: "POST /enrollments/{id}/activate"
+    occ_field: "expected_employee_version"
+    description: |
+      Activating a DRAFT Enrollment is gated on the owning Employee's eligibility.
+      The activation must carry the Employee version the client last observed; if it
+      has advanced (e.g. the employee was terminated, or a competing enrollment of the
+      same benefit_type was just activated and changed the employee's benefit state),
+      the activation is rejected as stale.
+    error_id: ERR_STALE_EMPLOYEE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: compute_monthly_employee_cost
+    trigger: "on POST /enrollments/{id}/activate and on PENDING_EOI->ACTIVE (EOI approval)"
+    algorithm: threshold
+    formula: |
+      if benefit_type in {MEDICAL, DENTAL, VISION}:
+        employer_share = round_half_up(tier.monthly_premium_cents * tier.employer_contribution_pct)
+        monthly_employee_cost_cents = tier.monthly_premium_cents - employer_share
+      elif benefit_type == VOLUNTARY_LIFE:
+        units = coverage_amount_cents / 100000          # number of $1000 units
+        monthly_employee_cost_cents = round_half_up(units * tier.rate_per_1000_monthly_cents)
+    input_set: "single Enrollment + its PlanTier + PlanOffering"
+    constants: {}
+    precision: "integer cents, round_half_up; employer_share rounded BEFORE subtraction (rounding order pinned)"
+    variants: []
+
+  - name: compute_per_paycheck_deduction
+    trigger: "on POST /enrollments/{id}/activate and on PENDING_EOI->ACTIVE (after compute_monthly_employee_cost)"
+    algorithm: threshold
+    formula: |
+      periods_per_year = 24 if employee.payroll_schedule == SEMI_MONTHLY else 26   # BIWEEKLY
+      annual_employee_cost = monthly_employee_cost_cents * 12
+      per_paycheck_deduction_cents = round_half_up(annual_employee_cost / periods_per_year)
+    input_set: "single Enrollment.monthly_employee_cost_cents + owning Employee.payroll_schedule"
+    constants:
+      SEMI_MONTHLY_PERIODS: 24
+      BIWEEKLY_PERIODS: 26
+    precision: "integer cents, round_half_up; annualize-then-divide (multiply by 12 before dividing by periods, order pinned)"
+    variants: []
+
+  - name: compute_retro_deduction_delta
+    trigger: "on POST /life-events/{id}/approve"
+    algorithm: chronological
+    formula: |
+      # Walk the already-processed pay periods (index 0 .. employee.pay_periods_processed-1)
+      # in ascending pay_period_index. For each period whose coverage falls on/after
+      # event_date, the deduction owed changes from old per_paycheck to new per_paycheck.
+      old_pp = prior_active_enrollment.per_paycheck_deduction_cents
+      new_pp = new_enrollment.per_paycheck_deduction_cents
+      affected = [periods p in 0..pay_periods_processed-1 where p maps to a date >= event_date]
+      total_retro_delta = sum over affected of (new_pp - old_pp)
+      # one RETRO_ADJUSTMENT DeductionLine per affected period with amount_cents = (new_pp - old_pp)
+    input_set: "already-processed pay periods of the employee; prior + new enrollment per_paycheck amounts"
+    constants: {}
+    precision: "integer cents; affected periods processed in ascending pay_period_index order (tie-break by pay_period_index ASC, deterministic)"
+    variants:
+      - name: prospective
+        when: "LifeEvent.adjustment_mode == PROSPECTIVE"
+        difference: "No RETRO_ADJUSTMENT lines posted for already-processed periods; total_retro_delta == 0. The new per_paycheck applies only from the next unprocessed pay period (index >= pay_periods_processed)."
+      - name: retroactive
+        when: "LifeEvent.adjustment_mode == RETROACTIVE"
+        difference: "Posts one RETRO_ADJUSTMENT DeductionLine per already-processed period on/after event_date with amount (new_pp - old_pp); total_retro_delta = (new_pp - old_pp) * count(affected)."
+
+  - name: reconcile_carrier_premium
+    trigger: "on emit CarrierFeedRecord (ADD / CHANGE)"
+    algorithm: aggregation
+    formula: |
+      # The carrier bills a prorated monthly premium when coverage starts mid-month,
+      # reconciled as the SUM OF TWO SEPARATELY-PRORATED COMPONENT LINES
+      # (employer share line + employee share line). The rounding order is pinned:
+      # round each component line to the cent FIRST, THEN sum — NOT sum-then-round.
+      days_in_month = calendar days in coverage_start_date's month
+      days_covered  = days_in_month - day_of_month(coverage_start_date) + 1
+      employer_monthly = round_half_up(tier.monthly_premium_cents * tier.employer_contribution_pct)
+      employee_monthly = tier.monthly_premium_cents - employer_monthly
+      prorated_employer = round_half_up(employer_monthly * days_covered / days_in_month)   # line rounded
+      prorated_employee = round_half_up(employee_monthly * days_covered / days_in_month)   # line rounded
+      reconciled_monthly_premium_cents = prorated_employer + prorated_employee             # sum of rounded lines
+      # CONTRAST (NOT used): sum_then_round = round_half_up(monthly_premium_cents * days_covered / days_in_month)
+      # The two diverge by a cent at certain proration ratios; this calc pins round-per-line-then-sum.
+    input_set: "the enrollment's tier (monthly_premium_cents, employer_contribution_pct) + coverage_start_date day-of-month"
+    constants: {}
+    precision: "integer cents, round_half_up; ROUND EACH COMPONENT LINE THEN SUM (rounding order explicitly pinned; differs from sum-then-round)"
+    variants: []
+
+  - name: compute_aca_affordability
+    trigger: "on POST /form-1095c (generation)"
+    algorithm: threshold
+    formula: |
+      lowest_cost_tier = the PlanTier with is_lowest_cost_self_only == true and offering.benefit_type == MEDICAL
+      lowest_cost_monthly_premium_cents = lowest_cost_tier.monthly_premium_cents
+                                          - round_half_up(lowest_cost_tier.monthly_premium_cents * lowest_cost_tier.employer_contribution_pct)
+      affordability_threshold_cents = round_half_up(employee.monthly_household_income_cents * ACA_AFFORDABILITY_PCT)
+      affordability_indicator = AFFORDABLE if lowest_cost_monthly_premium_cents <= affordability_threshold_cents else UNAFFORDABLE
+    input_set: "the is_lowest_cost_self_only MEDICAL tier + owning Employee.monthly_household_income_cents"
+    constants:
+      ACA_AFFORDABILITY_PCT: 0.0902
+    precision: "integer cents, round_half_up; boundary is <= (at-threshold counts as AFFORDABLE)"
+    variants: []
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "the role in X-User-Role is permitted for this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "every resource referenced in the path or as an FK in the body exists, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 4
+    category: business_constraint
+    check: "request body conforms: required fields present, enums valid, integers non-negative where constrained"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all"
+
+  - priority: 5
+    category: state
+    check: "target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 6
+    category: business_safety
+    check: "segregation of duties: the approving/verifying actor's X-User-ID differs from the submitter (life event) or the owning employee (dependent verify)"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /life-events/{id}/approve, POST /life-events/{id}/reject, POST /dependents/{id}/verify"
+
+  - priority: 7
+    category: business_referential
+    check: "an enrollment for VOLUNTARY_LIFE whose coverage_amount_cents exceeds the offering's guaranteed_issue_amount_cents may not be activated directly; it must route through EOI"
+    error_id: ERR_EOI_REQUIRED
+    http_status: 409
+    applies_to: "POST /enrollments/{id}/activate"
+
+  - priority: 8
+    category: business_safety
+    check: "the owning Employee.eligibility_status must be ELIGIBLE before an enrollment is activated or a life event is approved (cross-entity)"
+    error_id: ERR_EMPLOYEE_NOT_ELIGIBLE
+    http_status: 409
+    applies_to: "POST /enrollments/{id}/activate, POST /life-events/{id}/approve"
+
+  - priority: 9
+    category: business_temporal
+    check: "a LifeEvent.event_date must be within 30 days of the clock date on approval"
+    error_id: ERR_LIFE_EVENT_WINDOW_EXPIRED
+    http_status: 409
+    applies_to: "POST /life-events/{id}/approve"
+
+  - priority: 10
+    category: business_temporal
+    check: "a new WaitingPeriod window of any window_type must not overlap an existing window for the same employee (half-open [start,end); adjacency end==start is allowed)"
+    error_id: ERR_WAITING_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /employees/{id}/waiting-periods"
+
+  - priority: 11
+    category: business_constraint
+    check: "activating an enrollment whose closed coverage interval [coverage_start_date, coverage_end_date] overlaps an existing ACTIVE enrollment of the same benefit_type for the employee is rejected (closed inclusive; adjacency prev_end+1day==start is allowed)"
+    error_id: ERR_COVERAGE_OVERLAP
+    http_status: 409
+    applies_to: "POST /enrollments/{id}/activate"
+
+  - priority: 12
+    category: business_referential
+    check: "only a VERIFIED Dependent may be added to an enrollment"
+    error_id: ERR_DEPENDENT_NOT_VERIFIED
+    http_status: 409
+    applies_to: "POST /enrollments/{id}/add-dependent"
+
+  - priority: 12.5
+    category: business_referential
+    check: "creating an enrollment against a tier whose PlanOffering.status == ARCHIVED is rejected"
+    error_id: ERR_PLAN_ARCHIVED
+    http_status: 409
+    applies_to: "POST /employees/{id}/enrollments"
+
+  - priority: 13
+    category: business_constraint
+    check: "OCC: expected_employee_version in the body must equal the current Employee.version"
+    error_id: ERR_STALE_EMPLOYEE_VERSION
+    http_status: 412
+    applies_to: "POST /enrollments/{id}/activate, POST /life-events/{id}/approve"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Employee ----
+  - method: POST
+    path: "/employees"
+    description: "Create an employee"
+    roles: [BenefitsAdmin]
+    code: 201
+    input: [full_name, hire_date, employment_type, payroll_schedule, monthly_household_income_cents]
+    output: Employee
+    side_effects: ["eligibility_status set INELIGIBLE if SEASONAL else WAITING"]
+
+  - method: GET
+    path: "/employees/{id}"
+    description: "Fetch an employee"
+    roles: [BenefitsAdmin, PayrollOfficer, ComplianceOfficer, DependentVerifier]
+    code: 200
+    input: []
+    output: Employee
+    side_effects: []
+
+  - method: GET
+    path: "/employees"
+    description: "List employees (paginated)"
+    roles: [BenefitsAdmin, PayrollOfficer, ComplianceOfficer, DependentVerifier]
+    code: 200
+    input: ["employment_type?", "eligibility_status?", "limit?", "offset?"]
+    output: Employee[]
+    side_effects: []
+
+  - method: POST
+    path: "/employees/{id}/terminate"
+    description: "Terminate an employee; cascades to supersede ACTIVE enrollments and emit TERM feed records"
+    roles: [BenefitsAdmin]
+    code: 200
+    input: []
+    output: Employee
+    side_effects: ["cascade: ACTIVE enrollments -> SUPERSEDED with coverage_end_date = clock", "each emits CarrierFeedRecord TERM", "increments Employee.version by 1"]
+
+  # ---- WaitingPeriod (sub-resource of Employee) ----
+  - method: POST
+    path: "/employees/{id}/waiting-periods"
+    description: "Create a waiting-period window for an employee"
+    roles: [BenefitsAdmin]
+    code: 201
+    input: [window_type, start_date, end_date]
+    output: WaitingPeriod
+    side_effects: ["rejected if it overlaps an existing window (ERR_WAITING_PERIOD_OVERLAP)"]
+
+  - method: GET
+    path: "/employees/{id}/waiting-periods"
+    description: "List an employee's waiting-period windows (reverse-reachability for WaitingPeriod.employee_id)"
+    roles: [BenefitsAdmin, PayrollOfficer, ComplianceOfficer, DependentVerifier]
+    code: 200
+    input: []
+    output: WaitingPeriod[]
+    side_effects: []
+
+  # ---- PlanOffering / PlanTier (catalog) ----
+  - method: POST
+    path: "/plan-offerings"
+    description: "Create a plan offering"
+    roles: [BenefitsAdmin]
+    code: 201
+    input: [benefit_type, name, "requires_eoi?", "guaranteed_issue_amount_cents?"]
+    output: PlanOffering
+    side_effects: []
+
+  - method: GET
+    path: "/plan-offerings/{id}"
+    description: "Fetch a plan offering"
+    roles: [BenefitsAdmin, PayrollOfficer, ComplianceOfficer, DependentVerifier]
+    code: 200
+    input: []
+    output: PlanOffering
+    side_effects: []
+
+  - method: POST
+    path: "/plan-offerings/{id}/archive"
+    description: "Archive a plan offering (ACTIVE->ARCHIVED); archived offerings reject new enrollments"
+    roles: [BenefitsAdmin]
+    code: 200
+    input: []
+    output: PlanOffering
+    side_effects: ["status set ARCHIVED", "increments PlanOffering.version by 1"]
+
+  - method: POST
+    path: "/plan-tiers"
+    description: "Create a plan tier under an offering"
+    roles: [BenefitsAdmin]
+    code: 201
+    input: [plan_offering_id, coverage_level, monthly_premium_cents, employer_contribution_pct, "rate_per_1000_monthly_cents?", "is_lowest_cost_self_only?"]
+    output: PlanTier
+    side_effects: ["benefit_type for downstream enrollments derived from the offering"]
+
+  - method: GET
+    path: "/plan-tiers/{id}"
+    description: "Fetch a plan tier"
+    roles: [BenefitsAdmin, PayrollOfficer, ComplianceOfficer, DependentVerifier]
+    code: 200
+    input: []
+    output: PlanTier
+    side_effects: []
+
+  - method: GET
+    path: "/plan-tiers"
+    description: "List plan tiers, filterable by offering (reverse-reachability for PlanTier.plan_offering_id)"
+    roles: [BenefitsAdmin, PayrollOfficer, ComplianceOfficer, DependentVerifier]
+    code: 200
+    input: ["plan_offering_id?", "limit?", "offset?"]
+    output: PlanTier[]
+    side_effects: []
+
+  # ---- Dependent ----
+  - method: POST
+    path: "/employees/{id}/dependents"
+    description: "Register a dependent for an employee (starts PENDING)"
+    roles: [BenefitsAdmin]
+    code: 201
+    input: [relationship, full_name, date_of_birth]
+    output: Dependent
+    side_effects: ["verification_status initialized PENDING"]
+
+  - method: GET
+    path: "/dependents/{id}"
+    description: "Fetch a dependent"
+    roles: [BenefitsAdmin, DependentVerifier, ComplianceOfficer, PayrollOfficer]
+    code: 200
+    input: []
+    output: Dependent
+    side_effects: []
+
+  - method: GET
+    path: "/dependents"
+    description: "List dependents, filterable by employee (reverse-reachability for Dependent.employee_id)"
+    roles: [BenefitsAdmin, DependentVerifier, ComplianceOfficer, PayrollOfficer]
+    code: 200
+    input: ["employee_id?", "verification_status?", "limit?", "offset?"]
+    output: Dependent[]
+    side_effects: []
+
+  - method: POST
+    path: "/dependents/{id}/request-info"
+    description: "Verifier requests more info (PENDING->INFO_REQUESTED)"
+    roles: [DependentVerifier]
+    code: 200
+    input: []
+    output: Dependent
+    side_effects: ["increments Dependent.version by 1"]
+
+  - method: POST
+    path: "/dependents/{id}/resubmit"
+    description: "Admin resubmits documentation (INFO_REQUESTED->PENDING)"
+    roles: [BenefitsAdmin]
+    code: 200
+    input: []
+    output: Dependent
+    side_effects: ["increments Dependent.version by 1"]
+
+  - method: POST
+    path: "/dependents/{id}/verify"
+    description: "Verifier verifies a dependent (PENDING->VERIFIED); segregation of duties enforced"
+    roles: [DependentVerifier]
+    code: 200
+    input: []
+    output: Dependent
+    side_effects: ["verified_by_user_id set", "increments Dependent.version by 1"]
+
+  - method: POST
+    path: "/dependents/{id}/reject"
+    description: "Verifier rejects a dependent (PENDING->REJECTED)"
+    roles: [DependentVerifier]
+    code: 200
+    input: []
+    output: Dependent
+    side_effects: ["increments Dependent.version by 1"]
+
+  # ---- Enrollment ----
+  - method: POST
+    path: "/employees/{id}/enrollments"
+    description: "Create a DRAFT enrollment for an employee against a plan tier"
+    roles: [BenefitsAdmin]
+    code: 201
+    input: [plan_tier_id, "coverage_amount_cents?", coverage_start_date]
+    output: Enrollment
+    side_effects: ["status DRAFT; benefit_type copied from tier offering"]
+
+  - method: GET
+    path: "/enrollments/{id}"
+    description: "Fetch an enrollment"
+    roles: [BenefitsAdmin, PayrollOfficer, ComplianceOfficer, DependentVerifier]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: []
+
+  - method: GET
+    path: "/enrollments"
+    description: "List enrollments, filterable by employee or plan tier (reverse-reachability for Enrollment.employee_id, Enrollment.plan_tier_id, Enrollment.source_life_event_id, Enrollment.superseded_by_enrollment_id)"
+    roles: [BenefitsAdmin, PayrollOfficer, ComplianceOfficer, DependentVerifier]
+    code: 200
+    input: ["employee_id?", "plan_tier_id?", "source_life_event_id?", "superseded_by_enrollment_id?", "status?", "benefit_type?", "limit?", "offset?"]
+    output: Enrollment[]
+    side_effects: []
+
+  - method: POST
+    path: "/enrollments/{id}/activate"
+    description: "Activate a DRAFT enrollment (DRAFT->ACTIVE); OCC on the owning employee"
+    roles: [BenefitsAdmin]
+    code: 200
+    input: [expected_employee_version]
+    output: Enrollment
+    side_effects: ["recompute monthly_employee_cost_cents + per_paycheck_deduction_cents", "emit CarrierFeedRecord ADD", "increments Enrollment.version by 1", "increments Employee.version by 1"]
+
+  - method: POST
+    path: "/enrollments/{id}/submit-eoi"
+    description: "Submit an over-GI VOLUNTARY_LIFE enrollment for EOI (DRAFT->PENDING_EOI); creates EOIRequest"
+    roles: [BenefitsAdmin]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: ["create EOIRequest PENDING with excess_coverage_cents", "increments Enrollment.version by 1"]
+
+  - method: POST
+    path: "/enrollments/{id}/cancel"
+    description: "Cancel a DRAFT enrollment (DRAFT->CANCELLED)"
+    roles: [BenefitsAdmin]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: ["increments Enrollment.version by 1"]
+
+  - method: POST
+    path: "/enrollments/{id}/add-dependent"
+    description: "Attach a VERIFIED dependent to an enrollment; increments covered_dependent_count"
+    roles: [BenefitsAdmin]
+    code: 200
+    input: [dependent_id]
+    output: Enrollment
+    side_effects: ["covered_dependent_count += 1 when the dependent is VERIFIED", "increments Enrollment.version by 1"]
+
+  - method: POST
+    path: "/enrollments/{id}/remove-dependent"
+    description: "Detach a dependent from an enrollment; decrements covered_dependent_count"
+    roles: [BenefitsAdmin]
+    code: 200
+    input: [dependent_id]
+    output: Enrollment
+    side_effects: ["covered_dependent_count -= 1", "increments Enrollment.version by 1"]
+
+  # ---- EOIRequest ----
+  - method: GET
+    path: "/eoi-requests/{id}"
+    description: "Fetch an EOI request"
+    roles: [BenefitsAdmin, ComplianceOfficer]
+    code: 200
+    input: []
+    output: EOIRequest
+    side_effects: []
+
+  - method: GET
+    path: "/eoi-requests"
+    description: "List EOI requests, filterable by enrollment (reverse-reachability for EOIRequest.enrollment_id)"
+    roles: [BenefitsAdmin, ComplianceOfficer]
+    code: 200
+    input: ["enrollment_id?", "decision?", "limit?", "offset?"]
+    output: EOIRequest[]
+    side_effects: []
+
+  - method: POST
+    path: "/eoi-requests/{id}/decide"
+    description: "ComplianceOfficer decides an EOI request; APPROVED activates the enrollment, DENIED reverts it to DRAFT"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: [decision]
+    output: EOIRequest
+    side_effects: ["APPROVED: linked enrollment PENDING_EOI->ACTIVE + recompute costs + emit CarrierFeedRecord ADD", "DENIED: linked enrollment PENDING_EOI->DRAFT", "increments EOIRequest.version by 1"]
+
+  # ---- LifeEvent ----
+  - method: POST
+    path: "/employees/{id}/life-events"
+    description: "Submit a qualifying life event for an employee"
+    roles: [BenefitsAdmin]
+    code: 201
+    input: [event_type, event_date, requested_plan_tier_id, "requested_coverage_amount_cents?", adjustment_mode]
+    output: LifeEvent
+    side_effects: ["status SUBMITTED; submitted_by_user_id set from X-User-ID"]
+
+  - method: GET
+    path: "/life-events/{id}"
+    description: "Fetch a life event"
+    roles: [BenefitsAdmin, ComplianceOfficer, PayrollOfficer]
+    code: 200
+    input: []
+    output: LifeEvent
+    side_effects: []
+
+  - method: GET
+    path: "/life-events"
+    description: "List life events, filterable by employee (reverse-reachability for LifeEvent.employee_id, LifeEvent.requested_plan_tier_id)"
+    roles: [BenefitsAdmin, ComplianceOfficer, PayrollOfficer]
+    code: 200
+    input: ["employee_id?", "requested_plan_tier_id?", "status?", "limit?", "offset?"]
+    output: LifeEvent[]
+    side_effects: []
+
+  - method: POST
+    path: "/life-events/{id}/approve"
+    description: "Approve a life event (SUBMITTED->APPROVED); supersedes prior enrollment, mints new one, posts retro lines if RETROACTIVE; OCC on owning employee; segregation of duties enforced"
+    roles: [BenefitsAdmin]
+    code: 200
+    input: [expected_employee_version]
+    output: LifeEvent
+    side_effects: ["create new ACTIVE Enrollment (cascade)", "prior ACTIVE enrollment -> SUPERSEDED (cascade)", "emit CarrierFeedRecord TERM + ADD (cascade)", "RETROACTIVE: post RETRO_ADJUSTMENT DeductionLines (cascade)", "increments LifeEvent.version + Employee.version by 1"]
+
+  - method: POST
+    path: "/life-events/{id}/reject"
+    description: "Reject a life event (SUBMITTED->REJECTED); segregation of duties enforced"
+    roles: [BenefitsAdmin]
+    code: 200
+    input: []
+    output: LifeEvent
+    side_effects: ["increments LifeEvent.version by 1"]
+
+  # ---- DeductionLine (payroll ledger) ----
+  - method: POST
+    path: "/_payroll/run"
+    description: "Test-driving endpoint: advance the employee's payroll by one pay period, posting a REGULAR DeductionLine for each ACTIVE enrollment at its per_paycheck_deduction_cents"
+    roles: [PayrollOfficer]
+    code: 200
+    input: [employee_id]
+    output: Employee
+    side_effects: ["pay_periods_processed += 1", "one REGULAR DeductionLine per ACTIVE enrollment", "increments Employee.version by 1"]
+
+  - method: GET
+    path: "/deduction-lines/{id}"
+    description: "Fetch a deduction line"
+    roles: [PayrollOfficer, BenefitsAdmin, ComplianceOfficer]
+    code: 200
+    input: []
+    output: DeductionLine
+    side_effects: []
+
+  - method: GET
+    path: "/deduction-lines"
+    description: "List deduction lines, filterable by enrollment or employee (reverse-reachability for DeductionLine.enrollment_id, DeductionLine.employee_id)"
+    roles: [PayrollOfficer, BenefitsAdmin, ComplianceOfficer]
+    code: 200
+    input: ["enrollment_id?", "employee_id?", "line_type?", "limit?", "offset?"]
+    output: DeductionLine[]
+    side_effects: []
+
+  # ---- CarrierFeedRecord (EDI 834) ----
+  - method: GET
+    path: "/carrier-feed-records/{id}"
+    description: "Fetch a carrier feed record"
+    roles: [BenefitsAdmin, ComplianceOfficer, PayrollOfficer]
+    code: 200
+    input: []
+    output: CarrierFeedRecord
+    side_effects: []
+
+  - method: GET
+    path: "/carrier-feed-records"
+    description: "List carrier feed records, filterable by enrollment (reverse-reachability for CarrierFeedRecord.enrollment_id)"
+    roles: [BenefitsAdmin, ComplianceOfficer, PayrollOfficer]
+    code: 200
+    input: ["enrollment_id?", "transaction_set?", "limit?", "offset?"]
+    output: CarrierFeedRecord[]
+    side_effects: []
+
+  # ---- Form1095C (ACA) ----
+  - method: POST
+    path: "/employees/{id}/form-1095c"
+    description: "Generate an ACA 1095-C for an employee + tax year; computes affordability"
+    roles: [ComplianceOfficer]
+    code: 201
+    input: [tax_year]
+    output: Form1095C
+    side_effects: ["compute lowest_cost_monthly_premium_cents, affordability_threshold_cents, affordability_indicator"]
+
+  - method: GET
+    path: "/form-1095c/{id}"
+    description: "Fetch a 1095-C"
+    roles: [ComplianceOfficer, BenefitsAdmin]
+    code: 200
+    input: []
+    output: Form1095C
+    side_effects: []
+
+  - method: GET
+    path: "/form-1095c"
+    description: "List 1095-C forms, filterable by employee (reverse-reachability for Form1095C.employee_id)"
+    roles: [ComplianceOfficer, BenefitsAdmin]
+    code: 200
+    input: ["employee_id?", "tax_year?", "status?", "limit?", "offset?"]
+    output: Form1095C[]
+    side_effects: []
+
+  - method: POST
+    path: "/form-1095c/{id}/file"
+    description: "File a 1095-C (GENERATED->FILED); terminal"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Form1095C
+    side_effects: ["increments Form1095C.version by 1"]
+
+  # ---- Clock (test-driving) ----
+  - method: POST
+    path: "/_clock/advance"
+    description: "Test-driving endpoint: set the server clock to an absolute ISO 8601 instant; elapses crossed waiting periods and re-evaluates employee eligibility"
+    roles: [BenefitsAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["WaitingPeriod windows with end_date <= clock flip to ELAPSED", "owning Employee eligibility_status -> ELIGIBLE if not SEASONAL (bubble-up)"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "missing/invalid X-User-Role or X-User-ID headers" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "role not permitted for this operation per §1.7" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "a path or FK-referenced resource does not exist" }
+  - { id: ERR_INVALID_REQUEST, http: 422, condition: "missing required field, invalid enum, negative integer where non-negative required" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "requested transition not defined from the resource's current state" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "approver/verifier X-User-ID equals the submitter (life event) or the owning employee (dependent verify)" }
+  - { id: ERR_EOI_REQUIRED, http: 409, condition: "attempt to activate a VOLUNTARY_LIFE enrollment with coverage above guaranteed issue without EOI" }
+  - { id: ERR_EMPLOYEE_NOT_ELIGIBLE, http: 409, condition: "owning Employee.eligibility_status != ELIGIBLE on activate / life-event approve" }
+  - { id: ERR_LIFE_EVENT_WINDOW_EXPIRED, http: 409, condition: "LifeEvent.event_date more than 30 days before the clock date at approval" }
+  - { id: ERR_WAITING_PERIOD_OVERLAP, http: 409, condition: "new waiting-period window overlaps an existing one (half-open [start,end))" }
+  - { id: ERR_COVERAGE_OVERLAP, http: 409, condition: "activating an enrollment whose closed coverage interval overlaps an existing ACTIVE enrollment of the same benefit_type" }
+  - { id: ERR_DEPENDENT_NOT_VERIFIED, http: 409, condition: "adding a non-VERIFIED dependent to an enrollment" }
+  - { id: ERR_STALE_EMPLOYEE_VERSION, http: 412, condition: "expected_employee_version does not match the current Employee.version (OCC)" }
+  - { id: ERR_PLAN_ARCHIVED, http: 409, condition: "creating an enrollment against a tier of an ARCHIVED PlanOffering" }
+  - { id: ERR_FORM_ALREADY_FILED, http: 409, condition: "attempt to mutate a FILED Form1095C" }
+  - { id: ERR_VALIDATION_PAGINATION, http: 422, condition: "limit outside [1,100] or negative offset" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: BenefitsAdmin
+    description: "Configures the plan/tier catalog, manages employees, dependents, enrollments, and submits/approves life events (subject to segregation of duties)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /employees, POST /employees/{id}/terminate"
+      - "POST /employees/{id}/waiting-periods"
+      - "POST /plan-offerings, POST /plan-tiers"
+      - "POST /employees/{id}/dependents, POST /dependents/{id}/resubmit"
+      - "POST /employees/{id}/enrollments, POST /enrollments/{id}/activate, POST /enrollments/{id}/submit-eoi, POST /enrollments/{id}/cancel, POST /enrollments/{id}/add-dependent, POST /enrollments/{id}/remove-dependent"
+      - "POST /employees/{id}/life-events, POST /life-events/{id}/approve, POST /life-events/{id}/reject"
+      - "POST /_clock/advance"
+    shared_operations:
+      - "GET endpoints across employees, plans, dependents, enrollments, eoi-requests, life-events, deduction-lines, carrier-feed-records, form-1095c"
+
+  - name: DependentVerifier
+    description: "Owns dependent verification; cannot verify a dependent of an employee whose id matches the verifier's own X-User-ID (segregation)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /dependents/{id}/request-info, POST /dependents/{id}/verify, POST /dependents/{id}/reject"
+    shared_operations:
+      - "GET employees, dependents, enrollments"
+
+  - name: PayrollOfficer
+    description: "Owns payroll deduction sync and the retro adjustment ledger view"
+    identity: opaque
+    exclusive_operations:
+      - "POST /_payroll/run"
+    shared_operations:
+      - "GET employees, deduction-lines, carrier-feed-records, enrollments, life-events"
+
+  - name: ComplianceOfficer
+    description: "Owns evidence-of-insurability decisions and ACA 1095-C generation/filing"
+    identity: opaque
+    exclusive_operations:
+      - "POST /eoi-requests/{id}/decide"
+      - "POST /employees/{id}/form-1095c, POST /form-1095c/{id}/file"
+    shared_operations:
+      - "GET eoi-requests, form-1095c, employees, enrollments, dependents, carrier-feed-records"

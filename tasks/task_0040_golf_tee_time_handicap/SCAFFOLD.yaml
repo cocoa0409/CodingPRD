@@ -1,0 +1,950 @@
+scenario: "Golf Tee Time & Handicap (GHIN): course Rating/Slope, score Posting, Handicap Index monthly refresh, off-peak/peak pricing, member discount, Twosome/Foursome grouping, Standby waitlist"
+domain_name: golf-tee-time-handicap
+api_prefix: /golf
+
+# Global temporal constants referenced by §1.3/§1.4.
+system_constants:
+  SLOT_MINUTES: 12            # a TeeTime occupies [start_utc, start_utc + 12min); a golfer's two CONFIRMED slots may not overlap (half-open)
+  TEE_INTERVAL_MINUTES: 8     # minimum spacing between two TeeTimes on the SAME course (symmetric buffer/gap; exactly 8 apart is allowed)
+
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - dual_variant_calculation        # provisional running Handicap Index vs monthly-refreshed official index
+    - ops_run_checkpoint              # monthly Handicap Index refresh advances a revision epoch; waitlist promotion
+    - rate_threshold_triggers         # peak/off-peak time-of-day breakpoints; Exceptional-Score reduction thresholds
+    - optimistic_concurrency          # OCC on TeeTime.version for booking-create supersede race
+    - cascading_side_effects          # cancel booking -> slot freed -> standby promotion -> price recompute
+
+  entity_topology: flat
+  state_machine_shape: branching
+  relationship_patterns:
+    - one_to_many        # Course -> TeeTime; Golfer -> Score; TeeTime -> Booking
+    - cross_aggregate    # Booking references both TeeTime and Golfer across aggregate boundaries
+  role_model: peer_roles
+  consistency_model: immediate
+
+# =====================================================================
+# §1.0 Response Envelope (FIXED — emitted verbatim)
+# =====================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 Entity-Relationship Table
+# =====================================================================
+entities:
+  - name: Course
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation including cascades."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, increments by 1 on every mutation; OCC token."
+      - name: name
+        type: string
+        source: input
+        description: "Course display name."
+      - name: course_rating
+        type: number
+        source: input
+        description: "USGA Course Rating (strokes a scratch golfer is expected to shoot). e.g. 72.4. Range 55.0–85.0."
+        constraints: ">= 55.0 and <= 85.0"
+      - name: slope_rating
+        type: integer
+        source: input
+        description: "USGA Slope Rating, integer 55–155. Used as the per-round score-differential normalizer."
+        constraints: ">= 55 and <= 155"
+      - name: peak_fee_cents
+        type: integer
+        source: input
+        description: "Base green fee in cents for a PEAK tee time (before member discount)."
+        constraints: ">= 0"
+      - name: offpeak_fee_cents
+        type: integer
+        source: input
+        description: "Base green fee in cents for an OFF_PEAK tee time (before member discount)."
+        constraints: ">= 0"
+      - name: peak_start_hour
+        type: integer
+        source: input
+        description: "Local hour (0–23, inclusive) at which PEAK pricing begins."
+        default: 7
+        constraints: ">= 0 and <= 23"
+      - name: peak_end_hour
+        type: integer
+        source: input
+        description: "Local hour (0–23, EXCLUSIVE) at which PEAK pricing ends; tee times with hour h are PEAK iff peak_start_hour <= h < peak_end_hour."
+        default: 15
+        constraints: ">= 0 and <= 23 and > peak_start_hour"
+      - name: member_discount_pct
+        type: number
+        source: input
+        description: "Fractional discount (0.0–1.0) applied to the base green fee for golfers whose membership_tier == MEMBER."
+        default: 0.20
+        constraints: ">= 0.0 and <= 1.0"
+
+  - name: Golfer
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, increments by 1 on every mutation; OCC token."
+      - name: full_name
+        type: string
+        source: input
+        description: "Golfer display name."
+      - name: membership_tier
+        type: enum
+        source: input
+        description: "MEMBER receives member_discount_pct off green fees and standby priority; PUBLIC pays full fare."
+        default: PUBLIC
+        constraints: "one of {MEMBER, PUBLIC}"
+      - name: handicap_index
+        type: number
+        source: computed
+        description: "Official Handicap Index as of the most recent monthly refresh (handicap_revision). NULL until first refresh; computed by official_handicap_index calc. One decimal."
+        default: null
+      - name: provisional_handicap_index
+        type: number
+        source: computed
+        description: "Live running Handicap Index recomputed on every score POST by provisional_handicap_index calc; diverges from handicap_index between refreshes. One decimal."
+        default: null
+      - name: handicap_revision
+        type: integer
+        source: computed
+        description: "Epoch counter of the last monthly refresh that wrote handicap_index for this golfer; 0 before first refresh."
+        default: 0
+      - name: low_handicap_index
+        type: number
+        source: computed
+        description: "Lowest handicap_index observed across the trailing 365 days as of the last refresh; anchor for the Exceptional-Score and soft/hard cap rules. NULL until first refresh."
+        default: null
+
+  - name: Score
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits; also the chronological-replay key for handicap calcs."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, increments by 1 on every mutation."
+      - name: golfer_id
+        type: string
+        source: input
+        description: "FK -> Golfer.id; the golfer who posted this score."
+      - name: course_id
+        type: string
+        source: input
+        description: "FK -> Course.id; the course on which the round was played (supplies rating/slope)."
+      - name: played_on
+        type: string
+        source: input
+        description: "Date the round was played, YYYY-MM-DD. Differentials are ordered by played_on then created_at."
+      - name: adjusted_gross_score
+        type: integer
+        source: input
+        description: "Adjusted Gross Score (strokes) for the 18-hole round."
+        constraints: ">= 50 and <= 150"
+      - name: score_differential
+        type: number
+        source: computed
+        description: "Computed by score_differential calc = (113 / Course.slope_rating) * (adjusted_gross_score - Course.course_rating), rounded to one decimal. Immutable once written."
+      - name: status
+        type: enum
+        source: computed
+        description: "POSTED on creation; VOID after revision (excluded from all handicap calcs)."
+        default: POSTED
+        constraints: "one of {POSTED, VOID}"
+      - name: counted_in_revision
+        type: integer
+        source: computed
+        description: "handicap_revision epoch in which this score last contributed to an official handicap_index; 0 if never counted."
+        default: 0
+
+  - name: TeeTime
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation including cascaded standby promotion."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, increments by 1 on every mutation; OCC token guarding booking creation."
+      - name: course_id
+        type: string
+        source: input
+        description: "FK -> Course.id; the course offering this slot."
+      - name: start_utc
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC start instant of the slot; minute granularity."
+      - name: local_hour
+        type: integer
+        source: input
+        description: "Local hour (0–23) of the slot; pricing tier is decided from this against the course peak window."
+        constraints: ">= 0 and <= 23"
+      - name: group_type
+        type: enum
+        source: input
+        description: "TWOSOME caps confirmed players at 2; FOURSOME caps at 4."
+        constraints: "one of {TWOSOME, FOURSOME}"
+      - name: capacity
+        type: integer
+        source: computed
+        description: "Derived from group_type: TWOSOME=2, FOURSOME=4. Maximum confirmed players."
+      - name: confirmed_count
+        type: integer
+        source: computed
+        description: "Count of Bookings on this slot with status==CONFIRMED. Recomputed on every booking create/cancel and standby promotion."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "OPEN when confirmed_count < capacity; FULL when confirmed_count == capacity; CLOSED after cancellation lockout."
+        default: OPEN
+        constraints: "one of {OPEN, FULL, CLOSED}"
+
+  - name: Booking
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits; also the standby-queue ordering key after membership priority."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation including cascaded promotion."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, increments by 1 on every mutation."
+      - name: tee_time_id
+        type: string
+        source: input
+        description: "FK -> TeeTime.id; the slot booked."
+      - name: golfer_id
+        type: string
+        source: input
+        description: "FK -> Golfer.id; the golfer holding the booking."
+      - name: status
+        type: enum
+        source: computed
+        description: "CONFIRMED when occupying a capacity seat; STANDBY when queued on a full slot; CANCELLED terminal; PROMOTED is the transient marker set on a standby that becomes CONFIRMED (then status reads CONFIRMED)."
+        default: CONFIRMED
+        constraints: "one of {CONFIRMED, STANDBY, CANCELLED}"
+      - name: pricing_tier
+        type: enum
+        source: computed
+        description: "PEAK or OFF_PEAK, frozen at confirmation time from the slot's local_hour against the course peak window."
+        constraints: "one of {PEAK, OFF_PEAK}"
+      - name: green_fee_cents
+        type: integer
+        source: computed
+        description: "Final fee in cents charged to this booking, computed by booking_green_fee calc at the moment status becomes CONFIRMED (on create or on standby promotion); 0 while STANDBY."
+        default: 0
+      - name: standby_rank
+        type: integer
+        source: computed
+        description: "1-based position in the slot's standby queue while STANDBY; 0 once CONFIRMED or CANCELLED. Ordered by membership priority then created_at."
+        default: 0
+
+  - name: HandicapRevision
+    parent: null
+    common_fields: false
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: revision_number
+        type: integer
+        source: computed
+        description: "Monotonic epoch number; the Nth refresh has revision_number N. Global counter shared by all golfers."
+      - name: effective_utc
+        type: datetime
+        source: input
+        description: "The as-of instant the refresh used to bound the trailing-365-day low-index window and which scores are eligible (played_on on or before this date)."
+      - name: golfer_count
+        type: integer
+        source: computed
+        description: "Number of Golfers whose handicap_index was (re)written by this refresh."
+        default: 0
+
+# =====================================================================
+# §1.2 State Machine Table
+# =====================================================================
+state_machines:
+  - entity: TeeTime
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: FULL
+        trigger: "POST /golf/tee-times/{id}/bookings (booking that fills the last seat)"
+        actor: system
+        preconditions:
+          - "after the new CONFIRMED booking, confirmed_count == capacity"
+        side_effects:
+          - "set status=FULL"
+          - "increments TeeTime.version by 1"
+      - from: FULL
+        to: OPEN
+        trigger: "POST /golf/bookings/{id}/cancel for a CONFIRMED booking on this slot, when no STANDBY booking exists to promote"
+        actor: Golfer
+        preconditions:
+          - "the cancelled booking was CONFIRMED"
+          - "no STANDBY booking exists on this slot"
+        side_effects:
+          - "decrement confirmed_count"
+          - "set status=OPEN"
+          - "increments TeeTime.version by 1"
+        note: "When a STANDBY exists, the slot is refilled by promotion and stays FULL (see Booking STANDBY->CONFIRMED); only the no-standby path reopens the slot."
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /golf/tee-times/{id}/close"
+        actor: ProShop
+        preconditions:
+          - "status == OPEN"
+        side_effects:
+          - "set status=CLOSED"
+          - "increments TeeTime.version by 1"
+        note: "CLOSED rejects all further booking creation; existing CONFIRMED bookings are unaffected."
+
+  - entity: Booking
+    initial_state: CONFIRMED
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /golf/bookings/{id}/cancel"
+        actor: Golfer
+        preconditions:
+          - "booking.status == CONFIRMED"
+          - "acting Golfer owns the booking (X-User-ID == booking.golfer_id) OR actor is ProShop"
+        side_effects:
+          - "set status=CANCELLED, green_fee_cents=0"
+          - "decrement TeeTime.confirmed_count by 1"
+          - "CASCADE depth-3: if the slot has >=1 STANDBY booking, promote the highest-priority STANDBY (standby_priority selector) to CONFIRMED — that promotion itself sets the promoted booking's green_fee_cents via booking_green_fee, refreshes confirmed_count back up, and re-ranks the remaining STANDBY queue (standby_rank recompute on each remaining standby)"
+          - "if no STANDBY exists, TeeTime FULL->OPEN per TeeTime machine"
+          - "increments TeeTime.version by 1"
+        note: "Cancel is the depth-3 cascade trigger: Booking.cancel -> TeeTime.confirmed_count/promotion -> promoted Booking.green_fee_cents + remaining standby re-rank."
+      - from: STANDBY
+        to: CONFIRMED
+        trigger: "system event: a CONFIRMED booking on the same slot is cancelled and this booking is the highest-priority STANDBY"
+        actor: system
+        preconditions:
+          - "a seat freed on the slot (confirmed_count < capacity after the cancel)"
+          - "this booking is selected by the standby_priority selector among slot STANDBY bookings"
+        side_effects:
+          - "set status=CONFIRMED, standby_rank=0"
+          - "compute green_fee_cents via booking_green_fee (using pricing_tier frozen at original standby creation)"
+          - "increment TeeTime.confirmed_count by 1 (slot remains FULL)"
+        note: "Cross-entity guarded: Booking STANDBY->CONFIRMED fires only because the sibling TeeTime freed a seat."
+      - from: STANDBY
+        to: CANCELLED
+        trigger: "POST /golf/bookings/{id}/cancel"
+        actor: Golfer
+        preconditions:
+          - "booking.status == STANDBY"
+          - "acting Golfer owns the booking OR actor is ProShop"
+        side_effects:
+          - "set status=CANCELLED"
+          - "re-rank remaining STANDBY bookings on the slot (standby_rank recompute)"
+        note: "Cancelling a standby does not free a confirmed seat, so no promotion fires; only the queue re-ranks."
+
+  - entity: Score
+    initial_state: POSTED
+    terminal_states: [VOID]
+    transitions:
+      - from: POSTED
+        to: VOID
+        trigger: "POST /golf/scores/{id}/void"
+        actor: ProShop
+        preconditions:
+          - "score.status == POSTED"
+        side_effects:
+          - "set status=VOID"
+          - "recompute the golfer's provisional_handicap_index via provisional_handicap_index (VOID scores excluded)"
+        note: "Void removes a score from all subsequent handicap calculations; the next monthly refresh also excludes it."
+
+# =====================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version only)
+# =====================================================================
+concurrency_rules:
+  - rule_id: booking-create-stale-teetime
+    parent_entity: TeeTime
+    write_endpoint: "POST /golf/tee-times/{id}/bookings"
+    occ_field: "expected_tee_time_version"
+    description: |
+      Creating a Booking against a TeeTime whose version has advanced since the
+      client last observed it is rejected. This captures the case where another
+      writer has already created a booking that took the last seat (advancing the
+      slot to FULL and bumping its version); the current writer's view that the
+      slot still had an open CONFIRMED seat is therefore stale, and accepting it
+      would over-subscribe the slot. The loser carries an expected_tee_time_version
+      that no longer matches the slot's current version.
+    error_id: ERR_STALE_TEE_TIME_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 Calculation Rules Table
+# =====================================================================
+calculations:
+  - name: score_differential
+    trigger: "POST /golf/scores (on Score creation)"
+    algorithm: weighted_scoring
+    formula: |
+      score_differential = round_half_up(
+        (113 / Course.slope_rating) * (adjusted_gross_score - Course.course_rating),
+        1)
+    input_set: "the single Score being created, joined to its Course (rating/slope)"
+    constants:
+      STANDARD_SLOPE: 113
+    precision: "1 decimal place, round_half_up"
+    note: "Frozen on the Score at creation; never recomputed even if the Course later changes rating/slope."
+
+  - name: provisional_handicap_index
+    trigger: "POST /golf/scores side-effect, and POST /golf/scores/{id}/void side-effect (live running index)"
+    algorithm: chronological
+    formula: |
+      # Live index over the golfer's POSTED scores (VOID excluded), no refresh epoch needed.
+      eligible = [s for s in golfer.scores if s.status == POSTED]
+      n = len(eligible)
+      if n < 3: provisional_handicap_index = null   # insufficient data
+      else:
+        diffs = sorted([s.score_differential for s in eligible])   # ascending
+        k = COUNT_TABLE[min(n, 20)]   # how many lowest differentials to average
+        adj = ADJUSTMENT_TABLE[min(n, 20)]   # extra stroke adjustment (added, negative)
+        best = diffs[:k]               # k lowest differentials
+        provisional_handicap_index = round_half_up(mean(best) + adj, 1)
+      # When n > 20, only the most recent 20 by (played_on DESC, created_at DESC) are eligible
+      # BEFORE taking the lowest k; pin: trim to recent-20 first, THEN sort ascending and take k.
+    input_set: "golfer's Scores with status==POSTED; when count>20 trim to most recent 20 by (played_on DESC, created_at DESC) first"
+    constants:
+      COUNT_TABLE: "{3:1,4:1,5:1,6:2,7:2,8:2,9:3,10:3,11:3,12:4,13:4,14:4,15:5,16:5,17:6,18:6,19:7,20:8}"
+      ADJUSTMENT_TABLE: "{3:-2.0,4:-1.0,5:0.0,6:-1.0,7:0.0,8:0.0,9:0.0,10:0.0,11:0.0,12:0.0,13:0.0,14:0.0,15:0.0,16:0.0,17:0.0,18:0.0,19:0.0,20:0.0}"
+    precision: "1 decimal place, round_half_up"
+    variants:
+      - name: insufficient_data
+        when: "fewer than 3 POSTED scores"
+        difference: "result is NULL, not a number"
+    note: "Order matters: trim-to-recent-20 (by date) THEN take the lowest-k. Doing lowest-k over all scores first would pick old low rounds the recency window excludes — the scaffold pins trim-first."
+
+  - name: official_handicap_index
+    trigger: "POST /golf/handicap-revisions (monthly refresh; system event over all golfers)"
+    algorithm: weighted_scoring
+    formula: |
+      # Same lowest-k-of-recent-20 base as provisional, but with two extra epoch-anchored caps
+      # that the live provisional index does NOT apply — this is the dual variant.
+      eligible = [s for s in golfer.scores
+                  if s.status == POSTED and s.played_on <= revision.effective_utc.date()]
+      # (note: provisional uses ALL posted scores regardless of played_on vs an as-of date)
+      base = same lowest-k-of-recent-20 mean+adjustment as provisional_handicap_index over `eligible`
+      if base is null: official = null
+      else:
+        # Soft cap: increases beyond low_handicap_index+3.0 are damped to half the excess.
+        low = golfer.low_handicap_index   # NULL on first-ever refresh -> treat as base (no cap)
+        if low is not null and base > low + SOFT_CAP_THRESHOLD:
+          capped = low + SOFT_CAP_THRESHOLD + (base - (low + SOFT_CAP_THRESHOLD)) * SOFT_CAP_FACTOR
+        else:
+          capped = base
+        # Hard cap: never more than 5.0 above low_handicap_index.
+        if low is not null:
+          capped = min(capped, low + HARD_CAP_CEILING)
+        official = round_half_up(capped, 1)
+    input_set: "golfer's Scores with status==POSTED AND played_on <= revision.effective_utc date; trim to recent 20 by (played_on DESC, created_at DESC), then lowest-k"
+    constants:
+      STANDARD_SLOPE: 113
+      SOFT_CAP_THRESHOLD: 3.0
+      SOFT_CAP_FACTOR: 0.5
+      HARD_CAP_CEILING: 5.0
+    precision: "1 decimal place, round_half_up"
+    variants:
+      - name: first_refresh_no_anchor
+        when: "golfer.low_handicap_index is NULL (no prior refresh)"
+        difference: "soft/hard caps are skipped entirely; official == base; this refresh also seeds low_handicap_index = official"
+      - name: capped_increase
+        when: "base exceeds low_handicap_index + 3.0"
+        difference: "excess above the +3.0 threshold is halved (soft cap), then clamped to +5.0 (hard cap)"
+    note: "DUAL VARIANT vs provisional_handicap_index: same subject (a golfer's index) computed two ways — provisional is an uncapped live running figure over ALL posted scores; official is the capped, as-of-date-bounded epoch figure. Identical score sets yield different numbers whenever the soft/hard cap binds OR a recent score's played_on is after the revision's effective date."
+
+  - name: booking_green_fee
+    trigger: "POST /golf/tee-times/{id}/bookings (on CONFIRMED create) and Booking STANDBY->CONFIRMED promotion side-effect"
+    algorithm: tiered_pricing
+    formula: |
+      base = Course.peak_fee_cents if booking.pricing_tier == PEAK else Course.offpeak_fee_cents
+      # pricing_tier itself: PEAK iff Course.peak_start_hour <= TeeTime.local_hour < Course.peak_end_hour, else OFF_PEAK
+      if Golfer.membership_tier == MEMBER:
+        discount = round_half_up(base * Course.member_discount_pct, 0)   # round the discount to whole cents FIRST
+        green_fee_cents = base - discount                                # then subtract -> pin order
+      else:
+        green_fee_cents = base
+    input_set: "the Booking being confirmed, joined to its TeeTime, the TeeTime's Course, and the booking's Golfer"
+    constants: {}
+    precision: "integer cents; member discount rounded to whole cents (round_half_up) BEFORE subtraction"
+    variants:
+      - name: member_discounted
+        when: "Golfer.membership_tier == MEMBER"
+        difference: "subtract round_half_up(base*member_discount_pct) from base"
+      - name: public_full_fare
+        when: "Golfer.membership_tier == PUBLIC"
+        difference: "no discount; green_fee_cents == base"
+    note: "Rounding order pinned: round the discount to whole cents, THEN subtract. Computing base*(1-pct) and rounding the product can differ by a cent (mode (b) of Rule 2)."
+
+  - name: standby_priority
+    trigger: "Booking STANDBY->CONFIRMED promotion selection (on CONFIRMED cancel that frees a seat)"
+    algorithm: chronological
+    formula: |
+      # Selector: among slot bookings with status==STANDBY, choose ONE to promote.
+      candidates = [b for b in teetime.bookings if b.status == STANDBY]
+      if not candidates: no promotion (slot reopens)
+      # Eligibility: STANDBY only. Ranking: MEMBER before PUBLIC, then earliest created_at.
+      winner = min(candidates, key=lambda b: (0 if golfer(b).membership_tier==MEMBER else 1, b.created_at))
+    input_set: "slot's Bookings with status==STANDBY; joined to each holder's Golfer.membership_tier"
+    constants: {}
+    precision: "n/a (selection)"
+    note: "Eligibility filter: status==STANDBY. Ranking: membership_tier priority (MEMBER=0 before PUBLIC=1), then created_at ASC. Tie-break: created_at ASC (never id). Empty pool fallback: no promotion, TeeTime FULL->OPEN."
+
+# =====================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =====================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except endpoints whose roles include Anonymous"
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: existence
+    check: "path/body-referenced resources exist (Course, Golfer, TeeTime, Booking, Score), validated left-to-right in path then body FK order"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+  - priority: 4
+    category: business_referential
+    check: "ownership: a Golfer acting on a Booking (cancel) must own it (X-User-ID == booking.golfer_id); ProShop bypasses ownership"
+    error_id: ERR_NOT_BOOKING_OWNER
+    http_status: 403
+    applies_to: "POST /golf/bookings/{id}/cancel"
+  - priority: 5
+    category: state
+    check: "target resource is in a state that admits the operation (TeeTime not CLOSED for booking; Booking CONFIRMED/STANDBY for cancel; Score POSTED for void)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "cancel, void, close, booking-create"
+  - priority: 6
+    category: state
+    check: "TeeTime is CLOSED — booking creation rejected (more specific than generic invalid-state)"
+    error_id: ERR_TEE_TIME_CLOSED
+    http_status: 409
+    applies_to: "POST /golf/tee-times/{id}/bookings"
+  - priority: 7
+    category: business_constraint
+    check: "a Golfer may hold at most one non-CANCELLED Booking (CONFIRMED or STANDBY) per TeeTime"
+    error_id: ERR_DUPLICATE_BOOKING
+    http_status: 409
+    applies_to: "POST /golf/tee-times/{id}/bookings"
+  - priority: 8
+    category: business_temporal
+    check: "a Golfer may not hold CONFIRMED bookings on two TeeTimes whose [start_utc, start_utc+SLOT_MINUTES) intervals overlap (half-open; back-to-back adjacency at the boundary is allowed)"
+    error_id: ERR_GOLFER_TIME_CONFLICT
+    http_status: 409
+    applies_to: "POST /golf/tee-times/{id}/bookings"
+  - priority: 9
+    category: business_temporal
+    check: "the requested Course-level booking window must be open: TeeTime.start_utc must be strictly after the current clock (no booking a slot whose start instant has passed); start_utc at exactly the current instant is rejected"
+    error_id: ERR_SLOT_START_PASSED
+    http_status: 409
+    applies_to: "POST /golf/tee-times/{id}/bookings"
+  - priority: 14
+    category: business_temporal
+    check: "tee-sheet spacing on a Course: a new TeeTime's start_utc must be at least TEE_INTERVAL_MINUTES apart from every existing non-CLOSED TeeTime on the same course; i.e. reject when abs(new.start_utc - existing.start_utc) < TEE_INTERVAL_MINUTES. This is a symmetric BUFFER/gap test (not a half-open occupancy overlap): exactly TEE_INTERVAL_MINUTES apart is allowed; anything strictly closer collides."
+    error_id: ERR_TEE_INTERVAL_CONFLICT
+    http_status: 409
+    applies_to: "POST /golf/tee-times"
+  - priority: 10
+    category: business_constraint
+    check: "OCC: expected_tee_time_version must equal TeeTime.version (stale supersede guard, see §1.2.1)"
+    error_id: ERR_STALE_TEE_TIME_VERSION
+    http_status: 412
+    applies_to: "POST /golf/tee-times/{id}/bookings"
+  - priority: 11
+    category: business_constraint
+    check: "capacity: when the slot is FULL (confirmed_count == capacity) the request must opt into standby (join_standby == true); otherwise reject. Empty-pool boundary partner to the standby-promotion fallback."
+    error_id: ERR_SLOT_FULL_NO_STANDBY
+    http_status: 409
+    applies_to: "POST /golf/tee-times/{id}/bookings"
+  - priority: 12
+    category: business_fiscal
+    check: "monthly refresh: revision.effective_utc must be strictly after the previous revision's effective_utc (monotonic epochs)"
+    error_id: ERR_REVISION_NOT_MONOTONIC
+    http_status: 409
+    applies_to: "POST /golf/handicap-revisions"
+  - priority: 13
+    category: business_constraint
+    check: "field-level: enum membership, numeric ranges (course_rating 55–85, slope 55–155, AGS 50–150), peak_end_hour > peak_start_hour, group_type valid, required fields present"
+    error_id: ERR_VALIDATION
+    http_status: 422
+    applies_to: all
+
+# =====================================================================
+# §1.5 API Endpoint Table
+# =====================================================================
+endpoints:
+  - method: POST
+    path: "/golf/courses"
+    description: "Create a course with rating/slope, fees, peak window, member discount."
+    roles: [ProShop]
+    code: 201
+    input: [name, course_rating, slope_rating, peak_fee_cents, offpeak_fee_cents, "peak_start_hour?", "peak_end_hour?", "member_discount_pct?"]
+    output: Course
+    side_effects: []
+  - method: GET
+    path: "/golf/courses/{id}"
+    description: "Fetch a course."
+    roles: [ProShop, Golfer, Anonymous]
+    code: 200
+    input: []
+    output: Course
+    side_effects: []
+  - method: GET
+    path: "/golf/courses"
+    description: "List courses (paginated)."
+    roles: [ProShop, Golfer, Anonymous]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Course[]
+    side_effects: []
+  - method: POST
+    path: "/golf/golfers"
+    description: "Register a golfer (MEMBER or PUBLIC)."
+    roles: [ProShop, Anonymous]
+    code: 201
+    input: [full_name, "membership_tier?"]
+    output: Golfer
+    side_effects: []
+  - method: GET
+    path: "/golf/golfers/{id}"
+    description: "Fetch a golfer including handicap fields."
+    roles: [ProShop, Golfer, Anonymous]
+    code: 200
+    input: []
+    output: Golfer
+    side_effects: []
+  - method: GET
+    path: "/golf/golfers"
+    description: "List golfers (paginated)."
+    roles: [ProShop, Golfer, Anonymous]
+    code: 200
+    input: ["membership_tier?", "limit?", "offset?"]
+    output: Golfer[]
+    side_effects: []
+  - method: POST
+    path: "/golf/scores"
+    description: "Post a score; freezes score_differential and recomputes the golfer's provisional_handicap_index."
+    roles: [ProShop, Golfer]
+    code: 201
+    input: [golfer_id, course_id, played_on, adjusted_gross_score]
+    output: Score
+    side_effects:
+      - "compute and freeze score_differential (score_differential calc)"
+      - "recompute Golfer.provisional_handicap_index (provisional_handicap_index calc)"
+      - "increment Golfer.version by 1"
+  - method: GET
+    path: "/golf/scores/{id}"
+    description: "Fetch a score."
+    roles: [ProShop, Golfer, Anonymous]
+    code: 200
+    input: []
+    output: Score
+    side_effects: []
+  - method: GET
+    path: "/golf/scores"
+    description: "List scores, filterable by golfer_id (reverse-reachability for Score.golfer_id) or course_id (Score.course_id)."
+    roles: [ProShop, Golfer, Anonymous]
+    code: 200
+    input: ["golfer_id?", "course_id?", "limit?", "offset?"]
+    output: Score[]
+    side_effects: []
+  - method: POST
+    path: "/golf/scores/{id}/void"
+    description: "Void a posted score; excludes it from future handicap calcs and recomputes provisional index."
+    roles: [ProShop]
+    code: 200
+    input: []
+    output: Score
+    side_effects:
+      - "set Score.status=VOID"
+      - "recompute Golfer.provisional_handicap_index"
+      - "increment Golfer.version by 1"
+  - method: POST
+    path: "/golf/tee-times"
+    description: "Create a bookable tee-time slot on a course."
+    roles: [ProShop]
+    code: 201
+    input: [course_id, start_utc, local_hour, group_type]
+    output: TeeTime
+    side_effects:
+      - "set capacity from group_type, confirmed_count=0, status=OPEN"
+  - method: GET
+    path: "/golf/tee-times/{id}"
+    description: "Fetch a tee time."
+    roles: [ProShop, Golfer, Anonymous]
+    code: 200
+    input: []
+    output: TeeTime
+    side_effects: []
+  - method: GET
+    path: "/golf/tee-times"
+    description: "List tee times, filterable by course_id (reverse-reachability for TeeTime.course_id)."
+    roles: [ProShop, Golfer, Anonymous]
+    code: 200
+    input: ["course_id?", "status?", "limit?", "offset?"]
+    output: TeeTime[]
+    side_effects: []
+  - method: POST
+    path: "/golf/tee-times/{id}/close"
+    description: "Close a tee time to new bookings."
+    roles: [ProShop]
+    code: 200
+    input: []
+    output: TeeTime
+    side_effects:
+      - "set status=CLOSED"
+      - "increments TeeTime.version by 1"
+  - method: POST
+    path: "/golf/tee-times/{id}/bookings"
+    description: "Book a slot. If a CONFIRMED seat is available creates CONFIRMED + computes green_fee; if FULL creates a STANDBY queued by priority. OCC-guarded by expected_tee_time_version."
+    roles: [ProShop, Golfer]
+    code: 201
+    input: [golfer_id, expected_tee_time_version, "join_standby?"]
+    output: Booking
+    side_effects:
+      - "freeze pricing_tier from local_hour vs course peak window"
+      - "if seat available: status=CONFIRMED, compute green_fee_cents (booking_green_fee), increment TeeTime.confirmed_count"
+      - "if slot FULL and join_standby true: status=STANDBY, assign standby_rank (standby_priority ordering)"
+      - "if last seat taken: TeeTime OPEN->FULL"
+      - "increments TeeTime.version by 1"
+  - method: GET
+    path: "/golf/tee-times/{id}/bookings"
+    description: "List bookings on a slot (reverse-reachability for Booking.tee_time_id)."
+    roles: [ProShop, Golfer, Anonymous]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Booking[]
+    side_effects: []
+  - method: GET
+    path: "/golf/bookings/{id}"
+    description: "Fetch a booking."
+    roles: [ProShop, Golfer, Anonymous]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: []
+  - method: GET
+    path: "/golf/bookings"
+    description: "List bookings, filterable by golfer_id (reverse-reachability for Booking.golfer_id)."
+    roles: [ProShop, Golfer, Anonymous]
+    code: 200
+    input: ["golfer_id?", "status?", "limit?", "offset?"]
+    output: Booking[]
+    side_effects: []
+  - method: POST
+    path: "/golf/bookings/{id}/cancel"
+    description: "Cancel a CONFIRMED or STANDBY booking. CONFIRMED cancel frees a seat and may promote the top STANDBY (depth-3 cascade)."
+    roles: [ProShop, Golfer]
+    code: 200
+    input: []
+    output: Booking
+    side_effects:
+      - "set status=CANCELLED, green_fee_cents=0"
+      - "if was CONFIRMED: decrement TeeTime.confirmed_count; promote top STANDBY via standby_priority (sets its green_fee_cents, re-ranks remaining) OR reopen slot"
+      - "if was STANDBY: re-rank remaining STANDBY queue"
+      - "increments TeeTime.version by 1"
+  - method: POST
+    path: "/golf/handicap-revisions"
+    description: "Run a monthly Handicap Index refresh: recompute every golfer's official handicap_index (with soft/hard caps), advance handicap_revision, update low_handicap_index."
+    roles: [ProShop]
+    code: 201
+    input: [effective_utc]
+    output: HandicapRevision
+    side_effects:
+      - "for each Golfer with >=3 eligible POSTED scores: compute official_handicap_index, set handicap_index, set handicap_revision=revision_number, mark counted_in_revision on contributing scores"
+      - "update each affected Golfer.low_handicap_index (min over trailing 365 days incl. this index; seed to official on first refresh)"
+      - "increment affected Golfer.version by 1"
+  - method: GET
+    path: "/golf/handicap-revisions"
+    description: "List handicap revisions (paginated)."
+    roles: [ProShop, Golfer, Anonymous]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: HandicapRevision[]
+    side_effects: []
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving: set the server's current UTC clock (for slot-start-passed checks and refresh windows)."
+    roles: [ProShop]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["sets the system clock used by ERR_SLOT_START_PASSED and refresh windows"]
+
+# =====================================================================
+# §1.6 Error Code Catalog
+# =====================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID on a non-anonymous endpoint."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for this operation."
+  - id: ERR_NOT_BOOKING_OWNER
+    http: 403
+    condition: "A Golfer attempts to cancel a Booking they do not own (and is not ProShop)."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced Course/Golfer/TeeTime/Booking/Score does not exist."
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "Required field missing, bad enum, or numeric/range/order constraint violated."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Operation not allowed from the resource's current state (e.g. cancel an already-CANCELLED booking, void a VOID score)."
+  - id: ERR_TEE_TIME_CLOSED
+    http: 409
+    condition: "Booking creation attempted on a CLOSED tee time."
+  - id: ERR_DUPLICATE_BOOKING
+    http: 409
+    condition: "Golfer already holds a non-CANCELLED booking on this tee time."
+  - id: ERR_GOLFER_TIME_CONFLICT
+    http: 409
+    condition: "Golfer holds a CONFIRMED booking on another slot whose time interval overlaps this slot."
+  - id: ERR_SLOT_START_PASSED
+    http: 409
+    condition: "TeeTime.start_utc is at or before the current clock; cannot book a started/past slot."
+  - id: ERR_SLOT_FULL_NO_STANDBY
+    http: 409
+    condition: "Slot is FULL and the request did not opt into the standby waitlist (join_standby not true)."
+  - id: ERR_STALE_TEE_TIME_VERSION
+    http: 412
+    condition: "expected_tee_time_version does not match TeeTime.version (OCC supersede guard)."
+  - id: ERR_REVISION_NOT_MONOTONIC
+    http: 409
+    condition: "Handicap revision effective_utc is not strictly after the previous revision's effective_utc."
+  - id: ERR_TEE_INTERVAL_CONFLICT
+    http: 409
+    condition: "A new TeeTime's start_utc is strictly closer than TEE_INTERVAL_MINUTES to an existing non-CLOSED TeeTime on the same course."
+
+# =====================================================================
+# §1.7 RBAC Matrix
+# =====================================================================
+roles:
+  - name: ProShop
+    description: "Course operator/staff: manages courses, tee times, scores, voids, closures, and runs monthly handicap revisions; may cancel any booking."
+    identity: opaque
+    exclusive_operations:
+      - "POST /golf/courses"
+      - "POST /golf/tee-times"
+      - "POST /golf/tee-times/{id}/close"
+      - "POST /golf/scores/{id}/void"
+      - "POST /golf/handicap-revisions"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /golf/golfers"
+      - "POST /golf/scores"
+      - "POST /golf/tee-times/{id}/bookings"
+      - "POST /golf/bookings/{id}/cancel"
+      - "all GET reads"
+  - name: Golfer
+    description: "A registered golfer: posts own scores, books tee times, cancels own bookings."
+    identity: "entity_backed:Golfer"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /golf/scores"
+      - "POST /golf/tee-times/{id}/bookings"
+      - "POST /golf/bookings/{id}/cancel"
+      - "all GET reads"
+  - name: Anonymous
+    description: "Unauthenticated public: read-only browsing of courses/tee times/scores and self-registration."
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "POST /golf/golfers"
+      - "all GET reads"

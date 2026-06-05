@@ -1,0 +1,1179 @@
+scenario: "Credit Card Rewards & Redemption: cashback categories, signup bonus qualification, quarterly activation categories, spending tiers, points transfer to airlines/hotels, Statement Credit redemption, expiration and forfeiture"
+domain_name: credit-card-rewards-redemption
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: Pricing engine
+  secondary_archetype: Ledger reconciliation
+  complexity_layers:
+    - Optimistic concurrency        # OCC on CardAccount.version for redemption creation (CREATE-with-supersede on a finite points pool)
+    - Rate / threshold triggers     # spending tiers, signup-bonus threshold, quarterly category cap
+    - Dual-variant calculation      # provisional (PENDING) vs posted (POSTED) points; cash vs travel redemption value
+    - Cascading side effects        # transaction post -> lot mint -> account balance + tier + signup-bonus recompute; refund -> lot clawback chain
+
+  entity_topology: flat
+  # Peer entities linked by FK references (CardAccount, Transaction, Redemption, PointsLot, CategoryActivation are
+  # all addressed at top-level collections with *_id foreign keys in the body, not nested under a parent in the URL).
+
+  state_machine_shape: branching
+  # Transaction A->{POSTED,DECLINED}; POSTED->REFUNDED (revert). Redemption A->{CONFIRMED, REJECTED}; CONFIRMED->REVERSED.
+  # Divergent side-effect sets per branch; plus a revert edge on each — non-linear on two different entities.
+
+  relationship_patterns:
+    - one_to_many        # CardAccount -> Transaction, Redemption, PointsLot, CategoryActivation
+    - cross_aggregate    # Transaction references CashbackCategory/QuarterlyCategory; Redemption references TransferPartner
+
+  role_model: peer_roles
+  # Cardholder owns their own account/transactions/redemptions (entity_backed:CardAccount).
+  # ProgramAdmin manages catalog config (products, categories, partners) and posts/declines/refunds transactions.
+  # RewardsOps runs the period-close epoch (expiration sweep) and reviews redemptions. opaque operational roles.
+
+  consistency_model: immediate
+  # All balance, tier, signup-bonus, and lot mutations are atomic within the triggering request.
+
+# =====================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =====================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 Entity-Relationship Table
+# =====================================================================
+entities:
+  - name: CardProduct
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Product name (e.g., 'Cash Rewards Visa')."
+        constraints: "1..100 chars; required."
+      - name: base_earn_rate_bps
+        type: integer
+        source: input
+        description: "Base earn rate in basis points of points per cent spent (100 bps = 1x = 1 point per cent). All un-bonused spend earns at this rate."
+        constraints: ">= 0 and <= 1000; required."
+      - name: signup_bonus_points
+        type: integer
+        source: input
+        description: "Points granted once, when cumulative qualifying spend first reaches signup_bonus_spend_threshold_cents within the qualification window."
+        constraints: ">= 0; required."
+      - name: signup_bonus_spend_threshold_cents
+        type: integer
+        source: input
+        description: "Cumulative qualifying POSTED spend (in cents) the account must reach to earn the signup bonus."
+        constraints: ">= 1; required."
+      - name: signup_bonus_window_days
+        type: integer
+        source: input
+        description: "Number of days from CardAccount.opened_at during which qualifying spend counts toward the signup bonus (inclusive lower bound, exclusive upper bound at opened_at + window_days)."
+        constraints: ">= 1 and <= 365; required."
+      - name: tier_thresholds
+        type: array
+        source: input
+        description: "Ordered ascending list of annual-spend tier breakpoints in cents, each with a points multiplier in bps applied to ALL spend once the tier is reached. Element shape {min_annual_spend_cents:int, tier_multiplier_bps:int}. Tier 0 (implicit) = 0 spend, multiplier 100."
+        constraints: "0..4 elements; min_annual_spend_cents strictly ascending; first element min_annual_spend_cents >= 1."
+      - name: points_expiry_months
+        type: integer
+        source: input
+        description: "Number of whole months after a PointsLot is minted before it expires (lot.expires_at = lot.created_at + points_expiry_months months)."
+        constraints: ">= 1 and <= 120; required."
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle of the product catalog entry."
+        default: ACTIVE
+        constraints: "enum {ACTIVE, RETIRED}; new accounts may only reference an ACTIVE product."
+
+  - name: CashbackCategory
+    parent: null
+    common_fields: true
+    fields:
+      - name: card_product_id
+        type: string
+        source: input
+        description: "FK -> CardProduct.id; the product this fixed cashback category belongs to."
+        constraints: "required; referenced product must exist."
+      - name: code
+        type: string
+        source: input
+        description: "Merchant category code label (e.g., DINING, GROCERY, GAS, TRAVEL, OTHER)."
+        constraints: "UPPER_SNAKE; unique per card_product_id among CashbackCategory rows; required."
+      - name: earn_multiplier_bps
+        type: integer
+        source: input
+        description: "Earn multiplier in bps applied to spend in this category, replacing the base rate for matched transactions (e.g., 300 bps = 3x)."
+        constraints: ">= 100 and <= 1000; required."
+      - name: status
+        type: enum
+        source: system
+        description: "Whether this fixed category currently earns its bonus multiplier."
+        default: ACTIVE
+        constraints: "enum {ACTIVE, DISABLED}."
+
+  - name: QuarterlyCategory
+    parent: null
+    common_fields: true
+    fields:
+      - name: card_product_id
+        type: string
+        source: input
+        description: "FK -> CardProduct.id; the product this rotating quarterly category belongs to."
+        constraints: "required; referenced product must exist."
+      - name: code
+        type: string
+        source: input
+        description: "Rotating category label (e.g., GROCERY, GAS, ONLINE)."
+        constraints: "UPPER_SNAKE; required."
+      - name: quarter_label
+        type: string
+        source: input
+        description: "Calendar quarter this category is offered in, format 'YYYY-Qn' (e.g., '2026-Q3')."
+        constraints: "matches ^[0-9]{4}-Q[1-4]$; unique per (card_product_id, quarter_label); required."
+      - name: window_start
+        type: datetime
+        source: input
+        description: "Inclusive UTC start of the quarter window during which spend in this category earns the bonus multiplier (only after activation)."
+        constraints: "required; window_start < window_end."
+      - name: window_end
+        type: datetime
+        source: input
+        description: "Exclusive UTC end of the quarter window. Transactions with transacted_at >= window_end do not earn the quarterly bonus."
+        constraints: "required; window_end > window_start."
+      - name: earn_multiplier_bps
+        type: integer
+        source: input
+        description: "Earn multiplier in bps applied to activated spend in this category within the window, up to bonus_cap_cents of spend."
+        constraints: ">= 100 and <= 1000; required."
+      - name: bonus_cap_cents
+        type: integer
+        source: input
+        description: "Maximum spend (in cents) per account per quarter that earns the quarterly bonus multiplier; spend beyond the cap earns at base rate."
+        constraints: ">= 1; required."
+
+  - name: TransferPartner
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Partner program name (e.g., 'SkyMiles', 'HotelRewards')."
+        constraints: "1..100 chars; required."
+      - name: partner_type
+        type: enum
+        source: input
+        description: "Whether the partner is an airline or hotel program."
+        constraints: "enum {AIRLINE, HOTEL}; required."
+      - name: transfer_ratio_num
+        type: integer
+        source: input
+        description: "Numerator of the points->partner-miles transfer ratio. partner_units = floor(points * transfer_ratio_num / transfer_ratio_den)."
+        constraints: ">= 1; required."
+      - name: transfer_ratio_den
+        type: integer
+        source: input
+        description: "Denominator of the points->partner-miles transfer ratio."
+        constraints: ">= 1; required."
+      - name: min_transfer_points
+        type: integer
+        source: input
+        description: "Minimum points that may be transferred in a single POINTS_TRANSFER redemption to this partner."
+        constraints: ">= 1; required."
+      - name: status
+        type: enum
+        source: system
+        description: "Whether the partner currently accepts transfers."
+        default: ACTIVE
+        constraints: "enum {ACTIVE, SUSPENDED}; transfers allowed only to ACTIVE partners."
+
+  - name: CardAccount
+    parent: null
+    common_fields: true
+    fields:
+      - name: card_product_id
+        type: string
+        source: input
+        description: "FK -> CardProduct.id; the product this account is opened under."
+        constraints: "required; product must be ACTIVE at open time."
+      - name: cardholder_name
+        type: string
+        source: input
+        description: "Name of the cardholder."
+        constraints: "1..100 chars; required."
+      - name: opened_at
+        type: datetime
+        source: system
+        description: "UTC instant the account was opened; equals the server clock at creation. Anchors the signup-bonus window and the annual tier-spend year."
+      - name: points_balance
+        type: integer
+        source: computed
+        description: "Current redeemable points = sum of remaining_points over the account's PointsLot rows in status ACTIVE. Recomputed on every lot mint, lot consumption, lot clawback, and expiry sweep."
+        default: 0
+      - name: pending_points
+        type: integer
+        source: computed
+        description: "Provisional points from PENDING transactions, not yet redeemable. Recomputed when a transaction enters/leaves PENDING. Distinct ledger from points_balance."
+        default: 0
+      - name: qualifying_spend_cents
+        type: integer
+        source: computed
+        description: "Cumulative POSTED qualifying spend (in cents) within the signup-bonus window [opened_at, opened_at + product.signup_bonus_window_days). Drives signup-bonus qualification."
+        default: 0
+      - name: annual_spend_cents
+        type: integer
+        source: computed
+        description: "Cumulative POSTED net spend (in cents) within the current tier year [opened_at, opened_at + 365 days). Drives current_tier_index. Refunds within the year decrement it."
+        default: 0
+      - name: current_tier_index
+        type: integer
+        source: computed
+        description: "Highest tier index whose min_annual_spend_cents <= annual_spend_cents; 0 when below the first threshold. Re-derived on every spend/refund."
+        default: 0
+      - name: signup_bonus_status
+        type: enum
+        source: computed
+        description: "Signup-bonus lifecycle for this account."
+        default: NOT_QUALIFIED
+        constraints: "enum {NOT_QUALIFIED, EARNED, EXPIRED_UNQUALIFIED}; EARNED set once when qualifying_spend_cents first reaches threshold within window; EXPIRED_UNQUALIFIED set by close-period when window passes unmet."
+      - name: status
+        type: enum
+        source: system
+        description: "Account lifecycle."
+        default: PENDING
+        constraints: "enum {PENDING, ACTIVE, CLOSED}; transactions/redemptions allowed only when ACTIVE."
+
+  - name: Transaction
+    parent: null
+    common_fields: true
+    fields:
+      - name: card_account_id
+        type: string
+        source: input
+        description: "FK -> CardAccount.id; the account that made the purchase."
+        constraints: "required; account must be ACTIVE."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Purchase amount in cents."
+        constraints: ">= 1; required."
+      - name: category_code
+        type: string
+        source: input
+        description: "Merchant category code of the purchase (e.g., DINING, GROCERY, GAS, ONLINE, OTHER). Matched against CashbackCategory.code and QuarterlyCategory.code for the account's product."
+        constraints: "UPPER_SNAKE; required."
+      - name: transacted_at
+        type: datetime
+        source: input
+        description: "UTC instant of the purchase. Determines signup-window inclusion, tier-year inclusion, and quarterly-window inclusion. Must be <= server clock and >= account.opened_at."
+        constraints: "required; opened_at <= transacted_at <= now."
+      - name: earned_points
+        type: integer
+        source: computed
+        description: "Points credited for this transaction once POSTED, computed by the points_earning calculation (base/category/quarterly multiplier blend + tier multiplier). 0 while PENDING (tracked instead under pending_points)."
+        default: 0
+      - name: quarterly_bonus_applied_cents
+        type: integer
+        source: computed
+        description: "Portion of amount_cents (in cents) that received the quarterly bonus multiplier, after applying the per-quarter bonus_cap_cents across the account's activated quarterly spend. 0 when no quarterly category applies."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Transaction lifecycle."
+        default: PENDING
+        constraints: "enum {PENDING, POSTED, DECLINED, REFUNDED}."
+
+  - name: PointsLot
+    parent: null
+    common_fields: false
+    fields:
+      - name: card_account_id
+        type: string
+        source: input
+        description: "FK -> CardAccount.id; the account that owns this points lot."
+        constraints: "required."
+      - name: source_transaction_id
+        type: string
+        source: input
+        description: "FK -> Transaction.id; the POSTED transaction (or signup-bonus grant) that minted this lot. Null for the signup-bonus lot."
+        constraints: "optional; references a Transaction when present."
+      - name: lot_type
+        type: enum
+        source: system
+        description: "Origin of the lot."
+        constraints: "enum {EARN, SIGNUP_BONUS}; EARN minted on transaction POST, SIGNUP_BONUS minted when the bonus is earned."
+      - name: original_points
+        type: integer
+        source: system
+        description: "Points minted into this lot at creation."
+        constraints: ">= 1."
+      - name: remaining_points
+        type: integer
+        source: computed
+        description: "Points still available in this lot = original_points minus consumed-by-redemption minus clawed-back-by-refund. Drives account.points_balance."
+        default: 0
+      - name: expires_at
+        type: datetime
+        source: system
+        description: "UTC instant the lot expires = created_at + product.points_expiry_months months. After this instant a close-period sweep forfeits remaining_points."
+      - name: status
+        type: enum
+        source: system
+        description: "Lot lifecycle."
+        default: ACTIVE
+        constraints: "enum {ACTIVE, CONSUMED, EXPIRED, CLAWED_BACK}; CONSUMED when remaining_points hits 0 via redemption, EXPIRED by sweep, CLAWED_BACK when its source transaction is refunded."
+
+  - name: Redemption
+    parent: null
+    common_fields: true
+    fields:
+      - name: card_account_id
+        type: string
+        source: input
+        description: "FK -> CardAccount.id; the account redeeming points."
+        constraints: "required; account must be ACTIVE."
+      - name: redemption_type
+        type: enum
+        source: input
+        description: "Kind of redemption."
+        constraints: "enum {STATEMENT_CREDIT, POINTS_TRANSFER}; required."
+      - name: points_requested
+        type: integer
+        source: input
+        description: "Number of points the cardholder wants to redeem."
+        constraints: ">= 1; required; must not exceed account.points_balance at request time."
+      - name: transfer_partner_id
+        type: string
+        source: input
+        description: "FK -> TransferPartner.id; required when redemption_type == POINTS_TRANSFER, forbidden otherwise."
+        constraints: "conditional; partner must be ACTIVE."
+      - name: expected_card_account_version
+        type: integer
+        source: input
+        description: "OCC guard: the CardAccount.version the client last observed. Rejected with 412 if it no longer matches the account's current version."
+        constraints: "required; integer >= 1."
+      - name: redeemed_value
+        type: integer
+        source: computed
+        description: "Output value of the redemption: cents of statement credit for STATEMENT_CREDIT, or partner units for POINTS_TRANSFER. Computed by the redemption_value calculation."
+        default: 0
+      - name: lots_consumed
+        type: array
+        source: computed
+        description: "Ordered list of {points_lot_id, points_taken} recording the FIFO lot consumption for this redemption, used to reverse exactly on REVERSED."
+        default: []
+      - name: status
+        type: enum
+        source: system
+        description: "Redemption lifecycle."
+        default: PENDING
+        constraints: "enum {PENDING, CONFIRMED, REJECTED, REVERSED}."
+
+  - name: CategoryActivation
+    parent: null
+    common_fields: true
+    fields:
+      - name: card_account_id
+        type: string
+        source: input
+        description: "FK -> CardAccount.id; the account activating a quarterly category."
+        constraints: "required; account must be ACTIVE."
+      - name: quarterly_category_id
+        type: string
+        source: input
+        description: "FK -> QuarterlyCategory.id; the quarterly category being activated."
+        constraints: "required; category must belong to the account's card_product_id."
+      - name: activated_at
+        type: datetime
+        source: system
+        description: "UTC instant the activation was recorded; equals the server clock at creation. Spend earns the quarterly bonus only when transacted_at >= activated_at."
+      - name: status
+        type: enum
+        source: system
+        description: "Activation lifecycle."
+        default: ACTIVE
+        constraints: "enum {ACTIVE}; one ACTIVE activation per (card_account_id, quarterly_category_id)."
+
+# =====================================================================
+# §1.2 State Machine Table
+# =====================================================================
+state_machines:
+  - entity: CardAccount
+    initial_state: PENDING
+    terminal_states: [CLOSED]
+    transitions:
+      - from: PENDING
+        to: ACTIVE
+        trigger: "POST /accounts/{id}/activate"
+        actor: ProgramAdmin
+        preconditions:
+          - "account.status == PENDING"
+          - "referenced CardProduct.status == ACTIVE"
+        side_effects:
+          - "sets opened_at is unchanged (set at create); account becomes eligible for transactions and redemptions"
+          - "increments CardAccount.version by 1"
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /accounts/{id}/close"
+        actor: Cardholder | ProgramAdmin
+        preconditions:
+          - "account.status == ACTIVE"
+          - "no Redemption for this account in status PENDING"
+        side_effects:
+          - "all ACTIVE PointsLot rows for the account transition to EXPIRED (forfeiture on close); remaining_points zeroed"
+          - "account.points_balance recomputed to 0"
+          - "increments CardAccount.version by 1"
+        note: "Closing forfeits all unredeemed points (a conserved-quantity sink, see §1.3 points_conservation)."
+
+  - entity: Transaction
+    initial_state: PENDING
+    terminal_states: [DECLINED, REFUNDED]
+    transitions:
+      - from: PENDING
+        to: POSTED
+        trigger: "POST /transactions/{id}/post"
+        actor: ProgramAdmin
+        preconditions:
+          - "transaction.status == PENDING"
+          - "owning CardAccount.status == ACTIVE"
+        side_effects:
+          - "computes earned_points and quarterly_bonus_applied_cents via points_earning calc (depends on account.current_tier_index BEFORE this txn's spend is added)"
+          - "mints a PointsLot{lot_type:EARN, original_points:earned_points, remaining_points:earned_points, expires_at:created_at + product.points_expiry_months} when earned_points > 0"
+          - "moves the txn's provisional points out of account.pending_points and the lot's points into account.points_balance"
+          - "adds amount_cents to account.annual_spend_cents (if transacted_at within tier year) -> re-derive current_tier_index"
+          - "adds amount_cents to account.qualifying_spend_cents (if transacted_at within signup window) -> may trigger signup_bonus_grant cascade"
+          - "increments CardAccount.version by 1"
+        note: "Cascade origin: post -> tier re-derive -> (if qualifying_spend reaches threshold) signup_bonus_grant mints SIGNUP_BONUS lot -> points_balance recompute. Depth-3 chain, see §1.4/§1.8."
+      - from: PENDING
+        to: DECLINED
+        trigger: "POST /transactions/{id}/decline"
+        actor: ProgramAdmin
+        preconditions:
+          - "transaction.status == PENDING"
+        side_effects:
+          - "removes the txn's provisional points from account.pending_points"
+          - "no lot minted; no spend counters touched"
+          - "increments CardAccount.version by 1"
+      - from: POSTED
+        to: REFUNDED
+        trigger: "POST /transactions/{id}/refund"
+        actor: ProgramAdmin
+        preconditions:
+          - "transaction.status == POSTED"
+        side_effects:
+          - "claws back the EARN PointsLot minted by this txn: lot.status -> CLAWED_BACK; if its remaining_points were already partially redeemed, the shortfall is taken from account.points_balance down to a floor of 0 (negative-clawback guard)"
+          - "subtracts amount_cents from account.annual_spend_cents (floor 0) -> re-derive current_tier_index (may demote)"
+          - "subtracts amount_cents from account.qualifying_spend_cents (floor 0) within signup window"
+          - "account.points_balance recomputed"
+          - "increments CardAccount.version by 1"
+        note: "Cascade origin: refund -> lot clawback -> points_balance recompute (depth-2). Compensates the post transition; see §1.3 points_conservation."
+
+  - entity: Redemption
+    initial_state: PENDING
+    terminal_states: [REJECTED, REVERSED]
+    transitions:
+      - from: PENDING
+        to: CONFIRMED
+        trigger: "POST /redemptions/{id}/confirm"
+        actor: RewardsOps
+        preconditions:
+          - "redemption.status == PENDING"
+          - "owning CardAccount.status == ACTIVE"
+          - "account.points_balance >= redemption.points_requested (re-checked at confirm)"
+        side_effects:
+          - "consumes points_requested from the account's ACTIVE PointsLot rows in FIFO order (expires_at ASC, then created_at ASC) -> decrements each lot.remaining_points; records lots_consumed"
+          - "any lot reaching remaining_points == 0 transitions to CONSUMED"
+          - "computes redeemed_value via redemption_value calc"
+          - "account.points_balance recomputed"
+          - "increments CardAccount.version by 1"
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /redemptions/{id}/reject"
+        actor: RewardsOps
+        preconditions:
+          - "redemption.status == PENDING"
+        side_effects:
+          - "no lots consumed; no balance change"
+          - "increments CardAccount.version by 1"
+      - from: CONFIRMED
+        to: REVERSED
+        trigger: "POST /redemptions/{id}/reverse"
+        actor: RewardsOps
+        preconditions:
+          - "redemption.status == CONFIRMED"
+        side_effects:
+          - "restores points to the exact lots recorded in lots_consumed: each lot.remaining_points += points_taken; lots whose status was CONSUMED return to ACTIVE if not expired, else points spill into a fresh restoration lot expiring at the original lot's expires_at"
+          - "account.points_balance recomputed (net change == +points_requested, the compensation invariant)"
+          - "increments CardAccount.version by 1"
+        note: "Compensates confirm exactly; see §1.3 points_conservation."
+
+  - entity: CategoryActivation
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /category-activations (create)"
+        actor: Cardholder
+        preconditions:
+          - "no existing ACTIVE CategoryActivation for (card_account_id, quarterly_category_id)"
+          - "QuarterlyCategory.card_product_id == account.card_product_id"
+          - "owning CardAccount.status == ACTIVE"
+        side_effects:
+          - "subsequent transactions in the category within the quarter window and transacted_at >= activated_at earn the quarterly bonus multiplier"
+        note: "CategoryActivation is effectively append-only (single ACTIVE state); creation is the only transition."
+
+# ---------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: redemption-create-stale-account
+    parent_entity: CardAccount
+    write_endpoint: "POST /redemptions"
+    occ_field: "expected_card_account_version"
+    description: |
+      Creating a Redemption against a CardAccount whose version has advanced
+      since the client last observed it is rejected. This captures the case
+      where the finite points pool was just drawn down by another redemption
+      (or a refund clawed back points) — the new redemption legitimately
+      supersedes the client's stale view of points_balance, so the request is
+      rejected as a stale-version write rather than silently over-redeeming.
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 Calculation Rules Table
+# =====================================================================
+calculations:
+  - name: points_earning
+    trigger: "Transaction PENDING->POSTED (POST /transactions/{id}/post); also computes the provisional figure on Transaction create for pending_points"
+    algorithm: tiered_pricing
+    formula: |
+      # Inputs: txn.amount_cents (A), txn.category_code (C), txn.transacted_at (T),
+      #         account.card_product_id -> product, account.current_tier_index (snapshot BEFORE this txn's spend is added).
+      #
+      # Step 1 — per-cent base multiplier selection (category replaces base; quarterly stacks via separate cap):
+      #   fixed = ACTIVE CashbackCategory with code == C and card_product_id == product.id  (0 or 1)
+      #   cat_mult_bps = fixed.earn_multiplier_bps if fixed exists else product.base_earn_rate_bps
+      #
+      # Step 2 — quarterly bonus eligibility & cap allocation:
+      #   q = QuarterlyCategory with code == C, card_product_id == product.id,
+      #       window_start <= T < window_end
+      #   activated = exists ACTIVE CategoryActivation(account, q) with activated_at <= T
+      #   if q exists AND activated:
+      #       # remaining quarterly cap for this account & quarter:
+      #       used = sum over POSTED txns of this account in quarter q with quarterly_bonus_applied_cents>0 of quarterly_bonus_applied_cents,
+      #              processed in transacted_at ASC, then created_at ASC order
+      #       cap_remaining = max(0, q.bonus_cap_cents - used)
+      #       bonus_cents = min(A, cap_remaining)        # capped spend gets quarterly multiplier
+      #   else:
+      #       bonus_cents = 0
+      #   quarterly_bonus_applied_cents = bonus_cents
+      #
+      # Step 3 — tier multiplier (applies to the WHOLE transaction, on top of cat/quarterly):
+      #   tier_mult_bps = product.tier_thresholds[current_tier_index].tier_multiplier_bps  (100 for implicit tier 0)
+      #
+      # Step 4 — points (round once, at the very end — see precision):
+      #   base_part      = (A - bonus_cents) * cat_mult_bps
+      #   quarterly_part = bonus_cents * q.earn_multiplier_bps        # 0 if no quarterly
+      #   raw = (base_part + quarterly_part) * tier_mult_bps
+      #   earned_points = floor( raw / (100 * 100 * 100) )           # three bps divisions: cat/qtr, tier, and cents->points
+    input_set: "Single transaction at POST time; quarterly cap aggregation includes only POSTED txns of the same account in the same QuarterlyCategory window with quarterly_bonus_applied_cents>0."
+    constants:
+      BPS_DENOM: 100
+      POINTS_PER_POINT_BPS: 100
+    precision: "Integer points. Multiply all bps factors first, divide once with a single floor at the very end (round-down). NEVER round per-step — per-step rounding and end rounding diverge; the scaffold pins end-rounding."
+    variants:
+      - name: provisional
+        when: "Transaction is PENDING (computed at create, held in account.pending_points)."
+        difference: "Uses the SAME formula but the result is added to pending_points, not points_balance, and mints no lot. earned_points stays 0 on the row until POST."
+      - name: posted
+        when: "Transaction is POSTED."
+        difference: "Result written to earned_points, a PointsLot minted, points moved from pending_points to points_balance."
+
+  - name: redemption_value
+    trigger: "Redemption PENDING->CONFIRMED (POST /redemptions/{id}/confirm)"
+    algorithm: threshold
+    formula: |
+      # Inputs: redemption.redemption_type, redemption.points_requested (P), redemption.transfer_partner_id -> partner
+      if redemption_type == STATEMENT_CREDIT:
+          # statement credit is valued at a flat 1 cent per point
+          redeemed_value = P * STATEMENT_CREDIT_CENTS_PER_POINT          # cents
+      else:  # POINTS_TRANSFER
+          # transfer to partner at the partner's ratio, floor of fractional units
+          redeemed_value = floor( P * partner.transfer_ratio_num / partner.transfer_ratio_den )   # partner units
+    input_set: "Single redemption; partner ratio read from the referenced TransferPartner at confirm time."
+    constants:
+      STATEMENT_CREDIT_CENTS_PER_POINT: 1
+    precision: "Integer. STATEMENT_CREDIT exact; POINTS_TRANSFER floors the fractional partner units (round-down)."
+    variants:
+      - name: statement_credit
+        when: "redemption_type == STATEMENT_CREDIT"
+        difference: "value in cents = points * 1; no partner; no rounding loss."
+      - name: points_transfer
+        when: "redemption_type == POINTS_TRANSFER"
+        difference: "value in partner units = floor(points * ratio_num / ratio_den); same points spend can yield different value across partners; fractional units forfeited (round-down)."
+
+  - name: signup_bonus_progress
+    trigger: "Transaction POST (qualifying_spend update) and close-period sweep (window expiry)"
+    algorithm: threshold
+    formula: |
+      # account.qualifying_spend_cents accumulates POSTED amount_cents whose
+      # transacted_at is in [opened_at, opened_at + product.signup_bonus_window_days days).
+      # On each POST update:
+      if account.signup_bonus_status == NOT_QUALIFIED
+         and qualifying_spend_cents >= product.signup_bonus_spend_threshold_cents
+         and now < opened_at + product.signup_bonus_window_days days:
+            signup_bonus_status = EARNED
+            grant a SIGNUP_BONUS PointsLot{original_points: product.signup_bonus_points,
+                                           remaining_points: product.signup_bonus_points,
+                                           expires_at: created_at + product.points_expiry_months months}
+            account.points_balance += product.signup_bonus_points
+      # The window boundary is INCLUSIVE on the low end, EXCLUSIVE on the high end:
+      # a transaction with transacted_at == opened_at + window_days (to the millisecond) is OUTSIDE.
+    input_set: "POSTED transactions of the account within the signup window; the bonus is granted at most once."
+    constants:
+      QUALIFY_OP: ">="
+    precision: "Integer cents comparison; threshold uses >= (reaching exactly the threshold qualifies)."
+
+  - name: points_conservation
+    trigger: "Audited across every points-mutating transition: transaction post/refund, redemption confirm/reverse, close-period expiry sweep, account close."
+    algorithm: aggregation
+    formula: |
+      # Conserved quantity 1 — POINTS LEDGER IDENTITY (per account, at any instant):
+      #   minted_points  = sum(original_points) over all PointsLot of the account
+      #   redeemed_points = sum(points_taken) over lots_consumed of CONFIRMED redemptions (minus REVERSED restorations)
+      #   expired_points  = sum(remaining_points at expiry) over EXPIRED lots (sweep + close forfeiture)
+      #   clawed_points   = sum(clawback) over CLAWED_BACK lots (refunds)
+      #   INVARIANT: account.points_balance == minted_points - redeemed_points - expired_points - clawed_points
+      #
+      # Conserved quantity 2 — REDEMPTION REVERSAL IDENTITY (per redemption pair confirm+reverse):
+      #   for a CONFIRMED redemption R with points_requested = P that is later REVERSED,
+      #   the sum of remaining_points across the lots named in R.lots_consumed must increase by EXACTLY P
+      #   between just-before-reverse and just-after-reverse:
+      #   INVARIANT: delta(sum remaining_points over R.lots_consumed lots) == +P, and account.points_balance net delta == +P.
+    input_set: "All PointsLot, Redemption.lots_consumed of the account."
+    constants: {}
+    precision: "Exact integer points; no rounding (points are whole units throughout)."
+    variants:
+      - name: balance_identity
+        when: "any points-mutating event"
+        difference: "Conserves the per-account points_balance ledger identity (quantity = redeemable points)."
+      - name: reversal_identity
+        when: "redemption reverse compensates a prior confirm"
+        difference: "Conserves the per-redemption restored-points quantity (quantity = points returned to lots), a different conserved quantity from the account-wide balance."
+
+# =====================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =====================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a recognized role."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this operation per §1.7 (e.g., only ProgramAdmin may post/decline/refund transactions; only RewardsOps may confirm/reject/reverse redemptions or run close-period)."
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: auth
+    check: "For Cardholder-owned operations, X-User-ID equals the CardAccount.id being acted on (own-account ownership)."
+    error_id: ERR_NOT_ACCOUNT_OWNER
+    http_status: 403
+    applies_to: "POST /redemptions, POST /category-activations, POST /accounts/{id}/close (Cardholder), GET own resources"
+
+  - priority: 4
+    category: existence
+    check: "All path and FK-referenced resources exist (CardAccount, Transaction, Redemption, CardProduct, TransferPartner, QuarterlyCategory), validated left-to-right."
+    error_id: ERR_RESOURCE_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 5
+    category: existence
+    check: "Request body present and required fields supplied with correct primitive types; enum fields within their declared set."
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST/PUT"
+
+  - priority: 6
+    category: business_constraint
+    check: "Conditional field shape: transfer_partner_id required iff redemption_type == POINTS_TRANSFER (present for STATEMENT_CREDIT, or absent for POINTS_TRANSFER, is rejected)."
+    error_id: ERR_PARTNER_FIELD_MISMATCH
+    http_status: 422
+    applies_to: "POST /redemptions"
+
+  - priority: 7
+    category: state
+    check: "Target resource is in the correct state for the operation (account ACTIVE for txn/redemption/activation create; txn PENDING for post/decline; txn POSTED for refund; redemption PENDING for confirm/reject; redemption CONFIRMED for reverse; account PENDING for activate; account ACTIVE for close)."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints and create-under-parent endpoints"
+
+  - priority: 8
+    category: business_referential
+    check: "Cross-product integrity: QuarterlyCategory.card_product_id == account.card_product_id for activation; product ACTIVE when opening account; TransferPartner ACTIVE for transfer redemption."
+    error_id: ERR_CROSS_PRODUCT_MISMATCH
+    http_status: 422
+    applies_to: "POST /category-activations, POST /accounts, POST /redemptions"
+
+  - priority: 9
+    category: business_constraint
+    check: "Uniqueness: no second ACTIVE CategoryActivation for the same (card_account_id, quarterly_category_id); CashbackCategory.code unique per product; QuarterlyCategory (card_product_id, quarter_label) unique."
+    error_id: ERR_DUPLICATE_ACTIVATION
+    http_status: 409
+    applies_to: "POST /category-activations, POST /cashback-categories, POST /quarterly-categories"
+
+  - priority: 10
+    category: business_temporal
+    check: "Transaction transacted_at within [account.opened_at, server-now]; POINTS_TRANSFER points_requested >= partner.min_transfer_points."
+    error_id: ERR_TEMPORAL_OUT_OF_RANGE
+    http_status: 422
+    applies_to: "POST /transactions, POST /redemptions"
+
+  - priority: 11
+    category: business_constraint
+    check: "POINTS_TRANSFER points_requested >= partner.min_transfer_points (minimum-transfer floor)."
+    error_id: ERR_BELOW_MIN_TRANSFER
+    http_status: 422
+    applies_to: "POST /redemptions"
+
+  - priority: 12
+    category: business_fiscal
+    check: "OCC: expected_card_account_version == account.version at redemption create time."
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+    applies_to: "POST /redemptions"
+
+  - priority: 13
+    category: business_fiscal
+    check: "Sufficient redeemable points: points_requested <= account.points_balance at redemption create AND re-checked at confirm."
+    error_id: ERR_INSUFFICIENT_POINTS
+    http_status: 422
+    applies_to: "POST /redemptions, POST /redemptions/{id}/confirm"
+
+# =====================================================================
+# §1.5 API Endpoint Table
+# =====================================================================
+endpoints:
+  # ---- CardProduct (catalog config) ----
+  - method: POST
+    path: "/products"
+    description: "Create a card product (reward program definition)."
+    roles: [ProgramAdmin]
+    code: 201
+    input: [name, base_earn_rate_bps, signup_bonus_points, signup_bonus_spend_threshold_cents, signup_bonus_window_days, tier_thresholds, points_expiry_months]
+    output: CardProduct
+    side_effects: ["product created in status ACTIVE"]
+  - method: GET
+    path: "/products/{id}"
+    description: "Fetch a card product."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: []
+    output: CardProduct
+    side_effects: []
+  - method: GET
+    path: "/products"
+    description: "List card products."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: CardProduct[]
+    side_effects: []
+  - method: POST
+    path: "/products/{id}/retire"
+    description: "Retire a product so no new accounts may open under it."
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: CardProduct
+    side_effects: ["product.status -> RETIRED; increments CardProduct.version by 1"]
+
+  # ---- CashbackCategory (config under product, flat) ----
+  - method: POST
+    path: "/cashback-categories"
+    description: "Create a fixed cashback category for a product."
+    roles: [ProgramAdmin]
+    code: 201
+    input: [card_product_id, code, earn_multiplier_bps]
+    output: CashbackCategory
+    side_effects: ["category created in status ACTIVE"]
+  - method: GET
+    path: "/cashback-categories/{id}"
+    description: "Fetch a cashback category."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: []
+    output: CashbackCategory
+    side_effects: []
+  - method: GET
+    path: "/cashback-categories"
+    description: "List cashback categories, filterable by product (FK reverse-reachability for CashbackCategory.card_product_id)."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: ["card_product_id?", "status?", "limit?", "offset?"]
+    output: CashbackCategory[]
+    side_effects: []
+
+  # ---- QuarterlyCategory (config under product, flat) ----
+  - method: POST
+    path: "/quarterly-categories"
+    description: "Create a rotating quarterly bonus category for a product."
+    roles: [ProgramAdmin]
+    code: 201
+    input: [card_product_id, code, quarter_label, window_start, window_end, earn_multiplier_bps, bonus_cap_cents]
+    output: QuarterlyCategory
+    side_effects: ["quarterly category created"]
+  - method: GET
+    path: "/quarterly-categories/{id}"
+    description: "Fetch a quarterly category."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: []
+    output: QuarterlyCategory
+    side_effects: []
+  - method: GET
+    path: "/quarterly-categories"
+    description: "List quarterly categories, filterable by product (FK reverse-reachability for QuarterlyCategory.card_product_id)."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: ["card_product_id?", "quarter_label?", "limit?", "offset?"]
+    output: QuarterlyCategory[]
+    side_effects: []
+
+  # ---- TransferPartner (config) ----
+  - method: POST
+    path: "/transfer-partners"
+    description: "Create an airline/hotel transfer partner."
+    roles: [ProgramAdmin]
+    code: 201
+    input: [name, partner_type, transfer_ratio_num, transfer_ratio_den, min_transfer_points]
+    output: TransferPartner
+    side_effects: ["partner created in status ACTIVE"]
+  - method: GET
+    path: "/transfer-partners/{id}"
+    description: "Fetch a transfer partner."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: []
+    output: TransferPartner
+    side_effects: []
+  - method: GET
+    path: "/transfer-partners"
+    description: "List transfer partners."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: ["partner_type?", "status?", "limit?", "offset?"]
+    output: TransferPartner[]
+    side_effects: []
+  - method: POST
+    path: "/transfer-partners/{id}/suspend"
+    description: "Suspend a partner so it no longer accepts transfers."
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: TransferPartner
+    side_effects: ["partner.status -> SUSPENDED; increments TransferPartner.version by 1"]
+
+  # ---- CardAccount ----
+  - method: POST
+    path: "/accounts"
+    description: "Open a card account under a product (starts PENDING)."
+    roles: [ProgramAdmin]
+    code: 201
+    input: [card_product_id, cardholder_name]
+    output: CardAccount
+    side_effects: ["account created PENDING with opened_at = server clock; signup_bonus_status NOT_QUALIFIED; balances 0"]
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Fetch a card account incl. computed balances/tier/signup status."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: []
+    output: CardAccount
+    side_effects: []
+  - method: GET
+    path: "/accounts"
+    description: "List card accounts, filterable by product."
+    roles: [ProgramAdmin, RewardsOps]
+    code: 200
+    input: ["card_product_id?", "status?", "limit?", "offset?"]
+    output: CardAccount[]
+    side_effects: []
+  - method: POST
+    path: "/accounts/{id}/activate"
+    description: "Activate a PENDING account."
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: CardAccount
+    side_effects: ["account.status PENDING->ACTIVE; increments CardAccount.version by 1"]
+  - method: POST
+    path: "/accounts/{id}/close"
+    description: "Close an ACTIVE account; forfeits all unredeemed points."
+    roles: [ProgramAdmin, Cardholder]
+    code: 200
+    input: []
+    output: CardAccount
+    side_effects: ["all ACTIVE lots -> EXPIRED; points_balance -> 0; account.status ACTIVE->CLOSED; increments CardAccount.version by 1"]
+
+  # ---- Transaction ----
+  - method: POST
+    path: "/transactions"
+    description: "Record a purchase (starts PENDING); computes provisional points into account.pending_points."
+    roles: [ProgramAdmin]
+    code: 201
+    input: [card_account_id, amount_cents, category_code, transacted_at]
+    output: Transaction
+    side_effects: ["txn created PENDING; provisional points added to account.pending_points; increments CardAccount.version by 1"]
+  - method: GET
+    path: "/transactions/{id}"
+    description: "Fetch a transaction."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects: []
+  - method: GET
+    path: "/transactions"
+    description: "List transactions, filterable by account (FK reverse-reachability for Transaction.card_account_id)."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: ["card_account_id?", "status?", "limit?", "offset?"]
+    output: Transaction[]
+    side_effects: []
+  - method: POST
+    path: "/transactions/{id}/post"
+    description: "Post a PENDING transaction; computes earned_points, mints a PointsLot, updates spend counters/tier, may grant signup bonus."
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects: ["txn PENDING->POSTED; mints EARN PointsLot; pending_points->points_balance; annual/qualifying spend updated; tier re-derived; signup bonus cascade; increments CardAccount.version by 1"]
+  - method: POST
+    path: "/transactions/{id}/decline"
+    description: "Decline a PENDING transaction; releases provisional points."
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects: ["txn PENDING->DECLINED; provisional points removed from pending_points; increments CardAccount.version by 1"]
+  - method: POST
+    path: "/transactions/{id}/refund"
+    description: "Refund a POSTED transaction; claws back its EARN lot, reverses spend, may demote tier."
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects: ["txn POSTED->REFUNDED; EARN lot CLAWED_BACK; points_balance floored at 0; annual/qualifying spend decremented; tier re-derived; increments CardAccount.version by 1"]
+
+  # ---- PointsLot (read; minted as cascade side-effect, reverse-reachable only) ----
+  - method: GET
+    path: "/points-lots/{id}"
+    description: "Fetch a single points lot."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: []
+    output: PointsLot
+    side_effects: []
+  - method: GET
+    path: "/points-lots"
+    description: "List points lots, filterable by account (FK reverse-reachability for PointsLot.card_account_id and PointsLot.source_transaction_id)."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: ["card_account_id?", "source_transaction_id?", "status?", "limit?", "offset?"]
+    output: PointsLot[]
+    side_effects: []
+
+  # ---- Redemption ----
+  - method: POST
+    path: "/redemptions"
+    description: "Request a redemption (statement credit or points transfer); reserves nothing until confirm but validates balance and OCC."
+    roles: [Cardholder]
+    code: 201
+    input: [card_account_id, redemption_type, points_requested, "transfer_partner_id?", expected_card_account_version]
+    output: Redemption
+    side_effects: ["redemption created PENDING; OCC + balance validated; increments CardAccount.version by 1"]
+  - method: GET
+    path: "/redemptions/{id}"
+    description: "Fetch a redemption."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: []
+    output: Redemption
+    side_effects: []
+  - method: GET
+    path: "/redemptions"
+    description: "List redemptions, filterable by account (FK reverse-reachability for Redemption.card_account_id and Redemption.transfer_partner_id)."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: ["card_account_id?", "transfer_partner_id?", "status?", "limit?", "offset?"]
+    output: Redemption[]
+    side_effects: []
+  - method: POST
+    path: "/redemptions/{id}/confirm"
+    description: "Confirm a PENDING redemption; consumes points FIFO and computes redeemed_value."
+    roles: [RewardsOps]
+    code: 200
+    input: []
+    output: Redemption
+    side_effects: ["redemption PENDING->CONFIRMED; FIFO lot consumption; redeemed_value computed; points_balance recomputed; increments CardAccount.version by 1"]
+  - method: POST
+    path: "/redemptions/{id}/reject"
+    description: "Reject a PENDING redemption."
+    roles: [RewardsOps]
+    code: 200
+    input: []
+    output: Redemption
+    side_effects: ["redemption PENDING->REJECTED; increments CardAccount.version by 1"]
+  - method: POST
+    path: "/redemptions/{id}/reverse"
+    description: "Reverse a CONFIRMED redemption; restores exactly the consumed points to their lots."
+    roles: [RewardsOps]
+    code: 200
+    input: []
+    output: Redemption
+    side_effects: ["redemption CONFIRMED->REVERSED; points restored to lots_consumed; points_balance recomputed (+points_requested); increments CardAccount.version by 1"]
+
+  # ---- CategoryActivation ----
+  - method: POST
+    path: "/category-activations"
+    description: "Activate a quarterly category for an account."
+    roles: [Cardholder]
+    code: 201
+    input: [card_account_id, quarterly_category_id]
+    output: CategoryActivation
+    side_effects: ["activation created ACTIVE with activated_at = server clock"]
+  - method: GET
+    path: "/category-activations/{id}"
+    description: "Fetch a single category activation."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: []
+    output: CategoryActivation
+    side_effects: []
+  - method: GET
+    path: "/category-activations"
+    description: "List category activations, filterable by account (FK reverse-reachability for card_account_id and quarterly_category_id)."
+    roles: [ProgramAdmin, Cardholder, RewardsOps]
+    code: 200
+    input: ["card_account_id?", "quarterly_category_id?", "status?", "limit?", "offset?"]
+    output: CategoryActivation[]
+    side_effects: []
+
+  # ---- Period close / epoch (test-driving + business ops) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving: set the server clock to a fixed UTC instant (drives opened_at, transacted_at windows, expiry sweep). Outside the public business surface."
+    roles: [ProgramAdmin, RewardsOps]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock set to the given instant"]
+  - method: POST
+    path: "/close-period"
+    description: "RewardsOps epoch op: forfeit expired lots and mark unmet signup-bonus windows expired, as of the current server clock."
+    roles: [RewardsOps]
+    code: 200
+    input: []
+    output: "{ expired_lot_count: integer, expired_points: integer, signup_windows_expired: integer }"
+    side_effects: ["each ACTIVE PointsLot with expires_at <= now -> EXPIRED (remaining_points forfeited); each account whose signup window has passed unmet -> signup_bonus_status EXPIRED_UNQUALIFIED; affected accounts' points_balance recomputed; increments affected CardAccount.version by 1"]
+
+# =====================================================================
+# §1.6 Error Code Catalog
+# =====================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid auth headers or unrecognized X-User-Role."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Authenticated role not permitted for this operation."
+  - id: ERR_NOT_ACCOUNT_OWNER
+    http: 403
+    condition: "Cardholder acting on an account whose id != X-User-ID."
+  - id: ERR_RESOURCE_NOT_FOUND
+    http: 404
+    condition: "Path or FK-referenced resource does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, wrong type, malformed enum, or out-of-range scalar."
+  - id: ERR_PARTNER_FIELD_MISMATCH
+    http: 422
+    condition: "transfer_partner_id present for STATEMENT_CREDIT or absent for POINTS_TRANSFER."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource not in the required state for the requested transition."
+  - id: ERR_CROSS_PRODUCT_MISMATCH
+    http: 422
+    condition: "QuarterlyCategory belongs to a different product than the account; product RETIRED on open; partner SUSPENDED on transfer."
+  - id: ERR_DUPLICATE_ACTIVATION
+    http: 409
+    condition: "Second ACTIVE activation for the same (account, quarterly_category), or duplicate category code/quarter_label uniqueness violation."
+  - id: ERR_TEMPORAL_OUT_OF_RANGE
+    http: 422
+    condition: "transacted_at before opened_at or in the future."
+  - id: ERR_BELOW_MIN_TRANSFER
+    http: 422
+    condition: "POINTS_TRANSFER points_requested below partner.min_transfer_points."
+  - id: ERR_STALE_ACCOUNT_VERSION
+    http: 412
+    condition: "expected_card_account_version != account.version at redemption create."
+  - id: ERR_INSUFFICIENT_POINTS
+    http: 422
+    condition: "points_requested exceeds account.points_balance at create or re-check at confirm."
+
+# =====================================================================
+# §1.7 RBAC Matrix
+# =====================================================================
+roles:
+  - name: ProgramAdmin
+    description: "Operates the rewards program: manages catalog (products, categories, partners), opens/activates/closes accounts, and posts/declines/refunds transactions."
+    identity: opaque
+    exclusive_operations:
+      - "POST /products, POST /products/{id}/retire"
+      - "POST /cashback-categories, POST /quarterly-categories"
+      - "POST /transfer-partners, POST /transfer-partners/{id}/suspend"
+      - "POST /accounts, POST /accounts/{id}/activate"
+      - "POST /transactions, POST /transactions/{id}/post, /decline, /refund"
+    shared_operations:
+      - "POST /accounts/{id}/close (also Cardholder)"
+      - "GET reads on products/categories/partners/accounts/transactions/redemptions/points-lots/category-activations"
+      - "POST /_clock/set_current_utc (also RewardsOps)"
+
+  - name: Cardholder
+    description: "The account owner; requests redemptions, activates quarterly categories, may close own account."
+    identity: "entity_backed:CardAccount"
+    exclusive_operations:
+      - "POST /redemptions"
+      - "POST /category-activations"
+    shared_operations:
+      - "POST /accounts/{id}/close (own account; also ProgramAdmin)"
+      - "GET reads on own account/transactions/redemptions/points-lots/category-activations and on catalog config"
+
+  - name: RewardsOps
+    description: "Back-office operations: reviews redemptions (confirm/reject/reverse) and runs the period-close epoch (expiry + signup-window sweep)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /redemptions/{id}/confirm, /reject, /reverse"
+      - "POST /close-period"
+    shared_operations:
+      - "GET reads on accounts/transactions/redemptions/points-lots/category-activations and catalog config"
+      - "POST /_clock/set_current_utc (also ProgramAdmin)"

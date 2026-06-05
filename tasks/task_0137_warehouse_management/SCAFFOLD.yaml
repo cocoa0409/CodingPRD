@@ -1,0 +1,2111 @@
+scenario: "Warehouse Management System (WMS): inbound ASN receiving, putaway strategy, slotting optimization, wave/batch picking, pick-to-light, ABC cycle count, cross-docking, license plate (LPN) tracking, min/max replenishment"
+domain_name: "warehouse-management"
+api_prefix: "/warehouse"
+
+complexity_profile:
+  primary_archetype: "Quota / allocation"
+  secondary_archetype: "Workflow orchestration"
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - derived_field_reconciliation
+    - selector_policy
+  entity_topology: graph
+  # LicensePlate references Location + Sku + InboundAsn; InventoryAllocation is a
+  # many-to-many junction between LicensePlate and OrderLine; PutawayTask /
+  # PickTask / ReplenishmentTask span Location <-> LicensePlate <-> Sku across
+  # aggregate boundaries. Not a strict tree, not flat peers — a reference graph.
+  state_machine_shape: parallel
+  # Wave carries two independent axes (release_status x fulfillment_status).
+  # LicensePlate.disposition cycles (PUTAWAY_PENDING -> STORED -> ALLOCATED ->
+  # STORED on cancel). InboundAsn branches (RECEIVING -> {CROSS_DOCKED, PUT_AWAY}).
+  relationship_patterns:
+    - one_to_many        # InboundAsn -> AsnLine; OutboundOrder -> OrderLine; Wave -> PickTask
+    - many_to_many       # InventoryAllocation junctions LicensePlate <-> OrderLine
+    - cross_aggregate    # PutawayTask/PickTask reference Location + LicensePlate + Sku
+  role_model: segregation_of_duties
+  # ReceivingClerk receives ASNs; PutawayOperator/Picker execute floor tasks;
+  # InventoryController runs cycle counts & replenishment & slotting. The clerk
+  # who received an ASN cannot also approve its own cycle-count variance
+  # adjustment (segregation), and the PlatformAdmin/opaque operator configures
+  # SKUs and locations.
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Sku
+    parent: null
+    common_fields: true
+    fields:
+      - name: sku_code
+        type: string
+        source: input
+        description: "Human merchandising code; unique across all Sku."
+        constraints: "unique; non-empty"
+      - name: description
+        type: string
+        source: input
+        description: "Free-text item description."
+      - name: abc_class
+        type: enum
+        source: input
+        description: "Velocity class driving cycle-count cadence and slotting priority."
+        constraints: "one of {A, B, C}"
+      - name: each_volume_cm3
+        type: number
+        source: input
+        description: "Cubic volume of a single each; used by slotting fit checks."
+        constraints: "> 0"
+      - name: min_qty
+        type: integer
+        source: input
+        description: "Min/max replenishment floor; at-or-below it the SKU is replen-eligible."
+        constraints: ">= 0"
+      - name: max_qty
+        type: integer
+        source: input
+        description: "Min/max replenishment ceiling; replenishment refills the pick face up to this."
+        constraints: "> min_qty"
+      - name: on_hand_qty
+        type: integer
+        source: computed
+        description: "Sum of qty over all LicensePlate of this Sku whose disposition IN {STORED, ALLOCATED, PICKED_STAGED}. Recomputed on every LPN qty/disposition change. See calc sku_on_hand."
+        default: 0
+      - name: available_qty
+        type: integer
+        source: computed
+        description: "on_hand_qty minus sum of InventoryAllocation.allocated_qty (status IN {RESERVED, COMMITTED}) for this Sku. See calc sku_available."
+        default: 0
+      - name: cycle_count_due
+        type: boolean
+        source: computed
+        description: "True when days since last CONFIRMED CycleCount for this Sku exceeds the ABC cadence constant. See calc cycle_count_due_flag."
+        default: true
+
+  - name: Location
+    parent: null
+    common_fields: true
+    fields:
+      - name: location_code
+        type: string
+        source: input
+        description: "Aisle-bay-level code; unique across all Location."
+        constraints: "unique; non-empty"
+      - name: zone
+        type: enum
+        source: input
+        description: "Functional zone; gates which task types may target the location."
+        constraints: "one of {RECEIVING, RESERVE, PICK_FACE, CROSS_DOCK, STAGING}"
+      - name: max_volume_cm3
+        type: number
+        source: input
+        description: "Total cubic capacity of the bin."
+        constraints: "> 0"
+      - name: used_volume_cm3
+        type: number
+        source: computed
+        description: "Sum over LicensePlate stored at this Location of (qty * Sku.each_volume_cm3). Recomputed on every LPN move in/out. See calc location_used_volume."
+        default: 0
+      - name: status
+        type: enum
+        source: input
+        description: "Operational posture; BLOCKED locations reject all inbound moves."
+        default: "AVAILABLE"
+        constraints: "one of {AVAILABLE, BLOCKED}"
+      - name: pick_face_for_sku_id
+        type: string
+        source: input
+        description: "FK -> Sku.id; OPTIONAL — set only for zone=PICK_FACE locations that are the dedicated forward pick face of one Sku. null otherwise."
+        default: null
+
+  - name: LicensePlate
+    parent: null
+    common_fields: true
+    fields:
+      - name: lpn_code
+        type: string
+        source: input
+        description: "License-plate barcode; unique across all LicensePlate."
+        constraints: "unique; non-empty"
+      - name: sku_id
+        type: string
+        source: input
+        description: "FK -> Sku.id; the single Sku carried by this LPN (homogeneous LPN)."
+      - name: location_id
+        type: string
+        source: input
+        description: "FK -> Location.id; current resting Location. Set on putaway/replenish; null while disposition=PUTAWAY_PENDING."
+        default: null
+      - name: source_asn_id
+        type: string
+        source: input
+        description: "FK -> InboundAsn.id; the ASN whose receipt minted this LPN. null for LPNs created by replenishment splits."
+        default: null
+      - name: qty
+        type: integer
+        source: input
+        description: "Eaches currently on this LPN."
+        constraints: ">= 0"
+      - name: disposition
+        type: enum
+        source: system
+        description: "Lifecycle state. See state machine LicensePlate."
+        default: "PUTAWAY_PENDING"
+        constraints: "one of {PUTAWAY_PENDING, STORED, ALLOCATED, PICKED_STAGED, SHIPPED, DEPLETED}"
+
+  - name: InboundAsn
+    parent: null
+    common_fields: true
+    fields:
+      - name: asn_number
+        type: string
+        source: input
+        description: "Carrier ASN number; unique across all InboundAsn."
+        constraints: "unique; non-empty"
+      - name: supplier_name
+        type: string
+        source: input
+        description: "Originating supplier."
+      - name: handling_mode
+        type: enum
+        source: input
+        description: "PUTAWAY routes received goods to storage; CROSS_DOCK routes them straight to an outbound staging lane."
+        default: "PUTAWAY"
+        constraints: "one of {PUTAWAY, CROSS_DOCK}"
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state. See state machine InboundAsn."
+        default: "ANNOUNCED"
+        constraints: "one of {ANNOUNCED, RECEIVING, PUT_AWAY, CROSS_DOCKED, CLOSED, CANCELLED}"
+      - name: received_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the ReceivingClerk who first received against this ASN; pinned on the ANNOUNCED->RECEIVING transition. Used by segregation-of-duties checks."
+        default: null
+
+  - name: AsnLine
+    parent: InboundAsn
+    common_fields: true
+    fields:
+      - name: asn_id
+        type: string
+        source: input
+        description: "FK -> InboundAsn.id; the parent ASN."
+      - name: sku_id
+        type: string
+        source: input
+        description: "FK -> Sku.id; the expected Sku on this line."
+      - name: expected_qty
+        type: integer
+        source: input
+        description: "Eaches the supplier announced for this line."
+        constraints: "> 0"
+      - name: received_qty
+        type: integer
+        source: computed
+        description: "Sum of ReceiptEvent.received_qty for ReceiptEvent.asn_line_id == this line. Recomputed on every receipt. See calc asn_line_received."
+        default: 0
+      - name: line_status
+        type: enum
+        source: computed
+        description: "OPEN while received_qty < expected_qty; SATISFIED when received_qty == expected_qty; OVER when received_qty > expected_qty. See calc asn_line_status."
+        default: "OPEN"
+        constraints: "one of {OPEN, SATISFIED, OVER}"
+
+  - name: ReceiptEvent
+    parent: InboundAsn
+    common_fields: false
+    fields:
+      - name: asn_id
+        type: string
+        source: input
+        description: "FK -> InboundAsn.id; the ASN this receipt posts against."
+      - name: asn_line_id
+        type: string
+        source: input
+        description: "FK -> AsnLine.id; the line this receipt posts against."
+      - name: lpn_id
+        type: string
+        source: system
+        description: "FK -> LicensePlate.id; the LPN minted by this receipt event."
+      - name: received_qty
+        type: integer
+        source: input
+        description: "Eaches received on this event."
+        constraints: "> 0"
+
+  - name: PutawayTask
+    parent: null
+    common_fields: true
+    fields:
+      - name: lpn_id
+        type: string
+        source: input
+        description: "FK -> LicensePlate.id; the LPN to be put away."
+      - name: target_location_id
+        type: string
+        source: system
+        description: "FK -> Location.id; the destination chosen by the putaway selector at assignment time. null until ASSIGNED. See calc putaway_location_select."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state. See state machine PutawayTask."
+        default: "CREATED"
+        constraints: "one of {CREATED, ASSIGNED, COMPLETED, CANCELLED}"
+
+  - name: OutboundOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_number
+        type: string
+        source: input
+        description: "Customer order number; unique across all OutboundOrder."
+        constraints: "unique; non-empty"
+      - name: priority
+        type: integer
+        source: input
+        description: "Lower integer = higher priority; drives wave allocation ordering and tie-break ranking."
+        default: 5
+        constraints: ">= 1"
+      - name: wave_id
+        type: string
+        source: system
+        description: "FK -> Wave.id; the wave this order was assigned to. null until added to a wave."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state. See state machine OutboundOrder."
+        default: "OPEN"
+        constraints: "one of {OPEN, WAVED, PICKING, PICKED, SHIPPED, CANCELLED}"
+
+  - name: OrderLine
+    parent: OutboundOrder
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> OutboundOrder.id; the parent order."
+      - name: sku_id
+        type: string
+        source: input
+        description: "FK -> Sku.id; the ordered Sku."
+      - name: ordered_qty
+        type: integer
+        source: input
+        description: "Eaches ordered on this line."
+        constraints: "> 0"
+      - name: allocated_qty
+        type: integer
+        source: computed
+        description: "Sum of InventoryAllocation.allocated_qty (status IN {RESERVED, COMMITTED}) for this OrderLine. See calc order_line_allocated."
+        default: 0
+      - name: picked_qty
+        type: integer
+        source: computed
+        description: "Sum of InventoryAllocation.allocated_qty (status == COMMITTED) for this OrderLine. See calc order_line_picked."
+        default: 0
+
+  - name: InventoryAllocation
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_line_id
+        type: string
+        source: input
+        description: "FK -> OrderLine.id; the demand side of the reservation."
+      - name: lpn_id
+        type: string
+        source: input
+        description: "FK -> LicensePlate.id; the supply side of the reservation."
+      - name: allocated_qty
+        type: integer
+        source: input
+        description: "Eaches reserved from the LPN against the order line."
+        constraints: "> 0"
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state. See state machine InventoryAllocation."
+        default: "RESERVED"
+        constraints: "one of {RESERVED, COMMITTED, RELEASED}"
+
+  - name: Wave
+    parent: null
+    common_fields: true
+    fields:
+      - name: wave_label
+        type: string
+        source: input
+        description: "Operator label for the wave; unique across all Wave."
+        constraints: "unique; non-empty"
+      - name: release_status
+        type: enum
+        source: system
+        description: "Release axis (parallel dimension 1). See state machine Wave."
+        default: "PLANNING"
+        constraints: "one of {PLANNING, RELEASED, CLOSED}"
+      - name: fulfillment_status
+        type: enum
+        source: system
+        description: "Fulfillment axis (parallel dimension 2), independent of release_status. See state machine Wave."
+        default: "UNALLOCATED"
+        constraints: "one of {UNALLOCATED, ALLOCATED, PICKING, PICKED}"
+
+  - name: PickTask
+    parent: Wave
+    common_fields: true
+    fields:
+      - name: wave_id
+        type: string
+        source: input
+        description: "FK -> Wave.id; the wave that spawned this pick task."
+      - name: allocation_id
+        type: string
+        source: input
+        description: "FK -> InventoryAllocation.id; the reservation this pick fulfills."
+      - name: light_confirmed
+        type: boolean
+        source: system
+        description: "Pick-to-light flag; set true when the operator presses the bin light to confirm the pick."
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state. See state machine PickTask."
+        default: "PENDING"
+        constraints: "one of {PENDING, IN_PROGRESS, PICKED, SHORT, CANCELLED}"
+
+  - name: CycleCount
+    parent: null
+    common_fields: true
+    fields:
+      - name: location_id
+        type: string
+        source: input
+        description: "FK -> Location.id; the location being counted."
+      - name: sku_id
+        type: string
+        source: input
+        description: "FK -> Sku.id; the SKU being counted at that location."
+      - name: system_qty
+        type: integer
+        source: system
+        description: "On-hand snapshot (sum of LicensePlate.qty for this sku at this location, disposition IN {STORED, ALLOCATED}) captured at OPEN time. See calc cycle_count_system_qty."
+        default: 0
+      - name: counted_qty
+        type: integer
+        source: input
+        description: "Physical eaches counted by the controller; submitted on the COUNTED transition."
+        default: null
+        constraints: ">= 0"
+      - name: variance_qty
+        type: integer
+        source: computed
+        description: "counted_qty - system_qty; set on COUNTED. See calc cycle_count_variance."
+        default: 0
+      - name: counted_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the controller who submitted the count; pinned on OPEN->COUNTED. Used by segregation-of-duties on approval."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state. See state machine CycleCount."
+        default: "OPEN"
+        constraints: "one of {OPEN, COUNTED, RECONCILED, REJECTED}"
+
+  - name: ReplenishmentTask
+    parent: null
+    common_fields: true
+    fields:
+      - name: sku_id
+        type: string
+        source: input
+        description: "FK -> Sku.id; the SKU whose pick face is being refilled."
+      - name: pick_face_location_id
+        type: string
+        source: system
+        description: "FK -> Location.id; the SKU's PICK_FACE destination (Sku.pick_face_for_sku_id == sku). Pinned at creation. See calc replen_qty."
+        default: null
+      - name: source_lpn_id
+        type: string
+        source: system
+        description: "FK -> LicensePlate.id; the RESERVE LPN chosen by the source selector at assignment. null until ASSIGNED. See calc replen_source_select."
+        default: null
+      - name: replen_qty
+        type: integer
+        source: computed
+        description: "Eaches to move = Sku.max_qty minus pick-face on-hand at creation time. See calc replen_qty."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state. See state machine ReplenishmentTask."
+        default: "CREATED"
+        constraints: "one of {CREATED, ASSIGNED, COMPLETED, CANCELLED}"
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: InboundAsn
+    initial_state: ANNOUNCED
+    terminal_states: [CLOSED, CANCELLED]
+    transitions:
+      - from: ANNOUNCED
+        to: RECEIVING
+        trigger: "POST /warehouse/inbound-asns/{id}/receipts (first receipt)"
+        actor: ReceivingClerk
+        preconditions:
+          - "InboundAsn.status == ANNOUNCED"
+          - "the referenced AsnLine belongs to this ASN"
+          - "received_qty (request) > 0"
+        side_effects:
+          - "set InboundAsn.received_by_user_id = X-User-ID"
+          - "append a ReceiptEvent"
+          - "mint a LicensePlate (sku_id = AsnLine.sku_id, qty = received_qty, source_asn_id = this ASN, disposition = PUTAWAY_PENDING, location_id = null)"
+          - "recompute AsnLine.received_qty and AsnLine.line_status (calc asn_line_received, asn_line_status)"
+          - "recompute Sku.on_hand_qty (calc sku_on_hand)"
+          - "increments InboundAsn.version by 1"
+      - from: RECEIVING
+        to: RECEIVING
+        trigger: "POST /warehouse/inbound-asns/{id}/receipts (subsequent receipt)"
+        actor: ReceivingClerk
+        preconditions:
+          - "InboundAsn.status == RECEIVING"
+          - "the AsnLine belongs to this ASN"
+        side_effects:
+          - "append a ReceiptEvent; mint a LicensePlate as above"
+          - "recompute AsnLine.received_qty, AsnLine.line_status, Sku.on_hand_qty"
+          - "increments InboundAsn.version by 1"
+      - from: RECEIVING
+        to: PUT_AWAY
+        trigger: "POST /warehouse/inbound-asns/{id}/close"
+        actor: ReceivingClerk
+        preconditions:
+          - "InboundAsn.status == RECEIVING"
+          - "InboundAsn.handling_mode == PUTAWAY"
+          - "every AsnLine of this ASN has line_status IN {SATISFIED, OVER} (no OPEN line)"
+        side_effects:
+          - "for every PUTAWAY_PENDING LicensePlate with source_asn_id == this ASN, create a PutawayTask (status=CREATED)"
+          - "increments InboundAsn.version by 1"
+        note: "Branch A of the receiving fork (PUTAWAY handling)."
+      - from: RECEIVING
+        to: CROSS_DOCKED
+        trigger: "POST /warehouse/inbound-asns/{id}/close"
+        actor: ReceivingClerk
+        preconditions:
+          - "InboundAsn.status == RECEIVING"
+          - "InboundAsn.handling_mode == CROSS_DOCK"
+          - "every AsnLine of this ASN has line_status IN {SATISFIED, OVER}"
+        side_effects:
+          - "for every PUTAWAY_PENDING LicensePlate with source_asn_id == this ASN, move it directly to a CROSS_DOCK-zone Location chosen by calc crossdock_location_select; set LicensePlate.disposition = STORED, set LicensePlate.location_id; recompute that Location.used_volume_cm3 (calc location_used_volume)"
+          - "increments InboundAsn.version by 1"
+        note: "Branch B of the receiving fork (CROSS_DOCK handling). Divergent side-effect set vs branch A: no PutawayTask is created; the LPN lands STORED in a CROSS_DOCK lane immediately."
+      - from: PUT_AWAY
+        to: CLOSED
+        trigger: "system: last PutawayTask of this ASN reaches COMPLETED"
+        actor: system
+        preconditions:
+          - "every PutawayTask whose LPN has source_asn_id == this ASN is COMPLETED or CANCELLED, and at least one is COMPLETED"
+        side_effects:
+          - "increments InboundAsn.version by 1"
+        note: "Bubble-up: ASN auto-closes when all its putaway work finishes."
+      - from: CROSS_DOCKED
+        to: CLOSED
+        trigger: "POST /warehouse/inbound-asns/{id}/close-crossdock"
+        actor: ReceivingClerk
+        preconditions:
+          - "InboundAsn.status == CROSS_DOCKED"
+        side_effects:
+          - "increments InboundAsn.version by 1"
+      - from: ANNOUNCED
+        to: CANCELLED
+        trigger: "POST /warehouse/inbound-asns/{id}/cancel"
+        actor: ReceivingClerk
+        preconditions:
+          - "InboundAsn.status == ANNOUNCED (no receipts posted yet)"
+        side_effects:
+          - "increments InboundAsn.version by 1"
+
+  - entity: LicensePlate
+    initial_state: PUTAWAY_PENDING
+    terminal_states: [SHIPPED, DEPLETED]
+    transitions:
+      - from: PUTAWAY_PENDING
+        to: STORED
+        trigger: "POST /warehouse/putaway-tasks/{id}/complete OR cross-dock close"
+        actor: PutawayOperator
+        preconditions:
+          - "the LicensePlate.disposition == PUTAWAY_PENDING"
+          - "target Location.status == AVAILABLE"
+        side_effects:
+          - "set LicensePlate.location_id = target Location.id"
+          - "recompute target Location.used_volume_cm3 (calc location_used_volume)"
+          - "recompute Sku.on_hand_qty (calc sku_on_hand)"
+          - "increments LicensePlate.version by 1"
+      - from: STORED
+        to: ALLOCATED
+        trigger: "system: an InventoryAllocation against this LPN is created (RESERVED)"
+        actor: system
+        preconditions:
+          - "LicensePlate.disposition == STORED"
+          - "sum of RESERVED+COMMITTED InventoryAllocation.allocated_qty for this LPN == LicensePlate.qty (fully reserved)"
+        side_effects:
+          - "increments LicensePlate.version by 1"
+        note: "An LPN flips to ALLOCATED only once its whole qty is spoken for; a partial reservation leaves it STORED."
+      - from: ALLOCATED
+        to: STORED
+        trigger: "system: a RESERVED InventoryAllocation against this LPN is RELEASED (allocation cancel)"
+        actor: system
+        preconditions:
+          - "LicensePlate.disposition == ALLOCATED"
+          - "after release, sum of RESERVED+COMMITTED allocations for this LPN < LicensePlate.qty"
+        side_effects:
+          - "increments LicensePlate.version by 1"
+        note: "Cyclic edge STORED<->ALLOCATED; reservation churn drives the LPN back and forth."
+      - from: ALLOCATED
+        to: PICKED_STAGED
+        trigger: "POST /warehouse/pick-tasks/{id}/confirm (light-confirmed pick)"
+        actor: Picker
+        preconditions:
+          - "LicensePlate.disposition == ALLOCATED"
+          - "the PickTask.allocation_id points at a COMMITTED-eligible allocation on this LPN"
+        side_effects:
+          - "increments LicensePlate.version by 1"
+      - from: PICKED_STAGED
+        to: SHIPPED
+        trigger: "POST /warehouse/outbound-orders/{id}/ship"
+        actor: Picker
+        preconditions:
+          - "LicensePlate.disposition == PICKED_STAGED"
+        side_effects:
+          - "set LicensePlate.qty = 0; recompute Sku.on_hand_qty (calc sku_on_hand)"
+          - "increments LicensePlate.version by 1"
+      - from: STORED
+        to: DEPLETED
+        trigger: "system: a ReplenishmentTask complete drains this RESERVE LPN to qty 0"
+        actor: system
+        preconditions:
+          - "LicensePlate.disposition == STORED"
+          - "LicensePlate.qty reaches 0 after the replenishment move"
+        side_effects:
+          - "set LicensePlate.location_id = null; recompute the prior Location.used_volume_cm3 (calc location_used_volume)"
+          - "increments LicensePlate.version by 1"
+
+  - entity: PutawayTask
+    initial_state: CREATED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: CREATED
+        to: ASSIGNED
+        trigger: "POST /warehouse/putaway-tasks/{id}/assign"
+        actor: PutawayOperator
+        preconditions:
+          - "PutawayTask.status == CREATED"
+          - "the putaway selector (calc putaway_location_select) returns a non-empty candidate set"
+        side_effects:
+          - "set PutawayTask.target_location_id = selector result"
+          - "increments PutawayTask.version by 1"
+      - from: ASSIGNED
+        to: COMPLETED
+        trigger: "POST /warehouse/putaway-tasks/{id}/complete"
+        actor: PutawayOperator
+        preconditions:
+          - "PutawayTask.status == ASSIGNED"
+          - "target Location.status == AVAILABLE"
+          - "target Location residual capacity >= LPN volume (calc location_used_volume vs Location.max_volume_cm3)"
+        side_effects:
+          - "drive LicensePlate PUTAWAY_PENDING->STORED (set location_id, recompute Location.used_volume_cm3, recompute Sku.on_hand_qty)"
+          - "if every PutawayTask of the source ASN is now COMPLETED/CANCELLED with >=1 COMPLETED, bubble InboundAsn PUT_AWAY->CLOSED"
+          - "increments PutawayTask.version by 1"
+      - from: CREATED
+        to: CANCELLED
+        trigger: "POST /warehouse/putaway-tasks/{id}/cancel"
+        actor: PutawayOperator
+        preconditions:
+          - "PutawayTask.status == CREATED"
+        side_effects:
+          - "increments PutawayTask.version by 1"
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "POST /warehouse/putaway-tasks/{id}/cancel"
+        actor: PutawayOperator
+        preconditions:
+          - "PutawayTask.status == ASSIGNED"
+        side_effects:
+          - "clear PutawayTask.target_location_id"
+          - "increments PutawayTask.version by 1"
+
+  - entity: OutboundOrder
+    initial_state: OPEN
+    terminal_states: [SHIPPED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: WAVED
+        trigger: "POST /warehouse/waves/{id}/add-order"
+        actor: WavePlanner
+        preconditions:
+          - "OutboundOrder.status == OPEN"
+          - "Wave.release_status == PLANNING"
+        side_effects:
+          - "set OutboundOrder.wave_id = Wave.id"
+          - "increments OutboundOrder.version by 1"
+      - from: WAVED
+        to: PICKING
+        trigger: "system: Wave.fulfillment_status enters PICKING (wave release allocates then pick tasks start)"
+        actor: system
+        preconditions:
+          - "OutboundOrder.status == WAVED"
+          - "the order's Wave.fulfillment_status == PICKING"
+        side_effects:
+          - "increments OutboundOrder.version by 1"
+      - from: PICKING
+        to: PICKED
+        trigger: "system: every OrderLine of this order has picked_qty == ordered_qty"
+        actor: system
+        preconditions:
+          - "OutboundOrder.status == PICKING"
+          - "for every OrderLine, picked_qty == ordered_qty (calc order_line_picked)"
+        side_effects:
+          - "increments OutboundOrder.version by 1"
+      - from: PICKED
+        to: SHIPPED
+        trigger: "POST /warehouse/outbound-orders/{id}/ship"
+        actor: Picker
+        preconditions:
+          - "OutboundOrder.status == PICKED"
+        side_effects:
+          - "for each COMMITTED InventoryAllocation of this order, drive its PICKED_STAGED LicensePlate -> SHIPPED (qty->0, recompute Sku.on_hand_qty)"
+          - "set every InventoryAllocation of this order COMMITTED -> (stays COMMITTED, terminal); mark order SHIPPED"
+          - "increments OutboundOrder.version by 1"
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /warehouse/outbound-orders/{id}/cancel"
+        actor: WavePlanner
+        preconditions:
+          - "OutboundOrder.status == OPEN (not yet waved)"
+        side_effects:
+          - "increments OutboundOrder.version by 1"
+
+  - entity: InventoryAllocation
+    initial_state: RESERVED
+    terminal_states: [RELEASED, COMMITTED]
+    transitions:
+      - from: RESERVED
+        to: COMMITTED
+        trigger: "POST /warehouse/pick-tasks/{id}/confirm"
+        actor: Picker
+        preconditions:
+          - "InventoryAllocation.status == RESERVED"
+          - "the PickTask.light_confirmed == true at confirm time"
+        side_effects:
+          - "recompute OrderLine.picked_qty (calc order_line_picked) and OrderLine.allocated_qty"
+          - "increments InventoryAllocation.version by 1"
+      - from: RESERVED
+        to: RELEASED
+        trigger: "POST /warehouse/allocations/{id}/cancel"
+        actor: WavePlanner
+        preconditions:
+          - "InventoryAllocation.status == RESERVED"
+        side_effects:
+          - "recompute OrderLine.allocated_qty; recompute Sku.available_qty (calc sku_available)"
+          - "if the LPN is no longer fully reserved, drive LicensePlate ALLOCATED->STORED"
+          - "increments InventoryAllocation.version by 1"
+
+  - entity: Wave
+    initial_state: PLANNING
+    terminal_states: [CLOSED]
+    transitions:
+      # ----- release_status axis -----
+      - from: PLANNING
+        to: RELEASED
+        trigger: "POST /warehouse/waves/{id}/release"
+        actor: WavePlanner
+        preconditions:
+          - "Wave.release_status == PLANNING"
+          - "expected_wave_version (request) == Wave.version"
+          - "at least one OutboundOrder has wave_id == this Wave"
+        side_effects:
+          - "run wave allocation (calc wave_allocation_order): for each order line in priority order, create InventoryAllocation rows against STORED LPNs by FEFO/created_at; set Wave.fulfillment_status = ALLOCATED"
+          - "drive each fully-reserved LicensePlate STORED->ALLOCATED"
+          - "recompute Sku.available_qty for affected SKUs (calc sku_available)"
+          - "increments Wave.version by 1"
+      - from: RELEASED
+        to: CLOSED
+        trigger: "system: Wave.fulfillment_status reaches PICKED"
+        actor: system
+        preconditions:
+          - "Wave.release_status == RELEASED"
+          - "Wave.fulfillment_status == PICKED"
+        side_effects:
+          - "increments Wave.version by 1"
+      # ----- fulfillment_status axis (parallel, independent of release_status) -----
+      - from: ALLOCATED
+        to: PICKING
+        trigger: "POST /warehouse/waves/{id}/start-picking"
+        actor: WavePlanner
+        preconditions:
+          - "Wave.fulfillment_status == ALLOCATED"
+          - "Wave.release_status == RELEASED"
+        side_effects:
+          - "spawn one PickTask per InventoryAllocation of this wave (status PENDING)"
+          - "drive each WAVED OutboundOrder of this wave -> PICKING"
+          - "increments Wave.version by 1"
+        note: "fulfillment_status axis transition; release_status stays RELEASED."
+      - from: PICKING
+        to: PICKED
+        trigger: "system: every PickTask of this wave is PICKED, SHORT, or CANCELLED with >=1 PICKED"
+        actor: system
+        preconditions:
+          - "Wave.fulfillment_status == PICKING"
+          - "no PickTask of this wave is PENDING or IN_PROGRESS"
+        side_effects:
+          - "bubble Wave.release_status RELEASED->CLOSED"
+          - "increments Wave.version by 1"
+
+  - entity: PickTask
+    initial_state: PENDING
+    terminal_states: [PICKED, SHORT, CANCELLED]
+    transitions:
+      - from: PENDING
+        to: IN_PROGRESS
+        trigger: "POST /warehouse/pick-tasks/{id}/start"
+        actor: Picker
+        preconditions:
+          - "PickTask.status == PENDING"
+          - "the parent Wave.fulfillment_status == PICKING"
+        side_effects:
+          - "increments PickTask.version by 1"
+      - from: IN_PROGRESS
+        to: PICKED
+        trigger: "POST /warehouse/pick-tasks/{id}/confirm"
+        actor: Picker
+        preconditions:
+          - "PickTask.status == IN_PROGRESS"
+          - "light_confirmed (request) == true"
+          - "the InventoryAllocation referenced is RESERVED"
+        side_effects:
+          - "set PickTask.light_confirmed = true"
+          - "drive InventoryAllocation RESERVED->COMMITTED (recompute OrderLine.picked_qty)"
+          - "drive LicensePlate ALLOCATED->PICKED_STAGED"
+          - "if every OrderLine of the order is fully picked, bubble OutboundOrder PICKING->PICKED"
+          - "if no PickTask of the wave is PENDING/IN_PROGRESS, bubble Wave.fulfillment_status PICKING->PICKED"
+          - "increments PickTask.version by 1"
+      - from: IN_PROGRESS
+        to: SHORT
+        trigger: "POST /warehouse/pick-tasks/{id}/short"
+        actor: Picker
+        preconditions:
+          - "PickTask.status == IN_PROGRESS"
+        side_effects:
+          - "drive the PickTask's InventoryAllocation RESERVED->RELEASED (recompute OrderLine.allocated_qty, Sku.available_qty)"
+          - "if the LPN is no longer fully reserved, drive LicensePlate ALLOCATED->STORED"
+          - "increments PickTask.version by 1"
+        note: "Short-pick compensation: releases the reservation rather than committing it."
+      - from: PENDING
+        to: CANCELLED
+        trigger: "POST /warehouse/pick-tasks/{id}/cancel"
+        actor: WavePlanner
+        preconditions:
+          - "PickTask.status == PENDING"
+        side_effects:
+          - "drive the PickTask's InventoryAllocation RESERVED->RELEASED"
+          - "increments PickTask.version by 1"
+
+  - entity: CycleCount
+    initial_state: OPEN
+    terminal_states: [RECONCILED, REJECTED]
+    transitions:
+      - from: OPEN
+        to: COUNTED
+        trigger: "POST /warehouse/cycle-counts/{id}/submit"
+        actor: InventoryController
+        preconditions:
+          - "CycleCount.status == OPEN"
+          - "counted_qty (request) >= 0"
+        side_effects:
+          - "set CycleCount.counted_qty, CycleCount.counted_by_user_id = X-User-ID"
+          - "set CycleCount.variance_qty = counted_qty - system_qty (calc cycle_count_variance)"
+          - "increments CycleCount.version by 1"
+      - from: COUNTED
+        to: RECONCILED
+        trigger: "POST /warehouse/cycle-counts/{id}/approve"
+        actor: InventoryController
+        preconditions:
+          - "CycleCount.status == COUNTED"
+          - "approving X-User-ID != CycleCount.counted_by_user_id (segregation of duties)"
+          - "approving X-User-ID != InboundAsn.received_by_user_id of any ASN that fed an LPN at this location (segregation of duties)"
+        side_effects:
+          - "if variance_qty != 0, adjust the STORED LicensePlate qty at this location for this SKU by variance_qty (created_at ASC fill order); recompute Sku.on_hand_qty (calc sku_on_hand) and Location.used_volume_cm3"
+          - "set Sku.cycle_count_due = false (recompute via calc cycle_count_due_flag)"
+          - "increments CycleCount.version by 1"
+      - from: COUNTED
+        to: REJECTED
+        trigger: "POST /warehouse/cycle-counts/{id}/reject"
+        actor: InventoryController
+        preconditions:
+          - "CycleCount.status == COUNTED"
+          - "rejecting X-User-ID != CycleCount.counted_by_user_id (segregation of duties)"
+        side_effects:
+          - "no inventory adjustment; on-hand unchanged"
+          - "increments CycleCount.version by 1"
+
+  - entity: ReplenishmentTask
+    initial_state: CREATED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: CREATED
+        to: ASSIGNED
+        trigger: "POST /warehouse/replenishment-tasks/{id}/assign"
+        actor: InventoryController
+        preconditions:
+          - "ReplenishmentTask.status == CREATED"
+          - "the source selector (calc replen_source_select) returns a non-empty RESERVE-LPN candidate set with combined qty >= replen_qty"
+        side_effects:
+          - "set ReplenishmentTask.source_lpn_id = selector result"
+          - "increments ReplenishmentTask.version by 1"
+      - from: ASSIGNED
+        to: COMPLETED
+        trigger: "POST /warehouse/replenishment-tasks/{id}/complete"
+        actor: PutawayOperator
+        preconditions:
+          - "ReplenishmentTask.status == ASSIGNED"
+          - "source LicensePlate.qty >= replen_qty"
+        side_effects:
+          - "decrement source LicensePlate.qty by replen_qty; if it reaches 0 drive STORED->DEPLETED"
+          - "increment pick-face on-hand by replen_qty (mint/merge a PICK_FACE LicensePlate at pick_face_location_id, disposition STORED)"
+          - "recompute Sku.on_hand_qty (no net change), recompute both Locations' used_volume_cm3"
+          - "increments ReplenishmentTask.version by 1"
+      - from: CREATED
+        to: CANCELLED
+        trigger: "POST /warehouse/replenishment-tasks/{id}/cancel"
+        actor: InventoryController
+        preconditions:
+          - "ReplenishmentTask.status == CREATED"
+        side_effects:
+          - "increments ReplenishmentTask.version by 1"
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "POST /warehouse/replenishment-tasks/{id}/cancel"
+        actor: InventoryController
+        preconditions:
+          - "ReplenishmentTask.status == ASSIGNED"
+        side_effects:
+          - "clear ReplenishmentTask.source_lpn_id"
+          - "increments ReplenishmentTask.version by 1"
+
+  - entity: Location
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: BLOCKED
+        trigger: "POST /warehouse/locations/{id}/block"
+        actor: InventoryController
+        preconditions:
+          - "Location.status == AVAILABLE"
+        side_effects:
+          - "increments Location.version by 1"
+        note: "A BLOCKED location rejects inbound putaway/replenishment moves (ERR_CROSS_ENTITY_STATE / ERR_LOCATION_CAPACITY guard upstream)."
+      - from: BLOCKED
+        to: AVAILABLE
+        trigger: "POST /warehouse/locations/{id}/unblock"
+        actor: InventoryController
+        preconditions:
+          - "Location.status == BLOCKED"
+        side_effects:
+          - "increments Location.version by 1"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: wave-release-stale-version
+    parent_entity: Wave
+    write_endpoint: "POST /warehouse/waves/{id}/release"
+    occ_field: "expected_wave_version"
+    description: |
+      Releasing a Wave whose version has advanced since the client last
+      observed it is rejected with a stale-version error. Wave release is a
+      CREATE-with-supersede pattern: release synthesizes a fresh set of
+      InventoryAllocation rows against the available LPN pool, and a release
+      that legitimately ran first (adding an order or a prior release attempt
+      that bumped the wave) leaves the second client's view of the wave stale.
+      The check compares expected_wave_version against the current
+      Wave.version and rejects on mismatch.
+    error_id: ERR_STALE_WAVE_VERSION
+    http_status: 412
+
+  - rule_id: allocation-create-stale-lpn
+    parent_entity: LicensePlate
+    write_endpoint: "POST /warehouse/allocations"
+    occ_field: "expected_lpn_version"
+    description: |
+      Creating a manual InventoryAllocation against a LicensePlate whose
+      version has advanced since the client last read it is rejected with a
+      stale-version error. A reservation against an LPN legitimately supersedes
+      the prior available quantity; if the LPN's version moved (because another
+      reservation, a pick confirm, or a replenishment drain already changed its
+      qty/disposition), the current client's available-quantity view is stale
+      and the create is rejected on the version mismatch.
+    error_id: ERR_STALE_LPN_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: sku_on_hand
+    trigger: "on every LicensePlate qty or disposition change (receipt, putaway, pick confirm, ship, replenishment, cycle-count adjustment)"
+    algorithm: aggregation
+    formula: |
+      Sku.on_hand_qty = sum(lp.qty
+                            for lp in LicensePlate
+                            if lp.sku_id == Sku.id
+                            and lp.disposition in {STORED, ALLOCATED, PICKED_STAGED})
+    input_set: "LicensePlate of this Sku with disposition IN {STORED, ALLOCATED, PICKED_STAGED}; PUTAWAY_PENDING/SHIPPED/DEPLETED excluded."
+    constants: {}
+    precision: "integer eaches, exact"
+
+  - name: sku_available
+    trigger: "on allocation create/commit/release and on every on_hand change"
+    algorithm: aggregation
+    formula: |
+      reserved = sum(a.allocated_qty
+                     for a in InventoryAllocation
+                     if a.lpn.sku_id == Sku.id and a.status in {RESERVED, COMMITTED})
+      Sku.available_qty = Sku.on_hand_qty - reserved
+    input_set: "on_hand_qty of this Sku minus RESERVED+COMMITTED allocation qty across all LPNs of the Sku."
+    constants: {}
+    precision: "integer eaches, exact; may be 0 but never negative (guarded by ERR_INSUFFICIENT_AVAILABLE on allocate)"
+
+  - name: asn_line_received
+    trigger: "on every ReceiptEvent append against the line"
+    algorithm: aggregation
+    formula: |
+      AsnLine.received_qty = sum(r.received_qty
+                                 for r in ReceiptEvent
+                                 if r.asn_line_id == AsnLine.id)
+    input_set: "all ReceiptEvent for this AsnLine."
+    constants: {}
+    precision: "integer eaches, exact"
+
+  - name: asn_line_status
+    trigger: "on every AsnLine.received_qty recompute"
+    algorithm: threshold
+    formula: |
+      if received_qty <  expected_qty: line_status = OPEN
+      if received_qty == expected_qty: line_status = SATISFIED
+      if received_qty >  expected_qty: line_status = OVER
+    input_set: "single AsnLine; boundary at received_qty == expected_qty (SATISFIED is the exact-equality band, not >=)."
+    constants: {}
+    precision: "integer comparison"
+
+  - name: location_used_volume
+    trigger: "on every LicensePlate move into or out of a Location (putaway complete, cross-dock, ship, replenishment, cycle-count adjust)"
+    algorithm: aggregation
+    formula: |
+      Location.used_volume_cm3 = sum(lp.qty * lp.sku.each_volume_cm3
+                                     for lp in LicensePlate
+                                     if lp.location_id == Location.id
+                                     and lp.disposition in {STORED, ALLOCATED, PICKED_STAGED})
+    input_set: "LPNs currently resting at the Location (disposition STORED/ALLOCATED/PICKED_STAGED)."
+    constants: {}
+    precision: "2 decimal places, round_half_up applied once after the full sum (sum-then-round, NOT round-per-line)"
+
+  - name: putaway_location_select
+    trigger: "on POST /warehouse/putaway-tasks/{id}/assign"
+    algorithm: weighted_scoring
+    formula: |
+      lpn = task.lpn; sku = lpn.sku; need = lpn.qty * sku.each_volume_cm3
+      # eligibility filter
+      candidates = [loc for loc in Location
+                    if loc.status == AVAILABLE
+                    and loc.zone in {RESERVE, PICK_FACE}
+                    and (loc.max_volume_cm3 - loc.used_volume_cm3) >= need
+                    and (loc.zone != PICK_FACE or loc.pick_face_for_sku_id == sku.id)]
+      # ranking: ABC-class slotting. A-class wants PICK_FACE first (forward
+      # velocity); B/C-class wants RESERVE first (deep storage).
+      def rank(loc):
+          zone_pref = 0 if ((sku.abc_class == 'A') == (loc.zone == 'PICK_FACE')) else 1
+          residual  = loc.max_volume_cm3 - loc.used_volume_cm3   # tightest-fit: smaller residual ranks first
+          return (zone_pref, residual, loc.created_at)
+      winner = min(candidates, key=rank)   # ties broken by created_at ASC; id never used
+    input_set: "AVAILABLE Locations in {RESERVE, PICK_FACE} with residual capacity >= the LPN's volume; PICK_FACE only if dedicated to this Sku."
+    constants: {}
+    precision: "ranking tuple compared lexicographically; residual to 2 dp; final tie-break created_at ASC"
+
+  - name: crossdock_location_select
+    trigger: "on InboundAsn cross-dock close (handling_mode == CROSS_DOCK)"
+    algorithm: weighted_scoring
+    formula: |
+      need = lpn.qty * lpn.sku.each_volume_cm3
+      candidates = [loc for loc in Location
+                    if loc.status == AVAILABLE and loc.zone == CROSS_DOCK
+                    and (loc.max_volume_cm3 - loc.used_volume_cm3) >= need]
+      def rank(loc):
+          residual = loc.max_volume_cm3 - loc.used_volume_cm3   # most-open-first
+          return (-residual, loc.created_at)
+      winner = max-open: min(candidates, key=rank)   # ties broken by created_at ASC
+    input_set: "AVAILABLE CROSS_DOCK-zone Locations with residual capacity >= LPN volume."
+    constants: {}
+    precision: "residual to 2 dp; tie-break created_at ASC; id never used. NOTE: opposite ranking direction to putaway_location_select (most-open vs tightest-fit) — divergent slotting strategy."
+
+  - name: wave_allocation_order
+    trigger: "on POST /warehouse/waves/{id}/release"
+    algorithm: waterfall_allocation
+    formula: |
+      # Demand processed in deterministic order:
+      orders = sort(orders_in_wave, key=lambda o: (o.priority, o.created_at))
+      for o in orders:
+        for line in sort(o.lines, key=lambda l: l.created_at):
+          remaining = line.ordered_qty - line.allocated_qty
+          # supply: STORED LPNs of the line's SKU, FEFO-by-receipt then created_at
+          lpns = sort([lp for lp in LicensePlate
+                       if lp.sku_id == line.sku_id
+                       and lp.disposition == STORED
+                       and lp.qty > available_already_reserved(lp)],
+                      key=lambda lp: (lp.created_at,))   # oldest-received first; id never used
+          for lp in lpns:
+            if remaining == 0: break
+            free = lp.qty - reserved_on(lp)
+            take = min(free, remaining)
+            if take > 0:
+              create InventoryAllocation(order_line=line, lpn=lp, allocated_qty=take, status=RESERVED)
+              remaining -= take
+          # leftover remaining > 0 => line under-allocated (no error; picks short later)
+    input_set: "orders with wave_id == this wave, processed by (priority ASC, created_at ASC); each line's supply = STORED LPNs of its SKU by created_at ASC (oldest receipt first)."
+    constants: {}
+    precision: "integer eaches; allocation order is fully deterministic; id never used as a key"
+
+  - name: cycle_count_system_qty
+    trigger: "on POST /warehouse/cycle-counts (create / OPEN)"
+    algorithm: aggregation
+    formula: |
+      CycleCount.system_qty = sum(lp.qty
+                                  for lp in LicensePlate
+                                  if lp.location_id == CycleCount.location_id
+                                  and lp.sku_id == CycleCount.sku_id
+                                  and lp.disposition in {STORED, ALLOCATED})
+    input_set: "snapshot at OPEN time of LPNs at the location for the SKU (STORED/ALLOCATED)."
+    constants: {}
+    precision: "integer eaches, captured once at OPEN; not re-snapshotted on submit"
+
+  - name: cycle_count_variance
+    trigger: "on POST /warehouse/cycle-counts/{id}/submit (OPEN->COUNTED)"
+    algorithm: aggregation
+    formula: |
+      CycleCount.variance_qty = counted_qty - system_qty
+    input_set: "the counted_qty submitted minus the system_qty snapshot captured at OPEN."
+    constants: {}
+    precision: "signed integer eaches (may be negative)"
+
+  - name: cycle_count_due_flag
+    trigger: "on read of Sku and on cycle-count reconcile"
+    algorithm: threshold
+    formula: |
+      days = (now - last_reconciled_at_for_sku) in whole days, floor
+      cadence = CADENCE_DAYS[sku.abc_class]
+      Sku.cycle_count_due = (days >= cadence)   # boundary is >= : exactly cadence days due
+      # if no CONFIRMED/RECONCILED CycleCount exists for the SKU, due = true
+    input_set: "most recent RECONCILED CycleCount.updated_at among CycleCounts whose sku_id == Sku.id; if none, due."
+    constants:
+      CADENCE_DAYS: { A: 30, B: 60, C: 90 }
+    precision: "whole-day floor; boundary days >= cadence (exactly cadence days => due). Clock supplied by /_clock."
+
+  - name: order_line_allocated
+    trigger: "on allocation create/release"
+    algorithm: aggregation
+    formula: |
+      OrderLine.allocated_qty = sum(a.allocated_qty
+                                    for a in InventoryAllocation
+                                    if a.order_line_id == OrderLine.id
+                                    and a.status in {RESERVED, COMMITTED})
+    input_set: "RESERVED+COMMITTED allocations for the line."
+    constants: {}
+    precision: "integer eaches"
+
+  - name: order_line_picked
+    trigger: "on pick confirm (allocation RESERVED->COMMITTED)"
+    algorithm: aggregation
+    formula: |
+      OrderLine.picked_qty = sum(a.allocated_qty
+                                 for a in InventoryAllocation
+                                 if a.order_line_id == OrderLine.id
+                                 and a.status == COMMITTED)
+    input_set: "COMMITTED allocations only for the line."
+    constants: {}
+    precision: "integer eaches"
+
+  - name: replen_qty
+    trigger: "on POST /warehouse/replenishment-tasks (create)"
+    algorithm: threshold
+    formula: |
+      pick_face = Location where pick_face_for_sku_id == sku.id
+      face_on_hand = sum(lp.qty for lp in LicensePlate
+                         if lp.location_id == pick_face.id and lp.sku_id == sku.id
+                         and lp.disposition in {STORED, ALLOCATED})
+      # only replen-eligible when at-or-below min
+      assert face_on_hand <= sku.min_qty   # else ERR_REPLEN_NOT_NEEDED
+      ReplenishmentTask.replen_qty = sku.max_qty - face_on_hand
+    input_set: "pick-face on-hand for the SKU; eligibility boundary face_on_hand <= min_qty (<=, inclusive of exactly min)."
+    constants: {}
+    precision: "integer eaches; refill target is max_qty exactly"
+
+  - name: replen_source_select
+    trigger: "on POST /warehouse/replenishment-tasks/{id}/assign"
+    algorithm: weighted_scoring
+    formula: |
+      candidates = [lp for lp in LicensePlate
+                    if lp.sku_id == task.sku_id
+                    and lp.disposition == STORED
+                    and lp.location.zone == RESERVE
+                    and lp.qty > 0]
+      # FEFO proxy: drain oldest-received reserve LPN first; tie-break created_at then nothing else
+      def rank(lp): return (lp.created_at,)
+      pool = sort(candidates, key=rank)   # oldest first; id never used
+      winner = first lp such that running sum of selected lp.qty >= task.replen_qty
+      # if combined qty < replen_qty across the whole pool => empty/insufficient => ERR_NO_REPLEN_SOURCE
+    input_set: "STORED RESERVE-zone LPNs of the SKU with qty>0, oldest created_at first; selection accumulates until replen_qty covered."
+    constants: {}
+    precision: "deterministic by created_at ASC; id never used"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except GET (reads allow any authenticated role)"
+
+  - priority: 2
+    category: auth
+    check: "the role is permitted for this operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all mutating endpoints"
+
+  - priority: 3
+    category: existence
+    check: "every path/body resource id resolves to an existing entity, validated left-to-right in the path"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 4
+    category: existence
+    check: "required body fields present and typed correctly; enum values in declared set"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all mutating endpoints"
+
+  - priority: 5
+    category: state
+    check: "the target entity is in a state from which this transition is defined (state-machine from-state)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition/action endpoints"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_<parent>_version equals the parent entity's current version"
+    error_id: ERR_STALE_WAVE_VERSION
+    http_status: 412
+    applies_to: "POST /warehouse/waves/{id}/release"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_lpn_version equals the LicensePlate's current version"
+    error_id: ERR_STALE_LPN_VERSION
+    http_status: 412
+    applies_to: "POST /warehouse/allocations"
+
+  - priority: 7
+    category: business_safety
+    check: "segregation of duties — the user approving/rejecting a CycleCount is not the user who submitted its count, nor the ReceivingClerk who received an ASN feeding inventory at the counted location"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /warehouse/cycle-counts/{id}/approve, POST /warehouse/cycle-counts/{id}/reject"
+
+  - priority: 8
+    category: business_referential
+    check: "cross-entity state guard — a PutawayTask can only complete into a Location whose status == AVAILABLE; a wave can only release if it has >=1 order; a pick can only start if its parent Wave.fulfillment_status == PICKING"
+    error_id: ERR_CROSS_ENTITY_STATE
+    http_status: 409
+    applies_to: "POST /warehouse/putaway-tasks/{id}/complete, POST /warehouse/waves/{id}/release, POST /warehouse/pick-tasks/{id}/start"
+
+  - priority: 9
+    category: business_constraint
+    check: "uniqueness — sku_code, location_code, lpn_code, asn_number, order_number, wave_label are each unique within their entity type"
+    error_id: ERR_DUPLICATE_CODE
+    http_status: 409
+    applies_to: "POST creates for Sku, Location, LicensePlate, InboundAsn, OutboundOrder, Wave"
+
+  - priority: 10
+    category: business_temporal
+    check: "capacity/overlap — a putaway/cross-dock/replenishment move into a Location must not push used_volume_cm3 above max_volume_cm3 (volume is a shared aggregate capacity; the incoming LPN volume plus existing used must fit)"
+    error_id: ERR_LOCATION_CAPACITY
+    http_status: 409
+    applies_to: "POST /warehouse/putaway-tasks/{id}/complete, POST /warehouse/replenishment-tasks/{id}/complete"
+
+  - priority: 11
+    category: business_temporal
+    check: "pick-face dedication overlap — a PICK_FACE Location's pick_face_for_sku_id may be claimed by at most one Sku; assigning a second Sku's pick face to an already-dedicated PICK_FACE location is rejected"
+    error_id: ERR_PICKFACE_TAKEN
+    http_status: 409
+    applies_to: "POST /warehouse/locations"
+
+  - priority: 12
+    category: business_constraint
+    check: "replenishment is only created when pick-face on-hand <= Sku.min_qty (at-or-below floor)"
+    error_id: ERR_REPLEN_NOT_NEEDED
+    http_status: 409
+    applies_to: "POST /warehouse/replenishment-tasks"
+
+  - priority: 13
+    category: business_fiscal
+    check: "availability/quota — an InventoryAllocation cannot reserve more than the LPN's free qty (lp.qty minus existing RESERVED+COMMITTED on that LPN), and not more than the Sku.available_qty"
+    error_id: ERR_INSUFFICIENT_AVAILABLE
+    http_status: 409
+    applies_to: "POST /warehouse/allocations, POST /warehouse/waves/{id}/release"
+
+  - priority: 14
+    category: business_constraint
+    check: "ASN close requires no OPEN AsnLine (every line SATISFIED or OVER)"
+    error_id: ERR_ASN_LINES_OPEN
+    http_status: 409
+    applies_to: "POST /warehouse/inbound-asns/{id}/close"
+
+  - priority: 15
+    category: business_constraint
+    check: "putaway assign requires a non-empty candidate set from calc putaway_location_select (>=1 AVAILABLE RESERVE/PICK_FACE location with residual capacity >= the LPN's volume); replenishment assign requires a RESERVE-LPN pool from calc replen_source_select covering replen_qty"
+    error_id: ERR_NO_PUTAWAY_LOCATION
+    http_status: 409
+    applies_to: "POST /warehouse/putaway-tasks/{id}/assign, POST /warehouse/replenishment-tasks/{id}/assign"
+    note: "replenishment assign with no source uses ERR_NO_REPLEN_SOURCE; putaway assign with no location uses ERR_NO_PUTAWAY_LOCATION."
+
+  - priority: 16
+    category: business_constraint
+    check: "pick confirm requires light_confirmed == true in the request body (pick-to-light bin light pressed); a confirm with light_confirmed=false is rejected"
+    error_id: ERR_VALIDATION_LIGHT_REQUIRED
+    http_status: 409
+    applies_to: "POST /warehouse/pick-tasks/{id}/confirm"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Sku ----
+  - method: POST
+    path: "/warehouse/skus"
+    description: "Create a SKU."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [sku_code, description, abc_class, each_volume_cm3, min_qty, max_qty]
+    output: Sku
+    side_effects: ["initialize on_hand_qty=0, available_qty=0, cycle_count_due=true"]
+  - method: GET
+    path: "/warehouse/skus/{id}"
+    description: "Fetch a SKU with computed on_hand/available/due fields."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, Picker, WavePlanner, InventoryController]
+    code: 200
+    input: []
+    output: Sku
+    side_effects: ["recompute on_hand_qty, available_qty, cycle_count_due on read (calc sku_on_hand, sku_available, cycle_count_due_flag)"]
+  - method: GET
+    path: "/warehouse/skus"
+    description: "List SKUs (paginated)."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, Picker, WavePlanner, InventoryController]
+    code: 200
+    input:
+      - "abc_class?"
+      - "limit?"
+      - "offset?"
+    output: Sku[]
+    side_effects: []
+
+  # ---- Location ----
+  - method: POST
+    path: "/warehouse/locations"
+    description: "Create a storage location; for PICK_FACE may dedicate to one SKU."
+    roles: [PlatformAdmin, InventoryController]
+    code: 201
+    input:
+      - "location_code"
+      - "zone"
+      - "max_volume_cm3"
+      - "status?"
+      - "pick_face_for_sku_id?"
+    output: Location
+    side_effects: ["initialize used_volume_cm3=0; enforce pick-face dedication uniqueness (ERR_PICKFACE_TAKEN)"]
+  - method: GET
+    path: "/warehouse/locations/{id}"
+    description: "Fetch a location with computed used_volume."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, Picker, WavePlanner, InventoryController]
+    code: 200
+    input: []
+    output: Location
+    side_effects: ["recompute used_volume_cm3 (calc location_used_volume)"]
+  - method: GET
+    path: "/warehouse/locations"
+    description: "List locations; filter by zone or by pick_face_for_sku_id (FK reverse-reachability for Sku<-Location)."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, Picker, WavePlanner, InventoryController]
+    code: 200
+    input:
+      - "zone?"
+      - "pick_face_for_sku_id?"
+      - "status?"
+      - "limit?"
+      - "offset?"
+    output: Location[]
+    side_effects: []
+  - method: POST
+    path: "/warehouse/locations/{id}/block"
+    description: "Block a location (status AVAILABLE->BLOCKED); blocked bins reject inbound putaway/replen moves. Real WMS damaged-bin operation; also drives the PutawayTask->Location cross-entity guard."
+    roles: [InventoryController]
+    code: 200
+    input: []
+    output: Location
+    side_effects: ["set status=BLOCKED"]
+  - method: POST
+    path: "/warehouse/locations/{id}/unblock"
+    description: "Unblock a location (status BLOCKED->AVAILABLE)."
+    roles: [InventoryController]
+    code: 200
+    input: []
+    output: Location
+    side_effects: ["set status=AVAILABLE"]
+
+  # ---- InboundAsn + AsnLine + ReceiptEvent ----
+  - method: POST
+    path: "/warehouse/inbound-asns"
+    description: "Announce an inbound ASN (status ANNOUNCED)."
+    roles: [ReceivingClerk]
+    code: 201
+    input:
+      - "asn_number"
+      - "supplier_name"
+      - "handling_mode?"
+    output: InboundAsn
+    side_effects: ["status=ANNOUNCED"]
+  - method: GET
+    path: "/warehouse/inbound-asns/{id}"
+    description: "Fetch an ASN."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, WavePlanner, InventoryController]
+    code: 200
+    input: []
+    output: InboundAsn
+    side_effects: []
+  - method: GET
+    path: "/warehouse/inbound-asns"
+    description: "List ASNs (paginated)."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, WavePlanner, InventoryController]
+    code: 200
+    input:
+      - "status?"
+      - "limit?"
+      - "offset?"
+    output: InboundAsn[]
+    side_effects: []
+  - method: POST
+    path: "/warehouse/inbound-asns/{id}/lines"
+    description: "Add an expected line to an ANNOUNCED ASN."
+    roles: [ReceivingClerk]
+    code: 201
+    input: [sku_id, expected_qty]
+    output: AsnLine
+    side_effects: ["line_status=OPEN, received_qty=0"]
+  - method: GET
+    path: "/warehouse/inbound-asns/{id}/lines"
+    description: "List the lines of an ASN (FK reverse-reachability AsnLine.asn_id->InboundAsn)."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, InventoryController]
+    code: 200
+    input: []
+    output: AsnLine[]
+    side_effects: []
+  - method: GET
+    path: "/warehouse/asn-lines/{id}"
+    description: "Fetch a single AsnLine (anchors the asn-lines collection segment for FK reverse-reachability)."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, InventoryController]
+    code: 200
+    input: []
+    output: AsnLine
+    side_effects: ["recompute received_qty, line_status (calc asn_line_received, asn_line_status)"]
+  - method: GET
+    path: "/warehouse/asn-lines"
+    description: "List AsnLines filtered by asn_id or sku_id (FK reverse-reachability AsnLine.sku_id->Sku and asn_id->InboundAsn)."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, InventoryController]
+    code: 200
+    input:
+      - "asn_id?"
+      - "sku_id?"
+      - "limit?"
+      - "offset?"
+    output: AsnLine[]
+    side_effects: []
+  - method: POST
+    path: "/warehouse/inbound-asns/{id}/receipts"
+    description: "Post a receipt against an ASN line; mints an LPN. First receipt moves ASN ANNOUNCED->RECEIVING."
+    roles: [ReceivingClerk]
+    code: 201
+    input: [asn_line_id, received_qty]
+    output: ReceiptEvent
+    side_effects:
+      - "append ReceiptEvent; mint LicensePlate (PUTAWAY_PENDING)"
+      - "ANNOUNCED->RECEIVING on first receipt (set received_by_user_id)"
+      - "recompute AsnLine.received_qty, AsnLine.line_status, Sku.on_hand_qty"
+  - method: GET
+    path: "/warehouse/inbound-asns/{id}/receipts"
+    description: "List receipt events of an ASN (FK reverse-reachability ReceiptEvent.asn_id->InboundAsn)."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, InventoryController]
+    code: 200
+    input: []
+    output: ReceiptEvent[]
+    side_effects: []
+  - method: GET
+    path: "/warehouse/receipt-events/{id}"
+    description: "Fetch a single ReceiptEvent (anchors the receipt-events collection segment for FK reverse-reachability)."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, InventoryController]
+    code: 200
+    input: []
+    output: ReceiptEvent
+    side_effects: []
+  - method: GET
+    path: "/warehouse/receipt-events"
+    description: "List receipt events filtered by asn_line_id or lpn_id (FK reverse-reachability ReceiptEvent.asn_line_id->AsnLine, ReceiptEvent.lpn_id->LicensePlate)."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, InventoryController]
+    code: 200
+    input:
+      - "asn_line_id?"
+      - "lpn_id?"
+      - "asn_id?"
+      - "limit?"
+      - "offset?"
+    output: ReceiptEvent[]
+    side_effects: []
+  - method: POST
+    path: "/warehouse/inbound-asns/{id}/close"
+    description: "Close receiving; forks to PUT_AWAY (creates PutawayTasks) or CROSS_DOCKED (cross-docks LPNs) by handling_mode."
+    roles: [ReceivingClerk]
+    code: 200
+    input: []
+    output: InboundAsn
+    side_effects:
+      - "PUTAWAY: RECEIVING->PUT_AWAY, create one PutawayTask per PUTAWAY_PENDING LPN"
+      - "CROSS_DOCK: RECEIVING->CROSS_DOCKED, move LPNs STORED into CROSS_DOCK lane (calc crossdock_location_select), recompute Location.used_volume_cm3, Sku.on_hand_qty"
+  - method: POST
+    path: "/warehouse/inbound-asns/{id}/close-crossdock"
+    description: "Finalize a cross-docked ASN (CROSS_DOCKED->CLOSED)."
+    roles: [ReceivingClerk]
+    code: 200
+    input: []
+    output: InboundAsn
+    side_effects: ["CROSS_DOCKED->CLOSED"]
+  - method: POST
+    path: "/warehouse/inbound-asns/{id}/cancel"
+    description: "Cancel an ANNOUNCED ASN before any receipt."
+    roles: [ReceivingClerk]
+    code: 200
+    input: []
+    output: InboundAsn
+    side_effects: ["ANNOUNCED->CANCELLED"]
+
+  # ---- LicensePlate ----
+  - method: GET
+    path: "/warehouse/license-plates/{id}"
+    description: "Fetch an LPN."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, Picker, WavePlanner, InventoryController]
+    code: 200
+    input: []
+    output: LicensePlate
+    side_effects: []
+  - method: GET
+    path: "/warehouse/license-plates"
+    description: "List LPNs filtered by sku_id, location_id, source_asn_id, or disposition (FK reverse-reachability LicensePlate.sku_id->Sku, location_id->Location, source_asn_id->InboundAsn)."
+    roles: [PlatformAdmin, ReceivingClerk, PutawayOperator, Picker, WavePlanner, InventoryController]
+    code: 200
+    input:
+      - "sku_id?"
+      - "location_id?"
+      - "source_asn_id?"
+      - "disposition?"
+      - "limit?"
+      - "offset?"
+    output: LicensePlate[]
+    side_effects: []
+
+  # ---- PutawayTask ----
+  - method: GET
+    path: "/warehouse/putaway-tasks/{id}"
+    description: "Fetch a putaway task."
+    roles: [PlatformAdmin, PutawayOperator, InventoryController]
+    code: 200
+    input: []
+    output: PutawayTask
+    side_effects: []
+  - method: GET
+    path: "/warehouse/putaway-tasks"
+    description: "List putaway tasks filtered by lpn_id or target_location_id or status (FK reverse-reachability PutawayTask.lpn_id->LicensePlate, target_location_id->Location)."
+    roles: [PlatformAdmin, PutawayOperator, InventoryController]
+    code: 200
+    input:
+      - "lpn_id?"
+      - "target_location_id?"
+      - "status?"
+      - "limit?"
+      - "offset?"
+    output: PutawayTask[]
+    side_effects: []
+  - method: POST
+    path: "/warehouse/putaway-tasks/{id}/assign"
+    description: "Assign a destination via the putaway selector (calc putaway_location_select); CREATED->ASSIGNED."
+    roles: [PutawayOperator]
+    code: 200
+    input: []
+    output: PutawayTask
+    side_effects: ["set target_location_id (selector); CREATED->ASSIGNED"]
+  - method: POST
+    path: "/warehouse/putaway-tasks/{id}/complete"
+    description: "Complete putaway; drives LPN PUTAWAY_PENDING->STORED, recomputes volume & on-hand; may bubble ASN PUT_AWAY->CLOSED."
+    roles: [PutawayOperator]
+    code: 200
+    input: []
+    output: PutawayTask
+    side_effects: ["ASSIGNED->COMPLETED; LPN->STORED; recompute Location.used_volume_cm3, Sku.on_hand_qty; maybe ASN->CLOSED"]
+  - method: POST
+    path: "/warehouse/putaway-tasks/{id}/cancel"
+    description: "Cancel a putaway task (CREATED or ASSIGNED)."
+    roles: [PutawayOperator]
+    code: 200
+    input: []
+    output: PutawayTask
+    side_effects: ["->CANCELLED; clear target_location_id if ASSIGNED"]
+
+  # ---- OutboundOrder + OrderLine ----
+  - method: POST
+    path: "/warehouse/outbound-orders"
+    description: "Create an outbound order (OPEN)."
+    roles: [WavePlanner]
+    code: 201
+    input:
+      - "order_number"
+      - "priority?"
+    output: OutboundOrder
+    side_effects: ["status=OPEN"]
+  - method: GET
+    path: "/warehouse/outbound-orders/{id}"
+    description: "Fetch an outbound order."
+    roles: [PlatformAdmin, WavePlanner, Picker, InventoryController]
+    code: 200
+    input: []
+    output: OutboundOrder
+    side_effects: []
+  - method: GET
+    path: "/warehouse/outbound-orders"
+    description: "List outbound orders filtered by wave_id or status (FK reverse-reachability OutboundOrder.wave_id->Wave)."
+    roles: [PlatformAdmin, WavePlanner, Picker, InventoryController]
+    code: 200
+    input:
+      - "wave_id?"
+      - "status?"
+      - "limit?"
+      - "offset?"
+    output: OutboundOrder[]
+    side_effects: []
+  - method: POST
+    path: "/warehouse/outbound-orders/{id}/lines"
+    description: "Add a line to an OPEN order."
+    roles: [WavePlanner]
+    code: 201
+    input: [sku_id, ordered_qty]
+    output: OrderLine
+    side_effects: ["allocated_qty=0, picked_qty=0"]
+  - method: GET
+    path: "/warehouse/outbound-orders/{id}/lines"
+    description: "List the lines of an order (FK reverse-reachability OrderLine.order_id->OutboundOrder)."
+    roles: [PlatformAdmin, WavePlanner, Picker, InventoryController]
+    code: 200
+    input: []
+    output: OrderLine[]
+    side_effects: []
+  - method: GET
+    path: "/warehouse/order-lines/{id}"
+    description: "Fetch a single OrderLine (anchors the order-lines collection segment for FK reverse-reachability)."
+    roles: [PlatformAdmin, WavePlanner, Picker, InventoryController]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects: ["recompute allocated_qty, picked_qty (calc order_line_allocated, order_line_picked)"]
+  - method: GET
+    path: "/warehouse/order-lines"
+    description: "List order lines filtered by order_id or sku_id (FK reverse-reachability OrderLine.sku_id->Sku, order_id->OutboundOrder)."
+    roles: [PlatformAdmin, WavePlanner, Picker, InventoryController]
+    code: 200
+    input:
+      - "order_id?"
+      - "sku_id?"
+      - "limit?"
+      - "offset?"
+    output: OrderLine[]
+    side_effects: []
+  - method: POST
+    path: "/warehouse/outbound-orders/{id}/ship"
+    description: "Ship a PICKED order; drives staged LPNs->SHIPPED, order PICKED->SHIPPED."
+    roles: [Picker]
+    code: 200
+    input: []
+    output: OutboundOrder
+    side_effects: ["PICKED->SHIPPED; LPNs PICKED_STAGED->SHIPPED (qty->0); recompute Sku.on_hand_qty"]
+  - method: POST
+    path: "/warehouse/outbound-orders/{id}/cancel"
+    description: "Cancel an OPEN order (before waving)."
+    roles: [WavePlanner]
+    code: 200
+    input: []
+    output: OutboundOrder
+    side_effects: ["OPEN->CANCELLED"]
+
+  # ---- InventoryAllocation ----
+  - method: POST
+    path: "/warehouse/allocations"
+    description: "Manually reserve LPN qty against an order line (OCC on LPN.version). Drives LPN STORED->ALLOCATED if fully reserved."
+    roles: [WavePlanner]
+    code: 201
+    input: [order_line_id, lpn_id, allocated_qty, expected_lpn_version]
+    output: InventoryAllocation
+    side_effects:
+      - "create RESERVED allocation; recompute OrderLine.allocated_qty, Sku.available_qty"
+      - "if LPN fully reserved, LPN STORED->ALLOCATED"
+      - "increments LicensePlate.version by 1"
+  - method: GET
+    path: "/warehouse/allocations/{id}"
+    description: "Fetch an allocation."
+    roles: [PlatformAdmin, WavePlanner, Picker, InventoryController]
+    code: 200
+    input: []
+    output: InventoryAllocation
+    side_effects: []
+  - method: GET
+    path: "/warehouse/allocations"
+    description: "List allocations filtered by order_line_id or lpn_id or status (FK reverse-reachability InventoryAllocation.order_line_id->OrderLine, lpn_id->LicensePlate)."
+    roles: [PlatformAdmin, WavePlanner, Picker, InventoryController]
+    code: 200
+    input:
+      - "order_line_id?"
+      - "lpn_id?"
+      - "status?"
+      - "limit?"
+      - "offset?"
+    output: InventoryAllocation[]
+    side_effects: []
+  - method: POST
+    path: "/warehouse/allocations/{id}/cancel"
+    description: "Release a RESERVED allocation; recomputes ledgers; may drive LPN ALLOCATED->STORED."
+    roles: [WavePlanner]
+    code: 200
+    input: []
+    output: InventoryAllocation
+    side_effects: ["RESERVED->RELEASED; recompute OrderLine.allocated_qty, Sku.available_qty; maybe LPN ALLOCATED->STORED"]
+
+  # ---- Wave + PickTask ----
+  - method: POST
+    path: "/warehouse/waves"
+    description: "Create a wave (release_status=PLANNING, fulfillment_status=UNALLOCATED)."
+    roles: [WavePlanner]
+    code: 201
+    input: [wave_label]
+    output: Wave
+    side_effects: ["release_status=PLANNING, fulfillment_status=UNALLOCATED"]
+  - method: GET
+    path: "/warehouse/waves/{id}"
+    description: "Fetch a wave (both status axes)."
+    roles: [PlatformAdmin, WavePlanner, Picker, InventoryController]
+    code: 200
+    input: []
+    output: Wave
+    side_effects: []
+  - method: GET
+    path: "/warehouse/waves"
+    description: "List waves (paginated)."
+    roles: [PlatformAdmin, WavePlanner, Picker, InventoryController]
+    code: 200
+    input:
+      - "release_status?"
+      - "fulfillment_status?"
+      - "limit?"
+      - "offset?"
+    output: Wave[]
+    side_effects: []
+  - method: POST
+    path: "/warehouse/waves/{id}/add-order"
+    description: "Add an OPEN order to a PLANNING wave (order OPEN->WAVED)."
+    roles: [WavePlanner]
+    code: 200
+    input: [order_id]
+    output: Wave
+    side_effects: ["order OPEN->WAVED, set order.wave_id"]
+  - method: POST
+    path: "/warehouse/waves/{id}/release"
+    description: "Release the wave: run allocation waterfall (calc wave_allocation_order), set fulfillment_status=ALLOCATED. OCC on Wave.version."
+    roles: [WavePlanner]
+    code: 200
+    input: [expected_wave_version]
+    output: Wave
+    side_effects:
+      - "PLANNING->RELEASED; create RESERVED InventoryAllocation rows; fulfillment_status UNALLOCATED->ALLOCATED"
+      - "drive fully-reserved LPNs STORED->ALLOCATED; recompute Sku.available_qty"
+      - "increments Wave.version by 1"
+  - method: POST
+    path: "/warehouse/waves/{id}/start-picking"
+    description: "Start picking: spawn one PickTask per allocation; fulfillment_status ALLOCATED->PICKING; orders WAVED->PICKING."
+    roles: [WavePlanner]
+    code: 200
+    input: []
+    output: Wave
+    side_effects: ["fulfillment_status ALLOCATED->PICKING; spawn PickTasks; orders WAVED->PICKING"]
+  - method: GET
+    path: "/warehouse/waves/{id}/pick-tasks"
+    description: "List the pick tasks of a wave (FK reverse-reachability PickTask.wave_id->Wave)."
+    roles: [PlatformAdmin, WavePlanner, Picker, InventoryController]
+    code: 200
+    input: []
+    output: PickTask[]
+    side_effects: []
+  - method: GET
+    path: "/warehouse/pick-tasks/{id}"
+    description: "Fetch a pick task."
+    roles: [PlatformAdmin, WavePlanner, Picker, InventoryController]
+    code: 200
+    input: []
+    output: PickTask
+    side_effects: []
+  - method: GET
+    path: "/warehouse/pick-tasks"
+    description: "List pick tasks filtered by wave_id, allocation_id, or status (FK reverse-reachability PickTask.allocation_id->InventoryAllocation, wave_id->Wave)."
+    roles: [PlatformAdmin, WavePlanner, Picker, InventoryController]
+    code: 200
+    input:
+      - "wave_id?"
+      - "allocation_id?"
+      - "status?"
+      - "limit?"
+      - "offset?"
+    output: PickTask[]
+    side_effects: []
+  - method: POST
+    path: "/warehouse/pick-tasks/{id}/start"
+    description: "Begin a pick (PENDING->IN_PROGRESS); requires parent Wave.fulfillment_status==PICKING."
+    roles: [Picker]
+    code: 200
+    input: []
+    output: PickTask
+    side_effects: ["PENDING->IN_PROGRESS"]
+  - method: POST
+    path: "/warehouse/pick-tasks/{id}/confirm"
+    description: "Pick-to-light confirm (IN_PROGRESS->PICKED): commits allocation, stages LPN, bubbles order/wave completion."
+    roles: [Picker]
+    code: 200
+    input: [light_confirmed]
+    output: PickTask
+    side_effects:
+      - "set light_confirmed; allocation RESERVED->COMMITTED; LPN ALLOCATED->PICKED_STAGED"
+      - "recompute OrderLine.picked_qty; maybe order PICKING->PICKED; maybe wave PICKING->PICKED (and CLOSED)"
+  - method: POST
+    path: "/warehouse/pick-tasks/{id}/short"
+    description: "Short-pick (IN_PROGRESS->SHORT): releases the allocation, may revert LPN ALLOCATED->STORED."
+    roles: [Picker]
+    code: 200
+    input: []
+    output: PickTask
+    side_effects: ["allocation RESERVED->RELEASED; recompute OrderLine.allocated_qty, Sku.available_qty; maybe LPN ALLOCATED->STORED"]
+  - method: POST
+    path: "/warehouse/pick-tasks/{id}/cancel"
+    description: "Cancel a PENDING pick task; releases its allocation."
+    roles: [WavePlanner]
+    code: 200
+    input: []
+    output: PickTask
+    side_effects: ["PENDING->CANCELLED; allocation RESERVED->RELEASED"]
+
+  # ---- CycleCount ----
+  - method: POST
+    path: "/warehouse/cycle-counts"
+    description: "Open an ABC cycle count for a SKU at a location; snapshots system_qty (calc cycle_count_system_qty)."
+    roles: [InventoryController]
+    code: 201
+    input: [location_id, sku_id]
+    output: CycleCount
+    side_effects: ["status=OPEN; set system_qty snapshot"]
+  - method: GET
+    path: "/warehouse/cycle-counts/{id}"
+    description: "Fetch a cycle count."
+    roles: [PlatformAdmin, InventoryController, ReceivingClerk]
+    code: 200
+    input: []
+    output: CycleCount
+    side_effects: []
+  - method: GET
+    path: "/warehouse/cycle-counts"
+    description: "List cycle counts filtered by location_id or sku_id or status (FK reverse-reachability CycleCount.location_id->Location, sku_id->Sku)."
+    roles: [PlatformAdmin, InventoryController, ReceivingClerk]
+    code: 200
+    input:
+      - "location_id?"
+      - "sku_id?"
+      - "status?"
+      - "limit?"
+      - "offset?"
+    output: CycleCount[]
+    side_effects: []
+  - method: POST
+    path: "/warehouse/cycle-counts/{id}/submit"
+    description: "Submit the physical count (OPEN->COUNTED); computes variance (calc cycle_count_variance), pins counted_by_user_id."
+    roles: [InventoryController]
+    code: 200
+    input: [counted_qty]
+    output: CycleCount
+    side_effects: ["OPEN->COUNTED; set counted_qty, variance_qty, counted_by_user_id"]
+  - method: POST
+    path: "/warehouse/cycle-counts/{id}/approve"
+    description: "Approve & reconcile a count (COUNTED->RECONCILED); applies variance to inventory; segregation-of-duties enforced."
+    roles: [InventoryController]
+    code: 200
+    input: []
+    output: CycleCount
+    side_effects: ["COUNTED->RECONCILED; adjust LPN qty by variance (created_at ASC); recompute Sku.on_hand_qty, Location.used_volume_cm3, Sku.cycle_count_due"]
+  - method: POST
+    path: "/warehouse/cycle-counts/{id}/reject"
+    description: "Reject a count (COUNTED->REJECTED); no inventory change; segregation-of-duties enforced (approver != submitter)."
+    roles: [InventoryController]
+    code: 200
+    input: []
+    output: CycleCount
+    side_effects: ["COUNTED->REJECTED; no adjustment"]
+
+  # ---- ReplenishmentTask ----
+  - method: POST
+    path: "/warehouse/replenishment-tasks"
+    description: "Create a min/max replenishment task for a SKU; pins pick_face_location_id and computes replen_qty (calc replen_qty). Requires face on-hand <= min_qty."
+    roles: [InventoryController]
+    code: 201
+    input: [sku_id]
+    output: ReplenishmentTask
+    side_effects: ["status=CREATED; set pick_face_location_id, replen_qty"]
+  - method: GET
+    path: "/warehouse/replenishment-tasks/{id}"
+    description: "Fetch a replenishment task."
+    roles: [PlatformAdmin, InventoryController, PutawayOperator]
+    code: 200
+    input: []
+    output: ReplenishmentTask
+    side_effects: []
+  - method: GET
+    path: "/warehouse/replenishment-tasks"
+    description: "List replenishment tasks filtered by sku_id, source_lpn_id, pick_face_location_id, or status (FK reverse-reachability ReplenishmentTask.sku_id->Sku, source_lpn_id->LicensePlate, pick_face_location_id->Location)."
+    roles: [PlatformAdmin, InventoryController, PutawayOperator]
+    code: 200
+    input:
+      - "sku_id?"
+      - "source_lpn_id?"
+      - "pick_face_location_id?"
+      - "status?"
+      - "limit?"
+      - "offset?"
+    output: ReplenishmentTask[]
+    side_effects: []
+  - method: POST
+    path: "/warehouse/replenishment-tasks/{id}/assign"
+    description: "Assign a RESERVE source LPN via selector (calc replen_source_select); CREATED->ASSIGNED."
+    roles: [InventoryController]
+    code: 200
+    input: []
+    output: ReplenishmentTask
+    side_effects: ["set source_lpn_id (selector); CREATED->ASSIGNED"]
+  - method: POST
+    path: "/warehouse/replenishment-tasks/{id}/complete"
+    description: "Complete replenishment: move replen_qty from RESERVE LPN to pick face; capacity-checked; may DEPLETE source LPN."
+    roles: [PutawayOperator]
+    code: 200
+    input: []
+    output: ReplenishmentTask
+    side_effects: ["ASSIGNED->COMPLETED; decrement source LPN (maybe DEPLETED); add to pick-face LPN; recompute Sku.on_hand_qty, both Locations' used_volume_cm3"]
+  - method: POST
+    path: "/warehouse/replenishment-tasks/{id}/cancel"
+    description: "Cancel a replenishment task (CREATED or ASSIGNED)."
+    roles: [InventoryController]
+    code: 200
+    input: []
+    output: ReplenishmentTask
+    side_effects: ["->CANCELLED; clear source_lpn_id if ASSIGNED"]
+
+  # ---- Test-driving (clock) ----
+  - method: POST
+    path: "/warehouse/_clock/set_current_utc"
+    description: "Test-driving: set the server's current UTC clock (drives cycle_count_due_flag cadence)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["set server clock used by calc cycle_count_due_flag"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role or X-User-ID header missing/malformed on a mutating endpoint"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "the authenticated role is not permitted for this operation per §1.7"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced entity id does not resolve"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "missing/mistyped required field, or enum value outside the declared set"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "the target entity is not in a state from which the requested transition is defined"
+  - id: ERR_STALE_WAVE_VERSION
+    http: 412
+    condition: "expected_wave_version != Wave.version on release (OCC)"
+  - id: ERR_STALE_LPN_VERSION
+    http: 412
+    condition: "expected_lpn_version != LicensePlate.version on manual allocation (OCC)"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "the cycle-count approver/rejecter is the same user who counted it, or a ReceivingClerk who received an ASN feeding the counted location"
+  - id: ERR_CROSS_ENTITY_STATE
+    http: 409
+    condition: "a transition's cross-entity precondition fails (location BLOCKED on putaway-complete; wave has no order on release; parent wave not PICKING on pick-start)"
+  - id: ERR_DUPLICATE_CODE
+    http: 409
+    condition: "a unique code (sku_code/location_code/lpn_code/asn_number/order_number/wave_label) already exists"
+  - id: ERR_LOCATION_CAPACITY
+    http: 409
+    condition: "an inbound move would push Location.used_volume_cm3 above max_volume_cm3"
+  - id: ERR_PICKFACE_TAKEN
+    http: 409
+    condition: "a PICK_FACE location is dedicated to a SKU but another create tries to dedicate the same location to a different SKU"
+  - id: ERR_REPLEN_NOT_NEEDED
+    http: 409
+    condition: "replenishment requested while pick-face on-hand > Sku.min_qty"
+  - id: ERR_INSUFFICIENT_AVAILABLE
+    http: 409
+    condition: "an allocation/release would reserve more than the LPN's free qty or more than Sku.available_qty"
+  - id: ERR_ASN_LINES_OPEN
+    http: 409
+    condition: "ASN close attempted while at least one AsnLine is OPEN (received_qty < expected_qty)"
+  - id: ERR_NO_PUTAWAY_LOCATION
+    http: 409
+    condition: "putaway assign finds no eligible Location (empty candidate set from calc putaway_location_select)"
+  - id: ERR_NO_REPLEN_SOURCE
+    http: 409
+    condition: "replenishment assign finds no RESERVE LPN pool covering replen_qty (calc replen_source_select empty/insufficient)"
+  - id: ERR_VALIDATION_LIGHT_REQUIRED
+    http: 409
+    condition: "pick confirm submitted with light_confirmed != true (pick-to-light not pressed)"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Operational super-user; configures SKUs and locations, drives the test clock; read-all."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /warehouse/skus"
+      - "POST /warehouse/_clock/set_current_utc"
+    shared_operations:
+      - "POST /warehouse/locations"
+      - "all GET reads"
+
+  - name: ReceivingClerk
+    description: "Operates the inbound dock: announces ASNs, adds lines, posts receipts, closes/cancels ASNs."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /warehouse/inbound-asns"
+      - "POST /warehouse/inbound-asns/{id}/lines"
+      - "POST /warehouse/inbound-asns/{id}/receipts"
+      - "POST /warehouse/inbound-asns/{id}/close"
+      - "POST /warehouse/inbound-asns/{id}/close-crossdock"
+      - "POST /warehouse/inbound-asns/{id}/cancel"
+    shared_operations:
+      - "inbound/cycle-count GET reads"
+
+  - name: PutawayOperator
+    description: "Executes putaway and replenishment floor moves."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /warehouse/putaway-tasks/{id}/assign"
+      - "POST /warehouse/putaway-tasks/{id}/complete"
+      - "POST /warehouse/putaway-tasks/{id}/cancel"
+      - "POST /warehouse/replenishment-tasks/{id}/complete"
+    shared_operations:
+      - "task GET reads"
+
+  - name: Picker
+    description: "Executes pick-to-light picks, short-picks, and ships picked orders."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /warehouse/pick-tasks/{id}/start"
+      - "POST /warehouse/pick-tasks/{id}/confirm"
+      - "POST /warehouse/pick-tasks/{id}/short"
+      - "POST /warehouse/outbound-orders/{id}/ship"
+    shared_operations:
+      - "pick/order GET reads"
+
+  - name: WavePlanner
+    description: "Builds and releases waves, manages orders and manual allocations."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /warehouse/outbound-orders"
+      - "POST /warehouse/outbound-orders/{id}/lines"
+      - "POST /warehouse/outbound-orders/{id}/cancel"
+      - "POST /warehouse/allocations"
+      - "POST /warehouse/allocations/{id}/cancel"
+      - "POST /warehouse/waves"
+      - "POST /warehouse/waves/{id}/add-order"
+      - "POST /warehouse/waves/{id}/release"
+      - "POST /warehouse/waves/{id}/start-picking"
+      - "POST /warehouse/pick-tasks/{id}/cancel"
+    shared_operations:
+      - "wave/order GET reads"
+
+  - name: InventoryController
+    description: "Runs ABC cycle counts, approves/rejects variances (segregation of duties), creates replenishment, configures locations."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /warehouse/cycle-counts"
+      - "POST /warehouse/cycle-counts/{id}/submit"
+      - "POST /warehouse/cycle-counts/{id}/approve"
+      - "POST /warehouse/cycle-counts/{id}/reject"
+      - "POST /warehouse/replenishment-tasks"
+      - "POST /warehouse/replenishment-tasks/{id}/assign"
+      - "POST /warehouse/replenishment-tasks/{id}/cancel"
+    shared_operations:
+      - "POST /warehouse/locations"
+      - "inventory GET reads"

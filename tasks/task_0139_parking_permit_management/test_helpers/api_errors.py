@@ -1,0 +1,51 @@
+"""Error IDs and HTTP status mapping (PRD §5 Error Code Catalogue).
+
+After defining the mapping it is registered with the framework so that
+validate_error() can cross-check the HTTP status automatically.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+    ERR_NOT_RESOURCE_OWNER = "ERR_NOT_RESOURCE_OWNER"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_ZONE_TYPE_FORBIDDEN = "ERR_ZONE_TYPE_FORBIDDEN"
+    ERR_DUPLICATE = "ERR_DUPLICATE"
+    ERR_VALIDATION_NOT_REDEEMABLE = "ERR_VALIDATION_NOT_REDEEMABLE"
+    ERR_EVENT_WINDOW_OVERLAP = "ERR_EVENT_WINDOW_OVERLAP"
+    ERR_SPACE_OCCUPIED = "ERR_SPACE_OCCUPIED"
+    ERR_GATE_CLOSED = "ERR_GATE_CLOSED"
+    ERR_ZONE_AT_CAPACITY = "ERR_ZONE_AT_CAPACITY"
+    ERR_MERCHANT_BUDGET_EXHAUSTED = "ERR_MERCHANT_BUDGET_EXHAUSTED"
+    ERR_INVALID_TIME_RANGE = "ERR_INVALID_TIME_RANGE"
+    ERR_STALE_ZONE_VERSION = "ERR_STALE_ZONE_VERSION"
+    ERR_PAGINATION_INVALID = "ERR_PAGINATION_INVALID"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_UNAUTHORIZED: 403,
+    ApiErrorId.ERR_NOT_RESOURCE_OWNER: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_REQUEST: 400,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_ZONE_TYPE_FORBIDDEN: 409,
+    ApiErrorId.ERR_DUPLICATE: 409,
+    ApiErrorId.ERR_VALIDATION_NOT_REDEEMABLE: 409,
+    ApiErrorId.ERR_EVENT_WINDOW_OVERLAP: 409,
+    ApiErrorId.ERR_SPACE_OCCUPIED: 409,
+    ApiErrorId.ERR_GATE_CLOSED: 409,
+    ApiErrorId.ERR_ZONE_AT_CAPACITY: 409,
+    ApiErrorId.ERR_MERCHANT_BUDGET_EXHAUSTED: 409,
+    ApiErrorId.ERR_INVALID_TIME_RANGE: 409,
+    ApiErrorId.ERR_STALE_ZONE_VERSION: 412,
+    ApiErrorId.ERR_PAGINATION_INVALID: 400,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

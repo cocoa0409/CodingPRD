@@ -1,0 +1,35 @@
+"""Domain error classes and the error-id catalog (SCAFFOLD §1.6 / PRD §5)."""
+from __future__ import annotations
+
+
+class APIError(Exception):
+    def __init__(self, error_id: str, http_status: int, message: str = ""):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# error_id constants — verbatim from the scaffold error catalog.
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"            # 401
+ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"                  # 403
+ERR_NOT_FOUND = "ERR_NOT_FOUND"                        # 404
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"            # 400
+ERR_INVALID_STATE = "ERR_INVALID_STATE"               # 409
+ERR_TAX_ID_REQUIRED = "ERR_TAX_ID_REQUIRED"           # 422
+ERR_DUPLICATE_INVOICE = "ERR_DUPLICATE_INVOICE"       # 409
+ERR_GL_ACCOUNT_NOT_POSTABLE = "ERR_GL_ACCOUNT_NOT_POSTABLE"  # 422
+ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"      # 403
+ERR_PAYMENT_METHOD_MISMATCH = "ERR_PAYMENT_METHOD_MISMATCH"  # 422
+ERR_VENDOR_ON_HOLD = "ERR_VENDOR_ON_HOLD"             # 409
+ERR_INVOICE_ALREADY_SCHEDULED = "ERR_INVOICE_ALREADY_SCHEDULED"  # 409
+ERR_WRITEOFF_LIMIT_EXCEEDED = "ERR_WRITEOFF_LIMIT_EXCEEDED"  # 422
+ERR_EXCEPTION_UNRESOLVED = "ERR_EXCEPTION_UNRESOLVED"  # 409
+ERR_APPROVAL_OUT_OF_ORDER = "ERR_APPROVAL_OUT_OF_ORDER"      # 409
+ERR_STALE_BATCH_VERSION = "ERR_STALE_BATCH_VERSION"   # 412
+ERR_NO_APPROVAL_ROUTE = "ERR_NO_APPROVAL_ROUTE"       # 422
+ERR_PO_CLOSED = "ERR_PO_CLOSED"                       # 409
+ERR_ESCALATE_BELOW_CEILING = "ERR_ESCALATE_BELOW_CEILING"    # 422
+ERR_BATCH_EMPTY = "ERR_BATCH_EMPTY"                   # 409
+ERR_RECEIPT_WINDOW_OVERLAP = "ERR_RECEIPT_WINDOW_OVERLAP"    # 409
+ERR_ACCRUAL_PERIOD_OVERLAP = "ERR_ACCRUAL_PERIOD_OVERLAP"    # 409

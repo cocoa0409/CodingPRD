@@ -1,0 +1,1481 @@
+scenario: "Commercial Lease & CAM Reconciliation: base/percentage rent, CAM/operating-expense pool, pro-rata share, annual reconciliation/true-up, expense cap/gross-up, CPI/fixed escalation, tenant-improvement allowance, estoppel"
+domain_name: commercial-lease-cam
+api_prefix: /
+
+# ---------------------------------------------------------------------------
+# Complexity profile
+# ---------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: Ledger reconciliation
+  # Same expense data, two algorithms: estimated monthly CAM billed forward-
+  # looking vs actual CAM reconciled chronologically at year-end → divergent
+  # tenant charges (the true-up). Layered with cap/gross-up that reorder the math.
+  secondary_archetype: Pricing engine
+  # Percentage rent (breakpoint), CPI/fixed escalation, tiered cap recovery.
+  complexity_layers:
+    - Dual-variant calculation        # estimated CAM vs reconciled CAM true-up
+    - Derived field reconciliation     # Lease.outstanding_balance_cents, Reconciliation totals
+    - Optimistic concurrency           # OCC on Reconciliation.version for true-up posting
+    - Cascading side effects           # finalize recon → adjustments → ledger → lease balance
+
+  entity_topology: flat
+  # Property, Lease, Tenant, ExpensePool peer entities linked by FK references;
+  # no deep URL nesting — children carry parent_id in body and are filtered by it.
+
+  state_machine_shape: cyclic
+  # Reconciliation has a DRAFT→REVIEW→DRAFT revision loop AND a dispute cycle
+  # (POSTED→DISPUTED→POSTED). Estoppel has request/response cycle.
+
+  relationship_patterns:
+    - one_to_many        # Property → Lease, Property → ExpensePool, Lease → CamCharge
+    - cross_aggregate    # Reconciliation references Lease + ExpensePool across aggregates
+    - self_referential   # none
+
+  role_model: segregation_of_duties
+  # Same PropertyManager who DRAFTS a reconciliation cannot APPROVE it; an
+  # Accountant approves. Tenant is entity_backed and acts only on own lease.
+
+  consistency_model: immediate
+
+# ---------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: Property
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation including cascades."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, +1 on every mutation."
+      - name: name
+        type: string
+        source: input
+        description: "Property display name."
+      - name: total_rentable_sqft
+        type: integer
+        source: input
+        description: "Total rentable square footage of the property; denominator candidate for pro-rata share."
+        constraints: "integer > 0"
+      - name: occupied_sqft
+        type: integer
+        source: computed
+        description: "Sum of leased_sqft over all Leases on this Property whose status IN {ACTIVE, HOLDOVER}. Recomputed on lease activation/termination."
+      - name: gross_up_occupancy_pct
+        type: number
+        source: input
+        description: "Assumed occupancy used for variable-expense gross-up, e.g. 0.95 for 95%; used by the gross-up calculation."
+        default: 0.95
+        constraints: "0 < value <= 1"
+
+  - name: ExpensePool
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation including cascades."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, +1 on every mutation."
+      - name: property_id
+        type: string
+        source: input
+        description: "FK -> Property.id; the property whose common-area expenses this pool aggregates."
+      - name: pool_year
+        type: integer
+        source: input
+        description: "Calendar reconciliation year this pool covers, e.g. 2025."
+        constraints: "integer >= 2000"
+      - name: pro_rata_denominator
+        type: enum
+        source: input
+        description: "Whether pro-rata share uses TOTAL_RENTABLE (Property.total_rentable_sqft) or OCCUPIED (Property.occupied_sqft) as denominator. Drives the share formula."
+        default: TOTAL_RENTABLE
+        constraints: "enum: TOTAL_RENTABLE | OCCUPIED"
+      - name: admin_fee_pct
+        type: number
+        source: input
+        description: "Administrative fee applied on top of recoverable expenses, e.g. 0.15 for 15%."
+        default: 0.0
+        constraints: "0 <= value <= 1"
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle of the pool: OPEN while line items accrue, LOCKED once a reconciliation finalizes against it."
+        default: OPEN
+        constraints: "enum: OPEN | LOCKED"
+      - name: total_recoverable_cents
+        type: integer
+        source: computed
+        description: "Sum of ExpenseLineItem.amount_cents for items on this pool whose recoverability=RECOVERABLE, after gross-up, plus admin fee. Recomputed on line-item add/remove and on lock."
+
+  - name: ExpenseLineItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits; used as the tie-break ordering key for line-item processing."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, +1 on every mutation."
+      - name: pool_id
+        type: string
+        source: input
+        description: "FK -> ExpensePool.id; the pool this expense accrues to."
+      - name: category
+        type: enum
+        source: input
+        description: "Expense category."
+        constraints: "enum: LANDSCAPING | SECURITY | UTILITIES | INSURANCE | MANAGEMENT | TAXES | REPAIRS | SNOW_REMOVAL"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Gross expense amount in integer cents."
+        constraints: "integer >= 0"
+      - name: recoverability
+        type: enum
+        source: input
+        description: "RECOVERABLE expenses enter the pool; NON_RECOVERABLE are excluded; CAPPED_CONTROLLABLE are recoverable but subject to the controllable-expense cap."
+        default: RECOVERABLE
+        constraints: "enum: RECOVERABLE | NON_RECOVERABLE | CAPPED_CONTROLLABLE"
+      - name: is_variable
+        type: boolean
+        source: input
+        description: "True if the expense varies with occupancy (eligible for gross-up); false for fixed expenses (never grossed up)."
+        default: false
+
+  - name: Tenant
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input. Equals X-User-ID when X-User-Role=Tenant."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, +1 on every mutation."
+      - name: legal_name
+        type: string
+        source: input
+        description: "Tenant legal entity name."
+      - name: contact_email
+        type: string
+        source: input
+        description: "Primary billing contact email."
+
+  - name: Lease
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation including cascades."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, +1 on every mutation."
+      - name: property_id
+        type: string
+        source: input
+        description: "FK -> Property.id; the property this lease occupies space in."
+      - name: tenant_id
+        type: string
+        source: input
+        description: "FK -> Tenant.id; the tenant party on this lease."
+      - name: leased_sqft
+        type: integer
+        source: input
+        description: "Square footage demised to this tenant; numerator of pro-rata share."
+        constraints: "integer > 0"
+      - name: base_rent_cents_annual
+        type: integer
+        source: input
+        description: "Annual base rent in integer cents for the current lease year (escalated copy maintained by escalation calc)."
+        constraints: "integer >= 0"
+      - name: escalation_type
+        type: enum
+        source: input
+        description: "How base rent escalates each lease year: FIXED_PCT (fixed percent), CPI (indexed), or NONE."
+        default: NONE
+        constraints: "enum: FIXED_PCT | CPI | NONE"
+      - name: escalation_rate
+        type: number
+        source: input
+        description: "For FIXED_PCT, the annual increase fraction (e.g. 0.03). For CPI, the cap fraction on indexed increase. Ignored when escalation_type=NONE."
+        default: 0.0
+        constraints: "0 <= value <= 1"
+      - name: cpi_base_index
+        type: number
+        source: input
+        description: "Baseline CPI index value captured at lease commencement; CPI escalation compares current index to this. Required when escalation_type=CPI."
+        default: null
+      - name: pct_rent_rate
+        type: number
+        source: input
+        description: "Percentage-rent rate applied to sales above the breakpoint, e.g. 0.06 for 6%."
+        default: 0.0
+        constraints: "0 <= value <= 1"
+      - name: pct_rent_breakpoint_cents
+        type: integer
+        source: input
+        description: "Natural breakpoint: annual sales (in cents) above which percentage rent accrues. 0 means percentage rent applies from the first dollar."
+        default: 0
+        constraints: "integer >= 0"
+      - name: controllable_cap_pct
+        type: number
+        source: input
+        description: "Year-over-year cap on CAPPED_CONTROLLABLE recoveries, e.g. 0.05 = 5% over the prior-year capped base. 0 disables the cap."
+        default: 0.0
+        constraints: "0 <= value <= 1"
+      - name: prior_year_capped_base_cents
+        type: integer
+        source: input
+        description: "Tenant's share of CAPPED_CONTROLLABLE expenses from the prior reconciliation year; the base the controllable cap grows from."
+        default: 0
+        constraints: "integer >= 0"
+      - name: ti_allowance_cents
+        type: integer
+        source: input
+        description: "Total tenant-improvement allowance committed by landlord under this lease."
+        default: 0
+        constraints: "integer >= 0"
+      - name: ti_drawn_cents
+        type: integer
+        source: computed
+        description: "Sum of TiDraw.amount_cents for this lease whose status=APPROVED. Recomputed on TI draw approval."
+      - name: estimated_cam_cents_monthly
+        type: integer
+        source: input
+        description: "Monthly estimated CAM the tenant is billed during the year; basis of the forward-looking estimate that the year-end reconciliation trues up against."
+        default: 0
+        constraints: "integer >= 0"
+      - name: outstanding_balance_cents
+        type: integer
+        source: computed
+        description: "Running tenant ledger: sum of LedgerEntry.amount_cents (charges positive, payments/credits negative) for this lease. Recomputed on every ledger entry."
+      - name: status
+        type: enum
+        source: system
+        description: "Lease lifecycle."
+        default: DRAFT
+        constraints: "enum: DRAFT | ACTIVE | HOLDOVER | TERMINATED"
+
+  - name: TiDraw
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, +1 on every mutation."
+      - name: lease_id
+        type: string
+        source: input
+        description: "FK -> Lease.id; the lease whose TI allowance this draw consumes."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Requested draw amount in integer cents against the TI allowance."
+        constraints: "integer > 0"
+      - name: status
+        type: enum
+        source: system
+        description: "Draw lifecycle."
+        default: REQUESTED
+        constraints: "enum: REQUESTED | APPROVED | REJECTED"
+
+  - name: SalesReport
+    parent: null
+    common_fields: false
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits; tie-break key when two reports cover the same period."
+      - name: lease_id
+        type: string
+        source: input
+        description: "FK -> Lease.id; the lease this sales figure belongs to (drives percentage rent)."
+      - name: period_year
+        type: integer
+        source: input
+        description: "Calendar year the gross sales figure covers."
+        constraints: "integer >= 2000"
+      - name: gross_sales_cents
+        type: integer
+        source: input
+        description: "Reported gross sales for the period in integer cents."
+        constraints: "integer >= 0"
+
+  - name: Reconciliation
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation including cascades."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, +1 on every mutation; OCC field for true-up posting."
+      - name: lease_id
+        type: string
+        source: input
+        description: "FK -> Lease.id; the lease being reconciled."
+      - name: pool_id
+        type: string
+        source: input
+        description: "FK -> ExpensePool.id; the expense pool the reconciliation draws actual expenses from."
+      - name: recon_year
+        type: integer
+        source: input
+        description: "Reconciliation year; MUST equal the referenced pool's pool_year."
+        constraints: "integer >= 2000"
+      - name: pro_rata_share_pct
+        type: number
+        source: computed
+        description: "Tenant's pro-rata share fraction computed at finalize time from leased_sqft over the pool's denominator. Snapshotted on POSTED."
+      - name: reconciled_cam_cents
+        type: integer
+        source: computed
+        description: "Tenant's actual reconciled CAM = pro_rata_share * pool recoverable, after controllable cap, computed by the reconciliation calc. Snapshotted on POSTED."
+      - name: estimated_cam_billed_cents
+        type: integer
+        source: computed
+        description: "Total estimated CAM billed during the year = 12 * Lease.estimated_cam_cents_monthly. Snapshotted on POSTED."
+      - name: true_up_cents
+        type: integer
+        source: computed
+        description: "reconciled_cam_cents - estimated_cam_billed_cents; positive = tenant owes (debit), negative = tenant credit. Snapshotted on POSTED."
+      - name: status
+        type: enum
+        source: system
+        description: "Reconciliation lifecycle with revision and dispute cycles."
+        default: DRAFT
+        constraints: "enum: DRAFT | IN_REVIEW | POSTED | DISPUTED | VOID"
+
+  - name: LedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits; chronological order key for ledger replay and balance roll-forward."
+      - name: lease_id
+        type: string
+        source: input
+        description: "FK -> Lease.id; the lease ledger this entry posts to."
+      - name: entry_type
+        type: enum
+        source: input
+        description: "BASE_RENT, PCT_RENT, CAM_ESTIMATE, CAM_TRUEUP, TI_DRAW, PAYMENT, CREDIT_ADJUSTMENT."
+        constraints: "enum: BASE_RENT | PCT_RENT | CAM_ESTIMATE | CAM_TRUEUP | TI_DRAW | PAYMENT | CREDIT_ADJUSTMENT"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Signed amount: positive increases tenant balance (charge), negative decreases it (payment/credit)."
+      - name: source_reconciliation_id
+        type: string
+        source: input
+        description: "FK -> Reconciliation.id; set when entry_type=CAM_TRUEUP, linking the entry to the posting reconciliation; null otherwise."
+        default: null
+
+  - name: EstoppelCertificate
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no prefix; identity only, never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1, +1 on every mutation."
+      - name: lease_id
+        type: string
+        source: input
+        description: "FK -> Lease.id; the lease the estoppel certifies."
+      - name: asserted_balance_cents
+        type: integer
+        source: input
+        description: "Landlord-asserted outstanding balance the tenant is asked to confirm; snapshot of Lease.outstanding_balance_cents at issuance."
+      - name: asserted_base_rent_cents_annual
+        type: integer
+        source: input
+        description: "Landlord-asserted current annual base rent the tenant is asked to confirm."
+      - name: tenant_response
+        type: enum
+        source: system
+        description: "Tenant's response: CONFIRMED accepts assertions; DISPUTED rejects."
+        default: null
+        constraints: "enum: CONFIRMED | DISPUTED"
+      - name: dispute_note
+        type: string
+        source: input
+        description: "Tenant-supplied note required when responding DISPUTED."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Estoppel lifecycle: ISSUED awaiting tenant, then CONFIRMED or DISPUTED terminal."
+        default: ISSUED
+        constraints: "enum: ISSUED | CONFIRMED | DISPUTED"
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: Lease
+    initial_state: DRAFT
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /leases/{id}/activate"
+        actor: PropertyManager
+        preconditions:
+          - "Lease.status == DRAFT"
+          - "referenced Property exists and referenced Tenant exists"
+          - "Lease.leased_sqft <= (Property.total_rentable_sqft - Property.occupied_sqft) at activation time"
+          - "if Lease.escalation_type == CPI then Lease.cpi_base_index is not null"
+        side_effects:
+          - "set Lease.status = ACTIVE"
+          - "increment Property.occupied_sqft by Lease.leased_sqft (recompute Property.occupied_sqft); increments Property.version by 1"
+          - "post a BASE_RENT LedgerEntry of +Lease.base_rent_cents_annual; recompute Lease.outstanding_balance_cents"
+      - from: ACTIVE
+        to: HOLDOVER
+        trigger: "POST /leases/{id}/holdover"
+        actor: PropertyManager
+        preconditions:
+          - "Lease.status == ACTIVE"
+        side_effects:
+          - "set Lease.status = HOLDOVER (lease continues to occupy space and accrue charges past term)"
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /leases/{id}/terminate"
+        actor: PropertyManager
+        preconditions:
+          - "Lease.status IN {ACTIVE, HOLDOVER}"
+          - "no Reconciliation for this lease is in status IN {DRAFT, IN_REVIEW, DISPUTED}"
+        side_effects:
+          - "set Lease.status = TERMINATED"
+          - "decrement Property.occupied_sqft by Lease.leased_sqft (recompute Property.occupied_sqft); increments Property.version by 1"
+      - from: HOLDOVER
+        to: TERMINATED
+        trigger: "POST /leases/{id}/terminate"
+        actor: PropertyManager
+        preconditions:
+          - "Lease.status IN {ACTIVE, HOLDOVER}"
+          - "no Reconciliation for this lease is in status IN {DRAFT, IN_REVIEW, DISPUTED}"
+        side_effects:
+          - "set Lease.status = TERMINATED"
+          - "decrement Property.occupied_sqft by Lease.leased_sqft (recompute Property.occupied_sqft); increments Property.version by 1"
+
+  - entity: TiDraw
+    initial_state: REQUESTED
+    terminal_states: [APPROVED, REJECTED]
+    transitions:
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /ti-draws/{id}/approve"
+        actor: Accountant
+        preconditions:
+          - "TiDraw.status == REQUESTED"
+          - "referenced Lease.status IN {ACTIVE, HOLDOVER}"
+          - "Lease.ti_drawn_cents + TiDraw.amount_cents <= Lease.ti_allowance_cents (remaining TI allowance covers this draw)"
+        side_effects:
+          - "set TiDraw.status = APPROVED"
+          - "recompute Lease.ti_drawn_cents (add this draw); increments Lease.version by 1"
+          - "post a TI_DRAW LedgerEntry of -TiDraw.amount_cents (landlord-funded credit to tenant); recompute Lease.outstanding_balance_cents"
+      - from: REQUESTED
+        to: REJECTED
+        trigger: "POST /ti-draws/{id}/reject"
+        actor: Accountant
+        preconditions:
+          - "TiDraw.status == REQUESTED"
+        side_effects:
+          - "set TiDraw.status = REJECTED"
+
+  - entity: Reconciliation
+    initial_state: DRAFT
+    terminal_states: [VOID]
+    transitions:
+      - from: DRAFT
+        to: IN_REVIEW
+        trigger: "POST /reconciliations/{id}/submit"
+        actor: PropertyManager
+        preconditions:
+          - "Reconciliation.status == DRAFT"
+          - "referenced Lease.status IN {ACTIVE, HOLDOVER}"
+          - "Reconciliation.recon_year == referenced ExpensePool.pool_year"
+        side_effects:
+          - "set Reconciliation.status = IN_REVIEW"
+      - from: IN_REVIEW
+        to: DRAFT
+        trigger: "POST /reconciliations/{id}/return"
+        actor: Accountant
+        note: "Revision loop — accountant kicks the draft back to the property manager for correction."
+        preconditions:
+          - "Reconciliation.status == IN_REVIEW"
+        side_effects:
+          - "set Reconciliation.status = DRAFT"
+      - from: IN_REVIEW
+        to: POSTED
+        trigger: "POST /reconciliations/{id}/post"
+        actor: Accountant
+        note: "Segregation of duties — the Accountant who posts MUST NOT be the PropertyManager who submitted; OCC on Reconciliation.version."
+        preconditions:
+          - "Reconciliation.status == IN_REVIEW"
+          - "request body expected_reconciliation_version == Reconciliation.version"
+          - "referenced ExpensePool.status == OPEN (pool not already locked by another reconciliation)"
+        side_effects:
+          - "compute and snapshot Reconciliation.pro_rata_share_pct, reconciled_cam_cents, estimated_cam_billed_cents, true_up_cents (see calculations: reconciled_cam_true_up)"
+          - "set Reconciliation.status = POSTED"
+          - "set ExpensePool.status = LOCKED; recompute ExpensePool.total_recoverable_cents; increments ExpensePool.version by 1"
+          - "post a CAM_TRUEUP LedgerEntry of +true_up_cents (signed) with source_reconciliation_id = this Reconciliation.id; recompute Lease.outstanding_balance_cents; increments Lease.version by 1"
+          - "increments Reconciliation.version by 1"
+      - from: POSTED
+        to: DISPUTED
+        trigger: "POST /reconciliations/{id}/dispute"
+        actor: Tenant
+        note: "Dispute cycle entry — tenant contests a posted true-up."
+        preconditions:
+          - "Reconciliation.status == POSTED"
+          - "acting Tenant owns the referenced Lease (Lease.tenant_id == X-User-ID)"
+        side_effects:
+          - "set Reconciliation.status = DISPUTED"
+      - from: DISPUTED
+        to: POSTED
+        trigger: "POST /reconciliations/{id}/resolve-dispute"
+        actor: Accountant
+        note: "Dispute cycle exit — accountant resolves and re-affirms the posting (cyclic POSTED→DISPUTED→POSTED)."
+        preconditions:
+          - "Reconciliation.status == DISPUTED"
+        side_effects:
+          - "set Reconciliation.status = POSTED"
+      - from: DISPUTED
+        to: VOID
+        trigger: "POST /reconciliations/{id}/void"
+        actor: Accountant
+        note: "Compensation — void a disputed posting, reversing its ledger and pool effects."
+        preconditions:
+          - "Reconciliation.status == DISPUTED"
+        side_effects:
+          - "set Reconciliation.status = VOID"
+          - "post a CREDIT_ADJUSTMENT LedgerEntry of -true_up_cents (exact reversal of the CAM_TRUEUP posting) with source_reconciliation_id = this Reconciliation.id; recompute Lease.outstanding_balance_cents; increments Lease.version by 1"
+          - "set ExpensePool.status = OPEN; recompute ExpensePool.total_recoverable_cents; increments ExpensePool.version by 1"
+
+  - entity: EstoppelCertificate
+    initial_state: ISSUED
+    terminal_states: [CONFIRMED, DISPUTED]
+    transitions:
+      - from: ISSUED
+        to: CONFIRMED
+        trigger: "POST /estoppels/{id}/respond"
+        actor: Tenant
+        preconditions:
+          - "EstoppelCertificate.status == ISSUED"
+          - "acting Tenant owns the referenced Lease (Lease.tenant_id == X-User-ID)"
+          - "request tenant_response == CONFIRMED"
+          - "EstoppelCertificate.asserted_balance_cents == referenced Lease.outstanding_balance_cents (asserted figure matches live ledger)"
+        side_effects:
+          - "set EstoppelCertificate.tenant_response = CONFIRMED"
+          - "set EstoppelCertificate.status = CONFIRMED"
+      - from: ISSUED
+        to: DISPUTED
+        trigger: "POST /estoppels/{id}/respond"
+        actor: Tenant
+        preconditions:
+          - "EstoppelCertificate.status == ISSUED"
+          - "acting Tenant owns the referenced Lease (Lease.tenant_id == X-User-ID)"
+          - "request tenant_response == DISPUTED"
+          - "request dispute_note is present and non-empty"
+        side_effects:
+          - "set EstoppelCertificate.tenant_response = DISPUTED"
+          - "set EstoppelCertificate.dispute_note = request dispute_note"
+          - "set EstoppelCertificate.status = DISPUTED"
+
+  - entity: ExpensePool
+    initial_state: OPEN
+    terminal_states: []
+    transitions:
+      - from: OPEN
+        to: LOCKED
+        trigger: "system: a Reconciliation against this pool transitions IN_REVIEW→POSTED"
+        actor: system
+        preconditions:
+          - "ExpensePool.status == OPEN"
+        side_effects:
+          - "set ExpensePool.status = LOCKED; recompute ExpensePool.total_recoverable_cents; increments ExpensePool.version by 1"
+      - from: LOCKED
+        to: OPEN
+        trigger: "system: the posting Reconciliation against this pool transitions DISPUTED→VOID"
+        actor: system
+        preconditions:
+          - "ExpensePool.status == LOCKED"
+        side_effects:
+          - "set ExpensePool.status = OPEN; recompute ExpensePool.total_recoverable_cents; increments ExpensePool.version by 1"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: recon-post-stale-version
+    parent_entity: Reconciliation
+    write_endpoint: "POST /reconciliations/{id}/post"
+    occ_field: "expected_reconciliation_version"
+    description: |
+      Posting a Reconciliation whose version has advanced since the client last
+      observed it is rejected. A return-to-DRAFT then re-submit cycle (IN_REVIEW
+      ->DRAFT->IN_REVIEW) advances Reconciliation.version; a post carrying the
+      pre-cycle version is operating on a stale view of the reconciliation's
+      contents and is rejected with a stale-version error.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: pro_rata_share
+    trigger: "computed at Reconciliation IN_REVIEW->POSTED (post) and exposed via GET /reconciliations/{id}/preview"
+    algorithm: threshold
+    formula: |
+      # The denominator property is the POOL's property (property = the Property
+      # whose id == pool.property_id), NOT the lease's. Denominator field selected
+      # by the pool's pro_rata_denominator.
+      property = Property where id == pool.property_id
+      if pool.pro_rata_denominator == "TOTAL_RENTABLE":
+          denom = property.total_rentable_sqft
+      else:  # OCCUPIED
+          denom = property.occupied_sqft
+      if denom <= 0:
+          raise ERR_EMPTY_DENOMINATOR        # zero-denominator boundary
+      share = lease.leased_sqft / denom       # exact rational, not yet rounded
+      # share is carried at full precision into reconciled_cam (round once, at the end)
+    input_set: "Single Lease.leased_sqft over the pool's Property (pool.property_id) denominator selected by ExpensePool.pro_rata_denominator."
+    constants: {}
+    precision: "share kept at full float precision; final money rounded once in reconciled_cam_true_up"
+    variants:
+      - name: total_rentable_basis
+        when: "pool.pro_rata_denominator == TOTAL_RENTABLE"
+        difference: "denominator is the fixed Property.total_rentable_sqft"
+      - name: occupied_basis
+        when: "pool.pro_rata_denominator == OCCUPIED"
+        difference: "denominator is the live Property.occupied_sqft (smaller → larger share); zero occupancy raises ERR_EMPTY_DENOMINATOR"
+
+  - name: gross_up_pool
+    trigger: "recompute ExpensePool.total_recoverable_cents on ExpenseLineItem add/remove and on pool LOCK"
+    algorithm: aggregation
+    formula: |
+      # Variable recoverable expenses are grossed up to the assumed occupancy
+      # so a partially-occupied building still recovers full variable cost;
+      # fixed expenses are NEVER grossed up. Gross-up runs BEFORE the admin fee.
+      actual_occ = property.occupied_sqft / property.total_rentable_sqft   # full precision
+      gross_up_factor = property.gross_up_occupancy_pct / actual_occ        # >1 when underoccupied
+      recoverable = 0
+      for item in pool.line_items where item.recoverability IN {RECOVERABLE, CAPPED_CONTROLLABLE}:
+          base = item.amount_cents
+          if item.is_variable:
+              grossed = round_half_up(base * gross_up_factor)   # round per line item
+          else:
+              grossed = base                                    # fixed: no gross-up
+          recoverable += grossed
+      # admin fee applied to the grossed-up recoverable total, AFTER summing
+      total_recoverable_cents = recoverable + round_half_up(recoverable * pool.admin_fee_pct)
+    input_set: "ExpenseLineItem rows on the pool with recoverability IN {RECOVERABLE, CAPPED_CONTROLLABLE}; NON_RECOVERABLE excluded."
+    constants: {}
+    precision: "2 decimal places at cent granularity, round_half_up; gross-up rounded PER LINE ITEM then summed, admin fee rounded once on the sum (pinned order: gross-up rounding precedes summation precedes admin-fee rounding)."
+
+  - name: controllable_cap
+    trigger: "applied inside reconciled_cam_true_up before producing reconciled_cam_cents"
+    algorithm: threshold
+    formula: |
+      # The tenant's share of CAPPED_CONTROLLABLE expenses cannot grow more than
+      # controllable_cap_pct over the prior-year capped base. CAPPED_CONTROLLABLE
+      # is grossed up like any variable expense first (in gross_up_pool), but the
+      # cap is applied to the TENANT'S SHARE, not the pool total.
+      capped_pool = sum over pool.line_items where recoverability == CAPPED_CONTROLLABLE of
+                    (grossed amount as in gross_up_pool, NO admin fee on the capped slice)
+      tenant_capped_share = round_half_up(share * capped_pool)
+      if lease.controllable_cap_pct > 0 and lease.prior_year_capped_base_cents > 0:
+          cap_ceiling = round_half_up(lease.prior_year_capped_base_cents * (1 + lease.controllable_cap_pct))
+          allowed_capped = min(tenant_capped_share, cap_ceiling)        # cap binds when share exceeds ceiling
+      else:
+          allowed_capped = tenant_capped_share                         # cap disabled
+      capped_overage_cents = tenant_capped_share - allowed_capped       # amount disallowed by the cap
+    input_set: "CAPPED_CONTROLLABLE line items on the pool; the lease's controllable_cap_pct and prior_year_capped_base_cents."
+    constants: {}
+    precision: "2 decimal places, round_half_up; boundary is `>` strict (share strictly above ceiling triggers the cap; share == ceiling is allowed in full)."
+
+  - name: reconciled_cam_true_up
+    trigger: "computed at Reconciliation IN_REVIEW->POSTED (post); preview via GET /reconciliations/{id}/preview"
+    algorithm: forward_looking
+    formula: |
+      # DUAL VARIANT: estimated (billed monthly, forward-looking) vs reconciled
+      # (actual, chronological). The true-up is their signed difference.
+      share = pro_rata_share(lease, pool, property)            # full precision fraction
+      # Non-capped recoverable share (RECOVERABLE items, grossed + admin fee):
+      noncapped_pool = pool.total_recoverable_cents
+                       - (capped slice grossed amount, NO admin fee, from controllable_cap)
+                       - round_half_up((capped slice grossed amount) * pool.admin_fee_pct)
+      tenant_noncapped = round_half_up(share * noncapped_pool)
+      allowed_capped   = controllable_cap(lease, pool, share).allowed_capped
+      # admin fee on the allowed (post-cap) capped slice:
+      capped_with_admin = allowed_capped + round_half_up(allowed_capped * pool.admin_fee_pct)
+      reconciled_cam_cents       = tenant_noncapped + capped_with_admin
+      estimated_cam_billed_cents = 12 * lease.estimated_cam_cents_monthly
+      true_up_cents              = reconciled_cam_cents - estimated_cam_billed_cents
+      # positive true_up_cents => tenant owes (CAM_TRUEUP debit); negative => credit
+    input_set: "The POSTED pool's recoverable totals split into capped/non-capped slices, the lease's estimated CAM billed (12 * monthly), and the snapshot pro-rata share."
+    constants:
+      MONTHS_PER_YEAR: 12
+    precision: "2 decimal places, round_half_up; tenant non-capped share rounded once, capped slice rounded inside controllable_cap, then the two rounded slices summed (pinned: round each tenant slice, then sum — NOT sum-then-round)."
+    variants:
+      - name: estimated_variant
+        when: "during the lease year, billed monthly"
+        difference: "forward-looking: 12 * estimated_cam_cents_monthly, independent of actual pool expenses"
+      - name: reconciled_variant
+        when: "at year-end post"
+        difference: "chronological actuals: pro-rata share of the gross-up-and-cap-adjusted pool; differs from estimated by true_up_cents"
+
+  - name: base_rent_escalation
+    trigger: "POST /leases/{id}/escalate (advance to next lease year)"
+    algorithm: tiered_pricing
+    formula: |
+      # Three-way branch on escalation_type, each with >=3 inputs interacting.
+      if lease.escalation_type == "NONE":
+          new_base = lease.base_rent_cents_annual                    # unchanged
+      elif lease.escalation_type == "FIXED_PCT":
+          new_base = round_half_up(lease.base_rent_cents_annual * (1 + lease.escalation_rate))
+      elif lease.escalation_type == "CPI":
+          # indexed increase, capped at escalation_rate (CPI collar)
+          raw_increase = (request.current_cpi_index - lease.cpi_base_index) / lease.cpi_base_index
+          if raw_increase < 0: raw_increase = 0                       # CPI floor: never decrease rent
+          applied = min(raw_increase, lease.escalation_rate)          # collar/cap
+          new_base = round_half_up(lease.base_rent_cents_annual * (1 + applied))
+      # side effect: post a BASE_RENT LedgerEntry for (new_base - old_base) delta
+    input_set: "Single Lease; for CPI also the request.current_cpi_index against lease.cpi_base_index."
+    constants: {}
+    precision: "2 decimal places, round_half_up; CPI raw_increase floored at 0 then min-capped at escalation_rate (evaluation order pinned: floor BEFORE cap)."
+    variants:
+      - name: fixed_pct
+        when: "escalation_type == FIXED_PCT"
+        difference: "flat percent increase regardless of index"
+      - name: cpi_collared
+        when: "escalation_type == CPI"
+        difference: "index-driven increase, floored at 0 and capped at escalation_rate"
+
+  - name: percentage_rent
+    trigger: "POST /leases/{id}/percentage-rent-run (annual percentage-rent charge from a SalesReport)"
+    algorithm: threshold
+    formula: |
+      # Natural breakpoint: percentage rent accrues only on sales above the
+      # breakpoint. Inputs: gross_sales, breakpoint, rate (>=3, non-linear via max).
+      report = latest SalesReport for (lease_id, period_year) by created_at ASC tie-break
+      excess = max(0, report.gross_sales_cents - lease.pct_rent_breakpoint_cents)
+      pct_rent_cents = round_half_up(excess * lease.pct_rent_rate)
+      # boundary: sales == breakpoint => excess 0 => pct_rent 0 (>= breakpoint, not >)
+    input_set: "The latest SalesReport for the (lease, period_year) by created_at ASC; lease.pct_rent_rate and pct_rent_breakpoint_cents."
+    constants: {}
+    precision: "2 decimal places, round_half_up; breakpoint boundary is `>` strict (sales must exceed breakpoint; sales == breakpoint yields 0 percentage rent)."
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (Ordered by Priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "the role is permitted to call this endpoint per §1.7"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: auth
+    check: "for Tenant-restricted actions (dispute, estoppel respond), acting Tenant owns the referenced Lease (Lease.tenant_id == X-User-ID)"
+    error_id: ERR_NOT_LEASE_OWNER
+    http_status: 403
+    applies_to: "POST /reconciliations/{id}/dispute, POST /estoppels/{id}/respond"
+  - priority: 4
+    category: auth
+    check: "segregation of duties — the Accountant posting a reconciliation MUST NOT be the same X-User-ID that submitted it"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /reconciliations/{id}/post"
+  - priority: 5
+    category: existence
+    check: "every resource named in the path exists, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 6
+    category: existence
+    check: "every FK referenced in the request body exists (property_id, tenant_id, pool_id, lease_id, source_reconciliation_id)"
+    error_id: ERR_FK_NOT_FOUND
+    http_status: 404
+    applies_to: "all create/link endpoints"
+  - priority: 7
+    category: business_constraint
+    check: "request body is well-formed: required fields present, enums in range, integers non-negative where constrained"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all"
+  - priority: 8
+    category: state
+    check: "target resource is in a state that permits the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 9
+    category: state
+    check: "OCC: expected_reconciliation_version equals current Reconciliation.version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /reconciliations/{id}/post"
+  - priority: 10
+    category: business_referential
+    check: "Reconciliation.recon_year equals referenced ExpensePool.pool_year"
+    error_id: ERR_YEAR_MISMATCH
+    http_status: 422
+    applies_to: "POST /reconciliations, POST /reconciliations/{id}/submit"
+  - priority: 11
+    category: business_referential
+    check: "referenced ExpensePool.status == OPEN when posting (not already locked by another reconciliation)"
+    error_id: ERR_POOL_LOCKED
+    http_status: 409
+    applies_to: "POST /reconciliations/{id}/post"
+  - priority: 12
+    category: business_safety
+    check: "pro-rata denominator is positive (Property.total_rentable_sqft or occupied_sqft > 0) before computing share"
+    error_id: ERR_EMPTY_DENOMINATOR
+    http_status: 422
+    applies_to: "POST /reconciliations/{id}/post, GET /reconciliations/{id}/preview"
+  - priority: 13
+    category: business_constraint
+    check: "leased_sqft does not exceed the property's remaining capacity (total_rentable_sqft - occupied_sqft) at activation"
+    error_id: ERR_CAPACITY_EXCEEDED
+    http_status: 422
+    applies_to: "POST /leases/{id}/activate"
+  - priority: 14
+    category: business_temporal
+    check: "no two ACTIVE/HOLDOVER reconciliations for the same (lease_id, recon_year) overlap — a second recon for a year already covered by a POSTED recon is rejected"
+    error_id: ERR_DUPLICATE_RECON_PERIOD
+    http_status: 409
+    applies_to: "POST /reconciliations"
+  - priority: 15
+    category: business_temporal
+    check: "no two SalesReports for the same (lease_id, period_year) may both be billed — a percentage-rent run for a year already run is rejected"
+    error_id: ERR_PCT_RENT_ALREADY_RUN
+    http_status: 409
+    applies_to: "POST /leases/{id}/percentage-rent-run"
+  - priority: 16
+    category: business_fiscal
+    check: "TI draw does not exceed remaining allowance: Lease.ti_drawn_cents + amount_cents <= Lease.ti_allowance_cents"
+    error_id: ERR_TI_ALLOWANCE_EXCEEDED
+    http_status: 422
+    applies_to: "POST /ti-draws/{id}/approve"
+  - priority: 17
+    category: business_referential
+    check: "estoppel CONFIRMED response requires asserted_balance_cents == Lease.outstanding_balance_cents"
+    error_id: ERR_ESTOPPEL_BALANCE_MISMATCH
+    http_status: 422
+    applies_to: "POST /estoppels/{id}/respond"
+  - priority: 18
+    category: business_constraint
+    check: "estoppel DISPUTED response requires a non-empty dispute_note"
+    error_id: ERR_DISPUTE_NOTE_REQUIRED
+    http_status: 422
+    applies_to: "POST /estoppels/{id}/respond"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # ---- Property -----------------------------------------------------------
+  - method: POST
+    path: "/properties"
+    description: "Create a property."
+    roles: [PropertyManager, Accountant]
+    code: 201
+    input: ["name", "total_rentable_sqft", "gross_up_occupancy_pct?"]
+    output: Property
+    side_effects: ["occupied_sqft initialized to 0"]
+  - method: GET
+    path: "/properties/{id}"
+    description: "Fetch a property."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: []
+    output: Property
+    side_effects: []
+  - method: GET
+    path: "/properties"
+    description: "List properties (paginated)."
+    roles: [PropertyManager, Accountant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Property[]
+    side_effects: []
+  - method: GET
+    path: "/properties/{id}/leases"
+    description: "List leases on a property (reverse-reachability for Lease.property_id)."
+    roles: [PropertyManager, Accountant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Lease[]
+    side_effects: []
+  - method: GET
+    path: "/properties/{id}/expense-pools"
+    description: "List expense pools on a property (reverse-reachability for ExpensePool.property_id)."
+    roles: [PropertyManager, Accountant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ExpensePool[]
+    side_effects: []
+
+  # ---- Tenant -------------------------------------------------------------
+  - method: POST
+    path: "/tenants"
+    description: "Create a tenant."
+    roles: [PropertyManager, Accountant]
+    code: 201
+    input: [legal_name, contact_email]
+    output: Tenant
+    side_effects: []
+  - method: GET
+    path: "/tenants/{id}"
+    description: "Fetch a tenant."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: []
+    output: Tenant
+    side_effects: []
+  - method: GET
+    path: "/tenants/{id}/leases"
+    description: "List leases for a tenant (reverse-reachability for Lease.tenant_id)."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Lease[]
+    side_effects: []
+
+  # ---- ExpensePool / line items ------------------------------------------
+  - method: POST
+    path: "/expense-pools"
+    description: "Create an expense pool for a property/year."
+    roles: [PropertyManager, Accountant]
+    code: 201
+    input: ["property_id", "pool_year", "pro_rata_denominator?", "admin_fee_pct?"]
+    output: ExpensePool
+    side_effects: ["status=OPEN; total_recoverable_cents initialized to 0"]
+  - method: GET
+    path: "/expense-pools/{id}"
+    description: "Fetch an expense pool (includes computed total_recoverable_cents)."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: []
+    output: ExpensePool
+    side_effects: []
+  - method: POST
+    path: "/expense-pools/{id}/line-items"
+    description: "Add an expense line item to a pool."
+    roles: [PropertyManager, Accountant]
+    code: 201
+    input: ["category", "amount_cents", "recoverability?", "is_variable?"]
+    output: ExpenseLineItem
+    side_effects: ["recompute ExpensePool.total_recoverable_cents (gross_up_pool); increments ExpensePool.version by 1"]
+  - method: GET
+    path: "/expense-pools/{id}/line-items"
+    description: "List line items on a pool (reverse-reachability for ExpenseLineItem.pool_id)."
+    roles: [PropertyManager, Accountant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ExpenseLineItem[]
+    side_effects: []
+  - method: DELETE
+    path: "/expense-pools/{id}/line-items/{item_id}"
+    description: "Remove a line item from an OPEN pool."
+    roles: [PropertyManager, Accountant]
+    code: 200
+    input: []
+    output: ExpensePool
+    side_effects: ["recompute ExpensePool.total_recoverable_cents (gross_up_pool); increments ExpensePool.version by 1"]
+
+  # ---- Lease --------------------------------------------------------------
+  - method: POST
+    path: "/leases"
+    description: "Create a lease in DRAFT."
+    roles: [PropertyManager]
+    code: 201
+    input: ["property_id", "tenant_id", "leased_sqft", "base_rent_cents_annual", "escalation_type?", "escalation_rate?", "cpi_base_index?", "pct_rent_rate?", "pct_rent_breakpoint_cents?", "controllable_cap_pct?", "prior_year_capped_base_cents?", "ti_allowance_cents?", "estimated_cam_cents_monthly?"]
+    output: Lease
+    side_effects: ["status=DRAFT; outstanding_balance_cents=0; ti_drawn_cents=0"]
+  - method: GET
+    path: "/leases/{id}"
+    description: "Fetch a lease (includes computed ti_drawn_cents, outstanding_balance_cents)."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: []
+    output: Lease
+    side_effects: []
+  - method: POST
+    path: "/leases/{id}/activate"
+    description: "Activate a DRAFT lease."
+    roles: [PropertyManager]
+    code: 200
+    input: []
+    output: Lease
+    side_effects: ["status=ACTIVE; Property.occupied_sqft += leased_sqft (increments Property.version); post BASE_RENT LedgerEntry; recompute outstanding_balance_cents"]
+  - method: POST
+    path: "/leases/{id}/holdover"
+    description: "Move an ACTIVE lease to HOLDOVER."
+    roles: [PropertyManager]
+    code: 200
+    input: []
+    output: Lease
+    side_effects: ["status=HOLDOVER"]
+  - method: POST
+    path: "/leases/{id}/terminate"
+    description: "Terminate an ACTIVE/HOLDOVER lease."
+    roles: [PropertyManager]
+    code: 200
+    input: []
+    output: Lease
+    side_effects: ["status=TERMINATED; Property.occupied_sqft -= leased_sqft (increments Property.version)"]
+  - method: POST
+    path: "/leases/{id}/escalate"
+    description: "Advance the lease one year and escalate base rent (base_rent_escalation)."
+    roles: [PropertyManager]
+    code: 200
+    input: ["current_cpi_index?"]
+    output: Lease
+    side_effects: ["recompute base_rent_cents_annual (base_rent_escalation); post BASE_RENT LedgerEntry for the delta; recompute outstanding_balance_cents; increments Lease.version by 1"]
+  - method: POST
+    path: "/leases/{id}/percentage-rent-run"
+    description: "Run percentage rent for a period from the latest matching SalesReport (percentage_rent)."
+    roles: [PropertyManager, Accountant]
+    code: 200
+    input: [period_year]
+    output: Lease
+    side_effects: ["compute pct_rent_cents (percentage_rent); post PCT_RENT LedgerEntry of +pct_rent_cents; recompute outstanding_balance_cents; increments Lease.version by 1"]
+  - method: GET
+    path: "/leases/{id}/ledger"
+    description: "List ledger entries for a lease (reverse-reachability for LedgerEntry.lease_id), ordered created_at ASC."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: LedgerEntry[]
+    side_effects: []
+  - method: POST
+    path: "/leases/{id}/payments"
+    description: "Record a tenant payment (PAYMENT ledger entry, negative)."
+    roles: [PropertyManager, Accountant]
+    code: 201
+    input: [amount_cents]
+    output: LedgerEntry
+    side_effects: ["post PAYMENT LedgerEntry of -amount_cents; recompute Lease.outstanding_balance_cents; increments Lease.version by 1"]
+
+  # ---- SalesReport --------------------------------------------------------
+  - method: POST
+    path: "/sales-reports"
+    description: "File a gross-sales report for a lease/period (drives percentage rent)."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 201
+    input: [lease_id, period_year, gross_sales_cents]
+    output: SalesReport
+    side_effects: []
+  - method: GET
+    path: "/sales-reports/{id}"
+    description: "Fetch a single sales report."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: []
+    output: SalesReport
+    side_effects: []
+  - method: GET
+    path: "/sales-reports"
+    description: "List sales reports, filterable (reverse-reachability for SalesReport.lease_id)."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: ["lease_id?", "period_year?", "limit?", "offset?"]
+    output: SalesReport[]
+    side_effects: []
+
+  # ---- TiDraw -------------------------------------------------------------
+  - method: POST
+    path: "/ti-draws"
+    description: "Request a tenant-improvement draw against a lease allowance."
+    roles: [PropertyManager, Tenant]
+    code: 201
+    input: [lease_id, amount_cents]
+    output: TiDraw
+    side_effects: ["status=REQUESTED"]
+  - method: GET
+    path: "/ti-draws/{id}"
+    description: "Fetch a single TI draw."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: []
+    output: TiDraw
+    side_effects: []
+  - method: GET
+    path: "/ti-draws"
+    description: "List TI draws, filterable (reverse-reachability for TiDraw.lease_id)."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: ["lease_id?", "limit?", "offset?"]
+    output: TiDraw[]
+    side_effects: []
+  - method: POST
+    path: "/ti-draws/{id}/approve"
+    description: "Approve a requested TI draw (Accountant)."
+    roles: [Accountant]
+    code: 200
+    input: []
+    output: TiDraw
+    side_effects: ["status=APPROVED; recompute Lease.ti_drawn_cents (increments Lease.version); post TI_DRAW LedgerEntry of -amount_cents; recompute outstanding_balance_cents"]
+  - method: POST
+    path: "/ti-draws/{id}/reject"
+    description: "Reject a requested TI draw (Accountant)."
+    roles: [Accountant]
+    code: 200
+    input: []
+    output: TiDraw
+    side_effects: ["status=REJECTED"]
+
+  # ---- Reconciliation -----------------------------------------------------
+  - method: POST
+    path: "/reconciliations"
+    description: "Create a reconciliation (DRAFT) linking a lease and an expense pool for a year."
+    roles: [PropertyManager]
+    code: 201
+    input: [lease_id, pool_id, recon_year]
+    output: Reconciliation
+    side_effects: ["status=DRAFT"]
+  - method: GET
+    path: "/reconciliations/{id}"
+    description: "Fetch a reconciliation (snapshot fields populated once POSTED)."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: []
+    output: Reconciliation
+    side_effects: []
+  - method: GET
+    path: "/reconciliations"
+    description: "List reconciliations, filterable (reverse-reachability for Reconciliation.lease_id and pool_id)."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: ["lease_id?", "pool_id?", "limit?", "offset?"]
+    output: Reconciliation[]
+    side_effects: []
+  - method: GET
+    path: "/reconciliations/{id}/preview"
+    description: "Compute (without posting) pro_rata_share_pct, reconciled_cam_cents, estimated_cam_billed_cents, true_up_cents — read-only dry run."
+    roles: [PropertyManager, Accountant]
+    code: 200
+    input: []
+    output: Reconciliation
+    side_effects: []
+  - method: POST
+    path: "/reconciliations/{id}/submit"
+    description: "Submit a DRAFT reconciliation for review."
+    roles: [PropertyManager]
+    code: 200
+    input: []
+    output: Reconciliation
+    side_effects: ["status=IN_REVIEW"]
+  - method: POST
+    path: "/reconciliations/{id}/return"
+    description: "Return an IN_REVIEW reconciliation to DRAFT (revision loop)."
+    roles: [Accountant]
+    code: 200
+    input: []
+    output: Reconciliation
+    side_effects: ["status=DRAFT; increments Reconciliation.version by 1"]
+  - method: POST
+    path: "/reconciliations/{id}/post"
+    description: "Post an IN_REVIEW reconciliation: compute true-up, lock pool, charge ledger (OCC + segregation of duties)."
+    roles: [Accountant]
+    code: 200
+    input: [expected_reconciliation_version]
+    output: Reconciliation
+    side_effects: ["snapshot reconciled_cam/estimated/true_up; status=POSTED; ExpensePool.status=LOCKED (increments ExpensePool.version); post CAM_TRUEUP LedgerEntry (increments Lease.version); recompute outstanding_balance_cents; increments Reconciliation.version by 1"]
+  - method: POST
+    path: "/reconciliations/{id}/dispute"
+    description: "Tenant disputes a POSTED reconciliation."
+    roles: [Tenant]
+    code: 200
+    input: []
+    output: Reconciliation
+    side_effects: ["status=DISPUTED"]
+  - method: POST
+    path: "/reconciliations/{id}/resolve-dispute"
+    description: "Accountant resolves a dispute, re-affirming POSTED."
+    roles: [Accountant]
+    code: 200
+    input: []
+    output: Reconciliation
+    side_effects: ["status=POSTED"]
+  - method: POST
+    path: "/reconciliations/{id}/void"
+    description: "Accountant voids a DISPUTED reconciliation, reversing ledger and pool (compensation)."
+    roles: [Accountant]
+    code: 200
+    input: []
+    output: Reconciliation
+    side_effects: ["status=VOID; post reversing CREDIT_ADJUSTMENT LedgerEntry (increments Lease.version); recompute outstanding_balance_cents; ExpensePool.status=OPEN (increments ExpensePool.version)"]
+
+  # ---- Estoppel -----------------------------------------------------------
+  - method: POST
+    path: "/estoppels"
+    description: "Issue an estoppel certificate for a lease (snapshots asserted balance/base rent)."
+    roles: [PropertyManager, Accountant]
+    code: 201
+    input: [lease_id, asserted_balance_cents, asserted_base_rent_cents_annual]
+    output: EstoppelCertificate
+    side_effects: ["status=ISSUED"]
+  - method: GET
+    path: "/estoppels/{id}"
+    description: "Fetch an estoppel certificate."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: []
+    output: EstoppelCertificate
+    side_effects: []
+  - method: GET
+    path: "/estoppels"
+    description: "List estoppels, filterable (reverse-reachability for EstoppelCertificate.lease_id)."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: ["lease_id?", "limit?", "offset?"]
+    output: EstoppelCertificate[]
+    side_effects: []
+  - method: POST
+    path: "/estoppels/{id}/respond"
+    description: "Tenant responds CONFIRMED or DISPUTED to an issued estoppel."
+    roles: [Tenant]
+    code: 200
+    input: ["tenant_response", "dispute_note?"]
+    output: EstoppelCertificate
+    side_effects: ["status=CONFIRMED or DISPUTED; on DISPUTED store dispute_note"]
+
+  # ---- Reverse-reachability for LedgerEntry.source_reconciliation_id ------
+  - method: GET
+    path: "/reconciliations/{id}/ledger-entries"
+    description: "List ledger entries sourced by a reconciliation (reverse-reachability for LedgerEntry.source_reconciliation_id)."
+    roles: [PropertyManager, Accountant, Tenant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: LedgerEntry[]
+    side_effects: []
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID headers, or unknown role."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Role not permitted to call this endpoint per §1.7."
+  - id: ERR_NOT_LEASE_OWNER
+    http: 403
+    condition: "Acting Tenant is not the owner of the referenced lease (Lease.tenant_id != X-User-ID)."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "The Accountant posting a reconciliation is the same X-User-ID that submitted it."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A resource named in the path does not exist."
+  - id: ERR_FK_NOT_FOUND
+    http: 404
+    condition: "A foreign key in the request body references a non-existent resource."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Malformed body: missing required field, enum out of range, or constraint-violating value."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource is not in a state that permits the requested transition."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_reconciliation_version does not match the current Reconciliation.version (OCC)."
+  - id: ERR_YEAR_MISMATCH
+    http: 422
+    condition: "Reconciliation.recon_year does not equal the referenced ExpensePool.pool_year."
+  - id: ERR_POOL_LOCKED
+    http: 409
+    condition: "Referenced ExpensePool is LOCKED (already finalized by another reconciliation) when posting."
+  - id: ERR_EMPTY_DENOMINATOR
+    http: 422
+    condition: "Pro-rata denominator (total_rentable_sqft or occupied_sqft) is zero, so share is undefined."
+  - id: ERR_CAPACITY_EXCEEDED
+    http: 422
+    condition: "Lease.leased_sqft exceeds the property's remaining capacity at activation."
+  - id: ERR_DUPLICATE_RECON_PERIOD
+    http: 409
+    condition: "A reconciliation already exists POSTED for the same (lease_id, recon_year)."
+  - id: ERR_PCT_RENT_ALREADY_RUN
+    http: 409
+    condition: "Percentage rent has already been run for this (lease_id, period_year)."
+  - id: ERR_TI_ALLOWANCE_EXCEEDED
+    http: 422
+    condition: "Approving the TI draw would push ti_drawn_cents above ti_allowance_cents."
+  - id: ERR_ESTOPPEL_BALANCE_MISMATCH
+    http: 422
+    condition: "Estoppel CONFIRMED response but asserted_balance_cents != Lease.outstanding_balance_cents."
+  - id: ERR_DISPUTE_NOTE_REQUIRED
+    http: 422
+    condition: "Estoppel DISPUTED response (or reconciliation dispute path requiring note) without a non-empty dispute_note."
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "Generic business-rule violation not covered by a more specific error (fallback)."
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: PropertyManager
+    description: "Manages properties, leases, expense pools/line items; drafts and submits reconciliations; runs escalations and percentage rent. Cannot post (segregation of duties)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /leases (create lease)"
+      - "POST /leases/{id}/activate, /holdover, /terminate, /escalate"
+      - "POST /reconciliations (create), /reconciliations/{id}/submit"
+    shared_operations:
+      - "POST /properties, /tenants, /expense-pools, /expense-pools/{id}/line-items, DELETE line-items"
+      - "POST /leases/{id}/percentage-rent-run, /leases/{id}/payments"
+      - "POST /sales-reports, /ti-draws, /estoppels"
+      - "all GET reads"
+  - name: Accountant
+    description: "Reviews and posts reconciliations, approves/rejects TI draws, resolves disputes and voids. Cannot draft or submit a reconciliation it will later post (segregation of duties)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /reconciliations/{id}/return, /post, /resolve-dispute, /void"
+      - "POST /ti-draws/{id}/approve, /reject"
+    shared_operations:
+      - "POST /properties, /tenants, /expense-pools, /expense-pools/{id}/line-items, DELETE line-items"
+      - "POST /leases/{id}/percentage-rent-run, /leases/{id}/payments"
+      - "POST /sales-reports, /ti-draws, /estoppels"
+      - "all GET reads"
+  - name: Tenant
+    description: "A leaseholder. Files sales reports, requests TI draws, disputes posted reconciliations, and responds to estoppels — only on its own leases."
+    identity: "entity_backed:Tenant"
+    exclusive_operations:
+      - "POST /reconciliations/{id}/dispute (own lease)"
+      - "POST /estoppels/{id}/respond (own lease)"
+    shared_operations:
+      - "POST /sales-reports, /ti-draws (own lease)"
+      - "GET reads of own property/lease/pool/recon/estoppel/ledger"

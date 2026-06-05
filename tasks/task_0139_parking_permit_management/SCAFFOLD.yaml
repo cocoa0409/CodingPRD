@@ -1,0 +1,1591 @@
+scenario: "Parking & Permit Management: garage space inventory, hourly/daily/monthly rate, permit zone/waitlist, license-plate-recognition enforcement, citation/appeal, validation, dynamic event pricing, gated access"
+domain_name: "parking-permit-management"
+api_prefix: "/parking"
+
+complexity_profile:
+  primary_archetype: "Quota / allocation"
+  secondary_archetype: "Pricing engine"
+  complexity_layers:
+    - "Optimistic concurrency"
+    - "Cascading side effects"
+    - "Dual-variant calculation"
+    - "Rate / threshold triggers"
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (Garage, Zone, Space, Permit, PermitWaitlistEntry,
+  # AccessSession, RatePlan, EventPricing, Validation, Citation, Appeal, PlateRead). No nesting
+  # in URL paths beyond a single reverse-reachability sub-resource read per parent collection.
+
+  state_machine_shape: branching
+  # Permit: branching with revert (waitlist promote / approve / reject / revoke).
+  # Citation: branching fork-join into appeal (UPHELD vs DISMISSED diverge in side effects).
+  # AccessSession: linear-with-guard but gated by Space/Zone capacity cross-entity preconditions.
+
+  relationship_patterns:
+    - one_to_many        # Garage -> Zone -> Space; Zone -> Permit; Citation -> Appeal
+    - cross_aggregate    # AccessSession references Space, Permit, RatePlan, Validation across aggregates
+    - self_referential: false
+
+  role_model: peer_roles
+  # Motorist owns its own Permits/Appeals/Sessions; Merchant owns Validations; EnforcementOfficer
+  # issues Citations and reviews Appeals; FacilityAdmin owns inventory/rates/event-pricing/waitlist.
+
+  consistency_model: immediate
+  # All mutations atomic within a single request; derived fields (zone.permits_active_count,
+  # space.is_occupied, garage.occupied_count) recomputed synchronously in the same transaction.
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: Garage
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Human-readable garage name"
+      - name: timezone
+        type: string
+        source: input
+        description: "IANA tz name used only for display; all stored times are UTC"
+        default: "UTC"
+      - name: total_space_count
+        type: integer
+        source: computed
+        description: "Count of Space rows whose garage_id == this Garage.id, any status"
+      - name: occupied_count
+        type: integer
+        source: computed
+        description: "Count of Space rows for this garage with is_occupied == true; recomputed on every AccessSession OPEN/CLOSE side effect"
+      - name: gate_mode
+        type: enum
+        source: input
+        description: "Controls entry admission policy at the gate"
+        default: "PERMIT_OR_TRANSIENT"
+        constraints: "one of PERMIT_OR_TRANSIENT, PERMIT_ONLY, CLOSED"
+
+  - name: Zone
+    parent: null
+    common_fields: true
+    fields:
+      - name: garage_id
+        type: string
+        source: input
+        description: "FK -> Garage.id"
+      - name: code
+        type: string
+        source: input
+        description: "Short zone code, unique within the garage (e.g. 'A', 'RES')"
+      - name: zone_type
+        type: enum
+        source: input
+        description: "Governs whether transient parking or only permit parking is allowed in this zone"
+        constraints: "one of TRANSIENT, PERMIT, MIXED"
+      - name: permit_capacity
+        type: integer
+        source: input
+        description: "Maximum number of ACTIVE permits this zone may hold; 0 disallows permits"
+        constraints: ">= 0"
+      - name: permits_active_count
+        type: integer
+        source: computed
+        description: "Count of Permit rows for this zone with status == ACTIVE; recomputed on every Permit activation/revocation/expiry side effect"
+      - name: rate_plan_id
+        type: string
+        source: input
+        description: "FK -> RatePlan.id; the transient rate schedule applied to AccessSessions parked in this zone"
+
+  - name: Space
+    parent: null
+    common_fields: true
+    fields:
+      - name: zone_id
+        type: string
+        source: input
+        description: "FK -> Zone.id"
+      - name: label
+        type: string
+        source: input
+        description: "Physical stall label, unique within the zone (e.g. 'A-12')"
+      - name: status
+        type: enum
+        source: input
+        description: "Inventory availability of the stall"
+        default: "AVAILABLE"
+        constraints: "one of AVAILABLE, OUT_OF_SERVICE"
+      - name: is_occupied
+        type: boolean
+        source: computed
+        description: "True iff an AccessSession with status OPEN currently references this space_id"
+        default: false
+
+  - name: RatePlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Rate plan name"
+      - name: hourly_cents
+        type: integer
+        source: input
+        description: "Per-hour transient rate in cents (each started hour billed)"
+        constraints: ">= 0"
+      - name: daily_cap_cents
+        type: integer
+        source: input
+        description: "Maximum charge per calendar-day-equivalent 24h block in cents; caps the hourly accrual"
+        constraints: ">= 0"
+      - name: monthly_permit_cents
+        type: integer
+        source: input
+        description: "Flat monthly fee charged when a Permit on a zone bound to this plan is activated"
+        constraints: ">= 0"
+      - name: grace_minutes
+        type: integer
+        source: input
+        description: "Free leading minutes; duration at or below this is billed at 0"
+        default: 15
+        constraints: ">= 0"
+
+  - name: EventPricing
+    parent: null
+    common_fields: true
+    fields:
+      - name: garage_id
+        type: string
+        source: input
+        description: "FK -> Garage.id; the event surcharge applies to transient sessions in this garage"
+      - name: name
+        type: string
+        source: input
+        description: "Event name (e.g. 'Stadium Concert')"
+      - name: window_start_utc
+        type: datetime
+        source: input
+        description: "Inclusive UTC start of the event surcharge window"
+      - name: window_end_utc
+        type: datetime
+        source: input
+        description: "Exclusive UTC end of the event surcharge window (half-open [start, end))"
+      - name: flat_surcharge_cents
+        type: integer
+        source: input
+        description: "Flat surcharge in cents added once to any session whose entry_at falls inside the window"
+        constraints: ">= 0"
+      - name: multiplier
+        type: number
+        source: input
+        description: "Multiplier applied to the metered (hourly, pre-cap) portion before the flat surcharge and before the daily cap"
+        default: 1.0
+        constraints: ">= 1.0"
+      - name: status
+        type: enum
+        source: input
+        description: "PUBLISHED windows price sessions; DRAFT windows are ignored by pricing"
+        default: "DRAFT"
+        constraints: "one of DRAFT, PUBLISHED"
+
+  - name: Permit
+    parent: null
+    common_fields: true
+    fields:
+      - name: zone_id
+        type: string
+        source: input
+        description: "FK -> Zone.id; the permit zone this permit grants standing access to"
+      - name: motorist_id
+        type: string
+        source: input
+        description: "FK -> Motorist.id; the permit holder"
+      - name: plate
+        type: string
+        source: input
+        description: "Normalized license plate (uppercased, no spaces) the permit is bound to"
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state; see §1.2"
+        default: "REQUESTED"
+        constraints: "one of REQUESTED, ACTIVE, REVOKED, EXPIRED, REJECTED"
+      - name: valid_from_utc
+        type: datetime
+        source: computed
+        description: "Set to the activation timestamp when the permit transitions to ACTIVE"
+      - name: valid_until_utc
+        type: datetime
+        source: computed
+        description: "Set to valid_from_utc + 30 days at activation; permit auto-expires past this instant"
+      - name: monthly_fee_charged_cents
+        type: integer
+        source: computed
+        description: "Snapshot of RatePlan.monthly_permit_cents charged at activation"
+        default: 0
+
+  - name: PermitWaitlistEntry
+    parent: null
+    common_fields: true
+    fields:
+      - name: zone_id
+        type: string
+        source: input
+        description: "FK -> Zone.id; the zone the motorist is waiting for"
+      - name: motorist_id
+        type: string
+        source: input
+        description: "FK -> Motorist.id; the waiting motorist"
+      - name: plate
+        type: string
+        source: input
+        description: "Normalized plate to bind to the permit when promoted"
+      - name: status
+        type: enum
+        source: computed
+        description: "Waitlist lifecycle state; see §1.2"
+        default: "WAITING"
+        constraints: "one of WAITING, PROMOTED, CANCELLED"
+      - name: sequence
+        type: integer
+        source: system
+        description: "Monotonic per-zone insertion index assigned at creation; lower = earlier; ties impossible by construction"
+      - name: promoted_permit_id
+        type: string
+        source: computed
+        description: "FK -> Permit.id; set to the Permit created when this entry is promoted off the waitlist"
+
+  - name: Motorist
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Motorist name"
+      - name: email
+        type: string
+        source: input
+        description: "Contact email, globally unique"
+      - name: default_plate
+        type: string
+        source: input
+        description: "Normalized default license plate"
+      - name: outstanding_balance_cents
+        type: integer
+        source: computed
+        description: "Sum of Citation.amount_due_cents for this motorist over citations whose status IN {ISSUED, UPHELD}; recomputed on every citation issue/appeal-resolution side effect"
+        default: 0
+
+  - name: AccessSession
+    parent: null
+    common_fields: true
+    fields:
+      - name: garage_id
+        type: string
+        source: input
+        description: "FK -> Garage.id; garage entered"
+      - name: space_id
+        type: string
+        source: computed
+        description: "FK -> Space.id; the stall assigned by the server at entry via the selector policy"
+      - name: permit_id
+        type: string
+        source: input
+        description: "FK -> Permit.id; set when the entry is admitted as a permit session, else null"
+      - name: plate
+        type: string
+        source: input
+        description: "Normalized plate read at the entry gate"
+      - name: entry_at_utc
+        type: datetime
+        source: input
+        description: "UTC instant the vehicle entered; supplied by the gate"
+      - name: exit_at_utc
+        type: datetime
+        source: computed
+        description: "UTC instant the vehicle exited; set on CLOSE"
+      - name: status
+        type: enum
+        source: computed
+        description: "OPEN while parked, CLOSED on settled exit, VOIDED if cancelled before exit"
+        default: "OPEN"
+        constraints: "one of OPEN, CLOSED, VOIDED"
+      - name: session_kind
+        type: enum
+        source: computed
+        description: "PERMIT if admitted under a valid permit, TRANSIENT otherwise; fixed at entry"
+        constraints: "one of PERMIT, TRANSIENT"
+      - name: gross_charge_cents
+        type: integer
+        source: computed
+        description: "Metered charge before validation discounts, computed at CLOSE per §1.3 transient_charge"
+        default: 0
+      - name: validation_id
+        type: string
+        source: input
+        description: "FK -> Validation.id; an optional merchant validation applied at exit"
+      - name: net_charge_cents
+        type: integer
+        source: computed
+        description: "gross_charge_cents minus the validation discount, floored at 0; computed at CLOSE"
+        default: 0
+
+  - name: Validation
+    parent: null
+    common_fields: true
+    fields:
+      - name: garage_id
+        type: string
+        source: input
+        description: "FK -> Garage.id; garage where this validation may be redeemed"
+      - name: merchant_id
+        type: string
+        source: input
+        description: "FK -> Merchant.id; issuing merchant"
+      - name: discount_kind
+        type: enum
+        source: input
+        description: "How the discount reduces the gross charge"
+        constraints: "one of FLAT_CENTS, PERCENT, FREE_HOURS"
+      - name: discount_value
+        type: integer
+        source: input
+        description: "Cents for FLAT_CENTS; whole percent 0-100 for PERCENT; whole hours for FREE_HOURS"
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: computed
+        description: "ISSUED until redeemed by an AccessSession CLOSE, then REDEEMED; single-use"
+        default: "ISSUED"
+        constraints: "one of ISSUED, REDEEMED"
+      - name: expires_at_utc
+        type: datetime
+        source: input
+        description: "Validation is unusable at or after this UTC instant"
+
+  - name: Merchant
+    parent: null
+    common_fields: true
+    fields:
+      - name: garage_id
+        type: string
+        source: input
+        description: "FK -> Garage.id; garage the merchant is enrolled in"
+      - name: name
+        type: string
+        source: input
+        description: "Merchant business name"
+      - name: validation_budget_cents
+        type: integer
+        source: input
+        description: "Remaining cents the merchant may grant via validation discounts"
+        constraints: ">= 0"
+
+  - name: Citation
+    parent: null
+    common_fields: true
+    fields:
+      - name: garage_id
+        type: string
+        source: input
+        description: "FK -> Garage.id; garage where the violation occurred"
+      - name: plate
+        type: string
+        source: input
+        description: "Normalized plate cited"
+      - name: motorist_id
+        type: string
+        source: computed
+        description: "FK -> Motorist.id; resolved from plate at issue time if a matching Motorist exists, else null"
+      - name: plate_read_id
+        type: string
+        source: input
+        description: "FK -> PlateRead.id; the LPR read that triggered enforcement"
+      - name: violation_code
+        type: enum
+        source: input
+        description: "Category of violation"
+        constraints: "one of NO_PERMIT, EXPIRED_PERMIT, WRONG_ZONE, OVERSTAY"
+      - name: base_fine_cents
+        type: integer
+        source: input
+        description: "Base fine before repeat-offender escalation, in cents"
+        constraints: ">= 0"
+      - name: amount_due_cents
+        type: integer
+        source: computed
+        description: "Escalated fine computed at issue per §1.3 citation_fine"
+        default: 0
+      - name: prior_citation_count
+        type: integer
+        source: computed
+        description: "Snapshot of prior ISSUED/UPHELD citations for this plate counted at issue time"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Citation lifecycle; see §1.2"
+        default: "ISSUED"
+        constraints: "one of ISSUED, UPHELD, DISMISSED, PAID"
+
+  - name: Appeal
+    parent: null
+    common_fields: true
+    fields:
+      - name: citation_id
+        type: string
+        source: input
+        description: "FK -> Citation.id; the citation being appealed"
+      - name: motorist_id
+        type: string
+        source: input
+        description: "FK -> Motorist.id; the appealing motorist"
+      - name: reason
+        type: string
+        source: input
+        description: "Free-text appeal reason"
+      - name: status
+        type: enum
+        source: computed
+        description: "Appeal lifecycle; see §1.2"
+        default: "SUBMITTED"
+        constraints: "one of SUBMITTED, UPHELD, DISMISSED"
+
+  - name: PlateRead
+    parent: null
+    common_fields: false
+    fields:
+      - name: garage_id
+        type: string
+        source: input
+        description: "FK -> Garage.id; garage where the camera read occurred"
+      - name: plate
+        type: string
+        source: input
+        description: "Normalized plate text the camera reported"
+      - name: zone_id
+        type: string
+        source: input
+        description: "FK -> Zone.id; zone the camera observed the vehicle in"
+      - name: read_at_utc
+        type: datetime
+        source: input
+        description: "UTC instant of the camera read"
+      - name: enforcement_outcome
+        type: enum
+        source: computed
+        description: "Result of evaluating the read against permits/sessions per §1.3 lpr_enforcement"
+        constraints: "one of COMPLIANT, VIOLATION_NO_PERMIT, VIOLATION_EXPIRED_PERMIT, VIOLATION_WRONG_ZONE"
+      - name: matched_permit_id
+        type: string
+        source: computed
+        description: "FK -> Permit.id; the ACTIVE permit matched to plate+zone, else null"
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  - entity: Permit
+    initial_state: REQUESTED
+    terminal_states: [REVOKED, EXPIRED, REJECTED]
+    transitions:
+      - from: REQUESTED
+        to: ACTIVE
+        trigger: "POST /parking/permits/{id}/activate"
+        actor: FacilityAdmin
+        preconditions:
+          - "Permit.status == REQUESTED"
+          - "Zone (permit.zone_id) zone_type IN {PERMIT, MIXED}"
+          - "Zone.permits_active_count < Zone.permit_capacity (strict <)"
+        side_effects:
+          - "set Permit.status = ACTIVE"
+          - "set Permit.valid_from_utc = request entry timestamp (clock now)"
+          - "set Permit.valid_until_utc = valid_from_utc + 30 days"
+          - "set Permit.monthly_fee_charged_cents = RatePlan(zone.rate_plan_id).monthly_permit_cents"
+          - "recompute Zone.permits_active_count (+1)"
+          - "increments Permit.version by 1"
+      - from: REQUESTED
+        to: REJECTED
+        trigger: "POST /parking/permits/{id}/reject"
+        actor: FacilityAdmin
+        preconditions:
+          - "Permit.status == REQUESTED"
+        side_effects:
+          - "set Permit.status = REJECTED"
+          - "increments Permit.version by 1"
+      - from: ACTIVE
+        to: REVOKED
+        trigger: "POST /parking/permits/{id}/revoke"
+        actor: FacilityAdmin
+        preconditions:
+          - "Permit.status == ACTIVE"
+        side_effects:
+          - "set Permit.status = REVOKED"
+          - "recompute Zone.permits_active_count (-1)"
+          - "auto-promote the lowest-sequence WAITING PermitWaitlistEntry for this zone if capacity freed (cascade: creates a Permit in REQUESTED, sets entry.status=PROMOTED, entry.promoted_permit_id)"
+          - "increments Permit.version by 1"
+        note: "Revocation frees one capacity slot and triggers the waitlist promotion cascade described in §1.2 transitive chain T1."
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /parking/permits/{id}/expire-check (system sweep; expires iff clock now >= valid_until_utc)"
+        actor: system
+        preconditions:
+          - "Permit.status == ACTIVE"
+          - "clock now >= Permit.valid_until_utc"
+        side_effects:
+          - "set Permit.status = EXPIRED"
+          - "recompute Zone.permits_active_count (-1)"
+          - "auto-promote the lowest-sequence WAITING PermitWaitlistEntry for this zone if capacity freed (cascade T1)"
+          - "increments Permit.version by 1"
+
+  - entity: PermitWaitlistEntry
+    initial_state: WAITING
+    terminal_states: [PROMOTED, CANCELLED]
+    transitions:
+      - from: WAITING
+        to: PROMOTED
+        trigger: "system cascade from Permit REVOKED/EXPIRED freeing capacity, OR POST /parking/zones/{id}/promote-waitlist"
+        actor: system
+        preconditions:
+          - "PermitWaitlistEntry.status == WAITING"
+          - "this entry has the lowest sequence among WAITING entries for the zone"
+          - "Zone.permits_active_count < Zone.permit_capacity"
+        side_effects:
+          - "create a new Permit (status REQUESTED, zone_id, motorist_id, plate copied from entry)"
+          - "set PermitWaitlistEntry.status = PROMOTED"
+          - "set PermitWaitlistEntry.promoted_permit_id = new Permit.id"
+          - "increments PermitWaitlistEntry.version by 1"
+        note: "Promotion does NOT itself activate the new permit; FacilityAdmin must still activate it (which is what re-consumes the freed slot)."
+      - from: WAITING
+        to: CANCELLED
+        trigger: "POST /parking/waitlist-entries/{id}/cancel"
+        actor: Motorist
+        preconditions:
+          - "PermitWaitlistEntry.status == WAITING"
+        side_effects:
+          - "set PermitWaitlistEntry.status = CANCELLED"
+          - "increments PermitWaitlistEntry.version by 1"
+
+  - entity: AccessSession
+    initial_state: OPEN
+    terminal_states: [CLOSED, VOIDED]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /parking/sessions/{id}/exit"
+        actor: system
+        preconditions:
+          - "AccessSession.status == OPEN"
+          - "request exit_at_utc > AccessSession.entry_at_utc (strict >)"
+          - "if validation_id supplied: Validation.status == ISSUED AND exit_at_utc < Validation.expires_at_utc AND Validation.garage_id == session.garage_id"
+        side_effects:
+          - "set AccessSession.exit_at_utc = request exit_at_utc"
+          - "compute AccessSession.gross_charge_cents per §1.3 transient_charge (0 for PERMIT sessions)"
+          - "compute AccessSession.net_charge_cents = max(0, gross - validation discount) per §1.3 validation_discount"
+          - "set AccessSession.status = CLOSED"
+          - "set Space.is_occupied = false for session.space_id (cascade: recompute Garage.occupied_count -1)"
+          - "if validation_id supplied and discount applied: set Validation.status = REDEEMED and debit Merchant.validation_budget_cents by the applied discount (cascade T2)"
+          - "increments AccessSession.version by 1"
+        note: "PERMIT sessions are billed 0 and ignore validation; transitive chain T2 (exit -> validation redeemed -> merchant budget debited) only runs for TRANSIENT sessions with a validation."
+      - from: OPEN
+        to: VOIDED
+        trigger: "POST /parking/sessions/{id}/void"
+        actor: FacilityAdmin
+        preconditions:
+          - "AccessSession.status == OPEN"
+        side_effects:
+          - "set AccessSession.status = VOIDED"
+          - "set Space.is_occupied = false for session.space_id (cascade: recompute Garage.occupied_count -1)"
+          - "increments AccessSession.version by 1"
+
+  - entity: Citation
+    initial_state: ISSUED
+    terminal_states: [DISMISSED, PAID]
+    transitions:
+      - from: ISSUED
+        to: UPHELD
+        trigger: "system cascade from Appeal DISMISSED (the appeal failed, citation stands)"
+        actor: system
+        preconditions:
+          - "Citation.status == ISSUED"
+        side_effects:
+          - "set Citation.status = UPHELD"
+          - "recompute Motorist.outstanding_balance_cents (citation still counts)"
+          - "increments Citation.version by 1"
+        note: "Branch A of the appeal fork: appeal DISMISSED -> citation UPHELD, balance unchanged."
+      - from: ISSUED
+        to: DISMISSED
+        trigger: "system cascade from Appeal UPHELD (the appeal succeeded, citation voided)"
+        actor: system
+        preconditions:
+          - "Citation.status == ISSUED"
+        side_effects:
+          - "set Citation.status = DISMISSED"
+          - "recompute Motorist.outstanding_balance_cents (this citation's amount_due_cents removed from the sum, cascade T-appeal)"
+          - "increments Citation.version by 1"
+        note: "Branch B of the appeal fork: appeal UPHELD -> citation DISMISSED, balance decreases by amount_due_cents."
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /parking/citations/{id}/pay"
+        actor: Motorist
+        preconditions:
+          - "Citation.status == ISSUED"
+          - "request expected_citation_version matches Citation.version"
+        side_effects:
+          - "set Citation.status = PAID"
+          - "recompute Motorist.outstanding_balance_cents (this citation removed from the sum)"
+          - "increments Citation.version by 1"
+      - from: UPHELD
+        to: PAID
+        trigger: "POST /parking/citations/{id}/pay"
+        actor: Motorist
+        preconditions:
+          - "Citation.status == UPHELD"
+          - "request expected_citation_version matches Citation.version"
+        side_effects:
+          - "set Citation.status = PAID"
+          - "recompute Motorist.outstanding_balance_cents (this citation removed from the sum)"
+          - "increments Citation.version by 1"
+
+  - entity: Appeal
+    initial_state: SUBMITTED
+    terminal_states: [UPHELD, DISMISSED]
+    transitions:
+      - from: SUBMITTED
+        to: UPHELD
+        trigger: "POST /parking/appeals/{id}/decide with decision=UPHELD"
+        actor: EnforcementOfficer
+        preconditions:
+          - "Appeal.status == SUBMITTED"
+          - "Citation (appeal.citation_id) status == ISSUED"
+        side_effects:
+          - "set Appeal.status = UPHELD"
+          - "transition the linked Citation ISSUED -> DISMISSED (cascade T3 hop 1)"
+          - "Citation DISMISSED recomputes Motorist.outstanding_balance_cents downward (cascade T3 hop 2)"
+          - "increments Appeal.version by 1"
+        note: "Fork branch B with full transitive cascade T3: appeal decide(UPHELD) -> citation DISMISSED -> motorist balance recomputed."
+      - from: SUBMITTED
+        to: DISMISSED
+        trigger: "POST /parking/appeals/{id}/decide with decision=DISMISSED"
+        actor: EnforcementOfficer
+        preconditions:
+          - "Appeal.status == SUBMITTED"
+          - "Citation (appeal.citation_id) status == ISSUED"
+        side_effects:
+          - "set Appeal.status = DISMISSED"
+          - "transition the linked Citation ISSUED -> UPHELD (balance unchanged)"
+          - "increments Appeal.version by 1"
+        note: "Fork branch A: appeal decide(DISMISSED) -> citation UPHELD, no balance change."
+
+# ---- §1.2.1 Concurrency Rules ----
+concurrency_rules:
+  - rule_id: permit-activate-stale-zone-capacity
+    parent_entity: Zone
+    write_endpoint: "POST /parking/permits/{id}/activate"
+    occ_field: "expected_zone_version"
+    description: |
+      Activating a Permit against a Zone whose version has advanced since the
+      client last observed it is rejected as a stale-version conflict. A Zone's
+      version advances every time a permit it holds is activated, revoked, or
+      expired (each recomputes permits_active_count). A client that read the
+      zone at version N, saw one free slot, and then submits an activation
+      still carrying expected_zone_version = N after another activation has
+      already consumed that slot is rejected — its view of remaining capacity
+      is stale. Capacity is the legitimately-supersedable resource: the second
+      activation would itself succeed under natural semantics had no prior
+      write intervened, so this is a true race resolved by OCC, not a plain
+      state precondition.
+    error_id: ERR_STALE_ZONE_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: transient_charge
+    trigger: "AccessSession OPEN -> CLOSED (POST /parking/sessions/{id}/exit), TRANSIENT sessions only"
+    algorithm: tiered_pricing
+    formula: |
+      # PERMIT sessions: gross = 0 (covered by monthly fee). Below is TRANSIENT.
+      duration_min = minutes_between(entry_at_utc, exit_at_utc)   # exit strictly after entry
+      if duration_min <= rate_plan.grace_minutes:
+          return 0
+      # Metered hours: each STARTED hour is billed (ceil), measuring from entry (grace does
+      # not subtract time; it only zeroes out sub-grace stays).
+      billable_hours = ceil(duration_min / 60)
+      metered_cents = billable_hours * rate_plan.hourly_cents
+      # Event surcharge: pick the single PUBLISHED EventPricing for this garage whose
+      # half-open window [window_start_utc, window_end_utc) contains entry_at_utc. If several
+      # qualify, choose the one with the latest window_start_utc; tie-break on created_at ASC.
+      if an event window applies:
+          metered_cents = round_half_up(metered_cents * event.multiplier)     # multiplier first
+      # Daily cap: cap the metered portion per 24h block (whole blocks via floor, plus a final
+      # partial block). cap_blocks = floor(duration_min / 1440) + (1 if duration_min % 1440 > 0 else 0)
+      cap_blocks = ceil(duration_min / 1440)
+      metered_cents = min(metered_cents, cap_blocks * rate_plan.daily_cap_cents)
+      gross = metered_cents
+      if an event window applies:
+          gross = gross + event.flat_surcharge_cents                          # flat AFTER the cap
+      return gross
+    input_set: "Single AccessSession (TRANSIENT) plus its zone's RatePlan and at most one PUBLISHED EventPricing window for the garage."
+    constants:
+      MINUTES_PER_HOUR: 60
+      MINUTES_PER_DAY: 1440
+    precision: "integer cents; round_half_up only at the multiplier step; ceil for hour/day block counts"
+    variants:
+      - name: permit_session_zero
+        when: "session_kind == PERMIT"
+        difference: "gross is always 0 regardless of duration; the monthly fee already covered it"
+      - name: transient_metered
+        when: "session_kind == TRANSIENT"
+        difference: "full metered/event/cap pipeline above applies"
+
+  - name: validation_discount
+    trigger: "AccessSession OPEN -> CLOSED with validation_id supplied (TRANSIENT only)"
+    algorithm: threshold
+    formula: |
+      # gross is the §1.3 transient_charge result. Discount kind determines reduction.
+      if validation.discount_kind == FLAT_CENTS:
+          raw_discount = validation.discount_value
+      elif validation.discount_kind == PERCENT:
+          raw_discount = floor(gross * validation.discount_value / 100)
+      elif validation.discount_kind == FREE_HOURS:
+          # value free hours' worth of metered cents at the plan's hourly rate, NOT to exceed gross
+          raw_discount = validation.discount_value * rate_plan.hourly_cents
+      # A merchant cannot grant more than its remaining budget.
+      applied_discount = min(raw_discount, gross, merchant.validation_budget_cents)
+      net = gross - applied_discount       # floored at 0 by construction since applied <= gross
+      return { applied_discount, net }
+    input_set: "One AccessSession gross, one Validation, the Validation's Merchant budget, and the zone's RatePlan hourly rate."
+    constants:
+      PERCENT_BASE: 100
+    precision: "integer cents; floor for PERCENT; applied_discount is the three-way min"
+    variants:
+      - name: budget_clipped
+        when: "raw_discount > merchant.validation_budget_cents"
+        difference: "applied_discount is clipped to remaining merchant budget; net is higher than the nominal discount would give"
+      - name: full_discount
+        when: "raw_discount <= merchant.validation_budget_cents AND raw_discount <= gross"
+        difference: "applied_discount == raw_discount; merchant budget debited by the full nominal amount"
+
+  - name: citation_fine
+    trigger: "Citation creation (POST /parking/citations) — escalation by repeat-offender count"
+    algorithm: tiered_pricing
+    formula: |
+      # prior_count = number of Citation rows for the SAME plate with status IN {ISSUED, UPHELD}
+      # observed at issue time (excludes DISMISSED and PAID). Counted chronologically by created_at.
+      prior_count = count(citations where plate == new.plate AND status IN {ISSUED, UPHELD})
+      # Escalation multiplier tiers on prior_count:
+      #   0 prior          -> 1.00x
+      #   1 prior          -> 1.50x
+      #   2 prior          -> 2.00x
+      #   3+ prior         -> 3.00x  (>= 3, inclusive)
+      if   prior_count == 0: mult = 1.00
+      elif prior_count == 1: mult = 1.50
+      elif prior_count == 2: mult = 2.00
+      else:                  mult = 3.00      # prior_count >= 3
+      amount_due_cents = round_half_up(base_fine_cents * mult)
+      return { amount_due_cents, prior_count_snapshot: prior_count }
+    input_set: "The new Citation's base_fine_cents and the count of prior {ISSUED, UPHELD} citations for the same plate."
+    constants:
+      TIER_1_PRIOR: 1
+      TIER_2_PRIOR: 2
+      TIER_3_PRIOR: 3
+      MULT_T0: 1.00
+      MULT_T1: 1.50
+      MULT_T2: 2.00
+      MULT_T3: 3.00
+    precision: "integer cents; round_half_up on the single multiply"
+    variants:
+      - name: first_offense
+        when: "prior_count == 0"
+        difference: "no escalation; amount_due_cents == base_fine_cents"
+      - name: repeat_offender
+        when: "prior_count >= 1"
+        difference: "amount_due_cents escalated by the tiered multiplier; tier boundary at exactly 3 priors locks the ceiling at 3.00x"
+
+  - name: lpr_enforcement
+    trigger: "POST /parking/plate-reads — evaluate a camera read against active permits and open sessions"
+    algorithm: constraint_propagation
+    formula: |
+      # Normalize plate. Resolution order is fixed and short-circuits at the first match.
+      # 1. Is there an OPEN AccessSession for (garage_id, plate)? -> COMPLIANT (transient parker paid/parking)
+      open_session = OPEN AccessSession with garage_id == read.garage_id AND plate == read.plate
+      if open_session exists:
+          return COMPLIANT, matched_permit_id = null
+      # 2. Is there an ACTIVE Permit for this plate in the read's zone?
+      permit_in_zone = ACTIVE Permit with plate == read.plate AND zone_id == read.zone_id
+      if permit_in_zone exists:
+          if clock now >= permit.valid_until_utc:   # defensive: should have auto-expired
+              return VIOLATION_EXPIRED_PERMIT, matched_permit_id = permit.id
+          return COMPLIANT, matched_permit_id = permit.id
+      # 3. Is there an ACTIVE Permit for this plate in a DIFFERENT zone of the same garage?
+      permit_other_zone = ACTIVE Permit with plate == read.plate AND zone_id != read.zone_id
+                          AND Zone.garage_id == read.garage_id
+      if permit_other_zone exists:
+          return VIOLATION_WRONG_ZONE, matched_permit_id = permit_other_zone.id
+      # 4. No permit, no open session.
+      return VIOLATION_NO_PERMIT, matched_permit_id = null
+    input_set: "One PlateRead, all OPEN AccessSessions and ACTIVE Permits for the garage. Evaluation order is fixed: open session > in-zone permit > wrong-zone permit > no permit."
+    constants: {}
+    precision: "exact enum outcome; no rounding"
+    variants:
+      - name: compliant_open_session
+        when: "an OPEN session exists for (garage, plate)"
+        difference: "COMPLIANT even with no permit — the transient parker is mid-stay"
+      - name: wrong_zone_violation
+        when: "no in-zone permit but an ACTIVE permit exists in another zone of the same garage"
+        difference: "VIOLATION_WRONG_ZONE, matched_permit_id points at the out-of-zone permit"
+
+# ===========================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "the acting role is permitted to perform this operation per §1.7"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "every path/body referenced resource exists, validated left-to-right in the path then body FKs"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints referencing a resource id"
+  - priority: 4
+    category: state
+    check: "target resource is in a state that permits the requested transition (e.g. permit REQUESTED for activate, session OPEN for exit, citation ISSUED for appeal)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action/transition endpoints"
+  - priority: 5
+    category: business_referential
+    check: "ownership: a Motorist acting on a Permit/Appeal/Session/WaitlistEntry/Citation-pay must be the owner (resource.motorist_id == X-User-ID); a Merchant acting on a Validation must own it (validation.merchant_id == X-User-ID)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Motorist- and Merchant-owned mutation endpoints"
+  - priority: 6
+    category: business_constraint
+    check: "zone_type permits the operation: a permit may only be activated in a zone whose zone_type IN {PERMIT, MIXED}; a transient session may only park in a zone whose zone_type IN {TRANSIENT, MIXED}"
+    error_id: ERR_ZONE_TYPE_FORBIDDEN
+    http_status: 409
+    applies_to: "POST /parking/permits/{id}/activate, POST /parking/sessions"
+  - priority: 7
+    category: business_constraint
+    check: "uniqueness: Zone.code unique within garage; Space.label unique within zone; Motorist.email globally unique; at most one WAITING PermitWaitlistEntry per (zone_id, motorist_id)"
+    error_id: ERR_DUPLICATE
+    http_status: 409
+    applies_to: "POST /parking/zones, POST /parking/spaces, POST /parking/motorists, POST /parking/zones/{id}/waitlist"
+  - priority: 8
+    category: business_temporal
+    check: "validation redeemable: at session exit, exit_at_utc < Validation.expires_at_utc and Validation.status == ISSUED and Validation.garage_id == session.garage_id"
+    error_id: ERR_VALIDATION_NOT_REDEEMABLE
+    http_status: 409
+    applies_to: "POST /parking/sessions/{id}/exit"
+  - priority: 9
+    category: business_temporal
+    check: "EventPricing window is well-formed: window_end_utc strictly after window_start_utc; and a PUBLISHED window may not overlap [start,end) with another PUBLISHED window for the same garage"
+    error_id: ERR_EVENT_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /parking/event-pricing, POST /parking/event-pricing/{id}/publish"
+  - priority: 10
+    category: business_temporal
+    check: "gate admission: an AccessSession entry is rejected when the chosen space's zone already has an OPEN session occupying it, i.e. the assigned stall must not have a time-overlapping OPEN occupation"
+    error_id: ERR_SPACE_OCCUPIED
+    http_status: 409
+    applies_to: "POST /parking/sessions"
+  - priority: 11
+    category: business_safety
+    check: "gate_mode admission: garage.gate_mode == CLOSED rejects all entries; gate_mode == PERMIT_ONLY rejects entries without a valid ACTIVE permit for the plate"
+    error_id: ERR_GATE_CLOSED
+    http_status: 409
+    applies_to: "POST /parking/sessions"
+  - priority: 12
+    category: business_constraint
+    check: "permit capacity: Zone.permits_active_count < Zone.permit_capacity (strict) before activation"
+    error_id: ERR_ZONE_AT_CAPACITY
+    http_status: 409
+    applies_to: "POST /parking/permits/{id}/activate, POST /parking/zones/{id}/promote-waitlist"
+  - priority: 13
+    category: business_fiscal
+    check: "merchant validation budget: the applied discount must be > 0 only if merchant.validation_budget_cents > 0; a validation whose merchant has 0 remaining budget yields applied_discount 0"
+    error_id: ERR_MERCHANT_BUDGET_EXHAUSTED
+    http_status: 409
+    applies_to: "POST /parking/validations"
+  - priority: 14
+    category: business_constraint
+    check: "OCC: expected_zone_version (activate) / expected_citation_version (pay) must match the parent's current version"
+    error_id: ERR_STALE_ZONE_VERSION
+    http_status: 412
+    applies_to: "POST /parking/permits/{id}/activate, POST /parking/citations/{id}/pay"
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # ---- Garage ----
+  - method: POST
+    path: "/parking/garages"
+    description: "Create a garage"
+    roles: [FacilityAdmin]
+    code: 201
+    input: [name, "timezone?", "gate_mode?"]
+    output: Garage
+    side_effects: []
+  - method: GET
+    path: "/parking/garages/{id}"
+    description: "Read a garage (includes computed occupied_count, total_space_count)"
+    roles: [FacilityAdmin, EnforcementOfficer, Merchant, Motorist]
+    code: 200
+    input: []
+    output: Garage
+    side_effects: []
+  - method: PATCH
+    path: "/parking/garages/{id}"
+    description: "Update garage gate_mode"
+    roles: [FacilityAdmin]
+    code: 200
+    input: [gate_mode]
+    output: Garage
+    side_effects: ["affects subsequent POST /parking/sessions admission"]
+  - method: GET
+    path: "/parking/garages/{id}/zones"
+    description: "List zones for a garage (reverse-reachability for Zone.garage_id and EventPricing/Validation/Merchant via garage)"
+    roles: [FacilityAdmin, EnforcementOfficer, Merchant, Motorist]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Zone[]
+    side_effects: []
+  - method: GET
+    path: "/parking/garages/{id}/event-pricing"
+    description: "List EventPricing windows for a garage (reverse-reachability for EventPricing.garage_id)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: EventPricing[]
+    side_effects: []
+  - method: GET
+    path: "/parking/garages/{id}/merchants"
+    description: "List merchants enrolled in a garage (reverse-reachability for Merchant.garage_id)"
+    roles: [FacilityAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Merchant[]
+    side_effects: []
+  - method: GET
+    path: "/parking/garages/{id}/sessions"
+    description: "List access sessions for a garage (reverse-reachability for AccessSession.garage_id)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: AccessSession[]
+    side_effects: []
+  - method: GET
+    path: "/parking/garages/{id}/citations"
+    description: "List citations for a garage (reverse-reachability for Citation.garage_id)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Citation[]
+    side_effects: []
+
+  # ---- Zone ----
+  - method: POST
+    path: "/parking/zones"
+    description: "Create a zone in a garage"
+    roles: [FacilityAdmin]
+    code: 201
+    input: [garage_id, code, zone_type, permit_capacity, rate_plan_id]
+    output: Zone
+    side_effects: ["validates Zone.code unique within garage"]
+  - method: GET
+    path: "/parking/zones/{id}"
+    description: "Read a zone (includes computed permits_active_count)"
+    roles: [FacilityAdmin, EnforcementOfficer, Merchant, Motorist]
+    code: 200
+    input: []
+    output: Zone
+    side_effects: []
+  - method: GET
+    path: "/parking/zones/{id}/spaces"
+    description: "List spaces for a zone (reverse-reachability for Space.zone_id)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Space[]
+    side_effects: []
+  - method: GET
+    path: "/parking/zones/{id}/permits"
+    description: "List permits for a zone (reverse-reachability for Permit.zone_id)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Permit[]
+    side_effects: []
+  - method: GET
+    path: "/parking/zones/{id}/waitlist"
+    description: "List waitlist entries for a zone, ordered by sequence ASC (reverse-reachability for PermitWaitlistEntry.zone_id)"
+    roles: [FacilityAdmin, Motorist]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: PermitWaitlistEntry[]
+    side_effects: []
+  - method: POST
+    path: "/parking/zones/{id}/waitlist"
+    description: "Add a waitlist entry for a permit zone"
+    roles: [Motorist]
+    code: 201
+    input: [motorist_id, plate]
+    output: PermitWaitlistEntry
+    side_effects: ["assigns monotonic per-zone sequence", "enforces one WAITING entry per (zone, motorist)"]
+  - method: POST
+    path: "/parking/zones/{id}/promote-waitlist"
+    description: "Manually promote the lowest-sequence WAITING entry if capacity is free (idempotent operator action)"
+    roles: [FacilityAdmin]
+    code: 200
+    input: []
+    output: PermitWaitlistEntry
+    side_effects: ["creates a REQUESTED Permit", "sets entry PROMOTED + promoted_permit_id", "increments PermitWaitlistEntry.version by 1"]
+  - method: GET
+    path: "/parking/waitlist-entries/{id}"
+    description: "Read a waitlist entry"
+    roles: [FacilityAdmin, Motorist]
+    code: 200
+    input: []
+    output: PermitWaitlistEntry
+    side_effects: []
+  - method: POST
+    path: "/parking/waitlist-entries/{id}/cancel"
+    description: "Motorist cancels their own WAITING waitlist entry"
+    roles: [Motorist]
+    code: 200
+    input: []
+    output: PermitWaitlistEntry
+    side_effects: ["sets CANCELLED", "increments PermitWaitlistEntry.version by 1"]
+
+  # ---- Space ----
+  - method: POST
+    path: "/parking/spaces"
+    description: "Create a space in a zone"
+    roles: [FacilityAdmin]
+    code: 201
+    input: [zone_id, label, "status?"]
+    output: Space
+    side_effects: ["validates Space.label unique within zone", "recompute Garage.total_space_count"]
+  - method: GET
+    path: "/parking/spaces/{id}"
+    description: "Read a space (includes computed is_occupied)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: []
+    output: Space
+    side_effects: []
+
+  # ---- RatePlan ----
+  - method: POST
+    path: "/parking/rate-plans"
+    description: "Create a rate plan"
+    roles: [FacilityAdmin]
+    code: 201
+    input: [name, hourly_cents, daily_cap_cents, monthly_permit_cents, "grace_minutes?"]
+    output: RatePlan
+    side_effects: []
+  - method: GET
+    path: "/parking/rate-plans/{id}"
+    description: "Read a rate plan"
+    roles: [FacilityAdmin, EnforcementOfficer, Merchant, Motorist]
+    code: 200
+    input: []
+    output: RatePlan
+    side_effects: []
+  - method: GET
+    path: "/parking/rate-plans/{id}/zones"
+    description: "List zones bound to a rate plan (reverse-reachability for Zone.rate_plan_id)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Zone[]
+    side_effects: []
+
+  # ---- EventPricing ----
+  - method: POST
+    path: "/parking/event-pricing"
+    description: "Create a DRAFT event-pricing window"
+    roles: [FacilityAdmin]
+    code: 201
+    input: [garage_id, name, window_start_utc, window_end_utc, flat_surcharge_cents, "multiplier?"]
+    output: EventPricing
+    side_effects: ["validates window_end_utc > window_start_utc"]
+  - method: GET
+    path: "/parking/event-pricing/{id}"
+    description: "Read an event-pricing window"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: []
+    output: EventPricing
+    side_effects: []
+  - method: POST
+    path: "/parking/event-pricing/{id}/publish"
+    description: "Publish a DRAFT window so it begins pricing sessions"
+    roles: [FacilityAdmin]
+    code: 200
+    input: []
+    output: EventPricing
+    side_effects: ["sets status = PUBLISHED", "validates no PUBLISHED-window overlap for the garage"]
+
+  # ---- Motorist ----
+  - method: POST
+    path: "/parking/motorists"
+    description: "Register a motorist"
+    roles: [FacilityAdmin, Motorist]
+    code: 201
+    input: [full_name, email, default_plate]
+    output: Motorist
+    side_effects: ["validates email globally unique"]
+  - method: GET
+    path: "/parking/motorists/{id}"
+    description: "Read a motorist (includes computed outstanding_balance_cents)"
+    roles: [FacilityAdmin, EnforcementOfficer, Motorist]
+    code: 200
+    input: []
+    output: Motorist
+    side_effects: []
+  - method: GET
+    path: "/parking/motorists/{id}/permits"
+    description: "List a motorist's permits (reverse-reachability for Permit.motorist_id)"
+    roles: [FacilityAdmin, Motorist]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Permit[]
+    side_effects: []
+  - method: GET
+    path: "/parking/motorists/{id}/waitlist-entries"
+    description: "List a motorist's waitlist entries (reverse-reachability for PermitWaitlistEntry.motorist_id)"
+    roles: [FacilityAdmin, Motorist]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: PermitWaitlistEntry[]
+    side_effects: []
+  - method: GET
+    path: "/parking/motorists/{id}/citations"
+    description: "List a motorist's citations (reverse-reachability for Citation.motorist_id)"
+    roles: [FacilityAdmin, EnforcementOfficer, Motorist]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Citation[]
+    side_effects: []
+
+  # ---- Permit ----
+  - method: POST
+    path: "/parking/permits"
+    description: "Request a permit for a zone (status REQUESTED)"
+    roles: [Motorist]
+    code: 201
+    input: [zone_id, motorist_id, plate]
+    output: Permit
+    side_effects: []
+  - method: GET
+    path: "/parking/permits/{id}"
+    description: "Read a permit"
+    roles: [FacilityAdmin, EnforcementOfficer, Motorist]
+    code: 200
+    input: []
+    output: Permit
+    side_effects: []
+  - method: POST
+    path: "/parking/permits/{id}/activate"
+    description: "Activate a REQUESTED permit, consuming a zone capacity slot (OCC on zone version)"
+    roles: [FacilityAdmin]
+    code: 200
+    input: [expected_zone_version]
+    output: Permit
+    side_effects: ["sets ACTIVE + valid_from/until + monthly_fee_charged_cents", "recompute Zone.permits_active_count +1", "increments Zone.version by 1"]
+  - method: POST
+    path: "/parking/permits/{id}/reject"
+    description: "Reject a REQUESTED permit"
+    roles: [FacilityAdmin]
+    code: 200
+    input: []
+    output: Permit
+    side_effects: ["sets REJECTED", "increments Permit.version by 1"]
+  - method: POST
+    path: "/parking/permits/{id}/revoke"
+    description: "Revoke an ACTIVE permit, freeing a slot and cascading waitlist promotion"
+    roles: [FacilityAdmin]
+    code: 200
+    input: []
+    output: Permit
+    side_effects: ["sets REVOKED", "recompute Zone.permits_active_count -1", "cascade-promote lowest-sequence WAITING entry", "increments Permit.version by 1"]
+  - method: POST
+    path: "/parking/permits/{id}/expire-check"
+    description: "System sweep: expire an ACTIVE permit iff clock now >= valid_until_utc; cascades waitlist promotion"
+    roles: [FacilityAdmin]
+    code: 200
+    input: []
+    output: Permit
+    side_effects: ["sets EXPIRED when past valid_until_utc", "recompute Zone.permits_active_count -1", "cascade-promote lowest-sequence WAITING entry", "increments Permit.version by 1"]
+  - method: GET
+    path: "/parking/permits/{id}/waitlist-entry"
+    description: "List the waitlist entry that was promoted into this permit (reverse-reachability for PermitWaitlistEntry.promoted_permit_id; 0 or 1)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PermitWaitlistEntry[]
+    side_effects: []
+
+  # ---- Merchant + Validation ----
+  - method: POST
+    path: "/parking/merchants"
+    description: "Enroll a merchant in a garage"
+    roles: [FacilityAdmin]
+    code: 201
+    input: [garage_id, name, validation_budget_cents]
+    output: Merchant
+    side_effects: []
+  - method: GET
+    path: "/parking/merchants/{id}"
+    description: "Read a merchant (includes remaining validation_budget_cents)"
+    roles: [FacilityAdmin, Merchant]
+    code: 200
+    input: []
+    output: Merchant
+    side_effects: []
+  - method: GET
+    path: "/parking/merchants/{id}/validations"
+    description: "List validations issued by a merchant (reverse-reachability for Validation.merchant_id)"
+    roles: [FacilityAdmin, Merchant]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Validation[]
+    side_effects: []
+  - method: POST
+    path: "/parking/validations"
+    description: "Merchant issues a parking validation"
+    roles: [Merchant]
+    code: 201
+    input: [garage_id, merchant_id, discount_kind, discount_value, expires_at_utc]
+    output: Validation
+    side_effects: ["rejects when merchant budget is 0"]
+  - method: GET
+    path: "/parking/validations/{id}"
+    description: "Read a validation"
+    roles: [FacilityAdmin, Merchant, Motorist]
+    code: 200
+    input: []
+    output: Validation
+    side_effects: []
+  - method: GET
+    path: "/parking/garages/{id}/validations"
+    description: "List validations redeemable at a garage (reverse-reachability for Validation.garage_id)"
+    roles: [FacilityAdmin, Merchant]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Validation[]
+    side_effects: []
+
+  # ---- AccessSession (gated access) ----
+  - method: POST
+    path: "/parking/sessions"
+    description: "Gate entry: open an AccessSession; server selects a space and classifies PERMIT vs TRANSIENT"
+    roles: [FacilityAdmin]
+    code: 201
+    input: [garage_id, plate, entry_at_utc, "permit_id?"]
+    output: AccessSession
+    side_effects: ["selects an AVAILABLE+unoccupied Space per selector policy", "sets session_kind", "sets Space.is_occupied true", "recompute Garage.occupied_count +1"]
+  - method: GET
+    path: "/parking/sessions/{id}"
+    description: "Read an access session (includes gross/net charge after exit)"
+    roles: [FacilityAdmin, EnforcementOfficer, Motorist]
+    code: 200
+    input: []
+    output: AccessSession
+    side_effects: []
+  - method: POST
+    path: "/parking/sessions/{id}/exit"
+    description: "Gate exit: close the session, compute charges and apply validation"
+    roles: [FacilityAdmin]
+    code: 200
+    input: [exit_at_utc, "validation_id?"]
+    output: AccessSession
+    side_effects: ["computes gross/net", "frees the space", "redeems validation + debits merchant budget", "increments AccessSession.version by 1"]
+  - method: POST
+    path: "/parking/sessions/{id}/void"
+    description: "Void an OPEN session (gate error correction)"
+    roles: [FacilityAdmin]
+    code: 200
+    input: []
+    output: AccessSession
+    side_effects: ["sets VOIDED", "frees the space", "increments AccessSession.version by 1"]
+  - method: GET
+    path: "/parking/spaces/{id}/sessions"
+    description: "List sessions that referenced a space (reverse-reachability for AccessSession.space_id)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: AccessSession[]
+    side_effects: []
+  - method: GET
+    path: "/parking/permits/{id}/sessions"
+    description: "List sessions admitted under a permit (reverse-reachability for AccessSession.permit_id)"
+    roles: [FacilityAdmin, EnforcementOfficer, Motorist]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: AccessSession[]
+    side_effects: []
+  - method: GET
+    path: "/parking/validations/{id}/sessions"
+    description: "List sessions that redeemed a validation (reverse-reachability for AccessSession.validation_id)"
+    roles: [FacilityAdmin, Merchant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: AccessSession[]
+    side_effects: []
+
+  # ---- LPR / PlateRead (enforcement) ----
+  - method: POST
+    path: "/parking/plate-reads"
+    description: "Submit an LPR camera read; server evaluates enforcement outcome and matched permit"
+    roles: [EnforcementOfficer]
+    code: 201
+    input: [garage_id, plate, zone_id, read_at_utc]
+    output: PlateRead
+    side_effects: ["computes enforcement_outcome and matched_permit_id per §1.3 lpr_enforcement"]
+  - method: GET
+    path: "/parking/plate-reads/{id}"
+    description: "Read an LPR read result"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: []
+    output: PlateRead
+    side_effects: []
+  - method: GET
+    path: "/parking/garages/{id}/plate-reads"
+    description: "List plate reads for a garage (reverse-reachability for PlateRead.garage_id)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: ["enforcement_outcome?", "limit?", "offset?"]
+    output: PlateRead[]
+    side_effects: []
+  - method: GET
+    path: "/parking/zones/{id}/plate-reads"
+    description: "List plate reads observed in a zone (reverse-reachability for PlateRead.zone_id)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PlateRead[]
+    side_effects: []
+  - method: GET
+    path: "/parking/permits/{id}/plate-reads"
+    description: "List plate reads matched to a permit (reverse-reachability for PlateRead.matched_permit_id)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PlateRead[]
+    side_effects: []
+
+  # ---- Citation + Appeal ----
+  - method: POST
+    path: "/parking/citations"
+    description: "Issue a citation from a violation plate read; computes escalated fine"
+    roles: [EnforcementOfficer]
+    code: 201
+    input: [garage_id, plate, plate_read_id, violation_code, base_fine_cents]
+    output: Citation
+    side_effects: ["computes amount_due_cents + prior_citation_count", "resolves motorist_id from plate", "recompute Motorist.outstanding_balance_cents"]
+  - method: GET
+    path: "/parking/citations/{id}"
+    description: "Read a citation"
+    roles: [FacilityAdmin, EnforcementOfficer, Motorist]
+    code: 200
+    input: []
+    output: Citation
+    side_effects: []
+  - method: POST
+    path: "/parking/citations/{id}/pay"
+    description: "Motorist pays a citation (OCC on citation version)"
+    roles: [Motorist]
+    code: 200
+    input: [expected_citation_version]
+    output: Citation
+    side_effects: ["sets PAID", "recompute Motorist.outstanding_balance_cents", "increments Citation.version by 1"]
+  - method: GET
+    path: "/parking/citations/{id}/appeals"
+    description: "List appeals for a citation (reverse-reachability for Appeal.citation_id)"
+    roles: [FacilityAdmin, EnforcementOfficer, Motorist]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Appeal[]
+    side_effects: []
+  - method: GET
+    path: "/parking/plate-reads/{id}/citations"
+    description: "List citations issued from a plate read (reverse-reachability for Citation.plate_read_id)"
+    roles: [FacilityAdmin, EnforcementOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Citation[]
+    side_effects: []
+  - method: POST
+    path: "/parking/appeals"
+    description: "Motorist submits an appeal against an ISSUED citation"
+    roles: [Motorist]
+    code: 201
+    input: [citation_id, motorist_id, reason]
+    output: Appeal
+    side_effects: []
+  - method: GET
+    path: "/parking/appeals/{id}"
+    description: "Read an appeal"
+    roles: [FacilityAdmin, EnforcementOfficer, Motorist]
+    code: 200
+    input: []
+    output: Appeal
+    side_effects: []
+  - method: GET
+    path: "/parking/motorists/{id}/appeals"
+    description: "List a motorist's appeals (reverse-reachability for Appeal.motorist_id)"
+    roles: [FacilityAdmin, Motorist]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Appeal[]
+    side_effects: []
+  - method: POST
+    path: "/parking/appeals/{id}/decide"
+    description: "Enforcement officer decides an appeal; cascades the citation and motorist balance"
+    roles: [EnforcementOfficer]
+    code: 200
+    input: [decision]
+    output: Appeal
+    side_effects: ["UPHELD -> citation DISMISSED -> balance down; DISMISSED -> citation UPHELD", "increments Appeal.version by 1"]
+
+  # ---- test-driving clock ----
+  - method: POST
+    path: "/parking/_clock/set_current_utc"
+    description: "Test-driving endpoint: set the server's notion of current UTC for expiry/redemption checks"
+    roles: [FacilityAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["fixes clock now used by permit expiry, validation expiry, and LPR evaluation"]
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/unknown X-User-Role or missing X-User-ID"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "role not permitted for this operation per §1.7"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "acting Motorist/Merchant is not the owner of the targeted resource"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "referenced resource id does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "missing required field, malformed body, or invalid enum value"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "target resource not in a state that permits the requested transition"
+  - id: ERR_ZONE_TYPE_FORBIDDEN
+    http: 409
+    condition: "permit activation in a non-permit zone, or transient session in a permit-only zone"
+  - id: ERR_DUPLICATE
+    http: 409
+    condition: "uniqueness violation (zone code, space label, motorist email, duplicate WAITING waitlist entry)"
+  - id: ERR_VALIDATION_NOT_REDEEMABLE
+    http: 409
+    condition: "validation expired, already redeemed, or for a different garage at session exit"
+  - id: ERR_EVENT_WINDOW_OVERLAP
+    http: 409
+    condition: "PUBLISHED event window overlaps another PUBLISHED window for the same garage, or window_end_utc <= window_start_utc"
+  - id: ERR_SPACE_OCCUPIED
+    http: 409
+    condition: "no AVAILABLE + unoccupied space remains in an eligible zone at entry"
+  - id: ERR_GATE_CLOSED
+    http: 409
+    condition: "garage gate_mode is CLOSED, or PERMIT_ONLY and the plate has no valid ACTIVE permit"
+  - id: ERR_ZONE_AT_CAPACITY
+    http: 409
+    condition: "Zone.permits_active_count would reach or exceed permit_capacity on activation/promotion"
+  - id: ERR_MERCHANT_BUDGET_EXHAUSTED
+    http: 409
+    condition: "merchant has 0 remaining validation_budget_cents when issuing a validation"
+  - id: ERR_INVALID_TIME_RANGE
+    http: 409
+    condition: "exit_at_utc not strictly after entry_at_utc"
+  - id: ERR_STALE_ZONE_VERSION
+    http: 412
+    condition: "expected_zone_version (activate) or expected_citation_version (pay) does not match current parent version"
+  - id: ERR_PAGINATION_INVALID
+    http: 400
+    condition: "limit/offset out of bounds (limit < 1 or > 100, offset < 0)"
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: FacilityAdmin
+    description: "Owns garage inventory, zones, spaces, rate plans, event pricing, permit lifecycle, gate sessions, and waitlist promotion."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /parking/garages, PATCH /parking/garages/{id}"
+      - "POST /parking/zones, POST /parking/spaces, POST /parking/rate-plans"
+      - "POST /parking/event-pricing, POST /parking/event-pricing/{id}/publish"
+      - "POST /parking/permits/{id}/activate, .../reject, .../revoke, .../expire-check"
+      - "POST /parking/zones/{id}/promote-waitlist"
+      - "POST /parking/merchants"
+      - "POST /parking/sessions, .../exit, .../void"
+      - "POST /parking/_clock/set_current_utc"
+    shared_operations:
+      - "GET reads across all entities"
+      - "POST /parking/motorists (shared with Motorist)"
+  - name: Motorist
+    description: "Permit holder. Requests permits, joins/cancels waitlists, submits and owns appeals, pays own citations."
+    identity: "entity_backed:Motorist"
+    exclusive_operations:
+      - "POST /parking/permits (request)"
+      - "POST /parking/zones/{id}/waitlist, POST /parking/waitlist-entries/{id}/cancel"
+      - "POST /parking/appeals"
+      - "POST /parking/citations/{id}/pay"
+    shared_operations:
+      - "POST /parking/motorists (self-register, shared with FacilityAdmin)"
+      - "GET own permits/waitlist-entries/appeals/citations/sessions"
+  - name: Merchant
+    description: "Issues parking validations against its own budget; owns its Validation rows."
+    identity: "entity_backed:Merchant"
+    exclusive_operations:
+      - "POST /parking/validations"
+    shared_operations:
+      - "GET own validations, garage validations, validation sessions"
+      - "GET garage/zone/rate-plan reads"
+  - name: EnforcementOfficer
+    description: "Operates LPR enforcement, issues citations, and decides appeals."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /parking/plate-reads"
+      - "POST /parking/citations"
+      - "POST /parking/appeals/{id}/decide"
+    shared_operations:
+      - "GET plate-reads, citations, appeals, sessions, permits, zones, spaces"

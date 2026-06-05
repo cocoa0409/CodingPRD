@@ -21,6 +21,8 @@ import pytest
 import requests
 from loguru import logger
 
+from ._dnsboot import inject as _inject_dnsboot
+
 _api_url = os.environ.get("_PRD_BENCH_API_URL", "http://localhost:10000")
 _start_command = os.environ.get("_PRD_BENCH_START_COMMAND", "")
 _skip = os.environ.get("_PRD_BENCH_SKIP_LIFECYCLE", "false") == "true"
@@ -67,7 +69,7 @@ def _restart_server() -> bool:
 
     directory, command = _parse_command(_start_command)
     cwd = os.path.abspath(directory)
-    env = {**os.environ, "PORT": str(port)}
+    env = _inject_dnsboot({**os.environ, "PORT": str(port)})
 
     try:
         subprocess.Popen(

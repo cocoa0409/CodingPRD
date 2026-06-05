@@ -1,0 +1,39 @@
+"""Error IDs and HTTP status mapping (PRD §5 Error Code Catalogue)."""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_AUTH_MISSING = "ERR_AUTH_MISSING"
+    ERR_FORBIDDEN_ROLE = "ERR_FORBIDDEN_ROLE"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_VALIDATION = "ERR_VALIDATION"
+    ERR_DUPLICATE_TIER = "ERR_DUPLICATE_TIER"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_TOKEN_MISMATCH = "ERR_TOKEN_MISMATCH"
+    ERR_ANTI_PASSBACK = "ERR_ANTI_PASSBACK"
+    ERR_INTERCHANGE_DENIED = "ERR_INTERCHANGE_DENIED"
+    ERR_REFUND_INELIGIBLE = "ERR_REFUND_INELIGIBLE"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    ERR_BUDDY_ALLOTMENT_EXHAUSTED = "ERR_BUDDY_ALLOTMENT_EXHAUSTED"
+    ERR_BUDDY_DATE_CONFLICT = "ERR_BUDDY_DATE_CONFLICT"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_AUTH_MISSING: 401,
+    ApiErrorId.ERR_FORBIDDEN_ROLE: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_VALIDATION: 422,
+    ApiErrorId.ERR_DUPLICATE_TIER: 409,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_TOKEN_MISMATCH: 409,
+    ApiErrorId.ERR_ANTI_PASSBACK: 409,
+    ApiErrorId.ERR_INTERCHANGE_DENIED: 409,
+    ApiErrorId.ERR_REFUND_INELIGIBLE: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_BUDDY_ALLOTMENT_EXHAUSTED: 409,
+    ApiErrorId.ERR_BUDDY_DATE_CONFLICT: 409,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

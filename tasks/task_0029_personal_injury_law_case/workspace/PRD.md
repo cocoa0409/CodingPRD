@@ -1,0 +1,254 @@
+# Personal Injury Case Management API — Product Requirements Document
+
+## 1. Introduction
+
+A plaintiff-side personal injury law firm runs every matter through the same arc — intake, evidence gathering, demand, negotiation, possible litigation, settlement, lien resolution, and disbursement of the net to the client — but the bookkeeping behind that arc is unforgiving. A retainer must be signed before any case can leave intake. Medical bills cannot be claimed as damages until the underlying records have actually been pulled and reviewed. The statute of limitations runs against the firm in real wall-clock time, with the exact number of years dictated by the jurisdiction of the venue. Demand letters carry a multi-step pricing computation that turns line-item damages into a number on a letterhead, and that number must be reproducible. Settlements are negotiated in rounds, sometimes for years, and an accepted offer triggers a cascade that simultaneously closes out scheduled court dates, freezes medical-lien negotiations, and produces a check-cutting record whose contingency-fee rate is a function of whether suit had been filed. Lien holders must each be paid out of the proceeds, but never more than they asserted and never more than the pool allows, with the oldest lien getting first claim on any rounding remainder. None of this can ship as informal practice — it must be a precise, auditable system that two attorneys, a paralegal, and a managing partner can all touch without stepping on each other.
+
+This document specifies the REST API for that system. The audience is the engineering team implementing the case-management service; the perspective is the product team translating firm operations into machine-checkable rules. The fee model, the lien waterfall, the statute-of-limitations boundary, the segregation-of-duties guard between drafting and sending a demand letter, and the optimistic concurrency control protecting accept-and-disburse from racing clerical updates are all spelled out as contracts that the implementation must honor literally.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the API must carry two headers: `X-User-ID`, identifying the acting user, and `X-User-Role`, naming the role that user is acting under. A request that omits `X-User-Role` on any non-public endpoint is rejected with `ERR_MISSING_AUTH` (HTTP 401). A request that carries a role not authorized to invoke the requested endpoint is rejected with `ERR_FORBIDDEN_ROLE` (HTTP 403). Two endpoints — client self-registration and the test-driving clock setter — are public in the sense that they do not require `X-User-Role`; every other endpoint does.
+
+Five roles exist in the system. `Anonymous` is the public-form actor for client self-registration and for reading the system clock. `Paralegal` performs intake bookkeeping: signing the retainer on the client record, opening cases, registering medical providers, sending and processing medical records requests, recording asserted liens, and walking liens through the negotiation steps that lead to an agreed amount. `Attorney` owns case strategy: activating a case out of intake, deciding which damages items go into the demand model, reviewing received medical records, drafting demand letters, posting counter-offers in negotiation, disputing or resuming negotiation on medical liens, and marking scheduled court events as occurred. `ManagingPartner` holds the final approvals: sending demand letters, filing suit, accepting or rejecting settlement offers, releasing disbursements, and closing cases. `PlatformAdmin` exists solely to test-drive the system clock and is not a domain actor in any other sense.
+
+`X-User-ID` is treated as an opaque operator identifier for every role in this system — none of the five roles are entity-backed, so the server does not compare `X-User-ID` to any client's, case's, provider's, or other entity's `id` for ownership purposes. The server does, however, record the acting `X-User-ID` where business rules need to compare actors against one another: when an `Attorney` drafts a demand letter, the server stamps the `drafted_by_user_id` field on that letter with the acting `X-User-ID` for later use by the segregation-of-duties check when a `ManagingPartner` attempts to send it. When `X-User-Role` is `Anonymous`, `Paralegal`, `Attorney`, `ManagingPartner`, or `PlatformAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server may record it (as on `DemandLetter.drafted_by_user_id`) but does not resolve it to an entity row.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+All list endpoints accept two pagination query parameters. The `limit` parameter defaults to 10, has a minimum of 1, and a maximum of 100; the `offset` parameter defaults to 0 and has a minimum of 0. Newly created resources surface at the end of unfiltered listings by default: the canonical sort order on every list endpoint is by `created_at` ascending. The response `meta` object for list endpoints carries `limit`, `offset`, `total_count`, and `has_more` so the caller can drive pagination without re-counting.
+
+### 2.4. Common Resource Properties and Versioning
+
+Every persisted resource other than the singleton system clock carries the same four common fields. The `id` is a server-minted UUID, written as a plain UUID string without any type prefix, and the client never proposes it. The `created_at` and `updated_at` timestamps are server-minted ISO 8601 UTC strings with three fractional digits; `created_at` records the moment of creation and `updated_at` is refreshed on every mutation. The `version` field is a non-negative integer that starts at 1 at creation and increments by one on every mutation of that resource. The system clock is the lone exception: it is a singleton whose only persisted field is `current_utc` and which exposes only `id` and `created_at` — it carries no `updated_at` and no `version`.
+
+### 2.5. Nested Resource Retrieval and Path Existence
+
+Although the URL tree is structurally flat (all child resources reference their parent case through a `case_id` field in the body rather than through a nested path), every `{id}` segment in a path must still resolve to an existing entity of the expected type. If it does not — for example, when a settlement-offer action is invoked with an id that belongs to no settlement offer at all — the request is rejected with `ERR_RESOURCE_NOT_FOUND` (HTTP 404). Path resolution is performed left to right, so a malformed or missing leftmost id fails first. Foreign-key references in request bodies (such as the `client_id` on a new case, the `case_id` and `provider_id` on a new records request or lien, or a `counter_to_offer_id` on a counter-offer) are checked separately: a body field that names a non-existent entity is rejected with `ERR_FK_NOT_FOUND` (HTTP 404). Missing or malformed inputs that fail no other guard fall to `ERR_INVALID_REQUEST` (HTTP 400), the lowest-priority validation in the system, which fires only when none of the prior checks would have matched.
+
+### 2.6. Precision, Rounding, and Money
+
+All monetary amounts in this system are integer cents. There are no floating-point dollar fields anywhere in the public contract; both inputs and outputs use cent-denominated integers. When a calculation requires multiplication by a rate (a contingency-fee percentage, a present-value factor, a pain-and-suffering multiplier, or a buffer percentage), the multiplication is performed against the integer cent amount, and the product is rounded half-up to the nearest whole cent. Where a calculation pins a rounding step explicitly (the per-line rounds inside demand-letter pricing, the single round on the contingency fee, the per-lien floor inside the lien waterfall), the order and direction are part of the contract and are described in §3 where the calculation lives. Boundary inclusivity matters: the statute-of-limitations comparison is closed on the expired side — at the exact moment the clock equals the effective statute date, the statute has already run.
+
+### 2.7. Hierarchical Consistency and Cascades
+
+Many writes in this system touch more than one row. A demand letter being sent is the obvious example: the letter's own status moves to `SENT`, its `sent_at` is stamped, and the parent case auto-transitions out of `ACTIVE` into `DEMAND_SENT`. Accepting a settlement offer is more dramatic: the offer's status becomes `ACCEPTED`, the parent case is stamped with the offer's gross amount and moves to `SETTLED`, every medical lien on that case that was still in flight is auto-transitioned to `AGREED` at a proportionally-capped amount, every still-scheduled court event on that case is cancelled, and a pending disbursement record is created with the contingency fee, total lien payout, and net-to-client amounts all pre-computed. Whenever a cascade mutates the parent case, the case's `updated_at` is refreshed and its `version` is incremented by one. Whenever a cascade mutates a child entity, that entity's `updated_at` is likewise refreshed; child entities with a `version` field also have it incremented on every mutation, while child entities whose only common-field timestamp is `created_at` and whose only common-field counter is `version` follow the same rule. The cascade depth on these effects is not a hint — the implementation must produce all of them in the same operation, not as eventually-consistent follow-up.
+
+### 2.8. Optimistic Concurrency Control
+
+Two write paths in this system carry a heavy cascade and read business logic off the current shape of the parent case; both protect themselves with optimistic concurrency control. The accept action on a settlement offer is the first: the request body must carry an `expected_case_version` field, and that integer must equal the parent case's current `version` at the moment the server processes the write. If another writer has advanced the case since the client last read it — say, a paralegal included a new damages line item that bumped `included_damages_total_cents` and incremented `Case.version` between the partner reading the case and the partner clicking accept — the request is rejected with `ERR_STALE_CASE_VERSION` (HTTP 412), so the partner cannot accept an offer based on a damages picture that has already changed. The release action on a disbursement is the second OCC path: it likewise requires `expected_case_version` on the body, and a mismatch with the case's current `version` is rejected with `ERR_STALE_CASE_VERSION` (HTTP 412) for the same reason — a late lien adjustment that bumps the case version must force a re-read before the check is cut. No other endpoint takes a version field; only accepting an offer and releasing the disbursement do.
+
+### 2.9. Validation Priority Ordering
+
+When multiple validations could fail on the same request, the system applies them in a fixed priority order so that the returned `error_id` is deterministic. Authentication is checked first: a missing `X-User-Role` fails as `ERR_MISSING_AUTH` before anything else is inspected. Authorization (`ERR_FORBIDDEN_ROLE`) is next. Then existence checks run, with path-id resolution (`ERR_RESOURCE_NOT_FOUND`) ahead of body foreign-key resolution (`ERR_FK_NOT_FOUND`). After existence comes state: the direct state precondition on the target resource (`ERR_INVALID_STATE`) is checked before any cross-entity state precondition (`ERR_CROSS_ENTITY_STATE`). Business-safety and compliance checks follow — the statute-of-limitations guard (`ERR_STATUTE_EXPIRED`), the demand-letter segregation-of-duties guard (`ERR_SEGREGATION_OF_DUTIES`), and the retainer-signed precondition (`ERR_RETAINER_MISSING`). Business-referential checks then run: the medical-records prerequisite for including a medical bill (`ERR_MISSING_MEDICAL_RECORDS`), the demand-letter prerequisites (`ERR_DEMAND_PREREQUISITES_NOT_MET`), and the disputed-lien guard on accept (`ERR_DISPUTED_LIEN_BLOCKS_SETTLEMENT`). Business-temporal checks (`ERR_EVENT_IN_PAST`, `ERR_COURT_EVENT_CONFLICT`, `ERR_DUPLICATE_RECORDS_REQUEST`) and business-fiscal checks (`ERR_INVALID_COUNTER`, `ERR_DAMAGES_OVER_CAP`, `ERR_LIEN_OVERPAYMENT`) come next. The optimistic concurrency check on `expected_case_version` (`ERR_STALE_CASE_VERSION`) runs after the business checks. The generic input-shape catch-all (`ERR_INVALID_REQUEST`) sits at the lowest priority and only fires when none of the above match — it must never mask a more specific failure.
+
+### 2.10. The System Clock
+
+The system maintains an authoritative wall clock that every time-sensitive guard reads from: the statute-of-limitations comparison, the court-event-in-future check, the settlement-offer 30-day expiration, and the timestamping of side-effect fields like `received_at`, `reviewed_at`, `sent_at`, and `responded_at`. The clock is a singleton resource whose only field is `current_utc`. Tests drive it forward with a `PlatformAdmin`-only setter endpoint that takes a `to_iso8601` value. Two reads also pull the clock forward when they observe an opportunity: any GET on a single case will sweep that case's settlement offers, moving any still-`PENDING` offer whose `created_at` is at least 30 days behind the current clock to `EXPIRED`. The clock-set endpoint performs the same sweep system-wide whenever it advances the clock.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Intake and the Retainer Gate
+
+A new matter begins with a `Paralegal` registering the potential client on the public intake endpoint. The new record carries the client's `full_name`, `email`, and `phone`, with `email` being unique across all clients in the system. The retainer is not signed at registration: `retainer_signed` starts at `false` and `retainer_signed_at` is null. Once the client has actually signed the contingency retainer agreement, the paralegal flips it through the sign-retainer action, which sets `retainer_signed` to `true` and stamps `retainer_signed_at` with the current system clock value. With the client in place, the paralegal opens the matter by creating the case, supplying the `client_id`, the `accident_date` on which the injury occurred, the `jurisdiction` in which the case will sit, and optionally an integer `sol_tolled_days` to add for tolling reasons such as a minor claimant or fraudulent concealment. The `accident_date` must already be in the past relative to the current clock at creation. The case is opened in `INTAKE` status; its `statute_of_limitations_date` is computed from the accident date plus the jurisdictional statute years (California, New York, Texas, and Illinois each give two years; Florida gives four), and that statute date is effectively immutable because `accident_date` and `jurisdiction` cannot be changed after creation. The tolling number is added on top in days.
+
+The case sits in `INTAKE` until an `Attorney` activates it, at which point it moves `INTAKE → ACTIVE`. Activation has two preconditions: the client must have signed the retainer (otherwise the activation fails with `ERR_RETAINER_MISSING`), and the statute of limitations must not yet have run for this case at the current clock value (otherwise `ERR_STATUTE_EXPIRED`). A case that the firm decides not to take can be moved to `ABANDONED` instead — from `INTAKE` by an `Attorney`, or from `ACTIVE` by a `ManagingPartner` (only those two starting states are allowed; an attempt from any other state is rejected with `ERR_INVALID_STATE`). Both activation and abandonment are mutations of the case row, so each refreshes the case's `updated_at` and increments `Case.version` by one.
+
+### 3.2. Building the Evidence: Providers and Medical Records Requests
+
+Treating physicians, hospitals, and clinics are registered as `MedicalProvider` rows with `name` and `contact` fields, the latter typically a records-department email or fax. With a provider on file, the paralegal requests records for a specific case by creating a `MedicalRecordsRequest` carrying the `case_id` and `provider_id`. The system stamps `requested_at` and sets the status to `REQUESTED`. The system rejects a duplicate active request — defined as a request for the same `case_id` and `provider_id` whose current status is `REQUESTED` or `RECEIVED` — with `ERR_DUPLICATE_RECORDS_REQUEST`; the system does not impose any time buffer on this collision rule, so any two simultaneously-active requests for the same pair conflict regardless of when they were filed.
+
+When records actually arrive, the paralegal advances the request `REQUESTED → RECEIVED`, which stamps `received_at`. The `Attorney` then reviews the records, advancing `RECEIVED → REVIEWED` and stamping `reviewed_at`. Some requests dead-end: the paralegal may also move a `REQUESTED` request directly to `REJECTED` (a terminal state) when the provider refuses or the request is otherwise abandoned. The `REJECTED` and `REVIEWED` states are both terminal — no further transition is permitted.
+
+### 3.3. Damages Modeling
+
+Damages claims are entered as `DamagesItem` rows, one per line item, each carrying its parent `case_id`, a `category` drawn from the set `MEDICAL_BILLS`, `LOST_WAGES`, `PAIN_SUFFERING`, `FUTURE_MEDICAL`, or `PROPERTY`, an `amount_cents` in non-negative integer cents, and an optional `documentation_note` that points at the supporting records or wage stubs. New items begin in `PROPOSED` status. A jurisdictional damages cap applies: in California and Florida, a `PAIN_SUFFERING` item with `amount_cents` exceeding $250,000 (25,000,000 cents) is rejected with `ERR_DAMAGES_OVER_CAP`; other categories and other jurisdictions are uncapped at this layer.
+
+A `PROPOSED` item moves into the case's working damages model when the `Attorney` promotes it `PROPOSED → INCLUDED`. The promotion is gated: the case must be in `ACTIVE`, `DEMAND_SENT`, or `IN_NEGOTIATION` (any other state yields `ERR_CROSS_ENTITY_STATE`), and if the item's `category` is `MEDICAL_BILLS`, at least one `MedicalRecordsRequest` on the same `case_id` must have reached `REVIEWED` — otherwise the include is rejected with `ERR_MISSING_MEDICAL_RECORDS`. On inclusion the system recomputes `Case.included_damages_total_cents` as the sum of `amount_cents` across every `INCLUDED` item on the case (a depth-two cascade off the include action) and increments `Case.version` by one. An item can also be moved from `PROPOSED` to `EXCLUDED` by the `Attorney` — `EXCLUDED` is terminal. Pulling an already-`INCLUDED` item back out is more sensitive: only a `ManagingPartner` may move `INCLUDED → EXCLUDED`, the case must again be `ACTIVE`, `DEMAND_SENT`, or `IN_NEGOTIATION`, and no demand letter on the case may be in `SENT` or `ACKNOWLEDGED` status (because a line item that already shaped a transmitted demand cannot be silently retracted); failure on the demand-letter check is `ERR_CROSS_ENTITY_STATE`. The retraction recomputes `Case.included_damages_total_cents` and bumps `Case.version` by one.
+
+A read-only damages summary is available per case that returns, alongside the case identifier and the `included_damages_total_cents`, two gross damages numbers: a conservative `gross_economic_only_cents` and a standard `gross_full_model_cents`. The economic-only model sums `amount_cents` across `INCLUDED` items whose `category` is one of `MEDICAL_BILLS`, `LOST_WAGES`, `FUTURE_MEDICAL`, or `PROPERTY`; the full model adds the sum of `amount_cents` across `INCLUDED` items in `PAIN_SUFFERING`. The split exists because the firm uses the economic-only model in clear-liability cases where a `pain_multiplier` of `1.0` will be applied on the demand letter; for cases that warrant a `pain_multiplier` above `1.0`, the full model is the relevant number. In both modes, `PROPOSED` and `EXCLUDED` damages contribute nothing. The summary sum is over integer cents and requires no rounding.
+
+### 3.4. The Demand Letter and Its Pricing
+
+Once the case is `ACTIVE` and at least one medical records request on it is `REVIEWED`, an `Attorney` drafts a demand letter, supplying the `case_id` and a `pain_multiplier`. The multiplier must be at least `1.0` and at most `5.0`. If the case is not `ACTIVE` or no `REVIEWED` records request is present, the draft is rejected with `ERR_DEMAND_PREREQUISITES_NOT_MET`. The statute of limitations is also verified at draft time, so a stale matter is rejected with `ERR_STATUTE_EXPIRED`. The draft is created in `DRAFT` status, the system stamps `drafted_by_user_id` with the acting `X-User-ID`, and the `demand_amount_cents` is computed at draft creation time and is immutable thereafter.
+
+The demand amount is built up from the `INCLUDED` damages items at the moment of draft, in a strict, pinned order. First, four per-category line totals are computed and each is rounded half-up to whole cents independently: the medical line is the sum of `amount_cents` over `INCLUDED` items with `category == MEDICAL_BILLS` multiplied by one (so it is just the sum), the wages line is the same construction over `LOST_WAGES`, the property line is the same construction over `PROPERTY`, and the future-medical line is the sum of `amount_cents` over `INCLUDED` items in `FUTURE_MEDICAL` multiplied by the present-value discount factor `0.85` and rounded half-up. Next, the pain-and-suffering line is computed by summing the just-rounded medical line, wages line, and future-medical line — the property line is deliberately excluded from the multiplier base — multiplying that sum by the `pain_multiplier`, and rounding half-up. The five lines (medical, wages, property, future-medical, pain) are then added together as a pure integer-cent subtotal with no further rounding. A tiered negotiation buffer is then layered on top of that subtotal: if the subtotal is less than $5,000 (500,000 cents), the buffer rate is `0.20`; if the subtotal is at least $5,000 but less than $50,000 (5,000,000 cents), the buffer rate is `0.15`; if the subtotal is at least $50,000, the buffer rate is `0.10`. The buffer amount equals the subtotal multiplied by the applicable buffer rate, rounded half-up to whole cents. The final `demand_amount_cents` is the subtotal plus the buffer, taken as a pure integer-cent sum with no additional rounding step. The rounding order is part of the contract: each per-category line is rounded before the lines are summed, and the buffer is rounded once at the end — summing-then-rounding the whole computation produces a different cent value and is incorrect.
+
+A draft demand letter can be withdrawn by the `Attorney`, which moves it `DRAFT → WITHDRAWN` (a terminal state). The active path is for a `ManagingPartner` to send it, advancing `DRAFT → SENT`. Sending stamps `sent_at` with the current clock and enforces three preconditions: the case must be `ACTIVE`, at least one `REVIEWED` records request must still be present, and the segregation-of-duties guard must hold — the `ManagingPartner`'s `X-User-ID` must not equal the letter's stored `drafted_by_user_id`. A partner attempting to send a letter they themselves drafted is rejected with `ERR_SEGREGATION_OF_DUTIES`, even if every other precondition holds; the firm requires a separate set of eyes. Sending the letter also cascades up: as a depth-two side effect, the parent case auto-transitions `ACTIVE → DEMAND_SENT`, refreshing the case's `updated_at` and incrementing `Case.version` by one. From `SENT`, the `Attorney` may move the letter `SENT → ACKNOWLEDGED` when the carrier signals receipt; `ACKNOWLEDGED` is the natural end-of-life for a delivered letter.
+
+### 3.5. Settlement Negotiation in Rounds
+
+The first time anyone creates a `SettlementOffer` on a case, two things happen: the offer is born in `PENDING` status with `round_number` set to one, and the parent case auto-transitions `DEMAND_SENT → IN_NEGOTIATION` as a depth-two cascade, refreshing the case's `updated_at` and incrementing `Case.version` by one. The offer carries the `case_id` it belongs to, an `offer_amount_cents` in non-negative integer cents, a `by_party` value indicating whether `CARRIER` or `FIRM` proposed it, and (for an opening offer) a null `counter_to_offer_id`. The `responded_at` field stays null until something terminal or counter-terminal happens to the offer.
+
+Negotiations proceed in alternating rounds, encoded by the `counter_to_offer_id` chain. An `Attorney` creating a counter posts a new `SettlementOffer` whose `counter_to_offer_id` points at the prior `PENDING` offer; the system pins `round_number` to one more than the prior offer's `round_number` and transitions the prior offer `PENDING → COUNTERED`, stamping its `responded_at`. The counter must be on the same `case_id` as the prior offer, the prior offer's status must be `PENDING`, and the `by_party` on the new counter must be the opposite of the prior offer's `by_party` (a `CARRIER` offer is countered only by a `FIRM` offer and vice versa); any of these conditions failing yields `ERR_INVALID_COUNTER`. Because each counter both creates a new `PENDING` offer and resolves the previous one, the chain ping-pongs `PENDING → COUNTERED → PENDING → COUNTERED → ...` without bound, every round adding one new row and resolving one. New counters are only allowed while the parent case is in `IN_NEGOTIATION` or `LITIGATION`.
+
+Three terminal outcomes are possible at any point on the chain. A `ManagingPartner` may reject the current `PENDING` offer, moving it `PENDING → REJECTED` and stamping `responded_at`. A `ManagingPartner` may accept it, moving it `PENDING → ACCEPTED` and stamping `responded_at` — accept is the heavy operation described in §3.6. Or the offer may simply age out: once thirty days have passed since the offer's `created_at`, an offer still in `PENDING` is moved `PENDING → EXPIRED` by the system as a side effect of two events — any read of the parent case (which sweeps that case's offers against the current clock) and any successful clock-set call (which sweeps system-wide). On expiry, `responded_at` is stamped to the current clock value at the moment of the sweep.
+
+### 3.6. The Acceptance Cascade
+
+Accepting an offer is the most consequential write in the system, and it carries five preconditions in addition to the offer being `PENDING`. The parent case must be in `IN_NEGOTIATION` or `LITIGATION`; otherwise the request fails with `ERR_CROSS_ENTITY_STATE`. No medical lien on the case may be in `DISPUTED` status — the firm refuses to settle on top of an open lien dispute, so an attempt is rejected with `ERR_DISPUTED_LIEN_BLOCKS_SETTLEMENT` (this is the cross-entity guard that gives `DISPUTED` its operational teeth). The statute of limitations must not have expired (`ERR_STATUTE_EXPIRED`). And the request body must carry an `expected_case_version` integer matching the case's current `version`; a mismatch is rejected with `ERR_STALE_CASE_VERSION` (HTTP 412). This stale-version guard exists because the accept-time damages picture must be the one the partner actually reviewed — for example, if a paralegal includes a new damages item bumping `Case.version` between the partner reading the case and the partner clicking accept, the accept must be re-evaluated against the new total.
+
+When all guards pass, the offer transitions `PENDING → ACCEPTED`, its `responded_at` is stamped, and the parent case auto-transitions to `SETTLED` (as a depth-two cascade from either `IN_NEGOTIATION → SETTLED` or `LITIGATION → SETTLED` depending on where the case was). The accepting offer's `offer_amount_cents` is stamped onto the case as `gross_settlement_cents`. Three further cascades fire as depth-two effects of the case settling. First, every medical lien on the case whose status is `ASSERTED` or `NEGOTIATING` is auto-transitioned to `AGREED`, and each such lien's `negotiated_amount_cents` is set to the lesser of its `asserted_amount_cents` and the proportional cap defined by the lien waterfall described in §3.7 (the cap computation is a depth-three effect, fanning out across the lien set). Second, every `SCHEDULED` court event on the case is moved to `CANCELLED` — the docket is cleared. Third, a `Disbursement` row in `PENDING` status is created for the case, and its `contingency_fee_cents`, `total_lien_payout_cents`, and `net_to_client_cents` are computed at creation per §3.7 (again, depth-three calculations inside the depth-two disbursement creation). The case's `updated_at` is refreshed and its `version` is incremented by one.
+
+### 3.7. Medical Liens, the Waterfall, and the Net to the Client
+
+A `MedicalLien` records a provider's claim against the eventual recovery. The paralegal creates the lien with the `case_id`, the `provider_id`, and the `asserted_amount_cents` the provider claims; the new lien is born in `ASSERTED` status, and its `negotiated_amount_cents` is initialized equal to `asserted_amount_cents`. The paralegal then moves the lien `ASSERTED → NEGOTIATING` when discussions open. From `NEGOTIATING`, two roads lead away: the paralegal can land a deal, moving the lien `NEGOTIATING → AGREED` and supplying a `negotiated_amount_cents` in the request body that must be less than or equal to `asserted_amount_cents` (any overpayment is rejected with `ERR_LIEN_OVERPAYMENT`); or the `Attorney` can declare a dispute, moving the lien `NEGOTIATING → DISPUTED`. The `Attorney` can also resume a disputed negotiation by moving the lien `DISPUTED → NEGOTIATING`, which means the same lien can cycle `NEGOTIATING → DISPUTED → NEGOTIATING → DISPUTED` indefinitely. Only the disbursement release moves an `AGREED` lien to its terminal `PAID` state, and only as a system cascade — there is no client-driven transition into `PAID`.
+
+When a case settles, every still-open lien (status `ASSERTED`, `NEGOTIATING`, or `AGREED`) is captured into a proportional-allocation waterfall against a finite pool. The pool is what remains after the contingency fee is taken: starting from the case's just-stamped `gross_settlement_cents`, the contingency fee is computed first. The fee rate is a dual-variant: if the case has not been filed in court at the moment of accept — that is, if the case's `filed_in_court` flag is `false` — the rate is `0.3333` (the pre-suit rate); if suit has been filed (`filed_in_court` is `true`), the rate is `0.40` (the post-suit rate). The `contingency_fee_cents` is computed as the product of `gross_settlement_cents` and the applicable rate, with the multiplication performed as a single Decimal operation against integer cents, rounded half-up once at the end — there is no per-line rounding inside the fee. The pool distributable to liens is then `gross_settlement_cents` minus `contingency_fee_cents`. The same gross settlement amount produces a smaller fee under the pre-suit rate than under the post-suit rate, which means a pre-suit acceptance leaves more dollars in the lien pool and ultimately for the client than the same headline number after suit has been filed.
+
+The waterfall is ordered: the open liens on the case are taken in `created_at` ascending order (the oldest first), and ties on `created_at` are broken by `created_at` itself — order is never `id`-based. The sum of the liens' `asserted_amount_cents` is the total asserted. If the total asserted is less than or equal to the distributable pool, every lien gets paid its full `asserted_amount_cents` and the waterfall terminates. Otherwise, a shrink ratio is computed as the distributable pool divided by the total asserted, every lien's interim cap is set to its `asserted_amount_cents` multiplied by that shrink ratio and then floored to a whole cent, the sum of all the floored caps is taken, and the difference between the pool and that sum is a non-negative integer-cent remainder — flooring guarantees this. The remainder is then distributed cent by cent to the oldest liens first (in `created_at` ascending order), incrementing each lien's cap by one cent in turn until the remainder is exhausted. Each lien's `negotiated_amount_cents` is set to its final cap, and the lien is auto-transitioned `ASSERTED → AGREED` or `NEGOTIATING → AGREED` accordingly. The sum of all final caps is the `total_lien_payout_cents` stamped onto the freshly-created `Disbursement` at the moment of case settlement.
+
+The disbursement also captures the contingency fee and the `net_to_client_cents`, which is the gross settlement minus the contingency fee minus the total lien payout. The order is pinned: gross is stamped first, fee is computed against the gross and the filed-in-court flag, the distributable-to-liens amount is taken as gross minus fee, the waterfall runs against that distributable amount, the total lien payout is summed, and the net equals gross minus fee minus payout. Reversing this order — for example, computing the lien payout against the gross before taking the fee — yields a different net and is not the contract.
+
+A pending disbursement waits for the `ManagingPartner` to release it. Release moves the disbursement `PENDING → RELEASED` and is gated on three preconditions: the case must be `SETTLED`, every medical lien on the case must be in `AGREED` status (an `ASSERTED`, `NEGOTIATING`, or `DISPUTED` lien blocks release with `ERR_CROSS_ENTITY_STATE`), and the request body must carry an `expected_case_version` matching the case's current `version` — a mismatch is rejected with `ERR_STALE_CASE_VERSION` (HTTP 412). On release, every `AGREED` lien on the case auto-transitions `AGREED → PAID` as a depth-two cascade, and the case's `updated_at` is refreshed with `version` incremented by one.
+
+### 3.8. The Court Calendar and Litigation
+
+A `CourtEvent` is created either explicitly by an `Attorney` or `ManagingPartner` (with `case_id`, `event_type` in `FILING`, `HEARING`, `TRIAL`, or `MEDIATION`, a `scheduled_at` ISO 8601 UTC time, and an optional `duration_minutes` defaulting to 60), or implicitly as a side effect of filing suit. The explicit creation pins two temporal rules. First, `scheduled_at` must be strictly later than the current system clock at create time; any attempt to schedule an event at or before "now" is rejected with `ERR_EVENT_IN_PAST`. Second, `duration_minutes` must be greater than zero and no more than 600 minutes. Conflict avoidance is enforced for `HEARING`, `TRIAL`, and `MEDIATION` events: a new event of one of those types on a given `case_id` must not overlap any existing `SCHEDULED` event on the same `case_id` once a 24-hour buffer is applied to both ends of the new event — that is, the interval running from 24 hours before the new event's `scheduled_at` to 24 hours after the new event's `scheduled_at` plus its `duration_minutes` must not intersect the existing event's interval running from its `scheduled_at` to its `scheduled_at` plus its `duration_minutes`. Both endpoints are closed on both sides, so an exact-touch collision counts. A conflict is rejected with `ERR_COURT_EVENT_CONFLICT`.
+
+A scheduled event can be moved `SCHEDULED → OCCURRED` by the `Attorney` once the clock has caught up — specifically, the system clock at the moment of the mark must be at or later than the event's `scheduled_at`; otherwise the transition is rejected with `ERR_INVALID_STATE`. A scheduled event may also be cancelled by an `Attorney` or `ManagingPartner`, moving it `SCHEDULED → CANCELLED`. The system also cancels every `SCHEDULED` event on a case as a depth-two side effect of the case moving to `SETTLED`.
+
+Filing suit is the bridge between negotiation and litigation. Only a `ManagingPartner` can initiate it; the case must be in `IN_NEGOTIATION`, the statute of limitations must not yet have expired, and `Case.filed_in_court` must still be `false` (the firm files only once per matter — a second attempt is rejected with `ERR_INVALID_STATE`). On success, the case moves `IN_NEGOTIATION → LITIGATION`, `Case.filed_in_court` is set to `true`, a `CourtEvent` of `event_type` `FILING` is created in `status` `OCCURRED` with `scheduled_at` equal to the current clock value, and `Case.version` is incremented by one. The filing-flag flip is the gate for the dual-variant contingency fee described in §3.7: every later acceptance evaluates `Case.filed_in_court` to decide between the pre-suit and post-suit rate.
+
+### 3.9. Closing Out and the System Clock
+
+After a `Disbursement` has been released and every medical lien on the case has reached `PAID`, the `ManagingPartner` may close the case by moving it `SETTLED → CLOSED`. Attempting to close before both preconditions hold (a released disbursement and uniformly paid liens) is rejected with `ERR_CROSS_ENTITY_STATE`. `CLOSED` and `ABANDONED` are the two terminal states for a case.
+
+The test-driving clock has two endpoints: a `PlatformAdmin`-only setter that accepts a `to_iso8601` timestamp on the body and replaces `SystemClock.current_utc` with it, and a public reader that returns the singleton clock resource. Setting the clock to a new value sweeps every `PENDING` `SettlementOffer` whose `created_at` is at least thirty days behind the new clock value, transitioning each to `EXPIRED` and stamping its `responded_at`. The sweep is part of the same write — callers do not need to poll for it. The single-case read endpoint performs the same sweep scoped to that one case's offers.
+
+## 4. Endpoint Definitions
+
+All endpoints respond with the standard envelope from §2.2. New resource creations (the POSTs whose purpose is to bring a row into existence) return HTTP 201 Created; all other modifications and all reads return HTTP 200 OK. Authentication and authorization, existence, state, business-safety, business-referential, business-temporal, business-fiscal, optimistic concurrency, and finally generic input-shape checks are applied in the priority order laid out in §2.9; the first failing check determines the returned error.
+
+| Method | Path | Description | Authorized Role(s) |
+|--------|------|-------------|--------------------|
+| POST | `/clients/register` | Register a new client (intake step 1). | `Anonymous`, `Paralegal` |
+| POST | `/clients/{id}/sign-retainer` | Record the client's signed retainer. | `Paralegal` |
+| GET | `/clients/{id}` | Read a client by id. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| GET | `/clients` | List clients with pagination and optional `email` filter. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| POST | `/cases` | Open a new case (intake step 2). | `Paralegal` |
+| GET | `/cases/{id}` | Read a case (also sweeps that case's pending offers against the clock). | `Paralegal`, `Attorney`, `ManagingPartner` |
+| GET | `/cases` | List cases with optional `status`, `client_id`, `jurisdiction` filters. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| POST | `/cases/{id}/activate` | Move case `INTAKE → ACTIVE`. | `Attorney` |
+| POST | `/cases/{id}/abandon` | Move case `INTAKE` or `ACTIVE` to `ABANDONED`. | `Attorney`, `ManagingPartner` |
+| POST | `/cases/{id}/file-suit` | Move case `IN_NEGOTIATION → LITIGATION` and emit the `FILING` event. | `ManagingPartner` |
+| POST | `/cases/{id}/close` | Move case `SETTLED → CLOSED`. | `ManagingPartner` |
+| GET | `/cases/{id}/damages-summary` | Read the gross damages model for the case. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| POST | `/medical-providers` | Register a medical provider. | `Paralegal` |
+| GET | `/medical-providers/{id}` | Read a provider. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| GET | `/medical-providers` | List providers. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| POST | `/medical-records-requests` | Request records from a provider for a case. | `Paralegal` |
+| GET | `/medical-records-requests/{id}` | Read a records request. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| GET | `/medical-records-requests` | List records requests with filters. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| POST | `/medical-records-requests/{id}/receive` | Mark records request `REQUESTED → RECEIVED`. | `Paralegal` |
+| POST | `/medical-records-requests/{id}/review` | Mark records request `RECEIVED → REVIEWED`. | `Attorney` |
+| POST | `/medical-records-requests/{id}/reject` | Mark records request `REQUESTED → REJECTED`. | `Paralegal` |
+| POST | `/damages-items` | Add a damages line item (status `PROPOSED`). | `Paralegal`, `Attorney` |
+| GET | `/damages-items/{id}` | Read a damages item. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| GET | `/damages-items` | List damages items with filters. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| POST | `/damages-items/{id}/include` | Promote a damages item `PROPOSED → INCLUDED`. | `Attorney` |
+| POST | `/damages-items/{id}/exclude` | Move a damages item to `EXCLUDED`. | `Attorney`, `ManagingPartner` |
+| POST | `/medical-liens` | Record an asserted medical lien. | `Paralegal` |
+| GET | `/medical-liens/{id}` | Read a lien. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| GET | `/medical-liens` | List liens with filters. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| POST | `/medical-liens/{id}/negotiate` | Move lien `ASSERTED → NEGOTIATING`. | `Paralegal` |
+| POST | `/medical-liens/{id}/agree` | Move lien `NEGOTIATING → AGREED` at a negotiated amount. | `Paralegal` |
+| POST | `/medical-liens/{id}/dispute` | Move lien `NEGOTIATING → DISPUTED`. | `Attorney` |
+| POST | `/medical-liens/{id}/resume-negotiation` | Move lien `DISPUTED → NEGOTIATING`. | `Attorney` |
+| POST | `/demand-letters` | Draft a demand letter. | `Attorney` |
+| GET | `/demand-letters/{id}` | Read a demand letter. | `Attorney`, `ManagingPartner`, `Paralegal` |
+| GET | `/demand-letters` | List demand letters with filters. | `Attorney`, `ManagingPartner`, `Paralegal` |
+| POST | `/demand-letters/{id}/send` | Move demand letter `DRAFT → SENT` (segregation-of-duties enforced). | `ManagingPartner` |
+| POST | `/demand-letters/{id}/acknowledge` | Move demand letter `SENT → ACKNOWLEDGED`. | `Attorney` |
+| POST | `/demand-letters/{id}/withdraw` | Move demand letter `DRAFT → WITHDRAWN`. | `Attorney` |
+| POST | `/settlement-offers` | Create a settlement offer (new or counter). | `Attorney` |
+| GET | `/settlement-offers/{id}` | Read a settlement offer. | `Attorney`, `ManagingPartner`, `Paralegal` |
+| GET | `/settlement-offers` | List settlement offers with filters. | `Attorney`, `ManagingPartner`, `Paralegal` |
+| POST | `/settlement-offers/{id}/accept` | Accept an offer (requires `expected_case_version`). | `ManagingPartner` |
+| POST | `/settlement-offers/{id}/reject` | Reject an offer. | `ManagingPartner` |
+| POST | `/court-events` | Schedule a court calendar entry. | `Attorney`, `ManagingPartner` |
+| GET | `/court-events/{id}` | Read a court event. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| GET | `/court-events` | List court events with filters. | `Paralegal`, `Attorney`, `ManagingPartner` |
+| POST | `/court-events/{id}/mark-occurred` | Move court event `SCHEDULED → OCCURRED`. | `Attorney` |
+| POST | `/court-events/{id}/cancel` | Move court event `SCHEDULED → CANCELLED`. | `Attorney`, `ManagingPartner` |
+| GET | `/disbursements/{id}` | Read a disbursement. | `Attorney`, `ManagingPartner`, `Paralegal` |
+| GET | `/disbursements` | List disbursements with filters. | `Attorney`, `ManagingPartner`, `Paralegal` |
+| POST | `/disbursements/{id}/release` | Release the pending disbursement (requires `expected_case_version`). | `ManagingPartner` |
+| POST | `/_clock/set_current_utc` | Test-driving: set the authoritative system clock. | `PlatformAdmin` |
+| GET | `/_clock` | Test-driving: read the current clock. | `PlatformAdmin`, `Paralegal`, `Attorney`, `ManagingPartner` |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+|----------|------------------|
+| `ERR_MISSING_AUTH` | 401 |
+| `ERR_FORBIDDEN_ROLE` | 403 |
+| `ERR_RESOURCE_NOT_FOUND` | 404 |
+| `ERR_FK_NOT_FOUND` | 404 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_INVALID_STATE` | 409 |
+| `ERR_CROSS_ENTITY_STATE` | 409 |
+| `ERR_STATUTE_EXPIRED` | 422 |
+| `ERR_SEGREGATION_OF_DUTIES` | 422 |
+| `ERR_RETAINER_MISSING` | 422 |
+| `ERR_MISSING_MEDICAL_RECORDS` | 422 |
+| `ERR_DEMAND_PREREQUISITES_NOT_MET` | 422 |
+| `ERR_EVENT_IN_PAST` | 422 |
+| `ERR_COURT_EVENT_CONFLICT` | 409 |
+| `ERR_DUPLICATE_RECORDS_REQUEST` | 409 |
+| `ERR_INVALID_COUNTER` | 422 |
+| `ERR_DAMAGES_OVER_CAP` | 422 |
+| `ERR_LIEN_OVERPAYMENT` | 422 |
+| `ERR_DISPUTED_LIEN_BLOCKS_SETTLEMENT` | 422 |
+| `ERR_STALE_CASE_VERSION` | 412 |

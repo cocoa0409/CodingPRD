@@ -1,0 +1,1177 @@
+scenario: "Medical Prior Authorization Workflow: service/drug pre-approval request, clinical evidence upload, insurance review (Peer-to-Peer), expedited request, denial/Appeal three-tier process, expiration resubmission"
+domain_name: medical-prior-authorization
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: workflow_orchestration
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - scheduled_actions
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys: AuthorizationRequest references Member,
+  # Provider, Payer; child entities (ClinicalEvidence, ReviewDecision, Appeal,
+  # PeerToPeerSession) reference their parents by FK rather than nesting in URLs.
+
+  state_machine_shape: branching
+  # AuthorizationRequest: SUBMITTED -> UNDER_REVIEW -> {APPROVED, DENIED, PENDED}
+  # with PENDED -> UNDER_REVIEW revision loop and EXPIRED -> RESUBMITTED supersede
+  # cycle. Appeal: TIER1 -> TIER2 -> TIER3 fork-join with UPHELD/OVERTURNED per tier.
+
+  relationship_patterns:
+    - one_to_many        # AuthorizationRequest has many ClinicalEvidence / Appeal
+    - cross_aggregate    # Appeal outcome mutates AuthorizationRequest across aggregate boundary
+    - self_referential   # AuthorizationRequest.supersedes_request_id -> AuthorizationRequest.id
+
+  role_model: peer_roles
+  # Provider owns the request + evidence; Payer (via Reviewer) owns review decisions
+  # and P2P scheduling; neither can perform the other's exclusive operations.
+
+  consistency_model: immediate
+
+# ---------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: Provider
+    parent: null
+    common_fields: true
+    fields:
+      - name: npi
+        type: string
+        source: input
+        description: "National Provider Identifier (10 digits)"
+        constraints: "required, unique, exactly 10 numeric characters"
+      - name: name
+        type: string
+        source: input
+        description: "Provider or practice name"
+        constraints: "required, non-empty"
+      - name: specialty
+        type: enum
+        source: input
+        description: "Clinical specialty"
+        constraints: "one of {CARDIOLOGY, ONCOLOGY, ORTHOPEDICS, NEUROLOGY, PRIMARY_CARE, RADIOLOGY}"
+
+  - name: Payer
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Insurance payer name"
+        constraints: "required, non-empty"
+      - name: standard_sla_hours
+        type: integer
+        source: input
+        description: "Turnaround hours allowed for standard (non-expedited) review"
+        default: 168
+        constraints: ">= 1; used as STANDARD due-date base in sla_due_at calc"
+      - name: expedited_sla_hours
+        type: integer
+        source: input
+        description: "Turnaround hours allowed for expedited review"
+        default: 72
+        constraints: ">= 1; must be < standard_sla_hours"
+
+  - name: Member
+    parent: null
+    common_fields: true
+    fields:
+      - name: payer_id
+        type: string
+        source: input
+        description: "FK -> Payer.id; the member's insurance payer"
+        constraints: "required, must reference an existing Payer"
+      - name: member_number
+        type: string
+        source: input
+        description: "Payer-assigned member id"
+        constraints: "required, unique per payer_id"
+      - name: coinsurance_rate
+        type: number
+        source: input
+        description: "Member cost-share fraction of approved line-item cost (0.0-1.0)"
+        default: 0.2
+        constraints: ">= 0.0 and <= 1.0"
+      - name: active_authorization_count
+        type: integer
+        source: computed
+        description: "Count of this member's AuthorizationRequest rows in status APPROVED whose authorization_expires_at is in the future relative to the current clock; recomputed on every request approve/expire/supersede side effect"
+        default: 0
+
+  - name: AuthorizationRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the patient the authorization is for"
+        constraints: "required, must reference an existing Member"
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> Provider.id; the requesting provider"
+        constraints: "required, must reference an existing Provider"
+      - name: payer_id
+        type: string
+        source: computed
+        description: "FK -> Payer.id; copied from the referenced Member.payer_id at creation"
+      - name: request_type
+        type: enum
+        source: input
+        description: "Whether this is a service or drug pre-approval"
+        constraints: "one of {SERVICE, DRUG}"
+      - name: procedure_code
+        type: string
+        source: input
+        description: "CPT/HCPCS code (SERVICE) or NDC code (DRUG)"
+        constraints: "required, non-empty"
+      - name: requested_units
+        type: integer
+        source: input
+        description: "Units/sessions/days requested"
+        constraints: "required, >= 1"
+      - name: unit_cost_cents
+        type: integer
+        source: input
+        description: "Allowed cost per unit in cents (payer fee schedule)"
+        constraints: "required, >= 0"
+      - name: is_expedited
+        type: boolean
+        source: input
+        description: "Whether the requester flagged this as an expedited (urgent) request"
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state"
+        default: DRAFT
+        constraints: "one of {DRAFT, SUBMITTED, UNDER_REVIEW, PENDED, APPROVED, DENIED, EXPIRED, SUPERSEDED}"
+      - name: submitted_at
+        type: datetime
+        source: system
+        description: "Clock value when the request transitioned DRAFT->SUBMITTED; null while DRAFT"
+      - name: review_started_at
+        type: datetime
+        source: system
+        description: "Clock value when review most recently (re)started; reset on PENDED->UNDER_REVIEW"
+      - name: sla_due_at
+        type: datetime
+        source: computed
+        description: "Deadline for a review decision; see sla_due_at calculation"
+      - name: clock_paused_hours
+        type: number
+        source: computed
+        description: "Accumulated hours the SLA clock was paused while PENDED or during an open PeerToPeerSession; input to sla_due_at"
+        default: 0
+      - name: approved_units
+        type: integer
+        source: computed
+        description: "Units the payer approved; 0 unless an APPROVE/PARTIAL ReviewDecision exists; <= requested_units"
+        default: 0
+      - name: member_cost_share_cents
+        type: integer
+        source: computed
+        description: "Member's estimated out-of-pocket in cents; see member_cost_share calculation"
+        default: 0
+      - name: authorization_expires_at
+        type: datetime
+        source: computed
+        description: "When an APPROVED authorization lapses; submitted_at-independent, set on entry to APPROVED"
+      - name: supersedes_request_id
+        type: string
+        source: input
+        description: "FK -> AuthorizationRequest.id; set on a resubmission to point at the EXPIRED request it replaces; null for an original request"
+        constraints: "optional; when present must reference an AuthorizationRequest in status EXPIRED owned by the same member_id and provider_id"
+
+  - name: ClinicalEvidence
+    parent: null
+    common_fields: false
+    fields:
+      - name: request_id
+        type: string
+        source: input
+        description: "FK -> AuthorizationRequest.id; the request this evidence supports"
+        constraints: "required, must reference an existing AuthorizationRequest"
+      - name: document_type
+        type: enum
+        source: input
+        description: "Category of supporting clinical document"
+        constraints: "one of {CHART_NOTE, LAB_RESULT, IMAGING, MEDICATION_HISTORY, LETTER_OF_MEDICAL_NECESSITY}"
+      - name: line_item_cost_cents
+        type: integer
+        source: input
+        description: "Documented cost attributable to this evidence line in cents; summed by member_cost_share calc"
+        constraints: "required, >= 0"
+      - name: uri
+        type: string
+        source: input
+        description: "Storage URI for the uploaded document"
+        constraints: "required, non-empty"
+
+  - name: ReviewDecision
+    parent: null
+    common_fields: true
+    fields:
+      - name: request_id
+        type: string
+        source: input
+        description: "FK -> AuthorizationRequest.id; the request being decided"
+        constraints: "required, must reference an existing AuthorizationRequest in status UNDER_REVIEW"
+      - name: reviewer_id
+        type: string
+        source: input
+        description: "FK -> Reviewer.id; the payer clinical reviewer rendering the decision"
+        constraints: "required, must reference a Reviewer whose payer_id equals the request's payer_id"
+      - name: outcome
+        type: enum
+        source: input
+        description: "Review outcome"
+        constraints: "one of {APPROVE, PARTIAL, DENY, PEND}"
+      - name: approved_units
+        type: integer
+        source: input
+        description: "Units approved; required and >= 1 and <= request.requested_units when outcome=PARTIAL; equals request.requested_units when outcome=APPROVE; 0 otherwise"
+        default: 0
+      - name: rationale
+        type: string
+        source: input
+        description: "Clinical rationale / denial reason; required when outcome in {DENY, PARTIAL}"
+      - name: pend_reason
+        type: enum
+        source: input
+        description: "Reason additional info is required; required when outcome=PEND"
+        constraints: "one of {INSUFFICIENT_EVIDENCE, MISSING_LMN, PEER_TO_PEER_REQUIRED}"
+
+  - name: PeerToPeerSession
+    parent: null
+    common_fields: true
+    fields:
+      - name: request_id
+        type: string
+        source: input
+        description: "FK -> AuthorizationRequest.id; the request discussed in this P2P"
+        constraints: "required, must reference an AuthorizationRequest in status UNDER_REVIEW or PENDED"
+      - name: reviewer_id
+        type: string
+        source: input
+        description: "FK -> Reviewer.id; the payer reviewer occupying the slot"
+        constraints: "required, must reference a Reviewer whose payer_id equals the request's payer_id"
+      - name: slot_start
+        type: datetime
+        source: input
+        description: "Inclusive start of the reserved discussion slot"
+        constraints: "required, ISO 8601 UTC"
+      - name: slot_end
+        type: datetime
+        source: input
+        description: "Exclusive end of the reserved discussion slot"
+        constraints: "required, ISO 8601 UTC, strictly after slot_start"
+      - name: status
+        type: enum
+        source: system
+        description: "Slot lifecycle"
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, COMPLETED, CANCELLED}"
+
+  - name: Reviewer
+    parent: null
+    common_fields: true
+    fields:
+      - name: payer_id
+        type: string
+        source: input
+        description: "FK -> Payer.id; the payer this clinical reviewer works for"
+        constraints: "required, must reference an existing Payer"
+      - name: name
+        type: string
+        source: input
+        description: "Reviewer name"
+        constraints: "required, non-empty"
+      - name: specialty
+        type: enum
+        source: input
+        description: "Clinical specialty of the reviewer"
+        constraints: "one of {CARDIOLOGY, ONCOLOGY, ORTHOPEDICS, NEUROLOGY, PRIMARY_CARE, RADIOLOGY}"
+      - name: p2p_buffer_minutes
+        type: integer
+        source: input
+        description: "Minimum gap in minutes required between two of this reviewer's P2P slots; input to p2p overlap detection"
+        default: 0
+        constraints: ">= 0"
+
+  - name: Appeal
+    parent: null
+    common_fields: true
+    fields:
+      - name: request_id
+        type: string
+        source: input
+        description: "FK -> AuthorizationRequest.id; the DENIED request being appealed"
+        constraints: "required, must reference an AuthorizationRequest in status DENIED"
+      - name: tier
+        type: integer
+        source: system
+        description: "Appeal tier: 1 (internal reconsideration), 2 (internal medical director), 3 (external IRO)"
+        default: 1
+        constraints: "one of {1, 2, 3}"
+      - name: status
+        type: enum
+        source: system
+        description: "Appeal lifecycle"
+        default: OPEN
+        constraints: "one of {OPEN, UPHELD, OVERTURNED, ESCALATED, WITHDRAWN}"
+      - name: filed_at
+        type: datetime
+        source: system
+        description: "Clock value when this appeal tier was opened"
+      - name: appeal_deadline_at
+        type: datetime
+        source: computed
+        description: "Last clock instant a decision may be rendered for this tier; see appeal_deadline calculation"
+      - name: decision_rationale
+        type: string
+        source: input
+        description: "Rationale supplied when the tier is resolved UPHELD or OVERTURNED; required at decision time"
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: AuthorizationRequest
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /authorization-requests/{id}/submit"
+        actor: Provider
+        preconditions:
+          - "request owned by the acting Provider (provider_id == X-User-ID)"
+          - "at least one ClinicalEvidence row exists with request_id == this request"
+        side_effects:
+          - "set submitted_at = current clock"
+          - "set review_started_at = current clock"
+          - "compute sla_due_at via sla_due_at calculation (clock_paused_hours = 0)"
+          - "compute member_cost_share_cents via member_cost_share calculation"
+          - "increments AuthorizationRequest.version by 1"
+        note: "Cannot submit without evidence."
+      - from: SUBMITTED
+        to: UNDER_REVIEW
+        trigger: "POST /authorization-requests/{id}/start-review"
+        actor: Payer
+        preconditions:
+          - "acting Payer.id == request.payer_id"
+        side_effects:
+          - "set review_started_at = current clock"
+          - "recompute sla_due_at"
+          - "increments AuthorizationRequest.version by 1"
+      - from: UNDER_REVIEW
+        to: APPROVED
+        trigger: "POST /review-decisions (outcome in {APPROVE, PARTIAL})"
+        actor: Payer
+        preconditions:
+          - "reviewer.payer_id == request.payer_id"
+          - "no PeerToPeerSession for this request in status SCHEDULED (an open P2P must be COMPLETED or CANCELLED first)"
+        side_effects:
+          - "create ReviewDecision row"
+          - "set approved_units = decision.approved_units (= requested_units for APPROVE)"
+          - "recompute member_cost_share_cents via member_cost_share calculation using approved_units"
+          - "set authorization_expires_at = current clock + 365 days"
+          - "increment referenced Member.active_authorization_count by 1 (cascade)"
+          - "increments AuthorizationRequest.version by 1"
+        note: "Cross-aggregate cascade: request approval bumps Member.active_authorization_count."
+      - from: UNDER_REVIEW
+        to: DENIED
+        trigger: "POST /review-decisions (outcome = DENY)"
+        actor: Payer
+        preconditions:
+          - "reviewer.payer_id == request.payer_id"
+          - "decision.rationale present"
+          - "no PeerToPeerSession for this request in status SCHEDULED"
+        side_effects:
+          - "create ReviewDecision row"
+          - "set approved_units = 0"
+          - "increments AuthorizationRequest.version by 1"
+        note: "Opens the appeal pathway (Appeal may now be filed)."
+      - from: UNDER_REVIEW
+        to: PENDED
+        trigger: "POST /review-decisions (outcome = PEND)"
+        actor: Payer
+        preconditions:
+          - "reviewer.payer_id == request.payer_id"
+          - "decision.pend_reason present"
+        side_effects:
+          - "create ReviewDecision row"
+          - "set pend_started_marker = current clock (used by clock_paused_hours accrual)"
+          - "increments AuthorizationRequest.version by 1"
+        note: "SLA clock pauses while PENDED; see clock_paused_hours."
+      - from: PENDED
+        to: UNDER_REVIEW
+        trigger: "POST /authorization-requests/{id}/resume-review"
+        actor: Payer
+        preconditions:
+          - "acting Payer.id == request.payer_id"
+          - "at least one ClinicalEvidence row was added with request_id == this request after the PEND decision's created_at"
+        side_effects:
+          - "add (current clock - pend_started_marker) hours to clock_paused_hours"
+          - "set review_started_at = current clock"
+          - "recompute sla_due_at (now incorporating the new clock_paused_hours)"
+          - "increments AuthorizationRequest.version by 1"
+        note: "Revision loop: PENDED -> UNDER_REVIEW. New evidence required to resume."
+      - from: APPROVED
+        to: EXPIRED
+        trigger: "POST /_clock/advance (system: authorization_expires_at <= current clock) or POST /authorization-requests/{id}/expire"
+        actor: system
+        preconditions:
+          - "current clock >= authorization_expires_at"
+        side_effects:
+          - "set status = EXPIRED"
+          - "decrement referenced Member.active_authorization_count by 1 (cascade, floored at 0)"
+          - "increments AuthorizationRequest.version by 1"
+      - from: EXPIRED
+        to: SUPERSEDED
+        trigger: "POST /authorization-requests (resubmission with supersedes_request_id pointing here)"
+        actor: Provider
+        preconditions:
+          - "the new request carries expected_authorizationrequest_version equal to this EXPIRED request's current version"
+          - "this EXPIRED request has no other AuthorizationRequest already referencing it via supersedes_request_id"
+        side_effects:
+          - "set this request status = SUPERSEDED"
+          - "create the new resubmission AuthorizationRequest in DRAFT (copies request_type, procedure_code, requested_units, unit_cost_cents from this request)"
+          - "increments AuthorizationRequest.version by 1 on the superseded (this) request"
+        note: "CREATE-with-supersede; OCC-guarded — see concurrency_rules resubmit-supersede-stale."
+
+  - entity: Appeal
+    initial_state: OPEN
+    terminal_states: [UPHELD, OVERTURNED, WITHDRAWN]
+    transitions:
+      - from: OPEN
+        to: UPHELD
+        trigger: "POST /appeals/{id}/decide (decision = UPHELD)"
+        actor: Payer
+        preconditions:
+          - "acting Payer.id == appeal's request.payer_id"
+          - "appeal.tier in {1, 2} (tier-3 is decided by ExternalReviewer)"
+          - "decision_rationale present"
+          - "current clock <= appeal_deadline_at"
+        side_effects:
+          - "set status = UPHELD"
+          - "leave the underlying AuthorizationRequest in DENIED"
+          - "increments Appeal.version by 1"
+        note: "Branch A of fork-join: denial stands; member may escalate to next tier."
+      - from: OPEN
+        to: OVERTURNED
+        trigger: "POST /appeals/{id}/decide (decision = OVERTURNED)"
+        actor: Payer
+        preconditions:
+          - "acting Payer.id == appeal's request.payer_id"
+          - "appeal.tier in {1, 2}"
+          - "decision_rationale present"
+          - "current clock <= appeal_deadline_at"
+        side_effects:
+          - "set status = OVERTURNED"
+          - "transition the underlying AuthorizationRequest DENIED -> APPROVED (cross-aggregate cascade): set approved_units = requested_units, set authorization_expires_at = current clock + 365 days, recompute member_cost_share_cents, increment Member.active_authorization_count by 1"
+          - "increments Appeal.version by 1"
+        note: "Branch B of fork-join: overturn cascades back to the request and then to the Member counter (3-hop cascade)."
+      - from: OPEN
+        to: OVERTURNED
+        trigger: "POST /appeals/{id}/external-decide (decision = OVERTURNED, tier 3)"
+        actor: ExternalReviewer
+        preconditions:
+          - "appeal.tier == 3"
+          - "decision_rationale present"
+          - "current clock <= appeal_deadline_at"
+        side_effects:
+          - "set status = OVERTURNED"
+          - "transition the underlying AuthorizationRequest DENIED -> APPROVED (cross-aggregate cascade): set approved_units = requested_units, set authorization_expires_at = current clock + 365 days, recompute member_cost_share_cents, increment Member.active_authorization_count by 1"
+          - "increments Appeal.version by 1"
+        note: "Tier-3 external IRO decision; binding."
+      - from: OPEN
+        to: UPHELD
+        trigger: "POST /appeals/{id}/external-decide (decision = UPHELD, tier 3)"
+        actor: ExternalReviewer
+        preconditions:
+          - "appeal.tier == 3"
+          - "decision_rationale present"
+          - "current clock <= appeal_deadline_at"
+        side_effects:
+          - "set status = UPHELD"
+          - "leave the underlying AuthorizationRequest in DENIED (final; no further escalation)"
+          - "increments Appeal.version by 1"
+      - from: UPHELD
+        to: ESCALATED
+        trigger: "POST /appeals (escalation: new Appeal at tier = prior.tier + 1 for the same request)"
+        actor: Provider
+        preconditions:
+          - "prior appeal for this request is UPHELD and its tier < 3"
+          - "no other OPEN Appeal exists for this request"
+        side_effects:
+          - "set the prior appeal status = ESCALATED"
+          - "create new Appeal at tier = prior.tier + 1, status OPEN, filed_at = current clock"
+          - "compute new appeal's appeal_deadline_at via appeal_deadline calculation"
+          - "increments the prior Appeal.version by 1"
+        note: "Three-tier escalation cycle: tier N UPHELD -> tier N+1 OPEN."
+      - from: OPEN
+        to: WITHDRAWN
+        trigger: "POST /appeals/{id}/withdraw"
+        actor: Provider
+        preconditions:
+          - "appeal owned by the request's provider (request.provider_id == X-User-ID)"
+        side_effects:
+          - "set status = WITHDRAWN"
+          - "increments Appeal.version by 1"
+
+  - entity: PeerToPeerSession
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "POST /peer-to-peer-sessions/{id}/complete"
+        actor: Payer
+        preconditions:
+          - "acting Payer.id == the session's request.payer_id"
+        side_effects:
+          - "set status = COMPLETED"
+          - "add (slot_end - slot_start) hours to the linked AuthorizationRequest.clock_paused_hours and recompute that request's sla_due_at (cross-entity cascade)"
+          - "increments PeerToPeerSession.version by 1"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /peer-to-peer-sessions/{id}/cancel"
+        actor: Payer
+        preconditions:
+          - "acting Payer.id == the session's request.payer_id"
+        side_effects:
+          - "set status = CANCELLED"
+          - "increments PeerToPeerSession.version by 1"
+        note: "Cancellation frees the reviewer slot; no SLA pause is credited."
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: resubmit-supersede-stale
+    parent_entity: AuthorizationRequest
+    write_endpoint: "POST /authorization-requests"
+    occ_field: "expected_authorizationrequest_version"
+    description: |
+      Submitting a resubmission whose supersedes_request_id points at an
+      EXPIRED AuthorizationRequest whose version has advanced since the
+      client last read it is rejected. This captures the case where the
+      EXPIRED request has already been superseded by another resubmission
+      (which legitimately advanced its version and flipped it to SUPERSEDED);
+      the current client's view of the original is therefore stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: sla_due_at
+    trigger: "on AuthorizationRequest DRAFT->SUBMITTED, SUBMITTED->UNDER_REVIEW, PENDED->UNDER_REVIEW, and on PeerToPeerSession SCHEDULED->COMPLETED (recompute)"
+    algorithm: threshold
+    formula: |
+      base_hours = request.is_expedited ? payer.expedited_sla_hours : payer.standard_sla_hours
+      # clock_paused_hours accumulates: time spent in PENDED plus the duration of
+      # every COMPLETED PeerToPeerSession linked to this request.
+      sla_due_at = review_started_at + (base_hours + clock_paused_hours) hours
+    input_set: "single AuthorizationRequest; clock_paused_hours is the running sum over PENDED intervals and COMPLETED P2P slot durations for this request only"
+    constants:
+      EXPEDITED_DEFAULT_HOURS: 72
+      STANDARD_DEFAULT_HOURS: 168
+    precision: "hours as integer arithmetic on whole-hour additions; datetime to the second"
+    variants:
+      - name: expedited
+        when: "request.is_expedited == true"
+        difference: "base_hours = payer.expedited_sla_hours (72 default) instead of standard_sla_hours (168 default); produces an earlier sla_due_at for identical review_started_at"
+      - name: standard
+        when: "request.is_expedited == false"
+        difference: "base_hours = payer.standard_sla_hours"
+    note: "Combinatorial mode (a): >=3 inputs (is_expedited, payer SLA fields, clock_paused_hours, review_started_at) with a conditional branch on request state."
+
+  - name: member_cost_share
+    trigger: "on AuthorizationRequest DRAFT->SUBMITTED, on UNDER_REVIEW->APPROVED (with approved_units), and on Appeal OVERTURNED cascade"
+    algorithm: aggregation
+    formula: |
+      # Effective units: requested_units at submit time; approved_units once a
+      # decision exists (PARTIAL/APPROVE) or after an overturn.
+      effective_units = (request.status == APPROVED) ? request.approved_units : request.requested_units
+      # Two cost components summed, rounding PINNED to per-line-item then sum:
+      # (1) procedure cost share: round each unit's coinsurance, then multiply.
+      per_unit_share_cents = round_half_up(request.unit_cost_cents * member.coinsurance_rate)   # round PER UNIT first
+      procedure_share_cents = per_unit_share_cents * effective_units
+      # (2) evidence line-item cost share: round each ClinicalEvidence line, then sum.
+      evidence_share_cents = sum over ClinicalEvidence e (request_id == request.id) of
+                             round_half_up(e.line_item_cost_cents * member.coinsurance_rate)
+      member_cost_share_cents = procedure_share_cents + evidence_share_cents
+    input_set: "the request's unit_cost_cents and effective_units, plus ALL ClinicalEvidence rows with request_id == request.id (no status filter — evidence has no lifecycle)"
+    constants: {}
+    precision: "2 implied (cents are integers); round_half_up applied PER LINE ITEM BEFORE summing — NOT sum-then-round"
+    note: "Combinatorial mode (b): nested rounding where order matters; the scaffold pins round-per-line-item-then-sum. Dual-variant DOMAIN A (cost accounting on AuthorizationRequest)."
+
+  - name: approved_units_resolution
+    trigger: "on UNDER_REVIEW->APPROVED via ReviewDecision"
+    algorithm: threshold
+    formula: |
+      if decision.outcome == APPROVE:
+          approved_units = request.requested_units            # full
+      elif decision.outcome == PARTIAL:
+          # provisional vs final: payer may approve fewer units than requested
+          approved_units = decision.approved_units            # 1 <= x <= requested_units
+      else:
+          approved_units = 0
+    input_set: "single ReviewDecision and its parent AuthorizationRequest"
+    constants: {}
+    precision: "integer units"
+    variants:
+      - name: full_approval
+        when: "decision.outcome == APPROVE"
+        difference: "approved_units forced to requested_units; decision.approved_units input ignored"
+      - name: partial_approval
+        when: "decision.outcome == PARTIAL"
+        difference: "approved_units = decision.approved_units, which must be strictly less than requested_units; downstream member_cost_share uses the reduced count, yielding a smaller cost share than a full approval of the same request"
+
+  - name: appeal_deadline
+    trigger: "on Appeal creation (OPEN) and on UPHELD->ESCALATED (new tier OPEN)"
+    algorithm: threshold
+    formula: |
+      tier_window_days = APPEAL_TIER_WINDOW_DAYS[appeal.tier]   # 1->30, 2->30, 3->45
+      expedite_factor = request.is_expedited ? 0.25 : 1.0       # expedited appeals get a quarter of the window
+      window_days = tier_window_days * expedite_factor
+      appeal_deadline_at = appeal.filed_at + window_days days
+    input_set: "single Appeal and its parent request's is_expedited flag"
+    constants:
+      APPEAL_TIER_WINDOW_DAYS: { 1: 30, 2: 30, 3: 45 }
+      EXPEDITE_FACTOR: 0.25
+    precision: "window_days may be fractional; add as days then truncate to the second"
+    variants:
+      - name: standard_appeal
+        when: "request.is_expedited == false"
+        difference: "full tier window (30/30/45 days)"
+      - name: expedited_appeal
+        when: "request.is_expedited == true"
+        difference: "window multiplied by 0.25 — e.g., tier-3 expedited deadline is 45*0.25 = 11.25 days after filing, vs 45 days standard. Dual-variant DOMAIN B (compliance timeline on Appeal, distinct from cost accounting on AuthorizationRequest)."
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /providers, POST /payers, POST /members, POST /reviewers"
+  - priority: 2
+    category: auth
+    check: "acting role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "every path id and every FK in the body references an existing row, validated left-to-right (path ids before body FKs)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 4
+    category: state
+    check: "target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 5
+    category: business_referential
+    check: "referenced Reviewer's payer_id equals the request's payer_id (a reviewer may only act on its own payer's requests)"
+    error_id: ERR_REVIEWER_PAYER_MISMATCH
+    http_status: 422
+    applies_to: "POST /review-decisions, POST /peer-to-peer-sessions"
+  - priority: 6
+    category: business_safety
+    check: "a ReviewDecision (APPROVE/PARTIAL/DENY) cannot be rendered while any PeerToPeerSession for the request is SCHEDULED (the P2P must complete or cancel first)"
+    error_id: ERR_OPEN_P2P_BLOCKS_DECISION
+    http_status: 409
+    applies_to: "POST /review-decisions"
+  - priority: 7
+    category: business_safety
+    check: "DRAFT->SUBMITTED requires at least one ClinicalEvidence row for the request"
+    error_id: ERR_NO_EVIDENCE
+    http_status: 422
+    applies_to: "POST /authorization-requests/{id}/submit"
+  - priority: 8
+    category: business_temporal
+    check: "a PeerToPeerSession slot [slot_start, slot_end) must not collide with another non-CANCELLED slot of the same reviewer, where collision means the half-open intervals overlap OR the gap between them is less than the reviewer's p2p_buffer_minutes"
+    error_id: ERR_P2P_SLOT_CONFLICT
+    http_status: 409
+    applies_to: "POST /peer-to-peer-sessions"
+  - priority: 8.5
+    category: business_temporal
+    check: "approving a request would create a duplicate active authorization: the closed coverage interval [submitted_at, authorization_expires_at] for this Member + procedure_code must not overlap any existing APPROVED (non-EXPIRED, non-SUPERSEDED) AuthorizationRequest for the same Member + procedure_code. Aggregate capacity is exactly one concurrent authorization per (member, procedure_code); closed-interval semantics mean touching endpoints count as overlap."
+    error_id: ERR_DUPLICATE_ACTIVE_AUTH
+    http_status: 409
+    applies_to: "POST /review-decisions, POST /appeals/{id}/decide, POST /appeals/{id}/external-decide"
+  - priority: 9
+    category: business_temporal
+    check: "a ReviewDecision or Appeal decision rendered after the request's sla_due_at / appeal's appeal_deadline_at is rejected as out of window"
+    error_id: ERR_PAST_DEADLINE
+    http_status: 409
+    applies_to: "POST /review-decisions, POST /appeals/{id}/decide, POST /appeals/{id}/external-decide"
+  - priority: 10
+    category: business_constraint
+    check: "PARTIAL decision requires 1 <= approved_units < request.requested_units; APPROVE requires the request not already terminal; rationale required for DENY/PARTIAL; pend_reason required for PEND"
+    error_id: ERR_INVALID_DECISION_FIELDS
+    http_status: 422
+    applies_to: "POST /review-decisions"
+  - priority: 11
+    category: business_constraint
+    check: "an Appeal may only be filed for a request in status DENIED; escalation requires the prior appeal UPHELD with tier < 3 and no OPEN appeal outstanding"
+    error_id: ERR_APPEAL_NOT_ELIGIBLE
+    http_status: 422
+    applies_to: "POST /appeals"
+  - priority: 12
+    category: business_referential
+    check: "a resubmission's supersedes_request_id must reference an EXPIRED request owned by the same member_id and provider_id, not already superseded"
+    error_id: ERR_INVALID_SUPERSEDE_TARGET
+    http_status: 422
+    applies_to: "POST /authorization-requests"
+  - priority: 13
+    category: business_constraint
+    check: "expected_authorizationrequest_version on a supersede resubmission must equal the target request's current version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /authorization-requests"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # --- setup / actor entities ---
+  - method: POST
+    path: "/providers"
+    description: "Register a provider"
+    roles: [Anonymous]
+    code: 201
+    input: [npi, name, specialty]
+    output: Provider
+    side_effects: []
+  - method: GET
+    path: "/providers/{id}"
+    description: "Fetch a provider"
+    roles: [Provider, Payer, ExternalReviewer]
+    code: 200
+    input: []
+    output: Provider
+    side_effects: []
+  - method: POST
+    path: "/payers"
+    description: "Register a payer"
+    roles: [Anonymous]
+    code: 201
+    input: [name, "standard_sla_hours?", "expedited_sla_hours?"]
+    output: Payer
+    side_effects: []
+  - method: GET
+    path: "/payers/{id}"
+    description: "Fetch a payer"
+    roles: [Provider, Payer, ExternalReviewer]
+    code: 200
+    input: []
+    output: Payer
+    side_effects: []
+  - method: POST
+    path: "/members"
+    description: "Register a member under a payer"
+    roles: [Anonymous]
+    code: 201
+    input: [payer_id, member_number, "coinsurance_rate?"]
+    output: Member
+    side_effects: []
+  - method: GET
+    path: "/members/{id}"
+    description: "Fetch a member, including computed active_authorization_count"
+    roles: [Provider, Payer]
+    code: 200
+    input: []
+    output: Member
+    side_effects: []
+  - method: GET
+    path: "/members"
+    description: "List members, optionally filtered by payer_id (FK reverse-reachability for Member.payer_id)"
+    roles: [Provider, Payer]
+    code: 200
+    input: ["payer_id?", "limit?", "offset?"]
+    output: Member[]
+    side_effects: []
+  - method: POST
+    path: "/reviewers"
+    description: "Register a payer clinical reviewer"
+    roles: [Anonymous]
+    code: 201
+    input: [payer_id, name, specialty, "p2p_buffer_minutes?"]
+    output: Reviewer
+    side_effects: []
+  - method: GET
+    path: "/reviewers/{id}"
+    description: "Fetch a reviewer"
+    roles: [Provider, Payer]
+    code: 200
+    input: []
+    output: Reviewer
+    side_effects: []
+  - method: GET
+    path: "/reviewers"
+    description: "List reviewers, optionally filtered by payer_id (FK reverse-reachability for Reviewer.payer_id)"
+    roles: [Provider, Payer]
+    code: 200
+    input: ["payer_id?", "limit?", "offset?"]
+    output: Reviewer[]
+    side_effects: []
+
+  # --- authorization requests ---
+  - method: POST
+    path: "/authorization-requests"
+    description: "Create a prior-authorization request in DRAFT. When supersedes_request_id is present this is a resubmission that supersedes an EXPIRED request (OCC-guarded by expected_authorizationrequest_version)."
+    roles: [Provider]
+    code: 201
+    input: [member_id, provider_id, request_type, procedure_code, requested_units, unit_cost_cents, "is_expedited?", "supersedes_request_id?", "expected_authorizationrequest_version?"]
+    output: AuthorizationRequest
+    side_effects:
+      - "copy payer_id from referenced Member"
+      - "when supersedes_request_id present: set target request status = SUPERSEDED, increments AuthorizationRequest.version by 1 on the superseded target"
+  - method: GET
+    path: "/authorization-requests/{id}"
+    description: "Fetch a request with all computed fields"
+    roles: [Provider, Payer, ExternalReviewer]
+    code: 200
+    input: []
+    output: AuthorizationRequest
+    side_effects: []
+  - method: GET
+    path: "/authorization-requests"
+    description: "List requests, filterable by member_id, provider_id, payer_id, status (FK reverse-reachability for member_id, provider_id, payer_id, and self-ref supersedes_request_id)"
+    roles: [Provider, Payer, ExternalReviewer]
+    code: 200
+    input: ["member_id?", "provider_id?", "payer_id?", "status?", "supersedes_request_id?", "limit?", "offset?"]
+    output: AuthorizationRequest[]
+    side_effects: []
+  - method: POST
+    path: "/authorization-requests/{id}/submit"
+    description: "Submit a DRAFT request for review"
+    roles: [Provider]
+    code: 200
+    input: []
+    output: AuthorizationRequest
+    side_effects: ["set submitted_at, review_started_at; compute sla_due_at, member_cost_share_cents; increments AuthorizationRequest.version by 1"]
+  - method: POST
+    path: "/authorization-requests/{id}/start-review"
+    description: "Payer moves a SUBMITTED request to UNDER_REVIEW"
+    roles: [Payer]
+    code: 200
+    input: []
+    output: AuthorizationRequest
+    side_effects: ["set review_started_at; recompute sla_due_at; increments AuthorizationRequest.version by 1"]
+  - method: POST
+    path: "/authorization-requests/{id}/resume-review"
+    description: "Payer resumes a PENDED request to UNDER_REVIEW once new evidence is supplied"
+    roles: [Payer]
+    code: 200
+    input: []
+    output: AuthorizationRequest
+    side_effects: ["accrue clock_paused_hours; reset review_started_at; recompute sla_due_at; increments AuthorizationRequest.version by 1"]
+  - method: POST
+    path: "/authorization-requests/{id}/expire"
+    description: "Force an APPROVED request to EXPIRED when the clock is at/after authorization_expires_at"
+    roles: [Payer]
+    code: 200
+    input: []
+    output: AuthorizationRequest
+    side_effects: ["set status EXPIRED; decrement Member.active_authorization_count (floored at 0); increments AuthorizationRequest.version by 1"]
+
+  # --- evidence ---
+  - method: POST
+    path: "/clinical-evidence"
+    description: "Upload a clinical evidence document for a request"
+    roles: [Provider]
+    code: 201
+    input: [request_id, document_type, line_item_cost_cents, uri]
+    output: ClinicalEvidence
+    side_effects: []
+  - method: GET
+    path: "/clinical-evidence/{id}"
+    description: "Fetch one evidence document"
+    roles: [Provider, Payer, ExternalReviewer]
+    code: 200
+    input: []
+    output: ClinicalEvidence
+    side_effects: []
+  - method: GET
+    path: "/clinical-evidence"
+    description: "List evidence, filterable by request_id (FK reverse-reachability for ClinicalEvidence.request_id)"
+    roles: [Provider, Payer, ExternalReviewer]
+    code: 200
+    input: ["request_id?", "limit?", "offset?"]
+    output: ClinicalEvidence[]
+    side_effects: []
+
+  # --- review decisions ---
+  - method: POST
+    path: "/review-decisions"
+    description: "Payer reviewer renders a decision on an UNDER_REVIEW request; drives the request to APPROVED/DENIED/PENDED"
+    roles: [Payer]
+    code: 201
+    input: [request_id, reviewer_id, outcome, "approved_units?", "rationale?", "pend_reason?"]
+    output: ReviewDecision
+    side_effects:
+      - "transition the request per outcome (APPROVE/PARTIAL->APPROVED, DENY->DENIED, PEND->PENDED)"
+      - "on APPROVE/PARTIAL: set approved_units, authorization_expires_at, recompute member_cost_share_cents, increment Member.active_authorization_count (cascade)"
+      - "increments AuthorizationRequest.version by 1"
+  - method: GET
+    path: "/review-decisions/{id}"
+    description: "Fetch a review decision"
+    roles: [Provider, Payer, ExternalReviewer]
+    code: 200
+    input: []
+    output: ReviewDecision
+    side_effects: []
+  - method: GET
+    path: "/review-decisions"
+    description: "List decisions, filterable by request_id and reviewer_id (FK reverse-reachability for ReviewDecision.request_id and ReviewDecision.reviewer_id)"
+    roles: [Provider, Payer, ExternalReviewer]
+    code: 200
+    input: ["request_id?", "reviewer_id?", "limit?", "offset?"]
+    output: ReviewDecision[]
+    side_effects: []
+
+  # --- peer to peer ---
+  - method: POST
+    path: "/peer-to-peer-sessions"
+    description: "Schedule a Peer-to-Peer discussion slot for a request on a reviewer"
+    roles: [Payer]
+    code: 201
+    input: [request_id, reviewer_id, slot_start, slot_end]
+    output: PeerToPeerSession
+    side_effects: []
+  - method: GET
+    path: "/peer-to-peer-sessions/{id}"
+    description: "Fetch a P2P session"
+    roles: [Provider, Payer]
+    code: 200
+    input: []
+    output: PeerToPeerSession
+    side_effects: []
+  - method: GET
+    path: "/peer-to-peer-sessions"
+    description: "List P2P sessions, filterable by request_id and reviewer_id (FK reverse-reachability for PeerToPeerSession.request_id and PeerToPeerSession.reviewer_id)"
+    roles: [Provider, Payer]
+    code: 200
+    input: ["request_id?", "reviewer_id?", "limit?", "offset?"]
+    output: PeerToPeerSession[]
+    side_effects: []
+  - method: POST
+    path: "/peer-to-peer-sessions/{id}/complete"
+    description: "Mark a P2P slot COMPLETED; credits its duration to the request's SLA pause"
+    roles: [Payer]
+    code: 200
+    input: []
+    output: PeerToPeerSession
+    side_effects: ["add slot duration to request.clock_paused_hours; recompute request.sla_due_at; increments PeerToPeerSession.version by 1"]
+  - method: POST
+    path: "/peer-to-peer-sessions/{id}/cancel"
+    description: "Cancel a SCHEDULED P2P slot"
+    roles: [Payer]
+    code: 200
+    input: []
+    output: PeerToPeerSession
+    side_effects: ["set status CANCELLED; increments PeerToPeerSession.version by 1"]
+
+  # --- appeals ---
+  - method: POST
+    path: "/appeals"
+    description: "File a tier-1 appeal on a DENIED request, OR escalate (new tier = prior.tier+1) when the prior appeal was UPHELD"
+    roles: [Provider]
+    code: 201
+    input: [request_id]
+    output: Appeal
+    side_effects:
+      - "create Appeal (tier 1 if none exists, else prior.tier+1); compute appeal_deadline_at"
+      - "on escalation: set prior appeal status ESCALATED, increments Appeal.version by 1 on the prior appeal"
+  - method: GET
+    path: "/appeals/{id}"
+    description: "Fetch an appeal"
+    roles: [Provider, Payer, ExternalReviewer]
+    code: 200
+    input: []
+    output: Appeal
+    side_effects: []
+  - method: GET
+    path: "/appeals"
+    description: "List appeals, filterable by request_id (FK reverse-reachability for Appeal.request_id)"
+    roles: [Provider, Payer, ExternalReviewer]
+    code: 200
+    input: ["request_id?", "limit?", "offset?"]
+    output: Appeal[]
+    side_effects: []
+  - method: POST
+    path: "/appeals/{id}/decide"
+    description: "Payer renders a tier-1 or tier-2 appeal decision (UPHELD or OVERTURNED)"
+    roles: [Payer]
+    code: 200
+    input: [decision, decision_rationale]
+    output: Appeal
+    side_effects:
+      - "set appeal status; on OVERTURNED cascade the request DENIED->APPROVED and increment Member.active_authorization_count"
+      - "increments Appeal.version by 1"
+  - method: POST
+    path: "/appeals/{id}/external-decide"
+    description: "External IRO renders a binding tier-3 appeal decision (UPHELD or OVERTURNED)"
+    roles: [ExternalReviewer]
+    code: 200
+    input: [decision, decision_rationale]
+    output: Appeal
+    side_effects:
+      - "set appeal status; on OVERTURNED cascade the request DENIED->APPROVED and increment Member.active_authorization_count"
+      - "increments Appeal.version by 1"
+  - method: POST
+    path: "/appeals/{id}/withdraw"
+    description: "Provider withdraws an OPEN appeal"
+    roles: [Provider]
+    code: 200
+    input: []
+    output: Appeal
+    side_effects: ["set status WITHDRAWN; increments Appeal.version by 1"]
+
+  # --- test-driving clock ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving endpoint: set the server's current UTC clock to a fixed instant"
+    roles: [Provider, Payer, ExternalReviewer]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock pinned; auto-expiry sweep NOT triggered (use /expire)"]
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing or malformed X-User-Role / X-User-ID on a protected endpoint"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "acting role not permitted for the operation per §1.7"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a path id or body FK references a non-existent row"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested transition is not defined from the resource's current state"
+  - id: ERR_REVIEWER_PAYER_MISMATCH
+    http: 422
+    condition: "referenced reviewer's payer_id != the request's payer_id"
+  - id: ERR_OPEN_P2P_BLOCKS_DECISION
+    http: 409
+    condition: "a ReviewDecision is attempted while a SCHEDULED PeerToPeerSession exists for the request"
+  - id: ERR_NO_EVIDENCE
+    http: 422
+    condition: "submit attempted on a request with zero ClinicalEvidence rows"
+  - id: ERR_P2P_SLOT_CONFLICT
+    http: 409
+    condition: "P2P slot overlaps, or falls within p2p_buffer_minutes of, another non-CANCELLED slot of the same reviewer"
+  - id: ERR_PAST_DEADLINE
+    http: 409
+    condition: "decision rendered after sla_due_at (review) or appeal_deadline_at (appeal)"
+  - id: ERR_DUPLICATE_ACTIVE_AUTH
+    http: 409
+    condition: "approval would create an overlapping concurrent active authorization for the same member + procedure_code (closed-interval, capacity-1 semantics)"
+  - id: ERR_INVALID_DECISION_FIELDS
+    http: 422
+    condition: "decision field combination invalid (PARTIAL units out of range, missing rationale/pend_reason)"
+  - id: ERR_APPEAL_NOT_ELIGIBLE
+    http: 422
+    condition: "appeal filed on a non-DENIED request, or escalation without an UPHELD tier<3 prior, or an OPEN appeal already outstanding"
+  - id: ERR_INVALID_SUPERSEDE_TARGET
+    http: 422
+    condition: "supersedes_request_id target is not EXPIRED, belongs to a different member/provider, or is already superseded"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_authorizationrequest_version != target request's current version on a supersede resubmission"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "a required input field is missing or has an invalid type/enum/range value"
+  - id: ERR_PAGINATION_INVALID
+    http: 400
+    condition: "limit/offset outside allowed bounds"
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: Anonymous
+    description: "Unauthenticated registration surface"
+    identity: opaque
+    exclusive_operations:
+      - "POST /providers"
+      - "POST /payers"
+      - "POST /members"
+      - "POST /reviewers"
+    shared_operations: []
+  - name: Provider
+    description: "Requesting provider; owns AuthorizationRequest, ClinicalEvidence, and files/withdraws appeals"
+    identity: "entity_backed:Provider"
+    exclusive_operations:
+      - "POST /authorization-requests"
+      - "POST /authorization-requests/{id}/submit"
+      - "POST /clinical-evidence"
+      - "POST /appeals"
+      - "POST /appeals/{id}/withdraw"
+    shared_operations:
+      - "GET /authorization-requests, GET /authorization-requests/{id}"
+      - "GET /clinical-evidence, GET /review-decisions, GET /appeals, GET /peer-to-peer-sessions"
+      - "POST /_clock/set_current_utc"
+  - name: Payer
+    description: "Insurance payer; starts/resumes/expires review, renders ReviewDecisions, schedules/completes/cancels P2P, decides tier-1/2 appeals"
+    identity: "entity_backed:Payer"
+    exclusive_operations:
+      - "POST /authorization-requests/{id}/start-review"
+      - "POST /authorization-requests/{id}/resume-review"
+      - "POST /authorization-requests/{id}/expire"
+      - "POST /review-decisions"
+      - "POST /peer-to-peer-sessions"
+      - "POST /peer-to-peer-sessions/{id}/complete"
+      - "POST /peer-to-peer-sessions/{id}/cancel"
+      - "POST /appeals/{id}/decide"
+    shared_operations:
+      - "GET /authorization-requests, GET /authorization-requests/{id}"
+      - "GET /clinical-evidence, GET /review-decisions, GET /appeals, GET /peer-to-peer-sessions"
+      - "POST /_clock/set_current_utc"
+  - name: ExternalReviewer
+    description: "Independent Review Organization (IRO); renders binding tier-3 appeal decisions only"
+    identity: opaque
+    exclusive_operations:
+      - "POST /appeals/{id}/external-decide"
+    shared_operations:
+      - "GET /authorization-requests, GET /authorization-requests/{id}"
+      - "GET /clinical-evidence, GET /review-decisions, GET /appeals"
+      - "POST /_clock/set_current_utc"

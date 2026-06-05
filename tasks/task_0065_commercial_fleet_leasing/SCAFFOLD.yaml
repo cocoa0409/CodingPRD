@@ -1,0 +1,1544 @@
+scenario: "Commercial Fleet Leasing: vehicle allocation, mileage/fuel card/maintenance, Telematics, mileage overage settlement, collision repair, lease-end return, IFTA fuel tax filing"
+domain_name: commercial-fleet-leasing
+api_prefix: /fleet
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: ledger_reconciliation
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - derived_field_reconciliation
+    - rate_threshold_triggers
+
+  entity_topology: flat
+  # Peer entities (Lessee, Vehicle, Lease, Driver, Allocation, FuelCard, ...) linked by
+  # foreign keys carried in request bodies; no deep URL nesting beyond one sub-resource hop.
+
+  state_machine_shape: branching
+  # Vehicle and Lease carry branching + revert shapes; Allocation has a revert path;
+  # RepairOrder forks ASSESSED -> {APPROVED, TOTAL_LOSS}.
+
+  relationship_patterns:
+    - one_to_many        # Lessee -> Drivers, Lease -> FuelCards, Vehicle -> TelematicsReadings
+    - cross_aggregate    # RepairOrder references both Vehicle and Lease across aggregates
+
+  role_model: peer_roles
+  # FleetManager (lessor operator), Lessee (customer company), Driver, plus opaque
+  # ComplianceOfficer for IFTA filing and a TelematicsGateway device principal.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ============================================================================
+# §1.1 Entity-Relationship Table
+# ============================================================================
+entities:
+  - name: Lessee
+    parent: null
+    common_fields: true
+    fields:
+      - name: company_name
+        type: string
+        source: input
+        description: Legal name of the leasing customer company.
+      - name: billing_email
+        type: string
+        source: input
+        description: Contact email for invoices and settlements.
+      - name: account_status
+        type: enum
+        source: system
+        description: Account standing.
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED}"
+      - name: outstanding_balance_cents
+        type: integer
+        source: computed
+        description: "Sum of OverageSettlement.net_charge_cents and RepairOrder.lessee_responsible_cents across this Lessee's leases whose settlement is FINALIZED/CHARGED but not yet paid; reconciled on every settlement finalization."
+        default: 0
+
+  - name: Driver
+    parent: null
+    common_fields: true
+    fields:
+      - name: lessee_id
+        type: string
+        source: input
+        description: "FK -> Lessee.id; the company this driver works for."
+      - name: full_name
+        type: string
+        source: input
+        description: Driver full name.
+      - name: license_number
+        type: string
+        source: input
+        description: Commercial driver license number.
+        constraints: "unique across all Drivers"
+      - name: license_status
+        type: enum
+        source: system
+        description: License standing gating allocation.
+        default: VALID
+        constraints: "one of {VALID, SUSPENDED}"
+
+  - name: Vehicle
+    parent: null
+    common_fields: true
+    fields:
+      - name: vin
+        type: string
+        source: input
+        description: Vehicle identification number.
+        constraints: "unique across all Vehicles"
+      - name: class
+        type: enum
+        source: input
+        description: Vehicle weight class for IFTA qualification.
+        constraints: "one of {LIGHT_DUTY, MEDIUM_DUTY, HEAVY_DUTY}"
+      - name: status
+        type: enum
+        source: system
+        description: Lifecycle state (see §1.2).
+        default: AVAILABLE
+        constraints: "one of {AVAILABLE, ALLOCATED, IN_MAINTENANCE, IN_REPAIR, RETIRED}"
+      - name: odometer_miles
+        type: integer
+        source: system
+        description: "Latest odometer reading in miles; advanced by telematics readings and by lease-end return."
+        default: 0
+      - name: open_block_count
+        type: integer
+        source: computed
+        description: "Count of non-terminal blockers (MaintenanceOrder in {SCHEDULED,IN_PROGRESS} plus RepairOrder not in {COMPLETED,TOTAL_LOSS_SETTLED,REJECTED}) on this Vehicle; gates return to AVAILABLE."
+        default: 0
+
+  - name: Lease
+    parent: null
+    common_fields: true
+    fields:
+      - name: lessee_id
+        type: string
+        source: input
+        description: "FK -> Lessee.id; the customer holding the lease."
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the leased vehicle."
+      - name: status
+        type: enum
+        source: system
+        description: Lease lifecycle state (see §1.2).
+        default: DRAFT
+        constraints: "one of {DRAFT, ACTIVE, RETURN_INITIATED, PENDING_SETTLEMENT, CLOSED, CANCELLED}"
+      - name: term_start
+        type: datetime
+        source: input
+        description: Lease term start (ISO 8601 UTC).
+      - name: term_end
+        type: datetime
+        source: input
+        description: Contracted lease term end (ISO 8601 UTC).
+      - name: contracted_miles
+        type: integer
+        source: input
+        description: Mileage cap included in the lease over the full term.
+        constraints: "integer >= 0"
+      - name: per_mile_overage_cents
+        type: integer
+        source: input
+        description: Flat per-excess-mile rate used by the CONTRACT_FLAT overage variant.
+        constraints: "integer >= 0"
+      - name: overage_model
+        type: enum
+        source: input
+        description: Which overage settlement variant applies at lease end.
+        constraints: "one of {CONTRACT_FLAT, TIERED_EXCESS}"
+      - name: collision_deductible_cents
+        type: integer
+        source: input
+        description: Lessee deductible used in the collision-repair waterfall.
+        constraints: "integer >= 0"
+      - name: waterfall_model
+        type: enum
+        source: input
+        description: Which collision-repair allocation ordering applies (see §1.3 variants).
+        constraints: "one of {DEDUCTIBLE_FIRST, INSURANCE_FIRST}"
+      - name: odometer_start
+        type: integer
+        source: system
+        description: "Vehicle odometer captured when the lease activated; baseline for overage."
+        default: 0
+      - name: odometer_end
+        type: integer
+        source: system
+        description: "Vehicle odometer captured at lease-end return; 0 until return."
+        default: 0
+
+  - name: Allocation
+    parent: null
+    common_fields: true
+    fields:
+      - name: lease_id
+        type: string
+        source: input
+        description: "FK -> Lease.id; the lease whose vehicle is being assigned."
+      - name: driver_id
+        type: string
+        source: input
+        description: "FK -> Driver.id; the driver receiving the vehicle."
+      - name: status
+        type: enum
+        source: system
+        description: Allocation lifecycle (see §1.2).
+        default: ASSIGNED
+        constraints: "one of {ASSIGNED, RELEASED}"
+      - name: window_start
+        type: datetime
+        source: input
+        description: Start of the assignment interval (ISO 8601 UTC); half-open interval [start, end).
+      - name: window_end
+        type: datetime
+        source: input
+        description: End of the assignment interval (ISO 8601 UTC); half-open interval [start, end).
+
+  - name: FuelCard
+    parent: null
+    common_fields: true
+    fields:
+      - name: lease_id
+        type: string
+        source: input
+        description: "FK -> Lease.id; the lease this card draws against."
+      - name: card_number
+        type: string
+        source: input
+        description: Masked fuel card number.
+        constraints: "unique across all FuelCards"
+      - name: status
+        type: enum
+        source: system
+        description: Card state.
+        default: ACTIVE
+        constraints: "one of {ACTIVE, FROZEN, CLOSED}"
+      - name: total_gallons_purchased
+        type: number
+        source: computed
+        description: "Sum of FuelTransaction.gallons for POSTED transactions on this card; reconciled on each post."
+        default: 0
+
+  - name: FuelTransaction
+    parent: null
+    common_fields: false
+    fields:
+      - name: fuel_card_id
+        type: string
+        source: input
+        description: "FK -> FuelCard.id; the card charged."
+      - name: jurisdiction
+        type: enum
+        source: input
+        description: US/CA jurisdiction (two-letter code) where fuel was purchased; drives IFTA apportionment.
+        constraints: "one of {CA, NV, AZ, OR, TX, WA}"
+      - name: gallons
+        type: number
+        source: input
+        description: Gallons dispensed.
+        constraints: "number > 0"
+      - name: purchased_at
+        type: datetime
+        source: input
+        description: Purchase timestamp (ISO 8601 UTC); determines IFTA quarter.
+      - name: status
+        type: enum
+        source: system
+        description: Transaction state.
+        default: POSTED
+        constraints: "one of {POSTED, VOIDED}"
+
+  - name: TelematicsReading
+    parent: null
+    common_fields: false
+    fields:
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the reporting vehicle."
+      - name: jurisdiction
+        type: enum
+        source: input
+        description: Jurisdiction the miles were driven in; drives IFTA mileage apportionment.
+        constraints: "one of {CA, NV, AZ, OR, TX, WA}"
+      - name: odometer_miles
+        type: integer
+        source: input
+        description: Cumulative odometer at time of reading; must be monotonic non-decreasing per vehicle.
+        constraints: "integer >= current Vehicle.odometer_miles"
+      - name: segment_miles
+        type: integer
+        source: input
+        description: Miles driven in this jurisdiction since the prior reading.
+        constraints: "integer >= 0"
+      - name: harsh_events
+        type: integer
+        source: input
+        description: Count of harsh-braking/acceleration events in this segment (excess-wear scoring input).
+        default: 0
+      - name: idle_minutes
+        type: integer
+        source: input
+        description: Engine idle minutes in this segment (excess-wear scoring input).
+        default: 0
+      - name: recorded_at
+        type: datetime
+        source: input
+        description: Reading timestamp (ISO 8601 UTC).
+
+  - name: MaintenanceOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the vehicle serviced."
+      - name: kind
+        type: enum
+        source: input
+        description: Maintenance category.
+        constraints: "one of {PREVENTIVE, CORRECTIVE, RECALL}"
+      - name: window_start
+        type: datetime
+        source: input
+        description: Scheduled shop start (ISO 8601 UTC); closed interval, buffer-expanded for overlap detection.
+      - name: window_end
+        type: datetime
+        source: input
+        description: Scheduled shop end (ISO 8601 UTC); closed interval, buffer-expanded for overlap detection.
+      - name: status
+        type: enum
+        source: system
+        description: Maintenance lifecycle (see §1.2).
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, IN_PROGRESS, COMPLETED, CANCELLED}"
+      - name: labor_cents
+        type: integer
+        source: input
+        description: Labor cost component.
+        constraints: "integer >= 0"
+      - name: parts_cents
+        type: integer
+        source: input
+        description: Parts cost component.
+        constraints: "integer >= 0"
+      - name: total_cost_cents
+        type: integer
+        source: computed
+        description: "labor_cents + parts_cents, pinned at COMPLETED."
+        default: 0
+
+  - name: RepairOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the damaged vehicle."
+      - name: lease_id
+        type: string
+        source: input
+        description: "FK -> Lease.id; the lease whose deductible and lessee-responsibility apply."
+      - name: status
+        type: enum
+        source: system
+        description: Collision repair lifecycle (see §1.2).
+        default: REPORTED
+        constraints: "one of {REPORTED, ASSESSED, APPROVED, COMPLETED, TOTAL_LOSS, TOTAL_LOSS_SETTLED, REJECTED}"
+      - name: estimate_cents
+        type: integer
+        source: input
+        description: Adjuster repair-cost estimate set at assessment.
+        default: 0
+        constraints: "integer >= 0"
+      - name: insurance_cap_cents
+        type: integer
+        source: input
+        description: Maximum the insurer covers (bucket 2 of waterfall); set at assessment.
+        default: 0
+        constraints: "integer >= 0"
+      - name: driver_deductible_cents
+        type: integer
+        source: computed
+        description: "Bucket-1 allocation = min(estimate_cents, Lease.collision_deductible_cents); pinned at APPROVED."
+        default: 0
+      - name: insurance_paid_cents
+        type: integer
+        source: computed
+        description: "Bucket-2 allocation; pinned at APPROVED."
+        default: 0
+      - name: lessee_responsible_cents
+        type: integer
+        source: computed
+        description: "Bucket-1 + bucket-3 overflow the lessee owes; pinned at APPROVED."
+        default: 0
+
+  - name: OverageSettlement
+    parent: null
+    common_fields: true
+    fields:
+      - name: lease_id
+        type: string
+        source: input
+        description: "FK -> Lease.id; the lease being settled at return."
+      - name: status
+        type: enum
+        source: system
+        description: Settlement lifecycle (see §1.2).
+        default: DRAFT
+        constraints: "one of {DRAFT, FINALIZED}"
+      - name: excess_miles
+        type: integer
+        source: computed
+        description: "max(0, Lease.odometer_end - Lease.odometer_start - Lease.contracted_miles); pinned at FINALIZED."
+        default: 0
+      - name: mileage_charge_cents
+        type: integer
+        source: computed
+        description: "Overage charge per Lease.overage_model variant; pinned at FINALIZED."
+        default: 0
+      - name: excess_wear_score
+        type: number
+        source: computed
+        description: "Weighted telematics wear score (see §1.3); pinned at FINALIZED."
+        default: 0
+      - name: excess_wear_charge_cents
+        type: integer
+        source: computed
+        description: "EXCESS_WEAR_FLAT_CENTS when excess_wear_score > WEAR_THRESHOLD, else 0; pinned at FINALIZED."
+        default: 0
+      - name: net_charge_cents
+        type: integer
+        source: computed
+        description: "mileage_charge_cents + excess_wear_charge_cents; pinned at FINALIZED."
+        default: 0
+
+  - name: IftaReturn
+    parent: null
+    common_fields: true
+    fields:
+      - name: lessee_id
+        type: string
+        source: input
+        description: "FK -> Lessee.id; the carrier filing the return."
+      - name: quarter
+        type: string
+        source: input
+        description: IFTA reporting quarter, e.g. '2026Q1'.
+        constraints: "matches ^[0-9]{4}Q[1-4]$; unique per (lessee_id, quarter)"
+      - name: status
+        type: enum
+        source: system
+        description: Filing lifecycle (see §1.2).
+        default: DRAFT
+        constraints: "one of {DRAFT, FILED}"
+      - name: fleet_mpg
+        type: number
+        source: computed
+        description: "total_qualified_miles / total_qualified_gallons across the quarter; pinned at FILED, 3 decimals."
+        default: 0
+      - name: net_tax_due_cents
+        type: integer
+        source: computed
+        description: "Sum over jurisdictions of (tax_owed - tax_paid), per-jurisdiction rounding (see §1.3); pinned at FILED."
+        default: 0
+
+# ============================================================================
+# §1.2 State Machine Table
+# ============================================================================
+state_machines:
+  - entity: Vehicle
+    initial_state: AVAILABLE
+    terminal_states: [RETIRED]
+    transitions:
+      - from: AVAILABLE
+        to: ALLOCATED
+        trigger: "system event: a Lease referencing this Vehicle transitions DRAFT->ACTIVE"
+        actor: system
+        preconditions:
+          - "Vehicle.status == AVAILABLE"
+        side_effects:
+          - "set Vehicle.status = ALLOCATED"
+      - from: ALLOCATED
+        to: AVAILABLE
+        trigger: "system event: the Lease referencing this Vehicle transitions to CLOSED (lease-end return completed)"
+        actor: system
+        preconditions:
+          - "Vehicle.open_block_count == 0"
+        side_effects:
+          - "set Vehicle.status = AVAILABLE"
+      - from: ALLOCATED
+        to: IN_MAINTENANCE
+        trigger: "system event: a MaintenanceOrder on this Vehicle transitions to IN_PROGRESS"
+        actor: system
+        preconditions:
+          - "Vehicle.status == ALLOCATED"
+        side_effects:
+          - "set Vehicle.status = IN_MAINTENANCE"
+      - from: IN_MAINTENANCE
+        to: ALLOCATED
+        trigger: "system event: the MaintenanceOrder transitions IN_PROGRESS->COMPLETED and no other blocker is open"
+        actor: system
+        preconditions:
+          - "Vehicle.open_block_count == 0"
+        side_effects:
+          - "set Vehicle.status = ALLOCATED"
+      - from: ALLOCATED
+        to: IN_REPAIR
+        trigger: "system event: a RepairOrder on this Vehicle transitions to APPROVED"
+        actor: system
+        preconditions:
+          - "Vehicle.status == ALLOCATED"
+        side_effects:
+          - "set Vehicle.status = IN_REPAIR"
+      - from: IN_REPAIR
+        to: ALLOCATED
+        trigger: "system event: the RepairOrder transitions APPROVED->COMPLETED and no other blocker is open"
+        actor: system
+        preconditions:
+          - "Vehicle.open_block_count == 0"
+        side_effects:
+          - "set Vehicle.status = ALLOCATED"
+      - from: IN_REPAIR
+        to: RETIRED
+        trigger: "system event: a RepairOrder on this Vehicle transitions to TOTAL_LOSS_SETTLED"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "set Vehicle.status = RETIRED"
+
+  - entity: Lease
+    initial_state: DRAFT
+    terminal_states: [CLOSED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /fleet/leases/{id}/activate"
+        actor: FleetManager
+        preconditions:
+          - "Lease.status == DRAFT"
+          - "referenced Vehicle.status == AVAILABLE"
+          - "Lessee.account_status == ACTIVE"
+        side_effects:
+          - "set Lease.odometer_start = Vehicle.odometer_miles"
+          - "cascade: Vehicle AVAILABLE->ALLOCATED"
+          - "increments Lease.version by 1"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /fleet/leases/{id}/cancel"
+        actor: FleetManager
+        preconditions:
+          - "Lease.status == DRAFT"
+        side_effects:
+          - "set Lease.status = CANCELLED"
+      - from: ACTIVE
+        to: RETURN_INITIATED
+        trigger: "POST /fleet/leases/{id}/initiate-return"
+        actor: FleetManager
+        preconditions:
+          - "Lease.status == ACTIVE"
+          - "no Allocation on this Lease is in status ASSIGNED"
+        side_effects:
+          - "set Lease.odometer_end = Vehicle.odometer_miles"
+          - "freeze all ACTIVE FuelCards on this Lease (cascade: FuelCard ACTIVE->FROZEN)"
+          - "increments Lease.version by 1"
+      - from: RETURN_INITIATED
+        to: PENDING_SETTLEMENT
+        trigger: "POST /fleet/overage-settlements"
+        actor: FleetManager
+        preconditions:
+          - "Lease.status == RETURN_INITIATED"
+          - "no existing OverageSettlement for this Lease"
+        side_effects:
+          - "create OverageSettlement in DRAFT for this Lease"
+          - "set Lease.status = PENDING_SETTLEMENT"
+      - from: PENDING_SETTLEMENT
+        to: CLOSED
+        trigger: "system event: the Lease's OverageSettlement transitions DRAFT->FINALIZED"
+        actor: system
+        preconditions:
+          - "Vehicle.open_block_count == 0"
+        side_effects:
+          - "cascade: Vehicle ALLOCATED->AVAILABLE"
+          - "set Lease.status = CLOSED"
+
+  - entity: Allocation
+    initial_state: ASSIGNED
+    terminal_states: [RELEASED]
+    transitions:
+      - from: ASSIGNED
+        to: RELEASED
+        trigger: "POST /fleet/allocations/{id}/release"
+        actor: FleetManager
+        preconditions:
+          - "Allocation.status == ASSIGNED"
+        side_effects:
+          - "set Allocation.status = RELEASED"
+
+  - entity: MaintenanceOrder
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: IN_PROGRESS
+        trigger: "POST /fleet/maintenance-orders/{id}/start"
+        actor: FleetManager
+        preconditions:
+          - "MaintenanceOrder.status == SCHEDULED"
+          - "Vehicle.status IN {ALLOCATED, IN_MAINTENANCE}"
+        side_effects:
+          - "increment Vehicle.open_block_count by 1"
+          - "cascade: Vehicle ALLOCATED->IN_MAINTENANCE (only if Vehicle.status == ALLOCATED)"
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /fleet/maintenance-orders/{id}/complete"
+        actor: FleetManager
+        preconditions:
+          - "MaintenanceOrder.status == IN_PROGRESS"
+        side_effects:
+          - "set MaintenanceOrder.total_cost_cents = labor_cents + parts_cents"
+          - "decrement Vehicle.open_block_count by 1"
+          - "cascade: Vehicle IN_MAINTENANCE->ALLOCATED (only if open_block_count reaches 0 and Vehicle.status == IN_MAINTENANCE)"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /fleet/maintenance-orders/{id}/cancel"
+        actor: FleetManager
+        preconditions:
+          - "MaintenanceOrder.status == SCHEDULED"
+        side_effects:
+          - "set MaintenanceOrder.status = CANCELLED"
+
+  - entity: RepairOrder
+    initial_state: REPORTED
+    terminal_states: [COMPLETED, TOTAL_LOSS_SETTLED, REJECTED]
+    transitions:
+      - from: REPORTED
+        to: ASSESSED
+        trigger: "POST /fleet/repair-orders/{id}/assess"
+        actor: FleetManager
+        preconditions:
+          - "RepairOrder.status == REPORTED"
+        side_effects:
+          - "set RepairOrder.estimate_cents and insurance_cap_cents from request"
+          - "increment Vehicle.open_block_count by 1"
+      - from: ASSESSED
+        to: APPROVED
+        trigger: "POST /fleet/repair-orders/{id}/approve"
+        actor: FleetManager
+        preconditions:
+          - "RepairOrder.status == ASSESSED"
+          - "RepairOrder.estimate_cents <= TOTAL_LOSS_RATIO * insurance_cap_cents (not a total loss)"
+        side_effects:
+          - "run collision waterfall (see §1.3): pin driver_deductible_cents, insurance_paid_cents, lessee_responsible_cents"
+          - "cascade: Vehicle ALLOCATED->IN_REPAIR"
+      - from: ASSESSED
+        to: TOTAL_LOSS
+        trigger: "POST /fleet/repair-orders/{id}/declare-total-loss"
+        actor: FleetManager
+        preconditions:
+          - "RepairOrder.status == ASSESSED"
+          - "RepairOrder.estimate_cents > TOTAL_LOSS_RATIO * insurance_cap_cents"
+        side_effects:
+          - "set RepairOrder.status = TOTAL_LOSS"
+      - from: APPROVED
+        to: COMPLETED
+        trigger: "POST /fleet/repair-orders/{id}/complete"
+        actor: FleetManager
+        preconditions:
+          - "RepairOrder.status == APPROVED"
+        side_effects:
+          - "decrement Vehicle.open_block_count by 1"
+          - "cascade: Vehicle IN_REPAIR->ALLOCATED (only if open_block_count reaches 0)"
+      - from: TOTAL_LOSS
+        to: TOTAL_LOSS_SETTLED
+        trigger: "POST /fleet/repair-orders/{id}/settle-total-loss"
+        actor: FleetManager
+        preconditions:
+          - "RepairOrder.status == TOTAL_LOSS"
+        side_effects:
+          - "run collision waterfall (see §1.3): pin driver_deductible_cents, insurance_paid_cents, lessee_responsible_cents"
+          - "add RepairOrder.lessee_responsible_cents to Lessee.outstanding_balance_cents"
+          - "decrement Vehicle.open_block_count by 1"
+          - "cascade: Vehicle IN_REPAIR->RETIRED"
+      - from: ASSESSED
+        to: REJECTED
+        trigger: "POST /fleet/repair-orders/{id}/reject"
+        actor: FleetManager
+        preconditions:
+          - "RepairOrder.status == ASSESSED"
+        side_effects:
+          - "decrement Vehicle.open_block_count by 1"
+
+  - entity: OverageSettlement
+    initial_state: DRAFT
+    terminal_states: [FINALIZED]
+    transitions:
+      - from: DRAFT
+        to: FINALIZED
+        trigger: "POST /fleet/overage-settlements/{id}/finalize"
+        actor: FleetManager
+        preconditions:
+          - "OverageSettlement.status == DRAFT"
+          - "Lease.status == PENDING_SETTLEMENT"
+        side_effects:
+          - "pin excess_miles, mileage_charge_cents, excess_wear_score, excess_wear_charge_cents, net_charge_cents (see §1.3)"
+          - "add net_charge_cents to Lessee.outstanding_balance_cents"
+          - "cascade: Lease PENDING_SETTLEMENT->CLOSED (which cascades Vehicle ALLOCATED->AVAILABLE)"
+          - "increments OverageSettlement.version by 1"
+
+  - entity: IftaReturn
+    initial_state: DRAFT
+    terminal_states: [FILED]
+    transitions:
+      - from: DRAFT
+        to: FILED
+        trigger: "POST /fleet/ifta-returns/{id}/file"
+        actor: ComplianceOfficer
+        preconditions:
+          - "IftaReturn.status == DRAFT"
+          - "total_qualified_gallons > 0 (at least one POSTED FuelTransaction in quarter)"
+        side_effects:
+          - "pin fleet_mpg and net_tax_due_cents (see §1.3)"
+          - "increments IftaReturn.version by 1"
+
+  - entity: FuelTransaction
+    initial_state: POSTED
+    terminal_states: [VOIDED]
+    transitions:
+      - from: POSTED
+        to: VOIDED
+        trigger: "POST /fleet/fuel-transactions/{id}/void"
+        actor: FleetManager
+        preconditions:
+          - "FuelTransaction.status == POSTED"
+        side_effects:
+          - "set FuelTransaction.status = VOIDED"
+          - "subtract FuelTransaction.gallons from FuelCard.total_gallons_purchased"
+
+# ============================================================================
+# §1.2.1 Concurrency Rules
+# ============================================================================
+concurrency_rules:
+  - rule_id: repair-create-stale-vehicle
+    parent_entity: Vehicle
+    write_endpoint: "POST /fleet/repair-orders"
+    occ_field: "expected_vehicle_version"
+    description: |
+      Reporting a RepairOrder against a Vehicle whose version has advanced since
+      the client last observed it is rejected. A vehicle may legitimately carry
+      multiple repair orders, so a second create against identical state would
+      itself succeed; the rule guards the case where another writer has already
+      advanced the vehicle (e.g. a prior repair report that bumped the vehicle
+      snapshot) and this client's view is therefore stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: allocation-create-stale-lease
+    parent_entity: Lease
+    write_endpoint: "POST /fleet/allocations"
+    occ_field: "expected_lease_version"
+    description: |
+      Creating an Allocation against a Lease whose version has advanced since the
+      client last observed it is rejected. A lease may legitimately carry multiple
+      non-overlapping allocations, so a second create against identical state would
+      itself succeed; the rule guards the case where another writer has already
+      advanced the lease snapshot and this client's view is therefore stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ============================================================================
+# §1.3 Calculation Rules Table
+# ============================================================================
+calculations:
+  - name: mileage_overage_charge
+    trigger: "OverageSettlement DRAFT->FINALIZED"
+    algorithm: tiered_pricing
+    formula: |
+      excess_miles = max(0, Lease.odometer_end - Lease.odometer_start - Lease.contracted_miles)
+      if Lease.overage_model == CONTRACT_FLAT:
+          mileage_charge_cents = excess_miles * Lease.per_mile_overage_cents
+      elif Lease.overage_model == TIERED_EXCESS:
+          tier1_miles = min(excess_miles, TIER1_LIMIT_MILES)
+          tier2_miles = max(0, excess_miles - TIER1_LIMIT_MILES)
+          mileage_charge_cents = tier1_miles * TIER1_RATE_CENTS + tier2_miles * TIER2_RATE_CENTS
+    input_set: "Single Lease in RETURN_INITIATED/PENDING_SETTLEMENT with odometer_start and odometer_end pinned."
+    constants:
+      TIER1_LIMIT_MILES: 10000
+      TIER1_RATE_CENTS: 20
+      TIER2_RATE_CENTS: 35
+    precision: "integer cents, no rounding (all inputs integer)"
+    variants:
+      - name: CONTRACT_FLAT
+        when: "Lease.overage_model == CONTRACT_FLAT"
+        difference: "Flat per_mile_overage_cents on every excess mile; linear."
+      - name: TIERED_EXCESS
+        when: "Lease.overage_model == TIERED_EXCESS"
+        difference: "Two-tier marginal rate; first TIER1_LIMIT_MILES at TIER1_RATE_CENTS, remainder at TIER2_RATE_CENTS. Diverges from CONTRACT_FLAT for the same excess."
+
+  - name: ifta_net_tax
+    trigger: "IftaReturn DRAFT->FILED"
+    algorithm: aggregation
+    formula: |
+      # Quarter window: purchased_at / recorded_at within the IftaReturn.quarter.
+      # Qualified vehicles: class IN {MEDIUM_DUTY, HEAVY_DUTY}.
+      total_qualified_miles   = sum(TelematicsReading.segment_miles for qualified vehicles in quarter)
+      total_qualified_gallons = sum(FuelTransaction.gallons for POSTED txns on cards of qualified vehicles in quarter)
+      fleet_mpg = round(total_qualified_miles / total_qualified_gallons, 3)   # ROUND_HALF_UP
+      # Per-jurisdiction, ROUND PER-JURISDICTION THEN SUM (pinned order):
+      for J in jurisdictions:
+          miles_J   = sum(segment_miles where jurisdiction == J)
+          gallons_J = sum(gallons where jurisdiction == J)
+          taxable_gallons_J = round(miles_J / fleet_mpg, 3)              # ROUND_HALF_UP
+          tax_owed_J = round(taxable_gallons_J * RATE[J], 2)            # dollars
+          tax_paid_J = round(gallons_J * RATE[J], 2)
+          net_J      = round(tax_owed_J - tax_paid_J, 2)
+      net_tax_due_cents = round(100 * sum(net_J for all J), 0)
+    input_set: "All POSTED FuelTransactions and all TelematicsReadings for qualified vehicles in the quarter for this Lessee."
+    constants:
+      RATE: { CA: 0.40, NV: 0.27, AZ: 0.26, OR: 0.38, TX: 0.20, WA: 0.49 }
+    precision: "fleet_mpg and taxable_gallons 3 decimals; per-jurisdiction tax 2 decimals; final cents integer; ROUND_HALF_UP; rounding order = per-jurisdiction then sum"
+
+  - name: collision_repair_waterfall
+    trigger: "RepairOrder ASSESSED->APPROVED, and RepairOrder TOTAL_LOSS->TOTAL_LOSS_SETTLED"
+    algorithm: waterfall_allocation
+    formula: |
+      # Ordered buckets over estimate_cents; the bucket order is set by Lease.waterfall_model.
+      if Lease.waterfall_model == DEDUCTIBLE_FIRST:
+          driver_deductible_cents = min(estimate_cents, Lease.collision_deductible_cents)
+          remaining               = estimate_cents - driver_deductible_cents
+          insurance_paid_cents    = min(remaining, insurance_cap_cents)
+          overflow_cents          = remaining - insurance_paid_cents
+      elif Lease.waterfall_model == INSURANCE_FIRST:
+          insurance_paid_cents    = min(estimate_cents, insurance_cap_cents)
+          remaining               = estimate_cents - insurance_paid_cents
+          driver_deductible_cents = min(remaining, Lease.collision_deductible_cents)
+          overflow_cents          = remaining - driver_deductible_cents
+      lessee_responsible_cents = driver_deductible_cents + overflow_cents
+    input_set: "Single RepairOrder in ASSESSED with estimate_cents and insurance_cap_cents pinned, plus its Lease.collision_deductible_cents and Lease.waterfall_model."
+    constants:
+      TOTAL_LOSS_RATIO: 0.8
+    precision: "integer cents, no rounding"
+    variants:
+      - name: DEDUCTIBLE_FIRST
+        when: "Lease.waterfall_model == DEDUCTIBLE_FIRST"
+        difference: "Lessee deductible absorbs the first dollars; insurance fills next up to cap; overflow to lessee."
+      - name: INSURANCE_FIRST
+        when: "Lease.waterfall_model == INSURANCE_FIRST"
+        difference: "Insurance fills first up to cap; lessee deductible absorbs the remainder; overflow to lessee. Diverges from DEDUCTIBLE_FIRST when estimate_cents < deductible + cap."
+
+  - name: excess_wear_score
+    trigger: "OverageSettlement DRAFT->FINALIZED"
+    algorithm: weighted_scoring
+    formula: |
+      # Aggregate telematics over the lease's vehicle across the lease term:
+      total_miles  = max(1, Lease.odometer_end - Lease.odometer_start)
+      harsh_per_1k = sum(TelematicsReading.harsh_events) / total_miles * 1000
+      idle_pct     = sum(TelematicsReading.idle_minutes) / total_miles * 100   # minutes per 100 miles, treated as pct
+      speed_pct    = 0   # reserved; not populated in this revision
+      raw = W_HARSH * (harsh_per_1k * 10) + W_IDLE * idle_pct + W_SPEED * speed_pct
+      excess_wear_score = round(raw, 2)   # ROUND_HALF_UP
+      excess_wear_charge_cents = EXCESS_WEAR_FLAT_CENTS if excess_wear_score > WEAR_THRESHOLD else 0
+    input_set: "All TelematicsReadings for the lease's vehicle with recorded_at within [Lease.term_start, Lease.term_end]."
+    constants:
+      W_HARSH: 0.5
+      W_IDLE: 0.3
+      W_SPEED: 0.2
+      WEAR_THRESHOLD: 30
+      EXCESS_WEAR_FLAT_CENTS: 50000
+    precision: "score 2 decimals ROUND_HALF_UP; charge integer cents; strict > on WEAR_THRESHOLD"
+
+# ============================================================================
+# §1.4 Validation Rules Table (Ordered by Priority)
+# ============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Role permitted for this operation per §1.7"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "Path and FK-referenced resources exist, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 4
+    category: business_constraint
+    check: "Required body fields present and well-typed; enum values in allowed set"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all create/action endpoints"
+  - priority: 5
+    category: business_constraint
+    check: "Unique fields (Vehicle.vin, Driver.license_number, FuelCard.card_number, IftaReturn (lessee_id, quarter)) not already used"
+    error_id: ERR_DUPLICATE
+    http_status: 409
+    applies_to: "POST /fleet/vehicles, /fleet/drivers, /fleet/fuel-cards, /fleet/ifta-returns"
+  - priority: 6
+    category: state
+    check: "Target resource in a state from which the requested transition is defined (§1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints"
+  - priority: 7
+    category: business_referential
+    check: "On Lease activate, referenced Vehicle.status == AVAILABLE"
+    error_id: ERR_VEHICLE_NOT_AVAILABLE
+    http_status: 409
+    applies_to: "POST /fleet/leases/{id}/activate"
+  - priority: 8
+    category: business_safety
+    check: "On Allocation create, referenced Driver.license_status == VALID"
+    error_id: ERR_DRIVER_LICENSE_INVALID
+    http_status: 409
+    applies_to: "POST /fleet/allocations"
+  - priority: 9
+    category: business_safety
+    check: "On Allocation create, referenced Lease.status == ACTIVE"
+    error_id: ERR_LEASE_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /fleet/allocations"
+  - priority: 10
+    category: business_temporal
+    check: "On Allocation create, half-open window [window_start, window_end) does not overlap any ASSIGNED Allocation on the same Lease's vehicle (adjacency at the boundary is allowed)"
+    error_id: ERR_ALLOCATION_OVERLAP
+    http_status: 409
+    applies_to: "POST /fleet/allocations"
+  - priority: 11
+    category: business_temporal
+    check: "On MaintenanceOrder create, the closed window [window_start, window_end] expanded by MAINT_BUFFER_MINUTES=60 on both ends does not overlap any SCHEDULED/IN_PROGRESS MaintenanceOrder window on the same Vehicle; two windows conflict when the gap between them is <= 60 minutes (a gap strictly greater than 60 minutes is required)"
+    error_id: ERR_MAINTENANCE_OVERLAP
+    http_status: 409
+    applies_to: "POST /fleet/maintenance-orders"
+  - priority: 12
+    category: business_temporal
+    check: "On TelematicsReading create, odometer_miles >= current Vehicle.odometer_miles (monotonic non-decreasing)"
+    error_id: ERR_ODOMETER_REGRESSION
+    http_status: 409
+    applies_to: "POST /fleet/telematics-readings"
+  - priority: 13
+    category: business_referential
+    check: "On FuelTransaction create, the FuelCard.status == ACTIVE (a FROZEN/CLOSED card rejects charges)"
+    error_id: ERR_FUEL_CARD_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /fleet/fuel-transactions"
+  - priority: 14
+    category: business_constraint
+    check: "On Lease initiate-return, no Allocation on the lease is in status ASSIGNED"
+    error_id: ERR_ACTIVE_ALLOCATION_EXISTS
+    http_status: 409
+    applies_to: "POST /fleet/leases/{id}/initiate-return"
+  - priority: 15
+    category: business_constraint
+    check: "On Lease PENDING_SETTLEMENT->CLOSED, Vehicle.open_block_count == 0 (no open maintenance/repair)"
+    error_id: ERR_OPEN_BLOCKERS
+    http_status: 409
+    applies_to: "POST /fleet/overage-settlements/{id}/finalize"
+  - priority: 16
+    category: business_constraint
+    check: "On IftaReturn file, total_qualified_gallons > 0 (at least one POSTED fuel transaction for a qualified vehicle in quarter)"
+    error_id: ERR_NO_QUALIFIED_FUEL
+    http_status: 409
+    applies_to: "POST /fleet/ifta-returns/{id}/file"
+  - priority: 17
+    category: business_safety
+    check: "On RepairOrder approve, estimate_cents <= TOTAL_LOSS_RATIO * insurance_cap_cents (otherwise it must be declared a total loss)"
+    error_id: ERR_IS_TOTAL_LOSS
+    http_status: 409
+    applies_to: "POST /fleet/repair-orders/{id}/approve"
+  - priority: 18
+    category: business_safety
+    check: "On RepairOrder declare-total-loss, estimate_cents > TOTAL_LOSS_RATIO * insurance_cap_cents"
+    error_id: ERR_NOT_TOTAL_LOSS
+    http_status: 409
+    applies_to: "POST /fleet/repair-orders/{id}/declare-total-loss"
+  - priority: 19
+    category: business_constraint
+    check: "OCC: expected_<parent>_version matches current parent version on guarded creates (§1.2.1)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /fleet/repair-orders, POST /fleet/allocations"
+
+# ============================================================================
+# §1.5 API Endpoint Table
+# ============================================================================
+endpoints:
+  # --- Lessee ---
+  - method: POST
+    path: "/fleet/lessees"
+    description: "Register a leasing customer company."
+    roles: [FleetManager]
+    code: 201
+    input: [company_name, billing_email]
+    output: Lessee
+    side_effects: []
+  - method: GET
+    path: "/fleet/lessees/{id}"
+    description: "Fetch a lessee (includes computed outstanding_balance_cents)."
+    roles: [FleetManager, ComplianceOfficer, Lessee]
+    code: 200
+    input: []
+    output: Lessee
+    side_effects: []
+  - method: POST
+    path: "/fleet/lessees/{id}/suspend"
+    description: "Suspend a lessee account (blocks new lease activation)."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: Lessee
+    side_effects: ["set Lessee.account_status = SUSPENDED"]
+
+  # --- Driver ---
+  - method: POST
+    path: "/fleet/drivers"
+    description: "Register a driver under a lessee."
+    roles: [FleetManager, Lessee]
+    code: 201
+    input: [lessee_id, full_name, license_number]
+    output: Driver
+    side_effects: []
+  - method: GET
+    path: "/fleet/drivers/{id}"
+    description: "Fetch a driver."
+    roles: [FleetManager, ComplianceOfficer, Lessee]
+    code: 200
+    input: []
+    output: Driver
+    side_effects: []
+  - method: GET
+    path: "/fleet/drivers"
+    description: "List drivers, optionally filtered by lessee_id."
+    roles: [FleetManager, ComplianceOfficer, Lessee]
+    code: 200
+    input: ["lessee_id?", "limit?", "offset?"]
+    output: Driver[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/drivers/{id}/suspend-license"
+    description: "Mark a driver license SUSPENDED."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: Driver
+    side_effects: ["set Driver.license_status = SUSPENDED"]
+
+  # --- Vehicle ---
+  - method: POST
+    path: "/fleet/vehicles"
+    description: "Register a fleet vehicle."
+    roles: [FleetManager]
+    code: 201
+    input: [vin, class]
+    output: Vehicle
+    side_effects: []
+  - method: GET
+    path: "/fleet/vehicles/{id}"
+    description: "Fetch a vehicle (includes status, odometer_miles, open_block_count)."
+    roles: [FleetManager, ComplianceOfficer, Lessee]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: []
+  - method: GET
+    path: "/fleet/vehicles/{id}/telematics-readings"
+    description: "List telematics readings for a vehicle (reverse-reachability for TelematicsReading.vehicle_id)."
+    roles: [FleetManager, ComplianceOfficer, TelematicsGateway]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TelematicsReading[]
+    side_effects: []
+  - method: GET
+    path: "/fleet/vehicles/{id}/maintenance-orders"
+    description: "List maintenance orders for a vehicle (reverse-reachability for MaintenanceOrder.vehicle_id)."
+    roles: [FleetManager, Lessee]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: MaintenanceOrder[]
+    side_effects: []
+
+  # --- Lease ---
+  - method: POST
+    path: "/fleet/leases"
+    description: "Create a lease in DRAFT."
+    roles: [FleetManager]
+    code: 201
+    input: [lessee_id, vehicle_id, term_start, term_end, contracted_miles, per_mile_overage_cents, overage_model, collision_deductible_cents, waterfall_model]
+    output: Lease
+    side_effects: []
+  - method: GET
+    path: "/fleet/leases/{id}"
+    description: "Fetch a lease."
+    roles: [FleetManager, ComplianceOfficer, Lessee]
+    code: 200
+    input: []
+    output: Lease
+    side_effects: []
+  - method: GET
+    path: "/fleet/leases"
+    description: "List leases, optionally filtered by lessee_id or vehicle_id (reverse-reachability for Lease.lessee_id and Lease.vehicle_id)."
+    roles: [FleetManager, ComplianceOfficer, Lessee]
+    code: 200
+    input: ["lessee_id?", "vehicle_id?", "limit?", "offset?"]
+    output: Lease[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/leases/{id}/activate"
+    description: "Activate a DRAFT lease; allocates the vehicle and pins odometer_start."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: Lease
+    side_effects: ["pin odometer_start", "cascade Vehicle AVAILABLE->ALLOCATED", "increments Lease.version by 1"]
+  - method: POST
+    path: "/fleet/leases/{id}/cancel"
+    description: "Cancel a DRAFT lease."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: Lease
+    side_effects: ["set Lease.status = CANCELLED"]
+  - method: POST
+    path: "/fleet/leases/{id}/initiate-return"
+    description: "Begin lease-end return; pins odometer_end and freezes fuel cards."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: Lease
+    side_effects: ["pin odometer_end", "cascade FuelCard ACTIVE->FROZEN", "increments Lease.version by 1"]
+
+  # --- Allocation ---
+  - method: POST
+    path: "/fleet/allocations"
+    description: "Assign a vehicle (via its ACTIVE lease) to a driver for a time window."
+    roles: [FleetManager]
+    code: 201
+    input: [lease_id, driver_id, window_start, window_end, expected_lease_version]
+    output: Allocation
+    side_effects: ["increments Lease.version by 1"]
+  - method: GET
+    path: "/fleet/allocations/{id}"
+    description: "Fetch an allocation."
+    roles: [FleetManager, Lessee]
+    code: 200
+    input: []
+    output: Allocation
+    side_effects: []
+  - method: GET
+    path: "/fleet/allocations"
+    description: "List allocations filtered by lease_id or driver_id (reverse-reachability for Allocation.lease_id and Allocation.driver_id)."
+    roles: [FleetManager, Lessee]
+    code: 200
+    input: ["lease_id?", "driver_id?", "limit?", "offset?"]
+    output: Allocation[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/allocations/{id}/release"
+    description: "Release an allocation (end the assignment)."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: Allocation
+    side_effects: ["set Allocation.status = RELEASED"]
+
+  # --- FuelCard / FuelTransaction ---
+  - method: POST
+    path: "/fleet/fuel-cards"
+    description: "Issue a fuel card against a lease."
+    roles: [FleetManager]
+    code: 201
+    input: [lease_id, card_number]
+    output: FuelCard
+    side_effects: []
+  - method: GET
+    path: "/fleet/fuel-cards/{id}"
+    description: "Fetch a fuel card (includes computed total_gallons_purchased)."
+    roles: [FleetManager, Lessee]
+    code: 200
+    input: []
+    output: FuelCard
+    side_effects: []
+  - method: GET
+    path: "/fleet/fuel-cards"
+    description: "List fuel cards filtered by lease_id (reverse-reachability for FuelCard.lease_id)."
+    roles: [FleetManager, Lessee]
+    code: 200
+    input: ["lease_id?", "limit?", "offset?"]
+    output: FuelCard[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/fuel-transactions"
+    description: "Post a fuel purchase against a card."
+    roles: [FleetManager, Lessee]
+    code: 201
+    input: [fuel_card_id, jurisdiction, gallons, purchased_at]
+    output: FuelTransaction
+    side_effects: ["reconcile FuelCard.total_gallons_purchased"]
+  - method: GET
+    path: "/fleet/fuel-transactions/{id}"
+    description: "Fetch a fuel transaction."
+    roles: [FleetManager, ComplianceOfficer, Lessee]
+    code: 200
+    input: []
+    output: FuelTransaction
+    side_effects: []
+  - method: GET
+    path: "/fleet/fuel-transactions"
+    description: "List fuel transactions filtered by fuel_card_id (reverse-reachability for FuelTransaction.fuel_card_id)."
+    roles: [FleetManager, ComplianceOfficer, Lessee]
+    code: 200
+    input: ["fuel_card_id?", "limit?", "offset?"]
+    output: FuelTransaction[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/fuel-transactions/{id}/void"
+    description: "Void a posted fuel transaction; compensating-reverses the gallons it added."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: FuelTransaction
+    side_effects: ["set FuelTransaction.status = VOIDED", "subtract gallons from FuelCard.total_gallons_purchased"]
+
+  # --- Telematics ---
+  - method: POST
+    path: "/fleet/telematics-readings"
+    description: "Ingest a telematics reading; advances vehicle odometer."
+    roles: [TelematicsGateway, FleetManager]
+    code: 201
+    input: [vehicle_id, jurisdiction, odometer_miles, segment_miles, "harsh_events?", "idle_minutes?", recorded_at]
+    output: TelematicsReading
+    side_effects: ["set Vehicle.odometer_miles = odometer_miles"]
+
+  # --- Maintenance ---
+  - method: POST
+    path: "/fleet/maintenance-orders"
+    description: "Schedule a maintenance order on a vehicle."
+    roles: [FleetManager]
+    code: 201
+    input: [vehicle_id, kind, labor_cents, parts_cents, window_start, window_end]
+    output: MaintenanceOrder
+    side_effects: []
+  - method: GET
+    path: "/fleet/maintenance-orders/{id}"
+    description: "Fetch a maintenance order."
+    roles: [FleetManager, Lessee]
+    code: 200
+    input: []
+    output: MaintenanceOrder
+    side_effects: []
+  - method: POST
+    path: "/fleet/maintenance-orders/{id}/start"
+    description: "Begin maintenance; blocks the vehicle."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: MaintenanceOrder
+    side_effects: ["increment Vehicle.open_block_count", "cascade Vehicle ALLOCATED->IN_MAINTENANCE"]
+  - method: POST
+    path: "/fleet/maintenance-orders/{id}/complete"
+    description: "Complete maintenance; pins total_cost_cents and may unblock the vehicle."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: MaintenanceOrder
+    side_effects: ["pin total_cost_cents", "decrement Vehicle.open_block_count", "cascade Vehicle IN_MAINTENANCE->ALLOCATED"]
+  - method: POST
+    path: "/fleet/maintenance-orders/{id}/cancel"
+    description: "Cancel a scheduled maintenance order."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: MaintenanceOrder
+    side_effects: ["set MaintenanceOrder.status = CANCELLED"]
+
+  # --- Repair (collision) ---
+  - method: POST
+    path: "/fleet/repair-orders"
+    description: "Report a collision repair on a leased vehicle."
+    roles: [FleetManager]
+    code: 201
+    input: [vehicle_id, lease_id, expected_vehicle_version]
+    output: RepairOrder
+    side_effects: ["increments Vehicle.version by 1"]
+  - method: GET
+    path: "/fleet/repair-orders/{id}"
+    description: "Fetch a repair order (includes waterfall allocations)."
+    roles: [FleetManager, ComplianceOfficer, Lessee]
+    code: 200
+    input: []
+    output: RepairOrder
+    side_effects: []
+  - method: GET
+    path: "/fleet/repair-orders"
+    description: "List repair orders filtered by vehicle_id or lease_id (reverse-reachability for RepairOrder.vehicle_id and RepairOrder.lease_id)."
+    roles: [FleetManager, ComplianceOfficer, Lessee]
+    code: 200
+    input: ["vehicle_id?", "lease_id?", "limit?", "offset?"]
+    output: RepairOrder[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/repair-orders/{id}/assess"
+    description: "Adjuster assessment; sets estimate and insurance cap, blocks the vehicle."
+    roles: [FleetManager]
+    code: 200
+    input: [estimate_cents, insurance_cap_cents]
+    output: RepairOrder
+    side_effects: ["set estimate_cents, insurance_cap_cents", "increment Vehicle.open_block_count"]
+  - method: POST
+    path: "/fleet/repair-orders/{id}/approve"
+    description: "Approve repair (not a total loss); runs collision waterfall."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: RepairOrder
+    side_effects: ["run collision waterfall", "cascade Vehicle ALLOCATED->IN_REPAIR"]
+  - method: POST
+    path: "/fleet/repair-orders/{id}/declare-total-loss"
+    description: "Declare total loss when estimate exceeds the total-loss ratio of cap."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: RepairOrder
+    side_effects: ["set RepairOrder.status = TOTAL_LOSS"]
+  - method: POST
+    path: "/fleet/repair-orders/{id}/complete"
+    description: "Complete an approved repair; unblocks the vehicle."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: RepairOrder
+    side_effects: ["decrement Vehicle.open_block_count", "cascade Vehicle IN_REPAIR->ALLOCATED"]
+  - method: POST
+    path: "/fleet/repair-orders/{id}/settle-total-loss"
+    description: "Settle a total loss; charges lessee and retires the vehicle."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: RepairOrder
+    side_effects: ["add lessee_responsible_cents to Lessee.outstanding_balance_cents", "decrement Vehicle.open_block_count", "cascade Vehicle IN_REPAIR->RETIRED"]
+  - method: POST
+    path: "/fleet/repair-orders/{id}/reject"
+    description: "Reject a reported/assessed repair claim; unblocks the vehicle."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: RepairOrder
+    side_effects: ["decrement Vehicle.open_block_count"]
+
+  # --- Overage Settlement ---
+  - method: POST
+    path: "/fleet/overage-settlements"
+    description: "Open the settlement for a returned lease (moves Lease to PENDING_SETTLEMENT)."
+    roles: [FleetManager]
+    code: 201
+    input: [lease_id]
+    output: OverageSettlement
+    side_effects: ["set Lease.status = PENDING_SETTLEMENT"]
+  - method: GET
+    path: "/fleet/overage-settlements/{id}"
+    description: "Fetch a settlement (includes computed charges)."
+    roles: [FleetManager, ComplianceOfficer, Lessee]
+    code: 200
+    input: []
+    output: OverageSettlement
+    side_effects: []
+  - method: GET
+    path: "/fleet/overage-settlements"
+    description: "List settlements filtered by lease_id (reverse-reachability for OverageSettlement.lease_id)."
+    roles: [FleetManager, ComplianceOfficer, Lessee]
+    code: 200
+    input: ["lease_id?", "limit?", "offset?"]
+    output: OverageSettlement[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/overage-settlements/{id}/finalize"
+    description: "Finalize the settlement; computes charges, charges lessee, closes lease, frees vehicle."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: OverageSettlement
+    side_effects: ["pin charges", "add net_charge_cents to Lessee.outstanding_balance_cents", "cascade Lease PENDING_SETTLEMENT->CLOSED", "cascade Vehicle ALLOCATED->AVAILABLE", "increments OverageSettlement.version by 1"]
+
+  # --- IFTA ---
+  - method: POST
+    path: "/fleet/ifta-returns"
+    description: "Open an IFTA return for a lessee/quarter."
+    roles: [ComplianceOfficer]
+    code: 201
+    input: [lessee_id, quarter]
+    output: IftaReturn
+    side_effects: []
+  - method: GET
+    path: "/fleet/ifta-returns/{id}"
+    description: "Fetch an IFTA return (includes fleet_mpg and net_tax_due_cents when FILED)."
+    roles: [ComplianceOfficer, FleetManager, Lessee]
+    code: 200
+    input: []
+    output: IftaReturn
+    side_effects: []
+  - method: GET
+    path: "/fleet/ifta-returns"
+    description: "List IFTA returns filtered by lessee_id (reverse-reachability for IftaReturn.lessee_id)."
+    roles: [ComplianceOfficer, FleetManager, Lessee]
+    code: 200
+    input: ["lessee_id?", "limit?", "offset?"]
+    output: IftaReturn[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/ifta-returns/{id}/file"
+    description: "File the return; computes fleet_mpg and net_tax_due_cents."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: IftaReturn
+    side_effects: ["pin fleet_mpg, net_tax_due_cents"]
+
+# ============================================================================
+# §1.6 Error Code Catalog
+# ============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing X-User-Role or X-User-ID header."
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Role not permitted for this operation per §1.7."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Path or FK-referenced resource does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Missing/ill-typed required field or invalid enum value."
+  - id: ERR_DUPLICATE
+    http: 409
+    condition: "Unique field (vin, license_number, card_number, or (lessee_id, quarter)) already used."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition is not defined from the resource's current state."
+  - id: ERR_VEHICLE_NOT_AVAILABLE
+    http: 409
+    condition: "Lease activate attempted while referenced Vehicle.status != AVAILABLE."
+  - id: ERR_DRIVER_LICENSE_INVALID
+    http: 409
+    condition: "Allocation create attempted with a driver whose license_status == SUSPENDED."
+  - id: ERR_LEASE_NOT_ACTIVE
+    http: 409
+    condition: "Allocation create attempted against a lease whose status != ACTIVE."
+  - id: ERR_ALLOCATION_OVERLAP
+    http: 409
+    condition: "Allocation window overlaps an existing ASSIGNED allocation on the same vehicle."
+  - id: ERR_MAINTENANCE_OVERLAP
+    http: 409
+    condition: "MaintenanceOrder buffer-expanded window collides with another SCHEDULED/IN_PROGRESS order on the same vehicle."
+  - id: ERR_ODOMETER_REGRESSION
+    http: 409
+    condition: "TelematicsReading.odometer_miles is below the vehicle's current odometer."
+  - id: ERR_FUEL_CARD_NOT_ACTIVE
+    http: 409
+    condition: "Fuel transaction posted against a FROZEN or CLOSED card."
+  - id: ERR_ACTIVE_ALLOCATION_EXISTS
+    http: 409
+    condition: "Lease initiate-return attempted while an Allocation is still ASSIGNED."
+  - id: ERR_OPEN_BLOCKERS
+    http: 409
+    condition: "Settlement finalize attempted while Vehicle.open_block_count > 0."
+  - id: ERR_NO_QUALIFIED_FUEL
+    http: 409
+    condition: "IFTA file attempted with zero qualified gallons in the quarter."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "OCC expected_<parent>_version does not match the current parent version."
+  - id: ERR_NOT_TOTAL_LOSS
+    http: 409
+    condition: "declare-total-loss attempted when estimate_cents <= TOTAL_LOSS_RATIO * insurance_cap_cents."
+  - id: ERR_IS_TOTAL_LOSS
+    http: 409
+    condition: "approve attempted when estimate_cents > TOTAL_LOSS_RATIO * insurance_cap_cents (must declare total loss)."
+
+# ============================================================================
+# §1.7 RBAC Matrix
+# ============================================================================
+roles:
+  - name: FleetManager
+    description: "Lessor operator who runs the fleet: vehicles, leases, allocations, maintenance, repairs, settlements."
+    identity: opaque
+    exclusive_operations:
+      - "POST /fleet/lessees"
+      - "POST /fleet/lessees/{id}/suspend"
+      - "POST /fleet/vehicles"
+      - "POST /fleet/leases"
+      - "POST /fleet/leases/{id}/activate"
+      - "POST /fleet/leases/{id}/cancel"
+      - "POST /fleet/leases/{id}/initiate-return"
+      - "POST /fleet/allocations"
+      - "POST /fleet/allocations/{id}/release"
+      - "POST /fleet/drivers/{id}/suspend-license"
+      - "POST /fleet/fuel-cards"
+      - "POST /fleet/maintenance-orders"
+      - "POST /fleet/maintenance-orders/{id}/start"
+      - "POST /fleet/maintenance-orders/{id}/complete"
+      - "POST /fleet/maintenance-orders/{id}/cancel"
+      - "POST /fleet/repair-orders"
+      - "POST /fleet/repair-orders/{id}/assess"
+      - "POST /fleet/repair-orders/{id}/approve"
+      - "POST /fleet/repair-orders/{id}/declare-total-loss"
+      - "POST /fleet/repair-orders/{id}/complete"
+      - "POST /fleet/repair-orders/{id}/settle-total-loss"
+      - "POST /fleet/repair-orders/{id}/reject"
+      - "POST /fleet/overage-settlements"
+      - "POST /fleet/overage-settlements/{id}/finalize"
+    shared_operations:
+      - "POST /fleet/drivers"
+      - "POST /fleet/fuel-transactions"
+      - "POST /fleet/telematics-readings"
+      - "GET (read endpoints)"
+  - name: Lessee
+    description: "Customer company: registers its own drivers, posts fuel, reads its own resources."
+    identity: "entity_backed:Lessee"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /fleet/drivers"
+      - "POST /fleet/fuel-transactions"
+      - "GET (read endpoints scoped to own resources)"
+  - name: ComplianceOfficer
+    description: "Files IFTA returns and audits fuel/telematics data."
+    identity: opaque
+    exclusive_operations:
+      - "POST /fleet/ifta-returns"
+      - "POST /fleet/ifta-returns/{id}/file"
+    shared_operations:
+      - "GET (read endpoints)"
+  - name: TelematicsGateway
+    description: "Device principal that ingests telematics readings."
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "POST /fleet/telematics-readings"
+      - "GET /fleet/vehicles/{id}/telematics-readings"

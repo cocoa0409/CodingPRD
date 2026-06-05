@@ -1,0 +1,1593 @@
+scenario: "After-School Programs & Summer Camp Registration: session capacity, age grouping, weekly enrollment, parental authorization (medical/pickup), scholarships, sibling discount, rainy-day alternatives, emergency contact"
+domain_name: afterschool-summer-camp
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: "Quota / allocation"
+  secondary_archetype: "Temporal windowing"
+  complexity_layers:
+    - optimistic_concurrency      # OCC on Session.version for the enroll write-with-supersede race
+    - cascading_side_effects      # withdraw -> release seat -> promote waitlist -> recompute invoice -> resize discounts
+    - dual_variant_calculation    # tuition: provisional estimate at enrollment vs finalized at billing lock
+    - derived_field_reconciliation # Session.enrolled_count, Invoice totals stay consistent with child Enrollments
+
+  entity_topology: flat
+  # Flat peer entities linked by foreign keys (Guardian, Child, Program, Session, WeeklyOffering,
+  # Enrollment, AuthorizationForm, EmergencyContact, Invoice, ...). No nesting of business identity
+  # in URL paths; ids carried in bodies / filtered lists.
+
+  state_machine_shape: branching
+  # Enrollment forks REQUESTED -> {CONFIRMED, WAITLISTED} and rejoins; WeeklyOffering has a
+  # parallel weather dimension (NORMAL <-> RAIN_ACTIVATED cycle) independent of its OPEN/CLOSED axis.
+
+  relationship_patterns:
+    - one_to_many        # Guardian -> Child, Program -> Session, Session -> WeeklyOffering
+    - many_to_many       # Child <-> WeeklyOffering via Enrollment (junction)
+    - cross_aggregate    # Enrollment references Child (under Guardian) and WeeklyOffering (under Program)
+
+  role_model: peer_roles
+  # Guardian owns Child/Enrollment/AuthorizationForm/EmergencyContact; ProgramDirector owns
+  # Program/Session/WeeklyOffering and scholarship review; BillingAdmin owns Invoice finalization.
+
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Guardian
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Login identity; unique among Guardians."
+        constraints: "Unique (case-insensitive); non-empty."
+      - name: full_name
+        type: string
+        source: input
+        description: "Parent/guardian legal name."
+      - name: phone
+        type: string
+        source: input
+        description: "Primary contact phone."
+      - name: home_zip
+        type: string
+        source: input
+        description: "5-digit residential ZIP; used for residency scholarship tier eligibility."
+        constraints: "Exactly 5 digits."
+
+  - name: Child
+    parent: null
+    common_fields: true
+    fields:
+      - name: guardian_id
+        type: string
+        source: input
+        description: "FK -> Guardian.id; the owning guardian."
+      - name: first_name
+        type: string
+        source: input
+        description: "Child first name."
+      - name: birth_date
+        type: datetime
+        source: input
+        description: "Date of birth (ISO date). Drives age computation against a Session's age_as_of_date."
+      - name: age_years
+        type: integer
+        source: computed
+        description: "Computed whole-year age as of a referenced Session.age_as_of_date at enrollment time; see calc compute_child_age."
+      - name: household_size
+        type: integer
+        source: input
+        description: "Number of people in household; an input to scholarship income-tier eligibility."
+        default: 1
+        constraints: ">= 1."
+
+  - name: EmergencyContact
+    parent: null
+    common_fields: true
+    fields:
+      - name: child_id
+        type: string
+        source: input
+        description: "FK -> Child.id; the child this contact serves."
+      - name: contact_name
+        type: string
+        source: input
+        description: "Emergency contact full name."
+      - name: contact_phone
+        type: string
+        source: input
+        description: "Reachable phone for the emergency contact."
+      - name: relationship
+        type: string
+        source: input
+        description: "Relationship to child (e.g., grandparent, neighbor)."
+
+  - name: AuthorizationForm
+    parent: null
+    common_fields: true
+    fields:
+      - name: child_id
+        type: string
+        source: input
+        description: "FK -> Child.id; the child this authorization covers."
+      - name: form_type
+        type: enum
+        source: input
+        description: "Which authorization this form grants."
+        constraints: "One of {MEDICAL, PICKUP}."
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state; see state machine AuthorizationForm."
+        default: SUBMITTED
+        constraints: "One of {SUBMITTED, APPROVED, REVOKED}."
+      - name: medication_notes
+        type: string
+        source: input
+        description: "For MEDICAL forms: allergies/medication directives; null for PICKUP forms."
+        default: null
+      - name: authorized_pickup_names
+        type: array
+        source: input
+        description: "For PICKUP forms: list of names permitted to collect the child; empty for MEDICAL forms."
+        default: []
+
+  - name: Program
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Program name, e.g. 'Summer STEM Camp'."
+      - name: program_type
+        type: enum
+        source: input
+        description: "Behavioral family: AFTERSCHOOL bills per-week recurring; CAMP bills per-week of a contiguous block."
+        constraints: "One of {AFTERSCHOOL, CAMP}."
+      - name: min_age
+        type: integer
+        source: input
+        description: "Inclusive minimum age in whole years for any Session in this program."
+        constraints: ">= 0."
+      - name: max_age
+        type: integer
+        source: input
+        description: "Inclusive maximum age in whole years for any Session in this program."
+        constraints: ">= min_age."
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state; see state machine Program."
+        default: DRAFT
+        constraints: "One of {DRAFT, PUBLISHED, ARCHIVED}."
+
+  - name: Session
+    parent: null
+    common_fields: true
+    fields:
+      - name: program_id
+        type: string
+        source: input
+        description: "FK -> Program.id; the parent program."
+      - name: title
+        type: string
+        source: input
+        description: "Session title, e.g. 'Rocketry — Ages 8-10'."
+      - name: age_group_min
+        type: integer
+        source: input
+        description: "Inclusive min age (years) for this age-group session; must be within the program's [min_age, max_age]."
+        constraints: ">= Program.min_age."
+      - name: age_group_max
+        type: integer
+        source: input
+        description: "Inclusive max age (years) for this age-group session; must be within the program's [min_age, max_age]."
+        constraints: "<= Program.max_age and >= age_group_min."
+      - name: age_as_of_date
+        type: datetime
+        source: input
+        description: "Reference date (ISO date) at which a child's age is evaluated for this session's age grouping."
+      - name: weekly_capacity
+        type: integer
+        source: input
+        description: "Max CONFIRMED enrollments per WeeklyOffering of this session."
+        constraints: ">= 1."
+      - name: base_weekly_tuition_cents
+        type: integer
+        source: input
+        description: "List price per enrolled week before any discount or scholarship, in cents."
+        constraints: ">= 0."
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state; see state machine Session."
+        default: SCHEDULED
+        constraints: "One of {SCHEDULED, OPEN, CLOSED, CANCELLED}."
+
+  - name: WeeklyOffering
+    parent: null
+    common_fields: true
+    fields:
+      - name: session_id
+        type: string
+        source: input
+        description: "FK -> Session.id; the session this week belongs to."
+      - name: week_start
+        type: datetime
+        source: input
+        description: "ISO date of the Monday starting this enrollment week (half-open [week_start, week_start+7d))."
+      - name: enrolled_count
+        type: integer
+        source: computed
+        description: "Number of Enrollments for this offering in status CONFIRMED; reconciled on every enroll/withdraw/promote. See calc reconcile_offering_counts."
+        default: 0
+      - name: waitlist_count
+        type: integer
+        source: computed
+        description: "Number of Enrollments for this offering in status WAITLISTED; reconciled alongside enrolled_count."
+        default: 0
+      - name: capacity_state
+        type: enum
+        source: computed
+        description: "Derived occupancy posture: AVAILABLE when enrolled_count < session.weekly_capacity, else FULL. See calc reconcile_offering_counts."
+        default: AVAILABLE
+        constraints: "One of {AVAILABLE, FULL}."
+      - name: weather_state
+        type: enum
+        source: system
+        description: "Parallel weather dimension; see state machine WeeklyOffering."
+        default: NORMAL
+        constraints: "One of {NORMAL, RAIN_ACTIVATED}."
+      - name: rain_alternate_offering_id
+        type: string
+        source: input
+        description: "FK -> WeeklyOffering.id; the indoor alternate offering activated children move to on rain. Null until configured."
+        default: null
+
+  - name: ScholarshipAward
+    parent: null
+    common_fields: true
+    fields:
+      - name: child_id
+        type: string
+        source: input
+        description: "FK -> Child.id; the awarded child."
+      - name: tier
+        type: enum
+        source: input
+        description: "Requested scholarship tier; discount percent is looked up from this tier in calc compute_scholarship_discount."
+        constraints: "One of {NONE, PARTIAL, FULL}."
+      - name: status
+        type: enum
+        source: system
+        description: "Review lifecycle; see state machine ScholarshipAward."
+        default: REQUESTED
+        constraints: "One of {REQUESTED, APPROVED, DENIED, REVOKED}."
+      - name: approved_discount_pct
+        type: number
+        source: computed
+        description: "Fraction in [0,1] locked at APPROVED from the tier table; 0 while not APPROVED. See calc compute_scholarship_discount."
+        default: 0
+
+  - name: Enrollment
+    parent: null
+    common_fields: true
+    fields:
+      - name: child_id
+        type: string
+        source: input
+        description: "FK -> Child.id; the enrolled child."
+      - name: weekly_offering_id
+        type: string
+        source: input
+        description: "FK -> WeeklyOffering.id; the week the child is enrolling into."
+      - name: invoice_id
+        type: string
+        source: system
+        description: "FK -> Invoice.id; the draft invoice this enrollment's line item belongs to. Set at enrollment creation."
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state; see state machine Enrollment."
+        default: REQUESTED
+        constraints: "One of {REQUESTED, CONFIRMED, WAITLISTED, WITHDRAWN}."
+      - name: waitlist_rank
+        type: integer
+        source: computed
+        description: "Position among WAITLISTED siblings for the same offering, 1-based by created_at ASC; null when not WAITLISTED. See calc reconcile_offering_counts."
+        default: null
+      - name: provisional_tuition_cents
+        type: integer
+        source: computed
+        description: "Estimate computed at confirmation via compute_line_tuition (provisional variant); refreshed on discount resize."
+        default: 0
+      - name: final_tuition_cents
+        type: integer
+        source: computed
+        description: "Locked amount computed at invoice finalization via compute_line_tuition (final variant); 0 until the invoice locks."
+        default: 0
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: guardian_id
+        type: string
+        source: input
+        description: "FK -> Guardian.id; the billed guardian."
+      - name: billing_period
+        type: string
+        source: input
+        description: "Billing period label, e.g. '2026-W27'; one draft Invoice per guardian per period."
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state; see state machine Invoice."
+        default: DRAFT
+        constraints: "One of {DRAFT, FINALIZED, PAID, VOID}."
+      - name: subtotal_cents
+        type: integer
+        source: computed
+        description: "Sum of provisional_tuition_cents over CONFIRMED enrollments on this invoice while DRAFT; frozen sum of final_tuition_cents at FINALIZED. See calc compute_invoice_totals."
+        default: 0
+      - name: sibling_discount_cents
+        type: integer
+        source: computed
+        description: "Household sibling discount applied across this invoice's distinct children; see calc compute_sibling_discount."
+        default: 0
+      - name: total_due_cents
+        type: integer
+        source: computed
+        description: "subtotal_cents - sibling_discount_cents, floored at 0. See calc compute_invoice_totals."
+        default: 0
+      - name: amount_paid_cents
+        type: integer
+        source: system
+        description: "Cumulative payments recorded against this invoice."
+        default: 0
+
+  - name: Payment
+    parent: null
+    common_fields: false
+    fields:
+      - name: invoice_id
+        type: string
+        source: input
+        description: "FK -> Invoice.id; the invoice being paid."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Payment amount in cents."
+        constraints: ">= 1."
+      - name: method
+        type: enum
+        source: input
+        description: "Tender used."
+        constraints: "One of {CARD, ACH, WALLET}."
+
+  - name: WeatherEvent
+    parent: null
+    common_fields: false
+    fields:
+      - name: weekly_offering_id
+        type: string
+        source: input
+        description: "FK -> WeeklyOffering.id; the outdoor offering affected by the rain declaration."
+      - name: declared_at
+        type: datetime
+        source: system
+        description: "Server-stamped UTC time the rain day was declared."
+      - name: moved_enrollment_count
+        type: integer
+        source: system
+        description: "Number of CONFIRMED enrollments relocated to the alternate offering by this event."
+        default: 0
+
+  - name: AuditEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: entity_type
+        type: string
+        source: system
+        description: "Name of the entity whose transition was recorded."
+      - name: entity_id
+        type: string
+        source: system
+        description: "Id of the entity whose transition was recorded (identity reference only)."
+      - name: action
+        type: string
+        source: system
+        description: "Transition label, e.g. 'ENROLLMENT_CONFIRMED', 'SCHOLARSHIP_APPROVED'."
+      - name: actor_role
+        type: string
+        source: system
+        description: "Role that performed the action (from X-User-Role)."
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Program
+    initial_state: DRAFT
+    terminal_states: [ARCHIVED]
+    transitions:
+      - from: DRAFT
+        to: PUBLISHED
+        trigger: "POST /programs/{id}/publish"
+        actor: ProgramDirector
+        preconditions:
+          - "Program has >= 1 Session in status SCHEDULED or OPEN."
+          - "Program.min_age <= Program.max_age."
+        side_effects:
+          - "Program.status = PUBLISHED."
+          - "Appends an AuditEntry (action='PROGRAM_PUBLISHED')."
+          - "increments Program.version by 1."
+      - from: PUBLISHED
+        to: ARCHIVED
+        trigger: "POST /programs/{id}/archive"
+        actor: ProgramDirector
+        preconditions:
+          - "No Session of this Program is in status OPEN."
+        side_effects:
+          - "Program.status = ARCHIVED."
+          - "Appends an AuditEntry (action='PROGRAM_ARCHIVED')."
+          - "increments Program.version by 1."
+
+  - entity: Session
+    initial_state: SCHEDULED
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: OPEN
+        trigger: "POST /sessions/{id}/open"
+        actor: ProgramDirector
+        preconditions:
+          - "Parent Program.status == PUBLISHED (cross-entity: Session open requires its Program published)."
+          - "Session has >= 1 WeeklyOffering."
+        side_effects:
+          - "Session.status = OPEN."
+          - "Appends an AuditEntry (action='SESSION_OPENED')."
+          - "increments Session.version by 1."
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /sessions/{id}/close"
+        actor: ProgramDirector
+        preconditions:
+          - "Session.status == OPEN."
+        side_effects:
+          - "Session.status = CLOSED."
+          - "New enrollment requests against any WeeklyOffering of this session are rejected with ERR_SESSION_NOT_OPEN."
+          - "Appends an AuditEntry (action='SESSION_CLOSED')."
+          - "increments Session.version by 1."
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /sessions/{id}/cancel"
+        actor: ProgramDirector
+        preconditions:
+          - "Session.status IN {SCHEDULED, OPEN}."
+        side_effects:
+          - "Session.status = CANCELLED."
+          - "CASCADE depth-3 begins: for every WeeklyOffering of this session, every Enrollment in status CONFIRMED or WAITLISTED transitions to WITHDRAWN (link 1)."
+          - "Each WITHDRAWN enrollment's parent WeeklyOffering re-runs reconcile_offering_counts, decrementing enrolled_count/waitlist_count (link 2, caused by link 1)."
+          - "Each affected Enrollment's DRAFT Invoice re-runs compute_invoice_totals so subtotal_cents/sibling_discount_cents/total_due_cents drop (link 3, caused by link 2)."
+          - "Appends an AuditEntry (action='SESSION_CANCELLED')."
+          - "increments Session.version by 1."
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /sessions/{id}/cancel"
+        actor: ProgramDirector
+        preconditions:
+          - "Session.status IN {SCHEDULED, OPEN}."
+        side_effects:
+          - "Same depth-3 cascade as SCHEDULED->CANCELLED."
+          - "increments Session.version by 1."
+
+  - entity: WeeklyOffering
+    initial_state: NORMAL
+    terminal_states: []
+    note: "Parallel dimensions: capacity_state (AVAILABLE/FULL) is a computed occupancy posture reconciled by calc; weather_state (NORMAL/RAIN_ACTIVATED) is an independent cyclic dimension driven by the transitions below. The two axes evolve independently on the same row."
+    transitions:
+      - from: NORMAL
+        to: RAIN_ACTIVATED
+        trigger: "POST /weather-events (declare rain on an offering)"
+        actor: ProgramDirector
+        preconditions:
+          - "WeeklyOffering.weather_state == NORMAL."
+          - "WeeklyOffering.rain_alternate_offering_id is non-null (an indoor alternate is configured)."
+          - "Parent Session.status == OPEN (cross-entity: rain can only be activated on a live session's week)."
+        side_effects:
+          - "WeeklyOffering.weather_state = RAIN_ACTIVATED."
+          - "CASCADE depth-2: every CONFIRMED Enrollment on this offering is re-pointed to rain_alternate_offering_id (Enrollment.weekly_offering_id changes) (link 1)."
+          - "Both the source offering and the alternate offering re-run reconcile_offering_counts, moving enrolled_count between them (link 2, caused by link 1)."
+          - "Creates a WeatherEvent with moved_enrollment_count set to the number relocated."
+          - "Appends an AuditEntry (action='RAIN_ACTIVATED')."
+          - "increments WeeklyOffering.version by 1 on both offerings."
+        note: "Relocation order is created_at ASC of the CONFIRMED enrollments. Children that overflow the alternate's weekly_capacity are placed WAITLISTED on the alternate (still relocated)."
+      - from: RAIN_ACTIVATED
+        to: NORMAL
+        trigger: "POST /weekly-offerings/{id}/clear-rain"
+        actor: ProgramDirector
+        preconditions:
+          - "WeeklyOffering.weather_state == RAIN_ACTIVATED."
+        side_effects:
+          - "WeeklyOffering.weather_state = NORMAL."
+          - "Enrollments relocated by the prior RAIN_ACTIVATED remain on the alternate (no auto-return); only the weather posture resets so a future rain day can re-fire (cyclic)."
+          - "Appends an AuditEntry (action='RAIN_CLEARED')."
+          - "increments WeeklyOffering.version by 1."
+
+  - entity: AuthorizationForm
+    initial_state: SUBMITTED
+    terminal_states: [REVOKED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /authorization-forms/{id}/approve"
+        actor: ProgramDirector
+        preconditions:
+          - "AuthorizationForm.status == SUBMITTED."
+          - "If form_type == MEDICAL: medication_notes is non-empty."
+          - "If form_type == PICKUP: authorized_pickup_names is a non-empty array."
+        side_effects:
+          - "AuthorizationForm.status = APPROVED."
+          - "Appends an AuditEntry (action='AUTH_APPROVED')."
+          - "increments AuthorizationForm.version by 1."
+      - from: APPROVED
+        to: REVOKED
+        trigger: "POST /authorization-forms/{id}/revoke"
+        actor: Guardian
+        preconditions:
+          - "AuthorizationForm.status == APPROVED."
+          - "Acting Guardian owns the form's Child."
+        side_effects:
+          - "AuthorizationForm.status = REVOKED."
+          - "Appends an AuditEntry (action='AUTH_REVOKED')."
+          - "increments AuthorizationForm.version by 1."
+      - from: SUBMITTED
+        to: REVOKED
+        trigger: "POST /authorization-forms/{id}/revoke"
+        actor: Guardian
+        preconditions:
+          - "AuthorizationForm.status == SUBMITTED."
+          - "Acting Guardian owns the form's Child."
+        side_effects:
+          - "AuthorizationForm.status = REVOKED."
+          - "increments AuthorizationForm.version by 1."
+
+  - entity: ScholarshipAward
+    initial_state: REQUESTED
+    terminal_states: [DENIED, REVOKED]
+    transitions:
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /scholarship-awards/{id}/approve"
+        actor: ProgramDirector
+        preconditions:
+          - "ScholarshipAward.status == REQUESTED."
+          - "ScholarshipAward.tier != NONE."
+        side_effects:
+          - "ScholarshipAward.status = APPROVED."
+          - "approved_discount_pct locked from the tier table via compute_scholarship_discount."
+          - "CASCADE depth-3: every DRAFT Invoice holding a CONFIRMED Enrollment for this child re-runs compute_line_tuition (provisional) on those lines (link 1)."
+          - "Each touched line's new provisional_tuition_cents feeds compute_invoice_totals, lowering subtotal_cents (link 2, caused by link 1)."
+          - "compute_invoice_totals then re-derives total_due_cents from the new subtotal and current sibling_discount_cents (link 3, caused by link 2)."
+          - "Appends an AuditEntry (action='SCHOLARSHIP_APPROVED')."
+          - "increments ScholarshipAward.version by 1."
+      - from: REQUESTED
+        to: DENIED
+        trigger: "POST /scholarship-awards/{id}/deny"
+        actor: ProgramDirector
+        preconditions:
+          - "ScholarshipAward.status == REQUESTED."
+        side_effects:
+          - "ScholarshipAward.status = DENIED."
+          - "Appends an AuditEntry (action='SCHOLARSHIP_DENIED')."
+          - "increments ScholarshipAward.version by 1."
+      - from: APPROVED
+        to: REVOKED
+        trigger: "POST /scholarship-awards/{id}/revoke"
+        actor: ProgramDirector
+        preconditions:
+          - "ScholarshipAward.status == APPROVED."
+          - "No Invoice referencing this child's enrollments is FINALIZED, PAID, or VOID."
+        side_effects:
+          - "ScholarshipAward.status = REVOKED; approved_discount_pct reset to 0."
+          - "COMPENSATION: every DRAFT Invoice line for this child re-runs compute_line_tuition with discount 0, restoring provisional_tuition_cents (invariant: see scholarship_discount_conservation)."
+          - "compute_invoice_totals re-runs on each touched invoice."
+          - "Appends an AuditEntry (action='SCHOLARSHIP_REVOKED')."
+          - "increments ScholarshipAward.version by 1."
+
+  - entity: Enrollment
+    initial_state: REQUESTED
+    terminal_states: [WITHDRAWN]
+    note: "Branching fork-join: REQUESTED forks to CONFIRMED (capacity available) or WAITLISTED (capacity full); a WITHDRAWN seat promotes the head waitlisted enrollment back into the CONFIRMED branch (the join + revision loop)."
+    transitions:
+      - from: REQUESTED
+        to: CONFIRMED
+        trigger: "POST /enrollments (system auto-decides branch at creation when seat available)"
+        actor: Guardian
+        preconditions:
+          - "Acting Guardian owns the Child (cross-entity: Enrollment.child_id -> Child.guardian_id == X-User-ID)."
+          - "Parent Session.status == OPEN (cross-entity: Enrollment branch depends on the WeeklyOffering's Session state)."
+          - "WeeklyOffering.weather_state == NORMAL."
+          - "Child has an APPROVED AuthorizationForm of form_type MEDICAL AND one of form_type PICKUP."
+          - "Child has >= 1 EmergencyContact."
+          - "Child age (compute_child_age vs Session.age_as_of_date) is within [Session.age_group_min, Session.age_group_max]."
+          - "No existing non-WITHDRAWN Enrollment for the same (child_id, weekly_offering_id)."
+          - "WeeklyOffering.enrolled_count < Session.weekly_capacity (seat available)."
+          - "expected_weekly_offering_version matches WeeklyOffering.version (OCC)."
+        side_effects:
+          - "Enrollment.status = CONFIRMED."
+          - "reconcile_offering_counts: enrolled_count += 1; capacity_state recomputed."
+          - "provisional_tuition_cents computed via compute_line_tuition (provisional)."
+          - "Enrollment attached to the guardian's DRAFT Invoice for the offering's billing period (created if absent); compute_invoice_totals + compute_sibling_discount re-run."
+          - "Appends an AuditEntry (action='ENROLLMENT_CONFIRMED')."
+          - "increments WeeklyOffering.version by 1."
+      - from: REQUESTED
+        to: WAITLISTED
+        trigger: "POST /enrollments (system auto-decides branch at creation when seat full)"
+        actor: Guardian
+        preconditions:
+          - "Same authorization/emergency-contact/age/ownership/session-open/no-duplicate preconditions as the CONFIRMED branch."
+          - "WeeklyOffering.enrolled_count >= Session.weekly_capacity (no seat)."
+          - "expected_weekly_offering_version matches WeeklyOffering.version (OCC)."
+        side_effects:
+          - "Enrollment.status = WAITLISTED."
+          - "reconcile_offering_counts: waitlist_count += 1; waitlist_rank assigned = waitlist_count (created_at ASC)."
+          - "No invoice line created while WAITLISTED (provisional_tuition_cents stays 0)."
+          - "Appends an AuditEntry (action='ENROLLMENT_WAITLISTED')."
+          - "increments WeeklyOffering.version by 1."
+      - from: CONFIRMED
+        to: WITHDRAWN
+        trigger: "POST /enrollments/{id}/withdraw"
+        actor: Guardian
+        preconditions:
+          - "Enrollment.status == CONFIRMED."
+          - "Acting Guardian owns the Child."
+          - "The Enrollment's Invoice.status == DRAFT (cannot withdraw a billed seat)."
+        side_effects:
+          - "Enrollment.status = WITHDRAWN."
+          - "CASCADE depth-3: reconcile_offering_counts decrements enrolled_count, freeing a seat (link 1)."
+          - "If a WAITLISTED enrollment exists for the offering, the head one (lowest waitlist_rank == lowest created_at) auto-promotes WAITLISTED->CONFIRMED and gets a fresh provisional_tuition_cents (link 2, caused by link 1)."
+          - "The promoted enrollment's Invoice re-runs compute_invoice_totals + compute_sibling_discount; the withdrawn enrollment's invoice line is removed and its invoice re-totaled (link 3, caused by links 1-2)."
+          - "Appends an AuditEntry (action='ENROLLMENT_WITHDRAWN')."
+          - "increments WeeklyOffering.version by 1."
+      - from: WAITLISTED
+        to: CONFIRMED
+        trigger: "system promotion on a freed seat (no direct endpoint; fired by withdraw cascade)"
+        actor: system
+        preconditions:
+          - "A seat freed on the offering (enrolled_count < weekly_capacity)."
+          - "This enrollment has the lowest waitlist_rank among WAITLISTED siblings."
+        side_effects:
+          - "Enrollment.status = CONFIRMED; waitlist_rank cleared to null."
+          - "provisional_tuition_cents computed via compute_line_tuition; enrollment attached to a DRAFT invoice line."
+          - "reconcile_offering_counts re-ranks remaining WAITLISTED enrollments."
+      - from: WAITLISTED
+        to: WITHDRAWN
+        trigger: "POST /enrollments/{id}/withdraw"
+        actor: Guardian
+        preconditions:
+          - "Enrollment.status == WAITLISTED."
+          - "Acting Guardian owns the Child."
+        side_effects:
+          - "Enrollment.status = WITHDRAWN."
+          - "reconcile_offering_counts: waitlist_count -= 1; remaining WAITLISTED enrollments re-ranked by created_at ASC."
+          - "Appends an AuditEntry (action='ENROLLMENT_WITHDRAWN')."
+          - "increments WeeklyOffering.version by 1."
+
+  - entity: Invoice
+    initial_state: DRAFT
+    terminal_states: [PAID, VOID]
+    transitions:
+      - from: DRAFT
+        to: FINALIZED
+        trigger: "POST /invoices/{id}/finalize"
+        actor: BillingAdmin
+        preconditions:
+          - "Invoice.status == DRAFT."
+          - "Invoice has >= 1 CONFIRMED Enrollment line."
+          - "expected_invoice_version matches Invoice.version (OCC)."
+        side_effects:
+          - "Invoice.status = FINALIZED."
+          - "For every CONFIRMED enrollment line, final_tuition_cents computed via compute_line_tuition (final variant) and frozen."
+          - "subtotal_cents re-frozen as sum of final_tuition_cents; sibling_discount_cents re-frozen; total_due_cents = max(0, subtotal - sibling_discount)."
+          - "Appends an AuditEntry (action='INVOICE_FINALIZED')."
+          - "increments Invoice.version by 1."
+      - from: FINALIZED
+        to: PAID
+        trigger: "POST /payments (cumulative amount_paid_cents reaches total_due_cents)"
+        actor: BillingAdmin
+        preconditions:
+          - "Invoice.status == FINALIZED."
+          - "amount_paid_cents + payment.amount_cents >= total_due_cents."
+        side_effects:
+          - "Invoice.amount_paid_cents += payment.amount_cents."
+          - "Invoice.status = PAID."
+          - "Appends an AuditEntry (action='INVOICE_PAID')."
+          - "increments Invoice.version by 1."
+      - from: DRAFT
+        to: VOID
+        trigger: "POST /invoices/{id}/void"
+        actor: BillingAdmin
+        preconditions:
+          - "Invoice.status == DRAFT."
+        side_effects:
+          - "Invoice.status = VOID."
+          - "Appends an AuditEntry (action='INVOICE_VOIDED')."
+          - "increments Invoice.version by 1."
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: enroll-stale-offering-seat
+    parent_entity: WeeklyOffering
+    write_endpoint: "POST /enrollments"
+    occ_field: "expected_weekly_offering_version"
+    description: |
+      Creating an Enrollment against a WeeklyOffering whose version has advanced
+      since the client last observed it is rejected. This captures the case where
+      another guardian's enrollment has already taken the last seat (legitimately
+      flipping the offering to FULL and bumping its version); the current writer's
+      view of the offering — including its remaining-seat count — is therefore
+      stale, and the request is rejected rather than silently over-filling the week.
+    error_id: ERR_STALE_OFFERING_VERSION
+    http_status: 412
+
+  - rule_id: finalize-stale-invoice
+    parent_entity: Invoice
+    write_endpoint: "POST /invoices/{id}/finalize"
+    occ_field: "expected_invoice_version"
+    description: |
+      Finalizing an Invoice whose version has advanced since the client last read
+      it is rejected. A scholarship approval or a sibling withdrawal can re-run
+      compute_invoice_totals and bump the invoice version between read and finalize;
+      the finalize request then carries a stale expected_invoice_version and is
+      rejected so the admin does not lock obsolete totals.
+    error_id: ERR_STALE_INVOICE_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: compute_child_age
+    trigger: "On enrollment branch decision (POST /enrollments) and exposed via GET /children/{id}/age-eligibility."
+    algorithm: chronological
+    formula: |
+      # Whole-year age as of the session's reference date.
+      ref = Session.age_as_of_date            # ISO date
+      dob = Child.birth_date                  # ISO date
+      age_years = ref.year - dob.year
+      if (ref.month, ref.day) < (dob.month, dob.day):
+          age_years -= 1                      # birthday not yet reached on ref date
+      eligible = (Session.age_group_min <= age_years <= Session.age_group_max)
+    input_set: "A single Child and a single Session; no aggregation."
+    constants: {}
+    precision: "integer years, floor toward the most recent birthday on ref date"
+    variants: []
+
+  - name: compute_scholarship_discount
+    trigger: "On ScholarshipAward APPROVED transition; locks approved_discount_pct."
+    algorithm: threshold
+    formula: |
+      # Tier table lookup. Locked at approval; revoke resets to 0.
+      pct = TIER_TABLE[ScholarshipAward.tier]   # fraction in [0,1]
+      approved_discount_pct = pct
+    input_set: "One ScholarshipAward."
+    constants:
+      TIER_TABLE: { NONE: 0.0, PARTIAL: 0.5, FULL: 1.0 }
+    precision: "fraction with up to 2 decimal places"
+    variants: []
+
+  - name: compute_line_tuition
+    trigger: "On Enrollment CONFIRMED (provisional) and on Invoice FINALIZED per line (final). Re-run on scholarship approve/revoke cascade for DRAFT invoices."
+    algorithm: tiered_pricing
+    formula: |
+      # Mode (a): >=3 inputs with non-linear interaction (multiplicative discount
+      # then additive program surcharge, with conditional branch on program_type).
+      base = Session.base_weekly_tuition_cents
+      sch  = child's APPROVED ScholarshipAward.approved_discount_pct (else 0.0)
+      # Scholarship is a multiplicative reduction applied to base first.
+      after_scholarship = round_half_up(base * (1 - sch))
+      # CAMP programs add a flat materials surcharge per enrolled week AFTER scholarship;
+      # AFTERSCHOOL programs do not.
+      if Program.program_type == CAMP:
+          line = after_scholarship + CAMP_MATERIALS_SURCHARGE_CENTS
+      else:
+          line = after_scholarship
+      result = max(0, line)
+    input_set: "One Enrollment in CONFIRMED; reads its Session, Program, and the child's APPROVED ScholarshipAward if any."
+    constants:
+      CAMP_MATERIALS_SURCHARGE_CENTS: 1500
+    precision: "integer cents; round_half_up when applying the scholarship fraction BEFORE adding the surcharge (rounding-order pinned: scale-then-round, then add)."
+    variants:
+      - name: provisional
+        when: "Invoice.status == DRAFT — written to Enrollment.provisional_tuition_cents."
+        difference: "Uses the child's scholarship discount as it stands at calc time; recomputed by later cascades. Surcharge included."
+      - name: final
+        when: "Invoice.status transitions DRAFT->FINALIZED — written to Enrollment.final_tuition_cents and frozen."
+        difference: "Snapshots the discount at finalize and freezes it; later scholarship changes do not move final_tuition_cents (whereas provisional would)."
+
+  - name: compute_sibling_discount
+    trigger: "On Enrollment CONFIRMED/WITHDRAWN/promotion affecting a DRAFT invoice, and frozen at Invoice FINALIZED."
+    algorithm: tiered_pricing
+    formula: |
+      # Mode (c): circular-looking dependency, evaluation order pinned.
+      # sibling_discount depends on the per-line tuitions, which depend on scholarship,
+      # and total_due depends on sibling_discount — so order is: (1) line tuitions,
+      # (2) sibling_discount, (3) invoice totals. compute_sibling_discount runs at step (2).
+      distinct_children = number of DISTINCT child_id among CONFIRMED enrollments on this Invoice
+      if distinct_children < 2:
+          sibling_discount_cents = 0
+      else:
+          # Discount the cheapest sibling's most-expensive single week is NOT discounted;
+          # each ADDITIONAL distinct child beyond the first earns SIBLING_PCT off that
+          # child's single highest provisional_tuition_cents line on this invoice.
+          eligible_children = all distinct children except the one whose single highest line is largest (the anchor; tie-break: lowest Child.created_at)
+          per_child_best = for each eligible child, that child's max(provisional_tuition_cents) over their CONFIRMED lines on this invoice
+          sibling_discount_cents = round_half_up( SIBLING_PCT * sum(per_child_best) )
+    input_set: "All CONFIRMED enrollments on one DRAFT Invoice, grouped by child_id."
+    constants:
+      SIBLING_PCT: 0.10
+    precision: "integer cents; round_half_up on the final summed product (sum-then-round, NOT round-per-child)."
+    variants:
+      - name: draft
+        when: "Invoice DRAFT — computed over provisional_tuition_cents."
+        difference: "Uses provisional line amounts; moves as enrollments/scholarships change."
+      - name: frozen
+        when: "Invoice FINALIZED — computed over final_tuition_cents and frozen."
+        difference: "Uses frozen final line amounts; immutable after finalize."
+
+  - name: compute_invoice_totals
+    trigger: "On any change to a DRAFT invoice's CONFIRMED lines and at FINALIZED."
+    algorithm: aggregation
+    formula: |
+      # Evaluation order pinned (see compute_sibling_discount step list).
+      if Invoice.status == DRAFT:
+          subtotal_cents = sum(Enrollment.provisional_tuition_cents
+                               for e in CONFIRMED enrollments on this invoice)
+      else:  # FINALIZED/PAID — frozen snapshot
+          subtotal_cents = sum(Enrollment.final_tuition_cents for CONFIRMED lines)
+      # sibling_discount_cents was set in the prior step (compute_sibling_discount).
+      total_due_cents = max(0, subtotal_cents - sibling_discount_cents)
+    input_set: "CONFIRMED enrollments on one Invoice; excludes WAITLISTED and WITHDRAWN."
+    constants: {}
+    precision: "integer cents; floor of total at 0."
+    variants: []
+
+  - name: reconcile_offering_counts
+    trigger: "On every Enrollment branch/transition affecting a WeeklyOffering (confirm, waitlist, withdraw, promote, rain relocate)."
+    algorithm: aggregation
+    formula: |
+      enrolled_count = count(Enrollment for offering where status == CONFIRMED)
+      waitlist_count = count(Enrollment for offering where status == WAITLISTED)
+      capacity_state = FULL if enrolled_count >= Session.weekly_capacity else AVAILABLE
+      # Waitlist ranks reassigned 1-based over WAITLISTED enrollments by created_at ASC.
+      for i, e in enumerate(sorted(WAITLISTED enrollments, key=created_at ASC), start=1):
+          e.waitlist_rank = i
+    input_set: "All Enrollments for one WeeklyOffering, filtered by status."
+    constants: {}
+    precision: "integer counts; ranks 1-based."
+    variants: []
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except GET list/detail public reads"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for the operation per §1.7 RBAC."
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all mutations"
+
+  - priority: 3
+    category: existence
+    check: "All path/body referenced resources exist (validated left-to-right)."
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 4
+    category: business_referential
+    check: "Acting Guardian owns the Child / Enrollment / form referenced (X-User-ID == owning Guardian.id)."
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /children/{id}/*, POST /enrollments, POST /enrollments/{id}/withdraw, POST /authorization-forms/{id}/revoke"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a valid state for the requested transition (state-machine from-state)."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 6
+    category: state
+    check: "Enrollment requires its WeeklyOffering's Session.status == OPEN."
+    error_id: ERR_SESSION_NOT_OPEN
+    http_status: 409
+    applies_to: "POST /enrollments"
+
+  - priority: 7
+    category: business_constraint
+    check: "Enrollment requires the WeeklyOffering.weather_state == NORMAL (no enrolling into a rained-out outdoor week)."
+    error_id: ERR_OFFERING_RAINED_OUT
+    http_status: 409
+    applies_to: "POST /enrollments"
+
+  - priority: 8
+    category: business_safety
+    check: "Child has an APPROVED MEDICAL AuthorizationForm AND an APPROVED PICKUP AuthorizationForm before any enrollment confirm/waitlist."
+    error_id: ERR_AUTHORIZATION_INCOMPLETE
+    http_status: 422
+    applies_to: "POST /enrollments"
+
+  - priority: 9
+    category: business_safety
+    check: "Child has >= 1 EmergencyContact before any enrollment."
+    error_id: ERR_NO_EMERGENCY_CONTACT
+    http_status: 422
+    applies_to: "POST /enrollments"
+
+  - priority: 10
+    category: business_constraint
+    check: "Child age (compute_child_age vs Session.age_as_of_date) within [age_group_min, age_group_max]."
+    error_id: ERR_AGE_OUT_OF_GROUP
+    http_status: 422
+    applies_to: "POST /enrollments"
+
+  - priority: 11
+    category: business_constraint
+    check: "No existing non-WITHDRAWN Enrollment for the same (child_id, weekly_offering_id)."
+    error_id: ERR_DUPLICATE_ENROLLMENT
+    http_status: 409
+    applies_to: "POST /enrollments"
+
+  - priority: 12
+    category: business_temporal
+    check: "A child may not hold CONFIRMED/WAITLISTED enrollments in two WeeklyOfferings whose [week_start, week_start+7d) intervals overlap (one child cannot be in two camps the same week). Adjacency (next Monday) is allowed."
+    error_id: ERR_WEEK_OVERLAP_CHILD
+    http_status: 409
+    applies_to: "POST /enrollments"
+
+  - priority: 13
+    category: business_constraint
+    check: "On rain relocation, the alternate offering's age group must contain the child's age; otherwise the offering's rain declaration is rejected before any relocation occurs."
+    error_id: ERR_ALTERNATE_AGE_MISMATCH
+    http_status: 422
+    applies_to: "POST /weather-events"
+
+  - priority: 14
+    category: business_constraint
+    check: "On a rain declaration, the count of CONFIRMED enrollments to relocate from the source offering may exceed the alternate's weekly_capacity by at most RAIN_OVERFLOW_TOLERANCE=1 (overflow children land WAITLISTED on the alternate, but this hard cap protects the room). If relocate_count > alternate.weekly_capacity + 1, the declaration is rejected before any relocation occurs."
+    error_id: ERR_ALTERNATE_OVER_CAPACITY
+    http_status: 409
+    applies_to: "POST /weather-events"
+
+  - priority: 15
+    category: business_fiscal
+    check: "Cannot withdraw an Enrollment whose Invoice is not DRAFT (already billed)."
+    error_id: ERR_ENROLLMENT_BILLED
+    http_status: 409
+    applies_to: "POST /enrollments/{id}/withdraw"
+
+  - priority: 16
+    category: business_fiscal
+    check: "Payment amount must not exceed the invoice's outstanding balance (total_due_cents - amount_paid_cents)."
+    error_id: ERR_OVERPAYMENT
+    http_status: 422
+    applies_to: "POST /payments"
+
+  - priority: 17
+    category: business_constraint
+    check: "OCC: expected_<parent>_version must match the live parent version."
+    error_id: ERR_STALE_OFFERING_VERSION
+    http_status: 412
+    applies_to: "POST /enrollments, POST /invoices/{id}/finalize"
+
+  - priority: 18
+    category: business_constraint
+    check: "Required body fields present and well-typed; enum values in declared sets; numeric fields within declared bounds."
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all writes"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Guardian ----
+  - method: POST
+    path: "/guardians"
+    description: "Register a guardian."
+    roles: [Anonymous]
+    code: 201
+    input: [email, full_name, phone, home_zip]
+    output: Guardian
+    side_effects: ["Creates Guardian."]
+
+  - method: GET
+    path: "/guardians/{id}"
+    description: "Fetch a guardian."
+    roles: [Guardian, ProgramDirector, BillingAdmin]
+    code: 200
+    input: []
+    output: Guardian
+    side_effects: []
+
+  - method: GET
+    path: "/guardians/{id}/children"
+    description: "List children of a guardian (FK reverse-reachability for Child.guardian_id)."
+    roles: [Guardian, ProgramDirector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Child[]
+    side_effects: []
+
+  - method: GET
+    path: "/guardians/{id}/invoices"
+    description: "List invoices of a guardian (FK reverse-reachability for Invoice.guardian_id)."
+    roles: [Guardian, BillingAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+
+  # ---- Child ----
+  - method: POST
+    path: "/children"
+    description: "Create a child under the acting guardian."
+    roles: [Guardian]
+    code: 201
+    input: [guardian_id, first_name, birth_date, "household_size?"]
+    output: Child
+    side_effects: ["Creates Child."]
+
+  - method: GET
+    path: "/children/{id}"
+    description: "Fetch a child."
+    roles: [Guardian, ProgramDirector]
+    code: 200
+    input: []
+    output: Child
+    side_effects: []
+
+  - method: GET
+    path: "/children/{id}/age-eligibility"
+    description: "Computed read: child age vs a session's age group via compute_child_age."
+    roles: [Guardian, ProgramDirector]
+    code: 200
+    input: [session_id]
+    output: Child
+    side_effects: ["Runs compute_child_age (read-only)."]
+
+  - method: GET
+    path: "/children/{id}/emergency-contacts"
+    description: "List a child's emergency contacts (FK reverse-reachability for EmergencyContact.child_id)."
+    roles: [Guardian, ProgramDirector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: EmergencyContact[]
+    side_effects: []
+
+  - method: GET
+    path: "/children/{id}/authorization-forms"
+    description: "List a child's authorization forms (FK reverse-reachability for AuthorizationForm.child_id)."
+    roles: [Guardian, ProgramDirector]
+    code: 200
+    input: ["form_type?", "limit?", "offset?"]
+    output: AuthorizationForm[]
+    side_effects: []
+
+  - method: GET
+    path: "/children/{id}/scholarship-awards"
+    description: "List a child's scholarship awards (FK reverse-reachability for ScholarshipAward.child_id)."
+    roles: [Guardian, ProgramDirector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ScholarshipAward[]
+    side_effects: []
+
+  # ---- EmergencyContact ----
+  - method: POST
+    path: "/emergency-contacts"
+    description: "Add an emergency contact for a child."
+    roles: [Guardian]
+    code: 201
+    input: [child_id, contact_name, contact_phone, relationship]
+    output: EmergencyContact
+    side_effects: ["Creates EmergencyContact."]
+
+  # ---- AuthorizationForm ----
+  - method: POST
+    path: "/authorization-forms"
+    description: "Submit a medical or pickup authorization form for a child."
+    roles: [Guardian]
+    code: 201
+    input: [child_id, form_type, "medication_notes?", "authorized_pickup_names?"]
+    output: AuthorizationForm
+    side_effects: ["Creates AuthorizationForm in SUBMITTED."]
+
+  - method: POST
+    path: "/authorization-forms/{id}/approve"
+    description: "Director approves a submitted authorization form."
+    roles: [ProgramDirector]
+    code: 200
+    input: []
+    output: AuthorizationForm
+    side_effects: ["SUBMITTED->APPROVED; AuditEntry."]
+
+  - method: POST
+    path: "/authorization-forms/{id}/revoke"
+    description: "Guardian revokes their child's authorization form."
+    roles: [Guardian]
+    code: 200
+    input: []
+    output: AuthorizationForm
+    side_effects: ["->REVOKED; AuditEntry."]
+
+  # ---- Program ----
+  - method: POST
+    path: "/programs"
+    description: "Create a program (DRAFT)."
+    roles: [ProgramDirector]
+    code: 201
+    input: [name, program_type, min_age, max_age]
+    output: Program
+    side_effects: ["Creates Program in DRAFT."]
+
+  - method: GET
+    path: "/programs/{id}"
+    description: "Fetch a program."
+    roles: [Guardian, ProgramDirector, BillingAdmin]
+    code: 200
+    input: []
+    output: Program
+    side_effects: []
+
+  - method: GET
+    path: "/programs/{id}/sessions"
+    description: "List sessions of a program (FK reverse-reachability for Session.program_id)."
+    roles: [Guardian, ProgramDirector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Session[]
+    side_effects: []
+
+  - method: POST
+    path: "/programs/{id}/publish"
+    description: "Publish a program."
+    roles: [ProgramDirector]
+    code: 200
+    input: []
+    output: Program
+    side_effects: ["DRAFT->PUBLISHED; AuditEntry; version++."]
+
+  - method: POST
+    path: "/programs/{id}/archive"
+    description: "Archive a published program."
+    roles: [ProgramDirector]
+    code: 200
+    input: []
+    output: Program
+    side_effects: ["PUBLISHED->ARCHIVED; AuditEntry; version++."]
+
+  # ---- Session ----
+  - method: POST
+    path: "/sessions"
+    description: "Create an age-group session under a program."
+    roles: [ProgramDirector]
+    code: 201
+    input: [program_id, title, age_group_min, age_group_max, age_as_of_date, weekly_capacity, base_weekly_tuition_cents]
+    output: Session
+    side_effects: ["Creates Session in SCHEDULED."]
+
+  - method: GET
+    path: "/sessions/{id}"
+    description: "Fetch a session."
+    roles: [Guardian, ProgramDirector, BillingAdmin]
+    code: 200
+    input: []
+    output: Session
+    side_effects: []
+
+  - method: GET
+    path: "/sessions/{id}/weekly-offerings"
+    description: "List weekly offerings of a session (FK reverse-reachability for WeeklyOffering.session_id)."
+    roles: [Guardian, ProgramDirector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WeeklyOffering[]
+    side_effects: []
+
+  - method: POST
+    path: "/sessions/{id}/open"
+    description: "Open a scheduled session for enrollment."
+    roles: [ProgramDirector]
+    code: 200
+    input: []
+    output: Session
+    side_effects: ["SCHEDULED->OPEN; AuditEntry; version++."]
+
+  - method: POST
+    path: "/sessions/{id}/close"
+    description: "Close an open session to new enrollments."
+    roles: [ProgramDirector]
+    code: 200
+    input: []
+    output: Session
+    side_effects: ["OPEN->CLOSED; AuditEntry; version++."]
+
+  - method: POST
+    path: "/sessions/{id}/cancel"
+    description: "Cancel a session; cascades withdraw of all enrollments."
+    roles: [ProgramDirector]
+    code: 200
+    input: []
+    output: Session
+    side_effects: ["->CANCELLED; depth-3 cascade; version++."]
+
+  # ---- WeeklyOffering ----
+  - method: POST
+    path: "/weekly-offerings"
+    description: "Create a weekly offering under a session."
+    roles: [ProgramDirector]
+    code: 201
+    input: [session_id, week_start, "rain_alternate_offering_id?"]
+    output: WeeklyOffering
+    side_effects: ["Creates WeeklyOffering in NORMAL."]
+
+  - method: GET
+    path: "/weekly-offerings/{id}"
+    description: "Fetch a weekly offering with computed counts."
+    roles: [Guardian, ProgramDirector, BillingAdmin]
+    code: 200
+    input: []
+    output: WeeklyOffering
+    side_effects: []
+
+  - method: GET
+    path: "/weekly-offerings/{id}/rain-dependents"
+    description: "List weekly offerings that name this offering as their rain alternate (self-FK reverse-reachability for WeeklyOffering.rain_alternate_offering_id)."
+    roles: [Guardian, ProgramDirector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WeeklyOffering[]
+    side_effects: []
+
+  - method: GET
+    path: "/weekly-offerings/{id}/enrollments"
+    description: "List enrollments of an offering (FK reverse-reachability for Enrollment.weekly_offering_id)."
+    roles: [Guardian, ProgramDirector, BillingAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Enrollment[]
+    side_effects: []
+
+  - method: GET
+    path: "/weekly-offerings/{id}/weather-events"
+    description: "List weather events for an offering (FK reverse-reachability for WeatherEvent.weekly_offering_id)."
+    roles: [ProgramDirector, BillingAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WeatherEvent[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/weekly-offerings/{id}"
+    description: "Configure the rain alternate offering for a weekly offering."
+    roles: [ProgramDirector]
+    code: 200
+    input: [rain_alternate_offering_id, expected_weekly_offering_version]
+    output: WeeklyOffering
+    side_effects: ["Sets rain_alternate_offering_id; version++."]
+
+  - method: POST
+    path: "/weekly-offerings/{id}/clear-rain"
+    description: "Reset a weekly offering's weather posture to NORMAL."
+    roles: [ProgramDirector]
+    code: 200
+    input: []
+    output: WeeklyOffering
+    side_effects: ["RAIN_ACTIVATED->NORMAL; AuditEntry; version++."]
+
+  # ---- WeatherEvent ----
+  - method: POST
+    path: "/weather-events"
+    description: "Declare a rain day on an outdoor offering; relocates confirmed children to the alternate."
+    roles: [ProgramDirector]
+    code: 201
+    input: [weekly_offering_id]
+    output: WeatherEvent
+    side_effects: ["NORMAL->RAIN_ACTIVATED depth-2 cascade; relocates enrollments; reconcile_offering_counts on both."]
+
+  # ---- ScholarshipAward ----
+  - method: POST
+    path: "/scholarship-awards"
+    description: "Request a scholarship for a child."
+    roles: [Guardian]
+    code: 201
+    input: [child_id, tier]
+    output: ScholarshipAward
+    side_effects: ["Creates ScholarshipAward in REQUESTED."]
+
+  - method: POST
+    path: "/scholarship-awards/{id}/approve"
+    description: "Director approves a scholarship; cascades re-pricing of draft invoice lines."
+    roles: [ProgramDirector]
+    code: 200
+    input: []
+    output: ScholarshipAward
+    side_effects: ["REQUESTED->APPROVED; locks approved_discount_pct; depth-3 cascade; version++."]
+
+  - method: POST
+    path: "/scholarship-awards/{id}/deny"
+    description: "Director denies a scholarship request."
+    roles: [ProgramDirector]
+    code: 200
+    input: []
+    output: ScholarshipAward
+    side_effects: ["REQUESTED->DENIED; version++."]
+
+  - method: POST
+    path: "/scholarship-awards/{id}/revoke"
+    description: "Director revokes an approved scholarship; compensating re-price of draft lines."
+    roles: [ProgramDirector]
+    code: 200
+    input: []
+    output: ScholarshipAward
+    side_effects: ["APPROVED->REVOKED; discount reset to 0; compensating re-price; version++."]
+
+  # ---- Enrollment ----
+  - method: POST
+    path: "/enrollments"
+    description: "Enroll a child into a weekly offering; system auto-decides CONFIRMED vs WAITLISTED branch."
+    roles: [Guardian]
+    code: 201
+    input: [child_id, weekly_offering_id, expected_weekly_offering_version]
+    output: Enrollment
+    side_effects: ["Branch decision; reconcile_offering_counts; compute_line_tuition; invoice attach; version++ on offering."]
+
+  - method: GET
+    path: "/enrollments/{id}"
+    description: "Fetch an enrollment with computed tuition/rank."
+    roles: [Guardian, ProgramDirector, BillingAdmin]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: []
+
+  - method: GET
+    path: "/enrollments"
+    description: "List enrollments, filterable by child or invoice (FK reverse-reachability for Enrollment.child_id and Enrollment.invoice_id)."
+    roles: [Guardian, ProgramDirector, BillingAdmin]
+    code: 200
+    input: ["child_id?", "invoice_id?", "status?", "limit?", "offset?"]
+    output: Enrollment[]
+    side_effects: []
+
+  - method: POST
+    path: "/enrollments/{id}/withdraw"
+    description: "Withdraw an enrollment; frees a seat and promotes the head waitlist entry."
+    roles: [Guardian]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: ["->WITHDRAWN; depth-3 cascade; promotes head waitlist; re-totals invoices; version++ on offering."]
+
+  # ---- Invoice ----
+  - method: GET
+    path: "/invoices/{id}"
+    description: "Fetch an invoice with computed totals."
+    roles: [Guardian, BillingAdmin]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+
+  - method: GET
+    path: "/invoices/{id}/payments"
+    description: "List payments against an invoice (FK reverse-reachability for Payment.invoice_id)."
+    roles: [Guardian, BillingAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Payment[]
+    side_effects: []
+
+  - method: POST
+    path: "/invoices/{id}/finalize"
+    description: "Finalize a draft invoice; freezes final tuition and totals."
+    roles: [BillingAdmin]
+    code: 200
+    input: [expected_invoice_version]
+    output: Invoice
+    side_effects: ["DRAFT->FINALIZED; compute_line_tuition (final) per line; freeze totals; version++."]
+
+  - method: POST
+    path: "/invoices/{id}/void"
+    description: "Void a draft invoice."
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["DRAFT->VOID; AuditEntry; version++."]
+
+  # ---- Payment ----
+  - method: POST
+    path: "/payments"
+    description: "Record a payment against a finalized invoice."
+    roles: [BillingAdmin]
+    code: 201
+    input: [invoice_id, amount_cents, method]
+    output: Payment
+    side_effects: ["amount_paid_cents += amount; FINALIZED->PAID when balance covered."]
+
+  # ---- Audit ----
+  - method: GET
+    path: "/audit-entries"
+    description: "List audit entries, filterable by entity (entity_id is identity-only, not an FK)."
+    roles: [ProgramDirector, BillingAdmin]
+    code: 200
+    input: ["entity_type?", "entity_id?", "limit?", "offset?"]
+    output: AuditEntry[]
+    side_effects: []
+
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing or malformed X-User-Role / X-User-ID on a protected endpoint."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for this operation per RBAC."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced resource does not exist."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Acting Guardian does not own the child/enrollment/form."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Transition not allowed from the resource's current state."
+  - id: ERR_SESSION_NOT_OPEN
+    http: 409
+    condition: "Enrollment attempted on an offering whose Session is not OPEN."
+  - id: ERR_OFFERING_RAINED_OUT
+    http: 409
+    condition: "Enrollment attempted on an offering whose weather_state is RAIN_ACTIVATED."
+  - id: ERR_AUTHORIZATION_INCOMPLETE
+    http: 422
+    condition: "Child lacks an APPROVED MEDICAL and/or APPROVED PICKUP authorization form at enrollment."
+  - id: ERR_NO_EMERGENCY_CONTACT
+    http: 422
+    condition: "Child has zero emergency contacts at enrollment."
+  - id: ERR_AGE_OUT_OF_GROUP
+    http: 422
+    condition: "Child age as of the session's reference date falls outside the session's age group."
+  - id: ERR_DUPLICATE_ENROLLMENT
+    http: 409
+    condition: "A non-WITHDRAWN enrollment already exists for the same (child, weekly offering)."
+  - id: ERR_WEEK_OVERLAP_CHILD
+    http: 409
+    condition: "Child already enrolled (CONFIRMED/WAITLISTED) in an offering whose week interval overlaps the requested one."
+  - id: ERR_ALTERNATE_AGE_MISMATCH
+    http: 422
+    condition: "Rain alternate offering's age group does not contain a relocating child's age."
+  - id: ERR_ALTERNATE_OVER_CAPACITY
+    http: 409
+    condition: "Rain relocation would exceed the alternate offering's weekly_capacity beyond the overflow tolerance."
+  - id: ERR_ENROLLMENT_BILLED
+    http: 409
+    condition: "Withdraw attempted on an enrollment whose invoice is not DRAFT."
+  - id: ERR_OVERPAYMENT
+    http: 422
+    condition: "Payment exceeds the invoice's outstanding balance."
+  - id: ERR_STALE_OFFERING_VERSION
+    http: 412
+    condition: "expected_weekly_offering_version does not match the offering's current version on enroll."
+  - id: ERR_STALE_INVOICE_VERSION
+    http: 412
+    condition: "expected_invoice_version does not match the invoice's current version on finalize."
+  - id: ERR_NO_CONFIRMED_LINES
+    http: 409
+    condition: "Invoice finalize attempted with zero CONFIRMED enrollment lines."
+  - id: ERR_PROGRAM_NOT_PUBLISHED
+    http: 409
+    condition: "Session open attempted while parent Program is not PUBLISHED."
+  - id: ERR_NO_SESSION_FOR_PUBLISH
+    http: 409
+    condition: "Program publish attempted with no SCHEDULED/OPEN session."
+  - id: ERR_INVALID_AGE_RANGE
+    http: 400
+    condition: "Session/Program age range invalid (min > max or session group outside program range)."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, bad enum value, or out-of-bounds numeric input."
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Anonymous
+    description: "Unauthenticated caller; may only register a guardian."
+    identity: opaque
+    exclusive_operations:
+      - "POST /guardians"
+    shared_operations: []
+
+  - name: Guardian
+    description: "Parent/guardian; owns children, authorizations, emergency contacts, scholarship requests, and enrollments."
+    identity: "entity_backed:Guardian"
+    exclusive_operations:
+      - "POST /children"
+      - "POST /emergency-contacts"
+      - "POST /authorization-forms"
+      - "POST /authorization-forms/{id}/revoke"
+      - "POST /scholarship-awards"
+      - "POST /enrollments"
+      - "POST /enrollments/{id}/withdraw"
+    shared_operations:
+      - "GET reads of own children, enrollments, invoices, payments, forms"
+
+  - name: ProgramDirector
+    description: "Operates programs, sessions, weekly offerings, weather, authorization approval, and scholarship review."
+    identity: opaque
+    exclusive_operations:
+      - "POST /programs"
+      - "POST /programs/{id}/publish"
+      - "POST /programs/{id}/archive"
+      - "POST /sessions"
+      - "POST /sessions/{id}/open"
+      - "POST /sessions/{id}/close"
+      - "POST /sessions/{id}/cancel"
+      - "POST /weekly-offerings"
+      - "PATCH /weekly-offerings/{id}"
+      - "POST /weekly-offerings/{id}/clear-rain"
+      - "POST /weather-events"
+      - "POST /authorization-forms/{id}/approve"
+      - "POST /scholarship-awards/{id}/approve"
+      - "POST /scholarship-awards/{id}/deny"
+      - "POST /scholarship-awards/{id}/revoke"
+    shared_operations:
+      - "GET reads of programs, sessions, offerings, enrollments, forms, scholarships, audit"
+
+  - name: BillingAdmin
+    description: "Finalizes and voids invoices and records payments."
+    identity: opaque
+    exclusive_operations:
+      - "POST /invoices/{id}/finalize"
+      - "POST /invoices/{id}/void"
+      - "POST /payments"
+    shared_operations:
+      - "GET reads of invoices, payments, enrollments, audit"

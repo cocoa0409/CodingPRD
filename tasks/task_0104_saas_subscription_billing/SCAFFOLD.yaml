@@ -1,0 +1,1107 @@
+# =============================================================================
+# SaaS Subscription Billing — benchmark seed tables (§1.0–§1.7)
+# =============================================================================
+
+scenario: |
+  104. SaaS Subscription Billing: plan/tier/add-on, usage metering/overage,
+  upgrade/downgrade proration, trial/coupon/discount, dunning/failed-payment
+  retry, MRR/churn, per-jurisdiction tax, revenue schedule
+
+domain_name: saas-subscription-billing
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: Pricing engine
+  secondary_archetype: Ledger reconciliation
+  complexity_layers:
+    - Dual-variant calculation        # proration credit vs charge; MRR vs recognized revenue
+    - Rate / threshold triggers       # tiered usage overage breakpoints; dunning attempt boundary
+    - Cascading side effects          # plan change -> invoice lines -> revenue schedule -> account MRR
+    - Optimistic concurrency          # Subscription.version on plan-change writes
+    - Derived field reconciliation    # Account.mrr_cents denormalized from child subscriptions
+
+  entity_topology: flat
+  # 14 entities. Account is the aggregate root; Subscription, Invoice, Payment,
+  # UsageRecord, Coupon, Plan, AddOn, TaxJurisdiction, RevenueScheduleEntry,
+  # PlanPriceSchedule, SubscriptionPauseWindow, SubscriptionAddOn, InvoiceLine
+  # are peers joined by foreign keys (no deep nesting in URLs beyond one
+  # sub-resource hop).
+
+  state_machine_shape: parallel
+  # Subscription carries two independent dimensions (lifecycle_status × billing_status);
+  # Invoice has a branching+revert payment cycle. Not a single linear pipeline.
+
+  relationship_patterns:
+    - one_to_many        # Account -> Subscription, Subscription -> UsageRecord, Invoice -> InvoiceLine
+    - cross_aggregate    # Invoice references Subscription, Plan, Coupon, TaxJurisdiction
+
+  role_model: peer_roles
+  # BillingAdmin (operator) owns plans/coupons/jurisdictions and runs billing jobs;
+  # AccountOwner (entity-backed) owns their own account/subscriptions; Anonymous registers.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Plan
+    parent: null
+    common_fields: true
+    fields:
+      - { name: tier, type: enum, source: input, description: "BASIC | PRO | ENTERPRISE", constraints: "value in {BASIC, PRO, ENTERPRISE}; unique among non-archived plans" }
+      - { name: monthly_fee_cents, type: integer, source: input, description: "Recurring monthly fee in cents", constraints: ">= 0" }
+      - { name: included_usage_units, type: integer, source: input, description: "Metered units included before overage applies", constraints: ">= 0" }
+      - { name: overage_tiers, type: array, source: input, description: "Ordered marginal bands [{ up_to_units: int|null, rate_cents_per_unit: int }]. up_to_units is the cumulative cap measured in OVERAGE units (units above included_usage_units), strictly increasing; the last band has up_to_units null (unbounded)" }
+      - { name: trial_days, type: integer, source: input, default: 0, description: "Default trial length in days for subscriptions on this plan", constraints: ">= 0" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | ARCHIVED (archived plans reject new subscriptions but keep existing ones)" }
+
+  - name: PlanPriceSchedule
+    parent: Plan
+    common_fields: true
+    fields:
+      - { name: plan_id, type: string, source: system, description: "FK -> Plan.id" }
+      - { name: monthly_fee_cents, type: integer, source: input, description: "Scheduled monthly fee effective during the window", constraints: ">= 0" }
+      - { name: effective_from, type: datetime, source: input, description: "ISO 8601 UTC inclusive start of the price window" }
+      - { name: effective_to, type: datetime, source: input, description: "ISO 8601 UTC exclusive end; half-open [effective_from, effective_to). effective_from < effective_to required" }
+
+  - name: AddOn
+    parent: null
+    common_fields: true
+    fields:
+      - { name: code, type: string, source: input, description: "Unique add-on code across all add-ons" }
+      - { name: monthly_fee_cents, type: integer, source: input, description: "Recurring monthly fee in cents added on top of the plan", constraints: ">= 0" }
+
+  - name: Coupon
+    parent: null
+    common_fields: true
+    fields:
+      - { name: code, type: string, source: input, description: "Unique coupon code among non-expired coupons" }
+      - { name: discount_type, type: enum, source: input, description: "PERCENT | FIXED", constraints: "value in {PERCENT, FIXED}" }
+      - { name: percent_off, type: integer, source: input, required: false, description: "Whole-percent discount 1..100; required when discount_type=PERCENT, forbidden otherwise" }
+      - { name: amount_off_cents, type: integer, source: input, required: false, description: "Fixed discount in cents; required when discount_type=FIXED, forbidden otherwise", constraints: "> 0" }
+      - { name: duration, type: enum, source: input, description: "ONCE | RECURRING (RECURRING discounts apply to every billing cycle and count toward MRR; ONCE applies only to the first invoice)", constraints: "value in {ONCE, RECURRING}" }
+      - { name: max_redemptions, type: integer, source: input, description: "Total times this coupon may be redeemed across all accounts", constraints: ">= 1" }
+      - { name: redemption_count, type: integer, source: computed, default: 0, description: "Number of subscriptions that have redeemed this coupon" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | EXHAUSTED (auto-set when redemption_count reaches max_redemptions)" }
+
+  - name: TaxJurisdiction
+    parent: null
+    common_fields: true
+    fields:
+      - { name: region_code, type: string, source: input, description: "Region code e.g. US-CA, US-NY; unique" }
+      - { name: tax_rate_bps, type: integer, source: input, description: "Tax rate in basis points (875 = 8.75%)", constraints: ">= 0 and <= 10000" }
+
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Owner email; unique across accounts" }
+      - { name: company_name, type: string, source: input, description: "Account display name" }
+      - { name: region_code, type: string, source: input, description: "Tax region; must equal an existing TaxJurisdiction.region_code" }
+      - { name: tax_jurisdiction_id, type: string, source: system, description: "Forward reference to TaxJurisdiction.id, resolved from region_code at creation; looked up forward only, never reverse-navigated" }
+      - { name: payment_method_ok, type: boolean, source: input, default: true, description: "Whether the stored card currently authorizes charges; toggled by /_payments/set-card-state to drive dunning" }
+      - { name: mrr_cents, type: integer, source: computed, default: 0, description: "Denormalized committed monthly recurring revenue summed from this account's ACTIVE subscriptions; excludes TRIALING; recomputed on every subscription/add-on/coupon change" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | CLOSED" }
+
+  - name: Subscription
+    parent: Account
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: system, description: "FK -> Account.id" }
+      - { name: plan_id, type: string, source: input, description: "Forward reference to Plan.id (the currently effective plan); resolved forward at create/change-plan, never reverse-navigated" }
+      - { name: coupon_id, type: string, source: input, required: false, description: "Forward reference to Coupon.id (the redeemed coupon), null if none; resolved forward only, never reverse-navigated" }
+      - { name: period_start, type: datetime, source: system, description: "ISO 8601 UTC start of the current billing cycle" }
+      - { name: period_end, type: datetime, source: system, description: "ISO 8601 UTC end of the current billing cycle = period_start + 30 days" }
+      - { name: trial_end, type: datetime, source: system, required: false, description: "ISO 8601 UTC trial expiry; null when no trial" }
+      - { name: lifecycle_status, type: enum, source: system, default: "TRIALING", description: "Dimension 1: TRIALING | ACTIVE | CANCELED (terminal)" }
+      - { name: billing_status, type: enum, source: system, default: "CURRENT", description: "Dimension 2 (independent): CURRENT | PAST_DUE | UNPAID (evolves on payment success/failure independently of lifecycle_status)" }
+      - { name: dunning_attempt, type: integer, source: system, default: 0, description: "Number of failed-payment retries consumed on the current open invoice" }
+      - { name: next_retry_at, type: datetime, source: system, required: false, description: "ISO 8601 UTC when the next dunning retry is due; null when not PAST_DUE" }
+      - { name: mrr_contribution_cents, type: integer, source: computed, default: 0, description: "This subscription's normalized monthly recurring revenue: plan.monthly_fee_cents + sum(active add-on fees) - recurring-coupon discount; 0 while TRIALING or CANCELED" }
+
+  - name: SubscriptionAddOn
+    parent: Subscription
+    common_fields: true
+    fields:
+      - { name: subscription_id, type: string, source: system, description: "FK -> Subscription.id" }
+      - { name: addon_id, type: string, source: input, description: "Forward reference to AddOn.id; resolved forward only, never reverse-navigated" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | REMOVED (terminal); REMOVED add-ons stop contributing to MRR" }
+
+  - name: SubscriptionPauseWindow
+    parent: Subscription
+    common_fields: true
+    fields:
+      - { name: subscription_id, type: string, source: system, description: "FK -> Subscription.id" }
+      - { name: pause_from, type: datetime, source: input, description: "ISO 8601 UTC inclusive start of the pause" }
+      - { name: pause_to, type: datetime, source: input, description: "ISO 8601 UTC exclusive end of the pause; pause_from < pause_to required" }
+      - { name: status, type: enum, source: system, default: "SCHEDULED", description: "SCHEDULED | CANCELED (terminal)" }
+
+  - name: UsageRecord
+    parent: Subscription
+    common_fields: false
+    fields:
+      - { name: subscription_id, type: string, source: system, description: "FK -> Subscription.id" }
+      - { name: units, type: integer, source: input, description: "Metered units consumed by this event", constraints: "> 0" }
+      - { name: recorded_at, type: datetime, source: input, description: "ISO 8601 UTC event time; must fall within the subscription's current [period_start, period_end) to count toward this cycle's overage" }
+      - { name: billed, type: boolean, source: system, default: false, description: "Whether this record has been swept onto a finalized invoice (idempotent metering)" }
+
+  - name: Invoice
+    parent: Account
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: system, description: "FK -> Account.id" }
+      - { name: subscription_id, type: string, source: system, description: "Forward reference to Subscription.id; invoices are listed per-account, never reverse-navigated from a subscription directly" }
+      - { name: coupon_id, type: string, source: system, required: false, description: "Snapshot reference to the applied Coupon.id, null if none; immutable snapshot, never reverse-navigated" }
+      - { name: tax_jurisdiction_id, type: string, source: system, description: "Snapshot reference to TaxJurisdiction.id captured at finalization; immutable snapshot, never reverse-navigated" }
+      - { name: subtotal_cents, type: integer, source: computed, description: "Sum of all InvoiceLine.amount_cents (0 until finalized)" }
+      - { name: discount_cents, type: integer, source: computed, description: "Coupon discount applied to subtotal (0 until finalized)" }
+      - { name: tax_cents, type: integer, source: computed, description: "Tax on the discounted base (0 until finalized)" }
+      - { name: total_cents, type: integer, source: computed, description: "= (subtotal_cents - discount_cents) + tax_cents" }
+      - { name: amount_paid_cents, type: integer, source: computed, default: 0, description: "Sum of CLEARED payments allocated to this invoice" }
+      - { name: period_start, type: datetime, source: system, description: "ISO 8601 UTC service-period start this invoice covers" }
+      - { name: period_end, type: datetime, source: system, description: "ISO 8601 UTC service-period end this invoice covers" }
+      - { name: status, type: enum, source: system, default: "DRAFT", description: "DRAFT -> OPEN -> PAID; OPEN -> PAST_DUE (failed/overdue) -> OPEN (retry queued) ; PAST_DUE -> VOID (involuntary cancel) ; OPEN/DRAFT -> VOID" }
+
+  - name: InvoiceLine
+    parent: Invoice
+    common_fields: true
+    fields:
+      - { name: invoice_id, type: string, source: system, description: "FK -> Invoice.id" }
+      - { name: kind, type: enum, source: system, description: "SUBSCRIPTION | ADDON | OVERAGE | PRORATION_CREDIT | PRORATION_CHARGE", constraints: "value in {SUBSCRIPTION, ADDON, OVERAGE, PRORATION_CREDIT, PRORATION_CHARGE}" }
+      - { name: description, type: string, source: system, description: "Human-readable line description" }
+      - { name: amount_cents, type: integer, source: system, description: "Signed line amount in cents; PRORATION_CREDIT lines are negative" }
+
+  - name: Payment
+    parent: Invoice
+    common_fields: true
+    fields:
+      - { name: invoice_id, type: string, source: system, description: "FK -> Invoice.id" }
+      - { name: amount_cents, type: integer, source: system, description: "Charge amount attempted = invoice.total_cents at attempt time" }
+      - { name: attempt_number, type: integer, source: system, description: "1-based dunning attempt index that produced this payment" }
+      - { name: status, type: enum, source: system, default: "PENDING", description: "PENDING -> CLEARED | FAILED (terminal once resolved)" }
+
+  - name: RevenueScheduleEntry
+    parent: Invoice
+    common_fields: true
+    fields:
+      - { name: invoice_id, type: string, source: system, description: "FK -> Invoice.id" }
+      - { name: subscription_id, type: string, source: system, description: "Forward reference to Subscription.id; revenue entries are read per-invoice, never reverse-navigated from a subscription" }
+      - { name: service_period_start, type: datetime, source: system, description: "ISO 8601 UTC start of the period revenue is recognized over" }
+      - { name: service_period_end, type: datetime, source: system, description: "ISO 8601 UTC end of the recognition period" }
+      - { name: total_recognizable_cents, type: integer, source: system, description: "Subscription-fee portion of the paid invoice eligible for ratable recognition (excludes one-time overage and proration lines)" }
+      - { name: recognized_to_date_cents, type: integer, source: computed, description: "Amount recognized as of the current clock = total_recognizable_cents * elapsed_days / 30, clamped to [0, total_recognizable_cents]" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- Subscription dimension 1: lifecycle_status -------------------------
+  - entity: Subscription
+    dimension: lifecycle_status
+    initial_state: TRIALING
+    terminal_states: [CANCELED]
+    transitions:
+      - from: TRIALING
+        to: ACTIVE
+        trigger: "system: POST /_billing/run-renewals when now >= trial_end (or POST /accounts/{id}/subscriptions/{sid}/convert by AccountOwner to convert early)"
+        actor: system | AccountOwner
+        preconditions:
+          - "Subscription.lifecycle_status == TRIALING"
+          - "Plan referenced by plan_id has status ACTIVE (ERR_PLAN_ARCHIVED if a pending plan_change targeted an archived plan)"
+        side_effects:
+          - "Generate first cycle Invoice (status DRAFT) then finalize it via the Invoice-finalize calculation (subtotal/discount/tax/total)"
+          - "Set period_start = trial_end, period_end = trial_end + 30 days"
+          - "Recompute Subscription.mrr_contribution_cents and bubble up Account.mrr_cents (subscription now counts because it is ACTIVE)"
+      - from: ACTIVE
+        to: CANCELED
+        trigger: "POST /accounts/{id}/subscriptions/{sid}/cancel"
+        actor: AccountOwner
+        preconditions:
+          - "Subscription.lifecycle_status == ACTIVE"
+        side_effects:
+          - "Set lifecycle_status = CANCELED; set mrr_contribution_cents = 0"
+          - "Bubble up: recompute Account.mrr_cents (this subscription drops out) — this is the voluntary-churn event"
+          - "VOID any Invoice on this subscription still in DRAFT or OPEN with amount_paid_cents == 0"
+          - "Mark all this subscription's SubscriptionAddOn rows REMOVED"
+      - from: TRIALING
+        to: CANCELED
+        trigger: "POST /accounts/{id}/subscriptions/{sid}/cancel"
+        actor: AccountOwner
+        preconditions:
+          - "Subscription.lifecycle_status == TRIALING"
+        side_effects:
+          - "Set lifecycle_status = CANCELED (no invoice was ever generated, so no churn MRR delta — was already excluded)"
+      - from: ACTIVE
+        to: CANCELED
+        trigger: "system: POST /_billing/run-dunning after the final retry attempt fails"
+        actor: system
+        preconditions:
+          - "Subscription.lifecycle_status == ACTIVE"
+          - "Subscription.dunning_attempt == DUNNING_MAX_ATTEMPTS and the latest Payment FAILED"
+        side_effects:
+          - "Set lifecycle_status = CANCELED; set mrr_contribution_cents = 0 (involuntary churn)"
+          - "Set the open Invoice.status = VOID; set billing_status = UNPAID"
+          - "Bubble up: recompute Account.mrr_cents"
+
+  # ---- Subscription dimension 2: billing_status (independent axis) --------
+  - entity: Subscription
+    dimension: billing_status
+    initial_state: CURRENT
+    terminal_states: []
+    transitions:
+      - from: CURRENT
+        to: PAST_DUE
+        trigger: "system: POST /_billing/run-dunning when the open Invoice payment FAILED (card not OK)"
+        actor: system
+        preconditions:
+          - "An Invoice for this subscription is OPEN and its newest Payment is FAILED"
+        side_effects:
+          - "Increment Subscription.dunning_attempt by 1"
+          - "Set Invoice.status = PAST_DUE"
+          - "Set next_retry_at = first_failure_at + DUNNING_RETRY_OFFSETS_DAYS[dunning_attempt]"
+      - from: PAST_DUE
+        to: PAST_DUE
+        trigger: "system: POST /_billing/run-dunning when now >= next_retry_at and the retry payment FAILS again (cycle/self-loop)"
+        actor: system
+        preconditions:
+          - "Subscription.billing_status == PAST_DUE"
+          - "now >= Subscription.next_retry_at"
+          - "Subscription.dunning_attempt < DUNNING_MAX_ATTEMPTS"
+        side_effects:
+          - "Increment Subscription.dunning_attempt by 1; create a new Payment (FAILED)"
+          - "Set Invoice.status back to PAST_DUE; advance next_retry_at to first_failure_at + DUNNING_RETRY_OFFSETS_DAYS[dunning_attempt]"
+      - from: PAST_DUE
+        to: CURRENT
+        trigger: "system: POST /_billing/run-dunning when a retry payment CLEARS"
+        actor: system
+        preconditions:
+          - "Subscription.billing_status == PAST_DUE"
+          - "now >= Subscription.next_retry_at"
+        side_effects:
+          - "Set Invoice.status = PAID; set Invoice.amount_paid_cents = total_cents; reset dunning_attempt = 0; clear next_retry_at"
+          - "Create the RevenueScheduleEntry for the now-paid invoice"
+      - from: PAST_DUE
+        to: UNPAID
+        trigger: "system: POST /_billing/run-dunning after the final retry attempt fails"
+        actor: system
+        preconditions:
+          - "Subscription.billing_status == PAST_DUE"
+          - "Subscription.dunning_attempt == DUNNING_MAX_ATTEMPTS and the retry payment FAILED"
+        side_effects:
+          - "Set billing_status = UNPAID (this is the cross-effect that also drives lifecycle_status ACTIVE->CANCELED above)"
+
+  # ---- Invoice (branching with revert) ------------------------------------
+  - entity: Invoice
+    dimension: status
+    initial_state: DRAFT
+    terminal_states: [PAID, VOID]
+    transitions:
+      - from: DRAFT
+        to: OPEN
+        trigger: "system: invoice finalization at renewal/conversion/plan-change"
+        actor: system
+        preconditions:
+          - "Invoice.status == DRAFT"
+        side_effects:
+          - "Compute subtotal_cents, discount_cents, tax_cents, total_cents via the Invoice-finalize calculation"
+          - "Snapshot tax_jurisdiction_id from the account"
+          - "Attempt the first Payment (attempt_number = 1)"
+      - from: OPEN
+        to: PAID
+        trigger: "system: Payment for this invoice CLEARS"
+        actor: system
+        preconditions:
+          - "Invoice.status == OPEN"
+          - "A Payment with status CLEARED exists whose amount_cents == Invoice.total_cents"
+        side_effects:
+          - "Set amount_paid_cents = total_cents; create the RevenueScheduleEntry"
+      - from: OPEN
+        to: PAST_DUE
+        trigger: "system: POST /_billing/run-dunning when the Payment FAILS"
+        actor: system
+        preconditions:
+          - "Invoice.status == OPEN"
+        side_effects:
+          - "Mirror Subscription.billing_status CURRENT->PAST_DUE"
+      - from: PAST_DUE
+        to: OPEN
+        trigger: "system: POST /_billing/run-dunning queues the next retry (revert to OPEN before re-attempting)"
+        actor: system
+        preconditions:
+          - "Invoice.status == PAST_DUE"
+          - "Subscription.dunning_attempt < DUNNING_MAX_ATTEMPTS"
+        side_effects:
+          - "Invoice becomes OPEN again so the next Payment attempt can run (revision loop)"
+      - from: PAST_DUE
+        to: VOID
+        trigger: "system: final retry exhausted -> involuntary cancel"
+        actor: system
+        preconditions:
+          - "Invoice.status == PAST_DUE"
+          - "Subscription.dunning_attempt == DUNNING_MAX_ATTEMPTS"
+        side_effects:
+          - "Void the invoice; cascade Subscription lifecycle_status -> CANCELED"
+      - from: DRAFT
+        to: VOID
+        trigger: "system: subscription canceled while invoice unpaid"
+        actor: system
+        preconditions:
+          - "Invoice.status == DRAFT and Invoice.amount_paid_cents == 0"
+        side_effects: []
+      - from: OPEN
+        to: VOID
+        trigger: "system: subscription canceled while invoice unpaid"
+        actor: system
+        preconditions:
+          - "Invoice.status == OPEN and Invoice.amount_paid_cents == 0"
+        side_effects: []
+
+  # ---- Account ------------------------------------------------------------
+  - entity: Account
+    dimension: status
+    initial_state: ACTIVE
+    terminal_states: [CLOSED]
+    transitions:
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /accounts/{id}/close"
+        actor: AccountOwner
+        preconditions:
+          - "Account.status == ACTIVE"
+          - "No Subscription on this account has lifecycle_status in {TRIALING, ACTIVE} (ERR_ACCOUNT_HAS_ACTIVE_SUBS)"
+          - "No Invoice on this account is OPEN or PAST_DUE (ERR_ACCOUNT_HAS_OPEN_INVOICES)"
+        side_effects:
+          - "Set Account.status = CLOSED; set mrr_cents = 0"
+
+  # ---- SubscriptionPauseWindow --------------------------------------------
+  - entity: SubscriptionPauseWindow
+    dimension: status
+    initial_state: SCHEDULED
+    terminal_states: [CANCELED]
+    transitions:
+      - from: SCHEDULED
+        to: CANCELED
+        trigger: "DELETE /accounts/{id}/subscriptions/{sid}/pause-windows/{pwid}"
+        actor: AccountOwner
+        preconditions:
+          - "SubscriptionPauseWindow.status == SCHEDULED"
+        side_effects:
+          - "Set status = CANCELED; the window no longer occupies the timeline (a future overlapping window may now be scheduled)"
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: plan-change-stale-subscription
+    parent_entity: Subscription
+    write_endpoint: "POST /accounts/{id}/subscriptions/{sid}/change-plan"
+    occ_field: "expected_subscription_version"
+    description: |
+      Changing a Subscription's plan computes proration off the subscription's
+      currently effective plan, period window, and add-on set. A change-plan
+      write that carries a subscription version older than the one now stored
+      is rejected, because another change-plan (which legitimately supersedes
+      the prior effective plan and rewrites the proration basis) has advanced
+      the subscription since the client last observed it; proceeding would
+      prorate against a stale basis.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: proration_on_plan_change
+    trigger: "POST /accounts/{id}/subscriptions/{sid}/change-plan on an ACTIVE subscription"
+    algorithm: dual_variant
+    formula: |
+      # DAY-granular proration over a fixed 30-day cycle.
+      elapsed_days   = floor((now - period_start) / 1 day)        # full days consumed on the old plan
+      remaining_days = CYCLE_DAYS - elapsed_days                  # CYCLE_DAYS = 30
+      # Two variants over the SAME inputs but DIFFERENT direction:
+      #   CREDIT (refund of unused old plan) and CHARGE (cost of new plan for the remainder).
+      proration_credit_cents = round_half_up(old_plan.monthly_fee_cents * remaining_days / CYCLE_DAYS)
+      proration_charge_cents = round_half_up(new_plan.monthly_fee_cents * remaining_days / CYCLE_DAYS)
+      # Net proration = CHARGE - CREDIT. Emitted as two signed InvoiceLine rows:
+      #   PRORATION_CREDIT line amount = -proration_credit_cents (negative)
+      #   PRORATION_CHARGE line amount = +proration_charge_cents
+    input_set: "old_plan = subscription.plan before the change; new_plan = target; remaining_days computed from the subscription's current period_start and the clock"
+    constants:
+      CYCLE_DAYS: 30
+    precision: "cents, round_half_up, applied independently to each variant before signing"
+    variants:
+      - name: credit_variant
+        when: "the unused remainder of the OLD plan"
+        difference: "uses old_plan.monthly_fee_cents and yields a negative (refund) line"
+      - name: charge_variant
+        when: "the new plan's cost for the remaining days"
+        difference: "uses new_plan.monthly_fee_cents and yields a positive line; net = charge - credit"
+
+  - name: usage_overage_charge
+    trigger: "Invoice finalization at renewal — sweep of unbilled UsageRecords in the closing cycle"
+    algorithm: tiered_pricing
+    formula: |
+      # Sum units of all UsageRecord with billed=false whose recorded_at is in
+      # [period_start, period_end). Then apply MARGINAL tiered bands.
+      total_units = sum(ur.units for ur in usage where ur.billed == false
+                        and period_start <= ur.recorded_at < period_end)
+      overage_units = max(0, total_units - plan.included_usage_units)
+      # Walk plan.overage_tiers in order; each band [previous_cap, up_to_units]
+      # charges its rate on the units that fall inside the band. Multiply integer
+      # rate by integer units (no per-band rounding needed); sum is exact cents.
+      remaining = overage_units
+      cost = 0
+      prev_cap = 0
+      for band in plan.overage_tiers:                 # ordered; last band up_to_units = null
+          band_width = (band.up_to_units - prev_cap) if band.up_to_units != null else remaining
+          take = min(remaining, band_width)
+          cost += take * band.rate_cents_per_unit
+          remaining -= take
+          prev_cap = band.up_to_units
+          if remaining == 0: break
+      overage_cost_cents = cost
+    input_set: "UsageRecords with billed=false in the closing cycle window only; included_usage_units from the EFFECTIVE plan at finalization"
+    constants: {}
+    precision: "cents, exact (integer rate × integer units); no intermediate rounding"
+
+  - name: invoice_finalize_total
+    trigger: "Invoice DRAFT->OPEN finalization (renewal, trial conversion, plan-change settlement)"
+    algorithm: aggregation
+    formula: |
+      # PINNED EVALUATION ORDER (discount before tax, single rounding per step):
+      # 1. subtotal_cents = sum(line.amount_cents for all InvoiceLine)   # signed sum; proration credit lines are negative
+      # 2. discount_cents:
+      #      if coupon == null OR (coupon.duration == ONCE and this is NOT the first invoice): discount_cents = 0
+      #      elif coupon.discount_type == PERCENT: discount_cents = round_half_up(subtotal_cents * coupon.percent_off / 100)
+      #      elif coupon.discount_type == FIXED:   discount_cents = min(coupon.amount_off_cents, subtotal_cents)
+      # 3. taxable_base = subtotal_cents - discount_cents
+      # 4. tax_cents = round_half_up(taxable_base * jurisdiction.tax_rate_bps / 10000)   # single rounding on the discounted base
+      # 5. total_cents = taxable_base + tax_cents
+    input_set: "all InvoiceLine rows on the invoice; coupon snapshot; tax_jurisdiction snapshot from the account"
+    constants:
+      TAX_BPS_DENOMINATOR: 10000
+    precision: "cents, round_half_up; discount rounded at step 2, tax rounded at step 4 (sum-then-round on the discounted base — NOT round-per-line)"
+    variants:
+      - name: first_invoice
+        when: "the subscription's first finalized invoice"
+        difference: "ONCE coupons apply here only"
+      - name: renewal_invoice
+        when: "subsequent cycles"
+        difference: "ONCE coupons no longer discount; RECURRING coupons still apply"
+
+  - name: account_mrr
+    trigger: "Recompute on any subscription create/convert/cancel, add-on add/remove, or plan change (derived-field reconciliation)"
+    algorithm: aggregation
+    formula: |
+      # COMMITTED MRR — forward-looking snapshot of recurring revenue. Operates on the
+      # SUBSCRIPTION/ACCOUNT domain (not invoices).
+      # Per subscription mrr_contribution_cents (only when lifecycle_status == ACTIVE; TRIALING and CANCELED contribute 0):
+      #   base = plan.monthly_fee_cents + sum(addon.monthly_fee_cents for SubscriptionAddOn status==ACTIVE)
+      #   if coupon != null and coupon.duration == RECURRING:
+      #       if coupon.discount_type == PERCENT: recurring_discount = round_half_up(base * coupon.percent_off / 100)
+      #       else: recurring_discount = min(coupon.amount_off_cents, base)
+      #   else: recurring_discount = 0
+      #   mrr_contribution_cents = base - recurring_discount
+      # Account.mrr_cents = sum(mrr_contribution_cents over the account's subscriptions with lifecycle_status == ACTIVE)
+    input_set: "subscriptions with lifecycle_status == ACTIVE only; ACTIVE add-ons only; RECURRING coupons only"
+    constants: {}
+    precision: "cents, round_half_up on the per-subscription recurring discount"
+    variants:
+      - name: committed_mrr
+        when: "always, for Account.mrr_cents"
+        difference: "forward-looking projection of the next full cycle; ignores partial-period proration and one-time overage"
+
+  - name: dunning_retry_schedule
+    trigger: "POST /_billing/run-dunning ticks when an invoice payment fails"
+    algorithm: threshold
+    formula: |
+      # Failed payment advances the dunning state machine. attempt_number is
+      # 1-based; the first attempt fires at finalization (offset 0). On failure,
+      # dunning_attempt increments and next_retry_at is scheduled:
+      #   next_retry_at = first_failure_at + DUNNING_RETRY_OFFSETS_DAYS[dunning_attempt]
+      # DUNNING_RETRY_OFFSETS_DAYS = [0, 3, 7] indexed by dunning_attempt (1->3d after first fail, 2->7d).
+      # After dunning_attempt reaches DUNNING_MAX_ATTEMPTS (3) and the retry still
+      # fails, the subscription is involuntarily CANCELED and the invoice VOIDed.
+      # Boundary: at dunning_attempt == 2 the subscription stays PAST_DUE; at
+      # dunning_attempt == 3 it cancels (>= vs > on the attempt counter).
+    input_set: "the single open invoice and its FAILED payments for the subscription"
+    constants:
+      DUNNING_MAX_ATTEMPTS: 3
+      DUNNING_RETRY_OFFSETS_DAYS: [0, 3, 7]
+    precision: "integer attempt counter; day-granular retry offsets"
+
+  - name: recognized_revenue_to_date
+    trigger: "GET /invoices/{id}/revenue-schedule or computed read of a RevenueScheduleEntry"
+    algorithm: chronological
+    formula: |
+      # RECOGNIZED REVENUE — chronological, ratable daily recognition. Operates on the
+      # INVOICE/REVENUE-SCHEDULE domain (the dual-variant counterpart to committed MRR).
+      elapsed_days = clamp(floor((now - service_period_start) / 1 day), 0, RECOGNITION_DAYS)
+      recognized_to_date_cents = clamp(
+          round_half_up(total_recognizable_cents * elapsed_days / RECOGNITION_DAYS),
+          0, total_recognizable_cents)
+      # total_recognizable_cents excludes one-time OVERAGE and PRORATION lines — only the
+      # SUBSCRIPTION + ADDON recurring portion of the paid invoice is recognized ratably.
+    input_set: "a single RevenueScheduleEntry created when its invoice was PAID; only SUBSCRIPTION and ADDON line kinds enter total_recognizable_cents"
+    constants:
+      RECOGNITION_DAYS: 30
+    precision: "cents, round_half_up; clamped to [0, total_recognizable_cents]"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and (for non-Anonymous) X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Role is permitted for this operation per §1.7 RBAC matrix"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "Every path-referenced resource exists, validated left-to-right (account before subscription before nested)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids"
+
+  - priority: 4
+    category: existence
+    check: "Every FK in the request body resolves to an existing resource (plan_id, coupon_id, addon_id)"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "create subscription, change-plan, add add-on"
+
+  - priority: 5
+    category: business_constraint
+    check: "Request body is well-formed: required fields present, enums valid, numeric ranges respected (e.g. units > 0, percent_off 1..100, FIXED requires amount_off_cents)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all
+
+  - priority: 6
+    category: business_constraint
+    check: "Unique constraints: Account.email, Coupon.code, AddOn.code, Plan.tier (among non-archived plans), TaxJurisdiction.region_code"
+    error_id: ERR_DUPLICATE
+    http_status: 409
+    applies_to: "create account, create coupon, create add-on, create plan, create jurisdiction"
+
+  - priority: 7
+    category: state
+    check: "Target resource is in a state that permits this transition (subscription lifecycle/billing, invoice status, account status)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 8
+    category: business_referential
+    check: "Account.region_code on create resolves to an existing TaxJurisdiction.region_code"
+    error_id: ERR_JURISDICTION_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /accounts"
+
+  - priority: 9
+    category: business_constraint
+    check: "Referenced Plan is not ARCHIVED when creating a subscription or changing plan"
+    error_id: ERR_PLAN_ARCHIVED
+    http_status: 409
+    applies_to: "create subscription, change-plan"
+
+  - priority: 10
+    category: business_constraint
+    check: "Referenced Coupon is ACTIVE (not EXHAUSTED) and has redemption_count < max_redemptions at redemption time"
+    error_id: ERR_COUPON_NOT_REDEEMABLE
+    http_status: 409
+    applies_to: "create subscription with coupon_id, change-plan adding a coupon"
+
+  - priority: 11
+    category: business_constraint
+    check: "change-plan target plan differs from the current plan_id"
+    error_id: ERR_NO_PLAN_CHANGE
+    http_status: 409
+    applies_to: "change-plan"
+
+  - priority: 12
+    category: business_temporal
+    check: "UsageRecord.recorded_at falls within the subscription's current [period_start, period_end)"
+    error_id: ERR_USAGE_OUT_OF_PERIOD
+    http_status: 409
+    applies_to: "POST /accounts/{id}/subscriptions/{sid}/usage"
+
+  - priority: 13
+    category: business_constraint
+    check: "Adding a SubscriptionAddOn for an addon already ACTIVE on the subscription is rejected (no duplicate active add-on)"
+    error_id: ERR_ADDON_ALREADY_ACTIVE
+    http_status: 409
+    applies_to: "POST /accounts/{id}/subscriptions/{sid}/addons"
+
+  - priority: 14
+    category: business_constraint
+    check: "Optimistic-concurrency: expected_subscription_version matches Subscription.version (stale -> 412)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "change-plan"
+
+  - priority: 15
+    category: business_temporal
+    check: "PlanPriceSchedule half-open interval [effective_from, effective_to) must not overlap any other non-canceled schedule on the same plan by positive measure (touching/adjacent is allowed: a.effective_to == b.effective_from is OK)"
+    error_id: ERR_PRICE_SCHEDULE_OVERLAP
+    http_status: 409
+    applies_to: "POST /plans/{id}/price-schedules"
+
+  - priority: 16
+    category: business_temporal
+    check: "SubscriptionPauseWindow [pause_from, pause_to) must be separated from every SCHEDULED window on the same subscription by at least MIN_PAUSE_GAP_DAYS=7 (reject if [pause_from - 7d, pause_to + 7d) intersects an existing SCHEDULED window; buffered-gap semantics, NOT bare adjacency)"
+    error_id: ERR_PAUSE_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /accounts/{id}/subscriptions/{sid}/pause-windows"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Configuration: Plans -----------------------------------------------
+  - method: POST
+    path: "/plans"
+    description: "Create a subscription plan/tier"
+    roles: [BillingAdmin]
+    code: 201
+    input: [tier, monthly_fee_cents, included_usage_units, overage_tiers, "trial_days?"]
+    output: Plan
+    side_effects: []
+  - method: GET
+    path: "/plans"
+    description: "List plans (paginated; optional status filter)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Plan[]
+    side_effects: []
+  - method: GET
+    path: "/plans/{id}"
+    description: "Get a plan"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: []
+    output: Plan
+    side_effects: []
+  - method: POST
+    path: "/plans/{id}/archive"
+    description: "Archive a plan (rejects new subscriptions; existing keep it)"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+    output: Plan
+    side_effects: ["Plan.status = ARCHIVED"]
+  - method: POST
+    path: "/plans/{id}/price-schedules"
+    description: "Add a scheduled price window to a plan (rejects positive-measure overlap with existing windows)"
+    roles: [BillingAdmin]
+    code: 201
+    input: [monthly_fee_cents, effective_from, effective_to]
+    output: PlanPriceSchedule
+    side_effects: ["Validate half-open non-overlap against existing schedules on this plan"]
+  - method: GET
+    path: "/plans/{id}/price-schedules"
+    description: "List a plan's price schedules (reverse-reachability for PlanPriceSchedule.plan_id)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PlanPriceSchedule[]
+    side_effects: []
+
+  # ---- Configuration: Add-ons ---------------------------------------------
+  - method: POST
+    path: "/add-ons"
+    description: "Create an add-on"
+    roles: [BillingAdmin]
+    code: 201
+    input: [code, monthly_fee_cents]
+    output: AddOn
+    side_effects: []
+  - method: GET
+    path: "/add-ons"
+    description: "List add-ons (paginated)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: AddOn[]
+    side_effects: []
+
+  # ---- Configuration: Coupons ---------------------------------------------
+  - method: POST
+    path: "/coupons"
+    description: "Create a coupon"
+    roles: [BillingAdmin]
+    code: 201
+    input: [code, discount_type, "percent_off?", "amount_off_cents?", duration, max_redemptions]
+    output: Coupon
+    side_effects: []
+  - method: GET
+    path: "/coupons"
+    description: "List coupons (paginated)"
+    roles: [BillingAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Coupon[]
+    side_effects: []
+  - method: GET
+    path: "/coupons/{id}"
+    description: "Get a coupon (read redemption_count/status)"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+    output: Coupon
+    side_effects: []
+
+  # ---- Configuration: Tax jurisdictions -----------------------------------
+  - method: POST
+    path: "/tax-jurisdictions"
+    description: "Create a tax jurisdiction"
+    roles: [BillingAdmin]
+    code: 201
+    input: [region_code, tax_rate_bps]
+    output: TaxJurisdiction
+    side_effects: []
+  - method: GET
+    path: "/tax-jurisdictions"
+    description: "List tax jurisdictions (paginated)"
+    roles: [BillingAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TaxJurisdiction[]
+    side_effects: []
+
+  # ---- Accounts -----------------------------------------------------------
+  - method: POST
+    path: "/accounts"
+    description: "Register an account (resolves tax_jurisdiction_id from region_code)"
+    roles: [Anonymous]
+    code: 201
+    input: [email, company_name, region_code, "payment_method_ok?"]
+    output: Account
+    side_effects: ["Resolve tax_jurisdiction_id from region_code", "Set status = ACTIVE, mrr_cents = 0"]
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Get an account (read mrr_cents, status)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: []
+    output: Account
+    side_effects: []
+  - method: POST
+    path: "/accounts/{id}/close"
+    description: "Close an account"
+    roles: [AccountOwner]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["status = CLOSED", "mrr_cents = 0"]
+
+  # ---- Subscriptions ------------------------------------------------------
+  - method: POST
+    path: "/accounts/{id}/subscriptions"
+    description: "Create a subscription (starts TRIALING when plan.trial_days>0, else ACTIVE with immediate first invoice). Redeems coupon if supplied."
+    roles: [AccountOwner]
+    code: 201
+    input: [plan_id, "coupon_id?"]
+    output: Subscription
+    side_effects:
+      - "If plan.trial_days > 0: lifecycle_status = TRIALING, trial_end = now + trial_days, no invoice"
+      - "Else: lifecycle_status = ACTIVE, generate+finalize first Invoice, attempt Payment"
+      - "If coupon_id: increment Coupon.redemption_count (-> EXHAUSTED if it hits max)"
+      - "Recompute mrr_contribution_cents and bubble up Account.mrr_cents"
+  - method: GET
+    path: "/accounts/{id}/subscriptions"
+    description: "List subscriptions for an account (reverse-reachability for Subscription.account_id; paginated)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Subscription[]
+    side_effects: []
+  - method: GET
+    path: "/subscriptions/{id}"
+    description: "Get a subscription (read both status dimensions, mrr_contribution_cents, dunning_attempt)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects: []
+  - method: POST
+    path: "/accounts/{id}/subscriptions/{sid}/convert"
+    description: "Convert a TRIALING subscription to ACTIVE early"
+    roles: [AccountOwner]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects:
+      - "lifecycle_status TRIALING->ACTIVE; period_start = now; period_end = now + 30 days"
+      - "Generate+finalize first Invoice; attempt Payment"
+      - "Recompute Account.mrr_cents"
+  - method: POST
+    path: "/accounts/{id}/subscriptions/{sid}/change-plan"
+    description: "Upgrade/downgrade plan with day-granular proration (OCC-guarded)"
+    roles: [AccountOwner]
+    code: 200
+    input: [plan_id, expected_subscription_version]
+    output: Subscription
+    side_effects:
+      - "increments Subscription.version by 1"
+      - "Run proration_on_plan_change: emit PRORATION_CREDIT + PRORATION_CHARGE lines on a new DRAFT Invoice, finalize it"
+      - "Set Subscription.plan_id = new plan; recompute mrr_contribution_cents; bubble up Account.mrr_cents"
+  - method: POST
+    path: "/accounts/{id}/subscriptions/{sid}/cancel"
+    description: "Cancel a subscription (voluntary churn)"
+    roles: [AccountOwner]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects:
+      - "lifecycle_status -> CANCELED; mrr_contribution_cents = 0"
+      - "VOID unpaid DRAFT/OPEN invoices; REMOVE add-ons; bubble up Account.mrr_cents"
+
+  # ---- Subscription add-ons -----------------------------------------------
+  - method: POST
+    path: "/accounts/{id}/subscriptions/{sid}/addons"
+    description: "Attach an add-on to a subscription"
+    roles: [AccountOwner]
+    code: 201
+    input: [addon_id]
+    output: SubscriptionAddOn
+    side_effects: ["Recompute mrr_contribution_cents and Account.mrr_cents"]
+  - method: GET
+    path: "/subscriptions/{id}/addons"
+    description: "List a subscription's add-ons (reverse-reachability for SubscriptionAddOn.subscription_id)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: SubscriptionAddOn[]
+    side_effects: []
+  - method: DELETE
+    path: "/accounts/{id}/subscriptions/{sid}/addons/{aid}"
+    description: "Remove an add-on (status REMOVED)"
+    roles: [AccountOwner]
+    code: 200
+    input: []
+    output: SubscriptionAddOn
+    side_effects: ["status = REMOVED; recompute mrr_contribution_cents and Account.mrr_cents"]
+
+  # ---- Subscription pause windows -----------------------------------------
+  - method: POST
+    path: "/accounts/{id}/subscriptions/{sid}/pause-windows"
+    description: "Schedule a billing pause window (rejects windows within MIN_PAUSE_GAP_DAYS of an existing SCHEDULED window)"
+    roles: [AccountOwner]
+    code: 201
+    input: [pause_from, pause_to]
+    output: SubscriptionPauseWindow
+    side_effects: ["Validate buffered-gap non-conflict against existing SCHEDULED windows on this subscription"]
+  - method: GET
+    path: "/subscriptions/{id}/pause-windows"
+    description: "List a subscription's pause windows (reverse-reachability for SubscriptionPauseWindow.subscription_id)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: SubscriptionPauseWindow[]
+    side_effects: []
+  - method: DELETE
+    path: "/accounts/{id}/subscriptions/{sid}/pause-windows/{pwid}"
+    description: "Cancel a scheduled pause window"
+    roles: [AccountOwner]
+    code: 200
+    input: []
+    output: SubscriptionPauseWindow
+    side_effects: ["status = CANCELED"]
+
+  # ---- Usage metering -----------------------------------------------------
+  - method: POST
+    path: "/accounts/{id}/subscriptions/{sid}/usage"
+    description: "Record a metered usage event"
+    roles: [AccountOwner, BillingAdmin]
+    code: 201
+    input: [units, recorded_at]
+    output: UsageRecord
+    side_effects: ["Append a UsageRecord with billed=false"]
+  - method: GET
+    path: "/subscriptions/{id}/usage"
+    description: "List usage records for a subscription (reverse-reachability for UsageRecord.subscription_id; paginated)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: UsageRecord[]
+    side_effects: []
+
+  # ---- Invoices / lines / payments / revenue ------------------------------
+  - method: GET
+    path: "/accounts/{id}/invoices"
+    description: "List an account's invoices (reverse-reachability for Invoice.account_id; paginated)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: ["subscription_id?", "limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+  - method: GET
+    path: "/invoices/{id}"
+    description: "Get an invoice (read subtotal/discount/tax/total, status)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+  - method: GET
+    path: "/invoices/{id}/lines"
+    description: "List invoice lines (reverse-reachability for InvoiceLine.invoice_id)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: InvoiceLine[]
+    side_effects: []
+  - method: GET
+    path: "/invoices/{id}/payments"
+    description: "List payment attempts on an invoice (reverse-reachability for Payment.invoice_id; shows dunning attempts)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Payment[]
+    side_effects: []
+  - method: GET
+    path: "/invoices/{id}/revenue-schedule"
+    description: "Get the revenue schedule entry for a paid invoice with recognized_to_date_cents (reverse-reachability for RevenueScheduleEntry.invoice_id)"
+    roles: [BillingAdmin, AccountOwner]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RevenueScheduleEntry[]
+    side_effects: ["Compute recognized_to_date_cents as of the current clock"]
+
+  # ---- MRR / churn reporting ----------------------------------------------
+  - method: GET
+    path: "/reporting/mrr"
+    description: "Computed read: total committed MRR across all ACTIVE accounts plus churn since a given clock anchor"
+    roles: [BillingAdmin]
+    code: 200
+    input: ["since?"]
+    output: "{ total_mrr_cents: integer, active_subscription_count: integer, churned_subscription_count: integer, churned_mrr_cents: integer }"
+    side_effects: []
+
+  # ---- Test-driving endpoints (/_ namespace) ------------------------------
+  - method: POST
+    path: "/_clock/set"
+    description: "Set the server's current UTC clock (test-driving; advances do not auto-run billing)"
+    roles: [BillingAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ now: string }"
+    side_effects: ["Sets the simulated current time"]
+  - method: POST
+    path: "/_payments/set-card-state"
+    description: "Set an account's stored-card authorization state (drives payment success/failure deterministically)"
+    roles: [BillingAdmin]
+    code: 200
+    input: [account_id, payment_method_ok]
+    output: Account
+    side_effects: ["Set Account.payment_method_ok; subsequent payment attempts CLEAR iff true, else FAIL"]
+  - method: POST
+    path: "/_billing/run-renewals"
+    description: "Test-driving billing tick: convert TRIALING subscriptions whose trial_end <= now to ACTIVE, and renew ACTIVE subscriptions whose period_end <= now (generate+finalize next-cycle invoice, sweep usage, attempt payment)"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+    output: "{ converted_count: integer, renewed_count: integer, invoice_ids: string[] }"
+    side_effects:
+      - "TRIALING->ACTIVE conversions; ACTIVE renewals: finalize next-cycle invoice incl. usage overage sweep; advance period window"
+  - method: POST
+    path: "/_billing/run-dunning"
+    description: "Test-driving billing tick: for every OPEN/PAST_DUE invoice whose retry is due (now >= next_retry_at, or first attempt), attempt payment and advance the dunning state machine"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+    output: "{ retried_count: integer, cleared_count: integer, canceled_subscription_ids: string[] }"
+    side_effects:
+      - "Per invoice: attempt Payment; on FAIL advance dunning_attempt + billing_status; after DUNNING_MAX_ATTEMPTS cancel subscription; on CLEAR mark PAID + create RevenueScheduleEntry"
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/malformed auth headers" }
+  - { id: ERR_UNAUTHORIZED, http: 403, condition: "Role not permitted for this operation, or AccountOwner acting on another account's resource" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path-referenced resource does not exist" }
+  - { id: ERR_REFERENCE_NOT_FOUND, http: 404, condition: "Body FK (plan_id/coupon_id/addon_id) does not resolve" }
+  - { id: ERR_JURISDICTION_NOT_FOUND, http: 404, condition: "Account.region_code has no matching TaxJurisdiction" }
+  - { id: ERR_INVALID_REQUEST, http: 422, condition: "Malformed body: missing required field, bad enum, out-of-range number, units <= 0, percent_off out of 1..100, FIXED coupon missing amount_off_cents" }
+  - { id: ERR_DUPLICATE, http: 409, condition: "Uniqueness violation: account email, coupon code, add-on code, plan tier, jurisdiction region_code" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Operation not allowed from the resource's current state (subscription lifecycle/billing, invoice status, account status)" }
+  - { id: ERR_PLAN_ARCHIVED, http: 409, condition: "Subscription create/change-plan references an ARCHIVED plan" }
+  - { id: ERR_COUPON_NOT_REDEEMABLE, http: 409, condition: "Coupon is EXHAUSTED or redemption_count == max_redemptions" }
+  - { id: ERR_NO_PLAN_CHANGE, http: 409, condition: "change-plan target equals the current plan_id" }
+  - { id: ERR_USAGE_OUT_OF_PERIOD, http: 409, condition: "UsageRecord.recorded_at outside the subscription's current [period_start, period_end)" }
+  - { id: ERR_ADDON_ALREADY_ACTIVE, http: 409, condition: "Add-on already ACTIVE on the subscription" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_subscription_version does not match Subscription.version on change-plan" }
+  - { id: ERR_ACCOUNT_HAS_ACTIVE_SUBS, http: 409, condition: "Close account while a subscription is TRIALING or ACTIVE" }
+  - { id: ERR_ACCOUNT_HAS_OPEN_INVOICES, http: 409, condition: "Close account while an invoice is OPEN or PAST_DUE" }
+  - { id: ERR_PRICE_SCHEDULE_OVERLAP, http: 409, condition: "New PlanPriceSchedule overlaps an existing schedule on the same plan by positive measure (half-open intervals; adjacency allowed)" }
+  - { id: ERR_PAUSE_WINDOW_CONFLICT, http: 409, condition: "New SubscriptionPauseWindow falls within MIN_PAUSE_GAP_DAYS of an existing SCHEDULED window on the same subscription" }
+  - { id: ERR_VALIDATION_RANGE, http: 422, condition: "Pagination limit/offset out of bounds (limit 1..100, offset >= 0)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: BillingAdmin
+    description: "Platform operator: manages plans/add-ons/coupons/jurisdictions, runs billing jobs, reads all data and reporting"
+    identity: opaque
+    exclusive_operations:
+      - "POST /plans, POST /plans/{id}/archive, POST /plans/{id}/price-schedules"
+      - "POST /add-ons"
+      - "POST /coupons, GET /coupons, GET /coupons/{id}"
+      - "POST /tax-jurisdictions, GET /tax-jurisdictions"
+      - "GET /reporting/mrr"
+      - "POST /_clock/set, POST /_payments/set-card-state, POST /_billing/run-renewals, POST /_billing/run-dunning"
+    shared_operations:
+      - "GET /plans, GET /plans/{id}, GET /add-ons"
+      - "GET /accounts/{id}, GET reads on subscriptions/invoices/lines/payments/usage/revenue-schedule"
+      - "POST /accounts/{id}/subscriptions/{sid}/usage"
+
+  - name: AccountOwner
+    description: "Owns their own account; X-User-ID equals the Account.id; manages own subscriptions, add-ons, usage; reads own billing data"
+    identity: "entity_backed:Account"
+    exclusive_operations:
+      - "POST /accounts/{id}/close"
+      - "POST /accounts/{id}/subscriptions"
+      - "POST /accounts/{id}/subscriptions/{sid}/convert"
+      - "POST /accounts/{id}/subscriptions/{sid}/change-plan"
+      - "POST /accounts/{id}/subscriptions/{sid}/cancel"
+      - "POST /accounts/{id}/subscriptions/{sid}/addons, DELETE .../addons/{aid}"
+      - "POST /accounts/{id}/subscriptions/{sid}/pause-windows, DELETE .../pause-windows/{pwid}"
+    shared_operations:
+      - "GET /accounts/{id} (own only), GET own subscriptions/invoices/lines/payments/usage/revenue-schedule/pause-windows"
+      - "GET /plans/{id}/price-schedules"
+      - "POST /accounts/{id}/subscriptions/{sid}/usage (own only)"
+      - "GET /plans, GET /plans/{id}, GET /add-ons"
+
+  - name: Anonymous
+    description: "Unauthenticated registration only"
+    identity: opaque
+    exclusive_operations:
+      - "POST /accounts"
+    shared_operations: []

@@ -1,0 +1,1679 @@
+scenario: |
+  CMMS Preventive Maintenance: asset hierarchy, meter-based vs calendar PM triggers,
+  work order priority, spare-parts reservation, MTBF/MTTR, technician backlog,
+  warranty claim, downtime reason coding
+
+domain_name: cmms-preventive-maintenance
+api_prefix: ""
+
+# The system manages a maintenance program for a fleet of physical assets organized in a
+# parent/child hierarchy. Each asset accrues runtime on a usage meter and ages on the
+# calendar. PM schedules fire work orders either when a meter threshold is crossed
+# (meter-based) or when a calendar interval elapses (calendar-based). Work orders carry a
+# computed priority, reserve spare parts from a finite inventory, are assigned to
+# technicians (whose backlog is tracked), record downtime with reason codes, drive MTBF
+# and MTTR reliability metrics, and may be paid for by a warranty claim instead of the
+# maintenance budget.
+
+complexity_profile:
+  primary_archetype: quota_allocation          # finite spare-parts pool reserved -> committed -> released
+  secondary_archetype: scheduled_deferred_actions   # meter/calendar PM triggers fire deferred work orders
+  complexity_layers:
+    - optimistic_concurrency        # OCC on Asset.version and SparePart.version for true CREATE-with-supersede races
+    - cascading_side_effects        # WO close -> reservation commit -> inventory debit -> asset meter rebase -> PM re-arm; downtime close -> MTTR/MTBF recompute
+    - dual_variant_calculation      # PM next-due (meter vs calendar), warranty payable (full vs prorated)
+    - derived_field_reconciliation  # SparePart.reserved_qty, Technician.backlog_hours, Asset.mtbf/mttr kept consistent with source rows
+
+  entity_topology: graph
+  # Asset is self-referential (parent_asset_id forms a tree); WorkOrder, PartReservation,
+  # DowntimeEvent, WarrantyClaim form cross-aggregate references rather than nested URL paths.
+
+  state_machine_shape: parallel
+  # WorkOrder carries two independent dimensions: execution_status (DRAFT..CLOSED, with a
+  # ON_HOLD<->IN_PROGRESS cycle) and parts_status (NONE..COMMITTED..RELEASED). WarrantyClaim
+  # and PartReservation add branching machines on other entities.
+
+  relationship_patterns:
+    - self_referential   # Asset.parent_asset_id -> Asset
+    - one_to_many        # Asset -> PMSchedule, Asset -> MeterReading, WorkOrder -> PartReservation
+    - cross_aggregate    # WorkOrder -> Asset, WarrantyClaim -> WorkOrder, DowntimeEvent -> WorkOrder
+
+  role_model: peer_roles
+  # Planner owns PM schedules and work-order planning; Technician executes work and logs
+  # downtime; InventoryClerk owns spare-parts and reservations; WarrantyAdmin owns claims;
+  # MaintenanceManager is the operational superset for asset config and overrides.
+
+  consistency_model: immediate   # all cascades complete atomically within the triggering request
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Site
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: human-readable site name
+        constraints: non-empty, max 120 chars
+      - name: timezone
+        type: string
+        source: input
+        description: IANA timezone identifier used for display only; all timestamps stored UTC
+        default: "UTC"
+      - name: maintenance_budget_cents
+        type: integer
+        source: input
+        description: total maintenance budget for this site, in integer cents
+        constraints: ">= 0"
+      - name: budget_spent_cents
+        type: integer
+        source: computed
+        description: |
+          running sum of WorkOrder.actual_cost_cents over all CLOSED work orders whose asset
+          belongs to this site AND whose cost was NOT covered by an APPROVED warranty claim;
+          recomputed on every WorkOrder CLOSE and WarrantyClaim APPROVE/DENY
+        default: 0
+
+  - name: SparePart
+    parent: null
+    common_fields: true
+    fields:
+      - name: sku
+        type: string
+        source: input
+        description: stock-keeping unit; unique across all spare parts
+        constraints: non-empty, unique (case-sensitive exact match)
+      - name: name
+        type: string
+        source: input
+        description: part description
+      - name: on_hand_qty
+        type: integer
+        source: input
+        description: physical units currently in the storeroom (includes reserved units)
+        constraints: ">= 0"
+      - name: reserved_qty
+        type: computed
+        source: computed
+        description: |
+          sum of PartReservation.qty over reservations on this part whose status IN
+          {RESERVED, COMMITTED}; recomputed on every reservation create/commit/release
+        default: 0
+      - name: unit_cost_cents
+        type: integer
+        source: input
+        description: cost per unit in integer cents, used to value committed parts
+        constraints: ">= 0"
+      - name: reorder_point
+        type: integer
+        source: input
+        description: available-qty level at or below which the part is flagged low-stock
+        default: 0
+        constraints: ">= 0"
+
+  - name: Technician
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: technician full name
+      - name: skill_level
+        type: enum
+        source: input
+        description: certification level gating which work-order severity they may execute
+        constraints: one of {JUNIOR, SENIOR, MASTER}
+      - name: weekly_capacity_hours
+        type: number
+        source: input
+        description: contracted available hours per week, used as the backlog ceiling
+        constraints: "> 0"
+      - name: backlog_hours
+        type: number
+        source: computed
+        description: |
+          sum of WorkOrder.estimated_labor_hours over work orders assigned to this technician
+          whose execution_status IN {ASSIGNED, IN_PROGRESS, ON_HOLD}; recomputed on assign,
+          unassign, hold, resume, and close
+        default: 0
+
+  - name: Asset
+    parent: null
+    common_fields: true
+    fields:
+      - name: site_id
+        type: string
+        source: input
+        description: "FK -> Site.id; the site this asset is located at; immutable after create"
+      - name: parent_asset_id
+        type: string
+        source: input
+        description: "FK -> Asset.id; parent in the asset hierarchy, or null for a top-level asset; immutable after create"
+        default: null
+      - name: name
+        type: string
+        source: input
+        description: asset name / tag
+        constraints: non-empty
+      - name: criticality
+        type: enum
+        source: input
+        description: business criticality, an input to work-order priority scoring
+        constraints: one of {LOW, MEDIUM, HIGH, CRITICAL}
+        default: MEDIUM
+      - name: status
+        type: enum
+        source: computed
+        description: |
+          operational status; OPERATIONAL initially, DOWN while any DowntimeEvent on this asset
+          is OPEN, RETIRED after retire action (terminal). See §1.2.
+        constraints: one of {OPERATIONAL, DOWN, RETIRED}
+        default: OPERATIONAL
+      - name: meter_unit
+        type: enum
+        source: input
+        description: unit of the usage meter
+        constraints: one of {HOURS, CYCLES, KM}
+        default: HOURS
+      - name: meter_reading
+        type: number
+        source: computed
+        description: |
+          current cumulative meter value = the value field of the latest MeterReading for this
+          asset by reading_at (tie-break created_at ASC), or 0 if none; monotonic non-decreasing
+        default: 0
+      - name: warranty_expires_at
+        type: datetime
+        source: input
+        description: end of manufacturer warranty coverage (UTC, exclusive); null if no warranty
+        default: null
+      - name: warranty_cost_cap_cents
+        type: integer
+        source: input
+        description: maximum cents the warranty will reimburse per claim; null = unlimited within coverage
+        default: null
+      - name: acquisition_cost_cents
+        type: integer
+        source: input
+        description: capital cost of the asset, used to value full-replacement warranty claims
+        constraints: ">= 0"
+        default: 0
+      - name: mtbf_hours
+        type: number
+        source: computed
+        description: |
+          mean time between failures; see §1.3 calc_mtbf. Recomputed on every DowntimeEvent
+          OPEN (a failure starts) for this asset. 0 when fewer than 2 failures recorded.
+        default: 0
+      - name: mttr_hours
+        type: number
+        source: computed
+        description: |
+          mean time to repair; see §1.3 calc_mttr. Recomputed on every DowntimeEvent RESOLVE
+          for this asset. 0 when no resolved failure-type downtime recorded.
+        default: 0
+
+  - name: PMSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - name: asset_id
+        type: string
+        source: input
+        description: "FK -> Asset.id; the asset this schedule maintains; immutable after create"
+      - name: trigger_type
+        type: enum
+        source: input
+        description: whether this schedule fires on meter accrual or calendar elapse
+        constraints: one of {METER, CALENDAR}
+      - name: meter_interval
+        type: number
+        source: input
+        description: |
+          meter units between PMs; required when trigger_type==METER, must be null when
+          trigger_type==CALENDAR
+        default: null
+        constraints: "> 0 when present"
+      - name: calendar_interval_days
+        type: integer
+        source: input
+        description: |
+          days between PMs; required when trigger_type==CALENDAR, must be null when
+          trigger_type==METER
+        default: null
+        constraints: "> 0 when present"
+      - name: estimated_labor_hours
+        type: number
+        source: input
+        description: labor hours a generated work order is expected to consume
+        constraints: "> 0"
+      - name: severity
+        type: enum
+        source: input
+        description: PM severity, copied to generated work orders and gating technician skill
+        constraints: one of {ROUTINE, MAJOR, OVERHAUL}
+        default: ROUTINE
+      - name: anchor_meter
+        type: number
+        source: computed
+        description: |
+          meter value of the last PM completion (or asset meter at schedule create); the
+          baseline from which the next meter-based PM is measured. Rebased on work-order CLOSE.
+        default: 0
+      - name: anchor_date
+        type: datetime
+        source: computed
+        description: |
+          UTC timestamp of the last PM completion (or schedule create time); baseline for the
+          next calendar-based PM. Rebased on work-order CLOSE.
+      - name: next_due_meter
+        type: number
+        source: computed
+        description: "computed next-due meter value for METER schedules (anchor_meter + meter_interval); null for CALENDAR. See §1.3 calc_pm_next_due."
+        default: null
+      - name: next_due_date
+        type: datetime
+        source: computed
+        description: "computed next-due UTC date for CALENDAR schedules (anchor_date + calendar_interval_days); null for METER. See §1.3 calc_pm_next_due."
+        default: null
+      - name: active
+        type: boolean
+        source: input
+        description: when false the schedule never generates work orders (soft-pause)
+        default: true
+
+  - name: MeterReading
+    parent: null
+    common_fields: false
+    fields:
+      - name: asset_id
+        type: string
+        source: input
+        description: "FK -> Asset.id; the asset this reading was taken on"
+      - name: value
+        type: number
+        source: input
+        description: cumulative meter value at reading_at; must be >= asset's current meter_reading
+        constraints: ">= asset.meter_reading at time of submission"
+      - name: reading_at
+        type: datetime
+        source: input
+        description: UTC time the reading was taken; must be > the reading_at of the latest reading
+      - name: triggered_pm
+        type: boolean
+        source: computed
+        description: true when this reading caused at least one METER PMSchedule to become due and generate a work order
+        default: false
+
+  - name: WorkOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: asset_id
+        type: string
+        source: input
+        description: "FK -> Asset.id; the asset being maintained"
+      - name: pm_schedule_id
+        type: string
+        source: input
+        description: "FK -> PMSchedule.id; the schedule that generated this work order, or null for a corrective (unplanned) order"
+        default: null
+      - name: assigned_technician_id
+        type: string
+        source: computed
+        description: "FK -> Technician.id; technician currently assigned, or null while UNASSIGNED/DRAFT. Set by assign, cleared by unassign."
+        default: null
+      - name: wo_type
+        type: enum
+        source: input
+        description: planned PM vs unplanned corrective repair
+        constraints: one of {PREVENTIVE, CORRECTIVE}
+      - name: severity
+        type: enum
+        source: input
+        description: gating severity; for PREVENTIVE copied from the PMSchedule, for CORRECTIVE supplied by caller
+        constraints: one of {ROUTINE, MAJOR, OVERHAUL}
+      - name: execution_status
+        type: enum
+        source: computed
+        description: |
+          lifecycle dimension 1; see §1.2. one of {DRAFT, UNASSIGNED, ASSIGNED, IN_PROGRESS,
+          ON_HOLD, CLOSED, CANCELLED}
+        constraints: one of {DRAFT, UNASSIGNED, ASSIGNED, IN_PROGRESS, ON_HOLD, CLOSED, CANCELLED}
+        default: DRAFT
+      - name: parts_status
+        type: enum
+        source: computed
+        description: |
+          lifecycle dimension 2 (independent of execution_status); see §1.2. one of
+          {NONE, RESERVED, COMMITTED, RELEASED}
+        constraints: one of {NONE, RESERVED, COMMITTED, RELEASED}
+        default: NONE
+      - name: priority_score
+        type: number
+        source: computed
+        description: "computed work-order priority; see §1.3 calc_priority_score. Computed once at work-order creation from the asset's criticality/meter_reading and the schedule's next_due_meter as observed at that moment, then frozen (NOT recomputed on later asset changes)."
+        default: 0
+      - name: estimated_labor_hours
+        type: number
+        source: input
+        description: labor hours used for technician backlog; for PREVENTIVE copied from PMSchedule
+        constraints: "> 0"
+      - name: actual_cost_cents
+        type: integer
+        source: input
+        description: total parts+labor cost recorded at close; supplied to the close action
+        default: 0
+        constraints: ">= 0"
+      - name: warranty_claim_id
+        type: string
+        source: computed
+        description: "FK -> WarrantyClaim.id; the claim that paid for this work order, or null if site budget paid"
+        default: null
+      - name: opened_at
+        type: datetime
+        source: system
+        description: UTC time the work order entered IN_PROGRESS the first time; null if never started
+        default: null
+      - name: closed_at
+        type: datetime
+        source: system
+        description: UTC time the work order was CLOSED; null otherwise
+        default: null
+      - name: scheduled_start
+        type: datetime
+        source: input
+        description: |
+          UTC start of the maintenance window booked for the assigned technician; null until
+          scheduled. Set by the schedule-window action. Used for technician double-booking
+          overlap detection (closed-interval semantics, §1.4 priority 20).
+        default: null
+      - name: scheduled_end
+        type: datetime
+        source: input
+        description: |
+          UTC end of the maintenance window (exclusive upper bound for overlap math; two
+          windows that merely touch at an endpoint do NOT overlap). Must be > scheduled_start.
+        default: null
+
+  - name: PartReservation
+    parent: null
+    common_fields: true
+    fields:
+      - name: work_order_id
+        type: string
+        source: input
+        description: "FK -> WorkOrder.id; the work order consuming the part"
+      - name: spare_part_id
+        type: string
+        source: input
+        description: "FK -> SparePart.id; the part being reserved"
+      - name: qty
+        type: integer
+        source: input
+        description: number of units reserved
+        constraints: "> 0"
+      - name: status
+        type: enum
+        source: computed
+        description: reservation lifecycle; see §1.2. one of {RESERVED, COMMITTED, RELEASED}
+        constraints: one of {RESERVED, COMMITTED, RELEASED}
+        default: RESERVED
+      - name: committed_cost_cents
+        type: integer
+        source: computed
+        description: qty * SparePart.unit_cost_cents frozen at COMMIT; 0 while RESERVED or after RELEASE
+        default: 0
+
+  - name: DowntimeEvent
+    parent: null
+    common_fields: true
+    fields:
+      - name: asset_id
+        type: string
+        source: input
+        description: "FK -> Asset.id; the asset that went down"
+      - name: work_order_id
+        type: string
+        source: input
+        description: "FK -> WorkOrder.id; the corrective work order addressing this downtime, or null if logged standalone"
+        default: null
+      - name: reason_code
+        type: enum
+        source: input
+        description: downtime reason classification; FAILURE-class codes feed MTBF/MTTR, others do not
+        constraints: one of {MECHANICAL_FAILURE, ELECTRICAL_FAILURE, OPERATOR_ERROR, PLANNED_PM, IDLE}
+      - name: started_at
+        type: datetime
+        source: input
+        description: UTC time the asset went down
+      - name: ended_at
+        type: datetime
+        source: computed
+        description: UTC time the asset was restored; null while OPEN. Set by resolve action; must be > started_at.
+        default: null
+      - name: status
+        type: enum
+        source: computed
+        description: downtime lifecycle; see §1.2. one of {OPEN, RESOLVED}
+        constraints: one of {OPEN, RESOLVED}
+        default: OPEN
+      - name: duration_hours
+        type: number
+        source: computed
+        description: "(ended_at - started_at) in hours, set at resolve; 0 while OPEN. Used by §1.3 calc_mttr."
+        default: 0
+
+  - name: WarrantyClaim
+    parent: null
+    common_fields: true
+    fields:
+      - name: asset_id
+        type: string
+        source: input
+        description: "FK -> Asset.id; the asset under warranty"
+      - name: work_order_id
+        type: string
+        source: input
+        description: "FK -> WorkOrder.id; the work order whose cost this claim seeks to cover"
+      - name: claim_type
+        type: enum
+        source: input
+        description: full replacement (uses asset acquisition cost) vs repair (uses work-order actual cost)
+        constraints: one of {REPLACEMENT, REPAIR}
+      - name: claimed_cost_cents
+        type: integer
+        source: computed
+        description: "raw cost basis before cap (acquisition_cost_cents for REPLACEMENT, work order actual_cost_cents for REPAIR); see §1.3 calc_warranty_payable"
+        default: 0
+      - name: payable_cost_cents
+        type: integer
+        source: computed
+        description: "approved reimbursement after applying the asset's warranty_cost_cap_cents; see §1.3 calc_warranty_payable"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: claim lifecycle; see §1.2. one of {SUBMITTED, APPROVED, DENIED}
+        constraints: one of {SUBMITTED, APPROVED, DENIED}
+        default: SUBMITTED
+      - name: decision_reason
+        type: string
+        source: input
+        description: free-text reason supplied at approve/deny
+        default: null
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # --- WorkOrder dimension 1: execution_status (parallel with parts_status) ---
+  - entity: WorkOrder
+    dimension: execution_status
+    initial_state: DRAFT
+    terminal_states: [CLOSED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: UNASSIGNED
+        trigger: "POST /work-orders/{id}/release-to-queue"
+        actor: Planner
+        preconditions:
+          - "work order execution_status == DRAFT"
+          - "asset.status != RETIRED"
+        side_effects:
+          - "no inventory or backlog change"
+
+      - from: UNASSIGNED
+        to: ASSIGNED
+        trigger: "POST /work-orders/{id}/assign"
+        actor: Planner
+        preconditions:
+          - "work order execution_status == UNASSIGNED"
+          - "technician.skill_level rank >= severity rank per calc_skill_gate (ROUTINE->JUNIOR, MAJOR->SENIOR, OVERHAUL->MASTER)"
+          - "technician.backlog_hours + work_order.estimated_labor_hours <= technician.weekly_capacity_hours"
+        side_effects:
+          - "set assigned_technician_id = technician.id"
+          - "increase technician.backlog_hours by work_order.estimated_labor_hours (derived recompute)"
+
+      - from: ASSIGNED
+        to: ASSIGNED
+        trigger: "POST /work-orders/{id}/schedule-window"
+        actor: Planner
+        preconditions:
+          - "work order execution_status == ASSIGNED (must have an assigned technician to book a window for)"
+          - "scheduled_end > scheduled_start"
+          - "no non-terminal work order for the same assigned_technician_id has an overlapping [scheduled_start, scheduled_end) window (§1.4 priority 20)"
+        side_effects:
+          - "set scheduled_start, scheduled_end (no execution_status change; backlog unchanged)"
+        note: "field-setting self-edge on ASSIGNED; gated by state precondition and technician double-booking overlap"
+
+      - from: ASSIGNED
+        to: UNASSIGNED
+        trigger: "POST /work-orders/{id}/unassign"
+        actor: Planner
+        preconditions:
+          - "work order execution_status == ASSIGNED"
+        side_effects:
+          - "decrease technician.backlog_hours by work_order.estimated_labor_hours (derived recompute)"
+          - "clear assigned_technician_id = null"
+
+      - from: ASSIGNED
+        to: IN_PROGRESS
+        trigger: "POST /work-orders/{id}/start"
+        actor: Technician
+        preconditions:
+          - "work order execution_status == ASSIGNED"
+          - "acting technician == assigned_technician_id"
+          - "work order parts_status IN {NONE, RESERVED} (parts not yet committed is allowed)"
+        side_effects:
+          - "set opened_at = clock now if opened_at is null"
+
+      - from: IN_PROGRESS
+        to: ON_HOLD
+        trigger: "POST /work-orders/{id}/hold"
+        actor: Technician
+        preconditions:
+          - "work order execution_status == IN_PROGRESS"
+          - "acting technician == assigned_technician_id"
+        side_effects:
+          - "backlog_hours unchanged (still counts toward backlog)"
+
+      - from: ON_HOLD
+        to: IN_PROGRESS
+        trigger: "POST /work-orders/{id}/resume"
+        actor: Technician
+        preconditions:
+          - "work order execution_status == ON_HOLD"
+          - "acting technician == assigned_technician_id"
+        side_effects:
+          - "no field change beyond updated_at/version"
+        note: "ON_HOLD<->IN_PROGRESS forms the cycle that makes this dimension non-linear"
+
+      - from: IN_PROGRESS
+        to: CLOSED
+        trigger: "POST /work-orders/{id}/close"
+        actor: Technician
+        preconditions:
+          - "work order execution_status == IN_PROGRESS"
+          - "acting technician == assigned_technician_id"
+          - "work order parts_status IN {NONE, COMMITTED} (any RESERVED-but-not-committed reservation blocks close)"
+          - "no DowntimeEvent with this work_order_id is OPEN"
+        side_effects:
+          - "set closed_at = clock now"
+          - "decrease technician.backlog_hours by work_order.estimated_labor_hours (derived recompute)"
+          - "CASCADE: if parts_status == COMMITTED, debit SparePart.on_hand_qty by each committed reservation.qty and set those reservations RELEASED -> recompute each SparePart.reserved_qty"
+          - "CASCADE: if wo_type==PREVENTIVE and pm_schedule_id set, rebase PMSchedule.anchor_meter = asset.meter_reading and anchor_date = closed_at, then recompute next_due_meter/next_due_date (calc_pm_next_due)"
+          - "CASCADE: if warranty_claim_id is null, increase Site.budget_spent_cents by actual_cost_cents (warranty-covered orders do NOT hit the budget)"
+
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /work-orders/{id}/cancel"
+        actor: Planner
+        preconditions:
+          - "work order execution_status IN {DRAFT, UNASSIGNED, ASSIGNED}"
+        side_effects:
+          - "if execution_status was ASSIGNED, decrease technician.backlog_hours by estimated_labor_hours and clear assigned_technician_id"
+          - "CASCADE: release every PartReservation on this work order whose status==RESERVED (set RELEASED) -> recompute SparePart.reserved_qty (committed reservations cannot exist pre-IN_PROGRESS so none are debited)"
+
+      - from: UNASSIGNED
+        to: CANCELLED
+        trigger: "POST /work-orders/{id}/cancel"
+        actor: Planner
+        preconditions:
+          - "work order execution_status IN {DRAFT, UNASSIGNED, ASSIGNED}"
+        side_effects:
+          - "same as DRAFT->CANCELLED"
+
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "POST /work-orders/{id}/cancel"
+        actor: Planner
+        preconditions:
+          - "work order execution_status IN {DRAFT, UNASSIGNED, ASSIGNED}"
+        side_effects:
+          - "decrease technician.backlog_hours by estimated_labor_hours; clear assigned_technician_id; release RESERVED reservations"
+
+  # --- WorkOrder dimension 2: parts_status (parallel, independent of execution_status) ---
+  - entity: WorkOrder
+    dimension: parts_status
+    initial_state: NONE
+    terminal_states: [RELEASED]
+    transitions:
+      - from: NONE
+        to: RESERVED
+        trigger: "POST /work-orders/{id}/reservations (first reservation created)"
+        actor: InventoryClerk
+        preconditions:
+          - "work order execution_status IN {UNASSIGNED, ASSIGNED, IN_PROGRESS, ON_HOLD} (not DRAFT, not terminal)"
+          - "SparePart.on_hand_qty - SparePart.reserved_qty >= requested qty (available units)"
+        side_effects:
+          - "create PartReservation status=RESERVED; recompute SparePart.reserved_qty"
+      - from: RESERVED
+        to: RESERVED
+        trigger: "POST /work-orders/{id}/reservations (subsequent reservation created)"
+        actor: InventoryClerk
+        preconditions:
+          - "SparePart.on_hand_qty - SparePart.reserved_qty >= requested qty"
+        side_effects:
+          - "create another PartReservation status=RESERVED; recompute SparePart.reserved_qty"
+      - from: RESERVED
+        to: COMMITTED
+        trigger: "POST /work-orders/{id}/commit-parts"
+        actor: InventoryClerk
+        preconditions:
+          - "work order execution_status == IN_PROGRESS"
+          - "at least one PartReservation on this work order is RESERVED"
+        side_effects:
+          - "set every RESERVED reservation on this WO to COMMITTED; freeze committed_cost_cents = qty * unit_cost_cents on each (recompute does NOT change on_hand_qty yet)"
+          - "SparePart.reserved_qty unchanged (COMMITTED still counts as reserved until close debits stock)"
+      - from: COMMITTED
+        to: RELEASED
+        trigger: "system: WorkOrder close cascade"
+        actor: system
+        preconditions:
+          - "work order execution_status transitions to CLOSED"
+        side_effects:
+          - "debit SparePart.on_hand_qty by each committed qty; set reservations RELEASED; recompute SparePart.reserved_qty"
+      - from: RESERVED
+        to: RELEASED
+        trigger: "system: WorkOrder cancel cascade"
+        actor: system
+        preconditions:
+          - "work order execution_status transitions to CANCELLED"
+        side_effects:
+          - "set RESERVED reservations RELEASED; recompute SparePart.reserved_qty; on_hand_qty unchanged"
+
+  # --- PartReservation (its own row, branching: COMMITTED vs early RELEASE) ---
+  - entity: PartReservation
+    initial_state: RESERVED
+    terminal_states: [RELEASED]
+    transitions:
+      - from: RESERVED
+        to: RELEASED
+        trigger: "POST /reservations/{id}/release"
+        actor: InventoryClerk
+        preconditions:
+          - "reservation status == RESERVED"
+          - "parent work order execution_status != CLOSED"
+        side_effects:
+          - "recompute SparePart.reserved_qty (frees the units); on_hand_qty unchanged"
+          - "if this was the work order's last non-RELEASED reservation, set WorkOrder.parts_status = RELEASED"
+      - from: RESERVED
+        to: COMMITTED
+        trigger: "system: WorkOrder commit-parts"
+        actor: system
+        preconditions:
+          - "parent work order execution_status == IN_PROGRESS"
+        side_effects:
+          - "freeze committed_cost_cents = qty * SparePart.unit_cost_cents"
+      - from: COMMITTED
+        to: RELEASED
+        trigger: "system: WorkOrder close cascade"
+        actor: system
+        preconditions:
+          - "parent work order transitions to CLOSED"
+        side_effects:
+          - "debit SparePart.on_hand_qty by qty; recompute SparePart.reserved_qty"
+
+  # --- Asset (compound: status derived from open downtime; RETIRED terminal) ---
+  - entity: Asset
+    initial_state: OPERATIONAL
+    terminal_states: [RETIRED]
+    transitions:
+      - from: OPERATIONAL
+        to: DOWN
+        trigger: "system: DowntimeEvent OPEN created for this asset"
+        actor: system
+        preconditions:
+          - "asset.status == OPERATIONAL"
+        side_effects:
+          - "asset.status = DOWN"
+          - "CASCADE: recompute asset.mtbf_hours (calc_mtbf) using the new failure start if reason_code is a FAILURE class"
+      - from: DOWN
+        to: OPERATIONAL
+        trigger: "system: last OPEN DowntimeEvent on this asset RESOLVED"
+        actor: system
+        preconditions:
+          - "asset.status == DOWN"
+          - "no other DowntimeEvent on this asset remains OPEN"
+        side_effects:
+          - "asset.status = OPERATIONAL"
+      - from: OPERATIONAL
+        to: RETIRED
+        trigger: "POST /assets/{id}/retire"
+        actor: MaintenanceManager
+        preconditions:
+          - "asset.status == OPERATIONAL (cannot retire while DOWN)"
+          - "no WorkOrder on this asset has execution_status IN {UNASSIGNED, ASSIGNED, IN_PROGRESS, ON_HOLD}"
+          - "expected_asset_version matches asset.version (OCC)"
+        side_effects:
+          - "asset.status = RETIRED"
+          - "increments Asset.version by 1"
+          - "CASCADE: set every PMSchedule on this asset active=false (no further PM generation)"
+
+  # --- DowntimeEvent (branching: failure-class vs non-failure, both OPEN->RESOLVED) ---
+  - entity: DowntimeEvent
+    initial_state: OPEN
+    terminal_states: [RESOLVED]
+    transitions:
+      - from: OPEN
+        to: RESOLVED
+        trigger: "POST /downtime-events/{id}/resolve"
+        actor: Technician
+        preconditions:
+          - "downtime status == OPEN"
+          - "ended_at (supplied) > started_at"
+        side_effects:
+          - "set ended_at, status=RESOLVED, duration_hours = (ended_at - started_at)/3600"
+          - "CASCADE: if reason_code is FAILURE class, recompute asset.mttr_hours (calc_mttr)"
+          - "CASCADE: if this was the asset's last OPEN downtime, asset transitions DOWN->OPERATIONAL"
+
+  # --- WarrantyClaim (branching: APPROVED vs DENIED from SUBMITTED) ---
+  - entity: WarrantyClaim
+    initial_state: SUBMITTED
+    terminal_states: [APPROVED, DENIED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /warranty-claims/{id}/approve"
+        actor: WarrantyAdmin
+        preconditions:
+          - "claim status == SUBMITTED"
+          - "referenced work order execution_status == CLOSED"
+          - "work order closed_at < asset.warranty_expires_at (claim must fall within coverage)"
+          - "asset.status != RETIRED"
+        side_effects:
+          - "compute claimed_cost_cents and payable_cost_cents (calc_warranty_payable)"
+          - "set WorkOrder.warranty_claim_id = this claim id"
+          - "CASCADE: decrease Site.budget_spent_cents by work_order.actual_cost_cents (the budget previously charged at close is reimbursed by warranty)"
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /warranty-claims/{id}/deny"
+        actor: WarrantyAdmin
+        preconditions:
+          - "claim status == SUBMITTED"
+        side_effects:
+          - "set payable_cost_cents = 0; Site.budget_spent_cents unchanged (budget keeps the close-time charge)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: reservation-create-stale-part
+    parent_entity: SparePart
+    write_endpoint: "POST /work-orders/{id}/reservations"
+    occ_field: "expected_spare_part_version"
+    description: |
+      Creating a PartReservation against a SparePart whose version has advanced since the
+      client last observed it is rejected with a stale-version error. A reservation create
+      legitimately succeeds on its own (available units remain), so this is a true
+      CREATE-with-supersede race: another reservation against the same part has already
+      consumed availability and bumped the part's version, making this client's view stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: retire-asset-stale-asset
+    parent_entity: Asset
+    write_endpoint: "POST /assets/{id}/retire"
+    occ_field: "expected_asset_version"
+    description: |
+      Retiring an Asset whose version has advanced since the client last observed it is
+      rejected with a stale-version error. Retire legitimately supersedes the prior asset
+      state; if a meter reading, downtime open, or PM rebase has bumped the asset's version
+      since the client read it, the retire is acting on a stale view and is rejected.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: calc_pm_next_due
+    trigger: "PMSchedule create; WorkOrder close cascade (anchor rebase); MeterReading create (re-evaluate due)"
+    algorithm: threshold
+    formula: |
+      # DUAL-VARIANT by trigger_type — same conceptual "next PM due" produces a
+      # meter target on one entity-axis and a date target on the other.
+      if trigger_type == METER:
+        next_due_meter = anchor_meter + meter_interval          # units
+        next_due_date  = null
+        # A METER schedule becomes DUE when asset.meter_reading >= next_due_meter
+        is_due = asset.meter_reading >= next_due_meter          # >= boundary, inclusive
+      elif trigger_type == CALENDAR:
+        next_due_date  = anchor_date + calendar_interval_days days
+        next_due_meter = null
+        # A CALENDAR schedule becomes DUE when clock_now >= next_due_date
+        is_due = clock_now >= next_due_date                     # >= boundary, inclusive
+    input_set: "the single PMSchedule plus its asset's current meter_reading and the clock"
+    constants: {}
+    precision: "meter values: number, no rounding; dates: whole days added"
+    variants:
+      - name: meter_based
+        when: "trigger_type == METER"
+        difference: "due test is meter_reading >= anchor_meter + meter_interval; calendar fields null"
+      - name: calendar_based
+        when: "trigger_type == CALENDAR"
+        difference: "due test is clock_now >= anchor_date + calendar_interval_days; meter fields null"
+
+  - name: calc_priority_score
+    trigger: "WorkOrder create (computed once at creation, frozen)"
+    algorithm: weighted_scoring
+    formula: |
+      # >=3 inputs with NON-LINEAR interaction (mode (a)): criticality weight, severity
+      # weight, and a meter-overrun multiplier interact multiplicatively, then a corrective
+      # bump is added conditionally.
+      crit_weight = { LOW:1, MEDIUM:2, HIGH:4, CRITICAL:8 }[asset.criticality]
+      sev_weight  = { ROUTINE:1, MAJOR:3, OVERHAUL:5 }[work_order.severity]
+      # overrun ratio only meaningful for PREVENTIVE meter PMs; clamp to [1.0, 3.0]
+      if wo_type == PREVENTIVE and pm_schedule.trigger_type == METER:
+        raw = asset.meter_reading / max(pm_schedule.next_due_meter, 1)
+        overrun = min(max(raw, 1.0), 3.0)
+      else:
+        overrun = 1.0
+      base = crit_weight * sev_weight * overrun
+      corrective_bump = 10 if wo_type == CORRECTIVE else 0
+      priority_score = round(base + corrective_bump, 2)   # round_half_up, 2 dp
+    input_set: "the work order's asset (criticality, meter_reading), its severity, its wo_type, and (if PM) the schedule's next_due_meter"
+    constants:
+      CRIT_WEIGHTS: { LOW: 1, MEDIUM: 2, HIGH: 4, CRITICAL: 8 }
+      SEV_WEIGHTS: { ROUTINE: 1, MAJOR: 3, OVERHAUL: 5 }
+      OVERRUN_FLOOR: 1.0
+      OVERRUN_CEIL: 3.0
+      CORRECTIVE_BUMP: 10
+    precision: "2 decimal places, round_half_up"
+
+  - name: calc_mtbf
+    trigger: "DowntimeEvent OPEN created with a FAILURE-class reason_code for the asset"
+    algorithm: aggregation
+    formula: |
+      # Mean Time Between Failures over an asset's FAILURE-class downtime history.
+      # Include DowntimeEvent rows where reason_code IN {MECHANICAL_FAILURE, ELECTRICAL_FAILURE}
+      # (OPERATOR_ERROR, PLANNED_PM, IDLE excluded), ordered by started_at ASC,
+      # tie-break created_at ASC.
+      failures = [d for d in asset.downtime if d.reason_code in FAILURE_CODES]
+      sorted by started_at ASC, created_at ASC
+      if len(failures) < 2: return 0
+      gaps = [ (failures[i].started_at - failures[i-1].started_at)/3600 for i in 1..n-1 ]
+      mtbf_hours = round(sum(gaps) / len(gaps), 2)   # mean of consecutive start-to-start gaps
+    input_set: "all DowntimeEvent rows for the asset with reason_code IN {MECHANICAL_FAILURE, ELECTRICAL_FAILURE}, regardless of OPEN/RESOLVED"
+    constants:
+      FAILURE_CODES: [MECHANICAL_FAILURE, ELECTRICAL_FAILURE]
+    precision: "2 decimal places, round_half_up"
+
+  - name: calc_mttr
+    trigger: "DowntimeEvent RESOLVE for a FAILURE-class downtime on the asset"
+    algorithm: aggregation
+    formula: |
+      # Mean Time To Repair over an asset's RESOLVED FAILURE-class downtime.
+      # Include DowntimeEvent rows where status==RESOLVED AND reason_code IN FAILURE_CODES.
+      repaired = [d for d in asset.downtime if d.status==RESOLVED and d.reason_code in FAILURE_CODES]
+      if len(repaired) == 0: return 0
+      mttr_hours = round(sum(d.duration_hours for d in repaired) / len(repaired), 2)
+    input_set: "RESOLVED FAILURE-class DowntimeEvent rows for the asset"
+    constants:
+      FAILURE_CODES: [MECHANICAL_FAILURE, ELECTRICAL_FAILURE]
+    precision: "2 decimal places, round_half_up"
+
+  - name: calc_warranty_payable
+    trigger: "WarrantyClaim approve"
+    algorithm: threshold
+    formula: |
+      # DUAL-VARIANT by claim_type (different entity domain than calc_pm_next_due):
+      #   REPLACEMENT uses the asset's acquisition cost; REPAIR uses the work order's actual cost.
+      # Then a cap is applied (threshold). COMBINATORIAL mode (c): evaluation order is pinned —
+      # claimed_cost_cents is computed FIRST, then payable is min(claimed, cap), because the cap
+      # is meaningless until the claim basis is fixed.
+      if claim_type == REPLACEMENT:
+        claimed_cost_cents = asset.acquisition_cost_cents
+      elif claim_type == REPAIR:
+        claimed_cost_cents = work_order.actual_cost_cents
+      cap = asset.warranty_cost_cap_cents      # may be null = unlimited
+      if cap is null:
+        payable_cost_cents = claimed_cost_cents
+      else:
+        payable_cost_cents = min(claimed_cost_cents, cap)
+    input_set: "the claim's asset (acquisition_cost_cents, warranty_cost_cap_cents) OR work order (actual_cost_cents), per claim_type"
+    constants: {}
+    precision: "integer cents, no rounding"
+    variants:
+      - name: replacement
+        when: "claim_type == REPLACEMENT"
+        difference: "basis is asset.acquisition_cost_cents"
+      - name: repair
+        when: "claim_type == REPAIR"
+        difference: "basis is work_order.actual_cost_cents"
+
+  - name: calc_skill_gate
+    trigger: "WorkOrder assign (precondition check)"
+    algorithm: threshold
+    formula: |
+      # Severity requires a minimum technician skill rank.
+      sev_rank   = { ROUTINE:1, MAJOR:2, OVERHAUL:3 }[work_order.severity]
+      skill_rank = { JUNIOR:1, SENIOR:2, MASTER:3 }[technician.skill_level]
+      eligible = skill_rank >= sev_rank      # >= boundary: exact match is allowed
+    input_set: "the work order's severity and the candidate technician's skill_level"
+    constants:
+      SEV_RANK: { ROUTINE: 1, MAJOR: 2, OVERHAUL: 3 }
+      SKILL_RANK: { JUNIOR: 1, SENIOR: 2, MASTER: 3 }
+    precision: "integer ranks, exact comparison"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role header present and is a recognized role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "acting role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "every resource id in the path exists (validated left-to-right)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids"
+  - priority: 4
+    category: existence
+    check: "every FK id in the request body references an existing resource"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "all create endpoints with FK body fields"
+  - priority: 5
+    category: business_constraint
+    check: "request body has all required fields with correct types/enums"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all create/action endpoints"
+  - priority: 6
+    category: state
+    check: "target resource is in a state from which this transition is defined (§1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints"
+  - priority: 7
+    category: business_referential
+    check: "OCC: expected_<parent>_version matches the parent's current version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /work-orders/{id}/reservations, POST /assets/{id}/retire"
+  - priority: 8
+    category: business_safety
+    check: "technician.skill_level rank >= work_order.severity rank (calc_skill_gate) on assign"
+    error_id: ERR_SKILL_INSUFFICIENT
+    http_status: 422
+    applies_to: "POST /work-orders/{id}/assign"
+  - priority: 9
+    category: business_referential
+    check: "PMSchedule field combo valid: METER requires meter_interval & null calendar_interval_days; CALENDAR requires calendar_interval_days & null meter_interval"
+    error_id: ERR_SCHEDULE_CONFIG_INVALID
+    http_status: 422
+    applies_to: "POST /assets/{id}/pm-schedules"
+  - priority: 10
+    category: business_temporal
+    check: "MeterReading.value >= asset.meter_reading AND MeterReading.reading_at > latest reading_at (monotonic, non-overlapping)"
+    error_id: ERR_METER_NOT_MONOTONIC
+    http_status: 422
+    applies_to: "POST /assets/{id}/meter-readings"
+  - priority: 11
+    category: business_temporal
+    check: "DowntimeEvent overlap: a new OPEN downtime whose [started_at, +inf) overlaps an existing OPEN downtime on the same asset is rejected (an asset cannot have two concurrently-open downtimes)"
+    error_id: ERR_DOWNTIME_OVERLAP
+    http_status: 409
+    applies_to: "POST /assets/{id}/downtime-events"
+  - priority: 12
+    category: business_temporal
+    check: "DowntimeEvent resolve overlap: ended_at must be > started_at AND must not extend past the started_at of the next FAILURE-class downtime on the same asset (closed intervals may touch but not overlap)"
+    error_id: ERR_DOWNTIME_INTERVAL_INVALID
+    http_status: 422
+    applies_to: "POST /downtime-events/{id}/resolve"
+  - priority: 13
+    category: business_constraint
+    check: "spare-part availability: SparePart.on_hand_qty - SparePart.reserved_qty >= requested qty"
+    error_id: ERR_INSUFFICIENT_STOCK
+    http_status: 422
+    applies_to: "POST /work-orders/{id}/reservations"
+  - priority: 14
+    category: business_constraint
+    check: "technician backlog: technician.backlog_hours + work_order.estimated_labor_hours <= technician.weekly_capacity_hours on assign"
+    error_id: ERR_BACKLOG_EXCEEDED
+    http_status: 422
+    applies_to: "POST /work-orders/{id}/assign"
+  - priority: 15
+    category: business_temporal
+    check: "warranty coverage: on approve, work_order.closed_at < asset.warranty_expires_at"
+    error_id: ERR_WARRANTY_EXPIRED
+    http_status: 422
+    applies_to: "POST /warranty-claims/{id}/approve"
+  - priority: 16
+    category: business_constraint
+    check: "close requires all reservations resolved/committed: no PartReservation on the WO is RESERVED at close"
+    error_id: ERR_PARTS_NOT_COMMITTED
+    http_status: 409
+    applies_to: "POST /work-orders/{id}/close"
+  - priority: 17
+    category: business_constraint
+    check: "close requires no OPEN DowntimeEvent referencing this work order"
+    error_id: ERR_DOWNTIME_OPEN
+    http_status: 409
+    applies_to: "POST /work-orders/{id}/close"
+  - priority: 18
+    category: business_constraint
+    check: "SparePart.sku uniqueness on create"
+    error_id: ERR_DUPLICATE_SKU
+    http_status: 409
+    applies_to: "POST /spare-parts"
+  - priority: 19
+    category: business_constraint
+    check: "retire blocked while asset has active (non-terminal) work orders or is DOWN"
+    error_id: ERR_ASSET_BUSY
+    http_status: 409
+    applies_to: "POST /assets/{id}/retire"
+  - priority: 20
+    category: business_temporal
+    check: |
+      Technician double-booking: booking a maintenance window [scheduled_start, scheduled_end)
+      on a work order is rejected when it overlaps any other non-terminal (execution_status NOT
+      IN {CLOSED, CANCELLED}) work order window already booked for the SAME assigned technician.
+      Closed/exclusive-end semantics: windows that merely touch (one's scheduled_end ==
+      another's scheduled_start) do NOT overlap and are allowed; any positive-length intersection
+      is rejected. (Distinct interval geometry from the asset half-open downtime ray.)
+    error_id: ERR_TECH_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /work-orders/{id}/schedule-window"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Site ---
+  - method: POST
+    path: "/sites"
+    description: "create a site with a maintenance budget"
+    roles: [MaintenanceManager]
+    code: 201
+    input: [name, "timezone?", maintenance_budget_cents]
+    output: Site
+    side_effects: ["budget_spent_cents initialized to 0"]
+  - method: GET
+    path: "/sites/{id}"
+    description: "fetch a site including computed budget_spent_cents"
+    roles: [MaintenanceManager, Planner, WarrantyAdmin]
+    code: 200
+    input: []
+    output: Site
+    side_effects: []
+  - method: GET
+    path: "/sites"
+    description: "list sites (paginated)"
+    roles: [MaintenanceManager, Planner, WarrantyAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Site[]
+    side_effects: []
+
+  # --- SparePart ---
+  - method: POST
+    path: "/spare-parts"
+    description: "create a spare part"
+    roles: [InventoryClerk, MaintenanceManager]
+    code: 201
+    input: [sku, name, on_hand_qty, unit_cost_cents, "reorder_point?"]
+    output: SparePart
+    side_effects: ["reserved_qty initialized to 0"]
+  - method: GET
+    path: "/spare-parts/{id}"
+    description: "fetch a spare part with computed reserved_qty"
+    roles: [InventoryClerk, MaintenanceManager, Planner]
+    code: 200
+    input: []
+    output: SparePart
+    side_effects: []
+  - method: GET
+    path: "/spare-parts"
+    description: "list spare parts (paginated)"
+    roles: [InventoryClerk, MaintenanceManager, Planner]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: SparePart[]
+    side_effects: []
+
+  # --- Technician ---
+  - method: POST
+    path: "/technicians"
+    description: "create a technician"
+    roles: [MaintenanceManager]
+    code: 201
+    input: [name, skill_level, weekly_capacity_hours]
+    output: Technician
+    side_effects: ["backlog_hours initialized to 0"]
+  - method: GET
+    path: "/technicians/{id}"
+    description: "fetch a technician with computed backlog_hours"
+    roles: [MaintenanceManager, Planner, Technician]
+    code: 200
+    input: []
+    output: Technician
+    side_effects: []
+  - method: GET
+    path: "/technicians"
+    description: "list technicians (paginated)"
+    roles: [MaintenanceManager, Planner, Technician]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Technician[]
+    side_effects: []
+
+  # --- Asset ---
+  - method: POST
+    path: "/assets"
+    description: "create an asset (optionally under a parent asset)"
+    roles: [MaintenanceManager]
+    code: 201
+    input: [site_id, "parent_asset_id?", name, "criticality?", "meter_unit?", "warranty_expires_at?", "warranty_cost_cap_cents?", "acquisition_cost_cents?"]
+    output: Asset
+    side_effects: ["status=OPERATIONAL; meter_reading=0; mtbf_hours=0; mttr_hours=0"]
+  - method: GET
+    path: "/assets/{id}"
+    description: "fetch an asset with computed meter_reading, status, mtbf_hours, mttr_hours"
+    roles: [MaintenanceManager, Planner, Technician, WarrantyAdmin, InventoryClerk]
+    code: 200
+    input: []
+    output: Asset
+    side_effects: []
+  - method: GET
+    path: "/assets"
+    description: "list assets; filter by site_id or parent_asset_id (reverse-reachability for both FKs)"
+    roles: [MaintenanceManager, Planner, Technician, WarrantyAdmin, InventoryClerk]
+    code: 200
+    input: ["site_id?", "parent_asset_id?", "limit?", "offset?"]
+    output: Asset[]
+    side_effects: []
+  - method: POST
+    path: "/assets/{id}/retire"
+    description: "retire an asset (OCC-guarded); deactivates its PM schedules"
+    roles: [MaintenanceManager]
+    code: 200
+    input: [expected_asset_version]
+    output: Asset
+    side_effects:
+      - "asset.status=RETIRED"
+      - "increments Asset.version by 1"
+      - "CASCADE: set all PMSchedule.active=false on this asset"
+
+  # --- MeterReading (sub-resource of Asset) ---
+  - method: POST
+    path: "/assets/{id}/meter-readings"
+    description: "submit a meter reading; may trigger METER PM work-order generation"
+    roles: [Technician, MaintenanceManager]
+    code: 201
+    input: [value, reading_at]
+    output: MeterReading
+    side_effects:
+      - "recompute asset.meter_reading"
+      - "increments Asset.version by 1"
+      - "CASCADE: for each active METER PMSchedule on the asset now DUE (calc_pm_next_due is_due), auto-create a PREVENTIVE WorkOrder (execution_status=DRAFT, parts_status=NONE, priority via calc_priority_score) and set triggered_pm=true"
+  - method: GET
+    path: "/assets/{id}/meter-readings"
+    description: "list meter readings for an asset (reverse-reachability for MeterReading.asset_id)"
+    roles: [MaintenanceManager, Planner, Technician]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: MeterReading[]
+    side_effects: []
+
+  # --- PMSchedule (sub-resource of Asset for create + reverse-reachability) ---
+  - method: POST
+    path: "/assets/{id}/pm-schedules"
+    description: "create a PM schedule on an asset (meter-based or calendar-based)"
+    roles: [Planner, MaintenanceManager]
+    code: 201
+    input: [trigger_type, "meter_interval?", "calendar_interval_days?", estimated_labor_hours, "severity?", "active?"]
+    output: PMSchedule
+    side_effects:
+      - "anchor_meter=asset.meter_reading; anchor_date=now; compute next_due_meter/next_due_date (calc_pm_next_due)"
+  - method: GET
+    path: "/assets/{id}/pm-schedules"
+    description: "list PM schedules for an asset (reverse-reachability for PMSchedule.asset_id)"
+    roles: [Planner, MaintenanceManager, Technician]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PMSchedule[]
+    side_effects: []
+  - method: GET
+    path: "/pm-schedules/{id}"
+    description: "fetch a PM schedule with computed next-due fields"
+    roles: [Planner, MaintenanceManager, Technician]
+    code: 200
+    input: []
+    output: PMSchedule
+    side_effects: []
+  - method: POST
+    path: "/pm-schedules/{id}/generate-due"
+    description: "force-evaluate this schedule against the clock/meter and generate a WorkOrder if DUE (used for CALENDAR schedules and manual sweeps)"
+    roles: [Planner, MaintenanceManager]
+    code: 201
+    input: []
+    output: WorkOrder
+    side_effects:
+      - "if calc_pm_next_due is_due: create PREVENTIVE WorkOrder (DRAFT, priority via calc_priority_score); else ERR_PM_NOT_DUE"
+
+  # --- WorkOrder ---
+  - method: POST
+    path: "/work-orders"
+    description: "create a corrective (unplanned) work order; PM work orders are auto-generated"
+    roles: [Planner, MaintenanceManager]
+    code: 201
+    input: [asset_id, wo_type, severity, estimated_labor_hours]
+    output: WorkOrder
+    side_effects: ["execution_status=DRAFT; parts_status=NONE; priority via calc_priority_score"]
+  - method: GET
+    path: "/work-orders/{id}"
+    description: "fetch a work order with computed priority_score and both status dimensions"
+    roles: [Planner, MaintenanceManager, Technician, WarrantyAdmin, InventoryClerk]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: []
+  - method: GET
+    path: "/work-orders"
+    description: "list work orders; filter by asset_id, pm_schedule_id, assigned_technician_id, or warranty_claim_id (reverse-reachability for those FKs)"
+    roles: [Planner, MaintenanceManager, Technician, WarrantyAdmin, InventoryClerk]
+    code: 200
+    input: ["asset_id?", "pm_schedule_id?", "assigned_technician_id?", "warranty_claim_id?", "limit?", "offset?"]
+    output: WorkOrder[]
+    side_effects: []
+  - method: POST
+    path: "/work-orders/{id}/release-to-queue"
+    description: "move a DRAFT work order to UNASSIGNED"
+    roles: [Planner, MaintenanceManager]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["execution_status DRAFT->UNASSIGNED"]
+  - method: POST
+    path: "/work-orders/{id}/assign"
+    description: "assign an UNASSIGNED work order to a technician"
+    roles: [Planner, MaintenanceManager]
+    code: 200
+    input: [technician_id]
+    output: WorkOrder
+    side_effects:
+      - "execution_status UNASSIGNED->ASSIGNED; set assigned_technician_id"
+      - "recompute technician.backlog_hours (+estimated_labor_hours)"
+  - method: POST
+    path: "/work-orders/{id}/schedule-window"
+    description: "book a maintenance time window for the assigned technician (rejects double-booking)"
+    roles: [Planner, MaintenanceManager]
+    code: 200
+    input: [scheduled_start, scheduled_end]
+    output: WorkOrder
+    side_effects:
+      - "set scheduled_start, scheduled_end on the work order after technician double-booking overlap check (§1.4 priority 20)"
+  - method: POST
+    path: "/work-orders/{id}/unassign"
+    description: "return an ASSIGNED work order to the queue"
+    roles: [Planner, MaintenanceManager]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects:
+      - "execution_status ASSIGNED->UNASSIGNED; clear assigned_technician_id"
+      - "recompute technician.backlog_hours (-estimated_labor_hours)"
+  - method: POST
+    path: "/work-orders/{id}/start"
+    description: "begin work (ASSIGNED->IN_PROGRESS)"
+    roles: [Technician]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["set opened_at if null"]
+  - method: POST
+    path: "/work-orders/{id}/hold"
+    description: "pause an IN_PROGRESS work order"
+    roles: [Technician]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["execution_status IN_PROGRESS->ON_HOLD; backlog unchanged"]
+  - method: POST
+    path: "/work-orders/{id}/resume"
+    description: "resume an ON_HOLD work order (cyclic transition)"
+    roles: [Technician]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["execution_status ON_HOLD->IN_PROGRESS"]
+  - method: POST
+    path: "/work-orders/{id}/close"
+    description: "complete a work order; commits parts, debits stock, rebases PM, charges budget"
+    roles: [Technician]
+    code: 200
+    input: [actual_cost_cents]
+    output: WorkOrder
+    side_effects:
+      - "execution_status IN_PROGRESS->CLOSED; set closed_at; recompute technician.backlog_hours"
+      - "CASCADE: COMMITTED reservations RELEASED, debit SparePart.on_hand_qty, recompute reserved_qty"
+      - "CASCADE: PREVENTIVE -> rebase PMSchedule anchors and next-due"
+      - "CASCADE: if no warranty_claim_id, increase Site.budget_spent_cents by actual_cost_cents"
+  - method: POST
+    path: "/work-orders/{id}/cancel"
+    description: "cancel a non-terminal, non-started work order"
+    roles: [Planner, MaintenanceManager]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects:
+      - "execution_status -> CANCELLED; release RESERVED reservations; recompute reserved_qty and backlog"
+
+  # --- PartReservation (sub-resource of WorkOrder for create + list) ---
+  - method: POST
+    path: "/work-orders/{id}/reservations"
+    description: "reserve units of a spare part for a work order (OCC-guarded on the part)"
+    roles: [InventoryClerk]
+    code: 201
+    input: [spare_part_id, qty, expected_spare_part_version]
+    output: PartReservation
+    side_effects:
+      - "create PartReservation RESERVED; recompute SparePart.reserved_qty; set WorkOrder.parts_status=RESERVED"
+      - "increments SparePart.version by 1"
+  - method: GET
+    path: "/work-orders/{id}/reservations"
+    description: "list reservations for a work order (reverse-reachability for PartReservation.work_order_id)"
+    roles: [InventoryClerk, Planner, MaintenanceManager, Technician]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PartReservation[]
+    side_effects: []
+  - method: GET
+    path: "/reservations/{id}"
+    description: "fetch a reservation with computed status and committed_cost_cents"
+    roles: [InventoryClerk, Planner, MaintenanceManager]
+    code: 200
+    input: []
+    output: PartReservation
+    side_effects: []
+  - method: GET
+    path: "/reservations"
+    description: "list reservations; filter by spare_part_id (reverse-reachability for PartReservation.spare_part_id)"
+    roles: [InventoryClerk, Planner, MaintenanceManager]
+    code: 200
+    input: ["spare_part_id?", "limit?", "offset?"]
+    output: PartReservation[]
+    side_effects: []
+  - method: POST
+    path: "/reservations/{id}/release"
+    description: "release a RESERVED reservation early (before commit)"
+    roles: [InventoryClerk]
+    code: 200
+    input: []
+    output: PartReservation
+    side_effects:
+      - "status RESERVED->RELEASED; recompute SparePart.reserved_qty"
+      - "if last non-released reservation, set WorkOrder.parts_status=RELEASED"
+  - method: POST
+    path: "/work-orders/{id}/commit-parts"
+    description: "commit all RESERVED reservations on an IN_PROGRESS work order"
+    roles: [InventoryClerk]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects:
+      - "every RESERVED reservation -> COMMITTED; freeze committed_cost_cents; WorkOrder.parts_status=COMMITTED"
+
+  # --- DowntimeEvent ---
+  - method: POST
+    path: "/assets/{id}/downtime-events"
+    description: "log a downtime event on an asset with a reason code"
+    roles: [Technician, MaintenanceManager]
+    code: 201
+    input: [reason_code, started_at, "work_order_id?"]
+    output: DowntimeEvent
+    side_effects:
+      - "create DowntimeEvent OPEN; asset OPERATIONAL->DOWN; recompute asset.mtbf_hours if FAILURE-class"
+  - method: GET
+    path: "/assets/{id}/downtime-events"
+    description: "list downtime events for an asset (reverse-reachability for DowntimeEvent.asset_id)"
+    roles: [MaintenanceManager, Planner, Technician]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: DowntimeEvent[]
+    side_effects: []
+  - method: GET
+    path: "/downtime-events/{id}"
+    description: "fetch a downtime event with computed duration_hours and status"
+    roles: [MaintenanceManager, Planner, Technician]
+    code: 200
+    input: []
+    output: DowntimeEvent
+    side_effects: []
+  - method: GET
+    path: "/downtime-events"
+    description: "list downtime events; filter by work_order_id (reverse-reachability for DowntimeEvent.work_order_id)"
+    roles: [MaintenanceManager, Planner, Technician]
+    code: 200
+    input: ["work_order_id?", "limit?", "offset?"]
+    output: DowntimeEvent[]
+    side_effects: []
+  - method: POST
+    path: "/downtime-events/{id}/resolve"
+    description: "resolve an open downtime event; recomputes MTTR and may restore the asset"
+    roles: [Technician, MaintenanceManager]
+    code: 200
+    input: [ended_at]
+    output: DowntimeEvent
+    side_effects:
+      - "status OPEN->RESOLVED; set ended_at, duration_hours; recompute asset.mttr_hours if FAILURE-class"
+      - "CASCADE: if no other OPEN downtime, asset DOWN->OPERATIONAL"
+
+  # --- WarrantyClaim ---
+  - method: POST
+    path: "/warranty-claims"
+    description: "submit a warranty claim against a closed work order"
+    roles: [WarrantyAdmin, MaintenanceManager]
+    code: 201
+    input: [asset_id, work_order_id, claim_type]
+    output: WarrantyClaim
+    side_effects: ["status=SUBMITTED"]
+  - method: GET
+    path: "/warranty-claims/{id}"
+    description: "fetch a warranty claim with computed claimed/payable amounts"
+    roles: [WarrantyAdmin, MaintenanceManager, Planner]
+    code: 200
+    input: []
+    output: WarrantyClaim
+    side_effects: []
+  - method: GET
+    path: "/warranty-claims"
+    description: "list warranty claims; filter by asset_id or work_order_id (reverse-reachability for both FKs)"
+    roles: [WarrantyAdmin, MaintenanceManager, Planner]
+    code: 200
+    input: ["asset_id?", "work_order_id?", "limit?", "offset?"]
+    output: WarrantyClaim[]
+    side_effects: []
+  - method: POST
+    path: "/warranty-claims/{id}/approve"
+    description: "approve a claim; computes payable, links work order, reimburses the site budget"
+    roles: [WarrantyAdmin]
+    code: 200
+    input: ["decision_reason?"]
+    output: WarrantyClaim
+    side_effects:
+      - "status SUBMITTED->APPROVED; compute claimed/payable (calc_warranty_payable); set WorkOrder.warranty_claim_id"
+      - "CASCADE: decrease Site.budget_spent_cents by work_order.actual_cost_cents"
+  - method: POST
+    path: "/warranty-claims/{id}/deny"
+    description: "deny a claim"
+    roles: [WarrantyAdmin]
+    code: 200
+    input: ["decision_reason?"]
+    output: WarrantyClaim
+    side_effects: ["status SUBMITTED->DENIED; payable_cost_cents=0; budget unchanged"]
+
+  # --- Test-driving clock (controls the server's notion of 'now' for CALENDAR PMs/warranty) ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "test-driving: set the server's current UTC time for calendar PM due-checks and warranty coverage"
+    roles: [MaintenanceManager]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock set; subsequent now() returns this value"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role header missing or unrecognized"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "acting role not permitted for this operation"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a resource id in the path does not exist"
+  - id: ERR_REFERENCE_NOT_FOUND
+    http: 404
+    condition: "an FK id in the request body does not reference an existing resource"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "missing required field, wrong type, or invalid enum value"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "target resource is not in a state from which this transition is defined"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_<parent>_version does not match the parent's current version (OCC)"
+  - id: ERR_SKILL_INSUFFICIENT
+    http: 422
+    condition: "technician skill rank below the work order's severity rank on assign"
+  - id: ERR_SCHEDULE_CONFIG_INVALID
+    http: 422
+    condition: "PM schedule trigger_type/interval field combination is invalid"
+  - id: ERR_METER_NOT_MONOTONIC
+    http: 422
+    condition: "meter reading value < current meter_reading, or reading_at not strictly after the latest reading"
+  - id: ERR_DOWNTIME_OVERLAP
+    http: 409
+    condition: "a new OPEN downtime overlaps an existing OPEN downtime on the same asset"
+  - id: ERR_DOWNTIME_INTERVAL_INVALID
+    http: 422
+    condition: "resolve ended_at <= started_at, or the resolved interval overlaps the next FAILURE downtime's start"
+  - id: ERR_INSUFFICIENT_STOCK
+    http: 422
+    condition: "available units (on_hand_qty - reserved_qty) below requested reservation qty"
+  - id: ERR_BACKLOG_EXCEEDED
+    http: 422
+    condition: "assigning would push technician backlog above weekly_capacity_hours"
+  - id: ERR_WARRANTY_EXPIRED
+    http: 422
+    condition: "work order closed_at is not before asset.warranty_expires_at on claim approve"
+  - id: ERR_PARTS_NOT_COMMITTED
+    http: 409
+    condition: "close attempted while a PartReservation on the WO is still RESERVED"
+  - id: ERR_DOWNTIME_OPEN
+    http: 409
+    condition: "close attempted while a DowntimeEvent referencing the WO is OPEN"
+  - id: ERR_DUPLICATE_SKU
+    http: 409
+    condition: "spare part create with a sku that already exists"
+  - id: ERR_ASSET_BUSY
+    http: 409
+    condition: "retire attempted while asset is DOWN or has non-terminal work orders"
+  - id: ERR_PM_NOT_DUE
+    http: 409
+    condition: "generate-due called on a schedule that is not yet due"
+  - id: ERR_TECH_DOUBLE_BOOKED
+    http: 409
+    condition: "schedule-window overlaps another non-terminal work order window for the same assigned technician"
+  - id: ERR_VALIDATION
+    http: 400
+    condition: "pagination params out of range, or other generic field-level validation failure"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: MaintenanceManager
+    description: "operational superset; owns asset configuration, sites, technicians, retire/override; can act in most operator surfaces"
+    identity: opaque
+    exclusive_operations:
+      - "POST /sites"
+      - "POST /technicians"
+      - "POST /assets"
+      - "POST /assets/{id}/retire"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /spare-parts (with InventoryClerk)"
+      - "POST /assets/{id}/pm-schedules (with Planner)"
+      - "POST /pm-schedules/{id}/generate-due (with Planner)"
+      - "POST /work-orders + lifecycle planning ops (with Planner)"
+      - "POST /assets/{id}/meter-readings, /downtime-events, /downtime-events/{id}/resolve (with Technician)"
+      - "POST /warranty-claims (with WarrantyAdmin)"
+      - "all GET reads"
+  - name: Planner
+    description: "owns PM schedule definition and work-order planning lifecycle (release/assign/unassign/cancel)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /work-orders/{id}/release-to-queue"
+      - "POST /work-orders/{id}/assign"
+      - "POST /work-orders/{id}/schedule-window"
+      - "POST /work-orders/{id}/unassign"
+      - "POST /work-orders/{id}/cancel"
+    shared_operations:
+      - "POST /assets/{id}/pm-schedules (with MaintenanceManager)"
+      - "POST /pm-schedules/{id}/generate-due (with MaintenanceManager)"
+      - "POST /work-orders (with MaintenanceManager)"
+      - "GET reads on sites, assets, work-orders, pm-schedules, reservations, downtime, claims"
+  - name: Technician
+    description: "executes work orders (start/hold/resume/close), submits meter readings, logs and resolves downtime"
+    identity: entity_backed:Technician
+    exclusive_operations:
+      - "POST /work-orders/{id}/start"
+      - "POST /work-orders/{id}/hold"
+      - "POST /work-orders/{id}/resume"
+      - "POST /work-orders/{id}/close"
+    shared_operations:
+      - "POST /assets/{id}/meter-readings (with MaintenanceManager)"
+      - "POST /assets/{id}/downtime-events (with MaintenanceManager)"
+      - "POST /downtime-events/{id}/resolve (with MaintenanceManager)"
+      - "GET reads on assets, technicians, work-orders, pm-schedules, downtime, reservations"
+  - name: InventoryClerk
+    description: "owns spare-part catalog and reservation lifecycle (reserve/commit/release)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /work-orders/{id}/reservations"
+      - "POST /reservations/{id}/release"
+      - "POST /work-orders/{id}/commit-parts"
+    shared_operations:
+      - "POST /spare-parts (with MaintenanceManager)"
+      - "GET reads on spare-parts, reservations, assets, work-orders"
+  - name: WarrantyAdmin
+    description: "owns warranty claim decisions (approve/deny)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /warranty-claims/{id}/approve"
+      - "POST /warranty-claims/{id}/deny"
+    shared_operations:
+      - "POST /warranty-claims (with MaintenanceManager)"
+      - "GET reads on warranty-claims, sites, assets, work-orders"

@@ -1,0 +1,19 @@
+"""Domain thresholds — numeric constants from PRD calculations (PRD §2, §3)."""
+
+# Plan defaults (PRD §3.1).
+DEFAULT_MAX_CONTRIBUTION_RATE_PCT = 15
+DEFAULT_DISCOUNT_PCT = 15
+DEFAULT_ANNUAL_PURCHASE_LIMIT_USD = 25000
+
+# Offering duration bounds (PRD §3.2).
+OFFERING_DURATION_MIN_MONTHS = 6
+OFFERING_DURATION_MAX_MONTHS = 24
+
+# Qualifying-disposition holding-period clocks (PRD §3.8).
+QUALIFY_GRANT_YEARS = 2
+QUALIFY_PURCHASE_YEARS = 1
+
+# Pagination (PRD §2.3).
+PAGINATION_DEFAULT_LIMIT = 10
+PAGINATION_MIN_LIMIT = 1
+PAGINATION_MAX_LIMIT = 100

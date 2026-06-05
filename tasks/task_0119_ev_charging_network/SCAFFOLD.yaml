@@ -1,0 +1,1543 @@
+scenario: "EV Charging Network: session start/stop, kWh vs time pricing, idle/occupancy fee, OCPP station telemetry, roaming/eMSP settlement, stall reservation, dynamic load balancing, demand-charge avoidance"
+domain_name: ev-charging-network
+api_prefix: /api
+
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - dual_variant_calculation
+    - rate_threshold_triggers
+    - cascading_side_effects
+    - optimistic_concurrency
+
+  entity_topology: graph
+  # Sites own Stalls; Sessions reference Stalls + Drivers + Tariffs + (optional) Reservations
+  # + (optional) eMSP; SettlementBatches gather Sessions across the Stall/Site tree into an
+  # eMSP-scoped ledger — references cross aggregate boundaries (graph, not a strict tree).
+
+  state_machine_shape: parallel
+  # ChargingSession carries two independent dimensions (charging_status × billing_status);
+  # Reservation is a branching fork-join; Stall is cyclic (AVAILABLE↔FAULTED); SettlementBatch
+  # is linear-with-revert (OPEN→LOCKED→SETTLED, LOCKED→DISPUTED→OPEN).
+
+  relationship_patterns:
+    - one_to_many        # Site→Stall, ChargingSession→MeterEvent, SettlementBatch→SettlementLineItem
+    - cross_aggregate    # SettlementLineItem references ChargingSession across the eMSP boundary
+    - polymorphic        # (not used)
+
+  role_model: peer_roles
+  # Driver owns own sessions/reservations; CPOOperator owns sites/stalls/tariffs and runs
+  # load balancing + settlement; StationController is the opaque OCPP telemetry actor.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Site
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: human-readable site name
+        constraints: non-empty
+      - name: circuit_limit_kw
+        type: number
+        source: input
+        description: total grid circuit power budget (kW) shared by all stalls; ceiling for dynamic load balancing
+        constraints: "> 0"
+      - name: allocation_policy
+        type: enum
+        source: input
+        description: load-balancing variant selector
+        default: PROPORTIONAL
+        constraints: "one of {PROPORTIONAL, PRIORITY}"
+      - name: demand_charge_threshold_kw
+        type: number
+        source: input
+        description: site demand-charge avoidance breakpoint; aggregate draw is held at or below this when avoidance is armed
+        constraints: "> 0 and <= circuit_limit_kw"
+      - name: demand_avoidance_armed
+        type: boolean
+        source: input
+        description: when true, load balancer caps aggregate allocation at demand_charge_threshold_kw instead of circuit_limit_kw
+        default: false
+      - name: allocated_total_kw
+        type: number
+        source: computed
+        description: sum of allocated_power_kw across this site's sessions whose charging_status == CHARGING; recomputed on every load-balance run
+        default: 0
+      - name: active_session_count
+        type: integer
+        source: computed
+        description: count of this site's sessions whose charging_status IN {PREPARING, CHARGING, SUSPENDED}
+        default: 0
+
+  - name: Stall
+    parent: Site
+    common_fields: true
+    fields:
+      - name: site_id
+        type: string
+        source: input
+        description: "FK -> Site.id; owning site"
+      - name: connector_type
+        type: enum
+        source: input
+        description: physical connector standard
+        constraints: "one of {CCS, CHADEMO, J1772, NACS}"
+      - name: max_power_kw
+        type: number
+        source: input
+        description: hardware power ceiling of this stall (kW)
+        constraints: "> 0"
+      - name: ocpp_status
+        type: enum
+        source: system
+        description: OCPP-reported station status
+        default: AVAILABLE
+        constraints: "one of {AVAILABLE, OCCUPIED, FAULTED, UNAVAILABLE}"
+      - name: reservation_priority
+        type: integer
+        source: input
+        description: tie-ranked priority for PRIORITY allocation waterfall; lower number = higher priority
+        default: 100
+        constraints: ">= 1"
+
+  - name: Driver
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: driver login email
+        constraints: unique, non-empty
+      - name: full_name
+        type: string
+        source: input
+        description: driver display name
+      - name: home_emsp_id
+        type: string
+        source: input
+        description: "FK -> EMSP.id; the e-mobility service provider that bills this driver when roaming"
+      - name: wallet_balance_cents
+        type: integer
+        source: system
+        description: prepaid wallet balance in cents; debited when a home (non-roaming) session is rated
+        default: 0
+
+  - name: EMSP
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: e-mobility service provider name
+        constraints: non-empty
+      - name: commission_pct
+        type: number
+        source: input
+        description: CPO commission rate retained from each roaming session before remitting net to the eMSP
+        constraints: ">= 0 and < 1"
+      - name: receivable_balance_cents
+        type: integer
+        source: computed
+        description: net amount (cents) this eMSP currently owes the CPO across OPEN/LOCKED settlement line items; recomputed on line-item add/reverse
+        default: 0
+
+  - name: Tariff
+    parent: null
+    common_fields: true
+    fields:
+      - name: site_id
+        type: string
+        source: input
+        description: "FK -> Site.id; the site this tariff prices"
+      - name: connector_type
+        type: enum
+        source: input
+        description: connector standard this tariff applies to
+        constraints: "one of {CCS, CHADEMO, J1772, NACS}"
+      - name: pricing_mode
+        type: enum
+        source: input
+        description: cost variant selector for sessions priced by this tariff
+        constraints: "one of {ENERGY_BASED, TIME_BASED}"
+      - name: session_fee_cents
+        type: integer
+        source: input
+        description: flat per-session connection fee
+        default: 0
+        constraints: ">= 0"
+      - name: energy_tier_1_max_kwh
+        type: number
+        source: input
+        description: upper bound (kWh) of energy tier 1
+        constraints: "> 0"
+      - name: energy_tier_2_max_kwh
+        type: number
+        source: input
+        description: upper bound (kWh) of energy tier 2; tier 3 covers everything above
+        constraints: "> energy_tier_1_max_kwh"
+      - name: energy_rate_t1_cents
+        type: integer
+        source: input
+        description: per-kWh rate (cents) within tier 1
+        constraints: ">= 0"
+      - name: energy_rate_t2_cents
+        type: integer
+        source: input
+        description: per-kWh rate (cents) within tier 2
+        constraints: ">= 0"
+      - name: energy_rate_t3_cents
+        type: integer
+        source: input
+        description: per-kWh rate (cents) within tier 3
+        constraints: ">= 0"
+      - name: time_rate_cents_per_min
+        type: integer
+        source: input
+        description: per charging-minute rate (cents) used in TIME_BASED mode
+        constraints: ">= 0"
+      - name: idle_grace_minutes
+        type: integer
+        source: input
+        description: minutes of post-charge idle occupancy allowed before idle fee accrues
+        default: 0
+        constraints: ">= 0"
+      - name: idle_fee_cents_per_min
+        type: integer
+        source: input
+        description: per-minute idle/occupancy fee charged for idle minutes strictly beyond idle_grace_minutes
+        default: 0
+        constraints: ">= 0"
+      - name: effective_from
+        type: datetime
+        source: input
+        description: inclusive start of this tariff's effective window
+      - name: effective_to
+        type: datetime
+        source: input
+        description: inclusive end of this tariff's effective window
+        constraints: ">= effective_from"
+
+  - name: Reservation
+    parent: null
+    common_fields: true
+    fields:
+      - name: stall_id
+        type: string
+        source: input
+        description: "FK -> Stall.id; the reserved stall"
+      - name: driver_id
+        type: string
+        source: input
+        description: "FK -> Driver.id; the reserving driver"
+      - name: window_start
+        type: datetime
+        source: input
+        description: inclusive start of the reservation hold window
+      - name: window_end
+        type: datetime
+        source: input
+        description: exclusive end of the reservation hold window
+        constraints: "> window_start"
+      - name: status
+        type: enum
+        source: system
+        description: reservation lifecycle state
+        default: REQUESTED
+        constraints: "one of {REQUESTED, CONFIRMED, CHECKED_IN, CONSUMED, NO_SHOW, CANCELLED, EXPIRED}"
+      - name: hold_fee_cents
+        type: integer
+        source: input
+        description: deposit charged on confirmation; refunded on CONSUMED, forfeited on NO_SHOW
+        default: 0
+        constraints: ">= 0"
+
+  - name: ChargingSession
+    parent: null
+    common_fields: true
+    fields:
+      - name: stall_id
+        type: string
+        source: input
+        description: "FK -> Stall.id; the stall delivering power"
+      - name: driver_id
+        type: string
+        source: input
+        description: "FK -> Driver.id; the charging driver"
+      - name: tariff_id
+        type: string
+        source: system
+        description: "FK -> Tariff.id; the tariff resolved at session start for the stall's site+connector at the session clock"
+      - name: reservation_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id; optional reservation this session honors; null for walk-up sessions"
+        default: null
+      - name: emsp_id
+        type: string
+        source: system
+        description: "FK -> EMSP.id; set to the driver's home_emsp_id when the session is roaming, null for home sessions"
+        default: null
+      - name: is_roaming
+        type: boolean
+        source: input
+        description: true when the session is billed through the driver's home eMSP rather than the driver wallet
+        default: false
+      - name: charging_status
+        type: enum
+        source: system
+        description: physical charging dimension (independent of billing_status)
+        default: PREPARING
+        constraints: "one of {PREPARING, CHARGING, SUSPENDED, FINISHING, COMPLETED, ABORTED}"
+      - name: billing_status
+        type: enum
+        source: system
+        description: financial dimension (independent of charging_status)
+        default: UNBILLED
+        constraints: "one of {UNBILLED, RATED, SETTLED, REVERSED}"
+      - name: energy_delivered_kwh
+        type: number
+        source: computed
+        description: total kWh = latest MeterEvent.meter_kwh minus the start MeterEvent.meter_kwh for this session
+        default: 0
+      - name: charging_minutes
+        type: integer
+        source: computed
+        description: whole minutes the session spent in charging_status CHARGING (start→stop, excluding SUSPENDED idle minutes)
+        default: 0
+      - name: idle_minutes
+        type: integer
+        source: computed
+        description: whole minutes the session spent in charging_status SUSPENDED before stop
+        default: 0
+      - name: allocated_power_kw
+        type: number
+        source: computed
+        description: power (kW) granted to this session by the most recent site load-balance run; 0 unless charging_status == CHARGING
+        default: 0
+      - name: total_cost_cents
+        type: integer
+        source: computed
+        description: final session cost in cents computed at stop per the tariff's pricing_mode variant
+        default: 0
+      - name: idle_fee_cents
+        type: integer
+        source: computed
+        description: idle/occupancy portion of total_cost_cents
+        default: 0
+
+  - name: MeterEvent
+    parent: ChargingSession
+    common_fields: false
+    fields:
+      - name: session_id
+        type: string
+        source: input
+        description: "FK -> ChargingSession.id; the session this OCPP meter sample belongs to"
+      - name: meter_kwh
+        type: number
+        source: input
+        description: cumulative lifetime meter reading (kWh) reported by the station at sample time
+        constraints: ">= 0, monotonically non-decreasing per session"
+      - name: sampled_at
+        type: datetime
+        source: input
+        description: OCPP MeterValues timestamp
+      - name: reading_context
+        type: enum
+        source: input
+        description: OCPP reading context
+        constraints: "one of {TRANSACTION_BEGIN, SAMPLE_PERIODIC, TRANSACTION_END}"
+
+  - name: SettlementBatch
+    parent: null
+    common_fields: true
+    fields:
+      - name: emsp_id
+        type: string
+        source: input
+        description: "FK -> EMSP.id; the roaming partner this batch settles"
+      - name: status
+        type: enum
+        source: system
+        description: settlement batch lifecycle
+        default: OPEN
+        constraints: "one of {OPEN, LOCKED, SETTLED, DISPUTED}"
+      - name: line_item_count
+        type: integer
+        source: computed
+        description: count of SettlementLineItem rows whose batch_id == this batch
+        default: 0
+      - name: total_amount_cents
+        type: integer
+        source: computed
+        description: round-then-sum of member SettlementLineItem.net_amount_cents (each already rounded to whole cents); recomputed on add/reverse
+        default: 0
+
+  - name: SettlementLineItem
+    parent: SettlementBatch
+    common_fields: true
+    fields:
+      - name: batch_id
+        type: string
+        source: input
+        description: "FK -> SettlementBatch.id; owning batch"
+      - name: session_id
+        type: string
+        source: input
+        description: "FK -> ChargingSession.id; the roaming session being settled"
+      - name: gross_amount_cents
+        type: integer
+        source: computed
+        description: copied from the session's total_cost_cents at add time
+        default: 0
+      - name: commission_cents
+        type: integer
+        source: computed
+        description: round_half_up(gross_amount_cents * emsp.commission_pct), CPO's retained commission
+        default: 0
+      - name: net_amount_cents
+        type: integer
+        source: computed
+        description: gross_amount_cents minus commission_cents; the amount remitted to the eMSP for this session
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: line item lifecycle
+        default: PENDING
+        constraints: "one of {PENDING, SETTLED, REVERSED}"
+
+  - name: LoadAllocation
+    parent: Site
+    common_fields: true
+    fields:
+      - name: site_id
+        type: string
+        source: input
+        description: "FK -> Site.id; the site this allocation snapshot covers"
+      - name: trigger_reason
+        type: enum
+        source: system
+        description: what caused this load-balance run
+        constraints: "one of {SESSION_START, SESSION_STOP, SESSION_SUSPEND, MANUAL_REBALANCE}"
+      - name: policy_used
+        type: enum
+        source: system
+        description: allocation variant applied for this run
+        constraints: "one of {PROPORTIONAL, PRIORITY}"
+      - name: cap_kw
+        type: number
+        source: computed
+        description: ceiling enforced this run = demand_charge_threshold_kw when demand_avoidance_armed else circuit_limit_kw
+        default: 0
+      - name: allocated_total_kw
+        type: number
+        source: computed
+        description: sum of allocated_power_kw assigned to CHARGING sessions in this run; MUST be <= cap_kw
+        default: 0
+      - name: session_count
+        type: integer
+        source: computed
+        description: number of CHARGING sessions that received an allocation in this run
+        default: 0
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- ChargingSession: PARALLEL dimensions (charging_status × billing_status) ----
+  - entity: ChargingSession
+    initial_state: PREPARING            # charging_status dimension; billing_status starts UNBILLED
+    terminal_states: [COMPLETED, ABORTED]
+    transitions:
+      - from: PREPARING
+        to: CHARGING
+        trigger: "POST /sessions/{id}/begin-charging"
+        actor: StationController
+        preconditions:
+          - "charging_status == PREPARING"
+          - "stall.ocpp_status == OCCUPIED"
+          - "a TRANSACTION_BEGIN MeterEvent exists for this session"
+        side_effects:
+          - "set allocated_power_kw via a Site load-balance run (calculation site_load_allocation, trigger_reason SESSION_START)"
+          - "recompute Site.allocated_total_kw and Site.active_session_count"
+          - "create a LoadAllocation snapshot for the site"
+          - "increments ChargingSession.version by 1"
+      - from: CHARGING
+        to: SUSPENDED
+        trigger: "POST /sessions/{id}/suspend"
+        actor: StationController
+        preconditions:
+          - "charging_status == CHARGING"
+        side_effects:
+          - "set allocated_power_kw to 0"
+          - "re-run site_load_allocation (trigger_reason SESSION_SUSPEND) — freed power is redistributed to remaining CHARGING sessions"
+          - "recompute Site.allocated_total_kw"
+          - "begin accruing idle_minutes"
+          - "increments ChargingSession.version by 1"
+      - from: SUSPENDED
+        to: CHARGING
+        trigger: "POST /sessions/{id}/begin-charging"
+        actor: StationController
+        preconditions:
+          - "charging_status == SUSPENDED"
+          - "stall.ocpp_status == OCCUPIED"
+        side_effects:
+          - "stop accruing idle_minutes; freeze idle_minutes at elapsed SUSPENDED whole minutes"
+          - "re-run site_load_allocation (trigger_reason SESSION_START)"
+          - "increments ChargingSession.version by 1"
+        note: "cycle CHARGING→SUSPENDED→CHARGING (resume after a charging pause)"
+      - from: CHARGING
+        to: FINISHING
+        trigger: "POST /sessions/{id}/stop"
+        actor: [Driver, StationController]
+        preconditions:
+          - "charging_status IN {CHARGING, SUSPENDED}"
+          - "a TRANSACTION_END MeterEvent exists for this session"
+        side_effects:
+          - "compute energy_delivered_kwh, charging_minutes, idle_minutes"
+          - "set allocated_power_kw to 0"
+          - "re-run site_load_allocation (trigger_reason SESSION_STOP) on remaining CHARGING sessions"
+          - "auto-transition charging_status FINISHING→COMPLETED in the same request"
+          - "increments ChargingSession.version by 1"
+      - from: SUSPENDED
+        to: FINISHING
+        trigger: "POST /sessions/{id}/stop"
+        actor: [Driver, StationController]
+        preconditions:
+          - "charging_status == SUSPENDED"
+          - "a TRANSACTION_END MeterEvent exists for this session"
+        side_effects:
+          - "compute energy_delivered_kwh, charging_minutes, idle_minutes"
+          - "re-run site_load_allocation (trigger_reason SESSION_STOP)"
+          - "auto-transition charging_status FINISHING→COMPLETED in the same request"
+          - "increments ChargingSession.version by 1"
+      - from: FINISHING
+        to: COMPLETED
+        trigger: "system (auto, within the stop request)"
+        actor: system
+        preconditions:
+          - "charging_status == FINISHING"
+        side_effects:
+          - "billing_status dimension transitions UNBILLED→RATED (calculation session_cost): set total_cost_cents, idle_fee_cents"
+          - "if is_roaming == false: debit Driver.wallet_balance_cents by total_cost_cents"
+          - "if reservation_id is set and reservation.status == CHECKED_IN: transition Reservation CHECKED_IN→CONSUMED"
+          - "set Stall.ocpp_status to AVAILABLE"
+      - from: PREPARING
+        to: ABORTED
+        trigger: "POST /sessions/{id}/abort"
+        actor: [Driver, StationController]
+        preconditions:
+          - "charging_status == PREPARING"
+        side_effects:
+          - "set Stall.ocpp_status to AVAILABLE"
+          - "no cost is rated; billing_status stays UNBILLED"
+          - "increments ChargingSession.version by 1"
+      # billing_status dimension — independent transitions:
+      - from: RATED
+        to: SETTLED
+        trigger: "system (SettlementBatch SETTLED cascade)"
+        actor: system
+        preconditions:
+          - "billing_status == RATED"
+          - "the session's SettlementLineItem.status transitioned PENDING→SETTLED"
+        side_effects:
+          - "no further billing changes"
+        note: "billing_status dimension; orthogonal to charging_status which is already COMPLETED"
+      - from: RATED
+        to: REVERSED
+        trigger: "system (SettlementLineItem reversal cascade)"
+        actor: system
+        preconditions:
+          - "billing_status == RATED"
+          - "the session's SettlementLineItem.status transitioned PENDING→REVERSED"
+        side_effects:
+          - "decrement EMSP.receivable_balance_cents by the line item's net_amount_cents"
+
+  # ---- Reservation: BRANCHING fork-join with divergent side-effects per branch ----
+  - entity: Reservation
+    initial_state: REQUESTED
+    terminal_states: [CONSUMED, NO_SHOW, CANCELLED, EXPIRED]
+    transitions:
+      - from: REQUESTED
+        to: CONFIRMED
+        trigger: "POST /reservations/{id}/confirm"
+        actor: Driver
+        preconditions:
+          - "status == REQUESTED"
+          - "no overlapping CONFIRMED/CHECKED_IN reservation on the same stall (validation resource_temporal_overlap, buffered)"
+        side_effects:
+          - "charge hold_fee_cents (debit Driver.wallet_balance_cents)"
+          - "increments Reservation.version by 1"
+      - from: CONFIRMED
+        to: CHECKED_IN
+        trigger: "POST /reservations/{id}/check-in"
+        actor: Driver
+        preconditions:
+          - "status == CONFIRMED"
+          - "current clock is within [window_start, window_end)"
+          - "stall.ocpp_status IN {AVAILABLE, OCCUPIED}"
+        side_effects:
+          - "increments Reservation.version by 1"
+      - from: CHECKED_IN
+        to: CONSUMED
+        trigger: "system (ChargingSession FINISHING→COMPLETED cascade when reservation_id set)"
+        actor: system
+        preconditions:
+          - "status == CHECKED_IN"
+        side_effects:
+          - "refund hold_fee_cents (credit Driver.wallet_balance_cents)"
+        note: "branch A — fulfilled: deposit refunded"
+      - from: CONFIRMED
+        to: NO_SHOW
+        trigger: "system (clock passes window_end with no check-in)"
+        actor: system
+        preconditions:
+          - "status == CONFIRMED"
+          - "current clock >= window_end"
+        side_effects:
+          - "forfeit hold_fee_cents (no refund); Driver.wallet_balance_cents already debited at confirm and NOT credited back"
+        note: "branch B — no-show: deposit forfeited (divergent side-effect set vs CONSUMED)"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /reservations/{id}/cancel"
+        actor: Driver
+        preconditions:
+          - "status == REQUESTED"
+        side_effects:
+          - "no fee movement (hold not yet charged)"
+          - "increments Reservation.version by 1"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /reservations/{id}/cancel"
+        actor: Driver
+        preconditions:
+          - "status == CONFIRMED"
+        side_effects:
+          - "refund hold_fee_cents (credit Driver.wallet_balance_cents)"
+          - "increments Reservation.version by 1"
+      - from: REQUESTED
+        to: EXPIRED
+        trigger: "system (clock passes window_start while still REQUESTED)"
+        actor: system
+        preconditions:
+          - "status == REQUESTED"
+          - "current clock >= window_start"
+        side_effects:
+          - "no fee movement"
+
+  # ---- Stall: CYCLIC posture (AVAILABLE↔FAULTED↔AVAILABLE) driven by OCPP telemetry ----
+  - entity: Stall
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: OCCUPIED
+        trigger: "POST /sessions (a session is created on this stall)"
+        actor: [Driver, StationController]
+        preconditions:
+          - "ocpp_status == AVAILABLE"
+        side_effects:
+          - "increments Stall.version by 1"
+      - from: OCCUPIED
+        to: AVAILABLE
+        trigger: "system (ChargingSession FINISHING→COMPLETED or PREPARING→ABORTED cascade)"
+        actor: system
+        preconditions:
+          - "ocpp_status == OCCUPIED"
+        side_effects:
+          - "increments Stall.version by 1"
+      - from: AVAILABLE
+        to: FAULTED
+        trigger: "POST /stalls/{id}/ocpp-status (StatusNotification reports Faulted)"
+        actor: StationController
+        preconditions:
+          - "ocpp_status IN {AVAILABLE, OCCUPIED}"
+        side_effects:
+          - "if a session on this stall is in charging_status IN {PREPARING, CHARGING, SUSPENDED}: force that session charging_status → SUSPENDED, set its allocated_power_kw to 0, then re-run site_load_allocation (trigger_reason SESSION_SUSPEND) so freed power flows to remaining CHARGING sessions"
+          - "increments Stall.version by 1"
+        note: "cross-entity cascade root → Session → Site reallocation (depth-3 chain)"
+      - from: OCCUPIED
+        to: FAULTED
+        trigger: "POST /stalls/{id}/ocpp-status (StatusNotification reports Faulted)"
+        actor: StationController
+        preconditions:
+          - "ocpp_status == OCCUPIED"
+        side_effects:
+          - "force the active session charging_status → SUSPENDED, set its allocated_power_kw to 0, then re-run site_load_allocation (trigger_reason SESSION_SUSPEND)"
+          - "increments Stall.version by 1"
+      - from: FAULTED
+        to: AVAILABLE
+        trigger: "POST /stalls/{id}/ocpp-status (StatusNotification reports Available)"
+        actor: StationController
+        preconditions:
+          - "ocpp_status == FAULTED"
+        side_effects:
+          - "increments Stall.version by 1"
+        note: "cycle FAULTED→AVAILABLE recovery"
+      - from: AVAILABLE
+        to: UNAVAILABLE
+        trigger: "POST /stalls/{id}/ocpp-status (operator takes stall out of service)"
+        actor: StationController
+        preconditions:
+          - "ocpp_status == AVAILABLE"
+        side_effects:
+          - "increments Stall.version by 1"
+
+  # ---- SettlementBatch: linear with revert (cycle LOCKED→DISPUTED→OPEN) ----
+  - entity: SettlementBatch
+    initial_state: OPEN
+    terminal_states: [SETTLED]
+    transitions:
+      - from: OPEN
+        to: LOCKED
+        trigger: "POST /settlement-batches/{id}/lock"
+        actor: CPOOperator
+        preconditions:
+          - "status == OPEN"
+          - "line_item_count >= 1 (empty batch cannot be locked — boundary boundary_precision_check)"
+        side_effects:
+          - "recompute total_amount_cents = round-then-sum of member net_amount_cents"
+          - "increments SettlementBatch.version by 1"
+      - from: LOCKED
+        to: SETTLED
+        trigger: "POST /settlement-batches/{id}/settle"
+        actor: CPOOperator
+        preconditions:
+          - "status == LOCKED"
+          - "expected_settlementbatch_version matches"
+        side_effects:
+          - "for each member SettlementLineItem: PENDING→SETTLED"
+          - "for each member line item's session: billing_status RATED→SETTLED (cascade)"
+          - "decrement EMSP.receivable_balance_cents by total_amount_cents (the receivable is now collected)"
+          - "increments SettlementBatch.version by 1"
+        note: "depth-2 cascade root: batch → line items → sessions"
+      - from: LOCKED
+        to: DISPUTED
+        trigger: "POST /settlement-batches/{id}/dispute"
+        actor: CPOOperator
+        preconditions:
+          - "status == LOCKED"
+        side_effects:
+          - "increments SettlementBatch.version by 1"
+      - from: DISPUTED
+        to: OPEN
+        trigger: "POST /settlement-batches/{id}/reopen"
+        actor: CPOOperator
+        preconditions:
+          - "status == DISPUTED"
+        side_effects:
+          - "for each member SettlementLineItem with status PENDING: set status PENDING→REVERSED (compensation for the disputed total)"
+          - "for each reversed line item's session: billing_status RATED→REVERSED"
+          - "decrement EMSP.receivable_balance_cents by each reversed line item's net_amount_cents (receivable returns to its pre-add value; zero drift)"
+          - "recompute total_amount_cents = round-then-sum of remaining PENDING/SETTLED net_amount_cents (now 0 if all reversed) and line_item_count"
+          - "increments SettlementBatch.version by 1"
+        note: "cycle LOCKED→DISPUTED→OPEN — batch returns to editable state; outstanding PENDING line items are reversed so the eMSP receivable is restored"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: reservation-create-stale-stall
+    parent_entity: Stall
+    write_endpoint: "POST /api/reservations"
+    occ_field: "expected_stall_version"
+    description: |
+      Creating a Reservation against a Stall whose version has advanced since the
+      client last observed it is rejected with a stale-version error. This captures
+      the case where another writer has already created a reservation that
+      legitimately occupies an overlapping window on the same stall (advancing the
+      stall version), so the current writer's view of stall availability is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: settle-batch-stale-version
+    parent_entity: SettlementBatch
+    write_endpoint: "POST /api/settlement-batches/{id}/settle"
+    occ_field: "expected_settlementbatch_version"
+    description: |
+      Settling a SettlementBatch whose version has advanced since the client last
+      observed it is rejected with a stale-version error. This captures the case
+      where another writer has already added or reversed a line item (advancing the
+      batch version and changing total_amount_cents), so the current writer's view
+      of the settlement total is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: session_cost
+    trigger: "ChargingSession charging_status FINISHING→COMPLETED (the billing_status UNBILLED→RATED step inside POST /sessions/{id}/stop)"
+    algorithm: tiered_pricing
+    formula: |
+      # Resolve variant from tariff.pricing_mode. Both variants share idle + session fee.
+      idle_billable_minutes = max(0, idle_minutes - tariff.idle_grace_minutes)   # STRICTLY beyond grace
+      idle_fee_cents        = idle_billable_minutes * tariff.idle_fee_cents_per_min
+
+      if tariff.pricing_mode == ENERGY_BASED:
+          k = energy_delivered_kwh
+          t1 = min(k, tariff.energy_tier_1_max_kwh)
+          t2 = min(max(k - tariff.energy_tier_1_max_kwh, 0),
+                   tariff.energy_tier_2_max_kwh - tariff.energy_tier_1_max_kwh)
+          t3 = max(k - tariff.energy_tier_2_max_kwh, 0)
+          energy_cost = round_half_up(t1*energy_rate_t1_cents
+                                      + t2*energy_rate_t2_cents
+                                      + t3*energy_rate_t3_cents)
+          variable_cost = energy_cost
+      else:  # TIME_BASED
+          variable_cost = charging_minutes * tariff.time_rate_cents_per_min
+
+      total_cost_cents = variable_cost + idle_fee_cents + tariff.session_fee_cents
+    input_set: "single ChargingSession at stop; energy_delivered_kwh, charging_minutes, idle_minutes already computed from this session's MeterEvents; tariff resolved at start"
+    constants:
+      ROUNDING: round_half_up
+    precision: "whole cents, round_half_up; kWh kept to 3 decimals before the cents rounding"
+    variants:
+      - name: ENERGY_BASED
+        when: "tariff.pricing_mode == ENERGY_BASED"
+        difference: "variable_cost is tiered per-kWh energy; charging_minutes is ignored"
+      - name: TIME_BASED
+        when: "tariff.pricing_mode == TIME_BASED"
+        difference: "variable_cost is charging_minutes * time_rate_cents_per_min; energy tiers ignored — same physical session yields a different total than ENERGY_BASED"
+
+  - name: site_load_allocation
+    trigger: "any Site load-balance run: session begin-charging/suspend/stop, Stall FAULTED cascade, or POST /sites/{id}/rebalance"
+    algorithm: waterfall_allocation
+    formula: |
+      cap_kw = site.demand_charge_threshold_kw if site.demand_avoidance_armed else site.circuit_limit_kw
+      # candidate set: this site's sessions with charging_status == CHARGING
+      # each candidate's request = min(stall.max_power_kw, cap_kw)
+      sum_req = sum(request_i for i in candidates)
+
+      if site.allocation_policy == PROPORTIONAL:
+          if sum_req <= cap_kw:
+              allocated_i = request_i                         # everyone gets full request
+          else:
+              raw_i      = cap_kw * request_i / sum_req
+              allocated_i = floor_to_1_decimal(raw_i)          # truncate to 0.1 kW
+              # distribute the leftover (cap_kw - sum(allocated_i)) in 0.1 kW units
+              # to candidates ordered by stall.reservation_priority ASC, then created_at ASC
+      else:  # PRIORITY waterfall
+          remaining = cap_kw
+          for i in candidates sorted by (stall.reservation_priority ASC, created_at ASC):
+              allocated_i = min(request_i, remaining)
+              remaining  -= allocated_i
+      # invariant: sum(allocated_i) <= cap_kw
+    input_set: "Site's ChargingSessions where charging_status == CHARGING; SUSPENDED/PREPARING/terminal sessions excluded"
+    constants:
+      ALLOCATION_GRANULARITY_KW: 0.1
+    precision: "kW to 1 decimal place; PROPORTIONAL truncates (floor) then distributes remainder by priority then created_at ASC"
+    variants:
+      - name: PROPORTIONAL
+        when: "site.allocation_policy == PROPORTIONAL"
+        difference: "over-subscription split pro-rata by request share; leftover 0.1 kW units go to higher priority then earlier created_at"
+      - name: PRIORITY
+        when: "site.allocation_policy == PRIORITY"
+        difference: "strict waterfall — highest priority (lowest reservation_priority) fully satisfied first; lowest priority may receive 0 kW for the same input set"
+
+  - name: roaming_settlement_total
+    trigger: "POST /settlement-batches/{id}/line-items (per add) and SettlementBatch OPEN→LOCKED"
+    algorithm: aggregation
+    formula: |
+      # per line item, on add:
+      commission_cents = round_half_up(session.total_cost_cents * emsp.commission_pct)
+      net_amount_cents = session.total_cost_cents - commission_cents
+      gross_amount_cents = session.total_cost_cents
+      # batch total — ROUND-THEN-SUM (pinned order): each net_amount_cents is already
+      # an integer (rounded at add time); the batch total is their integer sum.
+      total_amount_cents = sum(li.net_amount_cents for li in batch.line_items
+                               where li.status IN {PENDING, SETTLED})
+      # NOTE: summing the pre-rounded per-line nets (round-then-sum) can differ by a
+      # cent from rounding the raw sum (sum-then-round); the pinned order is round-then-sum.
+    input_set: "SettlementLineItems of one batch whose status IN {PENDING, SETTLED}; REVERSED line items excluded"
+    constants:
+      ROUNDING: round_half_up
+      ORDER: round_then_sum
+    precision: "whole cents; per-line commission rounded round_half_up, then nets summed as integers"
+    variants:
+      - name: per_line_rounded
+        when: "always (the only sanctioned order)"
+        difference: "round each line's commission to whole cents BEFORE deriving net and summing — distinct from a sum-then-round order which is explicitly NOT used"
+
+  - name: idle_occupancy_fee
+    trigger: "computed inside session_cost at stop; also surfaced standalone on GET /sessions/{id}/cost-preview"
+    algorithm: threshold
+    formula: |
+      idle_billable_minutes = max(0, idle_minutes - tariff.idle_grace_minutes)
+      idle_fee_cents = idle_billable_minutes * tariff.idle_fee_cents_per_min
+      # boundary: idle_minutes == idle_grace_minutes -> 0 (grace is inclusive, fee strictly beyond)
+    input_set: "single ChargingSession; idle_minutes from SUSPENDED whole minutes"
+    constants:
+      GRACE_IS_INCLUSIVE: true
+    precision: "whole cents"
+    variants:
+      - name: within_grace
+        when: "idle_minutes <= tariff.idle_grace_minutes"
+        difference: "idle_fee_cents == 0"
+      - name: beyond_grace
+        when: "idle_minutes > tariff.idle_grace_minutes"
+        difference: "idle_fee_cents == (idle_minutes - grace) * idle_fee_cents_per_min"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "the role is permitted to invoke this endpoint per the RBAC matrix"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "every path/body id (site_id, stall_id, driver_id, tariff_id, reservation_id, session_id, batch_id, emsp_id) references an existing resource, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: auth
+    check: "an entity_backed Driver acting on a Reservation/ChargingSession must own it (X-User-ID == resource.driver_id)"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "Driver-owned session/reservation actions"
+
+  - priority: 5
+    category: existence
+    check: "request body conforms to endpoint input schema; required fields present and types valid; enum values within declared sets"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all
+
+  - priority: 6
+    category: state
+    check: "target resource is in a state from which the requested transition is defined (e.g., begin-charging requires session PREPARING/SUSPENDED; lock requires batch OPEN; settle requires batch LOCKED)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 7
+    category: state
+    check: "starting a session requires the target Stall.ocpp_status == AVAILABLE (cross-entity: Session start depends on Stall state)"
+    error_id: ERR_STALL_NOT_AVAILABLE
+    http_status: 409
+    applies_to: "POST /sessions"
+
+  - priority: 8
+    category: business_temporal
+    check: "reservation check-in must occur within [window_start, window_end); a window that has already ended cannot be checked in"
+    error_id: ERR_RESERVATION_WINDOW_CLOSED
+    http_status: 409
+    applies_to: "POST /reservations/{id}/check-in"
+
+  - priority: 9
+    category: business_constraint
+    check: "the stall's connector_type must match the resolved tariff/connector for the session; mismatch rejected"
+    error_id: ERR_CONNECTOR_MISMATCH
+    http_status: 409
+    applies_to: "POST /sessions"
+
+  - priority: 10
+    category: business_constraint
+    check: "no Tariff for the same (site_id, connector_type) may have an effective window overlapping an existing tariff's (closed-interval; touching endpoints allowed)"
+    error_id: ERR_TARIFF_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /tariffs"
+
+  - priority: 11
+    category: business_constraint
+    check: "no two CONFIRMED/CHECKED_IN reservations on the same stall may have windows overlapping within the turnaround buffer (half-open [start,end) plus RESERVATION_BUFFER_MIN)"
+    error_id: ERR_RESERVATION_OVERLAP
+    http_status: 409
+    applies_to: "POST /reservations/{id}/confirm"
+
+  - priority: 12
+    category: business_constraint
+    check: "no Tariff matches the stall's site_id+connector_type at the session start clock (session cannot be priced)"
+    error_id: ERR_NO_ACTIVE_TARIFF
+    http_status: 409
+    applies_to: "POST /sessions"
+
+  - priority: 13
+    category: business_constraint
+    check: "MeterEvent.meter_kwh must be monotonically non-decreasing within a session; a reading below the prior reading is rejected"
+    error_id: ERR_METER_REGRESSION
+    http_status: 409
+    applies_to: "POST /sessions/{id}/meter-events"
+
+  - priority: 14
+    category: business_constraint
+    check: "a SettlementLineItem may only be added for a session whose billing_status == RATED, is_roaming == true, and whose emsp_id matches the batch's emsp_id; and the session must not already be in another line item"
+    error_id: ERR_SESSION_NOT_SETTLEABLE
+    http_status: 409
+    applies_to: "POST /settlement-batches/{id}/line-items"
+
+  - priority: 15
+    category: business_fiscal
+    check: "a home (non-roaming) session may not be rated if it would drive Driver.wallet_balance_cents below 0 (insufficient wallet funds)"
+    error_id: ERR_INSUFFICIENT_WALLET
+    http_status: 402
+    applies_to: "POST /sessions/{id}/stop"
+
+  - priority: 16
+    category: business_fiscal
+    check: "a SettlementBatch cannot be locked while it has zero line items (empty-set boundary)"
+    error_id: ERR_EMPTY_BATCH
+    http_status: 409
+    applies_to: "POST /settlement-batches/{id}/lock"
+
+  - priority: 17
+    category: business_constraint
+    check: "OCC: write carrying a stale expected_<parent>_version is rejected"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /reservations, POST /settlement-batches/{id}/settle"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Site ----
+  - method: POST
+    path: /api/sites
+    description: "create a charging site with a power budget and load-balancing policy"
+    roles: [CPOOperator]
+    code: 201
+    input: [name, circuit_limit_kw, demand_charge_threshold_kw, "allocation_policy?", "demand_avoidance_armed?"]
+    output: Site
+    side_effects: []
+  - method: GET
+    path: /api/sites/{id}
+    description: "fetch a site with computed allocated_total_kw / active_session_count"
+    roles: [CPOOperator, Driver, StationController]
+    code: 200
+    input: []
+    output: Site
+    side_effects: []
+  - method: GET
+    path: /api/sites
+    description: "list sites (paginated)"
+    roles: [CPOOperator, Driver]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Site[]
+    side_effects: []
+  - method: POST
+    path: /api/sites/{id}/rebalance
+    description: "manually re-run dynamic load balancing for the site"
+    roles: [CPOOperator]
+    code: 200
+    input: []
+    output: LoadAllocation
+    side_effects:
+      - "run site_load_allocation (trigger_reason MANUAL_REBALANCE); recompute each CHARGING session's allocated_power_kw and Site.allocated_total_kw; create a LoadAllocation snapshot"
+  - method: GET
+    path: /api/sites/{id}/load-allocations
+    description: "list the site's load-allocation snapshots (reverse-reachability for LoadAllocation.site_id)"
+    roles: [CPOOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: LoadAllocation[]
+    side_effects: []
+  - method: GET
+    path: /api/sites/{id}/stalls
+    description: "list stalls under a site (reverse-reachability for Stall.site_id)"
+    roles: [CPOOperator, Driver, StationController]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Stall[]
+    side_effects: []
+  - method: GET
+    path: /api/sites/{id}/tariffs
+    description: "list tariffs for a site (reverse-reachability for Tariff.site_id)"
+    roles: [CPOOperator, Driver]
+    code: 200
+    input: ["limit?", "offset?", "connector_type?"]
+    output: Tariff[]
+    side_effects: []
+
+  # ---- Stall ----
+  - method: POST
+    path: /api/stalls
+    description: "create a stall under a site"
+    roles: [CPOOperator]
+    code: 201
+    input: [site_id, connector_type, max_power_kw, "reservation_priority?"]
+    output: Stall
+    side_effects: []
+  - method: GET
+    path: /api/stalls/{id}
+    description: "fetch a stall"
+    roles: [CPOOperator, Driver, StationController]
+    code: 200
+    input: []
+    output: Stall
+    side_effects: []
+  - method: POST
+    path: /api/stalls/{id}/ocpp-status
+    description: "StationController posts an OCPP StatusNotification; drives Stall AVAILABLE↔OCCUPIED↔FAULTED↔UNAVAILABLE"
+    roles: [StationController]
+    code: 200
+    input: [reported_status]
+    output: Stall
+    side_effects:
+      - "transition Stall.ocpp_status; if FAULTED with an active session, force that session SUSPENDED and re-run site_load_allocation"
+      - "increments Stall.version by 1"
+
+  # ---- Driver ----
+  - method: POST
+    path: /api/drivers
+    description: "register a driver with a home eMSP and wallet"
+    roles: [CPOOperator]
+    code: 201
+    input: [email, full_name, home_emsp_id]
+    output: Driver
+    side_effects: []
+  - method: GET
+    path: /api/drivers/{id}
+    description: "fetch a driver with wallet balance"
+    roles: [CPOOperator, Driver]
+    code: 200
+    input: []
+    output: Driver
+    side_effects: []
+  - method: POST
+    path: /api/drivers/{id}/wallet/adjustments
+    description: "operator credits or debits a driver's prepaid wallet (top-up / manual correction)"
+    roles: [CPOOperator]
+    code: 200
+    input: [amount_cents]
+    output: Driver
+    side_effects:
+      - "increment Driver.wallet_balance_cents by amount_cents (may be negative); rejected if result < 0"
+  - method: GET
+    path: /api/sessions
+    description: "list charging sessions; filterable by driver_id or stall_id (reverse-reachability for ChargingSession.driver_id and .stall_id)"
+    roles: [CPOOperator, Driver, StationController]
+    code: 200
+    input: ["limit?", "offset?", "driver_id?", "stall_id?", "reservation_id?", "tariff_id?", "emsp_id?"]
+    output: ChargingSession[]
+    side_effects: []
+
+  # ---- eMSP / Roaming ----
+  - method: POST
+    path: /api/emsps
+    description: "register a roaming e-mobility service provider with a commission rate"
+    roles: [CPOOperator]
+    code: 201
+    input: [name, commission_pct]
+    output: EMSP
+    side_effects: []
+  - method: GET
+    path: /api/emsps/{id}
+    description: "fetch an eMSP with computed receivable_balance_cents"
+    roles: [CPOOperator]
+    code: 200
+    input: []
+    output: EMSP
+    side_effects: []
+  - method: GET
+    path: /api/drivers
+    description: "list drivers; filterable by home_emsp_id (reverse-reachability for Driver.home_emsp_id)"
+    roles: [CPOOperator]
+    code: 200
+    input: ["limit?", "offset?", "home_emsp_id?"]
+    output: Driver[]
+    side_effects: []
+
+  # ---- Tariff ----
+  - method: POST
+    path: /api/tariffs
+    description: "create a tariff for a site+connector with an effective window; rejects window overlaps"
+    roles: [CPOOperator]
+    code: 201
+    input: [site_id, connector_type, pricing_mode, "session_fee_cents?", energy_tier_1_max_kwh, energy_tier_2_max_kwh, energy_rate_t1_cents, energy_rate_t2_cents, energy_rate_t3_cents, time_rate_cents_per_min, "idle_grace_minutes?", "idle_fee_cents_per_min?", effective_from, effective_to]
+    output: Tariff
+    side_effects:
+      - "validate no overlapping effective window for (site_id, connector_type)"
+  - method: GET
+    path: /api/tariffs/{id}
+    description: "fetch a tariff"
+    roles: [CPOOperator, Driver]
+    code: 200
+    input: []
+    output: Tariff
+    side_effects: []
+
+  # ---- Reservation ----
+  - method: POST
+    path: /api/reservations
+    description: "request a stall reservation for a window (OCC on stall.version)"
+    roles: [Driver]
+    code: 201
+    input: [stall_id, driver_id, window_start, window_end, "hold_fee_cents?", expected_stall_version]
+    output: Reservation
+    side_effects:
+      - "increments Stall.version by 1 (stall availability changes)"
+  - method: GET
+    path: /api/reservations/{id}
+    description: "fetch a reservation"
+    roles: [CPOOperator, Driver]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+  - method: GET
+    path: /api/reservations
+    description: "list reservations; filterable by stall_id or driver_id (reverse-reachability for Reservation.stall_id and .driver_id)"
+    roles: [CPOOperator, Driver]
+    code: 200
+    input: ["limit?", "offset?", "stall_id?", "driver_id?"]
+    output: Reservation[]
+    side_effects: []
+  - method: POST
+    path: /api/reservations/{id}/confirm
+    description: "confirm a requested reservation; charges hold fee; rejects buffered overlaps"
+    roles: [Driver]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects:
+      - "debit Driver.wallet_balance_cents by hold_fee_cents; status REQUESTED→CONFIRMED"
+  - method: POST
+    path: /api/reservations/{id}/check-in
+    description: "driver checks in within the window; status CONFIRMED→CHECKED_IN"
+    roles: [Driver]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+  - method: POST
+    path: /api/reservations/{id}/cancel
+    description: "cancel a REQUESTED or CONFIRMED reservation; refunds hold fee if already charged"
+    roles: [Driver]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects:
+      - "if was CONFIRMED, credit Driver.wallet_balance_cents by hold_fee_cents; status → CANCELLED"
+
+  # ---- ChargingSession ----
+  - method: POST
+    path: /api/sessions
+    description: "start a charging session on a stall (walk-up or honoring a reservation); resolves tariff, marks stall OCCUPIED"
+    roles: [Driver, StationController]
+    code: 201
+    input: [stall_id, driver_id, "reservation_id?", "is_roaming?"]
+    output: ChargingSession
+    side_effects:
+      - "resolve tariff_id for stall.site_id+connector_type at the clock; set emsp_id from driver.home_emsp_id when is_roaming; set Stall.ocpp_status AVAILABLE→OCCUPIED; charging_status starts PREPARING"
+      - "increments Stall.version by 1"
+  - method: GET
+    path: /api/sessions/{id}
+    description: "fetch a session with computed energy/minutes/cost fields"
+    roles: [CPOOperator, Driver, StationController]
+    code: 200
+    input: []
+    output: ChargingSession
+    side_effects: []
+  - method: POST
+    path: /api/sessions/{id}/meter-events
+    description: "StationController posts an OCPP MeterValues sample; enforces monotonic meter_kwh"
+    roles: [StationController]
+    code: 201
+    input: [meter_kwh, sampled_at, reading_context]
+    output: MeterEvent
+    side_effects:
+      - "append MeterEvent; recompute session.energy_delivered_kwh"
+  - method: GET
+    path: /api/sessions/{id}/meter-events
+    description: "list a session's meter events (reverse-reachability for MeterEvent.session_id)"
+    roles: [CPOOperator, Driver, StationController]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: MeterEvent[]
+    side_effects: []
+  - method: POST
+    path: /api/sessions/{id}/begin-charging
+    description: "OCPP StartTransaction / resume; charging_status PREPARING→CHARGING or SUSPENDED→CHARGING; runs load balancing"
+    roles: [StationController]
+    code: 200
+    input: []
+    output: ChargingSession
+    side_effects:
+      - "set allocated_power_kw via site_load_allocation; recompute Site.allocated_total_kw; create LoadAllocation"
+  - method: POST
+    path: /api/sessions/{id}/suspend
+    description: "OCPP SuspendedEV/EVSE; charging_status CHARGING→SUSPENDED; frees power, redistributes via load balancing"
+    roles: [StationController]
+    code: 200
+    input: []
+    output: ChargingSession
+    side_effects:
+      - "set allocated_power_kw to 0; begin idle accrual; re-run site_load_allocation"
+  - method: POST
+    path: /api/sessions/{id}/stop
+    description: "OCPP StopTransaction; charging_status →FINISHING→COMPLETED, billing_status UNBILLED→RATED; computes cost"
+    roles: [Driver, StationController]
+    code: 200
+    input: []
+    output: ChargingSession
+    side_effects:
+      - "compute energy_delivered_kwh/charging_minutes/idle_minutes; run session_cost → total_cost_cents, idle_fee_cents; debit wallet if home session; set Stall.ocpp_status AVAILABLE; re-run site_load_allocation; if reservation CHECKED_IN, transition it to CONSUMED"
+  - method: POST
+    path: /api/sessions/{id}/abort
+    description: "abort a PREPARING session before charging; releases stall, no cost"
+    roles: [Driver, StationController]
+    code: 200
+    input: []
+    output: ChargingSession
+    side_effects:
+      - "set Stall.ocpp_status AVAILABLE; charging_status PREPARING→ABORTED"
+  - method: GET
+    path: /api/sessions/{id}/cost-preview
+    description: "computed read: previews session_cost (and idle_occupancy_fee) for current meter state without rating"
+    roles: [CPOOperator, Driver, StationController]
+    code: 200
+    input: []
+    output: ChargingSession
+    side_effects: []
+
+  # ---- Settlement ----
+  - method: POST
+    path: /api/settlement-batches
+    description: "open a settlement batch for an eMSP"
+    roles: [CPOOperator]
+    code: 201
+    input: [emsp_id]
+    output: SettlementBatch
+    side_effects: []
+  - method: GET
+    path: /api/settlement-batches/{id}
+    description: "fetch a settlement batch with computed total_amount_cents"
+    roles: [CPOOperator]
+    code: 200
+    input: []
+    output: SettlementBatch
+    side_effects: []
+  - method: GET
+    path: /api/settlement-batches
+    description: "list settlement batches; filterable by emsp_id (reverse-reachability for SettlementBatch.emsp_id)"
+    roles: [CPOOperator]
+    code: 200
+    input: ["limit?", "offset?", "emsp_id?"]
+    output: SettlementBatch[]
+    side_effects: []
+  - method: POST
+    path: /api/settlement-batches/{id}/line-items
+    description: "add a rated roaming session to the batch; computes commission/net; bumps eMSP receivable"
+    roles: [CPOOperator]
+    code: 201
+    input: [session_id]
+    output: SettlementLineItem
+    side_effects:
+      - "compute gross/commission/net (roaming_settlement_total); recompute batch.total_amount_cents (round-then-sum) and batch.line_item_count; increment EMSP.receivable_balance_cents by net_amount_cents"
+  - method: GET
+    path: /api/settlement-batches/{id}/line-items
+    description: "list a batch's line items (reverse-reachability for SettlementLineItem.batch_id)"
+    roles: [CPOOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: SettlementLineItem[]
+    side_effects: []
+  - method: GET
+    path: /api/settlement-line-items
+    description: "list settlement line items; filterable by session_id (reverse-reachability for SettlementLineItem.session_id)"
+    roles: [CPOOperator]
+    code: 200
+    input: ["limit?", "offset?", "session_id?"]
+    output: SettlementLineItem[]
+    side_effects: []
+  - method: GET
+    path: /api/settlement-line-items/{id}
+    description: "fetch a single settlement line item"
+    roles: [CPOOperator]
+    code: 200
+    input: []
+    output: SettlementLineItem
+    side_effects: []
+  - method: POST
+    path: /api/settlement-batches/{id}/lock
+    description: "lock a non-empty OPEN batch; freezes total_amount_cents"
+    roles: [CPOOperator]
+    code: 200
+    input: []
+    output: SettlementBatch
+    side_effects:
+      - "recompute total_amount_cents (round-then-sum); status OPEN→LOCKED"
+  - method: POST
+    path: /api/settlement-batches/{id}/settle
+    description: "settle a LOCKED batch (OCC on batch.version); cascades line items + sessions to SETTLED"
+    roles: [CPOOperator]
+    code: 200
+    input: [expected_settlementbatch_version]
+    output: SettlementBatch
+    side_effects:
+      - "each line item PENDING→SETTLED; each member session billing_status RATED→SETTLED; decrement EMSP.receivable_balance_cents by total_amount_cents; status LOCKED→SETTLED"
+      - "increments SettlementBatch.version by 1"
+  - method: POST
+    path: /api/settlement-batches/{id}/dispute
+    description: "mark a LOCKED batch DISPUTED"
+    roles: [CPOOperator]
+    code: 200
+    input: []
+    output: SettlementBatch
+    side_effects: []
+  - method: POST
+    path: /api/settlement-batches/{id}/reopen
+    description: "reopen a DISPUTED batch back to OPEN; reverses outstanding PENDING line items and restores the eMSP receivable"
+    roles: [CPOOperator]
+    code: 200
+    input: []
+    output: SettlementBatch
+    side_effects:
+      - "each PENDING line item PENDING→REVERSED; each reversed line item's session billing_status RATED→REVERSED; decrement EMSP.receivable_balance_cents by each reversed net_amount_cents; recompute total_amount_cents and line_item_count; status DISPUTED→OPEN"
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: /api/_clock/set_current_utc
+    description: "test-driving endpoint: set the server's current UTC clock for time-gated transitions (reservation windows, tariff effectivity, no-show)"
+    roles: [CPOOperator]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects:
+      - "advance server clock; may drive system reservation transitions REQUESTED→EXPIRED and CONFIRMED→NO_SHOW on next observation"
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/unknown X-User-Role or X-User-ID headers"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "role not permitted for the endpoint, or entity_backed Driver acting on a resource it does not own"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced site/stall/driver/tariff/reservation/session/batch/emsp id does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "malformed body, missing required field, bad type, or enum value outside the declared set"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested transition not defined from the resource's current state"
+  - id: ERR_STALL_NOT_AVAILABLE
+    http: 409
+    condition: "POST /sessions on a stall whose ocpp_status != AVAILABLE"
+  - id: ERR_RESERVATION_WINDOW_CLOSED
+    http: 409
+    condition: "check-in attempted outside [window_start, window_end)"
+  - id: ERR_CONNECTOR_MISMATCH
+    http: 409
+    condition: "stall connector_type does not match the resolved tariff connector for the session"
+  - id: ERR_TARIFF_WINDOW_OVERLAP
+    http: 409
+    condition: "new tariff effective window overlaps an existing tariff for the same site_id+connector_type"
+  - id: ERR_RESERVATION_OVERLAP
+    http: 409
+    condition: "confirming a reservation whose buffered window collides with another CONFIRMED/CHECKED_IN reservation on the same stall"
+  - id: ERR_NO_ACTIVE_TARIFF
+    http: 409
+    condition: "no tariff matches the stall's site+connector at the session start clock"
+  - id: ERR_METER_REGRESSION
+    http: 409
+    condition: "MeterEvent.meter_kwh below the session's prior reading"
+  - id: ERR_SESSION_NOT_SETTLEABLE
+    http: 409
+    condition: "line-item session is not RATED, not roaming, eMSP mismatch, or already in a line item"
+  - id: ERR_INSUFFICIENT_WALLET
+    http: 402
+    condition: "rating a home session would drive Driver.wallet_balance_cents below 0"
+  - id: ERR_INSUFFICIENT_WALLET_HOLD
+    http: 402
+    condition: "confirming a reservation would drive Driver.wallet_balance_cents below 0 via the hold fee"
+  - id: ERR_EMPTY_BATCH
+    http: 409
+    condition: "locking a SettlementBatch with zero line items"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "write carries a stale expected_<parent>_version (reservation create on stall, or batch settle)"
+  - id: ERR_NEGATIVE_WALLET
+    http: 402
+    condition: "a wallet adjustment would drive Driver.wallet_balance_cents below 0"
+  - id: ERR_DUPLICATE_LINE_ITEM
+    http: 409
+    condition: "a session already appears in a settlement line item (any non-REVERSED batch)"
+  - id: ERR_TARIFF_INVALID_TIERS
+    http: 422
+    condition: "energy_tier_2_max_kwh <= energy_tier_1_max_kwh, or effective_to < effective_from"
+  - id: ERR_OVER_CIRCUIT_LIMIT
+    http: 409
+    condition: "demand_charge_threshold_kw exceeds circuit_limit_kw at site creation"
+  - id: ERR_VALIDATION_PAGINATION
+    http: 422
+    condition: "limit/offset out of [min,max] bounds on a list endpoint"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: CPOOperator
+    description: "Charge Point Operator — owns sites, stalls, tariffs, eMSP registration, drivers, load balancing, and roaming settlement"
+    identity: opaque
+    exclusive_operations:
+      - "POST /sites, POST /stalls, POST /tariffs, POST /drivers, POST /emsps"
+      - "POST /sites/{id}/rebalance"
+      - "POST /drivers/{id}/wallet/adjustments"
+      - "POST /settlement-batches and all /settlement-batches/{id}/* lifecycle ops"
+      - "POST /settlement-batches/{id}/line-items"
+      - "GET /emsps/{id}, GET /settlement-*, GET /sites/{id}/load-allocations"
+    shared_operations:
+      - "GET /sites, GET /sites/{id}, GET /stalls/{id}, GET /sessions, GET /sessions/{id}, GET /reservations, GET /tariffs/{id}"
+  - name: Driver
+    description: "EV driver — creates/confirms/cancels own reservations, starts/stops own sessions"
+    identity: "entity_backed:Driver"
+    exclusive_operations:
+      - "POST /reservations, POST /reservations/{id}/confirm, /check-in, /cancel"
+    shared_operations:
+      - "POST /sessions (own driver_id), POST /sessions/{id}/stop, POST /sessions/{id}/abort"
+      - "GET /sites, GET /sites/{id}, GET /sites/{id}/stalls, GET /sites/{id}/tariffs, GET /stalls/{id}, GET /drivers/{id}, GET /sessions, GET /sessions/{id}, GET /sessions/{id}/cost-preview, GET /sessions/{id}/meter-events, GET /reservations, GET /reservations/{id}, GET /tariffs/{id}"
+  - name: StationController
+    description: "OCPP station/charge-point firmware actor — posts telemetry (status, meter values) and drives charging transitions"
+    identity: opaque
+    exclusive_operations:
+      - "POST /stalls/{id}/ocpp-status"
+      - "POST /sessions/{id}/meter-events"
+      - "POST /sessions/{id}/begin-charging, /suspend"
+    shared_operations:
+      - "POST /sessions, POST /sessions/{id}/stop, POST /sessions/{id}/abort"
+      - "GET /sites/{id}, GET /sites/{id}/stalls, GET /stalls/{id}, GET /sessions, GET /sessions/{id}, GET /sessions/{id}/cost-preview, GET /sessions/{id}/meter-events"

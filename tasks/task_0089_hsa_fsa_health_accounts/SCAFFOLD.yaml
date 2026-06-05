@@ -1,0 +1,1342 @@
+scenario: "HSA/FSA Health Accounts: contribution caps (family/individual), qualified medical expenses, Dependent Care FSA, Use-it-or-lose-it, Grace Period/Carryover, IRS audit trail"
+domain_name: "hsa-fsa-health-accounts"
+api_prefix: "/"
+
+complexity_profile:
+  primary_archetype: "Ledger reconciliation"
+  secondary_archetype: "Compliance / audit"
+  complexity_layers:
+    - "Dual-variant calculation"
+    - "Rate / threshold triggers"
+    - "Cascading side effects"
+    - "Optimistic concurrency"
+    - "Derived field reconciliation"
+
+  entity_topology: flat
+  # Flat: PlanYear, Account, Contribution, Claim, ReimbursementBatch, LedgerEntry are peer
+  # entities linked by foreign keys (participant_id, plan_year_id, account_id, claim_id). The
+  # only nesting in URLs is the append-only sub-resources of an account (contributions,
+  # ledger-entries); everything else is a flat collection with FK filters.
+
+  state_machine_shape: branching
+  # Claim runs a branching fork-join with a revision loop: SUBMITTED -> {APPROVED, DENIED,
+  # PENDING_SUBSTANTIATION}; PENDING_SUBSTANTIATION -> {SUBMITTED (loop), DENIED}; APPROVED ->
+  # {REIMBURSED, VOIDED}; REIMBURSED -> VOIDED (clawback). Account runs a parallel-dimension
+  # machine: funding_status x compliance_hold evolve independently on the same row.
+
+  relationship_patterns:
+    - one_to_many       # Participant has many Accounts; Account has many Contributions, Claims, LedgerEntries
+    - cross_aggregate   # ReimbursementBatch.claim_ids span multiple Accounts of one Participant
+    - self_referential  # Account.carryover_source_account_id -> Account.id (prior-year carryover link)
+
+  role_model: segregation_of_duties
+  # The Adjudicator who APPROVES a Claim cannot be the FundDisburser who REIMBURSES it
+  # (X-User-ID compared); Participant submits/substantiates but cannot adjudicate or disburse.
+
+  consistency_model: immediate
+  # All cascades (ledger append, balance recompute, forfeiture/carryover sweep) complete inside
+  # the triggering request; derived balance fields are recomputed synchronously.
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Participant
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Login/contact email; unique per participant."
+        constraints: "unique; non-empty"
+      - name: full_name
+        type: string
+        source: input
+        description: "Legal name on file for IRS reporting."
+      - name: birth_date
+        type: string
+        source: input
+        description: "ISO 8601 date (YYYY-MM-DD); drives HSA age-55 catch-up eligibility."
+        constraints: "valid date in the past"
+      - name: marital_status
+        type: enum
+        source: input
+        description: "Drives Dependent Care FSA cap selection."
+        default: "SINGLE"
+        constraints: "one of {SINGLE, MARRIED_JOINT, MARRIED_SEPARATE}"
+      - name: hdhp_covered
+        type: boolean
+        source: input
+        description: "True when enrolled in a High-Deductible Health Plan; HSA accounts require this at activation."
+        default: false
+
+  - name: PlanYear
+    parent: null
+    common_fields: true
+    fields:
+      - name: label
+        type: string
+        source: input
+        description: "Human label, e.g. 'PY2026'."
+        constraints: "unique; non-empty"
+      - name: coverage_start
+        type: string
+        source: input
+        description: "ISO 8601 date the plan year begins (inclusive)."
+      - name: coverage_end
+        type: string
+        source: input
+        description: "ISO 8601 date the plan year ends (inclusive); a service_date in [coverage_start, coverage_end] is in-year."
+      - name: run_out_end
+        type: string
+        source: input
+        description: "ISO 8601 date through which in-year claims may still be filed (claims-filing run-out window end, inclusive). Settlement may run only after this date (or grace_period_end when later)."
+        constraints: "must be >= coverage_end"
+      - name: fsa_relief_mode
+        type: enum
+        source: input
+        description: "Mutually exclusive Health-FSA year-end relief: GRACE_PERIOD (extends the service window), CARRYOVER (rolls a capped unused balance forward), or NONE (strict use-it-or-lose-it). A single FSA plan may not elect both grace and carryover."
+        default: "NONE"
+        constraints: "one of {NONE, GRACE_PERIOD, CARRYOVER}"
+      - name: grace_period_end
+        type: string
+        source: input
+        description: "ISO 8601 date through which service_date is still in-year when fsa_relief_mode=GRACE_PERIOD; null/ignored otherwise."
+        default: null
+        constraints: "when fsa_relief_mode=GRACE_PERIOD must be > coverage_end and <= run_out_end"
+      - name: carryover_cap_cents
+        type: integer
+        source: input
+        description: "Maximum Health-FSA unused balance (cents) that rolls to the next plan year when fsa_relief_mode=CARRYOVER; ignored otherwise."
+        default: 0
+        constraints: ">= 0"
+      - name: hsa_individual_cap_cents
+        type: integer
+        source: input
+        description: "IRS HSA contribution limit (cents) for self-only HDHP coverage this plan year."
+        constraints: "> 0"
+      - name: hsa_family_cap_cents
+        type: integer
+        source: input
+        description: "IRS HSA contribution limit (cents) for family HDHP coverage this plan year."
+        constraints: "> hsa_individual_cap_cents"
+      - name: hsa_catchup_cents
+        type: integer
+        source: input
+        description: "Additional HSA contribution (cents) permitted for participants age 55+ during the plan year."
+        constraints: ">= 0"
+      - name: health_fsa_cap_cents
+        type: integer
+        source: input
+        description: "IRS Health-FSA election limit (cents) for this plan year."
+        constraints: "> 0"
+      - name: dcfsa_cap_joint_cents
+        type: integer
+        source: input
+        description: "Dependent Care FSA election limit (cents) for SINGLE or MARRIED_JOINT participants."
+        constraints: "> 0"
+      - name: dcfsa_cap_separate_cents
+        type: integer
+        source: input
+        description: "Dependent Care FSA election limit (cents) for MARRIED_SEPARATE participants (typically half the joint cap)."
+        constraints: "> 0; < dcfsa_cap_joint_cents"
+      - name: lifecycle
+        type: enum
+        source: computed
+        description: "Plan-year lifecycle: OPEN until year-end settlement sweeps its accounts, then SETTLED."
+        default: "OPEN"
+        constraints: "one of {OPEN, SETTLED}"
+
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - name: participant_id
+        type: string
+        source: input
+        description: "FK -> Participant.id; owner of this account."
+      - name: plan_year_id
+        type: string
+        source: input
+        description: "FK -> PlanYear.id; the plan year this account elects under."
+      - name: account_type
+        type: enum
+        source: input
+        description: "HSA | HEALTH_FSA | DCFSA. Governs which cap, relief, funding basis, and forfeiture rules apply."
+        constraints: "one of {HSA, HEALTH_FSA, DCFSA}"
+      - name: coverage_tier
+        type: enum
+        source: input
+        description: "SELF_ONLY | FAMILY. Selects the HSA cap (ignored for FSA/DCFSA)."
+        default: "SELF_ONLY"
+        constraints: "one of {SELF_ONLY, FAMILY}"
+      - name: elected_amount_cents
+        type: integer
+        source: input
+        description: "Annual election (cents). For HEALTH_FSA/DCFSA this is the full-year pledge; for HSA it is the funding target accrued by contributions."
+        constraints: ">= 0"
+      - name: auto_adjudication_threshold_cents
+        type: integer
+        source: input
+        description: "Claims at or below this amount may be APPROVED without substantiation; above it the Adjudicator must REQUEST_DOCS when unsubstantiated."
+        default: 0
+        constraints: ">= 0"
+      - name: funding_status
+        type: enum
+        source: computed
+        description: "Independent funding dimension: PENDING (created, not funded), ACTIVE (open for claims), DEPLETED (available_balance_cents == 0), CLOSED (terminal after year-end settlement)."
+        default: "PENDING"
+        constraints: "one of {PENDING, ACTIVE, DEPLETED, CLOSED}"
+      - name: compliance_hold
+        type: enum
+        source: computed
+        description: "Independent compliance dimension evolving alongside funding_status on the same row: CLEAR (no hold) or HELD (an unsubstantiated reimbursed claim blocks new reimbursements until resolved)."
+        default: "CLEAR"
+        constraints: "one of {CLEAR, HELD}"
+      - name: contributed_cents
+        type: integer
+        source: computed
+        description: "Sum of POSTED Contribution.amount_cents for this account; recomputed on every contribution post and reversal."
+        default: 0
+      - name: reimbursed_cents
+        type: integer
+        source: computed
+        description: "Sum of REIMBURSEMENT minus REIMBURSEMENT_REVERSAL LedgerEntry amounts for this account; recomputed on every disbursement/clawback."
+        default: 0
+      - name: available_balance_cents
+        type: integer
+        source: computed
+        description: "Spendable cash-on-hand under the chronological (final) algorithm. HSA: contributed_cents - reimbursed_cents. HEALTH_FSA/DCFSA: elected_amount_cents + carried_in_cents - reimbursed_cents."
+        default: 0
+      - name: forfeited_cents
+        type: integer
+        source: computed
+        description: "Cents forfeited at year-end settlement under use-it-or-lose-it (HEALTH_FSA net of carryover, DCFSA in full); always 0 for HSA."
+        default: 0
+      - name: carried_in_cents
+        type: integer
+        source: computed
+        description: "Carryover dollars (cents) rolled into this account from a prior plan year's HEALTH_FSA settlement; 0 otherwise."
+        default: 0
+      - name: carryover_source_account_id
+        type: string
+        source: system
+        description: "FK -> Account.id; the prior-year HEALTH_FSA account that fed carried_in_cents into this account (null when carried_in_cents == 0)."
+        default: null
+
+  - name: Contribution
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account this contribution funds."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Contribution amount (cents); always positive."
+        constraints: "> 0"
+      - name: source
+        type: enum
+        source: input
+        description: "PAYROLL | EMPLOYER | INDIVIDUAL. All three count toward the HSA cap."
+        constraints: "one of {PAYROLL, EMPLOYER, INDIVIDUAL}"
+      - name: posted_at
+        type: string
+        source: input
+        description: "ISO 8601 datetime the contribution is credited; used for chronological drawdown ordering."
+      - name: status
+        type: enum
+        source: computed
+        description: "POSTED (counts toward contributed_cents) or REVERSED (excluded)."
+        default: "POSTED"
+        constraints: "one of {POSTED, REVERSED}"
+
+  - name: Claim
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account reimbursing this claim."
+      - name: service_date
+        type: string
+        source: input
+        description: "ISO 8601 date the medical/dependent-care service was incurred; checked against the plan-year service window."
+      - name: expense_category
+        type: enum
+        source: input
+        description: "MEDICAL | DENTAL | VISION | PRESCRIPTION | DEPENDENT_CARE | OTC. Determines qualification against account_type."
+        constraints: "one of {MEDICAL, DENTAL, VISION, PRESCRIPTION, DEPENDENT_CARE, OTC}"
+      - name: claimed_amount_cents
+        type: integer
+        source: input
+        description: "Amount the participant requests (cents)."
+        constraints: "> 0"
+      - name: substantiated
+        type: boolean
+        source: input
+        description: "True when itemized receipt/documentation is attached; claims at/below the account's auto-adjudication threshold may be approved without it."
+        default: false
+      - name: reimbursable_amount_cents
+        type: integer
+        source: computed
+        description: "Approved reimbursable amount (cents) computed at adjudication; <= claimed_amount_cents and capped by the projected funding basis."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Claim lifecycle state."
+        default: "SUBMITTED"
+        constraints: "one of {SUBMITTED, PENDING_SUBSTANTIATION, APPROVED, DENIED, REIMBURSED, VOIDED}"
+      - name: denial_reason
+        type: enum
+        source: system
+        description: "Set when status=DENIED: NOT_QUALIFIED | OUTSIDE_WINDOW | INSUFFICIENT_FUNDS | UNSUBSTANTIATED | DUPLICATE; null otherwise."
+        default: null
+        constraints: "one of {NOT_QUALIFIED, OUTSIDE_WINDOW, INSUFFICIENT_FUNDS, UNSUBSTANTIATED, DUPLICATE}"
+      - name: adjudicated_by
+        type: string
+        source: system
+        description: "X-User-ID of the Adjudicator who approved/denied this claim (opaque operator id); null until adjudicated."
+        default: null
+      - name: reimbursed_by
+        type: string
+        source: system
+        description: "X-User-ID of the FundDisburser who reimbursed this claim; must differ from adjudicated_by (segregation of duties); null until reimbursed."
+        default: null
+
+  - name: ReimbursementBatch
+    parent: null
+    common_fields: true
+    fields:
+      - name: participant_id
+        type: string
+        source: input
+        description: "FK -> Participant.id; the participant whose APPROVED claims this batch disburses."
+      - name: claim_ids
+        type: array
+        source: input
+        description: "Ordered list of Claim.id to reimburse together; all must belong to participant_id and be APPROVED at disburse time."
+      - name: total_reimbursed_cents
+        type: integer
+        source: computed
+        description: "Sum of reimbursable_amount_cents over claims that successfully reimbursed in this batch."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "DRAFT (created), SETTLED (all member claims reimbursed), PARTIAL (some reimbursed, others skipped)."
+        default: "DRAFT"
+        constraints: "one of {DRAFT, SETTLED, PARTIAL}"
+
+  - name: LedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account this immutable audit row belongs to."
+      - name: claim_id
+        type: string
+        source: input
+        description: "FK -> Claim.id; the claim that produced this entry (null for CONTRIBUTION/FORFEITURE/CARRYOVER entries)."
+        default: null
+      - name: entry_type
+        type: enum
+        source: system
+        description: "CONTRIBUTION | CONTRIBUTION_REVERSAL | REIMBURSEMENT | REIMBURSEMENT_REVERSAL | FORFEITURE | CARRYOVER_OUT | CARRYOVER_IN. Append-only IRS audit trail."
+        constraints: "one of {CONTRIBUTION, CONTRIBUTION_REVERSAL, REIMBURSEMENT, REIMBURSEMENT_REVERSAL, FORFEITURE, CARRYOVER_OUT, CARRYOVER_IN}"
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Magnitude (cents) of the event, always a positive integer; entry_type carries the direction (debit vs credit)."
+        constraints: "> 0"
+      - name: memo
+        type: string
+        source: system
+        description: "Human-readable audit note, e.g. 'Reimbursed claim <id> under chronological algorithm'."
+
+  - name: ClockState
+    parent: null
+    common_fields: false
+    fields:
+      - name: current_utc
+        type: string
+        source: system
+        description: "The server's current wall-clock instant (ISO 8601). Year-end settlement and filing-window checks read this; mutated only by the test-driving clock endpoint."
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Account
+    initial_state: "PENDING"
+    terminal_states: ["CLOSED"]
+    note: |
+      Account carries TWO independent state dimensions on the same row (parallel machine):
+      funding_status {PENDING, ACTIVE, DEPLETED, CLOSED} and compliance_hold {CLEAR, HELD}.
+      Transitions below name the funding_status dimension unless prefixed 'HOLD:'.
+    transitions:
+      - from: "PENDING"
+        to: "ACTIVE"
+        trigger: "POST /accounts/{id}/activate"
+        actor: "PlanAdmin"
+        preconditions:
+          - "account.funding_status == PENDING"
+          - "for HEALTH_FSA/DCFSA: elected_amount_cents > 0"
+          - "for HSA: the owning Participant.hdhp_covered == true"
+        side_effects:
+          - "available_balance_cents recomputed via Available-Balance calc"
+          - "increments Account.version by 1"
+      - from: "ACTIVE"
+        to: "DEPLETED"
+        trigger: "system (REIMBURSEMENT side-effect when available_balance_cents reaches 0)"
+        actor: "system"
+        preconditions:
+          - "account.funding_status == ACTIVE"
+          - "available_balance_cents == 0 after the reimbursement posts"
+        side_effects:
+          - "no further reimbursements succeed until a CONTRIBUTION or REIMBURSEMENT_REVERSAL restores balance"
+      - from: "DEPLETED"
+        to: "ACTIVE"
+        trigger: "system (CONTRIBUTION post or REIMBURSEMENT_REVERSAL lifting available_balance_cents above 0)"
+        actor: "system"
+        preconditions:
+          - "account.funding_status == DEPLETED"
+          - "available_balance_cents > 0 after the event"
+        side_effects:
+          - "account re-opens for reimbursement"
+      - from: "ACTIVE"
+        to: "CLOSED"
+        trigger: "POST /plan-years/{id}/settle"
+        actor: "PlanAdmin"
+        preconditions:
+          - "account.funding_status == ACTIVE"
+          - "ClockState.current_utc date > the account's effective filing deadline (run_out_end, or grace_period_end when fsa_relief_mode=GRACE_PERIOD)"
+        side_effects:
+          - "Year-End-Settlement calc runs: HEALTH_FSA computes carryover then forfeiture; DCFSA forfeits all unused; HSA forfeits nothing"
+          - "appends FORFEITURE LedgerEntry when forfeited_cents > 0"
+          - "when carryover_out > 0: appends CARRYOVER_OUT LedgerEntry on this (source) account, then creates a new destination HEALTH_FSA Account for the SAME participant_id and the SAME plan_year_id, with funding_status=PENDING, elected_amount_cents=0, carried_in_cents=carryover_out, carryover_source_account_id=<source account id>, and appends a CARRYOVER_IN LedgerEntry on the destination (transitive cascade). The destination is a carryover-holding account discoverable only via GET /accounts?carryover_source_account_id=<source id>."
+          - "sets forfeited_cents and carried_in linkage; funding_status -> CLOSED"
+          - "increments Account.version by 1"
+      - from: "DEPLETED"
+        to: "CLOSED"
+        trigger: "POST /plan-years/{id}/settle"
+        actor: "PlanAdmin"
+        preconditions:
+          - "account.funding_status == DEPLETED"
+          - "ClockState.current_utc date > the account's effective filing deadline"
+        side_effects:
+          - "Year-End-Settlement calc runs (forfeited_cents is 0 for a depleted account)"
+          - "funding_status -> CLOSED; increments Account.version by 1"
+      - from: "CLEAR"
+        to: "HELD"
+        trigger: "HOLD: system (REIMBURSEMENT of a claim whose substantiated == false)"
+        actor: "system"
+        preconditions:
+          - "account.compliance_hold == CLEAR"
+          - "the reimbursed claim.substantiated == false"
+        side_effects:
+          - "compliance_hold -> HELD; subsequent reimbursements on this account are blocked until cleared"
+      - from: "HELD"
+        to: "CLEAR"
+        trigger: "HOLD: POST /accounts/{id}/clear-hold"
+        actor: "PlanAdmin"
+        preconditions:
+          - "account.compliance_hold == HELD"
+          - "every REIMBURSED claim on this account now has substantiated == true"
+        side_effects:
+          - "compliance_hold -> CLEAR; reimbursements may resume"
+          - "increments Account.version by 1"
+
+  - entity: Claim
+    initial_state: "SUBMITTED"
+    terminal_states: ["DENIED", "VOIDED"]
+    note: |
+      Branching fork-join with a revision loop. SUBMITTED forks to APPROVED / DENIED /
+      PENDING_SUBSTANTIATION; PENDING_SUBSTANTIATION loops back to SUBMITTED on resubmit
+      (cycle) or to DENIED; APPROVED joins to REIMBURSED or VOIDED; REIMBURSED may be
+      clawed back to VOIDED. REIMBURSED is non-terminal (clawback reachable); DENIED and
+      VOIDED are terminal.
+    transitions:
+      - from: "SUBMITTED"
+        to: "APPROVED"
+        trigger: "POST /claims/{id}/adjudicate with decision=APPROVE"
+        actor: "Adjudicator"
+        preconditions:
+          - "claim.status == SUBMITTED"
+          - "claim.expense_category qualified for account.account_type (Qualified-Expense rule)"
+          - "claim.service_date within the account's service window (Service-Window rule)"
+          - "claim.substantiated == true OR claimed_amount_cents <= account.auto_adjudication_threshold_cents"
+          - "Reimbursable-Amount calc yields reimbursable_amount_cents > 0"
+        side_effects:
+          - "sets reimbursable_amount_cents via Reimbursable-Amount calc (forward-looking variant)"
+          - "sets adjudicated_by = X-User-ID; denial_reason stays null"
+          - "increments Claim.version by 1"
+      - from: "SUBMITTED"
+        to: "PENDING_SUBSTANTIATION"
+        trigger: "POST /claims/{id}/adjudicate with decision=REQUEST_DOCS"
+        actor: "Adjudicator"
+        preconditions:
+          - "claim.status == SUBMITTED"
+          - "claim.substantiated == false"
+          - "claimed_amount_cents > account.auto_adjudication_threshold_cents"
+        side_effects:
+          - "sets adjudicated_by = X-User-ID; increments Claim.version by 1"
+      - from: "SUBMITTED"
+        to: "DENIED"
+        trigger: "POST /claims/{id}/adjudicate with decision=DENY"
+        actor: "Adjudicator"
+        preconditions:
+          - "claim.status == SUBMITTED"
+        side_effects:
+          - "sets denial_reason (NOT_QUALIFIED / OUTSIDE_WINDOW / INSUFFICIENT_FUNDS / DUPLICATE); adjudicated_by = X-User-ID"
+          - "increments Claim.version by 1"
+      - from: "PENDING_SUBSTANTIATION"
+        to: "SUBMITTED"
+        trigger: "POST /claims/{id}/resubmit"
+        actor: "Participant"
+        preconditions:
+          - "claim.status == PENDING_SUBSTANTIATION"
+          - "request supplies substantiated == true"
+        side_effects:
+          - "sets claim.substantiated = true; status -> SUBMITTED (revision loop, re-enters the adjudication queue)"
+          - "increments Claim.version by 1"
+      - from: "PENDING_SUBSTANTIATION"
+        to: "DENIED"
+        trigger: "POST /claims/{id}/adjudicate with decision=DENY"
+        actor: "Adjudicator"
+        preconditions:
+          - "claim.status == PENDING_SUBSTANTIATION"
+        side_effects:
+          - "sets denial_reason = UNSUBSTANTIATED; adjudicated_by = X-User-ID; increments Claim.version by 1"
+      - from: "APPROVED"
+        to: "REIMBURSED"
+        trigger: "POST /reimbursement-batches/{id}/disburse (per member claim)"
+        actor: "FundDisburser"
+        preconditions:
+          - "claim.status == APPROVED"
+          - "claim's account.compliance_hold == CLEAR"
+          - "claim's account.funding_status == ACTIVE and available_balance_cents >= reimbursable_amount_cents"
+          - "X-User-ID != claim.adjudicated_by (segregation of duties)"
+        side_effects:
+          - "appends REIMBURSEMENT LedgerEntry (amount = reimbursable_amount_cents); sets reimbursed_by = X-User-ID"
+          - "recomputes account.reimbursed_cents and available_balance_cents (cascade to Account)"
+          - "if available_balance_cents hits 0: account funding_status ACTIVE -> DEPLETED (cascade)"
+          - "if claim.substantiated == false: account compliance_hold CLEAR -> HELD (cascade)"
+          - "increments Claim.version by 1"
+      - from: "APPROVED"
+        to: "VOIDED"
+        trigger: "POST /claims/{id}/void"
+        actor: "Adjudicator"
+        preconditions:
+          - "claim.status == APPROVED"
+        side_effects:
+          - "reimbursable_amount_cents -> 0; status -> VOIDED (no funds had moved yet)"
+          - "increments Claim.version by 1"
+      - from: "REIMBURSED"
+        to: "VOIDED"
+        trigger: "POST /claims/{id}/void"
+        actor: "PlanAdmin"
+        preconditions:
+          - "claim.status == REIMBURSED"
+        side_effects:
+          - "appends REIMBURSEMENT_REVERSAL LedgerEntry (amount = reimbursable_amount_cents) (compensation)"
+          - "recomputes account.reimbursed_cents and available_balance_cents (cascade); restores balance"
+          - "if account funding_status == DEPLETED and balance now > 0: DEPLETED -> ACTIVE (cascade)"
+          - "if this was the only unsubstantiated REIMBURSED claim on the account: compliance_hold HELD -> CLEAR (cascade)"
+          - "increments Claim.version by 1"
+
+  - entity: Contribution
+    initial_state: "POSTED"
+    terminal_states: ["REVERSED"]
+    note: "Linear two-state lifecycle; a POSTED contribution may be REVERSED exactly once."
+    transitions:
+      - from: "POSTED"
+        to: "REVERSED"
+        trigger: "POST /accounts/{id}/contributions/{contribution_id}/reverse"
+        actor: "PlanAdmin"
+        preconditions:
+          - "contribution.status == POSTED"
+        side_effects:
+          - "appends CONTRIBUTION_REVERSAL LedgerEntry; recomputes account contributed_cents and available_balance_cents (cascade)"
+          - "if account funding_status == DEPLETED and balance now > 0: DEPLETED -> ACTIVE (cascade)"
+          - "increments Account.version by 1"
+
+  - entity: ReimbursementBatch
+    initial_state: "DRAFT"
+    terminal_states: ["SETTLED", "PARTIAL"]
+    note: |
+      Branching terminal fan-out: a DRAFT batch disburses to SETTLED (every member claim reimbursed)
+      or PARTIAL (at least one member claim skipped because it was not APPROVED, the account was HELD,
+      or funds were insufficient at draw-down).
+    transitions:
+      - from: "DRAFT"
+        to: "SETTLED"
+        trigger: "POST /reimbursement-batches/{id}/disburse"
+        actor: "FundDisburser"
+        preconditions:
+          - "batch.status == DRAFT"
+          - "every member claim reimbursed successfully in claim_ids order"
+        side_effects:
+          - "total_reimbursed_cents = sum of reimbursable_amount_cents over reimbursed claims; status -> SETTLED"
+      - from: "DRAFT"
+        to: "PARTIAL"
+        trigger: "POST /reimbursement-batches/{id}/disburse"
+        actor: "FundDisburser"
+        preconditions:
+          - "batch.status == DRAFT"
+          - "at least one member claim reimbursed AND at least one member claim skipped"
+        side_effects:
+          - "total_reimbursed_cents = sum over the reimbursed subset; status -> PARTIAL"
+        note: "If the FIRST member claim fails a per-claim precondition (state/hold/funds/segregation), the whole disburse is rejected with that claim's error and the batch stays DRAFT; PARTIAL only arises when some claims succeed and later ones are skipped."
+
+  - entity: PlanYear
+    initial_state: "OPEN"
+    terminal_states: ["SETTLED"]
+    note: "A plan year is OPEN until its accounts are swept by year-end settlement, after which it is SETTLED."
+    transitions:
+      - from: "OPEN"
+        to: "SETTLED"
+        trigger: "POST /plan-years/{id}/settle"
+        actor: "PlanAdmin"
+        preconditions:
+          - "plan_year lifecycle == OPEN"
+          - "ClockState.current_utc date > run_out_end (and > grace_period_end when fsa_relief_mode=GRACE_PERIOD)"
+        side_effects:
+          - "runs Year-End-Settlement over every eligible account (created_at ASC); plan_year lifecycle -> SETTLED"
+          - "increments PlanYear.version by 1"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: contribution-post-stale-account
+    parent_entity: Account
+    write_endpoint: "POST /accounts/{id}/contributions"
+    occ_field: "expected_account_version"
+    description: |
+      Posting a Contribution against an Account whose version has advanced since the client
+      last observed it is rejected on a stale version. A prior contribution (or a cascaded
+      balance recompute from a reimbursement) legitimately bumps the account's version; the
+      late poster's view is stale and the system rejects it so the cap check runs against the
+      current contributed_cents, not a superseded snapshot.
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+
+  - rule_id: batch-disburse-stale-account
+    parent_entity: Account
+    write_endpoint: "POST /reimbursement-batches/{id}/disburse"
+    occ_field: "expected_account_version"
+    description: |
+      Disbursing a reimbursement batch carries the disburser's last-observed version of the
+      account being drawn down. If another disbursement, contribution, or clawback has since
+      advanced that account's version, the carried version is stale and the disbursement is
+      rejected, forcing the disburser to re-read available_balance_cents before drawing it
+      down again.
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: HSA-Contribution-Cap
+    trigger: "POST /accounts/{id}/contributions (HSA accounts)"
+    algorithm: "threshold"
+    formula: |
+      base_cap = (account.coverage_tier == FAMILY) ? plan_year.hsa_family_cap_cents
+                                                    : plan_year.hsa_individual_cap_cents
+      age_at_year_end = floor(years_between(participant.birth_date, plan_year.coverage_end))
+      catchup = (age_at_year_end >= 55) ? plan_year.hsa_catchup_cents : 0
+      allowed = base_cap + catchup
+      prospective = account.contributed_cents + new_contribution.amount_cents
+      # boundary: prospective == allowed is OK; prospective > allowed rejected
+      if prospective > allowed: REJECT with ERR_CONTRIBUTION_CAP_EXCEEDED
+    input_set: "All POSTED Contribution rows for the HSA account (REVERSED excluded), plus the incoming amount."
+    constants:
+      CATCHUP_AGE: 55
+    precision: "integer cents; no rounding (all amounts are whole cents)"
+    variants:
+      - name: self_only
+        when: "account.coverage_tier == SELF_ONLY"
+        difference: "base_cap = hsa_individual_cap_cents"
+      - name: family
+        when: "account.coverage_tier == FAMILY"
+        difference: "base_cap = hsa_family_cap_cents; PAYROLL, EMPLOYER and INDIVIDUAL contributions all count toward the single shared cap"
+
+  - name: FSA-Election-Cap
+    trigger: "POST /accounts (HEALTH_FSA or DCFSA)"
+    algorithm: "threshold"
+    formula: |
+      if account_type == HEALTH_FSA:
+        allowed = plan_year.health_fsa_cap_cents
+      elif account_type == DCFSA:
+        allowed = (participant.marital_status == MARRIED_SEPARATE) ? plan_year.dcfsa_cap_separate_cents
+                                                                   : plan_year.dcfsa_cap_joint_cents
+      # carried_in_cents from a prior year does NOT consume the current-year election cap
+      # boundary: elected_amount_cents == allowed is OK; > allowed rejected
+      if account.elected_amount_cents > allowed: REJECT with ERR_ELECTION_CAP_EXCEEDED
+    input_set: "The single Account's elected_amount_cents vs the plan-year cap selected by account_type and (for DCFSA) the participant's marital_status."
+    constants: {}
+    precision: "integer cents"
+    variants:
+      - name: dcfsa_joint
+        when: "DCFSA and marital_status IN {SINGLE, MARRIED_JOINT}"
+        difference: "cap = dcfsa_cap_joint_cents"
+      - name: dcfsa_separate
+        when: "DCFSA and marital_status == MARRIED_SEPARATE"
+        difference: "cap = dcfsa_cap_separate_cents (half the joint cap)"
+
+  - name: Reimbursable-Amount
+    trigger: "POST /claims/{id}/adjudicate decision=APPROVE (forward-looking variant) AND POST /reimbursement-batches/{id}/disburse (chronological/final variant)"
+    algorithm: "forward_looking"
+    formula: |
+      # FORWARD-LOOKING (at APPROVE): projects future funding so an APPROVE need not wait for cash.
+      projected_basis =
+        HSA:         account.elected_amount_cents - account.reimbursed_cents   # full annual target, projects not-yet-posted payroll
+        HEALTH_FSA:  account.elected_amount_cents + account.carried_in_cents - account.reimbursed_cents  # uniform-coverage: full election from day one
+        DCFSA:       account.contributed_cents - account.reimbursed_cents       # pay-as-you-go: ONLY contributed funds, no uniform coverage
+      reimbursable_amount_cents = min(claim.claimed_amount_cents, max(0, projected_basis))   # stored on the Claim at APPROVE
+    input_set: "The claim's claimed_amount_cents and the account's reimbursed_cents plus the type-specific funding basis (elected vs contributed)."
+    constants: {}
+    precision: "integer cents"
+    variants:
+      - name: forward_looking_adjudication
+        when: "decision=APPROVE at adjudication time"
+        difference: "ceiling is the PROJECTED basis (HSA/HEALTH_FSA use the full annual election; DCFSA uses contributed-so-far)."
+      - name: chronological_disbursement
+        when: "at POST /reimbursement-batches/{id}/disburse"
+        difference: |
+          Re-evaluates against CASH ON HAND: the §1.1 available_balance_cents field (HSA:
+          contributed_cents - reimbursed_cents; FSA/DCFSA: elected_amount_cents + carried_in_cents
+          - reimbursed_cents). If cash-on-hand < the claim's stored reimbursable_amount_cents the
+          disburse is rejected (ERR_INSUFFICIENT_FUNDS) — the forward-looking approval over-projected
+          an HSA whose payroll contributions had not yet landed. The two variants diverge for HSA when
+          contributed_cents < elected_amount_cents.
+
+  - name: Available-Balance
+    trigger: "Account /activate; every REIMBURSEMENT / REIMBURSEMENT_REVERSAL / CONTRIBUTION / CONTRIBUTION_REVERSAL side-effect"
+    algorithm: "aggregation"
+    formula: |
+      contributed_cents = sum(c.amount_cents for c in Contribution
+                              where c.account_id == account.id and c.status == POSTED)
+      reimbursed_cents  = sum(e.amount_cents for e in LedgerEntry
+                              where e.account_id == account.id and e.entry_type == REIMBURSEMENT)
+                        - sum(e.amount_cents for e in LedgerEntry
+                              where e.account_id == account.id and e.entry_type == REIMBURSEMENT_REVERSAL)
+      available_balance_cents =
+         HSA:                 contributed_cents - reimbursed_cents
+         HEALTH_FSA/DCFSA:    elected_amount_cents + carried_in_cents - reimbursed_cents
+    input_set: "POSTED Contributions and REIMBURSEMENT/REIMBURSEMENT_REVERSAL LedgerEntries for the account."
+    constants: {}
+    precision: "integer cents"
+
+  - name: Year-End-Settlement
+    trigger: "POST /plan-years/{id}/settle (per account, processed in Account.created_at ASC order)"
+    algorithm: "waterfall_allocation"
+    formula: |
+      unused = available_balance_cents   # cash-on-hand chronological balance at settlement
+      if account_type == HSA:
+        carryover_out = 0; forfeited_cents = 0           # HSA funds roll indefinitely, never forfeit
+      elif account_type == HEALTH_FSA:
+        if plan_year.fsa_relief_mode == CARRYOVER:
+          carryover_out   = min(unused, plan_year.carryover_cap_cents)   # bucket 1: carryover up to cap
+          forfeited_cents = unused - carryover_out                       # bucket 2: remainder forfeits
+        else:   # NONE or GRACE_PERIOD (grace extends the service window, it does not preserve dollars)
+          carryover_out = 0
+          forfeited_cents = unused
+      elif account_type == DCFSA:
+        carryover_out = 0                                # DCFSA may NEVER carry over (regulatory)
+        forfeited_cents = unused
+      # cascade: carryover_out > 0 creates a destination HEALTH_FSA account (same participant_id and
+      # plan_year_id, elected 0, funding_status PENDING) credited with carried_in_cents = carryover_out
+      # and carryover_source_account_id = source account id; a CARRYOVER_IN LedgerEntry is appended to it.
+    input_set: "Per account: available_balance_cents at settlement time; accounts processed in Account.created_at ASC order."
+    constants: {}
+    precision: "integer cents"
+    variants:
+      - name: health_fsa_carryover
+        when: "HEALTH_FSA and fsa_relief_mode == CARRYOVER"
+        difference: "waterfall: fill the carryover bucket (capped) first, forfeit the remainder"
+      - name: health_fsa_strict
+        when: "HEALTH_FSA and fsa_relief_mode IN {NONE, GRACE_PERIOD}"
+        difference: "entire unused balance forfeits; grace only extended the earlier service window, not the dollars"
+      - name: dcfsa_forfeit
+        when: "DCFSA (any relief mode)"
+        difference: "entire unused balance forfeits; carryover is never permitted"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a recognized role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to perform this operation per the RBAC matrix"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "Path resources (account, claim, plan_year, batch) exist, validated left-to-right"
+    error_id: ERR_RESOURCE_NOT_FOUND
+    http_status: 404
+    applies_to: "all path-parameterized endpoints"
+
+  - priority: 4
+    category: existence
+    check: "Body foreign keys (account_id, plan_year_id, participant_id, claim_ids[]) reference existing entities"
+    error_id: ERR_RESOURCE_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /accounts, POST /claims, POST /reimbursement-batches"
+
+  - priority: 5
+    category: business_referential
+    check: "Participant acting on a resource owns it: the claim's account.participant_id (or account.participant_id) == X-User-ID for the Participant role"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Participant-role claim operations (POST /claims, POST /claims/{id}/resubmit)"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a state that permits this transition (per §1.2 from-state)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 7
+    category: business_safety
+    check: "Segregation of duties: the FundDisburser reimbursing a claim (X-User-ID) is not the Adjudicator who approved it (claim.adjudicated_by)"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /reimbursement-batches/{id}/disburse"
+
+  - priority: 8
+    category: business_safety
+    check: "Account compliance_hold is CLEAR before any reimbursement is disbursed against it"
+    error_id: ERR_ACCOUNT_ON_HOLD
+    http_status: 409
+    applies_to: "POST /reimbursement-batches/{id}/disburse"
+
+  - priority: 9
+    category: business_constraint
+    check: "Claim expense_category is qualified for the account_type (DEPENDENT_CARE only on DCFSA; MEDICAL/DENTAL/VISION/PRESCRIPTION/OTC only on HSA/HEALTH_FSA; DEPENDENT_CARE rejected on HSA/HEALTH_FSA; medical categories rejected on DCFSA)"
+    error_id: ERR_EXPENSE_NOT_QUALIFIED
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/adjudicate"
+
+  - priority: 10
+    category: business_temporal
+    check: "Claim service_date is within the account's effective service window (coverage_start..coverage_end, extended to grace_period_end when fsa_relief_mode=GRACE_PERIOD)"
+    error_id: ERR_SERVICE_DATE_OUTSIDE_WINDOW
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/adjudicate"
+
+  - priority: 11
+    category: business_constraint
+    check: "Duplicate-claim guard: no other claim on the same account in a non-DENIED, non-VOIDED status has identical service_date, expense_category and claimed_amount_cents"
+    error_id: ERR_DUPLICATE_CLAIM
+    http_status: 409
+    applies_to: "POST /claims"
+
+  - priority: 12
+    category: business_fiscal
+    check: "An HSA contribution would not push contributed_cents past base+catch-up cap"
+    error_id: ERR_CONTRIBUTION_CAP_EXCEEDED
+    http_status: 422
+    applies_to: "POST /accounts/{id}/contributions"
+
+  - priority: 13
+    category: business_fiscal
+    check: "An FSA/DCFSA election would not exceed the applicable plan-year cap"
+    error_id: ERR_ELECTION_CAP_EXCEEDED
+    http_status: 422
+    applies_to: "POST /accounts"
+
+  - priority: 14
+    category: business_temporal
+    check: |
+      Coverage-window overlap: opening an account whose plan year's effective coverage interval collides
+      with an existing non-CLOSED account of the SAME account_type for the same participant. Interval
+      semantics depend on account_type:
+        HEALTH_FSA -> CLOSED intervals [coverage_start, effective_end] where effective_end = max(coverage_end,
+          grace_period_end if GRACE_PERIOD else coverage_end); two windows collide when a.start <= b.effective_end
+          AND b.start <= a.effective_end (a shared boundary day IS a collision).
+        DCFSA      -> HALF-OPEN intervals [coverage_start, coverage_end); two windows collide when
+          a.start < b.coverage_end AND b.start < a.coverage_end (a shared boundary day is NOT a collision —
+          back-to-back DCFSA years are permitted).
+        HSA        -> never checked (HSA windows do not gate one another here).
+    error_id: ERR_COVERAGE_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /accounts"
+
+  - priority: 15
+    category: business_fiscal
+    check: "Funds are available for the claim: at APPROVE the Reimbursable-Amount projected basis must yield reimbursable_amount_cents > 0; at disbursement, cash-on-hand available_balance_cents >= the claim's stored reimbursable_amount_cents"
+    error_id: ERR_INSUFFICIENT_FUNDS
+    http_status: 422
+    applies_to: "POST /claims/{id}/adjudicate (decision=APPROVE), POST /reimbursement-batches/{id}/disburse"
+
+  - priority: 16
+    category: state
+    check: "OCC: expected_account_version matches the live Account.version on contribution post, contribution reverse, and batch disburse"
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+    applies_to: "POST /accounts/{id}/contributions, POST /accounts/{id}/contributions/{contribution_id}/reverse, POST /reimbursement-batches/{id}/disburse"
+
+  - priority: 17
+    category: business_constraint
+    check: "PlanYear relief config is coherent: GRACE_PERIOD requires a valid grace_period_end; CARRYOVER requires carryover_cap_cents > 0; grace and carryover are mutually exclusive"
+    error_id: ERR_RELIEF_MODE_CONFLICT
+    http_status: 422
+    applies_to: "POST /plan-years"
+
+  - priority: 18
+    category: business_constraint
+    check: "Required body fields present and well-typed; enum values valid; amounts > 0"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST/PATCH endpoints"
+
+  - priority: 19
+    category: business_temporal
+    check: "Claim filing occurs on or before the account's effective filing deadline (run_out_end; or grace_period_end when fsa_relief_mode=GRACE_PERIOD and that is later): ClockState.current_utc date <= the deadline"
+    error_id: ERR_FILING_WINDOW_CLOSED
+    http_status: 422
+    applies_to: "POST /claims"
+
+  - priority: 20
+    category: business_constraint
+    check: "Participant email is unique across all participants"
+    error_id: ERR_DUPLICATE_EMAIL
+    http_status: 409
+    applies_to: "POST /participants"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  - method: POST
+    path: "/participants"
+    description: "Register a participant."
+    roles: [PlanAdmin]
+    code: 201
+    input: [email, full_name, birth_date, "marital_status?", "hdhp_covered?"]
+    output: Participant
+    side_effects: ["creates Participant in default state"]
+
+  - method: GET
+    path: "/participants/{id}"
+    description: "Fetch a participant."
+    roles: [PlanAdmin, Participant, Adjudicator, FundDisburser]
+    code: 200
+    input: []
+    output: Participant
+    side_effects: []
+
+  - method: GET
+    path: "/participants"
+    description: "List participants (paginated)."
+    roles: [PlanAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Participant[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/participants/{id}"
+    description: "Update mutable participant fields (marital_status, hdhp_covered)."
+    roles: [PlanAdmin]
+    code: 200
+    input: ["marital_status?", "hdhp_covered?", expected_participant_version]
+    output: Participant
+    side_effects: ["increments Participant.version by 1"]
+
+  - method: POST
+    path: "/plan-years"
+    description: "Create a plan year with caps and FSA relief configuration."
+    roles: [PlanAdmin]
+    code: 201
+    input: [label, coverage_start, coverage_end, run_out_end, "fsa_relief_mode?", "grace_period_end?", "carryover_cap_cents?", hsa_individual_cap_cents, hsa_family_cap_cents, hsa_catchup_cents, health_fsa_cap_cents, dcfsa_cap_joint_cents, dcfsa_cap_separate_cents]
+    output: PlanYear
+    side_effects: ["creates PlanYear; runs the relief-config coherence check (ERR_RELIEF_MODE_CONFLICT)"]
+
+  - method: GET
+    path: "/plan-years/{id}"
+    description: "Fetch a plan year."
+    roles: [PlanAdmin, Participant, Adjudicator, FundDisburser]
+    code: 200
+    input: []
+    output: PlanYear
+    side_effects: []
+
+  - method: GET
+    path: "/plan-years"
+    description: "List plan years (paginated)."
+    roles: [PlanAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PlanYear[]
+    side_effects: []
+
+  - method: POST
+    path: "/plan-years/{id}/settle"
+    description: "Run year-end settlement for every ACTIVE/DEPLETED account under this plan year whose filing deadline has passed."
+    roles: [PlanAdmin]
+    code: 200
+    input: []
+    output: PlanYear
+    side_effects:
+      - "requires plan_year.lifecycle == OPEN (re-settlement of a SETTLED plan year is rejected with ERR_INVALID_STATE)"
+      - "for each eligible account (Account.created_at ASC): runs Year-End-Settlement calc"
+      - "appends FORFEITURE / CARRYOVER_OUT / CARRYOVER_IN LedgerEntries (cascade)"
+      - "HEALTH_FSA carryover creates a destination carryover-holding account credited with CARRYOVER_IN (cascade)"
+      - "transitions each settled account funding_status -> CLOSED; sets plan_year.lifecycle -> SETTLED; increments PlanYear.version by 1"
+
+  - method: POST
+    path: "/accounts"
+    description: "Open an HSA/HEALTH_FSA/DCFSA account for a participant under a plan year."
+    roles: [PlanAdmin]
+    code: 201
+    input: [participant_id, plan_year_id, account_type, "coverage_tier?", elected_amount_cents, "auto_adjudication_threshold_cents?"]
+    output: Account
+    side_effects: ["creates Account in PENDING/CLEAR; runs FSA-Election-Cap for FSA/DCFSA; runs the coverage-window-overlap check for HEALTH_FSA/DCFSA"]
+
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Fetch an account with computed balances."
+    roles: [PlanAdmin, Participant, Adjudicator, FundDisburser]
+    code: 200
+    input: []
+    output: Account
+    side_effects: []
+
+  - method: GET
+    path: "/accounts"
+    description: "List accounts, optionally filtered by participant, plan year, or carryover source."
+    roles: [PlanAdmin, Participant, Adjudicator, FundDisburser]
+    code: 200
+    input: ["participant_id?", "plan_year_id?", "carryover_source_account_id?", "account_type?", "limit?", "offset?"]
+    output: Account[]
+    side_effects: []
+
+  - method: POST
+    path: "/accounts/{id}/activate"
+    description: "Activate a PENDING account so it accepts claims."
+    roles: [PlanAdmin]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["funding_status PENDING -> ACTIVE; runs Available-Balance; increments Account.version by 1"]
+
+  - method: POST
+    path: "/accounts/{id}/clear-hold"
+    description: "Clear a compliance hold once every reimbursed claim on the account is substantiated."
+    roles: [PlanAdmin]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["compliance_hold HELD -> CLEAR; increments Account.version by 1"]
+
+  - method: POST
+    path: "/accounts/{id}/contributions"
+    description: "Post a contribution to an account (OCC-guarded)."
+    roles: [PlanAdmin]
+    code: 201
+    input: [amount_cents, source, posted_at, expected_account_version]
+    output: Contribution
+    side_effects:
+      - "runs HSA-Contribution-Cap (HSA) before accepting"
+      - "appends CONTRIBUTION LedgerEntry; recomputes contributed_cents and available_balance_cents via Available-Balance"
+      - "if account funding_status == DEPLETED and balance now > 0: DEPLETED -> ACTIVE (cascade)"
+      - "increments Account.version by 1"
+
+  - method: GET
+    path: "/accounts/{id}/contributions"
+    description: "List contributions for an account (reverse-reachability for Contribution.account_id)."
+    roles: [PlanAdmin, Participant, Adjudicator, FundDisburser]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Contribution[]
+    side_effects: []
+
+  - method: POST
+    path: "/accounts/{id}/contributions/{contribution_id}/reverse"
+    description: "Reverse a POSTED contribution (correction)."
+    roles: [PlanAdmin]
+    code: 200
+    input: [expected_account_version]
+    output: Contribution
+    side_effects:
+      - "Contribution.status POSTED -> REVERSED; appends CONTRIBUTION_REVERSAL LedgerEntry"
+      - "recomputes contributed_cents and available_balance_cents (cascade)"
+      - "increments Account.version by 1"
+
+  - method: POST
+    path: "/claims"
+    description: "Submit a reimbursement claim against an account."
+    roles: [Participant, PlanAdmin]
+    code: 201
+    input: [account_id, service_date, expense_category, claimed_amount_cents, "substantiated?"]
+    output: Claim
+    side_effects: ["creates Claim in SUBMITTED; runs Qualified-Expense, Service-Window and Duplicate-Claim guards"]
+
+  - method: GET
+    path: "/claims/{id}"
+    description: "Fetch a claim."
+    roles: [PlanAdmin, Participant, Adjudicator, FundDisburser]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: []
+
+  - method: GET
+    path: "/claims"
+    description: "List claims, optionally filtered by account or participant (reverse-reachability for Claim.account_id)."
+    roles: [PlanAdmin, Participant, Adjudicator, FundDisburser]
+    code: 200
+    input: ["account_id?", "participant_id?", "status?", "limit?", "offset?"]
+    output: Claim[]
+    side_effects: []
+
+  - method: POST
+    path: "/claims/{id}/adjudicate"
+    description: "Adjudicate a SUBMITTED or PENDING_SUBSTANTIATION claim: APPROVE, DENY, or REQUEST_DOCS."
+    roles: [Adjudicator]
+    code: 200
+    input: [decision, "denial_reason?"]
+    output: Claim
+    side_effects:
+      - "APPROVE: runs Reimbursable-Amount (forward-looking); sets reimbursable_amount_cents, adjudicated_by; SUBMITTED -> APPROVED"
+      - "DENY: sets denial_reason, adjudicated_by; -> DENIED"
+      - "REQUEST_DOCS: SUBMITTED -> PENDING_SUBSTANTIATION; sets adjudicated_by"
+      - "increments Claim.version by 1"
+
+  - method: POST
+    path: "/claims/{id}/resubmit"
+    description: "Participant resubmits a PENDING_SUBSTANTIATION claim with documentation."
+    roles: [Participant, PlanAdmin]
+    code: 200
+    input: [substantiated]
+    output: Claim
+    side_effects: ["sets substantiated=true; PENDING_SUBSTANTIATION -> SUBMITTED (revision loop); increments Claim.version by 1"]
+
+  - method: POST
+    path: "/claims/{id}/void"
+    description: "Void an APPROVED claim (Adjudicator) or claw back a REIMBURSED claim (PlanAdmin)."
+    roles: [Adjudicator, PlanAdmin]
+    code: 200
+    input: []
+    output: Claim
+    side_effects:
+      - "APPROVED -> VOIDED: reimbursable_amount_cents -> 0"
+      - "REIMBURSED -> VOIDED: appends REIMBURSEMENT_REVERSAL (compensation); recomputes balance; may lift DEPLETED -> ACTIVE and HELD -> CLEAR (cascade)"
+      - "increments Claim.version by 1"
+
+  - method: GET
+    path: "/claims/{id}/ledger-entries"
+    description: "Read ledger entries produced by a specific claim (reverse-reachability for LedgerEntry.claim_id)."
+    roles: [PlanAdmin, Participant, Adjudicator, FundDisburser]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: LedgerEntry[]
+    side_effects: []
+
+  - method: POST
+    path: "/reimbursement-batches"
+    description: "Create a draft reimbursement batch over a participant's APPROVED claims."
+    roles: [FundDisburser, PlanAdmin]
+    code: 201
+    input: [participant_id, claim_ids]
+    output: ReimbursementBatch
+    side_effects: ["creates ReimbursementBatch in DRAFT; validates each claim is APPROVED and owned by participant_id"]
+
+  - method: GET
+    path: "/reimbursement-batches/{id}"
+    description: "Fetch a reimbursement batch."
+    roles: [PlanAdmin, FundDisburser]
+    code: 200
+    input: []
+    output: ReimbursementBatch
+    side_effects: []
+
+  - method: GET
+    path: "/reimbursement-batches"
+    description: "List reimbursement batches, optionally filtered by participant (reverse-reachability for ReimbursementBatch.participant_id)."
+    roles: [PlanAdmin, FundDisburser]
+    code: 200
+    input: ["participant_id?", "limit?", "offset?"]
+    output: ReimbursementBatch[]
+    side_effects: []
+
+  - method: POST
+    path: "/reimbursement-batches/{id}/disburse"
+    description: "Disburse a batch: reimburse each member APPROVED claim in claim_ids order (OCC-guarded on the drawn-down account)."
+    roles: [FundDisburser]
+    code: 200
+    input: [expected_account_version]
+    output: ReimbursementBatch
+    side_effects:
+      - "for each member claim in order: enforces segregation-of-duties, compliance_hold CLEAR, chronological cash-on-hand >= reimbursable_amount_cents"
+      - "runs Reimbursable-Amount (chronological/final variant) per claim; APPROVED -> REIMBURSED; appends REIMBURSEMENT LedgerEntry"
+      - "recomputes account balances (cascade); may drive ACTIVE -> DEPLETED and CLEAR -> HELD"
+      - "sets batch.total_reimbursed_cents and status (SETTLED if all succeeded, PARTIAL if some skipped)"
+      - "increments Account.version by 1 for each account drawn down"
+
+  - method: GET
+    path: "/accounts/{id}/ledger-entries"
+    description: "Read the append-only IRS audit trail for an account (reverse-reachability for LedgerEntry.account_id)."
+    roles: [PlanAdmin, Participant, Adjudicator, FundDisburser]
+    code: 200
+    input: ["entry_type?", "limit?", "offset?"]
+    output: LedgerEntry[]
+    side_effects: []
+
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving endpoint: set the server clock so year-end settlement and filing-deadline checks are reachable deterministically."
+    roles: [PlanAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: ClockState
+    side_effects: ["sets ClockState.current_utc"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID header, or unrecognized role."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role is not permitted to perform this operation."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Participant acts on a claim/account whose owning participant_id != X-User-ID."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "FundDisburser disbursing a claim equals the Adjudicator who approved it (X-User-ID == claim.adjudicated_by)."
+  - id: ERR_RESOURCE_NOT_FOUND
+    http: 404
+    condition: "A path or body-referenced resource does not exist."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource is not in a state that permits the requested transition."
+  - id: ERR_ACCOUNT_ON_HOLD
+    http: 409
+    condition: "A reimbursement is attempted against an account whose compliance_hold == HELD."
+  - id: ERR_DUPLICATE_CLAIM
+    http: 409
+    condition: "A non-DENIED, non-VOIDED claim with identical account_id, service_date, expense_category and claimed_amount_cents already exists."
+  - id: ERR_STALE_ACCOUNT_VERSION
+    http: 412
+    condition: "expected_account_version does not match the live Account.version (OCC)."
+  - id: ERR_EXPENSE_NOT_QUALIFIED
+    http: 422
+    condition: "Claim expense_category is not qualified for the account_type."
+  - id: ERR_SERVICE_DATE_OUTSIDE_WINDOW
+    http: 422
+    condition: "Claim service_date is outside the account's effective service window (coverage window, grace-extended when applicable)."
+  - id: ERR_FILING_WINDOW_CLOSED
+    http: 422
+    condition: "A claim is filed after the account's effective filing deadline (run_out_end, or grace_period_end when later)."
+  - id: ERR_DUPLICATE_EMAIL
+    http: 409
+    condition: "A participant is registered with an email already in use."
+  - id: ERR_CONTRIBUTION_CAP_EXCEEDED
+    http: 422
+    condition: "An HSA contribution would push contributed_cents past the base+catch-up cap."
+  - id: ERR_ELECTION_CAP_EXCEEDED
+    http: 422
+    condition: "An FSA/DCFSA election exceeds the applicable plan-year cap."
+  - id: ERR_COVERAGE_WINDOW_OVERLAP
+    http: 409
+    condition: "A new HEALTH_FSA/DCFSA account's effective coverage interval overlaps an existing non-CLOSED account of the same type for the same participant (closed-interval semantics for HEALTH_FSA, half-open for DCFSA)."
+  - id: ERR_INSUFFICIENT_FUNDS
+    http: 422
+    condition: "At APPROVE the projected reimbursable_amount_cents would be 0 (no funds), or at disbursement cash-on-hand available_balance_cents < the claim's reimbursable_amount_cents."
+  - id: ERR_RELIEF_MODE_CONFLICT
+    http: 422
+    condition: "PlanYear relief config incoherent: GRACE_PERIOD without a valid grace_period_end, CARRYOVER with carryover_cap_cents == 0, or both relief mechanisms requested."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Malformed body: missing required field, bad enum, non-positive amount, or invalid OCC field type."
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlanAdmin
+    description: "Plan administrator: provisions plan years, accounts, contributions, settlement, holds, clawbacks, and the test clock."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /plan-years"
+      - "POST /plan-years/{id}/settle"
+      - "POST /participants"
+      - "PATCH /participants/{id}"
+      - "POST /accounts"
+      - "POST /accounts/{id}/activate"
+      - "POST /accounts/{id}/clear-hold"
+      - "POST /accounts/{id}/contributions"
+      - "POST /accounts/{id}/contributions/{contribution_id}/reverse"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /claims (also Participant)"
+      - "POST /claims/{id}/resubmit (also Participant)"
+      - "POST /claims/{id}/void (also Adjudicator; PlanAdmin owns the REIMBURSED->VOIDED clawback)"
+      - "POST /reimbursement-batches (also FundDisburser)"
+      - "all GET reads"
+
+  - name: Participant
+    description: "Account owner: submits and resubmits claims for their own accounts."
+    identity: "entity_backed:Participant"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /claims"
+      - "POST /claims/{id}/resubmit"
+      - "GET reads scoped to own participant resources"
+
+  - name: Adjudicator
+    description: "Claims adjudicator: approves/denies/requests-docs on claims; voids APPROVED (pre-disbursement) claims."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /claims/{id}/adjudicate"
+    shared_operations:
+      - "POST /claims/{id}/void (APPROVED->VOIDED only)"
+      - "GET reads"
+
+  - name: FundDisburser
+    description: "Treasury disburser: creates and disburses reimbursement batches. Cannot adjudicate the claims they disburse (segregation of duties)."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /reimbursement-batches/{id}/disburse"
+    shared_operations:
+      - "POST /reimbursement-batches (also PlanAdmin)"
+      - "GET reads"

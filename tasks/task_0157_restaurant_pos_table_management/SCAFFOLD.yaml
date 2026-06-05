@@ -1,0 +1,1648 @@
+scenario: "Restaurant POS & Table Management: order/modifier/coursing, kitchen display routing, table turn/waitlist, check split/comp/void, tip pooling, 86 item count, happy-hour price schedule, large-party auto-gratuity"
+domain_name: restaurant-pos
+api_prefix: ""   # flat topology: each resource collection lives at the root (/checks, /tables, /seatings, …); empty prefix keeps the lint segment-derivation honest
+
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: temporal_windowing
+  complexity_layers:
+    - dual_variant_calculation        # provisional (live) vs final (locked-at-close) check pricing; even-by-hours vs weighted-by-role tip pool
+    - cascading_side_effects          # clear-seating → free-table → promote-waitlist; void-item → restore 86-count
+    - rate_threshold_triggers         # large-party auto-gratuity at party_size >= 8; happy-hour minute-window crossing
+    - optimistic_concurrency          # CREATE-with-supersede on the head WaitlistEntry promotion against a stale DiningTable version
+
+  entity_topology: flat
+  # Peer resources joined by foreign keys (Seating.table_id, Check.seating_id, Course.check_id,
+  # OrderItem.course_id, …). No nesting in URL paths — every collection is a root path and
+  # children are reached via filtered-list GETs. Deliberately NOT hybrid.
+
+  state_machine_shape: cyclic
+  # Check is cyclic (OPEN ⇄ PRESENTED, then CLOSED/VOID); OrderItem is branching
+  # (FIRED → {SERVED, VOIDED, COMPED} with divergent side-effect sets). Plus linear
+  # pipelines on Seating, WaitlistEntry, TipPool.
+
+  relationship_patterns:
+    - one_to_many        # Check 1—* Course 1—* OrderItem 1—* ItemModifier; Restaurant 1—* MenuItem
+    - flat_with_references  # all cross-entity links are FK fields, never URL nesting
+    - cross_aggregate    # TipAllocation references both TipPool and StaffShift across aggregate boundaries
+
+  role_model: peer_roles
+  # Host owns waitlist + seatings; Server owns orders/courses/items/checks for their own seatings;
+  # KitchenStaff owns kitchen-display item state (mark served / 86); Manager owns comps/voids,
+  # tip-pool distribution, menu & schedule config. No single role is a superset of another.
+
+  consistency_model: immediate
+  # Every cascade (clear→free→promote, void→restore-86, close→tip-pool) is atomic within the
+  # triggering request's response.
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Restaurant
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "display name of the restaurant"
+      - name: tax_rate_bps
+        type: integer
+        source: input
+        description: "sales-tax rate in basis points (e.g. 875 = 8.75%); applied to the comped subtotal"
+        constraints: "0 <= tax_rate_bps <= 2000"
+      - name: large_party_threshold
+        type: integer
+        source: input
+        default: 8
+        description: "party_size at or above which auto-gratuity applies (inclusive lower bound, >=)"
+        constraints: ">= 2"
+      - name: auto_gratuity_bps
+        type: integer
+        source: input
+        default: 2000
+        description: "auto-gratuity rate in basis points applied to the comped subtotal for large parties (2000 = 20%)"
+        constraints: "0 <= auto_gratuity_bps <= 5000"
+      - name: comp_cap_bps
+        type: integer
+        source: input
+        default: 10000
+        description: "maximum total comp on a single check, in basis points of the pre-comp subtotal (10000 = 100%)"
+        constraints: "0 <= comp_cap_bps <= 10000"
+      - name: min_rest_minutes
+        type: integer
+        source: input
+        default: 0
+        description: "minimum rest gap, in minutes, required between two shifts of the same StaffMember (closed-interval buffer)"
+        constraints: ">= 0"
+      - name: current_utc
+        type: datetime
+        source: system
+        description: "server clock for this restaurant; advanced only via POST /_clock/set_current_utc; happy-hour evaluation and all timestamps read from it"
+
+  - name: MenuItem
+    parent: Restaurant
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: name
+        type: string
+        source: input
+        description: "menu item name"
+      - name: station
+        type: enum
+        source: input
+        description: "kitchen-display station this item routes to when fired"
+        constraints: "one of {GRILL, FRY, SAUTE, COLD, BAR, EXPO}"
+      - name: base_price_cents
+        type: integer
+        source: input
+        description: "regular price in cents charged outside happy-hour windows"
+        constraints: ">= 0"
+      - name: happy_hour_price_cents
+        type: integer
+        source: input
+        description: "discounted price in cents charged when the owning course fires inside an active happy-hour window; MUST be <= base_price_cents"
+        constraints: "0 <= happy_hour_price_cents <= base_price_cents"
+      - name: initial_available_count
+        type: integer
+        source: input
+        description: "starting 86-count: number of portions available at creation (the conserved baseline for the available-count invariant)"
+        constraints: ">= 0"
+      - name: available_count
+        type: integer
+        source: computed
+        description: "remaining portions; decremented by quantity when an OrderItem of this MenuItem fires, and restored ONLY when that item is VOIDED (a COMP does not restore it — the portion was consumed); an item cannot fire when this would go below 0 (86'd). Invariant: available_count + Σ(quantity over FIRED|SERVED|COMPED items of this MenuItem) == initial_available_count"
+      - name: is_86
+        type: boolean
+        source: computed
+        description: "true exactly when available_count == 0"
+
+  - name: HappyHourWindow
+    parent: Restaurant
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: day_of_week
+        type: integer
+        source: input
+        description: "ISO weekday this window applies to (1=Monday .. 7=Sunday), matched against current_utc weekday"
+        constraints: "1 <= day_of_week <= 7"
+      - name: start_minute
+        type: integer
+        source: input
+        description: "inclusive window start as minutes-after-UTC-midnight (>=)"
+        constraints: "0 <= start_minute < end_minute"
+      - name: end_minute
+        type: integer
+        source: input
+        description: "exclusive window end as minutes-after-UTC-midnight (<); a fire at exactly end_minute is OUTSIDE the window"
+        constraints: "start_minute < end_minute <= 1440"
+
+  - name: DiningTable
+    parent: Restaurant
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: table_number
+        type: string
+        source: input
+        description: "human label, unique within the restaurant"
+        constraints: "unique per restaurant_id"
+      - name: capacity
+        type: integer
+        source: input
+        description: "maximum party_size this table seats"
+        constraints: ">= 1"
+      - name: occupancy_status
+        type: enum
+        source: computed
+        description: "AVAILABLE on create; SEATED while an active Seating occupies it; DIRTY after the seating is cleared until bussed; back to AVAILABLE on buss"
+        constraints: "one of {AVAILABLE, SEATED, DIRTY}"
+        default: AVAILABLE
+
+  - name: WaitlistEntry
+    parent: Restaurant
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: party_name
+        type: string
+        source: input
+        description: "name the party is quoted under"
+      - name: party_size
+        type: integer
+        source: input
+        description: "number of guests in the party"
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: computed
+        description: "WAITING on create; PROMOTED when auto-seated by a freed table; SEATED once its Seating is confirmed; CANCELLED if removed while WAITING"
+        constraints: "one of {WAITING, PROMOTED, SEATED, CANCELLED}"
+        default: WAITING
+      - name: quoted_at
+        type: datetime
+        source: system
+        description: "current_utc at creation; FIFO ordering key for promotion (earliest quoted_at first, then created_at ASC as tie-break)"
+      - name: seating_id
+        type: string
+        source: computed
+        description: "FK -> Seating.id; set when the entry is promoted into a Seating, else null"
+
+  - name: Seating
+    parent: Restaurant
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: table_id
+        type: string
+        source: input
+        description: "FK -> DiningTable.id; the physical table this seating occupies"
+      - name: waitlist_entry_id
+        type: string
+        source: input
+        description: "FK -> WaitlistEntry.id; the promoted entry, or null for a walk-in seating"
+        constraints: "nullable"
+      - name: party_size
+        type: integer
+        source: input
+        description: "guests seated; MUST be <= table.capacity"
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: computed
+        description: "OPEN while guests are seated; CLEARED once the seating is ended (bus pending)"
+        constraints: "one of {OPEN, CLEARED}"
+        default: OPEN
+      - name: seated_at
+        type: datetime
+        source: system
+        description: "current_utc when the seating is created; start of the half-open occupation interval [seated_at, cleared_at)"
+      - name: cleared_at
+        type: datetime
+        source: computed
+        description: "current_utc when the seating is cleared; exclusive end of the occupation interval; null while OPEN"
+
+  - name: Check
+    parent: Restaurant
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: seating_id
+        type: string
+        source: input
+        description: "FK -> Seating.id; the seating this check belongs to"
+      - name: server_staff_id
+        type: string
+        source: input
+        description: "FK -> StaffMember.id; the Server who owns this check"
+      - name: party_size
+        type: integer
+        source: input
+        description: "billable party size for this check; drives auto-gratuity; copied from the seating but overridable on split"
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: computed
+        description: "OPEN while items may be added; PRESENTED when the bill is printed (can revert to OPEN); CLOSED once fully paid; VOID if the whole check is voided"
+        constraints: "one of {OPEN, PRESENTED, CLOSED, VOID}"
+        default: OPEN
+      - name: provisional_subtotal_cents
+        type: integer
+        source: computed
+        description: "live subtotal recomputed on every item add/void/comp using each line's price snapshot taken when the course fired; see calculations.provisional_check_subtotal"
+      - name: final_subtotal_cents
+        type: integer
+        source: computed
+        description: "subtotal locked at PRESENTED/CLOSE; recomputed from scratch by re-evaluating each fired course against happy-hour windows at the course's fired_at; see calculations.final_check_subtotal; null until first presented"
+      - name: comp_total_cents
+        type: integer
+        source: computed
+        description: "sum of comp_amount_cents over COMPED order items on this check, capped at comp_cap_bps of the pre-comp subtotal"
+      - name: auto_gratuity_cents
+        type: integer
+        source: computed
+        description: "auto-gratuity computed on the comped subtotal when party_size >= restaurant.large_party_threshold, else 0; see calculations.auto_gratuity"
+      - name: tax_cents
+        type: integer
+        source: computed
+        description: "tax on the comped subtotal at restaurant.tax_rate_bps"
+      - name: total_due_cents
+        type: integer
+        source: computed
+        description: "comped_subtotal + tax_cents + auto_gratuity_cents; the amount the guest owes"
+      - name: amount_paid_cents
+        type: integer
+        source: computed
+        description: "sum of amount_cents over SETTLED payments on this check"
+      - name: tip_cents
+        type: integer
+        source: computed
+        description: "sum of tip_cents over SETTLED payments on this check; contributed to the day's TipPool when the check closes"
+
+  - name: Course
+    parent: Restaurant
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: check_id
+        type: string
+        source: input
+        description: "FK -> Check.id; the check this course belongs to"
+      - name: course_number
+        type: integer
+        source: input
+        description: "coursing order (1=appetizer, 2=entree, …); courses fire lowest-number-first"
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: computed
+        description: "BUILDING while items are added; FIRED once sent to the kitchen display (timestamps fired_at)"
+        constraints: "one of {BUILDING, FIRED}"
+        default: BUILDING
+      - name: fired_at
+        type: datetime
+        source: computed
+        description: "current_utc when the course fires; the timestamp happy-hour pricing is evaluated against; null while BUILDING"
+
+  - name: OrderItem
+    parent: Restaurant
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: course_id
+        type: string
+        source: input
+        description: "FK -> Course.id; the course this item belongs to"
+      - name: menu_item_id
+        type: string
+        source: input
+        description: "FK -> MenuItem.id; the menu item ordered"
+      - name: quantity
+        type: integer
+        source: input
+        description: "number of portions"
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: computed
+        description: "PENDING while in a BUILDING course; FIRED when the course fires (decrements MenuItem.available_count, snapshots price); then SERVED (kitchen marks done), VOIDED (mistake), or COMPED (manager goodwill)"
+        constraints: "one of {PENDING, FIRED, SERVED, VOIDED, COMPED}"
+        default: PENDING
+      - name: unit_price_cents
+        type: integer
+        source: computed
+        description: "per-portion price snapshot taken at fire time: happy_hour_price_cents if the course's fired_at falls in an active HappyHourWindow, else base_price_cents; used by provisional_check_subtotal"
+      - name: line_subtotal_cents
+        type: integer
+        source: computed
+        description: "quantity * unit_price_cents + sum of ItemModifier.surcharge_cents * quantity; the per-line value summed by provisional_check_subtotal"
+      - name: comp_amount_cents
+        type: integer
+        source: computed
+        description: "the amount deducted from the gross subtotal when COMPED (defaults to the full line_subtotal_cents); the line stays in the subtotal at gross and comp_total_cents subtracts this; 0 otherwise"
+
+  - name: ItemModifier
+    parent: Restaurant
+    common_fields: false
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: order_item_id
+        type: string
+        source: input
+        description: "FK -> OrderItem.id; the line this modifier attaches to"
+      - name: name
+        type: string
+        source: input
+        description: "modifier label (e.g. 'extra cheese', 'no onions')"
+      - name: surcharge_cents
+        type: integer
+        source: input
+        description: "per-portion upcharge in cents (may be 0 for free modifiers)"
+        constraints: ">= 0"
+
+  - name: StaffMember
+    parent: Restaurant
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: name
+        type: string
+        source: input
+        description: "staff member name"
+      - name: role
+        type: enum
+        source: input
+        description: "job role; drives tip-pool weight under the WEIGHTED_BY_ROLE variant"
+        constraints: "one of {SERVER, BARTENDER, BUSSER}"
+      - name: tip_weight_bps
+        type: integer
+        source: input
+        description: "relative tip-pool weight in basis points used by the WEIGHTED_BY_ROLE variant (e.g. SERVER 10000, BUSSER 5000)"
+        constraints: ">= 0"
+
+  - name: StaffShift
+    parent: Restaurant
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: staff_id
+        type: string
+        source: input
+        description: "FK -> StaffMember.id; whose shift this is"
+      - name: business_date
+        type: string
+        source: input
+        description: "the YYYY-MM-DD this shift is worked; bins the shift into a day's TipPool"
+      - name: clock_in_minute
+        type: integer
+        source: input
+        description: "shift start as minutes-after-midnight on business_date (closed-interval start, inclusive)"
+        constraints: "0 <= clock_in_minute < clock_out_minute"
+      - name: clock_out_minute
+        type: integer
+        source: input
+        description: "shift end as minutes-after-midnight (closed-interval end, inclusive); two shifts of the same staff that touch or overlap within min_rest_minutes are rejected"
+        constraints: "clock_in_minute < clock_out_minute <= 1440"
+      - name: hours_worked_x100
+        type: integer
+        source: computed
+        description: "(clock_out_minute - clock_in_minute) * 100 / 60, rounded half-up to an integer; the hours basis (x100) for tip distribution"
+
+  - name: TipPool
+    parent: Restaurant
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: business_date
+        type: string
+        source: input
+        description: "YYYY-MM-DD this pool accumulates tips for; unique per restaurant_id"
+        constraints: "unique per (restaurant_id, business_date)"
+      - name: distribution_mode
+        type: enum
+        source: input
+        description: "EVEN_BY_HOURS (proportional to hours_worked) or WEIGHTED_BY_ROLE (proportional to hours * tip_weight); selects the distribution variant"
+        constraints: "one of {EVEN_BY_HOURS, WEIGHTED_BY_ROLE}"
+        default: EVEN_BY_HOURS
+      - name: status
+        type: enum
+        source: computed
+        description: "ACCUMULATING while checks close into it; DISTRIBUTED once paid out to shifts (terminal)"
+        constraints: "one of {ACCUMULATING, DISTRIBUTED}"
+        default: ACCUMULATING
+      - name: pooled_cents
+        type: integer
+        source: computed
+        description: "running sum of tip_cents over CLOSED, non-VOID checks whose close fell on this business_date; the conserved quantity for the tip-pool invariant"
+      - name: distributed_cents
+        type: integer
+        source: computed
+        description: "sum of TipAllocation.amount_cents once distributed; MUST equal pooled_cents after distribution (no drift)"
+
+  - name: TipAllocation
+    parent: Restaurant
+    common_fields: false
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: tip_pool_id
+        type: string
+        source: input
+        description: "FK -> TipPool.id; the pool being distributed"
+      - name: staff_shift_id
+        type: string
+        source: input
+        description: "FK -> StaffShift.id; the shift this payout credits"
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "this shift's cut of pooled_cents under the pool's distribution_mode; remainder cents go to the largest-share shift (tie-break created_at ASC)"
+
+  - name: Payment
+    parent: Restaurant
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: check_id
+        type: string
+        source: input
+        description: "FK -> Check.id; the check being paid"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "principal paid toward total_due_cents (excludes tip)"
+        constraints: ">= 0"
+      - name: tip_cents
+        type: integer
+        source: input
+        description: "tip paid with this payment; flows to the day's TipPool when the check closes"
+        constraints: ">= 0"
+      - name: method
+        type: enum
+        source: input
+        description: "tender type"
+        constraints: "one of {CASH, CARD, GIFT}"
+      - name: status
+        type: enum
+        source: computed
+        description: "SETTLED on creation; VOIDED if reversed (removes its amount/tip from the check and pool)"
+        constraints: "one of {SETTLED, VOIDED}"
+        default: SETTLED
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: DiningTable
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: SEATED
+        trigger: "POST /seatings (create a seating on this table)"
+        actor: Host
+        preconditions:
+          - "DiningTable.occupancy_status == AVAILABLE  (cross-entity: Seating create is gated on table state — Seating↔DiningTable)"
+          - "no OPEN Seating references this table_id"
+        side_effects:
+          - "create Seating(status=OPEN, seated_at=current_utc, cleared_at=null)"
+          - "set DiningTable.occupancy_status = SEATED"
+          - "if seating was created from a WaitlistEntry, that entry is already PROMOTED; this confirms it SEATED"
+      - from: SEATED
+        to: DIRTY
+        trigger: "POST /seatings/{id}/clear (system side-effect of clearing the active seating)"
+        actor: system
+        preconditions:
+          - "the referenced Seating.status == OPEN"
+        side_effects:
+          - "set referenced Seating.status = CLEARED, Seating.cleared_at = current_utc"
+          - "set DiningTable.occupancy_status = DIRTY"
+        note: "depth-2 cascade clear→free (Seating→DiningTable); the DIRTY table is later bussed (separate trigger) which fires the depth-3 promote chain"
+      - from: DIRTY
+        to: AVAILABLE
+        trigger: "POST /tables/{id}/buss"
+        actor: Host
+        preconditions:
+          - "DiningTable.occupancy_status == DIRTY"
+        side_effects:
+          - "set DiningTable.occupancy_status = AVAILABLE"
+          - "auto-promote the head WaitlistEntry whose party_size <= capacity: select WAITING entries with party_size <= capacity, order by quoted_at ASC then created_at ASC, take the first; if one exists set it PROMOTED, create its Seating(status=OPEN) on this table, set DiningTable.occupancy_status=SEATED, set WaitlistEntry.seating_id and set the entry SEATED"
+          - "increments DiningTable.version by 1"
+        note: "depth-3 transitive cascade ORIGINATES HERE: buss frees the table (link 1, DiningTable DIRTY→AVAILABLE) → that freeing promotes the head WaitlistEntry WAITING→PROMOTED (link 2, caused by the table becoming free) → that promotion creates a Seating and drives WaitlistEntry PROMOTED→SEATED (link 3, caused by the promotion). The promotion is the OCC-guarded supersede point (see concurrency_rules table-buss-stale-promote)."
+
+  - entity: Seating
+    initial_state: OPEN
+    terminal_states: [CLEARED]
+    transitions:
+      - from: OPEN
+        to: CLEARED
+        trigger: "POST /seatings/{id}/clear"
+        actor: Host
+        preconditions:
+          - "Seating.status == OPEN"
+          - "every Check with this seating_id is CLOSED or VOID (cross-entity: Seating clear gated on Check state — Seating↔Check)"
+        side_effects:
+          - "set Seating.cleared_at = current_utc (closes the half-open occupation interval [seated_at, cleared_at))"
+          - "transition the owning DiningTable SEATED→DIRTY"
+        note: "depth-2 cascade clear→free (Seating→DiningTable); promotion happens on the later buss, not here"
+
+  - entity: WaitlistEntry
+    initial_state: WAITING
+    terminal_states: [SEATED, CANCELLED]
+    transitions:
+      - from: WAITING
+        to: PROMOTED
+        trigger: "system side-effect of POST /tables/{id}/buss promotion, or POST /seatings citing this entry"
+        actor: system
+        preconditions:
+          - "WaitlistEntry.status == WAITING"
+          - "an AVAILABLE DiningTable with capacity >= party_size exists (cross-entity: WaitlistEntry↔DiningTable)"
+        side_effects:
+          - "set WaitlistEntry.seating_id to the created Seating.id"
+      - from: PROMOTED
+        to: SEATED
+        trigger: "completion of the seating created during promotion"
+        actor: system
+        preconditions:
+          - "WaitlistEntry.status == PROMOTED"
+          - "the referenced Seating exists and is OPEN"
+        side_effects:
+          - "none beyond status change"
+      - from: WAITING
+        to: CANCELLED
+        trigger: "POST /waitlist/{id}/cancel"
+        actor: Host
+        preconditions:
+          - "WaitlistEntry.status == WAITING"
+        side_effects:
+          - "none"
+
+  - entity: Course
+    initial_state: BUILDING
+    terminal_states: [FIRED]
+    transitions:
+      - from: BUILDING
+        to: FIRED
+        trigger: "POST /courses/{id}/fire"
+        actor: Server
+        preconditions:
+          - "Course.status == BUILDING"
+          - "the owning Check.status == OPEN (cross-entity: Course fire gated on Check state)"
+          - "course has at least one PENDING OrderItem"
+          - "for every PENDING OrderItem: MenuItem.available_count >= quantity (else 86 violation)"
+        side_effects:
+          - "set Course.fired_at = current_utc, Course.status = FIRED"
+          - "for each PENDING OrderItem: snapshot unit_price_cents (happy-hour-aware at fired_at), set status=FIRED, decrement MenuItem.available_count by quantity, recompute is_86"
+          - "recompute owning Check.provisional_subtotal_cents (calculations.provisional_check_subtotal)"
+
+  - entity: OrderItem
+    initial_state: PENDING
+    terminal_states: [SERVED, VOIDED, COMPED]
+    transitions:
+      - from: PENDING
+        to: FIRED
+        trigger: "system side-effect of POST /courses/{id}/fire"
+        actor: system
+        preconditions:
+          - "OrderItem.status == PENDING"
+          - "MenuItem.available_count >= quantity"
+        side_effects:
+          - "snapshot unit_price_cents and line_subtotal_cents; decrement MenuItem.available_count"
+      - from: FIRED
+        to: SERVED
+        trigger: "POST /order-items/{id}/serve  (kitchen display marks the item done)"
+        actor: KitchenStaff
+        preconditions:
+          - "OrderItem.status == FIRED"
+        side_effects:
+          - "none beyond status change"
+        note: "branch A of the FIRED→{SERVED,VOIDED,COMPED} fork — no pricing/86 side-effects"
+      - from: FIRED
+        to: VOIDED
+        trigger: "POST /order-items/{id}/void"
+        actor: Manager
+        preconditions:
+          - "OrderItem.status == FIRED"
+          - "owning Check.status in {OPEN, PRESENTED}"
+        side_effects:
+          - "restore MenuItem.available_count by quantity, recompute is_86 (compensating: restores the 86-count conserved quantity)"
+          - "recompute owning Check.provisional_subtotal_cents (line drops out)"
+        note: "branch B of the fork — depth-2 transitive cascade void→restore-86; divergent side-effects from SERVED"
+      - from: SERVED
+        to: VOIDED
+        trigger: "POST /order-items/{id}/void"
+        actor: Manager
+        preconditions:
+          - "OrderItem.status == SERVED"
+          - "owning Check.status in {OPEN, PRESENTED}"
+        side_effects:
+          - "restore MenuItem.available_count by quantity, recompute is_86"
+          - "recompute owning Check.provisional_subtotal_cents"
+      - from: FIRED
+        to: COMPED
+        trigger: "POST /order-items/{id}/comp"
+        actor: Manager
+        preconditions:
+          - "OrderItem.status == FIRED"
+          - "owning Check.status in {OPEN, PRESENTED}"
+          - "the resulting Check.comp_total_cents <= comp_cap_bps of the pre-comp subtotal (business_fiscal cap)"
+        side_effects:
+          - "set comp_amount_cents = line_subtotal_cents; the portion WAS consumed so MenuItem.available_count is NOT restored (this is what distinguishes COMP from VOID)"
+          - "recompute owning Check.comp_total_cents and downstream auto_gratuity/tax/total (comp lowers the comped subtotal)"
+        note: "branch C of the fork — divergent side-effects: keeps the line on the check at gross (comp_total deducts it), leaves available_count decremented, unlike VOID which restores the count and drops the line"
+      - from: SERVED
+        to: COMPED
+        trigger: "POST /order-items/{id}/comp"
+        actor: Manager
+        preconditions:
+          - "OrderItem.status == SERVED"
+          - "owning Check.status in {OPEN, PRESENTED}"
+          - "the resulting Check.comp_total_cents <= comp_cap_bps of the pre-comp subtotal"
+        side_effects:
+          - "set comp_amount_cents = line_subtotal_cents; MenuItem.available_count is NOT restored (the portion was consumed)"
+          - "recompute owning Check.comp_total_cents and downstream totals"
+
+  - entity: Check
+    initial_state: OPEN
+    terminal_states: [CLOSED, VOID]
+    transitions:
+      - from: OPEN
+        to: PRESENTED
+        trigger: "POST /checks/{id}/present"
+        actor: Server
+        preconditions:
+          - "Check.status == OPEN"
+          - "no Course on this check is still BUILDING (all coursing fired)"
+        side_effects:
+          - "compute and lock final_subtotal_cents (calculations.final_check_subtotal)"
+          - "recompute comp_total_cents, auto_gratuity_cents, tax_cents, total_due_cents on the locked subtotal"
+      - from: PRESENTED
+        to: OPEN
+        trigger: "POST /checks/{id}/reopen"
+        actor: Server
+        preconditions:
+          - "Check.status == PRESENTED"
+          - "amount_paid_cents == 0 (no SETTLED payment yet)"
+        side_effects:
+          - "clear final_subtotal_cents back to null; the check is editable again"
+        note: "the cyclic edge OPEN ⇄ PRESENTED that makes Check a non-linear (cyclic) state machine"
+      - from: PRESENTED
+        to: CLOSED
+        trigger: "POST /checks/{id}/close"
+        actor: Server
+        preconditions:
+          - "Check.status == PRESENTED"
+          - "amount_paid_cents >= total_due_cents (fully tendered)"
+        side_effects:
+          - "set Check.status = CLOSED"
+          - "contribute Check.tip_cents to the TipPool for the close-day business_date (create the pool if absent); increment TipPool.pooled_cents (cascade)"
+          - "if every Check on the seating is now CLOSED or VOID, the seating becomes eligible for clear"
+      - from: OPEN
+        to: VOID
+        trigger: "POST /checks/{id}/void"
+        actor: Manager
+        preconditions:
+          - "Check.status == OPEN"
+          - "amount_paid_cents == 0"
+        side_effects:
+          - "set Check.status = VOID"
+          - "void every non-VOIDED OrderItem on the check: restore each MenuItem.available_count (compensating restore of the 86-count quantity)"
+      - from: PRESENTED
+        to: VOID
+        trigger: "POST /checks/{id}/void"
+        actor: Manager
+        preconditions:
+          - "Check.status == PRESENTED"
+          - "amount_paid_cents == 0"
+        side_effects:
+          - "set Check.status = VOID"
+          - "void every non-VOIDED OrderItem on the check: restore each MenuItem.available_count"
+
+  - entity: TipPool
+    initial_state: ACCUMULATING
+    terminal_states: [DISTRIBUTED]
+    transitions:
+      - from: ACCUMULATING
+        to: DISTRIBUTED
+        trigger: "POST /tip-pools/{id}/distribute"
+        actor: Manager
+        preconditions:
+          - "TipPool.status == ACCUMULATING"
+          - "at least one StaffShift exists for this restaurant_id and business_date"
+          - "pooled_cents > 0"
+        side_effects:
+          - "compute one TipAllocation per StaffShift on this business_date (calculations.tip_pool_distribution) under distribution_mode"
+          - "set distributed_cents = sum of TipAllocation.amount_cents (MUST equal pooled_cents — compensating/conservation invariant)"
+          - "set TipPool.status = DISTRIBUTED"
+
+  - entity: Payment
+    initial_state: SETTLED
+    terminal_states: [VOIDED]
+    transitions:
+      - from: SETTLED
+        to: VOIDED
+        trigger: "POST /payments/{id}/void"
+        actor: Manager
+        preconditions:
+          - "Payment.status == SETTLED"
+          - "owning Check.status in {OPEN, PRESENTED} (cannot void a payment on a CLOSED check)"
+        side_effects:
+          - "recompute owning Check.amount_paid_cents and tip_cents (this payment drops out)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: table-buss-stale-promote
+    parent_entity: DiningTable
+    write_endpoint: "POST /tables/{id}/buss"
+    occ_field: "expected_table_version"
+    description: |
+      Bussing a DiningTable promotes the head WaitlistEntry onto it, which is a
+      legitimate CREATE-with-supersede: the freed table is claimed for whichever
+      waiting party is at the head of the FIFO queue. A buss request that carries
+      a DiningTable.version older than the table's current version is rejected,
+      because the table's occupancy has already advanced (e.g. another buss
+      already promoted a party and re-seated it) since the client last read it,
+      so this client's intended promotion would be against a stale view of the
+      table. Resolved by OCC on DiningTable.version.
+    error_id: ERR_STALE_TABLE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: provisional_check_subtotal
+    trigger: "recomputed on POST /courses/{id}/fire, POST /order-items/{id}/void, POST /order-items/{id}/comp — i.e. on every line change while the check is OPEN"
+    algorithm: aggregation
+    formula: |
+      # PROVISIONAL variant — GROSS subtotal using each line's price snapshot taken at fire.
+      # Includes FIRED, SERVED and COMPED lines at their GROSS value (comp deduction is handled
+      # separately by comp_total in the auto_gratuity calc); only VOIDED lines are excluded.
+      # Round PER LINE, then sum (pinned rounding order — mode (b) of Rule 2).
+      provisional_subtotal_cents = 0
+      for oi in OrderItems(course.check_id == check.id) where oi.status in {FIRED, SERVED, COMPED}:
+          # unit_price_cents was snapshotted at fire: happy_hour_price_cents if fired_at in window else base
+          line = oi.quantity * oi.unit_price_cents
+          line += oi.quantity * sum(m.surcharge_cents for m in ItemModifiers(oi.id))
+          # each line is already an integer cent value — no sub-cent rounding needed at line level
+          provisional_subtotal_cents += line
+      # VOIDED lines (and PENDING/un-fired lines) are excluded; COMPED lines stay at gross
+    input_set: "OrderItems on the check whose status ∈ {FIRED, SERVED, COMPED} (COMPED at gross); VOIDED and PENDING excluded. Uses the unit_price_cents SNAPSHOT from fire time, not the live happy-hour state."
+    constants: {}
+    precision: "integer cents; round per line then sum"
+    variants:
+      - name: provisional
+        when: "live, while the check is OPEN; reflects the price each course was actually fired at"
+        difference: "uses the fire-time unit_price_cents snapshot per line"
+
+  - name: final_check_subtotal
+    trigger: "computed and locked on POST /checks/{id}/present; recomputed on close"
+    algorithm: chronological
+    formula: |
+      # FINAL variant — same lines, but re-derives each line's unit price by RE-EVALUATING
+      # the happy-hour windows against the course's fired_at at present-time, processing
+      # courses in fired_at ASC order (tie-break created_at ASC). This DIFFERS from provisional
+      # only when a window's pricing was misapplied at fire, OR (the benchmark hook) when the
+      # final pass re-derives prices and the provisional snapshot used a stale window.
+      # Round PER LINE, then sum (same pinned order as provisional).
+      final_subtotal_cents = 0
+      for course in Courses(check.id) where status == FIRED, ordered by (fired_at ASC, created_at ASC):
+          in_window = exists HappyHourWindow w (same restaurant) with
+              w.day_of_week == weekday(course.fired_at)
+              and w.start_minute <= minute_of_day(course.fired_at) < w.end_minute
+          for oi in OrderItems(course.id) where status in {FIRED, SERVED, COMPED}:   # COMPED at gross; VOIDED excluded
+              price = menu_item.happy_hour_price_cents if in_window else menu_item.base_price_cents
+              line = oi.quantity * price + oi.quantity * sum(m.surcharge_cents)
+              final_subtotal_cents += line
+    input_set: "Same FIRED/SERVED/COMPED gross lines as provisional (VOIDED excluded), but price re-derived live from HappyHourWindow at fired_at rather than the snapshot."
+    constants: {}
+    precision: "integer cents; round per line then sum (identical order to provisional)"
+    variants:
+      - name: final
+        when: "locked at present/close"
+        difference: "re-evaluates happy-hour windows at fired_at instead of trusting the per-line snapshot; the dual-variant divergence target"
+
+  - name: auto_gratuity
+    trigger: "recomputed whenever the comped subtotal changes (fire, void, comp) and locked at present/close"
+    algorithm: threshold
+    formula: |
+      # EVALUATION ORDER IS PINNED (mode (c), circular-looking dependency):
+      #   1. base_subtotal = provisional_subtotal_cents (or final at present)
+      #   2. comp_total = min(sum(COMPED line comp_amount_cents),
+      #                       floor(base_subtotal * comp_cap_bps / 10000))
+      #   3. comped_subtotal = base_subtotal - comp_total            # <-- gratuity keys off THIS
+      #   4. auto_gratuity = (party_size >= large_party_threshold)
+      #                        ? round_half_up(comped_subtotal * auto_gratuity_bps / 10000)
+      #                        : 0
+      #   5. tax = round_half_up(comped_subtotal * tax_rate_bps / 10000)
+      #   6. total_due = comped_subtotal + tax + auto_gratuity
+      # auto_gratuity depends on comped_subtotal which depends on comp_total which is capped
+      # against base_subtotal — the order above is the pinned resolution of that dependency.
+      pass
+    input_set: "Check.party_size vs Restaurant.large_party_threshold (inclusive >=); comped_subtotal as derived above."
+    constants:
+      ROUND: round_half_up
+    precision: "integer cents, round_half_up on each of tax and auto_gratuity independently"
+    variants:
+      - name: large_party
+        when: "party_size >= large_party_threshold"
+        difference: "auto_gratuity_bps applied; below threshold it is exactly 0"
+
+  - name: tip_pool_distribution
+    trigger: "POST /tip-pools/{id}/distribute"
+    algorithm: waterfall_allocation
+    formula: |
+      # Distribute pooled_cents across every StaffShift on the pool's business_date.
+      # weight per shift depends on distribution_mode:
+      #   EVEN_BY_HOURS:     weight_i = shift.hours_worked_x100
+      #   WEIGHTED_BY_ROLE:  weight_i = shift.hours_worked_x100 * staff.tip_weight_bps
+      # Each shift's raw share = pooled_cents * weight_i / sum(weight)  (real number).
+      # Floor each to an integer cent. The leftover remainder
+      #   remainder = pooled_cents - sum(floor_i)
+      # is allocated ONE CENT AT A TIME to shifts in descending raw fractional part,
+      # tie-break by created_at ASC (NEVER by id). This guarantees
+      #   sum(amount_cents) == pooled_cents  (conservation, no drift).
+      shifts = StaffShifts(restaurant_id, business_date) ordered by created_at ASC
+      weights = [weight(s) for s in shifts]
+      raw = [pooled_cents * w / sum(weights) for w in weights]
+      floors = [floor(r) for r in raw]
+      remainder = pooled_cents - sum(floors)
+      order = shifts sorted by (frac(raw) DESC, created_at ASC)
+      for k in range(remainder): floors[order[k]] += 1
+      amount_cents_i = floors[i]
+    input_set: "All StaffShift rows for (restaurant_id, business_date); pooled_cents from the TipPool."
+    constants: {}
+    precision: "integer cents; floor then distribute remainder by largest fractional part, tie-break created_at ASC"
+    variants:
+      - name: even_by_hours
+        when: "TipPool.distribution_mode == EVEN_BY_HOURS"
+        difference: "weight = hours_worked_x100 only"
+      - name: weighted_by_role
+        when: "TipPool.distribution_mode == WEIGHTED_BY_ROLE"
+        difference: "weight = hours_worked_x100 * staff.tip_weight_bps — produces a different per-shift split for identical hours"
+
+  - name: check_split_allocation
+    trigger: "POST /checks/{id}/split"
+    algorithm: waterfall_allocation
+    formula: |
+      # Split a PRESENTED-eligible check's total_due_cents across N new child checks evenly.
+      # base = floor(total_due_cents / n); remainder = total_due_cents - base*n
+      # remainder cents go to the FIRST `remainder` children in creation order (index ASC).
+      # Guarantees sum(child.total_due_cents) == parent.total_due_cents (conservation).
+      base = total_due_cents // n
+      rem  = total_due_cents - base * n
+      for i in range(n): child[i].assigned_due = base + (1 if i < rem else 0)
+    input_set: "parent Check.total_due_cents and the requested split count n."
+    constants: {}
+    precision: "integer cents; even split with first-n-children remainder"
+    variants:
+      - name: even_split
+        when: "always (only even split is supported)"
+        difference: "n/a"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /restaurants and POST /_clock/set_current_utc bootstrap"
+  - priority: 2
+    category: auth
+    check: "the role in X-User-Role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "every path/body-referenced resource exists, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all id-bearing endpoints"
+  - priority: 4
+    category: existence
+    check: "required body fields present and well-typed; enum values legal"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all"
+  - priority: 5
+    category: state
+    check: "target resource is in a state from which the requested transition is legal"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 6
+    category: state
+    check: "OCC: expected_table_version equals the live DiningTable.version on POST /tables/{id}/buss"
+    error_id: ERR_STALE_TABLE_VERSION
+    http_status: 412
+    applies_to: "POST /tables/{id}/buss"
+  - priority: 7
+    category: business_referential
+    check: "Seating.party_size <= referenced DiningTable.capacity; Check.seating_id references a seating whose table belongs to the same restaurant"
+    error_id: ERR_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /seatings"
+  - priority: 8
+    category: business_safety
+    check: "a course cannot fire any PENDING OrderItem whose MenuItem.available_count < quantity (86'd / insufficient count)"
+    error_id: ERR_ITEM_86
+    http_status: 409
+    applies_to: "POST /courses/{id}/fire"
+  - priority: 9
+    category: business_constraint
+    check: "a course must hold at least one PENDING OrderItem before it can fire"
+    error_id: ERR_EMPTY_COURSE
+    http_status: 409
+    applies_to: "POST /courses/{id}/fire"
+  - priority: 10
+    category: business_fiscal
+    check: "comping an item must not push Check.comp_total_cents above comp_cap_bps of the pre-comp subtotal"
+    error_id: ERR_COMP_CAP_EXCEEDED
+    http_status: 409
+    applies_to: "POST /order-items/{id}/comp"
+  - priority: 11
+    category: business_fiscal
+    check: "closing a check requires amount_paid_cents >= total_due_cents"
+    error_id: ERR_UNDERPAID
+    http_status: 409
+    applies_to: "POST /checks/{id}/close"
+  - priority: 12
+    category: business_temporal
+    check: "a new Seating's [seated_at, cleared_at) interval must not overlap any other OPEN/cleared interval on the same DiningTable (half-open, no buffer)"
+    error_id: ERR_TABLE_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /seatings"
+  - priority: 13
+    category: business_temporal
+    check: "a new StaffShift's [clock_in_minute, clock_out_minute] closed interval, expanded by min_rest_minutes on each side, must not overlap another shift of the same StaffMember on the same business_date"
+    error_id: ERR_SHIFT_OVERLAP
+    http_status: 409
+    applies_to: "POST /staff-shifts"
+  - priority: 14
+    category: business_constraint
+    check: "split count n must satisfy 2 <= n <= party_size on POST /checks/{id}/split"
+    error_id: ERR_INVALID_SPLIT
+    http_status: 422
+    applies_to: "POST /checks/{id}/split"
+  - priority: 15
+    category: business_constraint
+    check: "distributing a tip pool requires pooled_cents > 0 and at least one StaffShift on its business_date"
+    error_id: ERR_POOL_EMPTY
+    http_status: 409
+    applies_to: "POST /tip-pools/{id}/distribute"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- bootstrap / config ----
+  - method: POST
+    path: "/restaurants"
+    description: "create the restaurant (tenant root + pricing config)"
+    roles: [Manager]
+    code: 201
+    input: [name, tax_rate_bps, "large_party_threshold?", "auto_gratuity_bps?", "comp_cap_bps?", "min_rest_minutes?"]
+    output: Restaurant
+    side_effects: ["initializes current_utc to epoch until set via /_clock"]
+  - method: GET
+    path: "/restaurants/{id}"
+    description: "read a restaurant + its pricing config"
+    roles: [Manager, Server, Host, KitchenStaff]
+    code: 200
+    input: []
+    output: Restaurant
+    side_effects: []
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "test-driving: set the restaurant's current_utc; happy-hour and all timestamps read from it"
+    roles: [Manager]
+    code: 200
+    input: [restaurant_id, to_iso8601]
+    output: Restaurant
+    side_effects: ["sets Restaurant.current_utc"]
+
+  # ---- menu / 86 ----
+  - method: POST
+    path: "/menu-items"
+    description: "create a menu item with station routing, prices, and starting 86-count"
+    roles: [Manager]
+    code: 201
+    input: [restaurant_id, name, station, base_price_cents, happy_hour_price_cents, initial_available_count]
+    output: MenuItem
+    side_effects: ["available_count = initial_available_count; is_86 = (available_count == 0)"]
+  - method: GET
+    path: "/menu-items/{id}"
+    description: "read a menu item incl. live available_count and is_86"
+    roles: [Manager, Server, Host, KitchenStaff]
+    code: 200
+    input: []
+    output: MenuItem
+    side_effects: []
+  - method: GET
+    path: "/menu-items"
+    description: "list menu items, filterable by restaurant_id"
+    roles: [Manager, Server, Host, KitchenStaff]
+    code: 200
+    input: ["restaurant_id?", "limit?", "offset?"]
+    output: MenuItem[]
+    side_effects: []
+  - method: POST
+    path: "/happy-hour-windows"
+    description: "create a happy-hour window"
+    roles: [Manager]
+    code: 201
+    input: [restaurant_id, day_of_week, start_minute, end_minute]
+    output: HappyHourWindow
+    side_effects: []
+  - method: GET
+    path: "/happy-hour-windows/{id}"
+    description: "read a happy-hour window"
+    roles: [Manager, Server]
+    code: 200
+    input: []
+    output: HappyHourWindow
+    side_effects: []
+  - method: GET
+    path: "/happy-hour-windows"
+    description: "list happy-hour windows, filterable by restaurant_id"
+    roles: [Manager, Server]
+    code: 200
+    input: ["restaurant_id?", "limit?", "offset?"]
+    output: HappyHourWindow[]
+    side_effects: []
+
+  # ---- tables / waitlist / seatings ----
+  - method: POST
+    path: "/tables"
+    description: "create a dining table"
+    roles: [Manager]
+    code: 201
+    input: [restaurant_id, table_number, capacity]
+    output: DiningTable
+    side_effects: ["occupancy_status = AVAILABLE"]
+  - method: GET
+    path: "/tables/{id}"
+    description: "read a dining table incl. occupancy_status and version"
+    roles: [Manager, Server, Host]
+    code: 200
+    input: []
+    output: DiningTable
+    side_effects: []
+  - method: GET
+    path: "/tables"
+    description: "list dining tables, filterable by restaurant_id"
+    roles: [Manager, Server, Host]
+    code: 200
+    input: ["restaurant_id?", "limit?", "offset?"]
+    output: DiningTable[]
+    side_effects: []
+  - method: POST
+    path: "/tables/{id}/buss"
+    description: "buss a DIRTY table back to AVAILABLE; auto-promotes the head waitlist entry (OCC-guarded supersede)"
+    roles: [Host]
+    code: 200
+    input: [expected_table_version]
+    output: DiningTable
+    side_effects:
+      - "DIRTY→AVAILABLE; promote head WaitlistEntry if any (WAITING→PROMOTED, create Seating, table→SEATED)"
+      - "increments DiningTable.version by 1"
+  - method: POST
+    path: "/waitlist"
+    description: "add a party to the waitlist"
+    roles: [Host]
+    code: 201
+    input: [restaurant_id, party_name, party_size]
+    output: WaitlistEntry
+    side_effects: ["status=WAITING; quoted_at = current_utc"]
+  - method: GET
+    path: "/waitlist/{id}"
+    description: "read a waitlist entry"
+    roles: [Manager, Host]
+    code: 200
+    input: []
+    output: WaitlistEntry
+    side_effects: []
+  - method: GET
+    path: "/waitlist"
+    description: "list waitlist entries, filterable by restaurant_id, status, and seating_id (reverse-reachability for WaitlistEntry.seating_id)"
+    roles: [Manager, Host]
+    code: 200
+    input: ["restaurant_id?", "status?", "seating_id?", "limit?", "offset?"]
+    output: WaitlistEntry[]
+    side_effects: []
+  - method: POST
+    path: "/waitlist/{id}/cancel"
+    description: "cancel a WAITING entry"
+    roles: [Host]
+    code: 200
+    input: []
+    output: WaitlistEntry
+    side_effects: ["status=CANCELLED"]
+  - method: POST
+    path: "/seatings"
+    description: "seat a party at a table (walk-in, or citing a promoted waitlist entry)"
+    roles: [Host]
+    code: 201
+    input: [restaurant_id, table_id, party_size, "waitlist_entry_id?"]
+    output: Seating
+    side_effects:
+      - "table AVAILABLE→SEATED; status=OPEN; seated_at=current_utc"
+      - "if waitlist_entry_id given, that entry → SEATED"
+  - method: GET
+    path: "/seatings/{id}"
+    description: "read a seating incl. interval and status"
+    roles: [Manager, Server, Host]
+    code: 200
+    input: []
+    output: Seating
+    side_effects: []
+  - method: GET
+    path: "/seatings"
+    description: "list seatings, filterable by restaurant_id, table_id, waitlist_entry_id"
+    roles: [Manager, Server, Host]
+    code: 200
+    input: ["restaurant_id?", "table_id?", "waitlist_entry_id?", "limit?", "offset?"]
+    output: Seating[]
+    side_effects: []
+  - method: POST
+    path: "/seatings/{id}/clear"
+    description: "end a seating; frees the table to DIRTY (origin of the clear→free→promote cascade)"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Seating
+    side_effects:
+      - "Seating OPEN→CLEARED, cleared_at=current_utc"
+      - "owning DiningTable SEATED→DIRTY"
+
+  # ---- staff / shifts ----
+  - method: POST
+    path: "/staff-members"
+    description: "create a staff member"
+    roles: [Manager]
+    code: 201
+    input: [restaurant_id, name, role, tip_weight_bps]
+    output: StaffMember
+    side_effects: []
+  - method: GET
+    path: "/staff-members/{id}"
+    description: "read a staff member"
+    roles: [Manager, Server]
+    code: 200
+    input: []
+    output: StaffMember
+    side_effects: []
+  - method: GET
+    path: "/staff-members"
+    description: "list staff members, filterable by restaurant_id"
+    roles: [Manager]
+    code: 200
+    input: ["restaurant_id?", "limit?", "offset?"]
+    output: StaffMember[]
+    side_effects: []
+  - method: POST
+    path: "/staff-shifts"
+    description: "clock a staff member onto a shift (overlap/rest-buffer guarded)"
+    roles: [Manager]
+    code: 201
+    input: [restaurant_id, staff_id, business_date, clock_in_minute, clock_out_minute]
+    output: StaffShift
+    side_effects: ["hours_worked_x100 computed"]
+  - method: GET
+    path: "/staff-shifts/{id}"
+    description: "read a staff shift"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: StaffShift
+    side_effects: []
+  - method: GET
+    path: "/staff-shifts"
+    description: "list staff shifts, filterable by restaurant_id, staff_id, business_date"
+    roles: [Manager]
+    code: 200
+    input: ["restaurant_id?", "staff_id?", "business_date?", "limit?", "offset?"]
+    output: StaffShift[]
+    side_effects: []
+
+  # ---- checks / courses / items / modifiers ----
+  - method: POST
+    path: "/checks"
+    description: "open a check on a seating, owned by a server"
+    roles: [Server]
+    code: 201
+    input: [restaurant_id, seating_id, server_staff_id, party_size]
+    output: Check
+    side_effects: ["status=OPEN; subtotals 0"]
+  - method: GET
+    path: "/checks/{id}"
+    description: "read a check incl. all computed totals"
+    roles: [Manager, Server]
+    code: 200
+    input: []
+    output: Check
+    side_effects: []
+  - method: GET
+    path: "/checks"
+    description: "list checks, filterable by restaurant_id, seating_id, server_staff_id, status"
+    roles: [Manager, Server]
+    code: 200
+    input: ["restaurant_id?", "seating_id?", "server_staff_id?", "status?", "limit?", "offset?"]
+    output: Check[]
+    side_effects: []
+  - method: POST
+    path: "/checks/{id}/present"
+    description: "present the bill: lock final_subtotal_cents and downstream totals"
+    roles: [Server]
+    code: 200
+    input: []
+    output: Check
+    side_effects: ["OPEN→PRESENTED; compute final_subtotal/comp/gratuity/tax/total"]
+  - method: POST
+    path: "/checks/{id}/reopen"
+    description: "reopen a presented check for editing (cyclic edge)"
+    roles: [Server]
+    code: 200
+    input: []
+    output: Check
+    side_effects: ["PRESENTED→OPEN; final_subtotal_cents → null"]
+  - method: POST
+    path: "/checks/{id}/close"
+    description: "close a fully-tendered check; contributes its tip to the day's tip pool"
+    roles: [Server]
+    code: 200
+    input: []
+    output: Check
+    side_effects: ["PRESENTED→CLOSED; TipPool.pooled_cents += tip_cents (create pool if absent)"]
+  - method: POST
+    path: "/checks/{id}/void"
+    description: "void an entire unpaid check; restores 86-counts of all its items"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: Check
+    side_effects: ["→VOID; void all order items; restore MenuItem.available_count"]
+  - method: POST
+    path: "/checks/{id}/split"
+    description: "split a check's total_due_cents evenly into n child checks"
+    roles: [Server]
+    code: 201
+    input: [n]
+    output: Check[]
+    side_effects: ["create n child checks summing to parent.total_due_cents"]
+  - method: POST
+    path: "/courses"
+    description: "create a coursing slot on a check"
+    roles: [Server]
+    code: 201
+    input: [restaurant_id, check_id, course_number]
+    output: Course
+    side_effects: ["status=BUILDING"]
+  - method: GET
+    path: "/courses/{id}"
+    description: "read a course"
+    roles: [Manager, Server, KitchenStaff]
+    code: 200
+    input: []
+    output: Course
+    side_effects: []
+  - method: GET
+    path: "/courses"
+    description: "list courses, filterable by restaurant_id and check_id"
+    roles: [Manager, Server, KitchenStaff]
+    code: 200
+    input: ["restaurant_id?", "check_id?", "limit?", "offset?"]
+    output: Course[]
+    side_effects: []
+  - method: POST
+    path: "/courses/{id}/fire"
+    description: "fire a course to the kitchen display; snapshots prices, decrements 86-counts"
+    roles: [Server]
+    code: 200
+    input: []
+    output: Course
+    side_effects: ["BUILDING→FIRED; items PENDING→FIRED; decrement available_count; recompute provisional_subtotal"]
+  - method: POST
+    path: "/order-items"
+    description: "add an item line to a BUILDING course"
+    roles: [Server]
+    code: 201
+    input: [restaurant_id, course_id, menu_item_id, quantity]
+    output: OrderItem
+    side_effects: ["status=PENDING"]
+  - method: GET
+    path: "/order-items/{id}"
+    description: "read an order item incl. price snapshot and comp amount"
+    roles: [Manager, Server, KitchenStaff]
+    code: 200
+    input: []
+    output: OrderItem
+    side_effects: []
+  - method: GET
+    path: "/order-items"
+    description: "list order items, filterable by restaurant_id, course_id, menu_item_id, status (KDS routing reads station via menu_item_id join)"
+    roles: [Manager, Server, KitchenStaff]
+    code: 200
+    input: ["restaurant_id?", "course_id?", "menu_item_id?", "status?", "limit?", "offset?"]
+    output: OrderItem[]
+    side_effects: []
+  - method: POST
+    path: "/order-items/{id}/serve"
+    description: "kitchen display marks a fired item served"
+    roles: [KitchenStaff]
+    code: 200
+    input: []
+    output: OrderItem
+    side_effects: ["FIRED→SERVED"]
+  - method: POST
+    path: "/order-items/{id}/void"
+    description: "void an item; restores its 86-count and drops it from the subtotal"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: OrderItem
+    side_effects: ["→VOIDED; restore available_count; recompute provisional_subtotal"]
+  - method: POST
+    path: "/order-items/{id}/comp"
+    description: "comp an item (0-charge goodwill); restores 86-count, lowers comped subtotal"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: OrderItem
+    side_effects: ["→COMPED; comp_amount_cents=line_subtotal_cents; restore available_count; recompute comp_total/totals"]
+  - method: POST
+    path: "/item-modifiers"
+    description: "attach a modifier to a PENDING order item"
+    roles: [Server]
+    code: 201
+    input: [restaurant_id, order_item_id, name, surcharge_cents]
+    output: ItemModifier
+    side_effects: []
+  - method: GET
+    path: "/item-modifiers/{id}"
+    description: "read a single item modifier"
+    roles: [Manager, Server, KitchenStaff]
+    code: 200
+    input: []
+    output: ItemModifier
+    side_effects: []
+  - method: GET
+    path: "/item-modifiers"
+    description: "list modifiers, filterable by restaurant_id and order_item_id"
+    roles: [Manager, Server, KitchenStaff]
+    code: 200
+    input: ["restaurant_id?", "order_item_id?", "limit?", "offset?"]
+    output: ItemModifier[]
+    side_effects: []
+
+  # ---- payments ----
+  - method: POST
+    path: "/payments"
+    description: "tender a payment toward a check's total_due"
+    roles: [Server]
+    code: 201
+    input: [restaurant_id, check_id, amount_cents, tip_cents, method]
+    output: Payment
+    side_effects: ["status=SETTLED; recompute Check.amount_paid_cents and tip_cents"]
+  - method: GET
+    path: "/payments/{id}"
+    description: "read a payment"
+    roles: [Manager, Server]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+  - method: GET
+    path: "/payments"
+    description: "list payments, filterable by restaurant_id and check_id"
+    roles: [Manager, Server]
+    code: 200
+    input: ["restaurant_id?", "check_id?", "limit?", "offset?"]
+    output: Payment[]
+    side_effects: []
+  - method: POST
+    path: "/payments/{id}/void"
+    description: "void a settled payment on a non-closed check"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: ["SETTLED→VOIDED; recompute Check.amount_paid_cents and tip_cents"]
+
+  # ---- tip pools / allocations ----
+  - method: POST
+    path: "/tip-pools"
+    description: "create a tip pool for a business_date with a distribution mode"
+    roles: [Manager]
+    code: 201
+    input: [restaurant_id, business_date, "distribution_mode?"]
+    output: TipPool
+    side_effects: ["status=ACCUMULATING; pooled_cents=0"]
+  - method: GET
+    path: "/tip-pools/{id}"
+    description: "read a tip pool incl. pooled_cents and distributed_cents"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: TipPool
+    side_effects: []
+  - method: GET
+    path: "/tip-pools"
+    description: "list tip pools, filterable by restaurant_id and business_date"
+    roles: [Manager]
+    code: 200
+    input: ["restaurant_id?", "business_date?", "limit?", "offset?"]
+    output: TipPool[]
+    side_effects: []
+  - method: POST
+    path: "/tip-pools/{id}/distribute"
+    description: "distribute a pool across the day's staff shifts"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: TipPool
+    side_effects: ["create TipAllocation per shift; distributed_cents=sum==pooled_cents; status=DISTRIBUTED"]
+  - method: GET
+    path: "/tip-allocations/{id}"
+    description: "read a single tip allocation"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: TipAllocation
+    side_effects: []
+  - method: GET
+    path: "/tip-allocations"
+    description: "list tip allocations, filterable by restaurant_id, tip_pool_id, staff_shift_id"
+    roles: [Manager]
+    code: 200
+    input: ["restaurant_id?", "tip_pool_id?", "staff_shift_id?", "limit?", "offset?"]
+    output: TipAllocation[]
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/blank X-User-Role or X-User-ID on a protected endpoint"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "role not permitted for the operation per §1.7 (e.g. Server attempting a comp)"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced resource id does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "missing required field, bad type, or illegal enum value"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "transition not legal from the resource's current state (e.g. fire an already-FIRED course, close an OPEN check, reopen after payment)"
+  - id: ERR_STALE_TABLE_VERSION
+    http: 412
+    condition: "expected_table_version != live DiningTable.version on buss (OCC supersede conflict)"
+  - id: ERR_CAPACITY_EXCEEDED
+    http: 409
+    condition: "Seating.party_size > DiningTable.capacity"
+  - id: ERR_ITEM_86
+    http: 409
+    condition: "firing a course whose PENDING item needs more portions than MenuItem.available_count (86'd / insufficient)"
+  - id: ERR_EMPTY_COURSE
+    http: 409
+    condition: "firing a course with no PENDING order items"
+  - id: ERR_COMP_CAP_EXCEEDED
+    http: 409
+    condition: "a comp would push Check.comp_total_cents above comp_cap_bps of the pre-comp subtotal"
+  - id: ERR_UNDERPAID
+    http: 409
+    condition: "closing a check whose amount_paid_cents < total_due_cents"
+  - id: ERR_TABLE_DOUBLE_BOOKED
+    http: 409
+    condition: "a new seating's [seated_at, cleared_at) interval overlaps an existing interval on the same table"
+  - id: ERR_SHIFT_OVERLAP
+    http: 409
+    condition: "a new staff shift's closed interval (expanded by min_rest_minutes) overlaps another shift of the same staff on the same business_date"
+  - id: ERR_INVALID_SPLIT
+    http: 422
+    condition: "split count n outside 2..party_size"
+  - id: ERR_POOL_EMPTY
+    http: 409
+    condition: "distributing a tip pool whose pooled_cents == 0, or that has no staff shifts on its business_date"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Manager
+    description: "back-of-house authority: menu/schedule/table/staff config, comps, voids, payment voids, tip-pool distribution"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /restaurants"
+      - "POST /menu-items"
+      - "POST /happy-hour-windows"
+      - "POST /tables"
+      - "POST /staff-members"
+      - "POST /staff-shifts"
+      - "POST /order-items/{id}/void"
+      - "POST /order-items/{id}/comp"
+      - "POST /checks/{id}/void"
+      - "POST /payments/{id}/void"
+      - "POST /tip-pools"
+      - "POST /tip-pools/{id}/distribute"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "GET (all read endpoints)"
+  - name: Server
+    description: "owns orders for their own seatings: courses, items, modifiers, firing, present/reopen/close/split, payments"
+    identity: "entity_backed:StaffMember"
+    exclusive_operations:
+      - "POST /checks"
+      - "POST /courses"
+      - "POST /courses/{id}/fire"
+      - "POST /order-items"
+      - "POST /item-modifiers"
+      - "POST /checks/{id}/present"
+      - "POST /checks/{id}/reopen"
+      - "POST /checks/{id}/close"
+      - "POST /checks/{id}/split"
+      - "POST /payments"
+    shared_operations:
+      - "GET menu-items, happy-hour-windows, tables, seatings, checks, courses, order-items, item-modifiers, payments, staff-members"
+  - name: Host
+    description: "front-of-house: waitlist, seating, clearing, bussing"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /waitlist"
+      - "POST /waitlist/{id}/cancel"
+      - "POST /seatings"
+      - "POST /seatings/{id}/clear"
+      - "POST /tables/{id}/buss"
+    shared_operations:
+      - "GET tables, seatings, waitlist, menu-items"
+  - name: KitchenStaff
+    description: "kitchen display: marks fired items served; reads the order/course/item stream routed by station"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /order-items/{id}/serve"
+    shared_operations:
+      - "GET menu-items, courses, order-items, item-modifiers"

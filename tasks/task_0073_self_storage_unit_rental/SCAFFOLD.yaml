@@ -1,0 +1,1247 @@
+# =============================================================================
+# Self-Storage Unit Rental (Public Storage style) — seed tables
+# Difficulty band: Expert (§0.4)
+# =============================================================================
+
+scenario: |
+  73. Self-Storage Unit Rental (Public Storage style): unit sizing, automatic
+  billing, late fees, Auction legal process (>90 days default), insurance
+  integration, transfer relocation, Climate-Controlled tier
+
+domain_name: self-storage-unit-rental
+api_prefix: ""
+
+# -----------------------------------------------------------------------------
+# Complexity Profile (§0.3)
+# -----------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: compliance_audit          # lien/auction legal process with mandatory >90-day default window
+  secondary_archetype: pricing_engine          # tiered rent, climate premium, proration, late fees, surplus waterfall
+  complexity_layers:
+    - optimistic_concurrency                   # OCC on Lease.version for CREATE-with-supersede (transfer, auction)
+    - cascading_side_effects                   # auction-sale and payment-cure cascades span Lease/Unit/Insurance/Auction
+    - dual_variant_calculation                 # ledger-replay vs denormalized balance; lien-date vs today redemption amount
+    - rate_threshold_triggers                  # >=90-day default, >=grace-day late fee
+    - derived_field_reconciliation             # Lease.balance_cents vs LedgerEntry replay; Facility.occupied_unit_count
+
+  entity_topology: flat                        # peer entities linked by FK; no nested URL ownership chains
+  state_machine_shape: branching               # Lease cure/delinquency cycle + Auction fork-join (SOLD/REDEEMED/CANCELLED)
+
+  relationship_patterns:
+    - one_to_many                              # Facility->Unit, Lease->Invoice, Lease->LedgerEntry
+    - cross_aggregate                          # Lease references Unit + Tenant across collections; AuctionProceeding gates on Lease
+
+  role_model: peer_roles                       # Tenant (entity-backed) vs FacilityManager / LienAdministrator (opaque operators)
+  consistency_model: immediate
+
+# -----------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# -----------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Facility
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Facility display name" }
+      - { name: state_code, type: string, source: input, description: "Two-letter US state code; governs lien default window and notice rules" }
+      - { name: climate_premium_pct, type: number, source: input, description: "Surcharge fraction applied to base rent for climate-controlled units, e.g. 0.20 = +20%", default: 0.20, constraints: ">= 0 and <= 1" }
+      - { name: lien_default_days, type: integer, source: input, description: "Days a lease must be past-due before it is auction-eligible (the >90-day default)", default: 90, constraints: ">= 1" }
+      - { name: late_fee_grace_days, type: integer, source: input, description: "Days past due before a late fee is assessed on an OVERDUE invoice", default: 5, constraints: ">= 0" }
+      - { name: late_fee_cents, type: integer, source: input, description: "Flat late fee charged once per invoice when it crosses the grace boundary", default: 2000, constraints: ">= 0" }
+      - { name: occupied_unit_count, type: integer, source: computed, description: "Count of Units belonging to this Facility whose status == OCCUPIED; recomputed on every Unit status change" }
+      # common_fields adds: id, created_at, updated_at, version
+
+  - name: Unit
+    parent: null
+    common_fields: true
+    fields:
+      - { name: facility_id, type: string, source: input, description: "FK -> Facility.id; the facility that owns this physical unit" }
+      - { name: unit_number, type: string, source: input, description: "Human label unique within a facility, e.g. 'B-114'" }
+      - { name: size_class, type: enum, source: input, description: "Unit footprint tier", constraints: "one of {SIZE_5X5, SIZE_10X10, SIZE_10X20}" }
+      - { name: climate_controlled, type: boolean, source: input, description: "True when this unit is in the Climate-Controlled tier", default: false }
+      - { name: monthly_rate_cents, type: integer, source: input, description: "Base monthly street rate in cents before climate premium and insurance", constraints: "> 0" }
+      - { name: status, type: enum, source: system, description: "Lifecycle of physical occupancy", constraints: "one of {AVAILABLE, OCCUPIED, VACATING}" }
+      - { name: current_lease_id, type: string, source: computed, description: "FK -> Lease.id; id of the Lease currently occupying this unit, or null when AVAILABLE" }
+      # common_fields adds: id, created_at, updated_at, version
+
+  - name: Tenant
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Tenant login/contact email; unique across tenants" }
+      - { name: full_name, type: string, source: input, description: "Tenant full legal name" }
+      - { name: state_code, type: string, source: input, description: "Tenant's state of residence" }
+      - { name: phone, type: string, source: input, description: "Contact phone", default: null }
+      # common_fields adds: id, created_at, updated_at, version
+
+  - name: Lease
+    parent: null
+    common_fields: true
+    fields:
+      - { name: facility_id, type: string, source: input, description: "FK -> Facility.id; denormalized from the leased Unit for fast facility-scoped queries" }
+      - { name: unit_id, type: string, source: input, description: "FK -> Unit.id; the unit this lease occupies (current unit after any transfer)" }
+      - { name: tenant_id, type: string, source: input, description: "FK -> Tenant.id; the renter" }
+      - { name: status, type: enum, source: system, description: "Lease lifecycle", constraints: "one of {PENDING, ACTIVE, DELINQUENT, PRE_LIEN, LIEN, AUCTION_SCHEDULED, AUCTIONED, TRANSFERRED, CLOSED}" }
+      - { name: start_date, type: datetime, source: input, description: "Lease occupancy start (move-in); ISO 8601 UTC. Drives first-month proration." }
+      - { name: end_date, type: datetime, source: system, description: "Occupancy end (move-out/auction/transfer close); null while occupying", default: null }
+      - { name: billing_day, type: integer, source: input, description: "Day-of-month (1-28) on which a monthly Invoice is generated", constraints: ">= 1 and <= 28" }
+      - { name: monthly_rate_cents, type: integer, source: system, description: "Base rent snapshotted from the Unit at activation; survives later Unit rate edits" }
+      - { name: climate_controlled, type: boolean, source: system, description: "Snapshot of the unit's climate flag at activation" }
+      - { name: insurance_required, type: boolean, source: input, description: "When true the lease must carry an ACTIVE InsurancePolicy to activate", default: true }
+      - { name: balance_cents, type: integer, source: computed, description: "Denormalized outstanding balance; running total maintained incrementally on each charge/payment/late-fee/credit. May be reconciled against the LedgerEntry replay." }
+      - { name: days_past_due, type: integer, source: computed, description: "Whole days between the current clock and the due_date of the oldest OPEN/PARTIAL/OVERDUE Invoice; 0 when none past due. Recomputed on every billing cycle." }
+      # common_fields adds: id, created_at, updated_at, version
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - { name: lease_id, type: string, source: input, description: "FK -> Lease.id; the lease this charge bills" }
+      - { name: period_start, type: datetime, source: system, description: "Inclusive start of the billing period" }
+      - { name: period_end, type: datetime, source: system, description: "Exclusive end of the billing period (half-open [period_start, period_end))" }
+      - { name: due_date, type: datetime, source: system, description: "Date payment is due; days_past_due measures the clock against this" }
+      - { name: base_amount_cents, type: integer, source: computed, description: "Base rent component for the period (prorated for the first period)" }
+      - { name: climate_amount_cents, type: integer, source: computed, description: "Climate premium component, 0 when the lease is not climate-controlled" }
+      - { name: insurance_amount_cents, type: integer, source: computed, description: "Insurance premium component snapshotted from the ACTIVE InsurancePolicy, 0 when none" }
+      - { name: late_fee_cents, type: integer, source: computed, description: "Flat late fee added once when the invoice crosses the grace boundary", default: 0 }
+      - { name: total_amount_cents, type: integer, source: computed, description: "base + climate + insurance + late_fee for this invoice" }
+      - { name: amount_paid_cents, type: integer, source: computed, description: "Cumulative payment applied to this invoice via waterfall allocation", default: 0 }
+      - { name: status, type: enum, source: system, description: "Invoice lifecycle", constraints: "one of {OPEN, PARTIAL, OVERDUE, PAID, WAIVED}" }
+      # common_fields adds: id, created_at, updated_at, version
+
+  - name: Payment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: lease_id, type: string, source: input, description: "FK -> Lease.id; the lease whose invoices this payment settles" }
+      - { name: amount_cents, type: integer, source: input, description: "Gross payment amount in cents", constraints: "> 0" }
+      - { name: status, type: enum, source: system, description: "APPLIED after allocation; REVERSED after a compensating reversal", constraints: "one of {APPLIED, REVERSED}" }
+      - { name: allocation, type: array, source: computed, description: "Ordered list of {invoice_id, applied_cents} produced by oldest-due-date-first waterfall allocation" }
+      - { name: overpay_credit_cents, type: integer, source: computed, description: "Portion of amount_cents left unallocated after all open invoices are covered; recorded as an account credit", default: 0 }
+      # common_fields adds: id, created_at, updated_at, version
+
+  - name: LedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - { name: lease_id, type: string, source: input, description: "FK -> Lease.id; the lease this immutable ledger line belongs to" }
+      - { name: entry_type, type: enum, source: system, description: "Kind of money movement", constraints: "one of {CHARGE, LATE_FEE, PAYMENT, CREDIT, REVERSAL, AUCTION_SETTLEMENT}" }
+      - { name: amount_cents, type: integer, source: system, description: "Signed amount: CHARGE/LATE_FEE are positive (increase balance), PAYMENT/CREDIT/AUCTION_SETTLEMENT are negative, REVERSAL re-adds a prior PAYMENT" }
+      - { name: source_type, type: enum, source: system, description: "Originating entity type", constraints: "one of {INVOICE, PAYMENT, AUCTION, MANUAL}" }
+      - { name: source_id, type: string, source: system, description: "Id of the originating Invoice/Payment/AuctionProceeding" }
+      # common_fields: false -> adds only id, created_at
+
+  - name: InsurancePolicy
+    parent: null
+    common_fields: true
+    fields:
+      - { name: lease_id, type: string, source: input, description: "FK -> Lease.id; the lease this policy protects" }
+      - { name: coverage_tier, type: enum, source: input, description: "Insurance tier", constraints: "one of {BASIC, STANDARD, PREMIUM}" }
+      - { name: coverage_limit_cents, type: integer, source: computed, description: "Maximum payout, derived from coverage_tier" }
+      - { name: monthly_premium_cents, type: integer, source: computed, description: "Monthly premium derived from coverage_tier; folded into each Invoice while ACTIVE" }
+      - { name: coverage_start, type: datetime, source: input, description: "Inclusive coverage start" }
+      - { name: coverage_end, type: datetime, source: system, description: "Exclusive coverage end (half-open [coverage_start, coverage_end)); null while ACTIVE", default: null }
+      - { name: status, type: enum, source: system, description: "Policy lifecycle", constraints: "one of {ACTIVE, LAPSED, CANCELLED}" }
+      # common_fields adds: id, created_at, updated_at, version
+
+  - name: AuctionProceeding
+    parent: null
+    common_fields: true
+    fields:
+      - { name: lease_id, type: string, source: input, description: "FK -> Lease.id; the delinquent lease being foreclosed" }
+      - { name: status, type: enum, source: system, description: "Lien/auction lifecycle", constraints: "one of {NOTICE_SENT, LIEN_FILED, SCHEDULED, SOLD, REDEEMED, CANCELLED}" }
+      - { name: notice_sent_date, type: datetime, source: system, description: "When the pre-lien notice was issued (clock at creation)" }
+      - { name: lien_filed_date, type: datetime, source: system, description: "When the lien was filed; null until LIEN_FILED", default: null }
+      - { name: scheduled_sale_date, type: datetime, source: input, description: "Date of the scheduled public sale; null until SCHEDULED", default: null }
+      - { name: redemption_amount_cents, type: integer, source: computed, description: "Amount the tenant must pay to redeem and cancel the auction; variant chooses lien-date snapshot vs today's accruing total" }
+      - { name: sale_proceeds_cents, type: integer, source: input, description: "Gross winning bid recorded at SOLD; null until sold", default: null }
+      - { name: surplus_cents, type: integer, source: computed, description: "Proceeds left for the tenant after the distribution waterfall; null until sold" }
+      # common_fields adds: id, created_at, updated_at, version
+
+  - name: TransferOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: lease_id, type: string, source: input, description: "FK -> Lease.id; the lease being relocated" }
+      - { name: from_unit_id, type: string, source: input, description: "FK -> Unit.id; unit being vacated (the lease's current unit)" }
+      - { name: to_unit_id, type: string, source: input, description: "FK -> Unit.id; destination unit, which must be AVAILABLE" }
+      - { name: status, type: enum, source: system, description: "Transfer lifecycle", constraints: "one of {REQUESTED, COMPLETED, CANCELLED}" }
+      - { name: prorated_adjustment_cents, type: integer, source: computed, description: "Signed rent adjustment applied to the lease balance when the destination rate differs from the source rate for the remainder of the current period" }
+      # common_fields adds: id, created_at, updated_at, version
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Unit
+    field: status
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: OCCUPIED
+        trigger: "POST /leases/{lease_id}/activate (lease activation binds this unit)"
+        actor: FacilityManager
+        preconditions:
+          - "Unit.status == AVAILABLE"
+        side_effects:
+          - "Unit.current_lease_id := the activating lease id"
+          - "Facility.occupied_unit_count += 1 (recompute occupied_unit_count for the unit's facility)"
+      - from: OCCUPIED
+        to: VACATING
+        trigger: "POST /transfer-orders/{transfer_order_id}/complete (source unit) OR system on auction SOLD"
+        actor: "FacilityManager or system"
+        preconditions:
+          - "Unit.status == OCCUPIED"
+        side_effects:
+          - "Unit marked VACATING transiently during relocation/auction cleanup"
+      - from: VACATING
+        to: AVAILABLE
+        trigger: "system (final step of transfer-complete or auction-sold cleanup)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Unit.current_lease_id := null"
+          - "Facility.occupied_unit_count recomputed for the unit's facility"
+      - from: OCCUPIED
+        to: AVAILABLE
+        trigger: "system (auction SOLD cleanup when no transient VACATING step is used)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Unit.current_lease_id := null"
+          - "Facility.occupied_unit_count recomputed for the unit's facility"
+
+  - entity: Lease
+    field: status
+    initial_state: PENDING
+    terminal_states: [AUCTIONED, TRANSFERRED, CLOSED]
+    note: "Cyclic delinquency: ACTIVE<->DELINQUENT and DELINQUENT/PRE_LIEN cure back to ACTIVE on full payment."
+    transitions:
+      - from: PENDING
+        to: ACTIVE
+        trigger: "POST /leases/{lease_id}/activate"
+        actor: FacilityManager
+        preconditions:
+          - "Lease.status == PENDING"
+          - "Unit.status == AVAILABLE (cross-entity: the leased Unit must be free)"
+          - "If Lease.insurance_required == true, an InsurancePolicy with status==ACTIVE exists for this lease"
+        side_effects:
+          - "Unit -> OCCUPIED; Unit.current_lease_id := lease id"
+          - "Lease.monthly_rate_cents := Unit.monthly_rate_cents; Lease.climate_controlled := Unit.climate_controlled (snapshot)"
+          - "First Invoice generated with prorated base for [start_date, next billing_day)"
+          - "LedgerEntry CHARGE appended for the first invoice total; Lease.balance_cents += first invoice total"
+      - from: ACTIVE
+        to: DELINQUENT
+        trigger: "POST /facilities/{facility_id}/billing-cycles (an invoice passes the grace boundary)"
+        actor: system
+        preconditions:
+          - "Lease.status == ACTIVE"
+          - "An Invoice on this lease has days_past_due >= Facility.late_fee_grace_days"
+        side_effects:
+          - "Invoice -> OVERDUE; one late_fee_cents added to that invoice; LedgerEntry LATE_FEE appended; Lease.balance_cents += late fee"
+      - from: DELINQUENT
+        to: PRE_LIEN
+        trigger: "POST /facilities/{facility_id}/billing-cycles (days_past_due crosses into pre-lien window)"
+        actor: system
+        preconditions:
+          - "Lease.status == DELINQUENT"
+          - "Lease.days_past_due >= 30 and < Facility.lien_default_days"
+        side_effects: []
+      - from: [DELINQUENT, PRE_LIEN]
+        to: ACTIVE
+        trigger: "POST /payments (full payment clears all OPEN/PARTIAL/OVERDUE invoices)"
+        actor: Tenant
+        preconditions:
+          - "Lease.status in {DELINQUENT, PRE_LIEN}"
+          - "After this payment is allocated, Lease.balance_cents == 0"
+        side_effects:
+          - "All overdue invoices -> PAID; days_past_due := 0 (cure)"
+          - "If an AuctionProceeding for this lease is in {NOTICE_SENT, LIEN_FILED}, it -> CANCELLED (cascade)"
+      - from: PRE_LIEN
+        to: LIEN
+        trigger: "POST /auction-proceedings (lien administrator opens proceeding)"
+        actor: LienAdministrator
+        preconditions:
+          - "Lease.status == PRE_LIEN"
+          - "Lease.days_past_due >= Facility.lien_default_days (the >=90-day default; boundary check)"
+        side_effects:
+          - "AuctionProceeding created in NOTICE_SENT; Lease -> LIEN"
+      - from: LIEN
+        to: AUCTION_SCHEDULED
+        trigger: "POST /auction-proceedings/{auction_id}/schedule"
+        actor: LienAdministrator
+        preconditions:
+          - "Lease.status == LIEN"
+          - "AuctionProceeding.status == LIEN_FILED"
+          - "scheduled_sale_date >= AuctionProceeding.lien_filed_date + 14 days (cooling-off window; temporal)"
+        side_effects:
+          - "AuctionProceeding -> SCHEDULED"
+      - from: [LIEN, AUCTION_SCHEDULED]
+        to: ACTIVE
+        trigger: "POST /auction-proceedings/{auction_id}/redeem"
+        actor: Tenant
+        preconditions:
+          - "Lease.status in {LIEN, AUCTION_SCHEDULED}"
+          - "Payment covering redemption_amount_cents has been applied so Lease.balance_cents == 0"
+        side_effects:
+          - "AuctionProceeding -> REDEEMED; Lease -> ACTIVE; days_past_due := 0"
+      - from: AUCTION_SCHEDULED
+        to: AUCTIONED
+        trigger: "POST /auction-proceedings/{auction_id}/complete-sale"
+        actor: LienAdministrator
+        preconditions:
+          - "Lease.status == AUCTION_SCHEDULED"
+          - "AuctionProceeding.status == SCHEDULED"
+        side_effects:
+          - "AuctionProceeding -> SOLD; surplus distribution waterfall runs"
+          - "LedgerEntry AUCTION_SETTLEMENT appended; Lease.balance_cents := 0 (settled)"
+          - "Lease -> AUCTIONED; Lease.end_date := clock"
+          - "Unit -> AVAILABLE; Unit.current_lease_id := null; Facility.occupied_unit_count recomputed"
+          - "Any ACTIVE InsurancePolicy on the lease -> CANCELLED; coverage_end := clock"
+      - from: ACTIVE
+        to: TRANSFERRED
+        trigger: "POST /transfer-orders/{transfer_order_id}/complete"
+        actor: FacilityManager
+        preconditions:
+          - "Lease.status == ACTIVE"
+          - "TransferOrder.status == REQUESTED"
+          - "TransferOrder.to_unit_id Unit.status == AVAILABLE (cross-entity)"
+        side_effects:
+          - "Old Unit -> AVAILABLE (current_lease_id := null); new Unit -> OCCUPIED (current_lease_id := lease id)"
+          - "Lease.unit_id := to_unit_id; Lease.monthly_rate_cents := new unit rate; Lease.climate_controlled := new unit flag"
+          - "prorated_adjustment_cents applied: LedgerEntry CHARGE or CREDIT; Lease.balance_cents adjusted"
+          - "Lease status returns to ACTIVE after the relocation completes (TRANSFERRED is the transient transfer marker; see note)"
+        note: "TRANSFERRED is recorded on the TransferOrder lifecycle; the Lease itself stays ACTIVE bound to the new unit. occupied_unit_count is invariant across the move."
+      - from: [ACTIVE, DELINQUENT]
+        to: CLOSED
+        trigger: "POST /leases/{lease_id}/close"
+        actor: FacilityManager
+        preconditions:
+          - "Lease.status in {ACTIVE, DELINQUENT}"
+          - "Lease.balance_cents == 0"
+        side_effects:
+          - "Lease.end_date := clock; Unit -> AVAILABLE; current_lease_id := null; occupied_unit_count recomputed"
+          - "Any ACTIVE InsurancePolicy -> CANCELLED; coverage_end := clock"
+
+  - entity: AuctionProceeding
+    field: status
+    initial_state: NOTICE_SENT
+    terminal_states: [SOLD, REDEEMED, CANCELLED]
+    note: "Fork-join: SCHEDULED branches to SOLD, REDEEMED, or CANCELLED with divergent side-effect sets."
+    transitions:
+      - from: NOTICE_SENT
+        to: LIEN_FILED
+        trigger: "POST /auction-proceedings/{auction_id}/file-lien"
+        actor: LienAdministrator
+        preconditions:
+          - "AuctionProceeding.status == NOTICE_SENT"
+          - "clock >= notice_sent_date + 14 days (statutory notice period)"
+        side_effects:
+          - "lien_filed_date := clock"
+      - from: LIEN_FILED
+        to: SCHEDULED
+        trigger: "POST /auction-proceedings/{auction_id}/schedule"
+        actor: LienAdministrator
+        preconditions:
+          - "AuctionProceeding.status == LIEN_FILED"
+          - "scheduled_sale_date >= lien_filed_date + 14 days"
+        side_effects:
+          - "scheduled_sale_date := body value; Lease -> AUCTION_SCHEDULED"
+      - from: SCHEDULED
+        to: SOLD
+        trigger: "POST /auction-proceedings/{auction_id}/complete-sale"
+        actor: LienAdministrator
+        preconditions:
+          - "AuctionProceeding.status == SCHEDULED"
+          - "sale_proceeds_cents > 0"
+        side_effects:
+          - "Distribution waterfall: proceeds -> outstanding rent+climate+insurance, then late fees, then lien admin cost, then tenant surplus"
+          - "surplus_cents := residual; Lease.balance_cents := 0; LedgerEntry AUCTION_SETTLEMENT appended"
+          - "Lease -> AUCTIONED; Unit -> AVAILABLE; ACTIVE InsurancePolicy -> CANCELLED (cascade)"
+      - from: [NOTICE_SENT, LIEN_FILED, SCHEDULED]
+        to: REDEEMED
+        trigger: "POST /auction-proceedings/{auction_id}/redeem"
+        actor: Tenant
+        preconditions:
+          - "AuctionProceeding.status in {NOTICE_SENT, LIEN_FILED, SCHEDULED}"
+          - "Lease.balance_cents == 0 (redemption_amount_cents fully paid)"
+        side_effects:
+          - "Lease -> ACTIVE; days_past_due := 0; no unit or insurance change"
+      - from: [NOTICE_SENT, LIEN_FILED]
+        to: CANCELLED
+        trigger: "POST /payments (cure pays off balance) OR POST /auction-proceedings/{auction_id}/cancel"
+        actor: "system or LienAdministrator"
+        preconditions:
+          - "AuctionProceeding.status in {NOTICE_SENT, LIEN_FILED}"
+        side_effects:
+          - "Proceeding closed without sale; Lease returns to ACTIVE if balance cleared"
+
+  - entity: InsurancePolicy
+    field: status
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: LAPSED
+        trigger: "POST /facilities/{facility_id}/billing-cycles (premium unpaid past grace)"
+        actor: system
+        preconditions:
+          - "InsurancePolicy.status == ACTIVE"
+          - "The lease's invoice carrying this premium is OVERDUE"
+        side_effects:
+          - "coverage_limit no longer payable while LAPSED"
+      - from: LAPSED
+        to: ACTIVE
+        trigger: "POST /payments (premium arrears cured)"
+        actor: Tenant
+        preconditions:
+          - "InsurancePolicy.status == LAPSED"
+          - "Lease.balance_cents == 0 after allocation"
+        side_effects: []
+      - from: [ACTIVE, LAPSED]
+        to: CANCELLED
+        trigger: "system (lease AUCTIONED/CLOSED) OR DELETE /insurance-policies/{policy_id}"
+        actor: "system or FacilityManager"
+        preconditions:
+          - "InsurancePolicy.status in {ACTIVE, LAPSED}"
+        side_effects:
+          - "coverage_end := clock"
+
+  - entity: TransferOrder
+    field: status
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: COMPLETED
+        trigger: "POST /transfer-orders/{transfer_order_id}/complete"
+        actor: FacilityManager
+        preconditions:
+          - "TransferOrder.status == REQUESTED"
+          - "to_unit Unit.status == AVAILABLE (cross-entity)"
+          - "Lease.status == ACTIVE"
+        side_effects:
+          - "Relocation executed (see Lease ACTIVE->TRANSFERRED transition side effects); occupied_unit_count invariant"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /transfer-orders/{transfer_order_id}/cancel"
+        actor: FacilityManager
+        preconditions:
+          - "TransferOrder.status == REQUESTED"
+        side_effects:
+          - "to_unit released from soft-hold; no rate change"
+
+  - entity: Invoice
+    field: status
+    initial_state: OPEN
+    terminal_states: [PAID, WAIVED]
+    transitions:
+      - from: OPEN
+        to: PARTIAL
+        trigger: "POST /payments (allocation covers part of this invoice)"
+        actor: Tenant
+        preconditions:
+          - "0 < amount_paid_cents < total_amount_cents"
+        side_effects:
+          - "amount_paid_cents increased; LedgerEntry PAYMENT appended; Lease.balance_cents decreased"
+      - from: [OPEN, PARTIAL, OVERDUE]
+        to: PAID
+        trigger: "POST /payments (allocation fully covers this invoice)"
+        actor: Tenant
+        preconditions:
+          - "amount_paid_cents == total_amount_cents"
+        side_effects:
+          - "Invoice fully settled"
+      - from: [OPEN, PARTIAL]
+        to: OVERDUE
+        trigger: "POST /facilities/{facility_id}/billing-cycles (days_past_due >= grace)"
+        actor: system
+        preconditions:
+          - "days_past_due >= Facility.late_fee_grace_days"
+        side_effects:
+          - "late_fee_cents := Facility.late_fee_cents (added once); total_amount_cents recomputed; LedgerEntry LATE_FEE appended"
+      - from: [OPEN, PARTIAL, OVERDUE]
+        to: WAIVED
+        trigger: "POST /invoices/{invoice_id}/waive"
+        actor: FacilityManager
+        preconditions:
+          - "Invoice.status in {OPEN, PARTIAL, OVERDUE}"
+        side_effects:
+          - "LedgerEntry CREDIT appended for the unpaid remainder; Lease.balance_cents -= unpaid remainder"
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules (OCC on parent version; true CREATE-with-supersede races)
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: transfer-create-stale-lease
+    parent_entity: Lease
+    write_endpoint: "POST /transfer-orders"
+    occ_field: "expected_lease_version"
+    description: |
+      Creating a TransferOrder against a Lease whose version has advanced since
+      the client last observed it is rejected. A prior writer may have already
+      relocated the lease (changing its unit_id and rate, legitimately
+      superseding this client's view), so the destination/source units this
+      request names are stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: auction-open-stale-lease
+    parent_entity: Lease
+    write_endpoint: "POST /auction-proceedings"
+    occ_field: "expected_lease_version"
+    description: |
+      Opening an AuctionProceeding against a Lease whose version has advanced
+      since last observed is rejected. Another writer may have just cured the
+      delinquency (a payment that moved the lease back toward ACTIVE), so this
+      client's belief that the lease is still PRE_LIEN and auction-eligible is
+      stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: monthly_charge_components
+    trigger: "Invoice generation during POST /facilities/{facility_id}/billing-cycles, and the first invoice on lease activate"
+    algorithm: tiered_pricing
+    formula: |
+      # Rule 2 mode (b): rounding-order is PINNED. Round each component to whole
+      # cents independently, THEN sum. (Do NOT sum fractional components then round.)
+      base = monthly_rate_cents                              # already integer cents
+      if lease.climate_controlled:
+          climate = round_half_up(monthly_rate_cents * facility.climate_premium_pct)
+      else:
+          climate = 0
+      insurance = active_policy.monthly_premium_cents if an ACTIVE InsurancePolicy exists else 0
+      total = base + climate + insurance                     # sum AFTER per-component rounding
+    input_set: "The lease's snapshot monthly_rate_cents and climate_controlled flag; the facility's climate_premium_pct; the lease's InsurancePolicy with status==ACTIVE (exactly one or none)."
+    constants:
+      ROUNDING: round_half_up
+    precision: "whole cents, round_half_up per component before summing"
+
+  - name: prorated_first_charge
+    trigger: "First Invoice on POST /leases/{lease_id}/activate"
+    algorithm: tiered_pricing
+    formula: |
+      # Rule 2 mode (a): >=3 inputs with conditional branch. Single round at the end.
+      days_in_month = calendar days in the month of start_date
+      days_occupied = days_in_month - day_of_month(start_date) + 1   # inclusive of move-in day
+      monthly_total = monthly_charge_components.total                  # base+climate+insurance for a full month
+      base_component = monthly_rate_cents + (climate component) + (insurance component)  # == monthly_total
+      prorated = round_half_up(monthly_total * days_occupied / days_in_month)
+    input_set: "start_date day-of-month, days_in_month, and the full monthly_charge_components total for this lease."
+    constants:
+      ROUNDING: round_half_up
+    precision: "whole cents, single round_half_up after the day-fraction multiply"
+
+  - name: lease_balance
+    trigger: "any LedgerEntry append (CHARGE, LATE_FEE, PAYMENT, CREDIT, REVERSAL, AUCTION_SETTLEMENT)"
+    algorithm: aggregation
+    formula: |
+      # DUAL-VARIANT (Rule 1, entity domain = Lease ledger / cost accounting).
+      # Both variants are valid reads of the same data and CAN diverge if the
+      # denormalized field is not reconciled.
+      base_balance = lease.balance_cents (denormalized running total)
+    input_set: "All LedgerEntry rows for the lease."
+    variants:
+      - name: denormalized_running_balance
+        when: "Default read of Lease.balance_cents; maintained incrementally on each ledger append."
+        difference: "O(1) field; trusts that every charge/payment incremented/decremented it. This is the authoritative value the API returns."
+      - name: ledger_replay_balance
+        when: "GET /leases/{lease_id}/ledger-balance recomputes from scratch."
+        difference: "Sums signed amount_cents over ALL LedgerEntry rows for the lease in created_at ASC order (tie-break: created_at ASC, then nothing else needed since one append per event). Must equal denormalized_running_balance when consistent; the endpoint exposes the replay so reconciliation drift is observable."
+
+  - name: redemption_amount
+    trigger: "GET /auction-proceedings/{auction_id} read of redemption_amount_cents, and the redeem precondition"
+    algorithm: chronological
+    formula: |
+      # DUAL-VARIANT (Rule 1, entity domain = AuctionProceeding lien math). Different
+      # entity domain from lease_balance: this is statutory redemption, not cost accounting.
+      outstanding = sum(total_amount_cents - amount_paid_cents for invoices in {OPEN,PARTIAL,OVERDUE})
+      lien_admin_cost = LIEN_ADMIN_COST_CENTS
+    input_set: "Unpaid invoice remainders for the lease plus the fixed lien administration cost."
+    constants:
+      LIEN_ADMIN_COST_CENTS: 15000
+    variants:
+      - name: lien_date_snapshot
+        when: "Statutory redemption amount frozen at the moment the lien is filed (AuctionProceeding -> LIEN_FILED)."
+        difference: "redemption = (outstanding as of lien_filed_date) + LIEN_ADMIN_COST_CENTS; late fees accruing AFTER lien_filed_date are excluded. Snapshot stored on file-lien."
+      - name: accruing_today
+        when: "Live redemption amount the GET endpoint returns while the proceeding is open."
+        difference: "redemption = (outstanding as of the current clock, INCLUDING late fees assessed after lien filing) + LIEN_ADMIN_COST_CENTS; strictly >= lien_date_snapshot once any post-lien late fee is assessed."
+
+  - name: late_fee_assessment
+    trigger: "POST /facilities/{facility_id}/billing-cycles per OPEN/PARTIAL invoice"
+    algorithm: threshold
+    formula: |
+      # Rule 6 boundary metric #1: grace boundary uses >= (NOT >).
+      days_past_due = floor((clock - invoice.due_date) / 1 day)
+      if invoice.status in {OPEN, PARTIAL} and days_past_due >= facility.late_fee_grace_days
+         and invoice.late_fee_cents == 0:
+          invoice.late_fee_cents = facility.late_fee_cents      # flat, added once
+          invoice.status = OVERDUE
+    input_set: "Each OPEN/PARTIAL invoice on every ACTIVE/DELINQUENT lease in the facility."
+    constants:
+      DEFAULT_LATE_FEE_CENTS: 2000
+      DEFAULT_GRACE_DAYS: 5
+    precision: "integer days; boundary is days_past_due >= grace_days"
+
+  - name: auction_surplus_waterfall
+    trigger: "POST /auction-proceedings/{auction_id}/complete-sale"
+    algorithm: waterfall_allocation
+    formula: |
+      # Rule 9 conserved quantity #1 (money): sum of all allocations + surplus == sale_proceeds_cents.
+      # Buckets filled in priority order; all amounts integer cents (no rounding remainder).
+      remaining = sale_proceeds_cents
+      pay(b1) = min(remaining, outstanding_rent_climate_insurance); remaining -= pay(b1)
+      pay(b2) = min(remaining, outstanding_late_fees);              remaining -= pay(b2)
+      pay(b3) = min(remaining, LIEN_ADMIN_COST_CENTS);              remaining -= pay(b3)
+      surplus_cents = remaining   # goes to tenant
+      INVARIANT: pay(b1)+pay(b2)+pay(b3)+surplus_cents == sale_proceeds_cents
+    input_set: "Unpaid invoice rent/climate/insurance remainders (bucket 1), unpaid late fees (bucket 2), fixed lien admin cost (bucket 3)."
+    constants:
+      LIEN_ADMIN_COST_CENTS: 15000
+    precision: "integer cents; ordered bucket fill, no rounding remainder"
+
+  - name: payment_waterfall_allocation
+    trigger: "POST /payments"
+    algorithm: waterfall_allocation
+    formula: |
+      # Oldest-due-first allocation. NO id used as tie-break.
+      order invoices in {OPEN, PARTIAL, OVERDUE} by due_date ASC, then created_at ASC (tie-break)
+      remaining = amount_cents
+      for inv in order:
+          apply = min(remaining, inv.total_amount_cents - inv.amount_paid_cents)
+          inv.amount_paid_cents += apply; remaining -= apply
+          inv.status = PAID if fully covered else PARTIAL
+      overpay_credit_cents = remaining   # if > 0, recorded as account CREDIT ledger entry
+    input_set: "All OPEN/PARTIAL/OVERDUE invoices on the lease."
+    precision: "integer cents; tie-break due_date ASC then created_at ASC (never id)"
+
+  - name: transfer_proration_adjustment
+    trigger: "POST /transfer-orders/{transfer_order_id}/complete"
+    algorithm: chronological
+    formula: |
+      # Rule 9 conserved quantity #2 (occupied_unit_count): vacate old + occupy new
+      # leaves Facility.occupied_unit_count UNCHANGED. Money side: rate delta prorated.
+      days_remaining = days from clock (exclusive) to current period_end (exclusive)
+      days_in_period = days in the current billing period
+      old_monthly = monthly_charge_components.total at old unit rate
+      new_monthly = monthly_charge_components.total at new unit rate
+      prorated_adjustment_cents = round_half_up((new_monthly - old_monthly) * days_remaining / days_in_period)
+      INVARIANT: Facility.occupied_unit_count unchanged (old AVAILABLE, new OCCUPIED).
+    input_set: "Old and new unit monthly totals; remaining days in current period."
+    constants:
+      ROUNDING: round_half_up
+    precision: "whole cents, single round_half_up"
+
+  - name: facility_occupied_unit_count
+    trigger: "any Unit status change (activate, transfer-complete, auction-sold, close)"
+    algorithm: aggregation
+    formula: |
+      occupied_unit_count = count(Unit where Unit.facility_id == facility.id and Unit.status == OCCUPIED)
+    input_set: "All Units of the facility filtered to status == OCCUPIED."
+    precision: "integer count"
+
+  - name: insurance_premium_by_tier
+    trigger: "POST /insurance-policies create"
+    algorithm: tiered_pricing
+    formula: |
+      monthly_premium_cents = TIER_PREMIUM[coverage_tier]
+      coverage_limit_cents  = TIER_LIMIT[coverage_tier]
+    input_set: "coverage_tier of the policy."
+    constants:
+      TIER_PREMIUM: { BASIC: 1000, STANDARD: 1500, PREMIUM: 2500 }
+      TIER_LIMIT:   { BASIC: 200000, STANDARD: 500000, PREMIUM: 1500000 }
+    precision: "integer cents lookup"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and recognized"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this operation per §1.7; entity-backed Tenant must own the target lease"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "All path/body referenced resources (facility, unit, tenant, lease, invoice, policy, auction, transfer order) exist; validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: business_constraint
+    check: "Body field types/enums valid; required fields present; numeric ranges respected (billing_day 1-28, amount_cents > 0)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all writes"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined (§1.2 from: set)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6
+    category: business_referential
+    check: "Cross-entity binding valid: lease activation requires Unit.status==AVAILABLE; transfer target Unit.status==AVAILABLE; auction opens only on the lease's own delinquency"
+    error_id: ERR_UNIT_NOT_AVAILABLE
+    http_status: 409
+    applies_to: "POST /leases/{id}/activate, POST /transfer-orders, POST /transfer-orders/{id}/complete"
+
+  - priority: 7
+    category: business_safety
+    check: "Lease activation requires an ACTIVE InsurancePolicy when insurance_required==true"
+    error_id: ERR_INSURANCE_REQUIRED
+    http_status: 409
+    applies_to: "POST /leases/{id}/activate"
+
+  - priority: 8
+    category: business_temporal
+    check: "Statutory windows respected: file-lien only after notice_sent_date+14d; schedule only when scheduled_sale_date >= lien_filed_date+14d; auction-open only when days_past_due >= Facility.lien_default_days"
+    error_id: ERR_WINDOW_NOT_ELAPSED
+    http_status: 409
+    applies_to: "POST /auction-proceedings, POST /auction-proceedings/{id}/file-lien, POST /auction-proceedings/{id}/schedule"
+
+  - priority: 9
+    category: business_temporal
+    check: "Unit occupancy intervals do not overlap: a Unit cannot be bound to two leases whose [start_date, end_date] closed intervals intersect"
+    error_id: ERR_UNIT_OCCUPANCY_OVERLAP
+    http_status: 409
+    applies_to: "POST /leases, POST /leases/{id}/activate"
+
+  - priority: 10
+    category: business_temporal
+    check: "InsurancePolicy coverage intervals on one lease do not overlap: half-open [coverage_start, coverage_end) intervals must be disjoint (adjacency allowed)"
+    error_id: ERR_COVERAGE_OVERLAP
+    http_status: 409
+    applies_to: "POST /insurance-policies"
+
+  - priority: 11
+    category: business_fiscal
+    check: "Auction completion requires sale_proceeds_cents > 0; payment amount_cents > 0; redeem/close require balance_cents == 0"
+    error_id: ERR_BALANCE_NOT_CLEARED
+    http_status: 409
+    applies_to: "POST /auction-proceedings/{id}/redeem, POST /leases/{id}/close"
+
+  - priority: 12
+    category: business_constraint
+    check: "Optimistic concurrency: expected_lease_version must equal Lease.version on transfer-order and auction-proceeding creation"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /transfer-orders, POST /auction-proceedings"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Facility ---
+  - method: POST
+    path: "/facilities"
+    description: "Create a storage facility"
+    roles: [FacilityManager]
+    code: 201
+    input: [name, state_code, "climate_premium_pct?", "lien_default_days?", "late_fee_grace_days?", "late_fee_cents?"]
+    output: Facility
+    side_effects: ["occupied_unit_count := 0; version := 1"]
+
+  - method: GET
+    path: "/facilities/{facility_id}"
+    description: "Get a facility (includes occupied_unit_count)"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: []
+    output: Facility
+    side_effects: []
+
+  - method: POST
+    path: "/facilities/{facility_id}/billing-cycles"
+    description: "Run automatic billing for the facility at the current clock: generate due monthly invoices, assess late fees on past-grace invoices, advance delinquency/pre-lien states, lapse unpaid insurance"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: Facility
+    side_effects:
+      - "For each ACTIVE/DELINQUENT lease whose billing_day is due, generate a monthly Invoice (monthly_charge_components) and append a CHARGE LedgerEntry"
+      - "late_fee_assessment: OPEN/PARTIAL invoices with days_past_due >= grace -> OVERDUE + flat late fee (once) + LATE_FEE LedgerEntry"
+      - "Lease ACTIVE->DELINQUENT when an invoice passes grace; DELINQUENT->PRE_LIEN when days_past_due >= 30"
+      - "ACTIVE InsurancePolicy -> LAPSED when its premium invoice is OVERDUE"
+      - "Recompute days_past_due on each affected lease"
+
+  # --- Unit ---
+  - method: POST
+    path: "/units"
+    description: "Create a physical unit in a facility"
+    roles: [FacilityManager]
+    code: 201
+    input: [facility_id, unit_number, size_class, monthly_rate_cents, "climate_controlled?"]
+    output: Unit
+    side_effects: ["status := AVAILABLE; current_lease_id := null; facility occupied_unit_count unchanged"]
+
+  - method: GET
+    path: "/units/{unit_id}"
+    description: "Get a unit"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: []
+    output: Unit
+    side_effects: []
+
+  - method: GET
+    path: "/units"
+    description: "List units; filter by facility_id, status, and/or current_lease_id"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: ["facility_id?", "status?", "current_lease_id?", "limit?", "offset?"]
+    output: Unit[]
+    side_effects: []
+
+  # --- Tenant ---
+  - method: POST
+    path: "/tenants"
+    description: "Register a tenant"
+    roles: [FacilityManager, Tenant]
+    code: 201
+    input: [email, full_name, state_code, "phone?"]
+    output: Tenant
+    side_effects: ["version := 1"]
+
+  - method: GET
+    path: "/tenants/{tenant_id}"
+    description: "Get a tenant"
+    roles: [FacilityManager, Tenant]
+    code: 200
+    input: []
+    output: Tenant
+    side_effects: []
+
+  # --- Lease ---
+  - method: POST
+    path: "/leases"
+    description: "Create a PENDING lease binding a tenant to a unit"
+    roles: [FacilityManager]
+    code: 201
+    input: [unit_id, tenant_id, start_date, billing_day, "insurance_required?"]
+    output: Lease
+    side_effects:
+      - "status := PENDING; facility_id := unit.facility_id; balance_cents := 0"
+      - "Reject if the unit's occupancy interval [start_date, end_date] overlaps an existing lease on the same unit (ERR_UNIT_OCCUPANCY_OVERLAP)"
+
+  - method: GET
+    path: "/leases/{lease_id}"
+    description: "Get a lease (includes balance_cents, days_past_due, status)"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: []
+    output: Lease
+    side_effects: []
+
+  - method: GET
+    path: "/leases"
+    description: "List leases; filter by facility_id, unit_id, or tenant_id"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: ["facility_id?", "unit_id?", "tenant_id?", "status?", "limit?", "offset?"]
+    output: Lease[]
+    side_effects: []
+
+  - method: GET
+    path: "/leases/{lease_id}/ledger-balance"
+    description: "Recompute the lease balance by replaying all LedgerEntry rows (ledger_replay_balance variant); for reconciliation against denormalized balance_cents"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: []
+    output: Lease
+    side_effects: []
+
+  - method: POST
+    path: "/leases/{lease_id}/activate"
+    description: "Activate a PENDING lease: bind the unit, snapshot rate/climate, generate the prorated first invoice"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: Lease
+    side_effects:
+      - "Lease PENDING->ACTIVE; Unit AVAILABLE->OCCUPIED; current_lease_id set; occupied_unit_count += 1"
+      - "First (prorated) Invoice + CHARGE LedgerEntry; balance_cents := first invoice total"
+
+  - method: POST
+    path: "/leases/{lease_id}/close"
+    description: "Close a lease with zero balance (move-out)"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: Lease
+    side_effects:
+      - "Lease -> CLOSED; end_date := clock; Unit -> AVAILABLE; occupied_unit_count recomputed"
+      - "ACTIVE InsurancePolicy -> CANCELLED"
+
+  # --- Invoice ---
+  - method: GET
+    path: "/invoices/{invoice_id}"
+    description: "Get an invoice"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+
+  - method: GET
+    path: "/invoices"
+    description: "List invoices; filter by lease_id and/or status"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: ["lease_id?", "status?", "limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+
+  - method: POST
+    path: "/invoices/{invoice_id}/waive"
+    description: "Waive the unpaid remainder of an invoice"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects:
+      - "Invoice -> WAIVED; CREDIT LedgerEntry for unpaid remainder; balance_cents decreased"
+
+  # --- Payment ---
+  - method: POST
+    path: "/payments"
+    description: "Record a tenant payment; allocated oldest-due-first across the lease's open invoices"
+    roles: [Tenant, FacilityManager]
+    code: 201
+    input: [lease_id, amount_cents]
+    output: Payment
+    side_effects:
+      - "payment_waterfall_allocation; PAYMENT LedgerEntry per covered invoice; balance_cents decreased"
+      - "Invoices -> PARTIAL/PAID; overpay recorded as CREDIT"
+      - "Cure cascade: DELINQUENT/PRE_LIEN lease -> ACTIVE when balance_cents == 0; open AuctionProceeding (NOTICE_SENT/LIEN_FILED) -> CANCELLED; LAPSED InsurancePolicy -> ACTIVE"
+
+  - method: GET
+    path: "/payments/{payment_id}"
+    description: "Get a payment (includes allocation breakdown)"
+    roles: [FacilityManager, Tenant]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+
+  - method: GET
+    path: "/payments"
+    description: "List payments; filter by lease_id"
+    roles: [FacilityManager, Tenant]
+    code: 200
+    input: ["lease_id?", "limit?", "offset?"]
+    output: Payment[]
+    side_effects: []
+
+  - method: POST
+    path: "/payments/{payment_id}/reverse"
+    description: "Reverse an APPLIED payment (compensating action); re-opens the invoices it covered"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: Payment
+    side_effects:
+      - "Payment -> REVERSED; REVERSAL LedgerEntry re-adds the amount; balance_cents increased to pre-payment value; affected invoices revert PAID/PARTIAL -> OPEN/PARTIAL"
+
+  # --- LedgerEntry (reverse-reachability for LedgerEntry.lease_id) ---
+  - method: GET
+    path: "/ledger-entries/{ledger_entry_id}"
+    description: "Get a single immutable ledger entry"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: []
+    output: LedgerEntry
+    side_effects: []
+
+  - method: GET
+    path: "/ledger-entries"
+    description: "List immutable ledger entries; filter by lease_id"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: ["lease_id?", "limit?", "offset?"]
+    output: LedgerEntry[]
+    side_effects: []
+
+  # --- InsurancePolicy ---
+  - method: POST
+    path: "/insurance-policies"
+    description: "Bind an insurance policy to a lease (premium/limit derived from tier)"
+    roles: [FacilityManager, Tenant]
+    code: 201
+    input: [lease_id, coverage_tier, coverage_start]
+    output: InsurancePolicy
+    side_effects:
+      - "status := ACTIVE; insurance_premium_by_tier sets monthly_premium_cents/coverage_limit_cents"
+      - "Reject if coverage interval [coverage_start, coverage_end) overlaps an existing policy on the same lease (ERR_COVERAGE_OVERLAP)"
+
+  - method: GET
+    path: "/insurance-policies/{policy_id}"
+    description: "Get an insurance policy"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: []
+    output: InsurancePolicy
+    side_effects: []
+
+  - method: GET
+    path: "/insurance-policies"
+    description: "List insurance policies; filter by lease_id"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: ["lease_id?", "status?", "limit?", "offset?"]
+    output: InsurancePolicy[]
+    side_effects: []
+
+  - method: DELETE
+    path: "/insurance-policies/{policy_id}"
+    description: "Cancel an insurance policy"
+    roles: [FacilityManager, Tenant]
+    code: 200
+    input: []
+    output: InsurancePolicy
+    side_effects: ["status -> CANCELLED; coverage_end := clock"]
+
+  # --- AuctionProceeding ---
+  - method: POST
+    path: "/auction-proceedings"
+    description: "Open a lien/auction proceeding against a delinquent (PRE_LIEN, >= lien_default_days past due) lease"
+    roles: [LienAdministrator]
+    code: 201
+    input: [lease_id, expected_lease_version]
+    output: AuctionProceeding
+    side_effects:
+      - "status := NOTICE_SENT; notice_sent_date := clock; Lease -> LIEN"
+      - "increments Lease.version by 1"
+      - "redemption_amount_cents seeded from current unpaid remainders + LIEN_ADMIN_COST_CENTS"
+
+  - method: GET
+    path: "/auction-proceedings/{auction_id}"
+    description: "Get an auction proceeding (redemption_amount_cents returns the accruing_today variant)"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: []
+    output: AuctionProceeding
+    side_effects: []
+
+  - method: GET
+    path: "/auction-proceedings"
+    description: "List auction proceedings; filter by lease_id"
+    roles: [FacilityManager, LienAdministrator, Tenant]
+    code: 200
+    input: ["lease_id?", "status?", "limit?", "offset?"]
+    output: AuctionProceeding[]
+    side_effects: []
+
+  - method: POST
+    path: "/auction-proceedings/{auction_id}/file-lien"
+    description: "File the lien after the statutory notice period; snapshots the lien-date redemption amount"
+    roles: [LienAdministrator]
+    code: 200
+    input: []
+    output: AuctionProceeding
+    side_effects:
+      - "status NOTICE_SENT->LIEN_FILED; lien_filed_date := clock"
+      - "lien_date_snapshot of redemption_amount computed and frozen"
+
+  - method: POST
+    path: "/auction-proceedings/{auction_id}/schedule"
+    description: "Schedule the public sale (must be >= lien_filed_date + 14d)"
+    roles: [LienAdministrator]
+    code: 200
+    input: [scheduled_sale_date]
+    output: AuctionProceeding
+    side_effects: ["status LIEN_FILED->SCHEDULED; Lease -> AUCTION_SCHEDULED"]
+
+  - method: POST
+    path: "/auction-proceedings/{auction_id}/complete-sale"
+    description: "Record the winning bid and run the surplus distribution waterfall"
+    roles: [LienAdministrator]
+    code: 200
+    input: [sale_proceeds_cents]
+    output: AuctionProceeding
+    side_effects:
+      - "status SCHEDULED->SOLD; auction_surplus_waterfall; surplus_cents set"
+      - "AUCTION_SETTLEMENT LedgerEntry; balance_cents := 0"
+      - "Lease -> AUCTIONED; Unit -> AVAILABLE; occupied_unit_count recomputed; ACTIVE InsurancePolicy -> CANCELLED"
+
+  - method: POST
+    path: "/auction-proceedings/{auction_id}/redeem"
+    description: "Tenant redeems by clearing the balance; cancels the sale"
+    roles: [Tenant]
+    code: 200
+    input: []
+    output: AuctionProceeding
+    side_effects: ["status -> REDEEMED; Lease -> ACTIVE; days_past_due := 0"]
+
+  - method: POST
+    path: "/auction-proceedings/{auction_id}/cancel"
+    description: "Administratively cancel a proceeding that has not yet sold"
+    roles: [LienAdministrator]
+    code: 200
+    input: []
+    output: AuctionProceeding
+    side_effects: ["status NOTICE_SENT/LIEN_FILED -> CANCELLED"]
+
+  # --- TransferOrder ---
+  - method: POST
+    path: "/transfer-orders"
+    description: "Request a relocation of an ACTIVE lease to an AVAILABLE destination unit"
+    roles: [FacilityManager]
+    code: 201
+    input: [lease_id, to_unit_id, expected_lease_version]
+    output: TransferOrder
+    side_effects:
+      - "status := REQUESTED; from_unit_id := lease.unit_id"
+      - "increments Lease.version by 1"
+
+  - method: GET
+    path: "/transfer-orders/{transfer_order_id}"
+    description: "Get a transfer order"
+    roles: [FacilityManager, Tenant]
+    code: 200
+    input: []
+    output: TransferOrder
+    side_effects: []
+
+  - method: GET
+    path: "/transfer-orders"
+    description: "List transfer orders; filter by lease_id, from_unit_id, or to_unit_id"
+    roles: [FacilityManager, Tenant]
+    code: 200
+    input: ["lease_id?", "from_unit_id?", "to_unit_id?", "status?", "limit?", "offset?"]
+    output: TransferOrder[]
+    side_effects: []
+
+  - method: POST
+    path: "/transfer-orders/{transfer_order_id}/complete"
+    description: "Complete the relocation: swap units, snapshot new rate, apply prorated adjustment"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: TransferOrder
+    side_effects:
+      - "TransferOrder -> COMPLETED; transfer_proration_adjustment applied (CHARGE or CREDIT LedgerEntry)"
+      - "old Unit -> AVAILABLE; new Unit -> OCCUPIED; Lease.unit_id/rate/climate updated; occupied_unit_count invariant"
+
+  - method: POST
+    path: "/transfer-orders/{transfer_order_id}/cancel"
+    description: "Cancel a requested transfer"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: TransferOrder
+    side_effects: ["status REQUESTED->CANCELLED"]
+
+  # --- Test-driving clock endpoint (/_ namespace) ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's current UTC clock (test-driving; advances billing/late-fee/window logic deterministically)"
+    roles: [FacilityManager]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock := to_iso8601; no entity mutated until the next billing-cycle/window-gated call"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/unrecognized X-User-Role or X-User-ID" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Role not permitted for this operation, or Tenant acting on a lease it does not own" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Referenced facility/unit/tenant/lease/invoice/policy/auction/transfer-order does not exist" }
+  - { id: ERR_INVALID_REQUEST, http: 422, condition: "Missing required field, bad enum, out-of-range value (billing_day not 1-28, amount_cents <= 0, climate_premium_pct outside [0,1])" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a state from which the requested transition is defined" }
+  - { id: ERR_UNIT_NOT_AVAILABLE, http: 409, condition: "Lease activation or transfer target requires a unit whose status == AVAILABLE" }
+  - { id: ERR_INSURANCE_REQUIRED, http: 409, condition: "Lease activation blocked: insurance_required but no ACTIVE InsurancePolicy" }
+  - { id: ERR_WINDOW_NOT_ELAPSED, http: 409, condition: "Statutory window not satisfied (notice period, cooling-off, or days_past_due < lien_default_days)" }
+  - { id: ERR_UNIT_OCCUPANCY_OVERLAP, http: 409, condition: "A lease's [start_date,end_date] closed occupancy interval intersects an existing lease on the same unit" }
+  - { id: ERR_COVERAGE_OVERLAP, http: 409, condition: "An insurance policy's [coverage_start,coverage_end) half-open interval intersects an existing policy on the same lease" }
+  - { id: ERR_BALANCE_NOT_CLEARED, http: 409, condition: "Operation requires Lease.balance_cents == 0 (redeem, close), or sale_proceeds_cents/amount_cents not > 0" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_lease_version does not equal current Lease.version on transfer-order/auction-proceeding creation" }
+  - { id: ERR_DUPLICATE_UNIT_NUMBER, http: 409, condition: "unit_number already used within the same facility" }
+  - { id: ERR_DUPLICATE_EMAIL, http: 409, condition: "Tenant email already registered" }
+  - { id: ERR_PROCEEDING_EXISTS, http: 409, condition: "An open (non-terminal) AuctionProceeding already exists for the lease" }
+  - { id: ERR_LEASE_HAS_ACTIVITY, http: 409, condition: "Cannot close/transfer a lease with a non-terminal AuctionProceeding" }
+  - { id: ERR_VALIDATION, http: 400, condition: "Generic malformed request body / unparseable JSON" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: FacilityManager
+    description: "Operator who manages facilities, units, leases, billing runs, transfers, waivers, and payment reversals."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /facilities — create facility"
+      - "POST /units — create unit"
+      - "POST /leases — create lease"
+      - "POST /leases/{id}/activate — activate lease"
+      - "POST /leases/{id}/close — close lease"
+      - "POST /facilities/{id}/billing-cycles — run automatic billing"
+      - "POST /invoices/{id}/waive — waive invoice"
+      - "POST /payments/{id}/reverse — reverse a payment"
+      - "POST /transfer-orders — request transfer"
+      - "POST /transfer-orders/{id}/complete — complete transfer"
+      - "POST /transfer-orders/{id}/cancel — cancel transfer"
+      - "POST /_clock/set_current_utc — set test clock"
+    shared_operations:
+      - "POST /tenants — register tenant (also Tenant)"
+      - "POST /payments — record payment (also Tenant)"
+      - "POST /insurance-policies — bind policy (also Tenant)"
+      - "DELETE /insurance-policies/{id} — cancel policy (also Tenant)"
+      - "GET reads on facilities/units/tenants/leases/invoices/payments/policies/auctions/transfers/ledger-entries"
+
+  - name: Tenant
+    description: "The renter; entity-backed. Acts only on its own leases (pays, redeems, buys insurance)."
+    identity: "entity_backed:Tenant"
+    exclusive_operations:
+      - "POST /auction-proceedings/{id}/redeem — redeem own lease from auction"
+    shared_operations:
+      - "POST /tenants — self register"
+      - "POST /payments — pay own lease (also FacilityManager)"
+      - "POST /insurance-policies — buy insurance on own lease (also FacilityManager)"
+      - "DELETE /insurance-policies/{id} — cancel own policy (also FacilityManager)"
+      - "GET reads scoped to own leases/invoices/payments/policies/auctions/transfers"
+
+  - name: LienAdministrator
+    description: "Lien/auction officer; opaque operator who runs the foreclosure legal process. Segregated from FacilityManager day-to-day ops."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /auction-proceedings — open proceeding"
+      - "POST /auction-proceedings/{id}/file-lien — file lien"
+      - "POST /auction-proceedings/{id}/schedule — schedule sale"
+      - "POST /auction-proceedings/{id}/complete-sale — record winning bid + distribute"
+      - "POST /auction-proceedings/{id}/cancel — cancel proceeding"
+    shared_operations:
+      - "GET reads on facilities/units/leases/invoices/policies/auctions/ledger-entries"

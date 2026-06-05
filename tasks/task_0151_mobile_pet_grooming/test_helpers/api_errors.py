@@ -1,0 +1,51 @@
+"""Error IDs and HTTP status mapping (PRD §5 Error Code Catalogue).
+
+Registering the map with the framework lets validate_error() auto-check the
+HTTP status code that accompanies each error_id.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_ROUTE_LOCKED = "ERR_ROUTE_LOCKED"
+    ERR_VACCINATION_REQUIRED = "ERR_VACCINATION_REQUIRED"
+    ERR_NO_QUALIFIED_GROOMER = "ERR_NO_QUALIFIED_GROOMER"
+    ERR_ZIP_NOT_COVERED = "ERR_ZIP_NOT_COVERED"
+    ERR_SLOT_OVERLAP = "ERR_SLOT_OVERLAP"
+    ERR_VAN_STOPS_FULL = "ERR_VAN_STOPS_FULL"
+    ERR_ACCOUNT_SUSPENDED = "ERR_ACCOUNT_SUSPENDED"
+    ERR_ROUTE_CAPACITY_EXCEEDED = "ERR_ROUTE_CAPACITY_EXCEEDED"
+    ERR_ADDON_NOT_ALLOWED = "ERR_ADDON_NOT_ALLOWED"
+    ERR_STALE_ROUTE_VERSION = "ERR_STALE_ROUTE_VERSION"
+    ERR_SHOW_CUT_UNSUPPORTED = "ERR_SHOW_CUT_UNSUPPORTED"
+    ERR_VALIDATION = "ERR_VALIDATION"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_REQUEST: 422,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_ROUTE_LOCKED: 409,
+    ApiErrorId.ERR_VACCINATION_REQUIRED: 422,
+    ApiErrorId.ERR_NO_QUALIFIED_GROOMER: 422,
+    ApiErrorId.ERR_ZIP_NOT_COVERED: 422,
+    ApiErrorId.ERR_SLOT_OVERLAP: 409,
+    ApiErrorId.ERR_VAN_STOPS_FULL: 409,
+    ApiErrorId.ERR_ACCOUNT_SUSPENDED: 422,
+    ApiErrorId.ERR_ROUTE_CAPACITY_EXCEEDED: 409,
+    ApiErrorId.ERR_ADDON_NOT_ALLOWED: 422,
+    ApiErrorId.ERR_STALE_ROUTE_VERSION: 412,
+    ApiErrorId.ERR_SHOW_CUT_UNSUPPORTED: 422,
+    ApiErrorId.ERR_VALIDATION: 422,
+}
+
+# Register with the framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

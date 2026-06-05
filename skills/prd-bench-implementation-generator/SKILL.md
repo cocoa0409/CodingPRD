@@ -164,13 +164,19 @@ These are the things that differentiate a passing implementation from a failing 
 
 INSTRUCTION.md owns the hard contract: `./implementation/start.sh` installs dependencies and runs the server in the foreground (`exec`), `0.0.0.0:$PORT` (default 10000), HTTP ready within 60s. Honor it verbatim.
 
-Given the skill's Python + Flask stack, the minimal `start.sh`:
+Given the skill's Python + Flask stack, the minimal `start.sh`. The dependency install MUST be guarded so it is a no-op once deps are present — `--isolation per-test-server` re-invokes `start.sh` before every test, and the 8-round stability sweep runs those reboots concurrently, so an unconditional `pip install` on every boot (hundreds of contended installs) slows startup past the runner's restart window and shows up as flaky `could not be restarted` failures. Guard on a cheap import of the framework:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-pip install -q -r requirements.txt
-exec python app.py
+cd "$(dirname "$0")"
+# Install only when missing — start.sh is re-run before every per-test reboot
+# (8 rounds concurrently); unconditional pip install here causes boot-time
+# contention and flaky "could not be restarted" timeouts.
+if ! python3 -c "import flask" >/dev/null 2>&1; then
+  python3 -m pip install -q -r requirements.txt
+fi
+exec python3 app.py
 ```
 
 And in `app.py`:
@@ -199,7 +205,7 @@ app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
 
 Before declaring done, verify:
 
-- [ ] `implementation/start.sh` exists, is a foreground bash launcher, and uses `exec` to hand off to the server process
+- [ ] `implementation/start.sh` exists, is a foreground bash launcher, uses `exec` to hand off to the server process, and **guards the dependency install** (`if ! python3 -c "import flask"`) so per-test reboots don't re-run `pip install` every time
 - [ ] Server starts and listens on `PORT` env var (default 10000), bound to `0.0.0.0`
 - [ ] **No entity seeding at startup** — `app.py` and module-init code MUST NOT populate `db.*` dicts, call any `seed_*()` helper, or otherwise inject entities at boot. The store starts empty; tests build all preconditions via the declared API surface.
 - [ ] All endpoints from the endpoint table are implemented

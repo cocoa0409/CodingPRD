@@ -1,0 +1,1195 @@
+# =============================================================================
+# Durable Medical Equipment (DME) benchmark seed tables
+# Expert difficulty.
+# =============================================================================
+
+scenario: "Durable Medical Equipment (DME): order/CMN, rental vs purchase/capped rental, Medicare HCPCS/modifier, prior auth, delivery/setup, CPAP resupply schedule, proof of delivery, recoupment/audit"
+
+domain_name: durable-medical-equipment
+# api_prefix is empty: every entity is a root-level peer collection
+# (/dme-orders, /patients, /cmns, ...) so each collection's own segment is the
+# resource path; FKs are carried in request bodies, not in URL nesting.
+api_prefix: ""
+
+# Flat topology: DMEOrder is the central business resource. Every other lifecycle
+# entity (CMN, PriorAuthorization, Delivery, RentalBillingCycle, ClaimLine,
+# CPAPResupplyOrder, Audit) carries an `order_id` FK back to it rather than nesting
+# in the URL. Catalog (HCPCSItem), Patient and Supplier are reference entities
+# linked by FK from DMEOrder.
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - optimistic_concurrency        # OCC on DMEOrder.version for the supersede-CMN race
+    - cascading_side_effects        # audit recoupment cascade; cap-conversion cascade
+    - dual_variant_calculation      # capped-rental projected vs chronological allowed amount
+    - rate_threshold_triggers       # 13-month rental cap, CPAP 90-day resupply window
+  entity_topology: flat
+  state_machine_shape: branching
+  relationship_patterns:
+    - one_to_many                   # DMEOrder -> RentalBillingCycle / ClaimLine / Delivery
+    - cross_aggregate               # ClaimLine references RentalBillingCycle and Audit
+  role_model: peer_roles
+  consistency_model: immediate
+
+# =============================================================================
+# Table 1.0: Response Envelope (FIXED — emitted verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# Table 1.1: Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Patient
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: full_name, type: string, source: input, description: "Beneficiary full name" }
+      - { name: medicare_id, type: string, source: input, description: "Medicare beneficiary identifier (MBI); unique across patients" }
+      - { name: date_of_birth, type: string, source: input, description: "ISO date (YYYY-MM-DD)" }
+      - { name: address_state, type: string, source: input, description: "Two-letter US state code of residence" }
+
+  - name: Supplier
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "DME supplier legal name" }
+      - { name: ptan, type: string, source: input, description: "Provider Transaction Access Number; unique across suppliers" }
+      - { name: accreditation_active, type: boolean, source: input, default: true, description: "Whether the supplier is currently Medicare-accredited" }
+
+  - name: HCPCSItem
+    parent: null
+    common_fields: true
+    fields:
+      - { name: hcpcs_code, type: string, source: input, description: "HCPCS code (e.g. E0601 CPAP, K0001 wheelchair); unique across catalog items" }
+      - { name: description, type: string, source: input, description: "Plain-language item description" }
+      - { name: billing_category, type: enum, source: input, description: "CAPPED_RENTAL | INEXPENSIVE_ROUTINE | PURCHASE_ONLY | OXYGEN. Drives which billing algorithm and cap apply." }
+      - { name: purchase_price_cents, type: integer, source: input, description: "Allowed lump-sum purchase price in cents (Medicare fee schedule)" }
+      - { name: monthly_rental_cents, type: integer, source: input, description: "Allowed monthly rental amount in cents before any modifier adjustment" }
+      - { name: requires_cmn, type: boolean, source: input, default: false, description: "Whether a Certificate of Medical Necessity is mandatory before delivery" }
+      - { name: requires_prior_auth, type: boolean, source: input, default: false, description: "Whether prior authorization is mandatory before delivery" }
+      - { name: is_cpap, type: boolean, source: input, default: false, description: "True only for the CPAP device; gates CPAP resupply orders" }
+
+  - name: DMEOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: input, description: "FK -> Patient.id" }
+      - { name: supplier_id, type: string, source: input, description: "FK -> Supplier.id; the supplier fulfilling this order" }
+      - { name: hcpcs_item_id, type: string, source: input, description: "FK -> HCPCSItem.id; the catalogued device being ordered" }
+      - { name: acquisition_type, type: enum, source: input, description: "RENTAL | PURCHASE. For CAPPED_RENTAL, OXYGEN and INEXPENSIVE_ROUTINE items the value MUST be RENTAL; for PURCHASE_ONLY items it MUST be PURCHASE (see validation ERR_ACQUISITION_TYPE_MISMATCH)." }
+      - { name: modifier, type: enum, source: input, default: NONE, description: "Medicare pricing modifier: NONE | NU (new purchase) | KX (medical-policy met). On a purchase, NU pays the full fee schedule and any other value pays the used rate; on a rental, KX pays full coverage and its absence on a CMN-required item caps coverage at COVERAGE_CAP_PCT — see calcs purchase_allowed_amount and modifier_adjusted_monthly." }
+      - { name: ordered_at_utc, type: datetime, source: input, description: "Clock-stamped order timestamp (ISO 8601 UTC); set from the system clock, used as the rental-cycle anchor" }
+      - { name: rental_months_billed, type: integer, source: computed, default: 0, description: "Count of RentalBillingCycle rows in BILLED or PAID status for this order" }
+      - { name: cap_reached, type: boolean, source: computed, default: false, description: "True once rental_months_billed >= RENTAL_CAP_MONTHS (13) for a CAPPED_RENTAL order; equipment then converts to beneficiary-owned" }
+      - { name: total_allowed_cents, type: integer, source: computed, default: 0, description: "Sum of allowed_amount_cents over all non-VOID ClaimLine rows for this order" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> READY_FOR_DELIVERY -> DELIVERED -> ACTIVE -> {CONVERTED_TO_PURCHASE | CLOSED}; or DRAFT -> CANCELLED. Branching on delivery and on cap conversion." }
+
+  - name: CMN
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> DMEOrder.id; the order this certificate supports" }
+      - { name: physician_npi, type: string, source: input, description: "Certifying physician's NPI" }
+      - { name: length_of_need_months, type: integer, source: input, description: "Months of medical need certified (1-99; 99 means lifetime)" }
+      - { name: signed_date, type: string, source: input, description: "ISO date the physician signed; must be on or before the order's ordered_at_utc date" }
+      - { name: superseded_by_id, type: string, source: system, default: null, description: "FK -> CMN.id; set when a newer ACTIVE CMN supersedes this one" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> ACTIVE -> {SUPERSEDED | REVOKED}. Only one ACTIVE CMN per order at a time." }
+
+  - name: PriorAuthorization
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> DMEOrder.id; the order requiring authorization" }
+      - { name: payer_reference, type: string, source: input, description: "Free-text payer-side reference for the request" }
+      - { name: decision_reason, type: string, source: system, default: null, description: "Reviewer-supplied reason captured on APPROVE/DENY" }
+      - { name: status, type: enum, source: system, description: "PENDING -> {APPROVED | DENIED}; APPROVED -> EXPIRED via system clock. Branching approve/deny." }
+      - { name: expires_at_utc, type: datetime, source: system, default: null, description: "ISO 8601 UTC; set to approval time + AUTH_VALIDITY_DAYS (60) on APPROVE" }
+
+  - name: Delivery
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> DMEOrder.id; the order being delivered/set up" }
+      - { name: scheduled_for_utc, type: datetime, source: input, description: "ISO 8601 UTC scheduled delivery/setup time" }
+      - { name: delivered_at_utc, type: datetime, source: system, default: null, description: "ISO 8601 UTC actual delivery time, stamped from clock on confirm" }
+      - { name: pod_signature_name, type: string, source: input, default: null, description: "Proof-of-delivery signer name; required to confirm delivery" }
+      - { name: pod_received, type: boolean, source: computed, default: false, description: "True once a confirm carried a non-empty pod_signature_name" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED -> {CONFIRMED | FAILED}; SCHEDULED -> CANCELLED. Branching." }
+
+  - name: RentalBillingCycle
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> DMEOrder.id; the rental order this monthly cycle bills" }
+      - { name: cycle_index, type: integer, source: system, description: "1-based sequential rental month for this order; assigned = current max cycle_index + 1" }
+      - { name: period_start_utc, type: datetime, source: system, description: "ISO 8601 UTC; defaults to ordered_at_utc + (cycle_index-1) months, or the explicit period_start_utc supplied on POST /dme-orders/{id}/rental-cycles when back-billing a correction month" }
+      - { name: period_end_utc, type: datetime, source: system, description: "ISO 8601 UTC; = period_start_utc + 1 month, exclusive upper bound" }
+      - { name: billed_amount_cents, type: integer, source: computed, description: "Allowed amount for this single month (see calc capped_rental_cycle_amount)" }
+      - { name: status, type: enum, source: system, description: "BILLED -> {PAID | RECOUPED}. Created directly in BILLED; RECOUPED is the audit compensation target." }
+
+  - name: ClaimLine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> DMEOrder.id; the order this claim line bills against" }
+      - { name: rental_cycle_id, type: string, source: input, default: null, description: "FK -> RentalBillingCycle.id; set for rental claim lines, null for purchase lines" }
+      - { name: audit_id, type: string, source: system, default: null, description: "FK -> Audit.id; set when an audit recoups this line" }
+      - { name: line_type, type: enum, source: input, description: "RENTAL_MONTH | PURCHASE | RECOUPMENT. RECOUPMENT lines are system-created negatives." }
+      - { name: allowed_amount_cents, type: integer, source: computed, description: "Signed cents posted to the order ledger; negative for RECOUPMENT lines" }
+      - { name: status, type: enum, source: system, description: "POSTED -> {SETTLED | VOID}. VOID lines drop out of total_allowed_cents." }
+
+  - name: CPAPResupplyOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> DMEOrder.id; the parent CPAP order (its HCPCSItem.is_cpap must be true)" }
+      - { name: supply_kind, type: enum, source: input, description: "MASK | TUBING | FILTER | HEADGEAR" }
+      - { name: requested_at_utc, type: datetime, source: system, description: "ISO 8601 UTC; stamped from the clock at request time, used as the resupply eligibility anchor" }
+      - { name: quantity, type: integer, source: input, description: "Units requested (1-12)" }
+      - { name: status, type: enum, source: system, description: "REQUESTED -> {SHIPPED | DENIED}. Branching on resupply eligibility window." }
+
+  - name: Audit
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> DMEOrder.id; the order under audit" }
+      - { name: reason_code, type: enum, source: input, description: "NO_VALID_CMN | NO_PROOF_OF_DELIVERY | OVERBILLED_PAST_CAP | NO_PRIOR_AUTH" }
+      - { name: recouped_total_cents, type: integer, source: computed, default: 0, description: "Absolute sum of allowed_amount_cents over the cycles recouped by this audit" }
+      - { name: recouped_cycle_count, type: integer, source: computed, default: 0, description: "Count of RentalBillingCycle rows this audit moved BILLED/PAID -> RECOUPED" }
+      - { name: status, type: enum, source: system, description: "OPEN -> {UPHELD | DISMISSED}. UPHELD triggers the recoupment cascade; DISMISSED closes with no ledger effect." }
+
+# =============================================================================
+# Table 1.2: State Machine Table
+# =============================================================================
+state_machines:
+  - entity: DMEOrder
+    initial_state: DRAFT
+    terminal_states: [CONVERTED_TO_PURCHASE, CLOSED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: READY_FOR_DELIVERY
+        trigger: "POST /dme-orders/{id}/mark-ready"
+        actor: SupplierUser
+        preconditions:
+          - "Order.status == DRAFT (ERR_INVALID_STATE)"
+          - "If HCPCSItem.requires_cmn: an ACTIVE CMN exists for this order (ERR_CMN_REQUIRED) — cross-entity: depends on CMN.status"
+          - "If HCPCSItem.requires_prior_auth: a PriorAuthorization for this order is in APPROVED status and its expires_at_utc > clock now (ERR_PRIOR_AUTH_REQUIRED) — cross-entity: depends on PriorAuthorization.status"
+          - "Supplier.accreditation_active == true (ERR_SUPPLIER_NOT_ACCREDITED)"
+        side_effects: []
+        note: "CMN and prior-auth cross-entity gates are evaluated in catalog order (CMN first, then prior auth)."
+
+      - from: READY_FOR_DELIVERY
+        to: DELIVERED
+        trigger: "system — set when a Delivery for this order transitions SCHEDULED->CONFIRMED"
+        actor: system
+        preconditions:
+          - "Order.status == READY_FOR_DELIVERY"
+        side_effects:
+          - "Bubble-up from Delivery confirm: Order.status -> DELIVERED"
+
+      - from: DELIVERED
+        to: ACTIVE
+        trigger: "POST /dme-orders/{id}/activate-billing"
+        actor: SupplierUser
+        preconditions:
+          - "Order.status == DELIVERED (ERR_INVALID_STATE)"
+          - "At least one Delivery for this order is CONFIRMED with pod_received == true (ERR_NO_PROOF_OF_DELIVERY) — cross-entity: depends on Delivery.status and Delivery.pod_received"
+        side_effects:
+          - "For PURCHASE orders: create one ClaimLine line_type=PURCHASE (calc purchase_allowed_amount), then recompute Order.total_allowed_cents"
+        note: "RENTAL orders start accruing monthly cycles only after ACTIVE; PURCHASE orders post their single line here."
+
+      - from: ACTIVE
+        to: CONVERTED_TO_PURCHASE
+        trigger: "system — fires inside POST /dme-orders/{id}/rental-cycles when the cycle that posts pushes rental_months_billed to RENTAL_CAP_MONTHS on a CAPPED_RENTAL order"
+        actor: system
+        preconditions:
+          - "HCPCSItem.billing_category == CAPPED_RENTAL"
+          - "Order.rental_months_billed == RENTAL_CAP_MONTHS (13) after the posting cycle"
+        side_effects:
+          - "Cascade L1->L2->L3: cycle posts (BILLED) -> Order.rental_months_billed becomes 13 and cap_reached=true -> Order.status -> CONVERTED_TO_PURCHASE"
+          - "Equipment becomes beneficiary-owned: subsequent POST /dme-orders/{id}/rental-cycles is rejected (ERR_RENTAL_CAP_REACHED)"
+
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /dme-orders/{id}/close"
+        actor: SupplierUser
+        preconditions:
+          - "Order.status == ACTIVE (ERR_INVALID_STATE)"
+        side_effects: []
+
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /dme-orders/{id}/cancel"
+        actor: SupplierUser
+        preconditions:
+          - "Order.status == DRAFT (ERR_INVALID_STATE)"
+        side_effects:
+          - "All ACTIVE/DRAFT CMN for this order -> REVOKED; all SCHEDULED Delivery -> CANCELLED"
+
+  - entity: CMN
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED, REVOKED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /cmns/{id}/activate"
+        actor: PhysicianUser
+        preconditions:
+          - "CMN.status == DRAFT (ERR_INVALID_STATE)"
+          - "CMN.signed_date <= date(Order.ordered_at_utc) (ERR_CMN_SIGNED_AFTER_ORDER)"
+          - "expected_order_version matches DMEOrder.version (ERR_STALE_ORDER_VERSION)"
+        side_effects:
+          - "Compensation/supersede cascade: if another CMN on this order is already ACTIVE, set that CMN.superseded_by_id = this.id and that CMN.status -> SUPERSEDED (active-CMN count conserved at exactly 1)"
+          - "Increments DMEOrder.version by 1"
+
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "system — set when a newer CMN on the same order is activated"
+        actor: system
+        preconditions:
+          - "CMN.status == ACTIVE"
+        side_effects:
+          - "superseded_by_id set to the newer CMN id"
+
+      - from: ACTIVE
+        to: REVOKED
+        trigger: "POST /cmns/{id}/revoke"
+        actor: PhysicianUser
+        preconditions:
+          - "CMN.status == ACTIVE (ERR_INVALID_STATE)"
+        side_effects: []
+
+  - entity: PriorAuthorization
+    initial_state: PENDING
+    terminal_states: [DENIED, EXPIRED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /prior-authorizations/{id}/approve"
+        actor: PayerReviewer
+        preconditions:
+          - "PriorAuthorization.status == PENDING (ERR_INVALID_STATE)"
+        side_effects:
+          - "expires_at_utc = clock now + AUTH_VALIDITY_DAYS (60)"
+          - "decision_reason captured from request"
+
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /prior-authorizations/{id}/deny"
+        actor: PayerReviewer
+        preconditions:
+          - "PriorAuthorization.status == PENDING (ERR_INVALID_STATE)"
+        side_effects:
+          - "decision_reason captured from request"
+
+      - from: APPROVED
+        to: EXPIRED
+        trigger: "system — re-evaluated against the clock on any read of mark-ready precondition; an APPROVED auth whose expires_at_utc <= clock now is treated as EXPIRED"
+        actor: system
+        preconditions:
+          - "PriorAuthorization.status == APPROVED and expires_at_utc <= clock now"
+        side_effects: []
+
+  - entity: Delivery
+    initial_state: SCHEDULED
+    terminal_states: [CONFIRMED, FAILED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: CONFIRMED
+        trigger: "POST /deliveries/{id}/confirm"
+        actor: SupplierUser
+        preconditions:
+          - "Delivery.status == SCHEDULED (ERR_INVALID_STATE)"
+          - "Order.status == READY_FOR_DELIVERY (ERR_INVALID_STATE) — cross-entity: depends on DMEOrder.status"
+          - "Request carries non-empty pod_signature_name (ERR_POD_SIGNATURE_REQUIRED)"
+        side_effects:
+          - "pod_received -> true, delivered_at_utc stamped from clock"
+          - "Bubble-up cascade: Order.status READY_FOR_DELIVERY -> DELIVERED"
+
+      - from: SCHEDULED
+        to: FAILED
+        trigger: "POST /deliveries/{id}/fail"
+        actor: SupplierUser
+        preconditions:
+          - "Delivery.status == SCHEDULED (ERR_INVALID_STATE)"
+        side_effects: []
+
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /deliveries/{id}/cancel"
+        actor: SupplierUser
+        preconditions:
+          - "Delivery.status == SCHEDULED (ERR_INVALID_STATE)"
+        side_effects: []
+
+  - entity: RentalBillingCycle
+    initial_state: BILLED
+    terminal_states: [PAID, RECOUPED]
+    transitions:
+      - from: NEW
+        to: BILLED
+        trigger: "system — created already BILLED on POST /dme-orders/{id}/rental-cycles, with its RENTAL_MONTH claim line"
+        actor: system
+        preconditions:
+          - "Order.cap_reached == false (ERR_RENTAL_CAP_REACHED) — checked FIRST so that an order which has converted to purchase because the cap was reached returns this specific error, not the generic ERR_INVALID_STATE"
+          - "Order.status == ACTIVE (ERR_INVALID_STATE) — for non-cap reasons the order must be ACTIVE (e.g. still DRAFT/DELIVERED/CLOSED/CANCELLED)"
+          - "New cycle's [period_start_utc, period_end_utc) does not overlap any existing cycle on this order (ERR_CYCLE_OVERLAP) — half-open: adjacent boundaries allowed"
+        side_effects:
+          - "Create ClaimLine line_type=RENTAL_MONTH (calc capped_rental_cycle_amount), set cycle.billed_amount_cents, recompute Order.rental_months_billed and Order.total_allowed_cents"
+          - "If CAPPED_RENTAL and rental_months_billed reaches 13: trigger Order ACTIVE -> CONVERTED_TO_PURCHASE cascade"
+        note: "NEW is the pre-persistence pseudo-state; cycles never exist in any state other than BILLED/PAID/RECOUPED once created."
+
+      - from: BILLED
+        to: PAID
+        trigger: "POST /rental-cycles/{id}/mark-paid"
+        actor: PayerReviewer
+        preconditions:
+          - "RentalBillingCycle.status == BILLED (ERR_INVALID_STATE)"
+        side_effects:
+          - "Linked ClaimLine.status POSTED -> SETTLED"
+
+      - from: BILLED
+        to: RECOUPED
+        trigger: "system — set during Audit UPHELD recoupment cascade"
+        actor: system
+        preconditions:
+          - "RentalBillingCycle.status in {BILLED, PAID}"
+        side_effects:
+          - "Audit recoupment cascade hop"
+
+      - from: PAID
+        to: RECOUPED
+        trigger: "system — set during Audit UPHELD recoupment cascade"
+        actor: system
+        preconditions:
+          - "RentalBillingCycle.status in {BILLED, PAID}"
+        side_effects:
+          - "Audit recoupment cascade hop"
+
+  - entity: CPAPResupplyOrder
+    initial_state: REQUESTED
+    terminal_states: [SHIPPED, DENIED]
+    transitions:
+      - from: REQUESTED
+        to: SHIPPED
+        trigger: "POST /cpap-resupply-orders/{id}/ship"
+        actor: SupplierUser
+        preconditions:
+          - "CPAPResupplyOrder.status == REQUESTED (ERR_INVALID_STATE)"
+          - "No prior SHIPPED resupply of the same supply_kind on this order within RESUPPLY_WINDOW_DAYS (90) before this order's requested_at_utc (ERR_RESUPPLY_TOO_SOON) — min-gap buffer interval"
+        side_effects: []
+
+      - from: REQUESTED
+        to: DENIED
+        trigger: "POST /cpap-resupply-orders/{id}/deny"
+        actor: SupplierUser
+        preconditions:
+          - "CPAPResupplyOrder.status == REQUESTED (ERR_INVALID_STATE)"
+        side_effects: []
+
+  - entity: Audit
+    initial_state: OPEN
+    terminal_states: [UPHELD, DISMISSED]
+    transitions:
+      - from: OPEN
+        to: UPHELD
+        trigger: "POST /audits/{id}/uphold"
+        actor: PayerReviewer
+        preconditions:
+          - "Audit.status == OPEN (ERR_INVALID_STATE)"
+        side_effects:
+          - "Recoupment cascade L1->L2->L3: move every RentalBillingCycle on the order in {BILLED, PAID} (ordered by cycle_index ASC) -> RECOUPED -> for each, create one ClaimLine line_type=RECOUPMENT with negative allowed_amount_cents and audit_id=this.id, its linked original ClaimLine -> VOID -> recompute Order.total_allowed_cents"
+          - "Set Audit.recouped_total_cents and Audit.recouped_cycle_count"
+          - "Invariant: Order.total_allowed_cents after upheld == sum of allowed_amount_cents over non-VOID ClaimLine rows (no drift)"
+
+      - from: OPEN
+        to: DISMISSED
+        trigger: "POST /audits/{id}/dismiss"
+        actor: PayerReviewer
+        preconditions:
+          - "Audit.status == OPEN (ERR_INVALID_STATE)"
+        side_effects: []
+
+# =============================================================================
+# Table 1.2.1: Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: cmn-activate-stale-order
+    parent_entity: DMEOrder
+    write_endpoint: "POST /cmns/{id}/activate"
+    occ_field: "expected_order_version"
+    description: |
+      Activating a CMN against a DMEOrder whose version has advanced since the
+      client last observed it is rejected with a stale-version error. Activating
+      a CMN legitimately supersedes any prior ACTIVE CMN on the same order (a true
+      supersede that both writers could each validly perform from the same
+      observed state), and each activation bumps the order's version; a second
+      activation still carrying the previously observed version is therefore
+      stale and rejected.
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+
+# =============================================================================
+# Table 1.3: Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: modifier_adjusted_monthly
+    trigger: "Computing billed_amount_cents for a RentalBillingCycle at creation (POST /dme-orders/{id}/rental-cycles)"
+    algorithm: threshold
+    formula: |
+      # Mode (a): >=3 inputs (base monthly, billing_category, modifier), non-linear
+      # nested min/max with a conditional branch on category.
+      base = HCPCSItem.monthly_rental_cents               # integer cents
+      # KX presence factor: medical-policy-met (KX) pays full; otherwise coverage
+      # is capped at COVERAGE_CAP_PCT of base for CMN-required items.
+      if DMEOrder.modifier == "KX":
+        coverage_pct = 100
+      elif HCPCSItem.requires_cmn:
+        coverage_pct = COVERAGE_CAP_PCT          # 80
+      else:
+        coverage_pct = 100
+      raw = base * coverage_pct / 100                      # may be fractional cents
+      # OXYGEN floor/ceiling band: oxygen monthly is clamped into [OXY_FLOOR, OXY_CEIL].
+      if HCPCSItem.billing_category == "OXYGEN":
+        adjusted = max(OXY_FLOOR_CENTS, min(OXY_CEIL_CENTS, raw))
+      else:
+        adjusted = raw
+      monthly_allowed_cents = round_half_up(adjusted)      # to whole cents
+    input_set: "Single cycle for one order; reads HCPCSItem.monthly_rental_cents, DMEOrder.modifier, HCPCSItem.requires_cmn, HCPCSItem.billing_category."
+    constants:
+      COVERAGE_CAP_PCT: 80
+      OXY_FLOOR_CENTS: 5000
+      OXY_CEIL_CENTS: 20000
+    precision: "round_half_up to whole cents"
+
+  - name: capped_rental_cycle_amount
+    trigger: "Setting billed_amount_cents on each RentalBillingCycle (POST /dme-orders/{id}/rental-cycles)"
+    algorithm: chronological
+    formula: |
+      # Each cycle bills modifier_adjusted_monthly for that month, processed in
+      # cycle_index order; the 13-month cap is enforced chronologically (cycle 13
+      # is the last billable month, then the order converts to purchase).
+      for cycle in order.cycles ordered by cycle_index ASC:
+        cycle.billed_amount_cents = modifier_adjusted_monthly(order)
+    input_set: "All RentalBillingCycle rows for the order (every cycle is BILLED/PAID/RECOUPED), ordered by cycle_index ASC."
+    precision: "whole cents"
+    variants:
+      - name: provisional_forward_looking
+        when: "A what-if quote before any cycle is billed (GET /dme-orders/{id}/rental-quote)"
+        difference: |
+          Projects the FULL capped-rental obligation forward as
+          RENTAL_CAP_MONTHS * modifier_adjusted_monthly in one shot, assuming all
+          13 months will bill at today's modifier-adjusted rate. Forward-looking:
+          it ignores how many cycles have actually been posted and any future
+          modifier change.
+      - name: final_chronological
+        when: "Actual posting of each monthly cycle (POST /dme-orders/{id}/rental-cycles)"
+        difference: |
+          Bills exactly one month at a time at the modifier-adjusted rate in effect
+          for that cycle; the realized total is the sum over actually-posted cycles
+          and differs from the provisional projection whenever fewer than 13 months
+          have been billed.
+
+  - name: purchase_allowed_amount
+    trigger: "Creating the PURCHASE ClaimLine on POST /dme-orders/{id}/activate-billing for a PURCHASE order"
+    algorithm: threshold
+    formula: |
+      base = HCPCSItem.purchase_price_cents
+      # NU (new) pays full fee schedule; absence of NU on a purchase pays the
+      # used-equipment rate (USED_PCT of fee schedule).
+      if DMEOrder.modifier == "NU":
+        allowed = base
+      else:
+        allowed = round_half_up(base * USED_PCT / 100)
+      purchase_allowed_cents = allowed
+    input_set: "Single order; reads HCPCSItem.purchase_price_cents and DMEOrder.modifier."
+    constants:
+      USED_PCT: 75
+    precision: "round_half_up to whole cents"
+
+  - name: audit_recoupment_total
+    trigger: "Audit OPEN -> UPHELD (POST /audits/{id}/uphold)"
+    algorithm: aggregation
+    formula: |
+      # Mode (b): round PER CYCLE then sum (pinned order). Each recouped cycle
+      # contributes a negative claim line equal to the NEGATION of that cycle's
+      # already-rounded billed_amount_cents; the audit total is the sum of the
+      # per-cycle absolute amounts. Summing first then rounding is NOT used.
+      recouped = [c for c in order.cycles if c.status in {BILLED, PAID}]
+      ordered  = sort(recouped, key=cycle_index ASC)
+      recouped_total_cents = sum( round_half_up(c.billed_amount_cents) for c in ordered )
+      recouped_cycle_count = len(ordered)
+    input_set: "RentalBillingCycle rows for the audited order whose status is BILLED or PAID, ordered by cycle_index ASC."
+    constants: {}
+    precision: "round per cycle then sum; round_half_up to whole cents"
+    variants:
+      - name: billed_basis
+        when: "Default audit basis (reason_code OVERBILLED_PAST_CAP, NO_VALID_CMN, NO_PRIOR_AUTH)"
+        difference: |
+          Recoups every cycle in {BILLED, PAID} — the payer claws back amounts even
+          for cycles not yet settled, because the certification/authorization defect
+          invalidates the whole billing stream.
+      - name: settled_only_basis
+        when: "Audit basis reason_code NO_PROOF_OF_DELIVERY"
+        difference: |
+          Recoups ONLY cycles in PAID status — a missing proof of delivery claws back
+          money that actually moved (PAID); unsettled BILLED cycles are merely voided,
+          not recouped, so recouped_total_cents is generally smaller than billed_basis
+          for the same set of cycles.
+
+  - name: cpap_resupply_eligibility
+    trigger: "POST /cpap-resupply-orders/{id}/ship"
+    algorithm: threshold
+    formula: |
+      prior = latest SHIPPED CPAPResupplyOrder on same order with same supply_kind,
+              by requested_at_utc DESC (tie-break created_at ASC)
+      if prior is None:
+        eligible = True
+      else:
+        gap_days = (this.requested_at_utc - prior.requested_at_utc) in whole days
+        eligible = (gap_days >= RESUPPLY_WINDOW_DAYS)    # >= : day 90 is eligible
+      if not eligible: reject ERR_RESUPPLY_TOO_SOON
+    input_set: "SHIPPED CPAPResupplyOrder rows on the same order with the same supply_kind."
+    constants:
+      RESUPPLY_WINDOW_DAYS: 90
+    precision: "whole days, floor of elapsed duration"
+
+  - name: order_total_allowed
+    trigger: "Any ClaimLine create/void; any cycle bill/recoup; audit uphold"
+    algorithm: aggregation
+    formula: |
+      total_allowed_cents = sum( cl.allowed_amount_cents
+                                 for cl in order.claim_lines if cl.status != VOID )
+    input_set: "ClaimLine rows for the order whose status != VOID (RECOUPMENT lines included as negatives)."
+    precision: "whole cents"
+
+  - name: rental_cap_progress
+    trigger: "After each RentalBillingCycle is posted (POST /dme-orders/{id}/rental-cycles)"
+    algorithm: threshold
+    formula: |
+      rental_months_billed = count(cycles where status in {BILLED, PAID})
+      cap_reached = (billing_category == CAPPED_RENTAL
+                     and rental_months_billed >= RENTAL_CAP_MONTHS)   # >= 13
+      # cycle 12 -> not reached; cycle 13 -> reached, order converts.
+    input_set: "RentalBillingCycle rows for the order in {BILLED, PAID}."
+    constants:
+      RENTAL_CAP_MONTHS: 13
+    precision: "integer count"
+
+# =============================================================================
+# Table 1.4: Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "Path/body referenced resources exist, validated left-to-right (order, then cmn/delivery/cycle/audit/resupply, then FK targets patient/supplier/hcpcs_item)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: state
+    check: "Target resource is in the required state for the requested transition. EXCEPTION: on POST /dme-orders/{id}/rental-cycles the cap check (priority 8) is evaluated before this generic state check, so an order that converted to purchase because the cap was reached yields ERR_RENTAL_CAP_REACHED, not ERR_INVALID_STATE."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 5
+    category: business_referential
+    check: "Compliance gates on mark-ready: CMN-required item has an ACTIVE CMN; prior-auth-required item has an APPROVED+unexpired PriorAuthorization (CMN checked before prior auth)"
+    error_id: "ERR_CMN_REQUIRED / ERR_PRIOR_AUTH_REQUIRED"
+    http_status: 422
+    applies_to: "POST /dme-orders/{id}/mark-ready"
+
+  - priority: 6
+    category: business_referential
+    check: "activate-billing requires at least one CONFIRMED Delivery with pod_received==true"
+    error_id: ERR_NO_PROOF_OF_DELIVERY
+    http_status: 422
+    applies_to: "POST /dme-orders/{id}/activate-billing"
+
+  - priority: 7
+    category: business_safety
+    check: "Supplier fulfilling the order is Medicare-accredited (accreditation_active==true)"
+    error_id: ERR_SUPPLIER_NOT_ACCREDITED
+    http_status: 422
+    applies_to: "POST /dme-orders/{id}/mark-ready"
+
+  - priority: 8
+    category: business_constraint
+    check: "Rental cap: a CAPPED_RENTAL order whose cap_reached==true cannot bill another rental cycle. On POST /dme-orders/{id}/rental-cycles this check is evaluated before the generic priority-4 state check (see priority 4 note), so a cap-converted order yields ERR_RENTAL_CAP_REACHED."
+    error_id: ERR_RENTAL_CAP_REACHED
+    http_status: 422
+    applies_to: "POST /dme-orders/{id}/rental-cycles"
+
+  - priority: 9
+    category: business_temporal
+    check: "New RentalBillingCycle [period_start_utc, period_end_utc) does not overlap any existing cycle on the order (half-open: shared boundary is allowed)"
+    error_id: ERR_CYCLE_OVERLAP
+    http_status: 422
+    applies_to: "POST /dme-orders/{id}/rental-cycles"
+
+  - priority: 10
+    category: business_temporal
+    check: "CPAP resupply of the same supply_kind must be >= RESUPPLY_WINDOW_DAYS after the prior SHIPPED resupply (min-gap buffer)"
+    error_id: ERR_RESUPPLY_TOO_SOON
+    http_status: 422
+    applies_to: "POST /cpap-resupply-orders/{id}/ship"
+
+  - priority: 11
+    category: business_constraint
+    check: "acquisition_type matches billing_category: CAPPED_RENTAL / OXYGEN / INEXPENSIVE_ROUTINE -> RENTAL; PURCHASE_ONLY -> PURCHASE"
+    error_id: ERR_ACQUISITION_TYPE_MISMATCH
+    http_status: 422
+    applies_to: "POST /dme-orders"
+
+  - priority: 12
+    category: business_constraint
+    check: "CPAP resupply may only be created against an order whose HCPCSItem.is_cpap==true"
+    error_id: ERR_NOT_A_CPAP_ORDER
+    http_status: 422
+    applies_to: "POST /cpap-resupply-orders"
+
+  - priority: 13
+    category: business_temporal
+    check: "CMN signed_date must be on or before the order's ordered_at_utc date when activating"
+    error_id: ERR_CMN_SIGNED_AFTER_ORDER
+    http_status: 422
+    applies_to: "POST /cmns/{id}/activate"
+
+  - priority: 14
+    category: state
+    check: "OCC: expected_order_version must match DMEOrder.version on CMN activate. Ordered AFTER the business_temporal signed-after-order check (priority 13) so that on POST /cmns/{id}/activate a CMN signed after the order returns ERR_CMN_SIGNED_AFTER_ORDER even when the version is also stale."
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+    applies_to: "POST /cmns/{id}/activate"
+
+  - priority: 15
+    category: business_constraint
+    check: "Required body fields present and well-typed; enums in range; quantity/length within stated bounds"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all create/transition endpoints with a body"
+
+  - priority: 16
+    category: business_constraint
+    check: "Uniqueness: Patient.medicare_id, Supplier.ptan, HCPCSItem.hcpcs_code unique"
+    error_id: ERR_DUPLICATE_VALUE
+    http_status: 409
+    applies_to: "POST /patients, POST /suppliers, POST /hcpcs-items"
+
+# =============================================================================
+# Table 1.5: API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Reference: Patient ----
+  - method: POST
+    path: "/patients"
+    description: "Register a beneficiary"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [full_name, medicare_id, date_of_birth, address_state]
+    output: Patient
+    side_effects: []
+  - method: GET
+    path: "/patients/{id}"
+    description: "Get a patient"
+    roles: [PlatformAdmin, SupplierUser]
+    code: 200
+    input: []
+    output: Patient
+    side_effects: []
+
+  # ---- Reference: Supplier ----
+  - method: POST
+    path: "/suppliers"
+    description: "Register a DME supplier"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [name, ptan, "accreditation_active?"]
+    output: Supplier
+    side_effects: []
+  - method: GET
+    path: "/suppliers/{id}"
+    description: "Get a supplier"
+    roles: [PlatformAdmin, SupplierUser]
+    code: 200
+    input: []
+    output: Supplier
+    side_effects: []
+  - method: PATCH
+    path: "/suppliers/{id}"
+    description: "Update supplier accreditation flag (business admin surface)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["accreditation_active?"]
+    output: Supplier
+    side_effects: []
+
+  # ---- Reference: HCPCSItem ----
+  - method: POST
+    path: "/hcpcs-items"
+    description: "Add a HCPCS catalog item"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [hcpcs_code, description, billing_category, purchase_price_cents, monthly_rental_cents, "requires_cmn?", "requires_prior_auth?", "is_cpap?"]
+    output: HCPCSItem
+    side_effects: []
+  - method: GET
+    path: "/hcpcs-items/{id}"
+    description: "Get a catalog item"
+    roles: [PlatformAdmin, SupplierUser]
+    code: 200
+    input: []
+    output: HCPCSItem
+    side_effects: []
+
+  # ---- DMEOrder ----
+  - method: POST
+    path: "/dme-orders"
+    description: "Create a DME order in DRAFT"
+    roles: [SupplierUser]
+    code: 201
+    input: [patient_id, supplier_id, hcpcs_item_id, acquisition_type, "modifier?", ordered_at_utc]
+    output: DMEOrder
+    side_effects: ["status=DRAFT; rental_months_billed=0; cap_reached=false; total_allowed_cents=0"]
+  - method: GET
+    path: "/dme-orders/{id}"
+    description: "Get a DME order with computed ledger fields"
+    roles: [SupplierUser, PayerReviewer, PlatformAdmin]
+    code: 200
+    input: []
+    output: DMEOrder
+    side_effects: []
+  - method: GET
+    path: "/dme-orders"
+    description: "List DME orders; filterable by patient_id, supplier_id, hcpcs_item_id"
+    roles: [SupplierUser, PayerReviewer, PlatformAdmin]
+    code: 200
+    input: ["patient_id?", "supplier_id?", "hcpcs_item_id?", "status?", "limit?", "offset?"]
+    output: DMEOrder[]
+    side_effects: []
+  - method: GET
+    path: "/dme-orders/{id}/rental-quote"
+    description: "Provisional forward-looking capped-rental quote (calc capped_rental_cycle_amount provisional variant)"
+    roles: [SupplierUser, PayerReviewer]
+    code: 200
+    input: []
+    output: "{ provisional_total_cents: integer, monthly_allowed_cents: integer, cap_months: integer }"
+    side_effects: []
+  - method: POST
+    path: "/dme-orders/{id}/mark-ready"
+    description: "Move order DRAFT -> READY_FOR_DELIVERY after compliance gates"
+    roles: [SupplierUser]
+    code: 200
+    input: []
+    output: DMEOrder
+    side_effects: ["status -> READY_FOR_DELIVERY"]
+  - method: POST
+    path: "/dme-orders/{id}/activate-billing"
+    description: "Move DELIVERED -> ACTIVE; PURCHASE orders post their single claim line here"
+    roles: [SupplierUser]
+    code: 200
+    input: []
+    output: DMEOrder
+    side_effects:
+      - "status -> ACTIVE"
+      - "PURCHASE: create ClaimLine line_type=PURCHASE (calc purchase_allowed_amount), recompute total_allowed_cents"
+  - method: POST
+    path: "/dme-orders/{id}/rental-cycles"
+    description: "Post the next monthly rental cycle (creates a BILLED cycle + RENTAL_MONTH claim line). Optional period_start_utc back-bills a correction month at an explicit period start."
+    roles: [SupplierUser]
+    code: 201
+    input: ["period_start_utc?"]
+    output: RentalBillingCycle
+    side_effects:
+      - "Assign cycle_index = max+1; period_start = supplied period_start_utc if present else ordered_at_utc + (cycle_index-1) months; period_end = period_start + 1 month"
+      - "Create ClaimLine line_type=RENTAL_MONTH (calc modifier_adjusted_monthly); set billed_amount_cents"
+      - "Recompute rental_months_billed and total_allowed_cents"
+      - "If CAPPED_RENTAL and rental_months_billed reaches 13: cascade order ACTIVE -> CONVERTED_TO_PURCHASE"
+  - method: POST
+    path: "/dme-orders/{id}/close"
+    description: "Close an ACTIVE order"
+    roles: [SupplierUser]
+    code: 200
+    input: []
+    output: DMEOrder
+    side_effects: ["status -> CLOSED"]
+  - method: POST
+    path: "/dme-orders/{id}/cancel"
+    description: "Cancel a DRAFT order"
+    roles: [SupplierUser]
+    code: 200
+    input: []
+    output: DMEOrder
+    side_effects: ["status -> CANCELLED; revoke CMNs; cancel SCHEDULED deliveries"]
+
+  # ---- CMN ----
+  - method: POST
+    path: "/cmns"
+    description: "Create a draft Certificate of Medical Necessity for an order"
+    roles: [PhysicianUser]
+    code: 201
+    input: [order_id, physician_npi, length_of_need_months, signed_date]
+    output: CMN
+    side_effects: ["status=DRAFT"]
+  - method: GET
+    path: "/cmns/{id}"
+    description: "Get a CMN"
+    roles: [PhysicianUser, SupplierUser, PayerReviewer]
+    code: 200
+    input: []
+    output: CMN
+    side_effects: []
+  - method: GET
+    path: "/cmns"
+    description: "List CMNs; filter by order_id (FK reverse-reachability for CMN.order_id) or superseded_by_id (FK reverse-reachability for the self-referential CMN.superseded_by_id)"
+    roles: [PhysicianUser, SupplierUser, PayerReviewer]
+    code: 200
+    input: ["order_id?", "superseded_by_id?", "status?", "limit?", "offset?"]
+    output: CMN[]
+    side_effects: []
+  - method: POST
+    path: "/cmns/{id}/activate"
+    description: "Activate a CMN (supersedes any prior ACTIVE CMN on the order); OCC-guarded on order version"
+    roles: [PhysicianUser]
+    code: 200
+    input: [expected_order_version]
+    output: CMN
+    side_effects:
+      - "status DRAFT -> ACTIVE"
+      - "Prior ACTIVE CMN on same order -> SUPERSEDED with superseded_by_id set"
+      - "Increments DMEOrder.version by 1"
+  - method: POST
+    path: "/cmns/{id}/revoke"
+    description: "Revoke an ACTIVE CMN"
+    roles: [PhysicianUser]
+    code: 200
+    input: []
+    output: CMN
+    side_effects: ["status ACTIVE -> REVOKED"]
+
+  # ---- PriorAuthorization ----
+  - method: POST
+    path: "/prior-authorizations"
+    description: "Open a prior authorization request for an order"
+    roles: [SupplierUser]
+    code: 201
+    input: [order_id, payer_reference]
+    output: PriorAuthorization
+    side_effects: ["status=PENDING"]
+  - method: GET
+    path: "/prior-authorizations/{id}"
+    description: "Get a prior authorization"
+    roles: [SupplierUser, PayerReviewer]
+    code: 200
+    input: []
+    output: PriorAuthorization
+    side_effects: []
+  - method: GET
+    path: "/prior-authorizations"
+    description: "List prior authorizations; filter by order_id (FK reverse-reachability)"
+    roles: [SupplierUser, PayerReviewer]
+    code: 200
+    input: ["order_id?", "status?", "limit?", "offset?"]
+    output: PriorAuthorization[]
+    side_effects: []
+  - method: POST
+    path: "/prior-authorizations/{id}/approve"
+    description: "Approve a pending prior authorization"
+    roles: [PayerReviewer]
+    code: 200
+    input: ["decision_reason?"]
+    output: PriorAuthorization
+    side_effects: ["status -> APPROVED; expires_at_utc = clock now + 60 days"]
+  - method: POST
+    path: "/prior-authorizations/{id}/deny"
+    description: "Deny a pending prior authorization"
+    roles: [PayerReviewer]
+    code: 200
+    input: ["decision_reason?"]
+    output: PriorAuthorization
+    side_effects: ["status -> DENIED"]
+
+  # ---- Delivery ----
+  - method: POST
+    path: "/deliveries"
+    description: "Schedule a delivery/setup for an order"
+    roles: [SupplierUser]
+    code: 201
+    input: [order_id, scheduled_for_utc, "pod_signature_name?"]
+    output: Delivery
+    side_effects: ["status=SCHEDULED"]
+  - method: GET
+    path: "/deliveries/{id}"
+    description: "Get a delivery"
+    roles: [SupplierUser, PayerReviewer]
+    code: 200
+    input: []
+    output: Delivery
+    side_effects: []
+  - method: GET
+    path: "/deliveries"
+    description: "List deliveries; filter by order_id (FK reverse-reachability)"
+    roles: [SupplierUser, PayerReviewer]
+    code: 200
+    input: ["order_id?", "status?", "limit?", "offset?"]
+    output: Delivery[]
+    side_effects: []
+  - method: POST
+    path: "/deliveries/{id}/confirm"
+    description: "Confirm delivery with proof-of-delivery signature; bubbles order READY_FOR_DELIVERY -> DELIVERED"
+    roles: [SupplierUser]
+    code: 200
+    input: [pod_signature_name]
+    output: Delivery
+    side_effects:
+      - "status -> CONFIRMED; pod_received=true; delivered_at_utc stamped"
+      - "Bubble-up: order READY_FOR_DELIVERY -> DELIVERED"
+  - method: POST
+    path: "/deliveries/{id}/fail"
+    description: "Mark a scheduled delivery as failed"
+    roles: [SupplierUser]
+    code: 200
+    input: []
+    output: Delivery
+    side_effects: ["status -> FAILED"]
+  - method: POST
+    path: "/deliveries/{id}/cancel"
+    description: "Cancel a scheduled delivery"
+    roles: [SupplierUser]
+    code: 200
+    input: []
+    output: Delivery
+    side_effects: ["status -> CANCELLED"]
+
+  # ---- RentalBillingCycle ----
+  - method: GET
+    path: "/rental-cycles/{id}"
+    description: "Get a rental billing cycle"
+    roles: [SupplierUser, PayerReviewer]
+    code: 200
+    input: []
+    output: RentalBillingCycle
+    side_effects: []
+  - method: GET
+    path: "/rental-cycles"
+    description: "List rental cycles; filter by order_id (FK reverse-reachability)"
+    roles: [SupplierUser, PayerReviewer]
+    code: 200
+    input: ["order_id?", "status?", "limit?", "offset?"]
+    output: RentalBillingCycle[]
+    side_effects: []
+  - method: POST
+    path: "/rental-cycles/{id}/mark-paid"
+    description: "Payer marks a BILLED cycle PAID; linked claim line SETTLED"
+    roles: [PayerReviewer]
+    code: 200
+    input: []
+    output: RentalBillingCycle
+    side_effects: ["status BILLED -> PAID; linked ClaimLine POSTED -> SETTLED"]
+
+  # ---- ClaimLine ----
+  - method: GET
+    path: "/claim-lines/{id}"
+    description: "Get a claim line"
+    roles: [SupplierUser, PayerReviewer]
+    code: 200
+    input: []
+    output: ClaimLine
+    side_effects: []
+  - method: GET
+    path: "/claim-lines"
+    description: "List claim lines; filter by order_id, rental_cycle_id, audit_id (FK reverse-reachability for all three ClaimLine FKs)"
+    roles: [SupplierUser, PayerReviewer]
+    code: 200
+    input: ["order_id?", "rental_cycle_id?", "audit_id?", "line_type?", "status?", "limit?", "offset?"]
+    output: ClaimLine[]
+    side_effects: []
+
+  # ---- CPAPResupplyOrder ----
+  - method: POST
+    path: "/cpap-resupply-orders"
+    description: "Request a CPAP resupply against a CPAP order"
+    roles: [SupplierUser]
+    code: 201
+    input: [order_id, supply_kind, quantity]
+    output: CPAPResupplyOrder
+    side_effects: ["status=REQUESTED; requested_at_utc stamped from clock"]
+  - method: GET
+    path: "/cpap-resupply-orders/{id}"
+    description: "Get a CPAP resupply order"
+    roles: [SupplierUser, PayerReviewer]
+    code: 200
+    input: []
+    output: CPAPResupplyOrder
+    side_effects: []
+  - method: GET
+    path: "/cpap-resupply-orders"
+    description: "List CPAP resupply orders; filter by order_id (FK reverse-reachability)"
+    roles: [SupplierUser, PayerReviewer]
+    code: 200
+    input: ["order_id?", "supply_kind?", "status?", "limit?", "offset?"]
+    output: CPAPResupplyOrder[]
+    side_effects: []
+  - method: POST
+    path: "/cpap-resupply-orders/{id}/ship"
+    description: "Ship a requested resupply if outside the 90-day window for that supply_kind"
+    roles: [SupplierUser]
+    code: 200
+    input: []
+    output: CPAPResupplyOrder
+    side_effects: ["status -> SHIPPED"]
+  - method: POST
+    path: "/cpap-resupply-orders/{id}/deny"
+    description: "Deny a requested resupply"
+    roles: [SupplierUser]
+    code: 200
+    input: []
+    output: CPAPResupplyOrder
+    side_effects: ["status -> DENIED"]
+
+  # ---- Audit ----
+  - method: POST
+    path: "/audits"
+    description: "Open an audit against an order"
+    roles: [PayerReviewer]
+    code: 201
+    input: [order_id, reason_code]
+    output: Audit
+    side_effects: ["status=OPEN"]
+  - method: GET
+    path: "/audits/{id}"
+    description: "Get an audit with recoupment totals"
+    roles: [PayerReviewer, SupplierUser]
+    code: 200
+    input: []
+    output: Audit
+    side_effects: []
+  - method: GET
+    path: "/audits"
+    description: "List audits; filter by order_id (FK reverse-reachability)"
+    roles: [PayerReviewer, SupplierUser]
+    code: 200
+    input: ["order_id?", "status?", "limit?", "offset?"]
+    output: Audit[]
+    side_effects: []
+  - method: POST
+    path: "/audits/{id}/uphold"
+    description: "Uphold an audit; runs the recoupment cascade over the order's BILLED/PAID cycles"
+    roles: [PayerReviewer]
+    code: 200
+    input: []
+    output: Audit
+    side_effects:
+      - "Recoupment cascade L1->L2->L3 (see state_machines Audit OPEN->UPHELD)"
+      - "Set recouped_total_cents and recouped_cycle_count; recompute order.total_allowed_cents"
+  - method: POST
+    path: "/audits/{id}/dismiss"
+    description: "Dismiss an audit with no ledger effect"
+    roles: [PayerReviewer]
+    code: 200
+    input: []
+    output: Audit
+    side_effects: ["status -> DISMISSED"]
+
+  # ---- Test-driving (clock) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the deterministic system clock (drives resupply timing, prior-auth expiry, delivery/resupply stamps)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ now_utc: string }"
+    side_effects: ["server clock now == to_iso8601"]
+
+# =============================================================================
+# Table 1.6: Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/invalid X-User-Role or X-User-ID header" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Acting role not permitted for this operation" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Referenced resource does not exist" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Malformed body, missing required field, bad enum, or out-of-range value" }
+  - { id: ERR_DUPLICATE_VALUE, http: 409, condition: "Unique field (medicare_id / ptan / hcpcs_code) already exists" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in the required state for this transition" }
+  - { id: ERR_ACQUISITION_TYPE_MISMATCH, http: 422, condition: "acquisition_type incompatible with item billing_category" }
+  - { id: ERR_CMN_REQUIRED, http: 422, condition: "mark-ready on a CMN-required item with no ACTIVE CMN" }
+  - { id: ERR_PRIOR_AUTH_REQUIRED, http: 422, condition: "mark-ready on a prior-auth-required item with no APPROVED+unexpired PriorAuthorization" }
+  - { id: ERR_SUPPLIER_NOT_ACCREDITED, http: 422, condition: "mark-ready when fulfilling supplier is not accredited" }
+  - { id: ERR_NO_PROOF_OF_DELIVERY, http: 422, condition: "activate-billing with no CONFIRMED delivery carrying pod_received==true" }
+  - { id: ERR_POD_SIGNATURE_REQUIRED, http: 422, condition: "confirm delivery with empty pod_signature_name" }
+  - { id: ERR_CMN_SIGNED_AFTER_ORDER, http: 422, condition: "CMN signed_date is after the order's ordered_at_utc date on activate" }
+  - { id: ERR_STALE_ORDER_VERSION, http: 412, condition: "expected_order_version does not match DMEOrder.version on CMN activate (OCC)" }
+  - { id: ERR_RENTAL_CAP_REACHED, http: 422, condition: "rental cycle posted on a CAPPED_RENTAL order whose cap_reached==true" }
+  - { id: ERR_CYCLE_OVERLAP, http: 422, condition: "new rental cycle period overlaps an existing cycle on the order" }
+  - { id: ERR_RESUPPLY_TOO_SOON, http: 422, condition: "CPAP resupply ship within RESUPPLY_WINDOW_DAYS of the prior shipped resupply of the same supply_kind" }
+  - { id: ERR_NOT_A_CPAP_ORDER, http: 422, condition: "CPAP resupply created against a non-CPAP order" }
+
+# =============================================================================
+# Table 1.7: RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Operator that manages reference data (patients, suppliers, catalog) and the deterministic clock."
+    identity: opaque
+    exclusive_operations:
+      - "POST /patients, POST /suppliers, PATCH /suppliers/{id}"
+      - "POST /hcpcs-items"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "GET on patients/suppliers/hcpcs-items/dme-orders"
+
+  - name: SupplierUser
+    description: "DME supplier staff that own orders, deliveries, rental cycles, CPAP resupplies."
+    identity: "entity_backed:Supplier"
+    exclusive_operations:
+      - "POST /dme-orders and all /dme-orders/{id}/* order-lifecycle transitions (mark-ready, activate-billing, rental-cycles, close, cancel)"
+      - "POST /deliveries and /deliveries/{id}/{confirm,fail,cancel}"
+      - "POST /prior-authorizations (open)"
+      - "POST /cpap-resupply-orders and /cpap-resupply-orders/{id}/{ship,deny}"
+    shared_operations:
+      - "GET reads on orders/cmns/deliveries/cycles/claim-lines/audits/prior-authorizations/resupply"
+
+  - name: PhysicianUser
+    description: "Certifying physician that authors and activates CMNs."
+    identity: opaque
+    exclusive_operations:
+      - "POST /cmns, POST /cmns/{id}/activate, POST /cmns/{id}/revoke"
+    shared_operations:
+      - "GET /cmns, GET /cmns/{id}"
+
+  - name: PayerReviewer
+    description: "Payer-side reviewer that decides prior auths, pays cycles, and runs audits/recoupment."
+    identity: opaque
+    exclusive_operations:
+      - "POST /prior-authorizations/{id}/{approve,deny}"
+      - "POST /rental-cycles/{id}/mark-paid"
+      - "POST /audits and /audits/{id}/{uphold,dismiss}"
+    shared_operations:
+      - "GET reads on orders/deliveries/cycles/claim-lines/audits/prior-authorizations/resupply; GET /dme-orders/{id}/rental-quote"

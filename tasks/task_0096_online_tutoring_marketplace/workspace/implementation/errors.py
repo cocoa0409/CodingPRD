@@ -1,0 +1,65 @@
+"""Error catalogue and the ApiError exception.
+
+Every error_id and HTTP status is taken verbatim from PRD section 5 / SCAFFOLD
+section 1.6. No error id or status is assumed.
+"""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# --- Request / auth ---
+ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER = ("ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER", 400)
+ERR_VALIDATION = ("ERR_VALIDATION", 400)
+ERR_UNAUTHORIZED = ("ERR_UNAUTHORIZED", 403)
+ERR_NOT_RESOURCE_OWNER = ("ERR_NOT_RESOURCE_OWNER", 403)
+
+# --- Not found ---
+ERR_TUTOR_NOT_FOUND = ("ERR_TUTOR_NOT_FOUND", 404)
+ERR_SUBJECT_NOT_FOUND = ("ERR_SUBJECT_NOT_FOUND", 404)
+ERR_CREDENTIAL_NOT_FOUND = ("ERR_CREDENTIAL_NOT_FOUND", 404)
+ERR_SUBJECT_TAG_NOT_FOUND = ("ERR_SUBJECT_TAG_NOT_FOUND", 404)
+ERR_PARENT_NOT_FOUND = ("ERR_PARENT_NOT_FOUND", 404)
+ERR_STUDENT_NOT_FOUND = ("ERR_STUDENT_NOT_FOUND", 404)
+ERR_BOOKING_NOT_FOUND = ("ERR_BOOKING_NOT_FOUND", 404)
+ERR_SESSION_NOT_FOUND = ("ERR_SESSION_NOT_FOUND", 404)
+ERR_SETTLEMENT_NOT_FOUND = ("ERR_SETTLEMENT_NOT_FOUND", 404)
+ERR_REFUND_CASE_NOT_FOUND = ("ERR_REFUND_CASE_NOT_FOUND", 404)
+
+# --- State ---
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_TUTOR_NOT_REINSTATABLE = ("ERR_TUTOR_NOT_REINSTATABLE", 409)
+
+# --- OCC ---
+ERR_STALE_REFUND_CASE_VERSION = ("ERR_STALE_REFUND_CASE_VERSION", 412)
+
+# --- Business: credential / subject gating ---
+ERR_SUBJECT_REQUIRES_CREDENTIAL = ("ERR_SUBJECT_REQUIRES_CREDENTIAL", 409)
+ERR_TUTOR_NOT_VERIFIED = ("ERR_TUTOR_NOT_VERIFIED", 409)
+ERR_TUTOR_SUBJECT_NOT_APPROVED = ("ERR_TUTOR_SUBJECT_NOT_APPROVED", 409)
+
+# --- Business: temporal ---
+ERR_BOOKING_TIME_INVALID = ("ERR_BOOKING_TIME_INVALID", 422)
+ERR_TUTOR_TIME_CONFLICT = ("ERR_TUTOR_TIME_CONFLICT", 409)
+ERR_STUDENT_TIME_CONFLICT = ("ERR_STUDENT_TIME_CONFLICT", 409)
+ERR_REFUND_WINDOW_CLOSED = ("ERR_REFUND_WINDOW_CLOSED", 409)
+
+# --- Business: negotiation / amounts ---
+ERR_OFFER_OUT_OF_BOUNDS = ("ERR_OFFER_OUT_OF_BOUNDS", 422)
+ERR_NEGOTIATION_ROUNDS_EXHAUSTED = ("ERR_NEGOTIATION_ROUNDS_EXHAUSTED", 409)
+ERR_AMOUNT_OUT_OF_RANGE = ("ERR_AMOUNT_OUT_OF_RANGE", 422)
+ERR_RESCHEDULE_LIMIT_REACHED = ("ERR_RESCHEDULE_LIMIT_REACHED", 409)
+
+# --- Business: fiscal ---
+ERR_INSUFFICIENT_WALLET_BALANCE = ("ERR_INSUFFICIENT_WALLET_BALANCE", 402)
+
+
+def raise_error(spec, message=None):
+    """spec is one of the (error_id, http_status) tuples above."""
+    error_id, http_status = spec
+    raise ApiError(error_id, http_status, message)

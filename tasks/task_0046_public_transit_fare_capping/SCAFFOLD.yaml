@@ -1,0 +1,1131 @@
+scenario: "Public Transit Fare Capping: single ride/daily cap/weekly cap, transfer discount, low-income discount, mobile payment integration, employer commuter benefit (Transit FSA), Reduced Fare Card"
+
+domain_name: transit-fare-capping
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: Ledger reconciliation
+  secondary_archetype: Pricing engine
+  complexity_layers:
+    - Dual-variant calculation        # chronological cap-accrual vs forward-looking projection
+    - Rate / threshold triggers       # daily/weekly cap breakpoints, transfer-window edges
+    - Derived field reconciliation    # FareWeek.charged_total_cents must reconcile with sum of Tap charges
+    - Optimistic concurrency          # CREATE-with-supersede of a benefit allocation on a Rider
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys: Rider, ReducedFareCard, FareWeek, Tap,
+  # FundingSource, BenefitAllocation, FareProduct. Taps reference a FareWeek and
+  # a Rider by FK; no nested ownership tree.
+
+  state_machine_shape: branching
+  # Tap: PENDING -> {CAPTURED, REJECTED}; CAPTURED -> REVERSED (refund branch with
+  # divergent side-effect sets). ReducedFareCard has a cyclic verify/expire loop.
+
+  relationship_patterns:
+    - one_to_many        # Rider -> Tap, Rider -> FareWeek, FareWeek -> Tap
+    - cross_aggregate    # Tap settlement reads FundingSource balance + BenefitAllocation
+
+  role_model: peer_roles
+  # Rider acts on own taps/cards; FareAdmin manages products and verifies cards;
+  # EmployerAdmin funds commuter benefit allocations; PaymentGateway settles charges.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — emitted verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: FareProduct
+    parent: null
+    common_fields: true
+    fields:
+      - name: zone_code
+        type: string
+        source: input
+        description: "Fare zone identifier, e.g. ZONE_A; unique across active products."
+        constraints: "uppercase alphanumeric; unique among products with status ACTIVE"
+      - name: base_fare_cents
+        type: integer
+        source: input
+        description: "Full single-ride fare in cents before any discount."
+        constraints: ">= 0"
+      - name: daily_cap_cents
+        type: integer
+        source: input
+        description: "Maximum a standard rider is charged across one calendar day in this zone."
+        constraints: ">= base_fare_cents"
+      - name: weekly_cap_cents
+        type: integer
+        source: input
+        description: "Maximum a standard rider is charged across one fare week in this zone."
+        constraints: ">= daily_cap_cents"
+      - name: transfer_window_minutes
+        type: integer
+        source: input
+        description: "Minutes after a charged tap during which a subsequent tap is a free/discounted transfer."
+        default: 120
+        constraints: "> 0"
+      - name: transfer_discount_pct
+        type: number
+        source: input
+        description: "Fraction of base_fare_cents discounted on a qualifying transfer tap (0.0 to 1.0; 1.0 = free transfer)."
+        default: 1.0
+        constraints: "0.0 <= value <= 1.0"
+      - name: reduced_fare_pct
+        type: number
+        source: input
+        description: "Fraction discount applied to base_fare and to both caps for a rider holding a VERIFIED ReducedFareCard."
+        default: 0.5
+        constraints: "0.0 <= value < 1.0"
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state; only ACTIVE products may be referenced by new taps."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, RETIRED}"
+
+  - name: Rider
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Rider login email; unique across all riders."
+        constraints: "unique; non-empty"
+      - name: full_name
+        type: string
+        source: input
+        description: "Rider display name."
+      - name: home_zone_code
+        type: string
+        source: input
+        description: "Default fare zone for this rider; must match an ACTIVE FareProduct.zone_code at registration."
+      - name: income_tier
+        type: enum
+        source: input
+        description: "Self-declared income tier governing low-income discount eligibility."
+        default: STANDARD
+        constraints: "one of {STANDARD, LOW_INCOME}"
+      - name: low_income_discount_pct
+        type: number
+        source: input
+        description: "Fraction discount on base_fare and on both caps when income_tier == LOW_INCOME; ignored otherwise."
+        default: 0.5
+        constraints: "0.0 <= value < 1.0"
+      - name: status
+        type: enum
+        source: system
+        description: "Rider account state; only ACTIVE riders may tap."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED}"
+
+  - name: FundingSource
+    parent: null
+    common_fields: true
+    fields:
+      - name: rider_id
+        type: string
+        source: input
+        description: "FK -> Rider.id; the rider this mobile payment source belongs to."
+      - name: source_type
+        type: enum
+        source: input
+        description: "Mobile payment integration channel for this funding source."
+        constraints: "one of {APPLE_PAY, GOOGLE_PAY, CONTACTLESS_CARD}"
+      - name: prepaid_balance_cents
+        type: integer
+        source: system
+        description: "Stored-value balance available to settle charges; debited on capture, credited on reversal."
+        default: 0
+        constraints: ">= 0"
+      - name: is_default
+        type: boolean
+        source: input
+        description: "Whether this is the rider's default funding source; exactly one default per rider after registration."
+        default: true
+      - name: status
+        type: enum
+        source: system
+        description: "Funding source state; only ACTIVE sources settle charges."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, REMOVED}"
+
+  - name: ReducedFareCard
+    parent: null
+    common_fields: true
+    fields:
+      - name: rider_id
+        type: string
+        source: input
+        description: "FK -> Rider.id; the rider this reduced-fare entitlement card belongs to."
+      - name: program_code
+        type: enum
+        source: input
+        description: "Reduced-fare program the card is issued under."
+        constraints: "one of {SENIOR, DISABILITY, STUDENT}"
+      - name: expires_on
+        type: string
+        source: input
+        description: "ISO 8601 date (YYYY-MM-DD); card is only honored on taps whose fare day is on or before this date."
+      - name: verification_token
+        type: string
+        source: system
+        description: "Server-issued token a FareAdmin must echo back to verify the card."
+      - name: status
+        type: enum
+        source: system
+        description: "Card lifecycle; only VERIFIED unexpired cards grant the reduced fare."
+        default: PENDING_VERIFICATION
+        constraints: "one of {PENDING_VERIFICATION, VERIFIED, EXPIRED, REVOKED}"
+
+  - name: BenefitAllocation
+    parent: null
+    common_fields: true
+    fields:
+      - name: rider_id
+        type: string
+        source: input
+        description: "FK -> Rider.id; the rider whose fares this Transit FSA allocation subsidizes."
+      - name: employer_ref
+        type: string
+        source: input
+        description: "Opaque employer identifier supplied by the funding EmployerAdmin."
+      - name: period_month
+        type: string
+        source: input
+        description: "ISO 8601 month (YYYY-MM); the calendar month this allocation may subsidize. Unique per (rider_id, period_month) among ACTIVE allocations."
+        constraints: "one ACTIVE allocation per (rider_id, period_month)"
+      - name: allocated_cents
+        type: integer
+        source: input
+        description: "Transit FSA pre-tax dollars (cents) granted for the period."
+        constraints: "> 0; <= MONTHLY_FSA_CAP_CENTS"
+      - name: consumed_cents
+        type: integer
+        source: computed
+        description: "Cents of this allocation already applied to captured taps; credited back on reversal. Derived from sum of Tap.benefit_applied_cents for CAPTURED taps citing this allocation."
+        default: 0
+        constraints: "0 <= value <= allocated_cents"
+      - name: status
+        type: enum
+        source: system
+        description: "Allocation lifecycle; only ACTIVE allocations subsidize taps."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUPERSEDED, EXHAUSTED}"
+
+  - name: FareWeek
+    parent: null
+    common_fields: true
+    fields:
+      - name: rider_id
+        type: string
+        source: input
+        description: "FK -> Rider.id; the rider this weekly fare-capping ledger belongs to."
+      - name: week_start_date
+        type: string
+        source: input
+        description: "ISO 8601 date (YYYY-MM-DD) of the Monday that opens this fare week. Unique per (rider_id, week_start_date)."
+        constraints: "must be a Monday; unique per (rider_id, week_start_date)"
+      - name: zone_code
+        type: string
+        source: input
+        description: "Fare zone whose caps govern this week's accrual; copied from the FareProduct at week creation."
+      - name: charged_total_cents
+        type: integer
+        source: computed
+        description: "Running sum of charge_cents over CAPTURED taps in this week; reconciles weekly cap. Decremented on reversal."
+        default: 0
+        constraints: ">= 0; <= effective weekly cap"
+      - name: status
+        type: enum
+        source: system
+        description: "Week ledger state; CLOSED weeks reject new taps."
+        default: OPEN
+        constraints: "one of {OPEN, CLOSED}"
+
+  - name: Tap
+    parent: null
+    common_fields: true
+    fields:
+      - name: rider_id
+        type: string
+        source: input
+        description: "FK -> Rider.id; the rider who tapped."
+      - name: fare_week_id
+        type: string
+        source: input
+        description: "FK -> FareWeek.id; the open fare week the tap is accrued into; the tap's fare day must fall within this week."
+      - name: funding_source_id
+        type: string
+        source: input
+        description: "FK -> FundingSource.id; the mobile payment source debited on capture."
+      - name: benefit_allocation_id
+        type: string
+        source: computed
+        description: "FK -> BenefitAllocation.id; the ACTIVE allocation (if any) selected to subsidize this tap; null when none applies."
+        default: null
+      - name: tapped_at
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC instant of the tap; determines fare day, transfer-window membership, and chronological accrual order."
+      - name: list_fare_cents
+        type: integer
+        source: computed
+        description: "Single-ride fare for this tap after reduced/low-income discount but before transfer discount and cap incremental logic."
+        default: 0
+      - name: transfer_discount_cents
+        type: integer
+        source: computed
+        description: "Cents removed from list_fare_cents because this tap is a qualifying transfer within the prior charged tap's window."
+        default: 0
+      - name: cap_credit_cents
+        type: integer
+        source: computed
+        description: "Cents removed because the daily or weekly cap was already reached or partially reached before this tap."
+        default: 0
+      - name: charge_cents
+        type: integer
+        source: computed
+        description: "Final out-of-pocket cents = list_fare - transfer_discount - cap_credit - benefit_applied_cents, floored at 0."
+        default: 0
+      - name: benefit_applied_cents
+        type: integer
+        source: computed
+        description: "Cents of the post-cap fare paid from the BenefitAllocation rather than the FundingSource."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Tap settlement state."
+        default: PENDING
+        constraints: "one of {PENDING, CAPTURED, REJECTED, REVERSED}"
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Tap
+    initial_state: PENDING
+    terminal_states: [REJECTED, REVERSED]
+    transitions:
+      - from: PENDING
+        to: CAPTURED
+        trigger: "POST /taps/{id}/settle"
+        actor: PaymentGateway
+        preconditions:
+          - "Tap.status == PENDING"
+          - "Rider.status == ACTIVE (rider_id)"
+          - "FundingSource.status == ACTIVE (funding_source_id)"
+          - "FareWeek.status == OPEN (fare_week_id)"
+          - "FundingSource.prepaid_balance_cents >= the tap's computed charge_cents"
+        side_effects:
+          - "run compute_tap_charge: set list_fare_cents, transfer_discount_cents, cap_credit_cents, benefit_applied_cents, charge_cents"
+          - "select benefit_allocation_id via benefit_selector (may set null)"
+          - "debit FundingSource.prepaid_balance_cents by charge_cents (cross-entity ledger)"
+          - "if benefit_applied_cents > 0: increment BenefitAllocation.consumed_cents by benefit_applied_cents; if consumed_cents == allocated_cents set BenefitAllocation.status = EXHAUSTED (cascade hop 2)"
+          - "increment FareWeek.charged_total_cents by charge_cents (cross-entity ledger reconciliation)"
+          - "refresh updated_at/version on Tap, FundingSource, FareWeek, and any touched BenefitAllocation"
+        note: "Charge is computed at settle time by chronological replay of prior CAPTURED taps in the same fare day and week."
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /taps/{id}/settle"
+        actor: PaymentGateway
+        preconditions:
+          - "Tap.status == PENDING"
+          - "computed charge_cents > FundingSource.prepaid_balance_cents (insufficient funds branch)"
+        side_effects:
+          - "set Tap.charge_cents to the computed amount that could not be settled"
+          - "no debit to FundingSource; no change to FareWeek.charged_total_cents or BenefitAllocation"
+          - "refresh Tap.updated_at/version"
+        note: "Divergent branch from CAPTURED: same trigger, opposite ledger side-effect set, selected by the funds precondition. The settle HTTP response is 402 ERR_INSUFFICIENT_FUNDS, but the Tap is still persisted as REJECTED (discoverable via GET /taps/{id}); the rejection is recorded, not silently discarded."
+      - from: CAPTURED
+        to: REVERSED
+        trigger: "POST /taps/{id}/reverse"
+        actor: FareAdmin
+        preconditions:
+          - "Tap.status == CAPTURED"
+          - "FareWeek.status == OPEN (fare_week_id)"
+        side_effects:
+          - "credit FundingSource.prepaid_balance_cents by charge_cents (compensating debit)"
+          - "decrement FareWeek.charged_total_cents by charge_cents (compensating ledger; invariant: rider_out_of_pocket conserved)"
+          - "if benefit_applied_cents > 0: decrement BenefitAllocation.consumed_cents by benefit_applied_cents; if allocation was EXHAUSTED restore status = ACTIVE (cascade hop 2 reversal)"
+          - "refresh updated_at/version on Tap, FundingSource, FareWeek, and any touched BenefitAllocation"
+        note: "Compensating action; conserves the global rider out-of-pocket quantity and the benefit-consumed quantity."
+
+  - entity: ReducedFareCard
+    initial_state: PENDING_VERIFICATION
+    terminal_states: [REVOKED]
+    transitions:
+      - from: PENDING_VERIFICATION
+        to: VERIFIED
+        trigger: "POST /reduced-fare-cards/{id}/verify"
+        actor: FareAdmin
+        preconditions:
+          - "ReducedFareCard.status == PENDING_VERIFICATION"
+          - "supplied verification_token matches the card's verification_token"
+          - "expires_on is on or after the current fare day (CLOCK)"
+        side_effects:
+          - "set status = VERIFIED"
+          - "refresh updated_at/version"
+        note: "A VERIFIED unexpired card makes the rider's taps use reduced_fare_pct."
+      - from: VERIFIED
+        to: EXPIRED
+        trigger: "POST /_clock/set_current_utc (system re-evaluation) or POST /reduced-fare-cards/{id}/refresh-expiry"
+        actor: system
+        preconditions:
+          - "ReducedFareCard.status == VERIFIED"
+          - "expires_on is strictly before the current fare day (CLOCK)"
+        side_effects:
+          - "set status = EXPIRED"
+          - "refresh updated_at/version"
+        note: "Cyclic re-entry: an EXPIRED card may be re-verified after expires_on is extended via PATCH then verify, forming a verify/expire loop."
+      - from: EXPIRED
+        to: VERIFIED
+        trigger: "POST /reduced-fare-cards/{id}/verify"
+        actor: FareAdmin
+        preconditions:
+          - "ReducedFareCard.status == EXPIRED"
+          - "supplied verification_token matches the card's verification_token"
+          - "expires_on is on or after the current fare day (CLOCK)"
+        side_effects:
+          - "set status = VERIFIED"
+          - "refresh updated_at/version"
+        note: "Closes the cycle VERIFIED -> EXPIRED -> VERIFIED."
+      - from: PENDING_VERIFICATION
+        to: REVOKED
+        trigger: "POST /reduced-fare-cards/{id}/revoke"
+        actor: FareAdmin
+        preconditions:
+          - "ReducedFareCard.status IN {PENDING_VERIFICATION, VERIFIED, EXPIRED}"
+        side_effects:
+          - "set status = REVOKED"
+          - "refresh updated_at/version"
+      - from: VERIFIED
+        to: REVOKED
+        trigger: "POST /reduced-fare-cards/{id}/revoke"
+        actor: FareAdmin
+        preconditions:
+          - "ReducedFareCard.status IN {PENDING_VERIFICATION, VERIFIED, EXPIRED}"
+        side_effects:
+          - "set status = REVOKED"
+          - "refresh updated_at/version"
+
+  - entity: BenefitAllocation
+    initial_state: ACTIVE
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "POST /benefit-allocations (create-with-supersede for same rider+period_month)"
+        actor: EmployerAdmin
+        preconditions:
+          - "an ACTIVE BenefitAllocation already exists for (rider_id, period_month)"
+          - "expected_rider_version matches Rider.version (OCC)"
+        side_effects:
+          - "set the prior allocation status = SUPERSEDED"
+          - "create a new ACTIVE allocation; transfer is NOT automatic — consumed_cents resets to 0 on the new allocation"
+          - "increment Rider.version by 1"
+        note: "True race resolved by OCC on Rider.version — see §1.2.1."
+      - from: ACTIVE
+        to: EXHAUSTED
+        trigger: "POST /taps/{id}/settle (cascade hop 2 from Tap capture)"
+        actor: system
+        preconditions:
+          - "consumed_cents reaches allocated_cents after a capture applies benefit"
+        side_effects:
+          - "set status = EXHAUSTED; future taps select no benefit from this allocation"
+          - "refresh updated_at/version"
+      - from: EXHAUSTED
+        to: ACTIVE
+        trigger: "POST /taps/{id}/reverse (cascade hop 2 reversal)"
+        actor: system
+        preconditions:
+          - "a reversal decrements consumed_cents below allocated_cents"
+        side_effects:
+          - "set status = ACTIVE"
+          - "refresh updated_at/version"
+
+  - entity: FareWeek
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /fare-weeks/{id}/close"
+        actor: FareAdmin
+        preconditions:
+          - "FareWeek.status == OPEN"
+          - "no Tap with status PENDING references this fare week"
+        side_effects:
+          - "set status = CLOSED; new taps and reversals against this week are rejected"
+          - "refresh updated_at/version"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: benefit-alloc-supersede-stale-rider
+    parent_entity: Rider
+    write_endpoint: "POST /benefit-allocations"
+    occ_field: "expected_rider_version"
+    description: |
+      Creating a BenefitAllocation for a (rider_id, period_month) that already has an
+      ACTIVE allocation legitimately supersedes the prior one (the new grant replaces
+      the old). Because such a create is a valid supersede under §3 of the product
+      spec, two strictly sequential creates that each carry the rider's last-observed
+      version cannot both proceed: the first create advances Rider.version, so the
+      second create — still presenting the stale expected_rider_version — is rejected.
+    error_id: ERR_STALE_RIDER_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: compute_tap_charge
+    trigger: "POST /taps/{id}/settle (Tap PENDING -> CAPTURED/REJECTED)"
+    algorithm: chronological
+    formula: |
+      # All amounts in integer cents. Evaluation order is pinned and load-bearing.
+      # Discounts compose multiplicatively; caps are applied chronologically AFTER discounts.
+
+      # --- Step 1: effective per-ride list fare (discount stacking, fixed order) ---
+      eff_discount_pct = 0.0
+      if rider has a VERIFIED ReducedFareCard whose expires_on >= fare_day:
+          eff_discount_pct = product.reduced_fare_pct
+      if rider.income_tier == LOW_INCOME:
+          eff_discount_pct = max(eff_discount_pct, rider.low_income_discount_pct)   # take the LARGER discount, never sum
+      list_fare_cents = round_half_up(product.base_fare_cents * (1 - eff_discount_pct))   # ROUND HERE, per-ride
+
+      # --- Step 2: transfer discount ---
+      # find the most recent CAPTURED tap for this rider strictly before tapped_at;
+      # tie-break on created_at ASC if two share tapped_at (never id).
+      prior = latest CAPTURED tap with prior.tapped_at < this.tapped_at
+      if prior exists AND (tapped_at - prior.tapped_at) <= product.transfer_window_minutes minutes:
+          transfer_discount_cents = round_half_up(list_fare_cents * product.transfer_discount_pct)
+      else:
+          transfer_discount_cents = 0
+      post_transfer = list_fare_cents - transfer_discount_cents
+
+      # --- Step 3: cap credit (daily then weekly; caps scaled by same eff_discount_pct) ---
+      eff_daily_cap   = round_half_up(product.daily_cap_cents  * (1 - eff_discount_pct))
+      eff_weekly_cap  = round_half_up(product.weekly_cap_cents * (1 - eff_discount_pct))
+      day_charged_before  = sum(charge_cents) over CAPTURED taps this rider, same fare_day, tapped_at < this.tapped_at
+      week_charged_before = FareWeek.charged_total_cents (already excludes this PENDING tap)
+      daily_room  = max(eff_daily_cap  - day_charged_before, 0)
+      weekly_room = max(eff_weekly_cap - week_charged_before, 0)
+      billable = min(post_transfer, daily_room, weekly_room)
+      cap_credit_cents = post_transfer - billable
+
+      # --- Step 4: benefit (FSA) application, AFTER caps ---
+      alloc = benefit_selector(rider, fare_day)        # see benefit_selector calc; may be null
+      if alloc is not null:
+          benefit_applied_cents = min(billable, alloc.allocated_cents - alloc.consumed_cents)
+      else:
+          benefit_applied_cents = 0
+      charge_cents = billable - benefit_applied_cents   # out-of-pocket from FundingSource; floored >= 0 by construction
+    input_set: "CAPTURED taps for the same rider within the same fare_day (daily) and same FareWeek (weekly), strictly before this tap's tapped_at, ordered by tapped_at ASC then created_at ASC."
+    constants:
+      ROUNDING: round_half_up
+    precision: "integer cents; round_half_up at each per-ride multiplication; caps compared as integers"
+    variants:
+      - name: chronological_actual
+        when: "at settle time (this is the canonical algorithm)"
+        difference: "Replays only taps strictly before this tap in time order; the running FareWeek.charged_total_cents and prior daily charges define the room. Order-dependent: a later-tapped ride absorbs the cap credit, an earlier one pays full fare."
+      - name: forward_looking_estimate
+        when: "GET /taps/quote (pre-tap estimate, no persistence)"
+        difference: |
+          Treats the hypothetical tap as APPENDED to today's already-CAPTURED set regardless of its
+          tapped_at, then estimates the marginal charge as
+            estimated = max( min(eff_daily_cap, daily_list_total + this_list_fare)
+                                 - day_charged_so_far , 0 ),
+          where day_charged_so_far is the current sum of CAPTURED charge_cents today and daily_list_total
+          is the sum of those taps' list_fare_cents. Because it appends rather than chronologically inserts,
+          a tap quoted with a tapped_at EARLIER than an already-captured tap is estimated as a transfer-of-cap-credit
+          marginal, whereas chronological_actual would price that same earlier tap at full fare (it has no prior
+          captured tap before it in time). The two therefore diverge whenever the quoted tap is out of eventual
+          chronological order. Weekly room and transfer discount are computed the same way as chronological_actual.
+
+  - name: benefit_selector
+    trigger: "Tap settle (selecting benefit_allocation_id) and GET /taps/quote"
+    algorithm: chronological
+    formula: |
+      # Candidate set: BenefitAllocation rows where
+      #   alloc.rider_id == tap.rider_id
+      #   AND alloc.status == ACTIVE
+      #   AND alloc.period_month == fare_day's YYYY-MM
+      #   AND (alloc.allocated_cents - alloc.consumed_cents) > 0
+      # Ranking: remaining_cents DESC (most headroom first).
+      # Tie-break: created_at ASC (oldest allocation first); never id.
+      # Fallback: empty candidate set -> select null (benefit_applied_cents = 0).
+      selected = first of sorted(candidates, key=(-remaining_cents, created_at ASC))
+    input_set: "ACTIVE BenefitAllocation rows for the rider whose period_month equals the tap's fare-day month and that have remaining headroom."
+    constants: {}
+    precision: "integer cents"
+
+  - name: rider_risk_score
+    trigger: "GET /riders/{id}/risk (read-time recompute) and after each Tap settle/reverse"
+    algorithm: weighted_scoring
+    formula: |
+      # Operates on the Rider domain (distinct from compute_tap_charge on the Tap domain).
+      # A behavioral risk score used to flag accounts for manual review; range [0, 100].
+      reject_count = count(Tap status == REJECTED for this rider)             # insufficient-funds rejects
+      reversal_count = count(Tap status == REVERSED for this rider)
+      low_balance = 1 if (default FundingSource.prepaid_balance_cents < LOW_BALANCE_FLOOR_CENTS) else 0
+      raw = W_REJECT * reject_count + W_REVERSAL * reversal_count + W_LOWBAL * low_balance
+      rider_risk_score = min(round_half_up(raw), 100)
+    input_set: "All Tap rows for the rider in REJECTED or REVERSED status, plus the rider's default ACTIVE FundingSource balance."
+    constants:
+      W_REJECT: 15
+      W_REVERSAL: 8
+      W_LOWBAL: 20
+      LOW_BALANCE_FLOOR_CENTS: 500
+    precision: "integer 0..100, round_half_up then clamp to 100"
+    variants:
+      - name: gross_score
+        when: "GET /riders/{id}/risk?mode=gross"
+        difference: "Counts every REJECTED and REVERSED tap ever recorded for the rider."
+      - name: trailing_week_score
+        when: "GET /riders/{id}/risk?mode=trailing_week (default)"
+        difference: "Counts only REJECTED/REVERSED taps whose tapped_at is within the 7 days ending at the current clock instant, producing a different number than gross whenever older incidents exist."
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /riders and POST /fare-products and GET endpoints that allow Anonymous"
+
+  - priority: 2
+    category: auth
+    check: "the role is permitted to invoke this endpoint per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: "for entity_backed Rider acting on its own taps/cards/funding-sources, X-User-ID equals the resource's rider_id"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /taps, GET /taps/{id}, POST /funding-sources, POST /reduced-fare-cards, GET /taps/quote"
+
+  - priority: 4
+    category: existence
+    check: "every path id and every FK in the body references an existing resource, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 5
+    category: existence
+    check: "required body fields present and well-typed; enum values in declared sets"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all POST/PATCH"
+
+  - priority: 6
+    category: state
+    check: "target resource is in a state from which the requested transition is defined (e.g., settle requires Tap PENDING; verify requires card PENDING_VERIFICATION or EXPIRED)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /taps/{id}/settle, POST /taps/{id}/reverse, POST /reduced-fare-cards/{id}/verify, POST /reduced-fare-cards/{id}/revoke, POST /fare-weeks/{id}/close"
+
+  - priority: 7
+    category: state
+    check: "the referenced FareWeek is OPEN when accruing or reversing a tap"
+    error_id: ERR_WEEK_CLOSED
+    http_status: 409
+    applies_to: "POST /taps, POST /taps/{id}/settle, POST /taps/{id}/reverse"
+
+  - priority: 8
+    category: business_referential
+    check: "a tap's tapped_at fare day falls within [week_start_date, week_start_date+6] of the cited FareWeek, and the FareWeek.zone_code matches the rider's chosen product zone"
+    error_id: ERR_TAP_WEEK_MISMATCH
+    http_status: 422
+    applies_to: "POST /taps"
+
+  - priority: 9
+    category: business_constraint
+    check: "verify must echo the exact verification_token issued for the card"
+    error_id: ERR_BAD_VERIFICATION_TOKEN
+    http_status: 422
+    applies_to: "POST /reduced-fare-cards/{id}/verify"
+
+  - priority: 10
+    category: business_constraint
+    check: "a card whose expires_on is before the current fare day cannot be verified"
+    error_id: ERR_CARD_EXPIRED
+    http_status: 409
+    applies_to: "POST /reduced-fare-cards/{id}/verify"
+
+  - priority: 11
+    category: business_constraint
+    check: "no second ACTIVE BenefitAllocation may be created for the same (rider_id, period_month) without superseding; supersede requires the OCC version"
+    error_id: ERR_DUPLICATE_ALLOCATION
+    http_status: 409
+    applies_to: "POST /benefit-allocations"
+
+  - priority: 12
+    category: business_constraint
+    check: "allocated_cents must not exceed MONTHLY_FSA_CAP_CENTS (regulatory Transit FSA monthly maximum)"
+    error_id: ERR_FSA_CAP_EXCEEDED
+    http_status: 422
+    applies_to: "POST /benefit-allocations"
+
+  - priority: 13
+    category: state
+    check: "OCC: expected_rider_version must equal Rider.version on a superseding allocation create"
+    error_id: ERR_STALE_RIDER_VERSION
+    http_status: 412
+    applies_to: "POST /benefit-allocations"
+
+  - priority: 14
+    category: business_fiscal
+    check: "at settle, the computed charge_cents must not exceed the funding source's prepaid_balance_cents; on failure the HTTP response is 402 ERR_INSUFFICIENT_FUNDS and the Tap is persisted as REJECTED (recorded, not discarded)"
+    error_id: ERR_INSUFFICIENT_FUNDS
+    http_status: 402
+    applies_to: "POST /taps/{id}/settle"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  - method: POST
+    path: /fare-products
+    description: "Create a fare product for a zone with caps, transfer rules, and discounts."
+    roles: [FareAdmin]
+    code: 201
+    input: [zone_code, base_fare_cents, daily_cap_cents, weekly_cap_cents, "transfer_window_minutes?", "transfer_discount_pct?", "reduced_fare_pct?"]
+    output: FareProduct
+    side_effects: ["set status=ACTIVE"]
+
+  - method: GET
+    path: /fare-products
+    description: "List fare products; filter by zone_code or status."
+    roles: [FareAdmin, Rider, EmployerAdmin, PaymentGateway, Anonymous]
+    code: 200
+    input: ["zone_code?", "status?", "limit?", "offset?"]
+    output: FareProduct[]
+    side_effects: []
+
+  - method: GET
+    path: /fare-products/{id}
+    description: "Fetch a single fare product."
+    roles: [FareAdmin, Rider, EmployerAdmin, PaymentGateway, Anonymous]
+    code: 200
+    input: []
+    output: FareProduct
+    side_effects: []
+
+  - method: POST
+    path: /fare-products/{id}/retire
+    description: "Retire a fare product so no new taps may reference it."
+    roles: [FareAdmin]
+    code: 200
+    input: []
+    output: FareProduct
+    side_effects: ["set status=RETIRED"]
+
+  - method: POST
+    path: /riders
+    description: "Register a rider (open to anonymous)."
+    roles: [Anonymous]
+    code: 201
+    input: [email, full_name, home_zone_code, "income_tier?", "low_income_discount_pct?"]
+    output: Rider
+    side_effects: ["set status=ACTIVE; version=1"]
+
+  - method: GET
+    path: /riders/{id}
+    description: "Fetch a rider."
+    roles: [FareAdmin, Rider, EmployerAdmin]
+    code: 200
+    input: []
+    output: Rider
+    side_effects: []
+
+  - method: GET
+    path: /riders/{id}/risk
+    description: "Compute the rider's behavioral risk score (read-time recompute)."
+    roles: [FareAdmin]
+    code: 200
+    input: ["mode?"]
+    output: "{ rider_id: string, rider_risk_score: integer, mode: string }"
+    side_effects: ["run rider_risk_score calculation"]
+
+  - method: POST
+    path: /riders/{id}/suspend
+    description: "Suspend a rider account; suspended riders cannot tap."
+    roles: [FareAdmin]
+    code: 200
+    input: []
+    output: Rider
+    side_effects: ["set status=SUSPENDED; increment Rider.version"]
+
+  - method: POST
+    path: /funding-sources
+    description: "Attach a mobile payment funding source to a rider."
+    roles: [Rider]
+    code: 201
+    input: [rider_id, source_type, "is_default?"]
+    output: FundingSource
+    side_effects: ["set status=ACTIVE; prepaid_balance_cents=0"]
+
+  - method: GET
+    path: /funding-sources
+    description: "List funding sources; filter by rider_id."
+    roles: [FareAdmin, Rider]
+    code: 200
+    input: ["rider_id?", "status?", "limit?", "offset?"]
+    output: FundingSource[]
+    side_effects: []
+
+  - method: GET
+    path: /funding-sources/{id}
+    description: "Fetch a single funding source including its prepaid_balance_cents."
+    roles: [FareAdmin, Rider]
+    code: 200
+    input: []
+    output: FundingSource
+    side_effects: []
+
+  - method: POST
+    path: /funding-sources/{id}/load
+    description: "Load prepaid stored value onto a funding source via the mobile payment integration."
+    roles: [Rider, FareAdmin]
+    code: 200
+    input: [amount_cents]
+    output: FundingSource
+    side_effects: ["increment prepaid_balance_cents by amount_cents; increment version"]
+
+  - method: POST
+    path: /reduced-fare-cards
+    description: "Apply for a reduced-fare card (senior/disability/student)."
+    roles: [Rider]
+    code: 201
+    input: [rider_id, program_code, expires_on]
+    output: ReducedFareCard
+    side_effects: ["set status=PENDING_VERIFICATION; issue verification_token"]
+
+  - method: GET
+    path: /reduced-fare-cards
+    description: "List reduced-fare cards; filter by rider_id."
+    roles: [FareAdmin, Rider]
+    code: 200
+    input: ["rider_id?", "status?", "limit?", "offset?"]
+    output: ReducedFareCard[]
+    side_effects: []
+
+  - method: GET
+    path: /reduced-fare-cards/{id}
+    description: "Fetch a single reduced-fare card."
+    roles: [FareAdmin, Rider]
+    code: 200
+    input: []
+    output: ReducedFareCard
+    side_effects: []
+
+  - method: PATCH
+    path: /reduced-fare-cards/{id}
+    description: "Extend a card's expires_on (e.g., renewal); enables re-verification of an expired card."
+    roles: [FareAdmin]
+    code: 200
+    input: [expires_on]
+    output: ReducedFareCard
+    side_effects: ["update expires_on; increment version"]
+
+  - method: POST
+    path: /reduced-fare-cards/{id}/verify
+    description: "Verify a reduced-fare card by echoing its verification_token."
+    roles: [FareAdmin]
+    code: 200
+    input: [verification_token]
+    output: ReducedFareCard
+    side_effects: ["set status=VERIFIED"]
+
+  - method: POST
+    path: /reduced-fare-cards/{id}/refresh-expiry
+    description: "Re-evaluate the card against the current clock; transition VERIFIED->EXPIRED if past expires_on."
+    roles: [FareAdmin]
+    code: 200
+    input: []
+    output: ReducedFareCard
+    side_effects: ["set status=EXPIRED when expires_on < current fare day"]
+
+  - method: POST
+    path: /reduced-fare-cards/{id}/revoke
+    description: "Revoke a reduced-fare card."
+    roles: [FareAdmin]
+    code: 200
+    input: []
+    output: ReducedFareCard
+    side_effects: ["set status=REVOKED"]
+
+  - method: POST
+    path: /benefit-allocations
+    description: "Fund a Transit FSA commuter benefit allocation for a rider/month; supersedes a prior ACTIVE one for the same month."
+    roles: [EmployerAdmin]
+    code: 201
+    input: [rider_id, employer_ref, period_month, allocated_cents, expected_rider_version]
+    output: BenefitAllocation
+    side_effects: ["set status=ACTIVE; consumed_cents=0; supersede prior ACTIVE for same (rider_id,period_month); increment Rider.version by 1"]
+
+  - method: GET
+    path: /benefit-allocations
+    description: "List benefit allocations; filter by rider_id or period_month."
+    roles: [FareAdmin, EmployerAdmin, Rider]
+    code: 200
+    input: ["rider_id?", "period_month?", "status?", "limit?", "offset?"]
+    output: BenefitAllocation[]
+    side_effects: []
+
+  - method: GET
+    path: /benefit-allocations/{id}
+    description: "Fetch a single benefit allocation including consumed_cents and status."
+    roles: [FareAdmin, EmployerAdmin, Rider]
+    code: 200
+    input: []
+    output: BenefitAllocation
+    side_effects: []
+
+  - method: POST
+    path: /fare-weeks
+    description: "Open a fare-capping week ledger for a rider, zone, and Monday week-start."
+    roles: [Rider, FareAdmin]
+    code: 201
+    input: [rider_id, week_start_date, zone_code]
+    output: FareWeek
+    side_effects: ["set status=OPEN; charged_total_cents=0"]
+
+  - method: GET
+    path: /fare-weeks
+    description: "List fare weeks; filter by rider_id."
+    roles: [FareAdmin, Rider]
+    code: 200
+    input: ["rider_id?", "status?", "limit?", "offset?"]
+    output: FareWeek[]
+    side_effects: []
+
+  - method: GET
+    path: /fare-weeks/{id}
+    description: "Fetch a fare week including charged_total_cents."
+    roles: [FareAdmin, Rider]
+    code: 200
+    input: []
+    output: FareWeek
+    side_effects: []
+
+  - method: POST
+    path: /fare-weeks/{id}/close
+    description: "Close a fare week so no further taps or reversals accrue."
+    roles: [FareAdmin]
+    code: 200
+    input: []
+    output: FareWeek
+    side_effects: ["set status=CLOSED"]
+
+  - method: POST
+    path: /taps
+    description: "Record a tap (PENDING) against an open fare week; pricing is computed at settle."
+    roles: [Rider]
+    code: 201
+    input: [rider_id, fare_week_id, funding_source_id, tapped_at]
+    output: Tap
+    side_effects: ["set status=PENDING"]
+
+  - method: GET
+    path: /taps
+    description: "List taps; filter by rider_id, fare_week_id, or funding_source_id."
+    roles: [FareAdmin, Rider]
+    code: 200
+    input: ["rider_id?", "fare_week_id?", "funding_source_id?", "benefit_allocation_id?", "status?", "limit?", "offset?"]
+    output: Tap[]
+    side_effects: []
+
+  - method: GET
+    path: /taps/{id}
+    description: "Fetch a single tap with its computed charge breakdown."
+    roles: [FareAdmin, Rider]
+    code: 200
+    input: []
+    output: Tap
+    side_effects: []
+
+  - method: GET
+    path: /taps/quote
+    description: "Forward-looking pre-tap fare quote for a rider/week/instant without persistence."
+    roles: [Rider]
+    code: 200
+    input: [rider_id, fare_week_id, tapped_at]
+    output: "{ rider_id: string, fare_week_id: string, estimated_charge_cents: integer, list_fare_cents: integer, transfer_discount_cents: integer, cap_credit_cents: integer }"
+    side_effects: ["run compute_tap_charge variant forward_looking_estimate; no persistence"]
+
+  - method: POST
+    path: /taps/{id}/settle
+    description: "Settle a PENDING tap: price it chronologically, debit funds, accrue caps and benefit."
+    roles: [PaymentGateway]
+    code: 200
+    input: []
+    output: Tap
+    side_effects: ["compute_tap_charge; benefit_selector; debit FundingSource; accrue FareWeek; consume BenefitAllocation; CAPTURED or REJECTED"]
+
+  - method: POST
+    path: /taps/{id}/reverse
+    description: "Reverse a CAPTURED tap: refund funds, decrement cap accrual, restore benefit (compensation)."
+    roles: [FareAdmin]
+    code: 200
+    input: []
+    output: Tap
+    side_effects: ["credit FundingSource; decrement FareWeek.charged_total_cents; restore BenefitAllocation.consumed_cents; status=REVERSED"]
+
+  - method: POST
+    path: /_clock/set_current_utc
+    description: "Test-driving endpoint: set the server's current UTC instant for clock-dependent logic (expiry, trailing-week, fare day)."
+    roles: [FareAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: string }"
+    side_effects: ["advance server clock"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID on a protected endpoint."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Role is authenticated but not permitted to invoke this endpoint."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "A Rider acts on a tap/card/funding-source/quote whose rider_id is not the rider's own id."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A path id or FK body reference does not resolve to an existing resource."
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Missing required field, wrong type, or enum value outside the declared set."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition is not defined from the resource's current state."
+  - id: ERR_WEEK_CLOSED
+    http: 409
+    condition: "Tap creation, settle, or reverse targets a FareWeek whose status is CLOSED."
+  - id: ERR_TAP_WEEK_MISMATCH
+    http: 422
+    condition: "Tap's fare day lies outside the cited FareWeek's [start, start+6] range or zone mismatch."
+  - id: ERR_BAD_VERIFICATION_TOKEN
+    http: 422
+    condition: "Verify request supplies a token that does not match the card's issued verification_token."
+  - id: ERR_CARD_EXPIRED
+    http: 409
+    condition: "Verify request targets a card whose expires_on precedes the current fare day."
+  - id: ERR_DUPLICATE_ALLOCATION
+    http: 409
+    condition: "A second ACTIVE BenefitAllocation for the same (rider_id, period_month) is created without OCC supersede semantics, or supersede preconditions fail."
+  - id: ERR_FSA_CAP_EXCEEDED
+    http: 422
+    condition: "allocated_cents exceeds MONTHLY_FSA_CAP_CENTS."
+  - id: ERR_STALE_RIDER_VERSION
+    http: 412
+    condition: "expected_rider_version on a superseding allocation create does not match Rider.version."
+  - id: ERR_INSUFFICIENT_FUNDS
+    http: 402
+    condition: "At settle, the computed charge_cents exceeds the funding source's prepaid_balance_cents; the Tap is persisted as REJECTED alongside this 402 response."
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: FareAdmin
+    description: "Transit authority operator: manages products, fare weeks, card verification, reversals, suspensions, risk review, and the test clock."
+    identity: opaque
+    exclusive_operations:
+      - "POST /fare-products"
+      - "POST /fare-products/{id}/retire"
+      - "POST /reduced-fare-cards/{id}/verify"
+      - "PATCH /reduced-fare-cards/{id}"
+      - "POST /reduced-fare-cards/{id}/refresh-expiry"
+      - "POST /reduced-fare-cards/{id}/revoke"
+      - "POST /fare-weeks/{id}/close"
+      - "POST /taps/{id}/reverse"
+      - "POST /riders/{id}/suspend"
+      - "GET /riders/{id}/risk"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "GET /fare-products"
+      - "GET /funding-sources"
+      - "POST /funding-sources/{id}/load"
+      - "GET /reduced-fare-cards"
+      - "GET /benefit-allocations"
+      - "POST /fare-weeks"
+      - "GET /fare-weeks"
+      - "GET /taps"
+      - "GET /taps/{id}"
+      - "GET /riders/{id}"
+
+  - name: Rider
+    description: "A transit rider acting on their own funding sources, cards, fare weeks, taps, and quotes."
+    identity: "entity_backed:Rider"
+    exclusive_operations:
+      - "POST /funding-sources"
+      - "POST /reduced-fare-cards"
+      - "POST /taps"
+      - "GET /taps/quote"
+    shared_operations:
+      - "GET /fare-products"
+      - "POST /funding-sources/{id}/load"
+      - "GET /funding-sources"
+      - "GET /reduced-fare-cards"
+      - "POST /fare-weeks"
+      - "GET /fare-weeks"
+      - "GET /benefit-allocations"
+      - "GET /taps"
+      - "GET /taps/{id}"
+      - "GET /riders/{id}"
+
+  - name: EmployerAdmin
+    description: "Employer benefits administrator funding Transit FSA commuter allocations."
+    identity: opaque
+    exclusive_operations:
+      - "POST /benefit-allocations"
+    shared_operations:
+      - "GET /fare-products"
+      - "GET /benefit-allocations"
+      - "GET /riders/{id}"
+
+  - name: PaymentGateway
+    description: "Mobile payment integration that settles PENDING taps into CAPTURED/REJECTED charges."
+    identity: opaque
+    exclusive_operations:
+      - "POST /taps/{id}/settle"
+    shared_operations:
+      - "GET /fare-products"
+
+  - name: Anonymous
+    description: "Unauthenticated caller; may register and browse public fare products only."
+    identity: opaque
+    exclusive_operations:
+      - "POST /riders"
+    shared_operations:
+      - "GET /fare-products"
