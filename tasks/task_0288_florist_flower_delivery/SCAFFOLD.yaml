@@ -1,0 +1,1593 @@
+scenario: "Florist & Flower Delivery: arrangement catalog/substitution policy, delivery date/time-window & zone, occasion/card message, wire-service fulfillment to local florist, same-day cutoff, recurring/event, holiday surge pricing, redelivery/quality claim"
+domain_name: florist-flower-delivery
+api_prefix: /floral
+
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: workflow_orchestration
+  complexity_layers:
+    - dual_variant_calculation        # quote-time estimate vs fulfillment-time final price
+    - cascading_side_effects          # claim -> redelivery spawn -> florist capacity reversion -> zone slot release
+    - rate_threshold_triggers         # same-day cutoff hour boundary; surge-window date boundary
+    - optimistic_concurrency          # OCC on Order.version when filing a claim / booking fulfillment
+    - selector_policy                 # wire-service florist selection from candidate pool
+
+  entity_topology: flat
+  # Peer entities (Florist, Customer, Zone, Arrangement, Order, ...) linked by FK
+  # references in request bodies; no deep nesting in URL paths. WireFulfillment,
+  # Substitution, QualityClaim, RecurringSchedule reference Order by FK.
+
+  state_machine_shape: parallel
+  # Order carries TWO independent state dimensions that evolve on different
+  # triggers: fulfillment_status (DRAFT->QUOTED->BOOKED->IN_TRANSIT->DELIVERED /
+  # CANCELLED) and payment_status (UNPAID->AUTHORIZED->CAPTURED->REFUNDED).
+  # QualityClaim adds a branching+cyclic machine (claim -> redelivery loops a new
+  # Order back into the fulfillment pipeline).
+
+  relationship_patterns:
+    - one_to_many        # Order has many Substitution rows; Florist fulfils many Orders
+    - cross_aggregate    # QualityClaim.redelivery_order_id references a sibling Order
+    - self_referential   # Order.parent_recurrence_order_id and redelivery chain reference Order
+
+  role_model: peer_roles
+  # Customer owns own Orders/Claims; Florist owns own WireFulfillments; Dispatcher
+  # (opaque operator) runs wire-service selection + capacity; CatalogAdmin (opaque)
+  # owns catalog/zone/holiday configuration. Non-overlapping resource ownership.
+
+  consistency_model: immediate
+  # All cascades (claim -> redelivery, capacity reversion, slot release, ledger
+  # recompute) complete atomically within the triggering request.
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: contact email; unique across customers
+        constraints: "unique; non-empty"
+      - name: full_name
+        type: string
+        source: input
+        description: customer display name
+      - name: loyalty_tier
+        type: enum
+        source: system
+        description: "loyalty tier driving the recurring/loyalty discount; promoted by completed-delivery count"
+        default: STANDARD
+        constraints: "one of {STANDARD, SILVER, GOLD}; STANDARD at creation, recomputed by promote_loyalty_tier"
+      - name: lifetime_delivered_count
+        type: integer
+        source: computed
+        description: "count of this customer's Orders whose fulfillment_status == DELIVERED; drives loyalty_tier"
+        default: 0
+      - name: wallet_credit_cents
+        type: integer
+        source: computed
+        description: "store-credit balance in cents; credited by quality-claim refunds and debited when applied to an order"
+        default: 0
+
+  - name: DeliveryZone
+    parent: null
+    common_fields: true
+    fields:
+      - name: zone_code
+        type: string
+        source: input
+        description: short zone identifier
+        constraints: "unique; non-empty"
+      - name: base_delivery_fee_cents
+        type: integer
+        source: input
+        description: base delivery fee for this zone in cents
+        constraints: ">= 0"
+      - name: same_day_cutoff_hour_utc
+        type: integer
+        source: input
+        description: "hour-of-day (UTC, 0-23) after which same-day delivery is no longer accepted for this zone"
+        constraints: "0..23"
+      - name: window_capacity_per_slot
+        type: integer
+        source: input
+        description: "max number of DeliverySlot bookings allowed for one (date,start_minute,end_minute) time window in this zone"
+        constraints: ">= 1"
+      - name: active
+        type: boolean
+        source: input
+        description: whether the zone currently accepts new orders
+        default: true
+
+  - name: Arrangement
+    parent: null
+    common_fields: true
+    fields:
+      - name: sku
+        type: string
+        source: input
+        description: catalog SKU
+        constraints: "unique; non-empty"
+      - name: display_name
+        type: string
+        source: input
+        description: arrangement display name
+      - name: base_price_cents
+        type: integer
+        source: input
+        description: catalog base price in cents (before delivery, surge, discounts)
+        constraints: ">= 0"
+      - name: premium_tier
+        type: enum
+        source: input
+        description: "drives surge eligibility; PREMIUM arrangements always surge on holiday windows, STANDARD only when window.applies_to_standard is true"
+        default: STANDARD
+        constraints: "one of {STANDARD, PREMIUM}"
+      - name: substitution_policy
+        type: enum
+        source: input
+        description: "governs what stem substitutions a fulfilling florist may apply: NONE forbids all, SAME_VALUE allows equal-or-lower priced swaps, FLORIST_CHOICE allows any swap up to substitution_cap_pct"
+        default: SAME_VALUE
+        constraints: "one of {NONE, SAME_VALUE, FLORIST_CHOICE}"
+      - name: substitution_cap_pct
+        type: number
+        source: input
+        description: "max fraction of base_price_cents by which the summed substitution deltas may raise the line price under FLORIST_CHOICE"
+        default: 0.15
+        constraints: "0 <= substitution_cap_pct <= 1"
+      - name: active
+        type: boolean
+        source: input
+        description: whether the arrangement is orderable
+        default: true
+
+  - name: HolidayWindow
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: holiday window label (e.g. Valentines, Mothers Day)
+        constraints: "unique; non-empty"
+      - name: start_date
+        type: string
+        source: input
+        description: "inclusive first delivery date (YYYY-MM-DD) on which surge applies"
+      - name: end_date
+        type: string
+        source: input
+        description: "inclusive last delivery date (YYYY-MM-DD) on which surge applies"
+      - name: surge_multiplier
+        type: number
+        source: input
+        description: "multiplier applied to the arrangement subtotal for deliveries inside the window"
+        constraints: "> 1.0"
+      - name: applies_to_standard
+        type: boolean
+        source: input
+        description: "when true, STANDARD-tier arrangements also surge; when false only PREMIUM arrangements surge"
+        default: false
+      - name: surge_cutoff_hour_utc
+        type: integer
+        source: input
+        description: "overrides DeliveryZone.same_day_cutoff_hour_utc for same-day orders whose delivery date falls inside this window"
+        constraints: "0..23"
+
+  - name: Florist
+    parent: null
+    common_fields: true
+    fields:
+      - name: shop_name
+        type: string
+        source: input
+        description: florist shop name
+      - name: covered_zone_id
+        type: string
+        source: input
+        description: "FK -> DeliveryZone.id; the single zone this florist fulfils"
+      - name: daily_capacity
+        type: integer
+        source: input
+        description: "max WireFulfillments this florist may hold per delivery date"
+        constraints: ">= 1"
+      - name: quality_rating
+        type: number
+        source: input
+        description: "0.0-5.0 service rating used as the wire-service ranking key"
+        default: 4.0
+        constraints: "0.0 <= quality_rating <= 5.0"
+      - name: wire_surcharge_cents
+        type: integer
+        source: input
+        description: "per-order surcharge this florist adds when it is the fulfilling shop"
+        default: 0
+        constraints: ">= 0"
+      - name: accepting
+        type: boolean
+        source: input
+        description: whether the florist currently accepts new wire fulfilments
+        default: true
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the ordering customer"
+      - name: arrangement_id
+        type: string
+        source: input
+        description: "FK -> Arrangement.id; the ordered arrangement"
+      - name: zone_id
+        type: string
+        source: input
+        description: "FK -> DeliveryZone.id; delivery zone (denormalised from address)"
+      - name: parent_recurrence_id
+        type: string
+        source: input
+        description: "FK -> RecurringSchedule.id; set on orders auto-generated by a recurring schedule, else null"
+        default: null
+      - name: source_order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; set on a redelivery order to the original order it remedies, else null"
+        default: null
+      - name: occasion
+        type: enum
+        source: input
+        description: occasion tag printed on the dispatch sheet
+        default: GENERAL
+        constraints: "one of {GENERAL, BIRTHDAY, ANNIVERSARY, SYMPATHY, ROMANCE}"
+      - name: card_message
+        type: string
+        source: input
+        description: gift card message text; max 240 chars
+        default: ""
+        constraints: "length <= 240"
+      - name: delivery_date
+        type: string
+        source: input
+        description: "requested delivery date (YYYY-MM-DD)"
+      - name: window_start_minute
+        type: integer
+        source: input
+        description: "delivery window start, minutes from midnight UTC (half-open interval start)"
+        constraints: "0..1439"
+      - name: window_end_minute
+        type: integer
+        source: input
+        description: "delivery window end, minutes from midnight UTC (half-open interval end, exclusive)"
+        constraints: "window_start_minute < window_end_minute <= 1440"
+      - name: apply_wallet_credit
+        type: boolean
+        source: input
+        description: "when true, available wallet_credit_cents is applied to reduce grand_total_cents at quote time"
+        default: false
+      - name: fulfillment_status
+        type: enum
+        source: system
+        description: "fulfillment dimension of the parallel state machine"
+        default: DRAFT
+        constraints: "one of {DRAFT, QUOTED, BOOKED, IN_TRANSIT, DELIVERED, CANCELLED}"
+      - name: payment_status
+        type: enum
+        source: system
+        description: "payment dimension of the parallel state machine; evolves independently of fulfillment_status"
+        default: UNPAID
+        constraints: "one of {UNPAID, AUTHORIZED, CAPTURED, REFUNDED}"
+      - name: estimated_total_cents
+        type: integer
+        source: computed
+        description: "quote-time estimated grand total (no substitutions yet); set by compute_quote_estimate on DRAFT->QUOTED"
+        default: 0
+      - name: final_total_cents
+        type: integer
+        source: computed
+        description: "fulfillment-time final grand total including applied substitutions; set by compute_final_total on BOOKED->IN_TRANSIT"
+        default: 0
+      - name: wallet_credit_applied_cents
+        type: integer
+        source: computed
+        description: "amount of wallet credit consumed by this order at quote time"
+        default: 0
+      - name: is_same_day
+        type: boolean
+        source: computed
+        description: "true when delivery_date equals the clock date at quote time"
+        default: false
+
+  - name: WireFulfillment
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; the order being fulfilled"
+      - name: florist_id
+        type: string
+        source: system
+        description: "FK -> Florist.id; the florist the wire-service selector picked for this order"
+      - name: assigned_delivery_date
+        type: string
+        source: system
+        description: "delivery date copied from the order; counts against the florist's daily_capacity"
+      - name: status
+        type: enum
+        source: system
+        description: fulfilment lifecycle on the florist side
+        default: ASSIGNED
+        constraints: "one of {ASSIGNED, ACCEPTED, RELEASED}"
+      - name: florist_surcharge_cents
+        type: integer
+        source: system
+        description: "wire_surcharge_cents snapshot from the chosen florist at assignment time"
+        default: 0
+
+  - name: DeliverySlot
+    parent: null
+    common_fields: false
+    fields:
+      - name: order_id
+        type: string
+        source: system
+        description: "FK -> Order.id; the order occupying this slot"
+      - name: zone_id
+        type: string
+        source: system
+        description: "FK -> DeliveryZone.id; zone whose window-capacity this booking consumes"
+      - name: slot_date
+        type: string
+        source: system
+        description: "delivery date (YYYY-MM-DD)"
+      - name: slot_start_minute
+        type: integer
+        source: system
+        description: "window start minute (half-open interval start)"
+      - name: slot_end_minute
+        type: integer
+        source: system
+        description: "window end minute (half-open interval end, exclusive)"
+      - name: released
+        type: boolean
+        source: system
+        description: "true once the booking is freed by cancel/claim; released slots do not count toward window capacity"
+        default: false
+
+  - name: Substitution
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; order whose arrangement is being substituted"
+      - name: florist_id
+        type: string
+        source: input
+        description: "FK -> Florist.id; florist applying the substitution"
+      - name: removed_stem
+        type: string
+        source: input
+        description: name of the stem removed from the arrangement
+      - name: added_stem
+        type: string
+        source: input
+        description: name of the stem added to the arrangement
+      - name: price_delta_cents
+        type: integer
+        source: input
+        description: "signed cents the added stem costs over the removed stem (positive raises the line, negative lowers it)"
+      - name: accepted
+        type: boolean
+        source: system
+        description: "true if the swap passed substitution-policy validation and counts toward the final total"
+        default: true
+
+  - name: QualityClaim
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; the delivered order being disputed"
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; claimant (must own the order)"
+      - name: reason
+        type: enum
+        source: input
+        description: claim reason
+        constraints: "one of {WILTED, WRONG_ITEM, LATE, DAMAGED}"
+      - name: requested_remedy
+        type: enum
+        source: input
+        description: "remedy the customer requests"
+        constraints: "one of {REDELIVERY, REFUND}"
+      - name: status
+        type: enum
+        source: system
+        description: claim lifecycle
+        default: OPEN
+        constraints: "one of {OPEN, APPROVED, REJECTED, RESOLVED}"
+      - name: refund_cents
+        type: integer
+        source: computed
+        description: "store-credit refund amount computed at approval for REFUND remedies; 0 for REDELIVERY"
+        default: 0
+      - name: redelivery_order_id
+        type: string
+        source: computed
+        description: "FK -> Order.id; the remedial order spawned when an APPROVED claim with REDELIVERY remedy is resolved, else null"
+        default: null
+
+  - name: RecurringSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; subscriber"
+      - name: arrangement_id
+        type: string
+        source: input
+        description: "FK -> Arrangement.id; arrangement reproduced each cycle"
+      - name: zone_id
+        type: string
+        source: input
+        description: "FK -> DeliveryZone.id; delivery zone reproduced each cycle"
+      - name: cadence
+        type: enum
+        source: input
+        description: emission cadence
+        constraints: "one of {WEEKLY, MONTHLY}"
+      - name: next_delivery_date
+        type: string
+        source: system
+        description: "(YYYY-MM-DD) the delivery date of the next order this schedule will emit; advanced by cadence on each emission"
+      - name: window_start_minute
+        type: integer
+        source: input
+        description: delivery window start minute applied to emitted orders
+        constraints: "0..1439"
+      - name: window_end_minute
+        type: integer
+        source: input
+        description: delivery window end minute applied to emitted orders
+        constraints: "window_start_minute < window_end_minute <= 1440"
+      - name: occurrences_remaining
+        type: integer
+        source: system
+        description: "remaining emissions; decremented on each emit; schedule auto-PAUSES when it reaches 0"
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: schedule lifecycle
+        default: ACTIVE
+        constraints: "one of {ACTIVE, PAUSED, CANCELLED}"
+      - name: recurring_discount_pct
+        type: number
+        source: input
+        description: "flat discount fraction applied to emitted orders' arrangement subtotal, stacked with loyalty discount"
+        default: 0.05
+        constraints: "0 <= recurring_discount_pct <= 0.5"
+
+  - name: ClockState
+    parent: null
+    common_fields: false
+    fields:
+      - name: current_utc
+        type: datetime
+        source: system
+        description: "the server's simulated wall clock; same-day cutoff and surge-window checks read this"
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  - entity: Order
+    initial_state: DRAFT          # fulfillment dimension
+    terminal_states: [DELIVERED, CANCELLED]
+    note: "Parallel machine. fulfillment_status (this block) and payment_status (next block) evolve on different triggers on the same Order row."
+    transitions:
+      - from: DRAFT
+        to: QUOTED
+        trigger: "POST /floral/orders/{id}/quote"
+        actor: Customer
+        preconditions:
+          - "order.fulfillment_status == DRAFT"
+          - "Arrangement.active == true AND DeliveryZone.active == true"
+          - "if delivery_date == clock date (same-day): clock hour-of-day < effective same-day cutoff (HolidayWindow.surge_cutoff_hour_utc if delivery_date inside a window, else DeliveryZone.same_day_cutoff_hour_utc)"
+        side_effects:
+          - "run compute_quote_estimate -> set order.estimated_total_cents"
+          - "set order.is_same_day"
+          - "if apply_wallet_credit: set order.wallet_credit_applied_cents = min(customer.wallet_credit_cents, pre-credit estimate); debit Customer.wallet_credit_cents by that amount"
+          - "increments Order.version by 1"
+      - from: QUOTED
+        to: BOOKED
+        trigger: "POST /floral/orders/{id}/book"
+        actor: Customer
+        preconditions:
+          - "order.fulfillment_status == QUOTED"
+          - "order.payment_status == AUTHORIZED"
+          - "a DeliverySlot for (zone_id, delivery_date, window) has window-capacity remaining (overlap_zone_window)"
+          - "the wire-service selector (select_fulfilling_florist) yields a non-empty candidate florist"
+        side_effects:
+          - "create DeliverySlot occupying (zone_id, delivery_date, window_start_minute, window_end_minute)"
+          - "create WireFulfillment via select_fulfilling_florist; snapshot florist_surcharge_cents; set assigned_delivery_date"
+          - "increment chosen Florist daily load (capacity check overlap_florist_capacity already passed)"
+          - "increments Order.version by 1"
+      - from: BOOKED
+        to: IN_TRANSIT
+        trigger: "POST /floral/orders/{id}/dispatch"
+        actor: Florist
+        preconditions:
+          - "order.fulfillment_status == BOOKED"
+          - "the WireFulfillment for this order has status == ACCEPTED"
+        side_effects:
+          - "run compute_final_total -> set order.final_total_cents (folds accepted Substitution deltas)"
+          - "increments Order.version by 1"
+      - from: IN_TRANSIT
+        to: DELIVERED
+        trigger: "POST /floral/orders/{id}/confirm-delivery"
+        actor: Florist
+        preconditions:
+          - "order.fulfillment_status == IN_TRANSIT"
+        side_effects:
+          - "set WireFulfillment.status remains ACCEPTED (delivered)"
+          - "increment Customer.lifetime_delivered_count by 1; run promote_loyalty_tier"
+          - "increments Order.version by 1"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /floral/orders/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "order.fulfillment_status IN {DRAFT, QUOTED, BOOKED}"
+        side_effects:
+          - "if a DeliverySlot exists and not released: set released=true (frees window capacity)"
+          - "if a WireFulfillment exists and status != RELEASED: set status=RELEASED; decrement chosen Florist daily load"
+          - "if wallet_credit_applied_cents > 0: refund it back to Customer.wallet_credit_cents"
+          - "increments Order.version by 1"
+        note: "Same transition definition applies from QUOTED and BOOKED; from DRAFT no slot/fulfillment exist yet so those branches are no-ops."
+      - from: QUOTED
+        to: CANCELLED
+        trigger: "POST /floral/orders/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "order.fulfillment_status == QUOTED"
+        side_effects:
+          - "refund wallet_credit_applied_cents to Customer.wallet_credit_cents if > 0"
+          - "increments Order.version by 1"
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /floral/orders/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "order.fulfillment_status == BOOKED"
+        side_effects:
+          - "release DeliverySlot (set released=true) -> frees zone window capacity"
+          - "RELEASE the WireFulfillment (status=RELEASED) -> decrements Florist daily load"
+          - "refund wallet_credit_applied_cents to Customer.wallet_credit_cents if > 0"
+          - "increments Order.version by 1"
+
+  - entity: Order
+    initial_state: UNPAID         # payment dimension (parallel)
+    terminal_states: [REFUNDED]
+    note: "Second, independent dimension on the same Order row. Triggers differ from fulfillment dimension; both advance Order.version."
+    transitions:
+      - from: UNPAID
+        to: AUTHORIZED
+        trigger: "POST /floral/orders/{id}/authorize-payment"
+        actor: Customer
+        preconditions:
+          - "order.payment_status == UNPAID"
+          - "order.fulfillment_status == QUOTED"
+        side_effects:
+          - "record authorized amount = order.estimated_total_cents"
+          - "increments Order.version by 1"
+      - from: AUTHORIZED
+        to: CAPTURED
+        trigger: "POST /floral/orders/{id}/dispatch (system, on BOOKED->IN_TRANSIT)"
+        actor: system
+        preconditions:
+          - "order.payment_status == AUTHORIZED"
+          - "order.fulfillment_status transitioning BOOKED->IN_TRANSIT"
+        side_effects:
+          - "capture amount = order.final_total_cents"
+          - "increments Order.version by 1"
+        note: "Payment capture is a side-effect of dispatch; the final captured amount is final_total_cents, which may differ from the authorized estimated_total_cents because of substitutions."
+      - from: CAPTURED
+        to: REFUNDED
+        trigger: "POST /floral/claims/{id}/resolve (system, when remedy=REFUND)"
+        actor: system
+        preconditions:
+          - "order.payment_status == CAPTURED"
+          - "the resolving QualityClaim has status==APPROVED and requested_remedy==REFUND"
+        side_effects:
+          - "credit Customer.wallet_credit_cents by QualityClaim.refund_cents"
+          - "increments Order.version by 1"
+
+  - entity: WireFulfillment
+    initial_state: ASSIGNED
+    terminal_states: [RELEASED]
+    transitions:
+      - from: ASSIGNED
+        to: ACCEPTED
+        trigger: "POST /floral/wire-fulfillments/{id}/accept"
+        actor: Florist
+        preconditions:
+          - "wire_fulfillment.status == ASSIGNED"
+          - "acting Florist.id == wire_fulfillment.florist_id"
+          - "the linked Order.fulfillment_status == BOOKED"
+        side_effects:
+          - "set status=ACCEPTED"
+          - "increments WireFulfillment.version by 1"
+      - from: ASSIGNED
+        to: RELEASED
+        trigger: "system, on Order cancel from BOOKED"
+        actor: system
+        preconditions:
+          - "wire_fulfillment.status == ASSIGNED"
+        side_effects:
+          - "decrement Florist daily load for assigned_delivery_date"
+          - "increments WireFulfillment.version by 1"
+      - from: ACCEPTED
+        to: RELEASED
+        trigger: "system, on Order cancel from BOOKED"
+        actor: system
+        preconditions:
+          - "wire_fulfillment.status == ACCEPTED"
+        side_effects:
+          - "decrement Florist daily load for assigned_delivery_date"
+          - "increments WireFulfillment.version by 1"
+
+  - entity: QualityClaim
+    initial_state: OPEN
+    terminal_states: [REJECTED, RESOLVED]
+    note: "Branching (APPROVE vs REJECT) with a cyclic limb: an APPROVED+REDELIVERY claim resolves by spawning a new Order that re-enters the Order fulfillment pipeline at DRAFT."
+    transitions:
+      - from: OPEN
+        to: APPROVED
+        trigger: "POST /floral/claims/{id}/approve"
+        actor: Dispatcher
+        preconditions:
+          - "claim.status == OPEN"
+          - "the linked Order.fulfillment_status == DELIVERED"
+        side_effects:
+          - "if requested_remedy==REFUND: run compute_claim_refund -> set claim.refund_cents"
+          - "increments QualityClaim.version by 1"
+      - from: OPEN
+        to: REJECTED
+        trigger: "POST /floral/claims/{id}/reject"
+        actor: Dispatcher
+        preconditions:
+          - "claim.status == OPEN"
+        side_effects:
+          - "increments QualityClaim.version by 1"
+      - from: APPROVED
+        to: RESOLVED
+        trigger: "POST /floral/claims/{id}/resolve"
+        actor: Dispatcher
+        preconditions:
+          - "claim.status == APPROVED"
+          - "expected_order_version matches the linked Order.version (OCC)"
+        side_effects:
+          - "if requested_remedy==REDELIVERY: create a redelivery Order (source_order_id=original.id, copy arrangement/zone/window/card_message, occasion, delivery_date = clock date + 1 day) at DRAFT/UNPAID; set claim.redelivery_order_id; this new Order re-enters the fulfillment pipeline"
+          - "if requested_remedy==REFUND: drive linked Order payment_status CAPTURED->REFUNDED; credit Customer.wallet_credit_cents by claim.refund_cents"
+          - "increments QualityClaim.version by 1; increments linked Order.version by 1"
+
+  - entity: RecurringSchedule
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /floral/recurring-schedules/{id}/emit"
+        actor: Dispatcher
+        preconditions:
+          - "schedule.status == ACTIVE"
+          - "schedule.occurrences_remaining >= 1"
+        side_effects:
+          - "create an Order at DRAFT (parent_recurrence_id=schedule.id, arrangement/zone from schedule, delivery_date=next_delivery_date, window from schedule, recurring discount flagged)"
+          - "advance next_delivery_date by cadence (WEEKLY=+7d, MONTHLY=+1 calendar month)"
+          - "decrement occurrences_remaining by 1"
+          - "increments RecurringSchedule.version by 1"
+        note: "Self-loop ACTIVE->ACTIVE; cyclic shape."
+      - from: ACTIVE
+        to: PAUSED
+        trigger: "POST /floral/recurring-schedules/{id}/emit (auto when occurrences_remaining hits 0) OR POST /floral/recurring-schedules/{id}/pause"
+        actor: Dispatcher
+        preconditions:
+          - "schedule.status == ACTIVE"
+        side_effects:
+          - "set status=PAUSED"
+          - "increments RecurringSchedule.version by 1"
+      - from: PAUSED
+        to: ACTIVE
+        trigger: "POST /floral/recurring-schedules/{id}/resume"
+        actor: Dispatcher
+        preconditions:
+          - "schedule.status == PAUSED"
+          - "schedule.occurrences_remaining >= 1"
+        side_effects:
+          - "set status=ACTIVE"
+          - "increments RecurringSchedule.version by 1"
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /floral/recurring-schedules/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "schedule.status IN {ACTIVE, PAUSED}"
+        side_effects:
+          - "set status=CANCELLED"
+          - "increments RecurringSchedule.version by 1"
+      - from: PAUSED
+        to: CANCELLED
+        trigger: "POST /floral/recurring-schedules/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "schedule.status == PAUSED"
+        side_effects:
+          - "set status=CANCELLED"
+          - "increments RecurringSchedule.version by 1"
+
+# ===========================================================================
+# §1.2.1 Concurrency Rules
+# ===========================================================================
+concurrency_rules:
+  - rule_id: claim-resolve-stale-order
+    parent_entity: Order
+    write_endpoint: "POST /floral/claims/{id}/resolve"
+    occ_field: "expected_order_version"
+    description: |
+      Resolving an APPROVED QualityClaim against an Order whose version has
+      advanced since the client last observed it is rejected on a stale
+      version. Resolution mutates the linked Order (spawns a redelivery
+      child or drives payment to REFUNDED), so it is a legitimate write
+      against the Order; a stale view means another writer already advanced
+      the Order (e.g. a second claim resolution, or a late dispatch capture)
+      and this request's Order snapshot is out of date.
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+
+  - rule_id: book-stale-order
+    parent_entity: Order
+    write_endpoint: "POST /floral/orders/{id}/book"
+    occ_field: "expected_order_version"
+    description: |
+      Booking a QUOTED Order whose version has advanced since the client
+      last observed it is rejected on a stale version. Booking creates a
+      DeliverySlot and a WireFulfillment and consumes finite zone-window and
+      florist-capacity, all keyed off the Order's current quote; a stale
+      Order view means a re-quote or a wallet-credit refund has changed the
+      total the client is about to commit, so the commit is refused.
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: compute_quote_estimate
+    trigger: "Order DRAFT->QUOTED (POST /floral/orders/{id}/quote)"
+    algorithm: tiered_pricing
+    formula: |
+      # arrangement subtotal, surge, discounts, delivery, wallet credit.
+      # EVALUATION ORDER IS PINNED (mode (c) circular-looking dependency):
+      #   surged_subtotal depends on whether delivery_date is inside a HolidayWindow,
+      #   which is decided BEFORE any discount; discounts then apply to the surged
+      #   subtotal; delivery fee is added AFTER discounts; wallet credit is applied LAST.
+      base = Arrangement.base_price_cents
+
+      # 1. holiday surge (applied to base, before discounts)
+      window = the HolidayWindow whose [start_date, end_date] (inclusive both ends)
+               contains Order.delivery_date, if any (at most one window may match;
+               if dates overlap, choose the window with the earliest start_date,
+               tie-break earliest created_at)
+      surge_applies = window is not null AND
+                      (Arrangement.premium_tier == PREMIUM OR window.applies_to_standard == true)
+      surged = round_half_up(base * window.surge_multiplier)  if surge_applies else base
+
+      # 2. discounts: loyalty + recurring, STACKED ADDITIVELY then clamped.
+      loyalty_pct = { STANDARD: 0.00, SILVER: 0.05, GOLD: 0.10 }[Customer.loyalty_tier]
+      recurring_pct = RecurringSchedule.recurring_discount_pct if Order.parent_recurrence_id else 0.00
+      discount_pct = min(loyalty_pct + recurring_pct, 0.30)   # combined cap 30%
+      discounted = round_half_up(surged * (1 - discount_pct))
+
+      # 3. delivery fee (added AFTER discounts; NOT discounted, NOT surged)
+      delivery = DeliveryZone.base_delivery_fee_cents
+
+      pre_credit = discounted + delivery       # florist wire surcharge is NOT known at quote time
+
+      # 4. wallet credit applied last
+      if Order.apply_wallet_credit:
+          applied = min(Customer.wallet_credit_cents, pre_credit)
+      else:
+          applied = 0
+      estimated_total_cents = pre_credit - applied
+    input_set: "single Order at quote time; the matching HolidayWindow (if any); the Customer's current loyalty_tier and wallet balance; the parent RecurringSchedule if parent_recurrence_id set"
+    constants:
+      LOYALTY_PCT: { STANDARD: 0.00, SILVER: 0.05, GOLD: 0.10 }
+      COMBINED_DISCOUNT_CAP: 0.30
+    precision: "integer cents; round_half_up at each round_half_up() call; surge rounds first, then discount rounds"
+    variants:
+      - name: estimate_variant
+        when: "DRAFT->QUOTED, before any florist is assigned and before substitutions exist"
+        difference: "uses base arrangement price only; EXCLUDES florist wire_surcharge_cents and ALL substitution deltas; this is the AUTHORIZED amount"
+
+  - name: compute_final_total
+    trigger: "Order BOOKED->IN_TRANSIT (POST /floral/orders/{id}/dispatch)"
+    algorithm: aggregation
+    formula: |
+      # FINAL variant: same surge/discount/delivery skeleton as the estimate, PLUS
+      # the chosen florist's wire surcharge AND the summed ACCEPTED substitution deltas.
+      # This is the CAPTURED amount and may diverge from estimated_total_cents.
+      base = Arrangement.base_price_cents
+      surged = (same surge rule as compute_quote_estimate)
+      discounted = round_half_up(surged * (1 - discount_pct))   # same discount_pct as quote
+      delivery = DeliveryZone.base_delivery_fee_cents
+      wire = WireFulfillment.florist_surcharge_cents            # NOW known
+      subs = sum(Substitution.price_delta_cents for s in Substitutions
+                 where s.order_id == Order.id AND s.accepted == true)
+      # subs delta is NOT discounted and NOT surged (applied at cost)
+      pre_credit = discounted + delivery + wire + subs
+      final_total_cents = max(0, pre_credit - Order.wallet_credit_applied_cents)
+    input_set: "the Order, its WireFulfillment, and all accepted Substitution rows where order_id == Order.id"
+    constants:
+      MIN_TOTAL_CENTS: 0
+    precision: "integer cents; substitution deltas summed as exact integers then added (no per-line rounding)"
+    variants:
+      - name: final_variant
+        when: "BOOKED->IN_TRANSIT, after florist assignment and substitution application"
+        difference: "INCLUDES florist wire_surcharge_cents and accepted substitution deltas absent from the estimate; reuses the SAME discount_pct and wallet_credit_applied snapshot, so divergence from estimate is exactly wire + subs"
+
+  - name: compute_claim_refund
+    trigger: "QualityClaim OPEN->APPROVED with requested_remedy==REFUND (POST /floral/claims/{id}/approve)"
+    algorithm: weighted_scoring
+    formula: |
+      # Refund is a reason-weighted fraction of the order's CAPTURED final_total_cents,
+      # floored by a per-reason minimum, capped at the captured amount.
+      captured = Order.final_total_cents
+      reason_pct = { WILTED: 0.50, WRONG_ITEM: 1.00, LATE: 0.25, DAMAGED: 0.75 }[claim.reason]
+      raw = round_half_up(captured * reason_pct)
+      floored = max(raw, REASON_FLOOR_CENTS[claim.reason])
+      refund_cents = min(floored, captured)
+    input_set: "the single QualityClaim, its linked delivered Order's final_total_cents"
+    constants:
+      REASON_PCT: { WILTED: 0.50, WRONG_ITEM: 1.00, LATE: 0.25, DAMAGED: 0.75 }
+      REASON_FLOOR_CENTS: { WILTED: 500, WRONG_ITEM: 0, LATE: 300, DAMAGED: 1000 }
+    precision: "integer cents; round_half_up on the percentage step; floor and cap are exact integer comparisons"
+    variants:
+      - name: refund_only
+        when: "requested_remedy==REFUND"
+        difference: "REDELIVERY remedy computes refund_cents=0 and instead spawns a remedial Order; only the REFUND branch runs this formula"
+
+  - name: select_fulfilling_florist
+    trigger: "Order QUOTED->BOOKED (POST /floral/orders/{id}/book), wire-service selection"
+    algorithm: weighted_scoring
+    formula: |
+      # SELECTOR POLICY — pick exactly one florist for the order.
+      # (a) eligibility filter (candidate set):
+      candidates = Florists where:
+          florist.covered_zone_id == Order.zone_id
+          AND florist.accepting == true
+          AND florist daily load for Order.delivery_date < florist.daily_capacity   # capacity headroom
+      # (b) ranking expression: highest quality_rating first,
+      #     then lowest wire_surcharge_cents (cheaper to customer)
+      rank by (quality_rating DESC, wire_surcharge_cents ASC)
+      # (c) tie-break: earliest created_at (NEVER id)
+      tie_break by created_at ASC
+      # (d) empty-set fallback:
+      if candidates is empty: reject the book with ERR_NO_FLORIST_AVAILABLE
+      chosen = first candidate after ranking + tie-break
+    input_set: "all Florist rows in the order's zone with capacity headroom for the delivery date"
+    constants: {}
+    precision: "ranking on declared fields only; created_at ASC tie-break; id strictly forbidden as a decision input"
+    variants: []
+
+  - name: promote_loyalty_tier
+    trigger: "Order IN_TRANSIT->DELIVERED (POST /floral/orders/{id}/confirm-delivery)"
+    algorithm: threshold
+    formula: |
+      # Recompute Customer.loyalty_tier from lifetime_delivered_count AFTER incrementing it.
+      n = Customer.lifetime_delivered_count   # already incremented by the delivery
+      if n >= GOLD_THRESHOLD:        tier = GOLD
+      elif n >= SILVER_THRESHOLD:    tier = SILVER
+      else:                          tier = STANDARD
+      # tier is monotonic non-decreasing: never demote.
+      Customer.loyalty_tier = max(current_tier, tier)   # ordered STANDARD<SILVER<GOLD
+    input_set: "the single Customer's lifetime_delivered_count after the delivery increment"
+    constants:
+      SILVER_THRESHOLD: 5
+      GOLD_THRESHOLD: 15
+    precision: "integer comparison; boundary is '>=' (exactly 5 delivered => SILVER, exactly 15 => GOLD)"
+    variants: []
+
+# ===========================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except Anonymous-permitted endpoints"
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted to call this endpoint per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: auth
+    check: "for entity_backed roles acting on an owned resource (Customer on own Order/Claim/Schedule, Florist on own WireFulfillment), X-User-ID equals the resource's owner FK"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "owned-resource mutations"
+
+  - priority: 4
+    category: existence
+    check: "every path id and body FK resolves to an existing row, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 5
+    category: business_constraint
+    check: "request body conforms to schema: required fields present, enums in range, card_message length <= 240, window_start_minute < window_end_minute, numeric ranges respected"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all writes"
+
+  - priority: 6
+    category: state
+    check: "target resource is in a state from which the requested transition is defined (§1.2 from-state)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 7
+    category: state
+    check: "cross-dimension/cross-entity precondition: book requires payment_status==AUTHORIZED; dispatch requires WireFulfillment.status==ACCEPTED; claim approve requires linked Order.fulfillment_status==DELIVERED"
+    error_id: ERR_PRECONDITION_NOT_MET
+    http_status: 409
+    applies_to: "POST .../book, POST .../dispatch, POST /floral/claims/{id}/approve"
+
+  - priority: 8
+    category: business_temporal
+    check: "same-day order: if delivery_date == clock date, clock hour-of-day must be < effective cutoff (HolidayWindow.surge_cutoff_hour_utc if the date is inside a window, else DeliveryZone.same_day_cutoff_hour_utc)"
+    error_id: ERR_PAST_SAME_DAY_CUTOFF
+    http_status: 409
+    applies_to: "POST /floral/orders/{id}/quote"
+
+  - priority: 9
+    category: business_temporal
+    check: "delivery_date must not be strictly before the clock date"
+    error_id: ERR_DELIVERY_DATE_IN_PAST
+    http_status: 409
+    applies_to: "POST /floral/orders/{id}/quote"
+
+  - priority: 10
+    category: business_safety
+    check: "substitution conforms to the arrangement's substitution_policy: NONE rejects any swap; SAME_VALUE rejects price_delta_cents > 0; FLORIST_CHOICE rejects when summed accepted deltas would exceed round_half_up(base_price_cents * substitution_cap_pct)"
+    error_id: ERR_SUBSTITUTION_NOT_ALLOWED
+    http_status: 409
+    applies_to: "POST /floral/substitutions"
+
+  - priority: 11
+    category: business_constraint
+    check: "zone window capacity: a DeliverySlot for (zone_id, delivery_date, [window_start_minute,window_end_minute)) collides with >= window_capacity_per_slot existing non-released bookings sharing the SAME half-open window (overlap_zone_window)"
+    error_id: ERR_ZONE_WINDOW_FULL
+    http_status: 409
+    applies_to: "POST /floral/orders/{id}/book"
+
+  - priority: 12
+    category: business_constraint
+    check: "florist daily capacity: chosen florist's non-released WireFulfillment count for delivery_date is already == daily_capacity (overlap_florist_capacity, aggregate-capacity semantics)"
+    error_id: ERR_NO_FLORIST_AVAILABLE
+    http_status: 409
+    applies_to: "POST /floral/orders/{id}/book"
+
+  - priority: 13
+    category: business_referential
+    check: "OCC: expected_order_version must equal the linked Order's current version on book and on claim resolve"
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+    applies_to: "POST /floral/orders/{id}/book, POST /floral/claims/{id}/resolve"
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # ---- Customers ----
+  - method: POST
+    path: "/floral/customers"
+    description: register a customer
+    roles: [CatalogAdmin, Dispatcher]
+    code: 201
+    input: [email, full_name]
+    output: Customer
+    side_effects: ["loyalty_tier=STANDARD; wallet_credit_cents=0"]
+  - method: GET
+    path: "/floral/customers/{id}"
+    description: fetch a customer
+    roles: [CatalogAdmin, Dispatcher, Customer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/floral/customers"
+    description: list customers
+    roles: [CatalogAdmin, Dispatcher]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Customer[]
+    side_effects: []
+
+  # ---- Zones ----
+  - method: POST
+    path: "/floral/zones"
+    description: create a delivery zone
+    roles: [CatalogAdmin]
+    code: 201
+    input: [zone_code, base_delivery_fee_cents, same_day_cutoff_hour_utc, window_capacity_per_slot, "active?"]
+    output: DeliveryZone
+    side_effects: []
+  - method: GET
+    path: "/floral/zones/{id}"
+    description: fetch a zone
+    roles: [CatalogAdmin, Dispatcher, Customer, Florist]
+    code: 200
+    input: []
+    output: DeliveryZone
+    side_effects: []
+  - method: GET
+    path: "/floral/zones"
+    description: list zones
+    roles: [CatalogAdmin, Dispatcher, Customer, Florist]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: DeliveryZone[]
+    side_effects: []
+
+  # ---- Arrangements ----
+  - method: POST
+    path: "/floral/arrangements"
+    description: create a catalog arrangement
+    roles: [CatalogAdmin]
+    code: 201
+    input: [sku, display_name, base_price_cents, "premium_tier?", "substitution_policy?", "substitution_cap_pct?", "active?"]
+    output: Arrangement
+    side_effects: []
+  - method: GET
+    path: "/floral/arrangements/{id}"
+    description: fetch an arrangement
+    roles: [CatalogAdmin, Dispatcher, Customer, Florist]
+    code: 200
+    input: []
+    output: Arrangement
+    side_effects: []
+  - method: GET
+    path: "/floral/arrangements"
+    description: list arrangements
+    roles: [CatalogAdmin, Dispatcher, Customer, Florist]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Arrangement[]
+    side_effects: []
+
+  # ---- Holiday windows ----
+  - method: POST
+    path: "/floral/holiday-windows"
+    description: create a holiday surge window
+    roles: [CatalogAdmin]
+    code: 201
+    input: [name, start_date, end_date, surge_multiplier, "applies_to_standard?", surge_cutoff_hour_utc]
+    output: HolidayWindow
+    side_effects: []
+  - method: GET
+    path: "/floral/holiday-windows/{id}"
+    description: fetch a holiday window
+    roles: [CatalogAdmin, Dispatcher]
+    code: 200
+    input: []
+    output: HolidayWindow
+    side_effects: []
+  - method: GET
+    path: "/floral/holiday-windows"
+    description: list holiday windows
+    roles: [CatalogAdmin, Dispatcher]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: HolidayWindow[]
+    side_effects: []
+
+  # ---- Florists ----
+  - method: POST
+    path: "/floral/florists"
+    description: register a fulfilling florist
+    roles: [Dispatcher]
+    code: 201
+    input: [shop_name, covered_zone_id, daily_capacity, "quality_rating?", "wire_surcharge_cents?", "accepting?"]
+    output: Florist
+    side_effects: []
+  - method: GET
+    path: "/floral/florists/{id}"
+    description: fetch a florist
+    roles: [Dispatcher, Florist, CatalogAdmin]
+    code: 200
+    input: []
+    output: Florist
+    side_effects: []
+  - method: GET
+    path: "/floral/florists"
+    description: "list florists; filterable by covered_zone_id for zone coverage discovery"
+    roles: [Dispatcher, Florist, CatalogAdmin]
+    code: 200
+    input: ["covered_zone_id?", "limit?", "offset?"]
+    output: Florist[]
+    side_effects: []
+  - method: PATCH
+    path: "/floral/florists/{id}"
+    description: "update florist mutable attributes (accepting, quality_rating, wire_surcharge_cents, daily_capacity)"
+    roles: [Dispatcher]
+    code: 200
+    input: ["accepting?", "quality_rating?", "wire_surcharge_cents?", "daily_capacity?"]
+    output: Florist
+    side_effects: ["increments Florist.version by 1"]
+
+  # ---- Orders ----
+  - method: POST
+    path: "/floral/orders"
+    description: create a draft order
+    roles: [Customer, Dispatcher]
+    code: 201
+    input: [customer_id, arrangement_id, zone_id, "occasion?", "card_message?", delivery_date, window_start_minute, window_end_minute, "apply_wallet_credit?"]
+    output: Order
+    side_effects: ["fulfillment_status=DRAFT; payment_status=UNPAID"]
+  - method: GET
+    path: "/floral/orders/{id}"
+    description: fetch an order
+    roles: [Customer, Dispatcher, Florist, CatalogAdmin]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+  - method: GET
+    path: "/floral/orders"
+    description: "list orders; filter by customer_id, arrangement_id, parent_recurrence_id, source_order_id, zone_id"
+    roles: [Customer, Dispatcher, Florist, CatalogAdmin]
+    code: 200
+    input: ["customer_id?", "arrangement_id?", "parent_recurrence_id?", "source_order_id?", "zone_id?", "limit?", "offset?"]
+    output: Order[]
+    side_effects: []
+  - method: POST
+    path: "/floral/orders/{id}/quote"
+    description: "quote the order: DRAFT->QUOTED, runs compute_quote_estimate"
+    roles: [Customer, Dispatcher]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["set estimated_total_cents, is_same_day, wallet_credit_applied_cents; debit Customer.wallet_credit_cents; increments Order.version by 1"]
+  - method: POST
+    path: "/floral/orders/{id}/authorize-payment"
+    description: "authorize payment for the quoted amount: UNPAID->AUTHORIZED"
+    roles: [Customer, Dispatcher]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["record authorized amount = estimated_total_cents; increments Order.version by 1"]
+  - method: POST
+    path: "/floral/orders/{id}/book"
+    description: "book the order: QUOTED->BOOKED; selects florist, reserves zone slot + florist capacity"
+    roles: [Customer, Dispatcher]
+    code: 200
+    input: [expected_order_version]
+    output: Order
+    side_effects: ["create DeliverySlot; create WireFulfillment via select_fulfilling_florist; increments Order.version by 1"]
+  - method: POST
+    path: "/floral/orders/{id}/dispatch"
+    description: "dispatch the order: BOOKED->IN_TRANSIT; runs compute_final_total; captures payment AUTHORIZED->CAPTURED"
+    roles: [Florist, Dispatcher]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["set final_total_cents; payment_status AUTHORIZED->CAPTURED at final_total_cents; increments Order.version by 1"]
+  - method: POST
+    path: "/floral/orders/{id}/confirm-delivery"
+    description: "confirm delivery: IN_TRANSIT->DELIVERED; increments lifetime_delivered_count; runs promote_loyalty_tier"
+    roles: [Florist, Dispatcher]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["increment Customer.lifetime_delivered_count; promote_loyalty_tier; increments Order.version by 1"]
+  - method: POST
+    path: "/floral/orders/{id}/cancel"
+    description: "cancel the order from DRAFT/QUOTED/BOOKED; releases slot/fulfillment/credit as applicable"
+    roles: [Customer, Dispatcher]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["release DeliverySlot; RELEASE WireFulfillment (decrement florist load); refund wallet credit; increments Order.version by 1"]
+  - method: GET
+    path: "/floral/orders/{id}/wire-fulfillments"
+    description: "reverse-reachability: WireFulfillments for an order"
+    roles: [Customer, Dispatcher, Florist, CatalogAdmin]
+    code: 200
+    input: []
+    output: WireFulfillment[]
+    side_effects: []
+  - method: GET
+    path: "/floral/orders/{id}/substitutions"
+    description: "reverse-reachability: Substitutions for an order"
+    roles: [Customer, Dispatcher, Florist, CatalogAdmin]
+    code: 200
+    input: []
+    output: Substitution[]
+    side_effects: []
+  - method: GET
+    path: "/floral/orders/{id}/delivery-slots"
+    description: "reverse-reachability: DeliverySlots for an order"
+    roles: [Dispatcher, CatalogAdmin]
+    code: 200
+    input: []
+    output: DeliverySlot[]
+    side_effects: []
+  - method: GET
+    path: "/floral/orders/{id}/claims"
+    description: "reverse-reachability: QualityClaims for an order"
+    roles: [Customer, Dispatcher, CatalogAdmin]
+    code: 200
+    input: []
+    output: QualityClaim[]
+    side_effects: []
+
+  # ---- Wire fulfillments ----
+  - method: GET
+    path: "/floral/wire-fulfillments/{id}"
+    description: fetch a wire fulfillment
+    roles: [Florist, Dispatcher, CatalogAdmin]
+    code: 200
+    input: []
+    output: WireFulfillment
+    side_effects: []
+  - method: GET
+    path: "/floral/wire-fulfillments"
+    description: "list wire fulfillments; filter by florist_id or order_id"
+    roles: [Florist, Dispatcher, CatalogAdmin]
+    code: 200
+    input: ["florist_id?", "order_id?", "limit?", "offset?"]
+    output: WireFulfillment[]
+    side_effects: []
+  - method: POST
+    path: "/floral/wire-fulfillments/{id}/accept"
+    description: "florist accepts the assignment: ASSIGNED->ACCEPTED"
+    roles: [Florist, Dispatcher]
+    code: 200
+    input: []
+    output: WireFulfillment
+    side_effects: ["set status=ACCEPTED; increments WireFulfillment.version by 1"]
+
+  # ---- Delivery slots (read) ----
+  - method: GET
+    path: "/floral/zones/{id}/delivery-slots"
+    description: "reverse-reachability: DeliverySlots booked against a zone"
+    roles: [Dispatcher, CatalogAdmin]
+    code: 200
+    input: []
+    output: DeliverySlot[]
+    side_effects: []
+
+  # ---- Substitutions ----
+  - method: POST
+    path: "/floral/substitutions"
+    description: "record a stem substitution against a BOOKED order; validated by substitution_policy"
+    roles: [Florist, Dispatcher]
+    code: 201
+    input: [order_id, florist_id, removed_stem, added_stem, price_delta_cents]
+    output: Substitution
+    side_effects: ["set accepted=true if policy passes; counts toward compute_final_total"]
+  - method: GET
+    path: "/floral/substitutions/{id}"
+    description: fetch a substitution
+    roles: [Florist, Dispatcher, CatalogAdmin]
+    code: 200
+    input: []
+    output: Substitution
+    side_effects: []
+  - method: GET
+    path: "/floral/substitutions"
+    description: "list substitutions; filter by order_id or florist_id"
+    roles: [Florist, Dispatcher, CatalogAdmin]
+    code: 200
+    input: ["order_id?", "florist_id?", "limit?", "offset?"]
+    output: Substitution[]
+    side_effects: []
+
+  # ---- Quality claims ----
+  - method: POST
+    path: "/floral/claims"
+    description: "file a quality claim against a DELIVERED order"
+    roles: [Customer, Dispatcher]
+    code: 201
+    input: [order_id, customer_id, reason, requested_remedy]
+    output: QualityClaim
+    side_effects: ["status=OPEN"]
+  - method: GET
+    path: "/floral/claims/{id}"
+    description: fetch a claim
+    roles: [Customer, Dispatcher, CatalogAdmin]
+    code: 200
+    input: []
+    output: QualityClaim
+    side_effects: []
+  - method: GET
+    path: "/floral/claims"
+    description: "list claims; filter by order_id or customer_id"
+    roles: [Customer, Dispatcher, CatalogAdmin]
+    code: 200
+    input: ["order_id?", "customer_id?", "limit?", "offset?"]
+    output: QualityClaim[]
+    side_effects: []
+  - method: POST
+    path: "/floral/claims/{id}/approve"
+    description: "approve a claim: OPEN->APPROVED; computes refund for REFUND remedies"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: QualityClaim
+    side_effects: ["if REFUND: compute_claim_refund -> refund_cents; increments QualityClaim.version by 1"]
+  - method: POST
+    path: "/floral/claims/{id}/reject"
+    description: "reject a claim: OPEN->REJECTED"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: QualityClaim
+    side_effects: ["increments QualityClaim.version by 1"]
+  - method: POST
+    path: "/floral/claims/{id}/resolve"
+    description: "resolve an APPROVED claim: APPROVED->RESOLVED; spawns redelivery Order or drives refund (OCC on Order)"
+    roles: [Dispatcher]
+    code: 200
+    input: [expected_order_version]
+    output: QualityClaim
+    side_effects: ["REDELIVERY: spawn redelivery Order, set redelivery_order_id; REFUND: Order CAPTURED->REFUNDED + credit wallet; increments QualityClaim.version and Order.version by 1"]
+
+  # ---- Recurring schedules ----
+  - method: POST
+    path: "/floral/recurring-schedules"
+    description: create a recurring schedule
+    roles: [Customer, Dispatcher]
+    code: 201
+    input: [customer_id, arrangement_id, zone_id, cadence, next_delivery_date, window_start_minute, window_end_minute, occurrences_remaining, "recurring_discount_pct?"]
+    output: RecurringSchedule
+    side_effects: ["status=ACTIVE"]
+  - method: GET
+    path: "/floral/recurring-schedules/{id}"
+    description: fetch a recurring schedule
+    roles: [Customer, Dispatcher, CatalogAdmin]
+    code: 200
+    input: []
+    output: RecurringSchedule
+    side_effects: []
+  - method: GET
+    path: "/floral/recurring-schedules"
+    description: "list recurring schedules; filter by customer_id, arrangement_id, zone_id"
+    roles: [Customer, Dispatcher, CatalogAdmin]
+    code: 200
+    input: ["customer_id?", "arrangement_id?", "zone_id?", "limit?", "offset?"]
+    output: RecurringSchedule[]
+    side_effects: []
+  - method: POST
+    path: "/floral/recurring-schedules/{id}/emit"
+    description: "emit the next order: ACTIVE->ACTIVE (auto-PAUSE when occurrences exhaust)"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: RecurringSchedule
+    side_effects: ["create Order; advance next_delivery_date; decrement occurrences_remaining; auto-PAUSE at 0; increments RecurringSchedule.version by 1"]
+  - method: POST
+    path: "/floral/recurring-schedules/{id}/pause"
+    description: "pause: ACTIVE->PAUSED"
+    roles: [Customer, Dispatcher]
+    code: 200
+    input: []
+    output: RecurringSchedule
+    side_effects: ["status=PAUSED; increments RecurringSchedule.version by 1"]
+  - method: POST
+    path: "/floral/recurring-schedules/{id}/resume"
+    description: "resume: PAUSED->ACTIVE"
+    roles: [Customer, Dispatcher]
+    code: 200
+    input: []
+    output: RecurringSchedule
+    side_effects: ["status=ACTIVE; increments RecurringSchedule.version by 1"]
+  - method: POST
+    path: "/floral/recurring-schedules/{id}/cancel"
+    description: "cancel: ACTIVE/PAUSED->CANCELLED"
+    roles: [Customer, Dispatcher]
+    code: 200
+    input: []
+    output: RecurringSchedule
+    side_effects: ["status=CANCELLED; increments RecurringSchedule.version by 1"]
+
+  # ---- Clock (test-driving) ----
+  - method: POST
+    path: "/floral/_clock/set_current_utc"
+    description: "test-driving: set the server's simulated clock"
+    roles: [CatalogAdmin, Dispatcher]
+    code: 200
+    input: [to_iso8601]
+    output: ClockState
+    side_effects: ["set ClockState.current_utc"]
+  - method: GET
+    path: "/floral/_clock"
+    description: "read the server's simulated clock"
+    roles: [CatalogAdmin, Dispatcher, Customer, Florist]
+    code: 200
+    input: []
+    output: ClockState
+    side_effects: []
+
+  # ---- Payment authorize for redelivery / direct order quote helper ----
+  - method: POST
+    path: "/floral/_payments/mark_authorized"
+    description: "test-driving: force an order's payment_status to AUTHORIZED at its estimated_total_cents without a real gateway (used to drive booking preconditions deterministically)"
+    roles: [Dispatcher]
+    code: 200
+    input: [order_id]
+    output: Order
+    side_effects: ["payment_status UNPAID->AUTHORIZED; increments Order.version by 1"]
+
+  # ---- Inject helpers (test-driving) ----
+  - method: POST
+    path: "/floral/_inject/set_loyalty_tier"
+    description: "test-driving: set a customer's loyalty_tier directly (no plausible business endpoint sets a tier; promotion is otherwise only via delivered-count)"
+    roles: [Dispatcher]
+    code: 200
+    input: [customer_id, loyalty_tier]
+    output: Customer
+    side_effects: ["set Customer.loyalty_tier; increments Customer.version by 1"]
+  - method: POST
+    path: "/floral/_inject/credit_wallet"
+    description: "test-driving: credit a customer's wallet_credit_cents directly to seed wallet-credit scenarios deterministically"
+    roles: [Dispatcher]
+    code: 200
+    input: [customer_id, amount_cents]
+    output: Customer
+    side_effects: ["increment Customer.wallet_credit_cents by amount_cents; increments Customer.version by 1"]
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing or malformed X-User-Role / X-User-ID headers on a protected endpoint"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "acting role not permitted for this endpoint"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "entity_backed role acting on a resource it does not own (X-User-ID != owner FK)"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a path id or body FK does not resolve to an existing row"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "schema violation: missing required field, enum out of range, card_message > 240 chars, window_start_minute >= window_end_minute, numeric out of range"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested transition is not defined from the resource's current state"
+  - id: ERR_PRECONDITION_NOT_MET
+    http: 409
+    condition: "cross-dimension/cross-entity precondition fails (e.g. book without AUTHORIZED payment, dispatch without ACCEPTED fulfillment, approve claim whose order is not DELIVERED)"
+  - id: ERR_PAST_SAME_DAY_CUTOFF
+    http: 409
+    condition: "same-day quote attempted after the effective same-day cutoff hour"
+  - id: ERR_DELIVERY_DATE_IN_PAST
+    http: 409
+    condition: "delivery_date is strictly before the clock date at quote time"
+  - id: ERR_SUBSTITUTION_NOT_ALLOWED
+    http: 409
+    condition: "substitution violates the arrangement's substitution_policy (NONE / SAME_VALUE positive delta / FLORIST_CHOICE over cap)"
+  - id: ERR_ZONE_WINDOW_FULL
+    http: 409
+    condition: "the requested (zone, date, half-open window) already holds window_capacity_per_slot non-released bookings"
+  - id: ERR_NO_FLORIST_AVAILABLE
+    http: 409
+    condition: "no florist in the order's zone has capacity headroom for the delivery date (empty selector candidate set), or chosen florist already at daily_capacity"
+  - id: ERR_STALE_ORDER_VERSION
+    http: 412
+    condition: "expected_order_version does not equal the linked Order's current version on book or claim resolve"
+  - id: ERR_SCHEDULE_EXHAUSTED
+    http: 409
+    condition: "emit/resume on a schedule with occurrences_remaining == 0"
+  - id: ERR_ZONE_INACTIVE
+    http: 409
+    condition: "quote against a DeliveryZone whose active == false"
+  - id: ERR_ARRANGEMENT_INACTIVE
+    http: 409
+    condition: "quote against an Arrangement whose active == false"
+  - id: ERR_CLAIM_WINDOW_INVALID
+    http: 409
+    condition: "claim filed against an Order that is not in fulfillment_status DELIVERED"
+  - id: ERR_VALIDATION_RANGE
+    http: 422
+    condition: "loyalty/discount/cap/multiplier configuration value out of its declared numeric range at creation time"
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: Customer
+    description: "the ordering customer; owns own Orders, QualityClaims, RecurringSchedules"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /floral/claims (file claim on own delivered order)"
+      - "POST /floral/recurring-schedules (subscribe)"
+    shared_operations:
+      - "POST /floral/orders (own order)"
+      - "POST /floral/orders/{id}/quote|authorize-payment|book|cancel (own order)"
+      - "POST /floral/recurring-schedules/{id}/pause|resume|cancel (own schedule)"
+      - "GET own orders/claims/schedules/zones/arrangements"
+
+  - name: Florist
+    description: "fulfilling local florist; owns own WireFulfillments; applies substitutions, dispatches, confirms delivery"
+    identity: "entity_backed:Florist"
+    exclusive_operations:
+      - "POST /floral/wire-fulfillments/{id}/accept (own assignment)"
+      - "POST /floral/substitutions (against orders it fulfils)"
+    shared_operations:
+      - "POST /floral/orders/{id}/dispatch|confirm-delivery"
+      - "GET florists/wire-fulfillments/orders/substitutions/arrangements/zones"
+
+  - name: Dispatcher
+    description: "wire-service operator; runs florist selection, capacity, claim adjudication, recurring emission; opaque operator identity"
+    identity: opaque
+    exclusive_operations:
+      - "POST /floral/florists (register florist)"
+      - "PATCH /floral/florists/{id}"
+      - "POST /floral/claims/{id}/approve|reject|resolve"
+      - "POST /floral/recurring-schedules/{id}/emit"
+      - "POST /floral/_payments/mark_authorized"
+    shared_operations:
+      - "all order/claim/schedule/substitution mutations as operator backstop"
+      - "POST /floral/_clock/set_current_utc"
+
+  - name: CatalogAdmin
+    description: "catalog/config owner; manages arrangements, zones, holiday windows, customers; opaque operator identity"
+    identity: opaque
+    exclusive_operations:
+      - "POST /floral/zones"
+      - "POST /floral/arrangements"
+      - "POST /floral/holiday-windows"
+      - "POST /floral/customers"
+    shared_operations:
+      - "GET catalog/zones/holiday-windows/orders/claims"
+      - "POST /floral/_clock/set_current_utc"

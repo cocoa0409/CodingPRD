@@ -1,0 +1,31 @@
+"""Domain thresholds — numeric constants from PRD calculations."""
+
+# From the expirable banding and due-date arithmetic (whole UTC days).
+MS_PER_DAY = 86_400_000
+
+# Default organization configuration.
+DEFAULT_RECRED_CYCLE_DAYS = 1095
+DEFAULT_EXPIRING_SOON_WINDOW_DAYS = 90
+DEFAULT_CLOCK_INIT = "2026-01-01T00:00:00.000Z"
+
+# Readiness-score penalty constants.
+SANCTION_UNIT_PENALTY = 5
+SANCTION_PENALTY_CAP = 40
+RECRED_DUE_PENALTY = 15
+
+# Peer-review chair tie-break multiplier.
+CHAIR_TIE_MULTIPLIER = 2
+
+# Quorum: minimum non-ABSTAIN votes required to finalize.
+QUORUM_MIN = 3
+
+THRESHOLDS = {
+    "MS_PER_DAY": MS_PER_DAY,
+    "DEFAULT_RECRED_CYCLE_DAYS": DEFAULT_RECRED_CYCLE_DAYS,
+    "DEFAULT_EXPIRING_SOON_WINDOW_DAYS": DEFAULT_EXPIRING_SOON_WINDOW_DAYS,
+    "SANCTION_UNIT_PENALTY": SANCTION_UNIT_PENALTY,
+    "SANCTION_PENALTY_CAP": SANCTION_PENALTY_CAP,
+    "RECRED_DUE_PENALTY": RECRED_DUE_PENALTY,
+    "CHAIR_TIE_MULTIPLIER": CHAIR_TIE_MULTIPLIER,
+    "QUORUM_MIN": QUORUM_MIN,
+}

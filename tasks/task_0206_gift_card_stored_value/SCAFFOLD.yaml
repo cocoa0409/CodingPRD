@@ -1,0 +1,1425 @@
+# =============================================================================
+# Retail Gift Card & Stored-Value Program — SCAFFOLD (§1.0–§1.7)
+# Difficulty band: EXPERT (§0.4)
+# =============================================================================
+
+scenario: |
+  Retail Gift Card & Stored-Value Program: card issuance (digital/physical),
+  activation/load, balance redemption/split tender, reload, expiration/breakage
+  rules (state law), refund-to-card, fraud/replacement, B2B bulk order
+
+domain_name: gift-card-stored-value
+api_prefix: /v1
+
+complexity_profile:
+  primary_archetype: event_sourcing
+  secondary_archetype: ledger_reconciliation
+  complexity_layers:
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+    - derived_field_reconciliation
+    - bulk_operations
+    - optimistic_concurrency
+
+  entity_topology: flat
+  # Peer entities under a flat /v1/<collection>/{id} surface, linked by FK fields
+  # carried in request bodies / query filters (program_id, card_id, customer_id,
+  # redemption_id, old_card_id, ...). No deep URL nesting; every child is reached
+  # by a filtered-list GET on its own collection.
+
+  state_machine_shape: parallel
+  # GiftCard carries two independent dimensions: lifecycle_status (issuance →
+  # active → terminal) AND risk_status (CLEAR ↔ FLAGGED ↔ FROZEN_RISK cycle).
+  # ReplacementRequest is branching (OPEN → {APPROVED, REJECTED}); RefundRequest
+  # is branching with a NEEDS_REVISION revision loop.
+
+  relationship_patterns:
+    - one_to_many        # Program → GiftCard; GiftCard → LedgerEntry
+    - many_to_many       # Redemption ↔ GiftCard via RedemptionLeg (split tender)
+    - self_referential   # ReplacementRequest links old GiftCard → new GiftCard
+    - cross_aggregate    # Redemption (own aggregate) debits many GiftCards
+
+  role_model: peer_roles
+  # ProgramAdmin configures; StoreAssociate runs POS issuance/load/redeem;
+  # Customer acts on own cards; FraudAnalyst owns risk + replacement; B2BBuyer
+  # owns bulk orders.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Program
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Retail program name" }
+      - { name: default_currency, type: string, source: input, default: "USD", description: "ISO currency code; all amounts are integer minor units (cents)" }
+      - { name: reload_min_cents, type: integer, source: input, default: 500, description: "Minimum load/reload amount in cents" }
+      - { name: reload_max_balance_cents, type: integer, source: input, default: 100000, description: "Maximum settled balance any card may hold after a load/reload/refund credit" }
+      - { name: hold_ttl_seconds, type: integer, source: input, default: 900, description: "Lifetime of an AuthorizationHold from created_at before it auto-expires" }
+      - { name: b2b_discount_pct, type: number, source: input, default: 0.035, description: "Per-card B2B discount fraction applied in bulk-order pricing" }
+      - { name: outstanding_liability_cents, type: integer, source: computed, description: "Sum of settled_balance_cents over all GiftCards in this program whose lifecycle_status IN {ACTIVE, EXHAUSTED}" }
+      - { name: breakage_recognized_cents, type: integer, source: computed, description: "Sum of -amount_cents over POSTED LedgerEntry of entry_type BREAKAGE in this program (recognized breakage revenue)" }
+      - { name: escheat_liability_cents, type: integer, source: computed, description: "Sum of -amount_cents over POSTED LedgerEntry of entry_type ESCHEAT in this program (value owed to states)" }
+
+  - name: StateRule
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> Program.id" }
+      - { name: state_code, type: string, source: input, description: "Two-letter US state code; unique per (program_id, state_code)" }
+      - { name: expiration_allowed, type: boolean, source: input, description: "Whether stored value may expire in this jurisdiction" }
+      - { name: dormancy_fee_allowed, type: boolean, source: input, description: "Whether dormancy fees may be assessed in this jurisdiction" }
+      - { name: breakage_policy, type: enum, source: input, description: "RECOGNIZE | ESCHEAT — RECOGNIZE books residual value as breakage revenue; ESCHEAT books escheat_rate of value owed to the state" }
+      - { name: escheat_rate, type: number, source: input, default: 0.60, description: "Fraction of dormant balance escheated when breakage_policy=ESCHEAT" }
+      - { name: dormancy_threshold_months, type: integer, source: input, default: 12, description: "Whole months of inactivity at or beyond which a card is dormant (inclusive)" }
+
+  - name: PromoCampaign
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> Program.id" }
+      - { name: name, type: string, source: input, description: "Campaign name" }
+      - { name: bonus_pct, type: number, source: input, description: "Bonus fraction credited on qualifying reloads (e.g., 0.10 = 10%)" }
+      - { name: window_start, type: datetime, source: input, description: "Inclusive UTC start of campaign window" }
+      - { name: window_end, type: datetime, source: input, description: "Exclusive UTC end of campaign window (half-open [start, end))" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | ACTIVE | ENDED — see PromoCampaign state machine" }
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Unique customer email" }
+      - { name: full_name, type: string, source: input, description: "Customer full name" }
+      - { name: residence_state_code, type: string, source: input, description: "Two-letter US state of residence; default jurisdiction for the customer's cards" }
+      - { name: is_corporate, type: boolean, source: input, default: false, description: "Corporate buyers may place B2B bulk orders" }
+
+  - name: GiftCard
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> Program.id" }
+      - { name: owner_customer_id, type: string, source: input, description: "FK -> Customer.id; nullable until assigned", constraints: "nullable" }
+      - { name: form_factor, type: enum, source: input, description: "DIGITAL | PHYSICAL" }
+      - { name: state_code, type: string, source: input, description: "Jurisdiction governing this card; selects the StateRule" }
+      - { name: lifecycle_status, type: enum, source: system, description: "INACTIVE | ACTIVE | VOIDED | EXPIRED | EXHAUSTED — see GiftCard lifecycle state machine. Risk freezing is a separate dimension (risk_status), so there is no FROZEN lifecycle state" }
+      - { name: risk_status, type: enum, source: system, default: "CLEAR", description: "CLEAR | FLAGGED | FROZEN_RISK — independent risk dimension; see GiftCard risk state machine" }
+      - { name: settled_balance_cents, type: integer, source: computed, description: "Sum of amount_cents over POSTED LedgerEntry on this card (credits positive, debits negative)" }
+      - { name: pending_hold_cents, type: integer, source: computed, description: "Sum of amount_cents over AuthorizationHolds on this card whose status=ACTIVE" }
+      - { name: available_balance_cents, type: integer, source: computed, description: "settled_balance_cents - pending_hold_cents (authorized-balance variant)" }
+      - { name: last_activity_at, type: datetime, source: computed, description: "created_at of the most recent POSTED LedgerEntry on this card, else card activation time" }
+      - { name: replaced_by_card_id, type: string, source: system, description: "FK -> GiftCard.id; set when this card is VOIDED via replacement", constraints: "nullable; self-referential" }
+
+  - name: LedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - { name: card_id, type: string, source: input, description: "FK -> GiftCard.id" }
+      - { name: program_id, type: string, source: system, description: "FK -> Program.id; copied from the card for program-level aggregation" }
+      - { name: entry_type, type: enum, source: system, description: "LOAD | RELOAD | BONUS | REDEEM | REFUND | TRANSFER_IN | TRANSFER_OUT | DORMANCY_FEE | BREAKAGE | ESCHEAT | REVERSAL" }
+      - { name: amount_cents, type: integer, source: system, description: "Signed minor units; credits positive (LOAD/RELOAD/BONUS/REFUND/TRANSFER_IN/REVERSAL-of-debit), debits negative (REDEEM/DORMANCY_FEE/BREAKAGE/ESCHEAT/TRANSFER_OUT)" }
+      - { name: status, type: enum, source: system, default: "POSTED", description: "POSTED | REVERSED — REVERSED entries are excluded from balance sums; the reversing entry carries entry_type=REVERSAL" }
+      - { name: source_ref_id, type: string, source: system, description: "Originating Redemption / RefundRequest / ReplacementRequest / BulkOrder id, for audit", constraints: "nullable; not a reverse-reachability FK" }
+      - { name: reverses_entry_id, type: string, source: system, description: "FK -> LedgerEntry.id; set on a REVERSAL entry pointing at the entry it cancels", constraints: "nullable; self-referential" }
+
+  - name: AuthorizationHold
+    parent: null
+    common_fields: true
+    fields:
+      - { name: card_id, type: string, source: input, description: "FK -> GiftCard.id" }
+      - { name: amount_cents, type: integer, source: input, description: "Held minor units; must be > 0" }
+      - { name: expires_at, type: datetime, source: computed, description: "created_at + Program.hold_ttl_seconds; hold auto-expires (status=EXPIRED) at/after this instant" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | CAPTURED | RELEASED | EXPIRED — see AuthorizationHold state machine" }
+
+  - name: Redemption
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> Program.id" }
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; the redeeming cardholder", constraints: "nullable for clerk-initiated POS sale" }
+      - { name: requested_amount_cents, type: integer, source: input, description: "Total sale amount the redemption must cover across split-tender legs; must be > 0" }
+      - { name: card_id_order, type: array, source: input, description: "Ordered list of GiftCard.ids defining waterfall allocation order for split tender" }
+      - { name: allocated_amount_cents, type: integer, source: computed, description: "Sum of RedemptionLeg.leg_amount_cents; equals requested_amount_cents on success" }
+      - { name: status, type: enum, source: system, description: "DRAFT | SETTLED | VOIDED — see Redemption state machine" }
+
+  - name: RedemptionLeg
+    parent: null
+    common_fields: false
+    fields:
+      - { name: redemption_id, type: string, source: system, description: "FK -> Redemption.id" }
+      - { name: card_id, type: string, source: system, description: "FK -> GiftCard.id" }
+      - { name: leg_amount_cents, type: integer, source: system, description: "Amount drawn from this card per the waterfall allocation; > 0 (zero-draw legs are not created)" }
+      - { name: ledger_entry_id, type: string, source: system, description: "FK -> LedgerEntry.id; the REDEEM debit posted for this leg", constraints: "nullable until SETTLED" }
+
+  - name: BulkOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> Program.id" }
+      - { name: buyer_customer_id, type: string, source: input, description: "FK -> Customer.id; must be a corporate customer" }
+      - { name: card_count, type: integer, source: input, description: "Number of cards to mint; must be >= 1" }
+      - { name: face_value_cents, type: integer, source: input, description: "Face value loaded onto each minted card on activation; must be > 0" }
+      - { name: state_code, type: string, source: input, description: "Jurisdiction stamped on every minted card" }
+      - { name: net_invoice_cents, type: integer, source: computed, description: "Per-card discounted price rounded to cents, then summed over card_count (round-per-card-then-sum)" }
+      - { name: status, type: enum, source: system, description: "QUOTED | CONFIRMED | ACTIVATED | CANCELLED — see BulkOrder state machine" }
+
+  - name: ReplacementRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: old_card_id, type: string, source: input, description: "FK -> GiftCard.id; the compromised card to be replaced" }
+      - { name: new_card_id, type: string, source: system, description: "FK -> GiftCard.id; the replacement card minted on approval", constraints: "nullable until APPROVED" }
+      - { name: reason, type: enum, source: input, description: "FRAUD | LOST | DAMAGED" }
+      - { name: transferred_amount_cents, type: integer, source: computed, description: "settled_balance_cents of old_card at approval, transferred to new_card" }
+      - { name: status, type: enum, source: system, description: "OPEN | APPROVED | REJECTED — see ReplacementRequest state machine" }
+
+  - name: RefundRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: card_id, type: string, source: input, description: "FK -> GiftCard.id; card to be credited" }
+      - { name: redemption_id, type: string, source: input, description: "FK -> Redemption.id; the prior settled redemption being refunded", constraints: "nullable" }
+      - { name: requested_refund_cents, type: integer, source: input, description: "Amount to credit back to the card; must be > 0" }
+      - { name: status, type: enum, source: system, description: "PENDING | NEEDS_REVISION | APPLIED | DENIED — see RefundRequest state machine" }
+
+  - name: DormancyWaiver
+    parent: null
+    common_fields: true
+    fields:
+      - { name: card_id, type: string, source: input, description: "FK -> GiftCard.id" }
+      - { name: window_start, type: datetime, source: input, description: "Inclusive UTC start of the dormancy-suppression window" }
+      - { name: window_end, type: datetime, source: input, description: "Inclusive UTC end of the dormancy-suppression window (closed interval [start, end])" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | REVOKED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # --------------------------------------------------------------- GiftCard: lifecycle dimension
+  - entity: GiftCard
+    dimension: lifecycle_status
+    initial_state: INACTIVE
+    terminal_states: [VOIDED, EXPIRED]
+    transitions:
+      - from: INACTIVE
+        to: ACTIVE
+        trigger: "POST /v1/cards/{card_id}/activate"
+        actor: StoreAssociate
+        preconditions:
+          - "card.lifecycle_status == INACTIVE (ERR_INVALID_STATE)"
+          - "initial_load_cents >= Program.reload_min_cents (ERR_RELOAD_BELOW_MIN)"
+          - "initial_load_cents <= Program.reload_max_balance_cents (ERR_BALANCE_CAP_EXCEEDED)"
+        side_effects:
+          - "Post LedgerEntry LOAD with amount_cents = +initial_load_cents; settled_balance_cents recomputed"
+          - "last_activity_at set to the LOAD entry created_at"
+          - "Program.outstanding_liability_cents recomputed (+= initial_load_cents)"
+
+      - from: ACTIVE
+        to: EXHAUSTED
+        trigger: "system (settled_balance_cents reaches 0 after a REDEEM/DORMANCY_FEE/ESCHEAT debit)"
+        actor: system
+        preconditions:
+          - "settled_balance_cents == 0 after the debit"
+        side_effects:
+          - "lifecycle_status auto-transitions ACTIVE→EXHAUSTED (balance depleted; reload/refund may revive)"
+
+      - from: EXHAUSTED
+        to: ACTIVE
+        trigger: "POST /v1/cards/{card_id}/reload"
+        actor: StoreAssociate
+        preconditions:
+          - "card.risk_status != FROZEN_RISK (ERR_CARD_RISK_FROZEN)"
+          - "amount_cents >= Program.reload_min_cents (ERR_RELOAD_BELOW_MIN)"
+          - "post-reload settled_balance_cents <= Program.reload_max_balance_cents (ERR_BALANCE_CAP_EXCEEDED)"
+        side_effects:
+          - "Post RELOAD credit; if a PromoCampaign is ACTIVE at the reload instant, also post BONUS credit = round_half_up(amount_cents * bonus_pct)"
+          - "lifecycle_status EXHAUSTED→ACTIVE; last_activity_at updated"
+
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /v1/cards/{card_id}/reload"
+        actor: StoreAssociate
+        preconditions:
+          - "card.risk_status != FROZEN_RISK (ERR_CARD_RISK_FROZEN)"
+          - "amount_cents >= Program.reload_min_cents (ERR_RELOAD_BELOW_MIN)"
+          - "post-reload settled_balance_cents <= Program.reload_max_balance_cents (ERR_BALANCE_CAP_EXCEEDED)"
+        side_effects:
+          - "Post RELOAD credit; if a PromoCampaign is ACTIVE, also post BONUS credit = round_half_up(amount_cents * bonus_pct)"
+          - "last_activity_at updated; Program.outstanding_liability_cents recomputed"
+
+      - from: ACTIVE
+        to: VOIDED
+        trigger: "system (ReplacementRequest OPEN→APPROVED on this old card)"
+        actor: system
+        preconditions:
+          - "A ReplacementRequest with old_card_id == this card transitions to APPROVED"
+        side_effects:
+          - "Post TRANSFER_OUT debit = -settled_balance_cents (zeroes this card)"
+          - "replaced_by_card_id set to the new card id"
+          - "Program.outstanding_liability_cents unchanged (value moves to the new card, not out of program)"
+
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /v1/cards/{card_id}/assess-dormancy"
+        actor: system
+        preconditions:
+          - "StateRule(program_id, card.state_code).expiration_allowed == true (ERR_EXPIRATION_NOT_ALLOWED)"
+          - "months_inactive(now, last_activity_at) >= StateRule.dormancy_threshold_months (else ERR_DORMANCY_NOT_DUE)"
+          - "No DormancyWaiver with status=ACTIVE covering now on this card (else ERR_DORMANCY_NOT_DUE)"
+        side_effects:
+          - "If StateRule.breakage_policy == RECOGNIZE: post BREAKAGE debit = -settled_balance_cents; Program.breakage_recognized_cents += that magnitude"
+          - "If StateRule.breakage_policy == ESCHEAT: post ESCHEAT debit = -round_half_up(settled_balance_cents * escheat_rate); Program.escheat_liability_cents += that magnitude"
+          - "lifecycle_status ACTIVE→EXPIRED; Program.outstanding_liability_cents recomputed"
+
+      - from: EXHAUSTED
+        to: EXPIRED
+        trigger: "POST /v1/cards/{card_id}/assess-dormancy"
+        actor: system
+        preconditions:
+          - "StateRule(program_id, card.state_code).expiration_allowed == true (ERR_EXPIRATION_NOT_ALLOWED)"
+          - "months_inactive(now, last_activity_at) >= StateRule.dormancy_threshold_months (else ERR_DORMANCY_NOT_DUE)"
+        side_effects:
+          - "No debit posted (balance already 0); lifecycle_status EXHAUSTED→EXPIRED"
+
+  # --------------------------------------------------------------- GiftCard: risk dimension (cyclic)
+  - entity: GiftCard
+    dimension: risk_status
+    initial_state: CLEAR
+    terminal_states: []
+    transitions:
+      - from: CLEAR
+        to: FLAGGED
+        trigger: "POST /v1/cards/{card_id}/flag"
+        actor: FraudAnalyst
+        preconditions:
+          - "card.lifecycle_status IN {ACTIVE, EXHAUSTED} (ERR_INVALID_STATE)"
+        side_effects:
+          - "risk_status CLEAR→FLAGGED; redemption from this card now requires the FraudAnalyst review path (ERR_CARD_RISK_REVIEW for others)"
+
+      - from: FLAGGED
+        to: FROZEN_RISK
+        trigger: "POST /v1/cards/{card_id}/freeze"
+        actor: FraudAnalyst
+        preconditions:
+          - "card.risk_status == FLAGGED (ERR_INVALID_STATE)"
+        side_effects:
+          - "risk_status FLAGGED→FROZEN_RISK; every AuthorizationHold on the card with status=ACTIVE → RELEASED (cascade); pending_hold_cents recomputed to 0"
+          - "REDEEM, RELOAD and new holds blocked (ERR_CARD_RISK_FROZEN)"
+
+      - from: FROZEN_RISK
+        to: CLEAR
+        trigger: "POST /v1/cards/{card_id}/clear-risk"
+        actor: FraudAnalyst
+        preconditions:
+          - "card.risk_status == FROZEN_RISK (ERR_INVALID_STATE)"
+        side_effects:
+          - "risk_status FROZEN_RISK→CLEAR (full cycle); REDEEM/RELOAD/holds unblocked"
+
+      - from: FLAGGED
+        to: CLEAR
+        trigger: "POST /v1/cards/{card_id}/clear-risk"
+        actor: FraudAnalyst
+        preconditions:
+          - "card.risk_status == FLAGGED (ERR_INVALID_STATE)"
+        side_effects:
+          - "risk_status FLAGGED→CLEAR"
+
+  # --------------------------------------------------------------- AuthorizationHold
+  - entity: AuthorizationHold
+    initial_state: ACTIVE
+    terminal_states: [CAPTURED, RELEASED, EXPIRED]
+    transitions:
+      - from: ACTIVE
+        to: CAPTURED
+        trigger: "system (Redemption DRAFT→SETTLED captures the hold backing a leg)"
+        actor: system
+        preconditions:
+          - "hold.status == ACTIVE"
+          - "now < hold.expires_at (else the hold is EXPIRED and cannot be captured)"
+        side_effects:
+          - "Hold amount converts to a REDEEM debit on the card; pending_hold_cents decreases by amount_cents; settled_balance_cents decreases by amount_cents (net available unchanged across the capture)"
+
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /v1/holds/{hold_id}/release"
+        actor: StoreAssociate
+        preconditions:
+          - "hold.status == ACTIVE (ERR_INVALID_STATE)"
+          - "now < hold.expires_at"
+        side_effects:
+          - "pending_hold_cents decreases by amount_cents; available_balance_cents increases by amount_cents; settled_balance_cents unchanged"
+
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /v1/holds/{hold_id}/release (when now >= expires_at)"
+        actor: system
+        preconditions:
+          - "now >= hold.expires_at"
+        side_effects:
+          - "Hold finalizes as EXPIRED; pending_hold_cents decreases by amount_cents; available_balance_cents increases by amount_cents"
+
+  # --------------------------------------------------------------- Redemption (split tender)
+  - entity: Redemption
+    initial_state: DRAFT
+    terminal_states: [VOIDED]
+    transitions:
+      - from: DRAFT
+        to: SETTLED
+        trigger: "POST /v1/redemptions/{redemption_id}/settle"
+        actor: StoreAssociate
+        preconditions:
+          - "expected_redemption_version == redemption.version (ERR_STALE_VERSION)"
+          - "requested_amount_cents > 0 and card_id_order non-empty (ERR_INVALID_REDEMPTION)"
+          - "Every card in card_id_order has lifecycle_status == ACTIVE (ERR_INVALID_STATE)"
+          - "Every card in card_id_order has risk_status != FROZEN_RISK (ERR_CARD_RISK_FROZEN); a FLAGGED card requires actor FraudAnalyst (else ERR_CARD_RISK_REVIEW)"
+          - "Sum of available_balance_cents over the cards >= requested_amount_cents (ERR_INSUFFICIENT_BALANCE)"
+        side_effects:
+          - "Run split_tender_allocation: create one RedemptionLeg per drawn card (waterfall over card_id_order)"
+          - "Post one REDEEM debit per leg; each card settled_balance_cents decreases; cards reaching 0 auto-transition ACTIVE→EXHAUSTED (cascade)"
+          - "allocated_amount_cents = requested_amount_cents; Program.outstanding_liability_cents recomputed"
+          - "increments Redemption.version by 1"
+
+      - from: DRAFT
+        to: VOIDED
+        trigger: "POST /v1/redemptions/{redemption_id}/void"
+        actor: StoreAssociate
+        preconditions:
+          - "redemption.status == DRAFT (ERR_INVALID_STATE)"
+        side_effects:
+          - "No ledger impact (no debits posted while DRAFT)"
+
+      - from: SETTLED
+        to: VOIDED
+        trigger: "system (RefundRequest PENDING→APPLIED with redemption_id == this redemption and full-amount reversal)"
+        actor: system
+        preconditions:
+          - "RefundRequest.requested_refund_cents == redemption.allocated_amount_cents"
+        side_effects:
+          - "For each RedemptionLeg, post a REVERSAL credit reversing the leg's REDEEM debit (reverses_entry_id set); original debit status→REVERSED"
+          - "Each card settled_balance_cents restored by leg_amount_cents; EXHAUSTED cards revive to ACTIVE (cascade)"
+          - "Program.outstanding_liability_cents recomputed (restored)"
+
+  # --------------------------------------------------------------- BulkOrder (B2B)
+  - entity: BulkOrder
+    initial_state: QUOTED
+    terminal_states: [ACTIVATED, CANCELLED]
+    transitions:
+      - from: QUOTED
+        to: CONFIRMED
+        trigger: "POST /v1/bulk-orders/{bulk_order_id}/confirm"
+        actor: B2BBuyer
+        preconditions:
+          - "buyer Customer.is_corporate == true (ERR_NOT_CORPORATE_BUYER)"
+          - "bulk_order.status == QUOTED (ERR_INVALID_STATE)"
+        side_effects:
+          - "net_invoice_cents pinned from bulk_order_pricing (round-per-card-then-sum)"
+
+      - from: CONFIRMED
+        to: ACTIVATED
+        trigger: "POST /v1/bulk-orders/{bulk_order_id}/activate"
+        actor: ProgramAdmin
+        preconditions:
+          - "bulk_order.status == CONFIRMED (ERR_INVALID_STATE)"
+        side_effects:
+          - "Mint card_count GiftCards (each INACTIVE→ACTIVE) with a LOAD credit of face_value_cents (cascade: cards minted → Program.outstanding_liability_cents recomputed)"
+          - "Each minted card: state_code = bulk_order.state_code, owner_customer_id = buyer_customer_id"
+
+      - from: QUOTED
+        to: CANCELLED
+        trigger: "POST /v1/bulk-orders/{bulk_order_id}/cancel"
+        actor: B2BBuyer
+        preconditions:
+          - "bulk_order.status == QUOTED (ERR_INVALID_STATE)"
+        side_effects: []
+
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /v1/bulk-orders/{bulk_order_id}/cancel"
+        actor: B2BBuyer
+        preconditions:
+          - "bulk_order.status == CONFIRMED (ERR_INVALID_STATE)"
+        side_effects: []
+
+  # --------------------------------------------------------------- ReplacementRequest (branching)
+  - entity: ReplacementRequest
+    initial_state: OPEN
+    terminal_states: [APPROVED, REJECTED]
+    transitions:
+      - from: OPEN
+        to: APPROVED
+        trigger: "POST /v1/replacements/{replacement_id}/approve"
+        actor: FraudAnalyst
+        preconditions:
+          - "expected_old_card_version == old_card.version (ERR_STALE_VERSION)"
+          - "old_card.lifecycle_status IN {ACTIVE, EXHAUSTED} and not VOIDED/EXPIRED (ERR_INVALID_STATE) — an already-replaced card is VOIDED, so this also blocks double-approval"
+        side_effects:
+          - "Run replacement_transfer: mint new GiftCard (INACTIVE→ACTIVE) cloning old_card.state_code/owner; transferred_amount_cents = old_card.settled_balance_cents"
+          - "old_card ACTIVE→VOIDED (cascade): TRANSFER_OUT debit zeroes old_card; new_card receives TRANSFER_IN credit = transferred_amount_cents"
+          - "old_card.replaced_by_card_id = new_card.id; increments old_card.version by 1"
+
+      - from: OPEN
+        to: REJECTED
+        trigger: "POST /v1/replacements/{replacement_id}/reject"
+        actor: FraudAnalyst
+        preconditions:
+          - "replacement.status == OPEN (ERR_INVALID_STATE)"
+        side_effects:
+          - "No card mutation"
+
+  # --------------------------------------------------------------- RefundRequest (branching + revision loop)
+  - entity: RefundRequest
+    initial_state: PENDING
+    terminal_states: [APPLIED, DENIED]
+    transitions:
+      - from: PENDING
+        to: NEEDS_REVISION
+        trigger: "POST /v1/refunds/{refund_id}/request-revision"
+        actor: ProgramAdmin
+        preconditions:
+          - "refund.status == PENDING (ERR_INVALID_STATE)"
+        side_effects: []
+
+      - from: NEEDS_REVISION
+        to: PENDING
+        trigger: "POST /v1/refunds/{refund_id}/resubmit"
+        actor: Customer
+        preconditions:
+          - "refund.status == NEEDS_REVISION (ERR_INVALID_STATE)"
+          - "requested_refund_cents > 0 (ERR_INVALID_REDEMPTION)"
+        side_effects:
+          - "requested_refund_cents updated to the resubmitted value (revision loop back to PENDING)"
+
+      - from: PENDING
+        to: APPLIED
+        trigger: "POST /v1/refunds/{refund_id}/approve"
+        actor: ProgramAdmin
+        preconditions:
+          - "card.lifecycle_status IN {ACTIVE, EXHAUSTED} (ERR_INVALID_STATE)"
+          - "post-refund settled_balance_cents <= Program.reload_max_balance_cents (ERR_BALANCE_CAP_EXCEEDED)"
+          - "if redemption_id set: requested_refund_cents <= referenced Redemption.allocated_amount_cents (ERR_REFUND_EXCEEDS_REDEMPTION)"
+        side_effects:
+          - "Post REFUND credit = +requested_refund_cents on the card; EXHAUSTED card revives to ACTIVE (cascade)"
+          - "If redemption_id set and requested_refund_cents == Redemption.allocated_amount_cents: drive that Redemption SETTLED→VOIDED with per-leg REVERSAL (cascade)"
+          - "Program.outstanding_liability_cents recomputed"
+
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /v1/refunds/{refund_id}/deny"
+        actor: ProgramAdmin
+        preconditions:
+          - "refund.status == PENDING (ERR_INVALID_STATE)"
+        side_effects: []
+
+  # --------------------------------------------------------------- PromoCampaign
+  - entity: PromoCampaign
+    initial_state: SCHEDULED
+    terminal_states: [ENDED]
+    transitions:
+      - from: SCHEDULED
+        to: ACTIVE
+        trigger: "POST /v1/campaigns/{campaign_id}/sync-status (or system on clock advance)"
+        actor: system
+        preconditions:
+          - "now >= window_start and now < window_end"
+        side_effects:
+          - "Campaign bonus_pct applies to reloads while status==ACTIVE"
+
+      - from: ACTIVE
+        to: ENDED
+        trigger: "POST /v1/campaigns/{campaign_id}/sync-status (or system on clock advance)"
+        actor: system
+        preconditions:
+          - "now >= window_end"
+        side_effects: []
+
+      - from: SCHEDULED
+        to: ENDED
+        trigger: "POST /v1/campaigns/{campaign_id}/sync-status (or system on clock advance)"
+        actor: system
+        preconditions:
+          - "now >= window_end (window passed without ever activating via sync)"
+        side_effects: []
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (true races only — OCC on parent.version)
+# =============================================================================
+concurrency_rules:
+  - rule_id: redemption-settle-stale-redemption
+    parent_entity: Redemption
+    write_endpoint: "POST /v1/redemptions/{redemption_id}/settle"
+    occ_field: "expected_redemption_version"
+    description: |
+      Settling a Redemption whose version has advanced since the client last
+      observed it is rejected. Another writer may have amended the redemption's
+      card_id_order or requested_amount_cents via PATCH (a legitimate
+      supersede of the prior allocation plan); the current writer's view of the
+      redemption is therefore stale and its settle is refused before any debit
+      posts.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: replacement-approve-stale-card
+    parent_entity: GiftCard
+    write_endpoint: "POST /v1/replacements/{replacement_id}/approve"
+    occ_field: "expected_old_card_version"
+    description: |
+      Approving a ReplacementRequest against an old GiftCard whose version has
+      advanced since the client last observed it is rejected. Another writer may
+      have just reloaded or partially redeemed the old card (changing the
+      balance that would be transferred); the approving writer's view of the
+      card is stale and the transfer is refused so no value moves on a wrong
+      balance.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: card_balance_dual_variant
+    trigger: "any GiftCard read; recomputed after every LedgerEntry post/reversal and AuthorizationHold change"
+    algorithm: aggregation
+    formula: |
+      settled_balance_cents   = SUM(LedgerEntry.amount_cents
+                                    WHERE card_id == card.id AND status == POSTED)
+      pending_hold_cents      = SUM(AuthorizationHold.amount_cents
+                                    WHERE card_id == card.id AND status == ACTIVE)
+      available_balance_cents = settled_balance_cents - pending_hold_cents
+    input_set: "POSTED ledger entries (REVERSED excluded); ACTIVE holds only"
+    precision: "integer cents; no rounding (all stored as minor units)"
+    variants:
+      - name: settled_balance
+        when: "posted-only view used by dormancy, breakage, escheat, and balance-cap checks"
+        difference: "ignores ACTIVE holds entirely — counts only POSTED ledger entries"
+      - name: authorized_balance
+        when: "forward-looking view used by Redemption.settle sufficiency and customer-facing 'spendable' display"
+        difference: "subtracts ACTIVE holds (settled minus pending_hold_cents); diverges from settled whenever a hold is outstanding"
+
+  - name: breakage_dual_variant
+    trigger: "GiftCard lifecycle ACTIVE→EXPIRED via assess-dormancy"
+    algorithm: threshold
+    formula: |
+      rule = StateRule(program_id, card.state_code)
+      IF rule.breakage_policy == RECOGNIZE:
+        recognized = card.settled_balance_cents              # full residual booked as revenue
+        post BREAKAGE debit of -recognized; Program.breakage_recognized_cents += recognized
+      ELIF rule.breakage_policy == ESCHEAT:
+        escheated  = round_half_up(card.settled_balance_cents * rule.escheat_rate)
+        post ESCHEAT debit of -escheated; Program.escheat_liability_cents += escheated
+        # residual (settled - escheated) is forfeited, not booked as revenue
+    input_set: "the single expiring card's settled_balance_cents and its StateRule"
+    constants: { DEFAULT_ESCHEAT_RATE: 0.60 }
+    precision: "round_half_up to whole cents"
+    variants:
+      - name: recognize_breakage_revenue
+        when: "StateRule.breakage_policy == RECOGNIZE (e.g., FL)"
+        difference: "books the FULL residual balance as breakage revenue; escheat_liability untouched"
+      - name: escheat_to_state
+        when: "StateRule.breakage_policy == ESCHEAT (e.g., CA)"
+        difference: "books only escheat_rate of residual as state liability; breakage_recognized untouched — same dormant card, different number"
+
+  - name: split_tender_allocation
+    trigger: "Redemption DRAFT→SETTLED"
+    algorithm: waterfall_allocation
+    formula: |
+      remaining = requested_amount_cents
+      FOR card_id IN card_id_order:            # client-pinned order IS the waterfall order
+        avail = max(card.available_balance_cents, 0)   # authorized-balance variant
+        take  = min(remaining, avail)
+        IF take > 0:
+          create RedemptionLeg(card_id, leg_amount_cents = take)
+          remaining -= take
+        IF remaining == 0: BREAK
+      IF remaining > 0: reject ERR_INSUFFICIENT_BALANCE (no leg/debit persisted)
+    input_set: "cards listed in card_id_order, in that exact order; available_balance_cents per card"
+    precision: "integer cents; exact (no remainder rounding)"
+    variants:
+      - name: order_sensitive_allocation
+        when: "always"
+        difference: "the SAME card set with a different card_id_order yields different per-card leg_amount_cents and a different set of cards driven to EXHAUSTED"
+
+  - name: bulk_order_pricing
+    trigger: "BulkOrder QUOTED→CONFIRMED (net_invoice_cents pinned)"
+    algorithm: tiered_pricing
+    formula: |
+      per_card_net      = round_half_up(face_value_cents * (1 - Program.b2b_discount_pct))
+      net_invoice_cents = per_card_net * card_count    # ROUND PER CARD, THEN MULTIPLY
+      # PINNED ORDER: round each card's discounted price to whole cents FIRST, then
+      # multiply by card_count. (Sum-then-round would differ by up to card_count-1 cents.)
+    input_set: "the single BulkOrder's face_value_cents, card_count, and Program.b2b_discount_pct"
+    constants: { DEFAULT_B2B_DISCOUNT_PCT: 0.035 }
+    precision: "round_half_up per card BEFORE multiplication (order pinned)"
+
+  - name: dormancy_assessment
+    trigger: "POST /v1/cards/{card_id}/assess-dormancy"
+    algorithm: threshold
+    formula: |
+      months_inactive = whole_months_between(last_activity_at, now)   # floor of elapsed whole months
+      rule    = StateRule(program_id, card.state_code)
+      dormant = months_inactive >= rule.dormancy_threshold_months      # INCLUSIVE boundary (>=)
+      IF rule.dormancy_fee_allowed AND dormant AND no ACTIVE DormancyWaiver covers now:
+        fee = min(DORMANCY_FEE_CENTS, card.settled_balance_cents)
+        post DORMANCY_FEE debit of -fee
+      # if expiration_allowed AND dormant: breakage_dual_variant runs and card → EXPIRED
+    input_set: "the single card's last_activity_at, settled_balance_cents, its StateRule, and ACTIVE waivers covering now"
+    constants: { DORMANCY_FEE_CENTS: 200, DORMANCY_THRESHOLD_MONTHS_DEFAULT: 12 }
+    precision: "integer cents"
+
+  - name: replacement_transfer
+    trigger: "ReplacementRequest OPEN→APPROVED"
+    algorithm: aggregation
+    formula: |
+      transferred = old_card.settled_balance_cents          # snapshot at approval
+      post TRANSFER_OUT debit of -transferred on old_card    # zeroes old card
+      post TRANSFER_IN  credit of +transferred on new_card
+      INVARIANT: old_card.settled_balance_cents(post) + new_card.settled_balance_cents(post)
+                 == old_card.settled_balance_cents(pre)      # value conserved across the pair
+    input_set: "old_card POSTED ledger sum at approval"
+    precision: "integer cents; exact (no rounding)"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role header present and one of the declared roles"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Role permitted to perform this operation per §1.7; entity-backed Customer/B2BBuyer must own the target resource"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "Every id in the path exists (left-to-right)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: business_constraint
+    check: "Body well-formed: required fields present, correct types, valid enum members"
+    error_id: ERR_VALIDATION
+    http_status: 422
+    applies_to: "all POST/PATCH endpoints"
+
+  - priority: 5
+    category: business_referential
+    check: "Every body FK references an existing same-program entity (owner_customer_id, card_id, redemption_id, old_card_id, buyer_customer_id, every member of card_id_order)"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 422
+    applies_to: "cards, redemptions, holds, bulk-orders, replacements, refunds, dormancy-waivers"
+
+  - priority: 6
+    category: business_constraint
+    check: "Domain shape: requested_amount_cents>0 & card_id_order non-empty (redemption); amount_cents>0 (hold); card_count>=1 & face_value_cents>0 (bulk); requested_refund_cents>0 (refund); unique (program_id,state_code) for StateRule"
+    error_id: ERR_INVALID_REDEMPTION
+    http_status: 422
+    applies_to: "redemptions, holds, bulk-orders, refunds, state-rules"
+
+  - priority: 7
+    category: state
+    check: "Optimistic concurrency: expected_<parent>_version matches current parent.version (redemptions/settle, replacements/approve)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "redemptions/settle, replacements/approve"
+
+  - priority: 8
+    category: state
+    check: "Target resource in a state the transition allows (card lifecycle/risk, redemption/refund/replacement/bulk-order/hold status)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 9
+    category: business_safety
+    check: "Risk gate: card.risk_status != FROZEN_RISK for redeem/reload/hold"
+    error_id: ERR_CARD_RISK_FROZEN
+    http_status: 409
+    applies_to: "redemptions/settle, cards/reload, holds (create)"
+
+  - priority: 10
+    category: business_safety
+    check: "Review gate: a FLAGGED card in a redemption requires FraudAnalyst actor"
+    error_id: ERR_CARD_RISK_REVIEW
+    http_status: 409
+    applies_to: "redemptions/settle"
+
+  - priority: 11
+    category: business_constraint
+    check: "Card already replaced: opening a replacement against an old_card that already has replaced_by_card_id set (an APPROVED replacement exists) is rejected"
+    error_id: ERR_CARD_ALREADY_REPLACED
+    http_status: 409
+    applies_to: "replacements (create)"
+
+  - priority: 12
+    category: business_temporal
+    check: "Jurisdiction/window gates: StateRule.expiration_allowed for expire (else ERR_EXPIRATION_NOT_ALLOWED); dormancy due & no waiver (else ERR_DORMANCY_NOT_DUE); DormancyWaiver must not overlap an ACTIVE waiver on the card (ERR_WAIVER_OVERLAP); PromoCampaign window must not overlap a program campaign (ERR_CAMPAIGN_OVERLAP)"
+    error_id: ERR_EXPIRATION_NOT_ALLOWED
+    http_status: 409
+    applies_to: "cards/assess-dormancy, dormancy-waivers (create), campaigns (create)"
+
+  - priority: 13
+    category: business_fiscal
+    check: "Reload/load floor & cap: amount >= reload_min_cents (ERR_RELOAD_BELOW_MIN); post-credit settled_balance_cents <= reload_max_balance_cents (ERR_BALANCE_CAP_EXCEEDED)"
+    error_id: ERR_BALANCE_CAP_EXCEEDED
+    http_status: 409
+    applies_to: "cards/activate, cards/reload, refunds/approve"
+
+  - priority: 14
+    category: business_fiscal
+    check: "Sufficient authorized balance: SUM(available_balance_cents over card_id_order) >= requested_amount_cents"
+    error_id: ERR_INSUFFICIENT_BALANCE
+    http_status: 409
+    applies_to: "redemptions/settle"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Program / config ----
+  - method: POST
+    path: "/v1/programs"
+    description: "Create a stored-value program"
+    roles: [ProgramAdmin]
+    code: 201
+    input: [name, "default_currency?", "reload_min_cents?", "reload_max_balance_cents?", "hold_ttl_seconds?", "b2b_discount_pct?"]
+    output: Program
+    side_effects: ["liability/breakage/escheat fields initialized to 0"]
+
+  - method: GET
+    path: "/v1/programs/{program_id}"
+    description: "Read a program with computed liability fields"
+    roles: [ProgramAdmin, StoreAssociate, FraudAnalyst, B2BBuyer, Customer]
+    code: 200
+    input: []
+    output: Program
+    side_effects: []
+
+  - method: POST
+    path: "/v1/state-rules"
+    description: "Define a jurisdiction's expiration/breakage/dormancy rule"
+    roles: [ProgramAdmin]
+    code: 201
+    input: [program_id, state_code, expiration_allowed, dormancy_fee_allowed, breakage_policy, "escheat_rate?", "dormancy_threshold_months?"]
+    output: StateRule
+    side_effects: []
+
+  - method: GET
+    path: "/v1/state-rules/{state_rule_id}"
+    description: "Read a state rule"
+    roles: [ProgramAdmin, StoreAssociate, FraudAnalyst]
+    code: 200
+    input: []
+    output: StateRule
+    side_effects: []
+
+  - method: GET
+    path: "/v1/state-rules"
+    description: "List state rules (filter by program_id, state_code)"
+    roles: [ProgramAdmin, StoreAssociate, FraudAnalyst]
+    code: 200
+    input: ["program_id?", "state_code?", "limit?", "offset?"]
+    output: StateRule[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/campaigns"
+    description: "Create a reload-bonus campaign (half-open [start,end) window)"
+    roles: [ProgramAdmin]
+    code: 201
+    input: [program_id, name, bonus_pct, window_start, window_end]
+    output: PromoCampaign
+    side_effects: ["status=SCHEDULED; rejected (ERR_CAMPAIGN_OVERLAP) if window overlaps an existing program campaign"]
+
+  - method: GET
+    path: "/v1/campaigns/{campaign_id}"
+    description: "Read a campaign"
+    roles: [ProgramAdmin, StoreAssociate]
+    code: 200
+    input: []
+    output: PromoCampaign
+    side_effects: []
+
+  - method: GET
+    path: "/v1/campaigns"
+    description: "List campaigns (filter by program_id)"
+    roles: [ProgramAdmin, StoreAssociate]
+    code: 200
+    input: ["program_id?", "limit?", "offset?"]
+    output: PromoCampaign[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/campaigns/{campaign_id}/sync-status"
+    description: "Recompute campaign status against the current clock"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: PromoCampaign
+    side_effects: ["status SCHEDULED→ACTIVE→ENDED per window vs now"]
+
+  # ---- Customer ----
+  - method: POST
+    path: "/v1/customers"
+    description: "Register a customer (cardholder or corporate buyer)"
+    roles: [ProgramAdmin, Customer]
+    code: 201
+    input: [email, full_name, residence_state_code, "is_corporate?"]
+    output: Customer
+    side_effects: []
+
+  - method: GET
+    path: "/v1/customers/{customer_id}"
+    description: "Read a customer"
+    roles: [ProgramAdmin, Customer, FraudAnalyst, B2BBuyer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  # ---- GiftCard issuance & lifecycle ----
+  - method: POST
+    path: "/v1/cards"
+    description: "Issue a card (digital/physical), INACTIVE until activated"
+    roles: [StoreAssociate, ProgramAdmin]
+    code: 201
+    input: [program_id, form_factor, state_code, "owner_customer_id?"]
+    output: GiftCard
+    side_effects: ["lifecycle_status=INACTIVE; risk_status=CLEAR"]
+
+  - method: GET
+    path: "/v1/cards/{card_id}"
+    description: "Read a card with computed balance fields"
+    roles: [StoreAssociate, ProgramAdmin, FraudAnalyst, Customer]
+    code: 200
+    input: []
+    output: GiftCard
+    side_effects: []
+
+  - method: GET
+    path: "/v1/cards"
+    description: "List cards (filter by program_id, owner_customer_id, lifecycle_status, replaced_by_card_id)"
+    roles: [StoreAssociate, ProgramAdmin, FraudAnalyst]
+    code: 200
+    input: ["program_id?", "owner_customer_id?", "lifecycle_status?", "replaced_by_card_id?", "limit?", "offset?"]
+    output: GiftCard[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/cards/{card_id}/activate"
+    description: "Activate an INACTIVE card with an initial load"
+    roles: [StoreAssociate]
+    code: 200
+    input: [initial_load_cents]
+    output: GiftCard
+    side_effects: ["LOAD credit posted; lifecycle_status INACTIVE→ACTIVE; floor/cap enforced"]
+
+  - method: POST
+    path: "/v1/cards/{card_id}/reload"
+    description: "Reload value onto an ACTIVE/EXHAUSTED card (campaign bonus may apply)"
+    roles: [StoreAssociate, Customer]
+    code: 200
+    input: [amount_cents]
+    output: GiftCard
+    side_effects: ["RELOAD credit + optional BONUS credit; EXHAUSTED→ACTIVE; cap/floor/risk enforced"]
+
+  - method: POST
+    path: "/v1/cards/{card_id}/assess-dormancy"
+    description: "Run dormancy/breakage/escheat assessment against the clock"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: GiftCard
+    side_effects: ["DORMANCY_FEE and/or BREAKAGE/ESCHEAT debits; lifecycle_status may → EXPIRED"]
+
+  - method: POST
+    path: "/v1/cards/{card_id}/flag"
+    description: "Flag a card for fraud review (CLEAR→FLAGGED)"
+    roles: [FraudAnalyst]
+    code: 200
+    input: []
+    output: GiftCard
+    side_effects: ["risk_status CLEAR→FLAGGED"]
+
+  - method: POST
+    path: "/v1/cards/{card_id}/freeze"
+    description: "Freeze a card's value (FLAGGED→FROZEN_RISK), releasing ACTIVE holds"
+    roles: [FraudAnalyst]
+    code: 200
+    input: []
+    output: GiftCard
+    side_effects: ["risk_status FLAGGED→FROZEN_RISK; ACTIVE holds→RELEASED (cascade)"]
+
+  - method: POST
+    path: "/v1/cards/{card_id}/clear-risk"
+    description: "Clear a card's risk hold (FLAGGED/FROZEN_RISK→CLEAR)"
+    roles: [FraudAnalyst]
+    code: 200
+    input: []
+    output: GiftCard
+    side_effects: ["risk_status →CLEAR"]
+
+  - method: GET
+    path: "/v1/ledger-entries/{ledger_entry_id}"
+    description: "Read a single ledger entry"
+    roles: [StoreAssociate, ProgramAdmin, FraudAnalyst, Customer]
+    code: 200
+    input: []
+    output: LedgerEntry
+    side_effects: []
+
+  - method: GET
+    path: "/v1/ledger-entries"
+    description: "List ledger entries (filter by card_id, program_id, entry_type, reverses_entry_id)"
+    roles: [StoreAssociate, ProgramAdmin, FraudAnalyst, Customer]
+    code: 200
+    input: ["card_id?", "program_id?", "entry_type?", "reverses_entry_id?", "limit?", "offset?"]
+    output: LedgerEntry[]
+    side_effects: []
+
+  # ---- AuthorizationHold ----
+  - method: POST
+    path: "/v1/holds"
+    description: "Place an authorization hold on a card (reduces available_balance)"
+    roles: [StoreAssociate]
+    code: 201
+    input: [card_id, amount_cents]
+    output: AuthorizationHold
+    side_effects: ["status=ACTIVE; expires_at = created_at + hold_ttl_seconds; pending_hold_cents increases"]
+
+  - method: GET
+    path: "/v1/holds/{hold_id}"
+    description: "Read a hold"
+    roles: [StoreAssociate, ProgramAdmin, FraudAnalyst]
+    code: 200
+    input: []
+    output: AuthorizationHold
+    side_effects: []
+
+  - method: GET
+    path: "/v1/holds"
+    description: "List holds (filter by card_id, status)"
+    roles: [StoreAssociate, ProgramAdmin, FraudAnalyst]
+    code: 200
+    input: ["card_id?", "status?", "limit?", "offset?"]
+    output: AuthorizationHold[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/holds/{hold_id}/release"
+    description: "Release an ACTIVE hold (or finalize an expired one)"
+    roles: [StoreAssociate]
+    code: 200
+    input: []
+    output: AuthorizationHold
+    side_effects: ["status ACTIVE→RELEASED (or EXPIRED if past expires_at); pending_hold_cents decreases"]
+
+  # ---- Redemption (split tender) ----
+  - method: POST
+    path: "/v1/redemptions"
+    description: "Draft a split-tender redemption over an ordered set of cards"
+    roles: [StoreAssociate, Customer]
+    code: 201
+    input: [program_id, requested_amount_cents, card_id_order, "customer_id?"]
+    output: Redemption
+    side_effects: ["status=DRAFT; no ledger impact yet"]
+
+  - method: GET
+    path: "/v1/redemptions/{redemption_id}"
+    description: "Read a redemption"
+    roles: [StoreAssociate, ProgramAdmin, FraudAnalyst, Customer]
+    code: 200
+    input: []
+    output: Redemption
+    side_effects: []
+
+  - method: GET
+    path: "/v1/redemptions"
+    description: "List redemptions (filter by program_id, customer_id)"
+    roles: [StoreAssociate, ProgramAdmin, FraudAnalyst]
+    code: 200
+    input: ["program_id?", "customer_id?", "limit?", "offset?"]
+    output: Redemption[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/v1/redemptions/{redemption_id}"
+    description: "Amend a DRAFT redemption's card_id_order or amount (advances version)"
+    roles: [StoreAssociate, Customer]
+    code: 200
+    input: ["requested_amount_cents?", "card_id_order?"]
+    output: Redemption
+    side_effects: ["increments Redemption.version by 1; only while DRAFT (else ERR_INVALID_STATE)"]
+
+  - method: POST
+    path: "/v1/redemptions/{redemption_id}/settle"
+    description: "Settle a DRAFT redemption: allocate waterfall, post REDEEM debits"
+    roles: [StoreAssociate, Customer, FraudAnalyst]
+    code: 200
+    input: [expected_redemption_version]
+    output: Redemption
+    side_effects:
+      - "split_tender_allocation runs; one RedemptionLeg + one REDEEM debit per drawn card"
+      - "cards reaching 0 auto-transition ACTIVE→EXHAUSTED (cascade)"
+      - "increments Redemption.version by 1"
+
+  - method: POST
+    path: "/v1/redemptions/{redemption_id}/void"
+    description: "Void a DRAFT redemption"
+    roles: [StoreAssociate]
+    code: 200
+    input: []
+    output: Redemption
+    side_effects: ["status DRAFT→VOIDED"]
+
+  - method: GET
+    path: "/v1/redemption-legs/{leg_id}"
+    description: "Read a single redemption leg"
+    roles: [StoreAssociate, ProgramAdmin, FraudAnalyst, Customer]
+    code: 200
+    input: []
+    output: RedemptionLeg
+    side_effects: []
+
+  - method: GET
+    path: "/v1/redemption-legs"
+    description: "List redemption legs (filter by redemption_id, card_id, ledger_entry_id)"
+    roles: [StoreAssociate, ProgramAdmin, FraudAnalyst, Customer]
+    code: 200
+    input: ["redemption_id?", "card_id?", "ledger_entry_id?", "limit?", "offset?"]
+    output: RedemptionLeg[]
+    side_effects: []
+
+  # ---- BulkOrder (B2B) ----
+  - method: POST
+    path: "/v1/bulk-orders"
+    description: "Quote a B2B bulk order"
+    roles: [B2BBuyer, ProgramAdmin]
+    code: 201
+    input: [program_id, buyer_customer_id, card_count, face_value_cents, state_code]
+    output: BulkOrder
+    side_effects: ["status=QUOTED"]
+
+  - method: GET
+    path: "/v1/bulk-orders/{bulk_order_id}"
+    description: "Read a bulk order with net_invoice_cents"
+    roles: [B2BBuyer, ProgramAdmin]
+    code: 200
+    input: []
+    output: BulkOrder
+    side_effects: []
+
+  - method: GET
+    path: "/v1/bulk-orders"
+    description: "List bulk orders (filter by program_id, buyer_customer_id)"
+    roles: [B2BBuyer, ProgramAdmin]
+    code: 200
+    input: ["program_id?", "buyer_customer_id?", "limit?", "offset?"]
+    output: BulkOrder[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/bulk-orders/{bulk_order_id}/confirm"
+    description: "Confirm a quoted order; pins net_invoice_cents"
+    roles: [B2BBuyer]
+    code: 200
+    input: []
+    output: BulkOrder
+    side_effects: ["status QUOTED→CONFIRMED; bulk_order_pricing pins net_invoice_cents"]
+
+  - method: POST
+    path: "/v1/bulk-orders/{bulk_order_id}/activate"
+    description: "Activate a confirmed order: mint and load all cards"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: BulkOrder
+    side_effects: ["status CONFIRMED→ACTIVATED; mint card_count ACTIVE cards each LOADed face_value_cents (cascade)"]
+
+  - method: POST
+    path: "/v1/bulk-orders/{bulk_order_id}/cancel"
+    description: "Cancel a quoted/confirmed order"
+    roles: [B2BBuyer]
+    code: 200
+    input: []
+    output: BulkOrder
+    side_effects: ["status →CANCELLED"]
+
+  # ---- ReplacementRequest (fraud/replacement) ----
+  - method: POST
+    path: "/v1/replacements"
+    description: "Open a replacement request for a compromised card"
+    roles: [FraudAnalyst, Customer]
+    code: 201
+    input: [old_card_id, reason]
+    output: ReplacementRequest
+    side_effects: ["status=OPEN; rejected (ERR_CARD_ALREADY_REPLACED) if old_card.replaced_by_card_id is already set"]
+
+  - method: GET
+    path: "/v1/replacements/{replacement_id}"
+    description: "Read a replacement request"
+    roles: [FraudAnalyst, ProgramAdmin, Customer]
+    code: 200
+    input: []
+    output: ReplacementRequest
+    side_effects: []
+
+  - method: GET
+    path: "/v1/replacements"
+    description: "List replacement requests (filter by old_card_id, new_card_id)"
+    roles: [FraudAnalyst, ProgramAdmin]
+    code: 200
+    input: ["old_card_id?", "new_card_id?", "limit?", "offset?"]
+    output: ReplacementRequest[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/replacements/{replacement_id}/approve"
+    description: "Approve a replacement: mint new card, transfer balance, void old card"
+    roles: [FraudAnalyst]
+    code: 200
+    input: [expected_old_card_version]
+    output: ReplacementRequest
+    side_effects:
+      - "replacement_transfer runs (TRANSFER_OUT on old, TRANSFER_IN on new)"
+      - "old card lifecycle_status ACTIVE→VOIDED (cascade); replaced_by_card_id set"
+      - "increments old GiftCard.version by 1"
+
+  - method: POST
+    path: "/v1/replacements/{replacement_id}/reject"
+    description: "Reject a replacement request"
+    roles: [FraudAnalyst]
+    code: 200
+    input: []
+    output: ReplacementRequest
+    side_effects: ["status OPEN→REJECTED"]
+
+  # ---- RefundRequest (refund-to-card) ----
+  - method: POST
+    path: "/v1/refunds"
+    description: "Open a refund-to-card request"
+    roles: [Customer, StoreAssociate, ProgramAdmin]
+    code: 201
+    input: [card_id, requested_refund_cents, "redemption_id?"]
+    output: RefundRequest
+    side_effects: ["status=PENDING"]
+
+  - method: GET
+    path: "/v1/refunds/{refund_id}"
+    description: "Read a refund request"
+    roles: [Customer, StoreAssociate, ProgramAdmin]
+    code: 200
+    input: []
+    output: RefundRequest
+    side_effects: []
+
+  - method: GET
+    path: "/v1/refunds"
+    description: "List refund requests (filter by card_id, redemption_id)"
+    roles: [Customer, StoreAssociate, ProgramAdmin]
+    code: 200
+    input: ["card_id?", "redemption_id?", "limit?", "offset?"]
+    output: RefundRequest[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/refunds/{refund_id}/approve"
+    description: "Approve a refund: credit the card (may reverse a redemption)"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: RefundRequest
+    side_effects: ["REFUND credit; EXHAUSTED→ACTIVE; full-amount redemption refund drives Redemption SETTLED→VOIDED (cascade)"]
+
+  - method: POST
+    path: "/v1/refunds/{refund_id}/request-revision"
+    description: "Ask the customer to revise a refund request"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: RefundRequest
+    side_effects: ["status PENDING→NEEDS_REVISION"]
+
+  - method: POST
+    path: "/v1/refunds/{refund_id}/resubmit"
+    description: "Customer resubmits a revised refund amount"
+    roles: [Customer]
+    code: 200
+    input: [requested_refund_cents]
+    output: RefundRequest
+    side_effects: ["status NEEDS_REVISION→PENDING; requested_refund_cents updated (revision loop)"]
+
+  - method: POST
+    path: "/v1/refunds/{refund_id}/deny"
+    description: "Deny a refund request"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: RefundRequest
+    side_effects: ["status PENDING→DENIED"]
+
+  # ---- DormancyWaiver ----
+  - method: POST
+    path: "/v1/dormancy-waivers"
+    description: "Create a dormancy-suppression window on a card (closed [start,end])"
+    roles: [ProgramAdmin, FraudAnalyst]
+    code: 201
+    input: [card_id, window_start, window_end]
+    output: DormancyWaiver
+    side_effects: ["status=ACTIVE; rejected (ERR_WAIVER_OVERLAP) if it overlaps an ACTIVE waiver on the card"]
+
+  - method: GET
+    path: "/v1/dormancy-waivers/{waiver_id}"
+    description: "Read a dormancy waiver"
+    roles: [ProgramAdmin, FraudAnalyst, StoreAssociate]
+    code: 200
+    input: []
+    output: DormancyWaiver
+    side_effects: []
+
+  - method: GET
+    path: "/v1/dormancy-waivers"
+    description: "List dormancy waivers (filter by card_id, status)"
+    roles: [ProgramAdmin, FraudAnalyst, StoreAssociate]
+    code: 200
+    input: ["card_id?", "status?", "limit?", "offset?"]
+    output: DormancyWaiver[]
+    side_effects: []
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/v1/_clock/set_current_utc"
+    description: "Set the server's current UTC instant (test-driving)"
+    roles: [ProgramAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock advances; affects dormancy, hold expiry, campaign windows"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED,        http: 401, condition: "X-User-Role header missing or not a declared role" }
+  - { id: ERR_FORBIDDEN,              http: 403, condition: "Role not permitted for this operation, or acting customer/buyer is not the resource owner" }
+  - { id: ERR_NOT_FOUND,              http: 404, condition: "A path id does not exist" }
+  - { id: ERR_VALIDATION,            http: 422, condition: "Missing required field, wrong type, or invalid enum value in the request body" }
+  - { id: ERR_REFERENCE_NOT_FOUND,    http: 422, condition: "A body FK references a missing or cross-program entity" }
+  - { id: ERR_INVALID_REDEMPTION,     http: 422, condition: "Bad domain shape: non-positive amount, empty card_id_order, card_count<1, face_value<=0, duplicate state-rule, or non-positive refund" }
+  - { id: ERR_STALE_VERSION,          http: 412, condition: "expected_<parent>_version does not match the current parent.version (OCC)" }
+  - { id: ERR_INVALID_STATE,          http: 409, condition: "Resource is not in a state the requested transition allows" }
+  - { id: ERR_CARD_RISK_FROZEN,       http: 409, condition: "Card risk_status is FROZEN_RISK; redeem/reload/hold blocked" }
+  - { id: ERR_CARD_RISK_REVIEW,       http: 409, condition: "A FLAGGED card may only be redeemed via the FraudAnalyst review path" }
+  - { id: ERR_CARD_ALREADY_REPLACED,  http: 409, condition: "Old card already has an APPROVED ReplacementRequest" }
+  - { id: ERR_EXPIRATION_NOT_ALLOWED, http: 409, condition: "StateRule.expiration_allowed is false for this card's jurisdiction" }
+  - { id: ERR_DORMANCY_NOT_DUE,       http: 409, condition: "Card has not reached the dormancy threshold, or an ACTIVE waiver covers now" }
+  - { id: ERR_WAIVER_OVERLAP,         http: 409, condition: "A new DormancyWaiver overlaps an existing ACTIVE waiver on the card" }
+  - { id: ERR_CAMPAIGN_OVERLAP,       http: 409, condition: "A new PromoCampaign window overlaps an existing program campaign" }
+  - { id: ERR_RELOAD_BELOW_MIN,       http: 409, condition: "Load/reload amount below Program.reload_min_cents" }
+  - { id: ERR_BALANCE_CAP_EXCEEDED,   http: 409, condition: "Post-credit settled_balance_cents would exceed Program.reload_max_balance_cents" }
+  - { id: ERR_INSUFFICIENT_BALANCE,   http: 409, condition: "Sum of available_balance_cents over the cards is below requested_amount_cents" }
+  - { id: ERR_REFUND_EXCEEDS_REDEMPTION, http: 409, condition: "requested_refund_cents exceeds the referenced Redemption.allocated_amount_cents" }
+  - { id: ERR_NOT_CORPORATE_BUYER,    http: 409, condition: "Bulk-order buyer Customer.is_corporate is false" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: ProgramAdmin
+    description: "Configures programs, state rules, campaigns; runs dormancy & bulk activation; adjudicates refunds"
+    identity: opaque
+    exclusive_operations:
+      - "POST /v1/programs — create program"
+      - "POST /v1/state-rules — define jurisdiction rules"
+      - "POST /v1/campaigns — create campaign"
+      - "POST /v1/campaigns/{id}/sync-status — recompute campaign status"
+      - "POST /v1/cards/{id}/assess-dormancy — run dormancy assessment"
+      - "POST /v1/bulk-orders/{id}/activate — mint/load bulk cards"
+      - "POST /v1/refunds/{id}/approve|deny|request-revision — adjudicate refunds"
+      - "POST /v1/_clock/set_current_utc — set test clock"
+    shared_operations:
+      - "POST /v1/cards — issue card (with StoreAssociate)"
+      - "POST /v1/bulk-orders — quote bulk order (with B2BBuyer)"
+      - "POST /v1/dormancy-waivers — create waiver (with FraudAnalyst)"
+      - "POST /v1/customers — register customer (with Customer)"
+      - "POST /v1/refunds — open refund (with Customer, StoreAssociate)"
+      - "GET reads across all collections"
+
+  - name: StoreAssociate
+    description: "POS operator: issues/activates/reloads cards, places holds, drafts & settles redemptions"
+    identity: opaque
+    exclusive_operations:
+      - "POST /v1/cards/{id}/activate — activate card"
+      - "POST /v1/holds — place hold"
+      - "POST /v1/holds/{id}/release — release hold"
+      - "POST /v1/redemptions/{id}/void — void draft redemption"
+    shared_operations:
+      - "POST /v1/cards — issue card (with ProgramAdmin)"
+      - "POST /v1/cards/{id}/reload — reload (with Customer)"
+      - "POST /v1/redemptions — draft redemption (with Customer)"
+      - "PATCH /v1/redemptions/{id} — amend draft (with Customer)"
+      - "POST /v1/redemptions/{id}/settle — settle (with Customer, FraudAnalyst)"
+      - "POST /v1/refunds — open refund (with Customer, ProgramAdmin)"
+
+  - name: Customer
+    description: "Cardholder acting on their own cards, redemptions, refunds, and replacement requests"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /v1/refunds/{id}/resubmit — resubmit revised refund"
+    shared_operations:
+      - "POST /v1/customers — register self (with ProgramAdmin)"
+      - "POST /v1/cards/{id}/reload — reload own card (with StoreAssociate)"
+      - "POST /v1/redemptions — draft redemption (with StoreAssociate)"
+      - "PATCH /v1/redemptions/{id} — amend draft (with StoreAssociate)"
+      - "POST /v1/redemptions/{id}/settle — settle own redemption (with StoreAssociate)"
+      - "POST /v1/refunds — open refund on own card (with StoreAssociate, ProgramAdmin)"
+      - "POST /v1/replacements — open replacement on own card (with FraudAnalyst)"
+      - "GET reads on own cards/redemptions/refunds/replacements"
+
+  - name: FraudAnalyst
+    description: "Risk operator: flags/freezes/clears cards, opens and adjudicates replacement requests, redeems flagged cards under review"
+    identity: opaque
+    exclusive_operations:
+      - "POST /v1/cards/{id}/flag — flag card"
+      - "POST /v1/cards/{id}/freeze — freeze card"
+      - "POST /v1/cards/{id}/clear-risk — clear risk"
+      - "POST /v1/replacements/{id}/approve — approve replacement"
+      - "POST /v1/replacements/{id}/reject — reject replacement"
+    shared_operations:
+      - "POST /v1/replacements — open replacement (with Customer)"
+      - "POST /v1/dormancy-waivers — create waiver (with ProgramAdmin)"
+      - "POST /v1/redemptions/{id}/settle — settle redemption with a FLAGGED card under review (with StoreAssociate, Customer)"
+      - "GET reads on cards/ledger/redemptions/replacements/holds"
+
+  - name: B2BBuyer
+    description: "Corporate buyer placing and managing bulk gift-card orders"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /v1/bulk-orders/{id}/confirm — confirm order"
+      - "POST /v1/bulk-orders/{id}/cancel — cancel order"
+    shared_operations:
+      - "POST /v1/bulk-orders — quote order (with ProgramAdmin)"
+      - "GET reads on own bulk orders"

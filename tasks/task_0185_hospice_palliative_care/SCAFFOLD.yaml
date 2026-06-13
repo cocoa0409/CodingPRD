@@ -1,0 +1,1326 @@
+scenario: "Hospice & Palliative Care: election/benefit period (90/90/60), level of care (routine/respite/GIP), interdisciplinary plan, medication/DME coverage, recertification/face-to-face, bereavement, revocation, per-diem cap"
+domain_name: hospice-palliative-care
+api_prefix: /hospice
+
+# ---------------------------------------------------------------------------
+# Complexity profile
+# ---------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: temporal_windowing
+  complexity_layers:
+    - dual_variant_calculation        # aggregate cap: provisional (year-to-date) vs final (settled) reconciliation; routine per-diem service-intensity add-on (high vs base rate)
+    - rate_threshold_triggers         # respite 5-consecutive-day cap; period-length boundary; cap overrun
+    - derived_field_reconciliation    # Election.days_used_in_period / Provider.cap_liability_cents kept consistent with care-day ledger
+    - optimistic_concurrency          # CREATE-with-supersede on Certification + CarePlan revision races against Election.version
+
+  entity_topology: hybrid
+  # Election is the aggregate root (patient's hospice spell). BenefitPeriod, Certification,
+  # CarePlan, CareDay, CoverageItem hang off it. Provider is a peer/config root that owns the
+  # annual aggregate cap. BereavementCase is created cross-aggregate at discharge.
+
+  state_machine_shape: branching
+  # Election: ELECTED -> {REVOKED, DISCHARGED, EXPIRED}; CareDay carries a parallel
+  # level-of-care dimension; Certification branches certified/rejected; CarePlan revises cyclically.
+
+  relationship_patterns:
+    - one_to_many          # Election -> BenefitPeriod, CareDay, CoverageItem
+    - cross_aggregate      # CareDay debits Provider.cap_liability_cents; BereavementCase references discharged Election
+    - self_referential     # CarePlan.supersedes_plan_id references the prior CarePlan revision
+
+  role_model: segregation_of_duties
+  # The certifying physician and the attending physician on a recertification must be distinct
+  # for the face-to-face encounter rule; IntakeCoordinator elects, Physician certifies,
+  # ClinicalManager sets level of care, BillingAdmin runs the cap settlement.
+
+  consistency_model: immediate
+
+# ---------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: Provider
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: Hospice agency legal name
+        constraints: non-empty
+      - name: cap_year_start
+        type: datetime
+        source: input
+        description: First day of this provider's annual cap accounting year (cap year), ISO 8601 UTC midnight. The cap window is [cap_year_start, cap_year_start + 365 days).
+      - name: per_beneficiary_cap_cents
+        type: integer
+        source: input
+        description: Statutory aggregate cap amount per beneficiary for the cap year, in cents (e.g., 3490000 = $34,900.00).
+        constraints: ">= 0"
+      - name: cap_liability_cents
+        type: integer
+        source: computed
+        description: Provisional cap liability = max(0, total_paid_cents - cap_allowance_cents) where cap_allowance_cents = per_beneficiary_cap_cents * counted_beneficiaries. Recomputed on every CareDay posting and on settlement. See §1.3 provisional_cap_liability.
+        default: 0
+      - name: total_paid_cents
+        type: integer
+        source: computed
+        description: Running sum of CareDay.payment_cents for every CareDay whose Election belongs to this provider with service date inside the current cap window. See §1.3.
+        default: 0
+      - name: counted_beneficiaries
+        type: integer
+        source: computed
+        description: Count of distinct Elections belonging to this provider that have at least one CareDay inside the current cap window (the cap-year beneficiary count). See §1.3.
+        default: 0
+      - name: cap_settled
+        type: boolean
+        source: system
+        description: True once the cap year has been settled via POST settlement. Blocks further CareDay postings dated inside the settled window.
+        default: false
+
+  - name: Election
+    parent: null
+    common_fields: true
+    fields:
+      - name: provider_id
+        type: string
+        source: input
+        description: FK -> Provider.id; the hospice agency that holds this election.
+      - name: patient_name
+        type: string
+        source: input
+        description: Beneficiary full name
+        constraints: non-empty
+      - name: election_date
+        type: datetime
+        source: input
+        description: Effective date of the hospice election (day 1 of benefit period 1), ISO 8601 UTC midnight.
+      - name: attending_physician_id
+        type: string
+        source: input
+        description: Opaque identifier of the patient's chosen attending physician of record (may equal a certifying Physician's user id, may be external). Stored as a string; not an FK.
+      - name: status
+        type: enum
+        source: system
+        description: Election lifecycle status.
+        default: ELECTED
+        constraints: "one of {ELECTED, REVOKED, DISCHARGED, EXPIRED}"
+      - name: current_period_number
+        type: integer
+        source: computed
+        description: Sequence number of the benefit period containing the current clock position; equals the highest BenefitPeriod.sequence whose window contains the elapsed-day cursor. See §1.3 period_sequencing.
+        default: 1
+      - name: days_used_in_period
+        type: integer
+        source: computed
+        description: Count of CareDay rows (any level) attached to the current benefit period. Reconciled on every CareDay posting; see §1.3 and the derived-field rule.
+        default: 0
+      - name: revocation_date
+        type: datetime
+        source: system
+        description: Day the beneficiary revoked, set by the revoke transition; null while ELECTED.
+        default: null
+      - name: bereavement_required
+        type: boolean
+        source: system
+        description: Set true when the election terminates by DISCHARGED (death) — gates BereavementCase creation. Stays false on REVOKED/EXPIRED.
+        default: false
+
+  - name: BenefitPeriod
+    parent: Election
+    common_fields: true
+    fields:
+      - name: election_id
+        type: string
+        source: input
+        description: FK -> Election.id; the election this period belongs to.
+      - name: sequence
+        type: integer
+        source: computed
+        description: 1-based benefit-period index. Period 1 and 2 are 90 days each; period 3 and every period thereafter are 60 days. See §1.3 period_sequencing.
+        constraints: ">= 1"
+      - name: length_days
+        type: integer
+        source: computed
+        description: Nominal length = 90 if sequence in {1,2} else 60. The 90/90/60... cadence.
+      - name: start_offset_days
+        type: integer
+        source: computed
+        description: Elapsed days from election_date to this period's first day = sum of length_days of all earlier periods. Period 1 start_offset_days = 0.
+      - name: requires_face_to_face
+        type: boolean
+        source: computed
+        description: True for sequence >= 3 (the recertification face-to-face encounter is mandatory before the third and each subsequent period). False for sequence 1 and 2.
+      - name: certification_id
+        type: string
+        source: system
+        description: "FK -> Certification.id; the CERTIFIED certification that opened this period. Null until a certification is recorded. Annotation: set by the certify transition."
+        default: null
+      - name: cert_status
+        type: enum
+        source: system
+        description: Certification posture of this period.
+        default: PENDING_CERT
+        constraints: "one of {PENDING_CERT, CERTIFIED}"
+
+  - name: Certification
+    parent: Election
+    common_fields: true
+    fields:
+      - name: election_id
+        type: string
+        source: input
+        description: FK -> Election.id; the election being certified.
+      - name: period_sequence
+        type: integer
+        source: input
+        description: Which benefit-period sequence this certification attests terminal illness for; must equal the election's next un-certified period sequence.
+        constraints: ">= 1"
+      - name: certifying_physician_id
+        type: string
+        source: input
+        description: FK -> Physician.id; the hospice physician/medical director attesting prognosis of six months or less.
+      - name: face_to_face_physician_id
+        type: string
+        source: input
+        description: "FK -> Physician.id; the physician who conducted the face-to-face encounter. Required (non-null) only when period_sequence >= 3; must differ from certifying_physician_id is NOT required, but must be a recognized hospice physician. Null permitted for sequence 1 and 2."
+        default: null
+      - name: face_to_face_date
+        type: datetime
+        source: input
+        description: Date the face-to-face encounter occurred; required when period_sequence >= 3 and must fall within the 30 days immediately before the period start (start_offset window). Null permitted otherwise.
+        default: null
+      - name: narrative_present
+        type: boolean
+        source: input
+        description: Whether the physician composed the required clinical narrative attesting prognosis. Must be true to certify.
+        default: false
+      - name: expected_election_version
+        type: integer
+        source: input
+        description: OCC guard — the Election.version the client last observed. Rejected with 412 if it no longer matches Election.version (a competing certification already advanced the election). See §1.2.1.
+      - name: status
+        type: enum
+        source: system
+        description: Certification outcome.
+        default: DRAFT
+        constraints: "one of {DRAFT, CERTIFIED, REJECTED}"
+      - name: rejection_reason
+        type: string
+        source: system
+        description: Populated when the certification is rejected; null otherwise.
+        default: null
+
+  - name: CarePlan
+    parent: Election
+    common_fields: true
+    fields:
+      - name: election_id
+        type: string
+        source: input
+        description: FK -> Election.id; the election this interdisciplinary plan of care governs.
+      - name: supersedes_plan_id
+        type: string
+        source: input
+        description: "FK -> CarePlan.id; the prior active CarePlan revision this one replaces (self-referential). Null for the first plan."
+        default: null
+      - name: revision_number
+        type: integer
+        source: computed
+        description: 1 for the first plan, prior.revision_number + 1 for each superseding revision.
+        default: 1
+      - name: idg_members
+        type: array
+        source: input
+        description: List of interdisciplinary group discipline codes present at the plan meeting; must include at least the four core disciplines (see constraints).
+        constraints: "each element one of {PHYSICIAN, NURSE, SOCIAL_WORK, COUNSELOR, AIDE, VOLUNTEER}; must contain PHYSICIAN, NURSE, SOCIAL_WORK, COUNSELOR"
+      - name: review_due_offset_days
+        type: integer
+        source: input
+        description: Days after the plan's creation that the next mandatory IDG review is due (calendar interval; standard is 15).
+        default: 15
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: system
+        description: Plan revision status.
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUPERSEDED}"
+
+  - name: CareDay
+    parent: Election
+    common_fields: true
+    fields:
+      - name: election_id
+        type: string
+        source: input
+        description: FK -> Election.id; the election receiving care on this day.
+      - name: benefit_period_id
+        type: string
+        source: system
+        description: "FK -> BenefitPeriod.id; the period whose [start_offset, start_offset+length) window contains this day. Resolved by the server from service_date. Annotation: set on posting."
+        default: null
+      - name: service_date
+        type: datetime
+        source: input
+        description: Calendar day of care, ISO 8601 UTC midnight. Must be >= election_date and strictly before any revocation/discharge date.
+      - name: level_of_care
+        type: enum
+        source: input
+        description: Level of care delivered this day.
+        constraints: "one of {ROUTINE, RESPITE, GIP}"
+      - name: high_intensity
+        type: boolean
+        source: input
+        description: ROUTINE-only flag — true marks a day inside the first 60 days of the election (the higher routine rate tier). Server validates against the elapsed-day position; see §1.3 routine_per_diem.
+        default: false
+      - name: payment_cents
+        type: integer
+        source: computed
+        description: Per-diem payment for this day, from the level-of-care rate table and routine tier. See §1.3 day_per_diem.
+      - name: respite_run_length
+        type: integer
+        source: computed
+        description: For RESPITE days, the count of consecutive RESPITE days ending on this day (1-based). Used by the 5-day respite cap. 0 for non-RESPITE days.
+        default: 0
+
+  - name: CoverageItem
+    parent: Election
+    common_fields: true
+    fields:
+      - name: election_id
+        type: string
+        source: input
+        description: FK -> Election.id; the election this medication or DME item is billed under.
+      - name: care_plan_id
+        type: string
+        source: input
+        description: FK -> CarePlan.id; the ACTIVE care plan revision under which this item is ordered.
+      - name: item_type
+        type: enum
+        source: input
+        description: Kind of covered item.
+        constraints: "one of {MEDICATION, DME}"
+      - name: related_to_terminal_dx
+        type: boolean
+        source: input
+        description: Whether the item relates to the terminal diagnosis and related conditions. Items unrelated to the terminal diagnosis are not covered by the hospice benefit and are rejected.
+      - name: coverage_status
+        type: enum
+        source: system
+        description: Coverage adjudication outcome.
+        default: COVERED
+        constraints: "one of {COVERED, EXCLUDED}"
+
+  - name: Physician
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: Physician name
+        constraints: non-empty
+      - name: is_medical_director
+        type: boolean
+        source: input
+        description: True if this physician may serve as the hospice medical director / sole certifier for an initial certification.
+        default: false
+
+  - name: BereavementCase
+    parent: null
+    common_fields: true
+    fields:
+      - name: election_id
+        type: string
+        source: input
+        description: FK -> Election.id; the discharged-by-death election whose family receives bereavement services.
+      - name: enrolled_date
+        type: datetime
+        source: input
+        description: Date bereavement services begin, ISO 8601 UTC midnight; must be >= the election's discharge (revocation_date stand-in) date.
+      - name: service_window_days
+        type: integer
+        source: input
+        description: Length of the bereavement service window in days (statutory minimum 365).
+        default: 365
+        constraints: ">= 365"
+      - name: status
+        type: enum
+        source: system
+        description: Bereavement case status.
+        default: OPEN
+        constraints: "one of {OPEN, CLOSED}"
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  - entity: Election
+    initial_state: ELECTED
+    terminal_states: [REVOKED, DISCHARGED, EXPIRED]
+    transitions:
+      - from: null
+        to: ELECTED
+        trigger: "POST /hospice/elections"
+        actor: IntakeCoordinator
+        preconditions:
+          - "provider_id references an existing Provider whose cap_settled covering election_date is not true"
+          - "election_date is ISO 8601 UTC midnight"
+        side_effects:
+          - "create BenefitPeriod sequence=1, length_days=90, start_offset_days=0, cert_status=PENDING_CERT"
+          - "set current_period_number=1, days_used_in_period=0"
+        note: "Period 1 is materialized at election; later periods are materialized lazily by the certify transition."
+
+      - from: ELECTED
+        to: ELECTED
+        trigger: "POST /hospice/certifications (certify)"
+        actor: Physician
+        preconditions:
+          - "Certification.period_sequence equals the election's lowest BenefitPeriod with cert_status=PENDING_CERT"
+          - "narrative_present == true"
+          - "for period_sequence in {1,2}: certifying physician is_medical_director == true OR a second certification by a distinct Physician exists for the same period_sequence (two-physician initial cert)"
+          - "for period_sequence >= 3: face_to_face_physician_id non-null AND face_to_face_date within the 30 days before the period start_offset window"
+          - "expected_election_version == Election.version"
+        side_effects:
+          - "set this period's cert_status=CERTIFIED, certification_id=this Certification.id"
+          - "set Certification.status=CERTIFIED"
+          - "materialize the next BenefitPeriod (sequence+1) with cert_status=PENDING_CERT, length_days per 90/90/60 rule, start_offset_days = prior start_offset + prior length"
+          - "increments Election.version by 1"
+        note: "Branching: same trigger yields CERTIFIED or REJECTED depending on preconditions."
+
+      - from: ELECTED
+        to: ELECTED
+        trigger: "POST /hospice/certifications (reject)"
+        actor: Physician
+        preconditions:
+          - "narrative_present == false OR (period_sequence >= 3 AND face-to-face window unmet)"
+        side_effects:
+          - "set Certification.status=REJECTED, rejection_reason set"
+          - "period cert_status stays PENDING_CERT; no new period materialized; Election.version unchanged"
+        note: "Reject branch — no version bump, election not advanced."
+
+      - from: ELECTED
+        to: REVOKED
+        trigger: "POST /hospice/elections/{id}/revoke"
+        actor: IntakeCoordinator
+        preconditions:
+          - "Election.status == ELECTED"
+          - "revocation_date >= election_date and >= the service_date of the latest CareDay"
+        side_effects:
+          - "set status=REVOKED, revocation_date set"
+          - "forfeit the remainder of the current benefit period (no compensation of already-paid CareDays)"
+          - "bereavement_required stays false (revocation is not death)"
+        note: "Patient keeps any future periods for a later re-election; this election instance is terminal."
+
+      - from: ELECTED
+        to: DISCHARGED
+        trigger: "POST /hospice/elections/{id}/discharge"
+        actor: ClinicalManager
+        preconditions:
+          - "Election.status == ELECTED"
+          - "discharge_reason in {DEATH, MOVED_OUT_OF_AREA, NO_LONGER_TERMINAL}"
+          - "revocation_date (discharge date) >= service_date of latest CareDay"
+        side_effects:
+          - "set status=DISCHARGED, revocation_date set to discharge date"
+          - "if discharge_reason == DEATH: set bereavement_required=true"
+          - "if discharge_reason == NO_LONGER_TERMINAL: the current period's cert_status is irrelevant going forward"
+        note: "Only DEATH opens bereavement eligibility."
+
+      - from: ELECTED
+        to: EXPIRED
+        trigger: "POST /_clock/set_current_utc (system, on clock advance past final certified period)"
+        actor: system
+        preconditions:
+          - "Election.status == ELECTED"
+          - "the clock cursor has advanced past the end of the highest CERTIFIED period AND the next period is still PENDING_CERT"
+        side_effects:
+          - "set status=EXPIRED"
+          - "bereavement_required stays false"
+        note: "Coverage lapses when a period ends un-recertified; auto-transition driven by the clock endpoint."
+
+  - entity: Certification
+    initial_state: DRAFT
+    terminal_states: [CERTIFIED, REJECTED]
+    transitions:
+      - from: null
+        to: DRAFT
+        trigger: "POST /hospice/certifications (with commit=false)"
+        actor: Physician
+        preconditions:
+          - "election exists and is ELECTED"
+          - "period_sequence equals the lowest PENDING_CERT period sequence"
+        side_effects:
+          - "persist Certification in DRAFT"
+        note: "Draft lets a second physician co-sign an initial cert before commit."
+
+      - from: DRAFT
+        to: CERTIFIED
+        trigger: "POST /hospice/certifications (with commit=true)"
+        actor: Physician
+        preconditions:
+          - "all certify-branch preconditions on the Election machine hold"
+        side_effects:
+          - "mirror the Election certify side-effects"
+        note: "OCC-guarded by expected_election_version."
+
+      - from: DRAFT
+        to: REJECTED
+        trigger: "POST /hospice/certifications (reject branch)"
+        actor: Physician
+        preconditions:
+          - "a certify precondition fails"
+        side_effects:
+          - "set rejection_reason"
+
+  - entity: CarePlan
+    initial_state: ACTIVE
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: null
+        to: ACTIVE
+        trigger: "POST /hospice/care-plans"
+        actor: ClinicalManager
+        preconditions:
+          - "election is ELECTED"
+          - "idg_members contains PHYSICIAN, NURSE, SOCIAL_WORK, COUNSELOR"
+          - "if supersedes_plan_id is null, no other ACTIVE CarePlan exists for the election; if non-null, that plan is ACTIVE"
+          - "expected_election_version == Election.version"
+        side_effects:
+          - "if supersedes_plan_id non-null: set that plan status=SUPERSEDED; set this revision_number = prior + 1"
+          - "increments Election.version by 1"
+        note: "Cyclic revise loop: ACTIVE -> (new ACTIVE) with old -> SUPERSEDED. CREATE-with-supersede race on Election.version, see §1.2.1."
+
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "POST /hospice/care-plans (a newer revision supersedes this one)"
+        actor: ClinicalManager
+        preconditions:
+          - "a new CarePlan names this plan in supersedes_plan_id"
+        side_effects:
+          - "status=SUPERSEDED; CoverageItems already ordered under this plan stay COVERED (historical)"
+        note: "Bubble: the superseded plan is closed when its successor is committed."
+
+  - entity: BereavementCase
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: null
+        to: OPEN
+        trigger: "POST /hospice/bereavement-cases"
+        actor: ClinicalManager
+        preconditions:
+          - "referenced Election.status == DISCHARGED AND Election.bereavement_required == true"
+          - "enrolled_date >= Election.revocation_date"
+          - "no OPEN BereavementCase already exists for the election"
+        side_effects:
+          - "create OPEN bereavement case"
+
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /hospice/bereavement-cases/{id}/close"
+        actor: ClinicalManager
+        preconditions:
+          - "BereavementCase.status == OPEN"
+        side_effects:
+          - "set status=CLOSED"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules (OCC on parent Election.version)
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: cert-create-stale-election
+    parent_entity: Election
+    write_endpoint: "POST /hospice/certifications"
+    occ_field: "expected_election_version"
+    description: |
+      Committing a Certification against an Election whose version has advanced
+      since the client last observed it is rejected. This captures the case where
+      another writer has already certified the same pending period (legitimately
+      advancing the election and materializing the next period), so the current
+      writer's view of the election — and of which period is pending — is stale.
+    error_id: ERR_STALE_ELECTION_VERSION
+    http_status: 412
+
+  - rule_id: careplan-supersede-stale-election
+    parent_entity: Election
+    write_endpoint: "POST /hospice/care-plans"
+    occ_field: "expected_election_version"
+    description: |
+      Creating a superseding CarePlan revision against an Election whose version
+      has advanced is rejected. This captures the CREATE-with-supersede case where
+      another writer has already committed a revision that superseded the same prior
+      plan, so the current writer's supersedes_plan_id target is no longer ACTIVE
+      and its election view is stale.
+    error_id: ERR_STALE_ELECTION_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: period_sequencing
+    trigger: "On Election create (period 1) and on each certify transition (materialize next period)"
+    algorithm: chronological
+    formula: |
+      # 90/90/60 cadence — sequence -> nominal length
+      def length_days(sequence):
+          return 90 if sequence in (1, 2) else 60
+      # start_offset accumulates earlier nominal lengths
+      def start_offset_days(sequence):
+          off = 0
+          for s in range(1, sequence):
+              off += length_days(s)
+          return off          # seq1->0, seq2->90, seq3->180, seq4->240, seq5->300, ...
+      # current_period_number from an elapsed-day cursor (clock - election_date)
+      def current_period_number(elapsed_days, highest_materialized):
+          seq = 1
+          while seq < highest_materialized and elapsed_days >= start_offset_days(seq + 1):
+              seq += 1
+          return seq
+    input_set: "Only BenefitPeriods materialized so far for the election; periods are materialized lazily by certify."
+    constants:
+      PERIOD_1_2_LENGTH: 90
+      PERIOD_3_PLUS_LENGTH: 60
+    precision: "integer days"
+    variants:
+      - name: nominal_window
+        when: "computing start_offset / length for materialization"
+        difference: "Uses nominal 90/90/60 lengths regardless of actual care days delivered."
+      - name: elapsed_cursor
+        when: "computing current_period_number for display/expiry"
+        difference: "Uses the clock cursor (days since election_date), which can fall short of nominal if the patient revoked early."
+
+  - name: day_per_diem
+    trigger: "On POST /hospice/care-days (CareDay posting)"
+    algorithm: tiered_pricing
+    formula: |
+      # Level-of-care rate table (cents/day). Routine has a two-tier service-intensity
+      # structure: the first ROUTINE_HIGH_DAYS days of the ELECTION are the high rate,
+      # subsequent ROUTINE days are the base rate.
+      def routine_rate(elapsed_day_index, high_intensity_flag):
+          # elapsed_day_index = (service_date - election_date).days, 0-based
+          in_high_window = elapsed_day_index < ROUTINE_HIGH_DAYS      # first 60 days
+          # high_intensity flag MUST agree with the window (validated, see §1.4)
+          return ROUTINE_HIGH_CENTS if in_high_window else ROUTINE_BASE_CENTS
+      def payment_cents(level, elapsed_day_index, high_intensity_flag):
+          if level == "ROUTINE":
+              return routine_rate(elapsed_day_index, high_intensity_flag)
+          if level == "RESPITE":
+              return RESPITE_CENTS
+          if level == "GIP":
+              return GIP_CENTS
+    input_set: "Single CareDay; routine tier keyed on elapsed_day_index = (service_date - election_date) in days."
+    constants:
+      ROUTINE_HIGH_DAYS: 60
+      ROUTINE_HIGH_CENTS: 21000      # $210.00/day, first 60 days
+      ROUTINE_BASE_CENTS: 16500      # $165.00/day, day 61+
+      RESPITE_CENTS: 47000           # $470.00/day inpatient respite
+      GIP_CENTS: 110000              # $1,100.00/day general inpatient
+    precision: "integer cents, no rounding (rates are whole-cent constants)"
+    variants:
+      - name: routine_high
+        when: "elapsed_day_index < 60"
+        difference: "Pays ROUTINE_HIGH_CENTS (service-intensity high tier)."
+      - name: routine_base
+        when: "elapsed_day_index >= 60"
+        difference: "Pays ROUTINE_BASE_CENTS."
+
+  - name: respite_run_length
+    trigger: "On POST /hospice/care-days when level_of_care == RESPITE"
+    algorithm: aggregation
+    formula: |
+      # Consecutive-day run ending on this RESPITE day, ordered by service_date ASC,
+      # created_at ASC as the deterministic tie-break when two CareDays share a date.
+      # A run is broken by any non-RESPITE day or a calendar gap (> 1 day).
+      def respite_run_length(election, new_day):
+          run = 1
+          cursor = new_day.service_date - 1 day
+          while exists CareDay c for election with c.service_date == cursor
+                and c.level_of_care == RESPITE:
+              run += 1
+              cursor -= 1 day
+          return run
+    input_set: "All RESPITE CareDays of the election with service_date < new_day.service_date, contiguous and immediately preceding."
+    constants:
+      RESPITE_MAX_CONSECUTIVE: 5
+    precision: "integer days"
+
+  - name: provisional_cap_liability
+    trigger: "On every CareDay posting (recompute) and on GET /hospice/providers/{id}/cap-summary"
+    algorithm: aggregation
+    formula: |
+      # Aggregate (Medicare) per-diem cap, PROVISIONAL variant — year-to-date.
+      total_paid_cents     = sum(CareDay.payment_cents
+                                 for CareDay c in this provider's elections
+                                 where cap_year_start <= c.service_date < cap_year_start + 365d)
+      counted_beneficiaries = count(distinct Election
+                                 having >= 1 such CareDay in the window)
+      cap_allowance_cents  = per_beneficiary_cap_cents * counted_beneficiaries
+      cap_liability_cents  = max(0, total_paid_cents - cap_allowance_cents)
+    input_set: "All CareDays of all Elections under the provider whose service_date is inside the cap window [cap_year_start, +365d)."
+    constants:
+      CAP_WINDOW_DAYS: 365
+    precision: "integer cents"
+    variants:
+      - name: provisional
+        when: "cap_settled == false (year in progress)"
+        difference: "counted_beneficiaries grows as new elections receive care; liability is a running estimate that can fall when a new beneficiary is added (raises allowance)."
+      - name: final_settled
+        when: "POST settlement (cap_settled flips true)"
+        difference: "Beneficiary count and total are frozen at settlement time; see final_cap_settlement. Liability becomes the demand amount and never changes afterward."
+
+  - name: final_cap_settlement
+    trigger: "On POST /hospice/providers/{id}/settle-cap"
+    algorithm: aggregation
+    formula: |
+      # FINAL variant — same arithmetic as provisional but evaluated once, then frozen.
+      # Distinguishing twist: a single beneficiary's payments are capped at the
+      # per-beneficiary amount BEFORE summing (streamlined cap), which can differ from
+      # the provisional aggregate when one beneficiary is a heavy GIP user.
+      def final_liability(provider):
+          frozen_total = 0
+          for election in provider.elections_with_caredays_in_window:
+              ben_paid = sum(cd.payment_cents for cd in election window care-days)
+              frozen_total += min(ben_paid, provider.per_beneficiary_cap_cents)   # per-beneficiary streamlined cap
+          # NOTE: provisional uses raw sum (no per-beneficiary min); final applies the min.
+          allowance = provider.per_beneficiary_cap_cents * counted_beneficiaries
+          raw_total = sum(all window care-day payments)
+          return max(0, raw_total - allowance)   # demand still on the aggregate, but
+          # the frozen snapshot of raw_total/allowance is stored; cap_settled=true
+    input_set: "Frozen snapshot of all in-window CareDays at settlement instant."
+    constants:
+      CAP_WINDOW_DAYS: 365
+    precision: "integer cents"
+    variants:
+      - name: provisional_vs_final_divergence
+        when: "comparing cap-summary before settlement to the settled demand"
+        difference: "Provisional recomputes live (can drop when a beneficiary is added); final is frozen at the settlement instant and immutable."
+
+  - name: days_used_reconciliation
+    trigger: "On every CareDay posting and on revoke/discharge"
+    algorithm: aggregation
+    formula: |
+      # Derived-field reconciliation: Election.days_used_in_period must equal the
+      # count of CareDays attached to the current (highest non-terminal-or-current)
+      # benefit period after each posting.
+      current_period = highest materialized BenefitPeriod whose
+                       [start_offset, start_offset+length) contains the latest CareDay
+      days_used_in_period = count(CareDay where benefit_period_id == current_period.id)
+    input_set: "CareDays bound to the current benefit period only; resets to 0 view when the cursor crosses into a new period."
+    constants: {}
+    precision: "integer count"
+
+# ===========================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "All path and FK-referenced resources exist (Provider, Election, BenefitPeriod, Certification, CarePlan, Physician, BereavementCase), validated left-to-right"
+    error_id: ERR_RESOURCE_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: state
+    check: "Target Election is ELECTED for certify / care-day / care-plan / coverage-item / revoke / discharge operations"
+    error_id: ERR_ELECTION_NOT_ELECTED
+    http_status: 409
+    applies_to: "certify, post care-day, post care-plan, post coverage-item, revoke, discharge"
+
+  - priority: 5
+    category: state
+    check: "Provider's cap year covering the operation date is not already settled (cap_settled == false) for any CareDay posting"
+    error_id: ERR_CAP_YEAR_SETTLED
+    http_status: 409
+    applies_to: "post care-day, settle-cap"
+
+  - priority: 6
+    category: business_referential
+    check: "Certification.period_sequence equals the election's lowest PENDING_CERT BenefitPeriod sequence (cannot certify out of order or re-certify)"
+    error_id: ERR_PERIOD_SEQUENCE_MISMATCH
+    http_status: 409
+    applies_to: "certify"
+
+  - priority: 7
+    category: business_safety
+    check: "Face-to-face encounter present and dated within 30 days before period start when period_sequence >= 3 (recertification face-to-face rule)"
+    error_id: ERR_FACE_TO_FACE_REQUIRED
+    http_status: 422
+    applies_to: "certify"
+
+  - priority: 8
+    category: business_safety
+    check: "Initial certification (sequence 1 or 2) carries a medical-director certifier OR two distinct-physician certifications; clinical narrative present (narrative_present == true)"
+    error_id: ERR_CERTIFICATION_INCOMPLETE
+    http_status: 422
+    applies_to: "certify"
+
+  - priority: 9
+    category: business_constraint
+    check: "CarePlan idg_members contains all four core disciplines {PHYSICIAN, NURSE, SOCIAL_WORK, COUNSELOR}"
+    error_id: ERR_IDG_INCOMPLETE
+    http_status: 422
+    applies_to: "post care-plan"
+
+  - priority: 10
+    category: business_constraint
+    check: "CoverageItem.related_to_terminal_dx == true; items unrelated to terminal diagnosis are not covered"
+    error_id: ERR_ITEM_NOT_COVERED
+    http_status: 422
+    applies_to: "post coverage-item"
+
+  - priority: 11
+    category: business_referential
+    check: "CoverageItem.care_plan_id references an ACTIVE CarePlan of the same election"
+    error_id: ERR_PLAN_NOT_ACTIVE
+    http_status: 409
+    applies_to: "post coverage-item"
+
+  - priority: 12
+    category: business_temporal
+    check: "CareDay.service_date >= election_date, and strictly before revocation_date/discharge date (no care after election terminates)"
+    error_id: ERR_SERVICE_DATE_OUT_OF_RANGE
+    http_status: 422
+    applies_to: "post care-day"
+
+  - priority: 13
+    category: business_safety
+    check: "Posting a RESPITE CareDay must not create a consecutive RESPITE run exceeding RESPITE_MAX_CONSECUTIVE (5) days"
+    error_id: ERR_RESPITE_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "post care-day"
+
+  - priority: 14
+    category: business_constraint
+    check: "CareDay.high_intensity flag agrees with the elapsed-day window: high_intensity == true requires elapsed_day_index < 60; high_intensity == false requires elapsed_day_index >= 60 for ROUTINE; non-ROUTINE days must have high_intensity == false"
+    error_id: ERR_INTENSITY_FLAG_MISMATCH
+    http_status: 422
+    applies_to: "post care-day"
+
+  - priority: 15
+    category: business_temporal
+    check: "No two CareDays for the same election may share a service_date (one care day per calendar day per election)"
+    error_id: ERR_DUPLICATE_CARE_DAY
+    http_status: 409
+    applies_to: "post care-day"
+
+  - priority: 16
+    category: business_referential
+    check: "BereavementCase requires referenced Election DISCHARGED with bereavement_required == true; only DEATH discharges qualify"
+    error_id: ERR_BEREAVEMENT_NOT_ELIGIBLE
+    http_status: 409
+    applies_to: "post bereavement-case"
+
+  - priority: 17
+    category: business_constraint
+    check: "OCC: expected_election_version matches Election.version on certify and care-plan-supersede writes"
+    error_id: ERR_STALE_ELECTION_VERSION
+    http_status: 412
+    applies_to: "certify, post care-plan"
+
+  - priority: 18
+    category: business_constraint
+    check: "Request body required fields present and well-typed; enum values within declared sets; pagination params within bounds"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # ---- Provider -----------------------------------------------------------
+  - method: POST
+    path: "/hospice/providers"
+    description: "Register a hospice provider with its annual aggregate cap parameters"
+    roles: [BillingAdmin]
+    code: 201
+    input: [name, cap_year_start, per_beneficiary_cap_cents]
+
+    output: Provider
+    side_effects: ["initialize cap_liability_cents=0, total_paid_cents=0, counted_beneficiaries=0, cap_settled=false"]
+
+  - method: GET
+    path: "/hospice/providers/{id}"
+    description: "Fetch a provider"
+    roles: [BillingAdmin, IntakeCoordinator, ClinicalManager]
+    code: 200
+    input: []
+
+    output: Provider
+    side_effects: []
+
+  - method: GET
+    path: "/hospice/providers/{id}/cap-summary"
+    description: "Computed read — provisional aggregate cap liability for the current cap year"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+
+    output: Provider
+    side_effects: ["recompute total_paid_cents, counted_beneficiaries, cap_liability_cents (provisional variant)"]
+
+  - method: POST
+    path: "/hospice/providers/{id}/settle-cap"
+    description: "Finalize and freeze the cap-year liability (final variant); marks cap_settled=true"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+
+    output: Provider
+    side_effects: ["compute final_cap_settlement", "freeze total_paid_cents/counted_beneficiaries/cap_liability_cents", "set cap_settled=true"]
+
+  - method: GET
+    path: "/hospice/providers/{id}/elections"
+    description: "Reverse-reachability — list elections under a provider"
+    roles: [BillingAdmin, IntakeCoordinator, ClinicalManager]
+    code: 200
+    input: ["limit?", "offset?"]
+
+    output: Election[]
+    side_effects: []
+
+  # ---- Physician ----------------------------------------------------------
+  - method: POST
+    path: "/hospice/physicians"
+    description: "Register a hospice physician"
+    roles: [ClinicalManager]
+    code: 201
+    input: [full_name, "is_medical_director?"]
+
+    output: Physician
+    side_effects: []
+
+  - method: GET
+    path: "/hospice/physicians/{id}"
+    description: "Fetch a physician"
+    roles: [ClinicalManager, Physician]
+    code: 200
+    input: []
+
+    output: Physician
+    side_effects: []
+
+  # ---- Election -----------------------------------------------------------
+  - method: POST
+    path: "/hospice/elections"
+    description: "Elect the hospice benefit for a beneficiary; materializes benefit period 1"
+    roles: [IntakeCoordinator]
+    code: 201
+    input: [provider_id, patient_name, election_date, attending_physician_id]
+
+    output: Election
+    side_effects: ["create BenefitPeriod sequence=1 (90 days)", "set current_period_number=1, days_used_in_period=0"]
+
+  - method: GET
+    path: "/hospice/elections/{id}"
+    description: "Fetch an election with computed period fields"
+    roles: [IntakeCoordinator, ClinicalManager, Physician, BillingAdmin]
+    code: 200
+    input: []
+
+    output: Election
+    side_effects: ["recompute current_period_number, days_used_in_period"]
+
+  - method: GET
+    path: "/hospice/elections"
+    description: "List elections (filterable by provider_id)"
+    roles: [IntakeCoordinator, ClinicalManager, BillingAdmin]
+    code: 200
+    input: ["provider_id?", "limit?", "offset?"]
+
+    output: Election[]
+    side_effects: []
+
+  - method: POST
+    path: "/hospice/elections/{id}/revoke"
+    description: "Beneficiary revokes the hospice election; forfeits remainder of current period"
+    roles: [IntakeCoordinator]
+    code: 200
+    input: [revocation_date]
+
+    output: Election
+    side_effects: ["status=REVOKED", "revocation_date set", "bereavement_required stays false"]
+
+  - method: POST
+    path: "/hospice/elections/{id}/discharge"
+    description: "Discharge the election (death / moved / no-longer-terminal)"
+    roles: [ClinicalManager]
+    code: 200
+    input: [discharge_date, discharge_reason]
+
+    output: Election
+    side_effects: ["status=DISCHARGED", "revocation_date set to discharge_date", "if DEATH: bereavement_required=true"]
+
+  # ---- BenefitPeriod ------------------------------------------------------
+  - method: GET
+    path: "/hospice/elections/{id}/benefit-periods"
+    description: "Reverse-reachability — list benefit periods of an election (90/90/60 cadence)"
+    roles: [IntakeCoordinator, ClinicalManager, Physician, BillingAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+
+    output: BenefitPeriod[]
+    side_effects: []
+
+  - method: GET
+    path: "/hospice/benefit-periods/{id}"
+    description: "Fetch a single benefit period"
+    roles: [IntakeCoordinator, ClinicalManager, Physician, BillingAdmin]
+    code: 200
+    input: []
+    output: BenefitPeriod
+    side_effects: []
+
+  - method: GET
+    path: "/hospice/benefit-periods"
+    description: "List benefit periods (filterable by election_id or certification_id) — reverse lookup for BenefitPeriod.certification_id"
+    roles: [IntakeCoordinator, ClinicalManager, Physician, BillingAdmin]
+    code: 200
+    input: ["election_id?", "certification_id?", "limit?", "offset?"]
+    output: BenefitPeriod[]
+    side_effects: []
+
+  # ---- Certification ------------------------------------------------------
+  - method: POST
+    path: "/hospice/certifications"
+    description: "Record a certification/recertification draft or commit; certify or reject the pending period"
+    roles: [Physician]
+    code: 201
+    input: [election_id, period_sequence, certifying_physician_id, "face_to_face_physician_id?", "face_to_face_date?", narrative_present, expected_election_version, "commit?"]
+
+    output: Certification
+    side_effects: ["on commit+pass: period cert_status=CERTIFIED, materialize next period, increments Election.version by 1", "on fail: status=REJECTED"]
+
+  - method: GET
+    path: "/hospice/certifications/{id}"
+    description: "Fetch a certification"
+    roles: [Physician, ClinicalManager]
+    code: 200
+    input: []
+
+    output: Certification
+    side_effects: []
+
+  - method: GET
+    path: "/hospice/elections/{id}/certifications"
+    description: "Reverse-reachability — list certifications of an election"
+    roles: [Physician, ClinicalManager, BillingAdmin]
+    code: 200
+    input: ["period_sequence?", "limit?", "offset?"]
+    output: Certification[]
+    side_effects: []
+
+  - method: GET
+    path: "/hospice/certifications"
+    description: "List certifications (filterable by certifying or face-to-face physician) — reverse lookup for Certification.certifying_physician_id and face_to_face_physician_id"
+    roles: [Physician, ClinicalManager, BillingAdmin]
+    code: 200
+    input: ["certifying_physician_id?", "face_to_face_physician_id?", "election_id?", "limit?", "offset?"]
+    output: Certification[]
+    side_effects: []
+
+  # ---- CarePlan -----------------------------------------------------------
+  - method: POST
+    path: "/hospice/care-plans"
+    description: "Create or revise the interdisciplinary plan of care (CREATE-with-supersede)"
+    roles: [ClinicalManager]
+    code: 201
+    input: [election_id, "supersedes_plan_id?", idg_members, "review_due_offset_days?", expected_election_version]
+
+    output: CarePlan
+    side_effects: ["if supersedes_plan_id: prior plan status=SUPERSEDED", "set revision_number", "increments Election.version by 1"]
+
+  - method: GET
+    path: "/hospice/care-plans/{id}"
+    description: "Fetch a care plan revision"
+    roles: [ClinicalManager, Physician, BillingAdmin]
+    code: 200
+    input: []
+
+    output: CarePlan
+    side_effects: []
+
+  - method: GET
+    path: "/hospice/elections/{id}/care-plans"
+    description: "Reverse-reachability — list care plan revisions of an election"
+    roles: [ClinicalManager, Physician, BillingAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: CarePlan[]
+    side_effects: []
+
+  - method: GET
+    path: "/hospice/care-plans"
+    description: "List care plans (filterable by supersedes_plan_id or election_id) — reverse lookup for the self-referential CarePlan.supersedes_plan_id"
+    roles: [ClinicalManager, Physician, BillingAdmin]
+    code: 200
+    input: ["supersedes_plan_id?", "election_id?", "status?", "limit?", "offset?"]
+    output: CarePlan[]
+    side_effects: []
+
+  # ---- CareDay ------------------------------------------------------------
+  - method: POST
+    path: "/hospice/care-days"
+    description: "Post a day of care at a level of care; computes per-diem and reconciles ledgers"
+    roles: [ClinicalManager]
+    code: 201
+    input: [election_id, service_date, level_of_care, "high_intensity?"]
+
+    output: CareDay
+    side_effects: ["compute payment_cents (day_per_diem)", "compute respite_run_length", "bind benefit_period_id", "reconcile Election.days_used_in_period", "recompute Provider cap ledger (provisional_cap_liability)"]
+
+  - method: GET
+    path: "/hospice/care-days/{id}"
+    description: "Fetch a care day"
+    roles: [ClinicalManager, BillingAdmin]
+    code: 200
+    input: []
+
+    output: CareDay
+    side_effects: []
+
+  - method: GET
+    path: "/hospice/elections/{id}/care-days"
+    description: "Reverse-reachability — list care days of an election (orders by service_date)"
+    roles: [ClinicalManager, BillingAdmin]
+    code: 200
+    input: ["level_of_care?", "limit?", "offset?"]
+    output: CareDay[]
+    side_effects: []
+
+  - method: GET
+    path: "/hospice/care-days"
+    description: "List care days (filterable by election_id or benefit_period_id) — reverse lookup for CareDay.benefit_period_id"
+    roles: [ClinicalManager, BillingAdmin]
+    code: 200
+    input: ["election_id?", "benefit_period_id?", "level_of_care?", "limit?", "offset?"]
+    output: CareDay[]
+    side_effects: []
+
+  # ---- CoverageItem -------------------------------------------------------
+  - method: POST
+    path: "/hospice/coverage-items"
+    description: "Order a medication or DME item under an active care plan"
+    roles: [ClinicalManager]
+    code: 201
+    input: [election_id, care_plan_id, item_type, related_to_terminal_dx]
+
+    output: CoverageItem
+    side_effects: ["adjudicate coverage_status (COVERED iff related_to_terminal_dx)"]
+
+  - method: GET
+    path: "/hospice/coverage-items/{id}"
+    description: "Fetch a coverage item"
+    roles: [ClinicalManager, BillingAdmin]
+    code: 200
+    input: []
+
+    output: CoverageItem
+    side_effects: []
+
+  - method: GET
+    path: "/hospice/elections/{id}/coverage-items"
+    description: "Reverse-reachability — list coverage items of an election"
+    roles: [ClinicalManager, BillingAdmin]
+    code: 200
+    input: ["item_type?", "limit?", "offset?"]
+
+    output: CoverageItem[]
+    side_effects: []
+
+  - method: GET
+    path: "/hospice/care-plans/{id}/coverage-items"
+    description: "Reverse-reachability — list coverage items ordered under a care plan revision"
+    roles: [ClinicalManager, BillingAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+
+    output: CoverageItem[]
+    side_effects: []
+
+  # ---- BereavementCase ----------------------------------------------------
+  - method: POST
+    path: "/hospice/bereavement-cases"
+    description: "Open a bereavement case for a death-discharged election's family"
+    roles: [ClinicalManager]
+    code: 201
+    input: [election_id, enrolled_date, "service_window_days?"]
+
+    output: BereavementCase
+    side_effects: ["create OPEN case"]
+
+  - method: GET
+    path: "/hospice/bereavement-cases/{id}"
+    description: "Fetch a bereavement case"
+    roles: [ClinicalManager]
+    code: 200
+    input: []
+
+    output: BereavementCase
+    side_effects: []
+
+  - method: POST
+    path: "/hospice/bereavement-cases/{id}/close"
+    description: "Close a bereavement case"
+    roles: [ClinicalManager]
+    code: 200
+    input: []
+
+    output: BereavementCase
+    side_effects: ["status=CLOSED"]
+
+  - method: GET
+    path: "/hospice/elections/{id}/bereavement-cases"
+    description: "Reverse-reachability — list bereavement cases of an election"
+    roles: [ClinicalManager, BillingAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+
+    output: BereavementCase[]
+    side_effects: []
+
+  # ---- Test-driving clock -------------------------------------------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving endpoint — set the server's current UTC clock; drives elapsed-day cursors and EXPIRED auto-transition"
+    roles: [BillingAdmin, IntakeCoordinator, ClinicalManager]
+    code: 200
+    input: [to_iso8601]
+
+    output: null
+    side_effects: ["advance current clock", "auto-transition any ELECTED election past its last CERTIFIED period to EXPIRED"]
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/malformed X-User-Role or X-User-ID headers"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for this operation"
+  - id: ERR_RESOURCE_NOT_FOUND
+    http: 404
+    condition: "A path or FK-referenced resource does not exist"
+  - id: ERR_ELECTION_NOT_ELECTED
+    http: 409
+    condition: "Operation requires Election.status == ELECTED but it is terminal (REVOKED/DISCHARGED/EXPIRED)"
+  - id: ERR_CAP_YEAR_SETTLED
+    http: 409
+    condition: "CareDay posting or re-settlement against a provider cap year already settled"
+  - id: ERR_PERIOD_SEQUENCE_MISMATCH
+    http: 409
+    condition: "Certification.period_sequence is not the election's lowest PENDING_CERT period (out-of-order or re-certify)"
+  - id: ERR_FACE_TO_FACE_REQUIRED
+    http: 422
+    condition: "period_sequence >= 3 but face-to-face physician/date missing or outside the 30-day pre-period window"
+  - id: ERR_CERTIFICATION_INCOMPLETE
+    http: 422
+    condition: "Initial cert lacks medical-director or second physician, or narrative_present == false"
+  - id: ERR_IDG_INCOMPLETE
+    http: 422
+    condition: "CarePlan idg_members missing one of the four core disciplines"
+  - id: ERR_ITEM_NOT_COVERED
+    http: 422
+    condition: "CoverageItem.related_to_terminal_dx == false (not covered by the hospice benefit)"
+  - id: ERR_PLAN_NOT_ACTIVE
+    http: 409
+    condition: "CoverageItem.care_plan_id references a CarePlan that is not ACTIVE or belongs to another election"
+  - id: ERR_SERVICE_DATE_OUT_OF_RANGE
+    http: 422
+    condition: "CareDay.service_date before election_date or on/after revocation/discharge date"
+  - id: ERR_RESPITE_LIMIT_EXCEEDED
+    http: 422
+    condition: "Posting a RESPITE day would exceed 5 consecutive RESPITE days"
+  - id: ERR_INTENSITY_FLAG_MISMATCH
+    http: 422
+    condition: "high_intensity flag disagrees with the elapsed-day window or set on a non-ROUTINE day"
+  - id: ERR_DUPLICATE_CARE_DAY
+    http: 409
+    condition: "Another CareDay already exists for this election on the same service_date"
+  - id: ERR_BEREAVEMENT_NOT_ELIGIBLE
+    http: 409
+    condition: "Election not DISCHARGED-by-death or already has an OPEN bereavement case"
+  - id: ERR_STALE_ELECTION_VERSION
+    http: 412
+    condition: "expected_election_version does not match the live Election.version (OCC)"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, bad enum, type error, or out-of-bounds pagination"
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: IntakeCoordinator
+    description: "Handles beneficiary election, revocation, and intake-side reads"
+    identity: opaque
+    exclusive_operations:
+      - "POST /hospice/elections"
+      - "POST /hospice/elections/{id}/revoke"
+    shared_operations:
+      - "GET /hospice/elections, /hospice/elections/{id}, /hospice/providers/{id}, /hospice/elections/{id}/benefit-periods"
+      - "POST /_clock/set_current_utc"
+
+  - name: Physician
+    description: "Hospice physician — certifies/recertifies terminal prognosis and conducts face-to-face encounters"
+    identity: entity_backed:Physician
+    exclusive_operations:
+      - "POST /hospice/certifications"
+    shared_operations:
+      - "GET /hospice/certifications/{id}, /hospice/elections/{id}/certifications, /hospice/physicians/{id}, /hospice/elections/{id}, /hospice/care-plans/{id}"
+
+  - name: ClinicalManager
+    description: "Owns the interdisciplinary plan, level-of-care day posting, coverage adjudication, discharge, and bereavement"
+    identity: opaque
+    exclusive_operations:
+      - "POST /hospice/care-plans"
+      - "POST /hospice/care-days"
+      - "POST /hospice/coverage-items"
+      - "POST /hospice/elections/{id}/discharge"
+      - "POST /hospice/bereavement-cases, /hospice/bereavement-cases/{id}/close"
+      - "POST /hospice/physicians"
+    shared_operations:
+      - "GET reads on elections, care-plans, care-days, coverage-items, bereavement-cases, benefit-periods, providers"
+      - "POST /_clock/set_current_utc"
+
+  - name: BillingAdmin
+    description: "Owns provider registration and the aggregate per-diem cap settlement"
+    identity: opaque
+    exclusive_operations:
+      - "POST /hospice/providers"
+      - "POST /hospice/providers/{id}/settle-cap"
+    shared_operations:
+      - "GET /hospice/providers/{id}, /hospice/providers/{id}/cap-summary, /hospice/providers/{id}/elections, and read access to elections/care-days/coverage-items/certifications"
+      - "POST /_clock/set_current_utc"

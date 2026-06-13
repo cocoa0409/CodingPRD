@@ -1,0 +1,1650 @@
+# =============================================================================
+# PRD Benchmark Scaffold — Restaurant Reservation & Waitlist
+# §1.0–§1.7 (difficulty design §1.8 and corner design §1.9 live in sibling files)
+# =============================================================================
+
+scenario: "Restaurant Reservation & Waitlist (OpenTable style): table inventory/turn time, party-size matching, reservation slots/pacing, waitlist & SMS notify, deposit/credit-card hold, no-show/cancellation policy, special requests, large-party/private dining"
+
+domain_name: restaurant-reservation-waitlist
+api_prefix: ""   # flat peer collections (/restaurants, /tables, /reservations, …); empty prefix lets every top-level collection sit at the root
+
+complexity_profile:
+  primary_archetype: temporal_windowing
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - optimistic_concurrency        # OCC on Table.version for create-with-supersede booking on a freed slot
+    - cascading_side_effects        # no-show → capture → strike → block → mass-cancel chain
+    - rate_threshold_triggers       # no-show strike threshold; per-slot pacing cap
+    - dual_variant_calculation      # deposit (standard vs private-dining) and reliability (provisional vs settled)
+
+  entity_topology: flat
+  # flat: peer entities (Restaurant, DiningArea, Table, ServicePeriod, Customer, Reservation,
+  # WaitlistEntry, DepositHold, SpecialRequest, Notification, PrivateDiningEvent) linked by FK
+  # fields in bodies; no deep URL nesting — sub-resource GETs exist only for FK reverse-reachability.
+
+  state_machine_shape: cyclic
+  # Reservation, WaitlistEntry, and PrivateDiningEvent all carry revert/loop edges
+  # (reschedule loop, re-queue loop, proposal-revision loop) — non-linear on three entities.
+
+  relationship_patterns:
+    - one_to_many        # Restaurant→Table, Restaurant→Reservation, Reservation→SpecialRequest
+    - cross_aggregate    # Reservation references Table + Customer across aggregate boundaries
+    - polymorphic        # Notification.target (RESERVATION | WAITLIST_ENTRY) via subject_type + subject_id
+
+  role_model: peer_roles
+  # Customer owns own bookings; Host runs the floor (seat/no-show/waitlist); Manager owns
+  # configuration, deposits, blocking, and private dining. Non-overlapping resource ownership.
+
+  consistency_model: immediate
+  # All cascades (capture → strike → block → mass-cancel; release → free table → promote waitlist)
+  # complete atomically inside the triggering request.
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMITTED VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Restaurant
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Restaurant display name"
+        constraints: "non-empty"
+      - name: timezone
+        type: string
+        source: input
+        description: "IANA timezone string used to interpret all reservation local times; all stored datetimes are UTC ISO 8601"
+        default: "America/New_York"
+      - name: default_turn_time_minutes
+        type: integer
+        source: input
+        description: "Default dwell time per reservation when a Table does not override it"
+        default: 90
+        constraints: ">= 30 and <= 360"
+      - name: cleanup_buffer_minutes
+        type: integer
+        source: input
+        description: "Buffer appended after a reservation's turn window before the same table may be re-occupied"
+        default: 15
+        constraints: ">= 0 and <= 60"
+      - name: late_cancel_cutoff_hours
+        type: integer
+        source: input
+        description: "Hours before reservation_start at or after which a cancel is 'late' and incurs the cancellation fee"
+        default: 24
+        constraints: ">= 0 and <= 168"
+      - name: no_show_strike_block_threshold
+        type: integer
+        source: input
+        description: "Strike count at or above which a Customer is auto-BLOCKED for this restaurant scope"
+        default: 3
+        constraints: ">= 1"
+      - name: per_seat_deposit_cents
+        type: integer
+        source: input
+        description: "Standard refundable deposit charged per seat for deposit-required reservations"
+        default: 2500
+        constraints: ">= 0"
+      - name: deposit_required_party_threshold
+        type: integer
+        source: input
+        description: "Party sizes at or above this require a deposit hold before CONFIRMED"
+        default: 6
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: computed
+        description: "OPEN accepts bookings; CLOSED rejects all new reservations and waitlist joins"
+        default: "OPEN"
+        constraints: "one of {OPEN, CLOSED}"
+
+  - name: DiningArea
+    parent: null
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: name
+        type: string
+        source: input
+        description: "Area label, e.g. MAIN_ROOM, PATIO, PRIVATE_ROOM"
+        constraints: "non-empty"
+      - name: kind
+        type: enum
+        source: input
+        description: "STANDARD areas host ordinary reservations; PRIVATE areas can be bought out wholesale by a PrivateDiningEvent"
+        default: "STANDARD"
+        constraints: "one of {STANDARD, PRIVATE}"
+      - name: status
+        type: enum
+        source: computed
+        description: "AVAILABLE when bookable; BOUGHT_OUT while a CONFIRMED PrivateDiningEvent occupies the area's window"
+        default: "AVAILABLE"
+        constraints: "one of {AVAILABLE, BOUGHT_OUT}"
+
+  - name: Table
+    parent: null
+    common_fields: true
+    fields:
+      - name: dining_area_id
+        type: string
+        source: input
+        description: "FK -> DiningArea.id"
+      - name: label
+        type: string
+        source: input
+        description: "Table label, e.g. T1, BOOTH_4"
+        constraints: "unique within dining_area_id"
+      - name: min_party_size
+        type: integer
+        source: input
+        description: "Smallest party this table will seat (party-size matching floor)"
+        default: 1
+        constraints: ">= 1"
+      - name: max_party_size
+        type: integer
+        source: input
+        description: "Largest party this table will seat (party-size matching ceiling)"
+        constraints: ">= min_party_size"
+      - name: turn_time_minutes
+        type: integer
+        source: input
+        description: "Per-table override of dwell time; when null the Restaurant.default_turn_time_minutes applies"
+        default: null
+        constraints: "null or (>= 30 and <= 360)"
+      - name: status
+        type: enum
+        source: computed
+        description: "AVAILABLE=bookable; SEATED=a party is currently dining; DIRTY=needs bussing after a party leaves; OUT_OF_SERVICE=manually disabled"
+        default: "AVAILABLE"
+        constraints: "one of {AVAILABLE, SEATED, DIRTY, OUT_OF_SERVICE}"
+
+  - name: ServicePeriod
+    parent: null
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: name
+        type: string
+        source: input
+        description: "Period label, e.g. DINNER, BRUNCH"
+        constraints: "non-empty"
+      - name: start_local_time
+        type: string
+        source: input
+        description: "Local HH:MM (24h) the period opens; reservation_start local time must be within [start_local_time, end_local_time)"
+        constraints: "HH:MM 24h"
+      - name: end_local_time
+        type: string
+        source: input
+        description: "Local HH:MM (24h) the period closes (exclusive)"
+        constraints: "HH:MM 24h, strictly after start_local_time"
+      - name: slot_interval_minutes
+        type: integer
+        source: input
+        description: "Granularity of bookable start times; reservation_start local minutes must align to this grid from start_local_time"
+        default: 30
+        constraints: "one of {15, 30, 60}"
+      - name: pacing_max_covers_per_slot
+        type: integer
+        source: input
+        description: "Maximum total covers (sum of party_size) that may have a reservation_start landing in the same slot grid time across the whole restaurant"
+        constraints: ">= 1"
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Guest name"
+        constraints: "non-empty"
+      - name: phone
+        type: string
+        source: input
+        description: "E.164 phone used for SMS notify; unique across customers"
+        constraints: "unique, matches ^\\+[1-9][0-9]{6,14}$"
+      - name: email
+        type: string
+        source: input
+        description: "Contact email"
+        default: null
+      - name: no_show_strikes
+        type: integer
+        source: computed
+        description: "Count of no-shows and late-cancels accrued; bumped by capture-bearing transitions, drives auto-block"
+        default: 0
+      - name: lifetime_reservations
+        type: integer
+        source: computed
+        description: "Count of reservations that reached COMPLETED; denominator for settled reliability"
+        default: 0
+      - name: lifetime_failures
+        type: integer
+        source: computed
+        description: "Count of reservations that reached NO_SHOW plus late CANCELLED; numerator for settled reliability"
+        default: 0
+      - name: settled_reliability_pct
+        type: number
+        source: computed
+        description: "Settled reliability score over closed history; see calc customer_settled_reliability"
+        default: 100.0
+      - name: status
+        type: enum
+        source: computed
+        description: "ACTIVE may book; BLOCKED cannot create or confirm reservations (auto-set at strike threshold or by Manager)"
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, BLOCKED}"
+
+  - name: Reservation
+    parent: null
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id"
+      - name: table_id
+        type: string
+        source: input
+        description: "FK -> Table.id; the specific table the booking holds (party-size and overlap checked against it)"
+        default: null
+      - name: expected_table_version
+        type: integer
+        source: input
+        description: "OCC token: Table.version the client last observed; required on create/reschedule to guard create-with-supersede on a freed slot"
+      - name: party_size
+        type: integer
+        source: input
+        description: "Number of covers; matched against Table.min_party_size/max_party_size"
+        constraints: ">= 1"
+      - name: reservation_start
+        type: datetime
+        source: input
+        description: "UTC ISO 8601 start instant of the booking"
+      - name: turn_window_end
+        type: datetime
+        source: computed
+        description: "reservation_start + effective turn time; end of dwell window (exclusive). See calc reservation_turn_window"
+      - name: release_at
+        type: datetime
+        source: computed
+        description: "turn_window_end + Restaurant.cleanup_buffer_minutes; instant after which the table frees for the next booking"
+      - name: deposit_required
+        type: boolean
+        source: computed
+        description: "True when party_size >= Restaurant.deposit_required_party_threshold; gates CONFIRMED on a held deposit"
+        default: false
+      - name: cancellation_fee_cents
+        type: integer
+        source: computed
+        description: "Fee assessed on late-cancel or no-show; see calc cancellation_fee. 0 until a fee-bearing transition fires"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state; see §1.2 Reservation machine"
+        default: "REQUESTED"
+        constraints: "one of {REQUESTED, CONFIRMED, SEATED, COMPLETED, CANCELLED, NO_SHOW}"
+
+  - name: WaitlistEntry
+    parent: null
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id"
+      - name: party_size
+        type: integer
+        source: input
+        description: "Number of covers waiting"
+        constraints: ">= 1"
+      - name: requested_start
+        type: datetime
+        source: input
+        description: "UTC ISO 8601 earliest start the party will accept"
+      - name: joined_at
+        type: datetime
+        source: system
+        description: "Server timestamp when the entry joined the queue; primary ordering key for promotion (created_at mirrors this)"
+      - name: notify_expires_at
+        type: datetime
+        source: computed
+        description: "Set when NOTIFIED: joined-notify instant + Restaurant notify TTL window; after this the offer lapses. See calc notify_window"
+        default: null
+      - name: notify_count
+        type: integer
+        source: computed
+        description: "Number of times this entry has been NOTIFIED then re-queued; ordering penalty input"
+        default: 0
+      - name: converted_reservation_id
+        type: string
+        source: computed
+        description: "FK -> Reservation.id; set when the entry converts into a confirmed reservation"
+        default: null
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state; see §1.2 WaitlistEntry machine"
+        default: "WAITING"
+        constraints: "one of {WAITING, NOTIFIED, CONVERTED, EXPIRED, CANCELLED}"
+
+  - name: DepositHold
+    parent: null
+    common_fields: true
+    fields:
+      - name: reservation_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id; the booking this card hold backs (1:1)"
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "Held amount; equals the reservation's standard deposit at placement time. See calc standard_deposit"
+        constraints: ">= 0"
+      - name: captured_cents
+        type: integer
+        source: computed
+        description: "Amount actually captured on no-show/late-cancel; <= amount_cents"
+        default: 0
+      - name: card_last4
+        type: string
+        source: input
+        description: "Last four digits of the card backing the hold (display only)"
+        constraints: "4 digits"
+      - name: status
+        type: enum
+        source: computed
+        description: "HELD=authorized; CAPTURED=fee charged; RELEASED=authorization voided; EXPIRED=auth lapsed unused. See §1.2 DepositHold machine"
+        default: "HELD"
+        constraints: "one of {HELD, CAPTURED, RELEASED, EXPIRED}"
+
+  - name: SpecialRequest
+    parent: null
+    common_fields: false
+    fields:
+      - name: reservation_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id"
+      - name: category
+        type: enum
+        source: input
+        description: "Type of request"
+        constraints: "one of {DIETARY, SEATING, OCCASION, ACCESSIBILITY, OTHER}"
+      - name: note
+        type: string
+        source: input
+        description: "Free-text detail of the request"
+        constraints: "non-empty, <= 500 chars"
+      - name: acknowledged
+        type: boolean
+        source: computed
+        description: "Set true once a Host acknowledges the request; immutable thereafter"
+        default: false
+
+  - name: Notification
+    parent: null
+    common_fields: false
+    fields:
+      - name: subject_type
+        type: enum
+        source: input
+        description: "Polymorphic target kind"
+        constraints: "one of {RESERVATION, WAITLIST_ENTRY}"
+      - name: subject_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id when subject_type=RESERVATION; FK -> WaitlistEntry.id when subject_type=WAITLIST_ENTRY (polymorphic; resolved by subject_type)"
+      - name: channel
+        type: enum
+        source: input
+        description: "Delivery channel"
+        default: "SMS"
+        constraints: "one of {SMS, EMAIL}"
+      - name: template
+        type: enum
+        source: input
+        description: "Message template fired"
+        constraints: "one of {WAITLIST_TABLE_READY, RESERVATION_CONFIRMED, RESERVATION_REMINDER, NO_SHOW_FEE_CHARGED, RESERVATION_CANCELLED}"
+      - name: to_phone
+        type: string
+        source: system
+        description: "Snapshot of recipient Customer.phone at send time"
+
+  - name: PrivateDiningEvent
+    parent: null
+    common_fields: true
+    fields:
+      - name: restaurant_id
+        type: string
+        source: input
+        description: "FK -> Restaurant.id"
+      - name: dining_area_id
+        type: string
+        source: input
+        description: "FK -> DiningArea.id; the PRIVATE area bought out for the event window"
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the host of record for the buyout"
+      - name: expected_dining_area_version
+        type: integer
+        source: input
+        description: "OCC token: DiningArea.version the client last observed; required on confirm to guard create-with-supersede buyout of the same window"
+      - name: party_size
+        type: integer
+        source: input
+        description: "Headcount for the buyout"
+        constraints: ">= 1"
+      - name: event_start
+        type: datetime
+        source: input
+        description: "UTC ISO 8601 start of the buyout window"
+      - name: event_end
+        type: datetime
+        source: input
+        description: "UTC ISO 8601 end of the buyout window (inclusive boundary for overlap)"
+      - name: food_minimum_cents
+        type: integer
+        source: input
+        description: "Contracted minimum spend for the event"
+        constraints: ">= 0"
+      - name: deposit_pct
+        type: number
+        source: input
+        description: "Fraction of food_minimum_cents required as a confirming deposit"
+        default: 0.25
+        constraints: ">= 0 and <= 1"
+      - name: service_charge_pct
+        type: number
+        source: input
+        description: "Service-charge fraction of food_minimum_cents prepaid as a separately-rounded second component of the confirming deposit"
+        default: 0.0
+        constraints: ">= 0 and <= 1"
+      - name: deposit_due_cents
+        type: integer
+        source: computed
+        description: "Computed confirming deposit (two separately-rounded components summed); see calc private_dining_deposit"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state; see §1.2 PrivateDiningEvent machine"
+        default: "INQUIRY"
+        constraints: "one of {INQUIRY, PROPOSED, CONFIRMED, COMPLETED, CANCELLED}"
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Reservation
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, CANCELLED, NO_SHOW]
+    transitions:
+      - from: REQUESTED
+        to: CONFIRMED
+        trigger: "POST /reservations/{id}/confirm"
+        actor: Host
+        preconditions:
+          - "Reservation.status == REQUESTED"
+          - "referenced Customer.status == ACTIVE (cross-entity: Reservation→Customer)"
+          - "if Reservation.deposit_required == true then a DepositHold with reservation_id == this.id exists in status HELD"
+          - "Reservation.table_id != null and the referenced Table.status IN {AVAILABLE, DIRTY} (not OUT_OF_SERVICE)"
+        side_effects:
+          - "set Reservation.status = CONFIRMED"
+          - "create Notification {subject_type: RESERVATION, template: RESERVATION_CONFIRMED, to_phone: Customer.phone}"
+        note: "Deposit must already be HELD; confirm does not place the hold."
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /reservations/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "Reservation.status == REQUESTED"
+        side_effects:
+          - "set Reservation.status = CANCELLED"
+          - "if a DepositHold HELD exists for this reservation, set it RELEASED (early cancel: no fee — calc cancellation_fee yields 0 before cutoff)"
+      - from: CONFIRMED
+        to: REQUESTED
+        trigger: "POST /reservations/{id}/reschedule"
+        actor: Customer
+        preconditions:
+          - "Reservation.status == CONFIRMED"
+          - "now is strictly before (reservation_start - Restaurant.late_cancel_cutoff_hours) — reschedule allowed only outside the late window"
+          - "new reservation_start passes party-size, pacing, service-period, and table-overlap checks for the (possibly new) table_id"
+          - "expected_table_version matches the target Table.version (OCC)"
+        side_effects:
+          - "recompute Reservation.turn_window_end and release_at via calc reservation_turn_window for the new start/table"
+          - "set Reservation.status = REQUESTED"
+          - "increments Table.version by 1 for the target table_id"
+        note: "Cyclic edge: CONFIRMED→REQUESTED forms the reschedule loop (non-linear)."
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /reservations/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "Reservation.status == CONFIRMED"
+        side_effects:
+          - "compute Reservation.cancellation_fee_cents via calc cancellation_fee (0 if early, fee if at/after late cutoff)"
+          - "if cancellation_fee_cents > 0 and a HELD DepositHold exists: set DepositHold.captured_cents = cancellation_fee_cents and DepositHold.status = CAPTURED; else if a HELD DepositHold exists: set it RELEASED"
+          - "if cancellation_fee_cents > 0: increment Customer.no_show_strikes by 1, increment Customer.lifetime_failures by 1, recompute Customer.settled_reliability_pct, and if Customer.no_show_strikes >= Restaurant.no_show_strike_block_threshold set Customer.status = BLOCKED (which cascades — see Customer machine)"
+          - "set Reservation.status = CANCELLED"
+          - "free the table: if Table.status == SEATED leave it, else the table's future slot frees and the top eligible WaitlistEntry is NOTIFIED (cascade — see WaitlistEntry promotion)"
+        note: "Cross-entity cascade origin (depth ≥3 on late cancel via Customer block)."
+      - from: CONFIRMED
+        to: SEATED
+        trigger: "POST /reservations/{id}/seat"
+        actor: Host
+        preconditions:
+          - "Reservation.status == CONFIRMED"
+          - "referenced Table.status IN {AVAILABLE, DIRTY} (cross-entity: Reservation→Table)"
+        side_effects:
+          - "set Reservation.status = SEATED"
+          - "set referenced Table.status = SEATED"
+      - from: CONFIRMED
+        to: NO_SHOW
+        trigger: "POST /reservations/{id}/no-show"
+        actor: Host
+        preconditions:
+          - "Reservation.status == CONFIRMED"
+          - "now >= reservation_start + Restaurant grace (grace = 15 minutes after reservation_start)"
+        side_effects:
+          - "compute Reservation.cancellation_fee_cents via calc cancellation_fee with variant=no_show (full per-seat fee)"
+          - "if a HELD DepositHold exists: set DepositHold.captured_cents = cancellation_fee_cents, DepositHold.status = CAPTURED"
+          - "increment Customer.no_show_strikes by 1 and Customer.lifetime_failures by 1, recompute Customer.settled_reliability_pct"
+          - "if Customer.no_show_strikes >= Restaurant.no_show_strike_block_threshold: set Customer.status = BLOCKED (cascade to Customer machine: mass-cancel other future CONFIRMED reservations)"
+          - "create Notification {subject_type: RESERVATION, template: NO_SHOW_FEE_CHARGED}"
+          - "set Reservation.status = NO_SHOW"
+        note: "Depth-≥3 cascade origin: NO_SHOW → DepositHold CAPTURED → strike/Customer BLOCKED → mass-cancel siblings."
+      - from: SEATED
+        to: COMPLETED
+        trigger: "POST /reservations/{id}/complete"
+        actor: Host
+        preconditions:
+          - "Reservation.status == SEATED"
+        side_effects:
+          - "set Reservation.status = COMPLETED"
+          - "increment Customer.lifetime_reservations by 1, recompute Customer.settled_reliability_pct"
+          - "set referenced Table.status = DIRTY"
+          - "if a HELD DepositHold exists set it RELEASED (guest honored the booking)"
+
+  - entity: WaitlistEntry
+    initial_state: WAITING
+    terminal_states: [CONVERTED, EXPIRED, CANCELLED]
+    transitions:
+      - from: WAITING
+        to: NOTIFIED
+        trigger: "POST /waitlist-entries/{id}/notify (Host) or cascade from a table freeing"
+        actor: Host
+        preconditions:
+          - "WaitlistEntry.status == WAITING"
+          - "Restaurant.status == OPEN"
+          - "this entry is the promotion winner: among WAITING entries for the same restaurant whose party_size fits some AVAILABLE table, the one with lowest (notify_count, joined_at) — see calc waitlist_promotion_rank"
+        side_effects:
+          - "set WaitlistEntry.status = NOTIFIED"
+          - "set WaitlistEntry.notify_expires_at via calc notify_window"
+          - "create Notification {subject_type: WAITLIST_ENTRY, template: WAITLIST_TABLE_READY, to_phone: Customer.phone}"
+      - from: NOTIFIED
+        to: CONVERTED
+        trigger: "POST /waitlist-entries/{id}/convert"
+        actor: Host
+        preconditions:
+          - "WaitlistEntry.status == NOTIFIED"
+          - "now <= WaitlistEntry.notify_expires_at"
+          - "an AVAILABLE Table whose [min_party_size, max_party_size] contains WaitlistEntry.party_size exists (cross-entity: WaitlistEntry→Table)"
+        side_effects:
+          - "create a Reservation {customer_id, party_size, table_id=chosen table, reservation_start=now, status=CONFIRMED} for the matched table"
+          - "set WaitlistEntry.converted_reservation_id = new Reservation.id"
+          - "set WaitlistEntry.status = CONVERTED"
+      - from: NOTIFIED
+        to: WAITING
+        trigger: "POST /waitlist-entries/{id}/requeue (Host) or system on notify_expires_at lapse"
+        actor: Host
+        preconditions:
+          - "WaitlistEntry.status == NOTIFIED"
+          - "now > WaitlistEntry.notify_expires_at OR Host explicitly re-queues"
+        side_effects:
+          - "increment WaitlistEntry.notify_count by 1"
+          - "clear WaitlistEntry.notify_expires_at to null"
+          - "set WaitlistEntry.status = WAITING"
+        note: "Cyclic edge: NOTIFIED→WAITING re-queue loop (non-linear). notify_count penalizes ordering."
+      - from: WAITING
+        to: CANCELLED
+        trigger: "POST /waitlist-entries/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "WaitlistEntry.status == WAITING"
+        side_effects:
+          - "set WaitlistEntry.status = CANCELLED"
+      - from: NOTIFIED
+        to: CANCELLED
+        trigger: "POST /waitlist-entries/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "WaitlistEntry.status == NOTIFIED"
+        side_effects:
+          - "set WaitlistEntry.status = CANCELLED"
+          - "a freed-by-decline slot re-runs promotion: the next eligible WAITING entry is NOTIFIED (cascade)"
+      - from: WAITING
+        to: EXPIRED
+        trigger: "system: requested_start window passed with no table (POST /_clock/set_current_utc advancing past requested_start + 120 min)"
+        actor: system
+        preconditions:
+          - "WaitlistEntry.status == WAITING"
+          - "now > requested_start + 120 minutes"
+        side_effects:
+          - "set WaitlistEntry.status = EXPIRED"
+
+  - entity: DepositHold
+    initial_state: HELD
+    terminal_states: [CAPTURED, RELEASED, EXPIRED]
+    transitions:
+      - from: HELD
+        to: CAPTURED
+        trigger: "cascade from Reservation NO_SHOW or late CANCELLED; or POST /deposit-holds/{id}/capture (Manager)"
+        actor: Manager
+        preconditions:
+          - "DepositHold.status == HELD"
+          - "referenced Reservation.status IN {NO_SHOW, CANCELLED} with cancellation_fee_cents > 0 (cross-entity: DepositHold→Reservation)"
+        side_effects:
+          - "set DepositHold.captured_cents = referenced Reservation.cancellation_fee_cents"
+          - "set DepositHold.status = CAPTURED"
+      - from: HELD
+        to: RELEASED
+        trigger: "cascade from Reservation COMPLETED or early CANCELLED; or POST /deposit-holds/{id}/release (Manager)"
+        actor: Manager
+        preconditions:
+          - "DepositHold.status == HELD"
+        side_effects:
+          - "set DepositHold.captured_cents = 0"
+          - "set DepositHold.status = RELEASED"
+      - from: HELD
+        to: EXPIRED
+        trigger: "system: authorization window lapses (POST /_clock advancing past reservation_start + 7 days with hold still HELD)"
+        actor: system
+        preconditions:
+          - "DepositHold.status == HELD"
+          - "now > referenced Reservation.reservation_start + 7 days"
+        side_effects:
+          - "set DepositHold.status = EXPIRED"
+
+  - entity: PrivateDiningEvent
+    initial_state: INQUIRY
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: INQUIRY
+        to: PROPOSED
+        trigger: "POST /private-dining-events/{id}/propose"
+        actor: Manager
+        preconditions:
+          - "PrivateDiningEvent.status == INQUIRY"
+          - "referenced DiningArea.kind == PRIVATE"
+        side_effects:
+          - "compute PrivateDiningEvent.deposit_due_cents via calc private_dining_deposit"
+          - "set PrivateDiningEvent.status = PROPOSED"
+      - from: PROPOSED
+        to: INQUIRY
+        trigger: "POST /private-dining-events/{id}/revise"
+        actor: Manager
+        preconditions:
+          - "PrivateDiningEvent.status == PROPOSED"
+        side_effects:
+          - "set PrivateDiningEvent.status = INQUIRY"
+        note: "Cyclic edge: PROPOSED→INQUIRY proposal-revision loop (non-linear)."
+      - from: PROPOSED
+        to: CONFIRMED
+        trigger: "POST /private-dining-events/{id}/confirm"
+        actor: Manager
+        preconditions:
+          - "PrivateDiningEvent.status == PROPOSED"
+          - "referenced DiningArea.status == AVAILABLE"
+          - "no other CONFIRMED PrivateDiningEvent on the same dining_area_id overlaps [event_start, event_end] (closed-interval whole-area exclusivity — calc covered in §1.4 overlap rule)"
+          - "expected_dining_area_version matches DiningArea.version (OCC)"
+        side_effects:
+          - "set referenced DiningArea.status = BOUGHT_OUT"
+          - "increments DiningArea.version by 1"
+          - "cancel (set CANCELLED) every CONFIRMED or REQUESTED Reservation whose table_id belongs to this dining_area_id and whose [reservation_start, release_at) intersects [event_start, event_end] (cascade), releasing their HELD DepositHolds"
+          - "set PrivateDiningEvent.status = CONFIRMED"
+        note: "Cascade origin: buyout confirm cancels conflicting reservations and releases their holds (depth ≥2)."
+      - from: CONFIRMED
+        to: COMPLETED
+        trigger: "POST /private-dining-events/{id}/complete"
+        actor: Manager
+        preconditions:
+          - "PrivateDiningEvent.status == CONFIRMED"
+        side_effects:
+          - "set referenced DiningArea.status = AVAILABLE"
+          - "set PrivateDiningEvent.status = COMPLETED"
+      - from: INQUIRY
+        to: CANCELLED
+        trigger: "POST /private-dining-events/{id}/cancel"
+        actor: Manager
+        preconditions:
+          - "PrivateDiningEvent.status == INQUIRY"
+        side_effects:
+          - "set PrivateDiningEvent.status = CANCELLED"
+      - from: PROPOSED
+        to: CANCELLED
+        trigger: "POST /private-dining-events/{id}/cancel"
+        actor: Manager
+        preconditions:
+          - "PrivateDiningEvent.status == PROPOSED"
+        side_effects:
+          - "set PrivateDiningEvent.status = CANCELLED"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /private-dining-events/{id}/cancel"
+        actor: Manager
+        preconditions:
+          - "PrivateDiningEvent.status == CONFIRMED"
+        side_effects:
+          - "set referenced DiningArea.status = AVAILABLE"
+          - "increments DiningArea.version by 1"
+          - "set PrivateDiningEvent.status = CANCELLED"
+
+  - entity: Customer
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: BLOCKED
+        trigger: "cascade from no_show_strikes >= threshold; or POST /customers/{id}/block (Manager)"
+        actor: Manager
+        preconditions:
+          - "Customer.status == ACTIVE"
+        side_effects:
+          - "set Customer.status = BLOCKED"
+          - "cascade: for every Reservation of this customer in status CONFIRMED or REQUESTED with reservation_start in the future, set it CANCELLED, compute cancellation_fee per calc cancellation_fee (block-cancel is treated as early → fee 0), and RELEASE its HELD DepositHold"
+        note: "Tail of the no-show cascade chain; depth-3 hop C→D (block → mass-cancel siblings)."
+      - from: BLOCKED
+        to: ACTIVE
+        trigger: "POST /customers/{id}/unblock"
+        actor: Manager
+        preconditions:
+          - "Customer.status == BLOCKED"
+        side_effects:
+          - "set Customer.status = ACTIVE"
+          - "set Customer.no_show_strikes = 0 (strike slate cleared on manual reinstatement)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version — true CREATE-with-supersede races only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: reservation-create-stale-table
+    parent_entity: Table
+    write_endpoint: "POST /reservations"
+    occ_field: "expected_table_version"
+    description: |
+      Creating a Reservation against a Table whose version has advanced since
+      the client last observed it is rejected. This captures the case where the
+      slot the client believed free was just taken (a prior create or reschedule
+      legitimately occupied an overlapping window on that table and bumped the
+      table's version), so the current writer's view of the table is stale.
+    error_id: ERR_STALE_TABLE_VERSION
+    http_status: 412
+
+  - rule_id: private-dining-confirm-stale-area
+    parent_entity: DiningArea
+    write_endpoint: "POST /private-dining-events/{id}/confirm"
+    occ_field: "expected_dining_area_version"
+    description: |
+      Confirming a PrivateDiningEvent buyout against a DiningArea whose version
+      has advanced since the client last observed it is rejected. This captures
+      the case where another buyout legitimately confirmed (and bought out) the
+      same area window, advancing the area's version, so this confirm's view of
+      the area is stale.
+    error_id: ERR_STALE_AREA_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: reservation_turn_window
+    trigger: "on POST /reservations (create), and recomputed on POST /reservations/{id}/reschedule"
+    algorithm: interval_merge
+    formula: |
+      effective_turn = Table.turn_time_minutes if Table.turn_time_minutes != null
+                       else Restaurant.default_turn_time_minutes
+      turn_window_end = reservation_start + minutes(effective_turn)
+      release_at      = turn_window_end + minutes(Restaurant.cleanup_buffer_minutes)
+    input_set: "the reservation's assigned Table (turn override) and its Restaurant (default turn + cleanup buffer)"
+    constants: {}
+    precision: "whole minutes; datetimes ISO 8601 with three fractional digits"
+
+  - name: standard_deposit
+    trigger: "on POST /reservations/{id}/deposit-holds (placing the card hold for a deposit_required reservation)"
+    algorithm: aggregation
+    formula: |
+      amount_cents = Restaurant.per_seat_deposit_cents * Reservation.party_size
+    input_set: "the reservation's party_size and its Restaurant.per_seat_deposit_cents"
+    constants: {}
+    precision: "integer cents; no rounding (product of integers)"
+    variants:
+      - name: standard_reservation
+        when: "ordinary table reservation with party_size >= deposit_required_party_threshold"
+        difference: "linear per-seat product on the Reservation domain"
+
+  - name: private_dining_deposit
+    trigger: "on POST /private-dining-events/{id}/propose"
+    algorithm: aggregation
+    formula: |
+      # COMBINATORIAL mode (b): two fractional components, each rounded to whole cents
+      # SEPARATELY, THEN summed. Order is pinned: round-then-sum, NOT sum-then-round.
+      food_component    = round_half_up(food_minimum_cents * deposit_pct)        # to whole cents
+      service_component = round_half_up(food_minimum_cents * service_charge_pct) # to whole cents
+      deposit_due_cents = food_component + service_component
+      # Contrast (the WRONG order, which the scaffold forbids):
+      #   round_half_up(food_minimum_cents*deposit_pct + food_minimum_cents*service_charge_pct)
+      # The two orders diverge by 1 cent whenever each component's fractional part is < .5
+      # but their sum's fractional part is >= .5 (e.g. food=100003, dp=0.25, sp=0.18:
+      # round-then-sum=43002, sum-then-round=43001).
+    input_set: "the event's food_minimum_cents, deposit_pct, and service_charge_pct"
+    constants: {}
+    precision: "round_half_up each component to integer cents, THEN sum (pinned order)"
+    variants:
+      - name: private_dining
+        when: "private-dining buyout"
+        difference: "percentage of contracted food minimum (PLUS a separately-rounded per-guest gratuity component) on the PrivateDiningEvent domain — distinct entity domain and distinct basis from standard_deposit (per-seat). DUAL-VARIANT vs standard_deposit (rule dual_variant_calc)."
+
+  - name: cancellation_fee
+    trigger: "on POST /reservations/{id}/cancel (late) and POST /reservations/{id}/no-show"
+    algorithm: threshold
+    formula: |
+      hours_before = (reservation_start - now) / 3600   # may be negative for no-show
+      per_seat = Restaurant.per_seat_deposit_cents
+      n = Reservation.party_size
+      if variant == no_show:
+          fee = per_seat * n                                  # 100% of held deposit
+      elif hours_before >= Restaurant.late_cancel_cutoff_hours:
+          fee = 0                                             # early cancel, fully refundable
+      elif hours_before >= 2:
+          fee = round_half_up(0.50 * per_seat * n)            # late but >= 2h out: 50%
+      else:
+          fee = per_seat * n                                  # < 2h out: 100%
+      fee = min(fee, DepositHold.amount_cents) if a HELD DepositHold exists else fee
+    input_set: "reservation_start, now (clock), party_size, Restaurant.per_seat_deposit_cents, Restaurant.late_cancel_cutoff_hours, and the HELD DepositHold.amount_cents cap"
+    constants:
+      LATE_TIER_HOURS: 2
+      LATE_TIER_PCT: 0.50
+    precision: "round_half_up to integer cents"
+    variants:
+      - name: late_cancel
+        when: "POST /cancel while CONFIRMED and now is within late_cancel_cutoff_hours of reservation_start"
+        difference: "tiered by hours_before: 0% (early), 50% (>=2h), 100% (<2h)"
+      - name: no_show
+        when: "POST /no-show"
+        difference: "always 100% of per-seat * party_size regardless of timing; capped at held amount"
+
+  - name: customer_settled_reliability
+    trigger: "recomputed on Reservation COMPLETED, NO_SHOW, and late CANCELLED"
+    algorithm: weighted_scoring
+    formula: |
+      denom = Customer.lifetime_reservations + Customer.lifetime_failures
+      if denom == 0:
+          settled_reliability_pct = 100.0
+      else:
+          settled_reliability_pct = round_half_up_1dp(
+              100.0 * Customer.lifetime_reservations / denom )
+    input_set: "Customer.lifetime_reservations (COMPLETED count) and Customer.lifetime_failures (NO_SHOW + late CANCELLED count) — settled history only"
+    constants: {}
+    precision: "round_half_up to 1 decimal place"
+    variants:
+      - name: settled
+        when: "final score over closed reservations only"
+        difference: "uses only terminal-outcome counts; the provisional variant differs"
+      - name: provisional
+        when: "GET /customers/{id}/reliability?mode=provisional — projects open CONFIRMED reservations as if they will succeed"
+        difference: "denom and numerator both add the count of the customer's currently CONFIRMED (open) reservations, treating them as future successes; yields a different number than settled for the same customer. DUAL-VARIANT (provisional vs settled) on the Customer domain — distinct entity domain from the deposit dual-variant (rule dual_variant_calc)."
+
+  - name: waitlist_promotion_rank
+    trigger: "on table-freeing cascade and POST /waitlist-entries/{id}/notify"
+    algorithm: chronological
+    formula: |
+      candidate set = WaitlistEntry where status == WAITING
+                      and restaurant_id == R
+                      and exists Table T with status == AVAILABLE
+                          and T.min_party_size <= entry.party_size <= T.max_party_size
+      winner = argmin over candidates of (notify_count ASC, joined_at ASC)
+      # joined_at is the deterministic tie-break; id is NEVER used.
+    input_set: "WAITING entries for restaurant R with a party-size-fitting AVAILABLE table"
+    constants: {}
+    precision: "exact ordering; tie-break joined_at ASC, never id"
+
+  - name: notify_window
+    trigger: "on WaitlistEntry WAITING→NOTIFIED"
+    algorithm: threshold
+    formula: |
+      notify_expires_at = now + minutes(NOTIFY_TTL_MINUTES)
+    input_set: "the clock at notify time"
+    constants:
+      NOTIFY_TTL_MINUTES: 10
+    precision: "whole minutes"
+
+  - name: pacing_slot_load
+    trigger: "on POST /reservations (create) and reschedule — pacing capacity check"
+    algorithm: aggregation
+    formula: |
+      slot_grid_time = floor reservation_start onto the ServicePeriod slot grid
+                       (start_local_time + k * slot_interval_minutes)
+      current_load = sum of party_size over Reservations with
+                     status IN {REQUESTED, CONFIRMED, SEATED}
+                     and the same restaurant_id
+                     and reservation_start landing on slot_grid_time
+      projected = current_load + new party_size
+      # accept iff projected <= ServicePeriod.pacing_max_covers_per_slot
+    input_set: "Reservations in {REQUESTED, CONFIRMED, SEATED} on the same restaurant and slot grid time"
+    constants: {}
+    precision: "integer covers; boundary is inclusive (projected == cap is allowed; cap+1 rejected)"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /customers (self-registration) and the /_clock test endpoint"
+  - priority: 2
+    category: auth
+    check: "the role is permitted to perform this operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "every path id and every FK in the body resolves to an existing entity, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all id-bearing requests"
+  - priority: 4
+    category: state
+    check: "target entity is in a state from which this transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 5
+    category: business_referential
+    check: "ownership — a Customer may only act on (cancel/reschedule/join-waitlist-as) resources whose customer_id equals X-User-ID"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /reservations/{id}/cancel, /reschedule, POST /waitlist-entries/{id}/cancel when acting as Customer"
+  - priority: 6
+    category: business_safety
+    check: "the acting/target Customer.status != BLOCKED for any create/confirm of a reservation or waitlist join"
+    error_id: ERR_CUSTOMER_BLOCKED
+    http_status: 403
+    applies_to: "POST /reservations, POST /reservations/{id}/confirm, POST /waitlist-entries"
+  - priority: 7
+    category: business_constraint
+    check: "Restaurant.status == OPEN for any new reservation or waitlist join"
+    error_id: ERR_RESTAURANT_CLOSED
+    http_status: 409
+    applies_to: "POST /reservations, POST /waitlist-entries"
+  - priority: 8
+    category: business_constraint
+    check: "party_size within the chosen Table's [min_party_size, max_party_size]"
+    error_id: ERR_PARTY_SIZE_MISMATCH
+    http_status: 422
+    applies_to: "POST /reservations, POST /reservations/{id}/reschedule"
+  - priority: 9
+    category: business_temporal
+    check: "reservation_start local time falls inside some ServicePeriod window and aligns to its slot grid"
+    error_id: ERR_OUTSIDE_SERVICE_PERIOD
+    http_status: 422
+    applies_to: "POST /reservations, POST /reservations/{id}/reschedule"
+  - priority: 10
+    category: business_temporal
+    check: "table-overlap — the new [reservation_start, release_at) does not intersect any active reservation's window on the same table_id (half-open with cleanup buffer baked into release_at)"
+    error_id: ERR_TABLE_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /reservations, POST /reservations/{id}/reschedule"
+  - priority: 11
+    category: business_temporal
+    check: "area-buyout overlap — no CONFIRMED PrivateDiningEvent on the table's dining_area_id has a [event_start, event_end] (closed) window intersecting the reservation window; and on confirm, no other CONFIRMED buyout overlaps this event's closed window"
+    error_id: ERR_AREA_BOUGHT_OUT
+    http_status: 409
+    applies_to: "POST /reservations, POST /reservations/{id}/reschedule, POST /private-dining-events/{id}/confirm"
+  - priority: 12
+    category: business_constraint
+    check: "pacing — projected slot covers (current_load + party_size) must not exceed ServicePeriod.pacing_max_covers_per_slot (inclusive boundary)"
+    error_id: ERR_PACING_EXCEEDED
+    http_status: 409
+    applies_to: "POST /reservations, POST /reservations/{id}/reschedule"
+  - priority: 13
+    category: business_fiscal
+    check: "confirm requires a HELD DepositHold when deposit_required == true"
+    error_id: ERR_DEPOSIT_REQUIRED
+    http_status: 402
+    applies_to: "POST /reservations/{id}/confirm"
+  - priority: 14
+    category: business_referential
+    check: "OCC — expected_table_version must equal the live Table.version (reservations) / expected_dining_area_version must equal DiningArea.version (buyout confirm)"
+    error_id: ERR_STALE_TABLE_VERSION
+    http_status: 412
+    applies_to: "POST /reservations, POST /reservations/{id}/reschedule, POST /private-dining-events/{id}/confirm"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Restaurant ----
+  - method: POST
+    path: "/restaurants"
+    description: "Create a restaurant with turn/pacing/deposit/no-show policy"
+    roles: [Manager]
+    code: 201
+    input: [name, "timezone?", "default_turn_time_minutes?", "cleanup_buffer_minutes?", "late_cancel_cutoff_hours?", "no_show_strike_block_threshold?", "per_seat_deposit_cents?", "deposit_required_party_threshold?"]
+    output: Restaurant
+    side_effects: ["Restaurant created with status OPEN"]
+  - method: GET
+    path: "/restaurants/{id}"
+    description: "Read a restaurant"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: []
+    output: Restaurant
+    side_effects: []
+  - method: POST
+    path: "/restaurants/{id}/close"
+    description: "Close the restaurant (rejects new bookings)"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: Restaurant
+    side_effects: ["Restaurant.status = CLOSED"]
+  - method: POST
+    path: "/restaurants/{id}/open"
+    description: "Re-open the restaurant"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: Restaurant
+    side_effects: ["Restaurant.status = OPEN"]
+
+  # ---- DiningArea (FK reverse-reachability for DiningArea.restaurant_id) ----
+  - method: POST
+    path: "/dining-areas"
+    description: "Create a dining area under a restaurant"
+    roles: [Manager]
+    code: 201
+    input: [restaurant_id, name, "kind?"]
+    output: DiningArea
+    side_effects: ["DiningArea created with status AVAILABLE"]
+  - method: GET
+    path: "/dining-areas/{id}"
+    description: "Read a dining area"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: []
+    output: DiningArea
+    side_effects: []
+  - method: GET
+    path: "/dining-areas"
+    description: "List dining areas, optionally filtered by restaurant"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: ["restaurant_id?", "limit?", "offset?"]
+    output: DiningArea[]
+    side_effects: []
+
+  # ---- Table (FK reverse-reachability for Table.dining_area_id) ----
+  - method: POST
+    path: "/tables"
+    description: "Create a table in a dining area"
+    roles: [Manager]
+    code: 201
+    input: [dining_area_id, label, "min_party_size?", max_party_size, "turn_time_minutes?"]
+    output: Table
+    side_effects: ["Table created with status AVAILABLE, version 1"]
+  - method: GET
+    path: "/tables/{id}"
+    description: "Read a table"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: []
+    output: Table
+    side_effects: []
+  - method: GET
+    path: "/tables"
+    description: "List tables, optionally filtered by dining area"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: ["dining_area_id?", "limit?", "offset?"]
+    output: Table[]
+    side_effects: []
+  - method: POST
+    path: "/tables/{id}/out-of-service"
+    description: "Mark a table OUT_OF_SERVICE"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: Table
+    side_effects: ["Table.status = OUT_OF_SERVICE", "increments Table.version by 1"]
+  - method: POST
+    path: "/tables/{id}/return-to-service"
+    description: "Return a table to AVAILABLE"
+    roles: [Manager, Host]
+    code: 200
+    input: []
+    output: Table
+    side_effects: ["Table.status = AVAILABLE", "increments Table.version by 1"]
+  - method: POST
+    path: "/tables/{id}/bus"
+    description: "Buss a DIRTY table back to AVAILABLE"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Table
+    side_effects: ["Table.status = AVAILABLE", "increments Table.version by 1", "table-freeing cascade: re-run waitlist promotion"]
+
+  # ---- ServicePeriod (FK reverse-reachability for ServicePeriod.restaurant_id) ----
+  - method: POST
+    path: "/service-periods"
+    description: "Create a service period with pacing config"
+    roles: [Manager]
+    code: 201
+    input: [restaurant_id, name, start_local_time, end_local_time, "slot_interval_minutes?", pacing_max_covers_per_slot]
+    output: ServicePeriod
+    side_effects: ["ServicePeriod created"]
+  - method: GET
+    path: "/service-periods/{id}"
+    description: "Read a service period"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: []
+    output: ServicePeriod
+    side_effects: []
+  - method: GET
+    path: "/service-periods"
+    description: "List service periods, optionally filtered by restaurant"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: ["restaurant_id?", "limit?", "offset?"]
+    output: ServicePeriod[]
+    side_effects: []
+
+  # ---- Customer (self-registration; entity_backed role) ----
+  - method: POST
+    path: "/customers"
+    description: "Register a customer (self-service; no auth required)"
+    roles: [Customer, Manager, Host]
+    code: 201
+    input: [full_name, phone, "email?"]
+    output: Customer
+    side_effects: ["Customer created with status ACTIVE, no_show_strikes 0"]
+  - method: GET
+    path: "/customers/{id}"
+    description: "Read a customer"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/customers/{id}/reliability"
+    description: "Computed reliability score; mode selects settled (default) or provisional projection"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: ["mode?"]
+    output: "{ customer_id: string, mode: string, reliability_pct: number, lifetime_reservations: integer, lifetime_failures: integer, open_confirmed_count: integer }"
+    side_effects: []
+  - method: POST
+    path: "/customers/{id}/block"
+    description: "Manually block a customer"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["Customer.status = BLOCKED", "cascade: mass-cancel future CONFIRMED/REQUESTED reservations and release their holds"]
+  - method: POST
+    path: "/customers/{id}/unblock"
+    description: "Reinstate a blocked customer and clear strikes"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["Customer.status = ACTIVE", "Customer.no_show_strikes = 0"]
+
+  # ---- Reservation ----
+  - method: POST
+    path: "/reservations"
+    description: "Create a reservation (REQUESTED) on a specific table; runs party-size, service-period, overlap, area-buyout, pacing, and OCC checks"
+    roles: [Customer, Host]
+    code: 201
+    input: [restaurant_id, customer_id, table_id, expected_table_version, party_size, reservation_start]
+    output: Reservation
+    side_effects: ["compute turn_window_end, release_at (calc reservation_turn_window)", "set deposit_required", "compute pacing_slot_load", "increments Table.version by 1"]
+  - method: GET
+    path: "/reservations/{id}"
+    description: "Read a reservation"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+  - method: GET
+    path: "/reservations"
+    description: "List reservations; filterable by restaurant, customer, or table (serves FK reverse-reachability for restaurant_id, customer_id, table_id)"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: ["restaurant_id?", "customer_id?", "table_id?", "status?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+  - method: POST
+    path: "/reservations/{id}/deposit-holds"
+    description: "Place a credit-card deposit hold for a deposit_required reservation"
+    roles: [Customer, Host]
+    code: 201
+    input: [card_last4]
+    output: DepositHold
+    side_effects: ["compute amount_cents (calc standard_deposit)", "DepositHold created HELD"]
+  - method: POST
+    path: "/reservations/{id}/confirm"
+    description: "Confirm a REQUESTED reservation (requires HELD deposit if deposit_required)"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["Reservation.status = CONFIRMED", "Notification RESERVATION_CONFIRMED"]
+  - method: POST
+    path: "/reservations/{id}/reschedule"
+    description: "Move a CONFIRMED reservation to a new start/table (cyclic edge back to REQUESTED); re-runs all booking checks + OCC"
+    roles: [Customer, Host]
+    code: 200
+    input: [table_id, expected_table_version, reservation_start]
+    output: Reservation
+    side_effects: ["recompute turn window", "Reservation.status = REQUESTED", "increments Table.version by 1"]
+  - method: POST
+    path: "/reservations/{id}/cancel"
+    description: "Cancel a REQUESTED or CONFIRMED reservation; computes cancellation_fee and captures/releases deposit; frees table"
+    roles: [Customer, Host]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["calc cancellation_fee", "capture or release DepositHold", "possible strike + Customer block cascade", "table-freeing cascade → waitlist promotion"]
+  - method: POST
+    path: "/reservations/{id}/seat"
+    description: "Seat a CONFIRMED party (Table → SEATED)"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["Reservation.status = SEATED", "Table.status = SEATED"]
+  - method: POST
+    path: "/reservations/{id}/no-show"
+    description: "Mark a CONFIRMED reservation NO_SHOW after grace; captures full deposit, strikes customer, may block + cascade"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["calc cancellation_fee (no_show variant)", "DepositHold CAPTURED", "strike + reliability recompute", "possible Customer block cascade", "Notification NO_SHOW_FEE_CHARGED"]
+  - method: POST
+    path: "/reservations/{id}/complete"
+    description: "Complete a SEATED reservation (Table → DIRTY)"
+    roles: [Host]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["Reservation.status = COMPLETED", "Customer.lifetime_reservations++", "reliability recompute", "Table.status = DIRTY", "release HELD DepositHold"]
+
+  # ---- DepositHold (FK reverse-reachability for DepositHold.reservation_id) ----
+  - method: GET
+    path: "/deposit-holds/{id}"
+    description: "Read a deposit hold"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: []
+    output: DepositHold
+    side_effects: []
+  - method: GET
+    path: "/deposit-holds"
+    description: "List deposit holds, filterable by reservation"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: ["reservation_id?", "status?", "limit?", "offset?"]
+    output: DepositHold[]
+    side_effects: []
+  - method: POST
+    path: "/deposit-holds/{id}/capture"
+    description: "Manager-initiated capture of a HELD deposit against a fee-bearing reservation"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: DepositHold
+    side_effects: ["DepositHold.captured_cents = Reservation.cancellation_fee_cents", "DepositHold.status = CAPTURED"]
+  - method: POST
+    path: "/deposit-holds/{id}/release"
+    description: "Manager-initiated release/void of a HELD deposit"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: DepositHold
+    side_effects: ["DepositHold.status = RELEASED"]
+
+  # ---- WaitlistEntry ----
+  - method: POST
+    path: "/waitlist-entries"
+    description: "Join the waitlist for a restaurant"
+    roles: [Customer, Host]
+    code: 201
+    input: [restaurant_id, customer_id, party_size, requested_start]
+    output: WaitlistEntry
+    side_effects: ["WaitlistEntry created WAITING, joined_at stamped"]
+  - method: GET
+    path: "/waitlist-entries/{id}"
+    description: "Read a waitlist entry"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: []
+    output: WaitlistEntry
+    side_effects: []
+  - method: GET
+    path: "/waitlist-entries"
+    description: "List waitlist entries; filterable by restaurant or customer (serves FK reverse-reachability for restaurant_id, customer_id) and by converted_reservation_id"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: ["restaurant_id?", "customer_id?", "converted_reservation_id?", "status?", "limit?", "offset?"]
+    output: WaitlistEntry[]
+    side_effects: []
+  - method: POST
+    path: "/waitlist-entries/{id}/notify"
+    description: "Notify the promotion-winning WAITING entry that a table is ready"
+    roles: [Host]
+    code: 200
+    input: []
+    output: WaitlistEntry
+    side_effects: ["status = NOTIFIED", "notify_expires_at via calc notify_window", "Notification WAITLIST_TABLE_READY"]
+  - method: POST
+    path: "/waitlist-entries/{id}/convert"
+    description: "Convert a NOTIFIED entry into a CONFIRMED reservation on a matching AVAILABLE table"
+    roles: [Host]
+    code: 200
+    input: [table_id]
+    output: WaitlistEntry
+    side_effects: ["create Reservation CONFIRMED", "set converted_reservation_id", "status = CONVERTED"]
+  - method: POST
+    path: "/waitlist-entries/{id}/requeue"
+    description: "Return a NOTIFIED entry to WAITING (no response / declined); bumps notify_count"
+    roles: [Host]
+    code: 200
+    input: []
+    output: WaitlistEntry
+    side_effects: ["notify_count++", "clear notify_expires_at", "status = WAITING"]
+  - method: POST
+    path: "/waitlist-entries/{id}/cancel"
+    description: "Customer leaves the waitlist"
+    roles: [Customer, Host]
+    code: 200
+    input: []
+    output: WaitlistEntry
+    side_effects: ["status = CANCELLED", "if was NOTIFIED, re-run promotion cascade"]
+
+  # ---- SpecialRequest (FK reverse-reachability for SpecialRequest.reservation_id) ----
+  - method: POST
+    path: "/reservations/{id}/special-requests"
+    description: "Attach a special request to a reservation"
+    roles: [Customer, Host]
+    code: 201
+    input: [category, note]
+    output: SpecialRequest
+    side_effects: ["SpecialRequest created, acknowledged false"]
+  - method: GET
+    path: "/reservations/{id}/special-requests"
+    description: "List special requests for a reservation (FK reverse-reachability for SpecialRequest.reservation_id)"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: SpecialRequest[]
+    side_effects: []
+  - method: POST
+    path: "/special-requests/{id}/acknowledge"
+    description: "Host acknowledges a special request (immutable thereafter)"
+    roles: [Host]
+    code: 200
+    input: []
+    output: SpecialRequest
+    side_effects: ["acknowledged = true"]
+
+  # ---- Notification (FK reverse-reachability for Notification.subject_id polymorphic) ----
+  - method: GET
+    path: "/notifications/{id}"
+    description: "Read a notification record"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: []
+    output: Notification
+    side_effects: []
+  - method: GET
+    path: "/notifications"
+    description: "List notification records; filter by subject (serves polymorphic FK reverse-reachability for subject_id over both target kinds)"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: ["subject_type?", "subject_id?", "channel?", "limit?", "offset?"]
+    output: Notification[]
+    side_effects: []
+
+  # ---- PrivateDiningEvent ----
+  - method: POST
+    path: "/private-dining-events"
+    description: "Open a private-dining inquiry for a PRIVATE area window"
+    roles: [Manager]
+    code: 201
+    input: [restaurant_id, dining_area_id, customer_id, party_size, event_start, event_end, food_minimum_cents, "deposit_pct?", "service_charge_pct?"]
+    output: PrivateDiningEvent
+    side_effects: ["PrivateDiningEvent created INQUIRY"]
+  - method: GET
+    path: "/private-dining-events/{id}"
+    description: "Read a private dining event"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: []
+    output: PrivateDiningEvent
+    side_effects: []
+  - method: GET
+    path: "/private-dining-events"
+    description: "List private dining events; filterable by restaurant, dining area, or customer (serves FK reverse-reachability for restaurant_id, dining_area_id, customer_id)"
+    roles: [Manager, Host, Customer]
+    code: 200
+    input: ["restaurant_id?", "dining_area_id?", "customer_id?", "status?", "limit?", "offset?"]
+    output: PrivateDiningEvent[]
+    side_effects: []
+  - method: POST
+    path: "/private-dining-events/{id}/propose"
+    description: "Move INQUIRY → PROPOSED, computing the confirming deposit"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: PrivateDiningEvent
+    side_effects: ["compute deposit_due_cents (calc private_dining_deposit)", "status = PROPOSED"]
+  - method: POST
+    path: "/private-dining-events/{id}/revise"
+    description: "Send a PROPOSED event back to INQUIRY for re-pricing (cyclic edge)"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: PrivateDiningEvent
+    side_effects: ["status = INQUIRY"]
+  - method: POST
+    path: "/private-dining-events/{id}/confirm"
+    description: "Confirm a buyout: occupy the area, OCC-guard, and cancel conflicting reservations"
+    roles: [Manager]
+    code: 200
+    input: [expected_dining_area_version]
+    output: PrivateDiningEvent
+    side_effects: ["DiningArea.status = BOUGHT_OUT", "increments DiningArea.version by 1", "cascade-cancel intersecting reservations + release holds", "status = CONFIRMED"]
+  - method: POST
+    path: "/private-dining-events/{id}/complete"
+    description: "Complete a CONFIRMED buyout, freeing the area"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: PrivateDiningEvent
+    side_effects: ["DiningArea.status = AVAILABLE", "status = COMPLETED"]
+  - method: POST
+    path: "/private-dining-events/{id}/cancel"
+    description: "Cancel a private dining event in any non-terminal state"
+    roles: [Manager]
+    code: 200
+    input: []
+    output: PrivateDiningEvent
+    side_effects: ["if was CONFIRMED: DiningArea.status = AVAILABLE and increments DiningArea.version by 1", "status = CANCELLED"]
+
+  # ---- Test-driving clock endpoint (last-resort namespace) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-only: set the server's notion of current UTC for time-gated transitions (no-show grace, late-cancel cutoff, notify TTL, waitlist/hold expiry)"
+    roles: [Manager]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: string }"
+    side_effects: ["server clock pinned; advancing it may fire system transitions (waitlist EXPIRED, hold EXPIRED) on next read of affected entities"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing or malformed X-User-Role / X-User-ID on an authenticated endpoint"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "authenticated role not permitted for this operation per §1.7"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Customer acting on a reservation/waitlist entry whose customer_id != X-User-ID"
+  - id: ERR_CUSTOMER_BLOCKED
+    http: 403
+    condition: "create/confirm reservation or join waitlist while the Customer.status == BLOCKED"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a path id or body FK does not resolve to an existing entity"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "transition not defined from the entity's current state"
+  - id: ERR_RESTAURANT_CLOSED
+    http: 409
+    condition: "new reservation or waitlist join while Restaurant.status == CLOSED"
+  - id: ERR_TABLE_DOUBLE_BOOKED
+    http: 409
+    condition: "requested [reservation_start, release_at) overlaps an active reservation window on the same table"
+  - id: ERR_AREA_BOUGHT_OUT
+    http: 409
+    condition: "reservation window intersects a CONFIRMED private-dining buyout of the table's area, or a confirm collides with an existing buyout window"
+  - id: ERR_PACING_EXCEEDED
+    http: 409
+    condition: "projected slot covers would exceed ServicePeriod.pacing_max_covers_per_slot"
+  - id: ERR_NO_SHOW_TOO_EARLY
+    http: 409
+    condition: "no-show marked before reservation_start + grace (15 minutes)"
+  - id: ERR_RESCHEDULE_TOO_LATE
+    http: 409
+    condition: "reschedule attempted at or after the late-cancel cutoff window"
+  - id: ERR_PARTY_SIZE_MISMATCH
+    http: 422
+    condition: "party_size outside the chosen Table's [min_party_size, max_party_size]"
+  - id: ERR_OUTSIDE_SERVICE_PERIOD
+    http: 422
+    condition: "reservation_start not within any service period window or not aligned to the slot grid"
+  - id: ERR_DEPOSIT_REQUIRED
+    http: 402
+    condition: "confirm a deposit_required reservation with no HELD DepositHold"
+  - id: ERR_AREA_NOT_PRIVATE
+    http: 422
+    condition: "propose a private-dining event on a DiningArea whose kind != PRIVATE"
+  - id: ERR_STALE_TABLE_VERSION
+    http: 412
+    condition: "expected_table_version != live Table.version on reservation create/reschedule"
+  - id: ERR_STALE_AREA_VERSION
+    http: 412
+    condition: "expected_dining_area_version != live DiningArea.version on buyout confirm"
+  - id: ERR_NOTIFY_WINDOW_EXPIRED
+    http: 409
+    condition: "convert a NOTIFIED waitlist entry after notify_expires_at"
+  - id: ERR_NO_MATCHING_TABLE
+    http: 409
+    condition: "convert/notify when no AVAILABLE table fits the waitlist party_size"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "malformed body: missing required field, bad enum, bad phone format, negative integer, deposit_pct out of [0,1]"
+  - id: ERR_DUPLICATE_PHONE
+    http: 409
+    condition: "registering a Customer with a phone already in use"
+  - id: ERR_DUPLICATE_DEPOSIT_HOLD
+    http: 409
+    condition: "placing a second DepositHold on a reservation that already has a non-RELEASED/non-EXPIRED hold"
+  - id: ERR_PAGINATION_INVALID
+    http: 422
+    condition: "limit/offset out of [min,max] bounds"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Customer
+    description: "A guest who registers, books and manages their own reservations, joins/leaves the waitlist, and attaches special requests."
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "self-register (POST /customers)"
+      - "act as resource owner: cancel/reschedule own reservation, cancel own waitlist entry (ownership enforced: customer_id == X-User-ID)"
+    shared_operations:
+      - "POST /reservations (own bookings), POST /reservations/{id}/deposit-holds, POST /reservations/{id}/special-requests, POST /waitlist-entries — shared with Host"
+      - "all GET reads of own and reference data"
+  - name: Host
+    description: "Front-of-house operator running the floor: confirms, seats, completes, marks no-show, and drives the waitlist (notify/convert/requeue)."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /reservations/{id}/confirm, /seat, /no-show, /complete"
+      - "POST /waitlist-entries/{id}/notify, /convert, /requeue"
+      - "POST /special-requests/{id}/acknowledge"
+      - "POST /tables/{id}/bus"
+    shared_operations:
+      - "POST /reservations, /reschedule, /cancel, deposit-holds, special-requests; POST /waitlist-entries, /waitlist-entries/{id}/cancel — shared with Customer"
+      - "POST /tables/{id}/return-to-service — shared with Manager"
+      - "all GET reads"
+  - name: Manager
+    description: "Back-of-house administrator: configures restaurants/areas/tables/service-periods, manages deposits, blocks/unblocks customers, and owns private dining, plus the test clock."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /restaurants, /restaurants/{id}/open|close"
+      - "POST /dining-areas, /tables, /service-periods, /tables/{id}/out-of-service"
+      - "POST /customers/{id}/block, /unblock"
+      - "POST /deposit-holds/{id}/capture, /release"
+      - "all POST /private-dining-events/* (create, propose, revise, confirm, complete, cancel)"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /tables/{id}/return-to-service — shared with Host"
+      - "POST /customers — shared with Customer/Host"
+      - "all GET reads"

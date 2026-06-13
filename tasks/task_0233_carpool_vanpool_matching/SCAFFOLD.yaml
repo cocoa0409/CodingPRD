@@ -1,0 +1,1408 @@
+# =============================================================================
+# Carpool & Vanpool Matching — SCAFFOLD (§1.0–§1.7)
+# Difficulty tier: Expert (§0.4)
+# =============================================================================
+
+scenario: |
+  Carpool & Vanpool Matching: rider/driver profile, route/schedule matching,
+  cost-share calculation, HOV/commuter-benefit subsidy, seat reservation,
+  reliability/no-show score, employer program, guaranteed ride home
+
+domain_name: carpool-vanpool-matching
+api_prefix: "/"
+
+complexity_profile:
+  primary_archetype: quota_allocation        # finite seats reserved/committed/released on each Trip
+  secondary_archetype: pricing_engine        # multi-step cost-share + HOV/commuter-benefit subsidy chains
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on Trip.version (last-seat) and Pool.version (last-membership)
+    - cascading_side_effects                 # trip-cancel and no-show cascades span 3–4 entities
+    - dual_variant_calculation               # estimate vs final cost-share; provisional vs confirmed reliability
+    - rate_threshold_triggers                # reliability floor, commuter-benefit cap, occupancy tiers
+    - derived_field_reconciliation           # Trip.seats_reserved, EmployerProgram.subsidy_consumed_cents, Member.reliability_score
+
+  entity_topology: flat                      # peer entities linked by FK; no nested URL ownership chains
+  state_machine_shape: parallel              # Reservation carries independent reservation_status × payment_status; Pool/MatchRequest cyclic; GRH branching
+  relationship_patterns:
+    - one_to_many                            # Pool→Trip, Trip→Reservation, EmployerProgram→Member
+    - many_to_many                           # Member↔Pool via Membership junction
+    - cross_aggregate                        # Reservation references Member, Trip, Pool, EmployerProgram across aggregates
+  role_model: peer_roles                     # Driver owns Pool/Vehicle/Trip; Rider owns MatchRequest/Reservation/GRH; ProgramAdmin owns EmployerProgram; PlatformOps operational override
+  consistency_model: immediate               # all cascades complete synchronously within the triggering request
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — emitted verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  # ---- Configuration -------------------------------------------------------
+  - name: EmployerProgram
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: employer_name, type: string, source: input, description: "Sponsoring employer name" }
+      - { name: hov_discount_pct, type: number, source: input, description: "Fraction of base cost-share subsidized when the trip used an HOV lane", constraints: "0.0 <= x <= 1.0; e.g. 0.50" }
+      - { name: employer_match_pct, type: number, source: input, description: "Fraction of the post-HOV rider cost-share the employer additionally matches", constraints: "0.0 <= x <= 1.0; e.g. 0.30" }
+      - { name: monthly_benefit_cap_cents, type: integer, source: input, description: "Per-member pre-tax commuter-benefit cap applied per calendar month", constraints: ">= 0; e.g. 31500" }
+      - { name: grh_annual_cap_cents, type: integer, source: input, description: "Per-member annual guaranteed-ride-home reimbursement cap", constraints: ">= 0; e.g. 20000" }
+      - { name: grh_per_event_cap_cents, type: integer, source: input, description: "Maximum reimbursement for a single guaranteed-ride-home claim", constraints: ">= 0; e.g. 6000" }
+      - { name: grh_max_events_per_year, type: integer, source: input, description: "Maximum approved GRH events per member per calendar year", default: 4, constraints: ">= 0" }
+      - { name: subsidy_budget_cents, type: integer, source: input, description: "Total subsidy budget the program will fund across all members" }
+      - { name: subsidy_consumed_cents, type: integer, source: computed, description: "Derived: signed sum of all SubsidyLedgerEntry.amount_cents for this program; starts at 0", default: 0 }
+      - { name: status, type: enum, source: system, description: "ACTIVE | FROZEN; FROZEN blocks new subsidy debits", default: "ACTIVE", constraints: "one of {ACTIVE, FROZEN}" }
+
+  # ---- People --------------------------------------------------------------
+  - name: Member
+    parent: null
+    common_fields: true
+    fields:
+      - { name: employer_program_id, type: string, source: input, description: "FK -> EmployerProgram.id; the program sponsoring this member" }
+      - { name: full_name, type: string, source: input, description: "Member full name" }
+      - { name: home_zone, type: string, source: input, description: "Residence corridor zone code, e.g. Z-NORTH" }
+      - { name: work_zone, type: string, source: input, description: "Workplace corridor zone code, e.g. Z-DOWNTOWN" }
+      - { name: can_drive, type: boolean, source: input, description: "Whether this member may own pools and drive trips", default: false }
+      - { name: wallet_balance_cents, type: integer, source: input, description: "Prepaid wallet balance charged for rider cost-share; driver reimbursements credit here", default: 0, constraints: ">= 0" }
+      - { name: completed_trip_count, type: integer, source: computed, description: "Derived: count of this member's Reservations whose reservation_status == COMPLETED", default: 0 }
+      - { name: no_show_count, type: integer, source: computed, description: "Derived: count of this member's Reservations whose reservation_status == NO_SHOW", default: 0 }
+      - { name: reliability_score, type: number, source: computed, description: "Derived weighted score in [0,100]; see calculations.reliability_score; new members start at 100.0", default: 100.0 }
+      - { name: month_benefit_used_cents, type: integer, source: computed, description: "Derived: subsidy applied to this member in the current clock month; resets when the clock month rolls over", default: 0 }
+      - { name: grh_year_used_cents, type: integer, source: computed, description: "Derived: GRH reimbursement reimbursed to this member in the current clock year", default: 0 }
+      - { name: grh_year_event_count, type: integer, source: computed, description: "Derived: count of REIMBURSED GRH events for this member in the current clock year", default: 0 }
+
+  - name: Vehicle
+    parent: null
+    common_fields: true
+    fields:
+      - { name: owner_member_id, type: string, source: input, description: "FK -> Member.id; the driving member who owns this vehicle" }
+      - { name: plate, type: string, source: input, description: "License plate identifier" }
+      - { name: seat_capacity, type: integer, source: input, description: "Total passenger seats excluding the driver", constraints: ">= 1; vanpool typically 6–14" }
+      - { name: hov_eligible, type: boolean, source: input, description: "Whether the vehicle is registered for HOV-lane use", default: true }
+
+  # ---- Pools & matching ----------------------------------------------------
+  - name: Pool
+    parent: null
+    common_fields: true
+    fields:
+      - { name: employer_program_id, type: string, source: input, description: "FK -> EmployerProgram.id; subsidizing program for this pool" }
+      - { name: driver_member_id, type: string, source: input, description: "FK -> Member.id; the driving member operating this pool" }
+      - { name: vehicle_id, type: string, source: input, description: "FK -> Vehicle.id; vehicle used for this pool" }
+      - { name: kind, type: enum, source: input, description: "CARPOOL | VANPOOL", constraints: "one of {CARPOOL, VANPOOL}" }
+      - { name: origin_zone, type: string, source: input, description: "Pool origin corridor zone code" }
+      - { name: dest_zone, type: string, source: input, description: "Pool destination corridor zone code" }
+      - { name: departure_days, type: array, source: input, description: "Service days, subset of {MON,TUE,WED,THU,FRI,SAT,SUN}" }
+      - { name: base_cost_cents, type: integer, source: input, description: "Fixed per-trip operating cost the riders collectively share", constraints: ">= 0" }
+      - { name: per_mile_cents, type: integer, source: input, description: "Marginal cost in cents per mile added to base_cost_cents per trip", constraints: ">= 0" }
+      - { name: seat_capacity, type: integer, source: computed, description: "Derived: copied from the linked Vehicle.seat_capacity at pool creation", default: 0 }
+      - { name: committed_seat_count, type: integer, source: computed, description: "Derived: sum of Membership.recurring_seats over this pool's Memberships in status ACTIVE", default: 0 }
+      - { name: status, type: enum, source: system, description: "FORMING | ACTIVE | SUSPENDED | CLOSED", default: "FORMING", constraints: "one of {FORMING, ACTIVE, SUSPENDED, CLOSED}" }
+
+  - name: MatchRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: rider_member_id, type: string, source: input, description: "FK -> Member.id; the rider seeking a pool" }
+      - { name: origin_zone, type: string, source: input, description: "Requested origin corridor zone" }
+      - { name: dest_zone, type: string, source: input, description: "Requested destination corridor zone" }
+      - { name: needed_days, type: array, source: input, description: "Requested service days, subset of {MON..SUN}" }
+      - { name: earliest_departure_min, type: integer, source: input, description: "Earliest acceptable departure as minutes-after-midnight local", constraints: "0 <= x < 1440" }
+      - { name: latest_departure_min, type: integer, source: input, description: "Latest acceptable departure as minutes-after-midnight local", constraints: "earliest_departure_min <= x < 1440" }
+      - { name: matched_pool_id, type: string, source: system, description: "FK -> Pool.id; pool selected by the matcher; null until MATCHED", required: false }
+      - { name: match_score, type: number, source: computed, description: "Derived match quality for the selected pool; see calculations.match_score; null until MATCHED", required: false }
+      - { name: status, type: enum, source: system, description: "OPEN | MATCHED | CONFIRMED | EXPIRED | CANCELLED", default: "OPEN", constraints: "one of {OPEN, MATCHED, CONFIRMED, EXPIRED, CANCELLED}" }
+
+  - name: Membership
+    parent: null
+    common_fields: true
+    fields:
+      - { name: pool_id, type: string, source: input, description: "FK -> Pool.id; the pool joined" }
+      - { name: rider_member_id, type: string, source: input, description: "FK -> Member.id; the joining rider" }
+      - { name: recurring_seats, type: integer, source: input, description: "Recurring seats this rider holds on every scheduled trip of the pool", default: 1, constraints: ">= 1" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | ENDED", default: "ACTIVE", constraints: "one of {ACTIVE, ENDED}" }
+
+  # ---- Trips & reservations ------------------------------------------------
+  - name: Trip
+    parent: null
+    common_fields: true
+    fields:
+      - { name: pool_id, type: string, source: input, description: "FK -> Pool.id; the pool this trip instantiates" }
+      - { name: departure_at, type: datetime, source: input, description: "Scheduled departure timestamp (ISO 8601 UTC)" }
+      - { name: duration_min, type: integer, source: input, description: "Planned trip duration in minutes", constraints: ">= 1" }
+      - { name: distance_miles, type: number, source: input, description: "Planned one-way trip distance in miles", constraints: "> 0" }
+      - { name: hov_lane_used, type: boolean, source: input, description: "Whether the HOV lane was actually used; finalized at completion, defaults to the vehicle's hov_eligible at scheduling", default: false }
+      - { name: seats_reserved, type: integer, source: computed, description: "Derived: sum of seat_count over this trip's Reservations whose reservation_status IN {RESERVED, CHECKED_IN, COMPLETED}", default: 0 }
+      - { name: total_cost_cents, type: integer, source: computed, description: "Derived: Pool.base_cost_cents + round(Pool.per_mile_cents * distance_miles); see calculations.trip_total_cost", default: 0 }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | BOARDING | IN_TRANSIT | COMPLETED | CANCELLED", default: "SCHEDULED", constraints: "one of {SCHEDULED, BOARDING, IN_TRANSIT, COMPLETED, CANCELLED}" }
+
+  - name: Reservation
+    parent: null
+    common_fields: true
+    fields:
+      - { name: trip_id, type: string, source: input, description: "FK -> Trip.id; the trip a seat is reserved on" }
+      - { name: rider_member_id, type: string, source: input, description: "FK -> Member.id; the reserving rider" }
+      - { name: seat_count, type: integer, source: input, description: "Seats requested on this trip", default: 1, constraints: ">= 1" }
+      - { name: reservation_status, type: enum, source: system, description: "RESERVED | CHECKED_IN | COMPLETED | NO_SHOW | CANCELLED (independent of payment_status)", default: "RESERVED", constraints: "one of {RESERVED, CHECKED_IN, COMPLETED, NO_SHOW, CANCELLED}" }
+      - { name: payment_status, type: enum, source: system, description: "PENDING | CHARGED | SETTLED | REFUNDED (independent of reservation_status)", default: "PENDING", constraints: "one of {PENDING, CHARGED, SETTLED, REFUNDED}" }
+      - { name: estimate_cost_share_cents, type: integer, source: computed, description: "Provisional rider cost-share computed at reservation; see calculations.cost_share (ESTIMATE variant)", default: 0 }
+      - { name: estimate_subsidy_cents, type: integer, source: computed, description: "Provisional subsidy at reservation; see calculations.subsidy (forward-looking)", default: 0 }
+      - { name: final_cost_share_cents, type: integer, source: computed, description: "Final rider cost-share computed at trip completion; see calculations.cost_share (FINAL variant); 0 until COMPLETED", default: 0 }
+      - { name: final_subsidy_cents, type: integer, source: computed, description: "Final subsidy applied at trip completion; 0 until COMPLETED", default: 0 }
+      - { name: net_charge_cents, type: integer, source: computed, description: "Amount actually charged to the rider wallet (final_cost_share_cents - final_subsidy_cents, floored at 0)", default: 0 }
+
+  - name: GuaranteedRideHome
+    parent: null
+    common_fields: true
+    fields:
+      - { name: rider_member_id, type: string, source: input, description: "FK -> Member.id; the member claiming a guaranteed ride home" }
+      - { name: employer_program_id, type: string, source: input, description: "FK -> EmployerProgram.id; the program reimbursing the claim" }
+      - { name: trip_id, type: string, source: input, description: "FK -> Trip.id; the missed/disrupted trip that justifies the claim", required: false }
+      - { name: claimed_fare_cents, type: integer, source: input, description: "Out-of-pocket fare the member paid for the alternate ride", constraints: ">= 0" }
+      - { name: reason_code, type: enum, source: input, description: "ILLNESS | OVERTIME | EMERGENCY | DRIVER_CANCEL", constraints: "one of {ILLNESS, OVERTIME, EMERGENCY, DRIVER_CANCEL}" }
+      - { name: reimbursed_cents, type: integer, source: computed, description: "Approved reimbursement; see calculations.grh_reimbursement; 0 until REIMBURSED", default: 0 }
+      - { name: status, type: enum, source: system, description: "REQUESTED | APPROVED | REIMBURSED | DENIED", default: "REQUESTED", constraints: "one of {REQUESTED, APPROVED, REIMBURSED, DENIED}" }
+      - { name: denial_reason, type: enum, source: system, description: "ANNUAL_CAP | EVENT_CAP | NOT_ELIGIBLE; set only on DENIED", required: false, constraints: "one of {ANNUAL_CAP, EVENT_CAP, NOT_ELIGIBLE}" }
+
+  # ---- Append-only ledgers -------------------------------------------------
+  - name: SubsidyLedgerEntry
+    parent: null
+    common_fields: false   # immutable event: id + created_at only
+    fields:
+      - { name: employer_program_id, type: string, source: input, description: "FK -> EmployerProgram.id; program whose subsidy budget this entry moves" }
+      - { name: member_id, type: string, source: input, description: "FK -> Member.id; member the subsidy was applied to or reversed for" }
+      - { name: reservation_id, type: string, source: input, description: "FK -> Reservation.id; reservation that produced this ledger movement", required: false }
+      - { name: amount_cents, type: integer, source: system, description: "Signed amount: positive DEBIT consumes budget, negative CREDIT returns budget" }
+      - { name: entry_type, type: enum, source: system, description: "DEBIT | CREDIT", constraints: "one of {DEBIT, CREDIT}" }
+      - { name: reason, type: enum, source: system, description: "RESERVATION_FINALIZED | RESERVATION_CANCELLED | TRIP_CANCELLED | GRH_REIMBURSED", constraints: "one of {RESERVATION_FINALIZED, RESERVATION_CANCELLED, TRIP_CANCELLED, GRH_REIMBURSED}" }
+
+  - name: ReliabilityEvent
+    parent: null
+    common_fields: false   # immutable event: id + created_at only
+    fields:
+      - { name: member_id, type: string, source: input, description: "FK -> Member.id; member whose reliability this event affects" }
+      - { name: reservation_id, type: string, source: input, description: "FK -> Reservation.id; reservation that produced this event", required: false }
+      - { name: event_type, type: enum, source: system, description: "COMPLETION | NO_SHOW | LATE_CANCEL | GRH_OVERUSE", constraints: "one of {COMPLETION, NO_SHOW, LATE_CANCEL, GRH_OVERUSE}" }
+      - { name: weight_delta, type: number, source: system, description: "Signed contribution this event adds to the reliability weighted sum" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- EmployerProgram: budget gate (ACTIVE <-> FROZEN) --------------------
+  - entity: EmployerProgram
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: FROZEN
+        trigger: "POST /employer-programs/{id}/freeze"
+        actor: "ProgramAdmin | PlatformOps"
+        preconditions:
+          - "EmployerProgram.status == ACTIVE"
+        side_effects:
+          - "EmployerProgram.status -> FROZEN (subsequent subsidy DEBITs collapse to 0; GRH approve is gated by ERR_DEPENDENCY_NOT_READY)"
+          - "increments EmployerProgram.version by 1"
+
+      - from: FROZEN
+        to: ACTIVE
+        trigger: "POST /employer-programs/{id}/unfreeze"
+        actor: "ProgramAdmin | PlatformOps"
+        preconditions:
+          - "EmployerProgram.status == FROZEN"
+        side_effects:
+          - "EmployerProgram.status -> ACTIVE"
+          - "increments EmployerProgram.version by 1"
+
+  # ---- Pool: cyclic (SUSPENDED <-> ACTIVE) ---------------------------------
+  - entity: Pool
+    initial_state: FORMING
+    terminal_states: [CLOSED]
+    transitions:
+      - from: FORMING
+        to: ACTIVE
+        trigger: "POST /pools/{id}/activate"
+        actor: Driver
+        preconditions:
+          - "Pool.status == FORMING"
+          - "Pool.committed_seat_count >= 1 (at least one ACTIVE Membership exists)"
+          - "linked Vehicle exists and EmployerProgram.status == ACTIVE"
+        side_effects:
+          - "Pool.status -> ACTIVE"
+          - "increments Pool.version by 1"
+
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /pools/{id}/suspend"
+        actor: "Driver | ProgramAdmin | PlatformOps"
+        preconditions:
+          - "Pool.status == ACTIVE"
+        side_effects:
+          - "Pool.status -> SUSPENDED"
+          - "all SCHEDULED Trips of this pool whose departure_at is in the future -> CANCELLED (cascade: each Trip cancel runs its own side_effects)"
+          - "increments Pool.version by 1"
+
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /pools/{id}/activate"
+        actor: "Driver | ProgramAdmin | PlatformOps"
+        preconditions:
+          - "Pool.status == SUSPENDED"
+          - "EmployerProgram.status == ACTIVE"
+        side_effects:
+          - "Pool.status -> ACTIVE (no past Trips restored; future trips re-scheduled manually)"
+          - "increments Pool.version by 1"
+
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /pools/{id}/close"
+        actor: "Driver | PlatformOps"
+        preconditions:
+          - "Pool.status == ACTIVE"
+          - "no Trip of this pool is in BOARDING or IN_TRANSIT"
+        side_effects:
+          - "Pool.status -> CLOSED"
+          - "all ACTIVE Memberships of this pool -> ENDED (cascade)"
+          - "all SCHEDULED future Trips -> CANCELLED (cascade)"
+          - "increments Pool.version by 1"
+
+      - from: SUSPENDED
+        to: CLOSED
+        trigger: "POST /pools/{id}/close"
+        actor: "Driver | PlatformOps"
+        preconditions:
+          - "Pool.status == SUSPENDED"
+        side_effects:
+          - "Pool.status -> CLOSED"
+          - "all ACTIVE Memberships of this pool -> ENDED (cascade)"
+          - "increments Pool.version by 1"
+
+  # ---- MatchRequest: cyclic (MATCHED -> OPEN revert) -----------------------
+  - entity: MatchRequest
+    initial_state: OPEN
+    terminal_states: [CONFIRMED, EXPIRED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: MATCHED
+        trigger: "POST /match-requests/{id}/match"
+        actor: "Rider | PlatformOps"
+        preconditions:
+          - "MatchRequest.status == OPEN"
+          - "at least one candidate Pool satisfies the eligibility filter (see calculations.match_score)"
+        side_effects:
+          - "matched_pool_id <- the selected pool id"
+          - "match_score <- selected pool's match_score"
+          - "MatchRequest.status -> MATCHED"
+
+      - from: MATCHED
+        to: OPEN
+        trigger: "POST /match-requests/{id}/reject"
+        actor: "Rider | PlatformOps"
+        preconditions:
+          - "MatchRequest.status == MATCHED"
+        side_effects:
+          - "matched_pool_id cleared, match_score cleared"
+          - "MatchRequest.status -> OPEN (the rejected pool id is recorded in an exclusion set so re-match never re-selects it)"
+
+      - from: MATCHED
+        to: CONFIRMED
+        trigger: "POST /match-requests/{id}/confirm"
+        actor: Rider
+        preconditions:
+          - "MatchRequest.status == MATCHED"
+          - "matched Pool.status == ACTIVE (cross-entity gate)"
+          - "matched Pool.committed_seat_count + 1 <= matched Pool.seat_capacity"
+        side_effects:
+          - "creates a Membership {pool_id: matched_pool_id, rider_member_id, recurring_seats: 1, status: ACTIVE}"
+          - "matched Pool.committed_seat_count recomputed (+1)"
+          - "MatchRequest.status -> CONFIRMED"
+
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /match-requests/{id}/cancel"
+        actor: "Rider | PlatformOps"
+        preconditions:
+          - "MatchRequest.status == OPEN"
+        side_effects:
+          - "MatchRequest.status -> CANCELLED"
+
+      - from: MATCHED
+        to: CANCELLED
+        trigger: "POST /match-requests/{id}/cancel"
+        actor: "Rider | PlatformOps"
+        preconditions:
+          - "MatchRequest.status == MATCHED"
+        side_effects:
+          - "MatchRequest.status -> CANCELLED"
+
+      - from: OPEN
+        to: EXPIRED
+        trigger: "POST /_batch/run (clock now > created_at + 14 days)"
+        actor: system
+        preconditions:
+          - "MatchRequest.status == OPEN"
+          - "clock_now > MatchRequest.created_at + 14 days"
+        side_effects:
+          - "MatchRequest.status -> EXPIRED"
+
+  # ---- Trip: linear lifecycle, heavy cascades ------------------------------
+  - entity: Trip
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: BOARDING
+        trigger: "POST /trips/{id}/open-boarding"
+        actor: "Driver | PlatformOps"
+        preconditions:
+          - "Trip.status == SCHEDULED"
+          - "owning Pool.status == ACTIVE (cross-entity gate)"
+        side_effects:
+          - "Trip.status -> BOARDING (reservations may still be checked in)"
+
+      - from: BOARDING
+        to: IN_TRANSIT
+        trigger: "POST /trips/{id}/depart"
+        actor: "Driver | PlatformOps"
+        preconditions:
+          - "Trip.status == BOARDING"
+        side_effects:
+          - "Trip.status -> IN_TRANSIT"
+          - "every RESERVED Reservation on this trip -> NO_SHOW (cascade: each no-show runs no-show side_effects: Member.no_show_count recompute, ReliabilityEvent NO_SHOW created, reliability_score recompute)"
+
+      - from: IN_TRANSIT
+        to: COMPLETED
+        trigger: "POST /trips/{id}/complete"
+        actor: "Driver | PlatformOps"
+        preconditions:
+          - "Trip.status == IN_TRANSIT"
+        side_effects:
+          - "hov_lane_used finalized from request body"
+          - "Trip.total_cost_cents recomputed (calculations.trip_total_cost)"
+          - "every CHECKED_IN Reservation -> COMPLETED; final_cost_share_cents recomputed (calculations.cost_share FINAL), final_subsidy_cents recomputed (calculations.subsidy), net_charge_cents charged to rider wallet, payment_status PENDING|CHARGED -> SETTLED"
+          - "for each finalized Reservation a SubsidyLedgerEntry DEBIT(amount = final_subsidy_cents, reason=RESERVATION_FINALIZED) is appended; EmployerProgram.subsidy_consumed_cents recomputed; Member.month_benefit_used_cents recomputed"
+          - "for each completed Reservation a ReliabilityEvent COMPLETION is appended; Member.completed_trip_count and reliability_score recomputed"
+          - "driver Member.wallet_balance_cents credited by sum(final_cost_share_cents) of completed reservations"
+
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /trips/{id}/cancel"
+        actor: "Driver | ProgramAdmin | PlatformOps | system"
+        preconditions:
+          - "Trip.status == SCHEDULED"
+        side_effects:
+          - "Trip.status -> CANCELLED"
+          - "every RESERVED Reservation on this trip -> CANCELLED (cascade depth: Reservation cancel -> wallet refund of any CHARGED amount + SubsidyLedgerEntry CREDIT(reason=TRIP_CANCELLED) -> EmployerProgram.subsidy_consumed_cents recompute)"
+
+      - from: BOARDING
+        to: CANCELLED
+        trigger: "POST /trips/{id}/cancel"
+        actor: "Driver | ProgramAdmin | PlatformOps"
+        preconditions:
+          - "Trip.status == BOARDING"
+        side_effects:
+          - "Trip.status -> CANCELLED"
+          - "every RESERVED or CHECKED_IN Reservation -> CANCELLED (cascade: wallet refund + SubsidyLedgerEntry CREDIT + EmployerProgram.subsidy_consumed_cents recompute)"
+
+  # ---- Reservation: PARALLEL dimensions (reservation_status × payment_status)
+  - entity: Reservation
+    initial_state: "RESERVED / PENDING"
+    terminal_states: ["COMPLETED / SETTLED", "NO_SHOW / *", "CANCELLED / REFUNDED"]
+    note: "Two independent status axes evolve on the same row; reservation_status governs the seat lifecycle, payment_status governs the money lifecycle."
+    transitions:
+      - from: "RESERVED"
+        to: "CHECKED_IN"
+        trigger: "POST /reservations/{id}/check-in"
+        actor: "Driver | PlatformOps"
+        preconditions:
+          - "Reservation.reservation_status == RESERVED"
+          - "owning Trip.status IN {BOARDING}"
+        side_effects:
+          - "reservation_status -> CHECKED_IN"
+
+      - from: "RESERVED"
+        to: "CANCELLED"
+        trigger: "POST /reservations/{id}/cancel"
+        actor: "Rider | Driver | PlatformOps"
+        preconditions:
+          - "Reservation.reservation_status == RESERVED"
+          - "owning Trip.status IN {SCHEDULED, BOARDING}"
+        side_effects:
+          - "reservation_status -> CANCELLED"
+          - "if payment_status == CHARGED: refund estimate_cost_share_cents to rider wallet, payment_status -> REFUNDED; else payment_status -> REFUNDED with 0 movement"
+          - "if a prior DEBIT existed for this reservation: append SubsidyLedgerEntry CREDIT(amount = -estimate_subsidy_cents, reason=RESERVATION_CANCELLED); EmployerProgram.subsidy_consumed_cents recomputed; Member.month_benefit_used_cents recomputed"
+          - "Trip.seats_reserved recomputed (seat released)"
+          - "if cancel occurs while owning Trip.status == BOARDING: append ReliabilityEvent LATE_CANCEL; reliability_score recomputed"
+
+      - from: "CHECKED_IN"
+        to: "COMPLETED"
+        trigger: "system (Trip complete cascade)"
+        actor: system
+        preconditions:
+          - "Reservation.reservation_status == CHECKED_IN"
+          - "owning Trip transition IN_TRANSIT -> COMPLETED"
+        side_effects:
+          - "reservation_status -> COMPLETED; final cost-share + subsidy applied; payment_status -> SETTLED (see Trip complete side_effects)"
+
+      - from: "RESERVED"
+        to: "NO_SHOW"
+        trigger: "system (Trip depart cascade) or POST /reservations/{id}/no-show"
+        actor: "system | Driver"
+        preconditions:
+          - "Reservation.reservation_status == RESERVED"
+          - "owning Trip.status IN {BOARDING, IN_TRANSIT}"
+        side_effects:
+          - "reservation_status -> NO_SHOW"
+          - "if payment_status == CHARGED: estimate_cost_share_cents retained as no-show penalty, payment_status -> SETTLED; else payment_status unchanged"
+          - "Member.no_show_count recomputed; append ReliabilityEvent NO_SHOW; reliability_score recomputed"
+          - "Trip.seats_reserved recomputed (seat released)"
+
+      - from: "RESERVED"
+        to: "CANCELLED"
+        trigger: "system (Trip cancel cascade)"
+        actor: system
+        preconditions:
+          - "owning Trip transition -> CANCELLED"
+        side_effects:
+          - "reservation_status -> CANCELLED; full refund; SubsidyLedgerEntry CREDIT(reason=TRIP_CANCELLED) if a DEBIT existed; no reliability penalty (driver/system fault)"
+
+  # ---- GuaranteedRideHome: BRANCHING (APPROVED vs DENIED) ------------------
+  - entity: GuaranteedRideHome
+    initial_state: REQUESTED
+    terminal_states: [REIMBURSED, DENIED]
+    transitions:
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /grh-claims/{id}/approve"
+        actor: "ProgramAdmin | PlatformOps"
+        preconditions:
+          - "GuaranteedRideHome.status == REQUESTED"
+          - "EmployerProgram.status == ACTIVE (cross-entity gate)"
+          - "Member.grh_year_event_count < EmployerProgram.grh_max_events_per_year"
+          - "Member.grh_year_used_cents < EmployerProgram.grh_annual_cap_cents"
+        side_effects:
+          - "GuaranteedRideHome.status -> APPROVED (no money moved yet)"
+
+      - from: APPROVED
+        to: REIMBURSED
+        trigger: "POST /grh-claims/{id}/reimburse"
+        actor: "ProgramAdmin | PlatformOps"
+        preconditions:
+          - "GuaranteedRideHome.status == APPROVED"
+        side_effects:
+          - "reimbursed_cents <- calculations.grh_reimbursement"
+          - "rider Member.wallet_balance_cents credited by reimbursed_cents"
+          - "append SubsidyLedgerEntry DEBIT(amount = reimbursed_cents, reason=GRH_REIMBURSED); EmployerProgram.subsidy_consumed_cents recomputed"
+          - "Member.grh_year_used_cents and grh_year_event_count recomputed"
+          - "if Member.grh_year_event_count after this reimbursement == EmployerProgram.grh_max_events_per_year: append ReliabilityEvent GRH_OVERUSE; reliability_score recomputed"
+          - "GuaranteedRideHome.status -> REIMBURSED"
+
+      - from: REQUESTED
+        to: DENIED
+        trigger: "POST /grh-claims/{id}/deny"
+        actor: "ProgramAdmin | PlatformOps"
+        preconditions:
+          - "GuaranteedRideHome.status == REQUESTED"
+        side_effects:
+          - "denial_reason set from request body (ANNUAL_CAP | EVENT_CAP | NOT_ELIGIBLE)"
+          - "GuaranteedRideHome.status -> DENIED (no money moved, no ledger entry)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: reservation-create-stale-trip
+    parent_entity: Trip
+    write_endpoint: "POST /reservations"
+    occ_field: "expected_trip_version"
+    description: |
+      Creating a Reservation against a Trip whose version has advanced since the
+      client last observed it is rejected. This captures the case where another
+      writer has already created a reservation that legitimately consumed the
+      remaining seat (advancing Trip.version via the seats_reserved recompute),
+      so the current writer's seat-availability view of the trip is stale.
+    error_id: ERR_STALE_TRIP_VERSION
+    http_status: 412
+
+  - rule_id: membership-join-stale-pool
+    parent_entity: Pool
+    write_endpoint: "POST /memberships"
+    occ_field: "expected_pool_version"
+    description: |
+      Creating a Membership against a Pool whose version has advanced since the
+      client last observed it is rejected. This captures the case where another
+      writer has already committed the last recurring seat (advancing Pool.version
+      via the committed_seat_count recompute), so the current writer's capacity
+      view of the pool is stale.
+    error_id: ERR_STALE_POOL_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: trip_total_cost
+    trigger: "Trip creation and Trip complete (IN_TRANSIT -> COMPLETED)"
+    algorithm: aggregation
+    formula: |
+      total_cost_cents = Pool.base_cost_cents + round_half_up(Pool.per_mile_cents * Trip.distance_miles)
+      # per_mile_cents and base_cost_cents are integers; distance_miles is a number.
+      # The single multiplication is rounded to the nearest cent (half-up) BEFORE adding base.
+    input_set: "the owning Pool's base_cost_cents/per_mile_cents and this Trip's distance_miles"
+    constants: {}
+    precision: "integer cents, round_half_up on the per-mile product"
+
+  - name: cost_share
+    trigger: "ESTIMATE at reservation create; FINAL at Trip complete (per completed reservation)"
+    algorithm: tiered_pricing
+    formula: |
+      # Per-trip cost shared across the rider seats present, with an occupancy
+      # discount tier (fuller pools are cheaper per seat). Driver seat is free.
+      # Let N = number of cost-sharing seats in the inclusion set (see variants).
+      # Let T = Trip.total_cost_cents.
+      # occupancy_tier(N):
+      #     N >= 4  -> tier_factor = 0.80   (vanpool-full discount)
+      #     N == 3  -> tier_factor = 0.90
+      #     N <= 2  -> tier_factor = 1.00
+      # per_seat_raw = (T * tier_factor) / N            # real number, not yet rounded
+      # this_reservation_share = round_half_up(per_seat_raw * this.seat_count)
+      # EVALUATION ORDER (pinned): compute tier_factor from N first, then divide,
+      # then multiply by this.seat_count, THEN round once. Never round per_seat_raw
+      # before multiplying by seat_count.
+    input_set: "ESTIMATE: N = sum of seat_count over Reservations on the trip in {RESERVED, CHECKED_IN} INCLUDING the reservation being created (forward-looking). FINAL: N = sum of seat_count over Reservations whose reservation_status == COMPLETED (chronological, only riders who actually rode)."
+    constants:
+      TIER_FULL_THRESHOLD: 4
+      TIER_FULL_FACTOR: 0.80
+      TIER_MID_THRESHOLD: 3
+      TIER_MID_FACTOR: 0.90
+      TIER_LOW_FACTOR: 1.00
+    precision: "integer cents, round_half_up; round once per reservation after multiplying by seat_count"
+    variants:
+      - name: ESTIMATE
+        when: "reservation create — populates estimate_cost_share_cents"
+        difference: "Inclusion set is forward-looking: counts RESERVED+CHECKED_IN seats including the new reservation. Charged immediately to wallet when payment chosen."
+      - name: FINAL
+        when: "Trip complete — populates final_cost_share_cents"
+        difference: "Inclusion set is chronological/actuals: counts only COMPLETED seats. No-shows and cancellations leave fewer seats, so per-seat share rises; the FINAL value diverges from ESTIMATE."
+
+  - name: subsidy
+    trigger: "ESTIMATE at reservation create (estimate_subsidy_cents); FINAL at Trip complete (final_subsidy_cents)"
+    algorithm: waterfall_allocation
+    formula: |
+      # Subsidy waterfall over a single rider cost-share. Inputs:
+      #   cs   = the rider's cost_share for this trip (estimate or final variant)
+      #   hov  = Trip.hov_lane_used (boolean)
+      #   P    = owning Pool's EmployerProgram
+      #   month_remaining = max(0, P.monthly_benefit_cap_cents - Member.month_benefit_used_cents)
+      # Step 1 (HOV layer):  hov_part = round_half_up(cs * P.hov_discount_pct) if hov else 0
+      # Step 2 (employer match layer): match_part = round_half_up((cs - hov_part) * P.employer_match_pct)
+      # Step 3 (per-rider sum BEFORE cap): raw_subsidy = hov_part + match_part
+      #         ROUNDING ORDER (pinned, mode-b): round EACH layer to cents first,
+      #         THEN sum. Do NOT compute (cs*(hov_pct+match_pct)) and round once.
+      # Step 4 (monthly cap waterfall): subsidy = min(raw_subsidy, month_remaining, cs)
+      # Step 5 (program budget guard): if EmployerProgram.status == FROZEN OR
+      #         (EmployerProgram.subsidy_consumed_cents + subsidy) > EmployerProgram.subsidy_budget_cents
+      #         then subsidy = 0 (no DEBIT appended).
+    input_set: "single reservation's cost_share plus the owning Pool's EmployerProgram caps and the member's month_benefit_used_cents at evaluation time"
+    constants: {}
+    precision: "integer cents, round_half_up per layer before summing (mode-b nested rounding)"
+    variants:
+      - name: forward_looking
+        when: "reservation create — uses estimate_cost_share_cents and month_benefit_used_cents as of create"
+        difference: "month_remaining read before any FINAL debit; HOV layer uses Trip.hov_lane_used default (vehicle hov_eligible at scheduling)."
+      - name: final
+        when: "Trip complete — uses final_cost_share_cents and the hov_lane_used finalized at completion"
+        difference: "If hov_lane_used was finalized false at completion, hov_part collapses to 0 and final subsidy diverges from the estimate."
+
+  - name: reliability_score
+    trigger: "any ReliabilityEvent append (COMPLETION, NO_SHOW, LATE_CANCEL, GRH_OVERUSE)"
+    algorithm: weighted_scoring
+    formula: |
+      # Recency-weighted reliability over the member's ReliabilityEvent log.
+      # Base = 100. Each event contributes weight_delta, decayed by event age in
+      # ops-batch ticks is NOT used; instead a fixed event weight by type:
+      #   COMPLETION : +2.0
+      #   NO_SHOW    : -15.0
+      #   LATE_CANCEL: -6.0
+      #   GRH_OVERUSE: -4.0
+      # PROVISIONAL variant additionally treats each of the member's currently
+      # RESERVED (not yet ridden) reservations as an expected COMPLETION (+2.0).
+      # raw = 100 + sum(weight_delta over events [+ provisional pending bonuses])
+      # reliability_score = round_half_up(clamp(raw, 0.0, 100.0), 1 decimal)
+      # EVALUATION: clamp AFTER summing all deltas, then round to 1 decimal.
+    input_set: "CONFIRMED: only persisted ReliabilityEvents. PROVISIONAL: persisted events plus +2.0 per current RESERVED reservation of the member."
+    constants:
+      COMPLETION_WEIGHT: 2.0
+      NO_SHOW_WEIGHT: -15.0
+      LATE_CANCEL_WEIGHT: -6.0
+      GRH_OVERUSE_WEIGHT: -4.0
+      SCORE_FLOOR: 0.0
+      SCORE_CEIL: 100.0
+    precision: "1 decimal place, round_half_up, clamp to [0,100] before rounding"
+    variants:
+      - name: CONFIRMED
+        when: "stored Member.reliability_score — recomputed on every ReliabilityEvent append"
+        difference: "Counts only realized events; this is the persisted field that gates reservation eligibility."
+      - name: PROVISIONAL
+        when: "GET /members/{id}/reliability?mode=provisional — what-if view"
+        difference: "Adds +2.0 per outstanding RESERVED reservation as if it will complete; never persisted; diverges upward from CONFIRMED while pending reservations exist."
+
+  - name: grh_reimbursement
+    trigger: "GRH reimburse (APPROVED -> REIMBURSED)"
+    algorithm: waterfall_allocation
+    formula: |
+      # Reimburse the claimed fare, capped per-event and by remaining annual allowance.
+      #   per_event_cap = EmployerProgram.grh_per_event_cap_cents
+      #   annual_remaining = max(0, EmployerProgram.grh_annual_cap_cents - Member.grh_year_used_cents)
+      #   reimbursed_cents = min(GuaranteedRideHome.claimed_fare_cents, per_event_cap, annual_remaining)
+      # Waterfall: the claim draws first against per_event_cap, then is further
+      # clipped by annual_remaining; the smaller binding cap wins.
+    input_set: "the claim's claimed_fare_cents plus the program's per-event and annual caps and the member's grh_year_used_cents at reimburse time"
+    constants: {}
+    precision: "integer cents (no fractional fares)"
+
+  - name: match_score
+    trigger: "POST /match-requests/{id}/match — selects the matched Pool from the candidate set"
+    algorithm: weighted_scoring
+    formula: |
+      # Candidate eligibility filter (a candidate Pool qualifies iff ALL hold):
+      #   Pool.status == ACTIVE
+      #   Pool.employer_program_id == MatchRequest rider's Member.employer_program_id
+      #   Pool.origin_zone == MatchRequest.origin_zone
+      #   Pool.dest_zone == MatchRequest.dest_zone
+      #   set(MatchRequest.needed_days) is a subset of set(Pool.departure_days)
+      #   Pool.committed_seat_count < Pool.seat_capacity   (a seat is free)
+      #   Pool.id NOT in this MatchRequest's exclusion set (previously rejected pools)
+      # Ranking score for each candidate (higher is better):
+      #   day_overlap  = |needed_days|  (always full overlap due to subset filter)
+      #   seat_room    = Pool.seat_capacity - Pool.committed_seat_count
+      #   score = round_half_up(10.0 * day_overlap + 1.0 * seat_room
+      #                          + 0.05 * driver Member.reliability_score, 2)
+      # SELECTION: pick the candidate with the highest score.
+      #   Tie-break 1: higher driver reliability_score.
+      #   Tie-break 2: earliest Pool.created_at (NEVER Pool.id).
+      # FALLBACK: empty candidate set -> ERR_NO_MATCH_FOUND (422); status stays OPEN.
+    input_set: "all Pools satisfying the eligibility filter for this MatchRequest"
+    constants:
+      DAY_WEIGHT: 10.0
+      SEAT_ROOM_WEIGHT: 1.0
+      DRIVER_RELIABILITY_WEIGHT: 0.05
+    precision: "2 decimal places on score, round_half_up; selection is exact"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except GET /healthz"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to invoke this endpoint per the RBAC matrix; for entity_backed roles acting on owned resources, X-User-ID must equal the resource's owning member id"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all role-gated endpoints"
+
+  - priority: 3
+    category: existence
+    check: "Every path-referenced resource exists; body FK references resolve (validated left-to-right)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 4
+    category: business_constraint
+    check: "Request body is well-formed: required fields present, enum members valid, numeric ranges satisfied (e.g. latest_departure_min >= earliest_departure_min, seat_count >= 1)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all write endpoints"
+
+  - priority: 5
+    category: state
+    check: "OCC: expected_trip_version / expected_pool_version equals the parent's current version on guarded creates"
+    error_id: ERR_STALE_TRIP_VERSION
+    http_status: 412
+    applies_to: "POST /reservations, POST /memberships"
+    note: "ERR_STALE_POOL_VERSION on POST /memberships; ERR_STALE_TRIP_VERSION on POST /reservations"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a state that permits the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 7
+    category: business_referential
+    check: "Cross-entity gate: owning Pool/Trip/EmployerProgram is in the required state for the operation (e.g. reserve requires Trip SCHEDULED and Pool ACTIVE; confirm requires Pool ACTIVE; GRH approve requires EmployerProgram ACTIVE)"
+    error_id: ERR_DEPENDENCY_NOT_READY
+    http_status: 409
+    applies_to: "POST /reservations, POST /match-requests/{id}/confirm, POST /trips/{id}/open-boarding, POST /grh-claims/{id}/approve"
+
+  - priority: 8
+    category: business_safety
+    check: "Rider reliability gate: a rider whose CONFIRMED reliability_score < 70.0 may not create a new Reservation"
+    error_id: ERR_RELIABILITY_TOO_LOW
+    http_status: 409
+    applies_to: "POST /reservations"
+
+  - priority: 9
+    category: business_temporal
+    check: "Trip scheduling overlap: a new Trip on the same Pool must not overlap [departure_at, departure_at+duration_min) of any non-CANCELLED Trip of that Pool (half-open interval, no buffer)"
+    error_id: ERR_TRIP_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /trips"
+
+  - priority: 10
+    category: business_temporal
+    check: "Rider double-booking: a new Reservation must not put the rider on two trips whose travel windows are within RIDER_BUFFER_MIN of each other (closed interval expanded by buffer on both sides)"
+    error_id: ERR_RIDER_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /reservations"
+
+  - priority: 11
+    category: business_constraint
+    check: "Seat capacity: seats_reserved + requested seat_count must not exceed the owning Trip's pool seat_capacity"
+    error_id: ERR_SEATS_EXHAUSTED
+    http_status: 409
+    applies_to: "POST /reservations"
+
+  - priority: 12
+    category: business_constraint
+    check: "Pool seat capacity for recurring membership: committed_seat_count + recurring_seats must not exceed Pool.seat_capacity"
+    error_id: ERR_POOL_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /memberships, POST /match-requests/{id}/confirm"
+
+  - priority: 13
+    category: business_safety
+    check: "GRH event-count cap: an APPROVE is rejected when Member.grh_year_event_count >= EmployerProgram.grh_max_events_per_year"
+    error_id: ERR_GRH_EVENT_CAP
+    http_status: 409
+    applies_to: "POST /grh-claims/{id}/approve"
+
+  - priority: 14
+    category: business_fiscal
+    check: "GRH annual cap: an APPROVE is rejected when Member.grh_year_used_cents >= EmployerProgram.grh_annual_cap_cents"
+    error_id: ERR_GRH_ANNUAL_CAP
+    http_status: 409
+    applies_to: "POST /grh-claims/{id}/approve"
+
+  - priority: 15
+    category: business_fiscal
+    check: "Wallet funds: rider wallet_balance_cents must cover the estimate_cost_share_cents charged at reservation when payment is taken immediately"
+    error_id: ERR_INSUFFICIENT_WALLET
+    http_status: 402
+    applies_to: "POST /reservations"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- EmployerProgram -----------------------------------------------------
+  - method: POST
+    path: "/employer-programs"
+    description: "Create an employer commuter program"
+    roles: [ProgramAdmin, PlatformOps]
+    code: 201
+    input: [employer_name, hov_discount_pct, employer_match_pct, monthly_benefit_cap_cents, grh_annual_cap_cents, grh_per_event_cap_cents, subsidy_budget_cents, "grh_max_events_per_year?"]
+    output: EmployerProgram
+    side_effects: ["status=ACTIVE, subsidy_consumed_cents=0"]
+
+  - method: GET
+    path: "/employer-programs/{id}"
+    description: "Get an employer program"
+    roles: [ProgramAdmin, PlatformOps, Driver, Rider]
+    code: 200
+    input: []
+    output: EmployerProgram
+    side_effects: []
+
+  - method: POST
+    path: "/employer-programs/{id}/freeze"
+    description: "Freeze a program so no new subsidy debits occur"
+    roles: [ProgramAdmin, PlatformOps]
+    code: 200
+    input: []
+    output: EmployerProgram
+    side_effects: ["status -> FROZEN"]
+
+  - method: POST
+    path: "/employer-programs/{id}/unfreeze"
+    description: "Unfreeze a frozen program"
+    roles: [ProgramAdmin, PlatformOps]
+    code: 200
+    input: []
+    output: EmployerProgram
+    side_effects: ["status -> ACTIVE"]
+
+  - method: GET
+    path: "/employer-programs/{id}/ledger"
+    description: "List SubsidyLedgerEntry rows for a program (reverse-reachability for SubsidyLedgerEntry.employer_program_id)"
+    roles: [ProgramAdmin, PlatformOps]
+    code: 200
+    input: []
+    output: SubsidyLedgerEntry[]
+    side_effects: []
+
+  # ---- Member --------------------------------------------------------------
+  - method: POST
+    path: "/members"
+    description: "Register a member (rider and/or driver)"
+    roles: [ProgramAdmin, PlatformOps]
+    code: 201
+    input: [employer_program_id, full_name, home_zone, work_zone, "can_drive?", "wallet_balance_cents?"]
+    output: Member
+    side_effects: ["reliability_score=100.0, all derived counters=0"]
+
+  - method: GET
+    path: "/members/{id}"
+    description: "Get a member profile with derived counters and reliability_score"
+    roles: [ProgramAdmin, PlatformOps, Driver, Rider]
+    code: 200
+    input: []
+    output: Member
+    side_effects: []
+
+  - method: GET
+    path: "/members"
+    description: "List members; filterable by employer_program_id (reverse-reachability for Member.employer_program_id)"
+    roles: [ProgramAdmin, PlatformOps]
+    code: 200
+    input: ["employer_program_id?", "limit?", "offset?"]
+    output: Member[]
+    side_effects: []
+
+  - method: GET
+    path: "/members/{id}/reliability"
+    description: "Get the member's reliability score; mode=provisional returns the what-if PROVISIONAL variant, mode=confirmed (default) returns the persisted score"
+    roles: [ProgramAdmin, PlatformOps, Driver, Rider]
+    code: 200
+    input: ["mode?"]
+    output: Member
+    side_effects: []
+
+  - method: POST
+    path: "/members/{id}/wallet/adjustments"
+    description: "Operator wallet top-up/debit adjustment (admin surface used to set up balances)"
+    roles: [PlatformOps, ProgramAdmin]
+    code: 200
+    input: [amount_cents]
+    output: Member
+    side_effects: ["wallet_balance_cents += amount_cents (may not go below 0)"]
+
+  # ---- Vehicle -------------------------------------------------------------
+  - method: POST
+    path: "/vehicles"
+    description: "Register a vehicle for a driving member"
+    roles: [Driver, PlatformOps]
+    code: 201
+    input: [owner_member_id, plate, seat_capacity, "hov_eligible?"]
+    output: Vehicle
+    side_effects: []
+
+  - method: GET
+    path: "/vehicles/{id}"
+    description: "Get a vehicle"
+    roles: [Driver, PlatformOps, ProgramAdmin, Rider]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: []
+
+  - method: GET
+    path: "/vehicles"
+    description: "List vehicles; filterable by owner_member_id (reverse-reachability for Vehicle.owner_member_id)"
+    roles: [Driver, PlatformOps, ProgramAdmin]
+    code: 200
+    input: ["owner_member_id?", "limit?", "offset?"]
+    output: Vehicle[]
+    side_effects: []
+
+  # ---- Pool ----------------------------------------------------------------
+  - method: POST
+    path: "/pools"
+    description: "Create a pool (FORMING) owned by the driving member"
+    roles: [Driver, PlatformOps]
+    code: 201
+    input: [employer_program_id, driver_member_id, vehicle_id, kind, origin_zone, dest_zone, departure_days, base_cost_cents, per_mile_cents]
+    output: Pool
+    side_effects: ["status=FORMING, seat_capacity copied from Vehicle.seat_capacity, committed_seat_count=0"]
+
+  - method: GET
+    path: "/pools/{id}"
+    description: "Get a pool"
+    roles: [Driver, PlatformOps, ProgramAdmin, Rider]
+    code: 200
+    input: []
+    output: Pool
+    side_effects: []
+
+  - method: GET
+    path: "/pools"
+    description: "List pools; filterable by employer_program_id, driver_member_id, vehicle_id (reverse-reachability for those FKs)"
+    roles: [Driver, PlatformOps, ProgramAdmin, Rider]
+    code: 200
+    input: ["employer_program_id?", "driver_member_id?", "vehicle_id?", "limit?", "offset?"]
+    output: Pool[]
+    side_effects: []
+
+  - method: POST
+    path: "/pools/{id}/activate"
+    description: "Activate a FORMING or reactivate a SUSPENDED pool"
+    roles: [Driver, ProgramAdmin, PlatformOps]
+    code: 200
+    input: []
+    output: Pool
+    side_effects: ["status -> ACTIVE; version++"]
+
+  - method: POST
+    path: "/pools/{id}/suspend"
+    description: "Suspend an ACTIVE pool; cancels its future SCHEDULED trips"
+    roles: [Driver, ProgramAdmin, PlatformOps]
+    code: 200
+    input: []
+    output: Pool
+    side_effects: ["status -> SUSPENDED; future SCHEDULED trips -> CANCELLED (cascade); version++"]
+
+  - method: POST
+    path: "/pools/{id}/close"
+    description: "Close a pool permanently"
+    roles: [Driver, PlatformOps]
+    code: 200
+    input: []
+    output: Pool
+    side_effects: ["status -> CLOSED; ACTIVE memberships -> ENDED; future SCHEDULED trips -> CANCELLED; version++"]
+
+  # ---- MatchRequest --------------------------------------------------------
+  - method: POST
+    path: "/match-requests"
+    description: "Create a rider match request (OPEN)"
+    roles: [Rider, PlatformOps]
+    code: 201
+    input: [rider_member_id, origin_zone, dest_zone, needed_days, earliest_departure_min, latest_departure_min]
+    output: MatchRequest
+    side_effects: ["status=OPEN"]
+
+  - method: GET
+    path: "/match-requests/{id}"
+    description: "Get a match request"
+    roles: [Rider, PlatformOps, ProgramAdmin]
+    code: 200
+    input: []
+    output: MatchRequest
+    side_effects: []
+
+  - method: GET
+    path: "/match-requests"
+    description: "List match requests; filterable by rider_member_id, matched_pool_id (reverse-reachability)"
+    roles: [Rider, PlatformOps, ProgramAdmin]
+    code: 200
+    input: ["rider_member_id?", "matched_pool_id?", "limit?", "offset?"]
+    output: MatchRequest[]
+    side_effects: []
+
+  - method: POST
+    path: "/match-requests/{id}/match"
+    description: "Run the matcher: select the best eligible pool and move OPEN -> MATCHED"
+    roles: [Rider, PlatformOps]
+    code: 200
+    input: []
+    output: MatchRequest
+    side_effects: ["matched_pool_id + match_score set; status -> MATCHED; empty candidate set -> ERR_NO_MATCH_FOUND"]
+
+  - method: POST
+    path: "/match-requests/{id}/reject"
+    description: "Reject the matched pool; MATCHED -> OPEN and exclude that pool from future matches"
+    roles: [Rider, PlatformOps]
+    code: 200
+    input: []
+    output: MatchRequest
+    side_effects: ["matched_pool_id cleared; pool added to exclusion set; status -> OPEN"]
+
+  - method: POST
+    path: "/match-requests/{id}/confirm"
+    description: "Confirm the matched pool; creates a Membership and moves MATCHED -> CONFIRMED"
+    roles: [Rider]
+    code: 200
+    input: []
+    output: MatchRequest
+    side_effects: ["Membership created; Pool.committed_seat_count++; status -> CONFIRMED"]
+
+  - method: POST
+    path: "/match-requests/{id}/cancel"
+    description: "Cancel an OPEN or MATCHED match request"
+    roles: [Rider, PlatformOps]
+    code: 200
+    input: []
+    output: MatchRequest
+    side_effects: ["status -> CANCELLED"]
+
+  # ---- Membership ----------------------------------------------------------
+  - method: POST
+    path: "/memberships"
+    description: "Join a pool as a recurring rider (OCC-guarded on Pool.version)"
+    roles: [Rider, PlatformOps]
+    code: 201
+    input: [pool_id, rider_member_id, expected_pool_version, "recurring_seats?"]
+    output: Membership
+    side_effects: ["status=ACTIVE; Pool.committed_seat_count recomputed; increments Pool.version by 1"]
+
+  - method: GET
+    path: "/memberships/{id}"
+    description: "Get a membership"
+    roles: [Rider, Driver, PlatformOps, ProgramAdmin]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: []
+
+  - method: GET
+    path: "/memberships"
+    description: "List memberships; filterable by pool_id, rider_member_id (reverse-reachability)"
+    roles: [Rider, Driver, PlatformOps, ProgramAdmin]
+    code: 200
+    input: ["pool_id?", "rider_member_id?", "limit?", "offset?"]
+    output: Membership[]
+    side_effects: []
+
+  - method: POST
+    path: "/memberships/{id}/end"
+    description: "End an active membership (rider leaves the pool)"
+    roles: [Rider, Driver, PlatformOps]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["status -> ENDED; Pool.committed_seat_count recomputed"]
+
+  # ---- Trip ----------------------------------------------------------------
+  - method: POST
+    path: "/trips"
+    description: "Schedule a trip instance for a pool"
+    roles: [Driver, PlatformOps]
+    code: 201
+    input: [pool_id, departure_at, duration_min, distance_miles, "hov_lane_used?"]
+    output: Trip
+    side_effects: ["status=SCHEDULED; total_cost_cents computed (trip_total_cost); hov_lane_used defaults from vehicle hov_eligible; seats_reserved=0"]
+
+  - method: GET
+    path: "/trips/{id}"
+    description: "Get a trip"
+    roles: [Driver, PlatformOps, ProgramAdmin, Rider]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: []
+
+  - method: GET
+    path: "/trips"
+    description: "List trips; filterable by pool_id (reverse-reachability for Trip.pool_id)"
+    roles: [Driver, PlatformOps, ProgramAdmin, Rider]
+    code: 200
+    input: ["pool_id?", "limit?", "offset?"]
+    output: Trip[]
+    side_effects: []
+
+  - method: POST
+    path: "/trips/{id}/open-boarding"
+    description: "Open boarding on a SCHEDULED trip (requires Pool ACTIVE)"
+    roles: [Driver, PlatformOps]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: ["status -> BOARDING"]
+
+  - method: POST
+    path: "/trips/{id}/depart"
+    description: "Depart a BOARDING trip; RESERVED riders become NO_SHOW"
+    roles: [Driver, PlatformOps]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: ["status -> IN_TRANSIT; RESERVED reservations -> NO_SHOW (cascade: reliability)"]
+
+  - method: POST
+    path: "/trips/{id}/complete"
+    description: "Complete an IN_TRANSIT trip; finalize cost-share, subsidy, payments, reliability"
+    roles: [Driver, PlatformOps]
+    code: 200
+    input: [hov_lane_used]
+    output: Trip
+    side_effects: ["status -> COMPLETED; CHECKED_IN reservations -> COMPLETED with FINAL cost-share/subsidy; ledger DEBITs; reliability COMPLETION events; driver wallet credited"]
+
+  - method: POST
+    path: "/trips/{id}/cancel"
+    description: "Cancel a SCHEDULED or BOARDING trip; refund and reverse subsidy"
+    roles: [Driver, ProgramAdmin, PlatformOps]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: ["status -> CANCELLED; reservations -> CANCELLED (cascade: wallet refund + ledger CREDIT + subsidy_consumed recompute)"]
+
+  # ---- Reservation ---------------------------------------------------------
+  - method: POST
+    path: "/reservations"
+    description: "Reserve seat(s) on a trip (OCC-guarded on Trip.version); charges wallet if pay_now"
+    roles: [Rider, PlatformOps]
+    code: 201
+    input: [trip_id, rider_member_id, expected_trip_version, "seat_count?", "pay_now?"]
+    output: Reservation
+    side_effects: ["reservation_status=RESERVED; estimate_cost_share_cents + estimate_subsidy_cents computed; if pay_now: wallet charged, payment_status=CHARGED; Trip.seats_reserved recomputed; increments Trip.version by 1"]
+
+  - method: GET
+    path: "/reservations/{id}"
+    description: "Get a reservation"
+    roles: [Rider, Driver, PlatformOps, ProgramAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+
+  - method: GET
+    path: "/reservations"
+    description: "List reservations; filterable by trip_id, rider_member_id (reverse-reachability)"
+    roles: [Rider, Driver, PlatformOps, ProgramAdmin]
+    code: 200
+    input: ["trip_id?", "rider_member_id?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+
+  - method: POST
+    path: "/reservations/{id}/check-in"
+    description: "Check a rider in on a BOARDING trip"
+    roles: [Driver, PlatformOps]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["reservation_status -> CHECKED_IN"]
+
+  - method: POST
+    path: "/reservations/{id}/no-show"
+    description: "Mark a RESERVED rider as a no-show"
+    roles: [Driver, PlatformOps]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["reservation_status -> NO_SHOW; reliability penalty; seat released"]
+
+  - method: POST
+    path: "/reservations/{id}/cancel"
+    description: "Cancel a RESERVED reservation; refund and reverse subsidy"
+    roles: [Rider, Driver, PlatformOps]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["reservation_status -> CANCELLED; wallet refund + ledger CREDIT; LATE_CANCEL reliability if BOARDING"]
+
+  # ---- GuaranteedRideHome --------------------------------------------------
+  - method: POST
+    path: "/grh-claims"
+    description: "Submit a guaranteed-ride-home claim (REQUESTED)"
+    roles: [Rider, PlatformOps]
+    code: 201
+    input: [rider_member_id, employer_program_id, claimed_fare_cents, reason_code, "trip_id?"]
+    output: GuaranteedRideHome
+    side_effects: ["status=REQUESTED"]
+
+  - method: GET
+    path: "/grh-claims/{id}"
+    description: "Get a GRH claim"
+    roles: [Rider, ProgramAdmin, PlatformOps]
+    code: 200
+    input: []
+    output: GuaranteedRideHome
+    side_effects: []
+
+  - method: GET
+    path: "/grh-claims"
+    description: "List GRH claims; filterable by rider_member_id, employer_program_id, trip_id (reverse-reachability)"
+    roles: [Rider, ProgramAdmin, PlatformOps]
+    code: 200
+    input: ["rider_member_id?", "employer_program_id?", "trip_id?", "limit?", "offset?"]
+    output: GuaranteedRideHome[]
+    side_effects: []
+
+  - method: POST
+    path: "/grh-claims/{id}/approve"
+    description: "Approve a REQUESTED claim (checks event + annual caps)"
+    roles: [ProgramAdmin, PlatformOps]
+    code: 200
+    input: []
+    output: GuaranteedRideHome
+    side_effects: ["status -> APPROVED"]
+
+  - method: POST
+    path: "/grh-claims/{id}/reimburse"
+    description: "Reimburse an APPROVED claim; credits wallet and debits subsidy"
+    roles: [ProgramAdmin, PlatformOps]
+    code: 200
+    input: []
+    output: GuaranteedRideHome
+    side_effects: ["reimbursed_cents computed; wallet credited; ledger DEBIT; status -> REIMBURSED"]
+
+  - method: POST
+    path: "/grh-claims/{id}/deny"
+    description: "Deny a REQUESTED claim with a denial reason"
+    roles: [ProgramAdmin, PlatformOps]
+    code: 200
+    input: [denial_reason]
+    output: GuaranteedRideHome
+    side_effects: ["status -> DENIED; denial_reason set"]
+
+  # ---- Ledger / reliability event reverse-reachability ---------------------
+  - method: GET
+    path: "/reliability-events/{id}"
+    description: "Get a single ReliabilityEvent (establishes the reliability-events collection segment)"
+    roles: [ProgramAdmin, PlatformOps, Driver, Rider]
+    code: 200
+    input: []
+    output: ReliabilityEvent
+    side_effects: []
+
+  - method: GET
+    path: "/reliability-events"
+    description: "List ReliabilityEvent rows; filterable by member_id, reservation_id (reverse-reachability for those FKs)"
+    roles: [ProgramAdmin, PlatformOps, Driver, Rider]
+    code: 200
+    input: ["member_id?", "reservation_id?", "limit?", "offset?"]
+    output: ReliabilityEvent[]
+    side_effects: []
+
+  - method: GET
+    path: "/subsidy-ledger-entries/{id}"
+    description: "Get a single SubsidyLedgerEntry (establishes the subsidy-ledger-entries collection segment)"
+    roles: [ProgramAdmin, PlatformOps]
+    code: 200
+    input: []
+    output: SubsidyLedgerEntry
+    side_effects: []
+
+  - method: GET
+    path: "/subsidy-ledger-entries"
+    description: "List SubsidyLedgerEntry rows; filterable by member_id, reservation_id, employer_program_id (reverse-reachability for those FKs)"
+    roles: [ProgramAdmin, PlatformOps]
+    code: 200
+    input: ["member_id?", "reservation_id?", "employer_program_id?", "limit?", "offset?"]
+    output: SubsidyLedgerEntry[]
+    side_effects: []
+
+  # ---- Test-driving / operational -----------------------------------------
+  - method: POST
+    path: "/_clock/set"
+    description: "Test-driving: set the simulation clock to an absolute ISO 8601 UTC instant"
+    roles: [PlatformOps]
+    code: 200
+    input: [now_iso8601]
+    output: null
+    side_effects: ["server clock_now set; month/year derived counters re-bucketed on next read"]
+
+  - method: POST
+    path: "/_batch/run"
+    description: "Test-driving: run the periodic batch (expires stale OPEN match requests > 14 days)"
+    roles: [PlatformOps]
+    code: 200
+    input: []
+    output: null
+    side_effects: ["OPEN MatchRequests older than 14 days -> EXPIRED"]
+
+  - method: GET
+    path: "/healthz"
+    description: "Liveness probe (no auth)"
+    roles: [ProgramAdmin, PlatformOps, Driver, Rider, Anonymous]
+    code: 200
+    input: []
+    output: null
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing or malformed X-User-Role / X-User-ID headers" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Role not permitted for the operation, or entity_backed user acting on a resource they do not own" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "A path-referenced resource or body FK reference does not exist" }
+  - { id: ERR_INVALID_REQUEST, http: 422, condition: "Malformed body: missing required field, invalid enum, out-of-range numeric, latest_departure_min < earliest_departure_min, seat_count < 1" }
+  - { id: ERR_STALE_TRIP_VERSION, http: 412, condition: "expected_trip_version does not equal the Trip's current version on reservation create" }
+  - { id: ERR_STALE_POOL_VERSION, http: 412, condition: "expected_pool_version does not equal the Pool's current version on membership create" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Target resource is not in a state that permits the requested transition" }
+  - { id: ERR_DEPENDENCY_NOT_READY, http: 409, condition: "A required cross-entity precondition is unmet (Trip not SCHEDULED, Pool not ACTIVE, EmployerProgram not ACTIVE)" }
+  - { id: ERR_RELIABILITY_TOO_LOW, http: 409, condition: "Rider CONFIRMED reliability_score < 70.0 on reservation create" }
+  - { id: ERR_TRIP_WINDOW_OVERLAP, http: 409, condition: "New trip overlaps the half-open [departure_at, departure_at+duration_min) window of another non-CANCELLED trip on the same pool" }
+  - { id: ERR_RIDER_DOUBLE_BOOKED, http: 409, condition: "New reservation puts the rider on two trips whose buffered travel windows overlap" }
+  - { id: ERR_SEATS_EXHAUSTED, http: 409, condition: "seats_reserved + requested seat_count would exceed the trip's pool seat_capacity" }
+  - { id: ERR_POOL_CAPACITY_EXCEEDED, http: 409, condition: "committed_seat_count + recurring_seats would exceed Pool.seat_capacity" }
+  - { id: ERR_GRH_EVENT_CAP, http: 409, condition: "grh_year_event_count >= grh_max_events_per_year on GRH approve" }
+  - { id: ERR_GRH_ANNUAL_CAP, http: 409, condition: "grh_year_used_cents >= grh_annual_cap_cents on GRH approve" }
+  - { id: ERR_INSUFFICIENT_WALLET, http: 402, condition: "Rider wallet cannot cover the immediate estimate_cost_share_cents charge" }
+  - { id: ERR_NO_MATCH_FOUND, http: 422, condition: "No candidate Pool satisfies the match eligibility filter" }
+  - { id: ERR_VALIDATION_DRIVER_REQUIRED, http: 422, condition: "Pool driver_member_id references a Member whose can_drive is false, or vehicle owner mismatch" }
+  - { id: ERR_PROGRAM_BUDGET_EXHAUSTED, http: 409, condition: "A subsidy DEBIT would exceed the program's subsidy_budget_cents (subsidy collapses to 0; surfaced only when an explicit budget-guard write is attempted)" }
+  - { id: ERR_MEMBERSHIP_DUPLICATE, http: 409, condition: "Rider already holds an ACTIVE Membership on this pool" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlatformOps
+    description: "Operational override: provisions programs/members, runs batch + clock, can drive any state transition for support purposes"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /_clock/set — set simulation clock"
+      - "POST /_batch/run — run periodic batch"
+    shared_operations:
+      - "every business endpoint (superset operator) — programs, members, vehicles, pools, match-requests, memberships, trips, reservations, grh-claims, ledgers"
+
+  - name: ProgramAdmin
+    description: "Employer-program administrator: owns EmployerProgram lifecycle and GRH adjudication"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /employer-programs — create program"
+      - "POST /employer-programs/{id}/freeze, /unfreeze — program budget control"
+      - "POST /members — register members under the program"
+      - "POST /grh-claims/{id}/approve, /reimburse, /deny — GRH adjudication"
+    shared_operations:
+      - "GET reads across programs, members, pools, trips, reservations, ledgers"
+      - "POST /pools/{id}/suspend — may suspend a pool in its program"
+      - "POST /trips/{id}/cancel — may cancel a trip in its program"
+
+  - name: Driver
+    description: "A driving member: owns vehicles, pools, and trip operation. entity_backed by Member; X-User-ID must equal the pool's/vehicle's owner member id for owned-resource writes."
+    identity: "entity_backed:Member"
+    exclusive_operations:
+      - "POST /vehicles — register own vehicle"
+      - "POST /pools — create own pool (driver_member_id must equal X-User-ID)"
+      - "POST /pools/{id}/activate, /suspend, /close — operate own pool"
+      - "POST /trips — schedule own pool's trip"
+      - "POST /trips/{id}/open-boarding, /depart, /complete — operate own trip"
+      - "POST /reservations/{id}/check-in, /no-show — manage riders on own trip"
+    shared_operations:
+      - "GET reads on pools, trips, reservations, memberships, members, vehicles"
+      - "POST /reservations/{id}/cancel — driver may cancel a rider on own trip"
+      - "POST /memberships/{id}/end — driver may end a membership on own pool"
+
+  - name: Rider
+    description: "A riding member: creates match requests, joins pools, reserves seats, files GRH claims. entity_backed by Member; X-User-ID must equal rider_member_id for owned-resource writes."
+    identity: "entity_backed:Member"
+    exclusive_operations:
+      - "POST /match-requests — create own request"
+      - "POST /match-requests/{id}/match, /reject, /confirm, /cancel — drive own request"
+      - "POST /memberships — join a pool as self (rider_member_id == X-User-ID)"
+      - "POST /reservations — reserve own seat (rider_member_id == X-User-ID)"
+      - "POST /grh-claims — file own claim (rider_member_id == X-User-ID)"
+    shared_operations:
+      - "GET reads on own reservations, memberships, match-requests, pools, trips, members"
+      - "POST /reservations/{id}/cancel — rider may cancel own reservation"
+      - "POST /memberships/{id}/end — rider may end own membership"

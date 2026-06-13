@@ -1,0 +1,51 @@
+"""Error IDs and their HTTP status mapping (PRD §5 Error Code Catalogue).
+
+Registering the map with the framework lets validate_error() auto-check the
+HTTP status that pairs with each error_id.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    ERR_AUTH_NOT_VERIFIED = "ERR_AUTH_NOT_VERIFIED"
+    ERR_PICKUP_CODE_MISMATCH = "ERR_PICKUP_CODE_MISMATCH"
+    ERR_MAILBOX_OCCUPIED = "ERR_MAILBOX_OCCUPIED"
+    ERR_NO_LOCKER_AVAILABLE = "ERR_NO_LOCKER_AVAILABLE"
+    ERR_UNRESOLVED_PACKAGES = "ERR_UNRESOLVED_PACKAGES"
+    ERR_AGREEMENT_NOT_ACTIVE = "ERR_AGREEMENT_NOT_ACTIVE"
+    ERR_DUPLICATE = "ERR_DUPLICATE"
+    ERR_NO_RECIPIENTS = "ERR_NO_RECIPIENTS"
+    ERR_INVALID_CLOCK = "ERR_INVALID_CLOCK"
+    ERR_PAYMENT_EXCEEDS_BALANCE = "ERR_PAYMENT_EXCEEDS_BALANCE"
+    ERR_MAILBOX_NOT_VACANT = "ERR_MAILBOX_NOT_VACANT"
+
+
+HTTP_STATUS_CODES: dict[str, int] = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_REQUEST: 422,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_AUTH_NOT_VERIFIED: 409,
+    ApiErrorId.ERR_PICKUP_CODE_MISMATCH: 409,
+    ApiErrorId.ERR_MAILBOX_OCCUPIED: 409,
+    ApiErrorId.ERR_NO_LOCKER_AVAILABLE: 409,
+    ApiErrorId.ERR_UNRESOLVED_PACKAGES: 409,
+    ApiErrorId.ERR_AGREEMENT_NOT_ACTIVE: 409,
+    ApiErrorId.ERR_DUPLICATE: 409,
+    ApiErrorId.ERR_NO_RECIPIENTS: 409,
+    ApiErrorId.ERR_INVALID_CLOCK: 422,
+    ApiErrorId.ERR_PAYMENT_EXCEEDS_BALANCE: 409,
+    ApiErrorId.ERR_MAILBOX_NOT_VACANT: 409,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

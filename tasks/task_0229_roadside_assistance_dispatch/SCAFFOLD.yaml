@@ -1,0 +1,1350 @@
+scenario: "Roadside Assistance Dispatch (AAA style): membership tier/coverage, service call (tow/jump/lockout/fuel/tire), GPS dispatch & ETA, provider network, mileage cap & overage, per-incident/annual limit, reimbursement claim, priority dispatch"
+domain_name: roadside-assistance-dispatch
+api_prefix: /
+
+# ---------------------------------------------------------------------------
+# Complexity profile
+# ---------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: quota_allocation          # finite annual service quota + finite provider/bay pool competed for
+  secondary_archetype: pricing_engine          # mileage cap/overage + tow cost + reimbursement reconciliation
+  complexity_layers:
+    - optimistic_concurrency                   # OCC on ServiceCall.version for offer dispatch over a stale call view
+    - cascading_side_effects                   # accept/complete/cancel cascade across DispatchOffer, ServiceProvider, Member, BayReservation, ServiceCall
+    - dual_variant_calculation                 # estimated vs final service cost; provisional vs adjudicated reimbursement
+    - selector_policy                          # priority dispatch picks one provider from an eligible pool by ranking
+
+  entity_topology: flat
+  # Peer entities (MembershipPlan, Member, ServiceProvider, Depot) linked by FK; ServiceCall and ReimbursementClaim
+  # reference them by FK in the body. DispatchOffer is nested under a ServiceCall; ProviderShift under a ServiceProvider;
+  # BayReservation under a Depot.
+
+  state_machine_shape: cyclic
+  # ServiceCall dispatch loop: DISPATCHING -> (offer made/declined/expired) -> DISPATCHING -> ... is a re-offer cycle.
+  # DispatchOffer is branching (OFFERED -> {ACCEPTED, DECLINED, EXPIRED}). ReimbursementClaim has a revision cycle
+  # (UNDER_REVIEW -> INFO_REQUESTED -> SUBMITTED -> UNDER_REVIEW). BayReservation is linear with a release/compensation.
+
+  relationship_patterns:
+    - one_to_many        # Member -> ServiceCall; ServiceCall -> DispatchOffer; ServiceProvider -> ProviderShift; Depot -> BayReservation; Member -> ReimbursementClaim
+    - cross_aggregate    # ServiceCall references Member; ReimbursementClaim references ServiceCall; BayReservation references ServiceCall + Depot
+
+  role_model: peer_roles
+  # Member owns its own ServiceCalls/Claims; ServiceProvider owns its DispatchOffers/Shifts; DispatchOperator is the
+  # platform operator (opaque) and owns plans/providers/depots/bay-reservations/dispatch/adjudication.
+
+  consistency_model: immediate
+
+# ---------------------------------------------------------------------------
+# §1.0 Response envelope (FIXED — verbatim)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: MembershipPlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: tier
+        type: enum
+        source: input
+        description: "Coverage tier name"
+        constraints: "one of {BASIC, PLUS, PREMIER}; unique across plans"
+      - name: annual_service_limit
+        type: integer
+        source: input
+        description: "Maximum number of dispatched-and-completed service calls a member on this plan may consume per annual period"
+        constraints: ">= 1"
+      - name: per_incident_mileage_cap_miles
+        type: number
+        source: input
+        description: "Free towing distance (miles) covered per tow incident before overage applies"
+        constraints: ">= 0; up to 3 decimal places"
+      - name: overage_rate_cents_per_mile
+        type: integer
+        source: input
+        description: "Member-paid overage charge in cents for each mile beyond per_incident_mileage_cap_miles on a tow"
+        constraints: ">= 0"
+      - name: priority_weight
+        type: integer
+        source: input
+        description: "Dispatch priority weight; higher weight is dispatched ahead of lower weight when providers are scarce"
+        constraints: ">= 1; PREMIER > PLUS > BASIC by convention but the server reads the numeric field"
+      - name: covered_service_types
+        type: array
+        source: input
+        description: "Service types covered without out-of-pocket base fee for this tier"
+        constraints: "non-empty subset of {TOW, JUMP, LOCKOUT, FUEL, TIRE}"
+      - name: base_service_fee_cents
+        type: integer
+        source: input
+        description: "Out-of-pocket base fee in cents charged when the requested service_type is NOT in covered_service_types"
+        constraints: ">= 0"
+
+  - name: Member
+    parent: null
+    common_fields: true
+    fields:
+      - name: plan_id
+        type: string
+        source: input
+        description: "FK -> MembershipPlan.id; the membership plan this member is enrolled on"
+      - name: full_name
+        type: string
+        source: input
+        description: "Member full name"
+      - name: status
+        type: enum
+        source: system
+        description: "Membership lifecycle status"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED}; initial ACTIVE; SUSPENDED set by POST /members/{id}/suspend, back to ACTIVE by POST /members/{id}/reinstate"
+      - name: home_lat
+        type: number
+        source: input
+        description: "Member home latitude (decimal degrees)"
+        constraints: "-90..90"
+      - name: home_lng
+        type: number
+        source: input
+        description: "Member home longitude (decimal degrees)"
+        constraints: "-180..180"
+      - name: annual_period_start
+        type: datetime
+        source: system
+        description: "Start of the current rolling annual usage period; set to created_at at registration; advanced by exactly 365 days at the first completion at or after annual_period_start + 365 days (resetting services_used_this_year to 0 first)"
+      - name: services_used_this_year
+        type: integer
+        source: computed
+        description: "Count of this member's ServiceCalls that reached COMPLETED within the current annual period [annual_period_start, annual_period_start + 365 days)"
+        default: 0
+      - name: outstanding_balance_cents
+        type: integer
+        source: computed
+        description: "Conserved quantity: sum of member_out_of_pocket_cents across this member's COMPLETED ServiceCalls minus sum of approved_amount_cents across this member's APPROVED ReimbursementClaims"
+        default: 0
+
+  - name: ServiceProvider
+    parent: null
+    common_fields: true
+    fields:
+      - name: company_name
+        type: string
+        source: input
+        description: "Provider/tow company name"
+      - name: status
+        type: enum
+        source: system
+        description: "Provider availability status"
+        default: AVAILABLE
+        constraints: "one of {AVAILABLE, ON_JOB, OFFLINE}; initial AVAILABLE"
+      - name: current_lat
+        type: number
+        source: input
+        description: "Provider current latitude (decimal degrees)"
+        constraints: "-90..90"
+      - name: current_lng
+        type: number
+        source: input
+        description: "Provider current longitude (decimal degrees)"
+        constraints: "-180..180"
+      - name: capabilities
+        type: array
+        source: input
+        description: "Service types this provider can perform"
+        constraints: "non-empty subset of {TOW, JUMP, LOCKOUT, FUEL, TIRE}"
+      - name: rating
+        type: number
+        source: input
+        description: "Provider quality rating 0.0..5.0, used as the primary dispatch ranking key"
+        constraints: "0.0..5.0; up to 2 decimal places"
+      - name: active_call_id
+        type: string
+        source: computed
+        description: "Denormalized back-pointer to the ServiceCall.id this provider is currently assigned to (set on accept, cleared on complete/cancel), or null when AVAILABLE/OFFLINE; not an ownership FK"
+
+  - name: ProviderShift
+    parent: ServiceProvider
+    common_fields: true
+    fields:
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> ServiceProvider.id; the provider this on-call shift belongs to"
+      - name: shift_start
+        type: datetime
+        source: input
+        description: "Inclusive start of the on-call window (half-open interval start)"
+      - name: shift_end
+        type: datetime
+        source: input
+        description: "Exclusive end of the on-call window (half-open interval end); must be strictly after shift_start"
+      - name: status
+        type: enum
+        source: system
+        description: "Shift lifecycle"
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, CANCELLED}; initial SCHEDULED"
+
+  - name: Depot
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Repair/storage depot name"
+      - name: lat
+        type: number
+        source: input
+        description: "Depot latitude (decimal degrees)"
+        constraints: "-90..90"
+      - name: lng
+        type: number
+        source: input
+        description: "Depot longitude (decimal degrees)"
+        constraints: "-180..180"
+      - name: bay_count
+        type: integer
+        source: input
+        description: "Total number of repair bays at this depot (aggregate capacity for concurrent BayReservations)"
+        constraints: ">= 1"
+      - name: cleanup_buffer_minutes
+        type: integer
+        source: input
+        description: "Minutes a bay stays blocked after a reservation's reserved_until before it can be reused (extends each reservation's effective occupancy window)"
+        constraints: ">= 0"
+      - name: occupied_bays
+        type: integer
+        source: computed
+        description: "Conserved quantity: count of this depot's BayReservations in ACTIVE status; must never exceed bay_count"
+        default: 0
+
+  - name: BayReservation
+    parent: Depot
+    common_fields: true
+    fields:
+      - name: depot_id
+        type: string
+        source: input
+        description: "FK -> Depot.id; the depot whose bay is reserved"
+      - name: service_call_id
+        type: string
+        source: input
+        description: "FK -> ServiceCall.id; the TOW call whose vehicle occupies the bay"
+      - name: reserved_from
+        type: datetime
+        source: input
+        description: "Inclusive start of the bay occupancy window (closed interval start)"
+      - name: reserved_until
+        type: datetime
+        source: input
+        description: "Inclusive end of the bay occupancy window (closed interval end); the effective block extends to reserved_until + depot.cleanup_buffer_minutes"
+      - name: status
+        type: enum
+        source: system
+        description: "Reservation lifecycle"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, RELEASED}; initial ACTIVE"
+
+  - name: ServiceCall
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the member who requested roadside assistance"
+      - name: service_type
+        type: enum
+        source: input
+        description: "Requested service"
+        constraints: "one of {TOW, JUMP, LOCKOUT, FUEL, TIRE}"
+      - name: breakdown_lat
+        type: number
+        source: input
+        description: "Breakdown location latitude (decimal degrees)"
+        constraints: "-90..90"
+      - name: breakdown_lng
+        type: number
+        source: input
+        description: "Breakdown location longitude (decimal degrees)"
+        constraints: "-180..180"
+      - name: dropoff_lat
+        type: number
+        source: input
+        description: "Tow drop-off latitude; required when service_type == TOW, ignored otherwise"
+        constraints: "-90..90"
+      - name: dropoff_lng
+        type: number
+        source: input
+        description: "Tow drop-off longitude; required when service_type == TOW, ignored otherwise"
+        constraints: "-180..180"
+      - name: status
+        type: enum
+        source: system
+        description: "Service-call lifecycle state"
+        default: DISPATCHING
+        constraints: "one of {DISPATCHING, ASSIGNED, EN_ROUTE, COMPLETED, CANCELLED, UNFULFILLED}; initial DISPATCHING"
+      - name: assigned_provider_id
+        type: string
+        source: computed
+        description: "Denormalized back-pointer to the ServiceProvider.id whose DispatchOffer was ACCEPTED (set on accept, cleared on cancel), or null while DISPATCHING/UNFULFILLED/CANCELLED; not an ownership FK"
+      - name: tow_distance_miles
+        type: number
+        source: computed
+        description: "Great-circle haversine distance in miles from breakdown to dropoff; computed at creation for TOW, 0 for non-tow"
+        default: 0
+      - name: estimated_cost_cents
+        type: integer
+        source: computed
+        description: "Provisional out-of-pocket estimate at creation: base fee (if uncovered) + estimated tow overage using tow_distance_miles"
+        default: 0
+      - name: final_cost_cents
+        type: integer
+        source: computed
+        description: "Final out-of-pocket recomputed on completion using provider-reported final_towed_miles; replaces the estimate"
+        default: 0
+      - name: member_out_of_pocket_cents
+        type: integer
+        source: computed
+        description: "Equals final_cost_cents once COMPLETED; the amount the member owes for this call and the basis for a reimbursement claim"
+        default: 0
+      - name: final_towed_miles
+        type: number
+        source: input
+        description: "Provider-reported actual towed distance, supplied on completion; defaults to tow_distance_miles when omitted"
+        default: 0
+      - name: dispatch_attempts
+        type: integer
+        source: computed
+        description: "Count of DispatchOffers ever created for this call; used to enforce the re-offer cap"
+        default: 0
+
+  - name: DispatchOffer
+    parent: ServiceCall
+    common_fields: true
+    fields:
+      - name: service_call_id
+        type: string
+        source: input
+        description: "FK -> ServiceCall.id; the call this offer dispatches"
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> ServiceProvider.id; the provider being offered the job"
+      - name: status
+        type: enum
+        source: system
+        description: "Offer lifecycle state"
+        default: OFFERED
+        constraints: "one of {OFFERED, ACCEPTED, DECLINED, EXPIRED}; initial OFFERED"
+      - name: eta_minutes
+        type: integer
+        source: computed
+        description: "Estimated time of arrival in whole minutes = ceil(offer_distance_miles / AVG_SPEED_MPH * 60), computed at offer creation"
+      - name: offer_distance_miles
+        type: number
+        source: computed
+        description: "Haversine distance in miles from the provider's current location to the breakdown location at offer creation"
+
+  - name: ReimbursementClaim
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the member filing the claim"
+      - name: service_call_id
+        type: string
+        source: input
+        description: "FK -> ServiceCall.id; the completed call the member paid out of pocket for and seeks reimbursement on"
+      - name: claimed_amount_cents
+        type: integer
+        source: input
+        description: "Amount in cents the member claims to have paid out of pocket"
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: system
+        description: "Claim adjudication state"
+        default: SUBMITTED
+        constraints: "one of {SUBMITTED, UNDER_REVIEW, INFO_REQUESTED, APPROVED, REJECTED}; initial SUBMITTED"
+      - name: approved_amount_cents
+        type: integer
+        source: computed
+        description: "Adjudicated payout = min(claimed_amount_cents, the linked call's member_out_of_pocket_cents); set on approval, 0 otherwise"
+        default: 0
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: ServiceCall
+    initial_state: DISPATCHING
+    terminal_states: [COMPLETED, CANCELLED, UNFULFILLED]
+    transitions:
+      - from: DISPATCHING
+        to: DISPATCHING
+        trigger: "POST /service-calls/{id}/offers (DispatchOperator dispatches an offer to a provider)"
+        actor: DispatchOperator
+        preconditions:
+          - "ServiceCall.status == DISPATCHING"
+          - "ServiceCall has no DispatchOffer currently in OFFERED status (only one live offer at a time)"
+          - "ServiceCall.dispatch_attempts < MAX_DISPATCH_ATTEMPTS"
+          - "target provider.status == AVAILABLE (cross-entity: ServiceCall offer depends on ServiceProvider state)"
+          - "target provider.capabilities contains ServiceCall.service_type"
+          - "expected_service_call_version matches ServiceCall.version"
+        side_effects:
+          - "creates a DispatchOffer in OFFERED with computed eta_minutes and offer_distance_miles"
+          - "increments ServiceCall.dispatch_attempts by 1"
+          - "increments ServiceCall.version by 1"
+        note: "self-loop: the call stays DISPATCHING; the outstanding offer must be resolved before another is dispatched"
+      - from: DISPATCHING
+        to: ASSIGNED
+        trigger: "POST /service-calls/{id}/offers/{offer_id}/accept (ServiceProvider accepts the live offer)"
+        actor: ServiceProvider
+        preconditions:
+          - "ServiceCall.status == DISPATCHING"
+          - "the offer.status == OFFERED and offer.service_call_id == this call"
+          - "acting ServiceProvider == offer.provider_id"
+          - "provider.status == AVAILABLE (cross-entity: depends on ServiceProvider state)"
+        side_effects:
+          - "CASCADE depth-3 hop1: offer.status -> ACCEPTED"
+          - "CASCADE depth-3 hop2 (caused by hop1): ServiceCall.status -> ASSIGNED and ServiceCall.assigned_provider_id = offer.provider_id"
+          - "CASCADE depth-3 hop3 (caused by hop2): the now-assigned ServiceProvider.status -> ON_JOB and provider.active_call_id = this call"
+          - "increments ServiceCall.version by 1"
+        note: "transitive cascade origin A (accept): Offer -> ServiceCall -> ServiceProvider, each hop caused by the prior"
+      - from: ASSIGNED
+        to: EN_ROUTE
+        trigger: "POST /service-calls/{id}/start (ServiceProvider marks travel begun)"
+        actor: ServiceProvider
+        preconditions:
+          - "ServiceCall.status == ASSIGNED"
+          - "acting ServiceProvider == ServiceCall.assigned_provider_id"
+        side_effects:
+          - "increments ServiceCall.version by 1"
+      - from: EN_ROUTE
+        to: COMPLETED
+        trigger: "POST /service-calls/{id}/complete (ServiceProvider reports job done with final_towed_miles)"
+        actor: ServiceProvider
+        preconditions:
+          - "ServiceCall.status == EN_ROUTE"
+          - "acting ServiceProvider == ServiceCall.assigned_provider_id"
+          - "member.services_used_this_year < member.plan.annual_service_limit at the time of completion (after any annual-period rollover) (cross-entity fiscal precondition)"
+        side_effects:
+          - "recomputes final_cost_cents via final_service_cost using final_towed_miles; sets member_out_of_pocket_cents = final_cost_cents"
+          - "if completion timestamp >= member.annual_period_start + 365 days: advance member.annual_period_start by 365 days and reset member.services_used_this_year to 0 first"
+          - "increments member.services_used_this_year by 1"
+          - "adds member_out_of_pocket_cents to member.outstanding_balance_cents (forward action of the financial conserved-quantity invariant)"
+          - "ServiceProvider.status -> AVAILABLE and provider.active_call_id = null"
+          - "increments ServiceCall.version by 1"
+        note: "boundary: services_used_this_year == annual_service_limit - 1 succeeds and brings the count to the limit; == limit is rejected"
+      - from: DISPATCHING
+        to: UNFULFILLED
+        trigger: "POST /service-calls/{id}/abandon (DispatchOperator gives up after exhausting the provider pool)"
+        actor: DispatchOperator
+        preconditions:
+          - "ServiceCall.status == DISPATCHING"
+          - "ServiceCall has no DispatchOffer currently in OFFERED status"
+          - "ServiceCall.dispatch_attempts >= 1"
+        side_effects:
+          - "increments ServiceCall.version by 1"
+        note: "terminal failure path when no provider accepted"
+      - from: DISPATCHING
+        to: CANCELLED
+        trigger: "POST /service-calls/{id}/cancel (Member cancels while still being dispatched)"
+        actor: Member
+        preconditions:
+          - "ServiceCall.status == DISPATCHING"
+          - "acting Member == ServiceCall.member_id"
+        side_effects:
+          - "CASCADE hop1: ServiceCall.status -> CANCELLED"
+          - "CASCADE hop2 (caused by hop1): any DispatchOffer in OFFERED on this call -> EXPIRED (conditional cascade — only the live offer)"
+          - "increments ServiceCall.version by 1"
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "POST /service-calls/{id}/cancel (Member cancels after a provider was assigned)"
+        actor: Member
+        preconditions:
+          - "ServiceCall.status == ASSIGNED"
+          - "acting Member == ServiceCall.member_id"
+        side_effects:
+          - "CASCADE depth-2 hop1: ServiceCall.status -> CANCELLED and assigned_provider_id cleared"
+          - "CASCADE depth-2 hop2 (caused by hop1): the previously-assigned ServiceProvider.status -> AVAILABLE and provider.active_call_id = null (compensation releasing the provider)"
+          - "increments ServiceCall.version by 1"
+        note: "transitive cascade origin B (cancel): ServiceCall -> ServiceProvider; compensating action of the provider-occupancy conserved-quantity invariant"
+
+  - entity: DispatchOffer
+    initial_state: OFFERED
+    terminal_states: [ACCEPTED, DECLINED, EXPIRED]
+    transitions:
+      - from: OFFERED
+        to: ACCEPTED
+        trigger: "POST /service-calls/{id}/offers/{offer_id}/accept"
+        actor: ServiceProvider
+        preconditions:
+          - "offer.status == OFFERED"
+          - "acting ServiceProvider == offer.provider_id"
+          - "parent ServiceCall.status == DISPATCHING"
+          - "provider.status == AVAILABLE"
+        side_effects:
+          - "drives parent ServiceCall DISPATCHING -> ASSIGNED and provider -> ON_JOB (divergent branch: this is the only OFFERED branch that mutates provider state)"
+        note: "branch A of the OFFERED fork — divergent side-effect set"
+      - from: OFFERED
+        to: DECLINED
+        trigger: "POST /service-calls/{id}/offers/{offer_id}/decline"
+        actor: ServiceProvider
+        preconditions:
+          - "offer.status == OFFERED"
+          - "acting ServiceProvider == offer.provider_id"
+        side_effects:
+          - "parent ServiceCall remains DISPATCHING, freeing it for the next offer; provider state untouched"
+        note: "branch B of the OFFERED fork — no provider mutation"
+      - from: OFFERED
+        to: EXPIRED
+        trigger: "POST /service-calls/{id}/offers/{offer_id}/expire (DispatchOperator times out a stale offer) OR cascaded by Member cancel"
+        actor: DispatchOperator
+        preconditions:
+          - "offer.status == OFFERED"
+        side_effects:
+          - "parent ServiceCall remains DISPATCHING when triggered directly, freeing it for the next offer; provider state untouched"
+        note: "branch C of the OFFERED fork — no provider mutation"
+
+  - entity: ReimbursementClaim
+    initial_state: SUBMITTED
+    terminal_states: [APPROVED, REJECTED]
+    transitions:
+      - from: SUBMITTED
+        to: UNDER_REVIEW
+        trigger: "POST /reimbursement-claims/{id}/begin-review"
+        actor: DispatchOperator
+        preconditions:
+          - "claim.status == SUBMITTED"
+        side_effects:
+          - "increments ReimbursementClaim.version by 1"
+      - from: UNDER_REVIEW
+        to: INFO_REQUESTED
+        trigger: "POST /reimbursement-claims/{id}/request-info"
+        actor: DispatchOperator
+        preconditions:
+          - "claim.status == UNDER_REVIEW"
+        side_effects:
+          - "increments ReimbursementClaim.version by 1"
+      - from: INFO_REQUESTED
+        to: SUBMITTED
+        trigger: "POST /reimbursement-claims/{id}/resubmit (Member supplies requested info)"
+        actor: Member
+        preconditions:
+          - "claim.status == INFO_REQUESTED"
+          - "acting Member == claim.member_id"
+        side_effects:
+          - "increments ReimbursementClaim.version by 1"
+        note: "revision cycle: SUBMITTED -> UNDER_REVIEW -> INFO_REQUESTED -> SUBMITTED"
+      - from: UNDER_REVIEW
+        to: APPROVED
+        trigger: "POST /reimbursement-claims/{id}/approve"
+        actor: DispatchOperator
+        preconditions:
+          - "claim.status == UNDER_REVIEW"
+          - "the linked ServiceCall.status == COMPLETED (cross-entity: Claim approval depends on ServiceCall state)"
+        side_effects:
+          - "sets approved_amount_cents = min(claimed_amount_cents, linked ServiceCall.member_out_of_pocket_cents) via reimbursement_payout"
+          - "subtracts approved_amount_cents from member.outstanding_balance_cents (compensating action of the financial conserved-quantity invariant)"
+          - "increments ReimbursementClaim.version by 1"
+      - from: UNDER_REVIEW
+        to: REJECTED
+        trigger: "POST /reimbursement-claims/{id}/reject"
+        actor: DispatchOperator
+        preconditions:
+          - "claim.status == UNDER_REVIEW"
+        side_effects:
+          - "approved_amount_cents stays 0; member.outstanding_balance_cents unchanged"
+          - "increments ReimbursementClaim.version by 1"
+
+  - entity: BayReservation
+    initial_state: ACTIVE
+    terminal_states: [RELEASED]
+    transitions:
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /depots/{id}/bay-reservations/{reservation_id}/release"
+        actor: DispatchOperator
+        preconditions:
+          - "reservation.status == ACTIVE"
+        side_effects:
+          - "decrements depot.occupied_bays by 1 (compensating action of the bay-occupancy conserved-quantity invariant)"
+          - "increments BayReservation.version by 1"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: offer-dispatch-stale-call
+    parent_entity: ServiceCall
+    write_endpoint: "POST /service-calls/{id}/offers"
+    occ_field: "expected_service_call_version"
+    description: |
+      Dispatching a new DispatchOffer against a ServiceCall whose version has
+      advanced since the operator last observed it is rejected. The canonical
+      case: another operator already dispatched an offer (legitimately allowed
+      while the call is DISPATCHING with no live offer, and which bumps the
+      call's version), so the current operator's view of the call is stale and
+      its dispatch would over-issue a second live offer. The OCC check reduces
+      this to a deterministic stale-version comparison.
+    error_id: ERR_STALE_CALL_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: estimated_service_cost
+    trigger: "on POST /service-calls (creation), as estimated_cost_cents"
+    algorithm: tiered_pricing
+    formula: |
+      # tow_distance_miles already computed via haversine at creation.
+      base = plan.base_service_fee_cents if service_type NOT in plan.covered_service_types else 0
+      if service_type == TOW:
+        overage_miles = max(0, tow_distance_miles - plan.per_incident_mileage_cap_miles)
+        overage_miles_r = round_half_up(overage_miles, 3)            # STEP 1: round miles to 3 decimals
+        overage = round_half_up(overage_miles_r * plan.overage_rate_cents_per_mile, 0)   # STEP 2: multiply, then round to whole cents
+      else:
+        overage = 0
+      estimated_cost_cents = base + overage
+    input_set: "the requesting Member's plan, the ServiceCall's service_type and tow_distance_miles at creation"
+    constants:
+      EARTH_RADIUS_MILES: 3958.7613
+    precision: "PINNED ORDER: round miles to 3 decimals FIRST, then multiply by rate, then round to whole cents (round_half_up). Round-then-multiply-then-round."
+    variants:
+      - name: covered_estimate
+        when: "service_type IN plan.covered_service_types"
+        difference: "base fee is 0; only tow overage (if TOW) contributes"
+      - name: uncovered_estimate
+        when: "service_type NOT IN plan.covered_service_types"
+        difference: "base fee added on top of any tow overage"
+
+  - name: final_service_cost
+    trigger: "on POST /service-calls/{id}/complete (EN_ROUTE -> COMPLETED), as final_cost_cents and member_out_of_pocket_cents"
+    algorithm: tiered_pricing
+    formula: |
+      # Same nested-rounding shape as estimated_service_cost but on provider-reported final_towed_miles.
+      miles = final_towed_miles if final_towed_miles provided else tow_distance_miles
+      base = plan.base_service_fee_cents if service_type NOT in plan.covered_service_types else 0
+      if service_type == TOW:
+        overage_miles = max(0, miles - plan.per_incident_mileage_cap_miles)
+        overage_miles_r = round_half_up(overage_miles, 3)            # STEP 1
+        overage = round_half_up(overage_miles_r * plan.overage_rate_cents_per_mile, 0)   # STEP 2
+      else:
+        overage = 0
+      final_cost_cents = base + overage
+      member_out_of_pocket_cents = final_cost_cents
+    input_set: "the call's plan snapshot, service_type, and provider-reported final_towed_miles at completion"
+    constants:
+      EARTH_RADIUS_MILES: 3958.7613
+    precision: "identical pinned regime to estimated_service_cost: round-then-multiply-then-round"
+    variants:
+      - name: estimate_held
+        when: "final_towed_miles omitted or equal to tow_distance_miles"
+        difference: "final_cost_cents == estimated_cost_cents (no reconciliation delta)"
+      - name: estimate_revised
+        when: "final_towed_miles differs from tow_distance_miles"
+        difference: "final_cost_cents diverges from estimated_cost_cents; the delta is what is booked to outstanding_balance_cents"
+
+  - name: reimbursement_payout
+    trigger: "on POST /reimbursement-claims/{id}/approve (UNDER_REVIEW -> APPROVED), as approved_amount_cents"
+    algorithm: aggregation
+    formula: |
+      approved_amount_cents = min(claim.claimed_amount_cents, linkedServiceCall.member_out_of_pocket_cents)
+      # side-effect: member.outstanding_balance_cents -= approved_amount_cents
+    input_set: "the claim's claimed_amount_cents and the linked COMPLETED ServiceCall's member_out_of_pocket_cents"
+    constants: {}
+    precision: "whole cents; both inputs are integer cents so no rounding needed"
+    variants:
+      - name: fully_reimbursed
+        when: "claimed_amount_cents <= linkedServiceCall.member_out_of_pocket_cents"
+        difference: "approved_amount_cents == claimed_amount_cents (member made whole)"
+      - name: capped_reimbursed
+        when: "claimed_amount_cents > linkedServiceCall.member_out_of_pocket_cents"
+        difference: "approved_amount_cents == linkedServiceCall.member_out_of_pocket_cents (over-claim trimmed to documented cost)"
+
+  - name: dispatch_priority_selection
+    trigger: "GET /service-calls/{id}/dispatch-candidates — server ranks the eligible provider pool for priority dispatch"
+    algorithm: weighted_scoring
+    formula: |
+      # Eligibility filter (candidate set) — ALL must hold:
+      candidates = ServiceProvider where
+        status == AVAILABLE
+        AND capabilities CONTAINS call.service_type
+        AND haversine_miles(provider.current, call.breakdown) <= MAX_DISPATCH_RADIUS_MILES
+        AND provider has at least one ProviderShift with status == SCHEDULED whose half-open window
+            [shift_start, shift_end) contains the current server clock (cross-entity shift gating)
+      # Ranking expression (sort key), applied left-to-right (>=3 inputs, conditional branch on TOW):
+      #   1. provider.rating DESC                                   (higher quality first)
+      #   2. offer_distance_miles ASC                               (closer first)
+      #   3. (only when call.service_type == TOW) capabilities length ASC   (prefer specialists with fewer capabilities for tows)
+      #   4. created_at ASC                                         (earliest-registered; common-field fallback, NEVER id)
+      ranked = sort(candidates, by=[rating DESC, offer_distance_miles ASC, (TOW ? capabilities_len ASC : skip), created_at ASC])
+      # Empty-pool fallback: return an empty array; the operator then abandons the call.
+    input_set: "ServiceProviders with status==AVAILABLE whose capabilities cover the call's service_type, within MAX_DISPATCH_RADIUS_MILES, currently inside a SCHEDULED shift window"
+    constants:
+      MAX_DISPATCH_RADIUS_MILES: 50
+      MAX_DISPATCH_ATTEMPTS: 3
+      EARTH_RADIUS_MILES: 3958.7613
+    precision: "distances to 3 decimals for comparison; rating compared at stored precision (2 decimals); the TOW-only capabilities_len tie-break is a conditional branch in the sort"
+
+  - name: eta_estimate
+    trigger: "on POST /service-calls/{id}/offers (offer creation), as DispatchOffer.eta_minutes"
+    algorithm: threshold
+    formula: |
+      offer_distance_miles = haversine_miles(provider.current, call.breakdown)
+      eta_minutes = ceil(offer_distance_miles / AVG_SPEED_MPH * 60)
+    input_set: "provider current location and call breakdown location at offer creation"
+    constants:
+      AVG_SPEED_MPH: 40
+      EARTH_RADIUS_MILES: 3958.7613
+    precision: "eta_minutes is a whole minute via ceil; offer_distance_miles to 3 decimals"
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "every resource referenced in the path or FK body field exists, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints referencing an id"
+
+  - priority: 4
+    category: auth
+    check: "acting Member/Provider owns the targeted resource (Member == resource.member_id; Provider == offer.provider_id / call.assigned_provider_id / shift.provider_id)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "member-owned and provider-owned mutating endpoints"
+
+  - priority: 5
+    category: state
+    check: "target resource is in a state from which this transition is legal"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6
+    category: business_constraint
+    check: "the requesting Member.status == ACTIVE before a ServiceCall may be created"
+    error_id: ERR_MEMBERSHIP_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /service-calls"
+
+  - priority: 7
+    category: business_safety
+    check: "the target ServiceProvider.capabilities contains the call's service_type (cannot dispatch a job a provider cannot perform)"
+    error_id: ERR_CAPABILITY_MISMATCH
+    http_status: 409
+    applies_to: "POST /service-calls/{id}/offers"
+
+  - priority: 8
+    category: business_referential
+    check: "the target provider.status == AVAILABLE when dispatching an offer or accepting one (cross-entity: ServiceCall transition depends on ServiceProvider state)"
+    error_id: ERR_PROVIDER_UNAVAILABLE
+    http_status: 409
+    applies_to: "POST /service-calls/{id}/offers, POST /service-calls/{id}/offers/{offer_id}/accept"
+
+  - priority: 9
+    category: business_constraint
+    check: "no DispatchOffer in OFFERED already exists on the call (only one live offer at a time)"
+    error_id: ERR_OFFER_ALREADY_OUTSTANDING
+    http_status: 409
+    applies_to: "POST /service-calls/{id}/offers"
+
+  - priority: 10
+    category: business_constraint
+    check: "ServiceCall.dispatch_attempts < MAX_DISPATCH_ATTEMPTS (MAX_DISPATCH_ATTEMPTS = 3) before creating another offer"
+    error_id: ERR_DISPATCH_LIMIT_REACHED
+    http_status: 409
+    applies_to: "POST /service-calls/{id}/offers"
+
+  - priority: 11
+    category: business_temporal
+    check: "a new ProviderShift [shift_start, shift_end) must not overlap (positive-measure) an existing SCHEDULED shift for the same provider; adjacency (shift_end == other.shift_start) is allowed"
+    error_id: ERR_SHIFT_OVERLAP
+    http_status: 409
+    applies_to: "POST /service-providers/{id}/shifts"
+
+  - priority: 12
+    category: business_temporal
+    check: "a new BayReservation must not be admitted when, across its closed window [reserved_from, reserved_until + cleanup_buffer], the depot already has bay_count ACTIVE reservations whose buffered windows overlap it (aggregate-capacity overlap)"
+    error_id: ERR_NO_BAY_AVAILABLE
+    http_status: 409
+    applies_to: "POST /depots/{id}/bay-reservations"
+
+  - priority: 13
+    category: business_fiscal
+    check: "member.services_used_this_year < member.plan.annual_service_limit when completing a call (annual incident quota, evaluated after any annual-period rollover)"
+    error_id: ERR_ANNUAL_LIMIT_EXCEEDED
+    http_status: 409
+    applies_to: "POST /service-calls/{id}/complete"
+
+  - priority: 14
+    category: business_referential
+    check: "the linked ServiceCall.status == COMPLETED before a ReimbursementClaim may be approved (cross-entity: Claim transition depends on ServiceCall state)"
+    error_id: ERR_CALL_NOT_COMPLETED
+    http_status: 409
+    applies_to: "POST /reimbursement-claims/{id}/approve"
+
+  - priority: 15
+    category: business_constraint
+    check: "claimed_amount_cents >= 1 and the linked ServiceCall.member_id == claim.member_id (a member may only claim on its own calls)"
+    error_id: ERR_INVALID_CLAIM_TARGET
+    http_status: 422
+    applies_to: "POST /reimbursement-claims"
+
+  - priority: 16
+    category: business_constraint
+    check: "request body conforms: required fields present, enums valid, numeric ranges respected, TOW requires dropoff coordinates, shift_end > shift_start, reserved_until >= reserved_from"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all POST/PATCH with a body"
+
+  - priority: 17
+    category: business_constraint
+    check: "pagination limit in 1..100 and offset >= 0"
+    error_id: ERR_INVALID_PAGINATION
+    http_status: 422
+    applies_to: "all GET list endpoints"
+
+  - priority: 18
+    category: business_constraint
+    check: "OCC: expected_service_call_version matches the live ServiceCall.version when dispatching an offer"
+    error_id: ERR_STALE_CALL_VERSION
+    http_status: 412
+    applies_to: "POST /service-calls/{id}/offers"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # ---- MembershipPlan ----
+  - method: POST
+    path: "/membership-plans"
+    description: "Create a membership/coverage plan"
+    roles: [DispatchOperator]
+    code: 201
+    input: [tier, annual_service_limit, per_incident_mileage_cap_miles, overage_rate_cents_per_mile, priority_weight, covered_service_types, base_service_fee_cents]
+    output: MembershipPlan
+    side_effects: []
+  - method: GET
+    path: "/membership-plans/{id}"
+    description: "Fetch a plan"
+    roles: [DispatchOperator, Member, ServiceProvider]
+    code: 200
+    input: []
+    output: MembershipPlan
+    side_effects: []
+  - method: GET
+    path: "/membership-plans"
+    description: "List plans"
+    roles: [DispatchOperator, Member, ServiceProvider]
+    code: 200
+    input: ["tier?", "limit?", "offset?"]
+    output: MembershipPlan[]
+    side_effects: []
+
+  # ---- Member ----
+  - method: POST
+    path: "/members"
+    description: "Register a member onto a plan"
+    roles: [DispatchOperator]
+    code: 201
+    input: [plan_id, full_name, home_lat, home_lng]
+    output: Member
+    side_effects: ["sets annual_period_start = created_at; status = ACTIVE; services_used_this_year = 0; outstanding_balance_cents = 0"]
+  - method: GET
+    path: "/members/{id}"
+    description: "Fetch a member (includes computed services_used_this_year and outstanding_balance_cents)"
+    roles: [DispatchOperator, Member]
+    code: 200
+    input: []
+    output: Member
+    side_effects: []
+  - method: GET
+    path: "/members"
+    description: "List members, filterable by plan or status (reverse-reachability for Member.plan_id)"
+    roles: [DispatchOperator]
+    code: 200
+    input: ["plan_id?", "status?", "limit?", "offset?"]
+    output: Member[]
+    side_effects: []
+  - method: POST
+    path: "/members/{id}/suspend"
+    description: "Suspend a membership (admin)"
+    roles: [DispatchOperator]
+    code: 200
+    input: []
+    output: Member
+    side_effects: ["member.status -> SUSPENDED"]
+  - method: POST
+    path: "/members/{id}/reinstate"
+    description: "Reinstate a suspended membership (admin)"
+    roles: [DispatchOperator]
+    code: 200
+    input: []
+    output: Member
+    side_effects: ["member.status -> ACTIVE"]
+
+  # ---- ServiceProvider ----
+  - method: POST
+    path: "/service-providers"
+    description: "Register a provider into the network"
+    roles: [DispatchOperator]
+    code: 201
+    input: [company_name, current_lat, current_lng, capabilities, rating]
+    output: ServiceProvider
+    side_effects: ["status = AVAILABLE; active_call_id = null"]
+  - method: GET
+    path: "/service-providers/{id}"
+    description: "Fetch a provider"
+    roles: [DispatchOperator, ServiceProvider]
+    code: 200
+    input: []
+    output: ServiceProvider
+    side_effects: []
+  - method: GET
+    path: "/service-providers"
+    description: "List providers, filterable by status"
+    roles: [DispatchOperator, ServiceProvider]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ServiceProvider[]
+    side_effects: []
+  - method: POST
+    path: "/service-providers/{id}/go-offline"
+    description: "Provider marks itself OFFLINE"
+    roles: [ServiceProvider]
+    code: 200
+    input: []
+    output: ServiceProvider
+    side_effects: ["status -> OFFLINE (only from AVAILABLE)"]
+  - method: POST
+    path: "/service-providers/{id}/go-online"
+    description: "Provider returns to AVAILABLE"
+    roles: [ServiceProvider]
+    code: 200
+    input: []
+    output: ServiceProvider
+    side_effects: ["status -> AVAILABLE (only from OFFLINE)"]
+  - method: GET
+    path: "/service-providers/{id}/offers"
+    description: "List the dispatch offers ever sent to this provider (reverse-reachability for DispatchOffer.provider_id)"
+    roles: [DispatchOperator, ServiceProvider]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: DispatchOffer[]
+    side_effects: []
+
+  # ---- ProviderShift ----
+  - method: POST
+    path: "/service-providers/{id}/shifts"
+    description: "Schedule an on-call shift window for a provider; rejected on overlap with another SCHEDULED shift"
+    roles: [DispatchOperator, ServiceProvider]
+    code: 201
+    input: [shift_start, shift_end]
+    output: ProviderShift
+    side_effects: ["creates ProviderShift in SCHEDULED after half-open overlap check"]
+  - method: GET
+    path: "/service-providers/{id}/shifts"
+    description: "List a provider's shifts (reverse-reachability for ProviderShift.provider_id)"
+    roles: [DispatchOperator, ServiceProvider]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ProviderShift[]
+    side_effects: []
+  - method: POST
+    path: "/service-providers/{id}/shifts/{shift_id}/cancel"
+    description: "Cancel a scheduled shift"
+    roles: [DispatchOperator, ServiceProvider]
+    code: 200
+    input: []
+    output: ProviderShift
+    side_effects: ["shift.status -> CANCELLED"]
+
+  # ---- Depot ----
+  - method: POST
+    path: "/depots"
+    description: "Create a tow/repair depot with finite bays"
+    roles: [DispatchOperator]
+    code: 201
+    input: [name, lat, lng, bay_count, cleanup_buffer_minutes]
+    output: Depot
+    side_effects: ["occupied_bays = 0"]
+  - method: GET
+    path: "/depots/{id}"
+    description: "Fetch a depot (includes computed occupied_bays)"
+    roles: [DispatchOperator, ServiceProvider, Member]
+    code: 200
+    input: []
+    output: Depot
+    side_effects: []
+  - method: GET
+    path: "/depots"
+    description: "List depots"
+    roles: [DispatchOperator, ServiceProvider, Member]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Depot[]
+    side_effects: []
+  - method: POST
+    path: "/depots/{id}/bay-reservations"
+    description: "Reserve a bay at a depot for a TOW drop-off window; rejected when no bay is free across the buffered window"
+    roles: [DispatchOperator]
+    code: 201
+    input: [service_call_id, reserved_from, reserved_until]
+    output: BayReservation
+    side_effects: ["creates BayReservation in ACTIVE after aggregate-capacity overlap check; increments depot.occupied_bays by 1 (forward action of the bay-occupancy invariant)"]
+  - method: GET
+    path: "/depots/{id}/bay-reservations"
+    description: "List a depot's bay reservations (reverse-reachability for BayReservation.depot_id and BayReservation.service_call_id)"
+    roles: [DispatchOperator]
+    code: 200
+    input: ["status?", "service_call_id?", "limit?", "offset?"]
+    output: BayReservation[]
+    side_effects: []
+  - method: POST
+    path: "/depots/{id}/bay-reservations/{reservation_id}/release"
+    description: "Release a bay reservation, freeing the bay"
+    roles: [DispatchOperator]
+    code: 200
+    input: []
+    output: BayReservation
+    side_effects: ["reservation.status -> RELEASED; decrements depot.occupied_bays by 1 (compensating action of the bay-occupancy invariant); version +1"]
+
+  # ---- ServiceCall ----
+  - method: POST
+    path: "/service-calls"
+    description: "Member requests roadside assistance; call opens in DISPATCHING with a computed estimate"
+    roles: [Member, DispatchOperator]
+    code: 201
+    input: [member_id, service_type, breakdown_lat, breakdown_lng, "dropoff_lat?", "dropoff_lng?"]
+    output: ServiceCall
+    side_effects: ["computes tow_distance_miles (haversine, TOW only); computes estimated_cost_cents via estimated_service_cost; status = DISPATCHING; dispatch_attempts = 0"]
+  - method: GET
+    path: "/service-calls/{id}"
+    description: "Fetch a service call"
+    roles: [DispatchOperator, Member, ServiceProvider]
+    code: 200
+    input: []
+    output: ServiceCall
+    side_effects: []
+  - method: GET
+    path: "/service-calls"
+    description: "List service calls, filterable by member or status (reverse-reachability for ServiceCall.member_id)"
+    roles: [DispatchOperator, Member]
+    code: 200
+    input: ["member_id?", "status?", "limit?", "offset?"]
+    output: ServiceCall[]
+    side_effects: []
+  - method: GET
+    path: "/service-calls/{id}/dispatch-candidates"
+    description: "Computed read: ranked eligible provider pool for priority dispatch (dispatch_priority_selection)"
+    roles: [DispatchOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ServiceProvider[]
+    side_effects: []
+  - method: POST
+    path: "/service-calls/{id}/offers"
+    description: "DispatchOperator dispatches an offer to a chosen provider (OCC-guarded)"
+    roles: [DispatchOperator]
+    code: 201
+    input: [provider_id, expected_service_call_version]
+    output: DispatchOffer
+    side_effects: ["creates DispatchOffer (OFFERED) with eta_minutes + offer_distance_miles; increments ServiceCall.dispatch_attempts by 1; increments ServiceCall.version by 1"]
+  - method: GET
+    path: "/service-calls/{id}/offers"
+    description: "List the dispatch offers made for a call (reverse-reachability for DispatchOffer.service_call_id)"
+    roles: [DispatchOperator, Member, ServiceProvider]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: DispatchOffer[]
+    side_effects: []
+  - method: GET
+    path: "/service-calls/{id}/bay-reservations"
+    description: "List the bay reservations made for this TOW call (reverse-reachability for BayReservation.service_call_id)"
+    roles: [DispatchOperator, Member]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: BayReservation[]
+    side_effects: []
+  - method: POST
+    path: "/service-calls/{id}/offers/{offer_id}/accept"
+    description: "Provider accepts the live offer; call becomes ASSIGNED"
+    roles: [ServiceProvider]
+    code: 200
+    input: []
+    output: DispatchOffer
+    side_effects: ["offer -> ACCEPTED; ServiceCall -> ASSIGNED; assigned_provider_id set; provider -> ON_JOB with active_call_id; ServiceCall.version +1"]
+  - method: POST
+    path: "/service-calls/{id}/offers/{offer_id}/decline"
+    description: "Provider declines the live offer; call stays DISPATCHING"
+    roles: [ServiceProvider]
+    code: 200
+    input: []
+    output: DispatchOffer
+    side_effects: ["offer -> DECLINED; ServiceCall remains DISPATCHING"]
+  - method: POST
+    path: "/service-calls/{id}/offers/{offer_id}/expire"
+    description: "Operator times out a stale offer; call stays DISPATCHING"
+    roles: [DispatchOperator]
+    code: 200
+    input: []
+    output: DispatchOffer
+    side_effects: ["offer -> EXPIRED; ServiceCall remains DISPATCHING"]
+  - method: POST
+    path: "/service-calls/{id}/start"
+    description: "Assigned provider begins travel; call -> EN_ROUTE"
+    roles: [ServiceProvider]
+    code: 200
+    input: []
+    output: ServiceCall
+    side_effects: ["status -> EN_ROUTE; ServiceCall.version +1"]
+  - method: POST
+    path: "/service-calls/{id}/complete"
+    description: "Provider completes the job with final towed miles; call -> COMPLETED, costs reconciled, quota and balance updated"
+    roles: [ServiceProvider]
+    code: 200
+    input: ["final_towed_miles?"]
+    output: ServiceCall
+    side_effects: ["computes final_cost_cents + member_out_of_pocket_cents via final_service_cost; rolls over annual period if elapsed; member.services_used_this_year +1; member.outstanding_balance_cents += member_out_of_pocket_cents; provider -> AVAILABLE; ServiceCall.version +1"]
+  - method: POST
+    path: "/service-calls/{id}/abandon"
+    description: "Operator abandons a call no provider accepted; call -> UNFULFILLED"
+    roles: [DispatchOperator]
+    code: 200
+    input: []
+    output: ServiceCall
+    side_effects: ["status -> UNFULFILLED; ServiceCall.version +1"]
+  - method: POST
+    path: "/service-calls/{id}/cancel"
+    description: "Member cancels their call (from DISPATCHING or ASSIGNED)"
+    roles: [Member]
+    code: 200
+    input: []
+    output: ServiceCall
+    side_effects: ["status -> CANCELLED; OFFERED offers -> EXPIRED; assigned provider released to AVAILABLE if ASSIGNED; ServiceCall.version +1"]
+
+  # ---- ReimbursementClaim ----
+  - method: POST
+    path: "/reimbursement-claims"
+    description: "Member files a reimbursement claim against a completed call"
+    roles: [Member, DispatchOperator]
+    code: 201
+    input: [member_id, service_call_id, claimed_amount_cents]
+    output: ReimbursementClaim
+    side_effects: ["status = SUBMITTED; approved_amount_cents = 0"]
+  - method: GET
+    path: "/reimbursement-claims/{id}"
+    description: "Fetch a claim"
+    roles: [DispatchOperator, Member]
+    code: 200
+    input: []
+    output: ReimbursementClaim
+    side_effects: []
+  - method: GET
+    path: "/reimbursement-claims"
+    description: "List claims, filterable by member or by linked service call (reverse-reachability for ReimbursementClaim.member_id and service_call_id)"
+    roles: [DispatchOperator, Member]
+    code: 200
+    input: ["member_id?", "service_call_id?", "status?", "limit?", "offset?"]
+    output: ReimbursementClaim[]
+    side_effects: []
+  - method: POST
+    path: "/reimbursement-claims/{id}/begin-review"
+    description: "Operator starts adjudication; claim -> UNDER_REVIEW"
+    roles: [DispatchOperator]
+    code: 200
+    input: []
+    output: ReimbursementClaim
+    side_effects: ["status -> UNDER_REVIEW; version +1"]
+  - method: POST
+    path: "/reimbursement-claims/{id}/request-info"
+    description: "Operator requests more info; claim -> INFO_REQUESTED"
+    roles: [DispatchOperator]
+    code: 200
+    input: []
+    output: ReimbursementClaim
+    side_effects: ["status -> INFO_REQUESTED; version +1"]
+  - method: POST
+    path: "/reimbursement-claims/{id}/resubmit"
+    description: "Member resubmits after providing info; claim -> SUBMITTED"
+    roles: [Member]
+    code: 200
+    input: []
+    output: ReimbursementClaim
+    side_effects: ["status -> SUBMITTED; version +1"]
+  - method: POST
+    path: "/reimbursement-claims/{id}/approve"
+    description: "Operator approves; payout computed and credited to member balance"
+    roles: [DispatchOperator]
+    code: 200
+    input: []
+    output: ReimbursementClaim
+    side_effects: ["approved_amount_cents = reimbursement_payout; member.outstanding_balance_cents -= approved_amount_cents; status -> APPROVED; version +1"]
+  - method: POST
+    path: "/reimbursement-claims/{id}/reject"
+    description: "Operator rejects the claim"
+    roles: [DispatchOperator]
+    code: 200
+    input: []
+    output: ReimbursementClaim
+    side_effects: ["status -> REJECTED; version +1"]
+
+  # ---- Test-driving clock (last-resort namespace) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving endpoint: pin the server's current UTC clock for shift-window, annual-period, and completion-timestamp tests"
+    roles: [DispatchOperator]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["sets the server clock used for created_at, shift-window containment, annual_period_start advancement, and completion timestamps"]
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/unknown X-User-Role or missing X-User-ID on a protected endpoint"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "acting role is not permitted to perform the operation"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "acting Member/Provider does not own the targeted resource"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "referenced plan/member/provider/shift/depot/reservation/call/offer/claim id does not exist"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "target resource is not in a state from which this transition is legal"
+  - id: ERR_MEMBERSHIP_NOT_ACTIVE
+    http: 409
+    condition: "Member.status != ACTIVE when creating a ServiceCall"
+  - id: ERR_CAPABILITY_MISMATCH
+    http: 409
+    condition: "dispatched provider's capabilities do not include the call's service_type"
+  - id: ERR_PROVIDER_UNAVAILABLE
+    http: 409
+    condition: "target provider.status != AVAILABLE when dispatching/accepting an offer"
+  - id: ERR_OFFER_ALREADY_OUTSTANDING
+    http: 409
+    condition: "a DispatchOffer in OFFERED already exists on the call when dispatching another"
+  - id: ERR_DISPATCH_LIMIT_REACHED
+    http: 409
+    condition: "ServiceCall.dispatch_attempts >= MAX_DISPATCH_ATTEMPTS when dispatching another offer"
+  - id: ERR_SHIFT_OVERLAP
+    http: 409
+    condition: "new ProviderShift overlaps (positive-measure) an existing SCHEDULED shift for the same provider"
+  - id: ERR_NO_BAY_AVAILABLE
+    http: 409
+    condition: "depot has bay_count ACTIVE reservations whose buffered windows overlap the requested window"
+  - id: ERR_ANNUAL_LIMIT_EXCEEDED
+    http: 409
+    condition: "member.services_used_this_year >= plan.annual_service_limit when completing a call (after rollover)"
+  - id: ERR_CALL_NOT_COMPLETED
+    http: 409
+    condition: "linked ServiceCall.status != COMPLETED when approving a claim"
+  - id: ERR_INVALID_CLAIM_TARGET
+    http: 422
+    condition: "claim references a call not owned by the member, or claimed_amount_cents < 1"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "missing required field, invalid enum, out-of-range numeric, TOW without dropoff coordinates, shift_end <= shift_start, or reserved_until < reserved_from"
+  - id: ERR_INVALID_PAGINATION
+    http: 422
+    condition: "limit out of 1..100 or offset < 0 on a list endpoint"
+  - id: ERR_STALE_CALL_VERSION
+    http: 412
+    condition: "expected_service_call_version does not match the live ServiceCall.version on offer dispatch"
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: DispatchOperator
+    description: "Platform operator: provisions plans/members/providers/depots, schedules dispatch and bay reservations, abandons calls, adjudicates claims"
+    identity: opaque
+    exclusive_operations:
+      - "POST /membership-plans"
+      - "POST /members"
+      - "POST /members/{id}/suspend"
+      - "POST /members/{id}/reinstate"
+      - "POST /service-providers"
+      - "POST /depots"
+      - "POST /depots/{id}/bay-reservations"
+      - "POST /depots/{id}/bay-reservations/{reservation_id}/release"
+      - "GET /service-calls/{id}/dispatch-candidates"
+      - "POST /service-calls/{id}/offers"
+      - "POST /service-calls/{id}/offers/{offer_id}/expire"
+      - "POST /service-calls/{id}/abandon"
+      - "POST /reimbursement-claims/{id}/begin-review"
+      - "POST /reimbursement-claims/{id}/request-info"
+      - "POST /reimbursement-claims/{id}/approve"
+      - "POST /reimbursement-claims/{id}/reject"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /service-calls (operator may file on behalf of a member)"
+      - "POST /reimbursement-claims (operator may file on behalf of a member)"
+      - "POST /service-providers/{id}/shifts (operator may schedule a provider's shift)"
+      - "POST /service-providers/{id}/shifts/{shift_id}/cancel"
+      - "GET endpoints"
+  - name: Member
+    description: "A roadside-assistance member who requests calls and files reimbursement claims"
+    identity: "entity_backed:Member"
+    exclusive_operations:
+      - "POST /service-calls/{id}/cancel"
+      - "POST /reimbursement-claims/{id}/resubmit"
+    shared_operations:
+      - "POST /service-calls"
+      - "POST /reimbursement-claims"
+      - "GET own member, own service-calls, own claims, plans, depots"
+  - name: ServiceProvider
+    description: "A tow/service provider in the network who manages shifts and accepts/declines offers and completes jobs"
+    identity: "entity_backed:ServiceProvider"
+    exclusive_operations:
+      - "POST /service-providers/{id}/go-offline"
+      - "POST /service-providers/{id}/go-online"
+      - "POST /service-calls/{id}/offers/{offer_id}/accept"
+      - "POST /service-calls/{id}/offers/{offer_id}/decline"
+      - "POST /service-calls/{id}/start"
+      - "POST /service-calls/{id}/complete"
+    shared_operations:
+      - "POST /service-providers/{id}/shifts"
+      - "POST /service-providers/{id}/shifts/{shift_id}/cancel"
+      - "GET own provider, own shifts, own offers, assigned calls, plans, depots"

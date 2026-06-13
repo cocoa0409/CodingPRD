@@ -1,0 +1,951 @@
+# =============================================================================
+# Dialysis Center Scheduling — SCAFFOLD (§1.0–§1.7)
+# Expert tier per §0.4. Flat topology (peer collections under root prefix).
+# =============================================================================
+
+scenario: |
+  Dialysis Center Scheduling: patient chair/shift assignment, treatment schedule
+  (3x/week), nephrologist orders, machine/station inventory, transient/guest
+  treatment, monthly lab schedule, missed-treatment tracking, transportation
+  coordination
+
+domain_name: dialysis-center-scheduling
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: quota_allocation        # finite chairs/machines competed for across shift slots
+  secondary_archetype: temporal_windowing    # station occupancy + machine maintenance windows
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on Patient.version for standing-slot/transient claims
+    - dual_variant_calculation               # contracted-vs-standard charge; rolling-vs-cumulative adherence
+    - cascading_side_effects                 # order revoke -> sessions cancel -> slots/transport release -> account reversal
+    - rate_threshold_triggers                # missed-treatment escalation + dialyzer reuse cap
+    - derived_field_reconciliation           # patient adherence + account balance + station occupancy
+
+  entity_topology: flat                      # peer entities with FK references, no nesting in URL paths
+  state_machine_shape: parallel              # TreatmentSession carries (clinical_status × billing_status); plus cyclic order revision
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate                        # StandingSlot binds Station+Shift+Patient across aggregates
+    - self_referential                       # TreatmentSession.rescheduled_from_id -> TreatmentSession.id
+  role_model: peer_roles                     # Nephrologist owns orders, Scheduler owns slots/sessions, BillingClerk owns statements
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Clinic
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: name, type: string, source: input, description: "Clinic name" }
+      - { name: time_zone, type: string, source: input, default: "UTC", description: "IANA tz label (informational only; all stamps are UTC)" }
+      - { name: dialyzer_reuse_limit, type: integer, source: input, default: 12, description: "Max permitted reuse count of a single dialyzer before mandatory retirement; applies to Machine.dialyzer_reuse_count" }
+      - { name: status, type: enum, source: system, default: "OPEN", description: "OPEN -> SUSPENDED -> OPEN (cyclic) ; OPEN -> CLOSED (terminal). SUSPENDED freezes new session/slot/lab creation" }
+
+  - name: Shift
+    parent: null
+    common_fields: true
+    fields:
+      - { name: clinic_id, type: string, source: input, description: "FK -> Clinic.id" }
+      - { name: code, type: string, source: input, description: "Human shift code, e.g. MON_AM; unique within clinic (case-sensitive)" }
+      - { name: day_pattern, type: enum, source: input, description: "MWF | TTHS — Mon/Wed/Fri or Tue/Thu/Sat recurring pattern" }
+      - { name: start_minute, type: integer, source: input, description: "Minute-of-day start (0..1439), inclusive" }
+      - { name: end_minute, type: integer, source: input, description: "Minute-of-day end (1..1440), exclusive; must be > start_minute" }
+      - { name: turnover_buffer_minutes, type: integer, source: input, default: 45, description: "Mandatory disinfection/turnover gap a machine needs after this shift's end_minute before the next shift on the same machine may start" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE -> RETIRED; RETIRED shift accepts no new standing slots or sessions" }
+
+  - name: Machine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: clinic_id, type: string, source: input, description: "FK -> Clinic.id" }
+      - { name: asset_tag, type: string, source: input, description: "Asset tag, unique within clinic (case-sensitive)" }
+      - { name: model, type: string, source: input, description: "Machine model" }
+      - { name: supports_hdf, type: boolean, source: input, default: false, description: "Whether machine can run HEMODIAFILTRATION modality" }
+      - { name: dialyzer_reuse_count, type: integer, source: computed, description: "Current reuse count of the mounted dialyzer; starts 0, +1 per COMPLETED HEMODIALYSIS/HEMODIAFILTRATION session run on this machine; reset to 0 by disinfection cycle" }
+      - { name: status, type: enum, source: system, default: "AVAILABLE", description: "AVAILABLE -> IN_MAINTENANCE -> AVAILABLE (cyclic); AVAILABLE -> RETIRED (terminal). IN_MAINTENANCE machine cannot host sessions" }
+
+  - name: Station
+    parent: null
+    common_fields: true
+    fields:
+      - { name: clinic_id, type: string, source: input, description: "FK -> Clinic.id" }
+      - { name: chair_label, type: string, source: input, description: "Chair label, unique within clinic (case-sensitive)" }
+      - { name: machine_id, type: string, source: input, description: "FK -> Machine.id; the machine bolted to this station. Must belong to same clinic" }
+      - { name: isolation_capable, type: boolean, source: input, default: false, description: "Whether station can host isolation-required patients (e.g., Hep-B positive)" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE -> OUT_OF_SERVICE -> ACTIVE (cyclic); OUT_OF_SERVICE station hosts no sessions" }
+
+  - name: Patient
+    parent: null
+    common_fields: true
+    fields:
+      - { name: clinic_id, type: string, source: input, description: "FK -> Clinic.id" }
+      - { name: mrn, type: string, source: input, description: "Medical record number, unique within clinic (case-sensitive)" }
+      - { name: full_name, type: string, source: input, description: "Patient full name" }
+      - { name: patient_kind, type: enum, source: input, default: "RESIDENT", description: "RESIDENT (standing 3x/week roster) | TRANSIENT (guest/visiting, ad-hoc sessions only, no standing slots)" }
+      - { name: payer_class, type: enum, source: input, default: "STANDARD", description: "CONTRACTED (in-network, discounted charge) | STANDARD (full charge). Selects the session charge variant" }
+      - { name: requires_isolation, type: boolean, source: input, default: false, description: "Whether the patient requires an isolation-capable station" }
+      - { name: coinsurance_pct, type: number, source: input, default: 0.0, description: "Patient coinsurance fraction (0..1) applied to billed_amount_cents on the monthly statement" }
+      - { name: no_show_count_window, type: integer, source: computed, description: "Count of MISSED sessions whose service_date falls within the trailing 30-day window ending at clinic clock now; recomputed on every MISSED mark and on clock advance" }
+      - { name: adherence_status, type: enum, source: computed, default: "GOOD_STANDING", description: "GOOD_STANDING -> AT_RISK -> SUSPENDED -> GOOD_STANDING (cyclic via reactivation). Driven by no_show_count_window thresholds" }
+      - { name: account_balance_cents, type: integer, source: computed, description: "Running patient liability ledger in cents; +coinsurance on session COMPLETE, +missed-fee on session MISSED, +fare on transport CONFIRM, -coinsurance on settle, -fare on confirmed-trip cancel, -total on statement pay; initial 0" }
+
+  - name: NephrologistOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: input, description: "FK -> Patient.id" }
+      - { name: clinic_id, type: string, source: computed, description: "FK -> Clinic.id; copied from the patient" }
+      - { name: modality, type: enum, source: input, description: "HEMODIALYSIS | HEMODIAFILTRATION | PERITONEAL — prescribed treatment modality" }
+      - { name: sessions_per_week, type: integer, source: input, default: 3, description: "Prescribed weekly frequency (1..3)" }
+      - { name: epo_units, type: integer, source: input, default: 0, description: "Prescribed EPO units per session (>=0), priced per whole 1000-unit block" }
+      - { name: iron_ordered, type: boolean, source: input, default: false, description: "Whether IV iron is ordered per session (flat add-on)" }
+      - { name: effective_from_date, type: string, source: input, description: "ISO date (YYYY-MM-DD); order governs sessions whose service_date >= this date" }
+      - { name: revision_no, type: integer, source: computed, description: "Revision counter; starts 1 on activate, +1 each commit-revision (cyclic ACTIVE->UNDER_REVISION->ACTIVE)" }
+      - { name: status, type: enum, source: system, default: "DRAFT", description: "DRAFT -> ACTIVE -> UNDER_REVISION -> ACTIVE (cyclic) ; ACTIVE -> REVOKED (terminal). Only an ACTIVE order authorizes sessions" }
+
+  - name: StandingSlot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: input, description: "FK -> Patient.id" }
+      - { name: clinic_id, type: string, source: computed, description: "FK -> Clinic.id; copied from the patient" }
+      - { name: shift_id, type: string, source: input, description: "FK -> Shift.id; the recurring shift this slot reserves" }
+      - { name: station_id, type: string, source: input, description: "FK -> Station.id; the recurring chair this slot reserves" }
+      - { name: status, type: enum, source: system, default: "RESERVED", description: "RESERVED -> RELEASED (terminal). A RESERVED slot occupies (station_id, shift_id) for the patient on every day_pattern occurrence" }
+
+  - name: TreatmentSession
+    parent: null
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: input, description: "FK -> Patient.id" }
+      - { name: clinic_id, type: string, source: computed, description: "FK -> Clinic.id; copied from the patient" }
+      - { name: order_id, type: string, source: input, description: "FK -> NephrologistOrder.id; the ACTIVE order authorizing this session" }
+      - { name: station_id, type: string, source: input, description: "FK -> Station.id; the chair occupied" }
+      - { name: shift_id, type: string, source: input, description: "FK -> Shift.id; the shift slot occupied" }
+      - { name: standing_slot_id, type: string, source: input, description: "FK -> StandingSlot.id; set when the session was generated from a standing slot, null for transient/ad-hoc bookings" }
+      - { name: rescheduled_from_id, type: string, source: input, description: "FK -> TreatmentSession.id; set when this session supersedes a rescheduled one, else null" }
+      - { name: service_date, type: string, source: input, description: "ISO date (YYYY-MM-DD) on which the session occurs; must fall on shift.day_pattern" }
+      - { name: billed_amount_cents, type: integer, source: computed, description: "Gross charge in cents from session_charge (variant chosen by patient.payer_class); set when clinical_status -> COMPLETED" }
+      - { name: missed_fee_cents, type: integer, source: computed, description: "No-show fee in cents charged when clinical_status -> MISSED; 0 otherwise" }
+      - { name: clinical_status, type: enum, source: system, default: "BOOKED", description: "BOOKED -> CHECKED_IN -> COMPLETED (terminal) ; BOOKED -> MISSED (terminal) ; BOOKED -> CANCELLED (terminal). Clinical axis (parallel with billing_status)" }
+      - { name: billing_status, type: enum, source: system, default: "UNBILLED", description: "UNBILLED -> BILLED -> SETTLED (terminal) ; UNBILLED -> VOID (terminal). Billing axis evolves independently of clinical_status" }
+
+  - name: LabOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: input, description: "FK -> Patient.id" }
+      - { name: clinic_id, type: string, source: computed, description: "FK -> Clinic.id; copied from the patient" }
+      - { name: panel, type: enum, source: input, description: "MONTHLY_CHEM | CBC | IRON_STUDIES — lab panel type" }
+      - { name: scheduled_date, type: string, source: input, description: "ISO date (YYYY-MM-DD); the planned draw date" }
+      - { name: status, type: enum, source: system, default: "SCHEDULED", description: "SCHEDULED -> COLLECTED (terminal) ; SCHEDULED -> CANCELLED (terminal)" }
+
+  - name: TransportTrip
+    parent: null
+    common_fields: true
+    fields:
+      - { name: session_id, type: string, source: input, description: "FK -> TreatmentSession.id" }
+      - { name: patient_id, type: string, source: computed, description: "FK -> Patient.id; copied from the session" }
+      - { name: direction, type: enum, source: input, description: "INBOUND (home->clinic) | OUTBOUND (clinic->home)" }
+      - { name: miles, type: number, source: input, description: "One-way trip distance in miles (>= 0)" }
+      - { name: cross_county, type: boolean, source: input, default: false, description: "Whether the trip crosses a county line (zone surcharge)" }
+      - { name: wheelchair, type: boolean, source: input, default: false, description: "Whether a wheelchair lift vehicle is required (flat add-on)" }
+      - { name: shared_ride, type: boolean, source: input, default: false, description: "Whether the trip is pooled with another patient (multiplier discount)" }
+      - { name: fare_cents, type: integer, source: computed, description: "Computed fare in cents from the transport_fare calculation" }
+      - { name: status, type: enum, source: system, default: "REQUESTED", description: "REQUESTED -> CONFIRMED -> COMPLETED (terminal) ; REQUESTED -> CANCELLED (terminal) ; CONFIRMED -> CANCELLED (terminal)" }
+
+  - name: MonthlyStatement
+    parent: null
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: input, description: "FK -> Patient.id" }
+      - { name: clinic_id, type: string, source: computed, description: "FK -> Clinic.id; copied from the patient" }
+      - { name: period_month, type: string, source: input, description: "ISO month (YYYY-MM); the billing period covered" }
+      - { name: session_count, type: integer, source: computed, description: "Count of the patient's COMPLETED sessions whose service_date is in period_month and billing_status is BILLED at run time" }
+      - { name: coinsurance_due_cents, type: integer, source: computed, description: "Sum over the included sessions of round(billed_amount_cents * patient.coinsurance_pct) — rounded PER SESSION then summed (pinned order)" }
+      - { name: missed_fee_total_cents, type: integer, source: computed, description: "Sum of missed_fee_cents over the patient's MISSED sessions whose service_date is in period_month" }
+      - { name: total_due_cents, type: integer, source: computed, description: "coinsurance_due_cents + missed_fee_total_cents" }
+      - { name: status, type: enum, source: system, default: "ISSUED", description: "ISSUED -> PAID (terminal) ; ISSUED -> CANCELLED (terminal)" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Clinic
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: SUSPENDED
+        trigger: "POST /clinics/{clinicId}/suspend"
+        actor: ClinicAdmin
+        preconditions: []
+        side_effects:
+          - "While SUSPENDED, creation of StandingSlot, TreatmentSession, and LabOrder is rejected with ERR_CLINIC_SUSPENDED"
+      - from: SUSPENDED
+        to: OPEN
+        trigger: "POST /clinics/{clinicId}/resume"
+        actor: ClinicAdmin
+        preconditions: []
+        side_effects: []
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /clinics/{clinicId}/close"
+        actor: ClinicAdmin
+        preconditions:
+          - "No TreatmentSession in clinical_status BOOKED or CHECKED_IN exists in the clinic (ERR_CLINIC_HAS_ACTIVE_SESSIONS)"
+        side_effects:
+          - "Cascade L1: every StandingSlot with status RESERVED in the clinic -> RELEASED"
+          - "Cascade L2: each released slot's TreatmentSession with clinical_status BOOKED -> CANCELLED"
+          - "Every Shift with status ACTIVE -> RETIRED"
+
+  - entity: Machine
+    initial_state: AVAILABLE
+    terminal_states: [RETIRED]
+    transitions:
+      - from: AVAILABLE
+        to: IN_MAINTENANCE
+        trigger: "POST /machines/{machineId}/start-maintenance"
+        actor: ClinicAdmin
+        preconditions:
+          - "No TreatmentSession in clinical_status CHECKED_IN currently running on a Station bound to this machine (ERR_MACHINE_IN_USE)"
+        side_effects: []
+      - from: IN_MAINTENANCE
+        to: AVAILABLE
+        trigger: "POST /machines/{machineId}/complete-maintenance"
+        actor: ClinicAdmin
+        preconditions: []
+        side_effects:
+          - "If request body disinfect=true, dialyzer_reuse_count -> 0"
+      - from: AVAILABLE
+        to: RETIRED
+        trigger: "POST /machines/{machineId}/retire"
+        actor: ClinicAdmin
+        preconditions:
+          - "No Station bound to this machine has a TreatmentSession in clinical_status BOOKED or CHECKED_IN (ERR_MACHINE_IN_USE)"
+        side_effects: []
+
+  - entity: Station
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: OUT_OF_SERVICE
+        trigger: "POST /stations/{stationId}/take-offline"
+        actor: ClinicAdmin
+        preconditions:
+          - "No TreatmentSession in clinical_status BOOKED or CHECKED_IN occupies this station (ERR_STATION_OCCUPIED)"
+        side_effects: []
+      - from: OUT_OF_SERVICE
+        to: ACTIVE
+        trigger: "POST /stations/{stationId}/bring-online"
+        actor: ClinicAdmin
+        preconditions: []
+        side_effects: []
+
+  - entity: NephrologistOrder
+    initial_state: DRAFT
+    terminal_states: [REVOKED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /orders/{orderId}/activate"
+        actor: Nephrologist
+        preconditions:
+          - "Patient has no other ACTIVE NephrologistOrder (ERR_ACTIVE_ORDER_EXISTS)"
+        side_effects:
+          - "revision_no initialized to 1"
+      - from: ACTIVE
+        to: UNDER_REVISION
+        trigger: "POST /orders/{orderId}/open-revision"
+        actor: Nephrologist
+        preconditions: []
+        side_effects: []
+      - from: UNDER_REVISION
+        to: ACTIVE
+        trigger: "POST /orders/{orderId}/commit-revision"
+        actor: Nephrologist
+        preconditions: []
+        side_effects:
+          - "Apply submitted modality/epo_units/iron_ordered/sessions_per_week changes"
+          - "revision_no -> revision_no + 1"
+      - from: ACTIVE
+        to: REVOKED
+        trigger: "POST /orders/{orderId}/revoke"
+        actor: Nephrologist
+        preconditions: []
+        side_effects:
+          - "Cascade L1: every TreatmentSession authorized by this order with clinical_status BOOKED -> CANCELLED"
+          - "Cascade L2: each such session's TransportTrip in REQUESTED or CONFIRMED -> CANCELLED"
+          - "Cascade L3: for each TransportTrip that was CONFIRMED at cancel time, reverse its fare from patient.account_balance_cents (account_balance_cents -= fare_cents)"
+        note: "Three-hop cascade: order revoke -> session cancel -> transport cancel -> account reversal"
+      - from: UNDER_REVISION
+        to: REVOKED
+        trigger: "POST /orders/{orderId}/revoke"
+        actor: Nephrologist
+        preconditions: []
+        side_effects:
+          - "Same cascade as ACTIVE -> REVOKED"
+
+  - entity: StandingSlot
+    initial_state: RESERVED
+    terminal_states: [RELEASED]
+    transitions:
+      - from: RESERVED
+        to: RELEASED
+        trigger: "POST /standing-slots/{slotId}/release"
+        actor: Scheduler
+        preconditions: []
+        side_effects:
+          - "Cascade: every TreatmentSession generated from this slot with clinical_status BOOKED -> CANCELLED (and that session's REQUESTED/CONFIRMED TransportTrip -> CANCELLED, with CONFIRMED fare reversed)"
+
+  - entity: TreatmentSession
+    initial_state: BOOKED
+    terminal_states: [COMPLETED, MISSED, CANCELLED]
+    transitions:
+      - from: BOOKED
+        to: CHECKED_IN
+        trigger: "POST /sessions/{sessionId}/check-in"
+        actor: Scheduler
+        preconditions:
+          - "Station bound machine.status == AVAILABLE (ERR_MACHINE_UNAVAILABLE)"
+          - "Station.status == ACTIVE (ERR_STATION_OFFLINE)"
+        side_effects: []
+      - from: CHECKED_IN
+        to: COMPLETED
+        trigger: "POST /sessions/{sessionId}/complete"
+        actor: Scheduler
+        preconditions:
+          - "For HEMODIALYSIS/HEMODIAFILTRATION: machine.dialyzer_reuse_count < clinic.dialyzer_reuse_limit (ERR_DIALYZER_REUSE_EXCEEDED)"
+        side_effects:
+          - "billed_amount_cents computed via session_charge (variant by patient.payer_class)"
+          - "patient.account_balance_cents += round_half_up(billed_amount_cents * patient.coinsurance_pct) (per-session rounding)"
+          - "If modality in {HEMODIALYSIS, HEMODIAFILTRATION}: machine.dialyzer_reuse_count += 1"
+          - "billing_status remains UNBILLED (independent axis)"
+      - from: BOOKED
+        to: MISSED
+        trigger: "POST /sessions/{sessionId}/mark-missed"
+        actor: Scheduler
+        preconditions: []
+        side_effects:
+          - "missed_fee_cents -> MISSED_FEE_CENTS constant"
+          - "patient.account_balance_cents += missed_fee_cents"
+          - "patient.no_show_count_window recomputed; adherence escalation applied (GOOD_STANDING -> AT_RISK at >=3, -> SUSPENDED at >=5)"
+          - "Any REQUESTED/CONFIRMED TransportTrip on this session -> CANCELLED (and CONFIRMED fare reversed from account_balance_cents)"
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /sessions/{sessionId}/cancel"
+        actor: Scheduler
+        preconditions: []
+        side_effects:
+          - "Any REQUESTED/CONFIRMED TransportTrip on this session -> CANCELLED (and CONFIRMED fare reversed from account_balance_cents)"
+
+  - entity: TreatmentSessionBilling
+    initial_state: UNBILLED
+    terminal_states: [SETTLED, VOID]
+    note: "Parallel billing axis on the same TreatmentSession row (field billing_status); evolves independently of clinical_status"
+    transitions:
+      - from: UNBILLED
+        to: BILLED
+        trigger: "POST /sessions/{sessionId}/bill"
+        actor: BillingClerk
+        preconditions:
+          - "clinical_status == COMPLETED (ERR_SESSION_NOT_COMPLETED)"
+        side_effects: []
+      - from: BILLED
+        to: SETTLED
+        trigger: "POST /sessions/{sessionId}/settle"
+        actor: BillingClerk
+        preconditions: []
+        side_effects:
+          - "patient.account_balance_cents -= round_half_up(billed_amount_cents * patient.coinsurance_pct)"
+      - from: UNBILLED
+        to: VOID
+        trigger: "POST /sessions/{sessionId}/void-billing"
+        actor: BillingClerk
+        preconditions:
+          - "clinical_status in {CANCELLED, MISSED} (ERR_SESSION_NOT_VOIDABLE)"
+        side_effects: []
+
+  - entity: TransportTrip
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: CONFIRMED
+        trigger: "POST /transport-trips/{tripId}/confirm"
+        actor: Scheduler
+        preconditions:
+          - "Owning TreatmentSession clinical_status in {BOOKED, CHECKED_IN} (ERR_SESSION_NOT_SCHEDULABLE)"
+        side_effects:
+          - "patient.account_balance_cents += fare_cents"
+      - from: CONFIRMED
+        to: COMPLETED
+        trigger: "POST /transport-trips/{tripId}/complete"
+        actor: Scheduler
+        preconditions:
+          - "Owning TreatmentSession clinical_status == COMPLETED (ERR_SESSION_NOT_COMPLETED)"
+        side_effects: []
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /transport-trips/{tripId}/cancel"
+        actor: Scheduler
+        preconditions: []
+        side_effects: []
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /transport-trips/{tripId}/cancel"
+        actor: Scheduler
+        preconditions: []
+        side_effects:
+          - "patient.account_balance_cents -= fare_cents (reverse the confirmed fare)"
+
+  - entity: LabOrder
+    initial_state: SCHEDULED
+    terminal_states: [COLLECTED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: COLLECTED
+        trigger: "POST /lab-orders/{labId}/collect"
+        actor: Scheduler
+        preconditions: []
+        side_effects: []
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /lab-orders/{labId}/cancel"
+        actor: Scheduler
+        preconditions: []
+        side_effects: []
+
+  - entity: MonthlyStatement
+    initial_state: ISSUED
+    terminal_states: [PAID, CANCELLED]
+    transitions:
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /statements/{statementId}/pay"
+        actor: BillingClerk
+        preconditions: []
+        side_effects:
+          - "patient.account_balance_cents -= total_due_cents"
+      - from: ISSUED
+        to: CANCELLED
+        trigger: "POST /statements/{statementId}/cancel"
+        actor: BillingClerk
+        preconditions: []
+        side_effects: []
+
+  - entity: Patient
+    initial_state: GOOD_STANDING
+    terminal_states: []
+    note: "adherence_status axis; cyclic GOOD_STANDING -> AT_RISK -> SUSPENDED -> GOOD_STANDING"
+    transitions:
+      - from: GOOD_STANDING
+        to: AT_RISK
+        trigger: "system (automatic when no_show_count_window crosses to >=3 on a mark-missed or clock advance)"
+        actor: system
+        preconditions:
+          - "no_show_count_window >= AT_RISK_THRESHOLD and < SUSPEND_THRESHOLD"
+        side_effects: []
+      - from: AT_RISK
+        to: SUSPENDED
+        trigger: "system (automatic when no_show_count_window crosses to >=5)"
+        actor: system
+        preconditions:
+          - "no_show_count_window >= SUSPEND_THRESHOLD"
+        side_effects:
+          - "Patient may not create new TRANSIENT/ad-hoc sessions until reactivated (ERR_PATIENT_SUSPENDED)"
+      - from: GOOD_STANDING
+        to: SUSPENDED
+        trigger: "system (automatic when no_show_count_window jumps to >=5 directly)"
+        actor: system
+        preconditions:
+          - "no_show_count_window >= SUSPEND_THRESHOLD"
+        side_effects:
+          - "Patient may not create new TRANSIENT/ad-hoc sessions until reactivated (ERR_PATIENT_SUSPENDED)"
+      - from: SUSPENDED
+        to: GOOD_STANDING
+        trigger: "POST /patients/{patientId}/reactivate"
+        actor: ClinicAdmin
+        preconditions: []
+        side_effects:
+          - "no_show_count_window is NOT cleared; reactivation resets adherence_status only"
+      - from: AT_RISK
+        to: GOOD_STANDING
+        trigger: "system (automatic when clock advance drops no_show_count_window below AT_RISK_THRESHOLD)"
+        actor: system
+        preconditions:
+          - "no_show_count_window < AT_RISK_THRESHOLD"
+        side_effects: []
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: standing-slot-claim-stale-patient
+    parent_entity: Patient
+    write_endpoint: "POST /standing-slots"
+    occ_field: "expected_patient_version"
+    description: |
+      Creating a StandingSlot reserving (station_id, shift_id) against a Patient
+      whose version has advanced since the client last observed it is rejected.
+      A standing-slot reservation legitimately competes for a finite (station,
+      shift) cell; once one create lands, the patient's version advances, so a
+      second create still carrying the previously observed version is rejected
+      as stale rather than silently double-booking the chair.
+    error_id: ERR_STALE_PATIENT_VERSION
+    http_status: 412
+
+  - rule_id: transient-session-book-stale-patient
+    parent_entity: Patient
+    write_endpoint: "POST /sessions"
+    occ_field: "expected_patient_version"
+    description: |
+      Booking an ad-hoc TreatmentSession against a Patient whose version has
+      advanced since the client last observed it is rejected. The chair-shift
+      pool is finite; once one booking lands the patient version advances, and a
+      second booking carrying the stale version is rejected rather than
+      over-committing the same chair-shift cell.
+    error_id: ERR_STALE_PATIENT_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: session_charge
+    trigger: "TreatmentSession CHECKED_IN -> COMPLETED (sets billed_amount_cents)"
+    algorithm: tiered_pricing
+    formula: |
+      base = MODALITY_BASE_CENTS[order.modality]
+      epo_add = (order.epo_units // 1000) * EPO_BLOCK_CENTS        # whole 1000-unit blocks only
+      iron_add = IRON_DOSE_CENTS if order.iron_ordered else 0
+      gross = base + epo_add + iron_add
+      # variant selection by patient.payer_class:
+      pct = CONTRACTED_PCT if patient.payer_class == 'CONTRACTED' else STANDARD_PCT
+      billed_amount_cents = round_half_up( gross * pct )           # single rounding to whole cents
+    input_set: "The single ACTIVE NephrologistOrder referenced by session.order_id, plus the owning patient's payer_class."
+    constants:
+      MODALITY_BASE_CENTS: { HEMODIALYSIS: 28500, HEMODIAFILTRATION: 34000, PERITONEAL: 22000 }
+      EPO_BLOCK_CENTS: 1200
+      IRON_DOSE_CENTS: 4500
+      CONTRACTED_PCT: 0.82
+      STANDARD_PCT: 1.00
+    precision: "whole cents, round_half_up"
+    variants:
+      - name: contracted
+        when: "patient.payer_class == CONTRACTED"
+        difference: "Gross is multiplied by 0.82 (in-network discount) before rounding"
+      - name: standard
+        when: "patient.payer_class == STANDARD"
+        difference: "Gross billed at 100% (no discount)"
+
+  - name: patient_adherence_score
+    trigger: "GET /patients/{patientId}/adherence (read-time computation)"
+    algorithm: aggregation
+    formula: |
+      Consider the patient's TERMINAL sessions only, classified:
+        C = clinical_status COMPLETED
+        M = clinical_status MISSED
+        (CANCELLED sessions are excluded from both numerator and denominator)
+      Order all such sessions by service_date ASC, then created_at ASC.
+      score(seq) = round_half_up( 100 * count(C in seq) / (count(C in seq) + count(M in seq)), 1 )
+                   (null if count(C)+count(M) == 0)
+      cumulative_score = score(all qualifying sessions)
+      rolling_score    = score(last ROLLING_WINDOW qualifying sessions by the above order)
+    input_set: "All terminal (COMPLETED or MISSED) sessions of the patient; CANCELLED excluded."
+    constants:
+      ROLLING_WINDOW: 8
+    precision: "1 decimal place (percentage), round_half_up"
+    variants:
+      - name: cumulative
+        when: "Reporting lifetime adherence"
+        difference: "Denominator is ALL qualifying sessions ever"
+      - name: rolling
+        when: "Reporting recent adherence"
+        difference: "Denominator is only the last 8 qualifying sessions (service_date ASC, created_at ASC); same data yields a different percentage"
+
+  - name: transport_fare
+    trigger: "TransportTrip creation (sets fare_cents)"
+    algorithm: tiered_pricing
+    formula: |
+      # tiered mileage (cents): first 5 mi @ 250/mi, next 10 mi @ 200/mi, beyond @ 150/mi
+      m = 0
+      t1 = min(miles, 5);            m += t1 * 250
+      rem = miles - t1
+      t2 = min(rem, 10);             m += t2 * 200
+      rem = rem - t2
+      m += rem * 150
+      sub = BASE_FLAG_CENTS + m
+      mult = SHARED_MULT if shared_ride else 1
+      # PINNED EVALUATION ORDER: apply shared multiplier to (base+mileage) and round to whole
+      # cents BEFORE adding the flat wheelchair add-on and the cross-county zone surcharge.
+      sub2 = round_half_up( sub * mult )
+      fare_cents = sub2 + (WHEELCHAIR_CENTS if wheelchair else 0) + (CROSS_COUNTY_CENTS if cross_county else 0)
+    input_set: "Trip's own miles, cross_county, wheelchair, shared_ride fields."
+    constants:
+      BASE_FLAG_CENTS: 800
+      SHARED_MULT: 0.75
+      WHEELCHAIR_CENTS: 1500
+      CROSS_COUNTY_CENTS: 500
+    precision: "whole cents, round_half_up; rounding applied once, after the shared multiplier, before flat add-ons"
+
+  - name: statement_rollup
+    trigger: "MonthlyStatement issuance (POST /statements)"
+    algorithm: aggregation
+    formula: |
+      included = patient's sessions where clinical_status == COMPLETED
+                 AND billing_status == BILLED
+                 AND service_date in period_month
+      session_count = count(included)
+      # PINNED ROUNDING ORDER: round each session's coinsurance to whole cents, THEN sum.
+      coinsurance_due_cents = sum over included of round_half_up(billed_amount_cents * patient.coinsurance_pct)
+      missed = patient's sessions where clinical_status == MISSED AND service_date in period_month
+      missed_fee_total_cents = sum over missed of missed_fee_cents
+      total_due_cents = coinsurance_due_cents + missed_fee_total_cents
+    input_set: "Patient's COMPLETED+BILLED sessions and MISSED sessions whose service_date is inside period_month."
+    constants: {}
+    precision: "whole cents; per-session round_half_up THEN sum (NOT sum-then-round)"
+
+  - name: no_show_window_rollup
+    trigger: "TreatmentSession BOOKED -> MISSED, and clock advance"
+    algorithm: threshold
+    formula: |
+      window_start = clock_now_date - 30 days   (inclusive 30-day trailing window ending at clock_now_date)
+      no_show_count_window = count of patient's MISSED sessions whose service_date >= window_start
+                             AND service_date <= clock_now_date
+      adherence_status:
+        if no_show_count_window >= SUSPEND_THRESHOLD: SUSPENDED
+        elif no_show_count_window >= AT_RISK_THRESHOLD: AT_RISK
+        else: GOOD_STANDING
+      (a manual reactivate overrides adherence_status to GOOD_STANDING without changing the count)
+    input_set: "Patient's MISSED sessions inside the trailing 30-day window from the clinic clock."
+    constants:
+      AT_RISK_THRESHOLD: 3
+      SUSPEND_THRESHOLD: 5
+      WINDOW_DAYS: 30
+      MISSED_FEE_CENTS: 7500
+    precision: "integer count; boundary is >= (exactly 3 -> AT_RISK, exactly 5 -> SUSPENDED). MISSED_FEE_CENTS is the flat no-show fee posted to missed_fee_cents on BOOKED -> MISSED"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and well-formed"
+    error_id: ERR_MISSING_USER_CONTEXT
+    http_status: 400
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "Path resource id exists (the {id} in the URL); body FK ids checked at priority 4"
+    error_id: "ERR_{RESOURCE}_NOT_FOUND"
+    http_status: 404
+    applies_to: all id-bearing endpoints
+
+  - priority: 4
+    category: business_referential
+    check: "Body FK references (patient_id, order_id, station_id, shift_id, machine_id, standing_slot_id, session_id, clinic_id) exist AND resolve to entities in the SAME clinic"
+    error_id: ERR_CROSS_CLINIC_REFERENCE
+    http_status: 422
+    applies_to: "POST sessions, POST standing-slots, POST stations, POST orders, POST transport-trips, POST lab-orders"
+
+  - priority: 5
+    category: state
+    check: "Clinic.status must be OPEN to create StandingSlot, TreatmentSession, or LabOrder"
+    error_id: ERR_CLINIC_SUSPENDED
+    http_status: 409
+    applies_to: "POST standing-slots, POST sessions, POST lab-orders"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in the correct state for the requested transition"
+    error_id: "varies (ERR_SESSION_NOT_COMPLETED, ERR_ORDER_NOT_ACTIVE, ERR_INVALID_STATE, ...)"
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 7
+    category: business_constraint
+    check: "A session/standing-slot's authorizing order must be ACTIVE and govern the service_date (order.effective_from_date <= service_date)"
+    error_id: ERR_ORDER_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST sessions, POST standing-slots"
+
+  - priority: 8
+    category: business_constraint
+    check: "service_date weekday must fall on the chosen shift.day_pattern (MWF -> Mon/Wed/Fri; TTHS -> Tue/Thu/Sat)"
+    error_id: ERR_DATE_NOT_ON_PATTERN
+    http_status: 422
+    applies_to: "POST sessions"
+
+  - priority: 9
+    category: business_safety
+    check: "If patient.requires_isolation, the chosen station must be isolation_capable"
+    error_id: ERR_ISOLATION_STATION_REQUIRED
+    http_status: 422
+    applies_to: "POST sessions, POST standing-slots"
+
+  - priority: 10
+    category: business_safety
+    check: "If order.modality == HEMODIAFILTRATION, the station's bound machine must have supports_hdf == true"
+    error_id: ERR_MODALITY_NOT_SUPPORTED
+    http_status: 422
+    applies_to: "POST sessions"
+
+  - priority: 11
+    category: business_safety
+    check: "Machine dialyzer_reuse_count must be < clinic.dialyzer_reuse_limit to COMPLETE a HEMODIALYSIS/HEMODIAFILTRATION session (the +1 would exceed the cap)"
+    error_id: ERR_DIALYZER_REUSE_EXCEEDED
+    http_status: 409
+    applies_to: "POST sessions/{id}/complete"
+
+  - priority: 12
+    category: business_temporal
+    check: "Station double-booking: no two non-CANCELLED/non-MISSED sessions may occupy the same (station_id, shift_id, service_date); standing slots reserve the cell for every day_pattern occurrence"
+    error_id: ERR_STATION_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST sessions, POST standing-slots"
+
+  - priority: 13
+    category: business_temporal
+    check: "Machine turnover overlap: two non-terminal sessions whose stations share the SAME machine on the same service_date must respect the earlier shift's turnover_buffer_minutes disinfection gap (earlier.end_minute + earlier.turnover_buffer_minutes <= later.start_minute) — buffered half-open adjacency on the MACHINE resource, distinct from the station-cell equality of priority 12"
+    error_id: ERR_TURNOVER_BUFFER_VIOLATION
+    http_status: 409
+    applies_to: "POST sessions"
+
+  - priority: 14
+    category: business_constraint
+    check: "TRANSIENT/ad-hoc session booking requires patient.adherence_status != SUSPENDED"
+    error_id: ERR_PATIENT_SUSPENDED
+    http_status: 409
+    applies_to: "POST sessions (ad-hoc/transient path)"
+
+  - priority: 15
+    category: business_constraint
+    check: "StandingSlot may only be created for patient_kind == RESIDENT"
+    error_id: ERR_TRANSIENT_NO_STANDING_SLOT
+    http_status: 422
+    applies_to: "POST standing-slots"
+
+  - priority: 16
+    category: business_constraint
+    check: "Request body field-level validation (required fields present, enums valid, miles >= 0, minutes in range, end_minute > start_minute, coinsurance_pct in [0,1])"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all POST/PUT
+
+  - priority: 17
+    category: business_constraint
+    check: "OCC: expected_patient_version must equal current patient.version on guarded creates"
+    error_id: ERR_STALE_PATIENT_VERSION
+    http_status: 412
+    applies_to: "POST standing-slots, POST sessions"
+
+# =============================================================================
+# §1.5 API Endpoint Table (flat collections under root prefix)
+# =============================================================================
+endpoints:
+  # ---- Clinic ----
+  - { method: POST, path: "/clinics", description: "Create clinic", roles: [ClinicAdmin], code: 201, input: [name, "time_zone?", "dialyzer_reuse_limit?"], output: Clinic, side_effects: ["status=OPEN"] }
+  - { method: GET, path: "/clinics", description: "List clinics", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: ["limit?", "offset?"], output: "Clinic[]", side_effects: [] }
+  - { method: GET, path: "/clinics/{clinicId}", description: "Get clinic", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: [], output: Clinic, side_effects: [] }
+  - { method: POST, path: "/clinics/{clinicId}/suspend", description: "Suspend clinic", roles: [ClinicAdmin], code: 200, input: ["expected_clinic_version?"], output: Clinic, side_effects: ["status->SUSPENDED"] }
+  - { method: POST, path: "/clinics/{clinicId}/resume", description: "Resume clinic", roles: [ClinicAdmin], code: 200, input: ["expected_clinic_version?"], output: Clinic, side_effects: ["status->OPEN"] }
+  - { method: POST, path: "/clinics/{clinicId}/close", description: "Close clinic", roles: [ClinicAdmin], code: 200, input: ["expected_clinic_version?"], output: Clinic, side_effects: ["RESERVED slots->RELEASED", "their BOOKED sessions->CANCELLED", "ACTIVE shifts->RETIRED"] }
+
+  # ---- Shift ----
+  - { method: POST, path: "/shifts", description: "Create shift", roles: [ClinicAdmin], code: 201, input: [clinic_id, code, day_pattern, start_minute, end_minute, "turnover_buffer_minutes?"], output: Shift, side_effects: [] }
+  - { method: GET, path: "/shifts", description: "List shifts (filter by clinic_id)", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: ["clinic_id?", "limit?", "offset?"], output: "Shift[]", side_effects: [] }
+  - { method: GET, path: "/shifts/{shiftId}", description: "Get shift", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: [], output: Shift, side_effects: [] }
+  - { method: POST, path: "/shifts/{shiftId}/retire", description: "Retire shift", roles: [ClinicAdmin], code: 200, input: [], output: Shift, side_effects: ["status->RETIRED"] }
+
+  # ---- Machine ----
+  - { method: POST, path: "/machines", description: "Create machine", roles: [ClinicAdmin], code: 201, input: [clinic_id, asset_tag, model, "supports_hdf?"], output: Machine, side_effects: ["status=AVAILABLE", "dialyzer_reuse_count=0"] }
+  - { method: GET, path: "/machines", description: "List machines (filter by clinic_id)", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: ["clinic_id?", "limit?", "offset?"], output: "Machine[]", side_effects: [] }
+  - { method: GET, path: "/machines/{machineId}", description: "Get machine", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: [], output: Machine, side_effects: [] }
+  - { method: POST, path: "/machines/{machineId}/start-maintenance", description: "Start machine maintenance", roles: [ClinicAdmin], code: 200, input: [], output: Machine, side_effects: ["status->IN_MAINTENANCE"] }
+  - { method: POST, path: "/machines/{machineId}/complete-maintenance", description: "Complete maintenance", roles: [ClinicAdmin], code: 200, input: ["disinfect?"], output: Machine, side_effects: ["status->AVAILABLE", "if disinfect: dialyzer_reuse_count->0"] }
+  - { method: POST, path: "/machines/{machineId}/retire", description: "Retire machine", roles: [ClinicAdmin], code: 200, input: [], output: Machine, side_effects: ["status->RETIRED"] }
+
+  # ---- Station ----
+  - { method: POST, path: "/stations", description: "Create station", roles: [ClinicAdmin], code: 201, input: [clinic_id, chair_label, machine_id, "isolation_capable?"], output: Station, side_effects: ["status=ACTIVE"] }
+  - { method: GET, path: "/stations", description: "List stations (filter by clinic_id, machine_id)", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: ["clinic_id?", "machine_id?", "limit?", "offset?"], output: "Station[]", side_effects: [] }
+  - { method: GET, path: "/stations/{stationId}", description: "Get station", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: [], output: Station, side_effects: [] }
+  - { method: POST, path: "/stations/{stationId}/take-offline", description: "Take station out of service", roles: [ClinicAdmin], code: 200, input: [], output: Station, side_effects: ["status->OUT_OF_SERVICE"] }
+  - { method: POST, path: "/stations/{stationId}/bring-online", description: "Bring station back online", roles: [ClinicAdmin], code: 200, input: [], output: Station, side_effects: ["status->ACTIVE"] }
+
+  # ---- Patient ----
+  - { method: POST, path: "/patients", description: "Create patient", roles: [ClinicAdmin, Scheduler], code: 201, input: [clinic_id, mrn, full_name, "patient_kind?", "payer_class?", "requires_isolation?", "coinsurance_pct?"], output: Patient, side_effects: ["adherence_status=GOOD_STANDING", "account_balance_cents=0", "no_show_count_window=0"] }
+  - { method: GET, path: "/patients", description: "List patients (filter by clinic_id)", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: ["clinic_id?", "limit?", "offset?"], output: "Patient[]", side_effects: [] }
+  - { method: GET, path: "/patients/{patientId}", description: "Get patient", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: [], output: Patient, side_effects: [] }
+  - { method: GET, path: "/patients/{patientId}/adherence", description: "Read computed adherence (both variants)", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: [], output: "{ cumulative_score: number, rolling_score: number, no_show_count_window: integer, adherence_status: string }", side_effects: [] }
+  - { method: POST, path: "/patients/{patientId}/reactivate", description: "Reactivate a SUSPENDED patient (admin override)", roles: [ClinicAdmin], code: 200, input: [], output: Patient, side_effects: ["adherence_status->GOOD_STANDING"] }
+
+  # ---- NephrologistOrder ----
+  - { method: POST, path: "/orders", description: "Create order (DRAFT)", roles: [Nephrologist], code: 201, input: [patient_id, modality, "sessions_per_week?", "epo_units?", "iron_ordered?", effective_from_date], output: NephrologistOrder, side_effects: ["status=DRAFT"] }
+  - { method: GET, path: "/orders", description: "List orders (filter by patient_id, clinic_id)", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: ["patient_id?", "clinic_id?", "limit?", "offset?"], output: "NephrologistOrder[]", side_effects: [] }
+  - { method: GET, path: "/orders/{orderId}", description: "Get order", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: [], output: NephrologistOrder, side_effects: [] }
+  - { method: POST, path: "/orders/{orderId}/activate", description: "Activate order", roles: [Nephrologist], code: 200, input: [], output: NephrologistOrder, side_effects: ["status->ACTIVE", "revision_no=1"] }
+  - { method: POST, path: "/orders/{orderId}/open-revision", description: "Open order revision", roles: [Nephrologist], code: 200, input: [], output: NephrologistOrder, side_effects: ["status->UNDER_REVISION"] }
+  - { method: POST, path: "/orders/{orderId}/commit-revision", description: "Commit order revision", roles: [Nephrologist], code: 200, input: ["modality?", "sessions_per_week?", "epo_units?", "iron_ordered?"], output: NephrologistOrder, side_effects: ["status->ACTIVE", "revision_no+=1", "apply changes"] }
+  - { method: POST, path: "/orders/{orderId}/revoke", description: "Revoke order", roles: [Nephrologist], code: 200, input: [], output: NephrologistOrder, side_effects: ["status->REVOKED", "cascade cancel BOOKED sessions", "cascade cancel transport", "reverse confirmed fares"] }
+
+  # ---- StandingSlot ----
+  - { method: POST, path: "/standing-slots", description: "Reserve a standing chair/shift slot", roles: [Scheduler], code: 201, input: [patient_id, shift_id, station_id, expected_patient_version], output: StandingSlot, side_effects: ["status=RESERVED", "increments Patient.version by 1"] }
+  - { method: GET, path: "/standing-slots", description: "List standing slots (filter by patient_id, clinic_id, shift_id, station_id)", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: ["patient_id?", "clinic_id?", "shift_id?", "station_id?", "limit?", "offset?"], output: "StandingSlot[]", side_effects: [] }
+  - { method: GET, path: "/standing-slots/{slotId}", description: "Get standing slot", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: [], output: StandingSlot, side_effects: [] }
+  - { method: POST, path: "/standing-slots/{slotId}/release", description: "Release a standing slot", roles: [Scheduler], code: 200, input: [], output: StandingSlot, side_effects: ["status->RELEASED", "cascade cancel BOOKED sessions"] }
+
+  # ---- TreatmentSession ----
+  - { method: POST, path: "/sessions", description: "Book a treatment session (standing or ad-hoc/transient)", roles: [Scheduler], code: 201, input: [patient_id, order_id, station_id, shift_id, service_date, "standing_slot_id?", "rescheduled_from_id?", expected_patient_version], output: TreatmentSession, side_effects: ["clinical_status=BOOKED", "billing_status=UNBILLED", "increments Patient.version by 1"] }
+  - { method: GET, path: "/sessions", description: "List sessions (filter by patient_id, order_id, station_id, shift_id, standing_slot_id, rescheduled_from_id, clinic_id)", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: ["patient_id?", "order_id?", "station_id?", "shift_id?", "standing_slot_id?", "rescheduled_from_id?", "clinic_id?", "limit?", "offset?"], output: "TreatmentSession[]", side_effects: [] }
+  - { method: GET, path: "/sessions/{sessionId}", description: "Get session", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: [], output: TreatmentSession, side_effects: [] }
+  - { method: POST, path: "/sessions/{sessionId}/check-in", description: "Check in a booked session", roles: [Scheduler], code: 200, input: [], output: TreatmentSession, side_effects: ["clinical_status->CHECKED_IN"] }
+  - { method: POST, path: "/sessions/{sessionId}/complete", description: "Complete a session", roles: [Scheduler], code: 200, input: [], output: TreatmentSession, side_effects: ["clinical_status->COMPLETED", "compute billed_amount_cents", "account_balance_cents += coinsurance", "machine.dialyzer_reuse_count += 1 (HD/HDF)"] }
+  - { method: POST, path: "/sessions/{sessionId}/mark-missed", description: "Mark a session missed (no-show)", roles: [Scheduler], code: 200, input: [], output: TreatmentSession, side_effects: ["clinical_status->MISSED", "missed_fee_cents set", "account_balance_cents += missed_fee", "no_show window recompute + adherence escalation", "cancel transport + reverse confirmed fare"] }
+  - { method: POST, path: "/sessions/{sessionId}/cancel", description: "Cancel a booked session", roles: [Scheduler], code: 200, input: [], output: TreatmentSession, side_effects: ["clinical_status->CANCELLED", "cancel transport + reverse confirmed fare"] }
+  - { method: POST, path: "/sessions/{sessionId}/bill", description: "Mark session billed", roles: [BillingClerk], code: 200, input: [], output: TreatmentSession, side_effects: ["billing_status->BILLED"] }
+  - { method: POST, path: "/sessions/{sessionId}/settle", description: "Settle a billed session", roles: [BillingClerk], code: 200, input: [], output: TreatmentSession, side_effects: ["billing_status->SETTLED", "account_balance_cents -= coinsurance"] }
+  - { method: POST, path: "/sessions/{sessionId}/void-billing", description: "Void billing for a cancelled/missed session", roles: [BillingClerk], code: 200, input: [], output: TreatmentSession, side_effects: ["billing_status->VOID"] }
+
+  # ---- TransportTrip ----
+  - { method: POST, path: "/transport-trips", description: "Request a transport trip for a session", roles: [Scheduler], code: 201, input: [session_id, direction, miles, "cross_county?", "wheelchair?", "shared_ride?"], output: TransportTrip, side_effects: ["status=REQUESTED", "compute fare_cents"] }
+  - { method: GET, path: "/transport-trips", description: "List transport trips (filter by session_id, patient_id)", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: ["session_id?", "patient_id?", "limit?", "offset?"], output: "TransportTrip[]", side_effects: [] }
+  - { method: GET, path: "/transport-trips/{tripId}", description: "Get transport trip", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: [], output: TransportTrip, side_effects: [] }
+  - { method: POST, path: "/transport-trips/{tripId}/confirm", description: "Confirm a transport trip", roles: [Scheduler], code: 200, input: [], output: TransportTrip, side_effects: ["status->CONFIRMED", "account_balance_cents += fare_cents"] }
+  - { method: POST, path: "/transport-trips/{tripId}/complete", description: "Complete a transport trip", roles: [Scheduler], code: 200, input: [], output: TransportTrip, side_effects: ["status->COMPLETED"] }
+  - { method: POST, path: "/transport-trips/{tripId}/cancel", description: "Cancel a transport trip", roles: [Scheduler], code: 200, input: [], output: TransportTrip, side_effects: ["status->CANCELLED", "if was CONFIRMED: account_balance_cents -= fare_cents"] }
+
+  # ---- LabOrder ----
+  - { method: POST, path: "/lab-orders", description: "Schedule a monthly lab", roles: [Nephrologist, Scheduler], code: 201, input: [patient_id, panel, scheduled_date], output: LabOrder, side_effects: ["status=SCHEDULED"] }
+  - { method: GET, path: "/lab-orders", description: "List lab orders (filter by patient_id, clinic_id)", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: ["patient_id?", "clinic_id?", "limit?", "offset?"], output: "LabOrder[]", side_effects: [] }
+  - { method: GET, path: "/lab-orders/{labId}", description: "Get lab order", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: [], output: LabOrder, side_effects: [] }
+  - { method: POST, path: "/lab-orders/{labId}/collect", description: "Mark lab collected", roles: [Scheduler], code: 200, input: [], output: LabOrder, side_effects: ["status->COLLECTED"] }
+  - { method: POST, path: "/lab-orders/{labId}/cancel", description: "Cancel lab order", roles: [Scheduler, Nephrologist], code: 200, input: [], output: LabOrder, side_effects: ["status->CANCELLED"] }
+
+  # ---- MonthlyStatement ----
+  - { method: POST, path: "/statements", description: "Issue a monthly statement (runs statement_rollup)", roles: [BillingClerk], code: 201, input: [patient_id, period_month], output: MonthlyStatement, side_effects: ["status=ISSUED", "compute session_count/coinsurance_due_cents/missed_fee_total_cents/total_due_cents"] }
+  - { method: GET, path: "/statements", description: "List statements (filter by patient_id, clinic_id)", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: ["patient_id?", "clinic_id?", "limit?", "offset?"], output: "MonthlyStatement[]", side_effects: [] }
+  - { method: GET, path: "/statements/{statementId}", description: "Get statement", roles: [ClinicAdmin, Scheduler, Nephrologist, BillingClerk], code: 200, input: [], output: MonthlyStatement, side_effects: [] }
+  - { method: POST, path: "/statements/{statementId}/pay", description: "Mark statement paid", roles: [BillingClerk], code: 200, input: [], output: MonthlyStatement, side_effects: ["status->PAID", "account_balance_cents -= total_due_cents"] }
+  - { method: POST, path: "/statements/{statementId}/cancel", description: "Cancel statement", roles: [BillingClerk], code: 200, input: [], output: MonthlyStatement, side_effects: ["status->CANCELLED"] }
+
+  # ---- Test-driving clock ----
+  - { method: POST, path: "/_clock/set_current_utc", description: "Set the clinic system clock (test-driving)", roles: [ClinicAdmin], code: 200, input: [to_iso8601], output: "{ now: string }", side_effects: ["recompute every patient.no_show_count_window and adherence_status against the new now"] }
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_MISSING_USER_CONTEXT, http: 400, condition: "X-User-ID or X-User-Role header missing/invalid" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Role not permitted for this operation" }
+  - { id: ERR_CLINIC_NOT_FOUND, http: 404, condition: "clinicId does not exist" }
+  - { id: ERR_PATIENT_NOT_FOUND, http: 404, condition: "patientId does not exist" }
+  - { id: ERR_SHIFT_NOT_FOUND, http: 404, condition: "shiftId does not exist" }
+  - { id: ERR_MACHINE_NOT_FOUND, http: 404, condition: "machineId does not exist" }
+  - { id: ERR_STATION_NOT_FOUND, http: 404, condition: "stationId does not exist" }
+  - { id: ERR_ORDER_NOT_FOUND, http: 404, condition: "orderId does not exist" }
+  - { id: ERR_SLOT_NOT_FOUND, http: 404, condition: "standing-slot slotId does not exist" }
+  - { id: ERR_SESSION_NOT_FOUND, http: 404, condition: "sessionId does not exist" }
+  - { id: ERR_TRIP_NOT_FOUND, http: 404, condition: "transport tripId does not exist" }
+  - { id: ERR_LAB_NOT_FOUND, http: 404, condition: "lab-order labId does not exist" }
+  - { id: ERR_STATEMENT_NOT_FOUND, http: 404, condition: "statementId does not exist" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Body field-level validation failed (missing required field, bad enum, out-of-range numeric, end_minute <= start_minute, miles < 0, coinsurance_pct outside [0,1])" }
+  - { id: ERR_CROSS_CLINIC_REFERENCE, http: 422, condition: "A body FK references a missing entity or one that belongs to a different clinic" }
+  - { id: ERR_CLINIC_SUSPENDED, http: 409, condition: "Clinic is not OPEN when creating a standing slot, session, or lab order" }
+  - { id: ERR_CLINIC_HAS_ACTIVE_SESSIONS, http: 409, condition: "Cannot close clinic while BOOKED/CHECKED_IN sessions exist" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Generic invalid state transition (source state not permitted)" }
+  - { id: ERR_ORDER_NOT_ACTIVE, http: 409, condition: "Authorizing order is not ACTIVE or does not govern the service_date" }
+  - { id: ERR_ACTIVE_ORDER_EXISTS, http: 409, condition: "Patient already has an ACTIVE order when activating another" }
+  - { id: ERR_SESSION_NOT_COMPLETED, http: 409, condition: "Operation requires session clinical_status == COMPLETED" }
+  - { id: ERR_SESSION_NOT_VOIDABLE, http: 409, condition: "void-billing requires clinical_status in {CANCELLED, MISSED}" }
+  - { id: ERR_SESSION_NOT_SCHEDULABLE, http: 409, condition: "transport confirm requires owning session in {BOOKED, CHECKED_IN}" }
+  - { id: ERR_DATE_NOT_ON_PATTERN, http: 422, condition: "service_date weekday not on the chosen shift.day_pattern" }
+  - { id: ERR_ISOLATION_STATION_REQUIRED, http: 422, condition: "Isolation patient assigned to a non-isolation-capable station" }
+  - { id: ERR_MODALITY_NOT_SUPPORTED, http: 422, condition: "HEMODIAFILTRATION ordered but station machine supports_hdf is false" }
+  - { id: ERR_DIALYZER_REUSE_EXCEEDED, http: 409, condition: "Completing the session would push machine.dialyzer_reuse_count to/over clinic.dialyzer_reuse_limit" }
+  - { id: ERR_STATION_DOUBLE_BOOKED, http: 409, condition: "Another non-terminal session already occupies (station, shift, service_date)" }
+  - { id: ERR_TURNOVER_BUFFER_VIOLATION, http: 409, condition: "Two sessions sharing the same machine on the same date violate the earlier shift's turnover/disinfection buffer gap" }
+  - { id: ERR_MACHINE_IN_USE, http: 409, condition: "Machine maintenance/retire blocked by a CHECKED_IN/BOOKED session on a bound station" }
+  - { id: ERR_MACHINE_UNAVAILABLE, http: 409, condition: "check-in requires the station's machine to be AVAILABLE" }
+  - { id: ERR_STATION_OFFLINE, http: 409, condition: "check-in requires station ACTIVE" }
+  - { id: ERR_STATION_OCCUPIED, http: 409, condition: "take-offline blocked by a BOOKED/CHECKED_IN session on the station" }
+  - { id: ERR_PATIENT_SUSPENDED, http: 409, condition: "Ad-hoc/transient booking blocked: patient adherence_status SUSPENDED" }
+  - { id: ERR_TRANSIENT_NO_STANDING_SLOT, http: 422, condition: "Standing slot requested for a non-RESIDENT patient" }
+  - { id: ERR_STALE_PATIENT_VERSION, http: 412, condition: "expected_patient_version does not match current patient.version (OCC)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: ClinicAdmin
+    description: "Operates clinic, inventory (shifts/machines/stations), patient lifecycle and reactivation"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /clinics and clinic suspend/resume/close"
+      - "POST /shifts + retire shift"
+      - "POST /machines + start/complete maintenance + retire"
+      - "POST /stations + take-offline/bring-online"
+      - "POST /patients/{id}/reactivate"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /patients (create patient, shared with Scheduler)"
+      - "all GET reads"
+
+  - name: Scheduler
+    description: "Owns standing slots, sessions, transport, labs"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /standing-slots + release"
+      - "POST /sessions + check-in/complete/mark-missed/cancel"
+      - "POST /transport-trips + confirm/complete/cancel"
+      - "POST /lab-orders/{id}/collect"
+    shared_operations:
+      - "POST /patients (create patient, shared with ClinicAdmin)"
+      - "POST /lab-orders (shared with Nephrologist)"
+      - "POST /lab-orders/{id}/cancel (shared with Nephrologist)"
+      - "all GET reads"
+
+  - name: Nephrologist
+    description: "Owns nephrologist orders and lab scheduling"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /orders + activate/open-revision/commit-revision/revoke"
+    shared_operations:
+      - "POST /lab-orders (shared with Scheduler)"
+      - "POST /lab-orders/{id}/cancel (shared with Scheduler)"
+      - "all GET reads"
+
+  - name: BillingClerk
+    description: "Owns session billing and monthly statements"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /sessions/{id}/bill, settle, void-billing"
+      - "POST /statements + pay/cancel"
+    shared_operations:
+      - "all GET reads"

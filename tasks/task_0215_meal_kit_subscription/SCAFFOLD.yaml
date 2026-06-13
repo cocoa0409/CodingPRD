@@ -1,0 +1,940 @@
+# =============================================================================
+# Meal Kit Subscription (HelloFresh style) — Scaffold §1.0–§1.7
+# =============================================================================
+
+scenario: |
+  Meal Kit Subscription (HelloFresh style): plan size/servings, weekly recipe
+  selection/skip, dietary preferences/allergens, delivery-day cutoff, cold-pack
+  shipping zone, billing/renewal, pause/cancel, referral credit
+
+domain_name: meal-kit-subscription
+api_prefix: ""   # flat multi-collection API: peer top-level resources (/members, /subscriptions, /weekly-boxes, ...)
+
+# Complexity profile -----------------------------------------------------------
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: scheduled_deferred_actions
+  complexity_layers:
+    - dual_variant_calculation     # provisional weekly bill (at lock) vs final charge (at cutoff)
+    - scheduled_actions            # delivery-day cutoff, scheduled pause/resume, renewal
+    - optimistic_concurrency       # OCC on Subscription.version for create-with-supersede plan changes
+    - rate_threshold_triggers      # serving-tier price breaks, loyalty tiers, referral cap
+    - derived_field_reconciliation # credit_balance_cents, lifetime_box_count kept consistent
+
+  entity_topology: flat            # peer entities linked by FK; no deep URL nesting
+  state_machine_shape: parallel    # WeeklyBox: selection_status x fulfillment_status evolve independently
+  relationship_patterns:
+    - one_to_many                  # Member -> Subscription -> WeeklyBox -> BoxRecipe
+    - many_to_many                 # WeeklyBox <-> Recipe via BoxRecipe junction
+    - self_referential             # Member.referred_by_member_id -> Member.id
+    - cross_aggregate              # Referral spans referrer Member and referee Member
+  role_model: peer_roles           # Member acts on own subscription; PlatformAdmin/Ops operate catalog & clock
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  # --- Configuration: Plan catalog (rarely changes) ---
+  - name: Plan
+    parent: null
+    common_fields: true
+    fields:
+      - { name: code, type: string, source: input, description: "Unique plan code (e.g., COUPLE_3)", constraints: "unique across Plans" }
+      - { name: servings_per_meal, type: integer, source: input, description: "Servings each meal yields", constraints: "must be one of {2,4}" }
+      - { name: meals_per_week, type: integer, source: input, description: "Number of recipe slots per weekly box", constraints: "2 <= meals_per_week <= 6" }
+      - { name: is_active, type: boolean, source: input, default: true, description: "Whether new subscriptions may select this plan" }
+
+  # --- Configuration: shipping zone surcharge table ---
+  - name: ShippingZone
+    parent: null
+    common_fields: true
+    fields:
+      - { name: zone_code, type: enum, source: input, description: "ZONE_A | ZONE_B | ZONE_C | ZONE_D", constraints: "unique; one of {ZONE_A,ZONE_B,ZONE_C,ZONE_D}" }
+      - { name: cold_pack_surcharge_cents, type: integer, source: input, description: "Flat cold-pack surcharge added per box for this zone", constraints: ">= 0" }
+      - { name: cutoff_weekday, type: integer, source: input, description: "ISO weekday (1=Mon..7=Sun) when selection locks for delivery", constraints: "1 <= cutoff_weekday <= 7" }
+      - { name: serviceable, type: boolean, source: input, default: true, description: "Whether this zone accepts new deliveries" }
+
+  # --- Configuration: recipe catalog ---
+  - name: Recipe
+    parent: null
+    common_fields: true
+    fields:
+      - { name: title, type: string, source: input, description: "Recipe display title" }
+      - { name: is_premium, type: boolean, source: input, default: false, description: "Premium recipes add a per-slot upcharge" }
+      - { name: contains_allergens, type: array, source: input, default: [], description: "List of allergen tags this recipe contains (e.g., PEANUT, DAIRY, GLUTEN, SHELLFISH)" }
+      - { name: diet_tags, type: array, source: input, default: [], description: "Diet compatibility tags (e.g., VEGETARIAN, PESCATARIAN, LOW_CARB)" }
+      - { name: is_available, type: boolean, source: input, default: true, description: "Whether the recipe may be selected into new boxes" }
+
+  # --- Resource: Member (self-referential via referred_by) ---
+  - name: Member
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Login email", constraints: "unique across Members" }
+      - { name: full_name, type: string, source: input, description: "Member full name" }
+      - { name: shipping_zone_id, type: string, source: input, description: "FK -> ShippingZone.id; member's delivery zone" }
+      - { name: referred_by_member_id, type: string, source: input, required: false, description: "FK -> Member.id; the referrer who recruited this member (self-referential), null if organic" }
+      - { name: referral_code, type: string, source: system, description: "System-minted unique share code for this member", constraints: "unique across Members" }
+      - { name: credit_balance_cents, type: integer, source: computed, default: 0, description: "Read-only running referral/pause credit wallet; reconciled by referral settlement, pause proration, and box billing" }
+      - { name: lifetime_box_count, type: integer, source: computed, default: 0, description: "Read-only count of WeeklyBoxes that reached SHIPPED for this member; drives loyalty tier" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | DEACTIVATED", default: "ACTIVE", constraints: "one of {ACTIVE,DEACTIVATED}" }
+
+  # --- Resource: Subscription (cyclic state machine ACTIVE<->PAUSED) ---
+  - name: Subscription
+    parent: null
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: input, description: "FK -> Member.id; owner of this subscription" }
+      - { name: plan_id, type: string, source: input, description: "FK -> Plan.id; the size/servings plan currently in force" }
+      - { name: diet_preference, type: enum, source: input, default: "STANDARD", description: "STANDARD | VEGETARIAN | PESCATARIAN | LOW_CARB | FAMILY_FRIENDLY; drives diet premium and allergen filter base" }
+      - { name: blocked_allergens, type: array, source: input, default: [], description: "Allergen tags that must never appear in any selected recipe (e.g., PEANUT)" }
+      - { name: monthly_addon_fee_cents, type: integer, source: input, default: 0, description: "Optional flat monthly add-on (e.g., premium-support); prorated on pause" }
+      - { name: billing_cycle_day, type: integer, source: input, description: "Day-of-month (1..28) the monthly add-on renews", constraints: "1 <= billing_cycle_day <= 28" }
+      - { name: scheduled_resume_date, type: datetime, source: computed, required: false, description: "Read-only ISO date the subscription auto-resumes from PAUSED; null when not paused" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | PAUSED | CANCELLED; CANCELLED is terminal", constraints: "one of {ACTIVE,PAUSED,CANCELLED}" }
+
+  # --- Resource: WeeklyBox (parallel state dims: selection_status x fulfillment_status) ---
+  - name: WeeklyBox
+    parent: null
+    common_fields: true
+    fields:
+      - { name: subscription_id, type: string, source: input, description: "FK -> Subscription.id; owning subscription" }
+      - { name: delivery_date, type: datetime, source: input, description: "ISO date this box is scheduled to deliver", constraints: "must be strictly after the subscription's current clock date" }
+      - { name: cutoff_at, type: datetime, source: computed, description: "Read-only ISO timestamp selection locks; derived from zone cutoff_weekday relative to delivery_date" }
+      - { name: provisional_charge_cents, type: integer, source: computed, default: 0, description: "Read-only provisional weekly bill computed when selection LOCKED; snapshot of credit at lock" }
+      - { name: final_charge_cents, type: integer, source: computed, required: false, description: "Read-only final charge computed at cutoff from live selection and live credit; null until CHARGED" }
+      - { name: selection_status, type: enum, source: system, default: "OPEN", description: "OPEN | LOCKED | SKIPPED; selection dimension", constraints: "one of {OPEN,LOCKED,SKIPPED}" }
+      - { name: fulfillment_status, type: enum, source: system, default: "PENDING", description: "PENDING | CHARGED | SHIPPED | REFUNDED; fulfillment dimension, evolves independently of selection_status", constraints: "one of {PENDING,CHARGED,SHIPPED,REFUNDED}" }
+
+  # --- Junction: BoxRecipe (WeeklyBox <-> Recipe many-to-many) ---
+  - name: BoxRecipe
+    parent: null
+    common_fields: true
+    fields:
+      - { name: box_id, type: string, source: input, description: "FK -> WeeklyBox.id; the box this slot belongs to" }
+      - { name: recipe_id, type: string, source: input, description: "FK -> Recipe.id; the chosen recipe" }
+      - { name: is_premium_snapshot, type: boolean, source: computed, description: "Read-only copy of Recipe.is_premium at selection time; drives per-slot upcharge" }
+
+  # --- Resource: Referral (cross-aggregate: referrer + referee) ---
+  - name: Referral
+    parent: null
+    common_fields: true
+    fields:
+      - { name: referrer_member_id, type: string, source: input, description: "FK -> Member.id; member who shared the code" }
+      - { name: referee_member_id, type: string, source: input, description: "FK -> Member.id; newly recruited member" }
+      - { name: reward_cents, type: integer, source: computed, default: 0, description: "Read-only reward credited to referrer on settlement; 0 until SETTLED" }
+      - { name: status, type: enum, source: system, default: "PENDING", description: "PENDING | SETTLED | VOID; SETTLED and VOID terminal", constraints: "one of {PENDING,SETTLED,VOID}" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- Subscription: cyclic ACTIVE <-> PAUSED, terminal CANCELLED ----
+  - entity: Subscription
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: PAUSED
+        trigger: "POST /subscriptions/{id}/pause"
+        actor: Member
+        preconditions:
+          - "Subscription.status == ACTIVE (else ERR_SUBSCRIPTION_NOT_ACTIVE)"
+          - "resume_date in body is strictly after the current clock date (else ERR_INVALID_RESUME_DATE)"
+        side_effects:
+          - "status -> PAUSED"
+          - "scheduled_resume_date := resume_date"
+          - "compute pause_proration_credit (calc:pause_proration_credit) and credit Member.credit_balance_cents (ledger sync to Member)"
+          - "all owning WeeklyBoxes with selection_status==OPEN and fulfillment_status==PENDING and delivery_date <= resume_date -> selection_status SKIPPED (cascade down; conditional)"
+          - "increments Subscription.version by 1"
+      - from: PAUSED
+        to: ACTIVE
+        trigger: "POST /subscriptions/{id}/resume"
+        actor: Member
+        preconditions:
+          - "Subscription.status == PAUSED (else ERR_SUBSCRIPTION_NOT_PAUSED)"
+        side_effects:
+          - "status -> ACTIVE"
+          - "scheduled_resume_date := null"
+          - "increments Subscription.version by 1"
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /subscriptions/{id}/cancel"
+        actor: Member
+        preconditions:
+          - "Subscription.status == ACTIVE (else ERR_SUBSCRIPTION_NOT_ACTIVE)"
+        side_effects:
+          - "status -> CANCELLED"
+          - "all owning WeeklyBoxes with fulfillment_status==PENDING -> selection_status SKIPPED and fulfillment_status stays PENDING (cascade down, non-terminal only)"
+          - "increments Subscription.version by 1"
+      - from: PAUSED
+        to: CANCELLED
+        trigger: "POST /subscriptions/{id}/cancel"
+        actor: Member
+        preconditions:
+          - "Subscription.status == PAUSED (else ERR_SUBSCRIPTION_NOT_PAUSED)"
+        side_effects:
+          - "status -> CANCELLED"
+          - "scheduled_resume_date := null"
+          - "increments Subscription.version by 1"
+
+  # ---- WeeklyBox: selection dimension (OPEN -> LOCKED -> [auto], OPEN -> SKIPPED) ----
+  - entity: WeeklyBox
+    initial_state: OPEN          # selection_status initial; fulfillment_status initial PENDING (parallel)
+    terminal_states: [REFUNDED]  # fulfillment terminal; selection_status has no independent terminal
+    transitions:
+      # --- selection_status dimension ---
+      - from: OPEN
+        to: LOCKED
+        trigger: "POST /weekly-boxes/{id}/lock-selection"
+        actor: Member
+        preconditions:
+          - "selection_status == OPEN (else ERR_SELECTION_NOT_OPEN)"
+          - "owning Subscription.status == ACTIVE (cross-entity: else ERR_SUBSCRIPTION_NOT_ACTIVE)"
+          - "number of BoxRecipe rows for this box == Plan.meals_per_week (else ERR_SELECTION_INCOMPLETE)"
+          - "current clock < cutoff_at (else ERR_CUTOFF_PASSED)"
+        side_effects:
+          - "selection_status -> LOCKED"
+          - "compute provisional_charge_cents (calc:weekly_box_charge variant=PROVISIONAL) using credit_balance_cents snapshot at lock"
+      - from: OPEN
+        to: SKIPPED
+        trigger: "POST /weekly-boxes/{id}/skip"
+        actor: Member
+        preconditions:
+          - "selection_status == OPEN (else ERR_SELECTION_NOT_OPEN)"
+          - "current clock < cutoff_at (else ERR_CUTOFF_PASSED)"
+        side_effects:
+          - "selection_status -> SKIPPED"
+          - "fulfillment_status -> REFUNDED if previously CHARGED (none at OPEN); otherwise remains PENDING"
+      - from: LOCKED
+        to: SKIPPED
+        trigger: "POST /weekly-boxes/{id}/skip"
+        actor: Member
+        preconditions:
+          - "selection_status == LOCKED (else ERR_SELECTION_NOT_LOCKED)"
+          - "fulfillment_status == PENDING (cross-dimension: else ERR_BOX_ALREADY_CHARGED)"
+          - "current clock < cutoff_at (else ERR_CUTOFF_PASSED)"
+        side_effects:
+          - "selection_status -> SKIPPED"
+          - "provisional_charge_cents := 0"
+      # --- fulfillment_status dimension (independent axis) ---
+      - from: PENDING
+        to: CHARGED
+        trigger: "POST /_clock/advance (system cutoff sweep) OR POST /weekly-boxes/{id}/charge"
+        actor: system
+        preconditions:
+          - "selection_status == LOCKED (cross-dimension: else ERR_BOX_NOT_LOCKED)"
+          - "current clock >= cutoff_at (else ERR_CUTOFF_NOT_REACHED)"
+          - "fulfillment_status == PENDING (else ERR_BOX_NOT_PENDING)"
+        side_effects:
+          - "compute final_charge_cents (calc:weekly_box_charge variant=FINAL) from live selection and live credit_balance_cents"
+          - "fulfillment_status -> CHARGED"
+          - "deduct credit applied: Member.credit_balance_cents -= credit_applied (ledger sync to Member)"
+      - from: CHARGED
+        to: SHIPPED
+        trigger: "POST /weekly-boxes/{id}/ship"
+        actor: PlatformOps
+        preconditions:
+          - "fulfillment_status == CHARGED (else ERR_BOX_NOT_CHARGED)"
+          - "owning Member.shipping_zone is serviceable == true (cross-entity: else ERR_ZONE_NOT_SERVICEABLE)"
+        side_effects:
+          - "fulfillment_status -> SHIPPED"
+          - "increment owning Member.lifetime_box_count by 1 (ledger sync to Member)"
+          - "if this is the referee Member's FIRST SHIPPED box, settle the referee's PENDING Referral (cascade: Referral PENDING->SETTLED, which itself credits the referrer Member.credit_balance_cents)"
+      - from: CHARGED
+        to: REFUNDED
+        trigger: "POST /weekly-boxes/{id}/refund"
+        actor: PlatformOps
+        preconditions:
+          - "fulfillment_status == CHARGED (else ERR_BOX_NOT_CHARGED)"
+        side_effects:
+          - "fulfillment_status -> REFUNDED"
+          - "restore credit consumed: Member.credit_balance_cents += credit_applied for this box (compensation, ledger sync to Member)"
+
+  # ---- Referral: PENDING -> SETTLED | VOID ----
+  - entity: Referral
+    initial_state: PENDING
+    terminal_states: [SETTLED, VOID]
+    transitions:
+      - from: PENDING
+        to: SETTLED
+        trigger: "system (cascade from referee's first WeeklyBox reaching SHIPPED)"
+        actor: system
+        preconditions:
+          - "referee Member has exactly one SHIPPED WeeklyBox and it is the triggering box (else not yet eligible)"
+          - "count of SETTLED Referrals for referrer in current billing cycle < MAX_REFERRAL_REWARDS_PER_CYCLE (else this Referral -> VOID, no reward)"
+        side_effects:
+          - "compute reward_cents (calc:referral_reward variant=SETTLED)"
+          - "status -> SETTLED"
+          - "credit referrer Member.credit_balance_cents += reward_cents (ledger sync to referrer Member)"
+      - from: PENDING
+        to: VOID
+        trigger: "POST /referrals/{id}/void OR system (cap exceeded on settlement attempt)"
+        actor: PlatformAdmin
+        preconditions:
+          - "status == PENDING (else ERR_REFERRAL_NOT_PENDING)"
+        side_effects:
+          - "status -> VOID"
+          - "reward_cents := 0"
+
+  # ---- Member: ACTIVE -> DEACTIVATED ----
+  - entity: Member
+    initial_state: ACTIVE
+    terminal_states: [DEACTIVATED]
+    transitions:
+      - from: ACTIVE
+        to: DEACTIVATED
+        trigger: "POST /members/{id}/deactivate"
+        actor: PlatformAdmin
+        preconditions:
+          - "Member.status == ACTIVE (else ERR_MEMBER_NOT_ACTIVE)"
+          - "Member has no Subscription in status ACTIVE or PAUSED (cross-entity: else ERR_MEMBER_HAS_LIVE_SUBSCRIPTION)"
+        side_effects:
+          - "status -> DEACTIVATED"
+          - "all PENDING Referrals where this member is referee -> VOID (cascade down; reward stays 0)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: plan-change-stale-subscription
+    parent_entity: Subscription
+    write_endpoint: "POST /subscriptions/{id}/plan-changes"
+    occ_field: "expected_subscription_version"
+    description: |
+      Submitting a plan change against a Subscription whose version has advanced
+      since the client last observed it is rejected with a stale-version error.
+      A plan change creates a new plan binding that supersedes the prior plan and
+      bumps the subscription version; a writer holding an out-of-date version view
+      (because a pause, resume, or earlier plan change already advanced it) is
+      rejected rather than overwriting the newer binding.
+    error_id: ERR_STALE_SUBSCRIPTION_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: weekly_box_charge
+    trigger: "WeeklyBox selection lock (PROVISIONAL) and cutoff charge (FINAL)"
+    algorithm: tiered_pricing
+    formula: |
+      # PINNED evaluation order (steps 1..11). All money in integer cents.
+      1. total_servings = Plan.servings_per_meal * Plan.meals_per_week
+      2. per_serving_rate =
+           899  if total_servings >= 16
+           999  if 8 <= total_servings < 16
+           1099 if total_servings < 8
+      3. base = (per_serving_rate + DIET_PREMIUM[Subscription.diet_preference]) * total_servings
+      4. premium_upcharge = PREMIUM_RECIPE_UPCHARGE * (count of BoxRecipe rows for this box where is_premium_snapshot == true)
+      5. subtotal = base + premium_upcharge
+      6. zone_total = subtotal + ShippingZone.cold_pack_surcharge_cents   (zone of the box's Member)
+      7. loyalty_pct = LOYALTY_TIERS lookup on Member.lifetime_box_count  (PRE-INCREMENT snapshot; the box's own ship has NOT yet bumped the counter)
+           0.10 if lifetime_box_count >= 24
+           0.05 if 12 <= lifetime_box_count < 24
+           0.00 if lifetime_box_count < 12
+      8. loyalty_discount = round_half_up(zone_total * loyalty_pct)       (round ONCE here, at the end of the percentage step)
+      9. after_loyalty = zone_total - loyalty_discount
+      10. credit_applied = min(Member.credit_balance_cents, REFERRAL_CREDIT_CAP_PER_BOX, after_loyalty)
+      11. charge = after_loyalty - credit_applied
+    input_set: "BoxRecipe rows for the box; Plan via Subscription.plan_id; ShippingZone via Member.shipping_zone_id; Member.credit_balance_cents and Member.lifetime_box_count"
+    constants:
+      DIET_PREMIUM: { STANDARD: 0, VEGETARIAN: 0, PESCATARIAN: 150, LOW_CARB: 200, FAMILY_FRIENDLY: 0 }
+      PREMIUM_RECIPE_UPCHARGE: 400
+      REFERRAL_CREDIT_CAP_PER_BOX: 2000
+      LOYALTY_TIERS: { T_GOLD_MIN: 24, T_SILVER_MIN: 12 }
+    precision: "integer cents; the only rounding is step 8 (round_half_up) — round once after the percentage multiply, never per intermediate"
+    variants:
+      - name: PROVISIONAL
+        when: "computed at OPEN->LOCKED; written to provisional_charge_cents"
+        difference: "reads the Member.credit_balance_cents and Member.lifetime_box_count snapshot as they stand at the lock instant; does NOT deduct credit (no ledger mutation). The locked BoxRecipe set is frozen at lock."
+      - name: FINAL
+        when: "computed at PENDING->CHARGED (cutoff); written to final_charge_cents"
+        difference: "re-reads the LIVE Member.credit_balance_cents and Member.lifetime_box_count at the charge instant — which may have changed since lock (e.g., a referral settled, or another box shipped bumping the loyalty tier) — and DOES deduct credit_applied from Member.credit_balance_cents. The BoxRecipe set is the same frozen lock-time set."
+
+  - name: pause_proration_credit
+    trigger: "Subscription ACTIVE->PAUSED"
+    algorithm: aggregation
+    formula: |
+      # Refund the unused portion of the monthly add-on fee for the current billing cycle.
+      cycle_days = PRORATION_CYCLE_DAYS
+      unused_days = max(0, cycle_days - days_elapsed_in_cycle)
+        where days_elapsed_in_cycle = (current clock date - most recent billing_cycle_day anchor on/before current date), clamped to [0, cycle_days]
+      # PINNED rounding order: multiply numerator first, divide, then round ONCE (multiply-then-round).
+      proration_credit = round_half_up(Subscription.monthly_addon_fee_cents * unused_days / cycle_days)
+    input_set: "Subscription.monthly_addon_fee_cents; days elapsed since billing anchor"
+    constants:
+      PRORATION_CYCLE_DAYS: 30
+    precision: "integer cents; round_half_up exactly once after the (fee * unused_days / cycle_days) expression — NOT per-day-rounded-then-multiplied"
+
+  - name: referral_reward
+    trigger: "Referral PENDING->SETTLED (settlement on referee's first SHIPPED box) and forward estimate read"
+    algorithm: chronological
+    formula: |
+      # SETTLED (chronological): when a referee's first box ships, settle the referrer's PENDING Referral.
+      # Eligibility ordered by Referral.created_at ASC within the referrer's current billing cycle.
+      settled_so_far = count of Referrals for referrer with status==SETTLED whose settlement fell in the current billing cycle
+      if settled_so_far < MAX_REFERRAL_REWARDS_PER_CYCLE:
+        reward_cents = REFERRAL_REWARD_CENTS
+      else:
+        reward_cents = 0  ; Referral -> VOID instead of SETTLED
+    input_set: "Referrals of the referrer in the current billing cycle, ordered by created_at ASC"
+    constants:
+      REFERRAL_REWARD_CENTS: 1500
+      MAX_REFERRAL_REWARDS_PER_CYCLE: 3
+    precision: "integer cents; no rounding"
+    variants:
+      - name: FORWARD_ESTIMATE
+        when: "read via GET /members/{id}/referral-summary"
+        difference: "forward-looking projection = REFERRAL_REWARD_CENTS * (count of the referrer's PENDING referrals), uncapped and not yet credited; an optimistic upper bound"
+      - name: SETTLED
+        when: "computed at PENDING->SETTLED"
+        difference: "chronological actual = REFERRAL_REWARD_CENTS per referral up to MAX_REFERRAL_REWARDS_PER_CYCLE in created_at order; beyond the cap the referral VOIDs with 0"
+
+  - name: cutoff_at
+    trigger: "WeeklyBox creation"
+    algorithm: projection
+    formula: |
+      # cutoff_at is the most recent ShippingZone.cutoff_weekday at 23:59:59Z strictly before delivery_date.
+      Let dz = delivery_date (date). Walk backward day-by-day from dz - 1 day until the weekday equals
+      ShippingZone.cutoff_weekday; set cutoff_at = that date at 23:59:59.000Z.
+      (Guarantees cutoff_at < delivery_date by construction.)
+    input_set: "WeeklyBox.delivery_date; ShippingZone.cutoff_weekday of the box's Member"
+    precision: "ISO 8601 UTC, milliseconds"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and X-User-Role is a declared role"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 400
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for the endpoint; for entity_backed Member ops, X-User-ID owns the targeted Subscription/WeeklyBox"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "All path/body resource ids exist (Member, Subscription, WeeklyBox, Recipe, Plan, ShippingZone, BoxRecipe, Referral), validated left-to-right"
+    error_id: "ERR_{RESOURCE}_NOT_FOUND"
+    http_status: 404
+    applies_to: all endpoints with resource ids
+
+  - priority: 4
+    category: state
+    check: "Target resource is in the correct state for the operation (selection_status / fulfillment_status / subscription status / referral status)"
+    error_id: "varies (ERR_SELECTION_NOT_OPEN, ERR_SELECTION_NOT_LOCKED, ERR_BOX_NOT_LOCKED, ERR_BOX_NOT_CHARGED, ERR_BOX_NOT_PENDING, ERR_SUBSCRIPTION_NOT_ACTIVE, ERR_SUBSCRIPTION_NOT_PAUSED, ERR_REFERRAL_NOT_PENDING)"
+    http_status: 409
+    applies_to: transition endpoints
+
+  - priority: 5
+    category: state
+    check: "OCC: expected_subscription_version on plan-change must equal current Subscription.version"
+    error_id: ERR_STALE_SUBSCRIPTION_VERSION
+    http_status: 412
+    applies_to: "POST /subscriptions/{id}/plan-changes"
+
+  - priority: 6
+    category: business_temporal
+    check: "Selection/skip/lock operations require current clock < cutoff_at; charge requires current clock >= cutoff_at"
+    error_id: "ERR_CUTOFF_PASSED (write before cutoff required) / ERR_CUTOFF_NOT_REACHED (charge before cutoff)"
+    http_status: 409
+    applies_to: "POST /weekly-boxes/{id}/lock-selection, /skip, add-recipe, /charge"
+
+  - priority: 7
+    category: business_safety
+    check: "Allergen safety: a selected recipe must not contain any allergen in the Subscription.blocked_allergens set"
+    error_id: ERR_ALLERGEN_BLOCKED
+    http_status: 422
+    applies_to: "POST /weekly-boxes/{id}/recipes (add BoxRecipe)"
+
+  - priority: 8
+    category: business_constraint
+    check: "Diet compatibility: selected recipe.diet_tags must include the Subscription.diet_preference when diet_preference != STANDARD and != FAMILY_FRIENDLY"
+    error_id: ERR_DIET_INCOMPATIBLE
+    http_status: 422
+    applies_to: "POST /weekly-boxes/{id}/recipes"
+
+  - priority: 9
+    category: business_constraint
+    check: "Box capacity: a box may hold at most Plan.meals_per_week BoxRecipe rows; duplicate recipe in the same box rejected"
+    error_id: "ERR_BOX_FULL / ERR_DUPLICATE_RECIPE"
+    http_status: 409
+    applies_to: "POST /weekly-boxes/{id}/recipes"
+
+  - priority: 10
+    category: business_temporal
+    check: "Overlap: at most one non-SKIPPED WeeklyBox may occupy a given delivery_date for a Subscription (closed-point collision on the delivery date)"
+    error_id: ERR_DELIVERY_DATE_TAKEN
+    http_status: 409
+    applies_to: "POST /weekly-boxes"
+
+  - priority: 11
+    category: business_temporal
+    check: "Pause window overlap: a pause [now, resume_date] may not overlap an existing non-cancelled pause window on the same Subscription; adjacency (resume_date == next pause start) is allowed (half-open intervals)"
+    error_id: ERR_PAUSE_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /subscriptions/{id}/pause"
+
+  - priority: 12
+    category: business_referential
+    check: "ShippingZone of a new Member must be serviceable; Plan selected by a new Subscription must be is_active"
+    error_id: "ERR_ZONE_NOT_SERVICEABLE / ERR_PLAN_INACTIVE"
+    http_status: 422
+    applies_to: "POST /members, POST /subscriptions, POST /subscriptions/{id}/plan-changes"
+
+  - priority: 13
+    category: business_constraint
+    check: "Self-referral forbidden: referrer_member_id != referee_member_id; referee must not already have a Referral"
+    error_id: "ERR_SELF_REFERRAL / ERR_REFEREE_ALREADY_REFERRED"
+    http_status: 422
+    applies_to: "POST /referrals"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Plan (config) ----
+  - method: POST
+    path: "/plans"
+    description: "Create a plan in the catalog"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [code, servings_per_meal, meals_per_week, "is_active?"]
+    output: Plan
+    side_effects: []
+  - method: GET
+    path: "/plans"
+    description: "List plans"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: ["is_active?", "limit?", "offset?"]
+    output: "Plan[]"
+    side_effects: []
+  - method: GET
+    path: "/plans/{id}"
+    description: "Get a plan"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: []
+    output: Plan
+    side_effects: []
+
+  # ---- ShippingZone (config) ----
+  - method: POST
+    path: "/shipping-zones"
+    description: "Create a shipping zone surcharge/cutoff config"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [zone_code, cold_pack_surcharge_cents, cutoff_weekday, "serviceable?"]
+    output: ShippingZone
+    side_effects: []
+  - method: GET
+    path: "/shipping-zones"
+    description: "List shipping zones"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "ShippingZone[]"
+    side_effects: []
+  - method: GET
+    path: "/shipping-zones/{id}"
+    description: "Get a shipping zone"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: []
+    output: ShippingZone
+    side_effects: []
+
+  # ---- Recipe (config) ----
+  - method: POST
+    path: "/recipes"
+    description: "Create a recipe in the catalog"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [title, "is_premium?", "contains_allergens?", "diet_tags?", "is_available?"]
+    output: Recipe
+    side_effects: []
+  - method: GET
+    path: "/recipes"
+    description: "List recipes"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: ["is_available?", "limit?", "offset?"]
+    output: "Recipe[]"
+    side_effects: []
+  - method: GET
+    path: "/recipes/{id}"
+    description: "Get a recipe"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: []
+    output: Recipe
+    side_effects: []
+  - method: GET
+    path: "/recipes/{id}/box-recipes"
+    description: "List BoxRecipe slots that selected this recipe (reverse FK reachability for recipe_id)"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "BoxRecipe[]"
+    side_effects: []
+
+  # ---- Member ----
+  - method: POST
+    path: "/members"
+    description: "Register a member; mints referral_code; optional referred_by_member_id creates a PENDING Referral via /referrals"
+    roles: [Anonymous]
+    code: 201
+    input: [email, full_name, shipping_zone_id, "referred_by_member_id?"]
+    output: Member
+    side_effects:
+      - "referral_code minted; credit_balance_cents=0; lifetime_box_count=0; status=ACTIVE"
+  - method: GET
+    path: "/members"
+    description: "List members; filter by referred_by_member_id or shipping_zone_id for reverse FK reachability"
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["referred_by_member_id?", "shipping_zone_id?", "limit?", "offset?"]
+    output: "Member[]"
+    side_effects: []
+  - method: GET
+    path: "/members/{id}"
+    description: "Get a member (credit_balance_cents, lifetime_box_count)"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: []
+    output: Member
+    side_effects: []
+  - method: GET
+    path: "/members/{id}/referral-summary"
+    description: "Computed read: forward-looking referral estimate + settled total for the member as referrer"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: []
+    output: "{ forward_estimate_cents: integer, settled_total_cents: integer, pending_count: integer }"
+    side_effects: []
+  - method: POST
+    path: "/members/{id}/deactivate"
+    description: "Deactivate a member (admin)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Member
+    side_effects:
+      - "status -> DEACTIVATED; cascade VOID of PENDING Referrals where this member is referee"
+
+  # ---- Subscription ----
+  - method: POST
+    path: "/subscriptions"
+    description: "Create a subscription for a member"
+    roles: [Member]
+    code: 201
+    input: [member_id, plan_id, "diet_preference?", "blocked_allergens?", "monthly_addon_fee_cents?", billing_cycle_day]
+    output: Subscription
+    side_effects: ["status=ACTIVE; version=1"]
+  - method: GET
+    path: "/subscriptions"
+    description: "List subscriptions; filter by member_id or plan_id (reverse FK reachability)"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: ["member_id?", "plan_id?", "limit?", "offset?"]
+    output: "Subscription[]"
+    side_effects: []
+  - method: GET
+    path: "/subscriptions/{id}"
+    description: "Get a subscription (status, version, scheduled_resume_date)"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects: []
+  - method: POST
+    path: "/subscriptions/{id}/plan-changes"
+    description: "Change plan (OCC create-with-supersede on subscription.version)"
+    roles: [Member]
+    code: 200
+    input: [plan_id, expected_subscription_version]
+    output: Subscription
+    side_effects:
+      - "plan_id := new plan; increments Subscription.version by 1"
+  - method: POST
+    path: "/subscriptions/{id}/pause"
+    description: "Pause a subscription until resume_date (prorates add-on, skips boxes in window)"
+    roles: [Member]
+    code: 200
+    input: [resume_date]
+    output: Subscription
+    side_effects:
+      - "status -> PAUSED; scheduled_resume_date set; pause_proration_credit credited to Member; in-window OPEN/PENDING boxes -> SKIPPED; increments Subscription.version by 1"
+  - method: POST
+    path: "/subscriptions/{id}/resume"
+    description: "Resume a paused subscription"
+    roles: [Member]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects: ["status -> ACTIVE; scheduled_resume_date cleared; increments Subscription.version by 1"]
+  - method: POST
+    path: "/subscriptions/{id}/cancel"
+    description: "Cancel a subscription (terminal)"
+    roles: [Member]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects: ["status -> CANCELLED; PENDING boxes -> SKIPPED; increments Subscription.version by 1"]
+
+  # ---- WeeklyBox ----
+  - method: POST
+    path: "/weekly-boxes"
+    description: "Create a weekly box for a subscription on a delivery date"
+    roles: [Member]
+    code: 201
+    input: [subscription_id, delivery_date]
+    output: WeeklyBox
+    side_effects: ["cutoff_at computed; selection_status=OPEN; fulfillment_status=PENDING"]
+  - method: GET
+    path: "/weekly-boxes"
+    description: "List weekly boxes; filter by subscription_id (reverse FK reachability)"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: ["subscription_id?", "limit?", "offset?"]
+    output: "WeeklyBox[]"
+    side_effects: []
+  - method: GET
+    path: "/weekly-boxes/{id}"
+    description: "Get a weekly box (provisional/final charge, both status dims)"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: []
+    output: WeeklyBox
+    side_effects: []
+  - method: POST
+    path: "/weekly-boxes/{id}/recipes"
+    description: "Add a recipe slot (BoxRecipe) to an OPEN box"
+    roles: [Member]
+    code: 201
+    input: [recipe_id]
+    output: BoxRecipe
+    side_effects: ["is_premium_snapshot copied from Recipe; allergen+diet+capacity validated"]
+  - method: GET
+    path: "/weekly-boxes/{id}/recipes"
+    description: "List BoxRecipe slots for a box (reverse FK reachability for box_id)"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "BoxRecipe[]"
+    side_effects: []
+  - method: DELETE
+    path: "/weekly-boxes/{id}/recipes/{boxRecipeId}"
+    description: "Remove a recipe slot from an OPEN box"
+    roles: [Member]
+    code: 204
+    input: []
+    output: null
+    side_effects: ["BoxRecipe removed"]
+  - method: POST
+    path: "/weekly-boxes/{id}/lock-selection"
+    description: "Lock selection (OPEN->LOCKED); computes provisional_charge_cents"
+    roles: [Member]
+    code: 200
+    input: []
+    output: WeeklyBox
+    side_effects: ["selection_status -> LOCKED; provisional_charge_cents computed (PROVISIONAL)"]
+  - method: POST
+    path: "/weekly-boxes/{id}/skip"
+    description: "Skip a box (OPEN/LOCKED -> SKIPPED) before cutoff"
+    roles: [Member]
+    code: 200
+    input: []
+    output: WeeklyBox
+    side_effects: ["selection_status -> SKIPPED; provisional_charge_cents := 0"]
+  - method: POST
+    path: "/weekly-boxes/{id}/charge"
+    description: "Charge a LOCKED box at/after cutoff (PENDING->CHARGED); computes final_charge_cents and deducts credit"
+    roles: [PlatformOps]
+    code: 200
+    input: []
+    output: WeeklyBox
+    side_effects: ["final_charge_cents computed (FINAL); fulfillment_status -> CHARGED; Member.credit_balance_cents -= credit_applied"]
+  - method: POST
+    path: "/weekly-boxes/{id}/ship"
+    description: "Ship a CHARGED box (CHARGED->SHIPPED); bumps lifetime_box_count; may settle a Referral"
+    roles: [PlatformOps]
+    code: 200
+    input: []
+    output: WeeklyBox
+    side_effects: ["fulfillment_status -> SHIPPED; Member.lifetime_box_count += 1; first-box cascade settles referee's PENDING Referral"]
+  - method: POST
+    path: "/weekly-boxes/{id}/refund"
+    description: "Refund a CHARGED box (CHARGED->REFUNDED); restores consumed credit"
+    roles: [PlatformOps]
+    code: 200
+    input: []
+    output: WeeklyBox
+    side_effects: ["fulfillment_status -> REFUNDED; Member.credit_balance_cents += credit_applied (compensation)"]
+
+  # ---- Referral ----
+  - method: POST
+    path: "/referrals"
+    description: "Create a referral linking referrer and referee (PENDING)"
+    roles: [PlatformAdmin, Member]
+    code: 201
+    input: [referrer_member_id, referee_member_id]
+    output: Referral
+    side_effects: ["status=PENDING; reward_cents=0"]
+  - method: GET
+    path: "/referrals"
+    description: "List referrals; filter by referrer_member_id or referee_member_id (reverse FK reachability)"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: ["referrer_member_id?", "referee_member_id?", "limit?", "offset?"]
+    output: "Referral[]"
+    side_effects: []
+  - method: GET
+    path: "/referrals/{id}"
+    description: "Get a referral"
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: []
+    output: Referral
+    side_effects: []
+  - method: POST
+    path: "/referrals/{id}/void"
+    description: "Void a PENDING referral (admin)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Referral
+    side_effects: ["status -> VOID; reward_cents := 0"]
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set"
+    description: "Set the system clock (test-driving)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [now_iso8601]
+    output: "{ now_iso8601: string }"
+    side_effects: ["system clock set; no automatic sweeps"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- auth ---
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role missing/invalid" }
+  - { id: ERR_UNAUTHORIZED, http: 403, condition: "Role not permitted, or Member acting on a resource it does not own" }
+  # --- existence ---
+  - { id: ERR_MEMBER_NOT_FOUND, http: 404, condition: "Member id does not exist" }
+  - { id: ERR_SUBSCRIPTION_NOT_FOUND, http: 404, condition: "Subscription id does not exist" }
+  - { id: ERR_WEEKLY_BOX_NOT_FOUND, http: 404, condition: "WeeklyBox id does not exist" }
+  - { id: ERR_BOX_RECIPE_NOT_FOUND, http: 404, condition: "BoxRecipe id does not exist on this box" }
+  - { id: ERR_RECIPE_NOT_FOUND, http: 404, condition: "Recipe id does not exist" }
+  - { id: ERR_PLAN_NOT_FOUND, http: 404, condition: "Plan id does not exist" }
+  - { id: ERR_SHIPPING_ZONE_NOT_FOUND, http: 404, condition: "ShippingZone id does not exist" }
+  - { id: ERR_REFERRAL_NOT_FOUND, http: 404, condition: "Referral id does not exist" }
+  # --- state ---
+  - { id: ERR_SUBSCRIPTION_NOT_ACTIVE, http: 409, condition: "Operation requires Subscription.status == ACTIVE" }
+  - { id: ERR_SUBSCRIPTION_NOT_PAUSED, http: 409, condition: "Operation requires Subscription.status == PAUSED" }
+  - { id: ERR_SELECTION_NOT_OPEN, http: 409, condition: "Operation requires WeeklyBox.selection_status == OPEN" }
+  - { id: ERR_SELECTION_NOT_LOCKED, http: 409, condition: "skip-from-locked requires WeeklyBox.selection_status == LOCKED" }
+  - { id: ERR_BOX_NOT_LOCKED, http: 409, condition: "charge requires WeeklyBox.selection_status == LOCKED" }
+  - { id: ERR_BOX_NOT_PENDING, http: 409, condition: "charge requires WeeklyBox.fulfillment_status == PENDING" }
+  - { id: ERR_BOX_ALREADY_CHARGED, http: 409, condition: "skip-from-locked requires fulfillment_status == PENDING (already CHARGED)" }
+  - { id: ERR_BOX_NOT_CHARGED, http: 409, condition: "ship/refund requires WeeklyBox.fulfillment_status == CHARGED" }
+  - { id: ERR_REFERRAL_NOT_PENDING, http: 409, condition: "void requires Referral.status == PENDING" }
+  - { id: ERR_MEMBER_NOT_ACTIVE, http: 409, condition: "deactivate requires Member.status == ACTIVE" }
+  # --- OCC ---
+  - { id: ERR_STALE_SUBSCRIPTION_VERSION, http: 412, condition: "expected_subscription_version != current Subscription.version" }
+  # --- temporal ---
+  - { id: ERR_CUTOFF_PASSED, http: 409, condition: "Selection/skip/lock attempted at or after cutoff_at" }
+  - { id: ERR_CUTOFF_NOT_REACHED, http: 409, condition: "Charge attempted before cutoff_at" }
+  - { id: ERR_INVALID_RESUME_DATE, http: 422, condition: "resume_date not strictly after current clock date" }
+  - { id: ERR_DELIVERY_DATE_TAKEN, http: 409, condition: "Another non-SKIPPED box already occupies this delivery_date for the subscription" }
+  - { id: ERR_PAUSE_WINDOW_OVERLAP, http: 409, condition: "Requested pause window overlaps an existing pause window (adjacency allowed)" }
+  # --- safety / constraint ---
+  - { id: ERR_ALLERGEN_BLOCKED, http: 422, condition: "Recipe contains an allergen in Subscription.blocked_allergens" }
+  - { id: ERR_DIET_INCOMPATIBLE, http: 422, condition: "Recipe.diet_tags missing the required diet_preference tag" }
+  - { id: ERR_BOX_FULL, http: 409, condition: "Box already holds Plan.meals_per_week BoxRecipe rows" }
+  - { id: ERR_DUPLICATE_RECIPE, http: 409, condition: "Recipe already present in this box" }
+  - { id: ERR_SELECTION_INCOMPLETE, http: 409, condition: "lock-selection requires exactly Plan.meals_per_week recipes" }
+  # --- referential / fiscal ---
+  - { id: ERR_ZONE_NOT_SERVICEABLE, http: 422, condition: "Member's ShippingZone is not serviceable" }
+  - { id: ERR_PLAN_INACTIVE, http: 422, condition: "Selected Plan.is_active == false" }
+  - { id: ERR_SELF_REFERRAL, http: 422, condition: "referrer_member_id == referee_member_id" }
+  - { id: ERR_REFEREE_ALREADY_REFERRED, http: 422, condition: "Referee already has a Referral" }
+  - { id: ERR_MEMBER_HAS_LIVE_SUBSCRIPTION, http: 409, condition: "deactivate blocked while member has ACTIVE/PAUSED subscription" }
+  - { id: ERR_VALIDATION, http: 400, condition: "Malformed body, missing required field, type mismatch, or out-of-range value" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Anonymous
+    description: "Unauthenticated caller; may only register a member"
+    identity: opaque
+    exclusive_operations:
+      - "POST /members — register"
+    shared_operations: []
+
+  - name: Member
+    description: "An authenticated member acting on their own subscriptions, boxes, and referrals"
+    identity: "entity_backed:Member"
+    exclusive_operations:
+      - "POST /subscriptions — create own subscription"
+      - "POST /subscriptions/{id}/plan-changes — change own plan (OCC)"
+      - "POST /subscriptions/{id}/pause — pause own subscription"
+      - "POST /subscriptions/{id}/resume — resume own subscription"
+      - "POST /subscriptions/{id}/cancel — cancel own subscription"
+      - "POST /weekly-boxes — create own box"
+      - "POST /weekly-boxes/{id}/recipes — add recipe to own box"
+      - "DELETE /weekly-boxes/{id}/recipes/{boxRecipeId} — remove recipe from own box"
+      - "POST /weekly-boxes/{id}/lock-selection — lock own box"
+      - "POST /weekly-boxes/{id}/skip — skip own box"
+    shared_operations:
+      - "POST /referrals — create referral (shared with PlatformAdmin)"
+      - "GET endpoints for catalog, own member, own subscriptions/boxes/box-recipes, referral-summary, referrals"
+
+  - name: PlatformOps
+    description: "Operations role that charges, ships, and refunds boxes"
+    identity: opaque
+    exclusive_operations:
+      - "POST /weekly-boxes/{id}/charge — charge a locked box at cutoff"
+      - "POST /weekly-boxes/{id}/ship — ship a charged box"
+      - "POST /weekly-boxes/{id}/refund — refund a charged box"
+    shared_operations: []
+
+  - name: PlatformAdmin
+    description: "Administrative role managing catalog (plans, zones, recipes), member lifecycle, referral voiding, and the test clock"
+    identity: opaque
+    exclusive_operations:
+      - "POST /plans, POST /shipping-zones, POST /recipes — catalog management"
+      - "POST /members/{id}/deactivate — deactivate member"
+      - "POST /referrals/{id}/void — void a referral"
+      - "POST /_clock/set — set system clock"
+      - "GET /members — list all members"
+    shared_operations:
+      - "POST /referrals — create referral (shared with Member)"
+      - "GET endpoints for catalog, members, subscriptions, boxes, referrals"

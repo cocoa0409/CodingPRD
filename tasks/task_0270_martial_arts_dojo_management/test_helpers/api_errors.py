@@ -1,0 +1,55 @@
+"""Error IDs and HTTP status mapping (PRD §5 error catalogue).
+
+After defining the mapping it is registered with the framework so
+validate_error() can cross-check HTTP status codes automatically.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_FK_NOT_FOUND = "ERR_FK_NOT_FOUND"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_DUPLICATE = "ERR_DUPLICATE"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_WAIVER_NOT_SIGNED = "ERR_WAIVER_NOT_SIGNED"
+    ERR_MEMBER_NOT_ACTIVE = "ERR_MEMBER_NOT_ACTIVE"
+    ERR_RANK_TERMINAL = "ERR_RANK_TERMINAL"
+    ERR_NOT_ELIGIBLE_FOR_TEST = "ERR_NOT_ELIGIBLE_FOR_TEST"
+    ERR_INSTRUCTOR_DOUBLE_BOOKED = "ERR_INSTRUCTOR_DOUBLE_BOOKED"
+    ERR_PROGRAM_MISMATCH = "ERR_PROGRAM_MISMATCH"
+    ERR_CLASS_FULL = "ERR_CLASS_FULL"
+    ERR_ALREADY_CHECKED_IN = "ERR_ALREADY_CHECKED_IN"
+    ERR_EVENT_IN_PAST = "ERR_EVENT_IN_PAST"
+    ERR_TEST_BALANCE_TOO_HIGH = "ERR_TEST_BALANCE_TOO_HIGH"
+    ERR_VALIDATION = "ERR_VALIDATION"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_UNAUTHORIZED: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_FK_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_REQUEST: 400,
+    ApiErrorId.ERR_DUPLICATE: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_WAIVER_NOT_SIGNED: 422,
+    ApiErrorId.ERR_MEMBER_NOT_ACTIVE: 422,
+    ApiErrorId.ERR_RANK_TERMINAL: 422,
+    ApiErrorId.ERR_NOT_ELIGIBLE_FOR_TEST: 422,
+    ApiErrorId.ERR_INSTRUCTOR_DOUBLE_BOOKED: 409,
+    ApiErrorId.ERR_PROGRAM_MISMATCH: 422,
+    ApiErrorId.ERR_CLASS_FULL: 409,
+    ApiErrorId.ERR_ALREADY_CHECKED_IN: 409,
+    ApiErrorId.ERR_EVENT_IN_PAST: 422,
+    ApiErrorId.ERR_TEST_BALANCE_TOO_HIGH: 422,
+    ApiErrorId.ERR_VALIDATION: 422,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

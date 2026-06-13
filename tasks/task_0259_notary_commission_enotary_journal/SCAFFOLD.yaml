@@ -1,0 +1,1508 @@
+# =============================================================================
+# Notary Commission & E-Notary Journal — PRD Benchmark Scaffold (§1.0–§1.7)
+# Difficulty: Expert
+# =============================================================================
+
+scenario: |
+  Notary Commission & E-Notary Journal: commissioning & bond, journal entry
+  (act/ID/fee), remote online notarization session, credential/document
+  verification, state fee cap, recordkeeping/audit, renewal, complaint
+
+domain_name: notary-commission-enotary-journal
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: workflow_orchestration
+  complexity_layers:
+    - optimistic_concurrency        # OCC on Notary.version for renewal writes
+    - cascading_side_effects        # complaint settlement → bond drawdown → risk → suspend → session abort
+    - dual_variant_calculation      # per-act fee cap vs per-session aggregate fee cap
+    - rate_threshold_triggers       # risk-score breakpoints, fee-cap and grace boundaries
+    - temporal_windowing            # session time windows (half-open) + bond coverage intervals (closed)
+
+  entity_topology: flat
+  # Flat peer entities linked by foreign keys (Notary, Session, JournalEntry,
+  # Complaint, Bond, Renewal are top-level peers; Signer/Document/FeeSchedule are
+  # the only nested children). No deep nesting in URL paths.
+
+  state_machine_shape: branching
+  # Notary commission machine branches (APPLIED→{COMMISSIONED, REJECTED}; ACTIVE→
+  # {SUSPENDED, REVOKED, EXPIRED}) with revert (SUSPENDED→ACTIVE). Session machine
+  # branches (IDENTITY_PENDING→{ID_VERIFIED, ID_FAILED}). Complaint machine has a
+  # revision cycle (UNDER_REVIEW→INFO_REQUESTED→UNDER_REVIEW).
+
+  relationship_patterns:
+    - one_to_many        # Notary→Session, Session→Document, Session→Signer
+    - flat_fk_reference  # JournalEntry, Complaint, Bond, Renewal reference Notary by FK
+    - cross_aggregate    # Complaint settlement reaches across to Bond and Notary
+
+  role_model: segregation_of_duties
+  # A Notary cannot adjudicate the Complaint filed against itself; the
+  # CommissionAuthority that adjudicates a complaint cannot also be the Notary
+  # who performed the act. Investigation and adjudication are separated.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  # --- Configuration: Jurisdiction (state-level rules) ---
+  - name: Jurisdiction
+    parent: null
+    common_fields: true
+    fields:
+      - { name: state_code, type: string, source: input, description: "Two-letter state code, unique", constraints: "uppercase, length 2; unique across Jurisdiction" }
+      - { name: ron_allowed, type: boolean, source: input, description: "Whether Remote Online Notarization is permitted in this state" }
+      - { name: bond_minimum_cents, type: integer, source: input, description: "Minimum surety bond face value required to commission, in cents", constraints: ">= 0" }
+      - { name: commission_term_months, type: integer, source: input, description: "Length of a commission term in months", constraints: "one of {48, 60, 96, 120}" }
+      - { name: renewal_grace_days, type: integer, source: input, description: "Days after expiry during which renewal without re-application is allowed", constraints: ">= 0" }
+      - { name: session_act_fee_cap_cents, type: integer, source: input, description: "Aggregate cap on the SUM of per-act fees within a single RON session, in cents", constraints: ">= 0" }
+      - { name: ron_surcharge_cap_cents, type: integer, source: input, description: "Maximum technology surcharge chargeable per RON session, in cents", constraints: ">= 0" }
+
+  # --- Configuration: FeeSchedule (per-act-type cap, child of Jurisdiction) ---
+  - name: FeeSchedule
+    parent: Jurisdiction
+    common_fields: true
+    fields:
+      - { name: jurisdiction_id, type: string, source: input, description: "FK -> Jurisdiction.id" }
+      - { name: act_type, type: enum, source: input, description: "ACKNOWLEDGMENT | JURAT | OATH | COPY_CERTIFICATION | SIGNATURE_WITNESS", constraints: "unique per (jurisdiction_id, act_type)" }
+      - { name: max_act_fee_cents, type: integer, source: input, description: "State statutory maximum fee for one act of this type, in cents", constraints: ">= 0" }
+
+  # --- Resource: Notary (the commissioned official; entity_backed role) ---
+  - name: Notary
+    parent: null
+    common_fields: true
+    fields:
+      - { name: jurisdiction_id, type: string, source: input, description: "FK -> Jurisdiction.id; commissioning state" }
+      - { name: full_name, type: string, source: input, description: "Notary legal name" }
+      - { name: email, type: string, source: input, description: "Contact email, unique", constraints: "unique across Notary" }
+      - { name: enotary_requested, type: boolean, source: input, description: "Applicant requested e-notary (RON) authorization", default: false }
+      - { name: enotary_authorized, type: boolean, source: computed, description: "True only after commissioning when jurisdiction.ron_allowed and bond is active and enotary_requested", default: false }
+      - { name: status, type: enum, source: system, description: "APPLIED | COMMISSIONED | ACTIVE | SUSPENDED | REVOKED | EXPIRED | REJECTED", default: APPLIED, constraints: "lifecycle per Notary state machine" }
+      - { name: bond_id, type: string, source: computed, description: "FK -> Bond.id; the active surety bond bound at commissioning (null until commissioned)", default: null }
+      - { name: commission_starts_at, type: datetime, source: computed, description: "Commission term start, stamped at COMMISSIONED transition", default: null }
+      - { name: commission_expires_at, type: datetime, source: computed, description: "= commission_starts_at + jurisdiction.commission_term_months months, stamped at COMMISSIONED", default: null }
+      - { name: risk_score, type: integer, source: computed, description: "Weighted compliance risk score from substantiated complaints; 0..100", default: 0 }
+      - { name: lifetime_fees_collected_cents, type: integer, source: computed, description: "Sum of fee_charged_cents over all POSTED JournalEntry for this notary", default: 0 }
+
+  # --- Resource: Bond (surety bond; conserved-quantity tracker) ---
+  - name: Bond
+    parent: null
+    common_fields: true
+    fields:
+      - { name: notary_id, type: string, source: input, description: "FK -> Notary.id; the bonded notary" }
+      - { name: jurisdiction_id, type: string, source: input, description: "FK -> Jurisdiction.id" }
+      - { name: face_value_cents, type: integer, source: input, description: "Total bond coverage face value in cents", constraints: ">= 0" }
+      - { name: coverage_start_at, type: datetime, source: input, description: "Start of the bond's coverage interval (inclusive)" }
+      - { name: coverage_end_at, type: datetime, source: input, description: "End of the bond's coverage interval (inclusive). CLOSED interval [start,end]: touching endpoints conflict", constraints: "coverage_end_at > coverage_start_at" }
+      - { name: claims_paid_cents, type: integer, source: computed, description: "Sum of settled complaint claim amounts drawn against this bond", default: 0 }
+      - { name: remaining_cents, type: integer, source: computed, description: "= face_value_cents - claims_paid_cents", default: 0 }
+      - { name: status, type: enum, source: system, description: "PENDING | ACTIVE | EXHAUSTED | CANCELLED", default: PENDING, constraints: "lifecycle per Bond state machine" }
+
+  # --- Resource: Renewal (commission renewal application) ---
+  - name: Renewal
+    parent: null
+    common_fields: true
+    fields:
+      - { name: notary_id, type: string, source: input, description: "FK -> Notary.id; the renewing notary" }
+      - { name: expected_notary_version, type: integer, source: input, description: "OCC: Notary.version the client last observed (renewal supersede guard)" }
+      - { name: new_bond_id, type: string, source: input, description: "FK -> Bond.id; bond covering the renewed term" }
+      - { name: status, type: enum, source: system, description: "SUBMITTED | APPROVED | DENIED", default: SUBMITTED, constraints: "lifecycle per Renewal state machine" }
+      - { name: filed_within_grace, type: boolean, source: computed, description: "True if filed before commission_expires_at + renewal_grace_days; else requires fresh application", default: true }
+
+  # --- Resource: Session (Remote Online Notarization session) ---
+  - name: Session
+    parent: null
+    common_fields: true
+    fields:
+      - { name: notary_id, type: string, source: input, description: "FK -> Notary.id; presiding notary" }
+      - { name: jurisdiction_id, type: string, source: computed, description: "FK -> Jurisdiction.id; copied from notary at creation" }
+      - { name: scheduled_start_at, type: datetime, source: input, description: "Start of the session's scheduled window (inclusive)" }
+      - { name: scheduled_end_at, type: datetime, source: input, description: "End of the session's scheduled window (exclusive). HALF-OPEN interval [start,end): adjacency (end==next start) allowed", constraints: "scheduled_end_at > scheduled_start_at" }
+      - { name: requested_surcharge_cents, type: integer, source: input, description: "Technology surcharge the notary intends to charge for this RON session", default: 0, constraints: ">= 0" }
+      - { name: fee_basis, type: enum, source: input, description: "PER_ACT | AGGREGATE — selects which fee-cap algorithm applies to this session", default: PER_ACT }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | IDENTITY_PENDING | ID_VERIFIED | ID_FAILED | ACTIVE | COMPLETED | TERMINATED | EXPIRED", default: SCHEDULED, constraints: "lifecycle per Session state machine" }
+      - { name: surcharge_charged_cents, type: integer, source: computed, description: "min(requested_surcharge_cents, jurisdiction.ron_surcharge_cap_cents); stamped on COMPLETED", default: 0 }
+      - { name: act_fees_total_cents, type: integer, source: computed, description: "Total capped act fees for all NOTARIZED documents, per fee_basis; stamped on COMPLETED", default: 0 }
+      - { name: session_total_fee_cents, type: integer, source: computed, description: "= act_fees_total_cents + surcharge_charged_cents; stamped on COMPLETED", default: 0 }
+
+  # --- Resource: Signer (credential-verified party in a session; child of Session) ---
+  - name: Signer
+    parent: Session
+    common_fields: true
+    fields:
+      - { name: session_id, type: string, source: input, description: "FK -> Session.id" }
+      - { name: full_name, type: string, source: input, description: "Signer legal name" }
+      - { name: kba_passed, type: boolean, source: input, description: "Knowledge-Based Authentication result submitted for this signer", default: false }
+      - { name: credential_analysis_passed, type: boolean, source: input, description: "Government-ID credential-analysis result submitted for this signer", default: false }
+      - { name: id_status, type: enum, source: system, description: "UNVERIFIED | VERIFIED | FAILED", default: UNVERIFIED, constraints: "VERIFIED requires kba_passed AND credential_analysis_passed" }
+
+  # --- Resource: Document (notarized document; child of Session) ---
+  - name: Document
+    parent: Session
+    common_fields: true
+    fields:
+      - { name: session_id, type: string, source: input, description: "FK -> Session.id" }
+      - { name: signer_id, type: string, source: input, description: "FK -> Signer.id; the signer executing this document" }
+      - { name: act_type, type: enum, source: input, description: "ACKNOWLEDGMENT | JURAT | OATH | COPY_CERTIFICATION | SIGNATURE_WITNESS" }
+      - { name: requested_fee_cents, type: integer, source: input, description: "Fee the notary intends to charge for this act before capping", constraints: ">= 0" }
+      - { name: capped_fee_cents, type: integer, source: computed, description: "min(requested_fee_cents, FeeSchedule.max_act_fee_cents) for PER_ACT basis; stamped on session COMPLETED", default: 0 }
+      - { name: status, type: enum, source: system, description: "PENDING | NOTARIZED | REFUSED", default: PENDING, constraints: "lifecycle per Document state machine" }
+
+  # --- Resource: JournalEntry (tamper-evident notarial act record) ---
+  - name: JournalEntry
+    parent: null
+    common_fields: true
+    fields:
+      - { name: notary_id, type: string, source: input, description: "FK -> Notary.id; performing notary" }
+      - { name: session_id, type: string, source: input, description: "FK -> Session.id; source RON session (null for in-person acts)", default: null }
+      - { name: document_id, type: string, source: input, description: "FK -> Document.id; source document (null for in-person acts)", default: null }
+      - { name: act_type, type: enum, source: input, description: "ACKNOWLEDGMENT | JURAT | OATH | COPY_CERTIFICATION | SIGNATURE_WITNESS" }
+      - { name: signer_name, type: string, source: input, description: "Recorded signer name for this act" }
+      - { name: id_method, type: enum, source: input, description: "PERSONAL_KNOWLEDGE | CREDIBLE_WITNESS | ID_CREDENTIAL | KBA_PLUS_CREDENTIAL" }
+      - { name: fee_charged_cents, type: integer, source: input, description: "Fee actually charged for this act, in cents", constraints: ">= 0" }
+      - { name: status, type: enum, source: system, description: "POSTED | AMENDED | VOID", default: POSTED, constraints: "lifecycle per JournalEntry state machine" }
+      - { name: amends_entry_id, type: string, source: computed, description: "FK -> JournalEntry.id; the prior entry this amendment supersedes (null unless created by amend)", default: null }
+
+  # --- Resource: Complaint (filed against a notary; investigation + adjudication) ---
+  - name: Complaint
+    parent: null
+    common_fields: true
+    fields:
+      - { name: notary_id, type: string, source: input, description: "FK -> Notary.id; the subject notary" }
+      - { name: filed_by_user_id, type: string, source: input, description: "Opaque identifier of the filer (CommissionAuthority operator id)" }
+      - { name: category, type: enum, source: input, description: "FRAUD | RECORDKEEPING | FEE_OVERCHARGE | OTHER" }
+      - { name: claim_amount_cents, type: integer, source: input, description: "Monetary claim sought against the notary's bond, in cents", default: 0, constraints: ">= 0" }
+      - { name: status, type: enum, source: system, description: "FILED | UNDER_REVIEW | INFO_REQUESTED | SUBSTANTIATED | DISMISSED | SETTLED", default: FILED, constraints: "lifecycle per Complaint state machine" }
+      - { name: settled_claim_cents, type: integer, source: computed, description: "Amount drawn against the bond at SETTLED (min of claim and bond.remaining_cents)", default: 0 }
+
+  # --- Event log: AuditEvent (append-only recordkeeping trail) ---
+  - name: AuditEvent
+    parent: null
+    common_fields: false
+    fields:
+      - { name: notary_id, type: string, source: input, description: "FK -> Notary.id; subject of the audited action" }
+      - { name: entity_type, type: enum, source: system, description: "NOTARY | SESSION | JOURNAL_ENTRY | COMPLAINT | BOND | RENEWAL" }
+      - { name: entity_id, type: string, source: system, description: "Id of the affected record" }
+      - { name: action, type: string, source: system, description: "Machine-readable action label, e.g. SESSION_COMPLETED, COMPLAINT_SETTLED" }
+      - { name: actor_role, type: enum, source: system, description: "NOTARY | COMMISSION_AUTHORITY | SYSTEM" }
+      - { name: detail, type: string, source: system, description: "Human-readable summary of the audited change" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---------- Notary commission lifecycle (branching + revert) ----------
+  - entity: Notary
+    initial_state: APPLIED
+    terminal_states: [REVOKED, REJECTED]
+    transitions:
+      - from: APPLIED
+        to: COMMISSIONED
+        trigger: "POST /notaries/{notaryId}/commission"
+        actor: CommissionAuthority
+        preconditions:
+          - "An ACTIVE Bond exists for this notary with face_value_cents >= jurisdiction.bond_minimum_cents (else ERR_BOND_BELOW_MINIMUM)"
+          - "Notary.status == APPLIED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "Set bond_id to the ACTIVE bond's id"
+          - "Stamp commission_starts_at = clock now; commission_expires_at = commission_starts_at + jurisdiction.commission_term_months"
+          - "Compute enotary_authorized = (jurisdiction.ron_allowed AND enotary_requested AND bond.status==ACTIVE)"
+          - "Append AuditEvent(action=NOTARY_COMMISSIONED)"
+
+      - from: APPLIED
+        to: REJECTED
+        trigger: "POST /notaries/{notaryId}/reject"
+        actor: CommissionAuthority
+        preconditions:
+          - "Notary.status == APPLIED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "Append AuditEvent(action=NOTARY_REJECTED)"
+
+      - from: COMMISSIONED
+        to: ACTIVE
+        trigger: "POST /notaries/{notaryId}/activate"
+        actor: CommissionAuthority
+        preconditions:
+          - "Notary.status == COMMISSIONED (else ERR_INVALID_STATE)"
+          - "Bond.status == ACTIVE (else ERR_BOND_NOT_ACTIVE)"
+        side_effects:
+          - "Append AuditEvent(action=NOTARY_ACTIVATED)"
+
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /notaries/{notaryId}/suspend OR system on risk_score >= RISK_SUSPEND_THRESHOLD"
+        actor: CommissionAuthority | system
+        preconditions:
+          - "Notary.status == ACTIVE (else ERR_INVALID_STATE)"
+        side_effects:
+          - "Set enotary_authorized = false"
+          - "Every Session of this notary in {SCHEDULED, IDENTITY_PENDING, ID_VERIFIED, ACTIVE} transitions to TERMINATED (cascade); each such Session's PENDING Documents transition to REFUSED"
+          - "Append AuditEvent(action=NOTARY_SUSPENDED)"
+
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /notaries/{notaryId}/reinstate"
+        actor: CommissionAuthority
+        preconditions:
+          - "Notary.status == SUSPENDED (else ERR_INVALID_STATE)"
+          - "risk_score < RISK_SUSPEND_THRESHOLD (else ERR_RISK_THRESHOLD_BLOCK)"
+          - "Bond.status == ACTIVE (else ERR_BOND_NOT_ACTIVE)"
+        side_effects:
+          - "Recompute enotary_authorized"
+          - "Append AuditEvent(action=NOTARY_REINSTATED)"
+
+      - from: SUSPENDED
+        to: REVOKED
+        trigger: "POST /notaries/{notaryId}/revoke"
+        actor: CommissionAuthority
+        preconditions:
+          - "Notary.status == SUSPENDED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "Set enotary_authorized = false"
+          - "Bond transitions to CANCELLED (cross-entity)"
+          - "Append AuditEvent(action=NOTARY_REVOKED)"
+
+      - from: ACTIVE
+        to: REVOKED
+        trigger: "POST /notaries/{notaryId}/revoke"
+        actor: CommissionAuthority
+        preconditions:
+          - "Notary.status == ACTIVE (else ERR_INVALID_STATE)"
+        side_effects:
+          - "Set enotary_authorized = false"
+          - "Every non-terminal Session transitions to TERMINATED (cascade) and its PENDING Documents to REFUSED"
+          - "Bond transitions to CANCELLED (cross-entity)"
+          - "Append AuditEvent(action=NOTARY_REVOKED)"
+
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /_clock/advance (system marks expiry when clock now > commission_expires_at)"
+        actor: system
+        preconditions:
+          - "Notary.status == ACTIVE"
+          - "clock now > commission_expires_at"
+        side_effects:
+          - "Set enotary_authorized = false"
+          - "Append AuditEvent(action=NOTARY_EXPIRED)"
+
+      - from: EXPIRED
+        to: ACTIVE
+        trigger: "POST /renewals/{renewalId}/approve (renewal restores an EXPIRED notary)"
+        actor: CommissionAuthority
+        preconditions:
+          - "Notary.status == EXPIRED"
+          - "Renewal.status == SUBMITTED and Renewal.filed_within_grace == true"
+        side_effects:
+          - "Stamp new commission_expires_at = clock now + jurisdiction.commission_term_months"
+          - "Append AuditEvent(action=NOTARY_RENEWED)"
+
+  # ---------- Bond lifecycle ----------
+  - entity: Bond
+    initial_state: PENDING
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: PENDING
+        to: ACTIVE
+        trigger: "POST /bonds/{bondId}/activate"
+        actor: CommissionAuthority
+        preconditions:
+          - "Bond.status == PENDING (else ERR_INVALID_STATE)"
+          - "face_value_cents >= jurisdiction.bond_minimum_cents (else ERR_BOND_BELOW_MINIMUM)"
+          - "No other ACTIVE bond of the same notary has a CLOSED coverage interval [start,end] overlapping this bond's (touching endpoints conflict) (else ERR_BOND_COVERAGE_OVERLAP)"
+        side_effects:
+          - "Set remaining_cents = face_value_cents; claims_paid_cents = 0"
+
+      - from: ACTIVE
+        to: EXHAUSTED
+        trigger: "system on Complaint SETTLED when claims_paid_cents reaches face_value_cents"
+        actor: system
+        preconditions:
+          - "Bond.status == ACTIVE"
+          - "claims_paid_cents == face_value_cents after a settlement draw"
+        side_effects:
+          - "Subject Notary auto-SUSPENDED if currently ACTIVE (cross-entity cascade)"
+
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "system on Notary REVOKED"
+        actor: system
+        preconditions:
+          - "Bond.status == ACTIVE"
+        side_effects: []
+
+  # ---------- Renewal lifecycle ----------
+  - entity: Renewal
+    initial_state: SUBMITTED
+    terminal_states: [APPROVED, DENIED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /renewals/{renewalId}/approve"
+        actor: CommissionAuthority
+        preconditions:
+          - "Renewal.status == SUBMITTED (else ERR_INVALID_STATE)"
+          - "filed_within_grace == true (else ERR_RENEWAL_OUT_OF_GRACE)"
+          - "new_bond referenced Bond.status == ACTIVE (else ERR_BOND_NOT_ACTIVE)"
+          - "Subject Notary.status in {ACTIVE, EXPIRED} (else ERR_INVALID_STATE) [cross-entity]"
+        side_effects:
+          - "Subject Notary's bond_id reset to new_bond_id"
+          - "If notary was EXPIRED → ACTIVE; commission_expires_at extended by jurisdiction.commission_term_months"
+          - "increments Notary.version by 1"
+          - "Append AuditEvent(action=NOTARY_RENEWED)"
+
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /renewals/{renewalId}/deny"
+        actor: CommissionAuthority
+        preconditions:
+          - "Renewal.status == SUBMITTED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "Append AuditEvent(action=RENEWAL_DENIED)"
+
+  # ---------- Session lifecycle (branching on identity outcome) ----------
+  - entity: Session
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, TERMINATED, EXPIRED]
+    transitions:
+      - from: SCHEDULED
+        to: IDENTITY_PENDING
+        trigger: "POST /sessions/{sessionId}/begin-identity"
+        actor: Notary
+        preconditions:
+          - "Session.status == SCHEDULED (else ERR_INVALID_STATE)"
+          - "Presiding Notary.enotary_authorized == true (else ERR_ENOTARY_NOT_AUTHORIZED) [cross-entity]"
+          - "At least one Signer attached (else ERR_NO_SIGNER)"
+        side_effects: []
+
+      - from: IDENTITY_PENDING
+        to: ID_VERIFIED
+        trigger: "POST /sessions/{sessionId}/resolve-identity (outcome=VERIFIED)"
+        actor: Notary
+        preconditions:
+          - "Session.status == IDENTITY_PENDING (else ERR_INVALID_STATE)"
+          - "Every Signer has kba_passed==true AND credential_analysis_passed==true (else ERR_CREDENTIAL_NOT_VERIFIED)"
+        side_effects:
+          - "Every Signer id_status -> VERIFIED"
+
+      - from: IDENTITY_PENDING
+        to: ID_FAILED
+        trigger: "POST /sessions/{sessionId}/resolve-identity (outcome=FAILED)"
+        actor: Notary
+        preconditions:
+          - "Session.status == IDENTITY_PENDING (else ERR_INVALID_STATE)"
+          - "At least one Signer lacks kba_passed or credential_analysis_passed (else ERR_CREDENTIAL_ALREADY_VERIFIED)"
+        side_effects:
+          - "Signers lacking either check -> id_status FAILED"
+
+      - from: ID_VERIFIED
+        to: ACTIVE
+        trigger: "POST /sessions/{sessionId}/start"
+        actor: Notary
+        preconditions:
+          - "Session.status == ID_VERIFIED (else ERR_INVALID_STATE)"
+          - "At least one Document attached (else ERR_NO_DOCUMENT)"
+        side_effects: []
+
+      - from: ID_FAILED
+        to: TERMINATED
+        trigger: "POST /sessions/{sessionId}/terminate"
+        actor: Notary
+        preconditions:
+          - "Session.status == ID_FAILED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "All PENDING Documents -> REFUSED"
+
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "POST /sessions/{sessionId}/complete"
+        actor: Notary
+        preconditions:
+          - "Session.status == ACTIVE (else ERR_INVALID_STATE)"
+          - "At least one Document was NOTARIZED in this session (else ERR_NO_NOTARIZED_DOCUMENT)"
+        side_effects:
+          - "Stamp each NOTARIZED Document.capped_fee_cents per fee_basis (calculation: document_capped_fee)"
+          - "Stamp surcharge_charged_cents = min(requested_surcharge_cents, jurisdiction.ron_surcharge_cap_cents)"
+          - "Stamp act_fees_total_cents per fee_basis (calculation: session_act_fees)"
+          - "Stamp session_total_fee_cents = act_fees_total_cents + surcharge_charged_cents"
+          - "Create one POSTED JournalEntry per NOTARIZED Document (fee_charged_cents = Document.capped_fee_cents) [cascade]"
+          - "Recompute presiding Notary.lifetime_fees_collected_cents [ledger sync]"
+          - "Append AuditEvent(action=SESSION_COMPLETED)"
+
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /sessions/{sessionId}/terminate"
+        actor: Notary | system
+        preconditions:
+          - "Session.status == ACTIVE (else ERR_INVALID_STATE)"
+        side_effects:
+          - "All PENDING Documents -> REFUSED"
+
+  # ---------- Document lifecycle ----------
+  - entity: Document
+    initial_state: PENDING
+    terminal_states: [NOTARIZED, REFUSED]
+    transitions:
+      - from: PENDING
+        to: NOTARIZED
+        trigger: "POST /sessions/{sessionId}/documents/{documentId}/notarize"
+        actor: Notary
+        preconditions:
+          - "Document.status == PENDING (else ERR_INVALID_STATE)"
+          - "Parent Session.status == ACTIVE (else ERR_INVALID_STATE) [cross-entity]"
+          - "Linked Signer.id_status == VERIFIED (else ERR_SIGNER_NOT_VERIFIED) [cross-entity]"
+        side_effects: []
+
+      - from: PENDING
+        to: REFUSED
+        trigger: "POST /sessions/{sessionId}/documents/{documentId}/refuse OR cascade from session TERMINATED"
+        actor: Notary | system
+        preconditions:
+          - "Document.status == PENDING (else ERR_INVALID_STATE)"
+        side_effects: []
+
+  # ---------- JournalEntry lifecycle ----------
+  - entity: JournalEntry
+    initial_state: POSTED
+    terminal_states: [AMENDED, VOID]
+    transitions:
+      - from: POSTED
+        to: AMENDED
+        trigger: "POST /journal-entries/{entryId}/amend"
+        actor: Notary
+        preconditions:
+          - "JournalEntry.status == POSTED (else ERR_ENTRY_NOT_POSTED)"
+          - "Performing Notary.status in {ACTIVE, SUSPENDED} (else ERR_INVALID_STATE) [cross-entity]"
+        side_effects:
+          - "Create a new POSTED JournalEntry with amends_entry_id = this entry's id (correction record)"
+          - "Recompute performing Notary.lifetime_fees_collected_cents [ledger sync]"
+          - "Append AuditEvent(action=JOURNAL_ENTRY_AMENDED)"
+
+      - from: POSTED
+        to: VOID
+        trigger: "POST /journal-entries/{entryId}/void"
+        actor: CommissionAuthority
+        preconditions:
+          - "JournalEntry.status == POSTED (else ERR_ENTRY_NOT_POSTED)"
+        side_effects:
+          - "Recompute performing Notary.lifetime_fees_collected_cents [ledger sync; voided entry excluded]"
+          - "Append AuditEvent(action=JOURNAL_ENTRY_VOIDED)"
+
+  # ---------- Complaint lifecycle (investigation cycle + branch) ----------
+  - entity: Complaint
+    initial_state: FILED
+    terminal_states: [DISMISSED, SETTLED]
+    transitions:
+      - from: FILED
+        to: UNDER_REVIEW
+        trigger: "POST /complaints/{complaintId}/open-review"
+        actor: CommissionAuthority
+        preconditions:
+          - "Complaint.status == FILED (else ERR_INVALID_STATE)"
+          - "filed_by_user_id != notary's X-User-ID (a notary cannot adjudicate its own complaint) [segregation_of_duties]"
+        side_effects:
+          - "Append AuditEvent(action=COMPLAINT_OPENED)"
+
+      - from: UNDER_REVIEW
+        to: INFO_REQUESTED
+        trigger: "POST /complaints/{complaintId}/request-info"
+        actor: CommissionAuthority
+        preconditions:
+          - "Complaint.status == UNDER_REVIEW (else ERR_INVALID_STATE)"
+        side_effects: []
+
+      - from: INFO_REQUESTED
+        to: UNDER_REVIEW
+        trigger: "POST /complaints/{complaintId}/resume-review"
+        actor: CommissionAuthority
+        preconditions:
+          - "Complaint.status == INFO_REQUESTED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "Append AuditEvent(action=COMPLAINT_RESUMED)"
+        note: "Revision cycle: UNDER_REVIEW <-> INFO_REQUESTED"
+
+      - from: UNDER_REVIEW
+        to: SUBSTANTIATED
+        trigger: "POST /complaints/{complaintId}/substantiate"
+        actor: CommissionAuthority
+        preconditions:
+          - "Complaint.status == UNDER_REVIEW (else ERR_INVALID_STATE)"
+        side_effects:
+          - "Recompute subject Notary.risk_score (calculation: notary_risk_score)"
+          - "If risk_score >= RISK_SUSPEND_THRESHOLD and Notary.status==ACTIVE → Notary auto-SUSPENDED (cascade)"
+          - "Append AuditEvent(action=COMPLAINT_SUBSTANTIATED)"
+
+      - from: UNDER_REVIEW
+        to: DISMISSED
+        trigger: "POST /complaints/{complaintId}/dismiss"
+        actor: CommissionAuthority
+        preconditions:
+          - "Complaint.status == UNDER_REVIEW (else ERR_INVALID_STATE)"
+        side_effects:
+          - "Append AuditEvent(action=COMPLAINT_DISMISSED)"
+
+      - from: SUBSTANTIATED
+        to: SETTLED
+        trigger: "POST /complaints/{complaintId}/settle"
+        actor: CommissionAuthority
+        preconditions:
+          - "Complaint.status == SUBSTANTIATED (else ERR_INVALID_STATE)"
+          - "Subject Notary's Bond.status == ACTIVE (else ERR_BOND_NOT_ACTIVE) [cross-entity]"
+          - "claim_amount_cents > 0 (else ERR_NO_CLAIM_AMOUNT)"
+        side_effects:
+          - "settled_claim_cents = min(claim_amount_cents, bond.remaining_cents) (calculation: bond_settlement_draw)"
+          - "bond.claims_paid_cents += settled_claim_cents; bond.remaining_cents -= settled_claim_cents [cross-entity ledger]"
+          - "If bond.remaining_cents == 0 → bond EXHAUSTED → subject Notary auto-SUSPENDED if ACTIVE (cascade depth 3)"
+          - "Append AuditEvent(action=COMPLAINT_SETTLED)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: renewal-create-stale-notary
+    parent_entity: Notary
+    write_endpoint: "POST /renewals"
+    occ_field: "expected_notary_version"
+    description: |
+      Submitting a Renewal against a Notary whose version has advanced since
+      the client last observed it is rejected. A renewal legitimately supersedes
+      the prior commission term (extends commission_expires_at and rebinds
+      bond_id); when an earlier renewal has already been approved, the second
+      writer's view of the notary is stale and its renewal must not silently
+      overwrite the fresher term.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  # --- DUAL-VARIANT (Rule 1 anchor A): session fee capping, two variants ---
+  - name: session_act_fees
+    trigger: "Session ACTIVE -> COMPLETED transition (POST /sessions/{id}/complete)"
+    algorithm: aggregation
+    formula: |
+      Let NOT = list of Documents with status==NOTARIZED in this session,
+        ordered by Document.created_at ASC (tie-break: created_at then nothing else needed).
+      For each d in NOT, let sched = FeeSchedule for (session.jurisdiction_id, d.act_type).
+      PER_ACT variant (fee_basis==PER_ACT):
+        d.capped_fee_cents = min(d.requested_fee_cents, sched.max_act_fee_cents)
+        act_fees_total_cents = sum(d.capped_fee_cents for d in NOT)
+      AGGREGATE variant (fee_basis==AGGREGATE):
+        raw = sum(d.requested_fee_cents for d in NOT)
+        act_fees_total_cents = min(raw, jurisdiction.session_act_fee_cap_cents)
+        d.capped_fee_cents distributed by waterfall over NOT in created_at ASC order:
+          remaining = act_fees_total_cents
+          for d in NOT (created_at ASC):
+            d.capped_fee_cents = min(d.requested_fee_cents, remaining)
+            remaining -= d.capped_fee_cents
+    input_set: "Documents in NOTARIZED status only; PENDING/REFUSED excluded"
+    constants: {}
+    precision: "integer cents; no fractional rounding"
+    variants:
+      - name: per_act_cap
+        when: "session.fee_basis == PER_ACT"
+        difference: "Each act independently capped at its FeeSchedule.max_act_fee_cents; sum the caps"
+      - name: aggregate_cap
+        when: "session.fee_basis == AGGREGATE"
+        difference: "Sum of raw requested fees capped at jurisdiction.session_act_fee_cap_cents; per-doc share by created_at-ASC waterfall"
+
+  - name: document_capped_fee
+    trigger: "Session COMPLETED (per-document stamp; sub-step of session_act_fees)"
+    algorithm: threshold
+    formula: |
+      PER_ACT: capped_fee_cents = min(requested_fee_cents, FeeSchedule.max_act_fee_cents)
+      AGGREGATE: capped_fee_cents = waterfall share per session_act_fees (created_at ASC)
+    input_set: "single Document at COMPLETED time"
+    constants: {}
+    precision: "integer cents"
+
+  - name: session_total_fee
+    trigger: "Session COMPLETED"
+    algorithm: aggregation
+    formula: |
+      surcharge_charged_cents = min(session.requested_surcharge_cents, jurisdiction.ron_surcharge_cap_cents)
+      session_total_fee_cents = act_fees_total_cents + surcharge_charged_cents
+    input_set: "session act fees + capped technology surcharge"
+    constants: {}
+    precision: "integer cents"
+
+  # --- DUAL-VARIANT (Rule 1 anchor B): weighted risk scoring on Notary ---
+  - name: notary_risk_score
+    trigger: "Complaint UNDER_REVIEW -> SUBSTANTIATED"
+    algorithm: weighted_scoring
+    formula: |
+      Let SUB = Complaints for this notary with status in {SUBSTANTIATED, SETTLED},
+        ordered by created_at ASC.
+      base = sum(CATEGORY_WEIGHT[c.category] for c in SUB)
+      risk_score = min(100, base)
+    input_set: "Complaints SUBSTANTIATED or SETTLED; FILED/UNDER_REVIEW/INFO_REQUESTED/DISMISSED excluded"
+    constants:
+      CATEGORY_WEIGHT: { FRAUD: 40, FEE_OVERCHARGE: 20, RECORDKEEPING: 15, OTHER: 10 }
+      RISK_SUSPEND_THRESHOLD: 50
+      SCORE_CEILING: 100
+    precision: "integer; ceiling at 100"
+    variants:
+      - name: provisional_on_substantiate
+        when: "computed at SUBSTANTIATED before settlement"
+        difference: "Includes the just-substantiated complaint; drives auto-suspend gate"
+      - name: final_after_settle
+        when: "recomputed when the complaint reaches SETTLED"
+        difference: "Same weight set; settlement does not change weight but keeps complaint in the SUB set"
+
+  # --- Combinatorial Rule 2 mode (b): nested rounding / ordering pinned ---
+  - name: lifetime_fees_collected
+    trigger: "Session COMPLETED, JournalEntry AMENDED, JournalEntry VOID"
+    algorithm: aggregation
+    formula: |
+      lifetime_fees_collected_cents =
+        sum(fee_charged_cents for JournalEntry je where je.notary_id == notary.id
+            AND je.status == POSTED)
+      ordered processing by je.created_at ASC (deterministic; integer cents so no
+      rounding, but order pinned so partial-recompute equals full recompute).
+    input_set: "POSTED JournalEntry only; AMENDED and VOID excluded"
+    constants: {}
+    precision: "integer cents"
+
+  # --- Combinatorial Rule 2 mode (c): circular-looking dependency, order pinned ---
+  - name: renewal_grace_eligibility
+    trigger: "POST /renewals (Renewal creation)"
+    algorithm: threshold
+    formula: |
+      Evaluation order is pinned (no circularity):
+      step 1: grace_deadline = notary.commission_expires_at + jurisdiction.renewal_grace_days (days)
+      step 2: filed_within_grace = (clock now <= grace_deadline)
+      A renewal filed AT EXACTLY grace_deadline is within grace (<=, inclusive).
+      filed_within_grace gates Renewal APPROVE; if false, approve is rejected
+      ERR_RENEWAL_OUT_OF_GRACE even though Renewal can still be SUBMITTED.
+    input_set: "single Notary + its Jurisdiction at renewal creation time"
+    constants: {}
+    precision: "day-granular comparison; boundary inclusive (<=)"
+
+  # --- Temporal overlap (Rule 8 anchor A): session window, HALF-OPEN ---
+  - name: session_window_overlap
+    trigger: "POST /sessions (creation)"
+    algorithm: interval_merge
+    formula: |
+      Let CAND = Sessions of the same notary with status NOT IN
+        {COMPLETED, TERMINATED, EXPIRED} (i.e., SCHEDULED, IDENTITY_PENDING,
+        ID_VERIFIED, ID_FAILED, ACTIVE), evaluated in created_at ASC order.
+      Two half-open intervals [a_start, a_end) and [b_start, b_end) OVERLAP iff
+        a_start < b_end AND b_start < a_end.
+      Adjacency (a_end == b_start) does NOT overlap (half-open).
+      If the new window overlaps any CAND window: reject ERR_SESSION_TIME_CONFLICT.
+    input_set: "non-terminal sessions of the same notary"
+    constants: {}
+    precision: "UTC instant comparison; half-open boundary (adjacency allowed)"
+
+  # --- Temporal overlap (Rule 8 anchor B): bond coverage, CLOSED ---
+  - name: bond_coverage_overlap
+    trigger: "POST /bonds/{id}/activate"
+    algorithm: interval_merge
+    formula: |
+      Let CAND = OTHER bonds of the same notary with status == ACTIVE,
+        evaluated in created_at ASC order.
+      Two closed intervals [a_start, a_end] and [b_start, b_end] OVERLAP iff
+        a_start <= b_end AND b_start <= a_end.
+      Touching endpoints (a_end == b_start) DO overlap (closed semantics) —
+        this is the geometric difference from session_window_overlap.
+      If the activating bond's interval overlaps any CAND: reject
+        ERR_BOND_COVERAGE_OVERLAP.
+    input_set: "ACTIVE bonds of the same notary other than this one"
+    constants: {}
+    precision: "UTC instant comparison; closed boundary (adjacency conflicts)"
+
+  # --- Conserved quantity Rule 9 anchor: bond settlement draw ---
+  - name: bond_settlement_draw
+    trigger: "Complaint SUBSTANTIATED -> SETTLED"
+    algorithm: waterfall_allocation
+    formula: |
+      draw = min(complaint.claim_amount_cents, bond.remaining_cents)
+      complaint.settled_claim_cents = draw
+      bond.claims_paid_cents += draw
+      bond.remaining_cents -= draw
+      INVARIANT: bond.face_value_cents == bond.claims_paid_cents + bond.remaining_cents
+        holds before and after every settlement.
+    input_set: "single Complaint + its subject notary's bond"
+    constants: {}
+    precision: "integer cents"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /jurisdictions, POST /notaries (registration), and /_clock/*"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this operation per §1.7 RBAC"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "All path/body referenced resources exist (validated left-to-right in path)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: business_constraint
+    check: "Required body fields present and well-typed; enum values within declared set"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all mutating endpoints"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a valid state for the requested transition (per §1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  # --- Business rules, domain-ordered: compliance/segregation FIRST, then
+  #     constraint, then fiscal/cap, then concurrency ---
+  - priority: 6
+    category: business_safety
+    check: "Segregation of duties: the operator opening review on a complaint must not be the subject notary (filed_by/adjudicator != notary)"
+    error_id: ERR_SEGREGATION_VIOLATION
+    http_status: 403
+    applies_to: "POST /complaints/{id}/open-review"
+
+  - priority: 7
+    category: business_referential
+    check: "Presiding notary's enotary_authorized must be true to begin a RON identity flow"
+    error_id: ERR_ENOTARY_NOT_AUTHORIZED
+    http_status: 409
+    applies_to: "POST /sessions/{id}/begin-identity"
+
+  - priority: 8
+    category: business_referential
+    check: "Every Signer credential verified (kba_passed AND credential_analysis_passed) before ID_VERIFIED; Document's Signer VERIFIED before notarize"
+    error_id: ERR_CREDENTIAL_NOT_VERIFIED
+    http_status: 409
+    applies_to: "POST /sessions/{id}/resolve-identity, POST /sessions/{id}/documents/{docId}/notarize"
+
+  - priority: 9
+    category: business_temporal
+    check: "Renewal approval only within grace window (now <= commission_expires_at + renewal_grace_days)"
+    error_id: ERR_RENEWAL_OUT_OF_GRACE
+    http_status: 409
+    applies_to: "POST /renewals/{id}/approve"
+
+  - priority: 10
+    category: business_fiscal
+    check: "Bond face_value_cents >= jurisdiction.bond_minimum_cents for commissioning and bond activation"
+    error_id: ERR_BOND_BELOW_MINIMUM
+    http_status: 409
+    applies_to: "POST /notaries/{id}/commission, POST /bonds/{id}/activate"
+
+  - priority: 11
+    category: business_fiscal
+    check: "A JournalEntry fee_charged_cents must not exceed the FeeSchedule cap for its act_type+jurisdiction on direct create"
+    error_id: ERR_FEE_EXCEEDS_CAP
+    http_status: 409
+    applies_to: "POST /journal-entries"
+
+  - priority: 12
+    category: business_temporal
+    check: "A new session's HALF-OPEN window [scheduled_start_at, scheduled_end_at) must not overlap any non-terminal session of the same notary. Adjacency (prev.end == new.start) is allowed."
+    error_id: ERR_SESSION_TIME_CONFLICT
+    http_status: 409
+    applies_to: "POST /sessions"
+
+  - priority: 13
+    category: business_temporal
+    check: "Activating a bond whose CLOSED coverage interval [coverage_start_at, coverage_end_at] overlaps another ACTIVE bond of the same notary is rejected. Touching endpoints (prev.end == new.start) DO conflict (closed semantics)."
+    error_id: ERR_BOND_COVERAGE_OVERLAP
+    http_status: 409
+    applies_to: "POST /bonds/{id}/activate"
+
+  - priority: 14
+    category: business_constraint
+    check: "OCC: expected_notary_version must equal the current Notary.version on renewal create"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /renewals"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---------- Jurisdiction (config) ----------
+  - method: POST
+    path: "/jurisdictions"
+    description: "Create a Jurisdiction (state config)"
+    roles: [CommissionAuthority]
+    code: 201
+    input: [state_code, ron_allowed, bond_minimum_cents, commission_term_months, renewal_grace_days, session_act_fee_cap_cents, ron_surcharge_cap_cents]
+    output: Jurisdiction
+    side_effects: []
+
+  - method: GET
+    path: "/jurisdictions/{jurisdictionId}"
+    description: "Get a Jurisdiction"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: []
+    output: Jurisdiction
+    side_effects: []
+
+  - method: GET
+    path: "/jurisdictions"
+    description: "List jurisdictions (paginated)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "state_code?"]
+    output: Jurisdiction[]
+    side_effects: []
+
+  - method: POST
+    path: "/jurisdictions/{jurisdictionId}/fee-schedules"
+    description: "Add a per-act fee schedule row to a jurisdiction"
+    roles: [CommissionAuthority]
+    code: 201
+    input: [act_type, max_act_fee_cents]
+    output: FeeSchedule
+    side_effects: []
+
+  - method: GET
+    path: "/jurisdictions/{jurisdictionId}/fee-schedules"
+    description: "List fee schedules for a jurisdiction (nested view)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "act_type?"]
+    output: FeeSchedule[]
+    side_effects: []
+
+  - method: GET
+    path: "/fee-schedules/{feeScheduleId}"
+    description: "Get a fee schedule row by id"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: []
+    output: FeeSchedule
+    side_effects: []
+
+  - method: GET
+    path: "/fee-schedules"
+    description: "List fee schedules (reverse-reachability for FeeSchedule.jurisdiction_id)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "jurisdiction_id?", "act_type?"]
+    output: FeeSchedule[]
+    side_effects: []
+
+  # ---------- Notary ----------
+  - method: POST
+    path: "/notaries"
+    description: "Register a notary applicant (status APPLIED)"
+    roles: [Anonymous]
+    code: 201
+    input: [jurisdiction_id, full_name, email, "enotary_requested?"]
+    output: Notary
+    side_effects: ["status=APPLIED; enotary_authorized=false"]
+
+  - method: GET
+    path: "/notaries/{notaryId}"
+    description: "Get a notary"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: []
+    output: Notary
+    side_effects: []
+
+  - method: GET
+    path: "/notaries"
+    description: "List notaries (paginated, filterable; reverse-reachability for Notary.jurisdiction_id and Notary.bond_id)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "jurisdiction_id?", "bond_id?", "status?"]
+    output: Notary[]
+    side_effects: []
+
+  - method: POST
+    path: "/notaries/{notaryId}/commission"
+    description: "Commission an APPLIED notary"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Notary
+    side_effects: ["status=COMMISSIONED; bind bond_id; stamp commission dates; compute enotary_authorized; AuditEvent"]
+
+  - method: POST
+    path: "/notaries/{notaryId}/reject"
+    description: "Reject an APPLIED notary"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Notary
+    side_effects: ["status=REJECTED; AuditEvent"]
+
+  - method: POST
+    path: "/notaries/{notaryId}/activate"
+    description: "Activate a COMMISSIONED notary"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Notary
+    side_effects: ["status=ACTIVE; AuditEvent"]
+
+  - method: POST
+    path: "/notaries/{notaryId}/suspend"
+    description: "Suspend an ACTIVE notary"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Notary
+    side_effects: ["status=SUSPENDED; enotary_authorized=false; cascade non-terminal Sessions -> TERMINATED; AuditEvent"]
+
+  - method: POST
+    path: "/notaries/{notaryId}/reinstate"
+    description: "Reinstate a SUSPENDED notary to ACTIVE"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Notary
+    side_effects: ["status=ACTIVE; recompute enotary_authorized; AuditEvent"]
+
+  - method: POST
+    path: "/notaries/{notaryId}/revoke"
+    description: "Revoke a notary (from ACTIVE or SUSPENDED)"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Notary
+    side_effects: ["status=REVOKED; enotary_authorized=false; cascade Sessions -> TERMINATED; Bond -> CANCELLED; AuditEvent"]
+
+  - method: GET
+    path: "/notaries/{notaryId}/audit-events"
+    description: "List the audit trail for a notary (nested view)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "entity_type?"]
+    output: AuditEvent[]
+    side_effects: []
+
+  - method: GET
+    path: "/audit-events/{auditEventId}"
+    description: "Get a single audit-trail record by id"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: []
+    output: AuditEvent
+    side_effects: []
+
+  - method: GET
+    path: "/audit-events"
+    description: "List audit-trail records (reverse-reachability for AuditEvent.notary_id)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "notary_id?", "entity_type?"]
+    output: AuditEvent[]
+    side_effects: []
+
+  # ---------- Bond ----------
+  - method: POST
+    path: "/bonds"
+    description: "Create a surety bond for a notary (status PENDING)"
+    roles: [CommissionAuthority]
+    code: 201
+    input: [notary_id, jurisdiction_id, face_value_cents, coverage_start_at, coverage_end_at]
+    output: Bond
+    side_effects: ["status=PENDING; remaining_cents=0 until activation"]
+
+  - method: GET
+    path: "/bonds/{bondId}"
+    description: "Get a bond"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: []
+    output: Bond
+    side_effects: []
+
+  - method: GET
+    path: "/bonds"
+    description: "List bonds (reverse-reachability for Bond.notary_id and Bond.jurisdiction_id)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "notary_id?", "jurisdiction_id?", "status?"]
+    output: Bond[]
+    side_effects: []
+
+  - method: POST
+    path: "/bonds/{bondId}/activate"
+    description: "Activate a PENDING bond (sets remaining_cents=face_value_cents)"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Bond
+    side_effects: ["status=ACTIVE; remaining_cents=face_value_cents; claims_paid_cents=0"]
+
+  # ---------- Renewal ----------
+  - method: POST
+    path: "/renewals"
+    description: "Submit a commission renewal (OCC on Notary.version)"
+    roles: [CommissionAuthority, Notary]
+    code: 201
+    input: [notary_id, expected_notary_version, new_bond_id]
+    output: Renewal
+    side_effects: ["status=SUBMITTED; compute filed_within_grace; increments Notary.version by 1"]
+
+  - method: GET
+    path: "/renewals/{renewalId}"
+    description: "Get a renewal"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: []
+    output: Renewal
+    side_effects: []
+
+  - method: GET
+    path: "/renewals"
+    description: "List renewals (reverse-reachability for Renewal.notary_id and Renewal.new_bond_id)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "notary_id?", "new_bond_id?", "status?"]
+    output: Renewal[]
+    side_effects: []
+
+  - method: POST
+    path: "/renewals/{renewalId}/approve"
+    description: "Approve a SUBMITTED renewal"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Renewal
+    side_effects: ["status=APPROVED; rebind notary bond_id; extend commission_expires_at; EXPIRED notary -> ACTIVE; AuditEvent"]
+
+  - method: POST
+    path: "/renewals/{renewalId}/deny"
+    description: "Deny a SUBMITTED renewal"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Renewal
+    side_effects: ["status=DENIED; AuditEvent"]
+
+  # ---------- Session (RON) ----------
+  - method: POST
+    path: "/sessions"
+    description: "Create a RON session (status SCHEDULED)"
+    roles: [Notary]
+    code: 201
+    input: [notary_id, scheduled_start_at, scheduled_end_at, "requested_surcharge_cents?", "fee_basis?"]
+    output: Session
+    side_effects: ["status=SCHEDULED; copy jurisdiction_id from notary; reject if window overlaps another non-terminal session of this notary"]
+
+  - method: GET
+    path: "/sessions/{sessionId}"
+    description: "Get a session"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: []
+    output: Session
+    side_effects: []
+
+  - method: GET
+    path: "/sessions"
+    description: "List sessions (reverse-reachability for Session.notary_id and Session.jurisdiction_id)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "notary_id?", "jurisdiction_id?", "status?"]
+    output: Session[]
+    side_effects: []
+
+  - method: POST
+    path: "/sessions/{sessionId}/signers"
+    description: "Attach a signer to a session"
+    roles: [Notary]
+    code: 201
+    input: [full_name, "kba_passed?", "credential_analysis_passed?"]
+    output: Signer
+    side_effects: ["id_status=UNVERIFIED"]
+
+  - method: GET
+    path: "/sessions/{sessionId}/signers"
+    description: "List signers in a session (reverse-reachability for Signer.session_id)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Signer[]
+    side_effects: []
+
+  - method: GET
+    path: "/signers/{signerId}"
+    description: "Get a signer by id (recordkeeping lookup)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: []
+    output: Signer
+    side_effects: []
+
+  - method: GET
+    path: "/signers"
+    description: "List signers (reverse-reachability for Signer.session_id at top level)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "session_id?"]
+    output: Signer[]
+    side_effects: []
+
+  - method: POST
+    path: "/sessions/{sessionId}/documents"
+    description: "Attach a document/act to a session"
+    roles: [Notary]
+    code: 201
+    input: [signer_id, act_type, requested_fee_cents]
+    output: Document
+    side_effects: ["status=PENDING"]
+
+  - method: GET
+    path: "/sessions/{sessionId}/documents"
+    description: "List documents in a session (reverse-reachability for Document.session_id)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "signer_id?"]
+    output: Document[]
+    side_effects: []
+
+  - method: GET
+    path: "/documents/{documentId}"
+    description: "Get a document by id (recordkeeping lookup)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: []
+    output: Document
+    side_effects: []
+
+  - method: GET
+    path: "/documents"
+    description: "List documents (reverse-reachability for Document.session_id and Document.signer_id at top level)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "session_id?", "signer_id?"]
+    output: Document[]
+    side_effects: []
+
+  - method: POST
+    path: "/sessions/{sessionId}/begin-identity"
+    description: "Move session to IDENTITY_PENDING"
+    roles: [Notary]
+    code: 200
+    input: []
+    output: Session
+    side_effects: ["status=IDENTITY_PENDING"]
+
+  - method: POST
+    path: "/sessions/{sessionId}/resolve-identity"
+    description: "Resolve signer identity (VERIFIED or FAILED branch)"
+    roles: [Notary]
+    code: 200
+    input: [outcome]
+    output: Session
+    side_effects: ["VERIFIED: signers id_status=VERIFIED, status=ID_VERIFIED; FAILED: status=ID_FAILED"]
+
+  - method: POST
+    path: "/sessions/{sessionId}/start"
+    description: "Start the active notarization phase"
+    roles: [Notary]
+    code: 200
+    input: []
+    output: Session
+    side_effects: ["status=ACTIVE"]
+
+  - method: POST
+    path: "/sessions/{sessionId}/documents/{documentId}/notarize"
+    description: "Notarize a document"
+    roles: [Notary]
+    code: 200
+    input: ["id_method?"]
+    output: Document
+    side_effects: ["Document status=NOTARIZED"]
+
+  - method: POST
+    path: "/sessions/{sessionId}/documents/{documentId}/refuse"
+    description: "Refuse a document"
+    roles: [Notary]
+    code: 200
+    input: []
+    output: Document
+    side_effects: ["Document status=REFUSED"]
+
+  - method: POST
+    path: "/sessions/{sessionId}/complete"
+    description: "Complete a session (stamps fees, spawns journal entries)"
+    roles: [Notary]
+    code: 200
+    input: []
+    output: Session
+    side_effects: ["status=COMPLETED; stamp capped fees + surcharge + total; create POSTED JournalEntry per NOTARIZED doc; recompute notary lifetime fees; AuditEvent"]
+
+  - method: POST
+    path: "/sessions/{sessionId}/terminate"
+    description: "Terminate a session (from ID_FAILED or ACTIVE)"
+    roles: [Notary, CommissionAuthority]
+    code: 200
+    input: []
+    output: Session
+    side_effects: ["status=TERMINATED; PENDING documents -> REFUSED"]
+
+  # ---------- JournalEntry ----------
+  - method: POST
+    path: "/journal-entries"
+    description: "Create an in-person journal entry directly (no session) with fee-cap enforcement"
+    roles: [Notary]
+    code: 201
+    input: [notary_id, act_type, signer_name, id_method, fee_charged_cents]
+    output: JournalEntry
+    side_effects: ["status=POSTED; recompute notary lifetime_fees_collected_cents; AuditEvent"]
+
+  - method: GET
+    path: "/journal-entries/{entryId}"
+    description: "Get a journal entry"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: []
+    output: JournalEntry
+    side_effects: []
+
+  - method: GET
+    path: "/journal-entries"
+    description: "List journal entries (reverse-reachability for JournalEntry.notary_id, session_id, document_id, amends_entry_id)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "notary_id?", "session_id?", "document_id?", "amends_entry_id?", "status?"]
+    output: JournalEntry[]
+    side_effects: []
+
+  - method: POST
+    path: "/journal-entries/{entryId}/amend"
+    description: "Amend a POSTED entry (creates a correction entry)"
+    roles: [Notary]
+    code: 200
+    input: [signer_name, fee_charged_cents]
+    output: JournalEntry
+    side_effects: ["entry status=AMENDED; create new POSTED correction entry with amends_entry_id; recompute notary lifetime fees; AuditEvent"]
+
+  - method: POST
+    path: "/journal-entries/{entryId}/void"
+    description: "Void a POSTED entry"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: JournalEntry
+    side_effects: ["entry status=VOID; recompute notary lifetime fees; AuditEvent"]
+
+  # ---------- Complaint ----------
+  - method: POST
+    path: "/complaints"
+    description: "File a complaint against a notary"
+    roles: [CommissionAuthority]
+    code: 201
+    input: [notary_id, category, "claim_amount_cents?"]
+    output: Complaint
+    side_effects: ["status=FILED; record filed_by_user_id from X-User-ID"]
+
+  - method: GET
+    path: "/complaints/{complaintId}"
+    description: "Get a complaint"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: []
+    output: Complaint
+    side_effects: []
+
+  - method: GET
+    path: "/complaints"
+    description: "List complaints (reverse-reachability for Complaint.notary_id)"
+    roles: [CommissionAuthority, Notary]
+    code: 200
+    input: ["limit?", "offset?", "notary_id?", "category?", "status?"]
+    output: Complaint[]
+    side_effects: []
+
+  - method: POST
+    path: "/complaints/{complaintId}/open-review"
+    description: "Open investigation (segregation-of-duties gate)"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Complaint
+    side_effects: ["status=UNDER_REVIEW; AuditEvent"]
+
+  - method: POST
+    path: "/complaints/{complaintId}/request-info"
+    description: "Request additional info (UNDER_REVIEW -> INFO_REQUESTED)"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Complaint
+    side_effects: ["status=INFO_REQUESTED"]
+
+  - method: POST
+    path: "/complaints/{complaintId}/resume-review"
+    description: "Resume review (INFO_REQUESTED -> UNDER_REVIEW)"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Complaint
+    side_effects: ["status=UNDER_REVIEW; AuditEvent"]
+
+  - method: POST
+    path: "/complaints/{complaintId}/substantiate"
+    description: "Substantiate a complaint (recompute risk; maybe auto-suspend)"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Complaint
+    side_effects: ["status=SUBSTANTIATED; recompute notary risk_score; auto-suspend if risk>=threshold; AuditEvent"]
+
+  - method: POST
+    path: "/complaints/{complaintId}/dismiss"
+    description: "Dismiss a complaint"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Complaint
+    side_effects: ["status=DISMISSED; AuditEvent"]
+
+  - method: POST
+    path: "/complaints/{complaintId}/settle"
+    description: "Settle a SUBSTANTIATED complaint (draws against bond)"
+    roles: [CommissionAuthority]
+    code: 200
+    input: []
+    output: Complaint
+    side_effects: ["status=SETTLED; settled_claim_cents draw; bond ledger update; maybe EXHAUSTED -> auto-suspend; AuditEvent"]
+
+  # ---------- Test-driving clock endpoint ----------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the system clock to a fixed UTC instant (test-driving)"
+    roles: [CommissionAuthority]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["System clock pinned to given instant for subsequent now() reads"]
+
+  - method: POST
+    path: "/_clock/advance"
+    description: "Advance clock and mark commission expiries (test-driving)"
+    roles: [CommissionAuthority]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["Move clock forward; any ACTIVE notary past commission_expires_at -> EXPIRED with cascade"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/invalid auth headers on a protected endpoint" }
+  - { id: ERR_UNAUTHORIZED, http: 403, condition: "Acting role not permitted for this operation" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Referenced resource does not exist or wrong scope" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, bad type, or out-of-set enum value" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a valid state for the requested transition" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_notary_version does not match current Notary.version (OCC)" }
+  - { id: ERR_SEGREGATION_VIOLATION, http: 403, condition: "A notary cannot adjudicate/open-review a complaint against itself" }
+  - { id: ERR_ENOTARY_NOT_AUTHORIZED, http: 409, condition: "Presiding notary lacks active e-notary authorization for RON" }
+  - { id: ERR_NO_SIGNER, http: 409, condition: "Session has no attached signer when one is required" }
+  - { id: ERR_NO_DOCUMENT, http: 409, condition: "Session has no attached document when starting active phase" }
+  - { id: ERR_NO_NOTARIZED_DOCUMENT, http: 409, condition: "Completing a session with zero NOTARIZED documents" }
+  - { id: ERR_CREDENTIAL_NOT_VERIFIED, http: 409, condition: "Signer credential checks (KBA + credential analysis) not both passed" }
+  - { id: ERR_CREDENTIAL_ALREADY_VERIFIED, http: 409, condition: "Resolve-identity FAILED requested but every signer already fully verified" }
+  - { id: ERR_SIGNER_NOT_VERIFIED, http: 409, condition: "Notarizing a document whose signer is not VERIFIED" }
+  - { id: ERR_BOND_BELOW_MINIMUM, http: 409, condition: "Bond face value below jurisdiction minimum" }
+  - { id: ERR_BOND_NOT_ACTIVE, http: 409, condition: "Operation requires an ACTIVE bond but bond is not ACTIVE" }
+  - { id: ERR_FEE_EXCEEDS_CAP, http: 409, condition: "Direct journal-entry fee exceeds the act-type fee schedule cap" }
+  - { id: ERR_RENEWAL_OUT_OF_GRACE, http: 409, condition: "Renewal approved/filed outside the grace window" }
+  - { id: ERR_RISK_THRESHOLD_BLOCK, http: 409, condition: "Reinstate blocked because risk_score still at/above suspend threshold" }
+  - { id: ERR_NO_CLAIM_AMOUNT, http: 409, condition: "Settling a complaint with claim_amount_cents == 0" }
+  - { id: ERR_ENTRY_NOT_POSTED, http: 409, condition: "Amend/void requested on an entry not in POSTED status" }
+  - { id: ERR_SESSION_TIME_CONFLICT, http: 409, condition: "New session window [start,end) overlaps another non-terminal session of the same notary (half-open)" }
+  - { id: ERR_BOND_COVERAGE_OVERLAP, http: 409, condition: "Bond coverage interval [start,end] overlaps another ACTIVE bond of the same notary (closed; endpoints conflict)" }
+  - { id: ERR_VALIDATION, http: 422, condition: "Semantically invalid value (e.g., negative cents, term not in allowed set, end <= start)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: CommissionAuthority
+    description: "State commissioning/regulatory operator: commissions, suspends, revokes, renews notaries; adjudicates complaints; manages jurisdictions, fee schedules, and bonds."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /jurisdictions"
+      - "POST /jurisdictions/{id}/fee-schedules"
+      - "POST /notaries/{id}/commission"
+      - "POST /notaries/{id}/reject"
+      - "POST /notaries/{id}/activate"
+      - "POST /notaries/{id}/suspend"
+      - "POST /notaries/{id}/reinstate"
+      - "POST /notaries/{id}/revoke"
+      - "POST /bonds"
+      - "POST /bonds/{id}/activate"
+      - "POST /renewals/{id}/approve"
+      - "POST /renewals/{id}/deny"
+      - "POST /complaints"
+      - "POST /complaints/{id}/open-review"
+      - "POST /complaints/{id}/request-info"
+      - "POST /complaints/{id}/resume-review"
+      - "POST /complaints/{id}/substantiate"
+      - "POST /complaints/{id}/dismiss"
+      - "POST /complaints/{id}/settle"
+      - "POST /journal-entries/{id}/void"
+      - "POST /_clock/set_current_utc"
+      - "POST /_clock/advance"
+    shared_operations:
+      - "GET endpoints (all)"
+      - "POST /renewals (shared with Notary)"
+      - "POST /sessions/{id}/terminate (shared with Notary)"
+
+  - name: Notary
+    description: "A commissioned notary public. Performs RON sessions, attaches signers/documents, notarizes, completes sessions, files journal entries, amends entries, and may file renewals. X-User-ID equals the acting Notary.id."
+    identity: "entity_backed:Notary"
+    exclusive_operations:
+      - "POST /sessions"
+      - "POST /sessions/{id}/signers"
+      - "POST /sessions/{id}/documents"
+      - "POST /sessions/{id}/begin-identity"
+      - "POST /sessions/{id}/resolve-identity"
+      - "POST /sessions/{id}/start"
+      - "POST /sessions/{id}/documents/{docId}/notarize"
+      - "POST /sessions/{id}/documents/{docId}/refuse"
+      - "POST /sessions/{id}/complete"
+      - "POST /journal-entries"
+      - "POST /journal-entries/{id}/amend"
+    shared_operations:
+      - "GET endpoints (all)"
+      - "POST /renewals (shared with CommissionAuthority)"
+      - "POST /sessions/{id}/terminate (shared with CommissionAuthority)"
+
+  - name: Anonymous
+    description: "Unauthenticated applicant surface. Only notary self-registration is open."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /notaries (register applicant)"
+    shared_operations: []

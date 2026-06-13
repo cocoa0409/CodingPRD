@@ -1,0 +1,865 @@
+# =============================================================================
+# PRD Benchmark Scaffold — Chiropractic Practice (Expert tier)
+# =============================================================================
+
+scenario: "Chiropractic Practice: exam/imaging, treatment plan (frequency/phases), insurance visit caps, cash/wellness plan, recurring appointment series, SOAP notes, no-show/late fee, maintenance care"
+
+domain_name: chiropractic-practice
+api_prefix: ""   # resources live at the root: /patients, /providers, /treatment-rooms, /appointments, ...
+
+complexity_profile:
+  primary_archetype: "Quota / allocation"          # insurance visit caps: a finite pool reserved at booking, committed at completion, released on cancel/no-show
+  secondary_archetype: "Temporal windowing"        # recurring appointment series across provider + room resources with overlap/buffer rules
+  complexity_layers:
+    - "Dual-variant calculation"                   # patient responsibility: insurance-adjudicated vs wellness/cash-rate — same visit, two billing algorithms
+    - "Cascading side effects"                      # plan phase advance → series regeneration → cap re-reservation → ledger recompute
+    - "Rate / threshold triggers"                   # no-show strike threshold, deductible-met threshold, cap-exhaustion threshold (>= vs >)
+    - "Optimistic concurrency"                      # CREATE-with-supersede of an active treatment plan against a stale Patient version
+
+  entity_topology: hybrid
+  # Patient is the aggregate root; clinical (exam, plan, phase, appointment, soap) hang off it as a tree,
+  # while InsurancePolicy, Provider, TreatmentRoom, FeeSchedule are flat peer resources referenced by FK.
+
+  state_machine_shape: compound
+  # TreatmentPlan is compound (status derived partly from phase progress + cap state);
+  # Appointment carries PARALLEL dimensions (attendance_status × billing_status evolve independently);
+  # TreatmentPlan phases form a CYCLIC loop (ACUTE → CORRECTIVE → MAINTENANCE, with re-exam able to send
+  # CORRECTIVE back to ACUTE on regression).
+
+  relationship_patterns:
+    - one_to_many        # Patient → Appointments, Plan → Phases, Appointment → SoapNote
+    - cross_aggregate    # Appointment references Provider, TreatmentRoom, InsurancePolicy across aggregate boundaries
+    - self_referential   # AppointmentSeries: each generated Appointment links to its series; reschedule links replacement → original
+
+  role_model: peer_roles
+  # Provider owns clinical authorship (exam, SOAP, plan); FrontDesk owns scheduling + fee posting;
+  # BillingClerk owns insurance adjudication + ledger; PracticeAdmin is operational/override.
+
+  consistency_model: immediate
+  # Every cap reservation, ledger debit, and cascade resolves atomically inside the triggering request.
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+
+  # ---- Configuration / reference entities (flat peers) ----
+  - name: Provider
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Provider display name" }
+      - { name: npi, type: string, source: input, description: "National Provider Identifier (10 digits)" }
+      - { name: license_state, type: string, source: input, description: "Two-letter state of licensure, e.g. CA" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | SUSPENDED; SUSPENDED providers cannot be assigned to new appointments", constraints: "enum {ACTIVE, SUSPENDED}" }
+
+  - name: TreatmentRoom
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Room label, e.g. 'Adjustment Room 1'" }
+      - { name: room_type, type: enum, source: input, description: "ADJUSTMENT | IMAGING; IMAGING rooms required for X_RAY visit_type", constraints: "enum {ADJUSTMENT, IMAGING}" }
+      - { name: turnover_buffer_minutes, type: integer, source: input, default: 0, description: "Mandatory idle minutes the room needs after an appointment ends before the next may start", constraints: ">= 0" }
+      - { name: status, type: enum, source: system, default: OPEN, description: "OPEN | CLOSED; CLOSED rooms reject new bookings", constraints: "enum {OPEN, CLOSED}" }
+
+  - name: FeeSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - { name: visit_type, type: enum, source: input, description: "ADJUSTMENT | EXAM | RE_EXAM | X_RAY | THERAPY", constraints: "enum {ADJUSTMENT, EXAM, RE_EXAM, X_RAY, THERAPY}" }
+      - { name: cash_rate_cents, type: integer, source: input, description: "List/cash price for this visit_type in cents", constraints: ">= 0" }
+      - { name: billed_amount_cents, type: integer, source: input, description: "Amount submitted to insurance for this visit_type in cents", constraints: ">= 0" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | RETIRED; only one ACTIVE FeeSchedule per visit_type at a time", constraints: "enum {ACTIVE, RETIRED}" }
+
+  - name: WellnessPlan
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Wellness plan label, e.g. 'Gold Maintenance'" }
+      - { name: monthly_fee_cents, type: integer, source: input, description: "Recurring monthly membership fee in cents", constraints: ">= 0" }
+      - { name: included_adjustments_per_month, type: integer, source: input, description: "Adjustments fully covered by the membership each calendar month", constraints: ">= 0" }
+      - { name: overage_discount_pct, type: number, source: input, description: "Fractional discount (0.0–1.0) applied to cash_rate for adjustments beyond the included count", constraints: "0.0 <= x <= 1.0" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE; wellness plans are immutable configuration in this version (no retire transition)", constraints: "enum {ACTIVE}" }
+
+  # ---- Patient aggregate root ----
+  - name: Patient
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Patient full name" }
+      - { name: date_of_birth, type: string, source: input, description: "ISO 8601 date (YYYY-MM-DD)" }
+      - { name: payer_mode, type: enum, source: input, default: CASH, description: "INSURANCE | CASH | WELLNESS; selects which billing algorithm applies (§1.3 patient_responsibility)", constraints: "enum {INSURANCE, CASH, WELLNESS}" }
+      - { name: wellness_plan_id, type: string, source: input, required: false, description: "FK -> WellnessPlan.id; required when payer_mode == WELLNESS, forbidden otherwise" }
+      - { name: no_show_strike_count, type: integer, source: computed, default: 0, description: "Cumulative count of NO_SHOW + LATE_CANCEL attendance outcomes; drives no_show_fee tier" }
+      - { name: ledger_balance_cents, type: integer, source: computed, default: 0, description: "Outstanding patient-owed balance = sum of posted patient_responsibility_cents across appointments minus payments; may be negative (credit)" }
+      - { name: is_dismissed, type: boolean, source: computed, default: false, description: "True once no_show_strike_count >= DISMISSAL_STRIKE_THRESHOLD; dismissed patients cannot book" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | DISMISSED; DISMISSED is terminal", constraints: "enum {ACTIVE, DISMISSED}" }
+
+  - name: InsurancePolicy
+    parent: Patient
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: system, description: "FK -> Patient.id" }
+      - { name: carrier_name, type: string, source: input, description: "Insurance carrier name" }
+      - { name: annual_visit_cap, type: integer, source: input, description: "Maximum chiropractic visits the carrier will cover this benefit year", constraints: ">= 0" }
+      - { name: visits_reserved, type: integer, source: computed, default: 0, description: "Count of cap slots held by booked-but-not-yet-completed appointments" }
+      - { name: visits_committed, type: integer, source: computed, default: 0, description: "Count of cap slots consumed by completed+adjudicated appointments" }
+      - { name: deductible_total_cents, type: integer, source: input, description: "Annual deductible in cents", constraints: ">= 0" }
+      - { name: deductible_met_cents, type: integer, source: computed, default: 0, description: "Cumulative amount applied to the deductible so far this year" }
+      - { name: coinsurance_pct, type: number, source: input, description: "Patient coinsurance fraction (0.0–1.0) on allowed amount after deductible", constraints: "0.0 <= x <= 1.0" }
+      - { name: allowed_amount_cents, type: integer, source: input, description: "Carrier-allowed amount per covered visit in cents (the contracted rate)", constraints: ">= 0" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | TERMINATED; TERMINATED policies cover no new visits", constraints: "enum {ACTIVE, TERMINATED}" }
+
+  - name: ExamRecord
+    parent: Patient
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: system, description: "FK -> Patient.id" }
+      - { name: provider_id, type: string, source: input, description: "FK -> Provider.id; authoring provider" }
+      - { name: exam_type, type: enum, source: input, description: "INITIAL | RE_EXAM", constraints: "enum {INITIAL, RE_EXAM}" }
+      - { name: imaging_ordered, type: boolean, source: input, default: false, description: "Whether X-ray imaging was ordered as part of this exam" }
+      - { name: severity_score, type: integer, source: input, description: "Clinical severity 1–10; seeds recommended phase frequency", constraints: "1 <= x <= 10" }
+      - { name: findings, type: string, source: input, required: false, description: "Free-text exam findings" }
+      - { name: status, type: enum, source: system, default: DRAFT, description: "DRAFT → FINALIZED; only FINALIZED exams may seed a TreatmentPlan", constraints: "enum {DRAFT, FINALIZED}" }
+
+  - name: TreatmentPlan
+    parent: Patient
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: system, description: "FK -> Patient.id" }
+      - { name: exam_record_id, type: string, source: input, description: "FK -> ExamRecord.id; the FINALIZED exam that justifies this plan" }
+      - { name: current_phase, type: enum, source: computed, default: ACUTE, description: "ACUTE | CORRECTIVE | MAINTENANCE; mirrors the active PlanPhase.phase_type", constraints: "enum {ACUTE, CORRECTIVE, MAINTENANCE}" }
+      - { name: total_planned_visits, type: integer, source: computed, default: 0, description: "Sum of planned_visit_count across all non-CANCELLED phases" }
+      - { name: visits_delivered, type: integer, source: computed, default: 0, description: "Count of appointments under this plan whose attendance_status == ATTENDED" }
+      - { name: status, type: enum, source: system, default: PROPOSED, description: "PROPOSED → ACTIVE → COMPLETED / DISCONTINUED; only one ACTIVE plan per patient", constraints: "enum {PROPOSED, ACTIVE, COMPLETED, DISCONTINUED}" }
+
+  - name: PlanPhase
+    parent: TreatmentPlan
+    common_fields: true
+    fields:
+      - { name: treatment_plan_id, type: string, source: system, description: "FK -> TreatmentPlan.id" }
+      - { name: phase_type, type: enum, source: input, description: "ACUTE | CORRECTIVE | MAINTENANCE", constraints: "enum {ACUTE, CORRECTIVE, MAINTENANCE}" }
+      - { name: sequence_index, type: integer, source: input, description: "Ordinal position within the plan (0-based); phases advance in ascending order", constraints: ">= 0" }
+      - { name: visits_per_week, type: integer, source: input, description: "Prescribed visit frequency for this phase", constraints: "1 <= x <= 7" }
+      - { name: planned_visit_count, type: integer, source: input, description: "Total adjustments planned for this phase", constraints: ">= 1" }
+      - { name: visits_completed, type: integer, source: computed, default: 0, description: "Count of ATTENDED appointments tied to this phase" }
+      - { name: status, type: enum, source: system, default: PENDING, description: "PENDING → IN_PROGRESS → COMPLETED / CANCELLED", constraints: "enum {PENDING, IN_PROGRESS, COMPLETED, CANCELLED}" }
+
+  - name: AppointmentSeries
+    parent: TreatmentPlan
+    common_fields: true
+    fields:
+      - { name: treatment_plan_id, type: string, source: system, description: "FK -> TreatmentPlan.id" }
+      - { name: plan_phase_id, type: string, source: input, description: "FK -> PlanPhase.id; the phase whose frequency this series materializes" }
+      - { name: provider_id, type: string, source: input, description: "FK -> Provider.id; default provider for generated appointments" }
+      - { name: treatment_room_id, type: string, source: input, description: "FK -> TreatmentRoom.id; default room for generated appointments" }
+      - { name: start_date, type: string, source: input, description: "ISO 8601 date of the first appointment in the series" }
+      - { name: weekday_pattern, type: array, source: input, description: "Array of weekday integers (0=Mon..6=Sun) on which visits recur each week" }
+      - { name: start_time_minutes, type: integer, source: input, description: "Minutes-after-midnight start time used for every generated appointment", constraints: "0 <= x < 1440" }
+      - { name: duration_minutes, type: integer, source: input, description: "Appointment length in minutes used for every generated appointment", constraints: "1 <= x <= 240" }
+      - { name: generated_count, type: integer, source: computed, default: 0, description: "Count of Appointments materialized from this series (== plan_phase.planned_visit_count on success)" }
+      - { name: status, type: enum, source: system, default: SCHEDULED, description: "SCHEDULED → REGENERATED / CANCELLED; REGENERATED when superseded by a phase re-plan", constraints: "enum {SCHEDULED, REGENERATED, CANCELLED}" }
+
+  - name: Appointment
+    parent: Patient
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: system, description: "FK -> Patient.id" }
+      - { name: appointment_series_id, type: string, source: input, required: false, description: "FK -> AppointmentSeries.id; null for ad-hoc single appointments" }
+      - { name: plan_phase_id, type: string, source: input, required: false, description: "FK -> PlanPhase.id; the phase this visit counts toward (null for unplanned visits)" }
+      - { name: provider_id, type: string, source: input, description: "FK -> Provider.id" }
+      - { name: treatment_room_id, type: string, source: input, description: "FK -> TreatmentRoom.id" }
+      - { name: insurance_policy_id, type: string, source: input, required: false, description: "FK -> InsurancePolicy.id; the policy a cap slot is reserved against (INSURANCE payer_mode only)" }
+      - { name: visit_type, type: enum, source: input, description: "ADJUSTMENT | EXAM | RE_EXAM | X_RAY | THERAPY", constraints: "enum {ADJUSTMENT, EXAM, RE_EXAM, X_RAY, THERAPY}" }
+      - { name: replaces_appointment_id, type: string, source: input, required: false, description: "FK -> Appointment.id; set when this appointment is a reschedule replacement for a cancelled one" }
+      - { name: scheduled_start, type: datetime, source: input, description: "ISO 8601 UTC appointment start instant" }
+      - { name: scheduled_end, type: datetime, source: computed, description: "= scheduled_start + duration_minutes (derived at booking)" }
+      - { name: duration_minutes, type: integer, source: input, description: "Appointment length in minutes", constraints: "1 <= x <= 240" }
+      - { name: counts_against_cap, type: boolean, source: computed, default: false, description: "True when a cap slot is reserved/committed on insurance_policy_id for this appointment" }
+      - { name: patient_responsibility_cents, type: integer, source: computed, default: 0, description: "Amount the patient owes for this visit, computed by §1.3 patient_responsibility at COMPLETED" }
+      - { name: insurance_paid_cents, type: integer, source: computed, default: 0, description: "Amount adjudicated to insurance for this visit (INSURANCE mode only)" }
+      - { name: no_show_fee_cents, type: integer, source: computed, default: 0, description: "Fee assessed on NO_SHOW / LATE_CANCEL per §1.3 no_show_fee" }
+      - { name: attendance_status, type: enum, source: system, default: BOOKED, description: "BOOKED → CHECKED_IN → ATTENDED / NO_SHOW / CANCELLED / LATE_CANCEL (parallel dimension A)", constraints: "enum {BOOKED, CHECKED_IN, ATTENDED, NO_SHOW, CANCELLED, LATE_CANCEL}" }
+      - { name: billing_status, type: enum, source: system, default: UNBILLED, description: "UNBILLED → POSTED → ADJUDICATED / WRITTEN_OFF (parallel dimension B, evolves independently of attendance)", constraints: "enum {UNBILLED, POSTED, ADJUDICATED, WRITTEN_OFF}" }
+
+  - name: SoapNote
+    parent: Appointment
+    common_fields: true
+    fields:
+      - { name: appointment_id, type: string, source: system, description: "FK -> Appointment.id; one SOAP note per appointment" }
+      - { name: provider_id, type: string, source: input, description: "FK -> Provider.id; authoring provider, must match appointment.provider_id" }
+      - { name: subjective, type: string, source: input, description: "Subjective section" }
+      - { name: objective, type: string, source: input, description: "Objective section" }
+      - { name: assessment, type: string, source: input, description: "Assessment section" }
+      - { name: plan, type: string, source: input, description: "Plan section" }
+      - { name: status, type: enum, source: system, default: DRAFT, description: "DRAFT → SIGNED; SIGNED is immutable", constraints: "enum {DRAFT, SIGNED}" }
+
+  - name: LedgerEntry
+    parent: Patient
+    common_fields: false
+    fields:
+      - { name: patient_id, type: string, source: system, description: "FK -> Patient.id" }
+      - { name: appointment_id, type: string, source: system, required: false, description: "FK -> Appointment.id; null for standalone payments/adjustments" }
+      - { name: entry_type, type: enum, source: system, description: "CHARGE | INSURANCE_PAYMENT | PATIENT_PAYMENT | NO_SHOW_FEE | WRITE_OFF", constraints: "enum {CHARGE, INSURANCE_PAYMENT, PATIENT_PAYMENT, NO_SHOW_FEE, WRITE_OFF}" }
+      - { name: amount_cents, type: integer, source: system, description: "Signed amount in cents; positive increases patient balance (CHARGE/NO_SHOW_FEE), negative decreases it (payments/write-offs)" }
+      - { name: memo, type: string, source: system, required: false, description: "Human-readable description of the entry" }
+
+  - name: PracticeClock
+    parent: null
+    common_fields: false
+    fields:
+      - { name: current_utc, type: datetime, source: system, description: "Deterministic system clock used for all late-cancel-window and benefit-year calculations" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+
+  # ---- Appointment: PARALLEL dimensions (attendance_status × billing_status) ----
+  - entity: Appointment
+    initial_state: "BOOKED / UNBILLED"
+    terminal_states: ["CANCELLED", "NO_SHOW", "LATE_CANCEL", "WRITTEN_OFF", "ADJUDICATED"]
+    transitions:
+      # --- attendance_status dimension ---
+      - from: BOOKED
+        to: CHECKED_IN
+        trigger: "POST /patients/{patientId}/appointments/{apptId}/check-in"
+        actor: FrontDesk
+        preconditions:
+          - "appointment.attendance_status == BOOKED"
+          - "patient.status == ACTIVE"
+          - "provider.status == ACTIVE"
+        side_effects:
+          - "attendance_status -> CHECKED_IN"
+
+      - from: CHECKED_IN
+        to: ATTENDED
+        trigger: "POST /patients/{patientId}/appointments/{apptId}/complete"
+        actor: Provider
+        preconditions:
+          - "appointment.attendance_status == CHECKED_IN"
+          - "a SIGNED SoapNote exists for this appointment"
+        side_effects:
+          - "attendance_status -> ATTENDED"
+          - "if counts_against_cap: insurance_policy.visits_reserved -= 1 AND insurance_policy.visits_committed += 1 (cap slot moves reserved->committed)"
+          - "if plan_phase_id set: plan_phase.visits_completed += 1 AND treatment_plan.visits_delivered += 1"
+          - "run calculation patient_responsibility -> set patient_responsibility_cents and insurance_paid_cents"
+          - "billing_status -> POSTED; append LedgerEntry(entry_type=CHARGE, amount_cents=+patient_responsibility_cents); patient.ledger_balance_cents += patient_responsibility_cents"
+          - "if plan_phase.visits_completed == plan_phase.planned_visit_count: plan_phase.status -> COMPLETED, which BUBBLES UP to advance the plan phase (see TreatmentPlan/PlanPhase machines)"
+
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /patients/{patientId}/appointments/{apptId}/cancel"
+        actor: FrontDesk
+        preconditions:
+          - "appointment.attendance_status == BOOKED"
+          - "now < scheduled_start - LATE_CANCEL_WINDOW_HOURS (cancellation is NOT late)"
+        side_effects:
+          - "attendance_status -> CANCELLED"
+          - "if counts_against_cap: insurance_policy.visits_reserved -= 1 (cap slot released, NOT committed)"
+          - "no fee assessed; no_show_fee_cents stays 0"
+
+      - from: BOOKED
+        to: LATE_CANCEL
+        trigger: "POST /patients/{patientId}/appointments/{apptId}/cancel"
+        actor: FrontDesk
+        preconditions:
+          - "appointment.attendance_status == BOOKED"
+          - "now >= scheduled_start - LATE_CANCEL_WINDOW_HOURS (within the late window) AND now < scheduled_start"
+        side_effects:
+          - "attendance_status -> LATE_CANCEL"
+          - "if counts_against_cap: insurance_policy.visits_reserved -= 1 (cap slot released)"
+          - "patient.no_show_strike_count += 1"
+          - "run calculation no_show_fee -> no_show_fee_cents; append LedgerEntry(entry_type=NO_SHOW_FEE, amount_cents=+no_show_fee_cents); patient.ledger_balance_cents += no_show_fee_cents"
+          - "billing_status -> POSTED"
+          - "if patient.no_show_strike_count >= DISMISSAL_STRIKE_THRESHOLD: patient.is_dismissed=true AND patient.status -> DISMISSED (cascade: cancel-release all that patient's remaining BOOKED/CHECKED_IN appointments)"
+
+      - from: BOOKED
+        to: NO_SHOW
+        trigger: "POST /patients/{patientId}/appointments/{apptId}/no-show"
+        actor: FrontDesk
+        preconditions:
+          - "appointment.attendance_status == BOOKED"
+          - "now >= scheduled_start (the slot has elapsed without check-in)"
+        side_effects:
+          - "attendance_status -> NO_SHOW"
+          - "if counts_against_cap: insurance_policy.visits_reserved -= 1 (cap slot released)"
+          - "patient.no_show_strike_count += 1"
+          - "run calculation no_show_fee -> no_show_fee_cents; append LedgerEntry(entry_type=NO_SHOW_FEE, amount_cents=+no_show_fee_cents); patient.ledger_balance_cents += no_show_fee_cents"
+          - "billing_status -> POSTED"
+          - "if patient.no_show_strike_count >= DISMISSAL_STRIKE_THRESHOLD: patient.is_dismissed=true AND patient.status -> DISMISSED (cascade-cancel remaining BOOKED/CHECKED_IN appointments)"
+
+      - from: CHECKED_IN
+        to: NO_SHOW
+        trigger: "POST /patients/{patientId}/appointments/{apptId}/no-show"
+        actor: FrontDesk
+        preconditions:
+          - "appointment.attendance_status == CHECKED_IN"
+          - "now >= scheduled_end (checked in but never completed)"
+        side_effects:
+          - "attendance_status -> NO_SHOW"
+          - "if counts_against_cap: insurance_policy.visits_reserved -= 1"
+          - "patient.no_show_strike_count += 1; run no_show_fee; append LedgerEntry(NO_SHOW_FEE); patient.ledger_balance_cents += no_show_fee_cents; billing_status -> POSTED"
+
+      # --- billing_status dimension (independent of attendance) ---
+      - from: POSTED
+        to: ADJUDICATED
+        trigger: "POST /patients/{patientId}/appointments/{apptId}/adjudicate"
+        actor: BillingClerk
+        preconditions:
+          - "appointment.billing_status == POSTED"
+          - "appointment.attendance_status == ATTENDED"
+          - "patient.payer_mode == INSURANCE"
+          - "appointment.insurance_policy_id is set"
+        side_effects:
+          - "billing_status -> ADJUDICATED"
+          - "append LedgerEntry(entry_type=INSURANCE_PAYMENT, amount_cents=-insurance_paid_cents); insurance_policy.deductible_met_cents increased per §1.3 patient_responsibility deductible application"
+        note: "Attendance dimension is unaffected; ATTENDED+POSTED -> ATTENDED+ADJUDICATED."
+
+      - from: POSTED
+        to: WRITTEN_OFF
+        trigger: "POST /patients/{patientId}/appointments/{apptId}/write-off"
+        actor: BillingClerk
+        preconditions:
+          - "appointment.billing_status == POSTED"
+        side_effects:
+          - "billing_status -> WRITTEN_OFF"
+          - "append LedgerEntry(entry_type=WRITE_OFF, amount_cents=-patient_responsibility_cents); patient.ledger_balance_cents -= patient_responsibility_cents (charge reversed)"
+        note: "Compensating action: leaves patient.ledger_balance_cents net unchanged vs. before the original CHARGE for this appointment."
+
+  # ---- ExamRecord: linear ----
+  - entity: ExamRecord
+    initial_state: DRAFT
+    terminal_states: ["FINALIZED"]
+    transitions:
+      - from: DRAFT
+        to: FINALIZED
+        trigger: "POST /patients/{patientId}/exams/{examId}/finalize"
+        actor: Provider
+        preconditions:
+          - "exam.status == DRAFT"
+          - "exam.provider_id == acting provider (X-User-ID)"
+        side_effects:
+          - "status -> FINALIZED (exam becomes eligible to seed a TreatmentPlan)"
+
+  # ---- TreatmentPlan: compound + lifecycle ----
+  - entity: TreatmentPlan
+    initial_state: PROPOSED
+    terminal_states: ["COMPLETED", "DISCONTINUED"]
+    transitions:
+      - from: PROPOSED
+        to: ACTIVE
+        trigger: "POST /patients/{patientId}/treatment-plans/{planId}/activate"
+        actor: Provider
+        preconditions:
+          - "plan.status == PROPOSED"
+          - "exam_record.status == FINALIZED"
+          - "patient has no other plan in status ACTIVE (cross-entity: TreatmentPlan vs sibling TreatmentPlan)"
+          - "plan has at least one PlanPhase"
+          - "client supplies expected_patient_version matching patient.version (OCC — supersede a prior PROPOSED plan)"
+        side_effects:
+          - "status -> ACTIVE"
+          - "lowest sequence_index PlanPhase.status -> IN_PROGRESS; treatment_plan.current_phase = that phase.phase_type"
+          - "increments Patient.version by 1"
+
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "system: bubble-up when the MAINTENANCE phase completes"
+        actor: system
+        preconditions:
+          - "the highest sequence_index PlanPhase reached status COMPLETED AND its phase_type == MAINTENANCE"
+        side_effects:
+          - "status -> COMPLETED"
+
+      - from: ACTIVE
+        to: DISCONTINUED
+        trigger: "POST /patients/{patientId}/treatment-plans/{planId}/discontinue"
+        actor: Provider
+        preconditions:
+          - "plan.status == ACTIVE"
+        side_effects:
+          - "status -> DISCONTINUED"
+          - "cascade: every non-terminal PlanPhase -> CANCELLED"
+          - "cascade: every SCHEDULED AppointmentSeries under the plan -> CANCELLED, which cascades to cancel-release each still-BOOKED Appointment it generated (cap slots released)"
+
+  # ---- PlanPhase: CYCLIC (re-exam can regress CORRECTIVE -> ACUTE) ----
+  - entity: PlanPhase
+    initial_state: PENDING
+    terminal_states: ["COMPLETED", "CANCELLED"]
+    transitions:
+      - from: PENDING
+        to: IN_PROGRESS
+        trigger: "system: set when the plan activates (lowest phase) or the prior phase completes/advances"
+        actor: system
+        preconditions:
+          - "treatment_plan.status == ACTIVE"
+          - "no sibling PlanPhase of lower sequence_index is still PENDING or IN_PROGRESS"
+        side_effects:
+          - "status -> IN_PROGRESS; treatment_plan.current_phase = this.phase_type"
+
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "system: bubble-up when an appointment completion makes visits_completed == planned_visit_count"
+        actor: system
+        preconditions:
+          - "phase.visits_completed == phase.planned_visit_count"
+        side_effects:
+          - "status -> COMPLETED"
+          - "if a higher sequence_index PENDING phase exists: that phase -> IN_PROGRESS (forward advance); else treatment_plan -> COMPLETED (bubble up)"
+
+      - from: IN_PROGRESS
+        to: PENDING
+        trigger: "POST /patients/{patientId}/treatment-plans/{planId}/re-exam-regress"
+        actor: Provider
+        preconditions:
+          - "phase.phase_type == CORRECTIVE AND phase.status == IN_PROGRESS"
+          - "the re-exam ExamRecord referenced is FINALIZED and has severity_score >= REGRESSION_SEVERITY_THRESHOLD"
+        side_effects:
+          - "this CORRECTIVE phase -> PENDING (cycle: regression sends it back so an earlier ACUTE-type phase can be re-run)"
+          - "the lowest sequence_index ACUTE phase that is COMPLETED -> IN_PROGRESS again with visits_completed reset to 0; treatment_plan.current_phase = ACUTE"
+          - "cascade: the current SCHEDULED AppointmentSeries for the regressed phases is set REGENERATED and a fresh series is generated at the ACUTE frequency (re-reserving cap slots)"
+        note: "Cyclic shape A(done)->...->CORRECTIVE->A(again). Distinct from the linear forward advance."
+
+  # ---- AppointmentSeries: generation lifecycle ----
+  - entity: AppointmentSeries
+    initial_state: SCHEDULED
+    terminal_states: ["REGENERATED", "CANCELLED"]
+    transitions:
+      - from: SCHEDULED
+        to: REGENERATED
+        trigger: "system: a phase re-plan or regression supersedes this series"
+        actor: system
+        preconditions:
+          - "series.status == SCHEDULED"
+        side_effects:
+          - "status -> REGENERATED; all still-BOOKED Appointments generated by this series are cancel-released (cap slots freed) before the replacement series materializes"
+
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "system: parent plan discontinued"
+        actor: system
+        preconditions:
+          - "series.status == SCHEDULED"
+        side_effects:
+          - "status -> CANCELLED; cascade-cancel-release each still-BOOKED generated Appointment"
+
+  # ---- SoapNote: linear, sign-locks ----
+  - entity: SoapNote
+    initial_state: DRAFT
+    terminal_states: ["SIGNED"]
+    transitions:
+      - from: DRAFT
+        to: SIGNED
+        trigger: "POST /patients/{patientId}/appointments/{apptId}/soap-note/sign"
+        actor: Provider
+        preconditions:
+          - "soap_note.status == DRAFT"
+          - "soap_note.provider_id == acting provider AND == appointment.provider_id"
+          - "appointment.attendance_status == CHECKED_IN (note signed before completion)"
+        side_effects:
+          - "status -> SIGNED (immutable; unblocks appointment completion)"
+
+  # ---- Patient: lifecycle ----
+  - entity: Patient
+    initial_state: ACTIVE
+    terminal_states: ["DISMISSED"]
+    transitions:
+      - from: ACTIVE
+        to: DISMISSED
+        trigger: "system: no_show_strike_count reaches DISMISSAL_STRIKE_THRESHOLD via a NO_SHOW/LATE_CANCEL"
+        actor: system
+        preconditions:
+          - "patient.no_show_strike_count >= DISMISSAL_STRIKE_THRESHOLD"
+        side_effects:
+          - "is_dismissed -> true; status -> DISMISSED"
+          - "cascade: cancel-release every BOOKED/CHECKED_IN Appointment for this patient (cap slots freed); any ACTIVE TreatmentPlan -> DISCONTINUED"
+
+  # ---- TreatmentRoom: availability ----
+  - entity: TreatmentRoom
+    initial_state: OPEN
+    terminal_states: ["CLOSED"]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /treatment-rooms/{roomId}/close"
+        actor: PracticeAdmin
+        preconditions:
+          - "room.status == OPEN"
+        side_effects:
+          - "status -> CLOSED (existing BOOKED appointments are unaffected; only NEW bookings/series are rejected with ERR_RESOURCE_UNAVAILABLE)"
+
+  # ---- InsurancePolicy: coverage lifecycle ----
+  - entity: InsurancePolicy
+    initial_state: ACTIVE
+    terminal_states: ["TERMINATED"]
+    transitions:
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /patients/{patientId}/insurance-policies/{policyId}/terminate"
+        actor: BillingClerk
+        preconditions:
+          - "policy.status == ACTIVE"
+        side_effects:
+          - "status -> TERMINATED (new INSURANCE bookings against this policy are rejected; already-reserved/committed slots are unchanged)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: plan-activate-stale-patient
+    parent_entity: Patient
+    write_endpoint: "POST /patients/{patientId}/treatment-plans/{planId}/activate"
+    occ_field: "expected_patient_version"
+    description: |
+      Activating a TreatmentPlan promotes it to the patient's single ACTIVE plan,
+      legitimately superseding any prior PROPOSED plan. If the patient's version has
+      advanced since the client last observed it (another writer already activated a
+      plan, bumping patient.version), the activation is rejected as stale. The loser's
+      view of the patient is out of date even though, on its own, a fresh activation
+      would succeed.
+    error_id: ERR_STALE_PATIENT_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+
+  - name: patient_responsibility
+    trigger: "Appointment COMPLETED (attendance_status BOOKED/CHECKED_IN -> ATTENDED) — sets patient_responsibility_cents and insurance_paid_cents"
+    algorithm: threshold
+    formula: |
+      fee = ACTIVE FeeSchedule for appointment.visit_type
+      mode = patient.payer_mode
+      # --- CASH variant ---
+      if mode == CASH:
+          patient_responsibility_cents = fee.cash_rate_cents
+          insurance_paid_cents = 0
+      # --- WELLNESS variant ---
+      elif mode == WELLNESS:
+          if appointment.visit_type == ADJUSTMENT:
+              # count this patient's ATTENDED ADJUSTMENT appointments in the SAME calendar month
+              # (by scheduled_start, UTC), INCLUDING this one, ordered by scheduled_start ASC,
+              # created_at ASC on ties; this appointment's ordinal is `n` (1-based).
+              if n <= wellness_plan.included_adjustments_per_month:
+                  patient_responsibility_cents = 0            # included
+              else:
+                  disc = round(fee.cash_rate_cents * wellness_plan.overage_discount_pct)   # round_half_up
+                  patient_responsibility_cents = fee.cash_rate_cents - disc
+          else:
+              patient_responsibility_cents = fee.cash_rate_cents   # non-adjustments billed at cash rate
+          insurance_paid_cents = 0
+      # --- INSURANCE variant ---
+      elif mode == INSURANCE:
+          policy = appointment.insurance_policy_id
+          allowed = policy.allowed_amount_cents
+          remaining_deductible = max(0, policy.deductible_total_cents - policy.deductible_met_cents)
+          applied_to_deductible = min(allowed, remaining_deductible)        # patient pays this dollar-for-dollar
+          after_deductible = allowed - applied_to_deductible
+          coins = round(after_deductible * policy.coinsurance_pct)          # round_half_up, patient share
+          patient_responsibility_cents = applied_to_deductible + coins
+          insurance_paid_cents = allowed - patient_responsibility_cents     # carrier covers the allowed amount minus the patient's share
+          # NOTE: policy.deductible_met_cents += applied_to_deductible is applied at ADJUDICATED, not here
+    input_set: "Single appointment's visit_type + the patient's payer_mode; for WELLNESS adjustments, the set of this patient's ATTENDED ADJUSTMENT appointments in the same calendar month (status filter: attendance_status == ATTENDED), ordered scheduled_start ASC then created_at ASC."
+    constants: {}
+    precision: "integer cents; round_half_up on every multiplication before truncation to whole cents"
+    variants:
+      - { name: cash, when: "patient.payer_mode == CASH", difference: "Full FeeSchedule.cash_rate_cents; insurance_paid_cents = 0." }
+      - { name: wellness, when: "patient.payer_mode == WELLNESS", difference: "First included_adjustments_per_month ADJUSTMENTs each calendar month are $0; overage adjustments get overage_discount_pct off cash; non-adjustments at cash." }
+      - { name: insurance, when: "patient.payer_mode == INSURANCE", difference: "Deductible applied dollar-for-dollar first, then coinsurance on the remainder of the allowed amount; insurance_paid_cents = allowed - patient_responsibility_cents." }
+
+  - name: no_show_fee
+    trigger: "Appointment NO_SHOW or LATE_CANCEL transition — sets no_show_fee_cents"
+    algorithm: threshold
+    formula: |
+      # tiered by the patient's strike count AFTER this strike is recorded.
+      strikes_after = patient.no_show_strike_count   # already incremented by the transition
+      if strikes_after <= FIRST_TIER_MAX_STRIKES:           # strikes 1..2
+          base = FIRST_TIER_FEE_CENTS
+      elif strikes_after <= SECOND_TIER_MAX_STRIKES:        # strikes 3..4
+          base = SECOND_TIER_FEE_CENTS
+      else:                                                  # strike 5+
+          base = THIRD_TIER_FEE_CENTS
+      # LATE_CANCEL is charged at LATE_CANCEL_MULTIPLIER of the tier fee; NO_SHOW at full.
+      if transition == LATE_CANCEL:
+          no_show_fee_cents = round(base * LATE_CANCEL_MULTIPLIER)   # round_half_up
+      else:
+          no_show_fee_cents = base
+    input_set: "The triggering appointment + the patient's post-increment no_show_strike_count."
+    constants:
+      FIRST_TIER_MAX_STRIKES: 2
+      SECOND_TIER_MAX_STRIKES: 4
+      FIRST_TIER_FEE_CENTS: 2500
+      SECOND_TIER_FEE_CENTS: 5000
+      THIRD_TIER_FEE_CENTS: 7500
+      LATE_CANCEL_MULTIPLIER: 0.5
+      DISMISSAL_STRIKE_THRESHOLD: 5
+      LATE_CANCEL_WINDOW_HOURS: 24
+      REGRESSION_SEVERITY_THRESHOLD: 6
+    precision: "integer cents; round_half_up"
+    variants:
+      - { name: no_show, when: "transition == NO_SHOW", difference: "Full tier fee." }
+      - { name: late_cancel, when: "transition == LATE_CANCEL", difference: "Tier fee * LATE_CANCEL_MULTIPLIER (0.5)." }
+
+  - name: cap_reservation_check
+    trigger: "Appointment booking (POST /patients/{patientId}/appointments) when payer_mode == INSURANCE and visit_type counts against cap"
+    algorithm: aggregation
+    formula: |
+      # cap-counting visit types: ADJUSTMENT, THERAPY, RE_EXAM (EXAM and X_RAY do NOT consume cap)
+      counts = appointment.visit_type in CAP_COUNTING_VISIT_TYPES
+      if not counts:
+          counts_against_cap = false
+          return OK
+      policy = insurance_policy_id
+      projected = policy.visits_reserved + policy.visits_committed + 1   # this booking
+      if projected > policy.annual_visit_cap:
+          reject ERR_VISIT_CAP_EXCEEDED         # strict >: equality is allowed (fills the last slot)
+      policy.visits_reserved += 1
+      counts_against_cap = true
+    input_set: "The single InsurancePolicy's visits_reserved + visits_committed counters plus this booking; CAP_COUNTING_VISIT_TYPES = {ADJUSTMENT, THERAPY, RE_EXAM}."
+    constants:
+      CAP_COUNTING_VISIT_TYPES: "[ADJUSTMENT, THERAPY, RE_EXAM]"
+    precision: "integer counts"
+    variants:
+      - { name: boundary_fills_last_slot, when: "visits_reserved + visits_committed + 1 == annual_visit_cap", difference: "Allowed — equality does not exceed; cap reaches exactly full." }
+      - { name: boundary_exceeds, when: "visits_reserved + visits_committed + 1 > annual_visit_cap", difference: "Rejected with ERR_VISIT_CAP_EXCEEDED (strict > test)." }
+
+  - name: series_generation
+    trigger: "POST /patients/{patientId}/treatment-plans/{planId}/series (materialize a phase's recurring appointments)"
+    algorithm: interval_merge
+    formula: |
+      # Generate exactly plan_phase.planned_visit_count appointments by walking forward from
+      # start_date, emitting one appointment on each weekday in weekday_pattern (ascending 0..6),
+      # week by week, until planned_visit_count appointments are emitted.
+      generated = []
+      cursor_week_start = start_date            # the calendar week containing start_date (Mon=week start)
+      while len(generated) < planned_visit_count:
+          for wd in sorted(weekday_pattern):    # ascending weekday order within the week
+              date = cursor_week_start + wd days
+              if date < start_date: continue    # skip days before the series start
+              start_dt = combine(date, start_time_minutes)  # UTC
+              end_dt = start_dt + duration_minutes
+              # overlap rule against same provider AND same room (see §1.4 priorities 11 & 12):
+              if collides_with_existing_BOOKED(provider_id, room_id, start_dt, end_dt): reject ERR_SCHEDULE_CONFLICT
+              for INSURANCE patients: run cap_reservation_check (rejects whole batch on first overflow)
+              generated.append(create Appointment(...))
+              if len(generated) == planned_visit_count: break
+          cursor_week_start += 7 days
+      generated_count = len(generated)         # == planned_visit_count on success
+    input_set: "One PlanPhase's planned_visit_count + the series weekday_pattern/start_date/time/duration; existing BOOKED appointments on the same provider and room for overlap checks; the patient's policy cap for reservation."
+    constants: {}
+    precision: "whole appointments; dates resolved in UTC against PracticeClock-independent calendar arithmetic"
+    variants:
+      - { name: insurance_batch_atomic, when: "payer_mode == INSURANCE and the batch would exceed the cap mid-generation", difference: "Entire generation is rejected atomically (no partial series) with ERR_VISIT_CAP_EXCEEDED." }
+      - { name: cash_no_cap, when: "payer_mode == CASH or WELLNESS", difference: "No cap reservation; only schedule-conflict checks apply." }
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all" }
+  - { priority: 2, category: auth, check: "Acting role is permitted for this operation per §1.7 RBAC matrix", error_id: ERR_FORBIDDEN_ROLE, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: existence, check: "Every path-referenced resource exists (validated left-to-right: patient, then nested resource)", error_id: ERR_PATIENT_NOT_FOUND, http_status: 404, applies_to: "all nested patient routes" }
+  - { priority: 4, category: existence, check: "Nested/leaf resource in path exists (appointment, exam, plan, phase, series, soap-note)", error_id: ERR_RESOURCE_NOT_FOUND, http_status: 404, applies_to: "all leaf routes" }
+  - { priority: 5, category: existence, check: "Every FK in the request body resolves to an existing resource (provider, room, fee schedule, policy, wellness plan, exam, phase)", error_id: ERR_REFERENCE_NOT_FOUND, http_status: 404, applies_to: "all create/booking endpoints" }
+  - { priority: 6, category: existence, check: "Required body fields present and well-typed; enum values in declared domain", error_id: ERR_INVALID_REQUEST, http_status: 400, applies_to: "all write endpoints" }
+  - { priority: 7, category: state, check: "Target resource is in a state from which the requested transition is defined in §1.2", error_id: ERR_INVALID_STATE, http_status: 409, applies_to: "all transition endpoints" }
+  - { priority: 8, category: business_referential, check: "OCC: expected_patient_version matches Patient.version on plan activation", error_id: ERR_STALE_PATIENT_VERSION, http_status: 412, applies_to: "POST /patients/{patientId}/treatment-plans/{planId}/activate" }
+  - { priority: 9, category: business_safety, check: "Patient.status == ACTIVE (not DISMISSED) for any booking or clinical write", error_id: ERR_PATIENT_DISMISSED, http_status: 409, applies_to: "booking, series generation, exam, plan endpoints" }
+  - { priority: 10, category: business_constraint, check: "payer_mode/wellness_plan_id coherence on patient create: WELLNESS requires wellness_plan_id; CASH/INSURANCE forbid it", error_id: ERR_PAYER_MODE_MISMATCH, http_status: 422, applies_to: "POST /patients" }
+  - { priority: 11, category: business_constraint, check: "Assigned Provider is ACTIVE (not SUSPENDED) and assigned TreatmentRoom is OPEN (not CLOSED)", error_id: ERR_RESOURCE_UNAVAILABLE, http_status: 409, applies_to: "booking and series endpoints" }
+  - { priority: 12, category: business_constraint, check: "X_RAY visit_type requires a TreatmentRoom of room_type == IMAGING", error_id: ERR_ROOM_TYPE_MISMATCH, http_status: 422, applies_to: "booking and series endpoints" }
+  - { priority: 13, category: business_temporal, check: "Provider overlap: new appointment [start,end) must not intersect any BOOKED/CHECKED_IN appointment for the same provider; adjacency (end==start) is allowed (half-open intervals)", error_id: ERR_PROVIDER_DOUBLE_BOOKED, http_status: 409, applies_to: "booking and series endpoints" }
+  - { priority: 14, category: business_temporal, check: "Room overlap: new appointment start must be >= prior room appointment end + room.turnover_buffer_minutes; the buffer makes adjacency insufficient (closed-with-buffer interval)", error_id: ERR_ROOM_BUFFER_CONFLICT, http_status: 409, applies_to: "booking and series endpoints" }
+  - { priority: 15, category: business_constraint, check: "INSURANCE patient booking requires insurance_policy_id of an ACTIVE policy owned by the patient", error_id: ERR_POLICY_REQUIRED, http_status: 422, applies_to: "booking and series endpoints (INSURANCE payer_mode)" }
+  - { priority: 16, category: business_fiscal, check: "Cap availability: visits_reserved + visits_committed + 1 must be <= policy.annual_visit_cap for cap-counting visit_types", error_id: ERR_VISIT_CAP_EXCEEDED, http_status: 409, applies_to: "booking and series endpoints (INSURANCE payer_mode)" }
+  - { priority: 17, category: business_constraint, check: "Completion requires a SIGNED SoapNote for the appointment", error_id: ERR_SOAP_NOTE_REQUIRED, http_status: 409, applies_to: "POST /patients/{patientId}/appointments/{apptId}/complete" }
+  - { priority: 18, category: business_constraint, check: "Only one ACTIVE TreatmentPlan per patient; activating a second is rejected", error_id: ERR_ACTIVE_PLAN_EXISTS, http_status: 409, applies_to: "POST /patients/{patientId}/treatment-plans/{planId}/activate" }
+  - { priority: 19, category: business_constraint, check: "Plan must reference a FINALIZED ExamRecord; activation requires at least one PlanPhase", error_id: ERR_PLAN_NOT_READY, http_status: 409, applies_to: "plan create/activate endpoints" }
+  - { priority: 20, category: business_constraint, check: "SoapNote author provider_id must equal the appointment's provider_id", error_id: ERR_SOAP_PROVIDER_MISMATCH, http_status: 422, applies_to: "POST /patients/{patientId}/appointments/{apptId}/soap-note" }
+  - { priority: 21, category: business_constraint, check: "Regression re-exam requires a FINALIZED RE_EXAM ExamRecord with severity_score >= REGRESSION_SEVERITY_THRESHOLD and a CORRECTIVE phase IN_PROGRESS", error_id: ERR_REGRESSION_NOT_ALLOWED, http_status: 409, applies_to: "POST /patients/{patientId}/treatment-plans/{planId}/re-exam-regress" }
+  - { priority: 22, category: business_constraint, check: "Semantic body validation (evaluated within the priority-6 field tier; listed last only to avoid renumbering): amount_cents > 0 on payments; weekday_pattern non-empty with every entry in 0..6 on series; sequence_index unique within a plan; severity_score in 1..10 on exams", error_id: ERR_VALIDATION, http_status: 422, applies_to: "POST /patients/{patientId}/payments, series, phases, exams" }
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+
+  # ---- Configuration resources ----
+  - { method: POST, path: "/providers", description: "Create a provider", roles: [PracticeAdmin], code: 201, input: [full_name, npi, license_state], output: Provider, side_effects: ["status initialized ACTIVE"] }
+  - { method: GET, path: "/providers", description: "List providers (paginated; optional status filter)", roles: [PracticeAdmin, FrontDesk, Provider, BillingClerk], code: 200, input: ["status?", "limit?", "offset?"], output: "Provider[]", side_effects: [] }
+  - { method: GET, path: "/providers/{providerId}", description: "Get a provider", roles: [PracticeAdmin, FrontDesk, Provider, BillingClerk], code: 200, input: [], output: Provider, side_effects: [] }
+  - { method: POST, path: "/providers/{providerId}/suspend", description: "Suspend a provider", roles: [PracticeAdmin], code: 200, input: [], output: Provider, side_effects: ["status -> SUSPENDED"] }
+
+  - { method: POST, path: "/treatment-rooms", description: "Create a treatment room", roles: [PracticeAdmin], code: 201, input: [name, room_type, "turnover_buffer_minutes?"], output: TreatmentRoom, side_effects: ["status initialized OPEN"] }
+  - { method: GET, path: "/treatment-rooms", description: "List treatment rooms", roles: [PracticeAdmin, FrontDesk, Provider, BillingClerk], code: 200, input: ["status?", "room_type?", "limit?", "offset?"], output: "TreatmentRoom[]", side_effects: [] }
+  - { method: GET, path: "/treatment-rooms/{roomId}", description: "Get a treatment room", roles: [PracticeAdmin, FrontDesk, Provider, BillingClerk], code: 200, input: [], output: TreatmentRoom, side_effects: [] }
+  - { method: POST, path: "/treatment-rooms/{roomId}/close", description: "Close a treatment room (no new bookings)", roles: [PracticeAdmin], code: 200, input: [], output: TreatmentRoom, side_effects: ["status -> CLOSED"] }
+
+  - { method: POST, path: "/fee-schedules", description: "Create a fee schedule for a visit_type (retires any prior ACTIVE one for the same visit_type)", roles: [PracticeAdmin], code: 201, input: [visit_type, cash_rate_cents, billed_amount_cents], output: FeeSchedule, side_effects: ["prior ACTIVE FeeSchedule for visit_type -> RETIRED; new one ACTIVE"] }
+  - { method: GET, path: "/fee-schedules", description: "List fee schedules (optional visit_type/status filter)", roles: [PracticeAdmin, FrontDesk, Provider, BillingClerk], code: 200, input: ["visit_type?", "status?", "limit?", "offset?"], output: "FeeSchedule[]", side_effects: [] }
+
+  - { method: POST, path: "/wellness-plans", description: "Create a wellness plan", roles: [PracticeAdmin], code: 201, input: [name, monthly_fee_cents, included_adjustments_per_month, overage_discount_pct], output: WellnessPlan, side_effects: ["status initialized ACTIVE"] }
+  - { method: GET, path: "/wellness-plans", description: "List wellness plans", roles: [PracticeAdmin, FrontDesk, Provider, BillingClerk], code: 200, input: ["status?", "limit?", "offset?"], output: "WellnessPlan[]", side_effects: [] }
+
+  # ---- Test-driving clock ----
+  - { method: POST, path: "/_clock/set", description: "Set the deterministic practice clock (test-driving)", roles: [PracticeAdmin], code: 200, input: [current_utc], output: PracticeClock, side_effects: ["PracticeClock.current_utc set; used by late-cancel-window and no-show checks"] }
+  - { method: GET, path: "/_clock", description: "Read the deterministic practice clock", roles: [PracticeAdmin, FrontDesk, Provider, BillingClerk], code: 200, input: [], output: PracticeClock, side_effects: [] }
+
+  # ---- Patient ----
+  - { method: POST, path: "/patients", description: "Register a patient", roles: [FrontDesk, PracticeAdmin], code: 201, input: [full_name, date_of_birth, payer_mode, "wellness_plan_id?"], output: Patient, side_effects: ["status ACTIVE; ledger_balance_cents=0; no_show_strike_count=0"] }
+  - { method: GET, path: "/patients", description: "List patients (paginated; optional status/payer_mode/wellness_plan_id filter — reverse-reachability for Patient.wellness_plan_id)", roles: [FrontDesk, PracticeAdmin, Provider, BillingClerk], code: 200, input: ["status?", "payer_mode?", "wellness_plan_id?", "limit?", "offset?"], output: "Patient[]", side_effects: [] }
+  - { method: GET, path: "/patients/{patientId}", description: "Get a patient (includes computed ledger_balance_cents, no_show_strike_count)", roles: [FrontDesk, PracticeAdmin, Provider, BillingClerk], code: 200, input: [], output: Patient, side_effects: [] }
+  - { method: POST, path: "/patients/{patientId}/payments", description: "Post a patient payment against the ledger", roles: [FrontDesk, BillingClerk], code: 201, input: [amount_cents], output: LedgerEntry, side_effects: ["append LedgerEntry(PATIENT_PAYMENT, -amount_cents); patient.ledger_balance_cents -= amount_cents"] }
+  - { method: GET, path: "/patients/{patientId}/ledger-entries", description: "List a patient's ledger entries (reverse-reachability for LedgerEntry)", roles: [FrontDesk, PracticeAdmin, BillingClerk], code: 200, input: ["entry_type?", "appointment_id?", "limit?", "offset?"], output: "LedgerEntry[]", side_effects: [] }
+
+  # ---- InsurancePolicy ----
+  - { method: POST, path: "/patients/{patientId}/insurance-policies", description: "Add an insurance policy to a patient", roles: [FrontDesk, BillingClerk, PracticeAdmin], code: 201, input: [carrier_name, annual_visit_cap, deductible_total_cents, coinsurance_pct, allowed_amount_cents], output: InsurancePolicy, side_effects: ["status ACTIVE; counters zeroed"] }
+  - { method: GET, path: "/patients/{patientId}/insurance-policies", description: "List a patient's insurance policies (reverse-reachability for InsurancePolicy)", roles: [FrontDesk, BillingClerk, PracticeAdmin, Provider], code: 200, input: ["status?", "limit?", "offset?"], output: "InsurancePolicy[]", side_effects: [] }
+  - { method: POST, path: "/patients/{patientId}/insurance-policies/{policyId}/terminate", description: "Terminate an insurance policy (covers no new visits)", roles: [BillingClerk, PracticeAdmin], code: 200, input: [], output: InsurancePolicy, side_effects: ["status -> TERMINATED"] }
+
+  # ---- Exam ----
+  - { method: POST, path: "/patients/{patientId}/exams", description: "Create an exam record (DRAFT)", roles: [Provider], code: 201, input: [provider_id, exam_type, "imaging_ordered?", severity_score, "findings?"], output: ExamRecord, side_effects: ["status DRAFT"] }
+  - { method: GET, path: "/patients/{patientId}/exams", description: "List a patient's exams (reverse-reachability for ExamRecord)", roles: [Provider, FrontDesk, PracticeAdmin], code: 200, input: ["status?", "exam_type?", "limit?", "offset?"], output: "ExamRecord[]", side_effects: [] }
+  - { method: POST, path: "/patients/{patientId}/exams/{examId}/finalize", description: "Finalize a DRAFT exam", roles: [Provider], code: 200, input: [], output: ExamRecord, side_effects: ["status -> FINALIZED"] }
+
+  # ---- TreatmentPlan + phases + series ----
+  - { method: POST, path: "/patients/{patientId}/treatment-plans", description: "Propose a treatment plan from a FINALIZED exam", roles: [Provider], code: 201, input: [exam_record_id], output: TreatmentPlan, side_effects: ["status PROPOSED; current_phase=ACUTE"] }
+  - { method: GET, path: "/patients/{patientId}/treatment-plans", description: "List a patient's treatment plans (reverse-reachability for TreatmentPlan)", roles: [Provider, FrontDesk, PracticeAdmin, BillingClerk], code: 200, input: ["status?", "limit?", "offset?"], output: "TreatmentPlan[]", side_effects: [] }
+  - { method: GET, path: "/patients/{patientId}/treatment-plans/{planId}", description: "Get a treatment plan (computed totals)", roles: [Provider, FrontDesk, PracticeAdmin, BillingClerk], code: 200, input: [], output: TreatmentPlan, side_effects: [] }
+  - { method: POST, path: "/patients/{patientId}/treatment-plans/{planId}/phases", description: "Add a plan phase", roles: [Provider], code: 201, input: [phase_type, sequence_index, visits_per_week, planned_visit_count], output: PlanPhase, side_effects: ["status PENDING; treatment_plan.total_planned_visits recomputed"] }
+  - { method: GET, path: "/patients/{patientId}/treatment-plans/{planId}/phases", description: "List plan phases (reverse-reachability for PlanPhase)", roles: [Provider, FrontDesk, PracticeAdmin], code: 200, input: ["status?", "limit?", "offset?"], output: "PlanPhase[]", side_effects: [] }
+  - { method: POST, path: "/patients/{patientId}/treatment-plans/{planId}/activate", description: "Activate a PROPOSED plan (OCC on patient)", roles: [Provider], code: 200, input: [expected_patient_version], output: TreatmentPlan, side_effects: ["status -> ACTIVE; lowest phase IN_PROGRESS; increments Patient.version by 1"] }
+  - { method: POST, path: "/patients/{patientId}/treatment-plans/{planId}/discontinue", description: "Discontinue an ACTIVE plan", roles: [Provider, PracticeAdmin], code: 200, input: [], output: TreatmentPlan, side_effects: ["status -> DISCONTINUED; cascade-cancel phases and series; release cap slots"] }
+  - { method: POST, path: "/patients/{patientId}/treatment-plans/{planId}/re-exam-regress", description: "Regress a CORRECTIVE phase back toward ACUTE after a re-exam", roles: [Provider], code: 200, input: [exam_record_id, plan_phase_id], output: TreatmentPlan, side_effects: ["CORRECTIVE phase -> PENDING; an ACUTE phase -> IN_PROGRESS (visits_completed reset); current series REGENERATED; fresh series generated; cap re-reserved"] }
+  - { method: POST, path: "/patients/{patientId}/treatment-plans/{planId}/series", description: "Materialize a phase's recurring appointment series", roles: [FrontDesk, Provider], code: 201, input: [plan_phase_id, provider_id, treatment_room_id, start_date, weekday_pattern, start_time_minutes, duration_minutes, "insurance_policy_id?"], output: AppointmentSeries, side_effects: ["generate planned_visit_count Appointments (each BOOKED); cap reserved per booking for INSURANCE; generated_count set"] }
+  - { method: GET, path: "/patients/{patientId}/treatment-plans/{planId}/series", description: "List appointment series under a plan (reverse-reachability for AppointmentSeries)", roles: [FrontDesk, Provider, PracticeAdmin], code: 200, input: ["plan_phase_id?", "status?", "limit?", "offset?"], output: "AppointmentSeries[]", side_effects: [] }
+
+  # ---- Appointment ----
+  - { method: POST, path: "/patients/{patientId}/appointments", description: "Book a single appointment", roles: [FrontDesk, Provider], code: 201, input: [provider_id, treatment_room_id, visit_type, scheduled_start, duration_minutes, "plan_phase_id?", "insurance_policy_id?", "appointment_series_id?", "replaces_appointment_id?"], output: Appointment, side_effects: ["attendance_status BOOKED; scheduled_end computed; cap reserved if INSURANCE + cap-counting"] }
+  - { method: GET, path: "/patients/{patientId}/appointments", description: "List a patient's appointments (reverse-reachability for Appointment; filters)", roles: [FrontDesk, Provider, PracticeAdmin, BillingClerk], code: 200, input: ["attendance_status?", "billing_status?", "appointment_series_id?", "plan_phase_id?", "insurance_policy_id?", "provider_id?", "limit?", "offset?"], output: "Appointment[]", side_effects: [] }
+  - { method: GET, path: "/patients/{patientId}/appointments/{apptId}", description: "Get an appointment (computed fees/responsibility)", roles: [FrontDesk, Provider, PracticeAdmin, BillingClerk], code: 200, input: [], output: Appointment, side_effects: [] }
+  - { method: POST, path: "/patients/{patientId}/appointments/{apptId}/check-in", description: "Check a patient in", roles: [FrontDesk], code: 200, input: [], output: Appointment, side_effects: ["attendance_status -> CHECKED_IN"] }
+  - { method: POST, path: "/patients/{patientId}/appointments/{apptId}/soap-note", description: "Create a DRAFT SOAP note for the appointment", roles: [Provider], code: 201, input: [provider_id, subjective, objective, assessment, plan], output: SoapNote, side_effects: ["status DRAFT"] }
+  - { method: GET, path: "/patients/{patientId}/appointments/{apptId}/soap-note", description: "List the appointment's SOAP note (reverse-reachability for SoapNote; 0 or 1)", roles: [Provider, FrontDesk, PracticeAdmin, BillingClerk], code: 200, input: ["status?"], output: "SoapNote[]", side_effects: [] }
+  - { method: POST, path: "/patients/{patientId}/appointments/{apptId}/soap-note/sign", description: "Sign the appointment's DRAFT SOAP note", roles: [Provider], code: 200, input: [], output: SoapNote, side_effects: ["status -> SIGNED"] }
+  - { method: POST, path: "/patients/{patientId}/appointments/{apptId}/complete", description: "Complete (attend) an appointment", roles: [Provider], code: 200, input: [], output: Appointment, side_effects: ["attendance_status -> ATTENDED; cap reserved->committed; phase/plan visit counters bump; patient_responsibility computed; CHARGE posted; billing_status POSTED; possible phase/plan bubble-up"] }
+  - { method: POST, path: "/patients/{patientId}/appointments/{apptId}/cancel", description: "Cancel a BOOKED appointment (LATE_CANCEL if inside the window)", roles: [FrontDesk], code: 200, input: [], output: Appointment, side_effects: ["attendance_status -> CANCELLED or LATE_CANCEL; cap released; strike+fee if late"] }
+  - { method: POST, path: "/patients/{patientId}/appointments/{apptId}/no-show", description: "Mark a BOOKED/CHECKED_IN appointment as a no-show", roles: [FrontDesk], code: 200, input: [], output: Appointment, side_effects: ["attendance_status -> NO_SHOW; cap released; strike+fee; possible dismissal cascade"] }
+  - { method: POST, path: "/patients/{patientId}/appointments/{apptId}/adjudicate", description: "Adjudicate insurance for a POSTED+ATTENDED appointment", roles: [BillingClerk], code: 200, input: [], output: Appointment, side_effects: ["billing_status -> ADJUDICATED; INSURANCE_PAYMENT ledger entry; deductible_met_cents increased"] }
+  - { method: POST, path: "/patients/{patientId}/appointments/{apptId}/write-off", description: "Write off a POSTED appointment's patient charge", roles: [BillingClerk], code: 200, input: [], output: Appointment, side_effects: ["billing_status -> WRITTEN_OFF; WRITE_OFF ledger entry reverses the charge"] }
+
+  # ---- Flat top-level read collections (cross-aggregate FK reverse-reachability) ----
+  # Each filtered list resolves every foreign key declared on the entity (cross-aggregate FKs that
+  # the nested sub-resource GETs above cannot reach). All return <Entity>[]; the single-resource GET
+  # gives each entity a canonical top-level collection segment.
+  - { method: GET, path: "/appointments", description: "Cross-aggregate appointment search; filters resolve every Appointment FK (patient_id, provider_id, treatment_room_id, insurance_policy_id, appointment_series_id, plan_phase_id, replaces_appointment_id)", roles: [FrontDesk, Provider, PracticeAdmin, BillingClerk], code: 200, input: ["patient_id?", "provider_id?", "treatment_room_id?", "insurance_policy_id?", "appointment_series_id?", "plan_phase_id?", "replaces_appointment_id?", "attendance_status?", "billing_status?", "limit?", "offset?"], output: "Appointment[]", side_effects: [] }
+  - { method: GET, path: "/appointments/{apptId}", description: "Get an appointment by id (top-level)", roles: [FrontDesk, Provider, PracticeAdmin, BillingClerk], code: 200, input: [], output: Appointment, side_effects: [] }
+  - { method: GET, path: "/appointment-series", description: "Cross-aggregate series search; filters resolve every AppointmentSeries FK (treatment_plan_id, plan_phase_id, provider_id, treatment_room_id)", roles: [FrontDesk, Provider, PracticeAdmin], code: 200, input: ["treatment_plan_id?", "plan_phase_id?", "provider_id?", "treatment_room_id?", "status?", "limit?", "offset?"], output: "AppointmentSeries[]", side_effects: [] }
+  - { method: GET, path: "/appointment-series/{seriesId}", description: "Get an appointment series by id (top-level)", roles: [FrontDesk, Provider, PracticeAdmin], code: 200, input: [], output: AppointmentSeries, side_effects: [] }
+  - { method: GET, path: "/plan-phases", description: "Cross-aggregate phase search; filters resolve PlanPhase.treatment_plan_id", roles: [Provider, FrontDesk, PracticeAdmin], code: 200, input: ["treatment_plan_id?", "status?", "limit?", "offset?"], output: "PlanPhase[]", side_effects: [] }
+  - { method: GET, path: "/plan-phases/{phaseId}", description: "Get a plan phase by id (top-level)", roles: [Provider, FrontDesk, PracticeAdmin], code: 200, input: [], output: PlanPhase, side_effects: [] }
+  - { method: GET, path: "/treatment-plans", description: "Cross-aggregate plan search; filters resolve TreatmentPlan.patient_id and TreatmentPlan.exam_record_id", roles: [Provider, FrontDesk, PracticeAdmin, BillingClerk], code: 200, input: ["patient_id?", "exam_record_id?", "status?", "limit?", "offset?"], output: "TreatmentPlan[]", side_effects: [] }
+  - { method: GET, path: "/treatment-plans/{planId}", description: "Get a treatment plan by id (top-level)", roles: [Provider, FrontDesk, PracticeAdmin, BillingClerk], code: 200, input: [], output: TreatmentPlan, side_effects: [] }
+  - { method: GET, path: "/exams", description: "Cross-aggregate exam search; filters resolve ExamRecord.patient_id and ExamRecord.provider_id", roles: [Provider, FrontDesk, PracticeAdmin], code: 200, input: ["patient_id?", "provider_id?", "status?", "exam_type?", "limit?", "offset?"], output: "ExamRecord[]", side_effects: [] }
+  - { method: GET, path: "/exams/{examId}", description: "Get an exam by id (top-level)", roles: [Provider, FrontDesk, PracticeAdmin], code: 200, input: [], output: ExamRecord, side_effects: [] }
+  - { method: GET, path: "/insurance-policies", description: "Cross-aggregate policy search; filter resolves InsurancePolicy.patient_id", roles: [FrontDesk, BillingClerk, PracticeAdmin, Provider], code: 200, input: ["patient_id?", "status?", "limit?", "offset?"], output: "InsurancePolicy[]", side_effects: [] }
+  - { method: GET, path: "/insurance-policies/{policyId}", description: "Get an insurance policy by id (top-level)", roles: [FrontDesk, BillingClerk, PracticeAdmin, Provider], code: 200, input: [], output: InsurancePolicy, side_effects: [] }
+  - { method: GET, path: "/soap-notes", description: "Cross-aggregate SOAP note search; filters resolve SoapNote.appointment_id and SoapNote.provider_id", roles: [Provider, FrontDesk, PracticeAdmin, BillingClerk], code: 200, input: ["appointment_id?", "provider_id?", "status?", "limit?", "offset?"], output: "SoapNote[]", side_effects: [] }
+  - { method: GET, path: "/soap-notes/{noteId}", description: "Get a SOAP note by id (top-level)", roles: [Provider, FrontDesk, PracticeAdmin, BillingClerk], code: 200, input: [], output: SoapNote, side_effects: [] }
+  - { method: GET, path: "/ledger-entries", description: "Cross-aggregate ledger search; filters resolve LedgerEntry.patient_id and LedgerEntry.appointment_id", roles: [FrontDesk, PracticeAdmin, BillingClerk], code: 200, input: ["patient_id?", "appointment_id?", "entry_type?", "limit?", "offset?"], output: "LedgerEntry[]", side_effects: [] }
+  - { method: GET, path: "/ledger-entries/{entryId}", description: "Get a ledger entry by id (top-level)", roles: [FrontDesk, PracticeAdmin, BillingClerk], code: 200, input: [], output: LedgerEntry, side_effects: [] }
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/invalid X-User-Role or X-User-ID header" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Acting role not permitted for the operation per §1.7" }
+  - { id: ERR_PATIENT_NOT_FOUND, http: 404, condition: "Path patientId does not resolve" }
+  - { id: ERR_RESOURCE_NOT_FOUND, http: 404, condition: "A leaf path resource (appointment/exam/plan/phase/series/soap-note/provider/room) does not resolve" }
+  - { id: ERR_REFERENCE_NOT_FOUND, http: 404, condition: "A body FK (provider/room/fee/policy/wellness_plan/exam/phase) does not resolve" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, bad type, or enum value outside declared domain" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Requested transition not defined from the resource's current state" }
+  - { id: ERR_STALE_PATIENT_VERSION, http: 412, condition: "expected_patient_version != Patient.version on plan activation (OCC)" }
+  - { id: ERR_PATIENT_DISMISSED, http: 409, condition: "Operation attempted on a DISMISSED patient" }
+  - { id: ERR_PAYER_MODE_MISMATCH, http: 422, condition: "WELLNESS without wellness_plan_id, or CASH/INSURANCE with wellness_plan_id" }
+  - { id: ERR_RESOURCE_UNAVAILABLE, http: 409, condition: "Assigned provider SUSPENDED or assigned room CLOSED" }
+  - { id: ERR_ROOM_TYPE_MISMATCH, http: 422, condition: "X_RAY visit booked into a non-IMAGING room" }
+  - { id: ERR_PROVIDER_DOUBLE_BOOKED, http: 409, condition: "New appointment interval intersects an existing BOOKED/CHECKED_IN appointment for the same provider (half-open overlap)" }
+  - { id: ERR_ROOM_BUFFER_CONFLICT, http: 409, condition: "New appointment starts before prior room appointment end + room.turnover_buffer_minutes" }
+  - { id: ERR_POLICY_REQUIRED, http: 422, condition: "INSURANCE patient booking without an ACTIVE owned insurance_policy_id" }
+  - { id: ERR_VISIT_CAP_EXCEEDED, http: 409, condition: "Reserving the booking would push visits_reserved+visits_committed past annual_visit_cap" }
+  - { id: ERR_SOAP_NOTE_REQUIRED, http: 409, condition: "Completion attempted without a SIGNED SoapNote" }
+  - { id: ERR_ACTIVE_PLAN_EXISTS, http: 409, condition: "Activating a plan while the patient already has an ACTIVE plan" }
+  - { id: ERR_PLAN_NOT_READY, http: 409, condition: "Plan references a non-FINALIZED exam, or activation attempted with zero phases" }
+  - { id: ERR_SOAP_PROVIDER_MISMATCH, http: 422, condition: "SoapNote provider_id differs from the appointment's provider_id" }
+  - { id: ERR_REGRESSION_NOT_ALLOWED, http: 409, condition: "Regression requested without a FINALIZED RE_EXAM at/above severity threshold, or no CORRECTIVE phase IN_PROGRESS" }
+  - { id: ERR_VALIDATION, http: 422, condition: "Generic semantic validation failure (e.g., negative amount_cents, weekday_pattern empty, sequence_index collision within a plan)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Provider
+    description: "Licensed chiropractor: authors exams, SOAP notes, treatment plans, and clinical state transitions"
+    identity: "entity_backed:Provider"
+    exclusive_operations:
+      - "Create/finalize ExamRecord"
+      - "Propose/activate/discontinue/regress TreatmentPlan and add PlanPhases"
+      - "Create/sign SoapNote"
+      - "Complete an appointment"
+    shared_operations:
+      - "Book an appointment (with FrontDesk)"
+      - "Generate an appointment series (with FrontDesk)"
+      - "Read patients, appointments, plans, providers, rooms"
+
+  - name: FrontDesk
+    description: "Reception: scheduling, check-in, cancel/no-show, patient registration, payments"
+    identity: "opaque"
+    exclusive_operations:
+      - "Register a patient"
+      - "Check in / cancel / mark no-show an appointment"
+    shared_operations:
+      - "Book an appointment (with Provider)"
+      - "Generate an appointment series (with Provider)"
+      - "Post a patient payment (with BillingClerk)"
+      - "Add an insurance policy (with BillingClerk/PracticeAdmin)"
+      - "Read patients, appointments, plans, providers, rooms"
+
+  - name: BillingClerk
+    description: "Billing: insurance adjudication, write-offs, payments, ledger"
+    identity: "opaque"
+    exclusive_operations:
+      - "Adjudicate an appointment"
+      - "Write off an appointment charge"
+    shared_operations:
+      - "Post a patient payment (with FrontDesk)"
+      - "Add an insurance policy (with FrontDesk/PracticeAdmin)"
+      - "Read patients, appointments, plans, ledger entries"
+
+  - name: PracticeAdmin
+    description: "Operational administrator: configures providers/rooms/fees/wellness plans, sets the clock, override discontinue"
+    identity: "opaque"
+    exclusive_operations:
+      - "Create providers, rooms, fee schedules, wellness plans"
+      - "Suspend a provider"
+      - "Set the practice clock"
+    shared_operations:
+      - "Register a patient (with FrontDesk)"
+      - "Discontinue a plan (with Provider)"
+      - "Add an insurance policy"
+      - "Read all resources"

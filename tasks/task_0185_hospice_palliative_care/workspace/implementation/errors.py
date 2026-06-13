@@ -1,0 +1,35 @@
+"""Error classes and error-id constants (PRD §5 / scaffold §1.6)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Error catalogue: (error_id, http_status)
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_FORBIDDEN_ROLE = ("ERR_FORBIDDEN_ROLE", 403)
+ERR_RESOURCE_NOT_FOUND = ("ERR_RESOURCE_NOT_FOUND", 404)
+ERR_ELECTION_NOT_ELECTED = ("ERR_ELECTION_NOT_ELECTED", 409)
+ERR_CAP_YEAR_SETTLED = ("ERR_CAP_YEAR_SETTLED", 409)
+ERR_PERIOD_SEQUENCE_MISMATCH = ("ERR_PERIOD_SEQUENCE_MISMATCH", 409)
+ERR_FACE_TO_FACE_REQUIRED = ("ERR_FACE_TO_FACE_REQUIRED", 422)
+ERR_CERTIFICATION_INCOMPLETE = ("ERR_CERTIFICATION_INCOMPLETE", 422)
+ERR_IDG_INCOMPLETE = ("ERR_IDG_INCOMPLETE", 422)
+ERR_ITEM_NOT_COVERED = ("ERR_ITEM_NOT_COVERED", 422)
+ERR_PLAN_NOT_ACTIVE = ("ERR_PLAN_NOT_ACTIVE", 409)
+ERR_SERVICE_DATE_OUT_OF_RANGE = ("ERR_SERVICE_DATE_OUT_OF_RANGE", 422)
+ERR_RESPITE_LIMIT_EXCEEDED = ("ERR_RESPITE_LIMIT_EXCEEDED", 422)
+ERR_INTENSITY_FLAG_MISMATCH = ("ERR_INTENSITY_FLAG_MISMATCH", 422)
+ERR_DUPLICATE_CARE_DAY = ("ERR_DUPLICATE_CARE_DAY", 409)
+ERR_BEREAVEMENT_NOT_ELIGIBLE = ("ERR_BEREAVEMENT_NOT_ELIGIBLE", 409)
+ERR_STALE_ELECTION_VERSION = ("ERR_STALE_ELECTION_VERSION", 412)
+ERR_INVALID_REQUEST = ("ERR_INVALID_REQUEST", 400)
+
+
+def err(spec, message=None):
+    """Build an ApiError from a (error_id, http_status) spec tuple."""
+    return ApiError(spec[0], spec[1], message)

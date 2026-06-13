@@ -1,0 +1,1380 @@
+# =============================================================================
+# PRD Benchmark Seed Tables — Food Bank & Pantry Distribution
+# Difficulty band: EXPERT (§0.4)
+# =============================================================================
+
+scenario: "Food Bank & Pantry Distribution: donation/rescue intake, TEFAP/purchased inventory, FEFO expiration, agency order/fair allocation, client household eligibility, distribution event, poundage reporting, cold storage"
+
+domain_name: food-bank-pantry-distribution
+api_prefix: /
+
+# -----------------------------------------------------------------------------
+# Complexity profile (§0.1–§0.3)
+# -----------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: quota_allocation
+  secondary_archetype: ledger_reconciliation
+  complexity_layers:
+    - optimistic_concurrency        # OCC on InventoryLot.version for order line reservation
+    - cascading_side_effects        # order approve -> line reserve -> lot debit -> event pack -> poundage post
+    - dual_variant_calculation      # planned (forward-looking) vs distributed (chronological) poundage
+    - rate_threshold_triggers       # fair-share cap, TEFAP income eligibility threshold, cold-storage capacity
+
+  entity_topology: flat
+  # Peer entities linked by FK references; no nested-ownership URL paths.
+  # InventoryLot, Agency, AgencyOrder, OrderLine, ClientHousehold,
+  # DistributionEvent, ColdStorageUnit, PoundageReport are peers.
+
+  state_machine_shape: branching
+  # AgencyOrder: SUBMITTED -> {APPROVED, REJECTED}; APPROVED -> FULFILLED | CANCELLED
+  # with revert (APPROVED -> SUBMITTED on recall). InventoryLot has a parallel
+  # disposition lifecycle. DistributionEvent fork-join with poundage reconciliation.
+
+  relationship_patterns:
+    - one_to_many          # AgencyOrder has many OrderLine; ColdStorageUnit holds many InventoryLot
+    - many_to_many         # OrderLine reserves against InventoryLot (allocation junction via reservations)
+    - cross_aggregate      # DistributionEvent references AgencyOrder + ClientHousehold across aggregates
+
+  role_model: peer_roles
+  # FoodBankOperator (warehouse), AllocationManager (approves orders / sets fair-share),
+  # AgencyCoordinator (entity-backed Agency; submits orders, runs distribution events),
+  # ComplianceAuditor (read + TEFAP eligibility certification).
+
+  consistency_model: immediate
+
+# -----------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — verbatim)
+# -----------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+
+  - name: ColdStorageUnit
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Human-readable unit label (e.g., 'Freezer A')."
+      - name: temp_zone
+        type: enum
+        source: input
+        description: "Temperature zone this unit provides."
+        constraints: "one of {DRY, REFRIGERATED, FROZEN}"
+      - name: capacity_lbs
+        type: number
+        source: input
+        description: "Maximum poundage this unit can hold."
+        constraints: "> 0"
+      - name: stored_lbs
+        type: number
+        source: computed
+        description: "Sum of remaining_lbs over InventoryLots whose cold_storage_unit_id == this.id and disposition IN {AVAILABLE, RESERVED}. Recomputed on every lot intake, reservation, debit, expiry, and disposal."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Capacity posture: AVAILABLE when stored_lbs < capacity_lbs, FULL when stored_lbs == capacity_lbs."
+        constraints: "one of {AVAILABLE, FULL}"
+        default: AVAILABLE
+
+  - name: InventoryLot
+    parent: null
+    common_fields: true
+    fields:
+      - name: cold_storage_unit_id
+        type: string
+        source: input
+        description: "FK -> ColdStorageUnit.id; the storage unit that physically holds this lot."
+      - name: food_category
+        type: enum
+        source: input
+        description: "Coarse food group, used for cold-chain matching and event packing."
+        constraints: "one of {PRODUCE, DAIRY, FROZEN_MEAT, DRY_GOODS, BAKERY}"
+      - name: required_temp_zone
+        type: enum
+        source: computed
+        description: "Cold-chain zone the food_category requires: PRODUCE/DAIRY->REFRIGERATED, FROZEN_MEAT->FROZEN, DRY_GOODS/BAKERY->DRY. Must equal the holding unit's temp_zone at intake."
+        constraints: "one of {DRY, REFRIGERATED, FROZEN}"
+      - name: source_type
+        type: enum
+        source: input
+        description: "Provenance / funding stream of the lot."
+        constraints: "one of {DONATION, RESCUE, TEFAP, PURCHASED}"
+      - name: intake_lbs
+        type: number
+        source: input
+        description: "Poundage received at intake."
+        constraints: "> 0"
+      - name: remaining_lbs
+        type: number
+        source: computed
+        description: "intake_lbs minus the sum of reserved_lbs over all OrderLine rows reserving this lot whose line_status IN {RESERVED, SHORT, PACKED} on a non-FINALIZED event, minus poundage permanently consumed by FINALIZED events, minus disposed poundage. Floor 0."
+        default: 0
+      - name: expiration_date
+        type: datetime
+        source: input
+        description: "Date after which the lot is expired (ISO 8601 UTC). Drives FEFO ordering and the EXPIRED transition."
+      - name: unit_cost_cents
+        type: integer
+        source: input
+        description: "Per-pound acquisition cost in cents. DONATION and RESCUE lots are 0; PURCHASED and TEFAP carry a positive value."
+        default: 0
+        constraints: ">= 0"
+      - name: disposition
+        type: enum
+        source: computed
+        description: "Lot lifecycle state (see §1.2)."
+        constraints: "one of {AVAILABLE, RESERVED, DEPLETED, EXPIRED, DISPOSED}"
+        default: AVAILABLE
+
+  - name: Agency
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Partner agency / pantry name."
+      - name: service_area
+        type: string
+        source: input
+        description: "County or ZIP cluster the agency serves."
+      - name: fair_share_weight
+        type: integer
+        source: input
+        description: "Relative fair-share weight used to compute this agency's poundage cap per allocation cycle (higher = larger share)."
+        default: 1
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: input
+        description: "Agency standing; suspended agencies cannot submit orders."
+        constraints: "one of {ACTIVE, SUSPENDED}"
+        default: ACTIVE
+      - name: lifetime_distributed_lbs
+        type: number
+        source: computed
+        description: "Running sum of poundage actually distributed (DistributionEvent.actual_distributed_lbs) across all FINALIZED events for this agency."
+        default: 0
+
+  - name: AllocationCycle
+    parent: null
+    common_fields: true
+    fields:
+      - name: label
+        type: string
+        source: input
+        description: "Cycle identifier (e.g., '2026-W23')."
+      - name: total_pool_lbs
+        type: number
+        source: input
+        description: "Total poundage made available for fair allocation this cycle."
+        constraints: "> 0"
+      - name: total_fair_share_weight
+        type: integer
+        source: computed
+        description: "Sum of fair_share_weight over all Agencies with status == ACTIVE at the moment this cycle is OPENED. Frozen at open."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Cycle lifecycle (see §1.2)."
+        constraints: "one of {DRAFT, OPEN, CLOSED}"
+        default: DRAFT
+
+  - name: AgencyOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: agency_id
+        type: string
+        source: input
+        description: "FK -> Agency.id; the ordering agency."
+      - name: allocation_cycle_id
+        type: string
+        source: input
+        description: "FK -> AllocationCycle.id; the cycle this order draws from."
+      - name: requested_lbs
+        type: number
+        source: computed
+        description: "Sum of OrderLine.requested_lbs across this order's lines."
+        default: 0
+      - name: approved_lbs
+        type: number
+        source: computed
+        description: "Sum of OrderLine.reserved_lbs across this order's lines after approval (FEFO reservation outcome)."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Order lifecycle (see §1.2)."
+        constraints: "one of {SUBMITTED, APPROVED, REJECTED, FULFILLED, CANCELLED}"
+        default: SUBMITTED
+
+  - name: OrderLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: agency_order_id
+        type: string
+        source: input
+        description: "FK -> AgencyOrder.id; the parent order."
+      - name: food_category
+        type: enum
+        source: input
+        description: "Food category requested on this line."
+        constraints: "one of {PRODUCE, DAIRY, FROZEN_MEAT, DRY_GOODS, BAKERY}"
+      - name: requested_lbs
+        type: number
+        source: input
+        description: "Poundage requested for this category."
+        constraints: "> 0"
+      - name: reserved_lbs
+        type: number
+        source: computed
+        description: "Poundage actually reserved against InventoryLots by the FEFO reservation run at order approval. May be less than requested_lbs on short supply."
+        default: 0
+      - name: reserved_lot_id
+        type: string
+        source: computed
+        description: "FK -> InventoryLot.id; the single FEFO-earliest lot this line reserved against (the lot consumed first). Null until approval."
+        default: null
+      - name: line_status
+        type: enum
+        source: computed
+        description: "RESERVED once approval reserves poundage; PACKED once the distribution event picks it; SHORT when reserved_lbs < requested_lbs."
+        constraints: "one of {PENDING, RESERVED, SHORT, PACKED}"
+        default: PENDING
+
+  - name: ClientHousehold
+    parent: null
+    common_fields: true
+    fields:
+      - name: agency_id
+        type: string
+        source: input
+        description: "FK -> Agency.id; the agency that registered this household."
+      - name: household_size
+        type: integer
+        source: input
+        description: "Number of persons in the household."
+        constraints: ">= 1"
+      - name: monthly_income_cents
+        type: integer
+        source: input
+        description: "Self-reported monthly household income in cents."
+        constraints: ">= 0"
+      - name: tefap_eligible
+        type: boolean
+        source: computed
+        description: "True when monthly_income_cents <= the TEFAP income threshold for household_size (see calc tefap_income_eligibility). Certifies the household for TEFAP-sourced food."
+        default: false
+      - name: certification_status
+        type: enum
+        source: computed
+        description: "Eligibility certification lifecycle (see §1.2)."
+        constraints: "one of {PENDING, CERTIFIED, DENIED, EXPIRED}"
+        default: PENDING
+
+  - name: DistributionEvent
+    parent: null
+    common_fields: true
+    fields:
+      - name: agency_order_id
+        type: string
+        source: input
+        description: "FK -> AgencyOrder.id; the approved order whose reserved lines are packed and handed out at this event."
+      - name: client_household_id
+        type: string
+        source: input
+        description: "FK -> ClientHousehold.id; the receiving household."
+      - name: planned_lbs
+        type: number
+        source: computed
+        description: "Forward-looking poundage to hand out: sum of reserved_lbs over the order's RESERVED lines at event packing (see calc planned_event_poundage)."
+        default: 0
+      - name: actual_distributed_lbs
+        type: number
+        source: input
+        description: "Operator-recorded poundage actually handed to the household at finalization."
+        default: 0
+        constraints: ">= 0"
+      - name: tefap_lbs
+        type: number
+        source: computed
+        description: "Portion of actual_distributed_lbs sourced from TEFAP lots, used for the TEFAP poundage report."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Event lifecycle (see §1.2)."
+        constraints: "one of {PLANNED, PACKED, FINALIZED, VOIDED}"
+        default: PLANNED
+
+  - name: PoundageReport
+    parent: null
+    common_fields: false
+    fields:
+      - name: allocation_cycle_id
+        type: string
+        source: input
+        description: "FK -> AllocationCycle.id; the cycle this snapshot summarizes."
+      - name: total_planned_lbs
+        type: number
+        source: computed
+        description: "Forward-looking poundage: sum of planned_lbs over all PACKED+FINALIZED DistributionEvents whose order draws from this cycle."
+        default: 0
+      - name: total_distributed_lbs
+        type: number
+        source: computed
+        description: "Chronological poundage: sum of actual_distributed_lbs over all FINALIZED DistributionEvents in this cycle, in event finalization order."
+        default: 0
+      - name: total_tefap_lbs
+        type: number
+        source: computed
+        description: "Sum of tefap_lbs over all FINALIZED DistributionEvents in this cycle."
+        default: 0
+      - name: shrinkage_lbs
+        type: number
+        source: computed
+        description: "total_planned_lbs minus total_distributed_lbs; the planned-vs-actual divergence (may be negative if over-distributed)."
+        default: 0
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+
+  # ---------------------------------------------------------------------------
+  - entity: InventoryLot
+    initial_state: AVAILABLE
+    terminal_states: [DISPOSED]
+    transitions:
+      - from: AVAILABLE
+        to: RESERVED
+        trigger: "System: order approval FEFO run reserves poundage against this lot (POST /agency-orders/{id}/approve)"
+        actor: system
+        preconditions:
+          - "lot.disposition == AVAILABLE"
+          - "lot.expiration_date > current_utc (not expired)"
+          - "lot.remaining_lbs > 0"
+        side_effects:
+          - "creates/updates the OrderLine.reserved_lot_id pointer and increases its reserved_lbs"
+          - "decreases InventoryLot.remaining_lbs by the reserved amount"
+          - "increments InventoryLot.version by 1"
+          - "if remaining_lbs reaches 0, lot transitions AVAILABLE -> DEPLETED instead of RESERVED"
+        note: "FEFO: lots are consumed in ascending (expiration_date, created_at) order; created_at breaks ties."
+      - from: AVAILABLE
+        to: DEPLETED
+        trigger: "System: reservation consumes the lot's last remaining pound (POST /agency-orders/{id}/approve)"
+        actor: system
+        preconditions:
+          - "lot.remaining_lbs reaches 0 after this reservation"
+        side_effects:
+          - "decreases InventoryLot.remaining_lbs to 0"
+          - "recomputes ColdStorageUnit.stored_lbs for the holding unit"
+          - "increments InventoryLot.version by 1"
+      - from: RESERVED
+        to: AVAILABLE
+        trigger: "System: order cancellation / recall releases the line's reservation (POST /agency-orders/{id}/cancel, POST /agency-orders/{id}/recall)"
+        actor: system
+        preconditions:
+          - "lot.disposition == RESERVED"
+        side_effects:
+          - "increases InventoryLot.remaining_lbs by the released reserved_lbs"
+          - "recomputes ColdStorageUnit.stored_lbs for the holding unit"
+          - "increments InventoryLot.version by 1"
+        note: "Compensating action: poundage released equals poundage reserved (conserved-quantity invariant lot_poundage_conservation)."
+      - from: RESERVED
+        to: DEPLETED
+        trigger: "System: distribution event finalization consumes the reserved poundage (POST /distribution-events/{id}/finalize)"
+        actor: system
+        preconditions:
+          - "lot.disposition == RESERVED"
+          - "the reserving OrderLine is PACKED on a FINALIZED event"
+        side_effects:
+          - "marks the reserved poundage as permanently consumed"
+          - "increments InventoryLot.version by 1"
+      - from: AVAILABLE
+        to: EXPIRED
+        trigger: "System: shelf-life sweep at clock advance past expiration_date (POST /_clock/set_current_utc)"
+        actor: system
+        preconditions:
+          - "lot.disposition == AVAILABLE"
+          - "lot.expiration_date <= current_utc"
+        side_effects:
+          - "recomputes ColdStorageUnit.stored_lbs (expired lots leave the cold-storage occupancy)"
+          - "increments InventoryLot.version by 1"
+        note: "Only AVAILABLE lots expire; RESERVED lots are protected until released or distributed."
+      - from: EXPIRED
+        to: DISPOSED
+        trigger: "POST /inventory-lots/{id}/dispose"
+        actor: FoodBankOperator
+        preconditions:
+          - "lot.disposition == EXPIRED"
+        side_effects:
+          - "sets remaining_lbs to 0"
+          - "increments InventoryLot.version by 1"
+      - from: AVAILABLE
+        to: DISPOSED
+        trigger: "POST /inventory-lots/{id}/dispose"
+        actor: FoodBankOperator
+        preconditions:
+          - "lot.disposition == AVAILABLE"
+        side_effects:
+          - "sets remaining_lbs to 0"
+          - "recomputes ColdStorageUnit.stored_lbs"
+          - "increments InventoryLot.version by 1"
+        note: "Manual disposal of unexpired but spoiled/recalled stock."
+
+  # ---------------------------------------------------------------------------
+  - entity: AllocationCycle
+    initial_state: DRAFT
+    terminal_states: [CLOSED]
+    transitions:
+      - from: DRAFT
+        to: OPEN
+        trigger: "POST /allocation-cycles/{id}/open"
+        actor: AllocationManager
+        preconditions:
+          - "cycle.status == DRAFT"
+          - "at least one Agency has status == ACTIVE"
+        side_effects:
+          - "freezes total_fair_share_weight = sum of fair_share_weight over ACTIVE agencies"
+          - "increments AllocationCycle.version by 1"
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /allocation-cycles/{id}/close"
+        actor: AllocationManager
+        preconditions:
+          - "cycle.status == OPEN"
+          - "no AgencyOrder in this cycle is in status SUBMITTED or APPROVED (all resolved to FULFILLED/REJECTED/CANCELLED)"
+        side_effects:
+          - "increments AllocationCycle.version by 1"
+        note: "Cross-entity guard: cycle close depends on the state of its child orders."
+
+  # ---------------------------------------------------------------------------
+  - entity: AgencyOrder
+    initial_state: SUBMITTED
+    terminal_states: [REJECTED, FULFILLED, CANCELLED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /agency-orders/{id}/approve"
+        actor: AllocationManager
+        preconditions:
+          - "order.status == SUBMITTED"
+          - "the order's AllocationCycle.status == OPEN"
+          - "the ordering Agency.status == ACTIVE"
+          - "order.requested_lbs <= agency fair-share cap remaining this cycle (see calc fair_share_cap)"
+        side_effects:
+          - "runs FEFO reservation per OrderLine: reserves against AVAILABLE lots in ascending (expiration_date, created_at) order, matching food_category"
+          - "sets each OrderLine.reserved_lbs, reserved_lot_id, line_status (RESERVED or SHORT)"
+          - "transitions reserved InventoryLots AVAILABLE -> RESERVED (or DEPLETED if drained)"
+          - "sets order.approved_lbs = sum of line reserved_lbs"
+          - "increments AgencyOrder.version by 1"
+        note: "Branch point: approve vs reject. FEFO reservation cascade originates here."
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /agency-orders/{id}/reject"
+        actor: AllocationManager
+        preconditions:
+          - "order.status == SUBMITTED"
+        side_effects:
+          - "increments AgencyOrder.version by 1"
+        note: "No reservation occurs; no inventory touched."
+      - from: APPROVED
+        to: SUBMITTED
+        trigger: "POST /agency-orders/{id}/recall"
+        actor: AllocationManager
+        preconditions:
+          - "order.status == APPROVED"
+          - "no DistributionEvent for this order is in PACKED or FINALIZED"
+        side_effects:
+          - "releases all line reservations: reserved InventoryLots RESERVED -> AVAILABLE, remaining_lbs restored"
+          - "resets OrderLine.reserved_lbs to 0, reserved_lot_id to null, line_status to PENDING"
+          - "resets order.approved_lbs to 0"
+          - "increments AgencyOrder.version by 1"
+        note: "Revision loop (cyclic): an approved order can return to SUBMITTED for re-approval. Compensating action — conserves lot poundage."
+      - from: APPROVED
+        to: FULFILLED
+        trigger: "System: a DistributionEvent for this order is FINALIZED (POST /distribution-events/{id}/finalize)"
+        actor: system
+        preconditions:
+          - "order.status == APPROVED"
+          - "at least one DistributionEvent for this order reached FINALIZED"
+        side_effects:
+          - "increments AgencyOrder.version by 1"
+      - from: APPROVED
+        to: CANCELLED
+        trigger: "POST /agency-orders/{id}/cancel"
+        actor: AgencyCoordinator
+        preconditions:
+          - "order.status == APPROVED"
+          - "no DistributionEvent for this order is in PACKED or FINALIZED"
+        side_effects:
+          - "releases all line reservations: reserved InventoryLots RESERVED -> AVAILABLE, remaining_lbs restored"
+          - "resets OrderLine.reserved_lbs to 0, reserved_lot_id to null, line_status to PENDING"
+          - "increments AgencyOrder.version by 1"
+        note: "Compensating action — conserves lot poundage (lot_poundage_conservation)."
+      - from: SUBMITTED
+        to: CANCELLED
+        trigger: "POST /agency-orders/{id}/cancel"
+        actor: AgencyCoordinator
+        preconditions:
+          - "order.status == SUBMITTED"
+        side_effects:
+          - "increments AgencyOrder.version by 1"
+        note: "No reservation to release."
+
+  # ---------------------------------------------------------------------------
+  - entity: ClientHousehold
+    initial_state: PENDING
+    terminal_states: [DENIED, EXPIRED]
+    transitions:
+      - from: PENDING
+        to: CERTIFIED
+        trigger: "POST /client-households/{id}/certify"
+        actor: ComplianceAuditor
+        preconditions:
+          - "household.certification_status == PENDING"
+          - "household.tefap_eligible == true (monthly_income_cents within threshold for household_size)"
+        side_effects:
+          - "increments ClientHousehold.version by 1"
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /client-households/{id}/certify"
+        actor: ComplianceAuditor
+        preconditions:
+          - "household.certification_status == PENDING"
+          - "household.tefap_eligible == false"
+        side_effects:
+          - "increments ClientHousehold.version by 1"
+        note: "Same trigger branches on tefap_eligible — CERTIFIED vs DENIED."
+      - from: CERTIFIED
+        to: EXPIRED
+        trigger: "System: certification ages out 365 days after certified (POST /_clock/set_current_utc)"
+        actor: system
+        preconditions:
+          - "household.certification_status == CERTIFIED"
+          - "current_utc >= certified_at + 365 days"
+        side_effects:
+          - "increments ClientHousehold.version by 1"
+        note: "Expired certification blocks new TEFAP distribution events for the household."
+
+  # ---------------------------------------------------------------------------
+  - entity: DistributionEvent
+    initial_state: PLANNED
+    terminal_states: [FINALIZED, VOIDED]
+    transitions:
+      - from: PLANNED
+        to: PACKED
+        trigger: "POST /distribution-events/{id}/pack"
+        actor: AgencyCoordinator
+        preconditions:
+          - "event.status == PLANNED"
+          - "the linked AgencyOrder.status == APPROVED"
+          - "the linked ClientHousehold.certification_status == CERTIFIED"
+          - "every TEFAP-sourced reserved line is covered only if household.tefap_eligible == true"
+        side_effects:
+          - "sets planned_lbs = sum of reserved_lbs over the order's RESERVED lines (calc planned_event_poundage)"
+          - "marks the order's RESERVED OrderLines line_status PACKED"
+          - "increments DistributionEvent.version by 1"
+        note: "Cross-entity precondition: event packing gated on AgencyOrder AND ClientHousehold state."
+      - from: PACKED
+        to: FINALIZED
+        trigger: "POST /distribution-events/{id}/finalize"
+        actor: AgencyCoordinator
+        preconditions:
+          - "event.status == PACKED"
+          - "actual_distributed_lbs >= 0"
+          - "actual_distributed_lbs <= planned_lbs (cannot hand out more than packed)"
+        side_effects:
+          - "computes tefap_lbs (calc event_tefap_split)"
+          - "reserved InventoryLots for the order's PACKED lines transition RESERVED -> DEPLETED"
+          - "the linked AgencyOrder transitions APPROVED -> FULFILLED"
+          - "increments Agency.lifetime_distributed_lbs by actual_distributed_lbs"
+          - "increments DistributionEvent.version by 1"
+        note: "Cascade origin: finalize -> lot deplete -> order fulfill -> agency ledger -> cycle poundage."
+      - from: PLANNED
+        to: VOIDED
+        trigger: "POST /distribution-events/{id}/void"
+        actor: AgencyCoordinator
+        preconditions:
+          - "event.status == PLANNED"
+        side_effects:
+          - "increments DistributionEvent.version by 1"
+        note: "No poundage moved; order lines remain RESERVED."
+      - from: PACKED
+        to: VOIDED
+        trigger: "POST /distribution-events/{id}/void"
+        actor: AgencyCoordinator
+        preconditions:
+          - "event.status == PACKED"
+        side_effects:
+          - "reverts the order's PACKED lines back to line_status RESERVED"
+          - "resets planned_lbs to 0"
+          - "increments DistributionEvent.version by 1"
+        note: "Compensating action — reverts packing without consuming poundage (event_packing_conservation)."
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: order-approve-stale-lot
+    parent_entity: InventoryLot
+    write_endpoint: "POST /agency-orders/{id}/approve"
+    occ_field: "expected_lot_version"
+    description: |
+      Approving an AgencyOrder pins the FEFO-earliest InventoryLot the
+      AllocationManager last observed via expected_lot_version. If that lot's
+      version has advanced since (another order's approval already reserved
+      against it, legitimately superseding the observed remaining_lbs), the
+      approval is rejected as stale. This is a true CREATE-with-supersede race:
+      a second sequential approve carrying the original version sees a lot whose
+      reservation balance has been validly changed by the intervening approval.
+    error_id: ERR_STALE_LOT_VERSION
+    http_status: 412
+
+  - rule_id: dispose-stale-lot
+    parent_entity: InventoryLot
+    write_endpoint: "POST /inventory-lots/{id}/dispose"
+    occ_field: "expected_lot_version"
+    description: |
+      Disposing an InventoryLot requires the expected_lot_version the operator
+      last read. If a clock-advance shelf-life sweep has since transitioned the
+      lot AVAILABLE -> EXPIRED (bumping its version), the dispose carrying the
+      stale version is rejected, forcing the operator to re-read the lot and
+      observe its current disposition before disposing.
+    error_id: ERR_STALE_LOT_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+
+  - name: fair_share_cap
+    trigger: "Evaluated during AgencyOrder approval (POST /agency-orders/{id}/approve) to bound how much the agency may draw this cycle."
+    algorithm: threshold
+    formula: |
+      cap_lbs = floor( cycle.total_pool_lbs
+                       * (agency.fair_share_weight / cycle.total_fair_share_weight) )
+      already_drawn = sum of approved_lbs over the agency's AgencyOrders in this cycle
+                      whose status IN {APPROVED, FULFILLED}
+      remaining_cap = cap_lbs - already_drawn
+      APPROVE allowed iff order.requested_lbs <= remaining_cap
+    input_set: "Agencies counted in total_fair_share_weight are those ACTIVE at cycle open (frozen). already_drawn counts only APPROVED/FULFILLED orders; SUBMITTED/REJECTED/CANCELLED excluded."
+    constants:
+      ROUNDING: floor
+    precision: "integer pounds, floor"
+    variants: []
+
+  - name: tefap_income_eligibility
+    trigger: "Recomputed whenever a ClientHousehold is created or its household_size / monthly_income_cents is updated; read at certification."
+    algorithm: threshold
+    formula: |
+      threshold_cents = TEFAP_BASE_CENTS + (household_size - 1) * TEFAP_PER_PERSON_CENTS
+      tefap_eligible = (monthly_income_cents <= threshold_cents)
+    input_set: "Single household; no cross-entity inputs."
+    constants:
+      TEFAP_BASE_CENTS: 199800        # 1-person monthly income ceiling, cents
+      TEFAP_PER_PERSON_CENTS: 70500   # added ceiling per additional household member, cents
+    precision: "integer cents; comparison is <= (a household exactly at threshold IS eligible)"
+    variants: []
+
+  - name: planned_event_poundage
+    trigger: "Computed at distribution event packing (POST /distribution-events/{id}/pack)."
+    algorithm: forward_looking
+    formula: |
+      planned_lbs = sum of OrderLine.reserved_lbs
+                    over the linked AgencyOrder's lines whose line_status == RESERVED
+    input_set: "Forward-looking: includes the order's currently-RESERVED lines (projected hand-out), excludes SHORT lines whose reserved_lbs is 0 and any already-PACKED lines."
+    constants: {}
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: provisional_at_pack
+        when: "at PACK time"
+        difference: "uses reserved_lbs (what the FEFO run secured), NOT requested_lbs — short lines contribute only their reserved amount."
+
+  - name: distributed_poundage_ledger
+    trigger: "Computed at PoundageReport generation (GET /poundage-reports/{cycle_id}) and on each event finalize."
+    algorithm: chronological
+    formula: |
+      Process FINALIZED DistributionEvents of the cycle in ascending
+      (finalized_at, created_at) order, accumulating a running total:
+        total_distributed_lbs = sum of actual_distributed_lbs over FINALIZED events
+        total_planned_lbs    = sum of planned_lbs over PACKED+FINALIZED events
+        shrinkage_lbs        = total_planned_lbs - total_distributed_lbs
+    input_set: "total_distributed_lbs includes ONLY FINALIZED events (chronological by finalized_at). total_planned_lbs includes PACKED and FINALIZED events (forward-looking). VOIDED events excluded from both."
+    constants: {}
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: planned_forward_looking
+        when: "for total_planned_lbs"
+        difference: "projects every PACKED-or-FINALIZED event's planned_lbs — includes packed-but-not-yet-finalized events."
+      - name: distributed_chronological
+        when: "for total_distributed_lbs"
+        difference: "counts ONLY FINALIZED events in finalization order; a packed-but-unfinalized event contributes 0. Same underlying events, divergent totals — shrinkage_lbs is the gap."
+
+  - name: event_tefap_split
+    trigger: "Computed at distribution event finalize (POST /distribution-events/{id}/finalize)."
+    algorithm: waterfall_allocation
+    formula: |
+      Attribute actual_distributed_lbs across the order's PACKED lines in ascending
+      (reserved_lot.expiration_date, reserved_lot.created_at) order (FEFO).
+      For each line in order, allocate min(remaining_to_attribute, line.reserved_lbs)
+      to that line; if the line's reserved_lot.source_type == TEFAP, add the
+      allocated amount to tefap_lbs. Stop when remaining_to_attribute reaches 0.
+        tefap_lbs = sum of amounts allocated to TEFAP-sourced lines
+    input_set: "Only the order's PACKED lines, walked in FEFO order of their reserved lots. Non-TEFAP lines consume the waterfall but add 0 to tefap_lbs."
+    constants: {}
+    precision: "2 decimal places, round_half_up; allocate per-line then sum (round each line's allocation, then total)"
+    variants:
+      - name: fefo_waterfall
+        when: "always"
+        difference: "rounding order is pinned: round each line allocation to 2dp, THEN sum — not sum-then-round."
+
+  - name: cold_storage_occupancy
+    trigger: "Recomputed on every InventoryLot intake, reservation, debit, expiry, and disposal that touches a unit."
+    algorithm: aggregation
+    formula: |
+      stored_lbs = sum of InventoryLot.remaining_lbs
+                   over lots where cold_storage_unit_id == unit.id
+                   AND disposition IN {AVAILABLE, RESERVED}
+      status = FULL if stored_lbs == capacity_lbs else AVAILABLE
+    input_set: "Lots in {AVAILABLE, RESERVED} only; DEPLETED/EXPIRED/DISPOSED lots leave occupancy."
+    constants: {}
+    precision: "2 decimal places, round_half_up"
+    variants: []
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "the acting role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: "for AgencyCoordinator-scoped operations, X-User-ID equals the Agency.id that owns the target resource (own order / own household / own event)"
+    error_id: ERR_AGENCY_SCOPE_VIOLATION
+    http_status: 403
+    applies_to: "POST /agency-orders, POST /agency-orders/{id}/cancel, POST /distribution-events, POST /distribution-events/{id}/pack, POST /distribution-events/{id}/finalize, POST /distribution-events/{id}/void, POST /client-households"
+
+  - priority: 4
+    category: existence
+    check: "every path id and body FK references an existing resource, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 5
+    category: existence
+    check: "required body fields present and correctly typed; enum values within declared domain"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all write endpoints"
+
+  - priority: 6
+    category: state
+    check: "the target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 7
+    category: business_safety
+    check: "cold-chain match at lot intake: InventoryLot.required_temp_zone (derived from food_category) equals the holding ColdStorageUnit.temp_zone"
+    error_id: ERR_COLD_CHAIN_MISMATCH
+    http_status: 422
+    applies_to: "POST /inventory-lots"
+
+  - priority: 8
+    category: business_safety
+    check: "household certification at event pack: linked ClientHousehold.certification_status == CERTIFIED; if any reserved line draws from a TEFAP lot, household.tefap_eligible must be true"
+    error_id: ERR_HOUSEHOLD_NOT_CERTIFIED
+    http_status: 409
+    applies_to: "POST /distribution-events/{id}/pack"
+
+  - priority: 9
+    category: business_referential
+    check: "agency standing: the ordering Agency.status == ACTIVE at order submission and approval"
+    error_id: ERR_AGENCY_SUSPENDED
+    http_status: 409
+    applies_to: "POST /agency-orders, POST /agency-orders/{id}/approve"
+
+  - priority: 10
+    category: business_temporal
+    check: "the AllocationCycle the order draws from is OPEN at submission and approval"
+    error_id: ERR_CYCLE_NOT_OPEN
+    http_status: 409
+    applies_to: "POST /agency-orders, POST /agency-orders/{id}/approve"
+
+  - priority: 11
+    category: business_constraint
+    check: "cold-storage capacity: lot intake must not push ColdStorageUnit.stored_lbs above capacity_lbs (would-exceed is rejected; exactly-at capacity is allowed)"
+    error_id: ERR_COLD_STORAGE_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /inventory-lots"
+
+  - priority: 12
+    category: business_constraint
+    check: "finalize poundage bound: actual_distributed_lbs must not exceed planned_lbs"
+    error_id: ERR_OVER_DISTRIBUTION
+    http_status: 422
+    applies_to: "POST /distribution-events/{id}/finalize"
+
+  - priority: 13
+    category: business_fiscal
+    check: "fair-share cap: order.requested_lbs must not exceed the agency's remaining fair-share cap this cycle (would-exceed is rejected; exactly-at cap is allowed)"
+    error_id: ERR_FAIR_SHARE_EXCEEDED
+    http_status: 409
+    applies_to: "POST /agency-orders/{id}/approve"
+
+  - priority: 14
+    category: business_referential
+    check: "OCC: expected_lot_version on approve/dispose must equal the current InventoryLot.version"
+    error_id: ERR_STALE_LOT_VERSION
+    http_status: 412
+    applies_to: "POST /agency-orders/{id}/approve, POST /inventory-lots/{id}/dispose"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+
+  # ---- ColdStorageUnit ----
+  - method: POST
+    path: "/cold-storage-units"
+    description: "Create a cold storage unit."
+    roles: [FoodBankOperator]
+    code: 201
+    input: [name, temp_zone, capacity_lbs]
+    output: ColdStorageUnit
+    side_effects: ["stored_lbs initialized to 0", "status initialized AVAILABLE"]
+
+  - method: GET
+    path: "/cold-storage-units/{id}"
+    description: "Fetch a cold storage unit with live occupancy."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor]
+    code: 200
+    input: []
+    output: ColdStorageUnit
+    side_effects: []
+
+  - method: GET
+    path: "/cold-storage-units"
+    description: "List cold storage units (paginated)."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor]
+    code: 200
+    input: ["limit?", "offset?", "temp_zone?", "status?"]
+    output: ColdStorageUnit[]
+    side_effects: []
+
+  - method: GET
+    path: "/cold-storage-units/{id}/inventory-lots"
+    description: "List InventoryLots held in this unit (FK reverse-reachability for InventoryLot.cold_storage_unit_id)."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor]
+    code: 200
+    input: ["limit?", "offset?", "disposition?"]
+    output: InventoryLot[]
+    side_effects: []
+
+  # ---- InventoryLot ----
+  - method: POST
+    path: "/inventory-lots"
+    description: "Intake a donation/rescue/TEFAP/purchased lot into a cold storage unit."
+    roles: [FoodBankOperator]
+    code: 201
+    input: ["cold_storage_unit_id", "food_category", "source_type", "intake_lbs", "expiration_date", "unit_cost_cents?"]
+    output: InventoryLot
+    side_effects:
+      - "derives required_temp_zone from food_category; enforces cold-chain match (ERR_COLD_CHAIN_MISMATCH)"
+      - "enforces cold-storage capacity (ERR_COLD_STORAGE_CAPACITY_EXCEEDED)"
+      - "sets remaining_lbs = intake_lbs, disposition = AVAILABLE"
+      - "recomputes ColdStorageUnit.stored_lbs and status (calc cold_storage_occupancy)"
+
+  - method: GET
+    path: "/inventory-lots/{id}"
+    description: "Fetch an inventory lot."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor]
+    code: 200
+    input: []
+    output: InventoryLot
+    side_effects: []
+
+  - method: GET
+    path: "/inventory-lots"
+    description: "List inventory lots, filterable by storage unit / category / disposition / source."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor]
+    code: 200
+    input: ["limit?", "offset?", "cold_storage_unit_id?", "food_category?", "disposition?", "source_type?"]
+    output: InventoryLot[]
+    side_effects: []
+
+  - method: POST
+    path: "/inventory-lots/{id}/dispose"
+    description: "Dispose an AVAILABLE or EXPIRED lot (OCC-guarded)."
+    roles: [FoodBankOperator]
+    code: 200
+    input: [expected_lot_version]
+    output: InventoryLot
+    side_effects:
+      - "AVAILABLE/EXPIRED -> DISPOSED; remaining_lbs set to 0"
+      - "recomputes ColdStorageUnit.stored_lbs"
+      - "increments InventoryLot.version by 1"
+
+  - method: GET
+    path: "/inventory-lots/{id}/order-lines"
+    description: "List OrderLines that reserved against this lot (FK reverse-reachability for OrderLine.reserved_lot_id)."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor]
+    code: 200
+    input: ["limit?", "offset?", "line_status?"]
+    output: OrderLine[]
+    side_effects: []
+
+  # ---- Agency ----
+  - method: POST
+    path: "/agencies"
+    description: "Register a partner agency."
+    roles: [AllocationManager]
+    code: 201
+    input: ["name", "service_area", "fair_share_weight?", "status?"]
+    output: Agency
+    side_effects: ["lifetime_distributed_lbs initialized to 0"]
+
+  - method: GET
+    path: "/agencies/{id}"
+    description: "Fetch an agency with lifetime distribution ledger."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor, AgencyCoordinator]
+    code: 200
+    input: []
+    output: Agency
+    side_effects: []
+
+  - method: GET
+    path: "/agencies"
+    description: "List agencies (paginated, filter by status)."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: Agency[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/agencies/{id}"
+    description: "Update agency standing or fair-share weight."
+    roles: [AllocationManager]
+    code: 200
+    input: ["status?", "fair_share_weight?", "service_area?"]
+    output: Agency
+    side_effects: ["increments Agency.version by 1"]
+
+  - method: GET
+    path: "/agencies/{id}/client-households"
+    description: "List client households registered by this agency (FK reverse-reachability for ClientHousehold.agency_id)."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor, AgencyCoordinator]
+    code: 200
+    input: ["limit?", "offset?", "certification_status?"]
+    output: ClientHousehold[]
+    side_effects: []
+
+  - method: GET
+    path: "/agencies/{id}/agency-orders"
+    description: "List orders placed by this agency (FK reverse-reachability for AgencyOrder.agency_id)."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor, AgencyCoordinator]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: AgencyOrder[]
+    side_effects: []
+
+  # ---- AllocationCycle ----
+  - method: POST
+    path: "/allocation-cycles"
+    description: "Create a DRAFT allocation cycle."
+    roles: [AllocationManager]
+    code: 201
+    input: [label, total_pool_lbs]
+    output: AllocationCycle
+    side_effects: ["status DRAFT; total_fair_share_weight 0 until open"]
+
+  - method: GET
+    path: "/allocation-cycles/{id}"
+    description: "Fetch an allocation cycle."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor, AgencyCoordinator]
+    code: 200
+    input: []
+    output: AllocationCycle
+    side_effects: []
+
+  - method: POST
+    path: "/allocation-cycles/{id}/open"
+    description: "Open a cycle; freezes total_fair_share_weight."
+    roles: [AllocationManager]
+    code: 200
+    input: []
+    output: AllocationCycle
+    side_effects:
+      - "DRAFT -> OPEN"
+      - "freezes total_fair_share_weight = sum of fair_share_weight over ACTIVE agencies"
+      - "increments AllocationCycle.version by 1"
+
+  - method: POST
+    path: "/allocation-cycles/{id}/close"
+    description: "Close a cycle once all its orders are resolved."
+    roles: [AllocationManager]
+    code: 200
+    input: []
+    output: AllocationCycle
+    side_effects: ["OPEN -> CLOSED", "increments AllocationCycle.version by 1"]
+
+  - method: GET
+    path: "/allocation-cycles/{id}/agency-orders"
+    description: "List orders drawing from this cycle (FK reverse-reachability for AgencyOrder.allocation_cycle_id)."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: AgencyOrder[]
+    side_effects: []
+
+  - method: GET
+    path: "/allocation-cycles/{id}/poundage-report"
+    description: "Return the cycle's poundage report as a 0-or-1 array (FK reverse-reachability for PoundageReport.allocation_cycle_id)."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor]
+    code: 200
+    input: []
+    output: PoundageReport[]
+    side_effects: ["computes the snapshot on read (calc distributed_poundage_ledger)"]
+
+  # ---- AgencyOrder + OrderLine ----
+  - method: POST
+    path: "/agency-orders"
+    description: "Submit an agency order with its order lines against an OPEN cycle."
+    roles: [AgencyCoordinator]
+    code: 201
+    input: [agency_id, allocation_cycle_id, lines]
+    output: AgencyOrder
+    side_effects:
+      - "creates child OrderLines from the lines array (each with food_category, requested_lbs)"
+      - "sets requested_lbs = sum of line requested_lbs"
+      - "status SUBMITTED; enforces ERR_AGENCY_SUSPENDED, ERR_CYCLE_NOT_OPEN, ERR_AGENCY_SCOPE_VIOLATION"
+
+  - method: GET
+    path: "/agency-orders/{id}"
+    description: "Fetch an order with rolled-up poundage."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor, AgencyCoordinator]
+    code: 200
+    input: []
+    output: AgencyOrder
+    side_effects: []
+
+  - method: GET
+    path: "/agency-orders/{id}/order-lines"
+    description: "List the order's lines with reservation detail (FK reverse-reachability for OrderLine.agency_order_id)."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor, AgencyCoordinator]
+    code: 200
+    input: ["limit?", "offset?", "line_status?"]
+    output: OrderLine[]
+    side_effects: []
+
+  - method: POST
+    path: "/agency-orders/{id}/approve"
+    description: "Approve an order: run FEFO reservation; OCC-guarded on the FEFO-earliest lot."
+    roles: [AllocationManager]
+    code: 200
+    input: [expected_lot_version]
+    output: AgencyOrder
+    side_effects:
+      - "enforces ERR_CYCLE_NOT_OPEN, ERR_AGENCY_SUSPENDED, ERR_FAIR_SHARE_EXCEEDED, ERR_STALE_LOT_VERSION"
+      - "FEFO reservation: AVAILABLE lots -> RESERVED/DEPLETED in (expiration_date, created_at) order, per food_category"
+      - "sets each OrderLine.reserved_lbs, reserved_lot_id, line_status; sets order.approved_lbs"
+      - "increments reserved InventoryLot.version by 1 each; SUBMITTED -> APPROVED; increments AgencyOrder.version by 1"
+
+  - method: POST
+    path: "/agency-orders/{id}/reject"
+    description: "Reject a submitted order."
+    roles: [AllocationManager]
+    code: 200
+    input: []
+    output: AgencyOrder
+    side_effects: ["SUBMITTED -> REJECTED", "increments AgencyOrder.version by 1"]
+
+  - method: POST
+    path: "/agency-orders/{id}/recall"
+    description: "Recall an approved order back to SUBMITTED, releasing reservations."
+    roles: [AllocationManager]
+    code: 200
+    input: []
+    output: AgencyOrder
+    side_effects:
+      - "APPROVED -> SUBMITTED"
+      - "releases reservations: reserved InventoryLots RESERVED -> AVAILABLE, remaining_lbs restored, versions bumped"
+      - "resets lines to PENDING; resets approved_lbs to 0; increments AgencyOrder.version by 1"
+
+  - method: POST
+    path: "/agency-orders/{id}/cancel"
+    description: "Cancel a submitted or approved order (agency-initiated)."
+    roles: [AgencyCoordinator]
+    code: 200
+    input: []
+    output: AgencyOrder
+    side_effects:
+      - "SUBMITTED/APPROVED -> CANCELLED"
+      - "if APPROVED, releases reservations: lots RESERVED -> AVAILABLE, remaining_lbs restored, versions bumped"
+      - "increments AgencyOrder.version by 1"
+
+  # ---- ClientHousehold ----
+  - method: POST
+    path: "/client-households"
+    description: "Register a client household under an agency."
+    roles: [AgencyCoordinator]
+    code: 201
+    input: [agency_id, household_size, monthly_income_cents]
+    output: ClientHousehold
+    side_effects:
+      - "computes tefap_eligible (calc tefap_income_eligibility); certification_status PENDING"
+
+  - method: GET
+    path: "/client-households/{id}"
+    description: "Fetch a client household."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor, AgencyCoordinator]
+    code: 200
+    input: []
+    output: ClientHousehold
+    side_effects: []
+
+  - method: PATCH
+    path: "/client-households/{id}"
+    description: "Update household size or income (re-derives tefap_eligible)."
+    roles: [AgencyCoordinator]
+    code: 200
+    input: ["household_size?", "monthly_income_cents?"]
+    output: ClientHousehold
+    side_effects: ["recomputes tefap_eligible", "increments ClientHousehold.version by 1"]
+
+  - method: POST
+    path: "/client-households/{id}/certify"
+    description: "Certify or deny a household's TEFAP eligibility."
+    roles: [ComplianceAuditor]
+    code: 200
+    input: []
+    output: ClientHousehold
+    side_effects:
+      - "PENDING -> CERTIFIED if tefap_eligible else PENDING -> DENIED"
+      - "stamps certified_at on CERTIFIED; increments ClientHousehold.version by 1"
+
+  # ---- DistributionEvent ----
+  - method: POST
+    path: "/distribution-events"
+    description: "Plan a distribution event linking an approved order to a household."
+    roles: [AgencyCoordinator]
+    code: 201
+    input: [agency_order_id, client_household_id]
+    output: DistributionEvent
+    side_effects: ["status PLANNED; planned_lbs 0"]
+
+  - method: GET
+    path: "/distribution-events/{id}"
+    description: "Fetch a distribution event."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor, AgencyCoordinator]
+    code: 200
+    input: []
+    output: DistributionEvent
+    side_effects: []
+
+  - method: GET
+    path: "/distribution-events"
+    description: "List distribution events, filterable by order / household / status."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor, AgencyCoordinator]
+    code: 200
+    input: ["limit?", "offset?", "agency_order_id?", "client_household_id?", "status?"]
+    output: DistributionEvent[]
+    side_effects: []
+
+  - method: POST
+    path: "/distribution-events/{id}/pack"
+    description: "Pack the event: compute planned poundage, mark order lines PACKED."
+    roles: [AgencyCoordinator]
+    code: 200
+    input: []
+    output: DistributionEvent
+    side_effects:
+      - "enforces ERR_HOUSEHOLD_NOT_CERTIFIED"
+      - "PLANNED -> PACKED; sets planned_lbs (calc planned_event_poundage); order RESERVED lines -> PACKED"
+      - "increments DistributionEvent.version by 1"
+
+  - method: POST
+    path: "/distribution-events/{id}/finalize"
+    description: "Finalize: record actual poundage, deplete lots, fulfill order, post ledgers."
+    roles: [AgencyCoordinator]
+    code: 200
+    input: [actual_distributed_lbs]
+    output: DistributionEvent
+    side_effects:
+      - "enforces ERR_OVER_DISTRIBUTION (actual_distributed_lbs <= planned_lbs)"
+      - "PACKED -> FINALIZED; computes tefap_lbs (calc event_tefap_split)"
+      - "reserved lots RESERVED -> DEPLETED; linked AgencyOrder APPROVED -> FULFILLED"
+      - "increments Agency.lifetime_distributed_lbs by actual_distributed_lbs; bumps versions"
+
+  - method: POST
+    path: "/distribution-events/{id}/void"
+    description: "Void a planned or packed event (reverts packing if PACKED)."
+    roles: [AgencyCoordinator]
+    code: 200
+    input: []
+    output: DistributionEvent
+    side_effects:
+      - "PLANNED/PACKED -> VOIDED; if PACKED, reverts order lines PACKED -> RESERVED and resets planned_lbs to 0"
+      - "increments DistributionEvent.version by 1"
+
+  # ---- PoundageReport ----
+  - method: GET
+    path: "/poundage-reports/{allocation_cycle_id}"
+    description: "Generate the cycle's poundage report (planned vs distributed vs TEFAP, shrinkage)."
+    roles: [FoodBankOperator, AllocationManager, ComplianceAuditor]
+    code: 200
+    input: []
+    output: PoundageReport
+    side_effects: ["computes total_planned_lbs, total_distributed_lbs, total_tefap_lbs, shrinkage_lbs (calc distributed_poundage_ledger)"]
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's current UTC clock; triggers shelf-life lot expiry sweep and certification aging."
+    roles: [FoodBankOperator, AllocationManager]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects:
+      - "AVAILABLE lots with expiration_date <= now -> EXPIRED; recomputes affected ColdStorageUnit.stored_lbs; bumps lot versions"
+      - "CERTIFIED households with certified_at + 365d <= now -> EXPIRED; bumps household versions"
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID header."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Authenticated role is not permitted to perform this operation."
+  - id: ERR_AGENCY_SCOPE_VIOLATION
+    http: 403
+    condition: "AgencyCoordinator acts on a resource not owned by their Agency (X-User-ID != owning agency_id)."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced path id or body FK does not resolve to an existing resource."
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Missing required field, wrong type, out-of-domain enum, or non-positive poundage."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition is not defined from the target resource's current state."
+  - id: ERR_COLD_CHAIN_MISMATCH
+    http: 422
+    condition: "Lot's required_temp_zone (from food_category) does not match the holding unit's temp_zone."
+  - id: ERR_COLD_STORAGE_CAPACITY_EXCEEDED
+    http: 409
+    condition: "Lot intake would push ColdStorageUnit.stored_lbs strictly above capacity_lbs."
+  - id: ERR_HOUSEHOLD_NOT_CERTIFIED
+    http: 409
+    condition: "Event pack attempted while household is not CERTIFIED, or a TEFAP line is packed for a non-tefap_eligible household."
+  - id: ERR_AGENCY_SUSPENDED
+    http: 409
+    condition: "Order submission/approval attempted for an Agency whose status == SUSPENDED."
+  - id: ERR_CYCLE_NOT_OPEN
+    http: 409
+    condition: "Order submission/approval against an AllocationCycle not in OPEN state."
+  - id: ERR_OVER_DISTRIBUTION
+    http: 422
+    condition: "Finalize actual_distributed_lbs exceeds the event's planned_lbs."
+  - id: ERR_FAIR_SHARE_EXCEEDED
+    http: 409
+    condition: "Order.requested_lbs would push the agency's drawn poundage strictly above its fair-share cap this cycle."
+  - id: ERR_STALE_LOT_VERSION
+    http: 412
+    condition: "expected_lot_version on approve/dispose does not equal the current InventoryLot.version."
+  - id: ERR_VALIDATION_PAGINATION
+    http: 422
+    condition: "limit/offset outside allowed bounds (limit 1..100, offset >= 0)."
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: FoodBankOperator
+    description: "Warehouse operator: intakes lots, manages cold storage, disposes expired stock."
+    identity: opaque
+    exclusive_operations:
+      - "POST /cold-storage-units"
+      - "POST /inventory-lots"
+      - "POST /inventory-lots/{id}/dispose"
+    shared_operations:
+      - "POST /_clock/set_current_utc"
+      - "GET (cold-storage-units, inventory-lots, agencies, allocation-cycles, agency-orders, order-lines, client-households, distribution-events, poundage-reports)"
+
+  - name: AllocationManager
+    description: "Runs fair allocation: manages agencies, cycles, approves/rejects/recalls orders."
+    identity: opaque
+    exclusive_operations:
+      - "POST /agencies"
+      - "PATCH /agencies/{id}"
+      - "POST /allocation-cycles"
+      - "POST /allocation-cycles/{id}/open"
+      - "POST /allocation-cycles/{id}/close"
+      - "POST /agency-orders/{id}/approve"
+      - "POST /agency-orders/{id}/reject"
+      - "POST /agency-orders/{id}/recall"
+    shared_operations:
+      - "POST /_clock/set_current_utc"
+      - "GET (all read endpoints)"
+
+  - name: AgencyCoordinator
+    description: "Partner-agency staff: registers households, submits/cancels orders, runs distribution events for their own agency."
+    identity: "entity_backed:Agency"
+    exclusive_operations:
+      - "POST /agency-orders"
+      - "POST /agency-orders/{id}/cancel"
+      - "POST /client-households"
+      - "PATCH /client-households/{id}"
+      - "POST /distribution-events"
+      - "POST /distribution-events/{id}/pack"
+      - "POST /distribution-events/{id}/finalize"
+      - "POST /distribution-events/{id}/void"
+    shared_operations:
+      - "GET (own agency, agencies/{id}, allocation-cycles/{id}, agency-orders, order-lines, client-households, distribution-events)"
+
+  - name: ComplianceAuditor
+    description: "Certifies household TEFAP eligibility and audits poundage; read-only elsewhere."
+    identity: opaque
+    exclusive_operations:
+      - "POST /client-households/{id}/certify"
+    shared_operations:
+      - "GET (all read endpoints, including poundage-reports)"

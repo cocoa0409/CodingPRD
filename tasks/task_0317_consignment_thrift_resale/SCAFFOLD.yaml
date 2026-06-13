@@ -1,0 +1,1657 @@
+scenario: |
+  Consignment & Thrift Clothing Resale: consignor agreement & intake/grading,
+  pricing & markdown schedule, split percentage & payout, unsold return/donation,
+  tag & inventory aging, store credit, daily settlement, item authentication.
+
+domain_name: consignment-thrift-resale
+api_prefix: ""
+
+# =============================================================================
+# Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - dual_variant_calculation        # gross-basis split vs net-of-fee split; provisional vs settled payout
+    - rate_threshold_triggers         # markdown breakpoints keyed on item age; store-credit bonus threshold
+    - cascading_side_effects          # sale -> sale-line split snapshot -> consignor ledger -> settlement totals
+    - derived_field_reconciliation    # consignor.unsettled_payable_cents, store_credit_cents reconciled from ledgers
+    - optimistic_concurrency          # DailySettlement finalize supersede on settlement.version
+    - scheduled_deferred_actions      # markdown takes effect as the aging clock advances
+
+  entity_topology: flat
+  # Peer entities linked by FK (Consignor, Agreement, Item, Sale, Settlement);
+  # SaleLine is the only nested child (under Sale). DailySettlement forms a star
+  # over the day's Sales and PayoutLedgerEntries via date filtering, not nesting.
+
+  state_machine_shape: parallel
+  # Item carries two independent dimensions: grading_status (intake/QA pipeline)
+  # and listing_status (floor lifecycle). AuthenticationReview is cyclic
+  # (IN_REVIEW <-> DISPUTED). DailySettlement is branching (OPEN -> {FINALIZED, VOIDED}).
+
+  relationship_patterns:
+    - one_to_many       # Consignor -> Items; Sale -> SaleLines; Consignor -> ledger entries
+    - cross_aggregate   # SaleLine references Item across aggregate boundary; Settlement spans many Sales
+
+  role_model: segregation_of_duties
+  # IntakeGrader grades; Authenticator authenticates (and a grader MUST NOT
+  # authenticate an item they personally graded); CashierClerk rings sales;
+  # SettlementManager finalizes settlements; StoreAdmin owns configuration.
+
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Consignor
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Consignor legal name"
+        constraints: "non-empty"
+      - name: email
+        type: string
+        source: input
+        description: "Contact email; globally unique among Consignors"
+        constraints: "unique, non-empty"
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle of the consignor account"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED, CLOSED}"
+      - name: store_credit_cents
+        type: integer
+        source: computed
+        description: "Derived running balance = sum of StoreCreditTransaction.amount_cents for this consignor (POSTED only). Reconciled on every credit/redeem."
+        default: 0
+        constraints: ">= 0"
+      - name: unsettled_payable_cents
+        type: integer
+        source: computed
+        description: "Derived = sum of PayoutLedgerEntry.amount_cents where settlement_id IS NULL and entry_type IN {SALE_PAYOUT, REVERSAL}. The cash the store still owes this consignor for sold items not yet swept into a finalized settlement."
+        default: 0
+        constraints: "may be negative if reversals exceed accrued payouts"
+      - name: lifetime_payout_cents
+        type: integer
+        source: computed
+        description: "Derived = sum of PayoutLedgerEntry.amount_cents where settlement_id IS NOT NULL and entry_type=SALE_PAYOUT. Cash actually paid out across all finalized settlements."
+        default: 0
+        constraints: ">= 0"
+
+  - name: MarkdownSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Human label, e.g. 'Standard 90-day'"
+        constraints: "non-empty"
+      - name: base_floor_pct
+        type: number
+        source: input
+        description: "Lower bound as a fraction of list_price below which markdown never pushes price (e.g. 0.30 = never below 30% of list)"
+        default: 0.30
+        constraints: "0 < base_floor_pct <= 1"
+      - name: tiers
+        type: array
+        source: input
+        description: "Ordered list of {min_age_days:int, discount_pct:number} breakpoints, sorted by min_age_days ASC. discount_pct is fraction off list_price (0.20 = 20% off). Applied as a step function: the tier with the greatest min_age_days that is <= item age wins."
+        constraints: "non-empty; min_age_days strictly increasing; first tier MUST have min_age_days=0; each discount_pct in [0,1)"
+      - name: is_archived
+        type: boolean
+        source: system
+        description: "Soft-archive flag; archived schedules cannot be attached to new agreements but remain referenced by existing ones"
+        default: false
+
+  - name: ConsignorAgreement
+    parent: null
+    common_fields: true
+    fields:
+      - name: consignor_id
+        type: string
+        source: input
+        description: "FK -> Consignor.id"
+        constraints: "Consignor.status == ACTIVE at creation"
+      - name: markdown_schedule_id
+        type: string
+        source: input
+        description: "FK -> MarkdownSchedule.id; MarkdownSchedule.is_archived == false at creation"
+      - name: split_pct
+        type: number
+        source: input
+        description: "Consignor's share of the split base as a fraction (0.50 = consignor keeps 50%). Store keeps 1 - split_pct of the base."
+        constraints: "0 < split_pct < 1"
+      - name: split_basis
+        type: enum
+        source: input
+        description: "Whether the split is computed on GROSS sale price or on NET (sale price minus per-item processing fee). Dual-variant driver."
+        default: GROSS
+        constraints: "one of {GROSS, NET}"
+      - name: unsold_disposition
+        type: enum
+        source: input
+        description: "What happens to items unsold past the agreement's return window: RETURN_TO_CONSIGNOR or DONATE or STORE_KEEPS"
+        default: DONATE
+        constraints: "one of {RETURN_TO_CONSIGNOR, DONATE, STORE_KEEPS}"
+      - name: return_window_days
+        type: integer
+        source: input
+        description: "Days after item goes ON_FLOOR before it becomes eligible for unsold disposition"
+        default: 90
+        constraints: ">= 1"
+      - name: payout_method
+        type: enum
+        source: input
+        description: "How consignor proceeds are paid: CASH (creates SALE_PAYOUT ledger entries swept by settlement) or STORE_CREDIT (proceeds become store credit at a bonus rate). Drives which downstream ledger a sale writes."
+        default: CASH
+        constraints: "one of {CASH, STORE_CREDIT}"
+      - name: status
+        type: enum
+        source: system
+        description: "ACTIVE agreements accept new intake; TERMINATED agreements do not"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, TERMINATED}"
+
+  - name: IntakeBatch
+    parent: null
+    common_fields: true
+    fields:
+      - name: agreement_id
+        type: string
+        source: input
+        description: "FK -> ConsignorAgreement.id; agreement.status == ACTIVE at creation"
+      - name: received_at
+        type: datetime
+        source: system
+        description: "Server clock at batch creation; defines the intake instant"
+      - name: status
+        type: enum
+        source: system
+        description: "OPEN while items are being graded; CLOSED once all items reach a terminal grading_status. No items may be added to a CLOSED batch."
+        default: OPEN
+        constraints: "one of {OPEN, CLOSED}"
+      - name: item_count
+        type: integer
+        source: computed
+        description: "Derived count of Items whose batch_id == this batch.id"
+        default: 0
+        constraints: ">= 0"
+
+  - name: Item
+    parent: null
+    common_fields: true
+    fields:
+      - name: batch_id
+        type: string
+        source: input
+        description: "FK -> IntakeBatch.id; batch.status == OPEN at creation"
+      - name: agreement_id
+        type: string
+        source: system
+        description: "FK -> ConsignorAgreement.id; copied from the batch's agreement at creation (denormalized so each item pins its own split terms)"
+      - name: consignor_id
+        type: string
+        source: system
+        description: "FK -> Consignor.id; copied from the agreement at creation"
+      - name: title
+        type: string
+        source: input
+        description: "Garment description, e.g. 'Wool peacoat, navy, M'"
+        constraints: "non-empty"
+      - name: requires_authentication
+        type: boolean
+        source: input
+        description: "True for branded/luxury items that must pass an AuthenticationReview before listing"
+        default: false
+      - name: list_price_cents
+        type: integer
+        source: input
+        description: "Original list price assigned at grading. Markdown computes the current price from this base. Set by the ACCEPTED transition."
+        constraints: ">= 0; required when grading_status moves to ACCEPTED"
+      - name: graded_by_user_id
+        type: string
+        source: system
+        description: "Opaque X-User-ID of the IntakeGrader who set grading_status to ACCEPTED. Used to enforce segregation of duties against authentication."
+      - name: grading_status
+        type: enum
+        source: system
+        description: "Intake/QA pipeline dimension (independent of listing_status)"
+        default: PENDING_GRADE
+        constraints: "one of {PENDING_GRADE, ACCEPTED, REJECTED}"
+      - name: listing_status
+        type: enum
+        source: system
+        description: "Floor lifecycle dimension (independent of grading_status). Only advances once grading_status==ACCEPTED."
+        default: NOT_LISTED
+        constraints: "one of {NOT_LISTED, ON_FLOOR, SOLD, RETURNED, DONATED, PULLED}"
+      - name: authentication_status
+        type: enum
+        source: system
+        description: "NOT_REQUIRED when requires_authentication==false; otherwise tracks the latest AuthenticationReview outcome"
+        default: NOT_REQUIRED
+        constraints: "one of {NOT_REQUIRED, PENDING_AUTH, AUTHENTIC, COUNTERFEIT}"
+      - name: floor_date
+        type: datetime
+        source: system
+        description: "Server clock at the moment listing_status became ON_FLOOR; null until then. Anchors markdown aging and the return window."
+        default: null
+      - name: current_price_cents
+        type: integer
+        source: computed
+        description: "Derived markdown price = apply_markdown(list_price_cents, age_days, schedule). Recomputed on read and at sale time. See calc 'markdown_price'."
+        default: null
+        constraints: ">= floor(list_price_cents * schedule.base_floor_pct)"
+      - name: sold_price_cents
+        type: integer
+        source: system
+        description: "The price the item actually sold for, frozen at sale time from current_price_cents (possibly overridden by a cashier discount). Null until SOLD."
+        default: null
+
+  - name: AuthenticationReview
+    parent: null
+    common_fields: true
+    fields:
+      - name: item_id
+        type: string
+        source: input
+        description: "FK -> Item.id; item.requires_authentication == true and item.grading_status == ACCEPTED at creation"
+      - name: opened_by_user_id
+        type: string
+        source: system
+        description: "Opaque X-User-ID of the Authenticator who opened the review. MUST NOT equal item.graded_by_user_id (segregation of duties)."
+      - name: status
+        type: enum
+        source: system
+        description: "Cyclic: IN_REVIEW can be DISPUTED and re-opened to IN_REVIEW any number of rounds before a terminal verdict"
+        default: IN_REVIEW
+        constraints: "one of {IN_REVIEW, DISPUTED, AUTHENTIC, COUNTERFEIT}"
+      - name: dispute_round
+        type: integer
+        source: system
+        description: "Increments by 1 each time the review re-enters IN_REVIEW from DISPUTED. Starts at 0."
+        default: 0
+        constraints: ">= 0"
+      - name: verdict_note
+        type: string
+        source: input
+        description: "Authenticator's note recorded with the terminal verdict"
+        default: null
+
+  - name: Sale
+    parent: null
+    common_fields: true
+    fields:
+      - name: sold_at
+        type: datetime
+        source: system
+        description: "Server clock at sale creation; defines the business day the sale belongs to (UTC calendar date)"
+      - name: business_date
+        type: string
+        source: system
+        description: "UTC calendar date (YYYY-MM-DD) derived from sold_at; the settlement-grouping key"
+      - name: rung_by_user_id
+        type: string
+        source: system
+        description: "Opaque X-User-ID of the CashierClerk who rang the sale"
+      - name: payment_method
+        type: enum
+        source: input
+        description: "How the buyer paid"
+        default: CARD
+        constraints: "one of {CASH, CARD, STORE_CREDIT}"
+      - name: gross_total_cents
+        type: integer
+        source: computed
+        description: "Derived = sum of SaleLine.sold_price_cents across all lines"
+        default: 0
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "COMPLETED on creation; VOIDED if reversed before its settlement finalizes"
+        default: COMPLETED
+        constraints: "one of {COMPLETED, VOIDED}"
+      - name: settlement_id
+        type: string
+        source: system
+        description: "FK -> DailySettlement.id; null until the day's settlement finalizes and sweeps this sale"
+        default: null
+
+  - name: SaleLine
+    parent: Sale
+    common_fields: false
+    fields:
+      - name: sale_id
+        type: string
+        source: system
+        description: "FK -> Sale.id"
+      - name: item_id
+        type: string
+        source: input
+        description: "FK -> Item.id; item.listing_status == ON_FLOOR at sale time"
+      - name: consignor_id
+        type: string
+        source: system
+        description: "FK -> Consignor.id; copied from the item for ledger attribution"
+      - name: sold_price_cents
+        type: integer
+        source: input
+        description: "Price this line sold at. Defaults to item.current_price_cents; a cashier may pass an explicit discounted value, but it MUST be within the markdown floor."
+        constraints: "floor(item.list_price_cents * schedule.base_floor_pct) <= sold_price_cents <= item.current_price_cents"
+      - name: processing_fee_cents
+        type: integer
+        source: computed
+        description: "Per-line flat processing fee from store config, frozen at sale time. Subtracted from the split base only when the agreement's split_basis == NET."
+        default: 0
+      - name: split_base_cents
+        type: integer
+        source: computed
+        description: "The amount the split percentage is applied to. GROSS basis: = sold_price_cents. NET basis: = max(0, sold_price_cents - processing_fee_cents). See calc 'split_base'."
+        default: 0
+      - name: consignor_proceeds_cents
+        type: integer
+        source: computed
+        description: "Derived = round_half_up(split_base_cents * agreement.split_pct). The consignor's cash (or pre-bonus store-credit) share. See calc 'consignor_proceeds'."
+        default: 0
+      - name: store_share_cents
+        type: integer
+        source: computed
+        description: "Derived = sold_price_cents - consignor_proceeds_cents. The store's retained amount (absorbs any processing fee and rounding remainder)."
+        default: 0
+
+  - name: PayoutLedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: consignor_id
+        type: string
+        source: input
+        description: "FK -> Consignor.id"
+      - name: sale_line_ref
+        type: string
+        source: input
+        description: "FK -> SaleLine.item_id; the item line that produced this entry. Stored as the item_id of the originating line."
+        default: null
+      - name: entry_type
+        type: enum
+        source: system
+        description: "SALE_PAYOUT (+ accrual created by a CASH-payout sale), REVERSAL (- created by a sale void)"
+        constraints: "one of {SALE_PAYOUT, REVERSAL}"
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Signed cents. SALE_PAYOUT > 0 (= line consignor_proceeds_cents), REVERSAL < 0 (= -consignor_proceeds_cents of the voided line)."
+      - name: settlement_id
+        type: string
+        source: system
+        description: "FK -> DailySettlement.id; null while the entry is unsettled, set when a settlement finalizes and sweeps it"
+        default: null
+
+  - name: StoreCreditTransaction
+    parent: null
+    common_fields: false
+    fields:
+      - name: consignor_id
+        type: string
+        source: input
+        description: "FK -> Consignor.id"
+      - name: txn_type
+        type: enum
+        source: system
+        description: "ISSUE (+ created by a STORE_CREDIT-payout sale, includes bonus), REDEEM (- created by the redeem endpoint when credit is spent)"
+        constraints: "one of {ISSUE, REDEEM}"
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Signed cents. ISSUE > 0 (= store_credit_payout issued amount), REDEEM < 0 (= -requested redeem amount). A REDEEM may not drive the consignor's POSTED store-credit balance below 0."
+      - name: status
+        type: enum
+        source: system
+        description: "POSTED transactions count toward store_credit_cents; VOID ones do not. A sale void flips its originating ISSUE transaction to VOID so the issued credit is unwound."
+        default: POSTED
+        constraints: "one of {POSTED, VOID}"
+
+  - name: DailySettlement
+    parent: null
+    common_fields: true
+    fields:
+      - name: business_date
+        type: string
+        source: input
+        description: "UTC calendar date (YYYY-MM-DD) this settlement reconciles. Unique among non-VOIDED settlements."
+        constraints: "unique among settlements whose status != VOIDED"
+      - name: status
+        type: enum
+        source: system
+        description: "OPEN accepts no more sales into scope only at finalize; FINALIZED sweeps payouts; VOIDED unwinds"
+        default: OPEN
+        constraints: "one of {OPEN, FINALIZED, VOIDED}"
+      - name: total_gross_cents
+        type: integer
+        source: computed
+        description: "Derived at finalize = sum of Sale.gross_total_cents for COMPLETED sales with this business_date"
+        default: 0
+      - name: total_consignor_payable_cents
+        type: integer
+        source: computed
+        description: "Derived at finalize = sum of consignor_proceeds_cents across all SaleLines of in-scope COMPLETED CASH-payout sales"
+        default: 0
+      - name: total_store_credit_issued_cents
+        type: integer
+        source: computed
+        description: "Derived at finalize = sum of StoreCreditTransaction.amount_cents (ISSUE, POSTED) generated by in-scope STORE_CREDIT-payout sales"
+        default: 0
+      - name: total_store_share_cents
+        type: integer
+        source: computed
+        description: "Derived at finalize = total_gross_cents - total_consignor_payable_cents - total_store_credit_issued_cents (the store's net after both payout channels)"
+        default: 0
+      - name: swept_sale_count
+        type: integer
+        source: computed
+        description: "Count of Sales swept into this settlement at finalize"
+        default: 0
+
+  - name: DonationRecord
+    parent: null
+    common_fields: true
+    fields:
+      - name: item_id
+        type: string
+        source: input
+        description: "FK -> Item.id; item.listing_status == ON_FLOOR and item past its return window at creation"
+      - name: consignor_id
+        type: string
+        source: system
+        description: "FK -> Consignor.id; copied from the item"
+      - name: disposition
+        type: enum
+        source: system
+        description: "Resolved from the item's agreement.unsold_disposition at creation"
+        constraints: "one of {RETURNED, DONATED, STORE_KEPT}"
+      - name: tax_receipt_value_cents
+        type: integer
+        source: computed
+        description: "For DONATED disposition only = floor(item.list_price_cents * DONATION_VALUATION_PCT); 0 otherwise"
+        default: 0
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+
+  # ---- Item: grading dimension (independent of listing dimension) ----
+  - entity: Item
+    initial_state: PENDING_GRADE        # grading_status dimension
+    terminal_states: [REJECTED]
+    transitions:
+      - from: PENDING_GRADE
+        to: ACCEPTED
+        trigger: "POST /items/{id}/grade with decision=ACCEPT"
+        actor: IntakeGrader
+        preconditions:
+          - "item.grading_status == PENDING_GRADE"
+          - "item.batch.status == OPEN"
+          - "list_price_cents provided and >= 0"
+        side_effects:
+          - "set item.grading_status = ACCEPTED"
+          - "set item.list_price_cents from request"
+          - "set item.graded_by_user_id = X-User-ID"
+          - "if item.requires_authentication: set item.authentication_status = PENDING_AUTH; else leave NOT_REQUIRED"
+          - "increment Item.version by 1"
+      - from: PENDING_GRADE
+        to: REJECTED
+        trigger: "POST /items/{id}/grade with decision=REJECT"
+        actor: IntakeGrader
+        preconditions:
+          - "item.grading_status == PENDING_GRADE"
+          - "item.batch.status == OPEN"
+        side_effects:
+          - "set item.grading_status = REJECTED"
+          - "set item.graded_by_user_id = X-User-ID"
+          - "increment Item.version by 1"
+
+  # ---- Item: listing dimension (parallel to grading dimension) ----
+  - entity: Item
+    initial_state: NOT_LISTED           # listing_status dimension
+    terminal_states: [SOLD, RETURNED, DONATED]
+    transitions:
+      - from: NOT_LISTED
+        to: ON_FLOOR
+        trigger: "POST /items/{id}/list"
+        actor: IntakeGrader
+        preconditions:
+          - "item.grading_status == ACCEPTED"
+          - "item.listing_status == NOT_LISTED"
+          - "item.authentication_status IN {NOT_REQUIRED, AUTHENTIC}  (CROSS-ENTITY: gated by the item's latest AuthenticationReview verdict)"
+        side_effects:
+          - "set item.listing_status = ON_FLOOR"
+          - "set item.floor_date = server clock"
+          - "recompute item.current_price_cents via markdown_price (age 0 -> tier-0 discount)"
+          - "increment Item.version by 1"
+      - from: ON_FLOOR
+        to: SOLD
+        trigger: "POST /sales (this item appears on a SaleLine)"
+        actor: CashierClerk
+        preconditions:
+          - "item.listing_status == ON_FLOOR"
+          - "sold_price_cents within [markdown floor, current_price_cents]"
+        side_effects:
+          - "set item.listing_status = SOLD"
+          - "set item.sold_price_cents = line.sold_price_cents"
+          - "CASCADE: create SaleLine; compute split_base, consignor_proceeds, store_share"
+          - "CASCADE: if agreement.payout_method==CASH -> create PayoutLedgerEntry(SALE_PAYOUT, +consignor_proceeds); recompute consignor.unsettled_payable_cents"
+          - "CASCADE: if agreement.payout_method==STORE_CREDIT -> create StoreCreditTransaction(ISSUE, +store_credit_payout); recompute consignor.store_credit_cents"
+          - "increment Item.version by 1"
+      - from: ON_FLOOR
+        to: PULLED
+        trigger: "POST /items/{id}/pull"
+        actor: IntakeGrader
+        preconditions:
+          - "item.listing_status == ON_FLOOR"
+          - "item is NOT past its return window (else use disposition endpoint)"
+        side_effects:
+          - "set item.listing_status = PULLED"
+          - "increment Item.version by 1"
+        note: "PULLED items can be relisted via POST /items/{id}/list"
+      - from: PULLED
+        to: ON_FLOOR
+        trigger: "POST /items/{id}/list"
+        actor: IntakeGrader
+        preconditions:
+          - "item.listing_status == PULLED"
+          - "item.authentication_status IN {NOT_REQUIRED, AUTHENTIC}"
+        side_effects:
+          - "set item.listing_status = ON_FLOOR"
+          - "set item.floor_date = server clock (aging clock restarts)"
+          - "recompute item.current_price_cents"
+          - "increment Item.version by 1"
+      - from: ON_FLOOR
+        to: RETURNED
+        trigger: "POST /items/{id}/dispose (agreement.unsold_disposition==RETURN_TO_CONSIGNOR)"
+        actor: SettlementManager
+        preconditions:
+          - "item.listing_status == ON_FLOOR"
+          - "item age since floor_date >= agreement.return_window_days  (past window)"
+          - "agreement.unsold_disposition == RETURN_TO_CONSIGNOR"
+        side_effects:
+          - "set item.listing_status = RETURNED"
+          - "CASCADE: create DonationRecord(disposition=RETURNED, tax_receipt_value_cents=0)"
+          - "increment Item.version by 1"
+      - from: ON_FLOOR
+        to: DONATED
+        trigger: "POST /items/{id}/dispose (agreement.unsold_disposition IN {DONATE, STORE_KEEPS})"
+        actor: SettlementManager
+        preconditions:
+          - "item.listing_status == ON_FLOOR"
+          - "item age since floor_date >= agreement.return_window_days"
+          - "agreement.unsold_disposition IN {DONATE, STORE_KEEPS}"
+        side_effects:
+          - "set item.listing_status = DONATED"
+          - "CASCADE: create DonationRecord(disposition=DONATED if DONATE else STORE_KEPT; tax_receipt_value_cents via donation_valuation when DONATED)"
+          - "increment Item.version by 1"
+
+  # ---- AuthenticationReview: cyclic (IN_REVIEW <-> DISPUTED) ----
+  - entity: AuthenticationReview
+    initial_state: IN_REVIEW
+    terminal_states: [AUTHENTIC, COUNTERFEIT]
+    transitions:
+      - from: IN_REVIEW
+        to: AUTHENTIC
+        trigger: "POST /authentication-reviews/{id}/verdict with verdict=AUTHENTIC"
+        actor: Authenticator
+        preconditions:
+          - "review.status == IN_REVIEW"
+        side_effects:
+          - "set review.status = AUTHENTIC"
+          - "CROSS-ENTITY: set item.authentication_status = AUTHENTIC (unblocks listing)"
+          - "increment AuthenticationReview.version by 1"
+      - from: IN_REVIEW
+        to: COUNTERFEIT
+        trigger: "POST /authentication-reviews/{id}/verdict with verdict=COUNTERFEIT"
+        actor: Authenticator
+        preconditions:
+          - "review.status == IN_REVIEW"
+        side_effects:
+          - "set review.status = COUNTERFEIT"
+          - "CROSS-ENTITY: set item.authentication_status = COUNTERFEIT"
+          - "CASCADE: set item.grading_status = REJECTED (counterfeit goods cannot be sold)"
+          - "increment AuthenticationReview.version by 1"
+      - from: IN_REVIEW
+        to: DISPUTED
+        trigger: "POST /authentication-reviews/{id}/dispute"
+        actor: SettlementManager
+        preconditions:
+          - "review.status == IN_REVIEW"
+        side_effects:
+          - "set review.status = DISPUTED"
+          - "increment AuthenticationReview.version by 1"
+      - from: DISPUTED
+        to: IN_REVIEW
+        trigger: "POST /authentication-reviews/{id}/reopen"
+        actor: Authenticator
+        preconditions:
+          - "review.status == DISPUTED"
+        side_effects:
+          - "set review.status = IN_REVIEW"
+          - "increment review.dispute_round by 1"
+          - "increment AuthenticationReview.version by 1"
+        note: "Cycle: DISPUTED -> IN_REVIEW may repeat any number of rounds before a terminal verdict."
+
+  # ---- DailySettlement: branching (OPEN -> {FINALIZED, VOIDED}) ----
+  - entity: DailySettlement
+    initial_state: OPEN
+    terminal_states: [FINALIZED, VOIDED]
+    transitions:
+      - from: OPEN
+        to: FINALIZED
+        trigger: "POST /settlements/{id}/finalize"
+        actor: SettlementManager
+        preconditions:
+          - "settlement.status == OPEN"
+          - "expected_settlement_version matches settlement.version (OCC)"
+          - "no other FINALIZED settlement exists for this business_date"
+        side_effects:
+          - "compute total_gross_cents, total_consignor_payable_cents, total_store_credit_issued_cents, total_store_share_cents over in-scope COMPLETED sales"
+          - "CASCADE: stamp settlement_id onto every in-scope COMPLETED Sale and onto every unsettled PayoutLedgerEntry whose sale_line belongs to those sales"
+          - "CASCADE: recompute each affected consignor.unsettled_payable_cents (entries now settled drop out) and consignor.lifetime_payout_cents (entries now settled enter)"
+          - "set swept_sale_count"
+          - "set settlement.status = FINALIZED"
+          - "increment DailySettlement.version by 1"
+      - from: OPEN
+        to: VOIDED
+        trigger: "POST /settlements/{id}/void"
+        actor: SettlementManager
+        preconditions:
+          - "settlement.status == OPEN"
+        side_effects:
+          - "set settlement.status = VOIDED"
+          - "increment DailySettlement.version by 1"
+        note: "Voiding an OPEN settlement frees its business_date for a new settlement; a FINALIZED settlement cannot be voided."
+
+  # ---- Sale: branching (COMPLETED -> VOIDED) ----
+  - entity: Sale
+    initial_state: COMPLETED
+    terminal_states: [VOIDED]
+    transitions:
+      - from: COMPLETED
+        to: VOIDED
+        trigger: "POST /sales/{id}/void"
+        actor: CashierClerk
+        preconditions:
+          - "sale.status == COMPLETED"
+          - "sale.settlement_id IS NULL  (CROSS-ENTITY: cannot void a sale already swept into a finalized settlement)"
+        side_effects:
+          - "set sale.status = VOIDED"
+          - "CASCADE: for each SaleLine, set item.listing_status = ON_FLOOR, clear item.sold_price_cents, recompute current_price_cents"
+          - "CASCADE: for CASH-payout lines, create PayoutLedgerEntry(REVERSAL, amount = -consignor_proceeds_cents); recompute consignor.unsettled_payable_cents"
+          - "CASCADE: for STORE_CREDIT-payout lines, flip the originating ISSUE StoreCreditTransaction.status to VOID (it drops out of the POSTED sum); recompute consignor.store_credit_cents"
+          - "increment Sale.version by 1"
+        note: "Compensating action: the REVERSAL ledger entry exactly offsets the original SALE_PAYOUT (their amounts sum to 0), and the ISSUE flip to VOID removes the issued credit, so the consignor's balance returns to its pre-sale value."
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: settlement-finalize-stale-version
+    parent_entity: DailySettlement
+    write_endpoint: "POST /settlements/{id}/finalize"
+    occ_field: "expected_settlement_version"
+    description: |
+      Finalizing a DailySettlement whose version has advanced since the client
+      last observed it is rejected. A settlement's version is bumped not only by
+      its own transitions but also when a late same-day Sale is voided and its
+      reversal touches the settlement's pending scope; a client that read an
+      older version and then issues finalize is carrying a stale view and must
+      re-read before sweeping payouts.
+    error_id: ERR_STALE_SETTLEMENT_VERSION
+    http_status: 412
+
+  - rule_id: item-grade-stale-version
+    parent_entity: Item
+    write_endpoint: "POST /items/{id}/grade"
+    occ_field: "expected_item_version"
+    description: |
+      Grading an Item whose version has advanced since the client last observed
+      it is rejected. The version may have advanced because a COUNTERFEIT
+      authentication verdict already cascaded a REJECTED grading status onto the
+      item; a grader carrying a stale version would otherwise overwrite that
+      verdict-driven rejection.
+    error_id: ERR_STALE_ITEM_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+
+  - name: markdown_price
+    trigger: "On read of item.current_price_cents, on POST /items/{id}/list, and snapshotted at sale time"
+    algorithm: threshold
+    formula: |
+      age_days = floor((NOW - item.floor_date) / 86400 seconds)   # whole days since floor
+      # Step function: pick the tier with the GREATEST min_age_days that is <= age_days.
+      applicable = max({ t in schedule.tiers : t.min_age_days <= age_days } by min_age_days)
+      raw_price = round_half_up(item.list_price_cents * (1 - applicable.discount_pct))
+      floor_price = floor(item.list_price_cents * schedule.base_floor_pct)
+      current_price_cents = max(raw_price, floor_price)
+    input_set: "Single item; schedule = item.agreement.markdown_schedule; floor_date must be non-null (item ON_FLOOR)."
+    constants:
+      SECONDS_PER_DAY: 86400
+    precision: "integer cents; raw_price uses round_half_up before flooring against base floor"
+    variants:
+      - name: at_list_time
+        when: "POST /items/{id}/list; age_days == 0"
+        difference: "Always selects the first tier (min_age_days=0). current_price = max(round_half_up(list*(1-tier0.discount_pct)), floor)."
+      - name: aged_read
+        when: "GET /items/{id} after floor_date + N days"
+        difference: "Selects the highest tier whose min_age_days <= age_days; price can have dropped to the base floor."
+
+  - name: split_base
+    trigger: "At sale time, per SaleLine, before consignor_proceeds"
+    algorithm: aggregation
+    formula: |
+      if agreement.split_basis == GROSS:
+          split_base_cents = line.sold_price_cents
+      else:  # NET
+          split_base_cents = max(0, line.sold_price_cents - line.processing_fee_cents)
+    input_set: "Single SaleLine; processing_fee_cents = store config PROCESSING_FEE_CENTS frozen at sale time."
+    constants:
+      PROCESSING_FEE_CENTS: 150
+    precision: "integer cents"
+    variants:
+      - name: gross_basis
+        when: "agreement.split_basis == GROSS"
+        difference: "Processing fee is ignored in the base; the store absorbs it out of its own share."
+      - name: net_basis
+        when: "agreement.split_basis == NET"
+        difference: "Processing fee is removed from the base BEFORE the split, so both parties effectively share the fee. Floors at 0 if fee exceeds price."
+
+  - name: consignor_proceeds
+    trigger: "At sale time, per SaleLine, after split_base (CASCADE side effect of Item ON_FLOOR->SOLD)"
+    algorithm: aggregation
+    formula: |
+      consignor_proceeds_cents = round_half_up(split_base_cents * agreement.split_pct)
+      store_share_cents        = line.sold_price_cents - consignor_proceeds_cents
+    input_set: "Single SaleLine; split_base from calc split_base; split_pct from the item's pinned agreement."
+    constants: {}
+    precision: "round_half_up to integer cents; store_share absorbs the rounding remainder (store_share = price - proceeds, NOT independently rounded)"
+    variants:
+      - name: cash_proceeds
+        when: "agreement.payout_method == CASH"
+        difference: "Proceeds become a PayoutLedgerEntry(SALE_PAYOUT, +consignor_proceeds_cents) credited to unsettled_payable."
+      - name: store_credit_proceeds
+        when: "agreement.payout_method == STORE_CREDIT"
+        difference: "Proceeds are upgraded by store_credit_payout (bonus) before becoming a StoreCreditTransaction(ISSUE). The CASH and STORE_CREDIT branches yield DIFFERENT credited amounts for identical line inputs."
+
+  - name: store_credit_payout
+    trigger: "At sale time when agreement.payout_method == STORE_CREDIT (CASCADE after consignor_proceeds)"
+    algorithm: threshold
+    formula: |
+      base = consignor_proceeds_cents
+      # Bonus tiers on the base proceeds amount (NON-linear: 3 inputs, conditional branch on tier):
+      if base >= BONUS_TIER2_MIN_CENTS:
+          bonus = round_half_up(base * BONUS_TIER2_PCT)
+      elif base >= BONUS_TIER1_MIN_CENTS:
+          bonus = round_half_up(base * BONUS_TIER1_PCT)
+      else:
+          bonus = 0
+      issued_cents = base + bonus
+    input_set: "Single SaleLine's consignor_proceeds_cents."
+    constants:
+      BONUS_TIER1_MIN_CENTS: 2000      # proceeds >= $20 -> tier 1 bonus
+      BONUS_TIER1_PCT: 0.10
+      BONUS_TIER2_MIN_CENTS: 10000     # proceeds >= $100 -> tier 2 bonus
+      BONUS_TIER2_PCT: 0.20
+    precision: "round_half_up to integer cents"
+    variants:
+      - name: below_threshold
+        when: "consignor_proceeds_cents < 2000"
+        difference: "bonus == 0; issued == base. Boundary: at exactly 2000 tier 1 applies (>=)."
+      - name: tier2
+        when: "consignor_proceeds_cents >= 10000"
+        difference: "20% bonus instead of 10%. Boundary: at exactly 10000 tier 2 applies (>=); 9999 gets only tier 1."
+
+  - name: donation_valuation
+    trigger: "On DonationRecord creation with disposition==DONATED"
+    algorithm: aggregation
+    formula: |
+      if disposition == DONATED:
+          tax_receipt_value_cents = floor(item.list_price_cents * DONATION_VALUATION_PCT)
+      else:
+          tax_receipt_value_cents = 0
+    input_set: "Single Item; list_price_cents pinned at grading."
+    constants:
+      DONATION_VALUATION_PCT: 0.25
+    precision: "floor to integer cents"
+    variants:
+      - name: donated
+        when: "disposition == DONATED"
+        difference: "Non-zero tax receipt value at 25% of list."
+      - name: returned_or_kept
+        when: "disposition IN {RETURNED, STORE_KEPT}"
+        difference: "tax_receipt_value_cents == 0 (no charitable deduction for a return or store retention)."
+
+  - name: settlement_rollup
+    trigger: "On POST /settlements/{id}/finalize (CASCADE)"
+    algorithm: aggregation
+    formula: |
+      scope = { Sale s : s.business_date == settlement.business_date AND s.status == COMPLETED }
+      total_gross_cents = sum(s.gross_total_cents for s in scope)
+      cash_lines   = { line of s in scope : line.item.agreement.payout_method == CASH }
+      credit_sales = { s in scope : every line's agreement.payout_method == STORE_CREDIT }   # see note
+      total_consignor_payable_cents      = sum(line.consignor_proceeds_cents for line in cash_lines)
+      total_store_credit_issued_cents    = sum(ISSUE StoreCreditTransaction.amount_cents generated by scope sales)
+      total_store_share_cents            = total_gross_cents - total_consignor_payable_cents - total_store_credit_issued_cents
+      swept_sale_count = count(scope)
+    input_set: "All COMPLETED Sales for the settlement's business_date; VOIDED sales excluded. Sales already carrying a settlement_id (swept by a prior finalize) are NOT in scope — a business_date has at most one FINALIZED settlement."
+    constants: {}
+    precision: "integer cents; sums are over already-rounded per-line values (round-per-line-then-sum order is pinned)"
+    variants:
+      - name: round_per_line_then_sum
+        when: "always"
+        difference: "Each line's consignor_proceeds_cents is rounded at sale time; settlement SUMS those rounded integers. It does NOT re-derive a single split on the gross total then round once. This ordering is pinned and can diverge from sum-then-round by up to N cents for N lines."
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /consignors and GET /* public reads"
+
+  - priority: 2
+    category: auth
+    check: "Role is permitted for this operation per RBAC matrix (§1.7)"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "All path-referenced resources exist, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all with path ids"
+
+  - priority: 4
+    category: existence
+    check: "All body FK references (consignor_id, agreement_id, batch_id, item_id, markdown_schedule_id) resolve to existing rows"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /agreements, POST /intake-batches, POST /items, POST /sales, POST /authentication-reviews"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which this transition is defined (e.g. grade only PENDING_GRADE; list only ACCEPTED+NOT_LISTED/PULLED; finalize only OPEN settlement)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_<parent>_version matches the parent's current version"
+    error_id: ERR_STALE_ITEM_VERSION
+    http_status: 412
+    applies_to: "POST /items/{id}/grade"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_settlement_version matches the settlement's current version"
+    error_id: ERR_STALE_SETTLEMENT_VERSION
+    http_status: 412
+    applies_to: "POST /settlements/{id}/finalize"
+
+  - priority: 7
+    category: business_safety
+    check: "Authenticator opening or ruling a review MUST NOT be the same user (X-User-ID) who graded the item (segregation of duties)"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /authentication-reviews, POST /authentication-reviews/{id}/verdict"
+
+  - priority: 8
+    category: business_safety
+    check: "Item requiring authentication cannot be listed unless its authentication_status is AUTHENTIC (or NOT_REQUIRED)"
+    error_id: ERR_AUTHENTICATION_REQUIRED
+    http_status: 409
+    applies_to: "POST /items/{id}/list"
+
+  - priority: 9
+    category: business_referential
+    check: "Item on a SaleLine must be ON_FLOOR; a SOLD/PULLED/disposed item cannot be sold"
+    error_id: ERR_ITEM_NOT_ON_FLOOR
+    http_status: 409
+    applies_to: "POST /sales"
+
+  - priority: 10
+    category: business_referential
+    check: "Each item_id appears at most once across all SaleLines of a single sale (no double-ringing the same garment)"
+    error_id: ERR_DUPLICATE_SALE_LINE
+    http_status: 409
+    applies_to: "POST /sales"
+
+  - priority: 11
+    category: business_temporal
+    check: "Dispose endpoint requires the item to be past its return window (age since floor_date >= agreement.return_window_days)"
+    error_id: ERR_RETURN_WINDOW_NOT_ELAPSED
+    http_status: 409
+    applies_to: "POST /items/{id}/dispose"
+
+  - priority: 12
+    category: business_temporal
+    check: "Pull endpoint requires the item NOT past its return window (use dispose past the window)"
+    error_id: ERR_RETURN_WINDOW_ELAPSED
+    http_status: 409
+    applies_to: "POST /items/{id}/pull"
+
+  - priority: 13
+    category: business_constraint
+    check: "sold_price_cents on a SaleLine within [floor(list_price*base_floor_pct), current_price_cents]"
+    error_id: ERR_PRICE_BELOW_FLOOR
+    http_status: 422
+    applies_to: "POST /sales"
+
+  - priority: 14
+    category: business_constraint
+    check: "At most one non-VOIDED DailySettlement per business_date"
+    error_id: ERR_SETTLEMENT_DATE_TAKEN
+    http_status: 409
+    applies_to: "POST /settlements"
+
+  - priority: 16
+    category: business_fiscal
+    check: "StoreCreditTransaction REDEEM may not drive the consignor's POSTED store-credit balance below 0"
+    error_id: ERR_INSUFFICIENT_STORE_CREDIT
+    http_status: 422
+    applies_to: "POST /consignors/{id}/store-credit/redeem"
+
+  - priority: 17
+    category: business_constraint
+    check: "MarkdownSchedule.tiers non-empty, min_age_days strictly increasing, first tier min_age_days==0, each discount_pct in [0,1)"
+    error_id: ERR_INVALID_SCHEDULE
+    http_status: 422
+    applies_to: "POST /markdown-schedules"
+
+  - priority: 18
+    category: business_constraint
+    check: "Required body fields present and well-typed (split_pct in (0,1), enums valid, list_price_cents>=0, email format)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST/PUT/PATCH"
+
+  - priority: 19
+    category: business_constraint
+    check: "Consignor email unique among Consignors"
+    error_id: ERR_DUPLICATE_EMAIL
+    http_status: 409
+    applies_to: "POST /consignors"
+
+  - priority: 20
+    category: business_constraint
+    check: "Agreement references a non-archived MarkdownSchedule and an ACTIVE Consignor"
+    error_id: ERR_AGREEMENT_PRECONDITION
+    http_status: 409
+    applies_to: "POST /agreements"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+
+  # ---- Consignor ----
+  - method: POST
+    path: "/consignors"
+    description: "Register a consignor"
+    roles: [StoreAdmin]
+    code: 201
+    input: [full_name, email]
+    output: Consignor
+    side_effects:
+      - "status=ACTIVE, store_credit_cents=0, unsettled_payable_cents=0, lifetime_payout_cents=0"
+
+  - method: GET
+    path: "/consignors/{id}"
+    description: "Read a consignor with reconciled derived balances"
+    roles: [StoreAdmin, SettlementManager, CashierClerk, IntakeGrader, Authenticator]
+    code: 200
+    input: []
+    output: Consignor
+    side_effects: ["recompute store_credit_cents, unsettled_payable_cents, lifetime_payout_cents before returning"]
+
+  - method: GET
+    path: "/consignors"
+    description: "List consignors (paginated, filterable by status)"
+    roles: [StoreAdmin, SettlementManager]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Consignor[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/consignors/{id}"
+    description: "Update consignor status (suspend/close/reactivate)"
+    roles: [StoreAdmin]
+    code: 200
+    input: [status]
+    output: Consignor
+    side_effects: ["increment Consignor.version by 1"]
+
+  - method: GET
+    path: "/consignors/{id}/agreements"
+    description: "Reverse-reachability: agreements for a consignor"
+    roles: [StoreAdmin, SettlementManager]
+    code: 200
+    input: []
+    output: ConsignorAgreement[]
+    side_effects: []
+
+  - method: GET
+    path: "/consignors/{id}/ledger-entries"
+    description: "Reverse-reachability: payout ledger entries for a consignor (filterable settled/unsettled)"
+    roles: [StoreAdmin, SettlementManager]
+    code: 200
+    input: ["settled?", "limit?", "offset?"]
+    output: PayoutLedgerEntry[]
+    side_effects: []
+
+  - method: GET
+    path: "/consignors/{id}/store-credit/transactions"
+    description: "Reverse-reachability: store-credit transactions for a consignor"
+    roles: [StoreAdmin, SettlementManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: StoreCreditTransaction[]
+    side_effects: []
+
+  - method: GET
+    path: "/consignors/{id}/sale-lines"
+    description: "Reverse-reachability: sale lines attributed to a consignor"
+    roles: [StoreAdmin, SettlementManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: SaleLine[]
+    side_effects: []
+
+  - method: POST
+    path: "/consignors/{id}/store-credit/redeem"
+    description: "Redeem store credit (manual spend)"
+    roles: [CashierClerk, StoreAdmin]
+    code: 201
+    input: [amount_cents]
+    output: StoreCreditTransaction
+    side_effects:
+      - "create StoreCreditTransaction(REDEEM, -amount_cents, POSTED)"
+      - "recompute consignor.store_credit_cents"
+
+  # ---- MarkdownSchedule ----
+  - method: POST
+    path: "/markdown-schedules"
+    description: "Create a markdown schedule"
+    roles: [StoreAdmin]
+    code: 201
+    input: [name, tiers, "base_floor_pct?"]
+    output: MarkdownSchedule
+    side_effects: ["is_archived=false"]
+
+  - method: GET
+    path: "/markdown-schedules/{id}"
+    description: "Read a markdown schedule"
+    roles: [StoreAdmin, SettlementManager, IntakeGrader]
+    code: 200
+    input: []
+    output: MarkdownSchedule
+    side_effects: []
+
+  - method: POST
+    path: "/markdown-schedules/{id}/archive"
+    description: "Soft-archive a schedule"
+    roles: [StoreAdmin]
+    code: 200
+    input: []
+    output: MarkdownSchedule
+    side_effects: ["set is_archived=true; increment version by 1"]
+
+  # ---- ConsignorAgreement ----
+  - method: POST
+    path: "/agreements"
+    description: "Create a consignor agreement"
+    roles: [StoreAdmin]
+    code: 201
+    input: [consignor_id, markdown_schedule_id, split_pct, "split_basis?", "unsold_disposition?", "return_window_days?", "payout_method?"]
+    output: ConsignorAgreement
+    side_effects: ["status=ACTIVE"]
+
+  - method: GET
+    path: "/agreements/{id}"
+    description: "Read an agreement"
+    roles: [StoreAdmin, SettlementManager, IntakeGrader, CashierClerk]
+    code: 200
+    input: []
+    output: ConsignorAgreement
+    side_effects: []
+
+  - method: GET
+    path: "/agreements"
+    description: "List agreements (filterable by consignor_id and markdown_schedule_id)"
+    roles: [StoreAdmin, SettlementManager]
+    code: 200
+    input: ["consignor_id?", "markdown_schedule_id?", "status?", "limit?", "offset?"]
+    output: ConsignorAgreement[]
+    side_effects: []
+
+  - method: POST
+    path: "/agreements/{id}/terminate"
+    description: "Terminate an agreement (no new intake)"
+    roles: [StoreAdmin]
+    code: 200
+    input: []
+    output: ConsignorAgreement
+    side_effects: ["set status=TERMINATED; increment version by 1"]
+
+  - method: GET
+    path: "/agreements/{id}/intake-batches"
+    description: "Reverse-reachability: intake batches under an agreement"
+    roles: [StoreAdmin, SettlementManager, IntakeGrader]
+    code: 200
+    input: []
+    output: IntakeBatch[]
+    side_effects: []
+
+  # ---- IntakeBatch ----
+  - method: POST
+    path: "/intake-batches"
+    description: "Open an intake batch for an agreement"
+    roles: [IntakeGrader, StoreAdmin]
+    code: 201
+    input: [agreement_id]
+    output: IntakeBatch
+    side_effects: ["received_at=server clock; status=OPEN; item_count=0"]
+
+  - method: GET
+    path: "/intake-batches/{id}"
+    description: "Read a batch with derived item_count"
+    roles: [IntakeGrader, StoreAdmin, SettlementManager]
+    code: 200
+    input: []
+    output: IntakeBatch
+    side_effects: ["recompute item_count"]
+
+  - method: POST
+    path: "/intake-batches/{id}/close"
+    description: "Close a batch (no further items)"
+    roles: [IntakeGrader, StoreAdmin]
+    code: 200
+    input: []
+    output: IntakeBatch
+    side_effects: ["set status=CLOSED; increment version by 1"]
+
+  - method: GET
+    path: "/intake-batches/{id}/items"
+    description: "Reverse-reachability: items in a batch"
+    roles: [IntakeGrader, StoreAdmin, SettlementManager]
+    code: 200
+    input: ["grading_status?", "listing_status?", "limit?", "offset?"]
+    output: Item[]
+    side_effects: []
+
+  # ---- Item ----
+  - method: POST
+    path: "/items"
+    description: "Add an item to an OPEN batch"
+    roles: [IntakeGrader, StoreAdmin]
+    code: 201
+    input: [batch_id, title, "requires_authentication?"]
+    output: Item
+    side_effects:
+      - "copy agreement_id and consignor_id from batch's agreement"
+      - "grading_status=PENDING_GRADE, listing_status=NOT_LISTED"
+      - "authentication_status = PENDING_AUTH if requires_authentication else NOT_REQUIRED"
+
+  - method: GET
+    path: "/items/{id}"
+    description: "Read an item with markdown-recomputed current_price_cents"
+    roles: [IntakeGrader, StoreAdmin, SettlementManager, CashierClerk, Authenticator]
+    code: 200
+    input: []
+    output: Item
+    side_effects: ["recompute current_price_cents via markdown_price when ON_FLOOR"]
+
+  - method: GET
+    path: "/items"
+    description: "List items (filterable by consignor_id, agreement_id, listing_status)"
+    roles: [IntakeGrader, StoreAdmin, SettlementManager, CashierClerk]
+    code: 200
+    input: ["consignor_id?", "agreement_id?", "listing_status?", "grading_status?", "limit?", "offset?"]
+    output: Item[]
+    side_effects: []
+
+  - method: POST
+    path: "/items/{id}/grade"
+    description: "Grade an item ACCEPT (with list price) or REJECT"
+    roles: [IntakeGrader]
+    code: 200
+    input: [decision, "list_price_cents?", expected_item_version]
+    output: Item
+    side_effects:
+      - "ACCEPT: grading_status=ACCEPTED, set list_price_cents, graded_by_user_id; if requires_authentication set authentication_status=PENDING_AUTH"
+      - "REJECT: grading_status=REJECTED, graded_by_user_id"
+      - "increment Item.version by 1"
+
+  - method: POST
+    path: "/items/{id}/list"
+    description: "Put an accepted (and authenticated, if required) item on the floor"
+    roles: [IntakeGrader]
+    code: 200
+    input: []
+    output: Item
+    side_effects:
+      - "listing_status=ON_FLOOR; floor_date=server clock; recompute current_price_cents; increment version by 1"
+
+  - method: POST
+    path: "/items/{id}/pull"
+    description: "Pull an on-floor item off the floor (before its return window elapses)"
+    roles: [IntakeGrader, StoreAdmin]
+    code: 200
+    input: []
+    output: Item
+    side_effects: ["listing_status=PULLED; increment version by 1"]
+
+  - method: POST
+    path: "/items/{id}/dispose"
+    description: "Dispose an unsold on-floor item past its return window per agreement disposition"
+    roles: [SettlementManager, StoreAdmin]
+    code: 201
+    input: []
+    output: DonationRecord
+    side_effects:
+      - "set item.listing_status RETURNED or DONATED; create DonationRecord; compute tax_receipt_value_cents; increment item.version by 1"
+
+  - method: GET
+    path: "/items/{id}/authentication-reviews"
+    description: "Reverse-reachability: authentication reviews for an item"
+    roles: [Authenticator, IntakeGrader, StoreAdmin, SettlementManager]
+    code: 200
+    input: []
+    output: AuthenticationReview[]
+    side_effects: []
+
+  - method: GET
+    path: "/items/{id}/donation-record"
+    description: "Reverse-reachability: donation record for a disposed item (array of 0 or 1)"
+    roles: [SettlementManager, StoreAdmin]
+    code: 200
+    input: []
+    output: DonationRecord[]
+    side_effects: []
+
+  - method: GET
+    path: "/items/{id}/sale-lines"
+    description: "Reverse-reachability: sale lines that reference this item (array of 0 or more across its sale history)"
+    roles: [CashierClerk, SettlementManager, StoreAdmin]
+    code: 200
+    input: []
+    output: SaleLine[]
+    side_effects: []
+
+  # ---- AuthenticationReview ----
+  - method: POST
+    path: "/authentication-reviews"
+    description: "Open an authentication review for an item requiring authentication"
+    roles: [Authenticator]
+    code: 201
+    input: [item_id]
+    output: AuthenticationReview
+    side_effects: ["status=IN_REVIEW, dispute_round=0, opened_by_user_id=X-User-ID"]
+
+  - method: GET
+    path: "/authentication-reviews/{id}"
+    description: "Read an authentication review"
+    roles: [Authenticator, SettlementManager, StoreAdmin, IntakeGrader]
+    code: 200
+    input: []
+    output: AuthenticationReview
+    side_effects: []
+
+  - method: POST
+    path: "/authentication-reviews/{id}/verdict"
+    description: "Rule a review AUTHENTIC or COUNTERFEIT"
+    roles: [Authenticator]
+    code: 200
+    input: [verdict, "verdict_note?"]
+    output: AuthenticationReview
+    side_effects:
+      - "AUTHENTIC: item.authentication_status=AUTHENTIC"
+      - "COUNTERFEIT: item.authentication_status=COUNTERFEIT AND CASCADE item.grading_status=REJECTED"
+      - "increment AuthenticationReview.version by 1"
+
+  - method: POST
+    path: "/authentication-reviews/{id}/dispute"
+    description: "Dispute an in-review authentication"
+    roles: [SettlementManager, StoreAdmin]
+    code: 200
+    input: []
+    output: AuthenticationReview
+    side_effects: ["status=DISPUTED; increment version by 1"]
+
+  - method: POST
+    path: "/authentication-reviews/{id}/reopen"
+    description: "Reopen a disputed review (cycle back to IN_REVIEW)"
+    roles: [Authenticator]
+    code: 200
+    input: []
+    output: AuthenticationReview
+    side_effects: ["status=IN_REVIEW; increment dispute_round by 1; increment version by 1"]
+
+  # ---- Sale ----
+  - method: POST
+    path: "/sales"
+    description: "Ring a sale of one or more on-floor items"
+    roles: [CashierClerk]
+    code: 201
+    input: [lines, "payment_method?"]
+    output: Sale
+    side_effects:
+      - "create Sale(status=COMPLETED, business_date from server clock)"
+      - "CASCADE per line: create SaleLine; mark item SOLD; compute split_base, consignor_proceeds, store_share"
+      - "CASCADE per line: CASH -> PayoutLedgerEntry(SALE_PAYOUT); STORE_CREDIT -> StoreCreditTransaction(ISSUE with bonus)"
+      - "recompute affected consignor derived balances"
+    note: "`lines` is an array of {item_id, sold_price_cents?}; sold_price_cents defaults to item.current_price_cents"
+
+  - method: GET
+    path: "/sales/{id}"
+    description: "Read a sale with gross_total and settlement linkage"
+    roles: [CashierClerk, SettlementManager, StoreAdmin]
+    code: 200
+    input: []
+    output: Sale
+    side_effects: []
+
+  - method: GET
+    path: "/sales"
+    description: "List sales (filterable by business_date, status, settlement_id)"
+    roles: [CashierClerk, SettlementManager, StoreAdmin]
+    code: 200
+    input: ["business_date?", "status?", "settlement_id?", "limit?", "offset?"]
+    output: Sale[]
+    side_effects: []
+
+  - method: GET
+    path: "/sales/{id}/lines"
+    description: "Reverse-reachability: sale lines under a sale"
+    roles: [CashierClerk, SettlementManager, StoreAdmin]
+    code: 200
+    input: []
+    output: SaleLine[]
+    side_effects: []
+
+  - method: POST
+    path: "/sales/{id}/void"
+    description: "Void an unsettled completed sale (compensating reversal)"
+    roles: [CashierClerk, SettlementManager]
+    code: 200
+    input: []
+    output: Sale
+    side_effects:
+      - "set status=VOIDED; CASCADE per line: item back to ON_FLOOR; create REVERSAL ledger entry for CASH lines, flip ISSUE to VOID for STORE_CREDIT lines; recompute balances"
+      - "increment Sale.version by 1"
+
+  # ---- DailySettlement ----
+  - method: POST
+    path: "/settlements"
+    description: "Open a daily settlement for a business_date"
+    roles: [SettlementManager]
+    code: 201
+    input: [business_date]
+    output: DailySettlement
+    side_effects: ["status=OPEN; totals=0"]
+
+  - method: GET
+    path: "/settlements/{id}"
+    description: "Read a settlement"
+    roles: [SettlementManager, StoreAdmin]
+    code: 200
+    input: []
+    output: DailySettlement
+    side_effects: []
+
+  - method: GET
+    path: "/settlements"
+    description: "List settlements (filterable by business_date, status)"
+    roles: [SettlementManager, StoreAdmin]
+    code: 200
+    input: ["business_date?", "status?", "limit?", "offset?"]
+    output: DailySettlement[]
+    side_effects: []
+
+  - method: POST
+    path: "/settlements/{id}/finalize"
+    description: "Finalize a settlement: roll up totals and sweep sales + ledger entries"
+    roles: [SettlementManager]
+    code: 200
+    input: [expected_settlement_version]
+    output: DailySettlement
+    side_effects:
+      - "compute totals via settlement_rollup; stamp settlement_id onto in-scope sales and unsettled ledger entries"
+      - "recompute affected consignors' unsettled_payable_cents and lifetime_payout_cents"
+      - "set status=FINALIZED; increment DailySettlement.version by 1"
+
+  - method: POST
+    path: "/settlements/{id}/void"
+    description: "Void an OPEN settlement (frees the business_date)"
+    roles: [SettlementManager]
+    code: 200
+    input: []
+    output: DailySettlement
+    side_effects: ["set status=VOIDED; increment version by 1"]
+
+  - method: GET
+    path: "/settlements/{id}/sales"
+    description: "Reverse-reachability: sales swept into a settlement"
+    roles: [SettlementManager, StoreAdmin]
+    code: 200
+    input: []
+    output: Sale[]
+    side_effects: []
+
+  - method: GET
+    path: "/settlements/{id}/ledger-entries"
+    description: "Reverse-reachability: payout ledger entries swept into a settlement"
+    roles: [SettlementManager, StoreAdmin]
+    code: 200
+    input: []
+    output: PayoutLedgerEntry[]
+    side_effects: []
+
+  # ---- DonationRecord ----
+  - method: GET
+    path: "/donation-records/{id}"
+    description: "Read a donation record"
+    roles: [SettlementManager, StoreAdmin]
+    code: 200
+    input: []
+    output: DonationRecord
+    side_effects: []
+
+  - method: GET
+    path: "/donation-records"
+    description: "List donation records (filterable by consignor_id, disposition)"
+    roles: [SettlementManager, StoreAdmin]
+    code: 200
+    input: ["consignor_id?", "disposition?", "limit?", "offset?"]
+    output: DonationRecord[]
+    side_effects: []
+
+  # ---- Test-driving (clock) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving: set the server's current UTC instant (drives markdown aging and return-window math)"
+    roles: [StoreAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock NOW := to_iso8601 for all subsequent age/date computations"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing or malformed X-User-Role / X-User-ID on a protected endpoint"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Authenticated role not permitted for this operation"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Path-referenced resource does not exist"
+  - id: ERR_REFERENCE_NOT_FOUND
+    http: 404
+    condition: "Body FK reference (consignor_id, agreement_id, batch_id, item_id, markdown_schedule_id) does not resolve"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Transition not defined from the resource's current state"
+  - id: ERR_STALE_ITEM_VERSION
+    http: 412
+    condition: "expected_item_version does not match Item.version on grade"
+  - id: ERR_STALE_SETTLEMENT_VERSION
+    http: 412
+    condition: "expected_settlement_version does not match DailySettlement.version on finalize"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "Authenticator acting on an item they graded (X-User-ID equals item.graded_by_user_id)"
+  - id: ERR_AUTHENTICATION_REQUIRED
+    http: 409
+    condition: "Listing an item whose authentication_status is PENDING_AUTH or COUNTERFEIT"
+  - id: ERR_ITEM_NOT_ON_FLOOR
+    http: 409
+    condition: "Sale line references an item whose listing_status != ON_FLOOR"
+  - id: ERR_DUPLICATE_SALE_LINE
+    http: 409
+    condition: "Same item_id appears more than once across a single sale's lines"
+  - id: ERR_RETURN_WINDOW_NOT_ELAPSED
+    http: 409
+    condition: "Dispose attempted before the item's return window elapsed"
+  - id: ERR_RETURN_WINDOW_ELAPSED
+    http: 409
+    condition: "Pull attempted on an item already past its return window"
+  - id: ERR_PRICE_BELOW_FLOOR
+    http: 422
+    condition: "SaleLine.sold_price_cents below the markdown floor or above current_price_cents"
+  - id: ERR_SETTLEMENT_DATE_TAKEN
+    http: 409
+    condition: "A non-VOIDED settlement already exists for the requested business_date"
+  - id: ERR_INSUFFICIENT_STORE_CREDIT
+    http: 422
+    condition: "REDEEM would drive POSTED store-credit balance below 0"
+  - id: ERR_INVALID_SCHEDULE
+    http: 422
+    condition: "Markdown schedule tiers invalid (empty, not increasing, missing min_age_days=0, or discount_pct out of [0,1))"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, malformed type, or out-of-range scalar (e.g. split_pct not in (0,1))"
+  - id: ERR_DUPLICATE_EMAIL
+    http: 409
+    condition: "Consignor email already in use"
+  - id: ERR_AGREEMENT_PRECONDITION
+    http: 409
+    condition: "Agreement references an archived schedule or a non-ACTIVE consignor"
+  - id: ERR_BATCH_CLOSED
+    http: 409
+    condition: "Adding an item to a CLOSED intake batch"
+  - id: ERR_AGREEMENT_TERMINATED
+    http: 409
+    condition: "Opening an intake batch under a TERMINATED agreement"
+  - id: ERR_LIST_PRICE_REQUIRED
+    http: 422
+    condition: "Grade ACCEPT without a list_price_cents"
+  - id: ERR_VALIDATION_PAGINATION
+    http: 400
+    condition: "limit/offset out of allowed bounds"
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: StoreAdmin
+    description: "Owns configuration (consignors, schedules, agreements) and has cross-cutting administrative reads. Opaque operator identity."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /consignors — register consignor"
+      - "PATCH /consignors/{id} — change consignor status"
+      - "POST /markdown-schedules — create schedule"
+      - "POST /markdown-schedules/{id}/archive — archive schedule"
+      - "POST /agreements — create agreement"
+      - "POST /agreements/{id}/terminate — terminate agreement"
+      - "POST /_clock/set_current_utc — test clock control"
+    shared_operations:
+      - "GET reads across consignors, agreements, batches, items, sales, settlements"
+      - "POST /intake-batches, POST /intake-batches/{id}/close, POST /items, POST /items/{id}/pull (shared with IntakeGrader)"
+      - "POST /items/{id}/dispose (shared with SettlementManager)"
+      - "POST /consignors/{id}/store-credit/redeem (shared with CashierClerk)"
+
+  - name: IntakeGrader
+    description: "Grades incoming items and manages the floor lifecycle (list/pull). Opaque operator identity tracked on items for segregation of duties."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /items/{id}/grade — grade ACCEPT/REJECT"
+      - "POST /items/{id}/list — put item on floor"
+    shared_operations:
+      - "POST /intake-batches, POST /intake-batches/{id}/close (shared with StoreAdmin)"
+      - "POST /items, POST /items/{id}/pull (shared with StoreAdmin)"
+      - "GET reads across batches, items, agreements, schedules, authentication-reviews"
+
+  - name: Authenticator
+    description: "Authenticates branded/luxury items. MUST NOT be the grader of the same item (segregation of duties). Opaque operator identity."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /authentication-reviews — open a review"
+      - "POST /authentication-reviews/{id}/verdict — rule AUTHENTIC/COUNTERFEIT"
+      - "POST /authentication-reviews/{id}/reopen — reopen a disputed review"
+    shared_operations:
+      - "GET reads on items and authentication-reviews"
+
+  - name: CashierClerk
+    description: "Rings and voids sales; redeems store credit. Opaque operator identity recorded on the sale."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /sales — ring a sale"
+    shared_operations:
+      - "POST /sales/{id}/void (shared with SettlementManager)"
+      - "POST /consignors/{id}/store-credit/redeem (shared with StoreAdmin)"
+      - "GET reads on sales, sale lines, items, agreements, consignors"
+
+  - name: SettlementManager
+    description: "Runs daily settlement, disputes authentications, disposes unsold items. Opaque operator identity."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /settlements — open settlement"
+      - "POST /settlements/{id}/finalize — finalize settlement"
+      - "POST /settlements/{id}/void — void OPEN settlement"
+      - "POST /authentication-reviews/{id}/dispute — dispute a review"
+    shared_operations:
+      - "POST /items/{id}/dispose (shared with StoreAdmin)"
+      - "POST /sales/{id}/void (shared with CashierClerk)"
+      - "GET reads across all resources"

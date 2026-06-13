@@ -1,0 +1,1461 @@
+scenario: "Airport Gate & Slot Management: flight schedule, gate/stand assignment, turn-time conflict detection, towing/remote stand, slot coordination, common-use (CUTE), ground equipment, IROPS reaccommodation"
+domain_name: airport-gate-slot-management
+api_prefix: /
+
+# =============================================================================
+# Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: temporal_windowing
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - optimistic_concurrency        # OCC on Gate.version for race on the same gate window
+    - cascading_side_effects        # IROPS cancel/divert cascades across assignments + allocations
+    - derived_field_reconciliation  # Gate.active_assignment_count / Flight.turn computed fields
+    - rate_threshold_triggers       # minimum turn time, slot tolerance window boundaries
+
+  entity_topology: graph
+  # Flight, Gate, RemoteStand, SlotPermit, CuteUnit, GroundEquipment are peer
+  # entities linked by FKs; GateAssignment is a junction between Flight and a
+  # stand resource (Gate XOR RemoteStand); CuteAllocation and GseAllocation are
+  # junctions between Flight and shared-equipment pools. No nesting in URL paths.
+
+  state_machine_shape: parallel
+  # Flight carries two independent state axes: schedule_status (lifecycle of the
+  # flight itself: SCHEDULED→ACTIVE→...→COMPLETED/CANCELLED) and
+  # handling_status (the gate-handling sub-lifecycle: UNASSIGNED→ASSIGNED→
+  # AT_GATE→TOWED_OFF→AT_GATE→DEPARTED). GateAssignment is cyclic
+  # (OCCUPIED→TOWED_AWAY→OCCUPIED). SlotPermit branches (CONFIRMED→{USED,FORFEITED}).
+
+  relationship_patterns:
+    - one_to_many        # Flight 1—* GateAssignment; Gate 1—* GateAssignment
+    - many_to_many       # Flight *—* CuteUnit via CuteAllocation; Flight *—* GroundEquipment via GseAllocation
+    - polymorphic        # GateAssignment.stand_ref points to Gate XOR RemoteStand (stand_type discriminator)
+    - cross_aggregate    # GateAssignment transitions gated by SlotPermit state on the same Flight
+
+  role_model: peer_roles
+  # GateController owns gate/stand assignment + towing; SlotCoordinator owns
+  # SlotPermit lifecycle; RampAgent owns CUTE + GSE allocation and at-gate/depart
+  # events; OpsAdmin is the cross-cutting operator (IROPS, resource registry, clock).
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Gate
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: "Gate identifier such as 'A12'. Unique across all gates."
+        constraints: "Unique"
+      - name: terminal
+        type: string
+        source: input
+        description: "Terminal label, e.g. 'T1'."
+      - name: max_wingspan_m
+        type: number
+        source: input
+        description: "Maximum aircraft wingspan in metres this gate can physically accept."
+        constraints: ">= 0"
+      - name: is_cute_equipped
+        type: boolean
+        source: input
+        description: "True if the gate has a built-in CUTE workstation (no separate CuteAllocation needed)."
+        default: false
+      - name: buffer_minutes
+        type: integer
+        source: input
+        description: "Inter-occupancy clean/buffer time enforced between consecutive assignments on this gate."
+        default: 10
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "Gate lifecycle state. ACTIVE on create; OUT_OF_SERVICE via POST /gates/{id}/out-of-service."
+        default: ACTIVE
+        constraints: "One of {ACTIVE, OUT_OF_SERVICE}"
+      - name: active_assignment_count
+        type: integer
+        source: computed
+        description: "Count of GateAssignment rows on this gate whose status IN {OCCUPIED, TOWED_AWAY}. Derived field reconciled on every assignment create/transition."
+        default: 0
+
+  - name: RemoteStand
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: "Remote stand identifier such as 'R5'. Unique across all remote stands."
+        constraints: "Unique"
+      - name: max_wingspan_m
+        type: number
+        source: input
+        description: "Maximum aircraft wingspan in metres this remote stand can accept."
+        constraints: ">= 0"
+      - name: capacity
+        type: integer
+        source: input
+        description: "Number of aircraft that can occupy this remote stand at once (multi-aircraft apron)."
+        default: 1
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: system
+        description: "Remote stand lifecycle state. Always ACTIVE in this version (no decommission/out-of-service workflow for remote stands)."
+        default: ACTIVE
+        constraints: "One of {ACTIVE}"
+      - name: occupancy_count
+        type: integer
+        source: computed
+        description: "Count of GateAssignment rows on this remote stand whose status = OCCUPIED. Derived field reconciled on every tow/release."
+        default: 0
+
+  - name: CuteUnit
+    parent: null
+    common_fields: true
+    fields:
+      - name: label
+        type: string
+        source: input
+        description: "Common-use workstation label such as 'CUTE-3'."
+      - name: terminal
+        type: string
+        source: input
+        description: "Terminal in which the CUTE workstation lives."
+      - name: status
+        type: enum
+        source: system
+        description: "CUTE unit availability state. Always AVAILABLE in this version (no retire workflow)."
+        default: AVAILABLE
+        constraints: "One of {AVAILABLE}"
+
+  - name: GroundEquipment
+    parent: null
+    common_fields: true
+    fields:
+      - name: asset_tag
+        type: string
+        source: input
+        description: "GSE asset tag such as 'GPU-07'."
+      - name: equipment_type
+        type: enum
+        source: input
+        description: "Ground support equipment type."
+        constraints: "One of {GPU, PUSHBACK_TUG, BELT_LOADER, AIR_START}"
+      - name: turnaround_minutes
+        type: integer
+        source: input
+        description: "Minimum cooldown minutes the asset needs between two allocations (released-to-next-grab gap)."
+        default: 0
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "GSE availability state. Always AVAILABLE in this version (no retire workflow)."
+        default: AVAILABLE
+        constraints: "One of {AVAILABLE}"
+
+  - name: Flight
+    parent: null
+    common_fields: true
+    fields:
+      - name: flight_no
+        type: string
+        source: input
+        description: "Carrier flight number such as 'AA482'."
+      - name: aircraft_wingspan_m
+        type: number
+        source: input
+        description: "Wingspan in metres of the aircraft operating this flight; gated against stand max_wingspan_m."
+        constraints: ">= 0"
+      - name: sched_arrival_utc
+        type: datetime
+        source: input
+        description: "Scheduled on-block (arrival) time, ISO 8601 UTC. Null for an originating departure with no inbound leg."
+      - name: sched_departure_utc
+        type: datetime
+        source: input
+        description: "Scheduled off-block (departure) time, ISO 8601 UTC."
+      - name: min_turn_minutes
+        type: integer
+        source: input
+        description: "Carrier-published minimum ground turn time for this flight; the assignment window must be >= this."
+        default: 45
+        constraints: ">= 0"
+      - name: schedule_status
+        type: enum
+        source: system
+        description: "Independent schedule-lifecycle axis."
+        default: SCHEDULED
+        constraints: "One of {SCHEDULED, ACTIVE, COMPLETED, CANCELLED, DIVERTED}"
+      - name: handling_status
+        type: enum
+        source: system
+        description: "Independent gate-handling axis; evolves separately from schedule_status."
+        default: UNASSIGNED
+        constraints: "One of {UNASSIGNED, ASSIGNED, AT_GATE, TOWED_OFF, DEPARTED}"
+      - name: scheduled_turn_minutes
+        type: integer
+        source: computed
+        description: "(sched_departure_utc - sched_arrival_utc) in whole minutes, or null when sched_arrival_utc is null. Computed on create."
+
+  - name: SlotPermit
+    parent: null
+    common_fields: true
+    fields:
+      - name: flight_id
+        type: string
+        source: input
+        description: "FK -> Flight.id; the flight this slot is coordinated for."
+      - name: movement_type
+        type: enum
+        source: input
+        description: "Whether the permit governs the arrival or the departure movement."
+        constraints: "One of {ARRIVAL, DEPARTURE}"
+      - name: slot_time_utc
+        type: datetime
+        source: input
+        description: "Coordinated slot time (on-block for ARRIVAL, off-block for DEPARTURE), ISO 8601 UTC."
+      - name: tolerance_minutes
+        type: integer
+        source: input
+        description: "Half-window (minutes) around slot_time_utc inside which the matching movement event must fall. Closed interval [slot - tol, slot + tol]."
+        default: 15
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "Slot permit lifecycle."
+        default: REQUESTED
+        constraints: "One of {REQUESTED, CONFIRMED, USED, FORFEITED, CANCELLED}"
+
+  - name: GateAssignment
+    parent: null
+    common_fields: true
+    fields:
+      - name: flight_id
+        type: string
+        source: input
+        description: "FK -> Flight.id; the flight occupying the stand."
+      - name: stand_type
+        type: enum
+        source: input
+        description: "Discriminator selecting which stand entity stand_id refers to."
+        constraints: "One of {GATE, REMOTE}"
+      - name: gate_id
+        type: string
+        source: input
+        description: "FK -> Gate.id; set when stand_type = GATE, else null."
+      - name: remote_stand_id
+        type: string
+        source: input
+        description: "FK -> RemoteStand.id; set when stand_type = REMOTE, else null."
+      - name: start_utc
+        type: datetime
+        source: input
+        description: "Planned on-stand time, ISO 8601 UTC; lower bound of the occupancy interval."
+      - name: end_utc
+        type: datetime
+        source: input
+        description: "Planned off-stand time, ISO 8601 UTC; upper bound of the occupancy interval. Must be > start_utc."
+      - name: status
+        type: enum
+        source: system
+        description: "Assignment occupancy lifecycle (cyclic via towing)."
+        default: PLANNED
+        constraints: "One of {PLANNED, OCCUPIED, TOWED_AWAY, RELEASED, CANCELLED}"
+      - name: tow_target_stand_id
+        type: string
+        source: system
+        description: "FK -> RemoteStand.id; the remote stand the aircraft was towed to while this gate assignment is TOWED_AWAY, else null."
+      - name: occupancy_minutes
+        type: integer
+        source: computed
+        description: "(end_utc - start_utc) in whole minutes; the planned window length used for the min-turn check."
+
+  - name: CuteAllocation
+    parent: null
+    common_fields: true
+    fields:
+      - name: flight_id
+        type: string
+        source: input
+        description: "FK -> Flight.id; the flight using the CUTE workstation."
+      - name: cute_unit_id
+        type: string
+        source: input
+        description: "FK -> CuteUnit.id; the common-use workstation allocated."
+      - name: start_utc
+        type: datetime
+        source: input
+        description: "Allocation start, ISO 8601 UTC."
+      - name: end_utc
+        type: datetime
+        source: input
+        description: "Allocation end, ISO 8601 UTC; must be > start_utc."
+      - name: status
+        type: enum
+        source: system
+        description: "CUTE allocation lifecycle."
+        default: HELD
+        constraints: "One of {HELD, RELEASED, CANCELLED}"
+
+  - name: GseAllocation
+    parent: null
+    common_fields: true
+    fields:
+      - name: flight_id
+        type: string
+        source: input
+        description: "FK -> Flight.id; the flight the GSE asset serves."
+      - name: equipment_id
+        type: string
+        source: input
+        description: "FK -> GroundEquipment.id; the GSE asset allocated."
+      - name: start_utc
+        type: datetime
+        source: input
+        description: "Allocation start, ISO 8601 UTC."
+      - name: end_utc
+        type: datetime
+        source: input
+        description: "Allocation end, ISO 8601 UTC; must be > start_utc."
+      - name: status
+        type: enum
+        source: system
+        description: "GSE allocation lifecycle."
+        default: HELD
+        constraints: "One of {HELD, RELEASED, CANCELLED}"
+
+  - name: ClockState
+    parent: null
+    common_fields: false
+    fields:
+      - name: current_utc
+        type: datetime
+        source: system
+        description: "Singleton simulated wall clock used for slot-tolerance and at-gate event checks. Set via the test-driving clock endpoint."
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # --- Flight: parallel axes (schedule_status × handling_status) -------------
+  - entity: Flight
+    initial_state: SCHEDULED              # schedule_status axis
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: ACTIVE
+        trigger: "POST /flights/{id}/activate"
+        actor: OpsAdmin
+        preconditions:
+          - "flight.schedule_status == SCHEDULED"
+        side_effects:
+          - "schedule_status = ACTIVE"
+        note: "schedule axis only; handling_status untouched."
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "POST /flights/{id}/complete"
+        actor: OpsAdmin
+        preconditions:
+          - "flight.schedule_status == ACTIVE"
+          - "flight.handling_status == DEPARTED"
+        side_effects:
+          - "schedule_status = COMPLETED"
+        note: "Cross-axis guard: schedule cannot complete until handling has reached DEPARTED."
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /flights/{id}/irops-cancel"
+        actor: OpsAdmin
+        preconditions:
+          - "flight.schedule_status IN {SCHEDULED, ACTIVE}"
+        side_effects:
+          - "schedule_status = CANCELLED"
+          - "CASCADE depth-3 (irops): every GateAssignment of this flight with status IN {PLANNED, OCCUPIED, TOWED_AWAY} -> CANCELLED (hop 1)"
+          - "each cancelled GateAssignment whose status was OCCUPIED|TOWED_AWAY decrements its stand's occupancy counter (Gate.active_assignment_count or RemoteStand.occupancy_count) (hop 2 follows from hop 1)"
+          - "for a GateAssignment that was TOWED_AWAY, its tow_target_stand RemoteStand.occupancy_count is also decremented as the tow is unwound (hop 2b)"
+          - "every HELD CuteAllocation and HELD GseAllocation of this flight -> CANCELLED, releasing those pooled resources (hop 3, triggered by the flight cancel, chained after assignment teardown)"
+          - "every SlotPermit of this flight with status IN {REQUESTED, CONFIRMED} -> FORFEITED (hop 3)"
+          - "handling_status = UNASSIGNED"
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /flights/{id}/irops-cancel"
+        actor: OpsAdmin
+        preconditions:
+          - "flight.schedule_status == ACTIVE"
+        side_effects:
+          - "same cascade as the SCHEDULED->CANCELLED irops-cancel transition"
+      - from: ACTIVE
+        to: DIVERTED
+        trigger: "POST /flights/{id}/irops-divert"
+        actor: OpsAdmin
+        preconditions:
+          - "flight.schedule_status == ACTIVE"
+        side_effects:
+          - "schedule_status = DIVERTED"
+          - "CASCADE depth-2 (divert): every GateAssignment of this flight with status IN {PLANNED, OCCUPIED} -> RELEASED (hop 1)"
+          - "each released GateAssignment decrements its stand occupancy counter (hop 2 follows from hop 1)"
+          - "handling_status = UNASSIGNED"
+        note: "DIVERTED is terminal for the handling axis but distinct from CANCELLED: slots are kept, not forfeited."
+
+  # --- Flight handling axis (independent of schedule_status) ------------------
+  - entity: Flight
+    initial_state: UNASSIGNED             # handling_status axis
+    terminal_states: [DEPARTED]
+    transitions:
+      - from: UNASSIGNED
+        to: ASSIGNED
+        trigger: "system: first GateAssignment for this flight reaches PLANNED"
+        actor: system
+        preconditions:
+          - "a GateAssignment with this flight_id is created"
+        side_effects:
+          - "handling_status = ASSIGNED"
+      - from: ASSIGNED
+        to: AT_GATE
+        trigger: "POST /gate-assignments/{id}/occupy"
+        actor: RampAgent
+        preconditions:
+          - "the GateAssignment transitions PLANNED -> OCCUPIED"
+        side_effects:
+          - "handling_status = AT_GATE"
+      - from: AT_GATE
+        to: TOWED_OFF
+        trigger: "POST /gate-assignments/{id}/tow"
+        actor: GateController
+        preconditions:
+          - "the GateAssignment transitions OCCUPIED -> TOWED_AWAY"
+        side_effects:
+          - "handling_status = TOWED_OFF"
+      - from: TOWED_OFF
+        to: AT_GATE
+        trigger: "POST /gate-assignments/{id}/return"
+        actor: GateController
+        preconditions:
+          - "the GateAssignment transitions TOWED_AWAY -> OCCUPIED"
+        side_effects:
+          - "handling_status = AT_GATE"
+      - from: AT_GATE
+        to: DEPARTED
+        trigger: "POST /gate-assignments/{id}/depart"
+        actor: RampAgent
+        preconditions:
+          - "the GateAssignment transitions OCCUPIED -> RELEASED"
+        side_effects:
+          - "handling_status = DEPARTED"
+
+  # --- GateAssignment: cyclic occupancy lifecycle (tow loop) ------------------
+  - entity: GateAssignment
+    initial_state: PLANNED
+    terminal_states: [RELEASED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: OCCUPIED
+        trigger: "POST /gate-assignments/{id}/occupy"
+        actor: RampAgent
+        preconditions:
+          - "assignment.status == PLANNED"
+          - "flight.schedule_status IN {SCHEDULED, ACTIVE}"
+        side_effects:
+          - "status = OCCUPIED"
+          - "increment the stand occupancy counter (Gate.active_assignment_count or RemoteStand.occupancy_count) by 1"
+          - "Flight.handling_status -> AT_GATE"
+      - from: OCCUPIED
+        to: TOWED_AWAY
+        trigger: "POST /gate-assignments/{id}/tow"
+        actor: GateController
+        preconditions:
+          - "assignment.status == OCCUPIED"
+          - "assignment.stand_type == GATE"
+          - "the target RemoteStand named in body is ACTIVE and has occupancy_count < capacity"
+          - "target RemoteStand.max_wingspan_m >= flight.aircraft_wingspan_m"
+        side_effects:
+          - "status = TOWED_AWAY"
+          - "tow_target_stand_id = body.target_remote_stand_id"
+          - "Gate.active_assignment_count for the source gate stays counted (assignment remains active) but the gate becomes physically free for new PLANNED windows after end of tow"
+          - "target RemoteStand.occupancy_count += 1"
+          - "Flight.handling_status -> TOWED_OFF"
+        note: "Tow loop start. Only GATE assignments can be towed to a remote stand."
+      - from: TOWED_AWAY
+        to: OCCUPIED
+        trigger: "POST /gate-assignments/{id}/return"
+        actor: GateController
+        preconditions:
+          - "assignment.status == TOWED_AWAY"
+        side_effects:
+          - "status = OCCUPIED"
+          - "target RemoteStand.occupancy_count -= 1 for the previous tow_target_stand_id"
+          - "tow_target_stand_id = null"
+          - "Flight.handling_status -> AT_GATE"
+          - "COMPENSATING-INVARIANT (tow-target-occupancy): the tow (occupancy_count += 1) paired with its return (occupancy_count -= 1) leaves the target RemoteStand.occupancy_count exactly equal to its value before the tow; no drift on the remote stand."
+        note: "Tow loop close: OCCUPIED -> TOWED_AWAY -> OCCUPIED is a cycle."
+      - from: OCCUPIED
+        to: RELEASED
+        trigger: "POST /gate-assignments/{id}/depart"
+        actor: RampAgent
+        preconditions:
+          - "assignment.status == OCCUPIED"
+        side_effects:
+          - "status = RELEASED"
+          - "decrement the stand occupancy counter by 1"
+          - "Flight.handling_status -> DEPARTED"
+          - "COMPENSATING-INVARIANT (stand-occupancy): the net change to (Gate.active_assignment_count + sum RemoteStand.occupancy_count) across the OCCUPIED->RELEASED pair is zero relative to the pre-OCCUPY baseline"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /gate-assignments/{id}/cancel  OR  flight irops-cancel cascade"
+        actor: GateController
+        preconditions:
+          - "assignment.status IN {PLANNED, OCCUPIED, TOWED_AWAY}"
+        side_effects:
+          - "status = CANCELLED"
+          - "if previous status was OCCUPIED|TOWED_AWAY, decrement the source stand occupancy counter"
+          - "if previous status was TOWED_AWAY, also decrement tow_target_stand RemoteStand.occupancy_count"
+          - "COMPENSATING-INVARIANT (stand-occupancy): cancelling an active assignment restores the occupancy counters to exactly their pre-OCCUPY values (no drift)"
+      - from: OCCUPIED
+        to: CANCELLED
+        trigger: "POST /gate-assignments/{id}/cancel  OR  flight irops-cancel cascade"
+        actor: GateController
+        preconditions:
+          - "assignment.status IN {PLANNED, OCCUPIED, TOWED_AWAY}"
+        side_effects:
+          - "status = CANCELLED"
+          - "decrement the source stand occupancy counter"
+
+  # --- SlotPermit: branching (CONFIRMED -> {USED, FORFEITED}) -----------------
+  - entity: SlotPermit
+    initial_state: REQUESTED
+    terminal_states: [USED, FORFEITED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: CONFIRMED
+        trigger: "POST /slot-permits/{id}/confirm"
+        actor: SlotCoordinator
+        preconditions:
+          - "permit.status == REQUESTED"
+          - "no other SlotPermit on the same airport movement_type with status IN {CONFIRMED, USED} occupies the same slot_time_utc minute (slot-uniqueness)"
+        side_effects:
+          - "status = CONFIRMED"
+      - from: CONFIRMED
+        to: USED
+        trigger: "POST /slot-permits/{id}/redeem"
+        actor: SlotCoordinator
+        preconditions:
+          - "permit.status == CONFIRMED"
+          - "ClockState.current_utc is inside the closed window [slot_time_utc - tolerance_minutes, slot_time_utc + tolerance_minutes]"
+        side_effects:
+          - "status = USED"
+        note: "Branch A: redeemed inside tolerance window."
+      - from: CONFIRMED
+        to: FORFEITED
+        trigger: "POST /slot-permits/{id}/forfeit  OR  redeem attempted outside tolerance"
+        actor: SlotCoordinator
+        preconditions:
+          - "permit.status == CONFIRMED"
+        side_effects:
+          - "status = FORFEITED"
+        note: "Branch B: explicit forfeit, divergent side-effect set from USED (slot freed for re-coordination)."
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /slot-permits/{id}/cancel"
+        actor: SlotCoordinator
+        preconditions:
+          - "permit.status IN {REQUESTED, CONFIRMED}"
+        side_effects:
+          - "status = CANCELLED"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: assignment-create-stale-gate
+    parent_entity: Gate
+    write_endpoint: "POST /gate-assignments"
+    occ_field: "expected_gate_version"
+    description: |
+      Creating a GateAssignment against a Gate whose version has advanced
+      since the client last observed it is rejected on a stale version. This
+      captures the case where another writer has already booked an
+      overlapping window on the same gate (which legitimately bumped the
+      gate's version and changed its free-window set), so the current
+      writer's view of the gate is stale. The loser carries an
+      expected_gate_version below the gate's current version.
+    error_id: ERR_STALE_GATE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: turn_time_feasibility
+    trigger: "POST /gate-assignments (assignment create), and re-checked when start_utc/end_utc supplied"
+    algorithm: threshold
+    formula: |
+      occupancy_minutes = floor((end_utc - start_utc) / 60 seconds)
+      # min-turn check (boundary precision: >= passes, < fails)
+      feasible = (occupancy_minutes >= flight.min_turn_minutes)
+      if not feasible: reject ERR_TURN_TIME_TOO_SHORT
+    input_set: "Exactly the one GateAssignment being created and its Flight.min_turn_minutes; no other rows participate."
+    constants: {}
+    precision: "whole minutes via floor of (end-start) seconds / 60"
+    variants:
+      - name: gate_window
+        when: "stand_type == GATE"
+        difference: "occupancy_minutes must be >= flight.min_turn_minutes."
+      - name: remote_window
+        when: "stand_type == REMOTE"
+        difference: "Same min-turn rule applies, but the remote-stand window is NOT subject to the gate buffer_minutes; only the min-turn floor governs."
+
+  - name: gate_window_conflict
+    trigger: "POST /gate-assignments with stand_type=GATE; and POST /gate-assignments/{id}/tow target check"
+    algorithm: interval_merge
+    formula: |
+      # Gate occupancy intervals are HALF-OPEN [start_utc, end_utc) but a
+      # buffer_minutes gap is REQUIRED between consecutive occupancies.
+      # New window [s, e) conflicts with existing window [s2, e2) on the same
+      # gate (existing.status IN {PLANNED, OCCUPIED, TOWED_AWAY}) when:
+      #   s < (e2 + buffer_minutes)  AND  s2 < (e + buffer_minutes)
+      # i.e. the buffer is added to BOTH ends; exact back-to-back e2 == s with
+      # buffer_minutes == 0 does NOT conflict (half-open), but with
+      # buffer_minutes > 0 a gap strictly less than buffer is a conflict.
+      conflict = (s < e2 + buffer) and (s2 < e + buffer)
+      if conflict for any existing window: reject ERR_GATE_WINDOW_CONFLICT
+    input_set: "All GateAssignment rows on the same gate_id whose status IN {PLANNED, OCCUPIED, TOWED_AWAY}; CANCELLED and RELEASED excluded."
+    constants: {}
+    precision: "buffer_minutes from the Gate; minute-resolution comparison on UTC instants"
+    variants:
+      - name: same_gate_buffered
+        when: "checking two windows on the same Gate"
+        difference: "buffer_minutes is added to both ends; half-open base interval."
+
+  - name: remote_stand_capacity_overlap
+    trigger: "POST /gate-assignments with stand_type=REMOTE; and POST /gate-assignments/{id}/tow"
+    algorithm: aggregation
+    formula: |
+      # Remote stand allows up to `capacity` occupants at once. Intervals
+      # are CLOSED [start_utc, end_utc] (adjacency touches DO collide) and there
+      # is NO buffer. Reject when, at any instant covered by the new window, the
+      # count of overlapping active windows (status IN {PLANNED, OCCUPIED}) plus
+      # this one would EXCEED capacity.
+      # Sweep the endpoints of all active windows on the stand; for the maximum
+      # overlap-at-once M with the new window included:
+      #   if M > capacity: reject ERR_REMOTE_STAND_FULL
+      # Closed-interval adjacency: existing [s2,e2], new [s,e] overlap when
+      #   s <= e2 AND s2 <= e   (touching endpoints count as overlap).
+      overlap = (s <= e2) and (s2 <= e)
+    input_set: "All GateAssignment rows on the same remote_stand_id (as primary stand OR as tow_target_stand_id of a TOWED_AWAY row) with status IN {PLANNED, OCCUPIED, TOWED_AWAY}."
+    constants: {}
+    precision: "integer capacity; closed-interval minute comparison"
+    variants:
+      - name: apron_capacity
+        when: "remote stand capacity > 1"
+        difference: "Up to capacity occupants at once permitted; only the (capacity+1)-th overlapping window is rejected."
+
+  - name: equipment_cooldown_overlap
+    trigger: "POST /gse-allocations"
+    algorithm: interval_merge
+    formula: |
+      # A GSE asset serves at most one flight at a time AND needs a cooldown
+      # gap of turnaround_minutes between a release and the next grab. Intervals
+      # are HALF-OPEN [start_utc, end_utc); cooldown is asymmetric — it is added
+      # only AFTER the earlier window's end (one-sided), unlike the gate buffer
+      # which is two-sided.
+      # New [s,e) conflicts with existing [s2,e2) (status = HELD) when:
+      #   s < e2 + turnaround   AND   s2 < e + turnaround
+      # but because cooldown is one-sided per pair, evaluate ordered by start:
+      #   earlier window W1, later window W2 -> require W2.start >= W1.end + turnaround
+      conflict = not (s >= e2 + turnaround or s2 >= e + turnaround)
+      if conflict: reject ERR_EQUIPMENT_BUSY
+    input_set: "All GseAllocation rows on the same equipment_id with status = HELD."
+    constants: {}
+    precision: "turnaround_minutes from the GroundEquipment; minute comparison"
+    variants:
+      - name: with_cooldown
+        when: "turnaround_minutes > 0"
+        difference: "Requires a gap; back-to-back HELD allocations with zero gap are rejected when turnaround_minutes > 0."
+      - name: zero_cooldown
+        when: "turnaround_minutes == 0"
+        difference: "Pure half-open exclusivity; touching endpoints e2 == s do NOT conflict."
+
+  - name: slot_compliance_window
+    trigger: "POST /slot-permits/{id}/redeem"
+    algorithm: threshold
+    formula: |
+      lo = slot_time_utc - tolerance_minutes
+      hi = slot_time_utc + tolerance_minutes
+      # CLOSED window: now == lo or now == hi PASSES (boundary inclusive).
+      compliant = (lo <= ClockState.current_utc <= hi)
+      if compliant: permit -> USED
+      else: reject ERR_SLOT_WINDOW_MISSED (permit stays CONFIRMED, may be forfeited)
+    input_set: "The single SlotPermit being redeemed and the ClockState singleton."
+    constants: {}
+    precision: "closed window, minute resolution on UTC instants"
+    variants:
+      - name: arrival_tolerance
+        when: "movement_type == ARRIVAL"
+        difference: "Window centred on the coordinated on-block slot."
+      - name: departure_tolerance
+        when: "movement_type == DEPARTURE"
+        difference: "Window centred on the coordinated off-block slot; same closed-interval arithmetic."
+
+  - name: cute_overlap
+    trigger: "POST /cute-allocations"
+    algorithm: interval_merge
+    formula: |
+      # A CUTE workstation serves at most one flight at a time. Intervals are
+      # HALF-OPEN [start_utc, end_utc) with NO buffer and NO cooldown — the
+      # simplest interval semantics in the scaffold (capacity 1, gap 0).
+      # New [s,e) conflicts with existing [s2,e2) (status = HELD) when:
+      #   s < e2  AND  s2 < e          (strict half-open overlap)
+      # Touching endpoints e2 == s do NOT conflict.
+      conflict = (s < e2) and (s2 < e)
+      if conflict for any HELD allocation on the same cute_unit_id: reject ERR_CUTE_BUSY
+    input_set: "All CuteAllocation rows on the same cute_unit_id with status = HELD."
+    constants: {}
+    precision: "minute comparison on UTC instants; half-open, capacity 1, zero buffer"
+    variants:
+      - name: strict_half_open
+        when: "always"
+        difference: "Pure exclusivity; adjacency (e2 == s) is allowed back-to-back."
+
+  - name: occupancy_counter_reconcile
+    trigger: "GateAssignment OCCUPIED->RELEASED / *->CANCELLED, and the irops-cancel / irops-divert cascades"
+    algorithm: aggregation
+    formula: |
+      # Order-sensitive reconciliation. A TOWED_AWAY assignment touches TWO
+      # counters: its source Gate.active_assignment_count AND its
+      # tow_target RemoteStand.occupancy_count. When such an assignment is
+      # torn down, the decrements look circular (which counter is "the stand"
+      # depends on tow state, which itself depends on whether the tow was
+      # unwound). The evaluation order is PINNED to make the result well-defined:
+      #   step 1: if status == TOWED_AWAY, decrement tow_target_stand RemoteStand.occupancy_count by 1, then set tow_target_stand_id = null  (unwind the tow first)
+      #   step 2: decrement the SOURCE stand counter by 1 (Gate.active_assignment_count for stand_type=GATE, else RemoteStand.occupancy_count)
+      #   step 3: set status to the terminal value (RELEASED or CANCELLED)
+      # Performing step 2 before step 1 would mis-attribute one decrement; the
+      # pinned order guarantees each physical occupancy is released exactly once.
+      net_change_to_global_occupancy == -(units this assignment held) and never double-counts the tow target
+    input_set: "The single GateAssignment being torn down plus the two stand counters it touches; no sweep over siblings."
+    constants: {}
+    precision: "integer counters; deterministic 3-step order"
+    variants:
+      - name: direct_release
+        when: "assignment was OCCUPIED (not towed)"
+        difference: "Only step 2 fires; tow-target step is a no-op."
+      - name: towed_release
+        when: "assignment was TOWED_AWAY"
+        difference: "Both step 1 (tow target) and step 2 (source gate) fire, in that order."
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "The role is permitted to perform this operation per §1.7."
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "Every resource referenced in the path and every FK in the body exists; validated left-to-right (path before body, FKs in declaration order)."
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 4
+    category: business_constraint
+    check: "Request body well-formed: required fields present, enum values legal, end_utc > start_utc, numeric fields within declared bounds, stand_type discriminator matches exactly one of gate_id/remote_stand_id."
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which this transition is legal (state-machine from-state precondition)."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 6
+    category: state
+    check: "Cross-axis/cross-entity state guard: flight.handling_status == DEPARTED before /complete; gate/stand status == ACTIVE before an assignment is created or occupied; flight.schedule_status IN {SCHEDULED, ACTIVE} before occupy."
+    error_id: ERR_CROSS_STATE_BLOCKED
+    http_status: 409
+    applies_to: "POST /flights/{id}/complete, POST /gate-assignments, POST /gate-assignments/{id}/occupy"
+
+  - priority: 7
+    category: business_constraint
+    check: "Wingspan fit: the chosen stand's max_wingspan_m >= flight.aircraft_wingspan_m (for the assignment's stand, and for a tow target)."
+    error_id: ERR_WINGSPAN_EXCEEDED
+    http_status: 422
+    applies_to: "POST /gate-assignments, POST /gate-assignments/{id}/tow"
+
+  - priority: 8
+    category: business_temporal
+    check: "Gate window conflict: a GATE assignment whose buffered interval collides with an existing active window on the same gate (gate_window_conflict calc)."
+    error_id: ERR_GATE_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /gate-assignments"
+
+  - priority: 9
+    category: business_temporal
+    check: "CUTE double-booking: a HELD CuteAllocation on the same cute_unit_id whose half-open interval overlaps the requested one."
+    error_id: ERR_CUTE_BUSY
+    http_status: 409
+    applies_to: "POST /cute-allocations"
+
+  - priority: 10
+    category: business_temporal
+    check: "GSE cooldown conflict: a HELD GseAllocation on the same equipment_id violating the one-sided turnaround cooldown (equipment_cooldown_overlap calc)."
+    error_id: ERR_EQUIPMENT_BUSY
+    http_status: 409
+    applies_to: "POST /gse-allocations"
+
+  - priority: 11
+    category: business_constraint
+    check: "Remote stand capacity: a REMOTE assignment (or tow target) whose closed interval pushes overlapping occupancy above capacity (remote_stand_capacity_overlap calc)."
+    error_id: ERR_REMOTE_STAND_FULL
+    http_status: 409
+    applies_to: "POST /gate-assignments, POST /gate-assignments/{id}/tow"
+
+  - priority: 12
+    category: business_constraint
+    check: "Slot uniqueness: confirming a SlotPermit whose slot_time_utc minute + movement_type already has a CONFIRMED/USED permit elsewhere."
+    error_id: ERR_SLOT_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /slot-permits/{id}/confirm"
+
+  - priority: 13
+    category: business_temporal
+    check: "Minimum turn time: occupancy_minutes < flight.min_turn_minutes (turn_time_feasibility calc, boundary >=)."
+    error_id: ERR_TURN_TIME_TOO_SHORT
+    http_status: 422
+    applies_to: "POST /gate-assignments"
+
+  - priority: 14
+    category: business_temporal
+    check: "Slot compliance window: redeeming a CONFIRMED permit while ClockState.current_utc is outside the closed tolerance window."
+    error_id: ERR_SLOT_WINDOW_MISSED
+    http_status: 422
+    applies_to: "POST /slot-permits/{id}/redeem"
+
+  - priority: 15
+    category: business_constraint
+    check: "OCC stale-version: expected_gate_version on assignment-create does not equal the gate's current version."
+    error_id: ERR_STALE_GATE_VERSION
+    http_status: 412
+    applies_to: "POST /gate-assignments"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Gate registry --------------------------------------------------------
+  - method: POST
+    path: "/gates"
+    description: "Register a gate."
+    roles: [OpsAdmin]
+    code: 201
+    input: ["code", "terminal", "max_wingspan_m", "is_cute_equipped?", "buffer_minutes?"]
+    output: Gate
+    side_effects: ["Gate created with status=ACTIVE, active_assignment_count=0, version=1"]
+
+  - method: GET
+    path: "/gates/{id}"
+    description: "Fetch a gate (exposes version for OCC and active_assignment_count)."
+    roles: [OpsAdmin, GateController, RampAgent, SlotCoordinator]
+    code: 200
+    input: []
+    output: Gate
+    side_effects: []
+
+  - method: GET
+    path: "/gates"
+    description: "List gates with pagination."
+    roles: [OpsAdmin, GateController, RampAgent, SlotCoordinator]
+    code: 200
+    input: ["status?", "terminal?", "limit?", "offset?"]
+    output: Gate[]
+    side_effects: []
+
+  - method: POST
+    path: "/gates/{id}/out-of-service"
+    description: "Take a gate out of service (no new occupancies)."
+    roles: [OpsAdmin]
+    code: 200
+    input: []
+    output: Gate
+    side_effects: ["Gate.status = OUT_OF_SERVICE"]
+
+  - method: GET
+    path: "/gates/{id}/gate-assignments"
+    description: "List GateAssignments on this gate (FK reverse-reachability for GateAssignment.gate_id)."
+    roles: [OpsAdmin, GateController, RampAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: GateAssignment[]
+    side_effects: []
+
+  # ---- RemoteStand registry -------------------------------------------------
+  - method: POST
+    path: "/remote-stands"
+    description: "Register a remote stand."
+    roles: [OpsAdmin]
+    code: 201
+    input: ["code", "max_wingspan_m", "capacity?"]
+    output: RemoteStand
+    side_effects: ["RemoteStand created with status=ACTIVE, occupancy_count=0"]
+
+  - method: GET
+    path: "/remote-stands/{id}"
+    description: "Fetch a remote stand."
+    roles: [OpsAdmin, GateController, RampAgent, SlotCoordinator]
+    code: 200
+    input: []
+    output: RemoteStand
+    side_effects: []
+
+  - method: GET
+    path: "/remote-stands"
+    description: "List remote stands."
+    roles: [OpsAdmin, GateController, RampAgent, SlotCoordinator]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: RemoteStand[]
+    side_effects: []
+
+  - method: GET
+    path: "/remote-stands/{id}/gate-assignments"
+    description: "List GateAssignments whose remote_stand_id is this stand (FK reverse-reachability for GateAssignment.remote_stand_id and tow_target_stand_id)."
+    roles: [OpsAdmin, GateController, RampAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: GateAssignment[]
+    side_effects: []
+
+  # ---- CuteUnit registry ----------------------------------------------------
+  - method: POST
+    path: "/cute-units"
+    description: "Register a common-use (CUTE) workstation."
+    roles: [OpsAdmin]
+    code: 201
+    input: ["label", "terminal"]
+    output: CuteUnit
+    side_effects: ["CuteUnit created with status=AVAILABLE"]
+
+  - method: GET
+    path: "/cute-units/{id}"
+    description: "Fetch a CUTE unit."
+    roles: [OpsAdmin, RampAgent, GateController]
+    code: 200
+    input: []
+    output: CuteUnit
+    side_effects: []
+
+  - method: GET
+    path: "/cute-units/{id}/cute-allocations"
+    description: "List CuteAllocations on this unit (FK reverse-reachability for CuteAllocation.cute_unit_id)."
+    roles: [OpsAdmin, RampAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: CuteAllocation[]
+    side_effects: []
+
+  # ---- GroundEquipment registry ---------------------------------------------
+  - method: POST
+    path: "/ground-equipment"
+    description: "Register a GSE asset."
+    roles: [OpsAdmin]
+    code: 201
+    input: ["asset_tag", "equipment_type", "turnaround_minutes?"]
+    output: GroundEquipment
+    side_effects: ["GroundEquipment created with status=AVAILABLE"]
+
+  - method: GET
+    path: "/ground-equipment/{id}"
+    description: "Fetch a GSE asset."
+    roles: [OpsAdmin, RampAgent, GateController]
+    code: 200
+    input: []
+    output: GroundEquipment
+    side_effects: []
+
+  - method: GET
+    path: "/ground-equipment/{id}/gse-allocations"
+    description: "List GseAllocations on this asset (FK reverse-reachability for GseAllocation.equipment_id)."
+    roles: [OpsAdmin, RampAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: GseAllocation[]
+    side_effects: []
+
+  # ---- Flight ---------------------------------------------------------------
+  - method: POST
+    path: "/flights"
+    description: "Create a flight schedule entry."
+    roles: [OpsAdmin]
+    code: 201
+    input: ["flight_no", "aircraft_wingspan_m", "sched_arrival_utc?", "sched_departure_utc", "min_turn_minutes?"]
+    output: Flight
+    side_effects: ["Flight created with schedule_status=SCHEDULED, handling_status=UNASSIGNED; scheduled_turn_minutes computed"]
+
+  - method: GET
+    path: "/flights/{id}"
+    description: "Fetch a flight (both status axes + computed turn)."
+    roles: [OpsAdmin, GateController, RampAgent, SlotCoordinator]
+    code: 200
+    input: []
+    output: Flight
+    side_effects: []
+
+  - method: GET
+    path: "/flights"
+    description: "List flights."
+    roles: [OpsAdmin, GateController, RampAgent, SlotCoordinator]
+    code: 200
+    input: ["schedule_status?", "handling_status?", "limit?", "offset?"]
+    output: Flight[]
+    side_effects: []
+
+  - method: POST
+    path: "/flights/{id}/activate"
+    description: "Move schedule axis SCHEDULED -> ACTIVE."
+    roles: [OpsAdmin]
+    code: 200
+    input: []
+    output: Flight
+    side_effects: ["schedule_status = ACTIVE"]
+
+  - method: POST
+    path: "/flights/{id}/complete"
+    description: "Move schedule axis ACTIVE -> COMPLETED (requires handling DEPARTED)."
+    roles: [OpsAdmin]
+    code: 200
+    input: []
+    output: Flight
+    side_effects: ["schedule_status = COMPLETED"]
+
+  - method: POST
+    path: "/flights/{id}/irops-cancel"
+    description: "IROPS cancel: cancel the flight and cascade-tear-down its assignments, allocations, and forfeit slots."
+    roles: [OpsAdmin]
+    code: 200
+    input: []
+    output: Flight
+    side_effects:
+      - "schedule_status = CANCELLED; handling_status = UNASSIGNED"
+      - "cascade: active GateAssignments -> CANCELLED with occupancy counters decremented"
+      - "cascade: HELD CuteAllocations and GseAllocations -> CANCELLED"
+      - "cascade: REQUESTED/CONFIRMED SlotPermits -> FORFEITED"
+
+  - method: POST
+    path: "/flights/{id}/irops-divert"
+    description: "IROPS divert: release the flight's gate assignments (slots kept)."
+    roles: [OpsAdmin]
+    code: 200
+    input: []
+    output: Flight
+    side_effects:
+      - "schedule_status = DIVERTED; handling_status = UNASSIGNED"
+      - "cascade: PLANNED/OCCUPIED GateAssignments -> RELEASED with occupancy counters decremented"
+
+  - method: GET
+    path: "/flights/{id}/gate-assignments"
+    description: "List GateAssignments for this flight (FK reverse-reachability for GateAssignment.flight_id)."
+    roles: [OpsAdmin, GateController, RampAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: GateAssignment[]
+    side_effects: []
+
+  - method: GET
+    path: "/flights/{id}/slot-permits"
+    description: "List SlotPermits for this flight (FK reverse-reachability for SlotPermit.flight_id)."
+    roles: [OpsAdmin, SlotCoordinator]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: SlotPermit[]
+    side_effects: []
+
+  - method: GET
+    path: "/flights/{id}/cute-allocations"
+    description: "List CuteAllocations for this flight (FK reverse-reachability for CuteAllocation.flight_id)."
+    roles: [OpsAdmin, RampAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: CuteAllocation[]
+    side_effects: []
+
+  - method: GET
+    path: "/flights/{id}/gse-allocations"
+    description: "List GseAllocations for this flight (FK reverse-reachability for GseAllocation.flight_id)."
+    roles: [OpsAdmin, RampAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: GseAllocation[]
+    side_effects: []
+
+  # ---- GateAssignment -------------------------------------------------------
+  - method: POST
+    path: "/gate-assignments"
+    description: "Create a gate or remote-stand assignment for a flight (OCC-guarded on the gate)."
+    roles: [GateController]
+    code: 201
+    input: ["flight_id", "stand_type", "gate_id?", "remote_stand_id?", "start_utc", "end_utc", "expected_gate_version?"]
+    output: GateAssignment
+    side_effects:
+      - "GateAssignment created with status=PLANNED; occupancy_minutes computed"
+      - "if first assignment for the flight: Flight.handling_status -> ASSIGNED"
+      - "increments Gate.version by 1 (when stand_type=GATE)"
+      - "runs turn_time_feasibility, gate_window_conflict (GATE) / remote_stand_capacity_overlap (REMOTE), wingspan checks"
+
+  - method: GET
+    path: "/gate-assignments/{id}"
+    description: "Fetch a gate assignment."
+    roles: [OpsAdmin, GateController, RampAgent]
+    code: 200
+    input: []
+    output: GateAssignment
+    side_effects: []
+
+  - method: GET
+    path: "/gate-assignments"
+    description: "List gate assignments (filterable by flight/gate/remote-stand/status)."
+    roles: [OpsAdmin, GateController, RampAgent]
+    code: 200
+    input: ["flight_id?", "gate_id?", "remote_stand_id?", "status?", "limit?", "offset?"]
+    output: GateAssignment[]
+    side_effects: []
+
+  - method: POST
+    path: "/gate-assignments/{id}/occupy"
+    description: "Aircraft arrives on stand: PLANNED -> OCCUPIED."
+    roles: [RampAgent]
+    code: 200
+    input: []
+    output: GateAssignment
+    side_effects: ["status=OCCUPIED; stand occupancy counter +1; Flight.handling_status -> AT_GATE"]
+
+  - method: POST
+    path: "/gate-assignments/{id}/tow"
+    description: "Tow aircraft off a gate to a remote stand: OCCUPIED -> TOWED_AWAY."
+    roles: [GateController]
+    code: 200
+    input: ["target_remote_stand_id"]
+    output: GateAssignment
+    side_effects: ["status=TOWED_AWAY; tow_target_stand_id set; target RemoteStand.occupancy_count +1; Flight.handling_status -> TOWED_OFF"]
+
+  - method: POST
+    path: "/gate-assignments/{id}/return"
+    description: "Tow aircraft back to its gate: TOWED_AWAY -> OCCUPIED."
+    roles: [GateController]
+    code: 200
+    input: []
+    output: GateAssignment
+    side_effects: ["status=OCCUPIED; tow target RemoteStand.occupancy_count -1; tow_target_stand_id cleared; Flight.handling_status -> AT_GATE"]
+
+  - method: POST
+    path: "/gate-assignments/{id}/depart"
+    description: "Aircraft departs: OCCUPIED -> RELEASED."
+    roles: [RampAgent]
+    code: 200
+    input: []
+    output: GateAssignment
+    side_effects: ["status=RELEASED; stand occupancy counter -1; Flight.handling_status -> DEPARTED"]
+
+  - method: POST
+    path: "/gate-assignments/{id}/cancel"
+    description: "Cancel an assignment (PLANNED/OCCUPIED/TOWED_AWAY -> CANCELLED)."
+    roles: [GateController]
+    code: 200
+    input: []
+    output: GateAssignment
+    side_effects: ["status=CANCELLED; occupancy counters restored if it was active"]
+
+  # ---- SlotPermit -----------------------------------------------------------
+  - method: POST
+    path: "/slot-permits"
+    description: "Request a coordinated slot for a flight movement."
+    roles: [SlotCoordinator]
+    code: 201
+    input: ["flight_id", "movement_type", "slot_time_utc", "tolerance_minutes?"]
+    output: SlotPermit
+    side_effects: ["SlotPermit created with status=REQUESTED"]
+
+  - method: GET
+    path: "/slot-permits/{id}"
+    description: "Fetch a slot permit."
+    roles: [OpsAdmin, SlotCoordinator]
+    code: 200
+    input: []
+    output: SlotPermit
+    side_effects: []
+
+  - method: GET
+    path: "/slot-permits"
+    description: "List slot permits."
+    roles: [OpsAdmin, SlotCoordinator]
+    code: 200
+    input: ["flight_id?", "movement_type?", "status?", "limit?", "offset?"]
+    output: SlotPermit[]
+    side_effects: []
+
+  - method: POST
+    path: "/slot-permits/{id}/confirm"
+    description: "Confirm a requested slot: REQUESTED -> CONFIRMED (slot-uniqueness enforced)."
+    roles: [SlotCoordinator]
+    code: 200
+    input: []
+    output: SlotPermit
+    side_effects: ["status=CONFIRMED"]
+
+  - method: POST
+    path: "/slot-permits/{id}/redeem"
+    description: "Redeem a confirmed slot inside its tolerance window: CONFIRMED -> USED."
+    roles: [SlotCoordinator]
+    code: 200
+    input: []
+    output: SlotPermit
+    side_effects: ["status=USED (when ClockState.current_utc inside closed tolerance window)"]
+
+  - method: POST
+    path: "/slot-permits/{id}/forfeit"
+    description: "Forfeit a confirmed slot: CONFIRMED -> FORFEITED."
+    roles: [SlotCoordinator]
+    code: 200
+    input: []
+    output: SlotPermit
+    side_effects: ["status=FORFEITED"]
+
+  - method: POST
+    path: "/slot-permits/{id}/cancel"
+    description: "Cancel a requested/confirmed slot: -> CANCELLED."
+    roles: [SlotCoordinator]
+    code: 200
+    input: []
+    output: SlotPermit
+    side_effects: ["status=CANCELLED"]
+
+  # ---- CuteAllocation -------------------------------------------------------
+  - method: POST
+    path: "/cute-allocations"
+    description: "Allocate a CUTE workstation to a flight for a window."
+    roles: [RampAgent]
+    code: 201
+    input: ["flight_id", "cute_unit_id", "start_utc", "end_utc"]
+    output: CuteAllocation
+    side_effects: ["CuteAllocation created with status=HELD; CUTE double-book check"]
+
+  - method: GET
+    path: "/cute-allocations/{id}"
+    description: "Fetch a CUTE allocation."
+    roles: [OpsAdmin, RampAgent]
+    code: 200
+    input: []
+    output: CuteAllocation
+    side_effects: []
+
+  - method: GET
+    path: "/cute-allocations"
+    description: "List CUTE allocations."
+    roles: [OpsAdmin, RampAgent]
+    code: 200
+    input: ["flight_id?", "cute_unit_id?", "status?", "limit?", "offset?"]
+    output: CuteAllocation[]
+    side_effects: []
+
+  - method: POST
+    path: "/cute-allocations/{id}/release"
+    description: "Release a CUTE allocation: HELD -> RELEASED."
+    roles: [RampAgent]
+    code: 200
+    input: []
+    output: CuteAllocation
+    side_effects: ["status=RELEASED"]
+
+  # ---- GseAllocation --------------------------------------------------------
+  - method: POST
+    path: "/gse-allocations"
+    description: "Allocate a GSE asset to a flight for a window."
+    roles: [RampAgent]
+    code: 201
+    input: ["flight_id", "equipment_id", "start_utc", "end_utc"]
+    output: GseAllocation
+    side_effects: ["GseAllocation created with status=HELD; cooldown overlap check"]
+
+  - method: GET
+    path: "/gse-allocations/{id}"
+    description: "Fetch a GSE allocation."
+    roles: [OpsAdmin, RampAgent]
+    code: 200
+    input: []
+    output: GseAllocation
+    side_effects: []
+
+  - method: GET
+    path: "/gse-allocations"
+    description: "List GSE allocations."
+    roles: [OpsAdmin, RampAgent]
+    code: 200
+    input: ["flight_id?", "equipment_id?", "status?", "limit?", "offset?"]
+    output: GseAllocation[]
+    side_effects: []
+
+  - method: POST
+    path: "/gse-allocations/{id}/release"
+    description: "Release a GSE allocation: HELD -> RELEASED."
+    roles: [RampAgent]
+    code: 200
+    input: []
+    output: GseAllocation
+    side_effects: ["status=RELEASED"]
+
+  # ---- Test-driving clock ---------------------------------------------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving endpoint: set the simulated wall clock used by slot-compliance checks."
+    roles: [OpsAdmin]
+    code: 200
+    input: ["to_iso8601"]
+    output: ClockState
+    side_effects: ["ClockState.current_utc = to_iso8601"]
+
+  - method: GET
+    path: "/_clock"
+    description: "Read the simulated wall clock."
+    roles: [OpsAdmin, SlotCoordinator]
+    code: 200
+    input: []
+    output: ClockState
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID, or unknown role."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Authenticated role not permitted for this operation."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A path resource or referenced FK does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Malformed body: missing required field, illegal enum, end_utc <= start_utc, stand_type/stand-id mismatch, out-of-range numeric."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Transition attempted from a state where it is not legal (from-state precondition fails)."
+  - id: ERR_CROSS_STATE_BLOCKED
+    http: 409
+    condition: "Cross-axis/cross-entity guard fails (e.g. /complete before handling DEPARTED; stand not ACTIVE; flight schedule not SCHEDULED/ACTIVE on occupy)."
+  - id: ERR_WINGSPAN_EXCEEDED
+    http: 422
+    condition: "Stand or tow-target max_wingspan_m < flight.aircraft_wingspan_m."
+  - id: ERR_GATE_WINDOW_CONFLICT
+    http: 409
+    condition: "GATE assignment buffered interval collides with an active window on the same gate."
+  - id: ERR_CUTE_BUSY
+    http: 409
+    condition: "HELD CuteAllocation on the same unit overlaps the requested window (half-open)."
+  - id: ERR_EQUIPMENT_BUSY
+    http: 409
+    condition: "HELD GseAllocation on the same asset violates the one-sided turnaround cooldown."
+  - id: ERR_REMOTE_STAND_FULL
+    http: 409
+    condition: "REMOTE assignment or tow target would push overlapping occupancy above capacity (closed interval)."
+  - id: ERR_SLOT_DOUBLE_BOOKED
+    http: 409
+    condition: "Confirming a permit whose slot_time_utc minute + movement_type already has a CONFIRMED/USED permit."
+  - id: ERR_TURN_TIME_TOO_SHORT
+    http: 422
+    condition: "occupancy_minutes < flight.min_turn_minutes (boundary: equal passes)."
+  - id: ERR_SLOT_WINDOW_MISSED
+    http: 422
+    condition: "Redeeming a permit while the clock is outside the closed tolerance window."
+  - id: ERR_STALE_GATE_VERSION
+    http: 412
+    condition: "expected_gate_version on assignment-create != gate's current version."
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "Pagination params out of range (limit/offset) or other semantically-invalid-but-well-formed input."
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: OpsAdmin
+    description: "Airport operations administrator: resource registry (gates, stands, CUTE, GSE), flight schedule lifecycle, IROPS actions, and the simulation clock."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /gates, POST /gates/{id}/out-of-service"
+      - "POST /remote-stands, POST /cute-units, POST /ground-equipment"
+      - "POST /flights, POST /flights/{id}/activate, POST /flights/{id}/complete"
+      - "POST /flights/{id}/irops-cancel, POST /flights/{id}/irops-divert"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "all GET reads"
+
+  - name: GateController
+    description: "Owns gate and remote-stand assignment, towing, and assignment cancellation."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /gate-assignments"
+      - "POST /gate-assignments/{id}/tow"
+      - "POST /gate-assignments/{id}/return"
+      - "POST /gate-assignments/{id}/cancel"
+    shared_operations:
+      - "GET reads on gates, remote-stands, flights, gate-assignments"
+
+  - name: RampAgent
+    description: "Owns at-gate ramp events (occupy, depart) and CUTE/GSE allocation."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /gate-assignments/{id}/occupy"
+      - "POST /gate-assignments/{id}/depart"
+      - "POST /cute-allocations, POST /cute-allocations/{id}/release"
+      - "POST /gse-allocations, POST /gse-allocations/{id}/release"
+    shared_operations:
+      - "GET reads on flights, gate-assignments, cute/gse allocations, equipment"
+
+  - name: SlotCoordinator
+    description: "Owns the SlotPermit lifecycle (request, confirm, redeem, forfeit, cancel)."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /slot-permits"
+      - "POST /slot-permits/{id}/confirm"
+      - "POST /slot-permits/{id}/redeem"
+      - "POST /slot-permits/{id}/forfeit"
+      - "POST /slot-permits/{id}/cancel"
+    shared_operations:
+      - "GET reads on slot-permits, flights, gates, remote-stands"

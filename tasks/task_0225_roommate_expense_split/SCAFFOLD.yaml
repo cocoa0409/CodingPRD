@@ -1,0 +1,1572 @@
+scenario: |
+  Roommate Matching & Shared Expense Splitting: roommate profile/preferences, room listing,
+  compatibility matching, shared-bill split (rent/utilities), expense ledger & settle-up,
+  payment reminders, move-in/out proration, dispute log
+
+domain_name: roommate-expense-split
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  secondary_archetype: multi_party_negotiation
+  complexity_layers:
+    - optimistic_concurrency        # OCC on Household.version for ledger writes
+    - dual_variant_calculation      # proration estimate vs final; compatibility strict vs lenient
+    - cascading_side_effects        # move-out → proration → splits → net balances → settlement
+    - derived_field_reconciliation  # member net_balance_cents kept consistent with ledger
+    - selector_policy               # compatibility ranking picks best applicant per listing
+
+  entity_topology: graph
+  # Profiles, listings, households, expenses link via foreign keys (many-to-many through
+  # Membership / BillSplit / ExpenseShare junctions); no strict URL nesting tree.
+
+  state_machine_shape: parallel
+  # Bill carries two independent dimensions (payment_status × reminder_status); MatchRequest,
+  # Settlement, and Dispute carry cyclic/branching shapes on their own entities.
+
+  relationship_patterns:
+    - one_to_many        # Household → Membership/Bill/Expense/Settlement/Dispute
+    - many_to_many       # RoommateProfile ↔ Household via Membership; ↔ Bill via BillSplit
+    - cross_aggregate    # Settlement and Dispute reference RoommateProfile across households
+
+  role_model: peer_roles
+  # Roommate owns profiles/listings/expenses; DisputeMediator adjudicates; PlatformOperator
+  # runs clock + reminder batch. Segregation: the filer of a dispute cannot adjudicate it.
+
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: RoommateProfile
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Login/contact email; unique across all profiles."
+        constraints: "non-empty; unique"
+      - name: full_name
+        type: string
+        source: input
+        description: "Display name."
+        constraints: "non-empty"
+      - name: monthly_income_cents
+        type: integer
+        source: input
+        description: "Declared monthly income in cents; used by BY_INCOME bill split."
+        constraints: ">= 0"
+      - name: cleanliness
+        type: integer
+        source: input
+        description: "Self-rated cleanliness 1..5 (5 = tidiest); compatibility input."
+        constraints: "1 <= cleanliness <= 5"
+      - name: sleep_schedule
+        type: enum
+        source: input
+        description: "EARLY_BIRD | NIGHT_OWL | FLEXIBLE; compatibility input."
+        constraints: "in {EARLY_BIRD, NIGHT_OWL, FLEXIBLE}"
+      - name: smoker
+        type: boolean
+        source: input
+        description: "Whether the applicant smokes; dealbreaker candidate."
+        default: false
+      - name: pets
+        type: boolean
+        source: input
+        description: "Whether the applicant has/keeps pets; dealbreaker candidate."
+        default: false
+      - name: net_balance_cents
+        type: integer
+        source: computed
+        description: >-
+          Household-scoped ledger position for this profile in the household it is currently an
+          ACTIVE/MOVED_OUT member of. Positive = the household owes this member (creditor);
+          negative = this member owes the household (debtor). Recomputed by household_net_balance.
+          Zero for profiles with no household membership.
+        default: 0
+
+  - name: RoomListing
+    parent: null
+    common_fields: true
+    fields:
+      - name: lister_id
+        type: string
+        source: input
+        description: "FK -> RoommateProfile.id; the profile offering the room."
+      - name: title
+        type: string
+        source: input
+        description: "Short listing title."
+        constraints: "non-empty"
+      - name: monthly_rent_cents
+        type: integer
+        source: input
+        description: "Base monthly rent for the room in cents."
+        constraints: "> 0"
+      - name: capacity
+        type: integer
+        source: input
+        description: "Maximum number of co-resident ACTIVE memberships the room admits (occupancy capacity at any single instant)."
+        constraints: "1 <= capacity <= 8"
+      - name: room_size_sqft
+        type: integer
+        source: input
+        description: "Room size in square feet; used by BY_ROOM_SIZE split weighting."
+        constraints: "> 0"
+      - name: wants_cleanliness
+        type: integer
+        source: input
+        description: "Lister's desired minimum cleanliness 1..5; compatibility input."
+        constraints: "1 <= wants_cleanliness <= 5"
+      - name: wants_sleep_schedule
+        type: enum
+        source: input
+        description: "Preferred co-resident schedule EARLY_BIRD | NIGHT_OWL | FLEXIBLE."
+        constraints: "in {EARLY_BIRD, NIGHT_OWL, FLEXIBLE}"
+      - name: no_smokers
+        type: boolean
+        source: input
+        description: "Dealbreaker flag: if true, smoker applicants are penalized/zeroed."
+        default: false
+      - name: no_pets
+        type: boolean
+        source: input
+        description: "Dealbreaker flag: if true, pet-owner applicants are penalized/zeroed."
+        default: false
+      - name: split_policy
+        type: enum
+        source: input
+        description: "EQUAL | BY_ROOM_SIZE | BY_INCOME; copied to the Household.split_policy when the household is created on first accept."
+        default: EQUAL
+        constraints: "in {EQUAL, BY_ROOM_SIZE, BY_INCOME}"
+      - name: status
+        type: enum
+        source: system
+        description: "OPEN | CLOSED; CLOSED once the linked Household reaches capacity."
+        default: OPEN
+        constraints: "in {OPEN, CLOSED}"
+
+  - name: MatchRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: listing_id
+        type: string
+        source: input
+        description: "FK -> RoomListing.id; the room being applied to."
+      - name: applicant_id
+        type: string
+        source: input
+        description: "FK -> RoommateProfile.id; the applying profile (not the lister)."
+      - name: scoring_mode
+        type: enum
+        source: input
+        description: "STRICT | LENIENT; selects compatibility_score variant. Default STRICT."
+        default: STRICT
+        constraints: "in {STRICT, LENIENT}"
+      - name: compatibility_score
+        type: integer
+        source: computed
+        description: "0..100 fit score computed by compatibility_score at creation, frozen thereafter."
+      - name: status
+        type: enum
+        source: system
+        description: "PENDING | ACCEPTED | REJECTED | WITHDRAWN; cyclic (WITHDRAWN→PENDING re-apply)."
+        default: PENDING
+        constraints: "in {PENDING, ACCEPTED, REJECTED, WITHDRAWN}"
+
+  - name: Household
+    parent: null
+    common_fields: true
+    fields:
+      - name: listing_id
+        type: string
+        source: system
+        description: "FK -> RoomListing.id; the room this household occupies. Set at household creation from the accepted MatchRequest's listing."
+      - name: manager_id
+        type: string
+        source: system
+        description: "FK -> RoommateProfile.id; the managing roommate (the lister). Set at household creation to the listing's lister_id."
+      - name: split_policy
+        type: enum
+        source: system
+        description: "EQUAL | BY_ROOM_SIZE | BY_INCOME; default split rule for Bills, snapshotted from RoomListing.split_policy at household creation."
+        default: EQUAL
+        constraints: "in {EQUAL, BY_ROOM_SIZE, BY_INCOME}"
+      - name: status
+        type: enum
+        source: system
+        description: >-
+          FORMING | ACTIVE | FROZEN | DISSOLVED. FORMING until first member ACTIVE; ACTIVE while
+          occupied; FROZEN suspends ledger writes during dispute adjudication; DISSOLVED terminal.
+        default: FORMING
+        constraints: "in {FORMING, ACTIVE, FROZEN, DISSOLVED}"
+      - name: active_member_count
+        type: integer
+        source: computed
+        description: "Count of Memberships in status ACTIVE for this household; drives capacity gate."
+        default: 0
+      - name: ledger_sum_cents
+        type: integer
+        source: computed
+        description: >-
+          Conservation invariant field: sum of net_balance_cents over all ACTIVE/MOVED_OUT members.
+          MUST equal 0 after every ledger mutation (see compensating_invariant rules).
+        default: 0
+
+  - name: Membership
+    parent: null
+    common_fields: true
+    fields:
+      - name: household_id
+        type: string
+        source: input
+        description: "FK -> Household.id; the household joined."
+      - name: profile_id
+        type: string
+        source: input
+        description: "FK -> RoommateProfile.id; the member."
+      - name: move_in_date
+        type: datetime
+        source: input
+        description: "Planned move-in date (date-only ISO, e.g. 2026-06-01T00:00:00.000Z)."
+      - name: planned_move_out_date
+        type: datetime
+        source: input
+        description: "Planned move-out date used by the forward-looking proration estimate."
+      - name: actual_move_out_date
+        type: datetime
+        source: system
+        description: "Set when the member moves out; drives the chronological final proration."
+        default: null
+      - name: occupied_days_estimate
+        type: integer
+        source: computed
+        description: "Projected occupied days in the current billing period (forward-looking variant)."
+        default: 0
+      - name: occupied_days_actual
+        type: integer
+        source: computed
+        description: "Realized occupied days once actual_move_out_date is set (chronological variant)."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "PENDING | ACTIVE | MOVED_OUT; PENDING until activated; MOVED_OUT terminal."
+        default: PENDING
+        constraints: "in {PENDING, ACTIVE, MOVED_OUT}"
+
+  - name: Bill
+    parent: null
+    common_fields: true
+    fields:
+      - name: household_id
+        type: string
+        source: input
+        description: "FK -> Household.id; the billed household."
+      - name: bill_type
+        type: enum
+        source: input
+        description: "RENT | UTILITIES; RENT bills must not overlap in billing period (see resource_temporal_overlap)."
+        constraints: "in {RENT, UTILITIES}"
+      - name: total_amount_cents
+        type: integer
+        source: input
+        description: "Total bill amount in cents to split across ACTIVE members."
+        constraints: "> 0"
+      - name: period_start
+        type: datetime
+        source: input
+        description: "Billing period start (inclusive, date-only ISO)."
+      - name: period_end
+        type: datetime
+        source: input
+        description: "Billing period end (inclusive). Must be strictly after period_start."
+      - name: split_policy_used
+        type: enum
+        source: computed
+        description: "EQUAL | BY_ROOM_SIZE | BY_INCOME; snapshot of Household.split_policy at issue time."
+      - name: payment_status
+        type: enum
+        source: system
+        description: "UNPAID | PARTIALLY_PAID | PAID; payment dimension (parallel to reminder_status)."
+        default: UNPAID
+        constraints: "in {UNPAID, PARTIALLY_PAID, PAID}"
+      - name: reminder_status
+        type: enum
+        source: system
+        description: "NONE | SCHEDULED | SENT; reminder dimension (parallel to payment_status)."
+        default: NONE
+        constraints: "in {NONE, SCHEDULED, SENT}"
+
+  - name: BillSplit
+    parent: Bill
+    common_fields: false
+    fields:
+      - name: bill_id
+        type: string
+        source: system
+        description: "FK -> Bill.id; the bill this share belongs to."
+      - name: profile_id
+        type: string
+        source: system
+        description: "FK -> RoommateProfile.id; the member who owes this share."
+      - name: share_cents
+        type: integer
+        source: computed
+        description: "Member's share of the bill in cents; bill_split distributes remainder by created_at ASC."
+      - name: paid
+        type: boolean
+        source: system
+        description: "Whether this member has settled their share of the bill."
+        default: false
+
+  - name: Expense
+    parent: null
+    common_fields: true
+    fields:
+      - name: household_id
+        type: string
+        source: input
+        description: "FK -> Household.id; the household the expense is logged against."
+      - name: payer_id
+        type: string
+        source: input
+        description: "FK -> RoommateProfile.id; the member who paid up front (a creditor)."
+      - name: description
+        type: string
+        source: input
+        description: "Free-text description of the expense."
+        constraints: "non-empty"
+      - name: total_amount_cents
+        type: integer
+        source: input
+        description: "Total amount paid in cents; conserved across ExpenseShares."
+        constraints: "> 0"
+      - name: split_mode
+        type: enum
+        source: input
+        description: "EQUAL | CUSTOM; EQUAL divides among participants, CUSTOM uses share_overrides."
+        default: EQUAL
+        constraints: "in {EQUAL, CUSTOM}"
+      - name: participant_ids
+        type: array
+        source: input
+        description: "Profile ids sharing this expense; each MUST be an ACTIVE member of household_id."
+        constraints: "non-empty; subset of household ACTIVE members"
+      - name: share_overrides
+        type: object
+        source: input
+        description: "CUSTOM mode only: map profile_id -> cents; values MUST sum to total_amount_cents."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "POSTED | VOIDED; VOIDED reverses ledger impact (compensating action)."
+        default: POSTED
+        constraints: "in {POSTED, VOIDED}"
+
+  - name: ExpenseShare
+    parent: Expense
+    common_fields: false
+    fields:
+      - name: expense_id
+        type: string
+        source: system
+        description: "FK -> Expense.id; the expense this share belongs to."
+      - name: profile_id
+        type: string
+        source: system
+        description: "FK -> RoommateProfile.id; the participant who owes this share."
+      - name: share_cents
+        type: integer
+        source: computed
+        description: "Participant's portion of the expense in cents; remainder by created_at ASC."
+
+  - name: Settlement
+    parent: null
+    common_fields: true
+    fields:
+      - name: household_id
+        type: string
+        source: input
+        description: "FK -> Household.id; the household the settle-up occurs within."
+      - name: from_profile_id
+        type: string
+        source: input
+        description: "FK -> RoommateProfile.id; the paying member (debtor)."
+      - name: to_profile_id
+        type: string
+        source: input
+        description: "FK -> RoommateProfile.id; the receiving member (creditor)."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Settlement amount in cents; must not exceed the debtor's outstanding debt."
+        constraints: "> 0"
+      - name: status
+        type: enum
+        source: system
+        description: "PROPOSED | CONFIRMED | DISPUTED | CANCELLED; cyclic (DISPUTED→PROPOSED re-propose)."
+        default: PROPOSED
+        constraints: "in {PROPOSED, CONFIRMED, DISPUTED, CANCELLED}"
+
+  - name: PaymentReminder
+    parent: null
+    common_fields: true
+    fields:
+      - name: household_id
+        type: string
+        source: input
+        description: "FK -> Household.id; the household reminded."
+      - name: bill_id
+        type: string
+        source: input
+        description: "FK -> Bill.id; the bill being reminded about. Null when settlement_id is set."
+        default: null
+      - name: settlement_id
+        type: string
+        source: input
+        description: "FK -> Settlement.id; the settlement being reminded about. Null when bill_id is set."
+        default: null
+      - name: due_date
+        type: datetime
+        source: input
+        description: "When payment is due; reminder dispatch fires when clock reaches due_date."
+      - name: status
+        type: enum
+        source: system
+        description: "SCHEDULED | SENT | ACKNOWLEDGED | CANCELLED; SENT by batch, ACKNOWLEDGED by member."
+        default: SCHEDULED
+        constraints: "in {SCHEDULED, SENT, ACKNOWLEDGED, CANCELLED}"
+
+  - name: Dispute
+    parent: null
+    common_fields: true
+    fields:
+      - name: household_id
+        type: string
+        source: input
+        description: "FK -> Household.id; the household the dispute concerns."
+      - name: expense_id
+        type: string
+        source: input
+        description: "FK -> Expense.id; the disputed expense (null if the dispute targets a settlement)."
+        default: null
+      - name: settlement_id
+        type: string
+        source: input
+        description: "FK -> Settlement.id; the disputed settlement (null if the dispute targets an expense)."
+        default: null
+      - name: filed_by_id
+        type: string
+        source: input
+        description: "FK -> RoommateProfile.id; the member who filed (cannot adjudicate own dispute)."
+      - name: reason
+        type: string
+        source: input
+        description: "Why the entry is disputed."
+        constraints: "non-empty"
+      - name: adjusted_amount_cents
+        type: integer
+        source: input
+        description: "Mediator-set corrected total for the target on RESOLVE; null until resolved."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "OPEN | UNDER_REVIEW | RESOLVED | REJECTED; cyclic (UNDER_REVIEW→OPEN reopen)."
+        default: OPEN
+        constraints: "in {OPEN, UNDER_REVIEW, RESOLVED, REJECTED}"
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: MatchRequest
+    initial_state: PENDING
+    terminal_states: [ACCEPTED, REJECTED]
+    transitions:
+      - from: PENDING
+        to: ACCEPTED
+        trigger: "POST /match-requests/{id}/accept"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is the lister of the request's RoomListing"
+          - "RoomListing.status == OPEN"
+          - "the listing's Household (if any) has active_member_count < RoomListing.capacity"
+        side_effects:
+          - "MatchRequest.status -> ACCEPTED"
+          - "if no Household exists for the listing, one is created (status FORMING, manager_id = lister, listing_id = listing, split_policy = RoomListing.split_policy)"
+          - "a Membership is created for applicant_id in status PENDING"
+        note: "Acceptance opens the household-formation path; activation happens via membership activate."
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /match-requests/{id}/reject"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is the lister of the request's RoomListing"
+        side_effects:
+          - "MatchRequest.status -> REJECTED"
+      - from: PENDING
+        to: WITHDRAWN
+        trigger: "POST /match-requests/{id}/withdraw"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is the applicant_id of the request"
+        side_effects:
+          - "MatchRequest.status -> WITHDRAWN"
+      - from: WITHDRAWN
+        to: PENDING
+        trigger: "POST /match-requests/{id}/reapply"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is the applicant_id of the request"
+          - "RoomListing.status == OPEN"
+        side_effects:
+          - "MatchRequest.status -> PENDING"
+          - "compatibility_score recomputed against the listing's current preferences"
+        note: "Cyclic edge: re-entry to PENDING after withdrawal."
+
+  - entity: Membership
+    initial_state: PENDING
+    terminal_states: [MOVED_OUT]
+    transitions:
+      - from: PENDING
+        to: ACTIVE
+        trigger: "POST /memberships/{id}/activate"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is the manager_id of the membership's Household"
+          - "Household.status in {FORMING, ACTIVE}"
+          - "if RoomListing.capacity == 1: no existing ACTIVE Membership on the same RoomListing has a half-open occupancy interval overlapping [move_in_date, planned_move_out_date) (resource_temporal_overlap; checked before the capacity count gate)"
+          - "Household.active_member_count < RoomListing.capacity (capacity count gate; cross-entity)"
+        side_effects:
+          - "Membership.status -> ACTIVE"
+          - "Household.active_member_count incremented; recomputed from ACTIVE memberships"
+          - "if Household.status == FORMING, Household.status -> ACTIVE"
+          - "if active_member_count reaches RoomListing.capacity, RoomListing.status -> CLOSED"
+          - "occupied_days_estimate recomputed via move_proration (estimate variant) against the household's current-period RENT Bill, if one exists (else 0)"
+      - from: ACTIVE
+        to: MOVED_OUT
+        trigger: "POST /memberships/{id}/move-out"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is the membership's profile_id OR the Household.manager_id"
+          - "Household.status != FROZEN (cross-entity state dependency)"
+        side_effects:
+          - "Membership.actual_move_out_date set to clock now; Membership.status -> MOVED_OUT"
+          - "occupied_days_actual recomputed (chronological proration) for the household's current-period unpaid RENT Bill (the one whose [period_start, period_end] contains actual_move_out_date)"
+          - "the departing member's BillSplit.share_cents is reset to move_proration's prorated_share_cents (= original full share * occupied_days_actual / period_days, round_half_up); the freed remainder (original full share - prorated) is redistributed across the remaining ACTIVE members via bill_split (EQUAL/BY_ROOM_SIZE/BY_INCOME weights, floor-then-remainder by created_at ASC); Bill.total_amount_cents == sum(share_cents) preserved"
+          - "household_net_balance recomputed for all members; Household.ledger_sum_cents stays 0"
+          - "Household.active_member_count decremented; if it reaches 0, Household.status -> DISSOLVED"
+          - "RoomListing.status -> OPEN if it was CLOSED and now below capacity"
+        note: "Depth-3+ cascade origin: move-out → proration → splits → net balances → (dissolve)."
+
+  - entity: Bill
+    initial_state: UNPAID
+    terminal_states: [PAID]
+    transitions:
+      - from: UNPAID
+        to: PARTIALLY_PAID
+        trigger: "POST /bills/{id}/record-payment"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is an ACTIVE member of the Bill's Household"
+          - "the payer's BillSplit.paid == false"
+          - "Household.status != FROZEN"
+        side_effects:
+          - "the payer's BillSplit.paid -> true"
+          - "if some but not all BillSplit.paid are true, Bill.payment_status -> PARTIALLY_PAID"
+      - from: PARTIALLY_PAID
+        to: PAID
+        trigger: "POST /bills/{id}/record-payment"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is an ACTIVE member of the Bill's Household"
+          - "this payment makes every BillSplit.paid == true"
+        side_effects:
+          - "Bill.payment_status -> PAID"
+          - "any SCHEDULED PaymentReminder for this bill -> CANCELLED"
+      - from: UNPAID
+        to: PAID
+        trigger: "POST /bills/{id}/record-payment"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is an ACTIVE member of the Bill's Household"
+          - "this is the only split and the payment makes every BillSplit.paid == true"
+        side_effects:
+          - "Bill.payment_status -> PAID"
+          - "any SCHEDULED PaymentReminder for this bill -> CANCELLED"
+        note: "Single-member household path: direct UNPAID->PAID."
+      - from: NONE
+        to: SCHEDULED
+        trigger: "POST /payment-reminders (bill_id set)"
+        actor: Roommate
+        preconditions:
+          - "Bill.payment_status != PAID"
+        side_effects:
+          - "Bill.reminder_status -> SCHEDULED"
+        note: "reminder_status dimension; independent of payment_status (parallel)."
+      - from: SCHEDULED
+        to: SENT
+        trigger: "POST /_reminders/dispatch (clock reached due_date)"
+        actor: PlatformOperator
+        preconditions:
+          - "a SCHEDULED PaymentReminder for this bill has due_date <= clock now"
+        side_effects:
+          - "PaymentReminder.status -> SENT"
+          - "Bill.reminder_status -> SENT"
+        note: "reminder dimension advances independently of payment_status."
+
+  - entity: Settlement
+    initial_state: PROPOSED
+    terminal_states: [CONFIRMED, CANCELLED]
+    transitions:
+      - from: PROPOSED
+        to: CONFIRMED
+        trigger: "POST /settlements/{id}/confirm"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is the to_profile_id (creditor) of the settlement"
+          - "expected_household_version matches Household.version (OCC)"
+          - "Household.status != FROZEN (cross-entity state dependency)"
+          - "from_profile_id Membership.status in {ACTIVE, MOVED_OUT} (cross-entity state dependency)"
+          - "amount_cents <= current outstanding debt of from_profile_id (|net_balance_cents| if negative)"
+        side_effects:
+          - "Settlement.status -> CONFIRMED"
+          - "from_profile_id.net_balance_cents increased by amount_cents (debt reduced)"
+          - "to_profile_id.net_balance_cents decreased by amount_cents (credit reduced)"
+          - "Household.ledger_sum_cents recomputed and stays 0 (compensating_invariant)"
+          - "increments Household.version by 1"
+          - "any SCHEDULED PaymentReminder for this settlement -> CANCELLED"
+      - from: PROPOSED
+        to: DISPUTED
+        trigger: "POST /disputes (settlement_id set) by debtor"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is the from_profile_id (debtor) of the settlement"
+          - "Settlement.status == PROPOSED"
+        side_effects:
+          - "Settlement.status -> DISPUTED"
+          - "a Dispute (status OPEN) is created referencing this settlement"
+      - from: DISPUTED
+        to: PROPOSED
+        trigger: "POST /settlements/{id}/repropose"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is the to_profile_id (creditor)"
+          - "the linked Dispute.status in {RESOLVED, REJECTED}"
+        side_effects:
+          - "Settlement.status -> PROPOSED"
+          - "Settlement.amount_cents set to Dispute.adjusted_amount_cents if the dispute RESOLVED with an adjustment"
+        note: "Cyclic edge: DISPUTED back to PROPOSED after the dispute closes."
+      - from: PROPOSED
+        to: CANCELLED
+        trigger: "POST /settlements/{id}/cancel"
+        actor: Roommate
+        preconditions:
+          - "acting Roommate is the from_profile_id (debtor) or to_profile_id (creditor)"
+        side_effects:
+          - "Settlement.status -> CANCELLED"
+
+  - entity: Dispute
+    initial_state: OPEN
+    terminal_states: [RESOLVED, REJECTED]
+    transitions:
+      - from: OPEN
+        to: UNDER_REVIEW
+        trigger: "POST /disputes/{id}/claim"
+        actor: DisputeMediator
+        preconditions:
+          - "acting DisputeMediator is NOT the filed_by_id (segregation of duties)"
+          - "Dispute.status == OPEN"
+        side_effects:
+          - "Dispute.status -> UNDER_REVIEW"
+          - "Household.status -> FROZEN (ledger writes suspended during review)"
+      - from: UNDER_REVIEW
+        to: OPEN
+        trigger: "POST /disputes/{id}/reopen"
+        actor: DisputeMediator
+        preconditions:
+          - "acting DisputeMediator claimed this dispute"
+        side_effects:
+          - "Dispute.status -> OPEN"
+          - "Household.status -> ACTIVE (unfreeze) if no other dispute is UNDER_REVIEW"
+        note: "Cyclic edge: review can bounce back to OPEN."
+      - from: UNDER_REVIEW
+        to: RESOLVED
+        trigger: "POST /disputes/{id}/resolve"
+        actor: DisputeMediator
+        preconditions:
+          - "acting DisputeMediator is NOT the filed_by_id (segregation of duties)"
+          - "if expense_id set: adjusted_amount_cents present and > 0"
+        side_effects:
+          - "Dispute.status -> RESOLVED; adjusted_amount_cents recorded"
+          - "if expense_id set: the Expense.total_amount_cents -> adjusted_amount_cents; ExpenseShares recomputed; household_net_balance recomputed; Household.ledger_sum_cents stays 0"
+          - "Household.status -> ACTIVE (unfreeze) if no other dispute is UNDER_REVIEW"
+        note: "Depth-3 cascade origin (expense path): resolve → expense amount → shares → net balances."
+      - from: UNDER_REVIEW
+        to: REJECTED
+        trigger: "POST /disputes/{id}/reject"
+        actor: DisputeMediator
+        preconditions:
+          - "acting DisputeMediator is NOT the filed_by_id (segregation of duties)"
+        side_effects:
+          - "Dispute.status -> REJECTED (target unchanged)"
+          - "Household.status -> ACTIVE (unfreeze) if no other dispute is UNDER_REVIEW"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: settlement-confirm-stale-household
+    parent_entity: Household
+    write_endpoint: "POST /settlements/{id}/confirm"
+    occ_field: "expected_household_version"
+    description: |
+      Confirming a Settlement against a Household whose version has advanced since the client last
+      observed it is rejected. A confirm legitimately rewrites both members' net_balance_cents and
+      bumps Household.version; a second confirm (or any other ledger write) that completed in between
+      leaves the caller's observed version stale, so the ledger position it intends to reduce no
+      longer holds. The stale-version check rejects deterministically.
+    error_id: ERR_STALE_HOUSEHOLD_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: compatibility_score
+    trigger: "POST /match-requests (at creation) and POST /match-requests/{id}/reapply"
+    algorithm: weighted_scoring
+    formula: |
+      # Inputs: applicant RoommateProfile P, RoomListing L. Result is an integer 0..100.
+      # Three weighted factors, then dealbreaker handling per scoring_mode.
+      cleanliness_fit = max(0, 5 - abs(P.cleanliness - L.wants_cleanliness)) / 5      # 0..1
+      if L.wants_sleep_schedule == "FLEXIBLE" or P.sleep_schedule == "FLEXIBLE":
+          sleep_fit = 1.0
+      elif P.sleep_schedule == L.wants_sleep_schedule:
+          sleep_fit = 1.0
+      else:
+          sleep_fit = 0.0
+      lifestyle_fit = 1.0
+      if L.no_smokers and P.smoker: lifestyle_fit = lifestyle_fit - 0.5
+      if L.no_pets    and P.pets:   lifestyle_fit = lifestyle_fit - 0.5
+      lifestyle_fit = max(0.0, lifestyle_fit)
+      base = W_CLEAN*cleanliness_fit + W_SLEEP*sleep_fit + W_LIFESTYLE*lifestyle_fit  # 0..100
+      raw = round(base, 0)            # round_half_up to integer
+      # Variant handling (see variants):
+      #   STRICT  : if (L.no_smokers and P.smoker) or (L.no_pets and P.pets): return 0
+      #   LENIENT : return raw (dealbreakers only reduce lifestyle_fit)
+      score = 0 if (STRICT and any_dealbreaker) else raw
+    input_set: "Single applicant profile vs single listing; no other entities."
+    constants:
+      W_CLEAN: 40
+      W_SLEEP: 30
+      W_LIFESTYLE: 30
+      MATCH_THRESHOLD: 60
+    precision: "integer score, round_half_up at the final step"
+    variants:
+      - name: strict
+        when: "scoring_mode == STRICT"
+        difference: "Any violated dealbreaker (no_smokers∧smoker or no_pets∧pets) forces score = 0 regardless of other fits."
+      - name: lenient
+        when: "scoring_mode == LENIENT"
+        difference: "Dealbreakers only subtract 0.5 each from lifestyle_fit; score is the weighted raw value, never hard-zeroed."
+
+  - name: bill_split
+    trigger: "POST /bills (issue) and any move-out recompute of a current-period unpaid RENT Bill"
+    algorithm: waterfall_allocation
+    formula: |
+      # Distribute Bill.total_amount_cents across the participating ACTIVE members.
+      # members = ACTIVE memberships of the household at issue time, ordered by Membership.created_at ASC.
+      # weight(m) by split_policy_used:
+      #   EQUAL        : weight = 1
+      #   BY_ROOM_SIZE : weight = RoomListing.room_size_sqft (same for all → behaves like EQUAL unless mixed)
+      #   BY_INCOME    : weight = max(1, member.monthly_income_cents)
+      W = sum(weight(m) for m in members)
+      # 1) floor each member's exact share to whole cents:
+      base[m] = floor(total_amount_cents * weight(m) / W)
+      assigned = sum(base[m])
+      remainder = total_amount_cents - assigned          # 0 <= remainder < len(members)
+      # 2) distribute the remainder cents ONE PER MEMBER, members ordered by created_at ASC:
+      for i in range(remainder): base[members[i]] += 1
+      share_cents[m] = base[m]
+      # Invariant: sum(share_cents) == total_amount_cents exactly.
+    input_set: "ACTIVE memberships of the bill's household at issue/recompute time."
+    constants: {}
+    precision: "whole cents; floor-then-distribute-remainder, remainder ordered by created_at ASC"
+
+  - name: move_proration
+    trigger: "estimate computed/refreshed on POST /memberships/{id}/activate and on POST /bills (RENT) for current ACTIVE members; final computed on POST /memberships/{id}/move-out"
+    algorithm: chronological
+    formula: |
+      # period_days = inclusive days in the current RENT Bill period [period_start, period_end].
+      period_days = (period_end.date() - period_start.date()).days + 1
+      # FORWARD-LOOKING (estimate, at membership create): uses planned dates clamped to the period.
+      est_start = max(move_in_date.date(), period_start.date())
+      est_end   = min(planned_move_out_date.date(), period_end.date())
+      occupied_days_estimate = max(0, (est_end - est_start).days + 1) if est_end >= est_start else 0
+      # CHRONOLOGICAL (final, at move-out): uses actual_move_out_date.
+      act_end   = min(actual_move_out_date.date(), period_end.date())
+      occupied_days_actual = max(0, (act_end - est_start).days + 1) if act_end >= est_start else 0
+      # Prorated rent share for a departing member on the current RENT bill:
+      prorated_share_cents = round(full_share_cents * occupied_days_X / period_days)   # round_half_up
+    input_set: "One membership and the household's current-period RENT Bill."
+    constants: {}
+    precision: "occupied days are whole days, inclusive of both endpoints; prorated cents round_half_up"
+    variants:
+      - name: estimate_forward_looking
+        when: "membership activation or RENT-bill issue; actual_move_out_date is null"
+        difference: "Uses planned_move_out_date (projected). Produces occupied_days_estimate; provisional. When no current-period RENT Bill exists yet, occupied_days_estimate stays 0."
+      - name: final_chronological
+        when: "move-out; actual_move_out_date is set"
+        difference: "Uses actual_move_out_date (realized). Produces occupied_days_actual; can diverge from the estimate when the member leaves early or late."
+
+  - name: household_net_balance
+    trigger: "Expense POST/void, ExpenseShare recompute, Settlement confirm, Dispute resolve, Membership move-out"
+    algorithm: aggregation
+    formula: |
+      # For each profile m that is an ACTIVE or MOVED_OUT member of household H:
+      #   credits(m) = sum(Expense.total_amount_cents) for POSTED expenses where payer_id == m
+      #   owed(m)    = sum(ExpenseShare.share_cents) for POSTED expenses where profile_id == m
+      #   plus bill obligations: owed(m) += sum(BillSplit.share_cents where profile_id==m and paid==false)
+      #   settled_paid(m)     = sum(Settlement.amount_cents) for CONFIRMED settlements where from_profile_id == m
+      #   settled_received(m) = sum(Settlement.amount_cents) for CONFIRMED settlements where to_profile_id == m
+      #   net_balance_cents(m) = credits(m) - owed(m) + settled_paid(m) - settled_received(m)
+      # Household.ledger_sum_cents = sum(net_balance_cents(m) over all members) MUST equal 0.
+    input_set: "POSTED expenses + their shares, unpaid BillSplits, and CONFIRMED settlements of household H."
+    constants: {}
+    precision: "whole cents; no rounding (all inputs are integer cents)"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /roommate-profiles and POST /_clock/set"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: "Ownership: the acting Roommate is the required owner/manager/party for this resource"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "ownership-gated endpoints (accept/reject/withdraw/activate/move-out/confirm/cancel/record-payment)"
+
+  - priority: 4
+    category: auth
+    check: "Segregation of duties: the acting DisputeMediator is not the dispute's filed_by_id"
+    error_id: ERR_SELF_ADJUDICATION
+    http_status: 403
+    applies_to: "POST /disputes/{id}/claim, /resolve, /reject"
+
+  - priority: 5
+    category: existence
+    check: "Every referenced resource id (path + body FKs) exists, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints taking a path id or FK body field"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a state from which this transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 7
+    category: state
+    check: "Household.status != FROZEN for any ledger-mutating write (expense, settlement confirm, bill payment, move-out)"
+    error_id: ERR_HOUSEHOLD_FROZEN
+    http_status: 409
+    applies_to: "POST /expenses, /settlements/{id}/confirm, /bills/{id}/record-payment, /memberships/{id}/move-out"
+
+  - priority: 8
+    category: business_referential
+    check: "Every participant_id / from_profile_id / to_profile_id / payer_id is an ACTIVE member of the named household"
+    error_id: ERR_NOT_HOUSEHOLD_MEMBER
+    http_status: 422
+    applies_to: "POST /expenses, POST /settlements"
+
+  - priority: 9
+    category: business_constraint
+    check: "Self-settlement forbidden: from_profile_id != to_profile_id"
+    error_id: ERR_SELF_SETTLEMENT
+    http_status: 422
+    applies_to: "POST /settlements"
+
+  - priority: 10
+    category: business_constraint
+    check: "CUSTOM expense share_overrides keys == participant_ids and values sum to total_amount_cents"
+    error_id: ERR_SHARES_DO_NOT_SUM
+    http_status: 422
+    applies_to: "POST /expenses (split_mode == CUSTOM)"
+
+  - priority: 11
+    category: business_temporal
+    check: "A new RENT Bill's [period_start, period_end] must not overlap an existing RENT Bill of the same household (closed-interval overlap)"
+    error_id: ERR_BILL_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /bills (bill_type == RENT)"
+
+  - priority: 12
+    category: business_temporal
+    check: "period_end strictly after period_start"
+    error_id: ERR_INVALID_PERIOD
+    http_status: 422
+    applies_to: "POST /bills"
+
+  - priority: 13
+    category: business_temporal
+    check: "Single-occupancy rooms only (RoomListing.capacity == 1): the activating membership's half-open occupancy interval [move_in_date, planned_move_out_date) must not overlap any existing ACTIVE membership on the same room. Two intervals overlap iff move_in_date < other.planned_move_out_date AND other.move_in_date < planned_move_out_date (touching endpoints do not overlap)."
+    error_id: ERR_OCCUPANCY_OVERLAP
+    http_status: 409
+    applies_to: "POST /memberships/{id}/activate (RoomListing.capacity == 1)"
+
+  - priority: 14
+    category: business_constraint
+    check: "Activation capacity: Household.active_member_count < RoomListing.capacity"
+    error_id: ERR_ROOM_AT_CAPACITY
+    http_status: 409
+    applies_to: "POST /memberships/{id}/activate"
+
+  - priority: 15
+    category: business_fiscal
+    check: "Settlement amount_cents must not exceed the debtor's outstanding debt (|net_balance_cents| when negative)"
+    error_id: ERR_SETTLEMENT_EXCEEDS_DEBT
+    http_status: 422
+    applies_to: "POST /settlements/{id}/confirm"
+
+  - priority: 16
+    category: business_fiscal
+    check: "Settle-up with nothing owed: confirming when debtor's net_balance_cents >= 0 (no debt)"
+    error_id: ERR_NO_OUTSTANDING_DEBT
+    http_status: 422
+    applies_to: "POST /settlements/{id}/confirm"
+
+  - priority: 17
+    category: business_constraint
+    check: "Compatibility gate: MatchRequest cannot be accepted when compatibility_score < MATCH_THRESHOLD"
+    error_id: ERR_BELOW_MATCH_THRESHOLD
+    http_status: 422
+    applies_to: "POST /match-requests/{id}/accept"
+
+  - priority: 18
+    category: business_constraint
+    check: "Applicant cannot be the lister of the same listing (no self-application)"
+    error_id: ERR_SELF_APPLICATION
+    http_status: 422
+    applies_to: "POST /match-requests"
+
+  - priority: 19
+    category: business_constraint
+    check: "Email uniqueness across RoommateProfiles"
+    error_id: ERR_EMAIL_TAKEN
+    http_status: 409
+    applies_to: "POST /roommate-profiles"
+
+  - priority: 20
+    category: business_referential
+    check: "Exactly one of bill_id / settlement_id set on a PaymentReminder; the other null"
+    error_id: ERR_REMINDER_TARGET_AMBIGUOUS
+    http_status: 422
+    applies_to: "POST /payment-reminders"
+
+  - priority: 21
+    category: business_constraint
+    check: "OCC: expected_household_version equals Household.version"
+    error_id: ERR_STALE_HOUSEHOLD_VERSION
+    http_status: 412
+    applies_to: "POST /settlements/{id}/confirm"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- RoommateProfile ----
+  - method: POST
+    path: "/roommate-profiles"
+    description: "Register a roommate profile."
+    roles: [Roommate]
+    code: 201
+    input: [email, full_name, monthly_income_cents, cleanliness, sleep_schedule, "smoker?", "pets?"]
+    output: RoommateProfile
+    side_effects: ["profile created with net_balance_cents = 0"]
+  - method: GET
+    path: "/roommate-profiles/{id}"
+    description: "Fetch a roommate profile."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: []
+    output: RoommateProfile
+    side_effects: []
+  - method: GET
+    path: "/roommate-profiles"
+    description: "List roommate profiles (paginated)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RoommateProfile[]
+    side_effects: []
+  - method: GET
+    path: "/roommate-profiles/{id}/bill-splits"
+    description: "List all BillSplit rows owed by this profile across bills (reverse-reachability for BillSplit.profile_id)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: BillSplit[]
+    side_effects: []
+  - method: GET
+    path: "/roommate-profiles/{id}/expense-shares"
+    description: "List all ExpenseShare rows owed by this profile across expenses (reverse-reachability for ExpenseShare.profile_id)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ExpenseShare[]
+    side_effects: []
+
+  # ---- RoomListing ----
+  - method: POST
+    path: "/room-listings"
+    description: "Create a room listing owned by the acting roommate (lister)."
+    roles: [Roommate]
+    code: 201
+    input: [lister_id, title, monthly_rent_cents, capacity, room_size_sqft, wants_cleanliness, wants_sleep_schedule, "no_smokers?", "no_pets?", "split_policy?"]
+    output: RoomListing
+    side_effects: ["listing created with status OPEN"]
+  - method: GET
+    path: "/room-listings/{id}"
+    description: "Fetch a room listing."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: []
+    output: RoomListing
+    side_effects: []
+  - method: GET
+    path: "/room-listings"
+    description: "List room listings; filter by lister_id."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["lister_id?", "limit?", "offset?"]
+    output: RoomListing[]
+    side_effects: []
+
+  # ---- MatchRequest ----
+  - method: POST
+    path: "/match-requests"
+    description: "Apply to a listing; compatibility_score computed at creation."
+    roles: [Roommate]
+    code: 201
+    input: [listing_id, applicant_id, "scoring_mode?"]
+    output: MatchRequest
+    side_effects: ["compatibility_score computed via compatibility_score (selected variant)"]
+  - method: GET
+    path: "/match-requests/{id}"
+    description: "Fetch a match request."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: []
+    output: MatchRequest
+    side_effects: []
+  - method: GET
+    path: "/match-requests"
+    description: "List match requests; filter by listing_id and/or applicant_id."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["listing_id?", "applicant_id?", "limit?", "offset?"]
+    output: MatchRequest[]
+    side_effects: []
+  - method: POST
+    path: "/match-requests/{id}/accept"
+    description: "Lister accepts an application; creates Household (if absent) + PENDING Membership."
+    roles: [Roommate]
+    code: 200
+    input: []
+    output: MatchRequest
+    side_effects: ["MatchRequest.status -> ACCEPTED", "Household created/looked up", "Membership created PENDING"]
+  - method: POST
+    path: "/match-requests/{id}/reject"
+    description: "Lister rejects an application."
+    roles: [Roommate]
+    code: 200
+    input: []
+    output: MatchRequest
+    side_effects: ["MatchRequest.status -> REJECTED"]
+  - method: POST
+    path: "/match-requests/{id}/withdraw"
+    description: "Applicant withdraws their application."
+    roles: [Roommate]
+    code: 200
+    input: []
+    output: MatchRequest
+    side_effects: ["MatchRequest.status -> WITHDRAWN"]
+  - method: POST
+    path: "/match-requests/{id}/reapply"
+    description: "Applicant re-applies after withdrawal; recomputes compatibility_score."
+    roles: [Roommate]
+    code: 200
+    input: []
+    output: MatchRequest
+    side_effects: ["MatchRequest.status -> PENDING", "compatibility_score recomputed"]
+
+  # ---- Household ----
+  - method: GET
+    path: "/households/{id}"
+    description: "Fetch a household with computed active_member_count and ledger_sum_cents."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: []
+    output: Household
+    side_effects: []
+  - method: GET
+    path: "/households"
+    description: "List households; filter by manager_id and/or listing_id."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["manager_id?", "listing_id?", "limit?", "offset?"]
+    output: Household[]
+    side_effects: []
+  - method: GET
+    path: "/households/{id}/memberships"
+    description: "List memberships of a household (reverse-reachability for Membership.household_id)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Membership[]
+    side_effects: []
+  - method: GET
+    path: "/households/{id}/bills"
+    description: "List bills of a household (reverse-reachability for Bill.household_id)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Bill[]
+    side_effects: []
+  - method: GET
+    path: "/households/{id}/expenses"
+    description: "List expenses of a household (reverse-reachability for Expense.household_id)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Expense[]
+    side_effects: []
+  - method: GET
+    path: "/households/{id}/settlements"
+    description: "List settlements of a household (reverse-reachability for Settlement.household_id)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Settlement[]
+    side_effects: []
+  - method: GET
+    path: "/households/{id}/disputes"
+    description: "List disputes of a household (reverse-reachability for Dispute.household_id)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Dispute[]
+    side_effects: []
+
+  # ---- Membership ----
+  - method: GET
+    path: "/memberships/{id}"
+    description: "Fetch a membership with proration day fields."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: []
+  - method: GET
+    path: "/memberships"
+    description: "List memberships; filter by profile_id and/or household_id."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["profile_id?", "household_id?", "limit?", "offset?"]
+    output: Membership[]
+    side_effects: []
+  - method: POST
+    path: "/memberships/{id}/activate"
+    description: "Manager activates a PENDING membership (capacity + occupancy gates)."
+    roles: [Roommate]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["Membership.status -> ACTIVE", "Household counts/status updated", "RoomListing may CLOSE"]
+  - method: POST
+    path: "/memberships/{id}/move-out"
+    description: "Member or manager moves a member out; triggers proration→splits→net-balance cascade."
+    roles: [Roommate]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["actual_move_out_date set", "final proration", "BillSplits recomputed", "net balances recomputed", "household may DISSOLVE", "listing may reopen"]
+
+  # ---- Bill ----
+  - method: POST
+    path: "/bills"
+    description: "Issue a bill for a household; bill_split distributes the total across ACTIVE members."
+    roles: [Roommate]
+    code: 201
+    input: [household_id, bill_type, total_amount_cents, period_start, period_end]
+    output: Bill
+    side_effects: ["split_policy_used snapshot", "BillSplit rows created via bill_split", "for a RENT bill, occupied_days_estimate recomputed via move_proration (estimate variant) for each ACTIVE member against this period"]
+  - method: GET
+    path: "/bills/{id}"
+    description: "Fetch a bill with payment_status and reminder_status."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: []
+    output: Bill
+    side_effects: []
+  - method: GET
+    path: "/bills/{id}/splits"
+    description: "List a bill's splits (reverse-reachability for BillSplit.bill_id and .profile_id)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: BillSplit[]
+    side_effects: []
+  - method: POST
+    path: "/bills/{id}/record-payment"
+    description: "Record a member's payment of their split; advances payment_status."
+    roles: [Roommate]
+    code: 200
+    input: [profile_id]
+    output: Bill
+    side_effects: ["payer BillSplit.paid -> true", "payment_status advanced", "reminders may cancel"]
+
+  # ---- Expense ----
+  - method: POST
+    path: "/expenses"
+    description: "Log a shared expense; ExpenseShares created; net balances recomputed."
+    roles: [Roommate]
+    code: 201
+    input: [household_id, payer_id, description, total_amount_cents, "split_mode?", participant_ids, "share_overrides?"]
+    output: Expense
+    side_effects: ["ExpenseShare rows created via bill_split-style split", "household_net_balance recomputed", "Household.ledger_sum_cents stays 0"]
+  - method: GET
+    path: "/expenses"
+    description: "List expenses; filter by household_id and/or payer_id (reverse-reachability for Expense.payer_id)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["household_id?", "payer_id?", "limit?", "offset?"]
+    output: Expense[]
+    side_effects: []
+  - method: GET
+    path: "/expenses/{id}"
+    description: "Fetch an expense."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: []
+    output: Expense
+    side_effects: []
+  - method: GET
+    path: "/expenses/{id}/shares"
+    description: "List an expense's shares (reverse-reachability for ExpenseShare.expense_id and .profile_id)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ExpenseShare[]
+    side_effects: []
+  - method: POST
+    path: "/expenses/{id}/void"
+    description: "Void a posted expense (compensating action); reverses ledger impact."
+    roles: [Roommate]
+    code: 200
+    input: []
+    output: Expense
+    side_effects: ["Expense.status -> VOIDED", "household_net_balance recomputed", "Household.ledger_sum_cents stays 0"]
+
+  # ---- Settlement ----
+  - method: POST
+    path: "/settlements"
+    description: "Propose a settle-up payment from debtor to creditor."
+    roles: [Roommate]
+    code: 201
+    input: [household_id, from_profile_id, to_profile_id, amount_cents]
+    output: Settlement
+    side_effects: ["Settlement created PROPOSED"]
+  - method: GET
+    path: "/settlements"
+    description: "List settlements; filter by household_id, from_profile_id, to_profile_id (reverse-reachability for Settlement.from_profile_id and .to_profile_id)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["household_id?", "from_profile_id?", "to_profile_id?", "limit?", "offset?"]
+    output: Settlement[]
+    side_effects: []
+  - method: GET
+    path: "/settlements/{id}"
+    description: "Fetch a settlement."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: []
+    output: Settlement
+    side_effects: []
+  - method: POST
+    path: "/settlements/{id}/confirm"
+    description: "Creditor confirms a settlement (OCC on Household.version); applies ledger effects."
+    roles: [Roommate]
+    code: 200
+    input: [expected_household_version]
+    output: Settlement
+    side_effects: ["Settlement.status -> CONFIRMED", "net balances updated", "Household.version +1", "reminders may cancel"]
+  - method: POST
+    path: "/settlements/{id}/repropose"
+    description: "Re-propose a previously disputed settlement once its dispute closes."
+    roles: [Roommate]
+    code: 200
+    input: []
+    output: Settlement
+    side_effects: ["Settlement.status -> PROPOSED", "amount_cents may adopt the dispute's adjusted amount"]
+  - method: POST
+    path: "/settlements/{id}/cancel"
+    description: "Cancel a proposed settlement."
+    roles: [Roommate]
+    code: 200
+    input: []
+    output: Settlement
+    side_effects: ["Settlement.status -> CANCELLED"]
+
+  # ---- PaymentReminder ----
+  - method: POST
+    path: "/payment-reminders"
+    description: "Schedule a payment reminder for a bill OR a settlement (exactly one)."
+    roles: [Roommate]
+    code: 201
+    input: [household_id, "bill_id?", "settlement_id?", due_date]
+    output: PaymentReminder
+    side_effects: ["reminder created SCHEDULED", "if bill_id set and Bill.reminder_status==NONE, Bill.reminder_status -> SCHEDULED"]
+  - method: GET
+    path: "/payment-reminders/{id}"
+    description: "Fetch a payment reminder."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: []
+    output: PaymentReminder
+    side_effects: []
+  - method: GET
+    path: "/payment-reminders"
+    description: "List payment reminders; filter by household_id, bill_id, settlement_id."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["household_id?", "bill_id?", "settlement_id?", "limit?", "offset?"]
+    output: PaymentReminder[]
+    side_effects: []
+  - method: POST
+    path: "/payment-reminders/{id}/acknowledge"
+    description: "Member acknowledges a sent reminder."
+    roles: [Roommate]
+    code: 200
+    input: []
+    output: PaymentReminder
+    side_effects: ["PaymentReminder.status -> ACKNOWLEDGED"]
+
+  # ---- Dispute ----
+  - method: POST
+    path: "/disputes"
+    description: "File a dispute over an expense or a settlement."
+    roles: [Roommate]
+    code: 201
+    input: [household_id, "expense_id?", "settlement_id?", filed_by_id, reason]
+    output: Dispute
+    side_effects: ["Dispute created OPEN", "if settlement_id set and debtor filed, Settlement.status -> DISPUTED"]
+  - method: GET
+    path: "/disputes/{id}"
+    description: "Fetch a dispute."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: []
+  - method: GET
+    path: "/disputes"
+    description: "List disputes; filter by household_id, expense_id, settlement_id, filed_by_id (reverse-reachability for Dispute.filed_by_id)."
+    roles: [Roommate, DisputeMediator, PlatformOperator]
+    code: 200
+    input: ["household_id?", "expense_id?", "settlement_id?", "filed_by_id?", "limit?", "offset?"]
+    output: Dispute[]
+    side_effects: []
+  - method: POST
+    path: "/disputes/{id}/claim"
+    description: "Mediator claims a dispute for review; freezes the household."
+    roles: [DisputeMediator]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["Dispute.status -> UNDER_REVIEW", "Household.status -> FROZEN"]
+  - method: POST
+    path: "/disputes/{id}/resolve"
+    description: "Mediator resolves a dispute, optionally adjusting the disputed amount."
+    roles: [DisputeMediator]
+    code: 200
+    input: ["adjusted_amount_cents?"]
+    output: Dispute
+    side_effects: ["Dispute.status -> RESOLVED", "expense amount/shares/net-balances recomputed if expense_id set", "household unfreezes"]
+  - method: POST
+    path: "/disputes/{id}/reject"
+    description: "Mediator rejects a dispute (target unchanged); unfreezes household."
+    roles: [DisputeMediator]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["Dispute.status -> REJECTED", "household unfreezes"]
+  - method: POST
+    path: "/disputes/{id}/reopen"
+    description: "Mediator bounces a dispute back to OPEN."
+    roles: [DisputeMediator]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["Dispute.status -> OPEN", "household unfreezes if no other dispute under review"]
+
+  # ---- Test-driving endpoints (/_ namespace) ----
+  - method: POST
+    path: "/_clock/set"
+    description: "Set the server's current UTC clock (test-driving; drives reminder due_date crossing)."
+    roles: [PlatformOperator]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock set to to_iso8601"]
+  - method: POST
+    path: "/_reminders/dispatch"
+    description: "Dispatch all SCHEDULED reminders whose due_date <= clock now (test-driving batch)."
+    roles: [PlatformOperator]
+    code: 200
+    input: []
+    output: null
+    side_effects: ["matching PaymentReminders -> SENT", "linked Bill.reminder_status -> SENT"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID on a protected endpoint."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for the operation per RBAC."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Acting roommate is not the required owner/manager/party of the resource."
+  - id: ERR_SELF_ADJUDICATION
+    http: 403
+    condition: "DisputeMediator attempts to claim/resolve/reject a dispute they filed."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced path id or FK body field does not resolve to an existing resource."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Transition is not defined from the resource's current state."
+  - id: ERR_HOUSEHOLD_FROZEN
+    http: 409
+    condition: "Ledger-mutating write attempted while Household.status == FROZEN."
+  - id: ERR_NOT_HOUSEHOLD_MEMBER
+    http: 422
+    condition: "A referenced profile is not an ACTIVE member of the named household."
+  - id: ERR_SELF_SETTLEMENT
+    http: 422
+    condition: "Settlement from_profile_id equals to_profile_id."
+  - id: ERR_SHARES_DO_NOT_SUM
+    http: 422
+    condition: "CUSTOM expense share_overrides do not sum to total_amount_cents or keys mismatch participants."
+  - id: ERR_BILL_PERIOD_OVERLAP
+    http: 409
+    condition: "A new RENT bill's closed period overlaps an existing RENT bill of the household."
+  - id: ERR_INVALID_PERIOD
+    http: 422
+    condition: "Bill period_end is not strictly after period_start."
+  - id: ERR_ROOM_AT_CAPACITY
+    http: 409
+    condition: "Activation would push active_member_count past RoomListing.capacity."
+  - id: ERR_OCCUPANCY_OVERLAP
+    http: 409
+    condition: "Occupancy interval overlaps another ACTIVE membership on the same room beyond capacity."
+  - id: ERR_SETTLEMENT_EXCEEDS_DEBT
+    http: 422
+    condition: "Settlement amount_cents exceeds the debtor's outstanding debt."
+  - id: ERR_NO_OUTSTANDING_DEBT
+    http: 422
+    condition: "Confirm attempted when the debtor has no outstanding debt (net_balance_cents >= 0)."
+  - id: ERR_BELOW_MATCH_THRESHOLD
+    http: 422
+    condition: "Accepting a match request whose compatibility_score < MATCH_THRESHOLD."
+  - id: ERR_SELF_APPLICATION
+    http: 422
+    condition: "applicant_id equals the listing's lister_id."
+  - id: ERR_EMAIL_TAKEN
+    http: 409
+    condition: "A RoommateProfile with the same email already exists."
+  - id: ERR_REMINDER_TARGET_AMBIGUOUS
+    http: 422
+    condition: "PaymentReminder does not name exactly one of bill_id / settlement_id."
+  - id: ERR_STALE_HOUSEHOLD_VERSION
+    http: 412
+    condition: "expected_household_version does not match the current Household.version on confirm."
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "A required field is missing or a field violates its declared type/range constraint."
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Roommate
+    description: "A person with a profile: lists rooms, applies, manages a household, logs expenses, settles up, files disputes."
+    identity: "entity_backed:RoommateProfile"
+    exclusive_operations:
+      - "POST /roommate-profiles"
+      - "POST /room-listings"
+      - "POST /match-requests (+ accept/reject/withdraw/reapply)"
+      - "POST /memberships/{id}/activate, /move-out"
+      - "POST /bills (+ record-payment)"
+      - "POST /expenses (+ void)"
+      - "POST /settlements (+ confirm/repropose/cancel)"
+      - "POST /payment-reminders (+ acknowledge)"
+      - "POST /disputes (file only)"
+    shared_operations:
+      - "GET on all resources"
+  - name: DisputeMediator
+    description: "Neutral operator who adjudicates disputes; cannot adjudicate disputes they filed."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /disputes/{id}/claim, /resolve, /reject, /reopen"
+    shared_operations:
+      - "GET on all resources"
+  - name: PlatformOperator
+    description: "System operator: advances the clock and runs the reminder dispatch batch."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /_clock/set"
+      - "POST /_reminders/dispatch"
+    shared_operations:
+      - "GET on all resources"

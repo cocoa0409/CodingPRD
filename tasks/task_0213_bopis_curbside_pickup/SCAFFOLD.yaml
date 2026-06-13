@@ -1,0 +1,1927 @@
+scenario: |
+  Buy-Online-Pickup-In-Store (BOPIS) & Curbside: store inventory availability,
+  pickup-slot capacity, pick/stage/ready workflow, identity/order verification,
+  curbside arrival check-in, hold/expiration & restock, substitution, partial pickup
+
+domain_name: bopis-curbside-pickup
+api_prefix: /
+# Multi-root flat topology: orders, stores, products, customers, pickup-slots,
+# store-inventory, order-lines, substitutions, curbside-checkins are peer top-level
+# collections (no single nesting root), so api_prefix is the server root.
+
+# Structural DNA --------------------------------------------------------------
+complexity_profile:
+  primary_archetype: quota_allocation
+  secondary_archetype: workflow_orchestration
+  complexity_layers:
+    - optimistic_concurrency        # OCC on StoreInventory.version (reserve race) + PickupSlot.version (book race)
+    - cascading_side_effects        # cancel/expire → release reservations → restock → slot decrement → ledger append
+    - dual_variant_calculation      # availability (reserve-blocking) on inventory vs no-show risk score on customer
+    - rate_threshold_triggers       # hold-expiry window (>= vs >), no-show strike threshold, slot fill ratio
+    - scheduled_actions             # hold expires_at vs clock; slot cutoff vs clock
+
+  entity_topology: hybrid
+  # Order -> OrderLine (parent-child, nested URL); flat FK refs to Store, PickupSlot,
+  # Customer, Product, StoreInventory; cross-cutting Substitution / PickupEvent / Hold.
+
+  state_machine_shape: parallel
+  # Order carries TWO independent axes: fulfillment_status (pick/stage/ready/pickup
+  # lifecycle) AND payment_status (AUTHORIZED -> CAPTURED/REFUNDED), evolving on the
+  # same row. OrderLine adds a substitution cycle (cyclic). Inventory is compound.
+
+  relationship_patterns:
+    - one_to_many        # Order has many OrderLine; Store has many StoreInventory/PickupSlot
+    - cross_aggregate    # OrderLine reserves StoreInventory across aggregate boundary
+    - polymorphic        # InventoryMovement.reason references Order/Hold/manual restock
+
+  role_model: peer_roles
+  # Customer owns own Orders; StorePicker/StoreAssociate operate store-side workflow;
+  # StoreManager overrides; PlatformAdmin (opaque) seeds catalog and drives the clock.
+
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: login/contact email; unique among Customers
+        constraints: required, unique, non-empty
+      - name: full_name
+        type: string
+        source: input
+        description: customer display name
+        constraints: required, non-empty
+      - name: phone
+        type: string
+        source: input
+        description: contact phone used for curbside arrival match
+        constraints: required, non-empty
+      - name: no_show_strikes
+        type: integer
+        source: computed
+        description: |
+          running count of Orders that EXPIRED while AWAITING_PICKUP attributable
+          to this customer; incremented by the hold-expiry transition, never decremented
+        default: 0
+        constraints: ">= 0"
+      - name: pickup_standing
+        type: enum
+        source: computed
+        description: |
+          derived risk posture from no_show_strikes; see calc no_show_risk_posture.
+          GOOD (strikes < 2), WATCH (2 <= strikes < 4), BLOCKED (strikes >= 4)
+        default: GOOD
+        constraints: "one of {GOOD, WATCH, BLOCKED}"
+
+  - name: Store
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: store display name
+        constraints: required, non-empty
+      - name: state_code
+        type: string
+        source: input
+        description: two-letter US state code of the store
+        constraints: required, length 2
+      - name: curbside_spaces
+        type: integer
+        source: input
+        description: number of curbside parking spaces (concurrent active check-ins cap)
+        constraints: ">= 1"
+      - name: hold_window_minutes
+        type: integer
+        source: input
+        description: |
+          minutes a staged hold remains valid after becoming AWAITING_PICKUP before
+          it is eligible to EXPIRE; drives Hold.expires_at
+        default: 120
+        constraints: ">= 1"
+      - name: active_curbside_count
+        type: integer
+        source: computed
+        description: |
+          number of CurbsideCheckIn rows for this store currently in state
+          ARRIVED or BEING_LOADED (not yet COMPLETED/CANCELLED); gates new check-ins
+          against curbside_spaces
+        default: 0
+        constraints: ">= 0"
+
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - name: sku
+        type: string
+        source: input
+        description: stock-keeping unit code; unique among Products
+        constraints: required, unique, non-empty
+      - name: name
+        type: string
+        source: input
+        description: product display name
+        constraints: required, non-empty
+      - name: unit_price_cents
+        type: integer
+        source: input
+        description: catalog price per unit in integer cents
+        constraints: "> 0"
+      - name: substitution_group
+        type: string
+        source: input
+        description: |
+          group key; a substitute Product offered for an OrderLine MUST share this
+          exact group key with the original Product. null disables substitution.
+        default: null
+        constraints: "non-empty string when present"
+
+  - name: StoreInventory
+    parent: null
+    common_fields: true
+    fields:
+      - name: store_id
+        type: string
+        source: input
+        description: FK -> Store.id; the store holding this stock
+        constraints: required, immutable
+      - name: product_id
+        type: string
+        source: input
+        description: FK -> Product.id; the product stocked
+        constraints: required, immutable; unique together with store_id
+      - name: on_hand
+        type: integer
+        source: input
+        description: |
+          physical units on the shelf/backroom. Set at creation and adjusted by
+          restock and by physical pick removal; NOT decremented by reservation.
+        default: 0
+        constraints: ">= 0"
+      - name: reserved
+        type: integer
+        source: computed
+        description: |
+          units soft-committed to non-terminal OrderLines at this store/product;
+          incremented on reserve, decremented on release/pickup
+        default: 0
+        constraints: ">= 0"
+      - name: available
+        type: integer
+        source: computed
+        description: |
+          derived bookable units = on_hand - reserved (floored at 0); see calc
+          inventory_availability. This is the value the reserve-blocking check reads.
+        default: 0
+        constraints: ">= 0"
+
+  - name: PickupSlot
+    parent: null
+    common_fields: true
+    fields:
+      - name: store_id
+        type: string
+        source: input
+        description: FK -> Store.id; the store this slot belongs to
+        constraints: required, immutable
+      - name: window_start
+        type: datetime
+        source: input
+        description: ISO-8601 UTC inclusive start of the pickup window
+        constraints: required
+      - name: window_end
+        type: datetime
+        source: input
+        description: ISO-8601 UTC exclusive end of the pickup window
+        constraints: "required; must be strictly after window_start"
+      - name: cutoff_offset_minutes
+        type: integer
+        source: input
+        description: |
+          minutes before window_start after which the slot can no longer be booked;
+          booking is allowed only while clock < window_start - cutoff_offset_minutes
+        default: 30
+        constraints: ">= 0"
+      - name: capacity
+        type: integer
+        source: input
+        description: maximum number of Orders that may book this slot
+        constraints: "> 0"
+      - name: booked_count
+        type: integer
+        source: computed
+        description: |
+          number of Orders currently holding this slot (non-released bookings);
+          incremented on book, decremented when an order releases the slot
+        default: 0
+        constraints: ">= 0, <= capacity"
+      - name: fill_status
+        type: enum
+        source: computed
+        description: |
+          OPEN (booked_count < capacity), FULL (booked_count == capacity); see
+          calc slot_fill_status
+        default: OPEN
+        constraints: "one of {OPEN, FULL}"
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: FK -> Customer.id; owner of this order
+        constraints: required, immutable
+      - name: store_id
+        type: string
+        source: input
+        description: FK -> Store.id; fulfilling store
+        constraints: required, immutable
+      - name: slot_id
+        type: string
+        source: input
+        description: FK -> PickupSlot.id; booked pickup slot (set at submission)
+        constraints: "required at submission; must belong to store_id"
+      - name: fulfillment_status
+        type: enum
+        source: computed
+        description: |
+          primary lifecycle axis. one of {DRAFT, SUBMITTED, PICKING, STAGED,
+          AWAITING_PICKUP, PARTIALLY_PICKED_UP, COMPLETED, CANCELLED, EXPIRED}
+        default: DRAFT
+        constraints: "see state_machines.Order(fulfillment)"
+      - name: payment_status
+        type: enum
+        source: computed
+        description: |
+          independent payment axis evolving on the same row. one of
+          {UNAUTHORIZED, AUTHORIZED, CAPTURED, REFUNDED, PARTIALLY_REFUNDED}
+        default: UNAUTHORIZED
+        constraints: "see state_machines.Order(payment)"
+      - name: authorized_total_cents
+        type: integer
+        source: computed
+        description: |
+          payment authorization amount captured at SUBMIT from sum of ordered
+          line subtotals; see calc order_authorized_total
+        default: 0
+        constraints: ">= 0"
+      - name: captured_total_cents
+        type: integer
+        source: computed
+        description: |
+          amount actually charged at pickup based on units handed over; see calc
+          order_captured_total. May differ from authorized_total_cents on partial
+          pickup or substitution.
+        default: 0
+        constraints: ">= 0"
+      - name: refunded_total_cents
+        type: integer
+        source: computed
+        description: |
+          cumulative amount refunded for not-picked-up units; see calc
+          order_refunded_total
+        default: 0
+        constraints: ">= 0"
+      - name: verified
+        type: boolean
+        source: computed
+        description: |
+          true once identity/order verification has passed for this order at the
+          store; required before any line may be handed over
+        default: false
+        constraints: "set true only by verify transition"
+
+  - name: OrderLine
+    parent: Order
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; the parent order
+        constraints: required, immutable
+      - name: product_id
+        type: string
+        source: input
+        description: FK -> Product.id; the ordered product
+        constraints: required, immutable
+      - name: qty_ordered
+        type: integer
+        source: input
+        description: units the customer requested for this line
+        constraints: "> 0"
+      - name: qty_reserved
+        type: integer
+        source: computed
+        description: |
+          units currently reserved against StoreInventory for this line; equals
+          qty_ordered while the order holds inventory, 0 after release/pickup
+        default: 0
+        constraints: ">= 0, <= qty_ordered"
+      - name: qty_picked
+        type: integer
+        source: computed
+        description: |
+          units physically picked and staged by the picker; may be < qty_ordered
+          when short-picked, triggering substitution or partial flow
+        default: 0
+        constraints: ">= 0, <= qty_ordered"
+      - name: qty_handed_over
+        type: integer
+        source: computed
+        description: units actually handed to the customer at pickup
+        default: 0
+        constraints: ">= 0, <= qty_picked"
+      - name: line_status
+        type: enum
+        source: computed
+        description: |
+          one of {PENDING, RESERVED, SHORT_PICKED, PICKED, SUBSTITUTION_PROPOSED,
+          SUBSTITUTED, HANDED_OVER, NOT_FULFILLED}
+        default: PENDING
+        constraints: "see state_machines.OrderLine"
+
+  - name: Substitution
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_line_id
+        type: string
+        source: input
+        description: FK -> OrderLine.id; the short-picked line being substituted
+        constraints: required, immutable
+      - name: substitute_product_id
+        type: string
+        source: input
+        description: |
+          FK -> Product.id; proposed replacement; MUST share substitution_group
+          with the original line's product and be non-null
+        constraints: required, immutable
+      - name: substitute_qty
+        type: integer
+        source: input
+        description: units of the substitute offered (the short quantity)
+        constraints: "> 0"
+      - name: decision_status
+        type: enum
+        source: computed
+        description: |
+          one of {PROPOSED, ACCEPTED, DECLINED, WITHDRAWN}; PROPOSED can cycle back
+          via WITHDRAWN then a new proposal
+        default: PROPOSED
+        constraints: "see state_machines.Substitution"
+      - name: price_delta_cents
+        type: integer
+        source: computed
+        description: |
+          signed price difference applied on ACCEPT; see calc substitution_price_delta.
+          (substitute.unit_price - original.unit_price) * substitute_qty
+        default: 0
+        constraints: "signed integer"
+
+  - name: Hold
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; the order this staged hold represents
+        constraints: required, immutable; one Hold per Order
+      - name: store_id
+        type: string
+        source: input
+        description: FK -> Store.id; staging store
+        constraints: required, immutable
+      - name: staged_at
+        type: datetime
+        source: system
+        description: clock value when the order reached AWAITING_PICKUP
+        constraints: set on creation
+      - name: expires_at
+        type: datetime
+        source: computed
+        description: |
+          staged_at + Store.hold_window_minutes; the hold is eligible to EXPIRE only
+          while clock >= expires_at; see calc hold_expiry_deadline
+        constraints: computed at staging
+      - name: hold_status
+        type: enum
+        source: computed
+        description: |
+          one of {ACTIVE, RELEASED, EXPIRED}; ACTIVE while awaiting pickup
+        default: ACTIVE
+        constraints: "see state_machines.Hold"
+
+  - name: CurbsideCheckIn
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; the order being picked up curbside
+        constraints: required, immutable
+      - name: store_id
+        type: string
+        source: input
+        description: FK -> Store.id; store of arrival
+        constraints: required, immutable
+      - name: vehicle_description
+        type: string
+        source: input
+        description: free-text vehicle/space description for the associate
+        constraints: required, non-empty
+      - name: checkin_status
+        type: enum
+        source: computed
+        description: |
+          one of {ARRIVED, BEING_LOADED, COMPLETED, CANCELLED}; ARRIVED and
+          BEING_LOADED both count toward Store.active_curbside_count
+        default: ARRIVED
+        constraints: "see state_machines.CurbsideCheckIn"
+
+  - name: PickupEvent
+    parent: Order
+    common_fields: false
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; the order this pickup event records
+        constraints: required, immutable
+      - name: order_line_id
+        type: string
+        source: input
+        description: FK -> OrderLine.id; the line handed over in this event
+        constraints: required, immutable
+      - name: qty_handed_over
+        type: integer
+        source: input
+        description: units handed over for this line in this pickup event
+        constraints: "> 0"
+      - name: captured_cents
+        type: integer
+        source: computed
+        description: |
+          amount captured for this event = effective unit price * qty_handed_over;
+          see calc order_captured_total
+        constraints: ">= 0"
+
+  - name: InventoryMovement
+    parent: null
+    common_fields: false
+    fields:
+      - name: store_inventory_id
+        type: string
+        source: input
+        description: FK -> StoreInventory.id; the inventory row affected
+        constraints: required, immutable
+      - name: movement_type
+        type: enum
+        source: system
+        description: |
+          one of {RESTOCK, RESERVE, RELEASE, PICK_REMOVE}; append-only ledger of
+          every inventory mutation, ordered by created_at
+        constraints: required
+      - name: delta_on_hand
+        type: integer
+        source: system
+        description: signed change to on_hand (RESTOCK +, PICK_REMOVE -, else 0)
+        default: 0
+        constraints: signed integer
+      - name: delta_reserved
+        type: integer
+        source: system
+        description: signed change to reserved (RESERVE +, RELEASE/PICK_REMOVE -)
+        default: 0
+        constraints: signed integer
+      - name: reason
+        type: string
+        source: system
+        description: |
+          polymorphic origin reference: "ORDER:<id>", "HOLD:<id>", or "MANUAL"
+        constraints: non-empty
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # --- Order fulfillment axis (parallel dimension A) -------------------------
+  - entity: Order
+    initial_state: DRAFT
+    terminal_states: [COMPLETED, CANCELLED, EXPIRED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /orders/{id}/submit"
+        actor: Customer
+        preconditions:
+          - "order has >= 1 OrderLine"
+          - "slot_id supplied and PickupSlot belongs to store_id"
+          - "PickupSlot.fill_status == OPEN (booked_count < capacity)"
+          - "clock < PickupSlot.window_start - cutoff_offset_minutes"
+          - "Customer.pickup_standing != BLOCKED"
+          - "for every OrderLine: StoreInventory(store_id, product_id).available >= qty_ordered"
+          - "expected_slot_version matches PickupSlot.version (OCC)"
+        side_effects:
+          - "for each OrderLine: reserve qty_ordered → StoreInventory.reserved += qty_ordered; recompute available; append InventoryMovement RESERVE; OrderLine.line_status = RESERVED; qty_reserved = qty_ordered"
+          - "PickupSlot.booked_count += 1; recompute slot_fill_status; increments PickupSlot.version by 1"
+          - "authorized_total_cents = order_authorized_total; payment_status = AUTHORIZED"
+          - "increments Order.version by 1"
+      - from: SUBMITTED
+        to: PICKING
+        trigger: "POST /orders/{id}/start-picking"
+        actor: StorePicker
+        preconditions:
+          - "fulfillment_status == SUBMITTED"
+        side_effects:
+          - "increments Order.version by 1"
+      - from: PICKING
+        to: STAGED
+        trigger: "POST /orders/{id}/stage"
+        actor: StorePicker
+        preconditions:
+          - "fulfillment_status == PICKING"
+          - "every OrderLine is in {PICKED, SUBSTITUTED, NOT_FULFILLED} (no line still PENDING/RESERVED/SHORT_PICKED/SUBSTITUTION_PROPOSED)"
+          - "at least one OrderLine in {PICKED, SUBSTITUTED} (cannot stage an all-NOT_FULFILLED order)"
+        side_effects:
+          - "increments Order.version by 1"
+      - from: STAGED
+        to: AWAITING_PICKUP
+        trigger: "POST /orders/{id}/ready"
+        actor: StorePicker
+        preconditions:
+          - "fulfillment_status == STAGED"
+        side_effects:
+          - "create Hold(order_id, store_id) with staged_at = clock, expires_at = hold_expiry_deadline, hold_status = ACTIVE"
+          - "increments Order.version by 1"
+      - from: AWAITING_PICKUP
+        to: PARTIALLY_PICKED_UP
+        trigger: "POST /orders/{id}/pickup (handed-over units < total picked units, >0)"
+        actor: StoreAssociate
+        preconditions:
+          - "fulfillment_status == AWAITING_PICKUP"
+          - "verified == true"
+          - "each requested line's qty_handed_over <= OrderLine.qty_picked"
+          - "sum of handed-over units across the request is > 0 and < sum of OrderLine.qty_picked"
+        side_effects:
+          - "create one PickupEvent per handed line; OrderLine.qty_handed_over += event qty; OrderLine.line_status = HANDED_OVER when fully handed"
+          - "captured_total_cents = order_captured_total; payment_status = CAPTURED"
+          - "increments Order.version by 1"
+      - from: AWAITING_PICKUP
+        to: COMPLETED
+        trigger: "POST /orders/{id}/pickup (all picked units handed over)"
+        actor: StoreAssociate
+        preconditions:
+          - "fulfillment_status == AWAITING_PICKUP"
+          - "verified == true"
+          - "sum of handed-over units == sum of OrderLine.qty_picked across all lines"
+        side_effects:
+          - "create PickupEvents; OrderLine.qty_handed_over = qty_picked; line_status = HANDED_OVER"
+          - "release any residual reservation for short/not-fulfilled lines: StoreInventory.reserved -= residual qty_reserved; recompute available; append InventoryMovement RELEASE; restock short units to on_hand if previously picked then not taken (none here); qty_reserved = 0"
+          - "captured_total_cents = order_captured_total; refunded_total_cents = order_refunded_total; payment_status = CAPTURED if refunded_total_cents == 0 else PARTIALLY_REFUNDED"
+          - "Hold.hold_status = RELEASED"
+          - "PickupSlot.booked_count -= 1; recompute slot_fill_status; increments PickupSlot.version by 1"
+          - "increments Order.version by 1"
+      - from: PARTIALLY_PICKED_UP
+        to: COMPLETED
+        trigger: "POST /orders/{id}/close"
+        actor: StoreAssociate
+        preconditions:
+          - "fulfillment_status == PARTIALLY_PICKED_UP"
+        side_effects:
+          - "for each OrderLine with qty_picked > qty_handed_over: restock the not-taken picked units → StoreInventory.on_hand += (qty_picked - qty_handed_over); release residual reservation; append InventoryMovement PICK_REMOVE reversal as RESTOCK; recompute available"
+          - "refunded_total_cents = order_refunded_total; payment_status = PARTIALLY_REFUNDED if refunded_total_cents > 0 else CAPTURED"
+          - "Hold.hold_status = RELEASED"
+          - "PickupSlot.booked_count -= 1; recompute slot_fill_status; increments PickupSlot.version by 1"
+          - "increments Order.version by 1"
+      - from: AWAITING_PICKUP
+        to: EXPIRED
+        trigger: "POST /_clock/advance (system sweep when clock >= Hold.expires_at) or POST /orders/{id}/expire"
+        actor: system
+        preconditions:
+          - "fulfillment_status == AWAITING_PICKUP"
+          - "clock >= Hold.expires_at"
+        side_effects:
+          - "for each OrderLine: restock the picked units back to the shelf → StoreInventory.on_hand += qty_picked (a picked-but-not-collected unit returns to stock); for substituted lines restock the substitute product instead; append InventoryMovement RESTOCK; line_status = NOT_FULFILLED"
+          - "for each OrderLine: release any residual reservation → StoreInventory.reserved -= qty_reserved; qty_reserved = 0; recompute available; append InventoryMovement RELEASE"
+          - "refunded_total_cents = authorized_total_cents (full refund of authorization); payment_status = REFUNDED"
+          - "Hold.hold_status = EXPIRED"
+          - "PickupSlot.booked_count -= 1; recompute slot_fill_status; increments PickupSlot.version by 1"
+          - "Customer.no_show_strikes += 1; recompute Customer.pickup_standing"
+          - "increments Order.version by 1"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /orders/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "fulfillment_status == DRAFT"
+        side_effects:
+          - "no inventory/slot to release (none reserved in DRAFT)"
+          - "increments Order.version by 1"
+      - from: SUBMITTED
+        to: CANCELLED
+        trigger: "POST /orders/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "fulfillment_status == SUBMITTED"
+        side_effects:
+          - "for each OrderLine: StoreInventory.reserved -= qty_reserved; recompute available; append InventoryMovement RELEASE; qty_reserved = 0; line_status = NOT_FULFILLED"
+          - "PickupSlot.booked_count -= 1; recompute slot_fill_status; increments PickupSlot.version by 1"
+          - "refunded_total_cents = authorized_total_cents; payment_status = REFUNDED"
+          - "increments Order.version by 1"
+      - from: PICKING
+        to: CANCELLED
+        trigger: "POST /orders/{id}/cancel"
+        actor: StoreManager
+        preconditions:
+          - "fulfillment_status == PICKING"
+        side_effects:
+          - "for each OrderLine: restock any already-picked units → StoreInventory.on_hand += qty_picked; StoreInventory.reserved -= qty_reserved; recompute available; append InventoryMovement RELEASE; qty_reserved = 0; qty_picked = 0; line_status = NOT_FULFILLED"
+          - "PickupSlot.booked_count -= 1; recompute slot_fill_status; increments PickupSlot.version by 1"
+          - "refunded_total_cents = authorized_total_cents; payment_status = REFUNDED"
+          - "increments Order.version by 1"
+
+  # --- Order payment axis (parallel dimension B, same row) -------------------
+  - entity: Order
+    initial_state: UNAUTHORIZED
+    terminal_states: [REFUNDED]
+    note: |
+      payment_status is an independent axis on the Order row; it is advanced by the
+      fulfillment transitions above (AUTHORIZED at SUBMIT; CAPTURED/PARTIALLY_REFUNDED
+      at pickup/close; REFUNDED at cancel/expire). Listed separately to make the
+      parallel-dimension shape explicit per §0.5 Rule 3.
+    transitions:
+      - from: UNAUTHORIZED
+        to: AUTHORIZED
+        trigger: "system: Order DRAFT->SUBMITTED side effect"
+        actor: system
+        preconditions:
+          - "fulfillment transition DRAFT->SUBMITTED fired"
+        side_effects:
+          - "authorized_total_cents pinned"
+      - from: AUTHORIZED
+        to: CAPTURED
+        trigger: "system: Order ->COMPLETED with refunded_total_cents == 0"
+        actor: system
+        preconditions:
+          - "fulfillment reached COMPLETED and refunded_total_cents == 0"
+        side_effects: []
+      - from: AUTHORIZED
+        to: PARTIALLY_REFUNDED
+        trigger: "system: Order ->COMPLETED with refunded_total_cents > 0"
+        actor: system
+        preconditions:
+          - "fulfillment reached COMPLETED/PARTIALLY_PICKED_UP-close and 0 < refunded_total_cents < authorized_total_cents"
+        side_effects: []
+      - from: AUTHORIZED
+        to: REFUNDED
+        trigger: "system: Order ->CANCELLED or ->EXPIRED"
+        actor: system
+        preconditions:
+          - "fulfillment reached CANCELLED or EXPIRED"
+        side_effects:
+          - "refunded_total_cents = authorized_total_cents"
+
+  # --- OrderLine substitution cycle (cyclic) ---------------------------------
+  - entity: OrderLine
+    initial_state: PENDING
+    terminal_states: [HANDED_OVER, NOT_FULFILLED]
+    transitions:
+      - from: PENDING
+        to: RESERVED
+        trigger: "system: Order DRAFT->SUBMITTED reserves inventory"
+        actor: system
+        preconditions:
+          - "StoreInventory(store_id, product_id).available >= qty_ordered"
+        side_effects:
+          - "qty_reserved = qty_ordered; StoreInventory.reserved += qty_ordered"
+      - from: RESERVED
+        to: PICKED
+        trigger: "POST /order-lines/{id}/pick"
+        actor: StorePicker
+        preconditions:
+          - "parent Order.fulfillment_status == PICKING"
+          - "qty_picked input == qty_ordered (full pick)"
+          - "StoreInventory.on_hand >= qty_ordered"
+        side_effects:
+          - "qty_picked = qty_ordered; StoreInventory.on_hand -= qty_ordered; StoreInventory.reserved -= qty_ordered; qty_reserved = 0; recompute available; append InventoryMovement PICK_REMOVE"
+          - "increments OrderLine.version by 1"
+      - from: RESERVED
+        to: SHORT_PICKED
+        trigger: "POST /order-lines/{id}/pick"
+        actor: StorePicker
+        preconditions:
+          - "parent Order.fulfillment_status == PICKING"
+          - "0 <= qty_picked input < qty_ordered (short pick)"
+          - "StoreInventory.on_hand >= qty_picked input"
+        side_effects:
+          - "qty_picked = input; StoreInventory.on_hand -= qty_picked; restock not-picked reservation: StoreInventory.reserved -= (qty_ordered - qty_picked); qty_reserved = qty_picked; recompute available; append InventoryMovement PICK_REMOVE and RELEASE"
+          - "increments OrderLine.version by 1"
+      - from: SHORT_PICKED
+        to: SUBSTITUTION_PROPOSED
+        trigger: "POST /substitutions (proposes substitute for the short qty)"
+        actor: StorePicker
+        preconditions:
+          - "line_status == SHORT_PICKED"
+          - "original Product.substitution_group is non-null"
+          - "substitute Product.substitution_group == original Product.substitution_group"
+        side_effects:
+          - "create Substitution(decision_status=PROPOSED); line_status = SUBSTITUTION_PROPOSED"
+          - "increments OrderLine.version by 1"
+      - from: SUBSTITUTION_PROPOSED
+        to: SHORT_PICKED
+        trigger: "POST /substitutions/{id}/withdraw or POST /substitutions/{id}/decline"
+        actor: Customer
+        note: "cyclic — declining/withdrawing returns the line to SHORT_PICKED so a new substitute may be proposed"
+        preconditions:
+          - "Substitution.decision_status == PROPOSED"
+        side_effects:
+          - "Substitution.decision_status = DECLINED (customer) or WITHDRAWN (picker); line_status = SHORT_PICKED"
+          - "increments OrderLine.version by 1"
+      - from: SUBSTITUTION_PROPOSED
+        to: SUBSTITUTED
+        trigger: "POST /substitutions/{id}/accept"
+        actor: Customer
+        preconditions:
+          - "Substitution.decision_status == PROPOSED"
+          - "StoreInventory(store_id, substitute_product_id).available >= substitute_qty"
+        side_effects:
+          - "Substitution.decision_status = ACCEPTED; price_delta_cents = substitution_price_delta"
+          - "reserve substitute: StoreInventory(substitute).reserved += substitute_qty; append InventoryMovement RESERVE; recompute available"
+          - "OrderLine.line_status = SUBSTITUTED; qty_picked stays; substitute units treated as picked for staging"
+          - "authorized_total_cents += price_delta_cents (re-authorize delta); increments Order.version by 1"
+          - "increments OrderLine.version by 1"
+      - from: SHORT_PICKED
+        to: NOT_FULFILLED
+        trigger: "POST /order-lines/{id}/abandon"
+        actor: StorePicker
+        preconditions:
+          - "line_status == SHORT_PICKED"
+          - "qty_picked == 0 (nothing picked for this line)"
+        side_effects:
+          - "release residual reservation: StoreInventory.reserved -= qty_reserved; qty_reserved = 0; recompute available; append InventoryMovement RELEASE; line_status = NOT_FULFILLED"
+          - "increments OrderLine.version by 1"
+      - from: PICKED
+        to: HANDED_OVER
+        trigger: "system: Order pickup transition hands over this line fully"
+        actor: system
+        preconditions:
+          - "qty_handed_over == qty_picked"
+        side_effects:
+          - "line_status = HANDED_OVER"
+      - from: SUBSTITUTED
+        to: HANDED_OVER
+        trigger: "system: Order pickup transition hands over this line fully"
+        actor: system
+        preconditions:
+          - "qty_handed_over == qty_picked"
+        side_effects:
+          - "line_status = HANDED_OVER"
+
+  # --- Substitution lifecycle ------------------------------------------------
+  - entity: Substitution
+    initial_state: PROPOSED
+    terminal_states: [ACCEPTED, DECLINED, WITHDRAWN]
+    transitions:
+      - from: PROPOSED
+        to: ACCEPTED
+        trigger: "POST /substitutions/{id}/accept"
+        actor: Customer
+        preconditions:
+          - "decision_status == PROPOSED"
+          - "acting Customer owns the parent Order"
+          - "StoreInventory(store_id, substitute_product_id).available >= substitute_qty"
+        side_effects:
+          - "price_delta_cents computed; substitute inventory reserved; parent OrderLine -> SUBSTITUTED (see OrderLine machine)"
+      - from: PROPOSED
+        to: DECLINED
+        trigger: "POST /substitutions/{id}/decline"
+        actor: Customer
+        preconditions:
+          - "decision_status == PROPOSED"
+          - "acting Customer owns the parent Order"
+        side_effects:
+          - "parent OrderLine -> SHORT_PICKED (re-openable)"
+      - from: PROPOSED
+        to: WITHDRAWN
+        trigger: "POST /substitutions/{id}/withdraw"
+        actor: StorePicker
+        preconditions:
+          - "decision_status == PROPOSED"
+        side_effects:
+          - "parent OrderLine -> SHORT_PICKED (re-openable)"
+
+  # --- Hold lifecycle --------------------------------------------------------
+  - entity: Hold
+    initial_state: ACTIVE
+    terminal_states: [RELEASED, EXPIRED]
+    transitions:
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "system: parent Order reaches COMPLETED"
+        actor: system
+        preconditions:
+          - "parent Order.fulfillment_status reached COMPLETED"
+        side_effects:
+          - "hold_status = RELEASED"
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system: clock >= expires_at sweep (POST /_clock/advance) or POST /orders/{id}/expire"
+        actor: system
+        preconditions:
+          - "clock >= expires_at"
+          - "parent Order.fulfillment_status == AWAITING_PICKUP"
+        side_effects:
+          - "hold_status = EXPIRED; parent Order -> EXPIRED (see Order machine cascade)"
+
+  # --- CurbsideCheckIn lifecycle ---------------------------------------------
+  - entity: CurbsideCheckIn
+    initial_state: ARRIVED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: ARRIVED
+        to: BEING_LOADED
+        trigger: "POST /curbside-checkins/{id}/start-loading"
+        actor: StoreAssociate
+        preconditions:
+          - "checkin_status == ARRIVED"
+          - "parent Order.verified == true"
+        side_effects:
+          - "increments CurbsideCheckIn.version by 1"
+      - from: BEING_LOADED
+        to: COMPLETED
+        trigger: "POST /curbside-checkins/{id}/complete"
+        actor: StoreAssociate
+        preconditions:
+          - "checkin_status == BEING_LOADED"
+          - "parent Order.fulfillment_status in {COMPLETED, PARTIALLY_PICKED_UP}"
+        side_effects:
+          - "Store.active_curbside_count -= 1; recompute"
+          - "increments CurbsideCheckIn.version by 1"
+      - from: ARRIVED
+        to: CANCELLED
+        trigger: "POST /curbside-checkins/{id}/cancel"
+        actor: StoreAssociate
+        preconditions:
+          - "checkin_status == ARRIVED"
+        side_effects:
+          - "Store.active_curbside_count -= 1; recompute"
+          - "increments CurbsideCheckIn.version by 1"
+      - from: BEING_LOADED
+        to: CANCELLED
+        trigger: "POST /curbside-checkins/{id}/cancel"
+        actor: StoreAssociate
+        preconditions:
+          - "checkin_status == BEING_LOADED"
+        side_effects:
+          - "Store.active_curbside_count -= 1; recompute"
+          - "increments CurbsideCheckIn.version by 1"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules (OCC on parent version — true CREATE-with-supersede races)
+# =============================================================================
+concurrency_rules:
+  - rule_id: slot-book-stale-slot
+    parent_entity: PickupSlot
+    write_endpoint: "POST /orders/{id}/submit"
+    occ_field: "expected_slot_version"
+    description: |
+      Submitting an Order books one unit of PickupSlot capacity. If the slot's
+      version has advanced since the client last observed it — because another
+      submission has already booked a unit and legitimately consumed capacity —
+      the submission is rejected as stale. The new booking would otherwise
+      supersede the client's stale view of remaining capacity.
+    error_id: ERR_STALE_SLOT_VERSION
+    http_status: 412
+
+  - rule_id: inventory-restock-stale-inventory
+    parent_entity: StoreInventory
+    write_endpoint: "POST /store-inventory/{id}/restock"
+    occ_field: "expected_inventory_version"
+    description: |
+      Restocking adjusts on_hand and supersedes the prior availability snapshot.
+      If StoreInventory.version has advanced since the client read it — because a
+      reservation or a prior restock already moved on_hand/reserved — the restock
+      is rejected as stale rather than applied on top of an outdated baseline.
+    error_id: ERR_STALE_INVENTORY_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: inventory_availability
+    trigger: "recomputed on every reserve, release, pick, restock affecting a StoreInventory row"
+    algorithm: aggregation
+    formula: |
+      available = max(0, on_hand - reserved)
+      # reserve-blocking check at SUBMIT reads `available` (NOT on_hand): a line of
+      # qty_ordered Q is reservable iff available >= Q. Reservation increments
+      # `reserved` but leaves `on_hand` untouched until the physical pick removes it.
+    input_set: "the single StoreInventory(store_id, product_id) row"
+    constants: {}
+    precision: "integer units, no rounding"
+    variants:
+      - name: reserve_view
+        when: "evaluated at SUBMIT and at substitution ACCEPT"
+        difference: "blocks when available < requested qty (reserved counts against)"
+      - name: pick_view
+        when: "evaluated at /order-lines/{id}/pick"
+        difference: "physical pick checks on_hand >= qty_picked (not available); the units are already reserved so reserved is not re-checked"
+
+  - name: no_show_risk_posture
+    trigger: "recomputed whenever Customer.no_show_strikes changes (hold EXPIRED cascade)"
+    algorithm: threshold
+    formula: |
+      if    no_show_strikes >= 4: pickup_standing = BLOCKED
+      elif  no_show_strikes >= 2: pickup_standing = WATCH
+      else:                        pickup_standing = GOOD
+      # BLOCKED customers cannot SUBMIT new orders (validation priority 20).
+      # Boundary precision: strikes == 2 -> WATCH (>=), strikes == 4 -> BLOCKED (>=).
+    input_set: "the single Customer row's no_show_strikes counter"
+    constants:
+      WATCH_THRESHOLD: 2
+      BLOCKED_THRESHOLD: 4
+    precision: "integer thresholds, inclusive (>=)"
+    variants:
+      - name: standing_eval
+        when: "on submit-time gating"
+        difference: "BLOCKED rejects SUBMIT; WATCH still permits but is a distinct posture"
+
+  - name: order_authorized_total
+    trigger: "pinned at Order DRAFT->SUBMITTED; adjusted by +price_delta on substitution ACCEPT"
+    algorithm: aggregation
+    formula: |
+      # Per-line subtotal first, integer cents, then sum. Order is pinned:
+      # compute each line subtotal = Product.unit_price_cents * qty_ordered,
+      # THEN sum the line subtotals. (No rounding occurs — prices are integer
+      # cents — but the per-line-then-sum order is pinned to match captured/
+      # refunded which DO involve a rounded effective unit price.)
+      authorized_total_cents = sum_over_lines( unit_price_cents * qty_ordered )
+      # On substitution ACCEPT: authorized_total_cents += price_delta_cents.
+    input_set: "all OrderLine rows of the order at submission (line_status RESERVED), plus accepted Substitution deltas"
+    constants: {}
+    precision: "integer cents"
+    variants: []
+
+  - name: order_captured_total
+    trigger: "recomputed at each pickup transition from handed-over units"
+    algorithm: aggregation
+    formula: |
+      # Effective unit price per line:
+      #   - normal line: original Product.unit_price_cents
+      #   - SUBSTITUTED line: substitute Product.unit_price_cents
+      # captured per line = round_half_up( effective_unit_price_cents ) * qty_handed_over
+      # (effective_unit_price_cents is already integer; round is a no-op but the
+      #  ROUNDING ORDER IS PINNED: round the per-unit effective price FIRST, then
+      #  multiply by qty_handed_over, then sum across lines — NOT sum-then-round.)
+      captured_total_cents = sum_over_lines( round_half_up(effective_unit_price_cents) * qty_handed_over )
+    input_set: "OrderLine rows with qty_handed_over > 0; effective price depends on SUBSTITUTED status"
+    constants: {}
+    precision: "round_half_up at the per-unit price step, then multiply, then sum"
+    variants:
+      - name: full_pickup
+        when: "all picked units handed over"
+        difference: "captured == authorized when no substitution and no shortfall"
+      - name: partial_pickup
+        when: "handed-over < picked"
+        difference: "captured covers only handed-over units; remainder refunded via order_refunded_total"
+
+  - name: order_refunded_total
+    trigger: "recomputed at COMPLETED/EXPIRED/CANCELLED transitions"
+    algorithm: aggregation
+    formula: |
+      # Refund = authorized minus captured for fulfillment endings; full authorized
+      # for cancel/expire.
+      if ending in {CANCELLED, EXPIRED}:
+          refunded_total_cents = authorized_total_cents
+      else:  # COMPLETED (incl. via partial close)
+          refunded_total_cents = authorized_total_cents - captured_total_cents
+      # Invariant (compensating): for any COMPLETED order,
+      #   captured_total_cents + refunded_total_cents == authorized_total_cents.
+    input_set: "the order's authorized_total_cents and captured_total_cents"
+    constants: {}
+    precision: "integer cents"
+    variants:
+      - name: terminal_full_refund
+        when: "CANCELLED or EXPIRED"
+        difference: "entire authorization refunded; captured stays 0"
+      - name: completion_residual_refund
+        when: "COMPLETED after partial pickup/substitution shortfall"
+        difference: "refund = authorized - captured (the not-handed-over remainder)"
+
+  - name: substitution_price_delta
+    trigger: "pinned at Substitution PROPOSED->ACCEPTED"
+    algorithm: aggregation
+    formula: |
+      price_delta_cents = (substitute.unit_price_cents - original.unit_price_cents) * substitute_qty
+      # signed; negative when the substitute is cheaper. Applied to
+      # authorized_total_cents on ACCEPT.
+    input_set: "the accepted Substitution row, its substitute Product, and the original OrderLine's Product"
+    constants: {}
+    precision: "integer cents, signed"
+    variants: []
+
+  - name: hold_expiry_deadline
+    trigger: "computed when Hold is created at Order STAGED->AWAITING_PICKUP (ready)"
+    algorithm: threshold
+    formula: |
+      expires_at = staged_at + Store.hold_window_minutes minutes
+      # The hold is eligible to EXPIRE only while clock >= expires_at (inclusive).
+      # Boundary precision: at clock == expires_at exactly, the hold IS expirable;
+      # at clock == expires_at - 1 minute, it is NOT.
+    input_set: "Hold.staged_at and the parent Store.hold_window_minutes"
+    constants: {}
+    precision: "minute granularity; comparison is >= (inclusive at the deadline)"
+    variants: []
+
+  - name: slot_fill_status
+    trigger: "recomputed whenever PickupSlot.booked_count changes"
+    algorithm: threshold
+    formula: |
+      fill_status = FULL if booked_count >= capacity else OPEN
+      # Booking is permitted only while OPEN (booked_count < capacity).
+      # Boundary precision: booked_count == capacity-1 -> still OPEN (one slot left);
+      # booked_count == capacity -> FULL (rejects further booking).
+    input_set: "the single PickupSlot row"
+    constants: {}
+    precision: "integer comparison, >= for FULL"
+    variants: []
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /customers, POST /_clock/*"
+
+  - priority: 2
+    category: auth
+    check: "X-User-Role is permitted for this endpoint per §1.7"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: "entity_backed Customer acting on an Order/Substitution must own it (X-User-ID == Order.customer_id)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Customer-owned order/substitution mutations"
+
+  - priority: 4
+    category: existence
+    check: "every path-referenced resource exists, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all with path ids"
+
+  - priority: 5
+    category: existence
+    check: "every FK in the body references an existing resource"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "create/submit endpoints with FK body fields"
+
+  - priority: 6
+    category: business_constraint
+    check: "required body fields present and well-typed; enums valid"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all bodied endpoints"
+
+  - priority: 7
+    category: business_constraint
+    check: "StoreInventory(store_id, product_id) is unique; second create rejected"
+    error_id: ERR_DUPLICATE_INVENTORY
+    http_status: 409
+    applies_to: "POST /store-inventory"
+
+  - priority: 8
+    category: state
+    check: "target resource is in a state from which the requested transition is defined"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 9
+    category: state
+    check: "OCC: expected_slot_version / expected_inventory_version matches the parent's current version"
+    error_id: ERR_STALE_SLOT_VERSION
+    http_status: 412
+    applies_to: "POST /orders/{id}/submit (slot), POST /store-inventory/{id}/restock (inventory)"
+    note: "submit uses ERR_STALE_SLOT_VERSION; restock uses ERR_STALE_INVENTORY_VERSION"
+
+  - priority: 10
+    category: business_referential
+    check: "submitted Order's PickupSlot.store_id == Order.store_id"
+    error_id: ERR_SLOT_STORE_MISMATCH
+    http_status: 409
+    applies_to: "POST /orders/{id}/submit"
+
+  - priority: 11
+    category: business_referential
+    check: "substitute Product shares the original Product's non-null substitution_group"
+    error_id: ERR_SUBSTITUTION_GROUP_MISMATCH
+    http_status: 409
+    applies_to: "POST /substitutions"
+
+  - priority: 12
+    category: business_temporal
+    check: "PickupSlot booking is before its cutoff: clock < window_start - cutoff_offset_minutes"
+    error_id: ERR_SLOT_CUTOFF_PASSED
+    http_status: 409
+    applies_to: "POST /orders/{id}/submit"
+
+  - priority: 13
+    category: business_temporal
+    check: "Hold expiry only when clock >= expires_at"
+    error_id: ERR_HOLD_NOT_EXPIRABLE
+    http_status: 409
+    applies_to: "POST /orders/{id}/expire"
+
+  - priority: 14
+    category: business_safety
+    check: "Customer.pickup_standing != BLOCKED at submit (no-show risk gate)"
+    error_id: ERR_CUSTOMER_BLOCKED
+    http_status: 409
+    applies_to: "POST /orders/{id}/submit"
+
+  - priority: 15
+    category: business_safety
+    check: "curbside check-in only when Store.active_curbside_count < Store.curbside_spaces"
+    error_id: ERR_CURBSIDE_FULL
+    http_status: 409
+    applies_to: "POST /curbside-checkins"
+
+  - priority: 16
+    category: business_safety
+    check: "one ACTIVE CurbsideCheckIn per Order (no duplicate active check-in)"
+    error_id: ERR_DUPLICATE_CHECKIN
+    http_status: 409
+    applies_to: "POST /curbside-checkins"
+
+  - priority: 17
+    category: business_constraint
+    check: "Order must be verified before any pickup/loading hand-over"
+    error_id: ERR_ORDER_NOT_VERIFIED
+    http_status: 409
+    applies_to: "POST /orders/{id}/pickup, POST /curbside-checkins/{id}/start-loading"
+
+  - priority: 18
+    category: business_constraint
+    check: "pickup hand-over qty per line must not exceed that line's qty_picked"
+    error_id: ERR_OVER_HANDOVER
+    http_status: 409
+    applies_to: "POST /orders/{id}/pickup"
+
+  - priority: 19
+    category: business_constraint
+    check: "physical pick requires StoreInventory.on_hand >= qty_picked"
+    error_id: ERR_INSUFFICIENT_ON_HAND
+    http_status: 409
+    applies_to: "POST /order-lines/{id}/pick"
+
+  - priority: 20
+    category: business_constraint
+    check: "stage requires all lines terminal-for-staging and at least one fulfilled line"
+    error_id: ERR_STAGE_NOT_READY
+    http_status: 409
+    applies_to: "POST /orders/{id}/stage"
+
+  - priority: 21
+    category: business_fiscal
+    check: "slot has capacity: booked_count < capacity (fill_status == OPEN)"
+    error_id: ERR_SLOT_FULL
+    http_status: 409
+    applies_to: "POST /orders/{id}/submit"
+
+  - priority: 22
+    category: business_fiscal
+    check: "for every OrderLine, StoreInventory.available >= qty_ordered at submit; substitute available at accept"
+    error_id: ERR_INSUFFICIENT_AVAILABILITY
+    http_status: 409
+    applies_to: "POST /orders/{id}/submit, POST /substitutions/{id}/accept"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Customers -------------------------------------------------------------
+  - method: POST
+    path: "/customers"
+    description: "register a customer"
+    roles: [Anonymous, PlatformAdmin]
+    code: 201
+    input: [email, full_name, phone]
+    output: Customer
+    side_effects: ["no_show_strikes=0; pickup_standing=GOOD"]
+
+  - method: GET
+    path: "/customers/{id}"
+    description: "fetch a customer (includes derived no_show_strikes, pickup_standing)"
+    roles: [Customer, StoreManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  - method: GET
+    path: "/customers/{id}/orders"
+    description: "list a customer's orders (reverse-reachability for Order.customer_id)"
+    roles: [Customer, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Order[]
+    side_effects: []
+
+  # --- Stores ----------------------------------------------------------------
+  - method: POST
+    path: "/stores"
+    description: "create a store"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [name, state_code, curbside_spaces, "hold_window_minutes?"]
+    output: Store
+    side_effects: ["active_curbside_count=0"]
+
+  - method: GET
+    path: "/stores/{id}"
+    description: "fetch a store (includes computed active_curbside_count)"
+    roles: [Customer, StorePicker, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Store
+    side_effects: []
+
+  - method: GET
+    path: "/stores/{id}/pickup-slots"
+    description: "list a store's pickup slots (reverse-reachability for PickupSlot.store_id)"
+    roles: [Customer, StorePicker, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PickupSlot[]
+    side_effects: []
+
+  - method: GET
+    path: "/stores/{id}/inventory"
+    description: "list a store's inventory rows (reverse-reachability for StoreInventory.store_id)"
+    roles: [Customer, StorePicker, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: StoreInventory[]
+    side_effects: []
+
+  - method: GET
+    path: "/stores/{id}/curbside-checkins"
+    description: "list a store's curbside check-ins (reverse-reachability for CurbsideCheckIn.store_id)"
+    roles: [StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CurbsideCheckIn[]
+    side_effects: []
+
+  - method: GET
+    path: "/stores/{id}/holds"
+    description: "list a store's staged holds (reverse-reachability for Hold.store_id)"
+    roles: [StorePicker, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Hold[]
+    side_effects: []
+
+  # --- Products --------------------------------------------------------------
+  - method: POST
+    path: "/products"
+    description: "create a catalog product"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [sku, name, unit_price_cents, "substitution_group?"]
+    output: Product
+    side_effects: []
+
+  - method: GET
+    path: "/products/{id}"
+    description: "fetch a product"
+    roles: [Customer, StorePicker, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Product
+    side_effects: []
+
+  # --- Store inventory -------------------------------------------------------
+  - method: POST
+    path: "/store-inventory"
+    description: "create a store/product inventory row"
+    roles: [PlatformAdmin, StoreManager]
+    code: 201
+    input: [store_id, product_id, on_hand]
+    output: StoreInventory
+    side_effects: ["reserved=0; available=on_hand; append InventoryMovement RESTOCK (initial)"]
+
+  - method: GET
+    path: "/store-inventory"
+    description: "filtered list of inventory rows (reverse-reachability for StoreInventory.product_id; also filterable by store_id)"
+    roles: [Customer, StorePicker, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["store_id?", "product_id?", "limit?", "offset?"]
+    output: StoreInventory[]
+    side_effects: []
+
+  - method: GET
+    path: "/store-inventory/{id}"
+    description: "fetch an inventory row (includes computed reserved, available)"
+    roles: [Customer, StorePicker, StoreManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: StoreInventory
+    side_effects: []
+
+  - method: GET
+    path: "/store-inventory/{id}/movements"
+    description: "list inventory movements for a row (reverse-reachability for InventoryMovement.store_inventory_id)"
+    roles: [StoreManager, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: InventoryMovement[]
+    side_effects: []
+
+  - method: POST
+    path: "/store-inventory/{id}/restock"
+    description: "adjust on_hand by a delta (OCC-guarded by inventory version)"
+    roles: [PlatformAdmin, StoreManager]
+    code: 200
+    input: [delta_on_hand, expected_inventory_version]
+    output: StoreInventory
+    side_effects:
+      - "on_hand += delta_on_hand; recompute available; append InventoryMovement RESTOCK"
+      - "increments StoreInventory.version by 1"
+
+  # --- Pickup slots ----------------------------------------------------------
+  - method: POST
+    path: "/pickup-slots"
+    description: "create a pickup slot for a store"
+    roles: [PlatformAdmin, StoreManager]
+    code: 201
+    input: [store_id, window_start, window_end, capacity, "cutoff_offset_minutes?"]
+    output: PickupSlot
+    side_effects: ["booked_count=0; fill_status=OPEN"]
+
+  - method: GET
+    path: "/pickup-slots/{id}"
+    description: "fetch a pickup slot (includes computed booked_count, fill_status)"
+    roles: [Customer, StorePicker, StoreManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: PickupSlot
+    side_effects: []
+
+  # --- Orders ----------------------------------------------------------------
+  - method: POST
+    path: "/orders"
+    description: "create a DRAFT order"
+    roles: [Customer]
+    code: 201
+    input: [customer_id, store_id]
+    output: Order
+    side_effects: ["fulfillment_status=DRAFT; payment_status=UNAUTHORIZED; verified=false"]
+
+  - method: GET
+    path: "/orders"
+    description: "filtered list of orders (reverse-reachability for Order.store_id and Order.slot_id; also filterable by customer_id)"
+    roles: [StorePicker, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["store_id?", "slot_id?", "customer_id?", "limit?", "offset?"]
+    output: Order[]
+    side_effects: []
+
+  - method: GET
+    path: "/orders/{id}"
+    description: "fetch an order (all computed totals + both status axes)"
+    roles: [Customer, StorePicker, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+
+  - method: POST
+    path: "/orders/{id}/lines"
+    description: "add an order line to a DRAFT order"
+    roles: [Customer]
+    code: 201
+    input: [product_id, qty_ordered]
+    output: OrderLine
+    side_effects: ["line_status=PENDING; qty_reserved=0"]
+
+  - method: GET
+    path: "/orders/{id}/lines"
+    description: "list an order's lines (reverse-reachability for OrderLine.order_id)"
+    roles: [Customer, StorePicker, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: OrderLine[]
+    side_effects: []
+
+  - method: GET
+    path: "/orders/{id}/pickup-events"
+    description: "list an order's pickup events (reverse-reachability for PickupEvent.order_id)"
+    roles: [Customer, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PickupEvent[]
+    side_effects: []
+
+  - method: GET
+    path: "/orders/{id}/holds"
+    description: "list the order's hold (reverse-reachability for Hold.order_id; 0 or 1)"
+    roles: [Customer, StorePicker, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Hold[]
+    side_effects: []
+
+  - method: GET
+    path: "/orders/{id}/curbside-checkins"
+    description: "list the order's curbside check-ins (reverse-reachability for CurbsideCheckIn.order_id)"
+    roles: [Customer, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: CurbsideCheckIn[]
+    side_effects: []
+
+  - method: POST
+    path: "/orders/{id}/submit"
+    description: "submit DRAFT order: book slot, reserve inventory, authorize payment (OCC on slot version)"
+    roles: [Customer]
+    code: 200
+    input: [slot_id, expected_slot_version]
+    output: Order
+    side_effects:
+      - "reserve each line; StoreInventory.reserved += qty_ordered; append RESERVE movements"
+      - "PickupSlot.booked_count += 1; recompute fill_status; increments PickupSlot.version by 1"
+      - "authorized_total_cents pinned; payment_status=AUTHORIZED; fulfillment_status=SUBMITTED"
+      - "increments Order.version by 1"
+
+  - method: POST
+    path: "/orders/{id}/start-picking"
+    description: "begin picking (SUBMITTED -> PICKING)"
+    roles: [StorePicker]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["fulfillment_status=PICKING; increments Order.version by 1"]
+
+  - method: POST
+    path: "/orders/{id}/stage"
+    description: "stage the order (PICKING -> STAGED)"
+    roles: [StorePicker]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["fulfillment_status=STAGED; increments Order.version by 1"]
+
+  - method: POST
+    path: "/orders/{id}/ready"
+    description: "mark ready, create Hold (STAGED -> AWAITING_PICKUP)"
+    roles: [StorePicker]
+    code: 200
+    input: []
+    output: Order
+    side_effects:
+      - "create Hold(staged_at=clock, expires_at=hold_expiry_deadline, hold_status=ACTIVE)"
+      - "fulfillment_status=AWAITING_PICKUP; increments Order.version by 1"
+
+  - method: POST
+    path: "/orders/{id}/verify"
+    description: "identity/order verification at the store"
+    roles: [StoreAssociate, StoreManager]
+    code: 200
+    input: [presented_name, presented_phone]
+    output: Order
+    side_effects: ["verified=true; increments Order.version by 1"]
+
+  - method: POST
+    path: "/orders/{id}/pickup"
+    description: "hand over units; full -> COMPLETED, partial -> PARTIALLY_PICKED_UP"
+    roles: [StoreAssociate]
+    code: 200
+    input: [handovers]
+    output: Order
+    side_effects:
+      - "create PickupEvent per handover; OrderLine.qty_handed_over += qty"
+      - "captured_total_cents=order_captured_total; payment_status=CAPTURED"
+      - "on full: release residual; refunded_total_cents computed; Hold RELEASED; slot booked_count -=1 (increments PickupSlot.version); fulfillment COMPLETED"
+      - "increments Order.version by 1"
+
+  - method: POST
+    path: "/orders/{id}/close"
+    description: "close a partially-picked-up order (PARTIALLY_PICKED_UP -> COMPLETED)"
+    roles: [StoreAssociate, StoreManager]
+    code: 200
+    input: []
+    output: Order
+    side_effects:
+      - "restock not-taken picked units → on_hand; release residual reservation; append RESTOCK/RELEASE movements"
+      - "refunded_total_cents computed; payment_status PARTIALLY_REFUNDED/CAPTURED; Hold RELEASED"
+      - "PickupSlot.booked_count -=1; recompute fill_status; increments PickupSlot.version by 1"
+      - "fulfillment_status=COMPLETED; increments Order.version by 1"
+
+  - method: POST
+    path: "/orders/{id}/cancel"
+    description: "cancel order (DRAFT/SUBMITTED by Customer; PICKING by StoreManager)"
+    roles: [Customer, StoreManager]
+    code: 200
+    input: []
+    output: Order
+    side_effects:
+      - "release reservations + restock picked units; append RELEASE/RESTOCK movements"
+      - "slot booked_count -=1 if booked (increments PickupSlot.version); refunded_total_cents=authorized_total_cents; payment_status=REFUNDED"
+      - "fulfillment_status=CANCELLED; increments Order.version by 1"
+
+  - method: POST
+    path: "/orders/{id}/expire"
+    description: "expire a hold that is past its deadline (AWAITING_PICKUP -> EXPIRED)"
+    roles: [StoreManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Order
+    side_effects:
+      - "release reservations; Hold EXPIRED; refunded_total_cents=authorized_total_cents; payment_status=REFUNDED"
+      - "slot booked_count -=1 (increments PickupSlot.version); Customer.no_show_strikes += 1; recompute pickup_standing"
+      - "fulfillment_status=EXPIRED; increments Order.version by 1"
+
+  # --- Order lines (picking) -------------------------------------------------
+  - method: GET
+    path: "/order-lines"
+    description: "filtered list of order lines (reverse-reachability for OrderLine.product_id; also filterable by order_id)"
+    roles: [StorePicker, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["product_id?", "order_id?", "limit?", "offset?"]
+    output: OrderLine[]
+    side_effects: []
+
+  - method: GET
+    path: "/order-lines/{id}"
+    description: "fetch an order line (computed qty fields, line_status)"
+    roles: [Customer, StorePicker, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects: []
+
+  - method: GET
+    path: "/order-lines/{id}/pickup-events"
+    description: "list pickup events for a line (reverse-reachability for PickupEvent.order_line_id)"
+    roles: [Customer, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PickupEvent[]
+    side_effects: []
+
+  - method: POST
+    path: "/order-lines/{id}/pick"
+    description: "physically pick a line: full -> PICKED, short -> SHORT_PICKED"
+    roles: [StorePicker]
+    code: 200
+    input: [qty_picked]
+    output: OrderLine
+    side_effects:
+      - "qty_picked set; StoreInventory.on_hand -= qty_picked; reserved adjusted; recompute available; append PICK_REMOVE (+RELEASE if short)"
+      - "increments OrderLine.version by 1"
+
+  - method: POST
+    path: "/order-lines/{id}/abandon"
+    description: "abandon a short line with nothing picked (SHORT_PICKED -> NOT_FULFILLED)"
+    roles: [StorePicker]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects:
+      - "release residual reservation; recompute available; append RELEASE; line_status=NOT_FULFILLED"
+      - "increments OrderLine.version by 1"
+
+  - method: GET
+    path: "/order-lines/{id}/substitutions"
+    description: "list substitutions for a line (reverse-reachability for Substitution.order_line_id)"
+    roles: [Customer, StorePicker, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Substitution[]
+    side_effects: []
+
+  # --- Substitutions ---------------------------------------------------------
+  - method: POST
+    path: "/substitutions"
+    description: "propose a substitute for a SHORT_PICKED line (-> SUBSTITUTION_PROPOSED)"
+    roles: [StorePicker]
+    code: 201
+    input: [order_line_id, substitute_product_id, substitute_qty]
+    output: Substitution
+    side_effects:
+      - "decision_status=PROPOSED; parent OrderLine.line_status=SUBSTITUTION_PROPOSED; increments OrderLine.version by 1"
+
+  - method: GET
+    path: "/substitutions"
+    description: "filtered list of substitutions (reverse-reachability for Substitution.substitute_product_id; also filterable by order_line_id)"
+    roles: [StorePicker, StoreManager, PlatformAdmin]
+    code: 200
+    input: ["substitute_product_id?", "order_line_id?", "limit?", "offset?"]
+    output: Substitution[]
+    side_effects: []
+
+  - method: GET
+    path: "/substitutions/{id}"
+    description: "fetch a substitution (decision_status, price_delta_cents)"
+    roles: [Customer, StorePicker, StoreManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Substitution
+    side_effects: []
+
+  - method: POST
+    path: "/substitutions/{id}/accept"
+    description: "customer accepts substitute (-> ACCEPTED; reserve substitute, apply price delta)"
+    roles: [Customer]
+    code: 200
+    input: []
+    output: Substitution
+    side_effects:
+      - "decision_status=ACCEPTED; price_delta_cents=substitution_price_delta; reserve substitute inventory; append RESERVE"
+      - "OrderLine.line_status=SUBSTITUTED; authorized_total_cents += price_delta_cents; increments Order.version by 1; increments OrderLine.version by 1"
+
+  - method: POST
+    path: "/substitutions/{id}/decline"
+    description: "customer declines (-> DECLINED; line back to SHORT_PICKED)"
+    roles: [Customer]
+    code: 200
+    input: []
+    output: Substitution
+    side_effects:
+      - "decision_status=DECLINED; parent OrderLine.line_status=SHORT_PICKED; increments OrderLine.version by 1"
+
+  - method: POST
+    path: "/substitutions/{id}/withdraw"
+    description: "picker withdraws proposal (-> WITHDRAWN; line back to SHORT_PICKED)"
+    roles: [StorePicker]
+    code: 200
+    input: []
+    output: Substitution
+    side_effects:
+      - "decision_status=WITHDRAWN; parent OrderLine.line_status=SHORT_PICKED; increments OrderLine.version by 1"
+
+  # --- Curbside check-ins ----------------------------------------------------
+  - method: POST
+    path: "/curbside-checkins"
+    description: "customer arrives curbside (creates ARRIVED check-in)"
+    roles: [Customer]
+    code: 201
+    input: [order_id, store_id, vehicle_description]
+    output: CurbsideCheckIn
+    side_effects:
+      - "checkin_status=ARRIVED; Store.active_curbside_count += 1; recompute"
+
+  - method: GET
+    path: "/curbside-checkins/{id}"
+    description: "fetch a curbside check-in"
+    roles: [Customer, StoreAssociate, StoreManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: CurbsideCheckIn
+    side_effects: []
+
+  - method: POST
+    path: "/curbside-checkins/{id}/start-loading"
+    description: "associate begins loading (ARRIVED -> BEING_LOADED; requires verified order)"
+    roles: [StoreAssociate]
+    code: 200
+    input: []
+    output: CurbsideCheckIn
+    side_effects: ["checkin_status=BEING_LOADED; increments CurbsideCheckIn.version by 1"]
+
+  - method: POST
+    path: "/curbside-checkins/{id}/complete"
+    description: "associate completes loading (BEING_LOADED -> COMPLETED)"
+    roles: [StoreAssociate]
+    code: 200
+    input: []
+    output: CurbsideCheckIn
+    side_effects:
+      - "checkin_status=COMPLETED; Store.active_curbside_count -= 1; recompute; increments CurbsideCheckIn.version by 1"
+
+  - method: POST
+    path: "/curbside-checkins/{id}/cancel"
+    description: "cancel a curbside check-in (ARRIVED/BEING_LOADED -> CANCELLED)"
+    roles: [StoreAssociate, Customer]
+    code: 200
+    input: []
+    output: CurbsideCheckIn
+    side_effects:
+      - "checkin_status=CANCELLED; Store.active_curbside_count -= 1; recompute; increments CurbsideCheckIn.version by 1"
+
+  # --- Test-driving clock ----------------------------------------------------
+  - method: POST
+    path: "/_clock/set"
+    description: "set the system clock to an absolute UTC instant (test-driving)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["system clock set; no automatic sweeps"]
+
+  - method: POST
+    path: "/_clock/advance"
+    description: "advance clock to an instant and run the hold-expiry sweep (test-driving)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects:
+      - "clock set; every Hold with hold_status=ACTIVE and clock >= expires_at fires the Order AWAITING_PICKUP->EXPIRED cascade"
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role or X-User-ID header missing on a protected endpoint"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "role not permitted for the endpoint per §1.7"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Customer acts on an Order/Substitution they do not own"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "path-referenced resource does not exist"
+  - id: ERR_REFERENCE_NOT_FOUND
+    http: 404
+    condition: "FK in request body references a non-existent resource"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "missing required field, wrong type, invalid enum, or non-positive qty"
+  - id: ERR_DUPLICATE_INVENTORY
+    http: 409
+    condition: "StoreInventory already exists for this (store_id, product_id)"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "transition not defined from the resource's current state"
+  - id: ERR_STALE_SLOT_VERSION
+    http: 412
+    condition: "expected_slot_version != PickupSlot.version at submit (OCC)"
+  - id: ERR_STALE_INVENTORY_VERSION
+    http: 412
+    condition: "expected_inventory_version != StoreInventory.version at restock (OCC)"
+  - id: ERR_SLOT_CUTOFF_PASSED
+    http: 409
+    condition: "clock >= window_start - cutoff_offset_minutes at submit"
+  - id: ERR_HOLD_NOT_EXPIRABLE
+    http: 409
+    condition: "manual expire requested but clock < Hold.expires_at"
+  - id: ERR_SLOT_STORE_MISMATCH
+    http: 409
+    condition: "submitted slot_id belongs to a different store than the order"
+  - id: ERR_SUBSTITUTION_GROUP_MISMATCH
+    http: 409
+    condition: "substitute Product's substitution_group differs from or null vs the original's"
+  - id: ERR_ORDER_NOT_VERIFIED
+    http: 409
+    condition: "pickup or start-loading attempted before the order is verified"
+  - id: ERR_OVER_HANDOVER
+    http: 409
+    condition: "pickup hand-over qty exceeds the line's qty_picked"
+  - id: ERR_CURBSIDE_FULL
+    http: 409
+    condition: "active_curbside_count >= curbside_spaces at check-in"
+  - id: ERR_DUPLICATE_CHECKIN
+    http: 409
+    condition: "an ACTIVE (ARRIVED/BEING_LOADED) check-in already exists for the order"
+  - id: ERR_SLOT_FULL
+    http: 409
+    condition: "PickupSlot.booked_count >= capacity at submit (fill_status==FULL)"
+  - id: ERR_INSUFFICIENT_AVAILABILITY
+    http: 409
+    condition: "StoreInventory.available < requested qty at submit or substitution accept"
+  - id: ERR_CUSTOMER_BLOCKED
+    http: 409
+    condition: "Customer.pickup_standing == BLOCKED at submit"
+  - id: ERR_INSUFFICIENT_ON_HAND
+    http: 409
+    condition: "StoreInventory.on_hand < qty_picked at physical pick"
+  - id: ERR_STAGE_NOT_READY
+    http: 409
+    condition: "stage attempted while a line is non-terminal-for-staging or no line fulfilled"
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Anonymous
+    description: "unauthenticated caller; may only register a customer and create catalog-free reads are not granted"
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "POST /customers"
+
+  - name: Customer
+    description: "owns own Orders; builds/submits orders, decides substitutions, checks in curbside"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /orders"
+      - "POST /orders/{id}/lines"
+      - "POST /orders/{id}/submit"
+      - "POST /substitutions/{id}/accept"
+      - "POST /substitutions/{id}/decline"
+      - "POST /curbside-checkins"
+    shared_operations:
+      - "POST /customers"
+      - "POST /orders/{id}/cancel (DRAFT/SUBMITTED only)"
+      - "POST /curbside-checkins/{id}/cancel"
+      - "GET reads of own resources"
+
+  - name: StorePicker
+    description: "store associate who picks, short-picks, stages, readies, proposes/withdraws substitutions"
+    identity: opaque
+    exclusive_operations:
+      - "POST /orders/{id}/start-picking"
+      - "POST /orders/{id}/stage"
+      - "POST /orders/{id}/ready"
+      - "POST /order-lines/{id}/pick"
+      - "POST /order-lines/{id}/abandon"
+      - "POST /substitutions"
+      - "POST /substitutions/{id}/withdraw"
+    shared_operations:
+      - "GET reads of store-side resources"
+
+  - name: StoreAssociate
+    description: "front-line associate who verifies orders, hands over units, runs curbside loading"
+    identity: opaque
+    exclusive_operations:
+      - "POST /orders/{id}/pickup"
+      - "POST /curbside-checkins/{id}/start-loading"
+      - "POST /curbside-checkins/{id}/complete"
+    shared_operations:
+      - "POST /orders/{id}/verify"
+      - "POST /orders/{id}/close"
+      - "POST /curbside-checkins/{id}/cancel"
+      - "GET reads of store-side resources"
+
+  - name: StoreManager
+    description: "store supervisor; inventory admin, slot admin, manager-only cancel/expire, override verify/close"
+    identity: opaque
+    exclusive_operations:
+      - "POST /orders/{id}/expire"
+    shared_operations:
+      - "POST /store-inventory"
+      - "POST /store-inventory/{id}/restock"
+      - "POST /pickup-slots"
+      - "POST /orders/{id}/cancel (PICKING)"
+      - "POST /orders/{id}/verify"
+      - "POST /orders/{id}/close"
+      - "GET reads"
+
+  - name: PlatformAdmin
+    description: "operator; seeds catalog (stores, products, slots, inventory), drives the clock, expires holds"
+    identity: opaque
+    exclusive_operations:
+      - "POST /stores"
+      - "POST /products"
+      - "POST /pickup-slots"
+      - "POST /_clock/set"
+      - "POST /_clock/advance"
+    shared_operations:
+      - "POST /customers"
+      - "POST /store-inventory"
+      - "POST /store-inventory/{id}/restock"
+      - "POST /orders/{id}/expire"
+      - "GET reads"

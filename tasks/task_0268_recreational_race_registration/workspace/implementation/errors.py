@@ -1,0 +1,36 @@
+"""Error catalogue (PRD 5 / SCAFFOLD 1.6). Exact error_id + http_status."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# error_id -> http status
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_FORBIDDEN_ROLE = ("ERR_FORBIDDEN_ROLE", 403)
+ERR_NOT_RESOURCE_OWNER = ("ERR_NOT_RESOURCE_OWNER", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_INVALID_REQUEST = ("ERR_INVALID_REQUEST", 422)
+ERR_RELATION_MISMATCH = ("ERR_RELATION_MISMATCH", 422)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_REGISTRATION_CLOSED = ("ERR_REGISTRATION_CLOSED", 409)
+ERR_OFFER_EXPIRED = ("ERR_OFFER_EXPIRED", 409)
+ERR_NO_ACTIVE_PRICING_TIER = ("ERR_NO_ACTIVE_PRICING_TIER", 409)
+ERR_FUNDRAISING_MINIMUM_NOT_MET = ("ERR_FUNDRAISING_MINIMUM_NOT_MET", 409)
+ERR_WAVE_FULL = ("ERR_WAVE_FULL", 409)
+ERR_DISTANCE_FULL = ("ERR_DISTANCE_FULL", 409)
+ERR_STALE_DISTANCE_VERSION = ("ERR_STALE_DISTANCE_VERSION", 412)
+ERR_PACKET_ALREADY_ISSUED = ("ERR_PACKET_ALREADY_ISSUED", 409)
+ERR_PACKET_NOT_ELIGIBLE = ("ERR_PACKET_NOT_ELIGIBLE", 409)
+ERR_INVALID_TIMING = ("ERR_INVALID_TIMING", 422)
+ERR_TARGET_EVENT_INVALID = ("ERR_TARGET_EVENT_INVALID", 409)
+ERR_DUPLICATE_PRICING_TIER = ("ERR_DUPLICATE_PRICING_TIER", 409)
+
+
+def err(spec, message=None):
+    """Build an ApiError from a (error_id, http_status) tuple constant."""
+    return ApiError(spec[0], spec[1], message)

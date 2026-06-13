@@ -1,0 +1,1191 @@
+scenario: |
+  210. Product Warranty Registration & Claims: product/serial registration, warranty
+  term & coverage tiers, extended-warranty purchase, claim intake/RMA, repair vs replace
+  vs refund, proof-of-purchase validation, depreciation/proration, warranty transfer
+
+domain_name: product-warranty-claims
+api_prefix: ""   # flat topology: all entity collections are top-level peers (/products, /registrations, /claims, …)
+
+# Structural DNA -------------------------------------------------------------
+complexity_profile:
+  primary_archetype: Ledger reconciliation
+  # Same Registration, two depreciation algorithms (straight-line vs declining-balance)
+  # produce divergent refund payouts for identical purchase facts.
+  secondary_archetype: Event sourcing
+  # Claim lifecycle (intake → RMA → adjudication) + append-only LedgerEntry stream
+  # from which a Registration's cumulative warranty-spend is reconstructed.
+  complexity_layers:
+    - Optimistic concurrency        # OCC on Registration.version for warranty transfer
+    - Dual-variant calculation      # proration: straight-line vs declining-balance refund value
+    - Cascading side effects        # claim approve → RMA dispatch → ledger debit → coverage recompute
+    - Derived field reconciliation  # Registration.remaining_coverage_cents reconciled from LedgerEntry stream
+
+  entity_topology: flat
+  # Peer entities linked by FK: Registration, Claim, ExtendedWarranty, ProofOfPurchase,
+  # WarrantyTransfer, LedgerEntry are all top-level with foreign keys, no nested URLs.
+
+  state_machine_shape: branching
+  # Claim forks ADJUDICATED → {REPAIR, REPLACE, REFUND} with divergent side-effect sets;
+  # ProofOfPurchase fork SUBMITTED → {VALIDATED, REJECTED}.
+
+  relationship_patterns:
+    - one_to_many        # Product 1—* CoverageTier; Registration 1—* Claim; Registration 1—* LedgerEntry
+    - cross_aggregate    # Claim references Registration across aggregate boundary; ledger debits parent
+
+  role_model: peer_roles
+  # Owner acts on own Registrations/Claims; WarrantyAdmin configures catalog + adjudicates;
+  # ClaimsProcessor handles RMA logistics; each owns a distinct slice of the surface.
+
+  consistency_model: immediate
+  # All cascades (claim approve → RMA → ledger → coverage recompute) complete atomically
+  # within the triggering request.
+
+# 1.0 Response Envelope (FIXED — EMIT VERBATIM) ------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# 1.1 Entity-Relationship Table ---------------------------------------------
+entities:
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - name: model_number
+        type: string
+        source: input
+        description: "Manufacturer model identifier; unique across catalog."
+        constraints: "non-empty; unique"
+      - name: category
+        type: enum
+        source: input
+        description: "Product category gating base warranty rules."
+        constraints: "one of {ELECTRONICS, APPLIANCE, POWER_TOOL, FURNITURE}"
+      - name: msrp_cents
+        type: integer
+        source: input
+        description: "Manufacturer suggested retail price in cents; refund-value baseline."
+        constraints: ">= 1"
+      - name: base_warranty_months
+        type: integer
+        source: input
+        description: "Length of the included base warranty term in whole months."
+        constraints: ">= 0"
+      - name: serviceable_lifespan_months
+        type: integer
+        source: input
+        description: "Expected product lifespan in months; denominator for depreciation proration."
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: system
+        description: "Catalog lifecycle state."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, DISCONTINUED}"
+
+  - name: Owner
+    parent: null
+    common_fields: false
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Owner's full name."
+        constraints: "non-empty"
+      - name: email
+        type: string
+        source: input
+        description: "Owner's contact email; unique."
+        constraints: "non-empty; unique"
+
+  - name: CoverageTier
+    parent: null
+    common_fields: true
+    fields:
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; the product this coverage tier extends."
+      - name: tier_name
+        type: enum
+        source: input
+        description: "Coverage tier label."
+        constraints: "one of {BASE, SILVER, GOLD, PLATINUM}; unique per (product_id, tier_name)"
+      - name: extension_months
+        type: integer
+        source: input
+        description: "Additional warranty months this tier adds beyond the base term."
+        constraints: ">= 0"
+      - name: price_cents
+        type: integer
+        source: input
+        description: "Purchase price of this extended-warranty tier in cents."
+        constraints: ">= 0"
+      - name: coverage_cap_cents
+        type: integer
+        source: input
+        description: "Maximum cumulative warranty spend reimbursable under this tier."
+        constraints: ">= 1"
+      - name: depreciation_method
+        type: enum
+        source: input
+        description: "Algorithm used to prorate refund value under this tier."
+        constraints: "one of {STRAIGHT_LINE, DECLINING_BALANCE}"
+      - name: refund_eligible
+        type: boolean
+        source: input
+        description: "Whether REFUND resolution is permitted for claims under this tier."
+        default: true
+      - name: premium_refund_method
+        type: enum
+        source: input
+        description: "Algorithm for refunding the unused extended-warranty premium on early cancellation."
+        default: PRO_RATA
+        constraints: "one of {PRO_RATA, SHORT_RATE}"
+      - name: status
+        type: enum
+        source: system
+        description: "Tier availability for new registrations/purchases."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, RETIRED}"
+
+  - name: Registration
+    parent: null
+    common_fields: true
+    fields:
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; the registered product model."
+      - name: serial_number
+        type: string
+        source: input
+        description: "Manufacturer serial of the registered unit; unique per product_id."
+        constraints: "non-empty; unique per (product_id, serial_number)"
+      - name: owner_user_id
+        type: string
+        source: input
+        description: "FK -> Owner.id; current warranty owner (Owner role identity)."
+      - name: purchase_date
+        type: datetime
+        source: input
+        description: "Retail purchase date (ISO 8601 UTC); warranty clock origin."
+      - name: purchase_price_cents
+        type: integer
+        source: input
+        description: "Actual retail price paid in cents; refund-value baseline when present."
+        constraints: ">= 1"
+      - name: proof_status
+        type: enum
+        source: computed
+        description: "Mirrors the latest ProofOfPurchase outcome for this registration."
+        default: UNVERIFIED
+        constraints: "one of {UNVERIFIED, VALIDATED, REJECTED}"
+      - name: warranty_end_date
+        type: datetime
+        source: computed
+        description: "purchase_date + (base_warranty_months + active extension_months); recomputed on extension."
+      - name: remaining_coverage_cents
+        type: integer
+        source: computed
+        description: "coverage_cap_cents minus sum of DEBIT LedgerEntry.amount_cents for this registration."
+      - name: status
+        type: enum
+        source: system
+        description: "Registration lifecycle state."
+        default: REGISTERED
+        constraints: "one of {REGISTERED, ACTIVE, TRANSFER_PENDING, EXPIRED, VOIDED}"
+      - name: active_tier_id
+        type: string
+        source: computed
+        description: "FK -> CoverageTier.id; the highest-coverage tier currently in force (BASE if none purchased)."
+
+  - name: ExtendedWarranty
+    parent: null
+    common_fields: true
+    fields:
+      - name: registration_id
+        type: string
+        source: input
+        description: "FK -> Registration.id; the registration this extension applies to."
+      - name: coverage_tier_id
+        type: string
+        source: input
+        description: "FK -> CoverageTier.id; the purchased tier."
+      - name: amount_paid_cents
+        type: integer
+        source: input
+        description: "Price paid for the extension in cents; must equal tier price_cents at purchase."
+        constraints: ">= 0"
+      - name: effective_date
+        type: datetime
+        source: system
+        description: "Timestamp the extension took effect (purchase time)."
+      - name: premium_refund_cents
+        type: integer
+        source: computed
+        description: "Unused-premium refund computed at cancellation via extended_warranty_premium_refund; 0 until cancelled."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Extension lifecycle state."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, CANCELLED}"
+
+  - name: ProofOfPurchase
+    parent: null
+    common_fields: true
+    fields:
+      - name: registration_id
+        type: string
+        source: input
+        description: "FK -> Registration.id; the registration this proof documents."
+      - name: document_type
+        type: enum
+        source: input
+        description: "Kind of proof submitted."
+        constraints: "one of {RECEIPT, INVOICE, BANK_STATEMENT}"
+      - name: stated_purchase_date
+        type: datetime
+        source: input
+        description: "Purchase date asserted by the document (ISO 8601 UTC)."
+      - name: stated_amount_cents
+        type: integer
+        source: input
+        description: "Purchase amount asserted by the document in cents."
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "Validation outcome of this proof document."
+        default: SUBMITTED
+        constraints: "one of {SUBMITTED, VALIDATED, REJECTED}"
+      - name: rejection_reason
+        type: enum
+        source: computed
+        description: "Reason code when REJECTED; null otherwise."
+        default: null
+        constraints: "one of {DATE_MISMATCH, AMOUNT_MISMATCH, EXPIRED_WINDOW, null}"
+
+  - name: Claim
+    parent: null
+    common_fields: true
+    fields:
+      - name: registration_id
+        type: string
+        source: input
+        description: "FK -> Registration.id; the registration the claim is filed against."
+      - name: defect_category
+        type: enum
+        source: input
+        description: "Nature of the reported defect."
+        constraints: "one of {MANUFACTURING, WEAR_AND_TEAR, ACCIDENTAL, COSMETIC}"
+      - name: reported_date
+        type: datetime
+        source: input
+        description: "Date the defect was reported (ISO 8601 UTC); must be within warranty window."
+      - name: resolution_type
+        type: enum
+        source: computed
+        description: "Adjudicated resolution; null until adjudication."
+        default: null
+        constraints: "one of {REPAIR, REPLACE, REFUND, null}"
+      - name: rma_number
+        type: string
+        source: system
+        description: "Return Merchandise Authorization code minted on RMA issuance; null before."
+        default: null
+      - name: assessed_value_cents
+        type: integer
+        source: computed
+        description: "Depreciated/prorated payout value computed at adjudication (refund) or repair/replace cost basis."
+        default: 0
+      - name: claims_processor_user_id
+        type: string
+        source: system
+        description: "Opaque ClaimsProcessor X-User-ID recorded at RMA issuance (audit only, not an entity FK); null before."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Claim lifecycle state."
+        default: INTAKE
+        constraints: "one of {INTAKE, RMA_ISSUED, ADJUDICATED, FULFILLED, DENIED, CLOSED}"
+
+  - name: WarrantyTransfer
+    parent: null
+    common_fields: false
+    fields:
+      - name: registration_id
+        type: string
+        source: input
+        description: "FK -> Registration.id; the registration being transferred."
+      - name: from_owner_user_id
+        type: string
+        source: system
+        description: "Owner id at transfer initiation, copied from Registration.owner_user_id (audit value on this event; discover via /registrations/{id}/transfers)."
+      - name: to_owner_user_id
+        type: string
+        source: input
+        description: "Intended new owner id (must reference an existing Owner; audit value on this event, discover via /registrations/{id}/transfers)."
+      - name: transfer_fee_cents
+        type: integer
+        source: computed
+        description: "Fee assessed for the transfer in cents (category-dependent)."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Transfer record outcome."
+        default: COMPLETED
+        constraints: "one of {COMPLETED, REVERSED}"
+
+  - name: LedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: registration_id
+        type: string
+        source: input
+        description: "FK -> Registration.id; the registration whose coverage ledger this entry affects."
+      - name: claim_id
+        type: string
+        source: input
+        description: "Claim id that produced this entry (audit value on this append-only ledger row; discover via /registrations/{id}/ledger); null for fee/credit entries."
+        default: null
+      - name: entry_type
+        type: enum
+        source: system
+        description: "Ledger movement type."
+        constraints: "one of {DEBIT, CREDIT}"
+      - name: reason
+        type: enum
+        source: system
+        description: "Why the entry was recorded."
+        constraints: "one of {REPAIR_COST, REPLACE_COST, REFUND_PAYOUT, REVERSAL, TRANSFER_FEE}"
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Signed-by-type magnitude in cents; always non-negative, direction given by entry_type."
+        constraints: ">= 0"
+
+# 1.2 State Machine Table ----------------------------------------------------
+state_machines:
+  - entity: ProofOfPurchase
+    initial_state: SUBMITTED
+    terminal_states: [VALIDATED, REJECTED]
+    transitions:
+      - from: SUBMITTED
+        to: VALIDATED
+        trigger: "POST /proofs/{id}/validate"
+        actor: WarrantyAdmin
+        preconditions:
+          - "ProofOfPurchase.status == SUBMITTED"
+          - "stated_purchase_date within VALIDATION_WINDOW_DAYS (=90) of Registration.purchase_date"
+          - "abs(stated_amount_cents - Registration.purchase_price_cents) <= AMOUNT_TOLERANCE_CENTS (=500)"
+        side_effects:
+          - "Set ProofOfPurchase.status = VALIDATED; rejection_reason = null"
+          - "Set parent Registration.proof_status = VALIDATED"
+          - "If Registration.status == REGISTERED, transition Registration REGISTERED -> ACTIVE (cross-entity bubble-up)"
+          - "increments Registration.version by 1"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /proofs/{id}/validate"
+        actor: WarrantyAdmin
+        preconditions:
+          - "ProofOfPurchase.status == SUBMITTED"
+          - "stated_purchase_date NOT within VALIDATION_WINDOW_DAYS of Registration.purchase_date, OR amount mismatch beyond tolerance"
+        side_effects:
+          - "Set ProofOfPurchase.status = REJECTED; set rejection_reason to first failing check (date checked before amount before window)"
+          - "Set parent Registration.proof_status = REJECTED"
+          - "increments Registration.version by 1"
+
+  - entity: ExtendedWarranty
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /extended-warranties/{id}/cancel"
+        actor: Owner
+        preconditions:
+          - "ExtendedWarranty.status == ACTIVE"
+          - "acting Owner == parent Registration.owner_user_id"
+          - "parent Registration.status IN {REGISTERED, ACTIVE}"
+        side_effects:
+          - "Compute ExtendedWarranty.premium_refund_cents via extended_warranty_premium_refund calc"
+          - "Set ExtendedWarranty.status = CANCELLED"
+          - "Recompute parent Registration.active_tier_id (drop to next-highest ACTIVE tier or BASE) and warranty_end_date"
+          - "Recompute Registration.remaining_coverage_cents to the new active tier's cap minus existing net debits"
+          - "increments Registration.version by 1"
+
+  - entity: Registration
+    initial_state: REGISTERED
+    terminal_states: [EXPIRED, VOIDED]
+    transitions:
+      - from: REGISTERED
+        to: ACTIVE
+        trigger: "system: ProofOfPurchase validated"
+        actor: system
+        preconditions:
+          - "Registration.proof_status == VALIDATED"
+        side_effects:
+          - "Registration becomes claim-eligible"
+          - "increments Registration.version by 1"
+      - from: ACTIVE
+        to: TRANSFER_PENDING
+        trigger: "POST /registrations/{id}/transfer"
+        actor: Owner
+        preconditions:
+          - "Registration.status == ACTIVE"
+          - "expected_registration_version matches Registration.version (OCC)"
+          - "no Claim of this registration in status IN {RMA_ISSUED, ADJUDICATED}"
+          - "to_owner_user_id references an existing Owner distinct from current owner"
+        side_effects:
+          - "Create WarrantyTransfer{from_owner_user_id=current owner, to_owner_user_id, status=COMPLETED}"
+          - "Compute transfer_fee_cents via warranty_transfer_fee calc; create LedgerEntry{entry_type=DEBIT, reason=TRANSFER_FEE, amount_cents=fee}"
+          - "Decrement Registration.remaining_coverage_cents by fee (derived-field reconciliation)"
+          - "increments Registration.version by 1"
+      - from: TRANSFER_PENDING
+        to: ACTIVE
+        trigger: "POST /registrations/{id}/transfer/accept"
+        actor: Owner
+        preconditions:
+          - "Registration.status == TRANSFER_PENDING"
+          - "acting Owner == WarrantyTransfer.to_owner_user_id"
+        side_effects:
+          - "Set Registration.owner_user_id = WarrantyTransfer.to_owner_user_id"
+          - "increments Registration.version by 1"
+      - from: TRANSFER_PENDING
+        to: ACTIVE
+        trigger: "POST /registrations/{id}/transfer/reject"
+        actor: Owner
+        preconditions:
+          - "Registration.status == TRANSFER_PENDING"
+          - "acting Owner == WarrantyTransfer.to_owner_user_id"
+        side_effects:
+          - "Set most recent WarrantyTransfer.status = REVERSED"
+          - "Create compensating LedgerEntry{entry_type=CREDIT, reason=REVERSAL, amount_cents=transfer_fee_cents}"
+          - "Restore Registration.remaining_coverage_cents by the reversed fee (transfer-fee conservation invariant)"
+          - "Registration.owner_user_id unchanged (transfer abandoned)"
+          - "increments Registration.version by 1"
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /_clock/advance (warranty_end_date passed)"
+        actor: system
+        preconditions:
+          - "current_utc > Registration.warranty_end_date"
+        side_effects:
+          - "Registration no longer claim-eligible"
+          - "increments Registration.version by 1"
+      - from: REGISTERED
+        to: VOIDED
+        trigger: "POST /registrations/{id}/void"
+        actor: WarrantyAdmin
+        preconditions:
+          - "Registration.status IN {REGISTERED, ACTIVE}"
+          - "no Claim of this registration in status IN {RMA_ISSUED, ADJUDICATED, FULFILLED}"
+        side_effects:
+          - "Cancel all ACTIVE ExtendedWarranty of this registration (status -> CANCELLED)"
+          - "increments Registration.version by 1"
+      - from: ACTIVE
+        to: VOIDED
+        trigger: "POST /registrations/{id}/void"
+        actor: WarrantyAdmin
+        preconditions:
+          - "Registration.status IN {REGISTERED, ACTIVE}"
+          - "no Claim of this registration in status IN {RMA_ISSUED, ADJUDICATED, FULFILLED}"
+        side_effects:
+          - "Cancel all ACTIVE ExtendedWarranty of this registration (status -> CANCELLED)"
+          - "increments Registration.version by 1"
+
+  - entity: Claim
+    initial_state: INTAKE
+    terminal_states: [FULFILLED, DENIED, CLOSED]
+    transitions:
+      - from: INTAKE
+        to: RMA_ISSUED
+        trigger: "POST /claims/{id}/issue-rma"
+        actor: ClaimsProcessor
+        preconditions:
+          - "Claim.status == INTAKE"
+          - "Registration.status == ACTIVE"
+          - "Registration.proof_status == VALIDATED"
+          - "reported_date <= Registration.warranty_end_date"
+        side_effects:
+          - "Mint Claim.rma_number; set claims_processor_user_id to acting processor"
+          - "increments Registration.version by 1"
+      - from: RMA_ISSUED
+        to: DENIED
+        trigger: "POST /claims/{id}/adjudicate (deny)"
+        actor: WarrantyAdmin
+        preconditions:
+          - "Claim.status == RMA_ISSUED"
+          - "defect_category IN {WEAR_AND_TEAR, ACCIDENTAL, COSMETIC} OR remaining_coverage_cents <= 0"
+        side_effects:
+          - "Set Claim.status = DENIED; resolution_type stays null"
+          - "increments Registration.version by 1"
+      - from: RMA_ISSUED
+        to: ADJUDICATED
+        trigger: "POST /claims/{id}/adjudicate (approve)"
+        actor: WarrantyAdmin
+        preconditions:
+          - "Claim.status == RMA_ISSUED"
+          - "defect_category == MANUFACTURING"
+          - "Registration.remaining_coverage_cents > 0"
+          - "if resolution_type == REFUND, active tier refund_eligible == true"
+        side_effects:
+          - "Set Claim.resolution_type IN {REPAIR, REPLACE, REFUND} (branch chosen by admin input)"
+          - "Compute Claim.assessed_value_cents (REFUND -> proration calc; REPAIR/REPLACE -> cost basis)"
+          - "Create LedgerEntry{entry_type=DEBIT, reason per resolution, claim_id, amount_cents=assessed_value_cents}"
+          - "Decrement Registration.remaining_coverage_cents by assessed_value_cents (ledger-sync, derived-field reconciliation)"
+          - "If REFUND, transition Registration ACTIVE -> VOIDED after fulfillment (refund terminates coverage)"
+          - "increments Registration.version by 1"
+      - from: ADJUDICATED
+        to: FULFILLED
+        trigger: "POST /claims/{id}/fulfill"
+        actor: ClaimsProcessor
+        preconditions:
+          - "Claim.status == ADJUDICATED"
+          - "Claim.resolution_type != null"
+        side_effects:
+          - "Set Claim.status = FULFILLED"
+          - "If resolution_type == REFUND, transition parent Registration -> VOIDED and cancel ACTIVE ExtendedWarranty (cascade)"
+          - "increments Registration.version by 1"
+      - from: RMA_ISSUED
+        to: CLOSED
+        trigger: "POST /claims/{id}/withdraw"
+        actor: Owner
+        preconditions:
+          - "Claim.status == RMA_ISSUED"
+          - "acting Owner == Registration.owner_user_id"
+        side_effects:
+          - "Set Claim.status = CLOSED; no ledger movement"
+          - "increments Registration.version by 1"
+
+# 1.2.1 Concurrency Rules ----------------------------------------------------
+concurrency_rules:
+  - rule_id: transfer-stale-registration
+    parent_entity: Registration
+    write_endpoint: "POST /registrations/{id}/transfer"
+    occ_field: "expected_registration_version"
+    description: |
+      Initiating a WarrantyTransfer against a Registration whose version has
+      advanced since the client last observed it is rejected. This captures the
+      case where another writer has already moved the registration (e.g. a claim
+      adjudication debited coverage and bumped the version, or a prior transfer
+      already completed) and the current writer's view of the registration is
+      therefore stale. The new transfer would legitimately supersede the prior
+      owner record, so it is a true write-write race resolved by OCC on the
+      parent Registration.version, not by a state precondition alone.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# 1.3 Calculation Rules Table ------------------------------------------------
+calculations:
+  - name: refund_proration
+    trigger: "Claim adjudication with resolution_type == REFUND (RMA_ISSUED -> ADJUDICATED)"
+    algorithm: decay_function
+    formula: |
+      base = min(Registration.purchase_price_cents, Product.msrp_cents)
+      elapsed_months = whole months from Registration.purchase_date to Claim.reported_date (floor)
+      L = Product.serviceable_lifespan_months
+      if tier.depreciation_method == STRAIGHT_LINE:
+          remaining_fraction = max(0, (L - elapsed_months)) / L
+          raw = base * remaining_fraction
+      elif tier.depreciation_method == DECLINING_BALANCE:
+          # monthly decay rate DECLINING_RATE applied per elapsed month
+          raw = base * (DECLINING_RATE ** elapsed_months)
+      assessed = min( round_half_up(raw), Registration.remaining_coverage_cents )
+      # rounding pinned: compute raw in cents as float, round_half_up to integer cents
+      # BEFORE applying the remaining_coverage_cents cap.
+      #
+      # Circular-looking dependency (evaluation order PINNED): assessed is capped by
+      # remaining_coverage_cents, and remaining_coverage_cents (post-adjudication) is
+      # reconciled from the very DEBIT this assessed value creates. The order is fixed:
+      #   (1) read remaining_coverage_cents from the PRE-adjudication ledger,
+      #   (2) compute assessed = min(round(raw), that pre-value),
+      #   (3) write the DEBIT LedgerEntry of amount=assessed,
+      #   (4) remaining_coverage_reconciliation then recomputes the post-value.
+      # Using the post-debit remaining_coverage in step (2) would be wrong (it would
+      # halve the cap); the scaffold forbids it.
+    input_set: "Single Registration + its active CoverageTier; elapsed measured purchase_date -> reported_date."
+    constants:
+      DECLINING_RATE: 0.97
+      VALIDATION_WINDOW_DAYS: 90
+    precision: "integer cents, round_half_up; round raw to cents BEFORE the remaining_coverage cap (cap applied last)"
+    variants:
+      - name: straight_line_refund
+        when: "active CoverageTier.depreciation_method == STRAIGHT_LINE"
+        difference: "Linear remaining-life fraction (L - elapsed)/L; reaches 0 at end of serviceable life."
+      - name: declining_balance_refund
+        when: "active CoverageTier.depreciation_method == DECLINING_BALANCE"
+        difference: "Geometric DECLINING_RATE**elapsed; never reaches 0, always strictly positive for the same inputs — divergent payout vs straight_line."
+
+  - name: extended_warranty_premium_refund
+    trigger: "ExtendedWarranty cancellation (ACTIVE -> CANCELLED via POST /extended-warranties/{id}/cancel)"
+    algorithm: decay_function
+    formula: |
+      P = ExtendedWarranty.amount_paid_cents
+      T = CoverageTier.extension_months                 # total covered months purchased
+      elapsed = whole months from ExtendedWarranty.effective_date to current_utc (floor)
+      unused = max(0, T - elapsed)
+      if tier.premium_refund_method == PRO_RATA:
+          raw = P * unused / T
+      elif tier.premium_refund_method == SHORT_RATE:
+          raw = P * unused / T * (1 - SHORT_RATE_PENALTY)
+      premium_refund_cents = round_half_up(raw)
+      # If T == 0 the tier adds no months; unused is 0 and refund is 0.
+    input_set: "Single ExtendedWarranty + its CoverageTier; elapsed measured effective_date -> current_utc."
+    constants:
+      SHORT_RATE_PENALTY: 0.10
+    precision: "integer cents, round_half_up on raw"
+    variants:
+      - name: pro_rata_premium_refund
+        when: "CoverageTier.premium_refund_method == PRO_RATA"
+        difference: "Full unused-fraction premium returned: P * unused / T."
+      - name: short_rate_premium_refund
+        when: "CoverageTier.premium_refund_method == SHORT_RATE"
+        difference: "Unused-fraction premium minus a SHORT_RATE_PENALTY surrender charge — strictly less than PRO_RATA for identical P,T,elapsed (divergent payout on the ExtendedWarranty domain)."
+
+  - name: warranty_transfer_fee
+    trigger: "Registration transfer initiation (ACTIVE -> TRANSFER_PENDING)"
+    algorithm: tiered_pricing
+    formula: |
+      # Combinatorial: ≥3 inputs (category, elapsed_months, remaining_coverage),
+      # tiered-rate selection on elapsed_months with a conditional category surcharge,
+      # then a floor/cap interaction.
+      elapsed_months = whole months purchase_date -> current_utc (floor)
+      if elapsed_months < 12:        rate_cents = TRANSFER_RATE_YEAR1
+      elif elapsed_months < 36:      rate_cents = TRANSFER_RATE_YEAR1_3
+      else:                          rate_cents = TRANSFER_RATE_YEAR3_PLUS
+      surcharge = CATEGORY_SURCHARGE_CENTS if Product.category == APPLIANCE else 0
+      raw = rate_cents + surcharge
+      fee = min( max(raw, TRANSFER_FEE_FLOOR_CENTS), Registration.remaining_coverage_cents )
+      # fee can never exceed remaining coverage; never drop below floor unless coverage is the binding cap.
+    input_set: "Single Registration + its Product; evaluated at transfer time against current_utc."
+    constants:
+      TRANSFER_RATE_YEAR1: 1500
+      TRANSFER_RATE_YEAR1_3: 2500
+      TRANSFER_RATE_YEAR3_PLUS: 4000
+      CATEGORY_SURCHARGE_CENTS: 1000
+      TRANSFER_FEE_FLOOR_CENTS: 1000
+    precision: "integer cents; tier selected first, surcharge added, then floor then coverage cap (order pinned)"
+
+  - name: remaining_coverage_reconciliation
+    trigger: "Any LedgerEntry create/reverse for a Registration; recomputed on read of Registration"
+    algorithm: aggregation
+    formula: |
+      cap = active CoverageTier.coverage_cap_cents
+      debits  = sum(amount_cents for LedgerEntry where registration_id == R.id AND entry_type == DEBIT)
+      credits = sum(amount_cents for LedgerEntry where registration_id == R.id AND entry_type == CREDIT)
+      remaining_coverage_cents = cap - debits + credits
+      # Conserved-quantity check: cap == remaining_coverage_cents + debits - credits at all times.
+    input_set: "All LedgerEntry rows for the registration, no status filter (ledger is append-only); ordered by created_at ASC for replay but sum is order-independent."
+    constants:
+      COVERAGE_FLOOR_CENTS: 0
+    precision: "integer cents; remaining_coverage_cents clamped at COVERAGE_FLOOR_CENTS (never negative)"
+
+# 1.4 Validation Rules Table (ordered by priority) --------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to perform this operation per §1.7 RBAC matrix"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "All path/body referenced resources exist, validated left-to-right in the path"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 4
+    category: state
+    check: "Target resource is in a valid state for the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "transition endpoints"
+  - priority: 5
+    category: state
+    check: "OCC: expected_registration_version equals current Registration.version on transfer initiation"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /registrations/{id}/transfer"
+  - priority: 6
+    category: business_referential
+    check: "Owner initiating/accepting acts on a registration they own (or are the named transfer recipient)"
+    error_id: ERR_NOT_OWNER
+    http_status: 403
+    applies_to: "POST /registrations/{id}/transfer, /transfer/accept, /transfer/reject, /claims, /claims/{id}/withdraw"
+  - priority: 7
+    category: business_safety
+    check: "Claim defect_category is MANUFACTURING for approval; non-manufacturing or out-of-window defects cannot be approved"
+    error_id: ERR_DEFECT_NOT_COVERED
+    http_status: 422
+    applies_to: "POST /claims/{id}/adjudicate"
+  - priority: 8
+    category: business_temporal
+    check: "Claim reported_date <= Registration.warranty_end_date and Registration not EXPIRED at intake"
+    error_id: ERR_WARRANTY_EXPIRED
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/issue-rma"
+  - priority: 9
+    category: business_constraint
+    check: "REFUND resolution requires the active CoverageTier.refund_eligible == true"
+    error_id: ERR_REFUND_NOT_ELIGIBLE
+    http_status: 422
+    applies_to: "POST /claims/{id}/adjudicate"
+  - priority: 10
+    category: business_constraint
+    check: "ExtendedWarranty amount_paid_cents must equal CoverageTier.price_cents; tier must be ACTIVE and belong to the registration's product"
+    error_id: ERR_TIER_MISMATCH
+    http_status: 422
+    applies_to: "POST /extended-warranties"
+  - priority: 14
+    category: business_temporal
+    check: "New ExtendedWarranty coverage interval [effective_date, effective_date+extension_months) must not overlap an existing ACTIVE extension's coverage interval on the same registration; intervals are half-open so an exactly-adjacent extension (new start == existing end) is permitted."
+    error_id: ERR_COVERAGE_OVERLAP
+    http_status: 409
+    applies_to: "POST /extended-warranties"
+  - priority: 15
+    category: business_temporal
+    check: "New Claim reported_date must be strictly more than CLAIM_COOLDOWN_DAYS (=30) after the most recent non-CLOSED Claim's reported_date on the same registration; the cooldown is a closed buffer gap (reported_date exactly cooldown days later is still rejected)."
+    error_id: ERR_CLAIM_COOLDOWN
+    http_status: 409
+    applies_to: "POST /claims"
+  - priority: 11
+    category: business_constraint
+    check: "serial_number unique per product_id on registration create"
+    error_id: ERR_DUPLICATE_SERIAL
+    http_status: 409
+    applies_to: "POST /registrations"
+  - priority: 12
+    category: business_fiscal
+    check: "Adjudication assessed_value_cents must not exceed Registration.remaining_coverage_cents; if remaining is 0 the claim cannot be approved"
+    error_id: ERR_COVERAGE_EXHAUSTED
+    http_status: 422
+    applies_to: "POST /claims/{id}/adjudicate"
+  - priority: 13
+    category: business_constraint
+    check: "Request body well-formed: required fields present, enums valid, integers non-negative where constrained"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+
+# 1.5 API Endpoint Table -----------------------------------------------------
+endpoints:
+  # --- Product catalog (configuration) ---
+  - method: POST
+    path: "/products"
+    description: "Create a product catalog entry."
+    roles: [WarrantyAdmin]
+    code: 201
+    input: [model_number, category, msrp_cents, base_warranty_months, serviceable_lifespan_months]
+    output: Product
+    side_effects: ["Product created with status=ACTIVE"]
+  - method: GET
+    path: "/products/{id}"
+    description: "Fetch a product by id."
+    roles: [WarrantyAdmin, Owner, ClaimsProcessor]
+    code: 200
+    input: []
+    output: Product
+    side_effects: []
+  - method: GET
+    path: "/products"
+    description: "List products (paginated)."
+    roles: [WarrantyAdmin, Owner, ClaimsProcessor]
+    code: 200
+    input: ["category?", "limit?", "offset?"]
+    output: Product[]
+    side_effects: []
+
+  # --- Coverage tiers (configuration; child of Product via FK) ---
+  - method: POST
+    path: "/coverage-tiers"
+    description: "Define a coverage tier for a product."
+    roles: [WarrantyAdmin]
+    code: 201
+    input: [product_id, tier_name, extension_months, price_cents, coverage_cap_cents, depreciation_method, "refund_eligible?"]
+    output: CoverageTier
+    side_effects: ["CoverageTier created with status=ACTIVE"]
+  - method: GET
+    path: "/coverage-tiers/{id}"
+    description: "Fetch a coverage tier by id."
+    roles: [WarrantyAdmin, Owner, ClaimsProcessor]
+    code: 200
+    input: []
+    output: CoverageTier
+    side_effects: []
+  - method: GET
+    path: "/coverage-tiers"
+    description: "List coverage tiers; filter by product_id (FK reverse-reachability for CoverageTier.product_id)."
+    roles: [WarrantyAdmin, Owner, ClaimsProcessor]
+    code: 200
+    input: ["product_id?", "limit?", "offset?"]
+    output: CoverageTier[]
+    side_effects: []
+
+  # --- Owner directory (entity-backed identity for Owner role) ---
+  - method: POST
+    path: "/owners"
+    description: "Register an Owner account (warranty owner identity)."
+    roles: [WarrantyAdmin]
+    code: 201
+    input: [full_name, email]
+    output: Owner
+    side_effects: ["Owner created"]
+  - method: GET
+    path: "/owners/{id}"
+    description: "Fetch an owner by id."
+    roles: [WarrantyAdmin, Owner]
+    code: 200
+    input: []
+    output: Owner
+    side_effects: []
+
+  # --- Registrations (resource) ---
+  - method: POST
+    path: "/registrations"
+    description: "Register a product unit by serial to an owner."
+    roles: [Owner, WarrantyAdmin]
+    code: 201
+    input: [product_id, serial_number, owner_user_id, purchase_date, purchase_price_cents]
+    output: Registration
+    side_effects: ["Registration created status=REGISTERED, proof_status=UNVERIFIED, active_tier_id=BASE tier, remaining_coverage_cents=cap of BASE tier"]
+  - method: GET
+    path: "/registrations/{id}"
+    description: "Fetch a registration; remaining_coverage_cents and warranty_end_date recomputed on read."
+    roles: [WarrantyAdmin, Owner, ClaimsProcessor]
+    code: 200
+    input: []
+    output: Registration
+    side_effects: []
+  - method: GET
+    path: "/registrations"
+    description: "List registrations; filter by owner_user_id, product_id, or active_tier_id (FK reverse-reachability)."
+    roles: [WarrantyAdmin, Owner, ClaimsProcessor]
+    code: 200
+    input: ["owner_user_id?", "product_id?", "active_tier_id?", "limit?", "offset?"]
+    output: Registration[]
+    side_effects: []
+  - method: POST
+    path: "/registrations/{id}/transfer"
+    description: "Initiate warranty transfer to a new owner (OCC-guarded)."
+    roles: [Owner]
+    code: 201
+    input: [to_owner_user_id, expected_registration_version]
+    output: WarrantyTransfer
+    side_effects:
+      - "Registration ACTIVE -> TRANSFER_PENDING"
+      - "Create WarrantyTransfer; compute transfer_fee_cents; create DEBIT LedgerEntry reason=TRANSFER_FEE"
+      - "Decrement Registration.remaining_coverage_cents by fee"
+      - "increments Registration.version by 1"
+  - method: POST
+    path: "/registrations/{id}/transfer/accept"
+    description: "Recipient accepts a pending transfer."
+    roles: [Owner]
+    code: 200
+    input: []
+    output: Registration
+    side_effects: ["Set owner_user_id=recipient; Registration TRANSFER_PENDING -> ACTIVE; increments Registration.version by 1"]
+  - method: POST
+    path: "/registrations/{id}/transfer/reject"
+    description: "Recipient rejects a pending transfer; transfer fee reversed (compensating)."
+    roles: [Owner]
+    code: 200
+    input: []
+    output: Registration
+    side_effects:
+      - "Most recent WarrantyTransfer.status=REVERSED"
+      - "Create CREDIT LedgerEntry reason=REVERSAL amount=transfer_fee_cents"
+      - "Restore Registration.remaining_coverage_cents; owner unchanged; TRANSFER_PENDING -> ACTIVE"
+      - "increments Registration.version by 1"
+  - method: POST
+    path: "/registrations/{id}/void"
+    description: "Void a registration (admin); cancels active extensions."
+    roles: [WarrantyAdmin]
+    code: 200
+    input: []
+    output: Registration
+    side_effects: ["Registration -> VOIDED; cancel all ACTIVE ExtendedWarranty; increments Registration.version by 1"]
+  - method: GET
+    path: "/registrations/{id}/ledger"
+    description: "List LedgerEntry rows for a registration (FK reverse-reachability for LedgerEntry.registration_id)."
+    roles: [WarrantyAdmin, Owner, ClaimsProcessor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: LedgerEntry[]
+    side_effects: []
+  - method: GET
+    path: "/registrations/{id}/transfers"
+    description: "List WarrantyTransfer rows for a registration (FK reverse-reachability for WarrantyTransfer.registration_id)."
+    roles: [WarrantyAdmin, Owner]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WarrantyTransfer[]
+    side_effects: []
+
+  # --- Extended warranties (resource) ---
+  - method: POST
+    path: "/extended-warranties"
+    description: "Purchase an extended-warranty tier for a registration."
+    roles: [Owner, WarrantyAdmin]
+    code: 201
+    input: [registration_id, coverage_tier_id, amount_paid_cents]
+    output: ExtendedWarranty
+    side_effects:
+      - "Create ExtendedWarranty status=ACTIVE"
+      - "Recompute Registration.warranty_end_date (+ tier extension_months)"
+      - "Set Registration.active_tier_id to highest-coverage tier; recompute remaining_coverage_cents to new cap minus existing debits"
+      - "increments Registration.version by 1"
+  - method: POST
+    path: "/extended-warranties/{id}/cancel"
+    description: "Owner cancels an active extended warranty; unused premium refunded via dual-variant calc."
+    roles: [Owner]
+    code: 200
+    input: []
+    output: ExtendedWarranty
+    side_effects:
+      - "ExtendedWarranty ACTIVE -> CANCELLED; compute premium_refund_cents"
+      - "Recompute Registration.active_tier_id, warranty_end_date, remaining_coverage_cents"
+      - "increments Registration.version by 1"
+  - method: GET
+    path: "/extended-warranties/{id}"
+    description: "Fetch an extended warranty by id."
+    roles: [WarrantyAdmin, Owner]
+    code: 200
+    input: []
+    output: ExtendedWarranty
+    side_effects: []
+  - method: GET
+    path: "/extended-warranties"
+    description: "List extended warranties; filter by registration_id (FK reverse-reachability) or coverage_tier_id."
+    roles: [WarrantyAdmin, Owner]
+    code: 200
+    input: ["registration_id?", "coverage_tier_id?", "limit?", "offset?"]
+    output: ExtendedWarranty[]
+    side_effects: []
+
+  # --- Proofs of purchase (document) ---
+  - method: POST
+    path: "/proofs"
+    description: "Submit a proof-of-purchase document for a registration."
+    roles: [Owner, WarrantyAdmin]
+    code: 201
+    input: [registration_id, document_type, stated_purchase_date, stated_amount_cents]
+    output: ProofOfPurchase
+    side_effects: ["ProofOfPurchase created status=SUBMITTED"]
+  - method: POST
+    path: "/proofs/{id}/validate"
+    description: "Validate or reject a submitted proof; cascades to Registration.proof_status and possibly REGISTERED->ACTIVE."
+    roles: [WarrantyAdmin]
+    code: 200
+    input: []
+    output: ProofOfPurchase
+    side_effects:
+      - "ProofOfPurchase SUBMITTED -> VALIDATED or REJECTED (per date/amount/window checks)"
+      - "Set Registration.proof_status; if VALIDATED and Registration REGISTERED, transition -> ACTIVE"
+      - "increments Registration.version by 1"
+  - method: GET
+    path: "/proofs/{id}"
+    description: "Fetch a proof by id."
+    roles: [WarrantyAdmin, Owner]
+    code: 200
+    input: []
+    output: ProofOfPurchase
+    side_effects: []
+  - method: GET
+    path: "/proofs"
+    description: "List proofs; filter by registration_id (FK reverse-reachability)."
+    roles: [WarrantyAdmin, Owner]
+    code: 200
+    input: ["registration_id?", "limit?", "offset?"]
+    output: ProofOfPurchase[]
+    side_effects: []
+
+  # --- Claims (resource) ---
+  - method: POST
+    path: "/claims"
+    description: "File a warranty claim against a registration."
+    roles: [Owner]
+    code: 201
+    input: [registration_id, defect_category, reported_date]
+    output: Claim
+    side_effects: ["Claim created status=INTAKE"]
+  - method: GET
+    path: "/claims/{id}"
+    description: "Fetch a claim by id."
+    roles: [WarrantyAdmin, Owner, ClaimsProcessor]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: []
+  - method: GET
+    path: "/claims"
+    description: "List claims; filter by registration_id (FK reverse-reachability) or status."
+    roles: [WarrantyAdmin, Owner, ClaimsProcessor]
+    code: 200
+    input: ["registration_id?", "status?", "limit?", "offset?"]
+    output: Claim[]
+    side_effects: []
+  - method: POST
+    path: "/claims/{id}/issue-rma"
+    description: "Issue an RMA for an intake claim (claims-processor logistics)."
+    roles: [ClaimsProcessor]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["Claim INTAKE -> RMA_ISSUED; mint rma_number; set claims_processor_user_id; increments Registration.version by 1"]
+  - method: POST
+    path: "/claims/{id}/adjudicate"
+    description: "Approve (with resolution) or deny a claim under RMA."
+    roles: [WarrantyAdmin]
+    code: 200
+    input: [decision, "resolution_type?", "repair_cost_cents?", "replace_cost_cents?"]
+    output: Claim
+    side_effects:
+      - "approve: Claim RMA_ISSUED -> ADJUDICATED; set resolution_type; compute assessed_value_cents; create DEBIT LedgerEntry; decrement remaining_coverage_cents"
+      - "deny: Claim RMA_ISSUED -> DENIED"
+      - "increments Registration.version by 1"
+  - method: POST
+    path: "/claims/{id}/fulfill"
+    description: "Fulfill an adjudicated claim (ship repair/replacement or issue refund)."
+    roles: [ClaimsProcessor]
+    code: 200
+    input: []
+    output: Claim
+    side_effects:
+      - "Claim ADJUDICATED -> FULFILLED"
+      - "If resolution_type == REFUND: Registration -> VOIDED; cancel ACTIVE ExtendedWarranty"
+      - "increments Registration.version by 1"
+  - method: POST
+    path: "/claims/{id}/withdraw"
+    description: "Owner withdraws a claim under RMA."
+    roles: [Owner]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["Claim RMA_ISSUED -> CLOSED; increments Registration.version by 1"]
+
+  # --- Test-driving endpoints (outside business surface) ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's current UTC clock (test-driving)."
+    roles: [WarrantyAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["Server clock set to provided instant"]
+  - method: POST
+    path: "/_clock/advance"
+    description: "Advance clock and run expiry sweep: ACTIVE registrations past warranty_end_date -> EXPIRED."
+    roles: [WarrantyAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["Clock advanced; ACTIVE registrations with warranty_end_date < now -> EXPIRED (version bumped each)"]
+
+# 1.6 Error Code Catalog -----------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID headers."
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Authenticated role not permitted for this operation per RBAC."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced Product/CoverageTier/Registration/Claim/Owner/ExtendedWarranty/ProofOfPurchase does not exist."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource not in a valid state for the requested transition."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_registration_version does not match current Registration.version on transfer initiation."
+  - id: ERR_NOT_OWNER
+    http: 403
+    condition: "Acting Owner is not the registration owner (or named transfer recipient) for an ownership-scoped operation."
+  - id: ERR_DEFECT_NOT_COVERED
+    http: 422
+    condition: "Claim approval attempted for a non-MANUFACTURING defect category."
+  - id: ERR_WARRANTY_EXPIRED
+    http: 422
+    condition: "Claim reported_date is after warranty_end_date, or registration is EXPIRED."
+  - id: ERR_REFUND_NOT_ELIGIBLE
+    http: 422
+    condition: "REFUND resolution requested but active CoverageTier.refund_eligible is false."
+  - id: ERR_TIER_MISMATCH
+    http: 422
+    condition: "Extended-warranty amount_paid_cents != tier price_cents, tier RETIRED, or tier not on registration's product."
+  - id: ERR_DUPLICATE_SERIAL
+    http: 409
+    condition: "serial_number already registered for this product_id."
+  - id: ERR_COVERAGE_EXHAUSTED
+    http: 422
+    condition: "Adjudication would exceed remaining_coverage_cents, or remaining coverage is already 0."
+  - id: ERR_COVERAGE_OVERLAP
+    http: 409
+    condition: "New ExtendedWarranty coverage interval [effective, effective+extension_months) overlaps an existing ACTIVE extension's interval on the same registration (half-open; adjacency end==start allowed)."
+  - id: ERR_CLAIM_COOLDOWN
+    http: 409
+    condition: "New Claim reported_date falls within CLAIM_COOLDOWN_DAYS after a prior non-CLOSED claim's reported_date on the same registration (closed interval with buffer gap)."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Malformed body: missing required field, invalid enum, negative integer where non-negative required."
+
+# 1.7 RBAC Matrix ------------------------------------------------------------
+roles:
+  - name: Owner
+    description: "Warranty owner; registers units, buys extensions, files/withdraws claims, transfers warranties."
+    identity: "entity_backed:Owner"
+    exclusive_operations:
+      - "POST /claims (file claim on own registration)"
+      - "POST /claims/{id}/withdraw"
+      - "POST /registrations/{id}/transfer"
+      - "POST /registrations/{id}/transfer/accept"
+      - "POST /registrations/{id}/transfer/reject"
+    shared_operations:
+      - "POST /registrations (shared with WarrantyAdmin)"
+      - "POST /extended-warranties (shared with WarrantyAdmin)"
+      - "POST /proofs (shared with WarrantyAdmin)"
+      - "GET reads on owned registrations/claims/proofs/extended-warranties/ledger"
+  - name: WarrantyAdmin
+    description: "Catalog and adjudication authority; configures products/tiers, validates proofs, adjudicates and voids."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /products"
+      - "POST /coverage-tiers"
+      - "POST /owners"
+      - "POST /proofs/{id}/validate"
+      - "POST /claims/{id}/adjudicate"
+      - "POST /registrations/{id}/void"
+      - "POST /_clock/set_current_utc"
+      - "POST /_clock/advance"
+    shared_operations:
+      - "POST /registrations (shared with Owner)"
+      - "POST /extended-warranties (shared with Owner)"
+      - "POST /proofs (shared with Owner)"
+      - "GET reads (all resources)"
+  - name: ClaimsProcessor
+    description: "RMA logistics operator; issues RMAs and fulfills adjudicated claims."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /claims/{id}/issue-rma"
+      - "POST /claims/{id}/fulfill"
+    shared_operations:
+      - "GET reads on products/coverage-tiers/registrations/claims/ledger"

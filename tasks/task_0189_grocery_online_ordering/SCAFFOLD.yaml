@@ -1,0 +1,1179 @@
+# =============================================================================
+# Grocery Online Ordering & Fulfillment — benchmark scaffold (Expert)
+# =============================================================================
+
+scenario: |
+  Grocery Online Ordering & Fulfillment: cart/substitution rules, weighted-item
+  pricing, pick/stage/handoff, delivery/pickup slot capacity, SNAP/EBT split
+  tender, age-restricted item check, cold-chain perishables, out-of-stock refund
+
+domain_name: grocery-online-ordering
+api_prefix: /v1
+
+complexity_profile:
+  primary_archetype: event_sourcing            # order lifecycle + out-of-stock refund reconciliation
+  secondary_archetype: quota_allocation        # finite delivery/pickup slot capacity
+  complexity_layers:
+    - dual_variant_calculation                 # estimated vs final weighted pricing
+    - cascading_side_effects                   # out-of-stock -> refund -> capture recompute
+    - rate_threshold_triggers                  # slot capacity boundary, cold-chain hold window
+    - optimistic_concurrency                   # slot rebooking supersede on FulfillmentSlot.version
+    - derived_field_reconciliation             # order totals reconciled from line/refund/payment
+
+  entity_topology: flat                         # peer collections under /v1 with FK references in bodies (no nested URL paths)
+  state_machine_shape: parallel                 # Order carries fulfillment_status x payment_status; OrderLine branches
+  relationship_patterns:
+    - one_to_many                               # Order -> OrderLine, Order -> Refund
+    - cross_aggregate                           # Order -> FulfillmentSlot, OrderLine -> Product, Order -> Customer
+    - polymorphic: false
+  role_model: peer_roles                        # Customer / Picker own different resources; StoreOps + PlatformAdmin operate
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Store
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Store display name" }
+      - { name: timezone, type: string, source: input, default: "UTC", description: "IANA timezone label, informational only" }
+      - { name: ebt_enabled, type: boolean, source: input, default: true, description: "Whether this store accepts SNAP/EBT tender" }
+      - { name: cold_chain_hold_minutes, type: integer, source: input, default: 120, description: "Max minutes a STAGED order containing cold-chain lines may wait before handoff is refused" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | CLOSED — CLOSED blocks new orders" }
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Customer email; unique" }
+      - { name: full_name, type: string, source: input, description: "Customer full name" }
+      - { name: date_of_birth, type: datetime, source: input, description: "ISO 8601 date; used for age-restricted line checks" }
+      - { name: snap_ebt_balance_cents, type: integer, source: input, default: 0, description: "Available SNAP/EBT balance in cents; debited by EBT tender, not refilled by refunds in v1" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | SUSPENDED — SUSPENDED blocks new orders" }
+
+  - name: Picker
+    parent: null
+    common_fields: true
+    fields:
+      - { name: store_id, type: string, source: input, description: "FK -> Store.id; the store this picker works at" }
+      - { name: full_name, type: string, source: input, description: "Picker full name" }
+      - { name: window_cooldown_minutes, type: integer, source: input, default: 15, description: "Required buffer in minutes between this picker's consecutive claimed pick windows" }
+      - { name: status, type: enum, source: system, default: "AVAILABLE", description: "AVAILABLE | OFF_SHIFT — OFF_SHIFT cannot claim orders" }
+
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - { name: store_id, type: string, source: input, description: "FK -> Store.id; the store carrying this product" }
+      - { name: sku, type: string, source: input, description: "Stock keeping unit; unique within store" }
+      - { name: name, type: string, source: input, description: "Product display name" }
+      - { name: pricing_mode, type: enum, source: input, description: "UNIT | WEIGHT — UNIT priced per each, WEIGHT priced per kilogram" }
+      - { name: unit_price_cents, type: integer, source: input, description: "Price per each (UNIT) or price per kilogram (WEIGHT), in cents; must be >= 0" }
+      - { name: ebt_eligible, type: boolean, source: input, default: false, description: "Whether this product may be paid with SNAP/EBT tender" }
+      - { name: age_restricted, type: boolean, source: input, default: false, description: "Whether sale requires an adult age verification at handoff" }
+      - { name: cold_chain, type: boolean, source: input, default: false, description: "Whether this product is a cold-chain perishable subject to the staged-hold window" }
+      - { name: on_hand_qty, type: number, source: input, default: 0, description: "Units (UNIT) or kilograms (WEIGHT) currently on hand; informational stock signal" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | DISCONTINUED — DISCONTINUED products cannot be added to new orders or substituted in" }
+
+  - name: FulfillmentSlot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: store_id, type: string, source: input, description: "FK -> Store.id; the store offering this slot" }
+      - { name: slot_type, type: enum, source: input, description: "DELIVERY | PICKUP" }
+      - { name: window_start, type: datetime, source: input, description: "ISO 8601 UTC inclusive start of the fulfillment window" }
+      - { name: window_end, type: datetime, source: input, description: "ISO 8601 UTC exclusive end of the fulfillment window; must be strictly after window_start" }
+      - { name: capacity, type: integer, source: input, description: "Maximum number of concurrently booked orders; must be >= 1" }
+      - { name: booked_count, type: integer, source: computed, description: "Count of Orders referencing this slot whose fulfillment_status is in {PLACED, PICKING, STAGED, HANDED_OFF}" }
+      - { name: status, type: enum, source: computed, default: "OPEN", description: "OPEN | FULL | CLOSED — FULL when booked_count == capacity, CLOSED when manually closed" }
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - { name: store_id, type: string, source: input, description: "FK -> Store.id; store fulfilling the order" }
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; the ordering customer" }
+      - { name: slot_id, type: string, source: input, description: "FK -> FulfillmentSlot.id; the booked fulfillment slot" }
+      - { name: picker_id, type: string, source: computed, description: "FK -> Picker.id; picker who claimed the order, null until claimed" }
+      - { name: fulfillment_status, type: enum, source: system, default: "PLACED", description: "PLACED | PICKING | STAGED | HANDED_OFF | CANCELLED — fulfillment dimension" }
+      - { name: payment_status, type: enum, source: system, default: "AUTHORIZED", description: "AUTHORIZED | CAPTURED | PARTIALLY_REFUNDED | REFUNDED | VOIDED — payment dimension, evolves independently" }
+      - { name: tip_cents, type: integer, source: input, default: 0, description: "Customer tip in cents; never EBT-eligible; must be >= 0" }
+      - { name: estimated_total_cents, type: integer, source: computed, description: "Sum over lines of estimated_line_cents plus tip_cents; pinned at placement" }
+      - { name: estimated_ebt_eligible_cents, type: integer, source: computed, description: "Sum over lines whose product is ebt_eligible of estimated_line_cents; tip excluded" }
+      - { name: final_total_cents, type: integer, source: computed, description: "Sum over {PICKED,SUBSTITUTED} lines of final_line_cents plus tip_cents; recomputed at stage and capture" }
+      - { name: final_ebt_eligible_cents, type: integer, source: computed, description: "Sum over {PICKED,SUBSTITUTED} ebt_eligible lines of final_line_cents; tip excluded" }
+      - { name: ebt_charged_cents, type: integer, source: computed, description: "EBT tender applied at capture: min(final_ebt_eligible_cents, customer.snap_ebt_balance_cents); 0 before capture" }
+      - { name: card_charged_cents, type: integer, source: computed, description: "Card tender applied at capture: final_total_cents - ebt_charged_cents; 0 before capture" }
+      - { name: refunded_total_cents, type: integer, source: computed, description: "Sum of amount_cents over this order's Refund records; 0 until a refund is recorded" }
+      - { name: net_captured_cents, type: integer, source: computed, description: "ebt_charged_cents + card_charged_cents - refunded_total_cents; 0 before capture" }
+      - { name: staged_at, type: datetime, source: system, description: "ISO 8601 UTC timestamp set when fulfillment_status becomes STAGED; null otherwise" }
+      - { name: requires_age_check, type: boolean, source: computed, description: "True if any {PICKED,SUBSTITUTED} line's effective product is age_restricted" }
+
+  - name: OrderLine
+    parent: Order
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> Order.id; parent order" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; ordered product" }
+      - { name: requested_qty, type: number, source: input, description: "Requested each-count for UNIT products; must be > 0 (use 1 for WEIGHT products)" }
+      - { name: estimated_weight_kg, type: number, source: input, required: false, description: "Estimated kilograms for WEIGHT products; required when product.pricing_mode == WEIGHT, ignored for UNIT" }
+      - { name: picked_qty, type: number, source: input, required: false, description: "Picked each-count (UNIT); set on PICKED transition for UNIT products" }
+      - { name: actual_weight_kg, type: number, source: input, required: false, description: "Actual scale weight in kilograms; set on PICKED transition for WEIGHT products" }
+      - { name: substitution_policy, type: enum, source: input, default: "NO_SUBSTITUTION", description: "NO_SUBSTITUTION | SAME_PRICE_OR_LESS | SHOPPER_CHOICE — governs whether a Substitution may be accepted" }
+      - { name: estimated_line_cents, type: integer, source: computed, description: "Estimated charge: UNIT -> unit_price_cents * requested_qty; WEIGHT -> round_half_up(unit_price_cents * estimated_weight_kg)" }
+      - { name: final_line_cents, type: integer, source: computed, description: "Final charge after pick: UNIT -> unit_price_cents * picked_qty; WEIGHT -> round_half_up(unit_price_cents * actual_weight_kg); 0 when OUT_OF_STOCK/CANCELLED; substitute charge when SUBSTITUTED" }
+      - { name: status, type: enum, source: system, default: "PENDING", description: "PENDING | PICKED | SUBSTITUTED | OUT_OF_STOCK | CANCELLED" }
+
+  - name: Substitution
+    parent: OrderLine
+    common_fields: true
+    fields:
+      - { name: order_line_id, type: string, source: input, description: "FK -> OrderLine.id; the line being substituted" }
+      - { name: substitute_product_id, type: string, source: input, description: "FK -> Product.id; proposed replacement product" }
+      - { name: substitute_qty, type: number, source: input, description: "Each-count of the substitute for UNIT products; must be > 0 (use 1 for WEIGHT substitutes)" }
+      - { name: substitute_weight_kg, type: number, source: input, required: false, description: "Actual kilograms for WEIGHT substitutes; required when substitute product is WEIGHT" }
+      - { name: substitute_line_cents, type: integer, source: computed, description: "Charge of the substitute computed with the same rule as final_line_cents over the substitute product" }
+      - { name: status, type: enum, source: system, default: "PROPOSED", description: "PROPOSED | ACCEPTED | REJECTED" }
+
+  - name: Payment
+    parent: Order
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> Order.id; parent order" }
+      - { name: ebt_amount_cents, type: integer, source: computed, description: "EBT tender captured; equals Order.ebt_charged_cents at capture time" }
+      - { name: card_amount_cents, type: integer, source: computed, description: "Card tender captured; equals Order.card_charged_cents at capture time" }
+      - { name: grand_total_cents, type: integer, source: computed, description: "ebt_amount_cents + card_amount_cents; equals Order.final_total_cents at capture" }
+      - { name: status, type: enum, source: system, default: "CAPTURED", description: "CAPTURED — split-tender capture record; immutable once created" }
+
+  - name: Refund
+    parent: Order
+    common_fields: false
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> Order.id; parent order" }
+      - { name: order_line_id, type: string, source: input, description: "FK -> OrderLine.id; the out-of-stock line that produced this refund" }
+      - { name: amount_cents, type: integer, source: computed, description: "Refund amount in cents; equals the estimated_line_cents that was captured for the out-of-stock line" }
+      - { name: reason, type: enum, source: system, default: "OUT_OF_STOCK", description: "OUT_OF_STOCK — append-only refund event reason" }
+
+  - name: AgeCheck
+    parent: Order
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> Order.id; parent order" }
+      - { name: verifier_user_id, type: string, source: input, description: "Opaque StoreOps user id who performed the in-person ID check" }
+      - { name: verified_birth_date, type: datetime, source: input, description: "ISO 8601 date read from the presented government ID" }
+      - { name: outcome, type: enum, source: computed, description: "PASS | FAIL — PASS when verified_birth_date implies age >= MIN_AGE_YEARS at slot.window_start" }
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- Order: PARALLEL dimensions (fulfillment_status x payment_status) ----
+  - entity: Order
+    field: fulfillment_status
+    initial_state: PLACED
+    terminal_states: [HANDED_OFF, CANCELLED]
+    transitions:
+      - from: PLACED
+        to: PICKING
+        trigger: "POST /v1/orders/{orderId}/claim"
+        actor: Picker
+        preconditions:
+          - "Order.fulfillment_status == PLACED (ERR_INVALID_ORDER_STATE)"
+          - "acting Picker.status == AVAILABLE"
+          - "claimed pick window [window_start, window_end) does not overlap, within the picker's window_cooldown_minutes buffer, any window this picker already holds (ERR_PICKER_WINDOW_CONFLICT)"
+        side_effects:
+          - "Order.picker_id = acting picker id"
+      - from: PICKING
+        to: STAGED
+        trigger: "POST /v1/orders/{orderId}/stage"
+        actor: Picker
+        preconditions:
+          - "Order.fulfillment_status == PICKING (ERR_INVALID_ORDER_STATE)"
+          - "every OrderLine is terminal (PICKED, SUBSTITUTED, OUT_OF_STOCK, or CANCELLED); none PENDING (ERR_LINES_NOT_RESOLVED)"
+          - "at least one line is PICKED or SUBSTITUTED (ERR_NOTHING_TO_STAGE)"
+        side_effects:
+          - "Order.staged_at = current clock"
+          - "recompute Order.final_total_cents, final_ebt_eligible_cents, requires_age_check"
+      - from: STAGED
+        to: HANDED_OFF
+        trigger: "POST /v1/orders/{orderId}/handoff"
+        actor: StoreOps
+        preconditions:
+          - "Order.fulfillment_status == STAGED (ERR_ORDER_NOT_STAGED)"
+          - "Order.payment_status == CAPTURED (ERR_PAYMENT_NOT_CAPTURED)"
+          - "if Order.requires_age_check: a PASS AgeCheck exists for the order (ERR_AGE_VERIFICATION_REQUIRED); a FAIL AgeCheck blocks handoff (ERR_AGE_VERIFICATION_FAILED)"
+          - "if any {PICKED,SUBSTITUTED} line is cold_chain: current clock < Order.staged_at + store.cold_chain_hold_minutes minutes (ERR_COLD_CHAIN_EXPIRED)"
+        side_effects: []
+      - from: [PLACED, PICKING, STAGED]
+        to: CANCELLED
+        trigger: "POST /v1/orders/{orderId}/cancel"
+        actor: [Customer, StoreOps]
+        preconditions:
+          - "Order.fulfillment_status in {PLACED, PICKING, STAGED}"
+          - "Order.fulfillment_status != HANDED_OFF (ERR_ORDER_ALREADY_HANDED_OFF)"
+        side_effects:
+          - "every non-terminal OrderLine (PENDING/PICKED/SUBSTITUTED) -> CANCELLED, final_line_cents set to 0"
+          - "FulfillmentSlot.booked_count decrements by 1 and FulfillmentSlot.version increments by 1; if slot was FULL it returns to OPEN"
+          - "if Order.payment_status in {CAPTURED, PARTIALLY_REFUNDED}: payment_status -> REFUNDED and net_captured_cents -> 0; else payment_status -> VOIDED"
+
+  - entity: Order
+    field: payment_status
+    initial_state: AUTHORIZED
+    terminal_states: [REFUNDED, VOIDED]
+    transitions:
+      - from: AUTHORIZED
+        to: CAPTURED
+        trigger: "POST /v1/orders/{orderId}/capture"
+        actor: StoreOps
+        preconditions:
+          - "Order.payment_status == AUTHORIZED (ERR_INVALID_ORDER_STATE)"
+          - "Order.fulfillment_status == STAGED (ERR_ORDER_NOT_STAGED)"
+          - "if store.ebt_enabled == false: final_ebt_eligible_cents == 0 (ERR_EBT_NOT_ACCEPTED)"
+        side_effects:
+          - "compute ebt_charged_cents = min(final_ebt_eligible_cents, customer.snap_ebt_balance_cents)"
+          - "compute card_charged_cents = final_total_cents - ebt_charged_cents"
+          - "debit customer.snap_ebt_balance_cents by ebt_charged_cents"
+          - "create one Payment record (status CAPTURED) with ebt_amount_cents/card_amount_cents/grand_total_cents"
+          - "Order.net_captured_cents = final_total_cents"
+        note: "EBT applied is bounded by balance; any uncovered EBT-eligible remainder spills to card, so capture never fails on a low EBT balance — the remainder simply lands on card."
+      - from: CAPTURED
+        to: PARTIALLY_REFUNDED
+        trigger: "system (out-of-stock refund recorded while captured value remains)"
+        actor: system
+        preconditions:
+          - "Order.payment_status == CAPTURED"
+          - "0 < refunded_total_cents < (ebt_charged_cents + card_charged_cents)"
+        side_effects:
+          - "Order.net_captured_cents = ebt_charged_cents + card_charged_cents - refunded_total_cents"
+      - from: [CAPTURED, PARTIALLY_REFUNDED]
+        to: REFUNDED
+        trigger: "system (cancel after capture, or refunded_total reaches captured total)"
+        actor: system
+        preconditions:
+          - "Order.payment_status in {CAPTURED, PARTIALLY_REFUNDED}"
+          - "refunded_total_cents == (ebt_charged_cents + card_charged_cents) OR order is being cancelled"
+        side_effects:
+          - "Order.net_captured_cents = 0"
+
+  # ---- OrderLine: BRANCHING pick with divergent side-effect sets ----
+  - entity: OrderLine
+    field: status
+    initial_state: PENDING
+    terminal_states: [PICKED, SUBSTITUTED, OUT_OF_STOCK, CANCELLED]
+    transitions:
+      - from: PENDING
+        to: PICKED
+        trigger: "POST /v1/order-lines/{lineId}/pick"
+        actor: Picker
+        preconditions:
+          - "OrderLine.status == PENDING (ERR_LINE_NOT_PENDING)"
+          - "parent Order.fulfillment_status == PICKING (ERR_ORDER_NOT_PICKING)"
+          - "for UNIT products picked_qty present and > 0; for WEIGHT products actual_weight_kg present and > 0 (ERR_INVALID_PICK_QUANTITY)"
+        side_effects:
+          - "recompute OrderLine.final_line_cents from picked_qty/actual_weight_kg"
+      - from: PENDING
+        to: SUBSTITUTED
+        trigger: "POST /v1/substitutions/{subId}/accept"
+        actor: [Customer, Picker]
+        preconditions:
+          - "OrderLine.status == PENDING (ERR_LINE_NOT_PENDING)"
+          - "parent Order.fulfillment_status == PICKING (ERR_ORDER_NOT_PICKING)"
+          - "Substitution.status == PROPOSED (ERR_SUBSTITUTION_NOT_PROPOSED)"
+          - "OrderLine.substitution_policy != NO_SUBSTITUTION (ERR_SUBSTITUTION_NOT_ALLOWED)"
+          - "if substitution_policy == SAME_PRICE_OR_LESS: substitute_line_cents <= estimated_line_cents (ERR_SUBSTITUTION_PRICE_EXCEEDED)"
+        side_effects:
+          - "Substitution.status -> ACCEPTED"
+          - "OrderLine.final_line_cents = Substitution.substitute_line_cents"
+      - from: PENDING
+        to: OUT_OF_STOCK
+        trigger: "POST /v1/order-lines/{lineId}/out-of-stock"
+        actor: Picker
+        preconditions:
+          - "OrderLine.status == PENDING (ERR_LINE_NOT_PENDING)"
+          - "parent Order.fulfillment_status == PICKING (ERR_ORDER_NOT_PICKING)"
+        side_effects:
+          - "OrderLine.final_line_cents = 0"
+        note: "Pre-capture out-of-stock: the line simply contributes 0 to final_total at stage; no Refund (payment is still AUTHORIZED)."
+      - from: PICKED
+        to: OUT_OF_STOCK
+        trigger: "POST /v1/order-lines/{lineId}/out-of-stock"
+        actor: [Picker, StoreOps]
+        preconditions:
+          - "OrderLine.status == PICKED (ERR_LINE_NOT_PICKED)"
+          - "parent Order.fulfillment_status == STAGED (ERR_ORDER_NOT_STAGED)"
+          - "parent Order.payment_status in {CAPTURED, PARTIALLY_REFUNDED} (ERR_PAYMENT_NOT_CAPTURED)"
+        side_effects:
+          - "let refunded = OrderLine.final_line_cents (the amount captured for this line); set OrderLine.final_line_cents = 0"
+          - "create Refund(amount_cents = refunded); Order.refunded_total_cents += refunded"
+          - "cascade Order.payment_status recompute (CAPTURED -> PARTIALLY_REFUNDED while net_captured_cents > 0; -> REFUNDED when refunded_total_cents reaches captured total) and Order.net_captured_cents recompute"
+          - "recompute Order.final_total_cents"
+        note: "Post-capture spoilage/defect correction on a staged, captured order; this is the depth-3 refund cascade (line -> Refund + refunded_total -> payment_status + net_captured)."
+      - from: [PENDING, PICKED, SUBSTITUTED]
+        to: CANCELLED
+        trigger: "system (parent Order cancelled)"
+        actor: system
+        preconditions:
+          - "parent Order transitions to CANCELLED"
+        side_effects:
+          - "OrderLine.final_line_cents = 0"
+
+  # ---- Substitution: BRANCHING accept/reject ----
+  - entity: Substitution
+    field: status
+    initial_state: PROPOSED
+    terminal_states: [ACCEPTED, REJECTED]
+    transitions:
+      - from: PROPOSED
+        to: ACCEPTED
+        trigger: "POST /v1/substitutions/{subId}/accept"
+        actor: [Customer, Picker]
+        preconditions:
+          - "Substitution.status == PROPOSED (ERR_SUBSTITUTION_NOT_PROPOSED)"
+          - "parent OrderLine.status == PENDING (ERR_LINE_NOT_PENDING)"
+          - "OrderLine.substitution_policy != NO_SUBSTITUTION (ERR_SUBSTITUTION_NOT_ALLOWED)"
+          - "if SAME_PRICE_OR_LESS: substitute_line_cents <= estimated_line_cents (ERR_SUBSTITUTION_PRICE_EXCEEDED)"
+        side_effects:
+          - "parent OrderLine.status -> SUBSTITUTED; OrderLine.final_line_cents = substitute_line_cents"
+      - from: PROPOSED
+        to: REJECTED
+        trigger: "POST /v1/substitutions/{subId}/reject"
+        actor: [Customer, Picker]
+        preconditions:
+          - "Substitution.status == PROPOSED (ERR_SUBSTITUTION_NOT_PROPOSED)"
+        side_effects:
+          - "no change to OrderLine; line remains PENDING (still pickable or markable out-of-stock)"
+
+  # ---- FulfillmentSlot: CYCLIC OPEN <-> FULL, plus CLOSED ----
+  - entity: FulfillmentSlot
+    field: status
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: FULL
+        trigger: "system (order placement makes booked_count == capacity)"
+        actor: system
+        preconditions:
+          - "booked_count == capacity after the placement"
+        side_effects:
+          - "slot rejects further placements with ERR_SLOT_FULL"
+      - from: FULL
+        to: OPEN
+        trigger: "system (order cancellation frees a booking)"
+        actor: system
+        preconditions:
+          - "booked_count < capacity after the cancellation"
+        side_effects: []
+      - from: [OPEN, FULL]
+        to: CLOSED
+        trigger: "POST /v1/slots/{slotId}/close"
+        actor: StoreOps
+        preconditions:
+          - "slot.status in {OPEN, FULL}"
+        side_effects:
+          - "slot rejects all new placements with ERR_SLOT_CLOSED; existing orders unaffected"
+
+  # ---- Store: ACTIVE <-> CLOSED ----
+  - entity: Store
+    field: status
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /v1/stores/{storeId}/close"
+        actor: PlatformAdmin
+        preconditions:
+          - "store.status == ACTIVE"
+        side_effects:
+          - "store rejects new orders with ERR_STORE_CLOSED"
+
+  # ---- Customer: ACTIVE <-> SUSPENDED ----
+  - entity: Customer
+    field: status
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /v1/customers/{customerId}/suspend"
+        actor: PlatformAdmin
+        preconditions:
+          - "customer.status == ACTIVE"
+        side_effects:
+          - "customer rejected on new order placement with ERR_CUSTOMER_SUSPENDED"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /v1/customers/{customerId}/reinstate"
+        actor: PlatformAdmin
+        preconditions:
+          - "customer.status == SUSPENDED"
+        side_effects: []
+
+  # ---- Product: ACTIVE -> DISCONTINUED ----
+  - entity: Product
+    field: status
+    initial_state: ACTIVE
+    terminal_states: [DISCONTINUED]
+    transitions:
+      - from: ACTIVE
+        to: DISCONTINUED
+        trigger: "POST /v1/products/{productId}/discontinue"
+        actor: [PlatformAdmin, StoreOps]
+        preconditions:
+          - "product.status == ACTIVE"
+        side_effects:
+          - "product rejected when added to new lines with ERR_PRODUCT_DISCONTINUED"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: slot-rebook-stale-slot
+    parent_entity: FulfillmentSlot
+    write_endpoint: "POST /v1/orders"
+    occ_field: "expected_slot_version"
+    description: |
+      Placing an Order against a FulfillmentSlot whose version has advanced since
+      the client last observed it is rejected. A prior placement that legitimately
+      consumed the last unit of capacity (driving booked_count to capacity and the
+      slot to FULL) advances the slot's version; a placement still carrying the
+      pre-booking version is operating on a stale view of remaining capacity and is
+      rejected on the stale-version check rather than silently overbooking.
+    error_id: ERR_SLOT_VERSION_STALE
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: line_charge
+    trigger: "OrderLine creation (estimated) and OrderLine pick/substitute-accept (final)"
+    algorithm: dual_variant
+    formula: |
+      Per-line charge in integer cents, computed per pricing_mode:
+        UNIT:   charge = unit_price_cents * qty                          # qty is each-count (integer)
+        WEIGHT: charge = round_half_up(unit_price_cents * weight_kg)     # round product to whole cents
+      estimated_line_cents uses (requested_qty for UNIT, estimated_weight_kg for WEIGHT).
+      final_line_cents uses (picked_qty for UNIT, actual_weight_kg for WEIGHT);
+        final_line_cents = 0 when the line is OUT_OF_STOCK or CANCELLED;
+        final_line_cents = substitute_line_cents when the line is SUBSTITUTED.
+    input_set: "single OrderLine and its Product"
+    constants: {}
+    precision: "integer cents; WEIGHT multiply-then-round_half_up"
+    variants:
+      - name: estimated
+        when: "at OrderLine creation, before pick"
+        difference: "uses requested_qty / estimated_weight_kg; written to estimated_line_cents"
+      - name: final
+        when: "at OrderLine pick (PICKED) or substitution accept (SUBSTITUTED)"
+        difference: "uses picked_qty / actual_weight_kg (or substitute weight); written to final_line_cents; diverges from estimated when scale weight differs"
+
+  - name: order_total_estimated
+    trigger: "Order placement (after all lines created)"
+    algorithm: aggregation
+    formula: |
+      estimated_total_cents = ( SUM of estimated_line_cents over all lines ) + tip_cents
+      estimated_ebt_eligible_cents = SUM of estimated_line_cents over lines whose Product.ebt_eligible == true
+      Rounding order is PINNED: each line is already rounded to whole cents by line_charge;
+      the order total is the integer SUM of already-rounded line charges (round-per-line, then sum),
+      NOT a re-round of a fractional product.
+    input_set: "all OrderLine of the Order at placement; tip_cents from Order"
+    constants: {}
+    precision: "integer cents; sum of per-line-rounded charges"
+
+  - name: order_total_final
+    trigger: "Order stage transition (PICKING -> STAGED); recomputed at capture and on out-of-stock refund"
+    algorithm: aggregation
+    formula: |
+      final_total_cents = ( SUM of final_line_cents over lines whose status in {PICKED, SUBSTITUTED} ) + tip_cents
+      final_ebt_eligible_cents = SUM of final_line_cents over {PICKED, SUBSTITUTED} lines whose EFFECTIVE Product.ebt_eligible == true
+        ( for SUBSTITUTED lines the effective product is the substitute_product )
+      OUT_OF_STOCK and CANCELLED lines contribute 0.
+      Round-per-line, then sum (same order as order_total_estimated).
+    input_set: "OrderLine of the Order in {PICKED, SUBSTITUTED}; tip_cents"
+    constants: {}
+    precision: "integer cents; sum of per-line-rounded charges"
+    variants:
+      - name: estimated_vs_final_divergence
+        when: "WEIGHT lines whose actual_weight_kg != estimated_weight_kg, or lines that went OUT_OF_STOCK"
+        difference: "final_total_cents differs from estimated_total_cents by the per-line deltas; the dual-variant divergence on the Order domain"
+
+  - name: split_tender_allocation
+    trigger: "Order capture (AUTHORIZED -> CAPTURED)"
+    algorithm: waterfall_allocation
+    formula: |
+      Inputs: final_ebt_eligible_cents (E), customer.snap_ebt_balance_cents (B), final_total_cents (T).
+      Step 1: ebt_charged_cents  = min(E, B)                    # EBT bucket: eligible items up to balance
+      Step 2: card_charged_cents = T - ebt_charged_cents        # card bucket: remainder (tip + ineligible + EBT overflow)
+      Invariant: ebt_charged_cents + card_charged_cents == T, and ebt_charged_cents <= B, and ebt_charged_cents <= E.
+      Evaluation order is PINNED: EBT bucket first, card bucket takes the remainder.
+    input_set: "Order final_ebt_eligible_cents, final_total_cents; Customer snap_ebt_balance_cents"
+    constants: {}
+    precision: "integer cents; nested min, no rounding (all inputs already integer cents)"
+
+  - name: out_of_stock_refund
+    trigger: "OrderLine PICKED -> OUT_OF_STOCK while Order.payment_status in {CAPTURED, PARTIALLY_REFUNDED}"
+    algorithm: chronological
+    formula: |
+      amount_cents = the OrderLine.final_line_cents that was captured for this line (its share of the captured total)
+                     read immediately BEFORE it is zeroed.
+      Refund records are append-only and processed in creation order (chronological).
+      Order.refunded_total_cents = SUM of amount_cents over all Refund records of the order.
+      net_captured_cents = ebt_charged_cents + card_charged_cents - refunded_total_cents.
+      The Order.payment_status cascades: CAPTURED -> PARTIALLY_REFUNDED while net_captured_cents > 0,
+      then -> REFUNDED when refunded_total_cents reaches ebt_charged_cents + card_charged_cents.
+      final_total_cents is also recomputed (the now-OUT_OF_STOCK line contributes 0).
+    input_set: "the OUT_OF_STOCK OrderLine's pre-zero final_line_cents; all prior Refund records of the Order (creation order)"
+    constants: {}
+    precision: "integer cents"
+
+  - name: age_check_outcome
+    trigger: "AgeCheck creation (POST /v1/age-checks)"
+    algorithm: threshold
+    formula: |
+      reference_date = date component (UTC) of the parent Order's FulfillmentSlot.window_start
+      age_years = whole completed years from verified_birth_date to reference_date
+      outcome = PASS if age_years >= MIN_AGE_YEARS else FAIL
+      Boundary is INCLUSIVE: a birth date that makes the customer exactly MIN_AGE_YEARS on reference_date -> PASS.
+    input_set: "AgeCheck.verified_birth_date; parent Order's FulfillmentSlot.window_start"
+    constants:
+      MIN_AGE_YEARS: 21
+    precision: "whole years, completed-birthday rule (>= boundary inclusive)"
+
+  - name: slot_capacity
+    trigger: "Order placement (book) and Order cancellation (release)"
+    algorithm: threshold
+    formula: |
+      booked_count = count of Orders referencing this slot whose fulfillment_status in
+                     {PLACED, PICKING, STAGED, HANDED_OFF}.
+      Placement is admitted iff booked_count < capacity BEFORE the new booking (boundary is strict <);
+      otherwise rejected with ERR_SLOT_FULL.
+      On placement success booked_count += 1; if booked_count == capacity then status -> FULL.
+      On cancellation booked_count -= 1; if status == FULL and booked_count < capacity then status -> OPEN.
+    input_set: "Orders referencing the slot, filtered by fulfillment_status"
+    constants: {}
+    precision: "integer count; admit boundary booked_count < capacity"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and well-formed"
+    error_id: ERR_MISSING_USER_CONTEXT
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Role authorized for this operation per §1.7 RBAC matrix; entity_backed Customer/Picker must own the targeted resource"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "Path resources exist (store, customer, picker, product, slot, order, order-line, substitution, age-check); unknown id -> not found"
+    error_id: "ERR_STORE_NOT_FOUND / ERR_CUSTOMER_NOT_FOUND / ERR_PRODUCT_NOT_FOUND / ERR_SLOT_NOT_FOUND / ERR_ORDER_NOT_FOUND / ERR_LINE_NOT_FOUND / ERR_SUBSTITUTION_NOT_FOUND / ERR_PICKER_NOT_FOUND"
+    http_status: 404
+    applies_to: all id-bearing endpoints
+
+  - priority: 4
+    category: business_referential
+    check: "Body foreign keys resolve and belong to the same store; product ACTIVE; customer ACTIVE; store ACTIVE"
+    error_id: "ERR_CUSTOMER_NOT_FOUND / ERR_SLOT_NOT_FOUND / ERR_PRODUCT_NOT_FOUND / ERR_PRODUCT_DISCONTINUED / ERR_CROSS_STORE_REFERENCE / ERR_CUSTOMER_SUSPENDED / ERR_STORE_CLOSED"
+    http_status: 409
+    applies_to: "POST /v1/orders, POST /v1/order-lines, POST /v1/substitutions"
+
+  - priority: 5
+    category: state
+    check: "Target resource in correct state for the transition (order fulfillment/payment dimension, line status, substitution status, slot status)"
+    error_id: "ERR_INVALID_ORDER_STATE / ERR_ORDER_NOT_PICKING / ERR_ORDER_NOT_STAGED / ERR_LINE_NOT_PENDING / ERR_SUBSTITUTION_NOT_PROPOSED / ERR_SLOT_CLOSED / ERR_ORDER_ALREADY_HANDED_OFF"
+    http_status: 409
+    applies_to: all transition endpoints
+
+  - priority: 6
+    category: business_constraint
+    check: "Concurrency / capacity / overlap / readiness constraints: slot OCC, slot capacity, slot window overlap, picker window overlap, stage readiness, pick quantity"
+    error_id: "ERR_SLOT_VERSION_STALE / ERR_SLOT_FULL / ERR_SLOT_WINDOW_OVERLAP / ERR_PICKER_WINDOW_CONFLICT / ERR_LINES_NOT_RESOLVED / ERR_NOTHING_TO_STAGE / ERR_INVALID_PICK_QUANTITY"
+    http_status: "409 / 412 / 400"
+    applies_to: "POST /v1/orders, POST /v1/slots, claim, stage, pick"
+
+  - priority: 7
+    category: business_safety
+    check: "Age-restricted handoff requires a PASS AgeCheck; a FAIL AgeCheck blocks handoff"
+    error_id: "ERR_AGE_VERIFICATION_REQUIRED / ERR_AGE_VERIFICATION_FAILED"
+    http_status: 403
+    applies_to: "POST /v1/orders/{id}/handoff"
+
+  - priority: 8
+    category: business_temporal
+    check: "Cold-chain hold window: a STAGED order with any cold-chain line may only hand off before staged_at + store.cold_chain_hold_minutes"
+    error_id: ERR_COLD_CHAIN_EXPIRED
+    http_status: 409
+    applies_to: "POST /v1/orders/{id}/handoff"
+
+  - priority: 9
+    category: business_fiscal
+    check: "Capture preconditions: order STAGED, payment AUTHORIZED, and ebt_enabled=false implies final_ebt_eligible_cents == 0; substitution price ceiling for SAME_PRICE_OR_LESS"
+    error_id: "ERR_ORDER_NOT_STAGED / ERR_PAYMENT_NOT_CAPTURED / ERR_EBT_NOT_ACCEPTED / ERR_SUBSTITUTION_PRICE_EXCEEDED"
+    http_status: "402 / 409"
+    applies_to: "POST /v1/orders/{id}/capture, POST /v1/orders/{id}/handoff, POST /v1/substitutions/{id}/accept"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Store ----
+  - method: POST
+    path: "/v1/stores"
+    description: "Create a store"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [name, "timezone?", "ebt_enabled?", "cold_chain_hold_minutes?"]
+    output: Store
+    side_effects: ["status=ACTIVE"]
+
+  - method: GET
+    path: "/v1/stores"
+    description: "List stores"
+    roles: [PlatformAdmin, StoreOps, Customer, Picker]
+    code: 200
+    input: []
+    output: "Store[]"
+    side_effects: []
+
+  - method: GET
+    path: "/v1/stores/{storeId}"
+    description: "Get a store"
+    roles: [PlatformAdmin, StoreOps, Customer, Picker]
+    code: 200
+    input: []
+    output: Store
+    side_effects: []
+
+  - method: POST
+    path: "/v1/stores/{storeId}/close"
+    description: "Close a store (blocks new orders)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Store
+    side_effects: ["status=CLOSED"]
+
+  # ---- Customer ----
+  - method: POST
+    path: "/v1/customers"
+    description: "Create a customer"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [email, full_name, date_of_birth, "snap_ebt_balance_cents?"]
+    output: Customer
+    side_effects: ["status=ACTIVE"]
+
+  - method: GET
+    path: "/v1/customers"
+    description: "List customers (filterable by email)"
+    roles: [PlatformAdmin, StoreOps]
+    code: 200
+    input: ["email?"]
+    output: "Customer[]"
+    side_effects: []
+
+  - method: GET
+    path: "/v1/customers/{customerId}"
+    description: "Get a customer"
+    roles: [PlatformAdmin, StoreOps, Customer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  - method: POST
+    path: "/v1/customers/{customerId}/suspend"
+    description: "Suspend a customer (blocks new orders)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["status=SUSPENDED"]
+
+  - method: POST
+    path: "/v1/customers/{customerId}/reinstate"
+    description: "Reinstate a SUSPENDED customer"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["status=ACTIVE"]
+
+  # ---- Picker ----
+  - method: POST
+    path: "/v1/pickers"
+    description: "Create a picker bound to a store"
+    roles: [PlatformAdmin, StoreOps]
+    code: 201
+    input: [store_id, full_name, "window_cooldown_minutes?"]
+    output: Picker
+    side_effects: ["status=AVAILABLE"]
+
+  - method: GET
+    path: "/v1/pickers"
+    description: "List pickers (filterable by store_id)"
+    roles: [PlatformAdmin, StoreOps, Picker]
+    code: 200
+    input: ["store_id?"]
+    output: "Picker[]"
+    side_effects: []
+
+  - method: GET
+    path: "/v1/pickers/{pickerId}"
+    description: "Get a picker"
+    roles: [PlatformAdmin, StoreOps, Picker]
+    code: 200
+    input: []
+    output: Picker
+    side_effects: []
+
+  # ---- Product ----
+  - method: POST
+    path: "/v1/products"
+    description: "Create a product in a store catalog"
+    roles: [PlatformAdmin, StoreOps]
+    code: 201
+    input: [store_id, sku, name, pricing_mode, unit_price_cents, "ebt_eligible?", "age_restricted?", "cold_chain?", "on_hand_qty?"]
+    output: Product
+    side_effects: ["status=ACTIVE"]
+
+  - method: GET
+    path: "/v1/products"
+    description: "List products (filterable by store_id, sku)"
+    roles: [PlatformAdmin, StoreOps, Customer, Picker]
+    code: 200
+    input: ["store_id?", "sku?"]
+    output: "Product[]"
+    side_effects: []
+
+  - method: GET
+    path: "/v1/products/{productId}"
+    description: "Get a product"
+    roles: [PlatformAdmin, StoreOps, Customer, Picker]
+    code: 200
+    input: []
+    output: Product
+    side_effects: []
+
+  - method: POST
+    path: "/v1/products/{productId}/discontinue"
+    description: "Discontinue a product"
+    roles: [PlatformAdmin, StoreOps]
+    code: 200
+    input: []
+    output: Product
+    side_effects: ["status=DISCONTINUED"]
+
+  # ---- FulfillmentSlot ----
+  - method: POST
+    path: "/v1/slots"
+    description: "Create a fulfillment slot; rejects window overlap with an existing slot of the same store and slot_type"
+    roles: [PlatformAdmin, StoreOps]
+    code: 201
+    input: [store_id, slot_type, window_start, window_end, capacity]
+    output: FulfillmentSlot
+    side_effects: ["status=OPEN, booked_count=0"]
+
+  - method: GET
+    path: "/v1/slots"
+    description: "List slots (filterable by store_id, slot_type)"
+    roles: [PlatformAdmin, StoreOps, Customer]
+    code: 200
+    input: ["store_id?", "slot_type?"]
+    output: "FulfillmentSlot[]"
+    side_effects: []
+
+  - method: GET
+    path: "/v1/slots/{slotId}"
+    description: "Get a slot"
+    roles: [PlatformAdmin, StoreOps, Customer]
+    code: 200
+    input: []
+    output: FulfillmentSlot
+    side_effects: []
+
+  - method: POST
+    path: "/v1/slots/{slotId}/close"
+    description: "Close a slot (blocks new placements)"
+    roles: [PlatformAdmin, StoreOps]
+    code: 200
+    input: []
+    output: FulfillmentSlot
+    side_effects: ["status=CLOSED"]
+
+  # ---- Order ----
+  - method: POST
+    path: "/v1/orders"
+    description: "Place an order: books a slot (OCC on slot version), creates lines, computes estimated totals"
+    roles: [Customer, StoreOps]
+    code: 201
+    input: [store_id, customer_id, slot_id, expected_slot_version, lines, "tip_cents?"]
+    output: Order
+    side_effects:
+      - "create one OrderLine per lines[] entry; compute each estimated_line_cents"
+      - "compute Order.estimated_total_cents, estimated_ebt_eligible_cents"
+      - "FulfillmentSlot.booked_count += 1; increments FulfillmentSlot.version by 1; slot -> FULL if booked_count == capacity"
+      - "fulfillment_status=PLACED, payment_status=AUTHORIZED"
+
+  - method: GET
+    path: "/v1/orders"
+    description: "List orders (filterable by store_id, customer_id, slot_id, picker_id)"
+    roles: [PlatformAdmin, StoreOps, Customer, Picker]
+    code: 200
+    input: ["store_id?", "customer_id?", "slot_id?", "picker_id?"]
+    output: "Order[]"
+    side_effects: []
+
+  - method: GET
+    path: "/v1/orders/{orderId}"
+    description: "Get an order"
+    roles: [PlatformAdmin, StoreOps, Customer, Picker]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+
+  - method: POST
+    path: "/v1/orders/{orderId}/claim"
+    description: "Picker claims order; fulfillment_status PLACED -> PICKING; enforces picker window non-overlap"
+    roles: [Picker]
+    code: 200
+    input: [window_start, window_end]
+    output: Order
+    side_effects: ["picker_id set, fulfillment_status=PICKING"]
+
+  - method: POST
+    path: "/v1/orders/{orderId}/stage"
+    description: "Stage a picked order; PICKING -> STAGED; sets staged_at, recomputes final totals"
+    roles: [Picker]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["staged_at set, fulfillment_status=STAGED, final totals recomputed"]
+
+  - method: POST
+    path: "/v1/orders/{orderId}/capture"
+    description: "Capture payment; AUTHORIZED -> CAPTURED; runs split-tender allocation, debits EBT balance, creates Payment"
+    roles: [StoreOps]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["ebt/card charged, snap balance debited, Payment created, payment_status=CAPTURED, net_captured_cents set"]
+
+  - method: POST
+    path: "/v1/orders/{orderId}/handoff"
+    description: "Hand off a staged, captured order; STAGED -> HANDED_OFF; enforces age + cold-chain gates"
+    roles: [StoreOps]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["fulfillment_status=HANDED_OFF"]
+
+  - method: POST
+    path: "/v1/orders/{orderId}/cancel"
+    description: "Cancel an order; cascades line cancellation, slot release (version bump), and payment void/refund"
+    roles: [Customer, StoreOps]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["fulfillment_status=CANCELLED, lines CANCELLED, slot booked_count decremented + version bumped, payment VOIDED or REFUNDED"]
+
+  # ---- OrderLine ----
+  - method: POST
+    path: "/v1/order-lines"
+    description: "Add a line to a PLACED order before claim (cart edit); computes estimated_line_cents"
+    roles: [Customer, StoreOps]
+    code: 201
+    input: [order_id, product_id, requested_qty, "estimated_weight_kg?", "substitution_policy?"]
+    output: OrderLine
+    side_effects: ["status=PENDING, estimated_line_cents computed, Order.estimated totals recomputed"]
+
+  - method: GET
+    path: "/v1/order-lines"
+    description: "List order lines (filterable by order_id, product_id)"
+    roles: [PlatformAdmin, StoreOps, Customer, Picker]
+    code: 200
+    input: ["order_id?", "product_id?"]
+    output: "OrderLine[]"
+    side_effects: []
+
+  - method: GET
+    path: "/v1/order-lines/{lineId}"
+    description: "Get an order line"
+    roles: [PlatformAdmin, StoreOps, Customer, Picker]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects: []
+
+  - method: POST
+    path: "/v1/order-lines/{lineId}/pick"
+    description: "Mark a line PICKED; records picked_qty/actual_weight_kg; recomputes final_line_cents"
+    roles: [Picker]
+    code: 200
+    input: ["picked_qty?", "actual_weight_kg?"]
+    output: OrderLine
+    side_effects: ["status=PICKED, final_line_cents recomputed"]
+
+  - method: POST
+    path: "/v1/order-lines/{lineId}/out-of-stock"
+    description: "Mark a line OUT_OF_STOCK. From PENDING during PICKING: line contributes 0, no refund. From PICKED on a STAGED+captured order: refund cascade."
+    roles: [Picker, StoreOps]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects: ["status=OUT_OF_STOCK, final_line_cents=0; if PICKED+captured: Refund created + refunded_total/payment_status/net_captured recompute + final_total recompute"]
+
+  # ---- Substitution ----
+  - method: POST
+    path: "/v1/substitutions"
+    description: "Propose a substitute product for a PENDING line; computes substitute_line_cents"
+    roles: [Picker]
+    code: 201
+    input: [order_line_id, substitute_product_id, substitute_qty, "substitute_weight_kg?"]
+    output: Substitution
+    side_effects: ["status=PROPOSED, substitute_line_cents computed"]
+
+  - method: GET
+    path: "/v1/substitutions"
+    description: "List substitutions (filterable by order_line_id, substitute_product_id)"
+    roles: [PlatformAdmin, StoreOps, Customer, Picker]
+    code: 200
+    input: ["order_line_id?", "substitute_product_id?"]
+    output: "Substitution[]"
+    side_effects: []
+
+  - method: GET
+    path: "/v1/substitutions/{subId}"
+    description: "Get a substitution"
+    roles: [PlatformAdmin, StoreOps, Customer, Picker]
+    code: 200
+    input: []
+    output: Substitution
+    side_effects: []
+
+  - method: POST
+    path: "/v1/substitutions/{subId}/accept"
+    description: "Accept a proposed substitution; line -> SUBSTITUTED; enforces policy and price ceiling"
+    roles: [Customer, Picker]
+    code: 200
+    input: []
+    output: Substitution
+    side_effects: ["status=ACCEPTED, line=SUBSTITUTED, final_line_cents set"]
+
+  - method: POST
+    path: "/v1/substitutions/{subId}/reject"
+    description: "Reject a proposed substitution; line stays PENDING"
+    roles: [Customer, Picker]
+    code: 200
+    input: []
+    output: Substitution
+    side_effects: ["status=REJECTED"]
+
+  # ---- Payment (capture record discovery) ----
+  - method: GET
+    path: "/v1/payments"
+    description: "List payment capture records (filterable by order_id)"
+    roles: [PlatformAdmin, StoreOps, Customer]
+    code: 200
+    input: ["order_id?"]
+    output: "Payment[]"
+    side_effects: []
+
+  - method: GET
+    path: "/v1/payments/{paymentId}"
+    description: "Get a payment capture record"
+    roles: [PlatformAdmin, StoreOps, Customer]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+
+  # ---- Refund (out-of-stock refund discovery) ----
+  - method: GET
+    path: "/v1/refunds"
+    description: "List refund records (filterable by order_id, order_line_id)"
+    roles: [PlatformAdmin, StoreOps, Customer]
+    code: 200
+    input: ["order_id?", "order_line_id?"]
+    output: "Refund[]"
+    side_effects: []
+
+  - method: GET
+    path: "/v1/refunds/{refundId}"
+    description: "Get a refund record"
+    roles: [PlatformAdmin, StoreOps, Customer]
+    code: 200
+    input: []
+    output: Refund
+    side_effects: []
+
+  # ---- AgeCheck ----
+  - method: POST
+    path: "/v1/age-checks"
+    description: "Record an in-person age verification; computes PASS/FAIL by completed-years rule against slot.window_start"
+    roles: [StoreOps]
+    code: 201
+    input: [order_id, verifier_user_id, verified_birth_date]
+    output: AgeCheck
+    side_effects: ["outcome computed PASS/FAIL"]
+
+  - method: GET
+    path: "/v1/age-checks"
+    description: "List age checks (filterable by order_id)"
+    roles: [PlatformAdmin, StoreOps, Customer]
+    code: 200
+    input: ["order_id?"]
+    output: "AgeCheck[]"
+    side_effects: []
+
+  - method: GET
+    path: "/v1/age-checks/{ageCheckId}"
+    description: "Get an age check"
+    roles: [PlatformAdmin, StoreOps, Customer]
+    code: 200
+    input: []
+    output: AgeCheck
+    side_effects: []
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving endpoint: set the server's deterministic current UTC clock used for staged_at and cold-chain evaluation"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server current_utc set to the given timestamp"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- request / auth ---
+  - { id: ERR_VALIDATION, http: 400, condition: "Malformed body, missing required field, or invalid enum/type" }
+  - { id: ERR_MISSING_USER_CONTEXT, http: 401, condition: "X-User-ID or X-User-Role header missing or malformed" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Authenticated role not permitted for the operation, or entity_backed user does not own the resource" }
+
+  # --- existence ---
+  - { id: ERR_STORE_NOT_FOUND, http: 404, condition: "Store id does not exist" }
+  - { id: ERR_CUSTOMER_NOT_FOUND, http: 404, condition: "Customer id does not exist" }
+  - { id: ERR_PRODUCT_NOT_FOUND, http: 404, condition: "Product id does not exist" }
+  - { id: ERR_SLOT_NOT_FOUND, http: 404, condition: "FulfillmentSlot id does not exist" }
+  - { id: ERR_PICKER_NOT_FOUND, http: 404, condition: "Picker id does not exist" }
+  - { id: ERR_ORDER_NOT_FOUND, http: 404, condition: "Order id does not exist" }
+  - { id: ERR_LINE_NOT_FOUND, http: 404, condition: "OrderLine id does not exist" }
+  - { id: ERR_SUBSTITUTION_NOT_FOUND, http: 404, condition: "Substitution id does not exist" }
+
+  # --- referential / cross-store ---
+  - { id: ERR_CROSS_STORE_REFERENCE, http: 409, condition: "Referenced slot/product/picker belongs to a different store than the order's store_id" }
+  - { id: ERR_PRODUCT_DISCONTINUED, http: 409, condition: "Referenced product is DISCONTINUED and cannot be ordered or substituted in" }
+  - { id: ERR_CUSTOMER_SUSPENDED, http: 409, condition: "Ordering customer is SUSPENDED" }
+  - { id: ERR_STORE_CLOSED, http: 409, condition: "Store is CLOSED; new orders refused" }
+
+  # --- order / line / substitution / slot state ---
+  - { id: ERR_INVALID_ORDER_STATE, http: 409, condition: "Order not in a valid fulfillment/payment state for this transition" }
+  - { id: ERR_ORDER_NOT_PICKING, http: 409, condition: "Operation requires Order.fulfillment_status == PICKING" }
+  - { id: ERR_ORDER_NOT_STAGED, http: 409, condition: "Operation requires Order.fulfillment_status == STAGED" }
+  - { id: ERR_ORDER_ALREADY_HANDED_OFF, http: 409, condition: "Order already HANDED_OFF; cannot cancel or re-transition" }
+  - { id: ERR_LINE_NOT_PENDING, http: 409, condition: "OrderLine not in PENDING state for pick/substitute/pre-capture out-of-stock" }
+  - { id: ERR_LINE_NOT_PICKED, http: 409, condition: "Post-capture out-of-stock requires OrderLine in PICKED state on a STAGED captured order" }
+  - { id: ERR_SUBSTITUTION_NOT_PROPOSED, http: 409, condition: "Substitution not in PROPOSED state" }
+  - { id: ERR_SLOT_CLOSED, http: 409, condition: "Slot is CLOSED; placement refused" }
+
+  # --- capacity / concurrency / overlap / constraints ---
+  - { id: ERR_SLOT_VERSION_STALE, http: 412, condition: "expected_slot_version does not match current FulfillmentSlot.version (OCC)" }
+  - { id: ERR_SLOT_FULL, http: 409, condition: "Slot booked_count == capacity at placement time" }
+  - { id: ERR_SLOT_WINDOW_OVERLAP, http: 409, condition: "New slot window overlaps an existing slot of same store and slot_type (half-open [start,end))" }
+  - { id: ERR_PICKER_WINDOW_CONFLICT, http: 409, condition: "Claimed pick window overlaps an existing claimed window of this picker within the cooldown buffer (closed-interval + buffer)" }
+  - { id: ERR_LINES_NOT_RESOLVED, http: 409, condition: "Stage attempted while at least one line is still PENDING" }
+  - { id: ERR_NOTHING_TO_STAGE, http: 409, condition: "Stage attempted but no line is PICKED or SUBSTITUTED" }
+  - { id: ERR_INVALID_PICK_QUANTITY, http: 400, condition: "Pick missing or non-positive picked_qty (UNIT) / actual_weight_kg (WEIGHT)" }
+
+  # --- safety / temporal / fiscal ---
+  - { id: ERR_AGE_VERIFICATION_REQUIRED, http: 403, condition: "Handoff of an age-restricted order without a PASS AgeCheck" }
+  - { id: ERR_AGE_VERIFICATION_FAILED, http: 403, condition: "Handoff blocked because the order's AgeCheck outcome is FAIL" }
+  - { id: ERR_COLD_CHAIN_EXPIRED, http: 409, condition: "Handoff after staged_at + store.cold_chain_hold_minutes for a cold-chain order" }
+  - { id: ERR_PAYMENT_NOT_CAPTURED, http: 409, condition: "Handoff attempted while payment_status != CAPTURED" }
+  - { id: ERR_EBT_NOT_ACCEPTED, http: 409, condition: "Store ebt_enabled == false but order has final_ebt_eligible_cents > 0 at capture" }
+  - { id: ERR_SUBSTITUTION_NOT_ALLOWED, http: 409, condition: "Substitution accept on a line whose substitution_policy is NO_SUBSTITUTION" }
+  - { id: ERR_SUBSTITUTION_PRICE_EXCEEDED, http: 409, condition: "SAME_PRICE_OR_LESS line but substitute_line_cents > estimated_line_cents" }
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Platform operator; provisions stores, customers, catalog, pickers, slots; sets the test clock"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /v1/stores — create store"
+      - "POST /v1/stores/{id}/close — close store"
+      - "POST /v1/customers — create customer"
+      - "POST /_clock/set_current_utc — set test clock"
+    shared_operations:
+      - "POST /v1/pickers, /v1/products, /v1/slots, /v1/products/{id}/discontinue, /v1/slots/{id}/close (shared with StoreOps)"
+      - "GET on all resources"
+
+  - name: StoreOps
+    description: "Store back-office operator; manages catalog/slots/pickers, captures payment, performs age checks, hands off, may place/cancel"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /v1/orders/{id}/capture — capture payment"
+      - "POST /v1/orders/{id}/handoff — hand off order"
+      - "POST /v1/age-checks — record age verification"
+    shared_operations:
+      - "POST /v1/pickers, /v1/products, /v1/slots, /v1/products/{id}/discontinue, /v1/slots/{id}/close (shared with PlatformAdmin)"
+      - "POST /v1/orders — place order (shared with Customer)"
+      - "POST /v1/order-lines — add line (shared with Customer)"
+      - "POST /v1/orders/{id}/cancel — cancel order (shared with Customer)"
+      - "GET on all resources"
+
+  - name: Customer
+    description: "Ordering customer; places own orders, edits cart, cancels own orders, decides substitutions on own orders"
+    identity: "entity_backed:Customer"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /v1/orders — place order (X-User-ID must equal customer_id; shared with StoreOps)"
+      - "POST /v1/order-lines — add line to own order (shared with StoreOps)"
+      - "POST /v1/orders/{id}/cancel — cancel own order (shared with StoreOps)"
+      - "POST /v1/substitutions/{id}/accept, /reject — decide substitution (shared with Picker)"
+      - "GET on stores, customers, products, slots, own orders, lines, substitutions, payments, refunds, age-checks"
+
+  - name: Picker
+    description: "In-store picker; claims orders, picks/marks-out-of-stock lines, proposes and decides substitutions, stages orders"
+    identity: "entity_backed:Picker"
+    exclusive_operations:
+      - "POST /v1/orders/{id}/claim — claim order (X-User-ID must equal a Picker.id of the order's store)"
+      - "POST /v1/orders/{id}/stage — stage order"
+      - "POST /v1/order-lines/{id}/pick — pick line"
+      - "POST /v1/order-lines/{id}/out-of-stock — mark line out of stock"
+      - "POST /v1/substitutions — propose substitution"
+    shared_operations:
+      - "POST /v1/substitutions/{id}/accept, /reject — decide substitution (shared with Customer)"
+      - "GET on stores, products, pickers, orders, lines, substitutions"

@@ -1,0 +1,76 @@
+"""Error classes and the error catalog (error_id -> HTTP status)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = http_status if http_status is not None else ERROR_STATUS.get(error_id, 400)
+
+
+# error_id -> HTTP status code (from PRD §5 / scaffold §1.6)
+ERROR_STATUS = {
+    # Auth
+    "ERR_MISSING_OR_INVALID_AUTH": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    # Not found
+    "ERR_DECLARATION_NOT_FOUND": 404,
+    "ERR_INSPECTOR_NOT_FOUND": 404,
+    "ERR_CASEWORKER_NOT_FOUND": 404,
+    "ERR_APPLICANT_NOT_FOUND": 404,
+    "ERR_ASSESSMENT_NOT_FOUND": 404,
+    "ERR_CASE_NOT_FOUND": 404,
+    "ERR_LINE_ITEM_NOT_FOUND": 404,
+    "ERR_DOB_NOT_FOUND": 404,
+    "ERR_APPEAL_NOT_FOUND": 404,
+    "ERR_REFERRAL_NOT_FOUND": 404,
+    "ERR_DISBURSEMENT_NOT_FOUND": 404,
+    "ERR_RECOUPMENT_NOT_FOUND": 404,
+    # Request validation
+    "ERR_INVALID_REQUEST": 422,
+    "ERR_MISSING_REQUIRED_FIELD": 422,
+    "ERR_DAMAGE_DATE_OUT_OF_PERIOD": 422,
+    # Temporal / registration
+    "ERR_REGISTRATION_CLOSED": 409,
+    "ERR_DECLARATION_NOT_OPEN": 409,
+    "ERR_DECLARATION_NOT_REGISTRATION_CLOSED": 409,
+    "ERR_DECLARATION_CLOSED": 409,
+    "ERR_OPEN_DISBURSING_CASES": 409,
+    # Applicant / assessment state
+    "ERR_APPLICANT_NOT_REGISTERED": 409,
+    "ERR_APPLICANT_NOT_INSPECTED": 409,
+    "ERR_APPLICANT_NOT_WITHDRAWABLE": 409,
+    "ERR_ASSESSMENT_NOT_SCHEDULED": 409,
+    "ERR_ASSESSMENT_NOT_INSPECTED": 409,
+    "ERR_ASSESSMENT_NOT_VERIFIED": 409,
+    "ERR_INSPECTOR_DOUBLE_BOOKED": 409,
+    "ERR_RENTAL_PERIOD_OVERLAP": 409,
+    # IhpCase / appeal state
+    "ERR_CASE_NOT_PENDING": 409,
+    "ERR_CASE_NOT_APPROVED": 409,
+    "ERR_CASE_NOT_DISBURSING": 409,
+    "ERR_CASE_NOT_APPEALABLE": 409,
+    "ERR_CASE_NOT_UNDER_APPEAL": 409,
+    "ERR_APPEAL_NOT_SUBMITTED": 409,
+    "ERR_NO_ELIGIBLE_AMOUNT": 409,
+    "ERR_INVALID_APPEAL_OUTCOME": 422,
+    # DOB / SBA
+    "ERR_DOB_NOT_RECORDED": 409,
+    "ERR_REFERRAL_NOT_OPEN": 409,
+    "ERR_SBA_NOT_ELIGIBLE": 422,
+    "ERR_INVALID_SBA_OUTCOME": 422,
+    # Disbursement fiscal / OCC
+    "ERR_LINE_ITEM_NOT_APPROVED": 409,
+    "ERR_DISBURSEMENT_EXCEEDS_OBLIGATION": 402,
+    "ERR_DISBURSEMENT_NOT_PAID": 409,
+    "ERR_STALE_CASE_VERSION": 412,
+    # Recoupment
+    "ERR_RECOUPMENT_NOT_ESTABLISHED": 409,
+    "ERR_RECOUPMENT_NOT_FULLY_RECOVERED": 409,
+    "ERR_OPEN_RECOUPMENT": 409,
+    # Rental assistance period
+    "ERR_RENTAL_PERIOD_NOT_ACTIVE": 409,
+    "ERR_CASE_NOT_FUNDABLE_FOR_RENTAL": 409,
+}

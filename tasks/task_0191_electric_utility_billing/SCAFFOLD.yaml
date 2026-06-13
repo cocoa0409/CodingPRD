@@ -1,0 +1,1470 @@
+scenario: |
+  Electric Utility Billing: AMI meter read import, inclining-block tiered rates,
+  time-of-use periods, demand charges (kW), net metering credit rollover,
+  levelized budget billing, disconnect/reconnect for nonpay, LIHEAP assistance
+
+domain_name: electric-utility-billing
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: ledger_reconciliation
+  complexity_layers:
+    - dual_variant_calculation        # budget-billed levelized amount vs actual usage cost (true-up)
+    - rate_threshold_triggers         # inclining-block tiers + arrears-day disconnect threshold
+    - cascading_side_effects          # delinquency -> disconnect notice -> service order -> account state
+    - optimistic_concurrency          # bill issuance and budget-plan reset against a stale account version
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (Account is the hub; meters, reads,
+  # bills, payments, service orders, plans all reference it by id). No deep
+  # nesting in URL paths — children are discovered by filtered-list GETs.
+
+  state_machine_shape: parallel
+  # Account carries two independent dimensions: service_status (ACTIVE /
+  # DISCONNECT_PENDING / DISCONNECTED / RECONNECT_PENDING) and financial_status
+  # (CURRENT / DELINQUENT / IN_ARREARS). Bill, ServiceOrder, BudgetBillingPlan,
+  # and AssistanceGrant carry their own cyclic / branching machines.
+
+  relationship_patterns:
+    - one_to_many        # Account -> Meter, Bill, Payment, ServiceOrder, MeterRead
+    - cross_aggregate    # Bill references the rate Tariff version it was priced under; Payment applies across Bills
+
+  role_model: peer_roles
+  # BillingOperator runs the rate engine and issues bills; FieldDispatcher
+  # executes disconnect/reconnect service orders; AssistanceCaseworker manages
+  # LIHEAP grants; Customer reads own account and submits payments.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Tariff
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: "Unique tariff code, e.g. RES-TOU-2026"
+        constraints: "unique across all Tariffs"
+      - name: name
+        type: string
+        source: input
+        description: "Human-readable tariff name"
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state; only ACTIVE tariffs may price new bills"
+        default: DRAFT
+        constraints: "one of {DRAFT, ACTIVE, RETIRED}"
+      - name: fixed_charge_cents
+        type: integer
+        source: input
+        description: "Flat monthly customer charge in cents, applied once per bill"
+        constraints: ">= 0"
+      - name: tier_breakpoints_kwh
+        type: array
+        source: input
+        description: "Ascending kWh breakpoints between inclining blocks, e.g. [500, 1000]; N breakpoints define N+1 tiers"
+        constraints: "strictly ascending; each value > 0"
+      - name: tier_rates_cents_per_kwh
+        type: array
+        source: input
+        description: "Per-kWh energy rate (cents) for each tier; length == len(tier_breakpoints_kwh)+1; strictly ascending so blocks incline"
+        constraints: "length == breakpoints+1; strictly ascending"
+      - name: tou_multipliers
+        type: object
+        source: input
+        description: "Map of TOU period -> multiplier applied to the tier-priced energy fraction in that period, keys exactly {ON_PEAK, MID_PEAK, OFF_PEAK}"
+        constraints: "each multiplier > 0; ON_PEAK >= MID_PEAK >= OFF_PEAK"
+      - name: demand_charge_cents_per_kw
+        type: integer
+        source: input
+        description: "Charge in cents per kW of billed peak demand"
+        constraints: ">= 0"
+      - name: net_metering_credit_cents_per_kwh
+        type: integer
+        source: input
+        description: "Credit in cents granted per kWh of net export (avoided-cost rate)"
+        constraints: ">= 0"
+
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - name: tariff_id
+        type: string
+        source: input
+        description: "FK -> Tariff.id; the tariff this account is priced under; must be ACTIVE at assignment"
+      - name: holder_name
+        type: string
+        source: input
+        description: "Account holder full name"
+      - name: service_status
+        type: enum
+        source: computed
+        description: "Service dimension (independent of financial_status)"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, DISCONNECT_PENDING, DISCONNECTED, RECONNECT_PENDING}"
+      - name: financial_status
+        type: enum
+        source: computed
+        description: "Financial dimension (independent of service_status)"
+        default: CURRENT
+        constraints: "one of {CURRENT, DELINQUENT, IN_ARREARS}"
+      - name: balance_cents
+        type: integer
+        source: computed
+        description: "Net amount owed in cents = sum of issued Bill.total_due_cents minus sum of applied Payment.amount_cents minus applied assistance; positive = owed, negative = credit"
+        default: 0
+      - name: net_metering_credit_balance_cents
+        type: integer
+        source: computed
+        description: "Carried-forward net-metering credit in cents; rolls month to month, never reduces balance below the fixed+demand floor of a bill"
+        default: 0
+      - name: oldest_unpaid_bill_due_date
+        type: datetime
+        source: computed
+        description: "Due date (ISO 8601) of the oldest issued, not-fully-paid Bill; null when none; drives arrears-day threshold"
+        default: null
+      - name: budget_plan_id
+        type: string
+        source: computed
+        description: "Denormalized pointer to the account's currently ACTIVE BudgetBillingPlan id, or null if none. The authoritative link is BudgetBillingPlan.account_id; discover via GET /budget-plans?account_id=. (Not a canonical FK: it is a derived convenience mirror, set/cleared by plan enroll/true-up/cancel.)"
+        default: null
+
+  - name: Meter
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account this meter serves"
+      - name: serial
+        type: string
+        source: input
+        description: "Manufacturer serial; unique across all Meters"
+        constraints: "unique"
+      - name: meter_type
+        type: enum
+        source: input
+        description: "Drives which read channels are expected"
+        default: BIDIRECTIONAL
+        constraints: "one of {CONSUMPTION_ONLY, BIDIRECTIONAL}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Meter lifecycle"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, REMOVED}"
+
+  - name: MeterRead
+    parent: null
+    common_fields: false
+    fields:
+      - name: meter_id
+        type: string
+        source: input
+        description: "FK -> Meter.id; the meter that produced this interval read"
+      - name: interval_start
+        type: datetime
+        source: input
+        description: "Inclusive ISO 8601 UTC start of the AMI interval"
+      - name: interval_end
+        type: datetime
+        source: input
+        description: "Exclusive ISO 8601 UTC end of the AMI interval; must equal interval_start + 60 minutes"
+        constraints: "interval_end == interval_start + 1h"
+      - name: import_kwh
+        type: number
+        source: input
+        description: "kWh delivered to the customer during this interval (grid -> customer)"
+        constraints: ">= 0"
+      - name: export_kwh
+        type: number
+        source: input
+        description: "kWh exported by the customer during this interval (customer -> grid); must be 0 for CONSUMPTION_ONLY meters"
+        constraints: ">= 0"
+      - name: tou_period
+        type: enum
+        source: computed
+        description: "TOU period derived from interval_start hour-of-day (UTC) per the FIXED schedule: ON_PEAK = hours 16-20 (16:00-21:00); MID_PEAK = hours 7-15 and 21-22 (07:00-16:00, 21:00-23:00); OFF_PEAK = hours 23-6 (23:00-07:00)"
+        constraints: "one of {ON_PEAK, MID_PEAK, OFF_PEAK}"
+      - name: avg_demand_kw
+        type: number
+        source: computed
+        description: "Average demand in kW over the interval = import_kwh / 1.0h (interval is one hour)"
+
+  - name: Bill
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the billed account"
+      - name: tariff_id
+        type: string
+        source: computed
+        description: "FK -> Tariff.id; the tariff version this bill was priced under, snapshotted at issuance"
+      - name: period_start
+        type: datetime
+        source: input
+        description: "Inclusive ISO 8601 UTC start of the billing period"
+      - name: period_end
+        type: datetime
+        source: input
+        description: "Exclusive ISO 8601 UTC end of the billing period; reads with interval_start in [period_start, period_end) are billed"
+      - name: status
+        type: enum
+        source: computed
+        description: "Bill lifecycle"
+        default: DRAFT
+        constraints: "one of {DRAFT, ISSUED, PARTIALLY_PAID, PAID, VOID}"
+      - name: total_import_kwh
+        type: number
+        source: computed
+        description: "Sum of import_kwh over billed reads"
+        default: 0
+      - name: total_export_kwh
+        type: number
+        source: computed
+        description: "Sum of export_kwh over billed reads"
+        default: 0
+      - name: billed_peak_demand_kw
+        type: number
+        source: computed
+        description: "Maximum avg_demand_kw over ON_PEAK reads in the period (demand charge basis)"
+        default: 0
+      - name: energy_charge_cents
+        type: integer
+        source: computed
+        description: "Tiered + TOU energy charge in cents"
+        default: 0
+      - name: demand_charge_cents
+        type: integer
+        source: computed
+        description: "billed_peak_demand_kw * tariff.demand_charge_cents_per_kw, rounded"
+        default: 0
+      - name: net_metering_credit_applied_cents
+        type: integer
+        source: computed
+        description: "Net-metering credit consumed by this bill in cents (>= 0)"
+        default: 0
+      - name: assistance_applied_cents
+        type: integer
+        source: computed
+        description: "LIHEAP assistance applied to this bill in cents (>= 0)"
+        default: 0
+      - name: total_due_cents
+        type: integer
+        source: computed
+        description: "Final amount due in cents after fixed + energy + demand - credit - assistance, floored at 0"
+        default: 0
+      - name: amount_paid_cents
+        type: integer
+        source: computed
+        description: "Sum of Payment allocations applied to this bill in cents"
+        default: 0
+      - name: due_date
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC payment due date for this bill"
+      - name: is_budget_billed
+        type: boolean
+        source: computed
+        description: "True when issued under an ACTIVE BudgetBillingPlan, so total_due_cents is the levelized amount not the actual cost"
+        default: false
+      - name: actual_cost_cents
+        type: integer
+        source: computed
+        description: "The cost that WOULD be due absent budget billing (fixed+energy+demand-credit-assistance, floored at 0); equals total_due_cents when not budget-billed"
+        default: 0
+
+  - name: Payment
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account being paid"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Payment amount in cents"
+        constraints: "> 0"
+      - name: method
+        type: enum
+        source: input
+        description: "Payment method"
+        default: ACH
+        constraints: "one of {ACH, CARD, CASH}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Payment lifecycle"
+        default: POSTED
+        constraints: "one of {POSTED, REVERSED}"
+      - name: allocations
+        type: array
+        source: computed
+        description: "Ordered list of {bill_id, applied_cents} allocations produced by waterfall application to oldest-due-first bills"
+
+  - name: ServiceOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account the field work targets"
+      - name: order_type
+        type: enum
+        source: input
+        description: "Kind of field work"
+        constraints: "one of {DISCONNECT, RECONNECT}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Service order lifecycle"
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, COMPLETED, CANCELLED}"
+      - name: reason
+        type: enum
+        source: input
+        description: "Why the order was raised"
+        default: NONPAY
+        constraints: "one of {NONPAY, CUSTOMER_REQUEST, RESTORE_AFTER_PAYMENT}"
+
+  - name: BudgetBillingPlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the enrolled account"
+      - name: status
+        type: enum
+        source: computed
+        description: "Plan lifecycle"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, TRUED_UP, CANCELLED}"
+      - name: levelized_amount_cents
+        type: integer
+        source: input
+        description: "Fixed monthly amount in cents charged on each bill while ACTIVE"
+        constraints: "> 0"
+      - name: accumulated_actual_cents
+        type: integer
+        source: computed
+        description: "Running sum of actual_cost_cents of bills issued under this plan"
+        default: 0
+      - name: accumulated_levelized_cents
+        type: integer
+        source: computed
+        description: "Running sum of levelized_amount_cents charged by this plan"
+        default: 0
+      - name: true_up_balance_cents
+        type: integer
+        source: computed
+        description: "accumulated_actual_cents - accumulated_levelized_cents at true-up; positive = customer owes catch-up, negative = credit"
+        default: 0
+
+  - name: AssistanceGrant
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the assisted account"
+      - name: program
+        type: enum
+        source: input
+        description: "Assistance program"
+        default: LIHEAP
+        constraints: "one of {LIHEAP, EMERGENCY_CRISIS}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Grant lifecycle"
+        default: PLEDGED
+        constraints: "one of {PLEDGED, APPLIED, EXHAUSTED, CANCELLED}"
+      - name: pledged_cents
+        type: integer
+        source: input
+        description: "Total assistance pledged in cents"
+        constraints: "> 0"
+      - name: remaining_cents
+        type: integer
+        source: computed
+        description: "Unconsumed assistance in cents; starts at pledged_cents, debited as bills consume it"
+        default: 0
+
+  - name: SystemClock
+    parent: null
+    common_fields: false
+    fields:
+      - name: current_utc
+        type: datetime
+        source: input
+        description: "The simulated wall clock in ISO 8601 UTC; arrears-day calculations and due-date comparisons read this"
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- Tariff: linear lifecycle DRAFT -> ACTIVE -> RETIRED ----
+  - entity: Tariff
+    initial_state: DRAFT
+    terminal_states: [RETIRED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /tariffs/{id}/activate"
+        actor: BillingOperator
+        preconditions:
+          - "tariff.status == DRAFT"
+          - "tier_rates length == breakpoints+1; both arrays strictly ascending; TOU multipliers ordered"
+        side_effects:
+          - "set status = ACTIVE"
+      - from: ACTIVE
+        to: RETIRED
+        trigger: "POST /tariffs/{id}/retire"
+        actor: BillingOperator
+        preconditions:
+          - "tariff.status == ACTIVE"
+        side_effects:
+          - "set status = RETIRED; accounts already on this tariff keep their snapshot but new bill issuance is rejected (ERR_TARIFF_NOT_ACTIVE)"
+
+  # ---- Account: PARALLEL dimensions (service_status x financial_status) ----
+  - entity: Account
+    initial_state: ACTIVE              # service_status dimension
+    terminal_states: []
+    note: |
+      Account has TWO independent state dimensions that evolve separately.
+      Dimension SERVICE (field service_status): ACTIVE -> DISCONNECT_PENDING ->
+      DISCONNECTED -> RECONNECT_PENDING -> ACTIVE (cyclic).
+      Dimension FINANCIAL (field financial_status): CURRENT <-> DELINQUENT <->
+      IN_ARREARS. The two never collapse into a single status.
+    transitions:
+      # --- SERVICE dimension ---
+      - from: ACTIVE
+        to: DISCONNECT_PENDING
+        trigger: "POST /accounts/{id}/disconnect-notice"
+        actor: BillingOperator
+        preconditions:
+          - "account.financial_status == IN_ARREARS"
+          - "account.service_status == ACTIVE"
+          - "no ACTIVE AssistanceGrant exists for the account (assistance shields from disconnect)"
+        side_effects:
+          - "set service_status = DISCONNECT_PENDING"
+          - "create ServiceOrder{order_type=DISCONNECT, reason=NONPAY, status=SCHEDULED}"
+          - "increments Account.version by 1"
+      - from: DISCONNECT_PENDING
+        to: DISCONNECTED
+        trigger: "POST /service-orders/{id}/complete (DISCONNECT order)"
+        actor: FieldDispatcher
+        preconditions:
+          - "service order.order_type == DISCONNECT and status == SCHEDULED"
+          - "account.service_status == DISCONNECT_PENDING"
+        side_effects:
+          - "set account.service_status = DISCONNECTED"
+          - "set service order.status = COMPLETED"
+          - "increments Account.version by 1"
+      - from: DISCONNECTED
+        to: RECONNECT_PENDING
+        trigger: "POST /accounts/{id}/reconnect-request"
+        actor: BillingOperator
+        preconditions:
+          - "account.service_status == DISCONNECTED"
+          - "account.financial_status IN {CURRENT, DELINQUENT} (arrears must be cleared below IN_ARREARS)"
+        side_effects:
+          - "set service_status = RECONNECT_PENDING"
+          - "create ServiceOrder{order_type=RECONNECT, reason=RESTORE_AFTER_PAYMENT, status=SCHEDULED}"
+          - "increments Account.version by 1"
+      - from: RECONNECT_PENDING
+        to: ACTIVE
+        trigger: "POST /service-orders/{id}/complete (RECONNECT order)"
+        actor: FieldDispatcher
+        preconditions:
+          - "service order.order_type == RECONNECT and status == SCHEDULED"
+          - "account.service_status == RECONNECT_PENDING"
+        side_effects:
+          - "set account.service_status = ACTIVE"
+          - "set service order.status = COMPLETED"
+          - "increments Account.version by 1"
+      - from: DISCONNECT_PENDING
+        to: ACTIVE
+        trigger: "system: payment clears arrears while disconnect order still SCHEDULED"
+        actor: system
+        preconditions:
+          - "account.service_status == DISCONNECT_PENDING"
+          - "applied payment moves financial_status out of IN_ARREARS"
+        side_effects:
+          - "set account.service_status = ACTIVE"
+          - "cancel the SCHEDULED DISCONNECT ServiceOrder (status = CANCELLED)"
+          - "increments Account.version by 1"
+      # --- FINANCIAL dimension ---
+      - from: CURRENT
+        to: DELINQUENT
+        trigger: "POST /bills/{id}/issue OR system arrears recompute on clock advance"
+        actor: BillingOperator
+        preconditions:
+          - "account has an ISSUED/PARTIALLY_PAID bill past its due_date relative to SystemClock"
+          - "oldest_unpaid arrears age < ARREARS_DAYS days"
+        side_effects:
+          - "set financial_status = DELINQUENT"
+          - "increments Account.version by 1"
+      - from: DELINQUENT
+        to: IN_ARREARS
+        trigger: "system arrears recompute on POST /_clock/set_current_utc"
+        actor: system
+        preconditions:
+          - "oldest_unpaid_bill_due_date is older than ARREARS_DAYS days vs SystemClock.current_utc"
+        side_effects:
+          - "set financial_status = IN_ARREARS"
+          - "increments Account.version by 1"
+      - from: IN_ARREARS
+        to: CURRENT
+        trigger: "POST /payments (waterfall clears all unpaid bills)"
+        actor: Customer
+        preconditions:
+          - "after allocation, no ISSUED/PARTIALLY_PAID bill remains past due"
+        side_effects:
+          - "set financial_status = CURRENT"
+          - "if service_status == DISCONNECT_PENDING, cascade-cancel disconnect (see system transition above)"
+          - "increments Account.version by 1"
+      - from: DELINQUENT
+        to: CURRENT
+        trigger: "POST /payments (waterfall clears all past-due bills)"
+        actor: Customer
+        preconditions:
+          - "after allocation, no ISSUED/PARTIALLY_PAID bill remains past due"
+        side_effects:
+          - "set financial_status = CURRENT"
+          - "increments Account.version by 1"
+
+  # ---- Bill: branching with VOID; PARTIALLY_PAID <-> via payment/reversal ----
+  - entity: Bill
+    initial_state: DRAFT
+    terminal_states: [PAID, VOID]
+    transitions:
+      - from: DRAFT
+        to: ISSUED
+        trigger: "POST /bills/{id}/issue"
+        actor: BillingOperator
+        preconditions:
+          - "bill.status == DRAFT"
+          - "account.tariff is ACTIVE"
+          - "expected_account_version matches account.version (OCC)"
+        side_effects:
+          - "run price_bill calculation; snapshot tariff_id; set energy/demand/credit/assistance/total fields"
+          - "debit Account.net_metering_credit_balance_cents by net_metering_credit_applied_cents"
+          - "if budget plan ACTIVE: set is_budget_billed=true, total_due_cents=levelized_amount; accumulate plan counters"
+          - "increase account.balance_cents by total_due_cents"
+          - "increments Account.version by 1"
+      - from: ISSUED
+        to: PARTIALLY_PAID
+        trigger: "system: payment allocation covers part of this bill"
+        actor: system
+        preconditions:
+          - "0 < amount_paid_cents < total_due_cents"
+        side_effects:
+          - "set status = PARTIALLY_PAID"
+      - from: ISSUED
+        to: PAID
+        trigger: "system: payment allocation covers the full bill"
+        actor: system
+        preconditions:
+          - "amount_paid_cents >= total_due_cents"
+        side_effects:
+          - "set status = PAID"
+      - from: PARTIALLY_PAID
+        to: PAID
+        trigger: "system: later payment allocation completes the bill"
+        actor: system
+        preconditions:
+          - "amount_paid_cents >= total_due_cents"
+        side_effects:
+          - "set status = PAID"
+      - from: ISSUED
+        to: VOID
+        trigger: "POST /bills/{id}/void"
+        actor: BillingOperator
+        preconditions:
+          - "bill.status == ISSUED and amount_paid_cents == 0"
+        side_effects:
+          - "decrease account.balance_cents by total_due_cents"
+          - "refund net_metering_credit_applied_cents back to Account.net_metering_credit_balance_cents"
+          - "refund assistance_applied_cents back to the source AssistanceGrant.remaining_cents (grant un-EXHAUSTED if needed)"
+          - "if budget-billed, decrement plan accumulated counters by this bill's contribution"
+          - "increments Account.version by 1"
+      - from: PARTIALLY_PAID
+        to: ISSUED
+        trigger: "POST /payments/{id}/reverse"
+        actor: BillingOperator
+        preconditions:
+          - "reversed payment's allocations touched this bill"
+          - "resulting amount_paid_cents drops below total_due_cents and above 0"
+        note: "Reversal can also drop PAID->PARTIALLY_PAID or PARTIALLY_PAID->ISSUED depending on resulting amount_paid_cents"
+        side_effects:
+          - "recompute amount_paid_cents from remaining POSTED allocations"
+          - "recompute bill.status from amount_paid_cents"
+
+  # ---- ServiceOrder: linear with cancel branch ----
+  - entity: ServiceOrder
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "POST /service-orders/{id}/complete"
+        actor: FieldDispatcher
+        preconditions:
+          - "service order.status == SCHEDULED"
+          - "account.service_status matches the order_type (DISCONNECT_PENDING for DISCONNECT, RECONNECT_PENDING for RECONNECT)"
+        side_effects:
+          - "set status = COMPLETED"
+          - "advance account.service_status (DISCONNECT->DISCONNECTED, RECONNECT->ACTIVE)"
+          - "increments Account.version by 1"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /service-orders/{id}/cancel OR system arrears-cleared cascade"
+        actor: BillingOperator
+        preconditions:
+          - "service order.status == SCHEDULED"
+        side_effects:
+          - "set status = CANCELLED"
+          - "if DISCONNECT order and account.service_status == DISCONNECT_PENDING, revert account.service_status = ACTIVE"
+          - "increments Account.version by 1"
+
+  # ---- BudgetBillingPlan: linear with cancel; true-up is terminal-ish ----
+  - entity: BudgetBillingPlan
+    initial_state: ACTIVE
+    terminal_states: [TRUED_UP, CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: TRUED_UP
+        trigger: "POST /budget-plans/{id}/true-up"
+        actor: BillingOperator
+        preconditions:
+          - "plan.status == ACTIVE"
+          - "expected_account_version matches account.version (OCC)"
+        side_effects:
+          - "compute true_up_balance_cents = accumulated_actual_cents - accumulated_levelized_cents"
+          - "adjust account.balance_cents by true_up_balance_cents"
+          - "set plan.status = TRUED_UP; clear account.budget_plan_id"
+          - "increments Account.version by 1"
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /budget-plans/{id}/cancel"
+        actor: BillingOperator
+        preconditions:
+          - "plan.status == ACTIVE"
+        side_effects:
+          - "compute true_up_balance_cents and adjust account.balance_cents (cancellation settles like a true-up)"
+          - "set plan.status = CANCELLED; clear account.budget_plan_id"
+          - "increments Account.version by 1"
+
+  # ---- AssistanceGrant: cyclic-ish (PLEDGED -> APPLIED -> EXHAUSTED), reversible on void ----
+  - entity: AssistanceGrant
+    initial_state: PLEDGED
+    terminal_states: [EXHAUSTED, CANCELLED]
+    transitions:
+      - from: PLEDGED
+        to: APPLIED
+        trigger: "system: first bill consumes part of the grant"
+        actor: system
+        preconditions:
+          - "0 < remaining_cents < pledged_cents after a bill applies assistance"
+        side_effects:
+          - "set status = APPLIED"
+      - from: APPLIED
+        to: EXHAUSTED
+        trigger: "system: a bill consumes the last of remaining_cents"
+        actor: system
+        preconditions:
+          - "remaining_cents == 0"
+        side_effects:
+          - "set status = EXHAUSTED"
+      - from: PLEDGED
+        to: EXHAUSTED
+        trigger: "system: a single bill consumes the entire grant"
+        actor: system
+        preconditions:
+          - "remaining_cents == 0 after one bill"
+        side_effects:
+          - "set status = EXHAUSTED"
+      - from: EXHAUSTED
+        to: APPLIED
+        trigger: "system: bill void refunds assistance back into the grant"
+        actor: system
+        preconditions:
+          - "a void refunds assistance so remaining_cents becomes > 0"
+        side_effects:
+          - "set status = APPLIED (or PLEDGED if remaining_cents == pledged_cents)"
+      - from: PLEDGED
+        to: CANCELLED
+        trigger: "POST /assistance-grants/{id}/cancel"
+        actor: AssistanceCaseworker
+        preconditions:
+          - "grant.status == PLEDGED (no assistance yet consumed)"
+        side_effects:
+          - "set status = CANCELLED"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: bill-issue-stale-account
+    parent_entity: Account
+    write_endpoint: "POST /bills/{id}/issue"
+    occ_field: "expected_account_version"
+    description: |
+      Issuing a Bill against an Account whose version has advanced since the
+      client last observed it is rejected on a stale version. Issuance debits
+      the account's net-metering credit balance and increases its balance, so a
+      second issuance carrying an out-of-date account version would double-apply
+      against a balance another issuance already moved.
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+  - rule_id: budget-trueup-stale-account
+    parent_entity: Account
+    write_endpoint: "POST /budget-plans/{id}/true-up"
+    occ_field: "expected_account_version"
+    description: |
+      Truing up a BudgetBillingPlan against an Account whose version has advanced
+      since the client last read it is rejected. True-up adjusts the account
+      balance by the accumulated actual-vs-levelized delta; a stale version means
+      a bill was issued (changing accumulated_actual_cents) after the client's
+      read, so the catch-up would be computed against a superseded snapshot.
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: price_bill
+    trigger: "POST /bills/{id}/issue (DRAFT -> ISSUED)"
+    algorithm: tiered_pricing
+    formula: |
+      # Inputs: billed reads = MeterRead where meter.account_id == bill.account_id
+      #   AND interval_start in [period_start, period_end).
+      # Step 1 — aggregate:
+      total_import_kwh = sum(read.import_kwh for read in billed)
+      total_export_kwh = sum(read.export_kwh for read in billed)
+      billed_peak_demand_kw = max(read.avg_demand_kw for read in billed
+                                  if read.tou_period == ON_PEAK)   # 0 if no ON_PEAK reads
+      # Step 2 — inclining-block tier pricing over total_import_kwh.
+      # tiers: breakpoints b[0..n-1] ascending, rates r[0..n] ascending.
+      # Allocate total_import_kwh across blocks, price each block at its rate.
+      remaining = total_import_kwh; lower = 0; tier_cost_cents = 0
+      for i in 0..n:                       # n+1 tiers
+        upper = b[i] if i < n else +inf
+        block_kwh = max(0, min(remaining, upper - lower))
+        tier_cost_cents += block_kwh * r[i]     # cents (rate is cents/kwh)
+        remaining -= block_kwh; lower = upper
+        if remaining <= 0: break
+      # Step 3 — TOU weighting: split tier_cost by the share of import_kwh in
+      # each TOU period, multiply each share by its tou_multiplier, then sum.
+      for p in {ON_PEAK, MID_PEAK, OFF_PEAK}:
+        share_p = (sum import_kwh of billed reads with tou_period==p) / total_import_kwh   # 0 if total==0
+        weighted_cents += tier_cost_cents * share_p * tou_multipliers[p]
+      energy_charge_cents = round_half_up(weighted_cents)            # ROUND ONCE, after TOU sum
+      # Step 4 — demand charge.
+      demand_charge_cents = round_half_up(billed_peak_demand_kw * demand_charge_cents_per_kw)
+      # Step 5 — gross before credits.
+      gross_cents = tariff.fixed_charge_cents + energy_charge_cents + demand_charge_cents
+      # Step 6 — net-metering credit (export credit), capped so it never reduces
+      # below the (fixed + demand) floor; energy may be fully offset but the
+      # fixed customer charge and demand charge are always billed.
+      export_credit_cents = round_half_up(total_export_kwh * net_metering_credit_cents_per_kwh)
+      credit_pool_cents = account.net_metering_credit_balance_cents + export_credit_cents
+      floor_cents = tariff.fixed_charge_cents + demand_charge_cents
+      max_creditable_cents = max(0, gross_cents - floor_cents)       # only energy is creditable
+      net_metering_credit_applied_cents = min(credit_pool_cents, max_creditable_cents)
+      carryover_cents = credit_pool_cents - net_metering_credit_applied_cents   # rolls forward
+      # Step 7 — assistance (LIHEAP) applied AFTER net-metering credit.
+      pre_assist_cents = gross_cents - net_metering_credit_applied_cents
+      assistance_applied_cents = min(active_grant.remaining_cents, pre_assist_cents)  # 0 if no grant
+      # Step 8 — finalize.
+      actual_cost_cents = max(0, pre_assist_cents - assistance_applied_cents)
+      total_due_cents = levelized_amount_cents if budget_plan ACTIVE else actual_cost_cents
+    input_set: "MeterRead rows for the account's meters whose interval_start ∈ [period_start, period_end); ON_PEAK reads only feed the demand max."
+    constants:
+      ARREARS_DAYS: 45
+    precision: "round_half_up to whole cents; energy_charge_cents rounded ONCE after the TOU-weighted sum (not per TOU period), demand_charge and export_credit rounded independently."
+    variants:
+      - name: budget_billed
+        when: "account has an ACTIVE BudgetBillingPlan at issuance"
+        difference: "total_due_cents = plan.levelized_amount_cents (fixed), while actual_cost_cents holds the real computed cost; the gap accrues into the plan's accumulated counters for later true-up."
+      - name: standard_billed
+        when: "no ACTIVE BudgetBillingPlan"
+        difference: "total_due_cents == actual_cost_cents (the directly computed amount)."
+
+  - name: budget_true_up
+    trigger: "POST /budget-plans/{id}/true-up (ACTIVE -> TRUED_UP) or /cancel"
+    algorithm: aggregation
+    formula: |
+      # accumulated_* are running sums maintained by price_bill on each issued
+      # budget-billed bill, in bill-issuance chronological order (created_at ASC).
+      true_up_balance_cents = accumulated_actual_cents - accumulated_levelized_cents
+      # Apply to the account balance:
+      account.balance_cents += true_up_balance_cents
+      # Positive => customer under-paid via levelized installments, owes catch-up.
+      # Negative => customer over-paid, receives a credit (balance decreases).
+    input_set: "Bills with is_budget_billed == true issued under this plan (status IN {ISSUED, PARTIALLY_PAID, PAID}); VOID bills are excluded by being decremented at void time."
+    constants: {}
+    precision: "exact integer cents; no rounding (counters are already in cents)."
+    variants:
+      - name: forward_looking_levelized
+        when: "computing the bill's total_due during the plan"
+        difference: "charges the fixed levelized_amount_cents regardless of that month's actual cost — a forward-looking smoothing estimate."
+      - name: chronological_actual_trueup
+        when: "settling the plan at true-up/cancel"
+        difference: "sums the chronological per-bill actual_cost_cents and reconciles against what was levelized — same months, different number than the levelized stream."
+
+  - name: arrears_age_evaluation
+    trigger: "POST /_clock/set_current_utc (system arrears recompute) and POST /payments"
+    algorithm: threshold
+    formula: |
+      if account.oldest_unpaid_bill_due_date is null:
+        financial_status = CURRENT
+      else:
+        days_past_due = floor((SystemClock.current_utc - oldest_unpaid_bill_due_date) / 1 day)
+        if days_past_due >= ARREARS_DAYS:    # boundary: exactly ARREARS_DAYS days qualifies
+          financial_status = IN_ARREARS
+        elif days_past_due > 0:
+          financial_status = DELINQUENT
+        else:
+          financial_status = CURRENT
+      # oldest_unpaid_bill_due_date = min(due_date) over bills with
+      # status IN {ISSUED, PARTIALLY_PAID} (PAID and VOID excluded); ties broken
+      # by created_at ASC (earliest-created bill wins, never by id).
+    input_set: "Bills with status IN {ISSUED, PARTIALLY_PAID}; due_date compared against SystemClock.current_utc."
+    constants:
+      ARREARS_DAYS: 45
+    precision: "integer days, floor of the UTC datetime difference; >= comparison at the ARREARS_DAYS boundary."
+    variants:
+      - name: instantaneous_on_payment
+        when: "recomputed immediately after a payment waterfall"
+        difference: "uses the post-allocation set of unpaid bills, so a clearing payment can drop status all the way to CURRENT in one step."
+      - name: cumulative_on_clock
+        when: "recomputed when the system clock advances"
+        difference: "same unpaid set but a later current_utc, so age can cross the ARREARS_DAYS threshold purely from time passing."
+
+  - name: payment_waterfall
+    trigger: "POST /payments"
+    algorithm: waterfall_allocation
+    formula: |
+      # Allocate amount_cents across the account's unpaid bills, OLDEST DUE FIRST.
+      unpaid = [b for b in account.bills if b.status IN {ISSUED, PARTIALLY_PAID}]
+      order unpaid by (due_date ASC, created_at ASC)     # tie-break created_at, never id
+      remaining = payment.amount_cents
+      allocations = []
+      for b in unpaid:
+        owed = b.total_due_cents - b.amount_paid_cents
+        applied = min(remaining, owed)
+        if applied > 0:
+          allocations.append({bill_id: b.id, applied_cents: applied})
+          b.amount_paid_cents += applied
+          remaining -= applied
+        if remaining == 0: break
+      # Overpayment (remaining > 0 after all bills) becomes account credit:
+      account.balance_cents -= payment.amount_cents      # full payment reduces balance
+      # Each touched bill recomputes status (ISSUED/PARTIALLY_PAID/PAID).
+    input_set: "Bills with status IN {ISSUED, PARTIALLY_PAID} for the account, ordered due_date ASC then created_at ASC."
+    constants: {}
+    precision: "exact integer cents; remainder (overpayment) reduces balance_cents and may make it negative (a credit)."
+    variants:
+      - name: full_clear
+        when: "amount covers every unpaid bill"
+        difference: "all touched bills reach PAID and financial_status recomputes (often to CURRENT), possibly cascading a disconnect cancel."
+      - name: partial_clear
+        when: "amount covers only the oldest bill(s)"
+        difference: "later bills stay ISSUED/PARTIALLY_PAID; oldest_unpaid_bill_due_date advances to the next unpaid bill."
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "the acting role is permitted to perform this operation per the RBAC matrix"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "every path-referenced resource exists, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with a path id"
+  - priority: 4
+    category: existence
+    check: "every FK in the request body references an existing resource"
+    error_id: ERR_FK_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /meters, POST /bills, POST /payments, POST /service-orders, POST /budget-plans, POST /assistance-grants, POST /accounts"
+  - priority: 5
+    category: business_constraint
+    check: "request body contains all required fields with valid types and enum members"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all POST/PUT/PATCH"
+  - priority: 6
+    category: business_constraint
+    check: "tier_rates_cents_per_kwh length == len(tier_breakpoints_kwh)+1 and both arrays strictly ascending; tou_multipliers ON_PEAK>=MID_PEAK>=OFF_PEAK"
+    error_id: ERR_INVALID_TARIFF_SHAPE
+    http_status: 422
+    applies_to: "POST /tariffs, POST /tariffs/{id}/activate"
+  - priority: 7
+    category: business_constraint
+    check: "MeterRead interval_end == interval_start + 60 minutes; export_kwh == 0 when meter.meter_type == CONSUMPTION_ONLY"
+    error_id: ERR_INVALID_INTERVAL
+    http_status: 422
+    applies_to: "POST /meter-reads"
+  - priority: 8
+    category: business_referential
+    check: "Account.tariff_id at assignment references a Tariff in ACTIVE status"
+    error_id: ERR_TARIFF_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /accounts, POST /bills/{id}/issue"
+  - priority: 9
+    category: state
+    check: "target resource is in a state from which the requested transition is defined"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints (issue, void, complete, cancel, true-up, disconnect-notice, reconnect-request, activate, reverse)"
+  - priority: 10
+    category: business_constraint
+    check: "service-order completion's order_type matches account.service_status (DISCONNECT<->DISCONNECT_PENDING, RECONNECT<->RECONNECT_PENDING)"
+    error_id: ERR_ORDER_ACCOUNT_MISMATCH
+    http_status: 409
+    applies_to: "POST /service-orders/{id}/complete"
+  - priority: 11
+    category: business_safety
+    check: "a disconnect-notice may not be raised while the account has an ACTIVE or PLEDGED/APPLIED AssistanceGrant (assistance shields from disconnect)"
+    error_id: ERR_ASSISTANCE_SHIELD
+    http_status: 409
+    applies_to: "POST /accounts/{id}/disconnect-notice"
+  - priority: 12
+    category: business_constraint
+    check: "a disconnect-notice requires account.financial_status == IN_ARREARS"
+    error_id: ERR_NOT_IN_ARREARS
+    http_status: 409
+    applies_to: "POST /accounts/{id}/disconnect-notice"
+  - priority: 13
+    category: business_constraint
+    check: "a reconnect-request requires account.financial_status NOT IN_ARREARS (arrears must be cleared first)"
+    error_id: ERR_ARREARS_NOT_CLEARED
+    http_status: 409
+    applies_to: "POST /accounts/{id}/reconnect-request"
+  - priority: 14
+    category: business_constraint
+    check: "an account may have at most one ACTIVE BudgetBillingPlan at a time"
+    error_id: ERR_BUDGET_PLAN_EXISTS
+    http_status: 409
+    applies_to: "POST /budget-plans"
+  - priority: 15
+    category: business_temporal
+    check: "Bill.period_end > period_start and a bill's [period_start, period_end) must not overlap an existing non-VOID bill for the same account"
+    error_id: ERR_BILL_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /bills"
+  - priority: 16
+    category: business_temporal
+    check: "a MeterRead's [interval_start, interval_end) must not duplicate/overlap an existing read for the same meter"
+    error_id: ERR_READ_OVERLAP
+    http_status: 409
+    applies_to: "POST /meter-reads"
+  - priority: 17
+    category: business_fiscal
+    check: "OCC: expected_account_version equals account.version on bill issuance and budget true-up"
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+    applies_to: "POST /bills/{id}/issue, POST /budget-plans/{id}/true-up"
+  - priority: 18
+    category: business_fiscal
+    check: "a payment reversal only targets a POSTED payment (a non-POSTED/already-REVERSED payment is rejected)"
+    error_id: ERR_INVALID_PAYMENT
+    http_status: 409
+    applies_to: "POST /payments/{id}/reverse"
+  - priority: 19
+    category: business_constraint
+    check: "numeric body fields satisfy their declared ranges: Payment.amount_cents > 0, BudgetBillingPlan.levelized_amount_cents > 0, AssistanceGrant.pledged_cents > 0, MeterRead.import_kwh >= 0 and export_kwh >= 0, Tariff fixed/demand/net-metering charges >= 0"
+    error_id: ERR_VALIDATION_RANGE
+    http_status: 422
+    applies_to: "POST /payments, POST /budget-plans, POST /assistance-grants, POST /meter-reads, POST /tariffs"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Tariff ----
+  - method: POST
+    path: "/tariffs"
+    description: "Create a DRAFT tariff with tier/TOU/demand/net-metering structure"
+    roles: [BillingOperator]
+    code: 201
+    input: [code, name, fixed_charge_cents, tier_breakpoints_kwh, tier_rates_cents_per_kwh, tou_multipliers, demand_charge_cents_per_kw, net_metering_credit_cents_per_kwh]
+    output: Tariff
+    side_effects: ["status = DRAFT"]
+  - method: POST
+    path: "/tariffs/{id}/activate"
+    description: "Activate a DRAFT tariff so accounts may be priced under it"
+    roles: [BillingOperator]
+    code: 200
+    input: []
+    output: Tariff
+    side_effects: ["status DRAFT -> ACTIVE"]
+  - method: POST
+    path: "/tariffs/{id}/retire"
+    description: "Retire an ACTIVE tariff; new bill issuance under it is then rejected"
+    roles: [BillingOperator]
+    code: 200
+    input: []
+    output: Tariff
+    side_effects: ["status ACTIVE -> RETIRED"]
+  - method: GET
+    path: "/tariffs/{id}"
+    description: "Read one tariff"
+    roles: [BillingOperator, Customer, AssistanceCaseworker, FieldDispatcher]
+    code: 200
+    input: []
+    output: Tariff
+    side_effects: []
+  - method: GET
+    path: "/tariffs"
+    description: "List tariffs (paginated)"
+    roles: [BillingOperator, Customer, AssistanceCaseworker, FieldDispatcher]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Tariff[]
+    side_effects: []
+
+  # ---- Account ----
+  - method: POST
+    path: "/accounts"
+    description: "Open an account against an ACTIVE tariff"
+    roles: [BillingOperator]
+    code: 201
+    input: [tariff_id, holder_name]
+    output: Account
+    side_effects: ["service_status = ACTIVE, financial_status = CURRENT, balance_cents = 0"]
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Read one account with computed balances and both status dimensions"
+    roles: [BillingOperator, Customer, AssistanceCaseworker, FieldDispatcher]
+    code: 200
+    input: []
+    output: Account
+    side_effects: []
+  - method: GET
+    path: "/accounts"
+    description: "List accounts (paginated, filterable by tariff and status dimensions)"
+    roles: [BillingOperator, AssistanceCaseworker]
+    code: 200
+    input: ["tariff_id?", "service_status?", "financial_status?", "limit?", "offset?"]
+    output: Account[]
+    side_effects: []
+  - method: POST
+    path: "/accounts/{id}/disconnect-notice"
+    description: "Raise a nonpay disconnect; creates a SCHEDULED DISCONNECT ServiceOrder"
+    roles: [BillingOperator]
+    code: 201
+    input: []
+    output: ServiceOrder
+    side_effects: ["account.service_status ACTIVE -> DISCONNECT_PENDING", "increments Account.version by 1"]
+  - method: POST
+    path: "/accounts/{id}/reconnect-request"
+    description: "Request reconnection of a disconnected account; creates a SCHEDULED RECONNECT ServiceOrder"
+    roles: [BillingOperator]
+    code: 201
+    input: []
+    output: ServiceOrder
+    side_effects: ["account.service_status DISCONNECTED -> RECONNECT_PENDING", "increments Account.version by 1"]
+
+  # ---- Meter ----
+  - method: POST
+    path: "/meters"
+    description: "Register a meter on an account"
+    roles: [BillingOperator]
+    code: 201
+    input: [account_id, serial, "meter_type?"]
+    output: Meter
+    side_effects: ["status = ACTIVE"]
+  - method: GET
+    path: "/meters/{id}"
+    description: "Read one meter"
+    roles: [BillingOperator, Customer, FieldDispatcher]
+    code: 200
+    input: []
+    output: Meter
+    side_effects: []
+  - method: GET
+    path: "/meters"
+    description: "List meters, filterable by account_id (FK reverse-reachability for Meter.account_id)"
+    roles: [BillingOperator, Customer, FieldDispatcher]
+    code: 200
+    input: ["account_id?", "status?", "limit?", "offset?"]
+    output: Meter[]
+    side_effects: []
+
+  # ---- MeterRead (AMI import) ----
+  - method: POST
+    path: "/meter-reads"
+    description: "Import one AMI interval read; computes tou_period and avg_demand_kw"
+    roles: [BillingOperator]
+    code: 201
+    input: [meter_id, interval_start, interval_end, import_kwh, "export_kwh?"]
+    output: MeterRead
+    side_effects: ["computes tou_period from interval_start, avg_demand_kw from import_kwh"]
+  - method: GET
+    path: "/meter-reads/{id}"
+    description: "Read one AMI interval read with computed tou_period and avg_demand_kw"
+    roles: [BillingOperator, Customer]
+    code: 200
+    input: []
+    output: MeterRead
+    side_effects: []
+  - method: GET
+    path: "/meter-reads"
+    description: "List meter reads, filterable by meter_id (FK reverse-reachability for MeterRead.meter_id)"
+    roles: [BillingOperator, Customer]
+    code: 200
+    input: ["meter_id?", "limit?", "offset?"]
+    output: MeterRead[]
+    side_effects: []
+
+  # ---- Bill ----
+  - method: POST
+    path: "/bills"
+    description: "Create a DRAFT bill for an account over a billing period"
+    roles: [BillingOperator]
+    code: 201
+    input: [account_id, period_start, period_end, due_date]
+    output: Bill
+    side_effects: ["status = DRAFT"]
+  - method: POST
+    path: "/bills/{id}/issue"
+    description: "Price and issue a bill (DRAFT -> ISSUED); runs price_bill; OCC on account"
+    roles: [BillingOperator]
+    code: 200
+    input: [expected_account_version]
+    output: Bill
+    side_effects: ["runs price_bill", "debits net_metering_credit_balance", "increases account.balance_cents by total_due_cents", "applies budget levelizing if plan ACTIVE", "increments Account.version by 1"]
+  - method: POST
+    path: "/bills/{id}/void"
+    description: "Void an ISSUED, unpaid bill; reverses all ledger side effects"
+    roles: [BillingOperator]
+    code: 200
+    input: []
+    output: Bill
+    side_effects: ["status ISSUED -> VOID", "decreases account.balance_cents", "refunds net-metering credit", "refunds assistance to grant", "increments Account.version by 1"]
+  - method: GET
+    path: "/bills/{id}"
+    description: "Read one bill with all computed charge lines"
+    roles: [BillingOperator, Customer, AssistanceCaseworker]
+    code: 200
+    input: []
+    output: Bill
+    side_effects: []
+  - method: GET
+    path: "/bills"
+    description: "List bills, filterable by account_id (FK reverse-reachability for Bill.account_id), tariff_id (FK reverse-reachability for Bill.tariff_id), and status"
+    roles: [BillingOperator, Customer, AssistanceCaseworker]
+    code: 200
+    input: ["account_id?", "tariff_id?", "status?", "limit?", "offset?"]
+    output: Bill[]
+    side_effects: []
+
+  # ---- Payment ----
+  - method: POST
+    path: "/payments"
+    description: "Post a payment; waterfall-allocates across oldest-due-first bills"
+    roles: [Customer, BillingOperator]
+    code: 201
+    input: [account_id, amount_cents, "method?"]
+    output: Payment
+    side_effects: ["waterfall allocation", "recomputes touched bill statuses", "recomputes financial_status", "may cascade-cancel a SCHEDULED disconnect"]
+  - method: POST
+    path: "/payments/{id}/reverse"
+    description: "Reverse a POSTED payment; un-applies its allocations and recomputes bills"
+    roles: [BillingOperator]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: ["status POSTED -> REVERSED", "recomputes touched bill amount_paid/status", "recomputes financial_status"]
+  - method: GET
+    path: "/payments/{id}"
+    description: "Read one payment with its allocations"
+    roles: [BillingOperator, Customer]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+  - method: GET
+    path: "/payments"
+    description: "List payments, filterable by account_id (FK reverse-reachability for Payment.account_id)"
+    roles: [BillingOperator, Customer]
+    code: 200
+    input: ["account_id?", "status?", "limit?", "offset?"]
+    output: Payment[]
+    side_effects: []
+
+  # ---- ServiceOrder ----
+  - method: GET
+    path: "/service-orders/{id}"
+    description: "Read one service order"
+    roles: [BillingOperator, FieldDispatcher]
+    code: 200
+    input: []
+    output: ServiceOrder
+    side_effects: []
+  - method: GET
+    path: "/service-orders"
+    description: "List service orders, filterable by account_id (FK reverse-reachability for ServiceOrder.account_id)"
+    roles: [BillingOperator, FieldDispatcher]
+    code: 200
+    input: ["account_id?", "status?", "order_type?", "limit?", "offset?"]
+    output: ServiceOrder[]
+    side_effects: []
+  - method: POST
+    path: "/service-orders/{id}/complete"
+    description: "Field-complete a service order; advances account.service_status"
+    roles: [FieldDispatcher]
+    code: 200
+    input: []
+    output: ServiceOrder
+    side_effects: ["status SCHEDULED -> COMPLETED", "advances account.service_status", "increments Account.version by 1"]
+  - method: POST
+    path: "/service-orders/{id}/cancel"
+    description: "Cancel a SCHEDULED service order; may revert pending service_status"
+    roles: [BillingOperator, FieldDispatcher]
+    code: 200
+    input: []
+    output: ServiceOrder
+    side_effects: ["status SCHEDULED -> CANCELLED", "reverts service_status if a DISCONNECT was pending", "increments Account.version by 1"]
+
+  # ---- BudgetBillingPlan ----
+  - method: POST
+    path: "/budget-plans"
+    description: "Enroll an account in levelized budget billing"
+    roles: [BillingOperator]
+    code: 201
+    input: [account_id, levelized_amount_cents]
+    output: BudgetBillingPlan
+    side_effects: ["status = ACTIVE", "set account.budget_plan_id"]
+  - method: POST
+    path: "/budget-plans/{id}/true-up"
+    description: "Settle a budget plan: reconcile actual vs levelized; OCC on account"
+    roles: [BillingOperator]
+    code: 200
+    input: [expected_account_version]
+    output: BudgetBillingPlan
+    side_effects: ["computes true_up_balance_cents", "adjusts account.balance_cents", "status ACTIVE -> TRUED_UP", "clears account.budget_plan_id", "increments Account.version by 1"]
+  - method: POST
+    path: "/budget-plans/{id}/cancel"
+    description: "Cancel a budget plan; settles the accrued true-up like a true-up"
+    roles: [BillingOperator]
+    code: 200
+    input: []
+    output: BudgetBillingPlan
+    side_effects: ["computes true_up_balance_cents", "adjusts account.balance_cents", "status ACTIVE -> CANCELLED", "clears account.budget_plan_id", "increments Account.version by 1"]
+  - method: GET
+    path: "/budget-plans/{id}"
+    description: "Read one budget plan with accumulated counters"
+    roles: [BillingOperator, Customer]
+    code: 200
+    input: []
+    output: BudgetBillingPlan
+    side_effects: []
+  - method: GET
+    path: "/budget-plans"
+    description: "List budget plans, filterable by account_id (FK reverse-reachability for BudgetBillingPlan.account_id)"
+    roles: [BillingOperator, Customer]
+    code: 200
+    input: ["account_id?", "status?", "limit?", "offset?"]
+    output: BudgetBillingPlan[]
+    side_effects: []
+
+  # ---- AssistanceGrant ----
+  - method: POST
+    path: "/assistance-grants"
+    description: "Pledge LIHEAP/crisis assistance to an account"
+    roles: [AssistanceCaseworker]
+    code: 201
+    input: [account_id, pledged_cents, "program?"]
+    output: AssistanceGrant
+    side_effects: ["status = PLEDGED", "remaining_cents = pledged_cents"]
+  - method: POST
+    path: "/assistance-grants/{id}/cancel"
+    description: "Cancel an unused (PLEDGED) assistance grant"
+    roles: [AssistanceCaseworker]
+    code: 200
+    input: []
+    output: AssistanceGrant
+    side_effects: ["status PLEDGED -> CANCELLED"]
+  - method: GET
+    path: "/assistance-grants/{id}"
+    description: "Read one assistance grant"
+    roles: [BillingOperator, AssistanceCaseworker, Customer]
+    code: 200
+    input: []
+    output: AssistanceGrant
+    side_effects: []
+  - method: GET
+    path: "/assistance-grants"
+    description: "List assistance grants, filterable by account_id (FK reverse-reachability for AssistanceGrant.account_id)"
+    roles: [BillingOperator, AssistanceCaseworker, Customer]
+    code: 200
+    input: ["account_id?", "status?", "limit?", "offset?"]
+    output: AssistanceGrant[]
+    side_effects: []
+
+  # ---- System clock (test-driving) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the simulated wall clock; triggers system arrears recompute across accounts"
+    roles: [BillingOperator]
+    code: 200
+    input: [current_utc]
+    output: SystemClock
+    side_effects: ["recomputes financial_status for all accounts via arrears_age_evaluation", "increments Account.version by 1 for any account whose financial_status changes"]
+  - method: GET
+    path: "/_clock"
+    description: "Read the current simulated clock"
+    roles: [BillingOperator, Customer, AssistanceCaseworker, FieldDispatcher]
+    code: 200
+    input: []
+    output: SystemClock
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID header"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Authenticated role not permitted for this operation per RBAC"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A path-referenced resource does not exist"
+  - id: ERR_FK_NOT_FOUND
+    http: 404
+    condition: "A foreign-key field in the request body references a non-existent resource"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Missing required field, wrong type, or invalid enum member"
+  - id: ERR_INVALID_TARIFF_SHAPE
+    http: 422
+    condition: "tier_rates length != breakpoints+1, arrays not strictly ascending, or TOU multipliers not ordered ON_PEAK>=MID_PEAK>=OFF_PEAK"
+  - id: ERR_INVALID_INTERVAL
+    http: 422
+    condition: "MeterRead interval_end != interval_start+60min, or export_kwh>0 on a CONSUMPTION_ONLY meter"
+  - id: ERR_TARIFF_NOT_ACTIVE
+    http: 409
+    condition: "Account assignment or bill issuance references a tariff that is not ACTIVE"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition is not defined from the resource's current state"
+  - id: ERR_ORDER_ACCOUNT_MISMATCH
+    http: 409
+    condition: "Service-order completion order_type does not match the account's pending service_status"
+  - id: ERR_ASSISTANCE_SHIELD
+    http: 409
+    condition: "Disconnect-notice attempted while the account has a PLEDGED or APPLIED assistance grant"
+  - id: ERR_NOT_IN_ARREARS
+    http: 409
+    condition: "Disconnect-notice attempted on an account whose financial_status is not IN_ARREARS"
+  - id: ERR_ARREARS_NOT_CLEARED
+    http: 409
+    condition: "Reconnect-request attempted while financial_status is still IN_ARREARS"
+  - id: ERR_BUDGET_PLAN_EXISTS
+    http: 409
+    condition: "Enrolling a budget plan while the account already has an ACTIVE plan"
+  - id: ERR_BILL_PERIOD_OVERLAP
+    http: 409
+    condition: "New bill period overlaps an existing non-VOID bill for the same account, or period_end <= period_start"
+  - id: ERR_READ_OVERLAP
+    http: 409
+    condition: "New meter read interval overlaps an existing read for the same meter"
+  - id: ERR_STALE_ACCOUNT_VERSION
+    http: 412
+    condition: "expected_account_version does not match the account's current version on issue or true-up"
+  - id: ERR_INVALID_PAYMENT
+    http: 409
+    condition: "Payment amount_cents <= 0, or reversing a payment that is not POSTED"
+  - id: ERR_VALIDATION_RANGE
+    http: 422
+    condition: "A numeric body field violates its declared range (e.g., pledged_cents <= 0, levelized_amount_cents <= 0, negative kWh)"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: BillingOperator
+    description: "Runs the rate engine: tariffs, accounts, bills, budget plans, disconnect/reconnect requests, payment reversals"
+    identity: opaque
+    exclusive_operations:
+      - "POST /tariffs and POST /tariffs/{id}/activate"
+      - "POST /accounts, POST /accounts/{id}/disconnect-notice, POST /accounts/{id}/reconnect-request"
+      - "POST /meters, POST /meter-reads"
+      - "POST /bills, POST /bills/{id}/issue, POST /bills/{id}/void"
+      - "POST /budget-plans, POST /budget-plans/{id}/true-up, POST /budget-plans/{id}/cancel"
+      - "POST /payments/{id}/reverse"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /payments (also Customer)"
+      - "POST /service-orders/{id}/cancel (also FieldDispatcher)"
+      - "GET reads across accounts, bills, payments, meters, tariffs, service-orders, budget-plans, assistance-grants"
+  - name: FieldDispatcher
+    description: "Executes field work: completes disconnect/reconnect service orders"
+    identity: opaque
+    exclusive_operations:
+      - "POST /service-orders/{id}/complete"
+    shared_operations:
+      - "POST /service-orders/{id}/cancel (also BillingOperator)"
+      - "GET reads on service-orders, meters, accounts, tariffs"
+  - name: AssistanceCaseworker
+    description: "Manages LIHEAP and crisis assistance grants"
+    identity: opaque
+    exclusive_operations:
+      - "POST /assistance-grants, POST /assistance-grants/{id}/cancel"
+    shared_operations:
+      - "GET reads on accounts, bills, assistance-grants, tariffs"
+  - name: Customer
+    description: "Account holder: reads own account/bills and submits payments"
+    identity: entity_backed:Account
+    exclusive_operations: []
+    shared_operations:
+      - "POST /payments (also BillingOperator)"
+      - "GET reads on own account, bills, payments, meters, meter-reads, budget-plans, assistance-grants, tariffs"

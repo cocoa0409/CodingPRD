@@ -1,0 +1,1413 @@
+# =============================================================================
+# Retail Pharmacy Prescription Fulfillment — Scaffold (Expert tier, §0.4)
+# =============================================================================
+
+scenario: |
+  Retail Pharmacy Prescription Fulfillment: e-prescription intake, fill/refill
+  workflow, drug-interaction/DUR check, real-time insurance adjudication,
+  refill-too-soon edit, prior-auth referral, will-call/auto-refill/sync,
+  controlled-substance PDMP
+
+domain_name: retail-pharmacy-fulfillment
+api_prefix: ""   # flat topology: every entity collection sits at the URL root
+
+# Expert-tier calibration (§0.4):
+#   13 entities, flat-topology REST surface, dual-variant adjudication
+#   (provisional vs final copay), 5 state machines (Fill is cyclic via PA
+#   referral; Patient + FillClaim are parallel dimensions; Prescription and
+#   PriorAuthRequest branch), segregation-of-duties RBAC. Difficulty comes
+#   from tight coupling: a single dispense cascades PdmpReport -> Patient
+#   posture -> controlled lock, and OCC guards both claim submission and PA
+#   decisions.
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: workflow_orchestration
+  complexity_layers:
+    - dual_variant_calculation
+    - cascading_side_effects
+    - rate_threshold_triggers
+    - optimistic_concurrency
+  entity_topology: flat
+  state_machine_shape: branching      # plus one cyclic (Fill) and one parallel (Patient) machine
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate
+    - self_referential                # DrugProduct.therapeutic_substitute_of_id references DrugProduct
+  role_model: segregation_of_duties
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  # ---- Clock (test-driving system epoch) ----
+  - name: PharmacyClock
+    parent: null
+    common_fields: false
+    fields:
+      - { name: id, type: string, source: system, description: "Singleton clock id (the literal string 'clock')" }
+      - { name: created_at, type: datetime, source: system, description: "Creation timestamp, ISO 8601 UTC" }
+      - { name: current_utc, type: datetime, source: system, default: "2026-01-01T00:00:00.000Z", description: "Deterministic wall clock; all date math (refill-too-soon, PDMP lookback, will-call expiry) reads this, never the host clock" }
+
+  # ---- Reference / configuration ----
+  - name: DrugProduct
+    parent: null
+    common_fields: true
+    fields:
+      - { name: ndc, type: string, source: input, description: "11-digit National Drug Code; unique across DrugProduct" }
+      - { name: name, type: string, source: input, description: "Brand or generic drug name" }
+      - { name: dea_schedule, type: enum, source: input, default: NONE, description: "Controlled-substance schedule", constraints: "one of NONE, CII, CIII, CIV, CV" }
+      - { name: unit_price_cents, type: integer, source: input, description: "Acquisition cost per dispensing unit (e.g. per tablet) in cents; >= 0" }
+      - { name: pa_required, type: boolean, source: input, default: false, description: "Whether this drug always requires prior authorization regardless of plan formulary" }
+      - { name: therapeutic_substitute_of_id, type: string, source: input, required: false, description: "FK -> DrugProduct.id; self-referential link to the brand product this generic substitutes for; null for non-substitutes" }
+      - { name: is_active, type: boolean, source: computed, default: true, description: "False once discontinued; discontinued products reject new prescriptions" }
+      - { name: status, type: enum, source: system, description: "ACTIVE -> DISCONTINUED", constraints: "one of ACTIVE, DISCONTINUED" }
+
+  - name: InsurancePlan
+    parent: null
+    common_fields: true
+    fields:
+      - { name: bin, type: string, source: input, description: "Bank Identification Number routing the claim; unique with pcn" }
+      - { name: pcn, type: string, source: input, description: "Processor Control Number; unique with bin" }
+      - { name: name, type: string, source: input, description: "Payer / plan display name" }
+      - { name: copay_pct, type: number, source: input, description: "Coinsurance fraction the patient pays of allowed amount, 0.0..1.0" }
+      - { name: copay_min_cents, type: integer, source: input, default: 0, description: "Floor copay in cents the patient always pays; >= 0" }
+      - { name: copay_max_cents, type: integer, source: input, description: "Ceiling copay in cents (out-of-pocket cap per fill); > copay_min_cents" }
+      - { name: dispensing_fee_cents, type: integer, source: input, default: 100, description: "Flat fee added to allowed amount before coinsurance; >= 0" }
+      - { name: refill_too_soon_threshold_pct, type: number, source: input, default: 0.80, description: "Fraction of prior days_supply that must elapse before a refill is allowed, 0.0..1.0" }
+      - { name: requires_pa_for_controlled, type: boolean, source: input, default: false, description: "If true, every CII drug claim is referred to prior auth before adjudication" }
+
+  - name: FormularyEntry
+    parent: null
+    common_fields: true
+    fields:
+      - { name: plan_id, type: string, source: input, description: "FK -> InsurancePlan.id; the plan this formulary row belongs to" }
+      - { name: drug_id, type: string, source: input, description: "FK -> DrugProduct.id; the covered drug" }
+      - { name: tier, type: integer, source: input, description: "Formulary tier 1..4; lower is cheaper", constraints: "1..4" }
+      - { name: allowed_amount_cents, type: integer, source: input, description: "Plan-negotiated allowed amount per dispensing unit in cents; >= 0" }
+      - { name: requires_pa, type: boolean, source: input, default: false, description: "Plan-specific prior-auth requirement for this drug" }
+
+  - name: Patient
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Patient legal name" }
+      - { name: date_of_birth, type: string, source: input, description: "ISO date YYYY-MM-DD" }
+      - { name: plan_id, type: string, source: input, required: false, description: "FK -> InsurancePlan.id; active coverage; null = cash patient" }
+      - { name: allergy_classes, type: array, source: input, default: [], description: "List of allergy class strings (e.g. 'PENICILLIN', 'SULFA') used by DUR allergy screening" }
+      - { name: auto_refill_enrolled, type: boolean, source: input, default: false, description: "Patient opted into auto-refill program" }
+      - { name: med_sync_day, type: integer, source: input, required: false, description: "Day-of-month 1..28 the patient's chronic meds are synchronized to; null = not enrolled", constraints: "1..28" }
+      - { name: pdmp_flag, type: enum, source: computed, default: CLEAR, description: "PDMP risk posture computed from controlled-fill history", constraints: "one of CLEAR, REVIEW, BLOCKED" }
+      - { name: controlled_status, type: enum, source: computed, default: ELIGIBLE, description: "Parallel controlled-dispensing dimension gated by PDMP", constraints: "one of ELIGIBLE, LOCKED" }
+
+  - name: Prescriber
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Prescriber name" }
+      - { name: npi, type: string, source: input, description: "10-digit National Provider Identifier; unique" }
+      - { name: dea_number, type: string, source: input, required: false, description: "DEA registration number; required to authorize controlled prescriptions" }
+      - { name: dea_active, type: boolean, source: input, default: true, description: "Whether the DEA registration is currently valid" }
+
+  - name: Prescription
+    parent: null
+    common_fields: true   # supplies version for OCC on fill creation
+    fields:
+      - { name: patient_id, type: string, source: input, description: "FK -> Patient.id; the patient" }
+      - { name: prescriber_id, type: string, source: input, description: "FK -> Prescriber.id; the authorizing prescriber" }
+      - { name: drug_id, type: string, source: input, description: "FK -> DrugProduct.id; prescribed drug" }
+      - { name: quantity_per_fill, type: integer, source: input, description: "Dispensing units per fill; > 0" }
+      - { name: days_supply, type: integer, source: input, description: "Days each fill is expected to last; > 0" }
+      - { name: refills_authorized, type: integer, source: input, default: 0, description: "Number of refills authorized beyond the original fill; >= 0" }
+      - { name: refills_remaining, type: integer, source: computed, description: "= refills_authorized - (count of Fills in non-CANCELLED states beyond the first); never below 0" }
+      - { name: written_utc, type: datetime, source: input, description: "Date the prescription was written (ISO 8601 UTC)" }
+      - { name: expires_utc, type: datetime, source: computed, description: "= written_utc + 365 days for non-controlled, + 180 days for CII..CV (computed at intake)" }
+      - { name: last_dispensed_utc, type: datetime, source: computed, required: false, description: "current_utc at the most recent Fill that reached DISPENSED; drives refill-too-soon math; null until first dispense" }
+      - { name: status, type: enum, source: system, description: "Prescription lifecycle", constraints: "one of ACTIVE, EXHAUSTED, EXPIRED, DISCONTINUED" }
+
+  - name: Fill
+    parent: null
+    common_fields: true   # version for OCC and parallel claim state
+    fields:
+      - { name: prescription_id, type: string, source: input, description: "FK -> Prescription.id; the parent prescription" }
+      - { name: fill_sequence, type: integer, source: computed, description: "1 for the original fill, increments per subsequent fill of the same prescription" }
+      - { name: quantity_dispensed, type: integer, source: computed, description: "Copied from Prescription.quantity_per_fill at creation" }
+      - { name: days_supply, type: integer, source: computed, description: "Copied from Prescription.days_supply at creation" }
+      - { name: gross_amount_cents, type: integer, source: computed, description: "= drug.unit_price_cents * quantity_dispensed; the pre-insurance cost" }
+      - { name: provisional_copay_cents, type: integer, source: computed, required: false, description: "Estimated patient copay computed at claim submission (forward-looking, uses formulary allowed amount)" }
+      - { name: final_copay_cents, type: integer, source: computed, required: false, description: "Adjudicated patient copay locked at claim PAID (chronological, uses plan accumulator at pay time)" }
+      - { name: plan_paid_cents, type: integer, source: computed, required: false, description: "= allowed_total - final_copay_cents at PAID; 0 for cash" }
+      - { name: dur_severity, type: enum, source: computed, default: NONE, description: "Highest DUR alert severity raised on this fill", constraints: "one of NONE, MINOR, MODERATE, SEVERE" }
+      - { name: dur_override_by, type: string, source: input, required: false, description: "X-User-ID of the Pharmacist who overrode a MODERATE/SEVERE DUR alert; null until overridden" }
+      - { name: claim_status, type: enum, source: system, default: UNCLAIMED, description: "Parallel adjudication dimension (independent of fill workflow status)", constraints: "one of UNCLAIMED, SUBMITTED, PAID, REJECTED, PA_PENDING, REVERSED" }
+      - { name: pickup_deadline_utc, type: datetime, source: computed, required: false, description: "= current_utc + 10 days when fill enters WILL_CALL; will-call expiry boundary" }
+      - { name: status, type: enum, source: system, description: "Fill fulfillment workflow status", constraints: "one of ENTERED, DUR_REVIEW, ADJUDICATING, PA_REFERRAL, READY_FILL, WILL_CALL, DISPENSED, RETURNED_TO_STOCK, CANCELLED" }
+
+  - name: DurAlert
+    parent: null
+    common_fields: true
+    fields:
+      - { name: fill_id, type: string, source: input, description: "FK -> Fill.id; the fill this alert was raised against" }
+      - { name: alert_type, type: enum, source: computed, description: "Category of DUR finding", constraints: "one of INTERACTION, ALLERGY, DUPLICATE_THERAPY, HIGH_DOSE" }
+      - { name: severity, type: enum, source: computed, description: "Clinical severity", constraints: "one of MINOR, MODERATE, SEVERE" }
+      - { name: detail, type: string, source: computed, description: "Human-readable description of the finding" }
+      - { name: overridden, type: boolean, source: computed, default: false, description: "True once a Pharmacist overrides this alert" }
+      - { name: override_reason, type: string, source: input, required: false, description: "Reason captured at override; required for SEVERE overrides" }
+
+  - name: InteractionRule
+    parent: null
+    common_fields: true
+    fields:
+      - { name: drug_a_id, type: string, source: input, description: "FK -> DrugProduct.id; first interacting drug" }
+      - { name: drug_b_id, type: string, source: input, description: "FK -> DrugProduct.id; second interacting drug" }
+      - { name: severity, type: enum, source: input, description: "Interaction severity", constraints: "one of MINOR, MODERATE, SEVERE" }
+      - { name: detail, type: string, source: input, description: "Description of the interaction" }
+
+  - name: PriorAuthRequest
+    parent: null
+    common_fields: true   # version for OCC on decision
+    fields:
+      - { name: fill_id, type: string, source: input, description: "FK -> Fill.id; the fill referred to prior auth" }
+      - { name: prescription_id, type: string, source: computed, description: "FK -> Prescription.id; copied from the fill at referral" }
+      - { name: reason, type: enum, source: computed, description: "Why PA was triggered", constraints: "one of DRUG_PA_REQUIRED, PLAN_PA_REQUIRED, CONTROLLED_PA_REQUIRED" }
+      - { name: submitted_utc, type: datetime, source: computed, description: "current_utc when the PA request was opened" }
+      - { name: decided_utc, type: datetime, source: computed, required: false, description: "current_utc when approved/denied; null while pending" }
+      - { name: expires_utc, type: datetime, source: computed, description: "= submitted_utc + 30 days; PA approval is invalid past this" }
+      - { name: status, type: enum, source: system, description: "PA lifecycle", constraints: "one of PENDING, APPROVED, DENIED, EXPIRED" }
+
+  - name: PdmpReport
+    parent: null
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: input, description: "FK -> Patient.id; the queried patient" }
+      - { name: fill_id, type: string, source: input, required: false, description: "FK -> Fill.id; the controlled fill that triggered the query; null for manual queries" }
+      - { name: lookback_days, type: integer, source: computed, default: 90, description: "Window scanned for controlled fills" }
+      - { name: controlled_fill_count, type: integer, source: computed, description: "Count of DISPENSED controlled (CII..CV) fills for the patient within lookback_days of current_utc" }
+      - { name: distinct_prescriber_count, type: integer, source: computed, description: "Count of distinct prescribers across those controlled fills" }
+      - { name: risk_score, type: integer, source: computed, description: "Weighted PDMP risk score (see calculations.pdmp_risk_score)" }
+      - { name: resulting_flag, type: enum, source: computed, description: "Posture this report drove Patient.pdmp_flag to", constraints: "one of CLEAR, REVIEW, BLOCKED" }
+
+  - name: PaymentRecord
+    parent: null
+    common_fields: true
+    fields:
+      - { name: fill_id, type: string, source: input, description: "FK -> Fill.id; the fill being paid for at pickup" }
+      - { name: amount_cents, type: integer, source: input, description: "Cash collected from the patient; must equal Fill.final_copay_cents (or gross for cash patients)" }
+      - { name: tendered_by, type: string, source: input, description: "X-User-ID of the cashier/technician collecting payment" }
+      - { name: refunded, type: boolean, source: computed, default: false, description: "True after a reversal refunds this payment" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- Prescription lifecycle (linear with auto-transitions) ----
+  - entity: Prescription
+    initial_state: ACTIVE
+    terminal_states: [EXHAUSTED, EXPIRED, DISCONTINUED]
+    transitions:
+      - from: ACTIVE
+        to: EXHAUSTED
+        trigger: "system (bubble-up when a Fill reaches DISPENSED and refills_remaining hits 0)"
+        actor: system
+        preconditions:
+          - "refills_remaining == 0 after decrementing for the just-DISPENSED fill"
+        side_effects:
+          - "Prescription.status = EXHAUSTED"
+        note: "Bubble-up: child Fill DISPENSED -> parent recomputes refills_remaining -> auto-EXHAUSTED"
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /prescriptions/{id}/expire-scan (system sweep keyed on PharmacyClock.current_utc)"
+        actor: system
+        preconditions:
+          - "PharmacyClock.current_utc > Prescription.expires_utc"
+        side_effects:
+          - "Prescription.status = EXPIRED"
+      - from: ACTIVE
+        to: DISCONTINUED
+        trigger: "POST /prescriptions/{id}/discontinue"
+        actor: Pharmacist
+        preconditions:
+          - "Prescription.status == ACTIVE (ERR_PRESCRIPTION_NOT_ACTIVE)"
+          - "No Fill of this prescription in a non-terminal workflow state other than ENTERED (ERR_OPEN_FILL_EXISTS)"
+        side_effects:
+          - "Prescription.status = DISCONTINUED"
+          - "Each Fill in ENTERED -> CANCELLED (cascade down)"
+
+  # ---- Fill fulfillment workflow (branching + cyclic via PA referral) ----
+  - entity: Fill
+    initial_state: ENTERED
+    terminal_states: [DISPENSED, RETURNED_TO_STOCK, CANCELLED]
+    transitions:
+      - from: ENTERED
+        to: DUR_REVIEW
+        trigger: "POST /fills/{id}/run-dur"
+        actor: Technician
+        preconditions:
+          - "Fill.status == ENTERED (ERR_FILL_NOT_ENTERED)"
+          - "Parent Prescription.status == ACTIVE (ERR_PRESCRIPTION_NOT_ACTIVE)"
+          - "DrugProduct.status == ACTIVE (ERR_DRUG_DISCONTINUED)"
+        side_effects:
+          - "Run DUR screen: create DurAlert rows for every matching InteractionRule, allergy class, duplicate therapy, high dose"
+          - "Fill.dur_severity = max severity across created alerts (NONE if none)"
+          - "If dur_severity == NONE -> Fill auto-advances to ADJUDICATING (see ENTERED->... note); otherwise stays DUR_REVIEW awaiting override"
+        note: "Branch point A: NONE severity skips review; MODERATE/SEVERE require Pharmacist override before leaving DUR_REVIEW"
+      - from: DUR_REVIEW
+        to: ADJUDICATING
+        trigger: "POST /fills/{id}/override-dur"
+        actor: Pharmacist
+        preconditions:
+          - "Fill.status == DUR_REVIEW (ERR_FILL_NOT_IN_DUR_REVIEW)"
+          - "All MODERATE/SEVERE DurAlerts for this fill carry override_reason (ERR_OVERRIDE_REASON_REQUIRED)"
+          - "Acting Pharmacist X-User-ID != Technician who created the fill when drug.dea_schedule is CII (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "Each MODERATE/SEVERE DurAlert.overridden = true"
+          - "Fill.dur_override_by = acting Pharmacist X-User-ID"
+      - from: DUR_REVIEW
+        to: CANCELLED
+        trigger: "POST /fills/{id}/cancel"
+        actor: Pharmacist
+        preconditions:
+          - "Fill.status in {ENTERED, DUR_REVIEW, ADJUDICATING, PA_REFERRAL, READY_FILL, WILL_CALL} (ERR_FILL_NOT_CANCELLABLE)"
+          - "Fill.claim_status not in {PAID} (ERR_CLAIM_PAID_REVERSE_FIRST)"
+        side_effects:
+          - "Fill.status = CANCELLED"
+          - "If claim_status == SUBMITTED or PA_PENDING -> claim_status = REVERSED (cross-entity parallel dim)"
+          - "Parent Prescription.refills_remaining recomputed (cancelled fill no longer counts)"
+      - from: ADJUDICATING
+        to: PA_REFERRAL
+        trigger: "POST /fills/{id}/submit-claim (when PA is required)"
+        actor: Technician
+        preconditions:
+          - "Fill.status == ADJUDICATING (ERR_FILL_NOT_ADJUDICATING)"
+          - "Fill.claim_status == UNCLAIMED (ERR_CLAIM_ALREADY_OPEN)"
+          - "expected_prescription_version matches Prescription.version (ERR_STALE_PRESCRIPTION_VERSION)"
+          - "PA is required AND no APPROVED PriorAuthRequest already exists for this fill: (drug.pa_required OR matching FormularyEntry.requires_pa OR (drug.dea_schedule==CII AND plan.requires_pa_for_controlled)) AND (no PriorAuthRequest for this fill with status==APPROVED)"
+        side_effects:
+          - "Create PriorAuthRequest (status PENDING, reason set, expires_utc = current_utc + 30d)"
+          - "Fill.claim_status = PA_PENDING"
+          - "Increments Prescription.version by 1"
+        note: "Branch point B + cycle entry: claim submission forks to PA_REFERRAL when PA required, else to READY_FILL. An APPROVED PriorAuthRequest for the fill suppresses re-referral so the resubmit clears to READY_FILL."
+      - from: ADJUDICATING
+        to: READY_FILL
+        trigger: "POST /fills/{id}/submit-claim (when adjudication PAYs and no PA needed)"
+        actor: Technician
+        preconditions:
+          - "Fill.status == ADJUDICATING (ERR_FILL_NOT_ADJUDICATING)"
+          - "Fill.claim_status == UNCLAIMED (ERR_CLAIM_ALREADY_OPEN)"
+          - "expected_prescription_version matches Prescription.version (ERR_STALE_PRESCRIPTION_VERSION)"
+          - "Refill-too-soon edit passes: current_utc - last_dispensed_utc >= floor(prior days_supply * plan.refill_too_soon_threshold_pct) days (ERR_REFILL_TOO_SOON)"
+          - "Patient.controlled_status == ELIGIBLE when drug is controlled (ERR_PATIENT_CONTROLLED_LOCKED)"
+        side_effects:
+          - "Compute provisional_copay_cents (forward-looking variant)"
+          - "Compute final_copay_cents and plan_paid_cents (adjudicated variant)"
+          - "Fill.claim_status = PAID"
+          - "Fill.status = READY_FILL"
+          - "Increments Prescription.version by 1"
+      - from: PA_REFERRAL
+        to: ADJUDICATING
+        trigger: "POST /prior-auth-requests/{id}/approve (cycle back)"
+        actor: Pharmacist
+        preconditions:
+          - "PriorAuthRequest.status == PENDING (ERR_PA_NOT_PENDING)"
+          - "current_utc <= PriorAuthRequest.expires_utc (ERR_PA_EXPIRED)"
+          - "expected_priorauthrequest_version matches (ERR_STALE_PA_VERSION)"
+        side_effects:
+          - "PriorAuthRequest.status = APPROVED, decided_utc = current_utc"
+          - "Fill.claim_status = UNCLAIMED (re-opened for a fresh claim)"
+          - "Fill.status = ADJUDICATING (cyclic return so claim can be resubmitted)"
+          - "Increments PriorAuthRequest.version by 1"
+        note: "Cycle: ADJUDICATING -> PA_REFERRAL -> ADJUDICATING; resubmit-claim then drives READY_FILL"
+      - from: PA_REFERRAL
+        to: CANCELLED
+        trigger: "POST /prior-auth-requests/{id}/deny"
+        actor: Pharmacist
+        preconditions:
+          - "PriorAuthRequest.status == PENDING (ERR_PA_NOT_PENDING)"
+          - "expected_priorauthrequest_version matches (ERR_STALE_PA_VERSION)"
+        side_effects:
+          - "PriorAuthRequest.status = DENIED, decided_utc = current_utc"
+          - "Fill.claim_status = REJECTED"
+          - "Fill.status = CANCELLED"
+          - "Parent Prescription.refills_remaining recomputed"
+          - "Increments PriorAuthRequest.version by 1"
+      - from: READY_FILL
+        to: WILL_CALL
+        trigger: "POST /fills/{id}/stage-will-call"
+        actor: Technician
+        preconditions:
+          - "Fill.status == READY_FILL (ERR_FILL_NOT_READY)"
+          - "Fill.claim_status == PAID (ERR_CLAIM_NOT_PAID)"
+        side_effects:
+          - "Fill.status = WILL_CALL"
+          - "Fill.pickup_deadline_utc = current_utc + 10 days"
+      - from: WILL_CALL
+        to: DISPENSED
+        trigger: "POST /fills/{id}/dispense"
+        actor: Pharmacist
+        preconditions:
+          - "Fill.status == WILL_CALL (ERR_FILL_NOT_WILL_CALL)"
+          - "current_utc <= Fill.pickup_deadline_utc (ERR_WILL_CALL_EXPIRED)"
+          - "A PaymentRecord exists for this fill with amount_cents == final_copay_cents (ERR_PAYMENT_REQUIRED)"
+          - "Acting Pharmacist X-User-ID != Technician who created the fill when drug.dea_schedule is CII (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "Fill.status = DISPENSED (set FIRST, before the PdmpReport regeneration below, so the committed-variant count includes this fill)"
+          - "Prescription.last_dispensed_utc = current_utc"
+          - "Prescription.refills_remaining recomputed; if 0 -> Prescription auto-EXHAUSTED (bubble-up)"
+          - "If drug is controlled: regenerate PdmpReport for patient (committed_at_dispense variant, counts DISPENSED controlled fills incl. this one), recompute Patient.pdmp_flag and controlled_status (cross-entity cascade depth 3: dispense -> PdmpReport.resulting_flag -> Patient.pdmp_flag -> Patient.controlled_status)"
+      - from: WILL_CALL
+        to: RETURNED_TO_STOCK
+        trigger: "POST /fills/{id}/expire-will-call (system sweep keyed on current_utc)"
+        actor: system
+        preconditions:
+          - "Fill.status == WILL_CALL"
+          - "current_utc > Fill.pickup_deadline_utc"
+        side_effects:
+          - "Fill.status = RETURNED_TO_STOCK"
+          - "Fill.claim_status = REVERSED (compensation: paid claim is reversed when drug returns to stock)"
+          - "Reverse plan_paid_cents and refund any PaymentRecord (PaymentRecord.refunded = true)"
+          - "Parent Prescription.refills_remaining recomputed (returned fill no longer counts)"
+      - from: READY_FILL
+        to: CANCELLED
+        trigger: "POST /fills/{id}/cancel"
+        actor: Pharmacist
+        preconditions:
+          - "Fill.status in {ENTERED, DUR_REVIEW, ADJUDICATING, PA_REFERRAL, READY_FILL, WILL_CALL} (ERR_FILL_NOT_CANCELLABLE)"
+          - "Fill.claim_status not in {PAID} unless reversed first... handled via reverse-claim (ERR_CLAIM_PAID_REVERSE_FIRST)"
+        side_effects:
+          - "Fill.status = CANCELLED"
+          - "Parent Prescription.refills_remaining recomputed"
+
+  # ---- Fill claim_status parallel dimension (independent of workflow status) ----
+  - entity: FillClaim
+    initial_state: UNCLAIMED
+    terminal_states: [REVERSED]
+    transitions:
+      - from: UNCLAIMED
+        to: SUBMITTED
+        trigger: "internal: claim adjudication begins on POST /fills/{id}/submit-claim"
+        actor: system
+        preconditions:
+          - "Fill.claim_status == UNCLAIMED"
+        side_effects:
+          - "Fill.claim_status = SUBMITTED (transient; resolves to PAID/REJECTED/PA_PENDING within the same request)"
+        note: "Parallel dimension on Fill row: claim_status evolves on its own axis alongside workflow status"
+      - from: SUBMITTED
+        to: PAID
+        trigger: "internal: adjudication returns PAY"
+        actor: system
+        preconditions:
+          - "Refill-too-soon and controlled-lock checks pass"
+        side_effects:
+          - "Fill.claim_status = PAID; final_copay_cents locked"
+      - from: SUBMITTED
+        to: PA_PENDING
+        trigger: "internal: adjudication returns PA-required"
+        actor: system
+        preconditions:
+          - "PA is required for drug/plan/controlled combination"
+        side_effects:
+          - "Fill.claim_status = PA_PENDING; PriorAuthRequest created"
+      - from: PA_PENDING
+        to: UNCLAIMED
+        trigger: "POST /prior-auth-requests/{id}/approve"
+        actor: Pharmacist
+        preconditions:
+          - "PriorAuthRequest.status == PENDING and not expired"
+        side_effects:
+          - "Fill.claim_status = UNCLAIMED (claim re-opened for resubmission)"
+      - from: PA_PENDING
+        to: REJECTED
+        trigger: "POST /prior-auth-requests/{id}/deny"
+        actor: Pharmacist
+        preconditions:
+          - "PriorAuthRequest.status == PENDING"
+        side_effects:
+          - "Fill.claim_status = REJECTED"
+      - from: PAID
+        to: REVERSED
+        trigger: "POST /fills/{id}/reverse-claim"
+        actor: Pharmacist
+        preconditions:
+          - "Fill.claim_status == PAID (ERR_CLAIM_NOT_PAID)"
+          - "Fill.status not in {DISPENSED} (ERR_FILL_ALREADY_DISPENSED)"
+        side_effects:
+          - "Fill.claim_status = REVERSED"
+          - "Reverse plan_paid_cents to 0; refund PaymentRecord if present (PaymentRecord.refunded = true)"
+          - "Conserves money: gross_amount_cents unchanged; plan_paid + final_copay reverts to 0 (compensating invariant)"
+
+  # ---- PriorAuthRequest lifecycle (branching approve/deny + expiry) ----
+  - entity: PriorAuthRequest
+    initial_state: PENDING
+    terminal_states: [APPROVED, DENIED, EXPIRED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /prior-auth-requests/{id}/approve"
+        actor: Pharmacist
+        preconditions:
+          - "status == PENDING (ERR_PA_NOT_PENDING)"
+          - "current_utc <= expires_utc (ERR_PA_EXPIRED)"
+          - "expected_priorauthrequest_version matches (ERR_STALE_PA_VERSION)"
+        side_effects:
+          - "status = APPROVED, decided_utc = current_utc"
+          - "Cross-entity: Fill.claim_status -> UNCLAIMED, Fill.status -> ADJUDICATING"
+          - "Increments PriorAuthRequest.version by 1"
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /prior-auth-requests/{id}/deny"
+        actor: Pharmacist
+        preconditions:
+          - "status == PENDING (ERR_PA_NOT_PENDING)"
+          - "expected_priorauthrequest_version matches (ERR_STALE_PA_VERSION)"
+        side_effects:
+          - "status = DENIED, decided_utc = current_utc"
+          - "Cross-entity: Fill.claim_status -> REJECTED, Fill.status -> CANCELLED"
+          - "Increments PriorAuthRequest.version by 1"
+      - from: PENDING
+        to: EXPIRED
+        trigger: "POST /prior-auth-requests/{id}/expire-scan (system sweep keyed on current_utc)"
+        actor: system
+        preconditions:
+          - "status == PENDING"
+          - "current_utc > expires_utc"
+        side_effects:
+          - "status = EXPIRED"
+          - "Cross-entity: Fill.claim_status -> REJECTED, Fill.status -> CANCELLED"
+
+  # ---- Patient PDMP / controlled-dispensing parallel dimensions ----
+  - entity: Patient
+    initial_state: CLEAR        # pdmp_flag dimension
+    terminal_states: []
+    transitions:
+      - from: CLEAR
+        to: REVIEW
+        trigger: "system (PdmpReport regenerated with REVIEW risk band)"
+        actor: system
+        preconditions:
+          - "pdmp_risk_score in REVIEW band (>= REVIEW_THRESHOLD and < BLOCK_THRESHOLD)"
+        side_effects:
+          - "Patient.pdmp_flag = REVIEW (controlled_status stays ELIGIBLE; pharmacist sees advisory)"
+      - from: REVIEW
+        to: BLOCKED
+        trigger: "system (PdmpReport regenerated with BLOCK risk band)"
+        actor: system
+        preconditions:
+          - "pdmp_risk_score >= BLOCK_THRESHOLD"
+        side_effects:
+          - "Patient.pdmp_flag = BLOCKED"
+          - "Patient.controlled_status = LOCKED (parallel dimension flips; new controlled claims rejected)"
+      - from: CLEAR
+        to: BLOCKED
+        trigger: "system (PdmpReport regenerated with BLOCK risk band directly)"
+        actor: system
+        preconditions:
+          - "pdmp_risk_score >= BLOCK_THRESHOLD"
+        side_effects:
+          - "Patient.pdmp_flag = BLOCKED"
+          - "Patient.controlled_status = LOCKED"
+      - from: BLOCKED
+        to: CLEAR
+        trigger: "POST /patients/{id}/clear-pdmp-block"
+        actor: Pharmacist
+        preconditions:
+          - "Patient.pdmp_flag == BLOCKED (ERR_PATIENT_NOT_BLOCKED)"
+          - "override_reason provided (ERR_OVERRIDE_REASON_REQUIRED)"
+        side_effects:
+          - "Patient.pdmp_flag = CLEAR"
+          - "Patient.controlled_status = ELIGIBLE (manual pharmacist clearance)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: claim-submit-stale-prescription
+    parent_entity: Prescription
+    write_endpoint: "POST /fills/{id}/submit-claim"
+    occ_field: "expected_prescription_version"
+    description: |
+      Submitting a claim for a Fill against a Prescription whose version has
+      advanced since the client last observed it is rejected. A separate fill
+      of the same prescription that already adjudicated (legitimately
+      decrementing refills_remaining and bumping Prescription.version) makes
+      the current client's view stale; the stale-version check rejects it.
+    error_id: ERR_STALE_PRESCRIPTION_VERSION
+    http_status: 412
+  - rule_id: pa-decision-stale-priorauth
+    parent_entity: PriorAuthRequest
+    write_endpoint: "POST /prior-auth-requests/{id}/approve"
+    occ_field: "expected_priorauthrequest_version"
+    description: |
+      Approving a PriorAuthRequest whose version advanced since the client
+      last read it is rejected. This captures the case where the PA was
+      already decided (approve/deny legitimately bumps version) and the
+      current writer's view is therefore stale.
+    error_id: ERR_STALE_PA_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: provisional_copay_estimate
+    trigger: "POST /fills/{id}/submit-claim (claim adjudication), forward-looking estimate"
+    algorithm: forward_looking
+    formula: |
+      # Forward-looking: estimate from the formulary allowed amount BEFORE
+      # consulting the running plan accumulator. Round per-unit then sum.
+      allowed_per_unit = FormularyEntry.allowed_amount_cents   # for (plan, drug)
+      allowed_total    = allowed_per_unit * Fill.quantity_dispensed + plan.dispensing_fee_cents
+      raw_copay        = round_half_up(allowed_total * plan.copay_pct)   # single round on the total
+      provisional_copay_cents = min(max(raw_copay, plan.copay_min_cents), plan.copay_max_cents)
+      # Cash patient (Patient.plan_id == null): provisional_copay_cents = gross_amount_cents
+    input_set: "The single FormularyEntry matching (Fill->Prescription->drug_id, patient.plan_id). If no entry exists -> ERR_DRUG_NOT_ON_FORMULARY."
+    constants: {}
+    precision: "integer cents, round_half_up on the coinsurance product"
+    variants:
+      - name: cash_patient
+        when: "Patient.plan_id is null"
+        difference: "No formulary lookup; provisional_copay_cents = gross_amount_cents (drug cost), plan_paid_cents = 0"
+    note: "Forward-looking: uses static formulary allowed amount, ignores prior fills' accumulator."
+
+  - name: final_copay_adjudicated
+    trigger: "claim PAY (ADJUDICATING -> READY_FILL), chronological adjudication"
+    algorithm: chronological
+    formula: |
+      # Chronological: process the patient's already-PAID/DISPENSED fills of
+      # THIS plan in created_at ASC order, sum the copay each contributed this
+      # plan-year, then cap the CURRENT fill so the patient's cumulative
+      # out-of-pocket never exceeds the plan's annual cap (copay_max_cents is
+      # the ANNUAL out-of-pocket maximum, applied cumulatively here — this is
+      # exactly where it diverges from the provisional estimate's per-fill cap).
+      allowed_total      = FormularyEntry.allowed_amount_cents * Fill.quantity_dispensed + plan.dispensing_fee_cents
+      raw_copay          = round_half_up(allowed_total * plan.copay_pct)
+      this_fill_copay    = max(raw_copay, plan.copay_min_cents)
+      prior_oop          = sum(final_copay_cents) over the patient's earlier fills
+                           (claim_status in {PAID, REVERSED->excluded}, status != CANCELLED)
+                           for the SAME (patient, plan), ordered created_at ASC
+      remaining_cap      = max(plan.copay_max_cents - prior_oop, 0)
+      final_copay_cents  = min(this_fill_copay, remaining_cap)
+      plan_paid_cents    = allowed_total - final_copay_cents
+    input_set: "PAID/DISPENSED fills for (patient, plan), status != CANCELLED, REVERSED fills excluded; processed created_at ASC (unique, no further tie-break needed)."
+    constants: {}
+    precision: "integer cents, round_half_up on the coinsurance product"
+    variants:
+      - name: cash_patient
+        when: "Patient.plan_id is null"
+        difference: "final_copay_cents = gross_amount_cents, plan_paid_cents = 0"
+    note: |
+      Dual-variant pair with provisional_copay_estimate (both on the Fill
+      domain): identical per-fill formula, but provisional applies copay_max
+      PER FILL (forward-looking, no history) while final applies copay_max
+      CUMULATIVELY across the patient's prior fills (chronological). On a
+      patient's SECOND fill whose prior copays already neared the annual cap,
+      provisional and final diverge.
+
+  - name: refill_too_soon_window
+    trigger: "POST /fills/{id}/submit-claim (refill-too-soon edit), threshold check"
+    algorithm: threshold
+    formula: |
+      # Boundary-precise: a refill is allowed only when enough of the prior
+      # supply has elapsed. Uses calendar days between current_utc and the
+      # parent prescription's last_dispensed_utc.
+      required_days = floor(prior_days_supply * plan.refill_too_soon_threshold_pct)
+      elapsed_days  = floor((current_utc - Prescription.last_dispensed_utc) / 1 day)
+      allowed = (elapsed_days >= required_days)     # >= , NOT >
+      # First fill (last_dispensed_utc null) always passes.
+    input_set: "prior_days_supply = Prescription.days_supply; only the most recent DISPENSED fill matters via last_dispensed_utc."
+    constants:
+      DEFAULT_THRESHOLD_PCT: 0.80
+    precision: "integer days, floor on both required_days and elapsed_days"
+    note: "Boundary: elapsed_days == required_days passes (>=); required_days - 1 fails."
+
+  - name: pdmp_risk_score
+    trigger: "controlled fill reaches DISPENSED (PdmpReport regeneration) OR manual POST /pdmp-reports, weighted scoring"
+    algorithm: weighted_scoring
+    formula: |
+      # Weighted: controlled fill volume + prescriber-shopping signal.
+      controlled_fill_count     = count of qualifying CII..CV fills for patient
+                                  within lookback_days of current_utc
+      distinct_prescriber_count = distinct prescribers across those fills
+      risk_score = controlled_fill_count * FILL_WEIGHT
+                 + max(distinct_prescriber_count - 1, 0) * PRESCRIBER_WEIGHT
+      resulting_flag = BLOCKED if risk_score >= BLOCK_THRESHOLD
+                       else REVIEW if risk_score >= REVIEW_THRESHOLD
+                       else CLEAR
+    input_set: "Qualifying fills whose drug.dea_schedule in {CII,CIII,CIV,CV}, within lookback_days (90) of current_utc, ordered created_at ASC. Which fills 'qualify' is variant-dependent (see variants)."
+    constants:
+      FILL_WEIGHT: 10
+      PRESCRIBER_WEIGHT: 15
+      REVIEW_THRESHOLD: 30
+      BLOCK_THRESHOLD: 60
+      lookback_days: 90
+    precision: "integer score"
+    variants:
+      - name: committed_at_dispense
+        when: "Regenerated as the dispense-time side effect (cross-entity cascade) and as the default for manual queries"
+        difference: "Counts ONLY fills already in DISPENSED status — the chronological, settled view. Drives the persisted Patient.pdmp_flag / controlled_status."
+      - name: provisional_at_submit
+        when: "Computed during submit-claim of a controlled drug to decide whether to admit the claim"
+        difference: "Forward-looking: counts DISPENSED fills PLUS the in-flight fill currently being adjudicated (status in {ADJUDICATING, READY_FILL}). Diverges from committed by exactly one fill's weight; used only to gate the claim, never persisted to pdmp_flag."
+    note: |
+      Combinatorial mode (a): >=3 inputs (fill count, distinct prescriber count,
+      weights) with nested max and tiered band selection. Dual-variant pair on
+      the Patient domain (distinct from the Fill-domain copay pair): the
+      provisional submit-time risk includes the in-flight fill, the committed
+      dispense-time risk does not, so the two scores diverge by one FILL_WEIGHT
+      (and possibly one PRESCRIBER_WEIGHT) on the boundary fill.
+
+  - name: dur_severity_rollup
+    trigger: "POST /fills/{id}/run-dur (DUR screen), aggregation"
+    algorithm: aggregation
+    formula: |
+      # Aggregate the max severity across all alert sources for this fill.
+      severities = []
+      for each InteractionRule pairing the fill's drug with any other drug on
+          a non-CANCELLED Fill of the SAME patient -> severities += rule.severity
+      if fill's drug shares an allergy_class in Patient.allergy_classes -> severities += SEVERE
+      if another non-CANCELLED Fill of same patient has same drug_id (duplicate therapy) -> severities += MODERATE
+      if quantity_dispensed / days_supply > HIGH_DOSE_UNITS_PER_DAY -> severities += MODERATE
+      dur_severity = max(severities) by rank {NONE<MINOR<MODERATE<SEVERE}
+    input_set: "Non-CANCELLED Fills of the same patient for interaction/duplicate screening; Patient.allergy_classes for allergy."
+    constants:
+      HIGH_DOSE_UNITS_PER_DAY: 4
+    precision: "enum rank"
+    note: "Aggregation max over heterogeneous alert sources."
+
+  - name: refills_remaining_recompute
+    trigger: "fill create, fill cancel, fill dispense, fill return-to-stock (derived-field reconciliation)"
+    algorithm: aggregation
+    formula: |
+      consumed = count of Fills of this prescription in states
+                 {ADJUDICATING, PA_REFERRAL, READY_FILL, WILL_CALL, DISPENSED}
+                 EXCLUDING the original (fill_sequence == 1)
+      refills_remaining = max(refills_authorized - consumed, 0)
+    input_set: "Fills of the prescription; CANCELLED and RETURNED_TO_STOCK and ENTERED and DUR_REVIEW excluded from consumed count."
+    constants: {}
+    precision: "integer, floored at 0"
+    note: "Derived-field reconciliation: recomputed on every fill lifecycle change; drives Prescription auto-EXHAUSTED bubble-up."
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and well-formed"
+    error_id: ERR_MISSING_USER_CONTEXT
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Role permitted for this operation per §1.7"
+    error_id: ERR_INSUFFICIENT_PERMISSIONS
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "Path resource ids exist, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all resource endpoints"
+  - priority: 4
+    category: existence
+    check: "FK body fields reference existing resources (patient_id, prescriber_id, drug_id, plan_id, fill_id)"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /prescriptions, POST /fills, POST /formulary-entries, POST /interaction-rules, POST /payment-records"
+  - priority: 5
+    category: state
+    check: "OCC: expected_<parent>_version matches current parent.version (when endpoint requires it)"
+    error_id: ERR_STALE_PRESCRIPTION_VERSION
+    http_status: 412
+    applies_to: "POST /fills/{id}/submit-claim, POST /prior-auth-requests/{id}/approve, POST /prior-auth-requests/{id}/deny"
+    note: "PA endpoints use ERR_STALE_PA_VERSION; submit-claim uses ERR_STALE_PRESCRIPTION_VERSION"
+  - priority: 6
+    category: state
+    check: "Target resource in a valid from-state for the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+    note: "Specific state errors (ERR_FILL_NOT_ENTERED, ERR_FILL_NOT_ADJUDICATING, ERR_PA_NOT_PENDING, etc.) are emitted per transition"
+  - priority: 7
+    category: business_safety
+    check: "Controlled prescription requires prescriber.dea_number present and dea_active==true"
+    error_id: ERR_PRESCRIBER_DEA_INVALID
+    http_status: 422
+    applies_to: "POST /prescriptions (controlled drug), POST /fills"
+  - priority: 8
+    category: business_safety
+    check: "DrugProduct.status == ACTIVE (not discontinued) when creating a prescription/fill"
+    error_id: ERR_DRUG_DISCONTINUED
+    http_status: 409
+    applies_to: "POST /prescriptions, POST /fills/{id}/run-dur"
+  - priority: 9
+    category: business_safety
+    check: "MODERATE/SEVERE DUR alerts must be overridden by a Pharmacist before leaving DUR_REVIEW; SEVERE requires override_reason"
+    error_id: ERR_DUR_NOT_OVERRIDDEN
+    http_status: 409
+    applies_to: "POST /fills/{id}/submit-claim"
+  - priority: 10
+    category: business_safety
+    check: "Segregation of duties: for CII drugs the Pharmacist overriding DUR or dispensing must not be the Technician (X-User-ID) who created the fill"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /fills/{id}/override-dur, POST /fills/{id}/dispense"
+  - priority: 11
+    category: business_safety
+    check: "Patient.controlled_status must be ELIGIBLE when adjudicating a controlled drug claim"
+    error_id: ERR_PATIENT_CONTROLLED_LOCKED
+    http_status: 403
+    applies_to: "POST /fills/{id}/submit-claim (controlled drug)"
+  - priority: 12
+    category: business_temporal
+    check: "Refill-too-soon: enough of the prior days_supply has elapsed since last_dispensed_utc"
+    error_id: ERR_REFILL_TOO_SOON
+    http_status: 409
+    applies_to: "POST /fills/{id}/submit-claim"
+  - priority: 13
+    category: business_temporal
+    check: "Prescription not expired (current_utc <= expires_utc) and not DISCONTINUED/EXHAUSTED"
+    error_id: ERR_PRESCRIPTION_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /fills, POST /fills/{id}/run-dur"
+  - priority: 14
+    category: business_temporal
+    check: "Will-call not expired (current_utc <= pickup_deadline_utc) at dispense"
+    error_id: ERR_WILL_CALL_EXPIRED
+    http_status: 409
+    applies_to: "POST /fills/{id}/dispense"
+  - priority: 15
+    category: business_constraint
+    check: "refills_remaining > 0 when creating a refill (fill_sequence > 1)"
+    error_id: ERR_NO_REFILLS_REMAINING
+    http_status: 409
+    applies_to: "POST /fills"
+  - priority: 16
+    category: business_constraint
+    check: "Drug must appear on the patient's plan formulary (for insured patients) or be flagged for PA"
+    error_id: ERR_DRUG_NOT_ON_FORMULARY
+    http_status: 422
+    applies_to: "POST /fills/{id}/submit-claim"
+  - priority: 17
+    category: business_constraint
+    check: "PaymentRecord.amount_cents must equal Fill.final_copay_cents (insured) or gross_amount_cents (cash)"
+    error_id: ERR_PAYMENT_AMOUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /payment-records"
+  - priority: 18
+    category: business_referential
+    check: "PriorAuthRequest must not be expired when approving"
+    error_id: ERR_PA_EXPIRED
+    http_status: 409
+    applies_to: "POST /prior-auth-requests/{id}/approve"
+  - priority: 19
+    category: business_constraint
+    check: "Override reason required for SEVERE DUR overrides and PDMP block clears"
+    error_id: ERR_OVERRIDE_REASON_REQUIRED
+    http_status: 422
+    applies_to: "POST /fills/{id}/override-dur, POST /patients/{id}/clear-pdmp-block"
+  - priority: 20
+    category: business_constraint
+    check: "Request body conforms to declared input schema; enum values legal; numeric fields in range"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Clock (test-driving) ----
+  - method: POST
+    path: "/_clock/set"
+    description: "Set the deterministic pharmacy clock"
+    roles: [PharmacyAdmin]
+    code: 200
+    input: [current_utc]
+    output: PharmacyClock
+    side_effects: ["PharmacyClock.current_utc = current_utc"]
+  - method: GET
+    path: "/_clock"
+    description: "Read the current pharmacy clock"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: []
+    output: PharmacyClock
+    side_effects: []
+
+  # ---- DrugProduct ----
+  - method: POST
+    path: "/drug-products"
+    description: "Create a drug product"
+    roles: [PharmacyAdmin]
+    code: 201
+    input: [ndc, name, "dea_schedule?", unit_price_cents, "pa_required?", "therapeutic_substitute_of_id?"]
+    output: DrugProduct
+    side_effects: ["status = ACTIVE", "is_active = true"]
+  - method: GET
+    path: "/drug-products"
+    description: "List drug products (filter by self-referential substitute link)"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: ["therapeutic_substitute_of_id?", "limit?", "offset?"]
+    output: "DrugProduct[]"
+    side_effects: []
+  - method: GET
+    path: "/drug-products/{id}"
+    description: "Get a drug product"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: []
+    output: DrugProduct
+    side_effects: []
+  - method: POST
+    path: "/drug-products/{id}/discontinue"
+    description: "Discontinue a drug product"
+    roles: [PharmacyAdmin]
+    code: 200
+    input: []
+    output: DrugProduct
+    side_effects: ["status = DISCONTINUED", "is_active = false"]
+
+  # ---- InsurancePlan ----
+  - method: POST
+    path: "/insurance-plans"
+    description: "Create an insurance plan"
+    roles: [PharmacyAdmin]
+    code: 201
+    input: [bin, pcn, name, copay_pct, "copay_min_cents?", copay_max_cents, "dispensing_fee_cents?", "refill_too_soon_threshold_pct?", "requires_pa_for_controlled?"]
+    output: InsurancePlan
+    side_effects: []
+  - method: GET
+    path: "/insurance-plans"
+    description: "List insurance plans"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "InsurancePlan[]"
+    side_effects: []
+  - method: GET
+    path: "/insurance-plans/{id}"
+    description: "Get an insurance plan"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: []
+    output: InsurancePlan
+    side_effects: []
+
+  # ---- FormularyEntry ----
+  - method: POST
+    path: "/formulary-entries"
+    description: "Add a drug to a plan formulary"
+    roles: [PharmacyAdmin]
+    code: 201
+    input: [plan_id, drug_id, tier, allowed_amount_cents, "requires_pa?"]
+    output: FormularyEntry
+    side_effects: []
+  - method: GET
+    path: "/formulary-entries"
+    description: "List formulary entries (filter by plan_id or drug_id)"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: ["plan_id?", "drug_id?", "limit?", "offset?"]
+    output: "FormularyEntry[]"
+    side_effects: []
+  - method: GET
+    path: "/formulary-entries/{id}"
+    description: "Get a formulary entry"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: []
+    output: FormularyEntry
+    side_effects: []
+
+  # ---- InteractionRule ----
+  - method: POST
+    path: "/interaction-rules"
+    description: "Create a drug-drug interaction rule"
+    roles: [PharmacyAdmin]
+    code: 201
+    input: [drug_a_id, drug_b_id, severity, detail]
+    output: InteractionRule
+    side_effects: []
+  - method: GET
+    path: "/interaction-rules"
+    description: "List interaction rules (filter by drug_a_id or drug_b_id)"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: ["drug_a_id?", "drug_b_id?", "limit?", "offset?"]
+    output: "InteractionRule[]"
+    side_effects: []
+  - method: GET
+    path: "/interaction-rules/{id}"
+    description: "Get an interaction rule"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: []
+    output: InteractionRule
+    side_effects: []
+
+  # ---- Patient ----
+  - method: POST
+    path: "/patients"
+    description: "Register a patient"
+    roles: [PharmacyAdmin, Technician]
+    code: 201
+    input: [full_name, date_of_birth, "plan_id?", "allergy_classes?", "auto_refill_enrolled?", "med_sync_day?"]
+    output: Patient
+    side_effects: ["pdmp_flag = CLEAR", "controlled_status = ELIGIBLE"]
+  - method: GET
+    path: "/patients"
+    description: "List patients (filter by plan_id)"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: ["plan_id?", "limit?", "offset?"]
+    output: "Patient[]"
+    side_effects: []
+  - method: GET
+    path: "/patients/{id}"
+    description: "Get a patient (includes computed pdmp_flag, controlled_status)"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: []
+    output: Patient
+    side_effects: []
+  - method: POST
+    path: "/patients/{id}/clear-pdmp-block"
+    description: "Pharmacist manually clears a PDMP block"
+    roles: [Pharmacist]
+    code: 200
+    input: [override_reason]
+    output: Patient
+    side_effects: ["pdmp_flag = CLEAR", "controlled_status = ELIGIBLE"]
+
+  # ---- Prescriber ----
+  - method: POST
+    path: "/prescribers"
+    description: "Create a prescriber"
+    roles: [PharmacyAdmin]
+    code: 201
+    input: [full_name, npi, "dea_number?", "dea_active?"]
+    output: Prescriber
+    side_effects: []
+  - method: GET
+    path: "/prescribers"
+    description: "List prescribers"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "Prescriber[]"
+    side_effects: []
+  - method: GET
+    path: "/prescribers/{id}"
+    description: "Get a prescriber"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: []
+    output: Prescriber
+    side_effects: []
+
+  # ---- Prescription ----
+  - method: POST
+    path: "/prescriptions"
+    description: "Intake an e-prescription"
+    roles: [PharmacyAdmin, Technician]
+    code: 201
+    input: [patient_id, prescriber_id, drug_id, quantity_per_fill, days_supply, "refills_authorized?", written_utc]
+    output: Prescription
+    side_effects: ["status = ACTIVE", "expires_utc computed", "refills_remaining = refills_authorized"]
+  - method: GET
+    path: "/prescriptions"
+    description: "List prescriptions (filter by patient_id, prescriber_id, drug_id)"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: ["patient_id?", "prescriber_id?", "drug_id?", "limit?", "offset?"]
+    output: "Prescription[]"
+    side_effects: []
+  - method: GET
+    path: "/prescriptions/{id}"
+    description: "Get a prescription (includes computed refills_remaining, last_dispensed_utc)"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: []
+    output: Prescription
+    side_effects: []
+  - method: POST
+    path: "/prescriptions/{id}/discontinue"
+    description: "Discontinue a prescription"
+    roles: [Pharmacist]
+    code: 200
+    input: []
+    output: Prescription
+    side_effects: ["status = DISCONTINUED", "ENTERED fills cascade to CANCELLED"]
+  - method: POST
+    path: "/prescriptions/{id}/expire-scan"
+    description: "System sweep: expire the prescription if past expires_utc"
+    roles: [PharmacyAdmin]
+    code: 200
+    input: []
+    output: Prescription
+    side_effects: ["status = EXPIRED if current_utc > expires_utc"]
+
+  # ---- Fill ----
+  - method: POST
+    path: "/fills"
+    description: "Create a fill or refill for a prescription"
+    roles: [PharmacyAdmin, Technician]
+    code: 201
+    input: [prescription_id]
+    output: Fill
+    side_effects:
+      - "status = ENTERED, claim_status = UNCLAIMED"
+      - "fill_sequence assigned, quantity_dispensed/days_supply copied, gross_amount_cents computed"
+      - "creator X-User-ID recorded for segregation-of-duties check"
+      - "Prescription.refills_remaining recomputed"
+  - method: GET
+    path: "/fills"
+    description: "List fills (filter by prescription_id)"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: ["prescription_id?", "limit?", "offset?"]
+    output: "Fill[]"
+    side_effects: []
+  - method: GET
+    path: "/fills/{id}"
+    description: "Get a fill (includes claim_status, copays, dur_severity)"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: []
+    output: Fill
+    side_effects: []
+  - method: POST
+    path: "/fills/{id}/run-dur"
+    description: "Run the DUR/drug-interaction screen on a fill"
+    roles: [Technician, Pharmacist]
+    code: 200
+    input: []
+    output: Fill
+    side_effects:
+      - "DurAlert rows created per matching rule/allergy/duplicate/high-dose"
+      - "dur_severity rolled up"
+      - "status -> DUR_REVIEW (or auto -> ADJUDICATING if dur_severity == NONE)"
+  - method: POST
+    path: "/fills/{id}/override-dur"
+    description: "Pharmacist overrides DUR alerts and advances the fill"
+    roles: [Pharmacist]
+    code: 200
+    input: ["override_reason?"]
+    output: Fill
+    side_effects:
+      - "MODERATE/SEVERE DurAlerts overridden = true"
+      - "dur_override_by = acting Pharmacist X-User-ID"
+      - "status -> ADJUDICATING"
+  - method: POST
+    path: "/fills/{id}/submit-claim"
+    description: "Submit the insurance claim for real-time adjudication"
+    roles: [Technician, Pharmacist]
+    code: 200
+    input: [expected_prescription_version]
+    output: Fill
+    side_effects:
+      - "provisional_copay_cents + final_copay_cents + plan_paid_cents computed (adjudicated)"
+      - "claim_status -> PAID and status -> READY_FILL on PAY"
+      - "OR PriorAuthRequest created, claim_status -> PA_PENDING, status -> PA_REFERRAL on PA-required"
+      - "Increments Prescription.version by 1"
+  - method: POST
+    path: "/fills/{id}/reverse-claim"
+    description: "Reverse a paid claim (compensation)"
+    roles: [Pharmacist]
+    code: 200
+    input: []
+    output: Fill
+    side_effects:
+      - "claim_status -> REVERSED, plan_paid_cents -> 0"
+      - "Refund PaymentRecord if present (refunded = true)"
+  - method: POST
+    path: "/fills/{id}/stage-will-call"
+    description: "Stage a ready fill in will-call"
+    roles: [Technician, Pharmacist]
+    code: 200
+    input: []
+    output: Fill
+    side_effects: ["status -> WILL_CALL", "pickup_deadline_utc = current_utc + 10d"]
+  - method: POST
+    path: "/fills/{id}/dispense"
+    description: "Dispense a will-call fill to the patient"
+    roles: [Pharmacist]
+    code: 200
+    input: []
+    output: Fill
+    side_effects:
+      - "status -> DISPENSED"
+      - "Prescription.last_dispensed_utc = current_utc; refills_remaining recomputed; auto-EXHAUSTED if 0"
+      - "If controlled: PdmpReport regenerated, Patient.pdmp_flag + controlled_status recomputed"
+  - method: POST
+    path: "/fills/{id}/cancel"
+    description: "Cancel a non-terminal fill"
+    roles: [Pharmacist, Technician]
+    code: 200
+    input: []
+    output: Fill
+    side_effects:
+      - "status -> CANCELLED"
+      - "open claim (SUBMITTED/PA_PENDING) -> REVERSED"
+      - "Prescription.refills_remaining recomputed"
+  - method: POST
+    path: "/fills/{id}/expire-will-call"
+    description: "System sweep: return an expired will-call fill to stock"
+    roles: [PharmacyAdmin]
+    code: 200
+    input: []
+    output: Fill
+    side_effects:
+      - "status -> RETURNED_TO_STOCK if current_utc > pickup_deadline_utc"
+      - "claim_status -> REVERSED, plan_paid reversed, PaymentRecord refunded"
+      - "Prescription.refills_remaining recomputed"
+
+  # ---- DurAlert ----
+  - method: GET
+    path: "/dur-alerts"
+    description: "List DUR alerts (filter by fill_id)"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: ["fill_id?", "limit?", "offset?"]
+    output: "DurAlert[]"
+    side_effects: []
+  - method: GET
+    path: "/dur-alerts/{id}"
+    description: "Get a DUR alert"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: []
+    output: DurAlert
+    side_effects: []
+
+  # ---- PriorAuthRequest ----
+  - method: GET
+    path: "/prior-auth-requests"
+    description: "List PA requests (filter by fill_id or prescription_id)"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: ["fill_id?", "prescription_id?", "limit?", "offset?"]
+    output: "PriorAuthRequest[]"
+    side_effects: []
+  - method: GET
+    path: "/prior-auth-requests/{id}"
+    description: "Get a PA request"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: []
+    output: PriorAuthRequest
+    side_effects: []
+  - method: POST
+    path: "/prior-auth-requests/{id}/approve"
+    description: "Approve a prior-auth request (cycles fill back to ADJUDICATING)"
+    roles: [Pharmacist]
+    code: 200
+    input: [expected_priorauthrequest_version]
+    output: PriorAuthRequest
+    side_effects:
+      - "status -> APPROVED, decided_utc = current_utc"
+      - "Fill.claim_status -> UNCLAIMED, Fill.status -> ADJUDICATING"
+      - "Increments PriorAuthRequest.version by 1"
+  - method: POST
+    path: "/prior-auth-requests/{id}/deny"
+    description: "Deny a prior-auth request"
+    roles: [Pharmacist]
+    code: 200
+    input: [expected_priorauthrequest_version]
+    output: PriorAuthRequest
+    side_effects:
+      - "status -> DENIED, decided_utc = current_utc"
+      - "Fill.claim_status -> REJECTED, Fill.status -> CANCELLED"
+      - "Increments PriorAuthRequest.version by 1"
+  - method: POST
+    path: "/prior-auth-requests/{id}/expire-scan"
+    description: "System sweep: expire a pending PA past its expires_utc"
+    roles: [PharmacyAdmin]
+    code: 200
+    input: []
+    output: PriorAuthRequest
+    side_effects:
+      - "status -> EXPIRED if current_utc > expires_utc"
+      - "Fill.claim_status -> REJECTED, Fill.status -> CANCELLED"
+
+  # ---- PdmpReport ----
+  - method: POST
+    path: "/pdmp-reports"
+    description: "Manually query PDMP for a patient (regenerates report + posture)"
+    roles: [Pharmacist]
+    code: 201
+    input: [patient_id]
+    output: PdmpReport
+    side_effects:
+      - "controlled_fill_count, distinct_prescriber_count, risk_score computed"
+      - "Patient.pdmp_flag and controlled_status recomputed from resulting_flag"
+  - method: GET
+    path: "/pdmp-reports"
+    description: "List PDMP reports (filter by patient_id or fill_id)"
+    roles: [PharmacyAdmin, Pharmacist]
+    code: 200
+    input: ["patient_id?", "fill_id?", "limit?", "offset?"]
+    output: "PdmpReport[]"
+    side_effects: []
+  - method: GET
+    path: "/pdmp-reports/{id}"
+    description: "Get a PDMP report"
+    roles: [PharmacyAdmin, Pharmacist]
+    code: 200
+    input: []
+    output: PdmpReport
+    side_effects: []
+
+  # ---- PaymentRecord ----
+  - method: POST
+    path: "/payment-records"
+    description: "Collect patient payment for a fill at pickup"
+    roles: [Cashier, Technician]
+    code: 201
+    input: [fill_id, amount_cents, tendered_by]
+    output: PaymentRecord
+    side_effects: ["refunded = false"]
+  - method: GET
+    path: "/payment-records"
+    description: "List payment records (filter by fill_id)"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: ["fill_id?", "limit?", "offset?"]
+    output: "PaymentRecord[]"
+    side_effects: []
+  - method: GET
+    path: "/payment-records/{id}"
+    description: "Get a payment record"
+    roles: [PharmacyAdmin, Pharmacist, Technician, Cashier]
+    code: 200
+    input: []
+    output: PaymentRecord
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- auth ---
+  - { id: ERR_MISSING_USER_CONTEXT, http: 401, condition: "X-User-ID or X-User-Role header missing/invalid" }
+  - { id: ERR_INSUFFICIENT_PERMISSIONS, http: 403, condition: "Role not permitted for this operation" }
+  # --- existence ---
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path resource id does not exist" }
+  - { id: ERR_REFERENCE_NOT_FOUND, http: 404, condition: "FK body field references a non-existent resource" }
+  # --- input ---
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Malformed body, missing required field, illegal enum, out-of-range numeric" }
+  - { id: ERR_DUPLICATE_NDC, http: 409, condition: "DrugProduct.ndc already exists" }
+  - { id: ERR_DUPLICATE_PLAN_ROUTING, http: 409, condition: "InsurancePlan (bin, pcn) already exists" }
+  - { id: ERR_DUPLICATE_NPI, http: 409, condition: "Prescriber.npi already exists" }
+  # --- OCC ---
+  - { id: ERR_STALE_PRESCRIPTION_VERSION, http: 412, condition: "expected_prescription_version != Prescription.version on submit-claim" }
+  - { id: ERR_STALE_PA_VERSION, http: 412, condition: "expected_priorauthrequest_version != PriorAuthRequest.version on approve/deny" }
+  # --- state: generic + specific ---
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a valid from-state for the transition (generic)" }
+  - { id: ERR_PRESCRIPTION_NOT_ACTIVE, http: 409, condition: "Prescription not ACTIVE (expired/exhausted/discontinued)" }
+  - { id: ERR_OPEN_FILL_EXISTS, http: 409, condition: "Discontinue blocked: a non-ENTERED non-terminal fill exists" }
+  - { id: ERR_FILL_NOT_ENTERED, http: 409, condition: "Fill not in ENTERED for run-dur" }
+  - { id: ERR_FILL_NOT_IN_DUR_REVIEW, http: 409, condition: "Fill not in DUR_REVIEW for override-dur" }
+  - { id: ERR_FILL_NOT_ADJUDICATING, http: 409, condition: "Fill not in ADJUDICATING for submit-claim" }
+  - { id: ERR_FILL_NOT_READY, http: 409, condition: "Fill not in READY_FILL for stage-will-call" }
+  - { id: ERR_FILL_NOT_WILL_CALL, http: 409, condition: "Fill not in WILL_CALL for dispense" }
+  - { id: ERR_FILL_NOT_CANCELLABLE, http: 409, condition: "Fill in a terminal state cannot be cancelled" }
+  - { id: ERR_FILL_ALREADY_DISPENSED, http: 409, condition: "Reverse-claim attempted after dispense" }
+  - { id: ERR_CLAIM_ALREADY_OPEN, http: 409, condition: "submit-claim while claim_status != UNCLAIMED" }
+  - { id: ERR_CLAIM_NOT_PAID, http: 409, condition: "reverse-claim or stage-will-call while claim_status != PAID" }
+  - { id: ERR_CLAIM_PAID_REVERSE_FIRST, http: 409, condition: "Cancel blocked while claim_status == PAID; reverse first" }
+  - { id: ERR_PA_NOT_PENDING, http: 409, condition: "PriorAuthRequest not PENDING for approve/deny" }
+  - { id: ERR_PA_EXPIRED, http: 409, condition: "PriorAuthRequest past expires_utc at approve" }
+  - { id: ERR_PATIENT_NOT_BLOCKED, http: 409, condition: "clear-pdmp-block while Patient.pdmp_flag != BLOCKED" }
+  # --- business_safety / compliance ---
+  - { id: ERR_PRESCRIBER_DEA_INVALID, http: 422, condition: "Controlled prescription/fill without valid active DEA registration" }
+  - { id: ERR_DRUG_DISCONTINUED, http: 409, condition: "Drug product is DISCONTINUED" }
+  - { id: ERR_DUR_NOT_OVERRIDDEN, http: 409, condition: "submit-claim while MODERATE/SEVERE DUR alerts not overridden" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "Same X-User-ID entered and verified/dispensed a CII fill" }
+  - { id: ERR_PATIENT_CONTROLLED_LOCKED, http: 403, condition: "Controlled claim while Patient.controlled_status == LOCKED" }
+  - { id: ERR_OVERRIDE_REASON_REQUIRED, http: 422, condition: "SEVERE DUR override or PDMP block clear without override_reason" }
+  # --- business_temporal / constraint ---
+  - { id: ERR_REFILL_TOO_SOON, http: 409, condition: "Refill submitted before refill-too-soon window elapsed" }
+  - { id: ERR_WILL_CALL_EXPIRED, http: 409, condition: "Dispense after pickup_deadline_utc" }
+  - { id: ERR_NO_REFILLS_REMAINING, http: 409, condition: "Refill created with refills_remaining == 0" }
+  - { id: ERR_DRUG_NOT_ON_FORMULARY, http: 422, condition: "Insured claim for a drug absent from the plan formulary" }
+  - { id: ERR_PAYMENT_AMOUNT_MISMATCH, http: 422, condition: "PaymentRecord.amount_cents != owed copay/gross" }
+  - { id: ERR_PAYMENT_REQUIRED, http: 409, condition: "Dispense without a matching PaymentRecord" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PharmacyAdmin
+    description: "Operations/admin: manages reference data (drugs, plans, formulary, interaction rules, prescribers), runs system sweeps and the clock"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /_clock/set — set clock"
+      - "POST /drug-products — create drug"
+      - "POST /drug-products/{id}/discontinue — discontinue drug"
+      - "POST /insurance-plans — create plan"
+      - "POST /formulary-entries — add formulary row"
+      - "POST /interaction-rules — create interaction rule"
+      - "POST /prescribers — create prescriber"
+      - "POST /prescriptions/{id}/expire-scan — expire prescriptions"
+      - "POST /fills/{id}/expire-will-call — return-to-stock sweep"
+      - "POST /prior-auth-requests/{id}/expire-scan — expire PA sweep"
+    shared_operations:
+      - "POST /patients — register patient (with Technician)"
+      - "POST /prescriptions — intake (with Technician)"
+      - "POST /fills — create fill (with Technician)"
+      - "GET endpoints — read access"
+  - name: Pharmacist
+    description: "Licensed pharmacist: clinical verification, DUR override, dispensing, PA decisions, claim reversal, PDMP queries and block clears"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /fills/{id}/override-dur — override DUR"
+      - "POST /fills/{id}/dispense — dispense"
+      - "POST /fills/{id}/reverse-claim — reverse claim"
+      - "POST /prescriptions/{id}/discontinue — discontinue prescription"
+      - "POST /prior-auth-requests/{id}/approve — approve PA"
+      - "POST /prior-auth-requests/{id}/deny — deny PA"
+      - "POST /pdmp-reports — query PDMP"
+      - "POST /patients/{id}/clear-pdmp-block — clear PDMP block"
+    shared_operations:
+      - "POST /fills/{id}/run-dur — run DUR (with Technician)"
+      - "POST /fills/{id}/submit-claim — adjudicate (with Technician)"
+      - "POST /fills/{id}/stage-will-call — stage (with Technician)"
+      - "POST /fills/{id}/cancel — cancel (with Technician)"
+      - "GET endpoints — read access"
+  - name: Technician
+    description: "Pharmacy technician: patient/prescription/fill intake, DUR run, claim submission, will-call staging, cancellation, payment collection"
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /patients — register patient (with PharmacyAdmin)"
+      - "POST /prescriptions — intake (with PharmacyAdmin)"
+      - "POST /fills — create fill (with PharmacyAdmin)"
+      - "POST /fills/{id}/run-dur — run DUR (with Pharmacist)"
+      - "POST /fills/{id}/submit-claim — adjudicate (with Pharmacist)"
+      - "POST /fills/{id}/stage-will-call — stage (with Pharmacist)"
+      - "POST /fills/{id}/cancel — cancel (with Pharmacist)"
+      - "POST /payment-records — collect payment (with Cashier)"
+      - "GET endpoints — read access"
+  - name: Cashier
+    description: "Front-counter cashier: collects payment at pickup; read-only otherwise"
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /payment-records — collect payment (with Technician)"
+      - "GET endpoints — read access"

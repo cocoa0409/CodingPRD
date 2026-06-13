@@ -1,0 +1,53 @@
+"""Error classes and error-id constants.
+
+Error catalog and HTTP statuses are taken verbatim from PRD §5 / SCAFFOLD §1.6.
+"""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Error catalog: id -> http status (PRD §5).
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+ERR_NOT_FOUND = "ERR_NOT_FOUND"
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+ERR_INVALID_STATE = "ERR_INVALID_STATE"
+ERR_STALE_POOL_VERSION = "ERR_STALE_POOL_VERSION"
+ERR_DRAW_REQUIRED = "ERR_DRAW_REQUIRED"
+ERR_EDUCATION_REQUIRED = "ERR_EDUCATION_REQUIRED"
+ERR_MINIMUM_AGE = "ERR_MINIMUM_AGE"
+ERR_RESIDENCY_RESTRICTED = "ERR_RESIDENCY_RESTRICTED"
+ERR_ENTRY_CLOSED = "ERR_ENTRY_CLOSED"
+ERR_DUPLICATE_ENTRY = "ERR_DUPLICATE_ENTRY"
+ERR_SEASON_NOT_OPEN = "ERR_SEASON_NOT_OPEN"
+ERR_BAG_LIMIT_EXCEEDED = "ERR_BAG_LIMIT_EXCEEDED"
+ERR_DUPLICATE_SKU = "ERR_DUPLICATE_SKU"
+
+
+_HTTP = {
+    ERR_UNAUTHENTICATED: 401,
+    ERR_UNAUTHORIZED: 403,
+    ERR_NOT_FOUND: 404,
+    ERR_INVALID_REQUEST: 400,
+    ERR_INVALID_STATE: 409,
+    ERR_STALE_POOL_VERSION: 412,
+    ERR_DRAW_REQUIRED: 409,
+    ERR_EDUCATION_REQUIRED: 409,
+    ERR_MINIMUM_AGE: 409,
+    ERR_RESIDENCY_RESTRICTED: 409,
+    ERR_ENTRY_CLOSED: 409,
+    ERR_DUPLICATE_ENTRY: 409,
+    ERR_SEASON_NOT_OPEN: 409,
+    ERR_BAG_LIMIT_EXCEEDED: 409,
+    ERR_DUPLICATE_SKU: 409,
+}
+
+
+def err(error_id, message=None):
+    return ApiError(error_id, _HTTP[error_id], message)

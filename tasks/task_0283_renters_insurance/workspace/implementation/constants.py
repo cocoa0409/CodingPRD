@@ -1,0 +1,16 @@
+"""Domain constants from PRD §3 and SCAFFOLD §1.2/§1.3."""
+
+MIN_BUNDLE_MEMBERS = 2          # §3.1
+GRACE_DAYS = 14                 # §3.4
+REINSTATE_WINDOW_DAYS = 30      # §3.5
+MAX_APPEALS = 2                 # §3.8
+REINSTATE_FEE_CENTS = 0         # fee satisfaction is driven by reinstatement_fee_paid / paid invoice
+
+TERRITORY_CODES = {"HIGH", "STANDARD", "LOW"}
+PP_VALUATION_METHODS = {"RCV", "ACV"}
+BILLING_MODES = {"ANNUAL", "MONTHLY"}
+COVERAGE_TYPES = {"PERSONAL_PROPERTY", "LIABILITY", "LOSS_OF_USE"}
+LOSS_TYPES = {"PERSONAL_PROPERTY", "LIABILITY", "LOSS_OF_USE"}
+INTEREST_TYPES = {"LANDLORD", "PROPERTY_MANAGER"}
+PAYMENT_METHODS = {"CARD", "ACH", "CHECK"}
+REFUND_METHODS = {"PRO_RATA", "SHORT_RATE"}

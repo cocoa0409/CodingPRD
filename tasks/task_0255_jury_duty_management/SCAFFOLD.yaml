@@ -1,0 +1,737 @@
+# =============================================================================
+# Jury Duty Management — benchmark seed tables (Expert)
+# §1.0–§1.7 only. §1.8 lives in SCAFFOLD_DIFFICULTY_DESIGN.yaml,
+# §1.9 in SCAFFOLD_CORNER_DESIGN.yaml.
+# =============================================================================
+
+scenario: |
+  255. Jury Duty Management: juror pool & random selection, summons issuance,
+  qualification questionnaire, deferral/excusal/exemption, reporting & check-in,
+  panel assignment, juror pay/mileage, failure-to-appear
+
+domain_name: jury-duty-management
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: quota_allocation
+  secondary_archetype: workflow_orchestration
+  complexity_layers:
+    - selector_policy            # random/weighted draw of jurors from the qualified pool
+    - dual_variant_calculation   # juror pay: estimated (at panel assignment) vs finalized (at release)
+    - cascading_side_effects     # disposition / FTA propagate across Summons → Panel → ServiceTerm counters
+    - rate_threshold_triggers    # FTA strike count crosses a configurable breakpoint → DISQUALIFIED
+    - optimistic_concurrency     # OCC on Panel.version (seat fill) and ServiceTerm.version (pool draw)
+
+  entity_topology: hybrid
+  # ServiceTerm is the aggregate root (pool, pay config, counters). Summons hangs
+  # off ServiceTerm + Juror. Panel/Trial are peer aggregates under ServiceTerm.
+  # PanelAssignment is a junction resolving the Summons↔Panel many-to-many.
+
+  state_machine_shape: branching
+  # Summons forks at qualification: REPORTING vs DEFERRED vs EXCUSED vs EXEMPT,
+  # with a deferral cycle (DEFERRED → re-issued SUMMONED on a later term).
+  # Panel is compound (status derived from seat fill + Trial state).
+
+  relationship_patterns:
+    - one_to_many        # ServiceTerm → Summons, ServiceTerm → Panel, Juror → Summons
+    - many_to_many       # Summons ↔ Panel via PanelAssignment
+    - cross_aggregate    # Panel seat fill reads Trial.status; pay reads ServiceTerm config
+
+  role_model: peer_roles
+  # JuryAdministrator runs the pool/draw/term; CourtClerk handles summons lifecycle
+  # & check-in; Judge empanels/dismisses panels; Juror responds to own summons.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: ServiceTerm
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: name, type: string, source: input, description: "Term label, e.g. '2026-Q3 Petit Jury'" }
+      - { name: report_date, type: datetime, source: input, description: "ISO 8601 UTC date jurors must report for this term" }
+      - { name: daily_pay_cents, type: integer, source: input, description: "Base statutory pay per full service day, in cents", constraints: ">= 0" }
+      - { name: half_day_pay_cents, type: integer, source: input, description: "Pay for a half service day (< full_day_hours on the floor), in cents", constraints: ">= 0" }
+      - { name: full_day_hours, type: number, source: input, description: "On-floor hours at/above which a service day counts as full", constraints: "> 0" }
+      - { name: mileage_rate_cents, type: integer, source: input, description: "Reimbursement per mile, in cents (round-trip miles supplied per juror)", constraints: ">= 0" }
+      - { name: pay_day_cap, type: integer, source: input, description: "Max number of paid service days reimbursed per summons under this term", constraints: ">= 1" }
+      - { name: fta_disqualify_threshold, type: integer, source: input, default: 3, description: "Recorded FTA strike count at or above which a Juror is auto-DISQUALIFIED", constraints: ">= 1" }
+      - { name: pool_size, type: integer, source: computed, default: 0, description: "Count of Juror rows whose qualification_status == QUALIFIED and disqualified == false for this term" }
+      - { name: summoned_count, type: integer, source: computed, default: 0, description: "Count of Summons in this term not in a terminal cancelled state" }
+      - { name: status, type: enum, source: system, description: "DRAFT | OPEN | CLOSED — DRAFT before pool seeded, OPEN once summonses may issue, CLOSED locks the term", default: "DRAFT" }
+      - { name: draw_seq, type: integer, source: system, default: 0, description: "Monotone counter incremented on every selection draw against this term; stable selection-order audit handle" }
+
+  - name: Juror
+    parent: ServiceTerm
+    common_fields: true
+    fields:
+      - { name: service_term_id, type: string, source: system, description: "FK -> ServiceTerm.id; the term this juror pool record belongs to" }
+      - { name: full_name, type: string, source: input, description: "Juror full name" }
+      - { name: birth_year, type: integer, source: input, description: "Year of birth; used for age qualification", constraints: "1900..2010" }
+      - { name: round_trip_miles, type: number, source: input, description: "Round-trip miles from residence to courthouse, for mileage reimbursement", constraints: ">= 0" }
+      - { name: qualification_status, type: enum, source: system, description: "PENDING | QUALIFIED | INELIGIBLE — set by questionnaire evaluation", default: "PENDING" }
+      - { name: fta_strike_count, type: integer, source: computed, default: 0, description: "Count of Strike rows (source==FTA) for this juror; recomputed on each strike" }
+      - { name: disqualified, type: boolean, source: computed, default: false, description: "true once fta_strike_count >= ServiceTerm.fta_disqualify_threshold; removes juror from the draw pool" }
+      - { name: last_drawn_seq, type: integer, source: system, default: 0, description: "ServiceTerm.draw_seq at which this juror was last drawn into a summons; 0 = never drawn" }
+
+  - name: Summons
+    parent: ServiceTerm
+    common_fields: true
+    fields:
+      - { name: service_term_id, type: string, source: system, description: "FK -> ServiceTerm.id; term this summons was issued under" }
+      - { name: juror_id, type: string, source: system, description: "FK -> Juror.id; the summoned juror" }
+      - { name: badge_number, type: integer, source: system, description: "Monotone per-term sequence assigned at issuance; stable check-in ordering handle" }
+      - { name: status, type: enum, source: system, description: "SUMMONED | QUALIFIED_PENDING | REPORTING | SERVING | RELEASED | DEFERRED | EXCUSED | EXEMPT | FAILED_TO_APPEAR — see §1.2", default: "SUMMONED" }
+      - { name: deferred_to_term_id, type: string, source: system, description: "FK -> ServiceTerm.id; populated when a deferral re-issues this summons onto a later term (null otherwise)" }
+      - { name: deferral_count, type: integer, source: computed, default: 0, description: "Count of approved DEFER dispositions in this summons's lineage" }
+      - { name: service_days, type: integer, source: computed, default: 0, description: "Count of CheckIn rows recorded against this summons (one per service day)" }
+
+  - name: QualificationResponse
+    parent: Summons
+    common_fields: false   # id, created_at only — append-only questionnaire submission
+    fields:
+      - { name: summons_id, type: string, source: system, description: "FK -> Summons.id; the summons being qualified" }
+      - { name: is_citizen, type: boolean, source: input, description: "Affirms U.S. citizenship" }
+      - { name: is_resident, type: boolean, source: input, description: "Affirms residency in the court's jurisdiction" }
+      - { name: felony_conviction, type: boolean, source: input, description: "Affirms an unrestored-rights felony conviction" }
+      - { name: english_proficient, type: boolean, source: input, description: "Affirms sufficient English proficiency" }
+      - { name: evaluated_status, type: enum, source: computed, description: "QUALIFIED | INELIGIBLE — computed by qualification_evaluation (§1.3)" }
+
+  - name: Disposition
+    parent: Summons
+    common_fields: true
+    fields:
+      - { name: summons_id, type: string, source: system, description: "FK -> Summons.id; the summons this request acts on" }
+      - { name: kind, type: enum, source: input, description: "DEFER | EXCUSE | EXEMPT" }
+      - { name: reason_code, type: enum, source: input, description: "MEDICAL | HARDSHIP | STUDENT | AGE | PRIOR_SERVICE | MILITARY | CAREGIVER | OTHER" }
+      - { name: requested_term_id, type: string, source: system, description: "FK -> ServiceTerm.id; target term for a DEFER (required when kind==DEFER, null otherwise)" }
+      - { name: decision, type: enum, source: system, description: "PENDING | GRANTED | DENIED", default: "PENDING" }
+      - { name: decided_by_role, type: string, source: system, description: "Role string of the actor who decided (CourtClerk for EXCUSE/EXEMPT, JuryAdministrator for DEFER); null while PENDING" }
+
+  - name: Trial
+    parent: ServiceTerm
+    common_fields: true
+    fields:
+      - { name: service_term_id, type: string, source: system, description: "FK -> ServiceTerm.id; term supplying the venire" }
+      - { name: caption, type: string, source: input, description: "Case caption" }
+      - { name: required_jurors, type: integer, source: input, description: "Seats the empaneled jury must hold", constraints: ">= 1" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | READY | IN_TRIAL | ADJOURNED — a Panel may only be SEATED while Trial is READY", default: "SCHEDULED" }
+
+  - name: Panel
+    parent: ServiceTerm
+    common_fields: true
+    fields:
+      - { name: service_term_id, type: string, source: system, description: "FK -> ServiceTerm.id; term this panel draws from" }
+      - { name: trial_id, type: string, source: system, description: "FK -> Trial.id; the trial this panel serves" }
+      - { name: target_size, type: integer, source: input, description: "Seats this panel must fill (defaults to Trial.required_jurors at creation)", constraints: ">= 1" }
+      - { name: seated_count, type: integer, source: computed, default: 0, description: "Count of PanelAssignment rows on this panel with status==SEATED" }
+      - { name: status, type: enum, source: system, description: "FORMING | SEATED | DISMISSED — FORMING until seated_count==target_size, SEATED on empanel, DISMISSED terminal", default: "FORMING" }
+
+  - name: PanelAssignment
+    parent: Panel
+    common_fields: true
+    fields:
+      - { name: panel_id, type: string, source: system, description: "FK -> Panel.id; the panel holding this seat" }
+      - { name: summons_id, type: string, source: system, description: "FK -> Summons.id; the summons occupying the seat" }
+      - { name: seat_index, type: integer, source: system, description: "Monotone 1-based seat number within the panel, assigned at seating" }
+      - { name: status, type: enum, source: system, description: "SEATED | EXCUSED_FROM_PANEL — EXCUSED_FROM_PANEL frees the seat and reverts the summons to REPORTING", default: "SEATED" }
+
+  - name: CheckIn
+    parent: Summons
+    common_fields: false   # id, created_at only — append-only service-day record
+    fields:
+      - { name: summons_id, type: string, source: system, description: "FK -> Summons.id; the summons reporting that day" }
+      - { name: service_date, type: datetime, source: input, description: "ISO 8601 UTC calendar date of the service day" }
+      - { name: on_floor_hours, type: number, source: input, description: "Hours the juror was present on the floor that day", constraints: ">= 0" }
+      - { name: day_kind, type: enum, source: computed, description: "FULL | HALF — FULL when on_floor_hours >= ServiceTerm.full_day_hours, else HALF (§1.3)" }
+
+  - name: Strike
+    parent: Juror
+    common_fields: false   # id, created_at only — append-only disciplinary record
+    fields:
+      - { name: juror_id, type: string, source: system, description: "FK -> Juror.id; the struck juror" }
+      - { name: summons_id, type: string, source: system, description: "FK -> Summons.id; the summons on which the failure occurred" }
+      - { name: source, type: enum, source: system, description: "FTA — recorded when a summons is marked FAILED_TO_APPEAR", default: "FTA" }
+
+  - name: PayVoucher
+    parent: Summons
+    common_fields: true
+    fields:
+      - { name: summons_id, type: string, source: system, description: "FK -> Summons.id; the summons being paid" }
+      - { name: variant, type: enum, source: system, description: "ESTIMATED | FINAL — ESTIMATED issued at panel seating, FINAL issued at release (§1.3)" }
+      - { name: paid_days, type: integer, source: computed, description: "Service days counted toward pay, capped at ServiceTerm.pay_day_cap" }
+      - { name: attendance_cents, type: integer, source: computed, description: "Per-day attendance pay summed over counted days (§1.3)" }
+      - { name: mileage_cents, type: integer, source: computed, description: "Mileage reimbursement = round(round_trip_miles * mileage_rate_cents) summed per counted day (§1.3)" }
+      - { name: total_cents, type: integer, source: computed, description: "= attendance_cents + mileage_cents" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: ServiceTerm
+    initial_state: DRAFT
+    terminal_states: [CLOSED]
+    transitions:
+      - from: DRAFT
+        to: OPEN
+        trigger: "POST /service-terms/{id}/open"
+        actor: JuryAdministrator
+        preconditions:
+          - "ServiceTerm.status == DRAFT"
+          - "At least one Juror with qualification_status == QUALIFIED and disqualified == false exists for this term"
+        side_effects:
+          - "Summonses may now be drawn/issued against this term"
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /service-terms/{id}/close"
+        actor: JuryAdministrator
+        preconditions:
+          - "ServiceTerm.status == OPEN"
+          - "No Summons in this term is in {REPORTING, SERVING} (all reporting jurors released or dispositioned)"
+          - "No Panel in this term is in status FORMING"
+        side_effects:
+          - "Term locks; no further draws, summons issuance, or check-ins permitted"
+
+  - entity: Juror
+    initial_state: PENDING
+    terminal_states: []
+    transitions:
+      - from: PENDING
+        to: QUALIFIED
+        trigger: "system (questionnaire evaluated QUALIFIED via POST /summonses/{id}/qualification, OR POST /jurors/{id}/qualify admin override)"
+        actor: system
+        preconditions:
+          - "Juror.disqualified == false"
+        side_effects:
+          - "ServiceTerm.pool_size recomputed (+1)"
+      - from: PENDING
+        to: INELIGIBLE
+        trigger: "system (questionnaire evaluated INELIGIBLE)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: QUALIFIED
+        to: INELIGIBLE
+        trigger: "system (Juror.disqualified flips true when fta_strike_count >= ServiceTerm.fta_disqualify_threshold)"
+        actor: system
+        preconditions:
+          - "Juror.fta_strike_count >= ServiceTerm.fta_disqualify_threshold"
+        side_effects:
+          - "Juror.disqualified set true"
+          - "ServiceTerm.pool_size recomputed (-1)"
+        note: "Threshold crossing is auto; see §1.3 fta_disqualification and Rule 6 boundary."
+
+  - entity: Summons
+    initial_state: SUMMONED
+    terminal_states: [EXCUSED, EXEMPT, FAILED_TO_APPEAR, RELEASED]
+    transitions:
+      - from: SUMMONED
+        to: QUALIFIED_PENDING
+        trigger: "POST /summonses/{id}/qualification"
+        actor: Juror
+        preconditions:
+          - "Summons.status == SUMMONED"
+          - "exactly one QualificationResponse may exist per summons"
+        side_effects:
+          - "QualificationResponse created and evaluated (§1.3 qualification_evaluation)"
+          - "If evaluated_status==INELIGIBLE, Juror.qualification_status set INELIGIBLE and summons auto-transitions to EXCUSED (reason auto INELIGIBLE)"
+          - "If evaluated_status==QUALIFIED, Juror.qualification_status set QUALIFIED, ServiceTerm.pool_size recomputed"
+        note: "Branch: QUALIFIED → QUALIFIED_PENDING (awaiting report); INELIGIBLE short-circuits to EXCUSED."
+      - from: QUALIFIED_PENDING
+        to: REPORTING
+        trigger: "POST /summonses/{id}/check-in (first check-in on/after ServiceTerm.report_date)"
+        actor: CourtClerk
+        preconditions:
+          - "Summons.status == QUALIFIED_PENDING"
+          - "ServiceTerm.status == OPEN"
+          - "CheckIn.service_date >= ServiceTerm.report_date (closed lower bound; §1.4 priority 22)"
+        side_effects:
+          - "CheckIn created; day_kind computed (§1.3)"
+          - "Summons.service_days incremented"
+      - from: REPORTING
+        to: REPORTING
+        trigger: "POST /summonses/{id}/check-in (subsequent service day)"
+        actor: CourtClerk
+        preconditions:
+          - "Summons.status == REPORTING"
+          - "ServiceTerm.status == OPEN"
+          - "no existing CheckIn on this summons shares the same service_date (no double-credit; §1.4 priority 41)"
+        side_effects:
+          - "CheckIn created; day_kind computed; Summons.service_days incremented"
+      - from: REPORTING
+        to: SERVING
+        trigger: "POST /panels/{id}/seat (this summons is the assignment)"
+        actor: Judge
+        preconditions:
+          - "Summons.status == REPORTING"
+          - "Panel.status == FORMING and Panel.seated_count < Panel.target_size"
+          - "Trial(Panel.trial_id).status == READY (cross-entity; §1.4 priority 32)"
+        side_effects:
+          - "PanelAssignment created (status SEATED, seat_index = Panel.seated_count+1)"
+          - "Panel.seated_count incremented; increments Panel.version by 1"
+          - "If Panel.seated_count == Panel.target_size after increment, Panel auto-transitions FORMING→SEATED and an ESTIMATED PayVoucher is issued for every SEATED summons on the panel (§1.3 pay_computation)"
+      - from: SERVING
+        to: REPORTING
+        trigger: "POST /panel-assignments/{id}/excuse-from-panel"
+        actor: Judge
+        preconditions:
+          - "PanelAssignment.status == SEATED"
+          - "Panel.status == FORMING (cannot pull a seat from a SEATED/empaneled panel)"
+        side_effects:
+          - "PanelAssignment.status set EXCUSED_FROM_PANEL; Panel.seated_count decremented; increments Panel.version by 1"
+          - "Summons reverts to REPORTING (seat freed, juror back in the reporting hall)"
+      - from: SERVING
+        to: RELEASED
+        trigger: "POST /summonses/{id}/release"
+        actor: CourtClerk
+        preconditions:
+          - "Summons.status == SERVING"
+          - "Panel(via PanelAssignment).status == DISMISSED OR Trial.status == ADJOURNED"
+        side_effects:
+          - "FINAL PayVoucher issued (§1.3 pay_computation, variant FINAL)"
+      - from: REPORTING
+        to: RELEASED
+        trigger: "POST /summonses/{id}/release"
+        actor: CourtClerk
+        preconditions:
+          - "Summons.status == REPORTING"
+          - "Summons holds no SEATED PanelAssignment"
+        side_effects:
+          - "FINAL PayVoucher issued (§1.3 pay_computation, variant FINAL)"
+      - from: QUALIFIED_PENDING
+        to: DEFERRED
+        trigger: "POST /dispositions/{id}/decide (kind==DEFER, decision GRANTED)"
+        actor: JuryAdministrator
+        preconditions:
+          - "Summons.status == QUALIFIED_PENDING"
+          - "Disposition.kind == DEFER and Disposition.requested_term_id references a ServiceTerm in status {DRAFT, OPEN}"
+          - "Summons.deferral_count < 2 (max two deferrals; §1.4 priority 40)"
+        side_effects:
+          - "Summons.deferred_to_term_id set to requested_term_id"
+          - "A new Summons (status SUMMONED) is created on requested_term_id for the same juror, badge_number minted on that term; new Summons.deferral_count = old.deferral_count + 1 (cascade)"
+        note: "Cyclic: DEFERRED re-issues a fresh SUMMONED summons on a later term."
+      - from: QUALIFIED_PENDING
+        to: EXCUSED
+        trigger: "POST /dispositions/{id}/decide (kind==EXCUSE, decision GRANTED)"
+        actor: CourtClerk
+        preconditions:
+          - "Summons.status == QUALIFIED_PENDING"
+          - "Disposition.kind == EXCUSE"
+        side_effects:
+          - "Summons terminal; no panel eligibility"
+      - from: QUALIFIED_PENDING
+        to: EXEMPT
+        trigger: "POST /dispositions/{id}/decide (kind==EXEMPT, decision GRANTED)"
+        actor: CourtClerk
+        preconditions:
+          - "Summons.status == QUALIFIED_PENDING"
+          - "Disposition.kind == EXEMPT"
+        side_effects:
+          - "Summons terminal; no panel eligibility"
+      - from: QUALIFIED_PENDING
+        to: FAILED_TO_APPEAR
+        trigger: "POST /summonses/{id}/mark-fta"
+        actor: CourtClerk
+        preconditions:
+          - "Summons.status == QUALIFIED_PENDING"
+          - "current clock >= ServiceTerm.report_date (cannot mark FTA before report date)"
+        side_effects:
+          - "Strike row created (source FTA) on the juror (cascade origin)"
+          - "Juror.fta_strike_count recomputed; if it reaches ServiceTerm.fta_disqualify_threshold the Juror.disqualified flips true and Juror QUALIFIED→INELIGIBLE (cascade hop), recomputing ServiceTerm.pool_size (cascade hop)"
+
+  - entity: Panel
+    initial_state: FORMING
+    terminal_states: [DISMISSED]
+    transitions:
+      - from: FORMING
+        to: SEATED
+        trigger: "system (automatic when seated_count reaches target_size during POST /panels/{id}/seat)"
+        actor: system
+        preconditions:
+          - "Panel.seated_count == Panel.target_size"
+        side_effects:
+          - "Trial(Panel.trial_id) transitions READY→IN_TRIAL"
+          - "ESTIMATED PayVoucher issued for each SEATED summons on the panel (§1.3)"
+      - from: SEATED
+        to: DISMISSED
+        trigger: "POST /panels/{id}/dismiss"
+        actor: Judge
+        preconditions:
+          - "Panel.status == SEATED"
+        side_effects:
+          - "Trial(Panel.trial_id) transitions IN_TRIAL→ADJOURNED"
+          - "Every SEATED summons on the panel remains SERVING until individually released (no auto-release)"
+      - from: FORMING
+        to: DISMISSED
+        trigger: "POST /panels/{id}/dismiss"
+        actor: Judge
+        preconditions:
+          - "Panel.status == FORMING"
+        side_effects:
+          - "All SEATED PanelAssignments set EXCUSED_FROM_PANEL; each occupying summons reverts SERVING→REPORTING (cascade); Panel.seated_count reset to 0; increments Panel.version by 1"
+
+  - entity: Disposition
+    initial_state: PENDING
+    terminal_states: [GRANTED, DENIED]
+    transitions:
+      - from: PENDING
+        to: GRANTED
+        trigger: "POST /dispositions/{id}/decide (decision GRANTED)"
+        actor: "CourtClerk (EXCUSE/EXEMPT) | JuryAdministrator (DEFER)"
+        preconditions:
+          - "Disposition.decision == PENDING"
+          - "Summons.status == QUALIFIED_PENDING"
+          - "DEFER decided only by JuryAdministrator; EXCUSE/EXEMPT decided only by CourtClerk (§1.4 priority 12)"
+        side_effects:
+          - "decided_by_role stamped; drives Summons transition per kind (see Summons machine)"
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /dispositions/{id}/decide (decision DENIED)"
+        actor: "CourtClerk (EXCUSE/EXEMPT) | JuryAdministrator (DEFER)"
+        preconditions:
+          - "Disposition.decision == PENDING"
+        side_effects:
+          - "decided_by_role stamped; Summons stays QUALIFIED_PENDING"
+
+  - entity: Trial
+    initial_state: SCHEDULED
+    terminal_states: [ADJOURNED]
+    transitions:
+      - from: SCHEDULED
+        to: READY
+        trigger: "POST /trials/{id}/ready"
+        actor: Judge
+        preconditions:
+          - "Trial.status == SCHEDULED"
+          - "ServiceTerm.status == OPEN"
+        side_effects:
+          - "Panels for this trial may now seat summonses (cross-entity gate)"
+      - from: READY
+        to: IN_TRIAL
+        trigger: "system (Panel FORMING→SEATED)"
+        actor: system
+        preconditions:
+          - "Trial.status == READY"
+        side_effects: []
+      - from: IN_TRIAL
+        to: ADJOURNED
+        trigger: "system (Panel SEATED→DISMISSED)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: panel-seat-stale-panel
+    parent_entity: Panel
+    write_endpoint: "POST /panels/{id}/seat"
+    occ_field: "expected_panel_version"
+    description: |
+      Seating a summons into a Panel whose version has advanced since the client
+      last observed it is rejected. Two independent clerks can each legitimately
+      seat a different REPORTING summons into the same FORMING panel (the product
+      allows any reporting juror to take any open seat), so a sequential second
+      seat that still carries the version observed before the first seat landed
+      is operating on a stale view of the panel's remaining seats and must fail.
+    error_id: ERR_STALE_PANEL_VERSION
+    http_status: 412
+
+  - rule_id: pool-draw-stale-term
+    parent_entity: ServiceTerm
+    write_endpoint: "POST /service-terms/{id}/draw"
+    occ_field: "expected_service_term_version"
+    description: |
+      Drawing a batch of jurors from a ServiceTerm whose version has advanced
+      since the client last observed it is rejected. A draw legitimately consumes
+      qualified jurors from the shared pool and bumps the term version; a second
+      draw still carrying the pre-first-draw version is working from a stale pool
+      snapshot and is rejected so the same juror is not double-drawn.
+    error_id: ERR_STALE_TERM_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: qualification_evaluation
+    trigger: "POST /summonses/{id}/qualification (QualificationResponse created)"
+    algorithm: weighted_scoring
+    formula: |
+      # Pure boolean predicate over the four questionnaire answers plus age.
+      age = CURRENT_YEAR - Juror.birth_year            # CURRENT_YEAR from the server clock
+      qualified = is_citizen
+                  AND is_resident
+                  AND english_proficient
+                  AND (felony_conviction == false)
+                  AND (age >= MIN_AGE)
+      evaluated_status = QUALIFIED if qualified else INELIGIBLE
+    input_set: "the single QualificationResponse just submitted + parent Juror.birth_year"
+    constants:
+      MIN_AGE: 18
+      CURRENT_YEAR: "year(server clock)"
+    precision: "integer age; no rounding"
+    variants: []
+
+  - name: pay_computation
+    trigger: "Panel FORMING→SEATED (ESTIMATED); POST /summonses/{id}/release (FINAL)"
+    algorithm: aggregation
+    formula: |
+      # Per service-day attendance, capped, then mileage per counted day.
+      # Counted days are the FIRST `paid_days` CheckIn rows in chronological
+      # order (service_date ASC, created_at ASC tie-break), where
+      #   paid_days = min(count(eligible CheckIns), ServiceTerm.pay_day_cap)
+      # day pay per counted CheckIn:
+      #   day_pay = ServiceTerm.daily_pay_cents      if day_kind == FULL
+      #             ServiceTerm.half_day_pay_cents   if day_kind == HALF
+      # ROUNDING ORDER IS PINNED: round mileage PER COUNTED DAY, then sum.
+      #   per_day_mileage = round_half_up(round_trip_miles * mileage_rate_cents)   # cents, per day
+      #   mileage_cents   = per_day_mileage * paid_days
+      #   attendance_cents = sum(day_pay over the `paid_days` counted CheckIns)
+      #   total_cents      = attendance_cents + mileage_cents
+    input_set: "CheckIn rows for the summons; eligibility differs by variant (see variants)"
+    constants:
+      ROUNDING: "round_half_up to whole cents on per-day mileage BEFORE summing"
+    precision: "all monetary fields integer cents; mileage rounded per-day then summed (NOT summed then rounded)"
+    variants:
+      - name: estimated
+        when: "issued at panel seating (Panel FORMING→SEATED)"
+        difference: "eligible CheckIns = all CheckIns recorded up to the seating instant; the venire has not finished serving, so days accrued after seating are NOT in this voucher"
+      - name: final
+        when: "issued at release (Summons→RELEASED)"
+        difference: "eligible CheckIns = ALL CheckIns on the summons through release; paid_days re-counts and re-caps over the full set, so FINAL.total_cents >= ESTIMATED.total_cents whenever post-seating service days exist"
+
+  - name: mileage_per_diem_reimbursement
+    trigger: "GET /service-terms/{id}/pool-projection (what-if reimbursement projection for the qualified pool)"
+    algorithm: aggregation
+    formula: |
+      # Projects the term's maximum mileage exposure if EVERY qualified,
+      # non-disqualified juror reported for the full pay_day_cap.
+      # ROUNDING ORDER IS PINNED THE OPPOSITE WAY from pay_computation to make
+      # the order-sensitivity observable: SUM raw miles across the pool FIRST,
+      # multiply by rate, then round ONCE at the end.
+      #   pool = Jurors where qualification_status==QUALIFIED and disqualified==false
+      #   total_miles = sum(round_trip_miles for j in pool) * pay_day_cap
+      #   projected_mileage_cents = round_half_up(total_miles * mileage_rate_cents)
+      projected_mileage_cents = round_half_up(
+          (sum(j.round_trip_miles for j in pool) * pay_day_cap) * mileage_rate_cents)
+    input_set: "all Jurors of the term with qualification_status==QUALIFIED and disqualified==false"
+    constants:
+      ROUNDING: "round_half_up, applied ONCE after the full pool sum (sum-then-round)"
+    precision: "integer cents; single terminal rounding"
+    variants: []
+
+  - name: fta_disqualification
+    trigger: "Strike created (POST /summonses/{id}/mark-fta side-effect)"
+    algorithm: threshold
+    formula: |
+      Juror.fta_strike_count = count(Strike rows where source==FTA for this juror)
+      Juror.disqualified = (Juror.fta_strike_count >= ServiceTerm.fta_disqualify_threshold)
+      # Boundary is INCLUSIVE: count == threshold disqualifies; count == threshold-1 does not.
+    input_set: "all FTA Strike rows for the juror in the term"
+    constants:
+      DEFAULT_THRESHOLD: 3
+    precision: "integer count; '>=' boundary (Rule 6)"
+    variants: []
+
+  - name: random_draw_selection
+    trigger: "POST /service-terms/{id}/draw"
+    algorithm: weighted_scoring
+    formula: |
+      # Server selects `count` jurors from the qualified pool with a DETERMINISTIC,
+      # auditable order (NO use of random id). Eligibility + ranking + tie-break +
+      # empty-pool fallback are all pinned (§Quality selector-determinism):
+      #   eligible = Jurors where qualification_status==QUALIFIED
+      #              AND disqualified==false
+      #              AND no non-cancelled Summons already exists for this juror in this term
+      #   rank key (ascending, "least-recently-burdened first"):
+      #     1. last_drawn_seq ASC      (never-drawn jurors, last_drawn_seq==0, come first)
+      #     2. fta_strike_count ASC    (cleaner records preferred)
+      #     3. created_at ASC          (stable final tie-break — created_at, NEVER id)
+      #   take the first `count` eligible jurors by this key.
+      #   on success: ServiceTerm.draw_seq += 1; each drawn juror.last_drawn_seq = new draw_seq;
+      #               a Summons (status SUMMONED) is created per drawn juror.
+      #   fallback: if eligible pool size < count → ERR_POOL_EXHAUSTED, no summons created.
+    input_set: "qualified, non-disqualified, not-yet-summoned Jurors of the term"
+    constants:
+      TIE_BREAK: "created_at ASC (never id)"
+    precision: "exact integer count; empty/short pool → ERR_POOL_EXHAUSTED"
+    variants: []
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1,  category: auth,                check: "X-User-Role and X-User-ID headers present", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all except POST /jurors (self-register allowed) — see roles" }
+  - { priority: 2,  category: auth,                check: "X-User-Role is a role declared in §1.7", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all" }
+  - { priority: 10, category: auth,                check: "role permitted for this endpoint per §1.7", error_id: ERR_FORBIDDEN, http_status: 403, applies_to: "all" }
+  - { priority: 11, category: auth,                check: "Juror acting on a summons must own it (Summons.juror_id == X-User-ID)", error_id: ERR_FORBIDDEN, http_status: 403, applies_to: "POST /summonses/{id}/qualification, POST /summonses/{id}/dispositions" }
+  - { priority: 12, category: auth,                check: "DEFER dispositions decided only by JuryAdministrator; EXCUSE/EXEMPT decided only by CourtClerk", error_id: ERR_DISPOSITION_ROLE_MISMATCH, http_status: 403, applies_to: "POST /dispositions/{id}/decide" }
+  - { priority: 20, category: existence,           check: "all path/body referenced resources exist, validated left-to-right", error_id: ERR_NOT_FOUND, http_status: 404, applies_to: "all with path/body ids" }
+  - { priority: 21, category: state,               check: "target resource is in a state from which the requested transition is defined (§1.2)", error_id: ERR_INVALID_STATE, http_status: 409, applies_to: "all transition endpoints" }
+  - { priority: 22, category: business_temporal,   check: "check-in service_date >= ServiceTerm.report_date (closed lower bound)", error_id: ERR_BEFORE_REPORT_DATE, http_status: 409, applies_to: "POST /summonses/{id}/check-in" }
+  - { priority: 23, category: business_temporal,   check: "cannot mark FTA before current clock reaches ServiceTerm.report_date", error_id: ERR_BEFORE_REPORT_DATE, http_status: 409, applies_to: "POST /summonses/{id}/mark-fta" }
+  - { priority: 30, category: business_constraint, check: "ServiceTerm.status must be OPEN to draw, issue summons, check in, or seat", error_id: ERR_TERM_NOT_OPEN, http_status: 409, applies_to: "POST /service-terms/{id}/draw, POST /summonses/{id}/check-in, POST /panels/{id}/seat" }
+  - { priority: 31, category: business_referential,check: "a Juror may hold at most one non-cancelled Summons per ServiceTerm", error_id: ERR_DUPLICATE_SUMMONS, http_status: 409, applies_to: "POST /service-terms/{id}/draw" }
+  - { priority: 32, category: business_constraint, check: "Panel may seat only while Trial(Panel.trial_id).status == READY", error_id: ERR_TRIAL_NOT_READY, http_status: 409, applies_to: "POST /panels/{id}/seat" }
+  - { priority: 33, category: business_constraint, check: "summons being seated must be in REPORTING (has checked in, not on another SEATED panel)", error_id: ERR_SUMMONS_NOT_REPORTING, http_status: 409, applies_to: "POST /panels/{id}/seat" }
+  - { priority: 40, category: business_constraint, check: "a summons may be deferred at most twice (Summons.deferral_count < 2 when granting a DEFER)", error_id: ERR_DEFERRAL_LIMIT, http_status: 409, applies_to: "POST /dispositions/{id}/decide" }
+  - { priority: 41, category: business_constraint, check: "no two CheckIns on one summons share the same service_date", error_id: ERR_DUPLICATE_SERVICE_DATE, http_status: 409, applies_to: "POST /summonses/{id}/check-in" }
+  - { priority: 50, category: business_constraint, check: "Panel.target_size and capacity: seated_count must not exceed target_size", error_id: ERR_PANEL_FULL, http_status: 409, applies_to: "POST /panels/{id}/seat" }
+  - { priority: 60, category: business_constraint, check: "draw count and a qualified eligible pool of at least `count` jurors must exist", error_id: ERR_POOL_EXHAUSTED, http_status: 409, applies_to: "POST /service-terms/{id}/draw" }
+  - { priority: 70, category: state,               check: "OCC: expected_panel_version must equal Panel.version", error_id: ERR_STALE_PANEL_VERSION, http_status: 412, applies_to: "POST /panels/{id}/seat" }
+  - { priority: 71, category: state,               check: "OCC: expected_service_term_version must equal ServiceTerm.version", error_id: ERR_STALE_TERM_VERSION, http_status: 412, applies_to: "POST /service-terms/{id}/draw" }
+  - { priority: 80, category: business_constraint, check: "required body fields present and well-typed (enum membership, numeric ranges)", error_id: ERR_INVALID_REQUEST, http_status: 422, applies_to: "all bodies" }
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- ServiceTerm ----
+  - { method: POST, path: "/service-terms", description: "Create a service term (DRAFT)", roles: [JuryAdministrator], code: 201, input: [name, report_date, daily_pay_cents, half_day_pay_cents, full_day_hours, mileage_rate_cents, pay_day_cap, "fta_disqualify_threshold?"], output: ServiceTerm, side_effects: ["status=DRAFT"] }
+  - { method: GET,  path: "/service-terms", description: "List service terms (paginated)", roles: [JuryAdministrator, CourtClerk, Judge], code: 200, input: ["status?", "limit?", "offset?"], output: "ServiceTerm[]", side_effects: [] }
+  - { method: GET,  path: "/service-terms/{id}", description: "Get a service term incl. computed counters", roles: [JuryAdministrator, CourtClerk, Judge], code: 200, input: [], output: ServiceTerm, side_effects: [] }
+  - { method: POST, path: "/service-terms/{id}/open", description: "Open the term (DRAFT→OPEN)", roles: [JuryAdministrator], code: 200, input: [], output: ServiceTerm, side_effects: ["DRAFT→OPEN"] }
+  - { method: POST, path: "/service-terms/{id}/close", description: "Close the term (OPEN→CLOSED)", roles: [JuryAdministrator], code: 200, input: [], output: ServiceTerm, side_effects: ["OPEN→CLOSED"] }
+  - { method: POST, path: "/service-terms/{id}/draw", description: "Random/weighted draw of `count` jurors → issues summonses", roles: [JuryAdministrator], code: 201, input: [count, expected_service_term_version], output: "Summons[]", side_effects: ["random_draw_selection (§1.3)", "draw_seq incremented", "Summons rows created", "increments ServiceTerm.version by 1"] }
+  - { method: GET,  path: "/service-terms/{id}/pool-projection", description: "What-if max mileage exposure for the qualified pool", roles: [JuryAdministrator], code: 200, input: [], output: "{ projected_mileage_cents: integer, pool_size: integer }", side_effects: ["mileage_per_diem_reimbursement (§1.3)"] }
+
+  # ---- Juror (pool) ----
+  - { method: POST, path: "/service-terms/{id}/jurors", description: "Add a juror to the term pool (PENDING)", roles: [JuryAdministrator], code: 201, input: [full_name, birth_year, round_trip_miles], output: Juror, side_effects: ["qualification_status=PENDING"] }
+  - { method: GET,  path: "/service-terms/{id}/jurors", description: "List jurors in a term pool (reverse-reachability for Juror.service_term_id)", roles: [JuryAdministrator, CourtClerk], code: 200, input: ["qualification_status?", "disqualified?", "limit?", "offset?"], output: "Juror[]", side_effects: [] }
+  - { method: GET,  path: "/jurors/{id}", description: "Get a juror", roles: [JuryAdministrator, CourtClerk, Juror], code: 200, input: [], output: Juror, side_effects: [] }
+  - { method: GET,  path: "/jurors/{id}/summonses", description: "List summonses issued to a juror (reverse-reachability for Summons.juror_id)", roles: [JuryAdministrator, CourtClerk, Juror], code: 200, input: ["status?", "limit?", "offset?"], output: "Summons[]", side_effects: [] }
+  - { method: POST, path: "/jurors/{id}/qualify", description: "Administrative qualification override (PENDING→QUALIFIED)", roles: [JuryAdministrator], code: 200, input: [], output: Juror, side_effects: ["qualification_status=QUALIFIED", "pool_size recomputed"] }
+
+  # ---- Summons ----
+  - { method: GET,  path: "/service-terms/{id}/summonses", description: "List summonses in a term (reverse-reachability for Summons.service_term_id and Summons.deferred_to_term_id)", roles: [JuryAdministrator, CourtClerk], code: 200, input: ["status?", "juror_id?", "deferred_to_term_id?", "limit?", "offset?"], output: "Summons[]", side_effects: [] }
+  - { method: GET,  path: "/summonses/{id}", description: "Get a summons", roles: [JuryAdministrator, CourtClerk, Juror], code: 200, input: [], output: Summons, side_effects: [] }
+  - { method: POST, path: "/summonses/{id}/qualification", description: "Juror submits qualification questionnaire (SUMMONED→QUALIFIED_PENDING or →EXCUSED)", roles: [Juror], code: 201, input: [is_citizen, is_resident, felony_conviction, english_proficient], output: QualificationResponse, side_effects: ["qualification_evaluation (§1.3)", "Juror.qualification_status set", "summons branches"] }
+  - { method: GET,  path: "/summonses/{id}/qualification", description: "Get the qualification response for a summons (reverse-reachability for QualificationResponse.summons_id)", roles: [JuryAdministrator, CourtClerk, Juror], code: 200, input: [], output: "QualificationResponse[]", side_effects: [] }
+  - { method: POST, path: "/summonses/{id}/check-in", description: "Record a service-day check-in (QUALIFIED_PENDING→REPORTING or REPORTING→REPORTING)", roles: [CourtClerk], code: 201, input: [service_date, on_floor_hours], output: CheckIn, side_effects: ["CheckIn created; day_kind computed (§1.3)", "service_days incremented"] }
+  - { method: GET,  path: "/summonses/{id}/check-ins", description: "List check-ins for a summons (reverse-reachability for CheckIn.summons_id)", roles: [JuryAdministrator, CourtClerk], code: 200, input: ["limit?", "offset?"], output: "CheckIn[]", side_effects: [] }
+  - { method: POST, path: "/summonses/{id}/release", description: "Release a reporting/serving juror (→RELEASED)", roles: [CourtClerk], code: 200, input: [], output: Summons, side_effects: ["FINAL PayVoucher issued (§1.3)"] }
+  - { method: POST, path: "/summonses/{id}/mark-fta", description: "Mark a no-show as FAILED_TO_APPEAR", roles: [CourtClerk], code: 200, input: [], output: Summons, side_effects: ["Strike created", "fta_disqualification cascade (§1.3)"] }
+  - { method: GET,  path: "/summonses/{id}/pay-vouchers", description: "List pay vouchers for a summons (reverse-reachability for PayVoucher.summons_id)", roles: [JuryAdministrator, CourtClerk, Juror], code: 200, input: ["variant?", "limit?", "offset?"], output: "PayVoucher[]", side_effects: [] }
+
+  # ---- Disposition ----
+  - { method: POST, path: "/summonses/{id}/dispositions", description: "Juror requests DEFER/EXCUSE/EXEMPT (Disposition PENDING)", roles: [Juror], code: 201, input: [kind, reason_code, "requested_term_id?"], output: Disposition, side_effects: ["Disposition status PENDING"] }
+  - { method: GET,  path: "/summonses/{id}/dispositions", description: "List dispositions for a summons (reverse-reachability for Disposition.summons_id)", roles: [JuryAdministrator, CourtClerk, Juror], code: 200, input: ["decision?", "limit?", "offset?"], output: "Disposition[]", side_effects: [] }
+  - { method: POST, path: "/dispositions/{id}/decide", description: "Decide a disposition (PENDING→GRANTED/DENIED)", roles: [CourtClerk, JuryAdministrator], code: 200, input: [decision], output: Disposition, side_effects: ["drives Summons transition (DEFER cascade re-issues summons)"] }
+  - { method: GET,  path: "/dispositions/{id}", description: "Get a disposition", roles: [JuryAdministrator, CourtClerk, Juror], code: 200, input: [], output: Disposition, side_effects: [] }
+  - { method: GET,  path: "/dispositions", description: "List dispositions filtered by requested deferral term (reverse-reachability for Disposition.requested_term_id)", roles: [JuryAdministrator, CourtClerk], code: 200, input: ["requested_term_id?", "decision?", "limit?", "offset?"], output: "Disposition[]", side_effects: [] }
+
+  # ---- Trial ----
+  - { method: POST, path: "/service-terms/{id}/trials", description: "Create a trial under a term (SCHEDULED)", roles: [JuryAdministrator, Judge], code: 201, input: [caption, required_jurors], output: Trial, side_effects: ["status=SCHEDULED"] }
+  - { method: GET,  path: "/service-terms/{id}/trials", description: "List trials in a term (reverse-reachability for Trial.service_term_id)", roles: [JuryAdministrator, CourtClerk, Judge], code: 200, input: ["status?", "limit?", "offset?"], output: "Trial[]", side_effects: [] }
+  - { method: GET,  path: "/trials/{id}", description: "Get a trial", roles: [JuryAdministrator, CourtClerk, Judge], code: 200, input: [], output: Trial, side_effects: [] }
+  - { method: POST, path: "/trials/{id}/ready", description: "Mark a trial READY for seating (SCHEDULED→READY)", roles: [Judge], code: 200, input: [], output: Trial, side_effects: ["READY enables panel seating"] }
+
+  # ---- Panel ----
+  - { method: POST, path: "/trials/{id}/panels", description: "Create a forming panel for a trial (FORMING)", roles: [Judge], code: 201, input: ["target_size?"], output: Panel, side_effects: ["status=FORMING; target_size defaults to Trial.required_jurors"] }
+  - { method: GET,  path: "/trials/{id}/panels", description: "List panels for a trial (reverse-reachability for Panel.trial_id)", roles: [JuryAdministrator, CourtClerk, Judge], code: 200, input: ["status?", "limit?", "offset?"], output: "Panel[]", side_effects: [] }
+  - { method: GET,  path: "/service-terms/{id}/panels", description: "List panels in a term (reverse-reachability for Panel.service_term_id)", roles: [JuryAdministrator, CourtClerk, Judge], code: 200, input: ["status?", "limit?", "offset?"], output: "Panel[]", side_effects: [] }
+  - { method: GET,  path: "/panels/{id}", description: "Get a panel incl. seated_count", roles: [JuryAdministrator, CourtClerk, Judge], code: 200, input: [], output: Panel, side_effects: [] }
+  - { method: POST, path: "/panels/{id}/seat", description: "Seat a REPORTING summons into a forming panel", roles: [Judge], code: 201, input: [summons_id, expected_panel_version], output: PanelAssignment, side_effects: ["PanelAssignment SEATED", "seated_count++", "summons REPORTING→SERVING", "auto SEAT + ESTIMATED vouchers at full panel", "increments Panel.version by 1"] }
+  - { method: POST, path: "/panels/{id}/dismiss", description: "Dismiss a panel (SEATED→DISMISSED or FORMING→DISMISSED)", roles: [Judge], code: 200, input: [], output: Panel, side_effects: ["Trial transition; cascade seat reversion when FORMING"] }
+  - { method: GET,  path: "/panels/{id}/assignments", description: "List seat assignments on a panel (reverse-reachability for PanelAssignment.panel_id)", roles: [JuryAdministrator, CourtClerk, Judge], code: 200, input: ["status?", "limit?", "offset?"], output: "PanelAssignment[]", side_effects: [] }
+  - { method: GET,  path: "/summonses/{id}/assignments", description: "List seat assignments for a summons (reverse-reachability for PanelAssignment.summons_id)", roles: [JuryAdministrator, CourtClerk, Judge], code: 200, input: ["status?", "limit?", "offset?"], output: "PanelAssignment[]", side_effects: [] }
+  - { method: POST, path: "/panel-assignments/{id}/excuse-from-panel", description: "Pull a seated juror off a forming panel (SERVING→REPORTING)", roles: [Judge], code: 200, input: [], output: PanelAssignment, side_effects: ["assignment EXCUSED_FROM_PANEL", "seated_count--", "summons SERVING→REPORTING", "increments Panel.version by 1"] }
+  - { method: GET,  path: "/panel-assignments/{id}", description: "Get a panel assignment", roles: [JuryAdministrator, CourtClerk, Judge], code: 200, input: [], output: PanelAssignment, side_effects: [] }
+
+  # ---- Strike (FTA history) ----
+  - { method: GET,  path: "/jurors/{id}/strikes", description: "List FTA strikes for a juror (reverse-reachability for Strike.juror_id)", roles: [JuryAdministrator, CourtClerk], code: 200, input: ["limit?", "offset?"], output: "Strike[]", side_effects: [] }
+  - { method: GET,  path: "/summonses/{id}/strikes", description: "List strikes recorded on a summons (reverse-reachability for Strike.summons_id)", roles: [JuryAdministrator, CourtClerk], code: 200, input: ["limit?", "offset?"], output: "Strike[]", side_effects: [] }
+
+  # ---- Test-driving clock ----
+  - { method: POST, path: "/_clock/set_current_utc", description: "Set the server clock (test-driving; gates report-date temporal checks)", roles: [JuryAdministrator], code: 200, input: [to_iso8601], output: "{ current_utc: string }", side_effects: ["server clock advanced"] }
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED,        http: 401, condition: "missing/invalid X-User-Role or X-User-ID headers" }
+  - { id: ERR_FORBIDDEN,              http: 403, condition: "role not permitted for endpoint, or juror acting on a summons it does not own" }
+  - { id: ERR_DISPOSITION_ROLE_MISMATCH, http: 403, condition: "wrong role deciding a disposition kind (DEFER needs JuryAdministrator; EXCUSE/EXEMPT need CourtClerk)" }
+  - { id: ERR_NOT_FOUND,              http: 404, condition: "referenced resource id does not exist" }
+  - { id: ERR_INVALID_STATE,          http: 409, condition: "transition not defined from the resource's current state" }
+  - { id: ERR_TERM_NOT_OPEN,          http: 409, condition: "operation requires ServiceTerm.status == OPEN" }
+  - { id: ERR_BEFORE_REPORT_DATE,     http: 409, condition: "check-in service_date earlier than report_date, or FTA marked before report_date" }
+  - { id: ERR_DUPLICATE_SUMMONS,      http: 409, condition: "draw would issue a second non-cancelled summons to a juror already summoned this term" }
+  - { id: ERR_DUPLICATE_SERVICE_DATE, http: 409, condition: "a check-in already exists for this summons on the supplied service_date" }
+  - { id: ERR_TRIAL_NOT_READY,        http: 409, condition: "seating attempted while the panel's trial is not in READY" }
+  - { id: ERR_SUMMONS_NOT_REPORTING,  http: 409, condition: "summons being seated is not in REPORTING" }
+  - { id: ERR_PANEL_FULL,             http: 409, condition: "seating attempted when seated_count already equals target_size" }
+  - { id: ERR_DEFERRAL_LIMIT,         http: 409, condition: "granting a DEFER would exceed two deferrals for the summons lineage" }
+  - { id: ERR_POOL_EXHAUSTED,         http: 409, condition: "draw `count` exceeds the eligible qualified pool" }
+  - { id: ERR_STALE_PANEL_VERSION,    http: 412, condition: "expected_panel_version does not match Panel.version (OCC)" }
+  - { id: ERR_STALE_TERM_VERSION,     http: 412, condition: "expected_service_term_version does not match ServiceTerm.version (OCC)" }
+  - { id: ERR_INVALID_REQUEST,        http: 422, condition: "missing required field, bad enum, or out-of-range numeric value" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: JuryAdministrator
+    description: "Runs the pool, term lifecycle, random draws, and deferral decisions"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /service-terms (create term)"
+      - "POST /service-terms/{id}/open, /close"
+      - "POST /service-terms/{id}/draw (random selection)"
+      - "POST /service-terms/{id}/jurors (seed pool), POST /jurors/{id}/qualify"
+      - "GET /service-terms/{id}/pool-projection"
+      - "decide DEFER dispositions"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "read terms, jurors, summonses, dispositions, trials, panels, strikes, vouchers"
+      - "POST /service-terms/{id}/trials (with Judge)"
+
+  - name: CourtClerk
+    description: "Handles summons lifecycle: check-in, release, FTA, and EXCUSE/EXEMPT decisions"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /summonses/{id}/check-in"
+      - "POST /summonses/{id}/release"
+      - "POST /summonses/{id}/mark-fta"
+      - "decide EXCUSE/EXEMPT dispositions"
+    shared_operations:
+      - "read terms, jurors, summonses, dispositions, trials, panels, strikes, vouchers"
+
+  - name: Judge
+    description: "Empanels and dismisses panels; readies trials"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /trials/{id}/ready"
+      - "POST /trials/{id}/panels (create panel)"
+      - "POST /panels/{id}/seat, /dismiss"
+      - "POST /panel-assignments/{id}/excuse-from-panel"
+    shared_operations:
+      - "read terms, summonses, trials, panels, assignments"
+      - "POST /service-terms/{id}/trials (with JuryAdministrator)"
+
+  - name: Juror
+    description: "The summoned person; responds to their own summons"
+    identity: "entity_backed:Juror"
+    exclusive_operations:
+      - "POST /summonses/{id}/qualification (own summons)"
+      - "POST /summonses/{id}/dispositions (own summons)"
+    shared_operations:
+      - "GET own juror, summons, qualification, dispositions, pay-vouchers"

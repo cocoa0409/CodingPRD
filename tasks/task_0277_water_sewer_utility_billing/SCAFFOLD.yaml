@@ -1,0 +1,1045 @@
+# =============================================================================
+# Water & Sewer Utility Billing — Scaffold Seed Tables (Expert band)
+# =============================================================================
+
+scenario: |
+  277. Water & Sewer Utility Billing: AMI/meter read import, consumption tiers & sewer ratio,
+  fixed + volumetric charges, irrigation/second meter, leak adjustment, budget billing,
+  shutoff/reconnect & moratorium, low-income assistance
+
+domain_name: water-sewer-utility-billing
+api_prefix: /
+
+# Structural DNA --------------------------------------------------------------
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: ledger_reconciliation
+  complexity_layers:
+    - dual_variant_calculation        # budget-billing estimate vs actual chronological true-up; sewer-with vs sewer-without irrigation deduction
+    - rate_threshold_triggers         # consumption tier breakpoints; arrears shutoff threshold
+    - cascading_side_effects          # shutoff -> service suspend -> bill late-fee accrual; reconnect -> restore
+    - derived_field_reconciliation    # Account.balance_due_cents reconciled against posted bills/payments/credits
+    - optimistic_concurrency          # budget-plan re-enrollment supersede via Account.version OCC
+
+  entity_topology: flat
+  # Peer entities linked by FK (Account, Meter, MeterRead, Bill, LeakAdjustment,
+  # BudgetBillingPlan, AssistanceEnrollment, ShutoffOrder, Payment) — no deep URL nesting;
+  # most resources carry account_id / bill_id foreign keys.
+
+  state_machine_shape: parallel
+  # Account carries TWO independent state axes (billing_status x service_status);
+  # ShutoffOrder is cyclic (SCHEDULED -> EXECUTED -> RECONNECTED, and RECONNECTED is terminal
+  # but a fresh ShutoffOrder can re-enter the cycle); Bill and LeakAdjustment are branching.
+
+  relationship_patterns:
+    - one_to_many       # Account -> Meter, Account -> Bill, Bill -> LeakAdjustment
+    - cross_aggregate   # Bill references RateSchedule + BillingCycle; ShutoffOrder references Bill
+
+  role_model: peer_roles
+  # BillingClerk owns bill generation/voiding; FieldOps owns shutoff/reconnect execution;
+  # AssistanceCaseworker owns assistance + leak adjudication; Customer (entity_backed:Account)
+  # reads own data, enrolls in budget billing, requests leak adjustments.
+
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: RateSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Human label, e.g. 'Residential 2026'" }
+      - { name: fixed_water_charge_cents, type: integer, source: input, description: "Flat monthly water service charge in cents", constraints: ">= 0" }
+      - { name: fixed_sewer_charge_cents, type: integer, source: input, description: "Flat monthly sewer service charge in cents", constraints: ">= 0" }
+      - { name: water_tiers, type: array, source: input, description: "Ordered ascending tier objects [{ up_to_gallons: int|null, rate_cents_per_kgal: int }]; final tier has up_to_gallons=null (infinite). Tiers are CUMULATIVE/marginal.", constraints: "non-empty; ascending up_to_gallons; exactly one null terminal" }
+      - { name: sewer_rate_cents_per_kgal, type: integer, source: input, description: "Flat volumetric sewer rate applied to billable sewer volume in cents per 1000 gallons", constraints: ">= 0" }
+      - { name: sewer_ratio_pct, type: integer, source: input, description: "Percent of potable consumption treated as sewer-discharged when no winter cap applies", default: 100, constraints: "0..100" }
+      - { name: sewer_cap_gallons, type: integer, source: input, required: false, description: "Optional winter-average cap on billable sewer gallons; null = uncapped", constraints: ">= 0 or null" }
+      - { name: leak_adjustment_rate_pct, type: integer, source: input, description: "Percent of the over-baseline leak volume that is credited at the lowest tier rate", default: 50, constraints: "0..100" }
+      - { name: assistance_discount_pct, type: integer, source: input, description: "Percent discount applied to fixed charges for enrolled low-income accounts", default: 25, constraints: "0..100" }
+      - { name: arrears_shutoff_threshold_cents, type: integer, source: input, description: "Minimum past-due balance (cents) at or above which a ShutoffOrder may be scheduled", default: 7500, constraints: ">= 0" }
+      - { name: reconnect_fee_cents, type: integer, source: input, description: "Fee charged on reconnect after an executed shutoff", default: 5000, constraints: ">= 0" }
+      - { name: late_fee_pct, type: integer, source: input, description: "Percent late fee on past-due principal at cycle close", default: 5, constraints: "0..100" }
+
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - { name: rate_schedule_id, type: string, source: input, description: "FK -> RateSchedule.id; pricing schedule governing this account's bills" }
+      - { name: holder_name, type: string, source: input, description: "Account holder name" }
+      - { name: service_address, type: string, source: input, description: "Service address string" }
+      - { name: billing_status, type: enum, source: system, description: "CURRENT | PAST_DUE | SHUTOFF_PENDING | DELINQUENT_PROTECTED — financial standing axis", default: "CURRENT", constraints: "CURRENT|PAST_DUE|SHUTOFF_PENDING|DELINQUENT_PROTECTED" }
+      - { name: service_status, type: enum, source: system, description: "ACTIVE | SUSPENDED | RESTORED — physical water-service axis (independent of billing_status)", default: "ACTIVE", constraints: "ACTIVE|SUSPENDED|RESTORED" }
+      - { name: balance_due_cents, type: integer, source: computed, description: "Derived ledger: sum of POSTED Bill.total_cents minus applied Payment.amount_cents minus applied credit, floored per reconciliation rule" }
+      - { name: past_due_cents, type: integer, source: computed, description: "Portion of balance_due_cents attributable to bills whose due cycle has CLOSED unpaid" }
+      - { name: budget_billing_enrolled, type: boolean, source: computed, description: "True when an ACTIVE BudgetBillingPlan exists for this account", default: false }
+      - { name: assistance_enrolled, type: boolean, source: computed, description: "True when an ACTIVE AssistanceEnrollment exists for this account", default: false }
+
+  - name: Meter
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; account this meter serves" }
+      - { name: meter_type, type: enum, source: input, description: "POTABLE (indoor, sewer-billable) | IRRIGATION (second meter, NOT sewer-billable)", constraints: "POTABLE|IRRIGATION" }
+      - { name: serial, type: string, source: input, description: "Physical meter serial number" }
+      - { name: last_reading_gallons, type: integer, source: computed, description: "Most recent imported MeterRead.reading_gallons for this meter, 0 if none", default: 0 }
+      - { name: status, type: enum, source: system, description: "ACTIVE | RETIRED", default: "ACTIVE", constraints: "ACTIVE|RETIRED" }
+
+  - name: MeterRead
+    parent: null
+    common_fields: false
+    fields:
+      - { name: meter_id, type: string, source: input, description: "FK -> Meter.id; meter this AMI read belongs to" }
+      - { name: reading_gallons, type: integer, source: input, description: "Cumulative odometer reading in gallons at read_date", constraints: ">= 0" }
+      - { name: read_date, type: datetime, source: input, description: "ISO-8601 UTC timestamp of the read" }
+      - { name: source, type: enum, source: input, description: "AMI | MANUAL", default: "AMI", constraints: "AMI|MANUAL" }
+      - { name: consumption_gallons, type: integer, source: computed, description: "reading_gallons minus the prior chronological read for the same meter; 0 for the first read; clamped to >= 0 (rollover guarded)" }
+
+  - name: BillingCycle
+    parent: null
+    common_fields: true
+    fields:
+      - { name: label, type: string, source: input, description: "e.g. '2026-05'" }
+      - { name: period_start, type: datetime, source: input, description: "Inclusive cycle window start (ISO-8601 UTC)" }
+      - { name: period_end, type: datetime, source: input, description: "Exclusive cycle window end (ISO-8601 UTC)" }
+      - { name: due_date, type: datetime, source: input, description: "Payment due date for bills in this cycle (ISO-8601 UTC)" }
+      - { name: status, type: enum, source: system, description: "OPEN | CLOSED — CLOSED triggers late-fee assessment on unpaid bills", default: "OPEN", constraints: "OPEN|CLOSED" }
+
+  - name: Bill
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; account billed" }
+      - { name: billing_cycle_id, type: string, source: input, description: "FK -> BillingCycle.id; cycle this bill belongs to" }
+      - { name: rate_schedule_id, type: string, source: system, description: "FK -> RateSchedule.id; pinned schedule snapshot at generation time" }
+      - { name: potable_consumption_gallons, type: integer, source: computed, description: "Summed consumption across this account's POTABLE meters within the cycle window" }
+      - { name: irrigation_consumption_gallons, type: integer, source: computed, description: "Summed consumption across this account's IRRIGATION meters within the cycle window" }
+      - { name: billable_sewer_gallons, type: integer, source: computed, description: "Sewer-billable volume per sewer-ratio rule (irrigation excluded, ratio + winter cap applied)" }
+      - { name: fixed_charge_cents, type: integer, source: computed, description: "fixed_water + fixed_sewer, after assistance discount on fixed charges if enrolled" }
+      - { name: water_volumetric_cents, type: integer, source: computed, description: "Tiered marginal water charge over total potable+irrigation consumption" }
+      - { name: sewer_volumetric_cents, type: integer, source: computed, description: "billable_sewer_gallons * sewer_rate, per kgal" }
+      - { name: leak_credit_cents, type: integer, source: computed, description: "Applied leak adjustment credit (<= 0 effect), 0 if none approved", default: 0 }
+      - { name: amount_billed_cents, type: integer, source: computed, description: "Actual computed charge = fixed + water_volumetric + sewer_volumetric - leak_credit (floored at 0)" }
+      - { name: total_cents, type: integer, source: computed, description: "Amount the account is asked to pay this cycle: equals budget_billing_amount_cents when account on ACTIVE budget plan, else amount_billed_cents" }
+      - { name: budget_billing_amount_cents, type: integer, source: computed, description: "Flat budget-billing installment charged this cycle when enrolled; 0 otherwise", default: 0 }
+      - { name: status, type: enum, source: system, description: "DRAFT | POSTED | PAID | VOID", default: "DRAFT", constraints: "DRAFT|POSTED|PAID|VOID" }
+      - { name: late_fee_cents, type: integer, source: computed, description: "Late fee assessed when the cycle CLOSED with this bill still unpaid", default: 0 }
+
+  - name: BudgetBillingPlan
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; enrolled account" }
+      - { name: monthly_amount_cents, type: integer, source: input, description: "Flat monthly installment requested by the account at enrollment", constraints: ">= 0" }
+      - { name: anchor_balance_cents, type: integer, source: system, description: "Account.balance_due_cents snapshot at enrollment, used as the true-up baseline" }
+      - { name: cycles_elapsed, type: integer, source: computed, description: "Count of POSTED bills against this account since plan enrollment", default: 0 }
+      - { name: trued_up_delta_cents, type: integer, source: computed, description: "actual-to-date minus installments-charged-to-date; positive = account underpaid", default: 0 }
+      - { name: status, type: enum, source: system, description: "ACTIVE | TRUED_UP | CANCELLED", default: "ACTIVE", constraints: "ACTIVE|TRUED_UP|CANCELLED" }
+
+  - name: AssistanceEnrollment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; low-income account receiving assistance" }
+      - { name: program_code, type: string, source: input, description: "Assistance program identifier (e.g. 'LIHWAP')" }
+      - { name: certified_until, type: datetime, source: input, description: "Eligibility certification expiry (ISO-8601 UTC)" }
+      - { name: grants_shutoff_protection, type: boolean, source: input, description: "When true, enrollment confers shutoff protection (DELINQUENT_PROTECTED)", default: true }
+      - { name: status, type: enum, source: system, description: "ACTIVE | EXPIRED | REVOKED", default: "ACTIVE", constraints: "ACTIVE|EXPIRED|REVOKED" }
+
+  - name: LeakAdjustment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: bill_id, type: string, source: input, description: "FK -> Bill.id; bill against which the leak credit is requested" }
+      - { name: account_id, type: string, source: system, description: "FK -> Account.id; copied from the bill at request time" }
+      - { name: baseline_gallons, type: integer, source: input, description: "Customer's normal historical consumption (gallons) supplied with the request", constraints: ">= 0" }
+      - { name: repair_evidence_ref, type: string, source: input, description: "Reference to uploaded repair documentation" }
+      - { name: credit_cents, type: integer, source: computed, description: "Computed leak credit per leak_adjustment rule, set on approval; 0 while pending/denied", default: 0 }
+      - { name: status, type: enum, source: system, description: "PENDING | APPROVED | DENIED", default: "PENDING", constraints: "PENDING|APPROVED|DENIED" }
+
+  - name: ShutoffOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; account targeted for shutoff" }
+      - { name: triggering_bill_id, type: string, source: input, description: "FK -> Bill.id; the past-due bill justifying the shutoff" }
+      - { name: scheduled_for, type: datetime, source: input, description: "Earliest execution date (ISO-8601 UTC)" }
+      - { name: reconnect_fee_charged_cents, type: integer, source: computed, description: "Reconnect fee added to the account on reconnect; 0 until reconnected", default: 0 }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | EXECUTED | RECONNECTED | CANCELLED", default: "SCHEDULED", constraints: "SCHEDULED|EXECUTED|RECONNECTED|CANCELLED" }
+
+  - name: Payment
+    parent: null
+    common_fields: false
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; account credited" }
+      - { name: amount_cents, type: integer, source: input, description: "Payment amount in cents", constraints: "> 0" }
+      - { name: applied_to_bill_id, type: string, source: computed, description: "Id of the oldest POSTED unpaid Bill the payment was applied to under the waterfall (computed pointer, not a navigable relation); null if applied to balance only" }
+      - { name: method, type: enum, source: input, description: "CARD | ACH | CASH", default: "ACH", constraints: "CARD|ACH|CASH" }
+
+  - name: Moratorium
+    parent: null
+    common_fields: true
+    fields:
+      - { name: label, type: string, source: input, description: "Moratorium label, e.g. 'Winter 2026 cold-weather rule'" }
+      - { name: window_start, type: datetime, source: input, description: "Inclusive start of the no-shutoff window (ISO-8601 UTC)" }
+      - { name: window_end, type: datetime, source: input, description: "Exclusive end of the no-shutoff window (ISO-8601 UTC)" }
+      - { name: active, type: boolean, source: computed, description: "True when the current server clock falls within [window_start, window_end)", default: false }
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- Account.billing_status (financial standing axis) --------------------
+  - entity: Account
+    field: billing_status
+    initial_state: CURRENT
+    terminal_states: []
+    transitions:
+      - from: CURRENT
+        to: PAST_DUE
+        trigger: "POST /billing-cycles/{id}/close (system, per account with unpaid POSTED bill)"
+        actor: system
+        preconditions:
+          - "Account has >=1 POSTED bill in the closing cycle with status != PAID"
+        side_effects:
+          - "Each unpaid POSTED bill in the cycle: late_fee_cents = round_half_up(unpaid principal * late_fee_pct/100); bill.total_cents unaffected, late_fee tracked separately and added to Account ledger"
+          - "Account.past_due_cents recomputed (derived_field_reconciliation)"
+          - "Account.balance_due_cents recomputed"
+      - from: PAST_DUE
+        to: SHUTOFF_PENDING
+        trigger: "POST /shutoff-orders"
+        actor: FieldOps
+        preconditions:
+          - "Account.past_due_cents >= rate_schedule.arrears_shutoff_threshold_cents"
+          - "Account.assistance_enrolled == false OR active assistance grants_shutoff_protection == false"
+          - "No active Moratorium covers scheduled_for"
+        side_effects:
+          - "ShutoffOrder created in SCHEDULED"
+      - from: SHUTOFF_PENDING
+        to: PAST_DUE
+        trigger: "POST /shutoff-orders/{id}/cancel"
+        actor: FieldOps
+        preconditions:
+          - "ShutoffOrder.status == SCHEDULED"
+        side_effects:
+          - "ShutoffOrder -> CANCELLED"
+      - from: PAST_DUE
+        to: DELINQUENT_PROTECTED
+        trigger: "POST /accounts/{id}/assistance-enrollments (grants_shutoff_protection=true)"
+        actor: AssistanceCaseworker
+        preconditions:
+          - "Account.billing_status == PAST_DUE"
+        side_effects:
+          - "AssistanceEnrollment created ACTIVE; Account.assistance_enrolled becomes true"
+        note: "cross_entity_state_dependency: Account billing transition gated by AssistanceEnrollment creation"
+      - from: DELINQUENT_PROTECTED
+        to: PAST_DUE
+        trigger: "POST /assistance-enrollments/{id}/revoke"
+        actor: AssistanceCaseworker
+        preconditions:
+          - "Account.past_due_cents > 0"
+        side_effects:
+          - "AssistanceEnrollment -> REVOKED; Account.assistance_enrolled becomes false"
+      - from: PAST_DUE
+        to: CURRENT
+        trigger: "POST /accounts/{id}/payments (clears past due)"
+        actor: Customer
+        preconditions:
+          - "Resulting Account.past_due_cents == 0 after payment waterfall"
+        side_effects:
+          - "Payment applied oldest-first; affected bills -> PAID; balance reconciled"
+      - from: SHUTOFF_PENDING
+        to: CURRENT
+        trigger: "POST /accounts/{id}/payments (clears past due while shutoff pending)"
+        actor: Customer
+        preconditions:
+          - "Resulting Account.past_due_cents == 0 after payment waterfall"
+          - "All ShutoffOrders for account are SCHEDULED (none EXECUTED)"
+        side_effects:
+          - "All SCHEDULED ShutoffOrders for the account -> CANCELLED (cascade)"
+          - "Payment applied; bills -> PAID"
+
+  # ---- Account.service_status (physical service axis) ----------------------
+  - entity: Account
+    field: service_status
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /shutoff-orders/{id}/execute"
+        actor: FieldOps
+        preconditions:
+          - "ShutoffOrder.status == SCHEDULED"
+          - "current clock >= ShutoffOrder.scheduled_for"
+          - "No active Moratorium covers the current clock date"
+          - "Account.billing_status == SHUTOFF_PENDING"
+        side_effects:
+          - "ShutoffOrder -> EXECUTED"
+          - "Account.service_status -> SUSPENDED"
+      - from: SUSPENDED
+        to: RESTORED
+        trigger: "POST /shutoff-orders/{id}/reconnect"
+        actor: FieldOps
+        preconditions:
+          - "ShutoffOrder.status == EXECUTED"
+          - "Account.past_due_cents == 0 (arrears cleared) OR caller is FieldOps performing hardship reconnect"
+        side_effects:
+          - "ShutoffOrder -> RECONNECTED; reconnect_fee_charged_cents = rate_schedule.reconnect_fee_cents"
+          - "Account.balance_due_cents increases by reconnect_fee_cents (cascade: reconnect fee posted as a charge)"
+          - "Account.service_status -> RESTORED"
+
+  # ---- Bill lifecycle (branching: DRAFT -> POSTED -> PAID, plus VOID) -------
+  - entity: Bill
+    field: status
+    initial_state: DRAFT
+    terminal_states: [PAID, VOID]
+    transitions:
+      - from: DRAFT
+        to: POSTED
+        trigger: "POST /bills/{id}/post"
+        actor: BillingClerk
+        preconditions:
+          - "Bill.billing_cycle is OPEN"
+          - "No other POSTED/PAID Bill exists for the same (account_id, billing_cycle_id)"
+        side_effects:
+          - "All computed charge fields finalized; rate_schedule_id pinned"
+          - "Account.balance_due_cents increases by total_cents (derived_field_reconciliation)"
+          - "If account on ACTIVE BudgetBillingPlan: plan.cycles_elapsed += 1 and plan.trued_up_delta_cents recomputed (cascade)"
+      - from: DRAFT
+        to: VOID
+        trigger: "POST /bills/{id}/void"
+        actor: BillingClerk
+        preconditions:
+          - "Bill.status == DRAFT"
+        side_effects:
+          - "Bill terminal; no ledger effect"
+      - from: POSTED
+        to: VOID
+        trigger: "POST /bills/{id}/void"
+        actor: BillingClerk
+        preconditions:
+          - "Bill.status == POSTED"
+          - "No Payment has been applied_to_bill_id == this bill"
+        side_effects:
+          - "Account.balance_due_cents decreases by total_cents (compensation: reverse the posting)"
+          - "If account on ACTIVE BudgetBillingPlan: plan.cycles_elapsed -= 1 and plan.trued_up_delta_cents recomputed (compensation)"
+      - from: POSTED
+        to: PAID
+        trigger: "POST /accounts/{id}/payments (waterfall reaches this bill)"
+        actor: Customer
+        preconditions:
+          - "Cumulative applied payment for this bill >= total_cents"
+        side_effects:
+          - "Bill terminal; contributes to Account.past_due_cents reduction"
+
+  # ---- LeakAdjustment lifecycle (branching adjudication) -------------------
+  - entity: LeakAdjustment
+    field: status
+    initial_state: PENDING
+    terminal_states: [APPROVED, DENIED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /leak-adjustments/{id}/approve"
+        actor: AssistanceCaseworker
+        preconditions:
+          - "Referenced Bill.status == POSTED (cross_entity_state_dependency: cannot credit a DRAFT/VOID/PAID bill)"
+          - "baseline_gallons < bill.potable_consumption_gallons (there is over-baseline volume to credit)"
+        side_effects:
+          - "credit_cents = leak_credit calculation output"
+          - "Bill.leak_credit_cents = credit_cents; Bill.amount_billed_cents recomputed (cascade)"
+          - "If Bill not on budget plan: Bill.total_cents recomputed; Account.balance_due_cents decreased by credit_cents (cascade, compensation against the original posting)"
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /leak-adjustments/{id}/deny"
+        actor: AssistanceCaseworker
+        preconditions:
+          - "LeakAdjustment.status == PENDING"
+        side_effects:
+          - "Terminal; credit_cents stays 0; no ledger effect"
+
+  # ---- ShutoffOrder lifecycle (cyclic: a fresh order re-enters per account) -
+  - entity: ShutoffOrder
+    field: status
+    initial_state: SCHEDULED
+    terminal_states: [RECONNECTED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: EXECUTED
+        trigger: "POST /shutoff-orders/{id}/execute"
+        actor: FieldOps
+        preconditions:
+          - "current clock >= scheduled_for"
+          - "No active Moratorium covers the current clock date (resource_temporal_overlap: order date inside a moratorium window is barred)"
+          - "Account.service_status == ACTIVE"
+        side_effects:
+          - "Account.service_status -> SUSPENDED (parallel-axis cross effect)"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /shutoff-orders/{id}/cancel"
+        actor: FieldOps
+        preconditions:
+          - "ShutoffOrder.status == SCHEDULED"
+        side_effects:
+          - "If account had no other SCHEDULED/EXECUTED order, Account.billing_status -> PAST_DUE"
+      - from: EXECUTED
+        to: RECONNECTED
+        trigger: "POST /shutoff-orders/{id}/reconnect"
+        actor: FieldOps
+        preconditions:
+          - "ShutoffOrder.status == EXECUTED"
+        side_effects:
+          - "reconnect_fee_charged_cents = rate_schedule.reconnect_fee_cents"
+          - "Account.balance_due_cents increases by reconnect_fee_cents (cascade)"
+          - "Account.service_status -> RESTORED"
+
+# ---- 1.2.1 Concurrency Rules ----------------------------------------------
+concurrency_rules:
+  - rule_id: budget-plan-create-stale-account
+    parent_entity: Account
+    write_endpoint: "POST /accounts/{id}/budget-billing-plans"
+    occ_field: "expected_account_version"
+    description: |
+      Enrolling a new BudgetBillingPlan against an Account whose version has advanced
+      since the client last observed it is rejected. A newly enrolled plan legitimately
+      supersedes any prior ACTIVE plan (which is auto-cancelled), so a second enrollment
+      carrying a stale account version is a genuine supersede race resolved by OCC, not a
+      state precondition: the loser observed the same eligible state the winner did.
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: tiered_water_volumetric
+    trigger: "Bill generation (POST /bills) and re-finalized on POST /bills/{id}/post"
+    algorithm: tiered_pricing
+    formula: |
+      total_gallons = potable_consumption_gallons + irrigation_consumption_gallons
+      # MARGINAL/cumulative tiers — each tier's marginal gallons priced at its own rate.
+      remaining = total_gallons
+      prev_ceiling = 0
+      charge = 0
+      for tier in water_tiers (ascending):
+        ceiling = tier.up_to_gallons (treat null as +infinity)
+        tier_span_gallons = max(0, min(remaining, ceiling - prev_ceiling))
+        # rate is per 1000 gallons; charge per tier rounded ONCE at the very end.
+        charge += tier_span_gallons * tier.rate_cents_per_kgal
+        remaining -= tier_span_gallons
+        prev_ceiling = ceiling
+        if remaining <= 0: break
+      water_volumetric_cents = round_half_up(charge / 1000)   # divide-by-kgal then round, SUM-THEN-ROUND
+    input_set: "All ACTIVE meters on the account (POTABLE and IRRIGATION), reads within [cycle.period_start, cycle.period_end)"
+    constants: {}
+    precision: "Sum all tier subtotals in (cents*gallons), divide by 1000, round_half_up to whole cents — ROUND ONCE AT END"
+    variants: []
+
+  - name: sewer_volumetric
+    trigger: "Bill generation (POST /bills)"
+    algorithm: threshold
+    formula: |
+      # IRRIGATION water never contributes to sewer (second-meter exclusion).
+      ratio_volume = round_half_up(potable_consumption_gallons * sewer_ratio_pct / 100)
+      if rate_schedule.sewer_cap_gallons != null:
+        billable_sewer_gallons = min(ratio_volume, sewer_cap_gallons)   # WINTER-CAP variant
+      else:
+        billable_sewer_gallons = ratio_volume                          # UNCAPPED variant
+      sewer_volumetric_cents = round_half_up(billable_sewer_gallons * sewer_rate_cents_per_kgal / 1000)
+    input_set: "potable_consumption_gallons only; irrigation_consumption_gallons explicitly excluded"
+    constants: {}
+    precision: "round_half_up at each of the two stages (ratio_volume, then cents)"
+    variants:
+      - name: uncapped
+        when: "rate_schedule.sewer_cap_gallons is null"
+        difference: "billable_sewer_gallons = potable * ratio_pct/100 with no cap"
+      - name: winter_capped
+        when: "rate_schedule.sewer_cap_gallons is set"
+        difference: "billable_sewer_gallons = min(ratio_volume, sewer_cap_gallons) — same potable input, different output"
+
+  - name: leak_credit
+    trigger: "POST /leak-adjustments/{id}/approve"
+    algorithm: threshold
+    formula: |
+      over_baseline = max(0, bill.potable_consumption_gallons - leak_adjustment.baseline_gallons)
+      lowest_tier_rate = water_tiers[0].rate_cents_per_kgal
+      # Credit the over-baseline gallons at the LOWEST tier rate, scaled by leak_adjustment_rate_pct.
+      credit_raw = over_baseline * lowest_tier_rate * (leak_adjustment_rate_pct / 100)
+      credit_cents = round_half_up(credit_raw / 1000)
+      credit_cents = min(credit_cents, bill.water_volumetric_cents)   # credit cannot exceed water charge
+    input_set: "Single bill referenced by the leak adjustment; uses its potable consumption only"
+    constants: {}
+    precision: "round_half_up after dividing by 1000; clamp to water_volumetric_cents ceiling"
+    variants: []
+
+  - name: account_balance_reconciliation
+    trigger: "Any of: bill post/void, payment applied, reconnect fee, leak credit, late fee at cycle close"
+    algorithm: aggregation
+    formula: |
+      posted_charges = sum(Bill.total_cents for bills WHERE status IN {POSTED, PAID})
+      late_fees      = sum(Bill.late_fee_cents for bills WHERE status IN {POSTED, PAID})
+      reconnect_fees = sum(ShutoffOrder.reconnect_fee_charged_cents for orders WHERE status == RECONNECTED)
+      payments       = sum(Payment.amount_cents for payments on account)
+      balance_due_cents = max(0, posted_charges + late_fees + reconnect_fees - payments)
+      # past_due: charges from bills whose cycle CLOSED and that are not PAID, minus payments already absorbed there
+      past_due_cents = sum(Bill.total_cents + Bill.late_fee_cents
+                           for bills WHERE status == POSTED AND BillingCycle.status == CLOSED)
+                       - payments_applied_to_those_bills
+      past_due_cents = max(0, past_due_cents)
+    input_set: "All POSTED/PAID bills, all RECONNECTED shutoff orders, all payments on the account"
+    constants: {}
+    precision: "Integer cents; floor at 0 via max(0, ...)"
+    variants: []
+
+  - name: budget_billing_amount_and_trueup
+    trigger: "Bill.total_cents at POST when account on ACTIVE plan; true-up at POST /budget-billing-plans/{id}/true-up"
+    algorithm: forward_looking
+    formula: |
+      # ESTIMATE variant (each cycle the account is on the plan):
+      budget_billing_amount_cents = plan.monthly_amount_cents
+      Bill.total_cents = plan.monthly_amount_cents            # flat installment, NOT actual amount_billed_cents
+      # CHRONOLOGICAL TRUE-UP variant (on true-up):
+      actual_to_date       = sum(Bill.amount_billed_cents for POSTED/PAID bills since enrollment, chronological by created_at ASC)
+      installments_to_date = plan.cycles_elapsed * plan.monthly_amount_cents
+      trued_up_delta_cents = actual_to_date - installments_to_date    # positive = account underpaid
+      # On true-up the delta posts to the account ledger as an adjustment.
+    input_set: "POSTED/PAID bills since plan enrollment, ordered chronologically by created_at ASC"
+    constants: {}
+    precision: "Integer cents; chronological accumulation, tie-break created_at ASC then bill.id is NEVER used"
+    variants:
+      - name: estimate_installment
+        when: "Each cycle while plan ACTIVE — Bill.total_cents charged"
+        difference: "total_cents = flat monthly_amount_cents (forward estimate), independent of actual consumption"
+      - name: chronological_trueup
+        when: "On explicit true-up"
+        difference: "Accumulates ACTUAL amount_billed_cents chronologically and reconciles the cumulative gap — same bills, different (chronological) algorithm and different number"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role header present and is one of the declared roles"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for the operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: auth
+    check: "Customer acting on an account resource must own it (X-User-ID == Account.id or resource.account_id)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Customer-scoped reads/writes"
+  - priority: 4
+    category: existence
+    check: "All path/body referenced resources exist (validated left-to-right in path, then FK bodies)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 5
+    category: existence
+    check: "Required input fields present and well-typed; enum values within declared domain"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all writes"
+  - priority: 6
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 7
+    category: state
+    check: "OCC: expected_account_version matches current Account.version on budget-plan enrollment"
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+    applies_to: "POST /accounts/{id}/budget-billing-plans"
+  - priority: 8
+    category: business_constraint
+    check: "At most one non-VOID Bill per (account_id, billing_cycle_id)"
+    error_id: ERR_DUPLICATE_BILL
+    http_status: 409
+    applies_to: "POST /bills, POST /bills/{id}/post"
+  - priority: 9
+    category: business_constraint
+    check: "MeterRead.reading_gallons must be >= the prior chronological read for the meter unless source=MANUAL rollover flagged"
+    error_id: ERR_READ_REGRESSION
+    http_status: 422
+    applies_to: "POST /meters/{id}/reads"
+  - priority: 10
+    category: business_safety
+    check: "Shutoff cannot be scheduled or executed when an active Moratorium covers the relevant date"
+    error_id: ERR_MORATORIUM_ACTIVE
+    http_status: 409
+    applies_to: "POST /shutoff-orders, POST /shutoff-orders/{id}/execute"
+  - priority: 11
+    category: business_safety
+    check: "Shutoff cannot be scheduled for an account whose ACTIVE assistance grants_shutoff_protection"
+    error_id: ERR_SHUTOFF_PROTECTED
+    http_status: 409
+    applies_to: "POST /shutoff-orders"
+  - priority: 12
+    category: business_temporal
+    check: "Shutoff cannot be executed before scheduled_for (current clock < scheduled_for)"
+    error_id: ERR_SHUTOFF_NOT_DUE
+    http_status: 409
+    applies_to: "POST /shutoff-orders/{id}/execute"
+  - priority: 13
+    category: business_referential
+    check: "Leak adjustment approval requires the referenced Bill to be POSTED"
+    error_id: ERR_BILL_NOT_POSTED
+    http_status: 409
+    applies_to: "POST /leak-adjustments/{id}/approve"
+  - priority: 14
+    category: business_fiscal
+    check: "Shutoff scheduling requires past_due_cents >= rate_schedule.arrears_shutoff_threshold_cents"
+    error_id: ERR_ARREARS_BELOW_THRESHOLD
+    http_status: 409
+    applies_to: "POST /shutoff-orders"
+  - priority: 15
+    category: business_fiscal
+    check: "Leak adjustment baseline_gallons must be below the bill's potable_consumption_gallons (positive over-baseline volume)"
+    error_id: ERR_NO_LEAK_VOLUME
+    http_status: 422
+    applies_to: "POST /leak-adjustments/{id}/approve"
+  - priority: 16
+    category: business_constraint
+    check: "Reconnect requires the order to be EXECUTED; reconnect of a SCHEDULED/CANCELLED order is rejected"
+    error_id: ERR_NOT_EXECUTED
+    http_status: 409
+    applies_to: "POST /shutoff-orders/{id}/reconnect"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- RateSchedule --------------------------------------------------------
+  - method: POST
+    path: "/rate-schedules"
+    description: "Create a rate schedule (tiers, fixed charges, sewer ratio, fees, assistance/leak policy)"
+    roles: [BillingClerk]
+    code: 201
+    input: [name, fixed_water_charge_cents, fixed_sewer_charge_cents, water_tiers, sewer_rate_cents_per_kgal, sewer_ratio_pct, "sewer_cap_gallons?", "leak_adjustment_rate_pct?", "assistance_discount_pct?", "arrears_shutoff_threshold_cents?", "reconnect_fee_cents?", "late_fee_pct?"]
+    output: RateSchedule
+    side_effects: []
+  - method: GET
+    path: "/rate-schedules/{id}"
+    description: "Fetch a rate schedule"
+    roles: [BillingClerk, FieldOps, AssistanceCaseworker, Customer]
+    code: 200
+    input: []
+    output: RateSchedule
+
+  # ---- Account -------------------------------------------------------------
+  - method: POST
+    path: "/accounts"
+    description: "Create a utility account"
+    roles: [BillingClerk]
+    code: 201
+    input: [rate_schedule_id, holder_name, service_address]
+    output: Account
+    side_effects: ["balance_due_cents initialized to 0; billing_status=CURRENT; service_status=ACTIVE"]
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Fetch an account with derived balances and dual status axes"
+    roles: [BillingClerk, FieldOps, AssistanceCaseworker, Customer]
+    code: 200
+    input: []
+    output: Account
+  - method: GET
+    path: "/accounts"
+    description: "List accounts (paginated; filter by status)"
+    roles: [BillingClerk, FieldOps, AssistanceCaseworker]
+    code: 200
+    input: ["billing_status?", "service_status?", "rate_schedule_id?", "limit?", "offset?"]
+    output: Account[]
+
+  # ---- Meter (FK Account) --------------------------------------------------
+  - method: POST
+    path: "/accounts/{id}/meters"
+    description: "Attach a meter (POTABLE or IRRIGATION) to an account"
+    roles: [BillingClerk]
+    code: 201
+    input: [meter_type, serial]
+    output: Meter
+    side_effects: []
+  - method: GET
+    path: "/accounts/{id}/meters"
+    description: "List meters for an account (reverse-reachability for Meter.account_id)"
+    roles: [BillingClerk, FieldOps, Customer]
+    code: 200
+    input: []
+    output: Meter[]
+  - method: GET
+    path: "/meters/{id}"
+    description: "Fetch a meter with last_reading_gallons"
+    roles: [BillingClerk, FieldOps, Customer]
+    code: 200
+    input: []
+    output: Meter
+
+  # ---- MeterRead (FK Meter) ------------------------------------------------
+  - method: POST
+    path: "/meters/{id}/reads"
+    description: "Import an AMI/manual meter read; computes consumption vs prior chronological read"
+    roles: [BillingClerk]
+    code: 201
+    input: [reading_gallons, read_date, "source?"]
+    output: MeterRead
+    side_effects: ["Meter.last_reading_gallons updated; consumption_gallons computed"]
+  - method: GET
+    path: "/meters/{id}/reads"
+    description: "List reads for a meter (reverse-reachability for MeterRead.meter_id), chronological"
+    roles: [BillingClerk, FieldOps, Customer]
+    code: 200
+    input: []
+    output: MeterRead[]
+
+  # ---- BillingCycle --------------------------------------------------------
+  - method: POST
+    path: "/billing-cycles"
+    description: "Open a billing cycle window"
+    roles: [BillingClerk]
+    code: 201
+    input: [label, period_start, period_end, due_date]
+    output: BillingCycle
+    side_effects: []
+  - method: GET
+    path: "/billing-cycles/{id}"
+    description: "Fetch a billing cycle"
+    roles: [BillingClerk, Customer]
+    code: 200
+    input: []
+    output: BillingCycle
+  - method: POST
+    path: "/billing-cycles/{id}/close"
+    description: "Close a cycle: assess late fees on unpaid POSTED bills and flip accounts to PAST_DUE"
+    roles: [BillingClerk]
+    code: 200
+    input: []
+    output: BillingCycle
+    side_effects: ["Each unpaid POSTED bill: late_fee_cents assessed; owning Account.billing_status -> PAST_DUE; balances reconciled (cascade)"]
+
+  # ---- Bill (FK Account, BillingCycle, RateSchedule) -----------------------
+  - method: POST
+    path: "/bills"
+    description: "Generate a DRAFT bill for an account+cycle; runs tiered water, sewer-ratio, fixed, assistance, budget-billing calculations"
+    roles: [BillingClerk]
+    code: 201
+    input: [account_id, billing_cycle_id]
+    output: Bill
+    side_effects: ["All computed charge fields populated; total_cents set to budget installment if on ACTIVE plan else amount_billed_cents"]
+  - method: GET
+    path: "/bills/{id}"
+    description: "Fetch a bill with full charge breakdown"
+    roles: [BillingClerk, AssistanceCaseworker, Customer]
+    code: 200
+    input: []
+    output: Bill
+  - method: GET
+    path: "/bills"
+    description: "List bills (reverse-reachability for Bill.account_id and Bill.billing_cycle_id and Bill.rate_schedule_id)"
+    roles: [BillingClerk, AssistanceCaseworker, Customer]
+    code: 200
+    input: ["account_id?", "billing_cycle_id?", "rate_schedule_id?", "status?", "limit?", "offset?"]
+    output: Bill[]
+  - method: POST
+    path: "/bills/{id}/post"
+    description: "Post a DRAFT bill to the ledger"
+    roles: [BillingClerk]
+    code: 200
+    input: []
+    output: Bill
+    side_effects: ["Account.balance_due_cents += total_cents; budget plan cycles_elapsed/trued_up_delta recomputed (cascade)"]
+  - method: POST
+    path: "/bills/{id}/void"
+    description: "Void a DRAFT or POSTED (unpaid) bill"
+    roles: [BillingClerk]
+    code: 200
+    input: []
+    output: Bill
+    side_effects: ["If POSTED: Account.balance_due_cents -= total_cents; budget plan compensation (cascade)"]
+
+  # ---- BudgetBillingPlan (FK Account) — OCC parent=Account -----------------
+  - method: POST
+    path: "/accounts/{id}/budget-billing-plans"
+    description: "Enroll account in budget billing; supersedes any prior ACTIVE plan (OCC on Account.version)"
+    roles: [Customer, BillingClerk]
+    code: 201
+    input: [monthly_amount_cents, expected_account_version]
+    output: BudgetBillingPlan
+    side_effects: ["Prior ACTIVE plan -> CANCELLED; anchor_balance_cents snapshot; Account.budget_billing_enrolled true; increments Account.version by 1"]
+  - method: GET
+    path: "/accounts/{id}/budget-billing-plans"
+    description: "List budget plans for an account (reverse-reachability for BudgetBillingPlan.account_id)"
+    roles: [BillingClerk, Customer]
+    code: 200
+    input: []
+    output: BudgetBillingPlan[]
+  - method: POST
+    path: "/budget-billing-plans/{id}/true-up"
+    description: "Reconcile a plan: chronological actual-vs-installment delta posted to the ledger"
+    roles: [BillingClerk]
+    code: 200
+    input: []
+    output: BudgetBillingPlan
+    side_effects: ["trued_up_delta_cents computed; Account.balance_due_cents adjusted by delta; plan -> TRUED_UP (cascade)"]
+
+  # ---- AssistanceEnrollment (FK Account) -----------------------------------
+  - method: POST
+    path: "/accounts/{id}/assistance-enrollments"
+    description: "Enroll a low-income account in assistance (discount + optional shutoff protection)"
+    roles: [AssistanceCaseworker]
+    code: 201
+    input: [program_code, certified_until, "grants_shutoff_protection?"]
+    output: AssistanceEnrollment
+    side_effects: ["Account.assistance_enrolled true; if grants protection and account PAST_DUE -> DELINQUENT_PROTECTED"]
+  - method: GET
+    path: "/accounts/{id}/assistance-enrollments"
+    description: "List assistance enrollments for an account (reverse-reachability for AssistanceEnrollment.account_id)"
+    roles: [AssistanceCaseworker, BillingClerk, Customer]
+    code: 200
+    input: []
+    output: AssistanceEnrollment[]
+  - method: POST
+    path: "/assistance-enrollments/{id}/revoke"
+    description: "Revoke an assistance enrollment"
+    roles: [AssistanceCaseworker]
+    code: 200
+    input: []
+    output: AssistanceEnrollment
+    side_effects: ["status -> REVOKED; Account.assistance_enrolled false; if was DELINQUENT_PROTECTED with arrears -> PAST_DUE (cascade)"]
+
+  # ---- LeakAdjustment (FK Bill, Account) -----------------------------------
+  - method: POST
+    path: "/leak-adjustments"
+    description: "Request a leak adjustment against a POSTED bill"
+    roles: [Customer, AssistanceCaseworker]
+    code: 201
+    input: [bill_id, baseline_gallons, repair_evidence_ref]
+    output: LeakAdjustment
+    side_effects: ["account_id copied from bill; status PENDING"]
+  - method: GET
+    path: "/leak-adjustments/{id}"
+    description: "Fetch a leak adjustment"
+    roles: [AssistanceCaseworker, Customer, BillingClerk]
+    code: 200
+    input: []
+    output: LeakAdjustment
+  - method: GET
+    path: "/leak-adjustments"
+    description: "List leak adjustments (reverse-reachability for LeakAdjustment.bill_id and account_id)"
+    roles: [AssistanceCaseworker, BillingClerk, Customer]
+    code: 200
+    input: ["bill_id?", "account_id?", "status?", "limit?", "offset?"]
+    output: LeakAdjustment[]
+  - method: POST
+    path: "/leak-adjustments/{id}/approve"
+    description: "Approve: compute leak credit, apply to bill and ledger"
+    roles: [AssistanceCaseworker]
+    code: 200
+    input: []
+    output: LeakAdjustment
+    side_effects: ["credit_cents computed; Bill.leak_credit_cents/amount_billed_cents/total_cents recomputed; Account.balance_due_cents -= credit_cents (cascade)"]
+  - method: POST
+    path: "/leak-adjustments/{id}/deny"
+    description: "Deny a pending leak adjustment"
+    roles: [AssistanceCaseworker]
+    code: 200
+    input: []
+    output: LeakAdjustment
+    side_effects: ["status -> DENIED"]
+
+  # ---- ShutoffOrder (FK Account, Bill) -------------------------------------
+  - method: POST
+    path: "/shutoff-orders"
+    description: "Schedule a shutoff for a sufficiently past-due, unprotected account outside any moratorium"
+    roles: [FieldOps]
+    code: 201
+    input: [account_id, triggering_bill_id, scheduled_for]
+    output: ShutoffOrder
+    side_effects: ["Account.billing_status -> SHUTOFF_PENDING; order SCHEDULED"]
+  - method: GET
+    path: "/shutoff-orders/{id}"
+    description: "Fetch a shutoff order"
+    roles: [FieldOps, BillingClerk, Customer]
+    code: 200
+    input: []
+    output: ShutoffOrder
+  - method: GET
+    path: "/shutoff-orders"
+    description: "List shutoff orders (reverse-reachability for ShutoffOrder.account_id and triggering_bill_id)"
+    roles: [FieldOps, BillingClerk, Customer]
+    code: 200
+    input: ["account_id?", "triggering_bill_id?", "status?", "limit?", "offset?"]
+    output: ShutoffOrder[]
+  - method: POST
+    path: "/shutoff-orders/{id}/execute"
+    description: "Execute a due, non-moratorium shutoff: suspends service"
+    roles: [FieldOps]
+    code: 200
+    input: []
+    output: ShutoffOrder
+    side_effects: ["order EXECUTED; Account.service_status -> SUSPENDED"]
+  - method: POST
+    path: "/shutoff-orders/{id}/reconnect"
+    description: "Reconnect after an executed shutoff: charges reconnect fee, restores service"
+    roles: [FieldOps]
+    code: 200
+    input: []
+    output: ShutoffOrder
+    side_effects: ["order RECONNECTED; reconnect_fee_charged_cents set; Account.balance_due_cents += reconnect fee; service_status -> RESTORED (cascade)"]
+  - method: POST
+    path: "/shutoff-orders/{id}/cancel"
+    description: "Cancel a scheduled shutoff"
+    roles: [FieldOps]
+    code: 200
+    input: []
+    output: ShutoffOrder
+    side_effects: ["order CANCELLED; Account.billing_status -> PAST_DUE if no other active order"]
+
+  # ---- Moratorium ----------------------------------------------------------
+  - method: POST
+    path: "/moratoriums"
+    description: "Declare a shutoff moratorium window (e.g. winter)"
+    roles: [AssistanceCaseworker, BillingClerk]
+    code: 201
+    input: [label, window_start, window_end]
+    output: Moratorium
+    side_effects: []
+  - method: GET
+    path: "/moratoriums"
+    description: "List active/declared moratoriums"
+    roles: [FieldOps, BillingClerk, AssistanceCaseworker, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Moratorium[]
+
+  # ---- Payment (FK Account) ------------------------------------------------
+  - method: POST
+    path: "/accounts/{id}/payments"
+    description: "Apply a payment; waterfall to oldest POSTED unpaid bills; may clear past-due and cancel scheduled shutoffs"
+    roles: [Customer, BillingClerk]
+    code: 201
+    input: [amount_cents, "method?"]
+    output: Payment
+    side_effects: ["Payment applied oldest-first; bills -> PAID when covered; balances reconciled; SCHEDULED shutoffs cancelled and billing_status -> CURRENT if past_due cleared (cascade)"]
+  - method: GET
+    path: "/accounts/{id}/payments"
+    description: "List payments for an account (reverse-reachability for Payment.account_id)"
+    roles: [BillingClerk, Customer]
+    code: 200
+    input: []
+    output: Payment[]
+
+  # ---- Test-driving clock --------------------------------------------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's current UTC clock (test-driving; gates shutoff due-date and moratorium checks)"
+    roles: [BillingClerk, FieldOps, AssistanceCaseworker]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["Server clock advanced/rewound to to_iso8601"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "X-User-Role header missing or unknown role" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Role not permitted for this operation per §1.7" }
+  - { id: ERR_NOT_RESOURCE_OWNER, http: 403, condition: "Customer acting on an account/resource they do not own" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Referenced path/FK resource does not exist" }
+  - { id: ERR_INVALID_REQUEST, http: 422, condition: "Missing/ill-typed required field or out-of-domain enum value" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Transition not defined from the resource's current state" }
+  - { id: ERR_STALE_ACCOUNT_VERSION, http: 412, condition: "expected_account_version != current Account.version on budget-plan enrollment" }
+  - { id: ERR_DUPLICATE_BILL, http: 409, condition: "A non-VOID Bill already exists for the (account_id, billing_cycle_id)" }
+  - { id: ERR_READ_REGRESSION, http: 422, condition: "reading_gallons below prior chronological read for the meter" }
+  - { id: ERR_MORATORIUM_ACTIVE, http: 409, condition: "Shutoff scheduling/execution barred by an active moratorium covering the relevant date" }
+  - { id: ERR_SHUTOFF_PROTECTED, http: 409, condition: "Account has ACTIVE assistance that grants shutoff protection" }
+  - { id: ERR_SHUTOFF_NOT_DUE, http: 409, condition: "Execute attempted before scheduled_for (current clock < scheduled_for)" }
+  - { id: ERR_BILL_NOT_POSTED, http: 409, condition: "Leak adjustment approve on a bill not in POSTED state" }
+  - { id: ERR_ARREARS_BELOW_THRESHOLD, http: 409, condition: "past_due_cents below rate_schedule.arrears_shutoff_threshold_cents at shutoff scheduling" }
+  - { id: ERR_NO_LEAK_VOLUME, http: 422, condition: "baseline_gallons >= bill.potable_consumption_gallons (no over-baseline volume to credit)" }
+  - { id: ERR_NOT_EXECUTED, http: 409, condition: "Reconnect attempted on an order that is not EXECUTED" }
+  - { id: ERR_BILL_HAS_PAYMENT, http: 409, condition: "Void attempted on a POSTED bill that already has an applied payment" }
+  - { id: ERR_CYCLE_CLOSED, http: 409, condition: "Bill generation/posting against a CLOSED billing cycle" }
+  - { id: ERR_NO_CONSUMPTION_DATA, http: 422, condition: "Bill generation for an account with no meter reads in the cycle window" }
+  - { id: ERR_VALIDATION_LIMIT, http: 422, condition: "Pagination limit/offset out of [1,100]/[0,inf) bounds" }
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: BillingClerk
+    description: "Back-office billing operator: rate schedules, accounts, meters/reads, cycles, bill generation/posting/voiding, budget true-up"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /rate-schedules"
+      - "POST /accounts"
+      - "POST /accounts/{id}/meters"
+      - "POST /meters/{id}/reads"
+      - "POST /billing-cycles"
+      - "POST /billing-cycles/{id}/close"
+      - "POST /bills"
+      - "POST /bills/{id}/post"
+      - "POST /bills/{id}/void"
+      - "POST /budget-billing-plans/{id}/true-up"
+    shared_operations:
+      - "GET (all read endpoints)"
+      - "POST /accounts/{id}/budget-billing-plans (also Customer)"
+      - "POST /accounts/{id}/payments (also Customer)"
+      - "POST /moratoriums (also AssistanceCaseworker)"
+  - name: FieldOps
+    description: "Field operations: schedules, executes, reconnects, and cancels physical shutoffs"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /shutoff-orders"
+      - "POST /shutoff-orders/{id}/execute"
+      - "POST /shutoff-orders/{id}/reconnect"
+      - "POST /shutoff-orders/{id}/cancel"
+    shared_operations:
+      - "GET (account, meter, shutoff, moratorium reads)"
+  - name: AssistanceCaseworker
+    description: "Caseworker: low-income assistance enrollment/revocation, leak-adjustment adjudication, moratorium declaration"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /accounts/{id}/assistance-enrollments"
+      - "POST /assistance-enrollments/{id}/revoke"
+      - "POST /leak-adjustments/{id}/approve"
+      - "POST /leak-adjustments/{id}/deny"
+    shared_operations:
+      - "POST /leak-adjustments (also Customer)"
+      - "POST /moratoriums (also BillingClerk)"
+      - "GET (bill, account, leak, assistance reads)"
+  - name: Customer
+    description: "Account holder: reads own data, enrolls in budget billing, makes payments, requests leak adjustments"
+    identity: "entity_backed:Account"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /accounts/{id}/budget-billing-plans (own account; also BillingClerk)"
+      - "POST /accounts/{id}/payments (own account; also BillingClerk)"
+      - "POST /leak-adjustments (own bill; also AssistanceCaseworker)"
+      - "GET own account, bills, meters, reads, payments, plans, leak adjustments, shutoff orders"

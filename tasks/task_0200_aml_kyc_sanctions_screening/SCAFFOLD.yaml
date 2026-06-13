@@ -1,0 +1,1945 @@
+scenario: |
+  AML/KYC & Sanctions Screening: customer due diligence/risk rating, beneficial ownership,
+  OFAC/sanctions/PEP screening, transaction monitoring rules, SAR/CTR FinCEN filing, case
+  disposition, EDD, lookback review
+
+domain_name: aml-kyc-sanctions-screening
+api_prefix: ""
+
+# Expert difficulty (§0.4): 12 entities, 28 write endpoints (+23 reverse-reachability/read
+# GETs), 26 error codes, 8 calculations (risk_scoring + transaction_monitoring carry 4
+# variants total), 7 state machines including cyclic (Customer, ScreeningHit), fork-join
+# (Case), parallel dimensions (Account kyc_status x monitoring_status) and compound
+# (LookbackReview). The core coupling is regulatory: a Customer's risk_rating gates its
+# CDD posture (NEW->RISK_RATED->APPROVED->EDD_REQUIRED cycles), screening Hits gate the
+# Customer's onboarding AND drive Alert -> Case escalation, transaction Alerts feed Cases,
+# Cases produce FinCEN SAR/CTR Filings, and a LookbackReview re-screens a historical
+# window of accounts whose mutations conserve named global quantities.
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: workflow_orchestration
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+
+  entity_topology: graph
+  # Customer is the hub. ScreeningHit, BeneficialOwner, Account, RiskAssessment hang off
+  # Customer via FK (flat references, not nested). Alert references Account and Customer;
+  # Case references Alert and Customer; Filing references Case; LookbackReviewItem references
+  # both LookbackReview and Account. Many-to-many-ish: a Case aggregates multiple Alerts.
+
+  state_machine_shape: cyclic
+  # Customer CDD lifecycle is cyclic (APPROVED -> EDD_REQUIRED -> APPROVED revision loops on
+  # periodic review / new derogatory hit). Case has a branching fork-join (TRIAGE ->
+  # {SAR_PATH, CTR_PATH, CLOSE_NO_ACTION}). Account carries parallel state dimensions
+  # (kyc_status x monitoring_status evolve independently). LookbackReview is compound
+  # (its status is derived from its items).
+
+  relationship_patterns:
+    - one_to_many       # Customer -> ScreeningHit, BeneficialOwner, Account, RiskAssessment
+    - many_to_many      # Case <-> Alert (a case bundles alerts; alert belongs to one case once linked)
+    - cross_aggregate   # Filing references Case; Alert references Account across the Customer boundary
+
+  role_model: segregation_of_duties
+  # An Analyst who created/triaged a Case cannot be the QualityReviewer who approves its
+  # Filing (4-eyes). ComplianceOfficer dispositions, Analyst investigates, QualityReviewer
+  # signs off, SystemFeed ingests transactions. Plus a PlatformAdmin opaque operator.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — emitted verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: Legal name of the customer (individual or entity).
+      - name: customer_type
+        type: enum
+        source: input
+        description: INDIVIDUAL or LEGAL_ENTITY.
+        constraints: "one of {INDIVIDUAL, LEGAL_ENTITY}"
+      - name: country_code
+        type: string
+        source: input
+        description: ISO 3166-1 alpha-2 country of residence/incorporation, uppercase.
+        constraints: "2 uppercase letters"
+      - name: date_of_birth
+        type: string
+        source: input
+        description: "ISO 8601 date (YYYY-MM-DD); required when customer_type==INDIVIDUAL, must be null otherwise."
+      - name: incorporation_date
+        type: string
+        source: input
+        description: "ISO 8601 date (YYYY-MM-DD); required when customer_type==LEGAL_ENTITY, must be null otherwise."
+      - name: is_pep_self_declared
+        type: boolean
+        source: input
+        description: Whether the customer self-declared Politically Exposed Person status at onboarding.
+        default: false
+      - name: cdd_status
+        type: enum
+        source: system
+        description: Customer Due Diligence lifecycle state (see §1.2 Customer state machine).
+        default: NEW
+        constraints: "one of {NEW, RISK_RATED, SCREENING_CLEARED, APPROVED, EDD_REQUIRED, REJECTED, OFFBOARDED}"
+      - name: risk_rating
+        type: enum
+        source: computed
+        description: "Latest risk band; copied from the APPLIED RiskAssessment.risk_band on rate/re-rate."
+        constraints: "null until first rating; then one of {LOW, MEDIUM, HIGH, PROHIBITED}"
+      - name: risk_score
+        type: number
+        source: computed
+        description: "Latest weighted risk score from the APPLIED RiskAssessment.total_score; null until first rating."
+      - name: edd_required
+        type: boolean
+        source: computed
+        description: "True when risk_rating==HIGH OR any open derogatory ScreeningHit exists; gates APPROVED transitions."
+        default: false
+      - name: periodic_review_due_at
+        type: datetime
+        source: computed
+        description: "created_at + review interval by risk band (see review_cadence calc); set on APPROVED, recomputed on re-rate."
+      - name: open_hit_count
+        type: integer
+        source: computed
+        description: "Count of ScreeningHit rows for this customer whose disposition IN {PENDING, ESCALATED}."
+        default: 0
+
+  - name: BeneficialOwner
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the LEGAL_ENTITY customer this UBO belongs to."
+      - name: full_name
+        type: string
+        source: input
+        description: Full legal name of the beneficial owner.
+      - name: ownership_pct
+        type: number
+        source: input
+        description: "Direct/indirect ownership percentage, 0 < pct <= 100, two decimals."
+        constraints: "0 < ownership_pct <= 100"
+      - name: country_code
+        type: string
+        source: input
+        description: ISO 3166-1 alpha-2 country of the UBO, uppercase.
+        constraints: "2 uppercase letters"
+      - name: is_control_person
+        type: boolean
+        source: input
+        description: Whether this person exercises significant control (FinCEN control prong).
+        default: false
+      - name: screening_status
+        type: enum
+        source: system
+        description: Per-UBO screening outcome.
+        default: UNSCREENED
+        constraints: "one of {UNSCREENED, CLEARED, HIT}"
+
+  - name: RiskAssessment
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the customer this assessment scores."
+      - name: variant
+        type: enum
+        source: input
+        description: "PROVISIONAL (onboarding estimate over self-declared inputs) or FINAL (post-screening actuals)."
+        constraints: "one of {PROVISIONAL, FINAL}"
+      - name: geography_factor
+        type: integer
+        source: input
+        description: "Country risk weight input, 1..5."
+        constraints: "integer 1..5"
+      - name: product_factor
+        type: integer
+        source: input
+        description: "Product/channel risk weight input, 1..5."
+        constraints: "integer 1..5"
+      - name: pep_factor
+        type: integer
+        source: input
+        description: "PEP exposure weight input, 1..5."
+        constraints: "integer 1..5"
+      - name: adverse_media_factor
+        type: integer
+        source: input
+        description: "Adverse-media weight input, 1..5."
+        constraints: "integer 1..5"
+      - name: total_score
+        type: number
+        source: computed
+        description: "Weighted score from the risk_scoring calc; precision 2dp."
+      - name: risk_band
+        type: enum
+        source: computed
+        description: "Band derived from total_score thresholds (see risk_scoring calc)."
+        constraints: "one of {LOW, MEDIUM, HIGH, PROHIBITED}"
+      - name: applied
+        type: boolean
+        source: computed
+        description: "True once this assessment has been applied to its Customer (copied to risk_rating/risk_score)."
+        default: false
+
+  - name: ScreeningHit
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the screened customer this hit belongs to."
+      - name: beneficial_owner_id
+        type: string
+        source: input
+        description: "FK -> BeneficialOwner.id; non-null when the hit is on a UBO rather than the customer, else null."
+      - name: list_type
+        type: enum
+        source: input
+        description: "Watchlist source that produced the hit."
+        constraints: "one of {OFAC_SDN, EU_SANCTIONS, PEP, ADVERSE_MEDIA}"
+      - name: matched_name
+        type: string
+        source: input
+        description: Name string matched on the list.
+      - name: match_score
+        type: number
+        source: input
+        description: "Fuzzy match confidence, 0.00..1.00, two decimals."
+        constraints: "0 <= match_score <= 1"
+      - name: is_derogatory
+        type: boolean
+        source: computed
+        description: "True when list_type IN {OFAC_SDN, EU_SANCTIONS} (true positive sanctions match), else false."
+        default: false
+      - name: disposition
+        type: enum
+        source: system
+        description: Hit disposition lifecycle (see §1.2 ScreeningHit state machine).
+        default: PENDING
+        constraints: "one of {PENDING, FALSE_POSITIVE, ESCALATED, CONFIRMED}"
+
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the owning customer."
+      - name: account_ref
+        type: string
+        source: input
+        description: External account reference; unique across all accounts.
+        constraints: "unique"
+      - name: opening_balance_cents
+        type: integer
+        source: input
+        description: "Opening balance in integer cents, >= 0."
+        constraints: ">= 0"
+      - name: kyc_status
+        type: enum
+        source: system
+        description: "Account KYC dimension (parallel to monitoring_status)."
+        default: PENDING_KYC
+        constraints: "one of {PENDING_KYC, KYC_OK, KYC_BLOCKED}"
+      - name: monitoring_status
+        type: enum
+        source: system
+        description: "Transaction-monitoring dimension (parallel to kyc_status)."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, UNDER_INVESTIGATION, FROZEN}"
+      - name: aggregate_cash_in_cents
+        type: integer
+        source: computed
+        description: "Running sum of Transaction.amount_cents for direction==CASH_IN on this account; resets per CTR window."
+        default: 0
+      - name: cumulative_credited_cents
+        type: integer
+        source: computed
+        description: "Lifetime sum of credited Transaction.amount_cents (CASH_IN + WIRE_IN); used for conservation invariant."
+        default: 0
+
+  - name: Transaction
+    parent: null
+    common_fields: false
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account this transaction posted to."
+      - name: direction
+        type: enum
+        source: input
+        description: "Flow direction."
+        constraints: "one of {CASH_IN, CASH_OUT, WIRE_IN, WIRE_OUT}"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Amount in integer cents, > 0."
+        constraints: "> 0"
+      - name: posted_at
+        type: datetime
+        source: input
+        description: "Client-supplied posting timestamp (ISO 8601 UTC); drives chronological CTR windowing."
+      - name: counterparty_country
+        type: string
+        source: input
+        description: "ISO 3166-1 alpha-2 counterparty country, uppercase."
+        constraints: "2 uppercase letters"
+      - name: triggered_rule
+        type: enum
+        source: computed
+        description: "The monitoring rule this transaction tripped, if any (see transaction_monitoring calc)."
+        constraints: "null or one of {STRUCTURING, RAPID_MOVEMENT, HIGH_RISK_GEO, CTR_THRESHOLD}"
+
+  - name: Alert
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account whose activity raised the alert."
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; denormalized owner for case routing."
+      - name: rule_code
+        type: enum
+        source: input
+        description: "The monitoring rule that fired."
+        constraints: "one of {STRUCTURING, RAPID_MOVEMENT, HIGH_RISK_GEO, CTR_THRESHOLD}"
+      - name: severity_score
+        type: number
+        source: computed
+        description: "Weighted alert severity (see alert_severity calc), precision 2dp."
+      - name: status
+        type: enum
+        source: system
+        description: Alert lifecycle (see §1.2 Alert state machine).
+        default: OPEN
+        constraints: "one of {OPEN, LINKED, DISMISSED}"
+      - name: case_id
+        type: string
+        source: input
+        description: "FK -> Case.id; set when the alert is linked to a case, else null."
+
+  - name: Case
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the subject customer of the investigation."
+      - name: opened_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the Analyst who opened the case; pins segregation-of-duties (4-eyes)."
+      - name: priority
+        type: enum
+        source: computed
+        description: "Derived from the max severity of linked alerts at link time (see case_priority calc)."
+        default: LOW
+        constraints: "one of {LOW, MEDIUM, HIGH, CRITICAL}"
+      - name: disposition
+        type: enum
+        source: system
+        description: Case disposition lifecycle (see §1.2 Case state machine).
+        default: TRIAGE
+        constraints: "one of {TRIAGE, INVESTIGATING, SAR_RECOMMENDED, CTR_REQUIRED, CLOSED_NO_ACTION, FILED}"
+      - name: linked_alert_count
+        type: integer
+        source: computed
+        description: "Count of Alert rows with case_id == this case AND status==LINKED."
+        default: 0
+
+  - name: Filing
+    parent: null
+    common_fields: true
+    fields:
+      - name: case_id
+        type: string
+        source: input
+        description: "FK -> Case.id; the case this regulatory filing reports."
+      - name: filing_type
+        type: enum
+        source: input
+        description: "SAR (Suspicious Activity Report) or CTR (Currency Transaction Report)."
+        constraints: "one of {SAR, CTR}"
+      - name: prepared_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the Analyst who prepared the filing; must equal Case.opened_by_user_id."
+      - name: approved_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the QualityReviewer who approved; must differ from prepared_by_user_id (4-eyes)."
+      - name: deadline_at
+        type: datetime
+        source: computed
+        description: "Regulatory deadline from filing_type (SAR: case open +30d; CTR: trigger posted_at +15d). See filing_deadline calc."
+      - name: status
+        type: enum
+        source: system
+        description: Filing lifecycle (see §1.2 Filing state machine).
+        default: DRAFT
+        constraints: "one of {DRAFT, SUBMITTED, ACCEPTED, REJECTED}"
+      - name: acknowledgement_code
+        type: string
+        source: input
+        description: "FinCEN BSA acknowledgement code, set on ACCEPTED, else null."
+
+  - name: LookbackReview
+    parent: null
+    common_fields: true
+    fields:
+      - name: reason
+        type: string
+        source: input
+        description: "Why the lookback was opened (e.g., 'new OFAC list version 2026-06')."
+      - name: window_start
+        type: datetime
+        source: input
+        description: "Inclusive start of the re-screening window (ISO 8601 UTC)."
+      - name: window_end
+        type: datetime
+        source: input
+        description: "Exclusive end of the re-screening window (ISO 8601 UTC); must be > window_start."
+      - name: status
+        type: enum
+        source: system
+        description: Compound status derived from its items (see §1.2 LookbackReview state machine).
+        default: PLANNED
+        constraints: "one of {PLANNED, IN_PROGRESS, COMPLETED, CANCELLED}"
+      - name: total_items
+        type: integer
+        source: computed
+        description: "Count of LookbackReviewItem rows under this review."
+        default: 0
+      - name: cleared_items
+        type: integer
+        source: computed
+        description: "Count of LookbackReviewItem rows with item_status==CLEARED."
+        default: 0
+      - name: escalated_items
+        type: integer
+        source: computed
+        description: "Count of LookbackReviewItem rows with item_status==ESCALATED."
+        default: 0
+
+  - name: LookbackReviewItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: lookback_review_id
+        type: string
+        source: input
+        description: "FK -> LookbackReview.id; the parent review."
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the in-window account being re-screened."
+      - name: item_status
+        type: enum
+        source: system
+        description: Per-item disposition (see §1.2 LookbackReviewItem state machine).
+        default: QUEUED
+        constraints: "one of {QUEUED, CLEARED, ESCALATED}"
+      - name: generated_alert_id
+        type: string
+        source: system
+        description: "FK -> Alert.id; the Alert minted when this item is ESCALATED, else null."
+
+  - name: AuditEvent
+    parent: null
+    common_fields: false
+    fields:
+      - name: entity_type
+        type: string
+        source: system
+        description: "Entity class the event concerns (Customer, Case, Filing, ...)."
+      - name: entity_id
+        type: string
+        source: system
+        description: "Id of the affected entity (identity reference only; not a business-decision input)."
+      - name: action
+        type: string
+        source: system
+        description: "Transition or operation name, e.g. 'CASE_DISPOSITIONED', 'FILING_APPROVED'."
+      - name: actor_user_id
+        type: string
+        source: system
+        description: "X-User-ID that performed the action (opaque or entity-backed)."
+      - name: actor_role
+        type: string
+        source: system
+        description: "X-User-Role header value at the time of the action."
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- Customer: cyclic CDD lifecycle ----
+  - entity: Customer
+    initial_state: NEW
+    terminal_states: [REJECTED, OFFBOARDED]
+    transitions:
+      - from: NEW
+        to: RISK_RATED
+        trigger: "POST /customers/{id}/risk-assessments (variant=PROVISIONAL) then POST /customers/{id}/apply-rating"
+        actor: ComplianceOfficer
+        preconditions:
+          - "customer.cdd_status == NEW"
+          - "a RiskAssessment with applied==false exists for this customer"
+        side_effects:
+          - "set customer.risk_rating = assessment.risk_band"
+          - "set customer.risk_score = assessment.total_score"
+          - "set assessment.applied = true"
+          - "recompute customer.edd_required (risk_scoring/edd_gate)"
+      - from: RISK_RATED
+        to: REJECTED
+        trigger: "system event: apply-rating produced risk_band==PROHIBITED"
+        actor: system
+        preconditions:
+          - "customer.risk_rating == PROHIBITED"
+        side_effects:
+          - "set customer.cdd_status = REJECTED (terminal)"
+          - "for each Account of this customer with monitoring_status != FROZEN: set kyc_status=KYC_BLOCKED, monitoring_status=FROZEN (cascade)"
+      - from: RISK_RATED
+        to: SCREENING_CLEARED
+        trigger: "POST /customers/{id}/clear-screening"
+        actor: ComplianceOfficer
+        preconditions:
+          - "customer.cdd_status == RISK_RATED"
+          - "customer.risk_rating != PROHIBITED"
+          - "customer.open_hit_count == 0 (no ScreeningHit in {PENDING, ESCALATED})"
+          - "every BeneficialOwner of this customer has screening_status != UNSCREENED (LEGAL_ENTITY only)"
+        side_effects:
+          - "set customer.cdd_status = SCREENING_CLEARED"
+      - from: SCREENING_CLEARED
+        to: APPROVED
+        trigger: "POST /customers/{id}/approve"
+        actor: ComplianceOfficer
+        preconditions:
+          - "customer.cdd_status == SCREENING_CLEARED"
+          - "customer.edd_required == false"
+        side_effects:
+          - "set customer.cdd_status = APPROVED"
+          - "compute customer.periodic_review_due_at = created_at + review interval (review_cadence)"
+          - "for each Account of this customer with kyc_status==PENDING_KYC: set kyc_status=KYC_OK (cascade)"
+      - from: SCREENING_CLEARED
+        to: EDD_REQUIRED
+        trigger: "POST /customers/{id}/approve when edd_required==true"
+        actor: ComplianceOfficer
+        preconditions:
+          - "customer.cdd_status == SCREENING_CLEARED"
+          - "customer.edd_required == true"
+        side_effects:
+          - "set customer.cdd_status = EDD_REQUIRED"
+        note: "approve is the same endpoint; the server routes to EDD_REQUIRED when edd_required is true."
+      - from: EDD_REQUIRED
+        to: APPROVED
+        trigger: "POST /customers/{id}/complete-edd"
+        actor: ComplianceOfficer
+        preconditions:
+          - "customer.cdd_status == EDD_REQUIRED"
+          - "customer.open_hit_count == 0"
+        side_effects:
+          - "set customer.cdd_status = APPROVED"
+          - "compute customer.periodic_review_due_at = created_at + review interval (review_cadence)"
+          - "for each Account of this customer with kyc_status==PENDING_KYC: set kyc_status=KYC_OK (cascade)"
+      - from: APPROVED
+        to: EDD_REQUIRED
+        trigger: "system event: a new derogatory ScreeningHit is CONFIRMED for an APPROVED customer (cyclic revision loop)"
+        actor: system
+        preconditions:
+          - "customer.cdd_status == APPROVED"
+          - "the confirmed hit is_derogatory == true"
+        side_effects:
+          - "set customer.cdd_status = EDD_REQUIRED"
+          - "set customer.edd_required = true"
+          - "for each Account of this customer with kyc_status==KYC_OK: set kyc_status=PENDING_KYC (cascade re-review)"
+        note: "Cycle: APPROVED -> EDD_REQUIRED -> APPROVED. Re-rating/new hits reopen due diligence."
+      - from: APPROVED
+        to: OFFBOARDED
+        trigger: "POST /customers/{id}/offboard"
+        actor: ComplianceOfficer
+        preconditions:
+          - "customer.cdd_status == APPROVED"
+        side_effects:
+          - "set customer.cdd_status = OFFBOARDED (terminal)"
+          - "for each Account of this customer with monitoring_status != FROZEN: set monitoring_status=FROZEN, kyc_status=KYC_BLOCKED (cascade)"
+
+  # ---- ScreeningHit: branching disposition with revert ----
+  - entity: ScreeningHit
+    initial_state: PENDING
+    terminal_states: [FALSE_POSITIVE, CONFIRMED]
+    transitions:
+      - from: PENDING
+        to: FALSE_POSITIVE
+        trigger: "POST /screening-hits/{id}/disposition (decision=FALSE_POSITIVE)"
+        actor: ComplianceOfficer
+        preconditions:
+          - "hit.disposition == PENDING"
+          - "hit.match_score < CONFIRM_FLOOR (0.95) OR hit.list_type IN {PEP, ADVERSE_MEDIA}"
+        side_effects:
+          - "set hit.disposition = FALSE_POSITIVE (terminal)"
+          - "recompute customer.open_hit_count (decrement)"
+          - "recompute customer.edd_required"
+      - from: PENDING
+        to: ESCALATED
+        trigger: "POST /screening-hits/{id}/disposition (decision=ESCALATE)"
+        actor: ComplianceOfficer
+        preconditions:
+          - "hit.disposition == PENDING"
+        side_effects:
+          - "set hit.disposition = ESCALATED"
+      - from: ESCALATED
+        to: PENDING
+        trigger: "POST /screening-hits/{id}/reopen (revert)"
+        actor: ComplianceOfficer
+        preconditions:
+          - "hit.disposition == ESCALATED"
+        side_effects:
+          - "set hit.disposition = PENDING"
+        note: "Revert edge: an escalation can be walked back to PENDING for re-review."
+      - from: ESCALATED
+        to: CONFIRMED
+        trigger: "POST /screening-hits/{id}/disposition (decision=CONFIRM)"
+        actor: ComplianceOfficer
+        preconditions:
+          - "hit.disposition == ESCALATED"
+          - "hit.is_derogatory == true"
+          - "hit.match_score >= CONFIRM_FLOOR (0.95)"
+        side_effects:
+          - "set hit.disposition = CONFIRMED (terminal)"
+          - "recompute customer.open_hit_count"
+          - "set customer.edd_required = true"
+          - "if customer.cdd_status == APPROVED: drive Customer APPROVED -> EDD_REQUIRED (cross-entity cascade, see Customer machine)"
+          - "if hit.beneficial_owner_id != null: set that BeneficialOwner.screening_status = HIT"
+
+  # ---- Account: PARALLEL state dimensions (kyc_status x monitoring_status) ----
+  - entity: Account
+    initial_state: "PENDING_KYC / ACTIVE"
+    terminal_states: []
+    transitions:
+      - from: "monitoring_status=ACTIVE"
+        to: "monitoring_status=UNDER_INVESTIGATION"
+        trigger: "system event: an Alert is created for this account (transaction_monitoring fired)"
+        actor: system
+        preconditions:
+          - "account.monitoring_status == ACTIVE"
+        side_effects:
+          - "set account.monitoring_status = UNDER_INVESTIGATION"
+        note: "monitoring_status dimension only; kyc_status untouched."
+      - from: "monitoring_status=UNDER_INVESTIGATION"
+        to: "monitoring_status=FROZEN"
+        trigger: "POST /accounts/{id}/freeze"
+        actor: ComplianceOfficer
+        preconditions:
+          - "account.monitoring_status == UNDER_INVESTIGATION"
+        side_effects:
+          - "set account.monitoring_status = FROZEN"
+      - from: "monitoring_status=UNDER_INVESTIGATION"
+        to: "monitoring_status=ACTIVE"
+        trigger: "system event: the last LINKED Alert on the account's open Case is dismissed/closed-no-action"
+        actor: system
+        preconditions:
+          - "account.monitoring_status == UNDER_INVESTIGATION"
+          - "no Alert with this account_id has status==LINKED"
+        side_effects:
+          - "set account.monitoring_status = ACTIVE"
+      - from: "kyc_status=PENDING_KYC"
+        to: "kyc_status=KYC_OK"
+        trigger: "system event: owning Customer reaches APPROVED (cascade, see Customer machine)"
+        actor: system
+        preconditions:
+          - "account.kyc_status == PENDING_KYC"
+          - "owning customer.cdd_status == APPROVED"
+        side_effects:
+          - "set account.kyc_status = KYC_OK"
+        note: "kyc_status dimension only; monitoring_status untouched."
+      - from: "kyc_status=KYC_OK"
+        to: "kyc_status=PENDING_KYC"
+        trigger: "system event: owning Customer goes APPROVED -> EDD_REQUIRED (new confirmed derogatory hit re-opens diligence; cascade)"
+        actor: system
+        preconditions:
+          - "account.kyc_status == KYC_OK"
+          - "owning customer.cdd_status == EDD_REQUIRED"
+        side_effects:
+          - "set account.kyc_status = PENDING_KYC"
+        note: "kyc_status dimension only; monitoring_status untouched. Re-review edge for the cyclic Customer loop."
+      - from: "kyc_status=KYC_OK"
+        to: "kyc_status=KYC_BLOCKED"
+        trigger: "system event: owning Customer reaches REJECTED or OFFBOARDED (cascade)"
+        actor: system
+        preconditions:
+          - "owning customer.cdd_status IN {REJECTED, OFFBOARDED}"
+        side_effects:
+          - "set account.kyc_status = KYC_BLOCKED"
+
+  # ---- Case: branching fork-join disposition ----
+  - entity: Case
+    initial_state: TRIAGE
+    terminal_states: [CLOSED_NO_ACTION, FILED]
+    transitions:
+      - from: TRIAGE
+        to: INVESTIGATING
+        trigger: "POST /cases/{id}/alerts (link first alert) — auto-advances to INVESTIGATING"
+        actor: Analyst
+        preconditions:
+          - "case.disposition == TRIAGE"
+        side_effects:
+          - "set alert.status = LINKED, alert.case_id = case.id"
+          - "set case.disposition = INVESTIGATING"
+          - "recompute case.linked_alert_count and case.priority (case_priority)"
+          - "set the alert's Account.monitoring_status = UNDER_INVESTIGATION if currently ACTIVE (cross-entity cascade)"
+      - from: INVESTIGATING
+        to: SAR_RECOMMENDED
+        trigger: "POST /cases/{id}/disposition (decision=RECOMMEND_SAR)"
+        actor: Analyst
+        preconditions:
+          - "case.disposition == INVESTIGATING"
+          - "case.linked_alert_count >= 1"
+        side_effects:
+          - "set case.disposition = SAR_RECOMMENDED"
+        note: "Branch A of the fork."
+      - from: INVESTIGATING
+        to: CTR_REQUIRED
+        trigger: "POST /cases/{id}/disposition (decision=REQUIRE_CTR)"
+        actor: Analyst
+        preconditions:
+          - "case.disposition == INVESTIGATING"
+          - "at least one LINKED Alert has rule_code == CTR_THRESHOLD"
+        side_effects:
+          - "set case.disposition = CTR_REQUIRED"
+        note: "Branch B of the fork; only valid when a CTR_THRESHOLD alert is linked."
+      - from: INVESTIGATING
+        to: CLOSED_NO_ACTION
+        trigger: "POST /cases/{id}/disposition (decision=CLOSE_NO_ACTION)"
+        actor: ComplianceOfficer
+        preconditions:
+          - "case.disposition == INVESTIGATING"
+        side_effects:
+          - "set case.disposition = CLOSED_NO_ACTION (terminal)"
+          - "for each LINKED Alert on this case: set status=DISMISSED, case_id=null (cascade)"
+          - "for each Account whose only LINKED alerts were on this case: set monitoring_status=ACTIVE if it was UNDER_INVESTIGATION (cross-entity cascade)"
+        note: "Branch C of the fork; ComplianceOfficer override required to close."
+      - from: SAR_RECOMMENDED
+        to: FILED
+        trigger: "system event: a SAR Filing for this case reaches ACCEPTED (join, see Filing machine)"
+        actor: system
+        preconditions:
+          - "case.disposition == SAR_RECOMMENDED"
+          - "a Filing with this case_id, filing_type==SAR, status==ACCEPTED exists"
+        side_effects:
+          - "set case.disposition = FILED (terminal)"
+      - from: CTR_REQUIRED
+        to: FILED
+        trigger: "system event: a CTR Filing for this case reaches ACCEPTED (join)"
+        actor: system
+        preconditions:
+          - "case.disposition == CTR_REQUIRED"
+          - "a Filing with this case_id, filing_type==CTR, status==ACCEPTED exists"
+        side_effects:
+          - "set case.disposition = FILED (terminal)"
+
+  # ---- Filing: linear with reject revert ----
+  - entity: Filing
+    initial_state: DRAFT
+    terminal_states: [ACCEPTED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /filings/{id}/submit"
+        actor: QualityReviewer
+        preconditions:
+          - "filing.status == DRAFT"
+          - "filing.approved_by_user_id != null"
+          - "filing.approved_by_user_id != filing.prepared_by_user_id (4-eyes segregation of duties)"
+        side_effects:
+          - "set filing.status = SUBMITTED"
+      - from: SUBMITTED
+        to: ACCEPTED
+        trigger: "POST /filings/{id}/acknowledge (decision=ACCEPT)"
+        actor: SystemFeed
+        preconditions:
+          - "filing.status == SUBMITTED"
+          - "acknowledgement_code provided"
+        side_effects:
+          - "set filing.status = ACCEPTED (terminal)"
+          - "set filing.acknowledgement_code"
+          - "drive the owning Case to FILED (cross-entity bubble-up, see Case machine)"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /filings/{id}/acknowledge (decision=REJECT)"
+        actor: SystemFeed
+        preconditions:
+          - "filing.status == SUBMITTED"
+        side_effects:
+          - "set filing.status = REJECTED"
+      - from: REJECTED
+        to: DRAFT
+        trigger: "POST /filings/{id}/revise (revert)"
+        actor: Analyst
+        preconditions:
+          - "filing.status == REJECTED"
+        side_effects:
+          - "set filing.status = DRAFT"
+          - "clear filing.approved_by_user_id (must be re-approved)"
+        note: "Revert edge: a rejected filing returns to DRAFT for correction and re-approval."
+
+  # ---- LookbackReview: compound (status derived from items) ----
+  - entity: LookbackReview
+    initial_state: PLANNED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: IN_PROGRESS
+        trigger: "POST /lookback-reviews/{id}/enqueue — materializes one LookbackReviewItem per in-window account"
+        actor: ComplianceOfficer
+        preconditions:
+          - "review.status == PLANNED"
+        side_effects:
+          - "create one LookbackReviewItem (item_status=QUEUED) per Account that itself has >=1 in-window Transaction, i.e. account_id in lookback_window_membership.scoped_accounts (half-open [window_start, window_end), end exclusive); one item per distinct in-window account regardless of how many of its transactions match"
+          - "set review.total_items = number created"
+          - "set review.status = IN_PROGRESS (only if total_items > 0; else stays PLANNED and enqueue returns ERR_REVIEW_EMPTY)"
+        note: "Compound parent: status advances based on items materialized/closed. Scope is the ACCOUNT's own transactions (lookback_window_membership), not the owning customer's other accounts."
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "system event: every LookbackReviewItem reaches a terminal item_status (CLEARED or ESCALATED)"
+        actor: system
+        preconditions:
+          - "review.status == IN_PROGRESS"
+          - "review.total_items > 0"
+          - "cleared_items + escalated_items == total_items"
+        side_effects:
+          - "set review.status = COMPLETED (terminal)"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /lookback-reviews/{id}/cancel"
+        actor: ComplianceOfficer
+        preconditions:
+          - "review.status == PLANNED"
+        side_effects:
+          - "set review.status = CANCELLED (terminal)"
+
+  # ---- LookbackReviewItem: per-item disposition (drives parent bubble-up) ----
+  - entity: LookbackReviewItem
+    initial_state: QUEUED
+    terminal_states: [CLEARED, ESCALATED]
+    transitions:
+      - from: QUEUED
+        to: CLEARED
+        trigger: "POST /lookback-items/{id}/disposition (decision=CLEAR)"
+        actor: Analyst
+        preconditions:
+          - "item.item_status == QUEUED"
+          - "parent review.status == IN_PROGRESS"
+        side_effects:
+          - "set item.item_status = CLEARED"
+          - "increment parent review.cleared_items"
+          - "if cleared_items + escalated_items == total_items: bubble parent IN_PROGRESS -> COMPLETED"
+      - from: QUEUED
+        to: ESCALATED
+        trigger: "POST /lookback-items/{id}/disposition (decision=ESCALATE)"
+        actor: Analyst
+        preconditions:
+          - "item.item_status == QUEUED"
+          - "parent review.status == IN_PROGRESS"
+        side_effects:
+          - "set item.item_status = ESCALATED"
+          - "create an Alert (rule_code=HIGH_RISK_GEO, status=OPEN) for item.account_id; set item.generated_alert_id (cascade)"
+          - "set the Alert's Account.monitoring_status = UNDER_INVESTIGATION if currently ACTIVE (cross-entity cascade)"
+          - "increment parent review.escalated_items"
+          - "if cleared_items + escalated_items == total_items: bubble parent IN_PROGRESS -> COMPLETED"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: case-link-alert-stale-case
+    parent_entity: Case
+    write_endpoint: "POST /cases/{id}/alerts"
+    occ_field: "expected_case_version"
+    description: |
+      Linking an Alert to a Case whose version has advanced since the client last
+      observed it is rejected as a stale-version write. A linked alert legitimately
+      recomputes case.priority and linked_alert_count and may auto-advance
+      TRIAGE -> INVESTIGATING, so a second link carrying a version observed before
+      the first link no longer reflects the case's current priority/disposition and
+      is rejected on the stale-version precondition.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: customer-apply-rating-stale-customer
+    parent_entity: Customer
+    write_endpoint: "POST /customers/{id}/apply-rating"
+    occ_field: "expected_customer_version"
+    description: |
+      Applying a RiskAssessment to a Customer whose version has advanced since the
+      client last observed it is rejected as a stale-version write. Applying a rating
+      mutates risk_rating, risk_score, edd_required and (when PROHIBITED) cascades to
+      accounts; a second apply carrying a stale customer version would overwrite a
+      rating the client never saw, so it is rejected.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: risk_scoring
+    trigger: "on POST /customers/{id}/risk-assessments (computes total_score, risk_band, applied gate)"
+    algorithm: weighted_scoring
+    formula: |
+      # Weighted multi-factor score with a non-linear PEP override (mode (a)).
+      # Factors are integers 1..5. Weights are fixed.
+      base = (geography_factor * W_GEO)
+           + (product_factor   * W_PROD)
+           + (pep_factor       * W_PEP)
+           + (adverse_media_factor * W_MEDIA)
+      # Non-linear interaction: a maxed PEP OR adverse-media factor forces a +12 surcharge,
+      # but the surcharge is applied at most once (max over the two, not summed).
+      surcharge = 12 if max(pep_factor, adverse_media_factor) == 5 else 0
+      total_score = round(base + surcharge, 2)   # 2dp, round_half_up
+      # Band thresholds (>= boundaries are inclusive):
+      #   total_score >= 84  -> PROHIBITED
+      #   60 <= total_score < 84 -> HIGH
+      #   35 <= total_score < 60 -> MEDIUM
+      #   total_score < 35  -> LOW
+      risk_band = PROHIBITED if total_score >= 84
+                  else HIGH  if total_score >= 60
+                  else MEDIUM if total_score >= 35
+                  else LOW
+    input_set: "the four *_factor inputs on this single RiskAssessment row."
+    constants:
+      W_GEO: 4
+      W_PROD: 3
+      W_PEP: 5
+      W_MEDIA: 3
+      PROHIBITED_THRESHOLD: 84
+      HIGH_THRESHOLD: 60
+      MEDIUM_THRESHOLD: 35
+      PEP_MEDIA_SURCHARGE: 12
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: provisional
+        when: "variant==PROVISIONAL, computed at onboarding over self-declared factors"
+        difference: "Uses self-declared factors as supplied; produces an estimate band that gates initial onboarding posture."
+      - name: final
+        when: "variant==FINAL, computed after screening with adjudicated factors"
+        difference: |
+          Adds +1 to pep_factor (capped at 5) when the customer has any CONFIRMED derogatory
+          ScreeningHit (disposition==CONFIRMED AND is_derogatory==true) at compute time, applied
+          BEFORE the weighted formula. This makes PROVISIONAL and FINAL diverge for identical input
+          factors whenever a sanctions hit was confirmed. PROVISIONAL never applies this bump.
+
+  - name: edd_gate
+    trigger: "on apply-rating, on screening-hit CONFIRM, on screening-hit FALSE_POSITIVE, on clear-screening"
+    algorithm: aggregation
+    formula: |
+      open_hit_count = count(ScreeningHit where customer_id==C.id AND disposition IN {PENDING, ESCALATED})
+      edd_required = (C.risk_rating == HIGH) OR (open_hit_count > 0)
+                     OR (exists ScreeningHit where customer_id==C.id AND disposition==CONFIRMED AND is_derogatory==true)
+    input_set: "all ScreeningHit rows for the customer; the customer's current risk_rating."
+    constants: {}
+    precision: "integer counts; boolean output"
+
+  - name: transaction_monitoring
+    trigger: "on POST /accounts/{id}/transactions — evaluates rules in fixed order, sets triggered_rule and may mint an Alert"
+    algorithm: threshold
+    formula: |
+      # Rules evaluated in THIS fixed precedence; first match wins -> triggered_rule.
+      # (1) CTR_THRESHOLD: per CTR rolling window, aggregate_cash_in_cents for direction==CASH_IN.
+      #     A new CASH_IN that makes window aggregate STRICTLY GREATER THAN CTR_LIMIT_CENTS fires.
+      #     i.e. fires when (prior_window_cash_in + amount_cents) > 1000000  (>$10,000.00 strict).
+      #     Exactly 1000000 does NOT fire (boundary: > not >=).
+      # (2) STRUCTURING: a CASH_IN with 900000 <= amount_cents <= 1000000 (just-under-threshold band,
+      #     inclusive both ends) fires STRUCTURING even though CTR did not.
+      # (3) HIGH_RISK_GEO: counterparty_country IN HIGH_RISK_COUNTRIES set.
+      # (4) RAPID_MOVEMENT: a CASH_OUT/WIRE_OUT whose amount_cents >= RAPID_FRACTION (0.90) of the
+      #     account's cumulative_credited_cents observed BEFORE this transaction.
+      # Window: CTR window is the calendar-day bucket of posted_at (UTC, [00:00, next 00:00)).
+      # When posted_at crosses into a new UTC day, aggregate_cash_in_cents resets to 0 first.
+      if direction==CASH_IN and (window_cash_in_after) > CTR_LIMIT_CENTS: triggered_rule=CTR_THRESHOLD
+      elif direction==CASH_IN and STRUCT_LOW <= amount_cents <= STRUCT_HIGH: triggered_rule=STRUCTURING
+      elif counterparty_country in HIGH_RISK_COUNTRIES: triggered_rule=HIGH_RISK_GEO
+      elif direction in {CASH_OUT, WIRE_OUT} and amount_cents >= round(RAPID_FRACTION * prior_cumulative_credited_cents): triggered_rule=RAPID_MOVEMENT
+      else: triggered_rule = null
+      # Side effect: when triggered_rule != null, mint an Alert(rule_code=triggered_rule, status=OPEN).
+    input_set: |
+      this Transaction; the account's same-UTC-day prior CASH_IN sum (aggregate_cash_in_cents after
+      reset logic); the account's cumulative_credited_cents BEFORE this transaction.
+    constants:
+      CTR_LIMIT_CENTS: 1000000
+      STRUCT_LOW: 900000
+      STRUCT_HIGH: 1000000
+      RAPID_FRACTION: 0.90
+      HIGH_RISK_COUNTRIES: ["IR", "KP", "SY", "CU"]
+    precision: "integer cents; RAPID threshold uses round_half_up on the product before comparison"
+    variants:
+      - name: instantaneous
+        when: "STRUCTURING / HIGH_RISK_GEO / RAPID_MOVEMENT — single-transaction evaluation"
+        difference: "Decided from the single transaction's own fields (and prior cumulative for RAPID), no windowing."
+      - name: cumulative_window
+        when: "CTR_THRESHOLD — cumulative same-UTC-day CASH_IN window"
+        difference: |
+          Crosses the threshold by ACCUMULATION across the day, not a single amount. The same
+          $9,500 cash-in can be benign at day-start but tip the window over $10,000 later the
+          same day, firing CTR; STRUCTURING/HIGH_RISK_GEO never accumulate.
+
+  - name: alert_severity
+    trigger: "on Alert creation (system mint or escalation mint)"
+    algorithm: weighted_scoring
+    formula: |
+      # Combinatorial mode (c): a circular-LOOKING dependency pinned by explicit order.
+      # base_weight depends on rule_code; the customer-risk multiplier depends on the
+      # owning customer's risk_rating; geo_bonus depends on whether the originating
+      # transaction's counterparty_country is high-risk. Evaluation order is fixed:
+      #   step 1: base = RULE_BASE[rule_code]
+      #   step 2: mult = RISK_MULT[customer.risk_rating]  (PROHIBITED treated as HIGH for mult)
+      #   step 3: severity_score = round(base * mult, 2)
+      severity_score = round(RULE_BASE[rule_code] * RISK_MULT[customer.risk_rating], 2)
+    input_set: "the firing Alert's rule_code; the owning Customer's risk_rating at mint time."
+    constants:
+      RULE_BASE: { STRUCTURING: 40, RAPID_MOVEMENT: 35, HIGH_RISK_GEO: 25, CTR_THRESHOLD: 20 }
+      RISK_MULT: { LOW: 1.0, MEDIUM: 1.5, HIGH: 2.0, PROHIBITED: 2.0 }
+      NULL_RATING_MULT: 1.0
+    precision: "2 decimal places, round_half_up"
+
+  - name: case_priority
+    trigger: "on POST /cases/{id}/alerts (recomputed each time an alert is linked)"
+    algorithm: aggregation
+    formula: |
+      max_sev = max(alert.severity_score for alert in LINKED alerts of this case)   # status==LINKED only
+      priority = CRITICAL if max_sev >= 70
+                 else HIGH if max_sev >= 50
+                 else MEDIUM if max_sev >= 30
+                 else LOW
+      # Tie-break is irrelevant (max over a scalar); window is "alerts with case_id==case.id AND status==LINKED".
+    input_set: "all Alert rows with case_id==this case AND status==LINKED."
+    constants:
+      CRITICAL_THRESHOLD: 70
+      HIGH_THRESHOLD: 50
+      MEDIUM_THRESHOLD: 30
+    precision: "2 decimal places on severity; integer band selection"
+
+  - name: filing_deadline
+    trigger: "on POST /cases/{id}/filings (computes deadline_at by filing_type)"
+    algorithm: chronological
+    formula: |
+      if filing_type == SAR:
+        deadline_at = case.created_at + SAR_DEADLINE_DAYS days   # 30 days from case open
+      else:  # CTR
+        # earliest posted_at among the case's LINKED alerts' originating-account transactions
+        # with triggered_rule==CTR_THRESHOLD, + CTR_DEADLINE_DAYS. If none, fall back to
+        # case.created_at + CTR_DEADLINE_DAYS. Tie-break on equal posted_at: earliest created_at.
+        ctr_anchor = min(posted_at over CTR_THRESHOLD transactions on this case's accounts)
+                     if any else case.created_at
+        deadline_at = ctr_anchor + CTR_DEADLINE_DAYS days
+    input_set: "the case's created_at; for CTR, the CTR_THRESHOLD transactions on the case's accounts."
+    constants:
+      SAR_DEADLINE_DAYS: 30
+      CTR_DEADLINE_DAYS: 15
+    precision: "datetime arithmetic in whole days, UTC"
+
+  - name: review_cadence
+    trigger: "on Customer APPROVED transition (sets periodic_review_due_at)"
+    algorithm: threshold
+    formula: |
+      interval_days = HIGH_DAYS if risk_rating==HIGH
+                      else MEDIUM_DAYS if risk_rating==MEDIUM
+                      else LOW_DAYS  # LOW
+      periodic_review_due_at = customer.created_at + interval_days days
+    input_set: "customer.risk_rating and customer.created_at."
+    constants:
+      HIGH_DAYS: 90
+      MEDIUM_DAYS: 180
+      LOW_DAYS: 365
+    precision: "datetime arithmetic in whole days, UTC"
+
+  - name: lookback_window_membership
+    trigger: "on POST /lookback-reviews/{id}/enqueue (selects which accounts get a LookbackReviewItem)"
+    algorithm: interval_merge
+    formula: |
+      # HALF-OPEN interval [window_start, window_end): a Transaction is IN-WINDOW iff
+      #   window_start <= txn.posted_at < window_end   (start inclusive, end EXCLUSIVE).
+      # An Account is in-scope for the review iff at least one of its Transactions is in-window.
+      # Distinct one-row-per-account: an account with multiple in-window transactions yields
+      # exactly ONE LookbackReviewItem.
+      in_window(txn) = (txn.posted_at >= review.window_start) AND (txn.posted_at < review.window_end)
+      scoped_accounts = DISTINCT { txn.account_id : in_window(txn) }
+      # A transaction posted_at == window_end is NOT in-window (exclusive end);
+      # a transaction posted_at == window_start IS in-window (inclusive start).
+    input_set: "all Transaction rows; the review's window_start (inclusive) and window_end (exclusive)."
+    constants: {}
+    precision: "datetime comparison, UTC; half-open [start, end)"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /customers (anonymous onboarding is not permitted — all endpoints require auth)"
+
+  - priority: 2
+    category: auth
+    check: "The authenticated role is permitted to perform this operation per §1.7 RBAC."
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "Every path/body referenced resource exists; validated left-to-right in the path, then body FKs."
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 4
+    category: business_constraint
+    check: "Request body well-formed: required fields present, enum values valid, numeric ranges honored, types correct."
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all write endpoints"
+
+  - priority: 5
+    category: business_constraint
+    check: "customer_type-conditional fields: date_of_birth required iff INDIVIDUAL; incorporation_date required iff LEGAL_ENTITY; the other must be null."
+    error_id: ERR_TYPE_FIELD_MISMATCH
+    http_status: 422
+    applies_to: "POST /customers"
+
+  - priority: 6
+    category: business_referential
+    check: "Account.account_ref is unique across all accounts."
+    error_id: ERR_DUPLICATE_ACCOUNT_REF
+    http_status: 409
+    applies_to: "POST /customers/{id}/accounts"
+
+  - priority: 7
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined (see §1.2)."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 8
+    category: state
+    check: "OCC: expected_<parent>_version equals the parent entity's current version."
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /cases/{id}/alerts, POST /customers/{id}/apply-rating"
+
+  - priority: 9
+    category: business_safety
+    check: "Cannot approve/clear-screening a customer with open derogatory exposure: open_hit_count must be 0 before clear-screening; a PROHIBITED risk_rating blocks SCREENING_CLEARED."
+    error_id: ERR_OPEN_HITS_BLOCK_CLEARANCE
+    http_status: 409
+    applies_to: "POST /customers/{id}/clear-screening"
+
+  - priority: 10
+    category: business_safety
+    check: "Cannot CONFIRM a ScreeningHit that is not derogatory or whose match_score < CONFIRM_FLOOR (0.95)."
+    error_id: ERR_HIT_NOT_CONFIRMABLE
+    http_status: 409
+    applies_to: "POST /screening-hits/{id}/disposition (decision=CONFIRM)"
+
+  - priority: 11
+    category: business_safety
+    check: "4-eyes: a Filing's approved_by_user_id (QualityReviewer) must differ from prepared_by_user_id (Analyst); same user cannot prepare and approve."
+    error_id: ERR_SEGREGATION_VIOLATION
+    http_status: 409
+    applies_to: "POST /filings/{id}/approve, POST /filings/{id}/submit"
+
+  - priority: 12
+    category: business_constraint
+    check: "A CTR Filing may only be created for a Case in CTR_REQUIRED; a SAR Filing only for a Case in SAR_RECOMMENDED."
+    error_id: ERR_FILING_TYPE_MISMATCH
+    http_status: 409
+    applies_to: "POST /cases/{id}/filings"
+
+  - priority: 13
+    category: business_constraint
+    check: "REQUIRE_CTR disposition requires at least one LINKED Alert with rule_code==CTR_THRESHOLD on the case."
+    error_id: ERR_NO_CTR_ALERT
+    http_status: 409
+    applies_to: "POST /cases/{id}/disposition (decision=REQUIRE_CTR)"
+
+  - priority: 14
+    category: business_constraint
+    check: "An Alert already LINKED to a case (status==LINKED) cannot be linked again."
+    error_id: ERR_ALERT_ALREADY_LINKED
+    http_status: 409
+    applies_to: "POST /cases/{id}/alerts"
+
+  - priority: 15
+    category: business_referential
+    check: "An Alert linked to a case must belong to the same customer as the case (alert.customer_id == case.customer_id)."
+    error_id: ERR_ALERT_CUSTOMER_MISMATCH
+    http_status: 409
+    applies_to: "POST /cases/{id}/alerts"
+
+  - priority: 16
+    category: business_temporal
+    check: "LookbackReview.window_end must be strictly after window_start."
+    error_id: ERR_INVALID_WINDOW
+    http_status: 422
+    applies_to: "POST /lookback-reviews"
+
+  - priority: 17
+    category: business_constraint
+    check: "BeneficialOwner may only be added to a LEGAL_ENTITY customer; INDIVIDUAL customers reject UBOs."
+    error_id: ERR_UBO_ON_INDIVIDUAL
+    http_status: 409
+    applies_to: "POST /customers/{id}/beneficial-owners"
+
+  - priority: 18
+    category: business_fiscal
+    check: "Aggregate ownership across a customer's BeneficialOwner rows must not exceed 100.00%."
+    error_id: ERR_OWNERSHIP_EXCEEDS_100
+    http_status: 409
+    applies_to: "POST /customers/{id}/beneficial-owners"
+
+  - priority: 19
+    category: business_constraint
+    check: "Transactions cannot be posted to an account whose kyc_status==KYC_BLOCKED or monitoring_status==FROZEN."
+    error_id: ERR_ACCOUNT_NOT_TRANSACTABLE
+    http_status: 409
+    applies_to: "POST /accounts/{id}/transactions"
+
+  - priority: 20
+    category: business_constraint
+    check: "An Alert whose originating Account.monitoring_status==FROZEN cannot be linked to a case (the account is locked from further investigation routing). Checked after already-linked and customer-mismatch."
+    error_id: ERR_ACCOUNT_BLOCKED_FOR_CASE
+    http_status: 409
+    applies_to: "POST /cases/{id}/alerts"
+
+  - priority: 21
+    category: business_constraint
+    check: "decision value must be in the allowed set for the disposition endpoint: screening-hits {FALSE_POSITIVE, ESCALATE, CONFIRM}; cases {RECOMMEND_SAR, REQUIRE_CTR, CLOSE_NO_ACTION}; lookback-items {CLEAR, ESCALATE}; filings {ACCEPT, REJECT}."
+    error_id: ERR_INVALID_DECISION
+    http_status: 422
+    applies_to: "POST /screening-hits/{id}/disposition, POST /cases/{id}/disposition, POST /lookback-items/{id}/disposition, POST /filings/{id}/acknowledge"
+
+  - priority: 22
+    category: state
+    check: "Lookback item disposition requires item_status==QUEUED AND parent review.status==IN_PROGRESS."
+    error_id: ERR_ITEM_NOT_QUEUED
+    http_status: 409
+    applies_to: "POST /lookback-items/{id}/disposition"
+
+  - priority: 23
+    category: state
+    check: "Filing approve requires status==DRAFT; submit requires status==DRAFT with approved_by_user_id set. Any other status rejects."
+    error_id: ERR_NOT_APPROVABLE
+    http_status: 409
+    applies_to: "POST /filings/{id}/approve, POST /filings/{id}/submit"
+
+  - priority: 24
+    category: business_constraint
+    check: "apply-rating requires a RiskAssessment row for this customer with the given risk_assessment_id and applied==false."
+    error_id: ERR_NO_UNAPPLIED_ASSESSMENT
+    http_status: 409
+    applies_to: "POST /customers/{id}/apply-rating"
+
+  - priority: 25
+    category: business_constraint
+    check: "enqueue requires at least one in-window account (total_items>0); zero in-window accounts rejects and leaves the review PLANNED."
+    error_id: ERR_REVIEW_EMPTY
+    http_status: 409
+    applies_to: "POST /lookback-reviews/{id}/enqueue"
+
+  - priority: 26
+    category: business_constraint
+    check: "Pagination bounds: limit in 1..100, offset >= 0."
+    error_id: ERR_PAGINATION_INVALID
+    http_status: 422
+    applies_to: "all list (GET collection) endpoints"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Customer CRUD + CDD lifecycle ----
+  - method: POST
+    path: "/customers"
+    description: "Create a customer in NEW cdd_status."
+    roles: [ComplianceOfficer, PlatformAdmin]
+    code: 201
+    input: ["legal_name", "customer_type", "country_code", "date_of_birth?", "incorporation_date?", "is_pep_self_declared?"]
+    output: Customer
+    side_effects: ["customer created with cdd_status=NEW, risk_rating=null"]
+
+  - method: GET
+    path: "/customers/{id}"
+    description: "Fetch a customer by id."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  - method: GET
+    path: "/customers"
+    description: "List customers (paginated); filter by cdd_status."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["cdd_status?", "limit?", "offset?"]
+    output: Customer[]
+    side_effects: []
+
+  - method: POST
+    path: "/customers/{id}/risk-assessments"
+    description: "Create a RiskAssessment (PROVISIONAL or FINAL); computes total_score and risk_band."
+    roles: [ComplianceOfficer]
+    code: 201
+    input: [variant, geography_factor, product_factor, pep_factor, adverse_media_factor]
+    output: RiskAssessment
+    side_effects: ["run risk_scoring to set total_score and risk_band; assessment.applied=false"]
+
+  - method: GET
+    path: "/customers/{id}/risk-assessments"
+    description: "List a customer's RiskAssessment rows (reverse-reachability for RiskAssessment.customer_id)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RiskAssessment[]
+    side_effects: []
+
+  - method: POST
+    path: "/customers/{id}/apply-rating"
+    description: "Apply the latest unapplied RiskAssessment to the customer (NEW->RISK_RATED); OCC-guarded."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: [risk_assessment_id, expected_customer_version]
+    output: Customer
+    side_effects:
+      - "copy assessment.risk_band->customer.risk_rating, assessment.total_score->customer.risk_score"
+      - "set assessment.applied=true; recompute edd_required (edd_gate)"
+      - "if risk_band==PROHIBITED: cascade customer->REJECTED and freeze/block all its accounts"
+      - "increments Customer.version by 1"
+
+  - method: POST
+    path: "/customers/{id}/clear-screening"
+    description: "Advance RISK_RATED -> SCREENING_CLEARED after screening hits resolved."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["set cdd_status=SCREENING_CLEARED"]
+
+  - method: POST
+    path: "/customers/{id}/approve"
+    description: "Approve a SCREENING_CLEARED customer; routes to APPROVED or EDD_REQUIRED by edd_required."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects:
+      - "if edd_required==false: cdd_status=APPROVED, set periodic_review_due_at (review_cadence), cascade accounts PENDING_KYC->KYC_OK"
+      - "if edd_required==true: cdd_status=EDD_REQUIRED"
+
+  - method: POST
+    path: "/customers/{id}/complete-edd"
+    description: "Complete EDD: EDD_REQUIRED -> APPROVED once open_hit_count==0."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["cdd_status=APPROVED, set periodic_review_due_at, cascade accounts PENDING_KYC->KYC_OK"]
+
+  - method: POST
+    path: "/customers/{id}/offboard"
+    description: "Offboard an APPROVED customer (terminal); cascade-freeze its accounts."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["cdd_status=OFFBOARDED; cascade each non-FROZEN account -> monitoring_status=FROZEN, kyc_status=KYC_BLOCKED"]
+
+  # ---- Beneficial owners ----
+  - method: POST
+    path: "/customers/{id}/beneficial-owners"
+    description: "Add a beneficial owner to a LEGAL_ENTITY customer."
+    roles: [ComplianceOfficer]
+    code: 201
+    input: ["full_name", "ownership_pct", "country_code", "is_control_person?"]
+    output: BeneficialOwner
+    side_effects: ["UBO created with screening_status=UNSCREENED"]
+
+  - method: GET
+    path: "/customers/{id}/beneficial-owners"
+    description: "List a customer's beneficial owners (reverse-reachability for BeneficialOwner.customer_id)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: BeneficialOwner[]
+    side_effects: []
+
+  - method: POST
+    path: "/beneficial-owners/{id}/screen"
+    description: "Record a UBO screening outcome (CLEARED, or HIT which also creates a ScreeningHit)."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: ["outcome", "list_type?", "matched_name?", "match_score?"]
+    output: BeneficialOwner
+    side_effects:
+      - "set screening_status=outcome"
+      - "if outcome==HIT: create a ScreeningHit(beneficial_owner_id set, disposition=PENDING); recompute owner customer.open_hit_count and edd_required"
+
+  # ---- Screening hits ----
+  - method: POST
+    path: "/customers/{id}/screening-hits"
+    description: "Record a screening hit against the customer (customer-level, not UBO)."
+    roles: [ComplianceOfficer]
+    code: 201
+    input: [list_type, matched_name, match_score]
+    output: ScreeningHit
+    side_effects: ["hit created disposition=PENDING; set is_derogatory by list_type; recompute customer.open_hit_count and edd_required"]
+
+  - method: GET
+    path: "/customers/{id}/screening-hits"
+    description: "List a customer's screening hits (reverse-reachability for ScreeningHit.customer_id)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["disposition?", "limit?", "offset?"]
+    output: ScreeningHit[]
+    side_effects: []
+
+  - method: GET
+    path: "/beneficial-owners/{id}"
+    description: "Fetch a beneficial owner by id (single-resource)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: []
+    output: BeneficialOwner
+    side_effects: []
+
+  - method: GET
+    path: "/beneficial-owners/{id}/screening-hits"
+    description: "List screening hits for a UBO (reverse-reachability for ScreeningHit.beneficial_owner_id)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ScreeningHit[]
+    side_effects: []
+
+  - method: POST
+    path: "/screening-hits/{id}/disposition"
+    description: "Disposition a hit: FALSE_POSITIVE | ESCALATE | CONFIRM (see ScreeningHit machine)."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: [decision]
+    output: ScreeningHit
+    side_effects:
+      - "FALSE_POSITIVE: terminal; recompute open_hit_count and edd_required"
+      - "ESCALATE: PENDING->ESCALATED"
+      - "CONFIRM: ESCALATED->CONFIRMED; set edd_required=true; if customer APPROVED cascade->EDD_REQUIRED; if UBO hit set UBO.screening_status=HIT"
+
+  - method: POST
+    path: "/screening-hits/{id}/reopen"
+    description: "Revert an ESCALATED hit back to PENDING."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: ScreeningHit
+    side_effects: ["disposition ESCALATED->PENDING"]
+
+  # ---- Accounts + transactions ----
+  - method: POST
+    path: "/customers/{id}/accounts"
+    description: "Open an account for a customer (PENDING_KYC / ACTIVE)."
+    roles: [ComplianceOfficer, PlatformAdmin]
+    code: 201
+    input: [account_ref, opening_balance_cents]
+    output: Account
+    side_effects: ["account created kyc_status=PENDING_KYC, monitoring_status=ACTIVE"]
+
+  - method: GET
+    path: "/customers/{id}/accounts"
+    description: "List a customer's accounts (reverse-reachability for Account.customer_id)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Account[]
+    side_effects: []
+
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Fetch an account by id."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Account
+    side_effects: []
+
+  - method: POST
+    path: "/accounts/{id}/transactions"
+    description: "Post a transaction; runs transaction_monitoring and may mint an Alert."
+    roles: [SystemFeed, ComplianceOfficer]
+    code: 201
+    input: [direction, amount_cents, posted_at, counterparty_country]
+    output: Transaction
+    side_effects:
+      - "update aggregate_cash_in_cents (with UTC-day reset) and cumulative_credited_cents"
+      - "set triggered_rule via transaction_monitoring"
+      - "if triggered_rule != null: mint Alert(rule_code=triggered_rule, status=OPEN, severity via alert_severity); set account.monitoring_status=UNDER_INVESTIGATION if ACTIVE"
+
+  - method: GET
+    path: "/accounts/{id}/transactions"
+    description: "List an account's transactions (reverse-reachability for Transaction.account_id)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Transaction[]
+    side_effects: []
+
+  - method: POST
+    path: "/accounts/{id}/freeze"
+    description: "Freeze an account UNDER_INVESTIGATION (monitoring dimension)."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["monitoring_status UNDER_INVESTIGATION->FROZEN"]
+
+  # ---- Alerts ----
+  - method: GET
+    path: "/accounts/{id}/alerts"
+    description: "List alerts for an account (reverse-reachability for Alert.account_id)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Alert[]
+    side_effects: []
+
+  - method: GET
+    path: "/alerts"
+    description: "List alerts; filter by account_id, customer_id, case_id, or status (reverse-reachability for Alert.customer_id and Alert.case_id)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["account_id?", "customer_id?", "case_id?", "status?", "limit?", "offset?"]
+    output: Alert[]
+    side_effects: []
+
+  - method: GET
+    path: "/alerts/{id}"
+    description: "Fetch an alert by id."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Alert
+    side_effects: []
+
+  # ---- Cases ----
+  - method: POST
+    path: "/cases"
+    description: "Open an investigation case in TRIAGE for a customer; records opened_by_user_id."
+    roles: [Analyst]
+    code: 201
+    input: [customer_id]
+    output: Case
+    side_effects: ["case created disposition=TRIAGE, opened_by_user_id=X-User-ID"]
+
+  - method: GET
+    path: "/cases/{id}"
+    description: "Fetch a case by id."
+    roles: [Analyst, ComplianceOfficer, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Case
+    side_effects: []
+
+  - method: GET
+    path: "/cases"
+    description: "List cases; filter by customer_id or disposition (reverse-reachability for Case.customer_id)."
+    roles: [Analyst, ComplianceOfficer, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["customer_id?", "disposition?", "limit?", "offset?"]
+    output: Case[]
+    side_effects: []
+
+  - method: POST
+    path: "/cases/{id}/alerts"
+    description: "Link an OPEN alert to the case; OCC-guarded; auto-advances TRIAGE->INVESTIGATING; recomputes priority."
+    roles: [Analyst]
+    code: 200
+    input: [alert_id, expected_case_version]
+    output: Case
+    side_effects:
+      - "set alert.status=LINKED, alert.case_id=case.id"
+      - "set case.disposition=INVESTIGATING (from TRIAGE); recompute linked_alert_count and priority (case_priority)"
+      - "set the alert's Account.monitoring_status=UNDER_INVESTIGATION if ACTIVE"
+      - "increments Case.version by 1"
+
+  - method: POST
+    path: "/cases/{id}/disposition"
+    description: "Disposition INVESTIGATING case: RECOMMEND_SAR | REQUIRE_CTR | CLOSE_NO_ACTION (fork)."
+    roles: [Analyst, ComplianceOfficer]
+    code: 200
+    input: [decision]
+    output: Case
+    side_effects:
+      - "RECOMMEND_SAR: disposition=SAR_RECOMMENDED"
+      - "REQUIRE_CTR: disposition=CTR_REQUIRED (requires a LINKED CTR_THRESHOLD alert)"
+      - "CLOSE_NO_ACTION: disposition=CLOSED_NO_ACTION; dismiss LINKED alerts; revert account monitoring_status to ACTIVE (ComplianceOfficer only)"
+
+  - method: GET
+    path: "/cases/{id}/alerts"
+    description: "List alerts linked to a case (reverse-reachability path form for Alert.case_id)."
+    roles: [Analyst, ComplianceOfficer, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Alert[]
+    side_effects: []
+
+  # ---- Filings ----
+  - method: POST
+    path: "/cases/{id}/filings"
+    description: "Create a SAR or CTR Filing for a case in the matching disposition; computes deadline_at."
+    roles: [Analyst]
+    code: 201
+    input: [filing_type]
+    output: Filing
+    side_effects: ["filing created status=DRAFT, prepared_by_user_id=X-User-ID, deadline_at via filing_deadline"]
+
+  - method: GET
+    path: "/cases/{id}/filings"
+    description: "List a case's filings (reverse-reachability for Filing.case_id)."
+    roles: [Analyst, ComplianceOfficer, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Filing[]
+    side_effects: []
+
+  - method: GET
+    path: "/filings/{id}"
+    description: "Fetch a filing by id."
+    roles: [Analyst, ComplianceOfficer, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Filing
+    side_effects: []
+
+  - method: POST
+    path: "/filings/{id}/approve"
+    description: "QualityReviewer approves a DRAFT filing; sets approved_by_user_id; enforces 4-eyes."
+    roles: [QualityReviewer]
+    code: 200
+    input: []
+    output: Filing
+    side_effects: ["set approved_by_user_id=X-User-ID (must differ from prepared_by_user_id)"]
+
+  - method: POST
+    path: "/filings/{id}/submit"
+    description: "Submit an approved DRAFT filing to FinCEN (DRAFT->SUBMITTED)."
+    roles: [QualityReviewer]
+    code: 200
+    input: []
+    output: Filing
+    side_effects: ["status DRAFT->SUBMITTED (requires approved_by_user_id set and != prepared_by_user_id)"]
+
+  - method: POST
+    path: "/filings/{id}/acknowledge"
+    description: "Record FinCEN acknowledgement: ACCEPT (->ACCEPTED, drives Case->FILED) or REJECT (->REJECTED)."
+    roles: [SystemFeed]
+    code: 200
+    input: ["decision", "acknowledgement_code?"]
+    output: Filing
+    side_effects:
+      - "ACCEPT: status SUBMITTED->ACCEPTED, set acknowledgement_code, bubble Case->FILED"
+      - "REJECT: status SUBMITTED->REJECTED"
+
+  - method: POST
+    path: "/filings/{id}/revise"
+    description: "Revert a REJECTED filing to DRAFT for correction (clears approved_by_user_id)."
+    roles: [Analyst]
+    code: 200
+    input: []
+    output: Filing
+    side_effects: ["status REJECTED->DRAFT; approved_by_user_id cleared"]
+
+  # ---- Lookback review ----
+  - method: POST
+    path: "/lookback-reviews"
+    description: "Plan a lookback re-screening review over a time window."
+    roles: [ComplianceOfficer]
+    code: 201
+    input: [reason, window_start, window_end]
+    output: LookbackReview
+    side_effects: ["review created status=PLANNED"]
+
+  - method: GET
+    path: "/lookback-reviews/{id}"
+    description: "Fetch a lookback review (with derived counts)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: []
+    output: LookbackReview
+    side_effects: []
+
+  - method: POST
+    path: "/lookback-reviews/{id}/enqueue"
+    description: "Materialize one LookbackReviewItem per in-window account; PLANNED->IN_PROGRESS."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: LookbackReview
+    side_effects: ["create QUEUED items per in-window account; set total_items; status->IN_PROGRESS if total_items>0"]
+
+  - method: POST
+    path: "/lookback-reviews/{id}/cancel"
+    description: "Cancel a PLANNED lookback review."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: LookbackReview
+    side_effects: ["status PLANNED->CANCELLED"]
+
+  - method: GET
+    path: "/lookback-reviews/{id}/items"
+    description: "List a review's items (reverse-reachability for LookbackReviewItem.lookback_review_id)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["item_status?", "limit?", "offset?"]
+    output: LookbackReviewItem[]
+    side_effects: []
+
+  - method: GET
+    path: "/lookback-items/{id}"
+    description: "Fetch a lookback review item by id (single-resource)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: []
+    output: LookbackReviewItem
+    side_effects: []
+
+  - method: GET
+    path: "/lookback-items"
+    description: "List lookback items; filter by account_id or generated_alert_id (reverse-reachability for LookbackReviewItem.account_id and generated_alert_id)."
+    roles: [ComplianceOfficer, Analyst, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["account_id?", "generated_alert_id?", "limit?", "offset?"]
+    output: LookbackReviewItem[]
+    side_effects: []
+
+  - method: POST
+    path: "/lookback-items/{id}/disposition"
+    description: "Disposition a QUEUED item: CLEAR or ESCALATE (mints an Alert on ESCALATE); bubbles parent to COMPLETED."
+    roles: [Analyst]
+    code: 200
+    input: [decision]
+    output: LookbackReviewItem
+    side_effects:
+      - "CLEAR: item_status=CLEARED; increment parent cleared_items"
+      - "ESCALATE: item_status=ESCALATED; mint Alert(rule_code=HIGH_RISK_GEO, OPEN) for item.account_id, set generated_alert_id, set account UNDER_INVESTIGATION; increment parent escalated_items"
+      - "if all items terminal: bubble parent IN_PROGRESS->COMPLETED"
+
+  # ---- Audit + test-driving ----
+  - method: GET
+    path: "/audit-events"
+    description: "List audit events; filter by entity_type/entity_id (reverse-reachability for AuditEvent.entity_id)."
+    roles: [ComplianceOfficer, QualityReviewer, PlatformAdmin]
+    code: 200
+    input: ["entity_type?", "entity_id?", "limit?", "offset?"]
+    output: AuditEvent[]
+    side_effects: []
+
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving: set the server's current UTC clock (for deadline / review-cadence assertions)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server current-time anchor set to to_iso8601"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID header."
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Authenticated role not permitted for this operation."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced path or FK resource does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Malformed body: missing required field, invalid enum, out-of-range numeric, wrong type."
+  - id: ERR_TYPE_FIELD_MISMATCH
+    http: 422
+    condition: "customer_type-conditional field constraint violated (DOB vs incorporation_date)."
+  - id: ERR_DUPLICATE_ACCOUNT_REF
+    http: 409
+    condition: "account_ref already used by another account."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not defined from the resource's current state."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "OCC expected_<parent>_version does not match the parent's current version."
+  - id: ERR_OPEN_HITS_BLOCK_CLEARANCE
+    http: 409
+    condition: "clear-screening attempted while open_hit_count>0 or risk_rating==PROHIBITED."
+  - id: ERR_HIT_NOT_CONFIRMABLE
+    http: 409
+    condition: "CONFIRM attempted on a non-derogatory hit or match_score<CONFIRM_FLOOR."
+  - id: ERR_SEGREGATION_VIOLATION
+    http: 409
+    condition: "Filing approver equals preparer (4-eyes violated)."
+  - id: ERR_FILING_TYPE_MISMATCH
+    http: 409
+    condition: "Filing type does not match the case's disposition (SAR vs CTR)."
+  - id: ERR_NO_CTR_ALERT
+    http: 409
+    condition: "REQUIRE_CTR without a LINKED CTR_THRESHOLD alert on the case."
+  - id: ERR_ALERT_ALREADY_LINKED
+    http: 409
+    condition: "Linking an alert already in status LINKED."
+  - id: ERR_ALERT_CUSTOMER_MISMATCH
+    http: 409
+    condition: "Alert customer_id does not equal case customer_id on link."
+  - id: ERR_INVALID_WINDOW
+    http: 422
+    condition: "LookbackReview window_end not strictly after window_start."
+  - id: ERR_UBO_ON_INDIVIDUAL
+    http: 409
+    condition: "Beneficial owner added to an INDIVIDUAL customer."
+  - id: ERR_OWNERSHIP_EXCEEDS_100
+    http: 409
+    condition: "Aggregate UBO ownership_pct would exceed 100.00."
+  - id: ERR_ACCOUNT_NOT_TRANSACTABLE
+    http: 409
+    condition: "Transaction posted to a KYC_BLOCKED or FROZEN account."
+  - id: ERR_NOT_APPROVABLE
+    http: 409
+    condition: "Filing approve/submit attempted from a status other than DRAFT, or with approved_by unset on submit."
+  - id: ERR_REVIEW_EMPTY
+    http: 409
+    condition: "enqueue produced zero in-window accounts (review stays PLANNED)."
+  - id: ERR_ITEM_NOT_QUEUED
+    http: 409
+    condition: "Lookback item disposition attempted on an item not in QUEUED, or parent not IN_PROGRESS."
+  - id: ERR_INVALID_DECISION
+    http: 422
+    condition: "decision value not in the allowed set for the disposition endpoint."
+  - id: ERR_NO_UNAPPLIED_ASSESSMENT
+    http: 409
+    condition: "apply-rating with no matching unapplied RiskAssessment for the customer."
+  - id: ERR_PAGINATION_INVALID
+    http: 422
+    condition: "limit/offset out of allowed bounds (limit 1..100, offset>=0)."
+  - id: ERR_ACCOUNT_BLOCKED_FOR_CASE
+    http: 409
+    condition: "Linking an alert whose account is already FROZEN to a new case (no further investigation possible)."
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: ComplianceOfficer
+    description: "Owns CDD lifecycle, screening dispositions, account freezes, lookback planning."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /customers/{id}/risk-assessments"
+      - "POST /customers/{id}/apply-rating"
+      - "POST /customers/{id}/clear-screening"
+      - "POST /customers/{id}/approve"
+      - "POST /customers/{id}/complete-edd"
+      - "POST /customers/{id}/offboard"
+      - "POST /customers/{id}/beneficial-owners"
+      - "POST /beneficial-owners/{id}/screen"
+      - "POST /customers/{id}/screening-hits"
+      - "POST /screening-hits/{id}/disposition"
+      - "POST /screening-hits/{id}/reopen"
+      - "POST /accounts/{id}/freeze"
+      - "POST /lookback-reviews"
+      - "POST /lookback-reviews/{id}/enqueue"
+      - "POST /lookback-reviews/{id}/cancel"
+    shared_operations:
+      - "POST /customers"
+      - "POST /customers/{id}/accounts"
+      - "POST /accounts/{id}/transactions"
+      - "POST /cases/{id}/disposition (CLOSE_NO_ACTION override)"
+      - "GET endpoints (reads)"
+
+  - name: Analyst
+    description: "Investigates alerts/cases, links alerts, recommends dispositions, prepares filings. Cannot self-approve filings (4-eyes)."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /cases"
+      - "POST /cases/{id}/alerts"
+      - "POST /cases/{id}/filings"
+      - "POST /filings/{id}/revise"
+      - "POST /lookback-items/{id}/disposition"
+    shared_operations:
+      - "POST /cases/{id}/disposition (RECOMMEND_SAR / REQUIRE_CTR)"
+      - "GET endpoints (reads)"
+
+  - name: QualityReviewer
+    description: "Second pair of eyes: approves and submits filings. Must differ from the filing's preparer."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /filings/{id}/approve"
+      - "POST /filings/{id}/submit"
+    shared_operations:
+      - "GET endpoints (reads)"
+
+  - name: SystemFeed
+    description: "Ingestion/integration role: posts transactions and records FinCEN acknowledgements."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /filings/{id}/acknowledge"
+    shared_operations:
+      - "POST /accounts/{id}/transactions"
+
+  - name: PlatformAdmin
+    description: "Operational superuser: creates customers/accounts, reads everything, drives the test clock."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /customers"
+      - "POST /customers/{id}/accounts"
+      - "GET endpoints (reads)"

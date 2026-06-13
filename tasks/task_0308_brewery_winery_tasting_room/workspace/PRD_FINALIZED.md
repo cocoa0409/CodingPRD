@@ -1,0 +1,294 @@
+# Brewery / Winery Tasting Room & Club API — Product Requirements Document
+
+## 1. Introduction
+
+This document specifies the requirements for an integrated operations platform serving a bonded winery or brewery that runs a tasting room, a direct-to-consumer club, and a self-distribution wholesale channel under a single roof. The premises is a regulated entity: every gallon that leaves bulk storage in a taxpaid form accrues federal excise, every bottle shipped to a consumer is bound by the destination state's volume limits and a minimum-age gate, and every taxable removal must be recorded in an append-only compliance ledger that can be reconstructed for a TTB audit. The platform must keep production accounting (untaxpaid bulk gallons, taxpaid removals, excise owed), finished-goods inventory (on-hand, allocated, and freely sellable bottles), and club liabilities (loyalty point balances) continuously reconciled as operators across five distinct job functions act on the same shared inventory.
+
+The business problem this system solves is that these concerns are deeply coupled but are operated by people who do not see each other's screens. A cellar manager bottling a finished SKU is simultaneously generating an excise liability on the premises and minting the inventory a club manager will later allocate and ship. A tasting-room cashier selling a bottle is drawing down that same inventory and minting loyalty points the club owes back. A compliance officer suspending the premises must instantly halt every taxable removal anyone else is about to perform. The API is therefore organized around precise, immediate consistency: a write that touches one entity cascades deterministically to every balance it affects, and concurrent writers are protected from acting on stale views of shared inventory and premises state through explicit version checks. The remainder of this document defines the global contracts that every endpoint honors (Section 2) and the business workflows that connect production, the tasting room, the club, reservations, and self-distribution (Section 3), followed by the endpoint and error catalogues (Sections 4 and 5).
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the system-wide rules, envelopes, and cross-cutting principles that apply uniformly across every endpoint.
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the API must be authenticated with two mandatory HTTP headers. The `X-User-ID` header identifies the acting user, and the `X-User-Role` header declares the operational capacity under which they are acting. If either header is missing or malformed, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). When the headers are well-formed but the declared role is not permitted to perform the requested operation per the authorization matrix in Section 4, the request is rejected with `ERR_FORBIDDEN` (HTTP 403).
+
+The system recognizes exactly five roles, spelled precisely as follows: `ComplianceOfficer`, `CellarManager`, `ClubManager`, `TastingRoomStaff`, and `Member`. The four staff roles partition the write surface by job function. A `ComplianceOfficer` owns TTB and production accounting, the premises lifecycle, the compliance ledger, and the self-distribution channel; it cannot run club or point-of-sale write operations. A `CellarManager` owns production batches, bottling runs, products, and allocation releases. A `ClubManager` owns members, memberships, billing, and club shipments. A `TastingRoomStaff` operator owns tasting-room point-of-sale orders and table or event reservations.
+
+The first four roles — `ComplianceOfficer`, `CellarManager`, `ClubManager`, and `TastingRoomStaff` — carry an opaque identity: when `X-User-Role` is any of these, `X-User-ID` is an operator identifier not tied to any persisted entity. The server may record such an identifier on a ledger entry's `note` or treat it purely as an audit token, but it never compares it to any entity's `id`. The fifth role is different. When `X-User-Role` is `Member`, `X-User-ID` is the `id` of the acting `Member` entity; the member self-serves its own account, reading only its own member record, its own memberships, and its own shipments. Ownership checks on any resource that references a `Member` compare the resource's `member_id` (directly, or by way of the membership that owns a shipment) to `X-User-ID`. A `Member` who attempts to read a member record, membership, or shipment it does not own is rejected with `ERR_NOT_RESOURCE_OWNER` (HTTP 403).
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+List endpoints are paginated through two query parameters. The `limit` parameter caps the number of items returned; it defaults to 10 when omitted, with a minimum of 1 and a maximum of 100. The `offset` parameter is the number of items to skip and defaults to 0.
+
+Unless an endpoint states otherwise, all list responses are sorted by the resource's creation timestamp in ascending order. Every list response carries the pagination fields `limit`, `offset`, `total_count`, and `has_more` inside the `meta` object of the envelope.
+
+### 2.4. Common Resource Properties and Versioning
+
+Every primary resource — wineries, production batches, products, allocation releases, members, memberships, shipments, tasting orders, reservations, and distribution orders — carries a system-managed `id` formatted as a UUID with no type prefix, a `created_at` timestamp, an `updated_at` timestamp, and an integer `version`. Both timestamps are ISO 8601 in UTC with three fractional digits. The `version` field begins at 1 on creation and increments by one on every mutation of the resource; `updated_at` is refreshed on every such mutation while `created_at` is fixed at creation.
+
+The compliance ledger entry is the sole exception. A `ComplianceLedgerEntry` is an immutable audit event: it carries only an `id` and a `created_at`. It has no `updated_at` and no `version`, because once booked it is never modified. Any statement elsewhere in this document about version increments or `updated_at` refreshes does not apply to ledger entries.
+
+Derived and computed fields participate in versioning exactly as input fields do. When a side effect recomputes a winery's `bulk_volume_gallons`, `excise_tax_owed_cents`, or `loyalty_point_liability`, or adjusts a product's `on_hand_bottles`, `allocated_bottles`, or `free_bottles`, that recomputation is a mutation of the owning resource: its `updated_at` advances and its `version` increments by one, except where a transition's specification explicitly states a different number of version increments.
+
+### 2.5. Hierarchical Consistency and Cascading Side Effects
+
+Many operations mutate more than one resource in a single, immediate, all-or-nothing step, and the system keeps every affected balance reconciled before the response is returned. The canonical example is a bottling run, which removes bulk from a batch, mints finished bottles onto a product, and accrues excise on the premises in one depth-three cascade (detailed in Section 3). Whenever such a cascade fires, each touched resource is independently mutated — its derived fields recomputed, its `updated_at` refreshed, and its `version` incremented per the rule in Section 2.4.
+
+Cascades also propagate down ownership chains when a parent is taken out of service. Suspending a member pauses that member's active memberships, and pausing each membership cancels that membership's scheduled shipments, and each cancelled shipment in turn frees the bottles it had reserved on its allocation release. The system performs every hop of such a chain automatically, without requiring the client to issue a separate request against each child. Compensating cascades — restoring inventory on a refund, freeing a reservation on a cancellation, forfeiting loyalty points on a membership cancellation — are applied with equal rigor so that no balance drifts from its true value.
+
+### 2.6. Nested Path Validation and Foreign-Key Scoping
+
+All collections are top-level; relationships between resources are expressed through foreign-key fields in request bodies rather than through nested URLs. When a request carries a path identifier (for example a batch, product, release, member, membership, shipment, order, reservation, distribution order, or ledger entry id), the system validates each path-referenced resource for existence; a path that names a resource that does not exist is rejected with `ERR_NOT_FOUND` (HTTP 404), and where a path contains more than one identifier they are validated left to right with the first missing identifier determining the error.
+
+Creation endpoints that carry body foreign keys — `winery_id`, `source_batch_id`, `product_id`, `release_id`, `member_id`, `membership_id` — must resolve every such reference, and every referenced resource must belong to the same winery as the resource being created. A body foreign key that does not resolve, or that resolves to a resource owned by a different winery, is rejected with `ERR_FK_NOT_FOUND` (HTTP 404).
+
+### 2.7. Monetary, Volume, and Rounding Precision
+
+All monetary amounts in this system are stored and returned as integer cents; there are no fractional-cent values in any response. Volumes in gallons and case counts are carried at full precision through intermediate calculations and are only converted to integer cents at the final monetary step. The mandated rounding method for every monetary conversion is round half up: a value exactly at the midpoint rounds away from zero to the next whole cent. Where a calculation in Section 3 specifies a particular point at which rounding occurs (for example, rounding each order line before summation, or rounding a discount once after the effective percentage is fully resolved), that pinned rounding order is part of the contract and must be honored exactly, because rounding at a different step can shift a result by whole cents.
+
+### 2.8. Compliance Gating and Premises Suspension
+
+The premises itself is a gate on all taxable removals. While a winery's `status` is `ACTIVE`, removals proceed; while it is `SUSPENDED`, every taxable removal is blocked — specifically bottling runs, shipment releases, and distribution shipments. An attempt to perform any of these three operations while the owning winery is `SUSPENDED` is rejected with `ERR_WINERY_SUSPENDED` (HTTP 409); for a shipment release the suspended premises instead diverts the shipment to a held state, as described in Section 3.
+
+Age and destination-state limits are first-class compliance gates as well. The minimum age for any age-restricted operation is 21 years, evaluated against the current server clock from the subject's date of birth. State direct-to-consumer shipping is bounded by a rolling case limit per destination state. These gates are described in business context in Section 3; the present subsection establishes only that compliance checks take precedence over inventory and fiscal checks in evaluation order, so that a compliance failure surfaces as a compliance error rather than being masked by a downstream inventory or budget condition.
+
+### 2.9. Validation Ordering
+
+When several conditions could reject a single request, they are evaluated in a fixed priority order, and the first condition that fails determines the error returned. The order is: authentication of the headers (`ERR_UNAUTHENTICATED`) first; then role authorization (`ERR_FORBIDDEN`); then, for a `Member` acting on its own resources, the self-ownership check (`ERR_NOT_RESOURCE_OWNER`); then existence of every path-referenced resource (`ERR_NOT_FOUND`); then resolution and winery-scoping of body foreign keys (`ERR_FK_NOT_FOUND`); then, for a transition, whether the target resource is in a state that permits the requested transition (`ERR_INVALID_STATE`); then the optimistic-concurrency version check on version-guarded writes (the stale-version errors of Section 2.10); then the business-safety gates in the order age (`ERR_AGE_RESTRICTION`), state shipping limit (`ERR_STATE_SHIPPING_LIMIT`), premises suspension (`ERR_WINERY_SUSPENDED`); then the business constraints and temporal checks — per-member allocation cap (`ERR_PER_MEMBER_CAP_EXCEEDED`), release window (`ERR_RELEASE_WINDOW_CLOSED`), reservation overlap (`ERR_TABLE_DOUBLE_BOOKED`), billing currency (`ERR_BILLING_PAST_DUE`); then the fiscal sufficiency checks — inventory and bulk sufficiency (`ERR_INSUFFICIENT_INVENTORY`, `ERR_INSUFFICIENT_BULK`) and loyalty-point sufficiency (`ERR_INSUFFICIENT_POINTS`); and finally, lowest priority, field-level request validity (`ERR_INVALID_REQUEST`). This ordering guarantees that, for example, a request a role may not perform never leaks the existence of a resource, and that a compliance hold is never masked by a later inventory check.
+
+### 2.10. Optimistic Concurrency Control
+
+Three operations are guarded against lost updates by an explicit version check, because each draws on a shared parent whose state a client may have observed before another writer advanced it. In each case the request must carry a non-optional version field naming the client's last observed `version` of the parent; if that value no longer matches the parent's current `version`, the write is rejected. Endpoints not enumerated here take no version field.
+
+First, a premises suspend or reinstate must carry `expected_winery_version` matching the target winery's current `version`. If an intervening suspension or reinstatement has already advanced the winery's version since the client last read it, the request is rejected with `ERR_STALE_WINERY_VERSION` (HTTP 412), because the client's view of premises status is stale.
+
+Second, an allocation-release lifecycle transition must carry `expected_release_version` matching the target release's current `version`. If an intervening transition has already advanced the release version, the request is rejected with `ERR_STALE_RELEASE_VERSION` (HTTP 412).
+
+Third, opening an allocation release additionally draws free bottles from the parent product, so it must also carry `expected_product_version` matching that product's current `version`. A client that read the product before a sibling release was opened against it holds a stale view of the product's free inventory; if `expected_product_version` no longer matches the product's current `version` — which the prior open advanced — the open is rejected with `ERR_STALE_PRODUCT_VERSION` (HTTP 412). The same `ERR_STALE_PRODUCT_VERSION` (HTTP 412) likewise rejects a product activate or discontinue whose `expected_product_version` does not match the product's current `version`.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Founding the Premises and Production Accounting
+
+Everything in the system hangs off a bonded **Winery**, the TTB accounting root, created by a `ComplianceOfficer` with a legal or trade `name`, a `ttb_permit_number` (unique across all wineries), and a two-letter `home_state_code` for the state in which the premises is licensed. A new winery starts with `status` `ACTIVE` and all of its accounting balances at zero: `bulk_volume_gallons` (untaxpaid bulk gallons on hand), `bottled_taxpaid_volume_gallons` (cumulative taxpaid gallons removed via bottling), `excise_tax_owed_cents` (cumulative excise accrued, in cents), and `loyalty_point_liability` (the sum of unredeemed loyalty points across all of this winery's memberships).
+
+The winery's `bulk_volume_gallons` is always the sum, over every batch of this winery whose status is `FERMENTING`, `AGING`, or `BOTTLING`, of that batch's gallons charged in less its losses less its bottled removals — that is, the sum of each non-terminal batch's available bulk. Terminal batches (`CLOSED` and `DUMPED`) contribute nothing. The `loyalty_point_liability` is the sum of `loyalty_points` over all of this winery's memberships, recomputed whenever any membership's point balance changes.
+
+A `ComplianceOfficer` can take the premises out of service and bring it back. Every lifecycle transition in the system is driven by a single transition endpoint per resource whose request body carries an `action` naming the specific transition to perform (here, suspend or reinstate). Suspending the premises transitions the winery `ACTIVE → SUSPENDED`; reinstating transitions it `SUSPENDED → ACTIVE`. Each of these two transitions requires that the winery currently be in the originating state and that `expected_winery_version` match the winery's current `version`; a mismatch is rejected with `ERR_STALE_WINERY_VERSION`. Each successful transition increments the winery's `version` by one. While `SUSPENDED`, the premises blocks every taxable removal, as Section 2.8 establishes.
+
+### 3.2. The Production Batch Lifecycle and Bulk Accounting
+
+A **ProductionBatch** is the TTB production record. A `CellarManager` (or a `ComplianceOfficer`) creates one against a `winery_id`, with a `lot_code` unique within that winery, a `beverage_class` of `WINE`, `BEER`, or `CIDER` that selects the excise rate class, the `volume_in_gallons` charged into the batch at start, and the `abv_percent` (alcohol by volume) that drives the excise tier for wine. A new batch begins `FERMENTING`; its `loss_gallons` (cumulative fermentation and racking loss, never less than zero and never more than `volume_in_gallons`) and `bottled_volume_gallons` (gallons removed via bottling) both start at zero, and its `available_bulk_gallons` — defined at all times as `volume_in_gallons` minus `loss_gallons` minus `bottled_volume_gallons`, and never negative — starts equal to the volume charged in.
+
+A batch advances through a branching lifecycle. From `FERMENTING` it can begin aging, transitioning `FERMENTING → AGING`, which is permitted only while the batch is `FERMENTING` and its `available_bulk_gallons` is greater than zero; this records no removal but causes the winery's `bulk_volume_gallons` to be recomputed. Alternatively, from `FERMENTING` the batch can be dumped, transitioning `FERMENTING → DUMPED`, a terminal branch sibling of begin-aging. Dumping is permitted only while the batch is `FERMENTING` and only if no product whose `source_batch_id` is this batch still has any bottles on hand; if some sourced product still has `on_hand_bottles` greater than zero, the dump is rejected with `ERR_BATCH_HAS_INVENTORY`. A dump sets `loss_gallons` to the full `volume_in_gallons`, driving `available_bulk_gallons` to zero, and recomputes the winery's `bulk_volume_gallons` (this batch now contributing zero). A dump books no excise, because the lost bulk was never taxpaid.
+
+From `AGING` a `CellarManager` opens bottling, transitioning `AGING → BOTTLING`, permitted only while the batch is `AGING` and `available_bulk_gallons` is greater than zero. The `BOTTLING` state is where finished inventory is minted, through repeated bottling runs described in Section 3.3; the state machine models each bottling run as a self-loop that keeps the batch in `BOTTLING`. Finally, from `BOTTLING` the manager closes the batch, transitioning `BOTTLING → CLOSED`, permitted while the batch is `BOTTLING`. Closing books any remaining `available_bulk_gallons` into `loss_gallons`, driving `available_bulk_gallons` to zero, and recomputes the winery's `bulk_volume_gallons`. `CLOSED` and `DUMPED` are the two terminal states.
+
+### 3.3. Bottling: The Taxable Removal Cascade
+
+Bottling is the heart of production accounting and the system's deepest cascade. A `CellarManager` performs a bottling run against a batch by supplying the `product_id` of the SKU being filled and the count of `requested_bottles` to fill. A run is permitted only when the batch is in `BOTTLING`, the owning winery is `ACTIVE` (otherwise `ERR_WINERY_SUSPENDED`), the referenced product's `source_batch_id` equals this batch's id and the product is not `DISCONTINUED`, and the bulk this run would remove does not exceed the batch's `available_bulk_gallons` (otherwise `ERR_INSUFFICIENT_BULK`).
+
+The gallons removed by a run are computed from the bottle count and the product's fill volume: the removal in gallons equals `requested_bottles` multiplied by the product's `bottle_volume_ml` divided by 1000 to convert milliliters to liters, then divided by 3.78541 liters per gallon. This removal figure is carried at full precision.
+
+A successful run then cascades in three hops, all immediate. In the first hop the run adds its removal gallons to the batch's `bottled_volume_gallons` and recomputes the batch's `available_bulk_gallons`. In the second hop the run mints finished inventory: the product's `on_hand_bottles` increases by `requested_bottles`. In the third hop the premises books the tax: the winery's `bottled_taxpaid_volume_gallons` increases by the removal gallons, and the winery's `excise_tax_owed_cents` increases by the excise this run accrues. The winery's `bulk_volume_gallons` is likewise recomputed as the running sum over non-terminal batches. Two compliance ledger entries are appended for the run: one of `entry_type` `BOTTLING_REMOVAL` and one of `entry_type` `EXCISE_ACCRUAL`, each scoped to the winery with a `subject_type` of `PRODUCTION_BATCH` and a `subject_id` identifying the batch, recording the `volume_gallons` removed and the `excise_cents` accrued together with a human-readable `note`.
+
+The excise accrued on a run depends on the batch's beverage class, and only on the gallons removed in this single run — never on the whole batch. For a `WINE` batch the rate is keyed on alcohol by volume: when the batch's `abv_percent` is at most 14.0, the rate is 107 cents per gallon; when the `abv_percent` is strictly greater than 14.0, the rate is 157 cents per gallon. The wine excise in cents is the removal gallons multiplied by the selected per-gallon rate, rounded half up to a whole number of cents. For a `BEER` batch the gallons are first converted to barrels by dividing the removal gallons by 31.0 gallons per barrel, and the excise in cents is that barrel count multiplied by 1800 cents per barrel, rounded half up to whole cents; beer ignores ABV entirely. For a `CIDER` batch the excise is a flat 23 cents per gallon — the removal gallons multiplied by 23, rounded half up to whole cents — and is likewise not keyed on ABV. In every class the gallons are held at full precision and rounding to whole cents happens exactly once, at the final multiply.
+
+### 3.4. Finished Products and Inventory
+
+A **Product** is a finished SKU or vintage with its own inventory, created by a `CellarManager` against a `winery_id` and a `source_batch_id` naming the batch it is bottled from, with a `sku` unique within the winery, a `vintage_year`, a per-bottle fill volume `bottle_volume_ml` (for example 750), a tasting-room `list_price_cents`, and an `is_age_restricted` flag that defaults to true and gates the age checks at point of sale and shipment. A new product is born `DRAFT` with `on_hand_bottles`, `allocated_bottles`, and `free_bottles` all zero and `version` 1.
+
+A product's inventory is tracked through three reconciled quantities. `on_hand_bottles` is the count physically in inventory — minted by bottling runs and removed by shipment release, point-of-sale sale, and distribution shipment. `allocated_bottles` is the count tied up in open allocation releases (both reserved and committed) that have not yet shipped out. `free_bottles` is always `on_hand_bottles` minus `allocated_bottles` — the bottles sellable outside any allocation. These derived quantities are kept reconciled on every inventory event.
+
+A product moves through a linear, version-guarded lifecycle. A `CellarManager` activates a product, transitioning `DRAFT → ACTIVE`, which is permitted only while the product is `DRAFT`, only if its source batch is in `BOTTLING` or `CLOSED`, and only if `expected_product_version` matches the product's current `version` (otherwise `ERR_STALE_PRODUCT_VERSION`); the activation increments the product's `version` by one. Later the manager can discontinue a product, transitioning `ACTIVE → DISCONTINUED`, permitted only while the product is `ACTIVE`, only if this product has no allocation release currently in `OPEN` status, and only if `expected_product_version` matches the product's current `version` (otherwise `ERR_STALE_PRODUCT_VERSION`); the discontinuation also increments the product's `version` by one. A product must be `ACTIVE` to be sold at point of sale, shipped to a club member, or self-distributed. `DISCONTINUED` is terminal.
+
+### 3.5. Allocation Releases: Reserving Finite Inventory
+
+An **AllocationRelease** is a finite club or library release window carved out of a product's inventory, created by a `CellarManager` against a `winery_id` and the `product_id` it releases, with a `pool_bottles` total set aside, a `per_member_cap` limiting how many bottles any single membership may claim from it, and two UTC instants `opens_at` and `closes_at` bounding the claim window. A new release is `DRAFT` with `reserved_bottles`, `committed_bottles`, and `available_bottles` all zero and `version` 1. Across its life, `reserved_bottles` counts bottles held by scheduled or held shipments drawing on the release, `committed_bottles` counts bottles locked in by released or delivered shipments, and `available_bottles` is always `pool_bottles` minus `reserved_bottles` minus `committed_bottles`, never negative.
+
+A release is opened and closed by a `CellarManager` through a version-guarded transition. Opening transitions the release `DRAFT → OPEN` and is permitted only while the release is `DRAFT`, only while the product is `ACTIVE`, and only if the product's `free_bottles` is at least the `pool_bottles` being set aside (otherwise `ERR_INSUFFICIENT_INVENTORY`); it also requires both `expected_release_version` to match the release's current `version` (otherwise `ERR_STALE_RELEASE_VERSION`) and `expected_product_version` to match the product's current `version` (otherwise `ERR_STALE_PRODUCT_VERSION`). On open, the product's `allocated_bottles` increases by `pool_bottles` and its `free_bottles` is recomputed — the cascade by which an open release reserves inventory out of the product's free pool — the release's `available_bottles` is initialized to `pool_bottles`, the release's `version` increments by one, and the product's `version` increments by one.
+
+Closing transitions the release `OPEN → CLOSED` and is permitted only while the release is `OPEN` and only if `expected_release_version` matches the release's current `version` (otherwise `ERR_STALE_RELEASE_VERSION`). On close, any residual `available_bottles` is freed back to the product — the product's `allocated_bottles` decreases by that residual `available_bottles` — and the release's `available_bottles` is set to zero, while bottles already committed or reserved on in-flight shipments remain tracked; the release's `version` increments by one. `CLOSED` is terminal. The reason opening additionally checks `expected_product_version` is precisely that two managers opening sibling releases against the same product race on its free inventory: whoever opens first advances the product's `version`, so a second open carrying the now-stale `expected_product_version` is rejected with `ERR_STALE_PRODUCT_VERSION` (HTTP 412) before it can over-allocate inventory it never truly observed as free.
+
+### 3.6. Members and Club Memberships
+
+A **Member** is a club member of record, created by a `ClubManager` against a `winery_id`, with a `full_name`, an `email` unique within the winery, a `date_of_birth` (UTC midnight) that drives the 21-year age gate, and a `ship_to_state_code` naming the two-letter destination state for that member's club shipments. A member begins as a `PROSPECT`. A `ClubManager` activates the member, transitioning `PROSPECT → ACTIVE`, permitted only while the member is `PROSPECT` and only if the member is at least 21 years old at the current clock, computed from `date_of_birth`; an underage member is rejected with `ERR_AGE_RESTRICTION`. A member must be `ACTIVE` to enroll a membership.
+
+A `ClubManager` may suspend an active member, transitioning `ACTIVE → SUSPENDED`, and later reinstate one, transitioning `SUSPENDED → ACTIVE`. Suspending a member fires a cascade: in the first hop every membership of this member whose status is `ACTIVE` is paused (`ACTIVE → PAUSED`), and in the second hop each such paused membership's `SCHEDULED` shipments are cancelled, and each of those cancellations frees the bottles it had reserved on its allocation release. The manager can also close a member, transitioning the member to `CLOSED`, permitted only while the member is `ACTIVE` or `SUSPENDED` and only if no membership of this member is still `ACTIVE`. `CLOSED` is terminal.
+
+A **Membership** is a club enrollment with billing and loyalty, created by a `ClubManager` against a `member_id` and `winery_id`, with a `tier` of `SILVER`, `GOLD`, or `PLATINUM` that drives both the club discount and the loyalty multiplier, a `cadence_months` recurring-shipment cadence (for example 3 for quarterly), and a `bottles_per_shipment` target count. A new membership starts `ENROLLED` with its `billing_status` `CURRENT`, its `loyalty_points` (unredeemed balance) at zero, and its `lifetime_bottles_shipped` at zero. The `billing_status` is a dimension parallel to the membership's `status`, taking the values `CURRENT` or `PAST_DUE`; a `ClubManager` sets it directly, and a `PAST_DUE` membership cannot have a shipment released.
+
+A membership moves through a branching lifecycle driven by a `ClubManager`. It is activated, transitioning `ENROLLED → ACTIVE`, permitted only while the membership is `ENROLLED` and only while the owning member is `ACTIVE`; a membership must be `ACTIVE` to schedule shipments. It is paused, transitioning `ACTIVE → PAUSED`; pausing cancels every `SCHEDULED` shipment of the membership, each cancellation freeing the bottles it reserved on its release. It is resumed, transitioning `PAUSED → ACTIVE`, permitted only while the membership is `PAUSED` and only while the member is `ACTIVE`. It is cancelled, transitioning to `CANCELLED`: a cancel from the active state is permitted while the membership is `ACTIVE`, `PAUSED`, or `ENROLLED`, and a cancel from the paused state is permitted while the membership is `PAUSED`. In both cancel branches every `SCHEDULED` shipment of the membership is cancelled, each freeing its reserved bottles on its release, and additionally the membership's `loyalty_points` are zeroed out and the winery's `loyalty_point_liability` is recomputed so that the premises liability drops by exactly the forfeited balance. `CANCELLED` is terminal.
+
+### 3.7. Club Shipments: Scheduling, Compliance Gates, and Release
+
+A **Shipment** is one instance of a recurring club shipment, scheduled by a `ClubManager` against a `winery_id`, the `membership_id` that owns it, the `release_id` it draws bottles from, and the count of `requested_bottles` the member is claiming. On creation the shipment is `SCHEDULED`; its `ship_to_state_code` is snapshotted from the owning member's `ship_to_state_code` at scheduling time, its pricing fields `subtotal_cents`, `discount_cents`, and `total_cents` are computed as described below, its `loyalty_points_earned` is zero until release, and its `hold_reason` is `NONE`. Scheduling reserves inventory: the release's `reserved_bottles` increases by `requested_bottles` and its `available_bottles` is recomputed. Scheduling is allowed only against an `OPEN` release whose claim window currently contains the server clock — that is, the current instant is at or after `opens_at` (inclusive) and strictly before `closes_at` (exclusive); a claim outside that window is rejected with `ERR_RELEASE_WINDOW_CLOSED`. Scheduling also enforces the per-member allocation cap: a membership's cumulative reserved-plus-committed bottles on a single release must not exceed that release's `per_member_cap`, and a claim that would push it past the cap is rejected with `ERR_PER_MEMBER_CAP_EXCEEDED`. There must additionally be enough release inventory for the claim, or the schedule is rejected with `ERR_INSUFFICIENT_INVENTORY`.
+
+A shipment's pricing is computed at scheduling and recomputed on release. The `subtotal_cents` is `requested_bottles` multiplied by the product's `list_price_cents`. The discount is tier-driven with a volume kicker: the base discount percentage is 0.05 for `SILVER`, 0.10 for `GOLD`, and 0.15 for `PLATINUM`; if `requested_bottles` is at least 12, a volume kicker of 0.05 is added to that base percentage; the resulting effective percentage is then capped at a maximum of 0.18 — the cap applied last, after the kicker. The `discount_cents` is the `subtotal_cents` multiplied by that fully resolved effective percentage, rounded half up to whole cents in a single rounding step rather than per component. The `total_cents` is `subtotal_cents` minus `discount_cents`. As a worked illustration of the pinned order, a `PLATINUM` membership claiming at least 12 bottles would compute 0.15 plus 0.05 equals 0.20, then capped to 0.18; the same `PLATINUM` membership claiming fewer than 12 bottles gets a plain 0.15.
+
+Releasing a shipment is the compliance moment. A `ClubManager` requests release; if every gate passes, the shipment transitions `SCHEDULED → RELEASED`, and if any gate fails it diverts instead to `SCHEDULED → HELD`. The gates, evaluated in this priority order, are: the owning winery must be `ACTIVE` (otherwise the hold reason is `WINERY_SUSPENDED`); the member must be at least 21 years old at the current clock (otherwise the hold reason is `AGE`); the rolling state shipping limit for the shipment's `ship_to_state_code` must not be exceeded (otherwise the hold reason is `STATE_LIMIT`); and the membership's `billing_status` must be `CURRENT` (otherwise the hold reason is `BILLING`). A release also requires that the drawn release still be `OPEN`, failing which it is rejected with `ERR_RELEASE_NOT_OPEN`. When a release diverts to `HELD`, the shipment's `hold_reason` is set to the first failing gate by that very priority — `WINERY_SUSPENDED` first, then `AGE`, then `STATE_LIMIT`, then `BILLING` — and the reserved bottles remain held on the release. When the hold reason is `AGE`, a compliance ledger entry of `entry_type` `AGE_REJECTION` is appended; when it is `STATE_LIMIT`, an entry of `entry_type` `STATE_LIMIT_REJECTION` is appended, each carrying a `subject_type` of `SHIPMENT` and the shipment's id as `subject_id`. The standalone compliance errors `ERR_AGE_RESTRICTION` (for the age gate), `ERR_STATE_SHIPPING_LIMIT` (for the state-limit gate), `ERR_WINERY_SUSPENDED` (for premises suspension), and `ERR_BILLING_PAST_DUE` (for a past-due membership) name these same conditions where a hard rejection rather than a hold is the outcome.
+
+When a shipment does transition to `RELEASED` — whether directly from `SCHEDULED` or later from `HELD` once all gates pass — the release of inventory cascades. The release's `reserved_bottles` decreases by `requested_bottles` and its `committed_bottles` increases by the same, the product's `on_hand_bottles` and `allocated_bottles` each decrease by `requested_bottles` (committing the bottles out of inventory), the shipment's `loyalty_points_earned` are minted onto the membership's `loyalty_points` with the winery's `loyalty_point_liability` recomputed, the membership's `lifetime_bottles_shipped` increases by `requested_bottles`, and a compliance ledger entry of `entry_type` `SHIPMENT_RELEASE` is appended. A held shipment that is later released has its `hold_reason` reset to `NONE` and applies the identical commit, loyalty, and ledger side effects. A released shipment is later marked delivered, transitioning `RELEASED → DELIVERED`, which carries no inventory side effect. A shipment may instead be cancelled: a held shipment can be cancelled (`HELD → CANCELLED`) and a scheduled shipment can be cancelled (`SCHEDULED → CANCELLED`), and in either case the release's `reserved_bottles` decreases by `requested_bottles`, freeing the reservation. `DELIVERED` and `CANCELLED` are terminal.
+
+The loyalty points a shipment mints on release follow the club's accrual rule. The tier multiplier is 1 for `SILVER`, 2 for `GOLD`, and 3 for `PLATINUM`. The points earned are the net spend in cents divided by 100 cents per point, taken as a floor to whole points, then multiplied by the tier multiplier; this is the `loyalty_points_earned` added to the membership's `loyalty_points`. The winery's `loyalty_point_liability` is, at all times, the sum of `loyalty_points` across every membership of that winery — equal to a single membership's balance only in a winery with exactly one membership.
+
+### 3.8. The State Shipping Limit
+
+Direct-to-consumer shipping into a state is bounded by a rolling case limit, evaluated as a gate on shipment release. Bottles are converted to nine-liter cases: the cases in a shipment equal `requested_bottles` multiplied by the product's `bottle_volume_ml` divided by 1000 (milliliters to liters), then divided by 9.0 liters per nine-liter case. The system sums the prior cases already shipped by this member to the same `ship_to_state_code` — counting only that member's shipments to that state whose status is `RELEASED` or `DELIVERED` and whose `created_at` falls within the trailing 365 days ending at the current clock — and adds the candidate shipment's cases. If that running total of prior cases plus this shipment's cases is strictly greater than the destination state's case limit, the gate fails and the shipment is held with reason `STATE_LIMIT` (or, where evaluated as a hard rejection, `ERR_STATE_SHIPPING_LIMIT`). Reaching exactly the limit passes; only strictly exceeding it fails. The per-state limits are 24.0 cases for `CA`, 36.0 cases for `NY`, 9.0 cases for `TX`, and 0.0 cases for `PA`; a state not in this table uses the default limit of 24.0 cases. Because the `PA` limit is zero, any case at all to Pennsylvania fails the gate. Case counts are kept at full precision in this comparison.
+
+### 3.9. The Tasting Room: Point-of-Sale Orders
+
+A **TastingOrder** is a tasting-room point-of-sale order opened by a `TastingRoomStaff` operator against a `winery_id`, with an array of `line_items` and optionally an attached `member_id` for loyalty and discount (omitted for a walk-in). Each entry in `line_items` is an object naming a `product_id`, a `kind` of `FLIGHT`, `BOTTLE`, or `GLASS`, a `quantity`, and optionally a `unit_price_cents`; lines of kind `BOTTLE` draw from the product's free inventory. The order also carries a `guest_age_verified` flag (the staff attestation that the guest's 21-plus identification was checked, defaulting to false) and a `redeem_points` count of loyalty points the cashier elects to redeem (defaulting to zero). A new order is `OPEN` with its computed totals — `subtotal_cents`, `member_discount_cents`, `loyalty_redeemed_cents`, `total_cents`, and `loyalty_points_earned` — initialized.
+
+The order total is computed line by line with rounding pinned per line. For each line, the extended price is its `quantity` multiplied by its unit price — the line's `unit_price_cents` when supplied, otherwise the referenced product's `list_price_cents` — and that extended price is rounded half up to whole cents per line. The `subtotal_cents` is the sum of those per-line rounded totals across all lines; this rounding-each-line-then-summing order is mandatory and can differ by cents from summing raw then rounding. When a member is attached, the `member_discount_cents` is the bottle subtotal — the sum of the rounded line totals over the `BOTTLE` lines only — multiplied by the membership's tier discount percentage (0.05 for `SILVER`, 0.10 for `GOLD`, 0.15 for `PLATINUM`), rounded half up once; with no member attached it is zero. The `loyalty_redeemed_cents` is the smaller of two quantities: `redeem_points` multiplied by 5 cents per point, and the `subtotal_cents` minus the `member_discount_cents`. The `total_cents` is the `subtotal_cents` minus the `member_discount_cents` minus the `loyalty_redeemed_cents`, floored at zero so it is never negative.
+
+Paying an order transitions it `OPEN → PAID`. Payment is permitted only while the order is `OPEN`; every `BOTTLE` line's product must be `ACTIVE` with `free_bottles` at least the line's `quantity` (otherwise `ERR_INSUFFICIENT_INVENTORY`); if any line is age-restricted, either `guest_age_verified` must be true or an attached member must be at least 21 years old (otherwise `ERR_AGE_RESTRICTION`); and `redeem_points` must not exceed the attached membership's `loyalty_points` (otherwise `ERR_INSUFFICIENT_POINTS`). On payment, each `BOTTLE` line decrements the product's `on_hand_bottles` by its `quantity`, the order's `loyalty_points_earned` are minted onto the attached membership using the same floor-then-multiply accrual as shipments (net spend in cents divided by 100, floored, times the tier multiplier), the redeemed points are deducted from the membership — specifically the redeemed value in cents divided by 5 cents per point, taken as a ceiling to whole points consumed — and the winery's `loyalty_point_liability` is recomputed. An open order may instead be voided, transitioning `OPEN → VOID`, with no side effects. A paid order may be refunded, transitioning `PAID → REFUNDED`, which compensates the payment: each `BOTTLE` line restores the product's `on_hand_bottles` by its `quantity`, the `loyalty_points_earned` are reversed off the membership's `loyalty_points`, the redeemed points are restored, and the winery's `loyalty_point_liability` is recomputed. `VOID` and `REFUNDED` are terminal.
+
+### 3.10. Reservations and Ticketed Events
+
+A **Reservation** holds a tasting-room table for a window of time, created by a `TastingRoomStaff` operator against a `winery_id`, a `table_code` identifying the table or resource (for example `T1` or `PATIO`), a `party_size` of guests, a UTC `starts_at` (inclusive) and `ends_at` (exclusive) bounding the seating window, and an `is_event` flag (defaulting to false) that distinguishes a standard tasting from a ticketed event. For an event, a deposit is required: the `deposit_cents` is the `party_size` multiplied by 1500 cents per guest; for a non-event the `deposit_cents` is zero. A new reservation is `REQUESTED`.
+
+A reservation is confirmed by transitioning `REQUESTED → CONFIRMED`, permitted only while the reservation is `REQUESTED` and only if no other reservation already in `CONFIRMED` or `SEATED` status occupies an overlapping interval on the same `table_code`. The interval is half-open over `[starts_at, ends_at)`, so two reservations that merely touch — where one's `ends_at` equals the other's `starts_at` — do not conflict; a genuine overlap is rejected with `ERR_TABLE_DOUBLE_BOOKED`. A confirmed reservation is seated by transitioning `CONFIRMED → SEATED`, and a seated reservation is completed by transitioning `SEATED → COMPLETED`. A confirmed reservation may be marked a no-show, transitioning `CONFIRMED → NO_SHOW`, which frees the table interval so that a later confirmation on the same table and window no longer conflicts — the revert of the capacity hold. A reservation may be cancelled from either of its early states: from `REQUESTED` (`REQUESTED → CANCELLED`, with no capacity effect) or from `CONFIRMED` (`CONFIRMED → CANCELLED`, which likewise frees the table interval). `COMPLETED`, `NO_SHOW`, and `CANCELLED` are terminal.
+
+### 3.11. Self-Distribution: Wholesale Orders
+
+A **DistributionOrder** is a self-distribution wholesale order created by a `ComplianceOfficer` against a `winery_id` and the `product_id` being distributed, with a `retailer_license_number` for the destination licensed retailer, a two-letter `dest_state_code`, and a `case_count` of 12-bottle cases. On creation the order is `DRAFT`; its `bottles_ordered` is the `case_count` multiplied by 12 bottles per case, and its `wholesale_total_cents` is computed as described below. The wholesale invoice is built in a pinned order: the gross is `bottles_ordered` multiplied by the product's `list_price_cents`; the wholesale base is that gross multiplied by the wholesale percentage of 0.50, rounded half up to whole cents; then a freight tier is selected on the wholesale base (not on the gross) — if the rounded wholesale base is at least 50000 cents, freight is 1500 cents, otherwise freight is 2500 cents; and the `wholesale_total_cents` is the wholesale base plus that freight. Keying freight on the post-discount base rather than on the gross is deliberate and changes the tier outcome near the boundary.
+
+The order advances through its lifecycle under a `ComplianceOfficer`. It is submitted, transitioning `DRAFT → SUBMITTED`, permitted only while `DRAFT`, only if the product is `ACTIVE`, and only if the product's `free_bottles` is at least `bottles_ordered` (otherwise `ERR_INSUFFICIENT_INVENTORY`). It is shipped, transitioning `SUBMITTED → SHIPPED`, permitted only while `SUBMITTED`, only if the winery is `ACTIVE` (otherwise `ERR_WINERY_SUSPENDED`), and only if `free_bottles` still covers `bottles_ordered` (otherwise `ERR_INSUFFICIENT_INVENTORY`); shipping removes the bottles by decreasing the product's `on_hand_bottles` by `bottles_ordered` and appends a compliance ledger entry of `entry_type` `DISTRIBUTION_REMOVAL` with `subject_type` `DISTRIBUTION_ORDER`, booking no new excise because the stock was already taxpaid at bottling. It is invoiced, transitioning `SHIPPED → INVOICED`, which finalizes the `wholesale_total_cents`. A draft or submitted order may instead be cancelled, transitioning `DRAFT → CANCELLED` or `SUBMITTED → CANCELLED`. `INVOICED` and `CANCELLED` are terminal.
+
+### 3.12. The Compliance Ledger and the Test Clock
+
+The **ComplianceLedgerEntry** is the append-only TTB, excise, and shipping audit log; a `ComplianceOfficer` reads it but no one writes it directly — entries are minted only as side effects of the operations above. Each entry records the `winery_id` it belongs to, an `entry_type` (one of `BOTTLING_REMOVAL`, `EXCISE_ACCRUAL`, `SHIPMENT_RELEASE`, `DISTRIBUTION_REMOVAL`, `AGE_REJECTION`, or `STATE_LIMIT_REJECTION`), a polymorphic `subject_type` (one of `PRODUCTION_BATCH`, `SHIPMENT`, `DISTRIBUTION_ORDER`, or `TASTING_ORDER`) together with the `subject_id` of that subject, the `volume_gallons` removed or accrued (zero for entries that move no volume), the `excise_cents` accrued (zero for non-tax entries), and a human-readable `note` describing the booked event. Because the ledger is immutable, an entry carries only its `id` and `created_at` and never an `updated_at` or `version`.
+
+Because age, release-window, and the trailing-365-day evaluations all depend on the current instant, the system exposes an administrative test-driving capability that sets the deterministic server clock. A `ComplianceOfficer` supplies a `to_iso8601` instant, and the server's notion of "now" is set to that instant for all subsequent age, window, and 365-day evaluations.
+
+## 4. Endpoint Definitions
+
+Operations that create a new resource return a `201 Created` status code. Operations that modify an existing resource — including every state transition and every billing or clock adjustment — return a `200 OK` status code. All endpoints honor the global header, validation-ordering, pagination, and concurrency rules of Section 2.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/wineries` | Create a bonded winery/brewery premises | ComplianceOfficer |
+| GET | `/wineries/{wineryId}` | Get a winery with TTB accounting balances | ComplianceOfficer, CellarManager, ClubManager, TastingRoomStaff |
+| POST | `/wineries/{wineryId}/transitions` | Suspend or reinstate the premises | ComplianceOfficer |
+| POST | `/batches` | Create a production batch | CellarManager, ComplianceOfficer |
+| GET | `/batches` | List production batches | CellarManager, ComplianceOfficer |
+| GET | `/batches/{batchId}` | Get a production batch | CellarManager, ComplianceOfficer |
+| POST | `/batches/{batchId}/transitions` | Advance batch lifecycle (BEGIN_AGING/OPEN_BOTTLING/CLOSE/DUMP) | CellarManager |
+| POST | `/batches/{batchId}/bottling-runs` | Bottle a product from this batch (taxable removal) | CellarManager |
+| POST | `/products` | Create a finished SKU/vintage | CellarManager |
+| GET | `/products` | List products | CellarManager, ComplianceOfficer, ClubManager, TastingRoomStaff |
+| GET | `/products/{productId}` | Get a product with inventory balances | CellarManager, ComplianceOfficer, ClubManager, TastingRoomStaff |
+| POST | `/products/{productId}/transitions` | Activate or discontinue a product | CellarManager |
+| POST | `/releases` | Create a finite allocation release | CellarManager |
+| GET | `/releases` | List allocation releases | CellarManager, ClubManager, ComplianceOfficer |
+| GET | `/releases/{releaseId}` | Get an allocation release | CellarManager, ClubManager, ComplianceOfficer |
+| POST | `/releases/{releaseId}/transitions` | Open or close a release | CellarManager |
+| POST | `/members` | Create a club member | ClubManager |
+| GET | `/members` | List members | ClubManager, ComplianceOfficer |
+| GET | `/members/{memberId}` | Get a member | ClubManager, Member |
+| POST | `/members/{memberId}/transitions` | Member lifecycle (ACTIVATE/SUSPEND/REINSTATE/CLOSE) | ClubManager |
+| POST | `/memberships` | Enroll a club membership | ClubManager |
+| GET | `/memberships` | List memberships | ClubManager, Member, ComplianceOfficer |
+| GET | `/memberships/{membershipId}` | Get a membership | ClubManager, Member |
+| POST | `/memberships/{membershipId}/transitions` | Membership lifecycle (ACTIVATE/PAUSE/RESUME/CANCEL) | ClubManager |
+| POST | `/memberships/{membershipId}/billing` | Set membership billing status | ClubManager |
+| POST | `/shipments` | Schedule a recurring club shipment | ClubManager |
+| GET | `/shipments` | List shipments | ClubManager, Member, ComplianceOfficer |
+| GET | `/shipments/{shipmentId}` | Get a shipment | ClubManager, Member |
+| POST | `/shipments/{shipmentId}/transitions` | Shipment lifecycle (RELEASE/HOLD/DELIVER/CANCEL) | ClubManager |
+| POST | `/tasting-orders` | Open a tasting-room POS order | TastingRoomStaff |
+| GET | `/tasting-orders` | List tasting orders | TastingRoomStaff, ComplianceOfficer |
+| GET | `/tasting-orders/{orderId}` | Get a tasting order | TastingRoomStaff |
+| POST | `/tasting-orders/{orderId}/transitions` | POS order lifecycle (PAY/VOID/REFUND) | TastingRoomStaff |
+| POST | `/reservations` | Create a tasting-room/event reservation | TastingRoomStaff |
+| GET | `/reservations` | List reservations | TastingRoomStaff, ComplianceOfficer |
+| GET | `/reservations/{reservationId}` | Get a reservation | TastingRoomStaff |
+| POST | `/reservations/{reservationId}/transitions` | Reservation lifecycle (CONFIRM/SEAT/COMPLETE/MARK_NO_SHOW/CANCEL) | TastingRoomStaff |
+| POST | `/distribution-orders` | Create a self-distribution wholesale order | ComplianceOfficer |
+| GET | `/distribution-orders` | List distribution orders | ComplianceOfficer |
+| GET | `/distribution-orders/{distOrderId}` | Get a distribution order | ComplianceOfficer |
+| POST | `/distribution-orders/{distOrderId}/transitions` | Distribution lifecycle (SUBMIT/SHIP/INVOICE/CANCEL) | ComplianceOfficer |
+| GET | `/ledger-entries` | List compliance ledger entries | ComplianceOfficer |
+| GET | `/ledger-entries/{entryId}` | Get a single compliance ledger entry | ComplianceOfficer |
+| POST | `/_clock/set_current_utc` | Set the deterministic server clock (test-driving) | ComplianceOfficer |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_FORBIDDEN` | 403 |
+| `ERR_NOT_RESOURCE_OWNER` | 403 |
+| `ERR_NOT_FOUND` | 404 |
+| `ERR_FK_NOT_FOUND` | 404 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_INVALID_STATE` | 409 |
+| `ERR_STALE_PRODUCT_VERSION` | 412 |
+| `ERR_STALE_RELEASE_VERSION` | 412 |
+| `ERR_STALE_WINERY_VERSION` | 412 |
+| `ERR_AGE_RESTRICTION` | 422 |
+| `ERR_STATE_SHIPPING_LIMIT` | 422 |
+| `ERR_WINERY_SUSPENDED` | 409 |
+| `ERR_PER_MEMBER_CAP_EXCEEDED` | 422 |
+| `ERR_RELEASE_WINDOW_CLOSED` | 422 |
+| `ERR_TABLE_DOUBLE_BOOKED` | 409 |
+| `ERR_BILLING_PAST_DUE` | 409 |
+| `ERR_INSUFFICIENT_INVENTORY` | 409 |
+| `ERR_INSUFFICIENT_BULK` | 409 |
+| `ERR_INSUFFICIENT_POINTS` | 422 |
+| `ERR_RELEASE_NOT_OPEN` | 409 |
+| `ERR_BATCH_HAS_INVENTORY` | 409 |

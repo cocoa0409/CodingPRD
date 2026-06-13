@@ -1,0 +1,46 @@
+"""Error IDs and HTTP status mapping for the AMC API (PRD §5).
+
+After defining the mapping it is registered with the framework so that
+validate_error() can cross-check the HTTP status code automatically.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+    ERR_AIR_FIREWALL_VIOLATION = "ERR_AIR_FIREWALL_VIOLATION"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_NO_ELIGIBLE_APPRAISER = "ERR_NO_ELIGIBLE_APPRAISER"
+    ERR_ASSIGNMENT_NOT_REVISABLE = "ERR_ASSIGNMENT_NOT_REVISABLE"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_STALE_ORDER_VERSION = "ERR_STALE_ORDER_VERSION"
+    ERR_APPRAISER_WINDOW_CONFLICT = "ERR_APPRAISER_WINDOW_CONFLICT"
+    ERR_PROPERTY_WINDOW_CONFLICT = "ERR_PROPERTY_WINDOW_CONFLICT"
+    ERR_INVALID_WINDOW = "ERR_INVALID_WINDOW"
+    ERR_SECOND_REVIEW_REQUIRED = "ERR_SECOND_REVIEW_REQUIRED"
+    ERR_LENDER_BUDGET_EXCEEDED = "ERR_LENDER_BUDGET_EXCEEDED"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+
+
+# PRD §5 Error Code Catalogue — verbatim HTTP status codes.
+HTTP_STATUS_CODES: dict[str, int] = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_UNAUTHORIZED: 403,
+    ApiErrorId.ERR_AIR_FIREWALL_VIOLATION: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_NO_ELIGIBLE_APPRAISER: 422,
+    ApiErrorId.ERR_ASSIGNMENT_NOT_REVISABLE: 409,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_STALE_ORDER_VERSION: 412,
+    ApiErrorId.ERR_APPRAISER_WINDOW_CONFLICT: 409,
+    ApiErrorId.ERR_PROPERTY_WINDOW_CONFLICT: 409,
+    ApiErrorId.ERR_INVALID_WINDOW: 422,
+    ApiErrorId.ERR_SECOND_REVIEW_REQUIRED: 409,
+    ApiErrorId.ERR_LENDER_BUDGET_EXCEEDED: 422,
+    ApiErrorId.ERR_INVALID_REQUEST: 422,
+}
+
+# Register with the framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

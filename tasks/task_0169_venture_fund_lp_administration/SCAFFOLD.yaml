@@ -1,0 +1,1565 @@
+scenario: |
+  169. Venture Fund / LP Administration: commitment/capital call, drawdown schedule,
+  portfolio mark, management fee/offset, distribution waterfall (pref/carry/clawback),
+  LP statement/K-1, recycling, side-letter terms.
+
+domain_name: venture-fund-lp-administration
+api_prefix: ""
+
+# =============================================================================
+# Complexity profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: Ledger reconciliation
+  secondary_archetype: Quota / allocation        # waterfall distribution across ordered tiers
+  complexity_layers:
+    - Dual-variant calculation                   # provisional vs final fee/carry; gross vs net marks
+    - Cascading side effects                      # call -> allocation -> commitment ledger -> fund unfunded
+    - Optimistic concurrency                      # OCC on Fund.version for capital-call issuance
+    - Derived field reconciliation                # Commitment.drawn/distributed mirrors child allocations
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (Commitment -> Fund, Commitment -> LP,
+  # CapitalCallAllocation -> CapitalCall + Commitment). No deep URL nesting; FKs in body.
+
+  state_machine_shape: branching
+  # CapitalCall: ISSUED -> {SETTLED, DEFAULTED} branches with divergent side effects.
+  # DistributionEvent: cyclic recall (RECALLED -> back to recyclable pool).
+
+  relationship_patterns:
+    - one_to_many        # Fund -> Commitments, CapitalCall -> Allocations
+    - many_to_many       # Investment links Fund and PortfolioCompany; Commitments span calls
+    - cross_aggregate    # DistributionAllocation references Commitment across the distribution aggregate
+
+  role_model: peer_roles
+  # FundManager (GP-side ops) vs FundAdministrator (back-office accounting) vs
+  # LimitedPartnerUser (read own statements, fund own calls) vs ComplianceOfficer (side letters, audit).
+
+  consistency_model: immediate
+  # All ledger mutations atomic within a single request; derived fields recomputed in-request.
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Fund
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: Fund display name.
+      - name: vintage_year
+        type: integer
+        source: input
+        description: Fund vintage year (e.g. 2023).
+      - name: target_size_cents
+        type: integer
+        source: input
+        description: Target fund size in integer cents.
+        constraints: ">= 0"
+      - name: mgmt_fee_rate_bps
+        type: integer
+        source: input
+        description: Annual management fee rate in basis points on committed capital (e.g. 200 = 2.00%).
+        constraints: "0..1000"
+      - name: carry_rate_bps
+        type: integer
+        source: input
+        description: GP carried-interest rate in basis points of profit above the preferred return (e.g. 2000 = 20%).
+        constraints: "0..5000"
+      - name: pref_rate_bps
+        type: integer
+        source: input
+        description: LP preferred (hurdle) return rate in basis points per annum, simple non-compounding (e.g. 800 = 8%).
+        constraints: "0..3000"
+      - name: gp_catchup_rate_bps
+        type: integer
+        source: input
+        description: GP catch-up share in basis points applied in waterfall tier 3 (e.g. 10000 = 100% catch-up).
+        default: 10000
+        constraints: "0..10000"
+      - name: recycling_cap_pct_bps
+        type: integer
+        source: input
+        description: Maximum recyclable distributions as basis points of total committed capital (e.g. 12000 = 120%).
+        default: 0
+        constraints: ">= 0"
+      - name: fee_offset_pct_bps
+        type: integer
+        source: input
+        description: Percentage in basis points of portfolio-company fees that offset (reduce) LP management fees (e.g. 10000 = 100% offset).
+        default: 0
+        constraints: "0..10000"
+      - name: status
+        type: enum
+        source: system
+        description: Fund lifecycle state.
+        default: FORMING
+        constraints: "FORMING | INVESTING | HARVESTING | WOUND_DOWN"
+      - name: total_committed_cents
+        type: integer
+        source: computed
+        description: Sum of Commitment.committed_cents over all Commitments with status IN {ACTIVE, DEFAULTED} on this Fund.
+      - name: total_called_cents
+        type: integer
+        source: computed
+        description: Sum of CapitalCall.called_amount_cents over CapitalCalls with status IN {ISSUED, SETTLED, PARTIALLY_DEFAULTED} on this Fund.
+      - name: total_distributed_cents
+        type: integer
+        source: computed
+        description: Sum of DistributionEvent.gross_amount_cents over DistributionEvents with status IN {DECLARED, PAID} on this Fund.
+      - name: recycled_to_date_cents
+        type: integer
+        source: computed
+        description: Sum of DistributionEvent.recycled_amount_cents over DistributionEvents with status = RECALLED on this Fund.
+
+  - name: LimitedPartner
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: Legal entity name of the LP.
+      - name: lp_type
+        type: enum
+        source: input
+        description: Investor classification affecting K-1 treatment.
+        constraints: "INDIVIDUAL | INSTITUTION | FUND_OF_FUNDS | SOVEREIGN"
+      - name: tax_id_last4
+        type: string
+        source: input
+        description: Last four digits of the LP tax identifier, used on the K-1.
+      - name: is_tax_exempt
+        type: boolean
+        source: input
+        description: Whether the LP is tax-exempt (affects UBTI flag on K-1).
+        default: false
+      - name: default_strike_count
+        type: integer
+        source: computed
+        description: Count of CapitalCallAllocations on this LP's Commitments with status = DEFAULTED.
+
+  - name: Commitment
+    parent: null
+    common_fields: true
+    fields:
+      - name: fund_id
+        type: string
+        source: input
+        description: "FK -> Fund.id; the fund this commitment belongs to."
+      - name: lp_id
+        type: string
+        source: input
+        description: "FK -> LimitedPartner.id; the committing LP."
+      - name: committed_cents
+        type: integer
+        source: input
+        description: Total capital the LP commits to the fund, in integer cents.
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: system
+        description: Commitment lifecycle state.
+        default: PENDING
+        constraints: "PENDING | ACTIVE | DEFAULTED | CLOSED"
+      - name: drawn_cents
+        type: integer
+        source: computed
+        description: Sum of CapitalCallAllocation.paid_amount_cents for this Commitment where allocation status = PAID, minus recycling restorations applied to this commitment.
+      - name: distributed_cents
+        type: integer
+        source: computed
+        description: Sum of DistributionAllocation.amount_cents for this Commitment where the parent DistributionEvent status IN {DECLARED, PAID}.
+      - name: unfunded_cents
+        type: integer
+        source: computed
+        description: committed_cents minus drawn_cents (floored at 0); the remaining callable capital for this commitment.
+
+  - name: CapitalCall
+    parent: null
+    common_fields: true
+    fields:
+      - name: fund_id
+        type: string
+        source: input
+        description: "FK -> Fund.id; the fund issuing the call."
+      - name: call_number
+        type: integer
+        source: system
+        description: Monotonic per-fund sequence number assigned on issuance (1, 2, 3, ...).
+      - name: purpose
+        type: enum
+        source: input
+        description: Reason for the drawdown, which controls fee-offset eligibility.
+        constraints: "INVESTMENT | MANAGEMENT_FEE | EXPENSE"
+      - name: called_amount_cents
+        type: integer
+        source: input
+        description: Aggregate amount requested across all participating commitments, in integer cents.
+        constraints: ">= 1"
+      - name: due_date
+        type: datetime
+        source: input
+        description: ISO 8601 date by which allocations must be funded.
+      - name: status
+        type: enum
+        source: system
+        description: Capital-call lifecycle state.
+        default: ISSUED
+        constraints: "ISSUED | SETTLED | PARTIALLY_DEFAULTED | DEFAULTED | CANCELLED"
+      - name: funded_amount_cents
+        type: integer
+        source: computed
+        description: Sum of CapitalCallAllocation.paid_amount_cents for allocations of this call with status = PAID.
+
+  - name: CapitalCallAllocation
+    parent: null
+    common_fields: true
+    fields:
+      - name: capital_call_id
+        type: string
+        source: input
+        description: "FK -> CapitalCall.id; the parent call."
+      - name: commitment_id
+        type: string
+        source: input
+        description: "FK -> Commitment.id; the commitment being drawn."
+      - name: allocated_amount_cents
+        type: integer
+        source: computed
+        description: Pro-rata share of the call assigned to this commitment, computed at allocation time (see allocate_capital_call calculation).
+      - name: paid_amount_cents
+        type: integer
+        source: system
+        description: Amount actually funded by the LP; equals allocated_amount_cents on a full PAID, 0 while PENDING or DEFAULTED.
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Allocation funding state.
+        default: PENDING
+        constraints: "PENDING | PAID | DEFAULTED | WAIVED"
+
+  - name: PortfolioCompany
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: Portfolio company name.
+      - name: sector
+        type: string
+        source: input
+        description: Industry sector label.
+      - name: status
+        type: enum
+        source: system
+        description: Portfolio company holding state.
+        default: PROSPECT
+        constraints: "PROSPECT | HELD | EXITED | WRITTEN_OFF"
+
+  - name: Investment
+    parent: null
+    common_fields: true
+    fields:
+      - name: fund_id
+        type: string
+        source: input
+        description: "FK -> Fund.id; the investing fund."
+      - name: portfolio_company_id
+        type: string
+        source: input
+        description: "FK -> PortfolioCompany.id; the company invested in."
+      - name: cost_basis_cents
+        type: integer
+        source: input
+        description: Total capital deployed into this company, in integer cents.
+        constraints: ">= 1"
+      - name: ownership_pct_bps
+        type: integer
+        source: input
+        description: Fully-diluted ownership in basis points (e.g. 1500 = 15%).
+        constraints: "1..10000"
+      - name: status
+        type: enum
+        source: system
+        description: Investment holding state.
+        default: ACTIVE
+        constraints: "ACTIVE | REALIZED | IMPAIRED"
+      - name: current_mark_cents
+        type: integer
+        source: computed
+        description: Fair value from the latest ValuationMark with status = FINAL on this Investment; equals cost_basis_cents until the first FINAL mark exists.
+      - name: realized_proceeds_cents
+        type: integer
+        source: input
+        description: Cash proceeds received on realization; 0 until the investment is REALIZED.
+        default: 0
+
+  - name: ValuationMark
+    parent: null
+    common_fields: true
+    fields:
+      - name: investment_id
+        type: string
+        source: input
+        description: "FK -> Investment.id; the investment being marked."
+      - name: as_of_date
+        type: datetime
+        source: input
+        description: ISO 8601 valuation date.
+      - name: fair_value_cents
+        type: integer
+        source: input
+        description: Proposed fair value of the holding at as_of_date, in integer cents.
+        constraints: ">= 0"
+      - name: methodology
+        type: enum
+        source: input
+        description: Valuation methodology applied.
+        constraints: "LAST_ROUND | DCF | COMPARABLES | WRITE_OFF"
+      - name: status
+        type: enum
+        source: system
+        description: Mark review state.
+        default: DRAFT
+        constraints: "DRAFT | FINAL | SUPERSEDED"
+
+  - name: ManagementFeeAccrual
+    parent: null
+    common_fields: true
+    fields:
+      - name: fund_id
+        type: string
+        source: input
+        description: "FK -> Fund.id; the fund accruing the fee."
+      - name: period_start
+        type: datetime
+        source: input
+        description: ISO 8601 inclusive start of the fee period.
+      - name: period_end
+        type: datetime
+        source: input
+        description: ISO 8601 exclusive end of the fee period.
+      - name: gross_fee_cents
+        type: integer
+        source: computed
+        description: Management fee before offset for the period (see accrue_management_fee calculation).
+      - name: offset_applied_cents
+        type: integer
+        source: computed
+        description: Portion of portfolio-company fees applied to reduce this accrual (see fee_offset variant).
+      - name: net_fee_cents
+        type: integer
+        source: computed
+        description: gross_fee_cents minus offset_applied_cents, floored at 0.
+      - name: status
+        type: enum
+        source: system
+        description: Accrual lifecycle state.
+        default: ACCRUED
+        constraints: "ACCRUED | INVOICED | PAID | REVERSED"
+
+  - name: DistributionEvent
+    parent: null
+    common_fields: true
+    fields:
+      - name: fund_id
+        type: string
+        source: input
+        description: "FK -> Fund.id; the distributing fund."
+      - name: source_investment_id
+        type: string
+        source: input
+        description: "FK -> Investment.id; the realized investment whose proceeds are being distributed."
+      - name: gross_amount_cents
+        type: integer
+        source: input
+        description: Total cash to distribute before waterfall split, in integer cents.
+        constraints: ">= 1"
+      - name: distribution_type
+        type: enum
+        source: input
+        description: Whether the proceeds are return of capital, gain, or income.
+        constraints: "RETURN_OF_CAPITAL | CAPITAL_GAIN | INCOME"
+      - name: recyclable
+        type: boolean
+        source: input
+        description: Whether this distribution may later be recalled into the recyclable pool.
+        default: false
+      - name: lp_share_cents
+        type: integer
+        source: computed
+        description: Aggregate amount allocated to LPs after the waterfall (sum of tiers 1, 2, and LP portion of tier 4).
+      - name: gp_carry_cents
+        type: integer
+        source: computed
+        description: Carried interest paid to the GP (tier 3 catch-up plus GP portion of tier 4).
+      - name: recycled_amount_cents
+        type: integer
+        source: system
+        description: Amount recalled back into unfunded commitments on RECALLED; 0 otherwise.
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Distribution lifecycle state.
+        default: DECLARED
+        constraints: "DECLARED | PAID | RECALLED | REVERSED"
+
+  - name: DistributionAllocation
+    parent: null
+    common_fields: true
+    fields:
+      - name: distribution_event_id
+        type: string
+        source: input
+        description: "FK -> DistributionEvent.id; the parent distribution."
+      - name: commitment_id
+        type: string
+        source: input
+        description: "FK -> Commitment.id; the commitment receiving this share."
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: Pro-rata LP share of the distribution assigned to this commitment, by paid-in capital.
+      - name: clawback_flag
+        type: boolean
+        source: computed
+        description: True when a prior GP carry payment must be clawed back because cumulative LP return fell below the pref floor at this event.
+        default: false
+
+  - name: SideLetter
+    parent: null
+    common_fields: true
+    fields:
+      - name: fund_id
+        type: string
+        source: input
+        description: "FK -> Fund.id; the fund the side letter modifies."
+      - name: lp_id
+        type: string
+        source: input
+        description: "FK -> LimitedPartner.id; the LP granted the side-letter terms."
+      - name: mfn_rank
+        type: integer
+        source: input
+        description: Most-favored-nation rank; lower rank takes precedence when terms conflict.
+        constraints: ">= 1"
+      - name: fee_discount_bps
+        type: integer
+        source: input
+        description: Management-fee reduction in basis points granted to this LP (e.g. 50 = 0.50% off).
+        default: 0
+        constraints: "0..1000"
+      - name: excused_purposes
+        type: array
+        source: input
+        description: List of CapitalCall.purpose values this LP is excused from funding (e.g. ["EXPENSE"]).
+        default: []
+      - name: status
+        type: enum
+        source: system
+        description: Side-letter lifecycle state.
+        default: PROPOSED
+        constraints: "PROPOSED | EXECUTED | TERMINATED"
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Fund
+    initial_state: FORMING
+    terminal_states: [WOUND_DOWN]
+    transitions:
+      - from: FORMING
+        to: INVESTING
+        trigger: "POST /funds/{id}/activate"
+        actor: FundManager
+        preconditions:
+          - "Fund.status == FORMING"
+          - "At least one Commitment on this Fund has status == ACTIVE"
+        side_effects:
+          - "Fund.status set to INVESTING"
+          - "increments Fund.version by 1"
+      - from: INVESTING
+        to: HARVESTING
+        trigger: "POST /funds/{id}/begin-harvest"
+        actor: FundManager
+        preconditions:
+          - "Fund.status == INVESTING"
+        side_effects:
+          - "Fund.status set to HARVESTING"
+          - "increments Fund.version by 1"
+      - from: HARVESTING
+        to: WOUND_DOWN
+        trigger: "POST /funds/{id}/wind-down"
+        actor: FundManager
+        preconditions:
+          - "Fund.status == HARVESTING"
+          - "No CapitalCall on this Fund has status == ISSUED (all calls resolved)"
+          - "No Investment on this Fund has status == ACTIVE"
+        side_effects:
+          - "Fund.status set to WOUND_DOWN"
+          - "Every Commitment on this Fund with status == ACTIVE set to CLOSED (cascade down)"
+          - "increments Fund.version by 1"
+
+  - entity: Commitment
+    initial_state: PENDING
+    terminal_states: [CLOSED]
+    transitions:
+      - from: PENDING
+        to: ACTIVE
+        trigger: "POST /commitments/{id}/accept"
+        actor: FundManager
+        preconditions:
+          - "Commitment.status == PENDING"
+          - "Fund.status IN {FORMING, INVESTING}"
+        side_effects:
+          - "Commitment.status set to ACTIVE"
+          - "Fund.total_committed_cents recomputed (ledger sync)"
+      - from: ACTIVE
+        to: DEFAULTED
+        trigger: "POST /commitments/{id}/declare-default"
+        actor: FundManager
+        preconditions:
+          - "Commitment.status == ACTIVE"
+          - "LimitedPartner.default_strike_count >= DEFAULT_STRIKE_LIMIT (= 1) for the owning LP"
+        side_effects:
+          - "Commitment.status set to DEFAULTED"
+          - "Every CapitalCallAllocation on this Commitment with status == PENDING set to DEFAULTED (cascade down)"
+          - "each such allocation's parent CapitalCall.funded_amount_cents recomputed; if any allocation defaulted, that CapitalCall transitions ISSUED -> PARTIALLY_DEFAULTED (cross-entity, see CapitalCall machine)"
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /funds/{id}/wind-down (cascade)"
+        actor: system
+        preconditions:
+          - "Owning Fund transitions HARVESTING -> WOUND_DOWN"
+        side_effects:
+          - "Commitment.status set to CLOSED"
+
+  - entity: CapitalCall
+    initial_state: ISSUED
+    terminal_states: [SETTLED, DEFAULTED, CANCELLED]
+    transitions:
+      - from: ISSUED
+        to: SETTLED
+        trigger: "POST /capital-call-allocations/{id}/fund (last PENDING allocation paid)"
+        actor: system
+        preconditions:
+          - "CapitalCall.status == ISSUED"
+          - "Every CapitalCallAllocation of this call has status IN {PAID, WAIVED}"
+        side_effects:
+          - "CapitalCall.status set to SETTLED"
+          - "CapitalCall.funded_amount_cents recomputed (bubble up from allocations)"
+      - from: ISSUED
+        to: PARTIALLY_DEFAULTED
+        trigger: "POST /capital-call-allocations/{id}/default OR Commitment default cascade"
+        actor: FundAdministrator
+        preconditions:
+          - "CapitalCall.status == ISSUED"
+          - "At least one CapitalCallAllocation of this call has status == DEFAULTED AND at least one has status IN {PAID, PENDING}"
+        side_effects:
+          - "CapitalCall.status set to PARTIALLY_DEFAULTED"
+          - "the defaulting allocation's owning LimitedPartner.default_strike_count recomputed (cross-entity)"
+      - from: PARTIALLY_DEFAULTED
+        to: SETTLED
+        trigger: "POST /capital-call-allocations/{id}/fund (remaining PENDING allocations paid)"
+        actor: system
+        preconditions:
+          - "CapitalCall.status == PARTIALLY_DEFAULTED"
+          - "Every non-DEFAULTED CapitalCallAllocation of this call has status IN {PAID, WAIVED}"
+        side_effects:
+          - "CapitalCall.status set to SETTLED"
+      - from: ISSUED
+        to: DEFAULTED
+        trigger: "POST /capital-call-allocations/{id}/default (all allocations defaulted)"
+        actor: FundAdministrator
+        preconditions:
+          - "CapitalCall.status == ISSUED"
+          - "Every CapitalCallAllocation of this call has status == DEFAULTED"
+        side_effects:
+          - "CapitalCall.status set to DEFAULTED"
+      - from: ISSUED
+        to: CANCELLED
+        trigger: "POST /capital-calls/{id}/cancel"
+        actor: FundManager
+        preconditions:
+          - "CapitalCall.status == ISSUED"
+          - "No CapitalCallAllocation of this call has status == PAID"
+        side_effects:
+          - "CapitalCall.status set to CANCELLED"
+          - "Every CapitalCallAllocation of this call set to WAIVED (cascade down)"
+
+  - entity: ValuationMark
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: DRAFT
+        to: FINAL
+        trigger: "POST /valuation-marks/{id}/finalize"
+        actor: FundAdministrator
+        preconditions:
+          - "ValuationMark.status == DRAFT"
+          - "Owning Investment.status == ACTIVE"
+        side_effects:
+          - "ValuationMark.status set to FINAL"
+          - "any prior ValuationMark on the same Investment with status == FINAL set to SUPERSEDED (cascade down)"
+          - "owning Investment.current_mark_cents recomputed from this mark (ledger sync)"
+          - "if methodology == WRITE_OFF, owning Investment.status set to IMPAIRED and owning PortfolioCompany.status set to WRITTEN_OFF (cross-entity cascade)"
+      - from: FINAL
+        to: SUPERSEDED
+        trigger: "POST /valuation-marks/{id}/finalize on a newer mark (cascade)"
+        actor: system
+        preconditions:
+          - "A newer ValuationMark on the same Investment transitions DRAFT -> FINAL"
+        side_effects:
+          - "ValuationMark.status set to SUPERSEDED"
+
+  - entity: DistributionEvent
+    initial_state: DECLARED
+    terminal_states: [PAID, REVERSED]
+    transitions:
+      - from: DECLARED
+        to: PAID
+        trigger: "POST /distribution-events/{id}/pay"
+        actor: FundAdministrator
+        preconditions:
+          - "DistributionEvent.status == DECLARED"
+          - "Every DistributionAllocation of this event has amount_cents assigned (event was split)"
+        side_effects:
+          - "DistributionEvent.status set to PAID"
+          - "each Commitment referenced by an allocation has distributed_cents recomputed (ledger sync, cascade)"
+          - "Fund.total_distributed_cents recomputed (bubble up)"
+      - from: PAID
+        to: RECALLED
+        trigger: "POST /distribution-events/{id}/recall"
+        actor: FundManager
+        preconditions:
+          - "DistributionEvent.status == PAID"
+          - "DistributionEvent.recyclable == true"
+          - "Fund.recycled_to_date_cents + this event's recallable amount <= Fund.recycling_cap_pct_bps * Fund.total_committed_cents / 10000 (recycling cap)"
+        side_effects:
+          - "DistributionEvent.status set to RECALLED"
+          - "DistributionEvent.recycled_amount_cents set to the recalled amount (see recycle_distribution calc)"
+          - "each affected Commitment.drawn_cents reduced by its recycled share, restoring unfunded_cents (cross-entity cascade)"
+          - "Fund.recycled_to_date_cents recomputed (bubble up)"
+      - from: DECLARED
+        to: REVERSED
+        trigger: "POST /distribution-events/{id}/reverse"
+        actor: FundManager
+        preconditions:
+          - "DistributionEvent.status == DECLARED"
+        side_effects:
+          - "DistributionEvent.status set to REVERSED"
+          - "all DistributionAllocations of this event have amount_cents set to 0 (compensation; no Commitment.distributed_cents drift since event never reached PAID)"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: capital-call-issue-stale-fund
+    parent_entity: Fund
+    write_endpoint: "POST /capital-calls"
+    occ_field: "expected_fund_version"
+    description: |
+      Issuing a CapitalCall against a Fund whose version has advanced since the
+      client last observed it is rejected as a stale-version write. A capital call
+      consumes unfunded commitment capacity and is assigned the next monotonic
+      call_number; a writer holding a stale view of the fund (e.g. another call
+      was issued, or a commitment was accepted, advancing Fund.version) would
+      otherwise mis-sequence the call. The OCC check forces the writer to refresh.
+    error_id: ERR_STALE_FUND_VERSION
+    http_status: 412
+
+  - rule_id: distribution-declare-stale-fund
+    parent_entity: Fund
+    write_endpoint: "POST /distribution-events"
+    occ_field: "expected_fund_version"
+    description: |
+      Declaring a DistributionEvent against a Fund whose version has advanced
+      since the client last read it is rejected. The waterfall split depends on
+      cumulative called and distributed capital recorded on the fund; a stale
+      view would compute the pref/carry tiers against outdated totals. The OCC
+      check on Fund.version makes the loser refresh before re-declaring.
+    error_id: ERR_STALE_FUND_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: allocate_capital_call
+    trigger: "POST /capital-calls (on issuance, splitting called_amount_cents across participating commitments)"
+    algorithm: waterfall_allocation
+    formula: |
+      # Pro-rata split of called_amount_cents across ACTIVE commitments by unfunded capacity,
+      # honoring side-letter excused purposes, with the largest-remainder method for cents.
+      participating = [c for c in Commitments(fund_id)
+                       if c.status == ACTIVE
+                       and not lp_excused(c.lp_id, fund_id, call.purpose)
+                       and c.unfunded_cents > 0]
+      total_unfunded = sum(c.unfunded_cents for c in participating)
+      reject ERR_CALL_EXCEEDS_UNFUNDED if call.called_amount_cents > total_unfunded
+      # Step 1: floor pro-rata share per commitment.
+      raw[c]   = call.called_amount_cents * c.unfunded_cents / total_unfunded   # exact rational
+      floor[c] = floor(raw[c])
+      # Step 2: distribute the leftover cents by LARGEST FRACTIONAL REMAINDER,
+      #         ties broken by Commitment.created_at ASC (never by id).
+      leftover = call.called_amount_cents - sum(floor[c] for c in participating)
+      order = participating sorted by (frac(raw[c]) DESC, c.created_at ASC)
+      allocated[c] = floor[c] + (1 if index(c, order) < leftover else 0)
+      # Each commitment's allocated_amount_cents is capped at its unfunded_cents (never over-draw).
+    input_set: "Commitments on the fund with status == ACTIVE and unfunded_cents > 0 and LP not excused for this purpose."
+    constants: {}
+    precision: "integer cents; largest-remainder distribution; ties by created_at ASC"
+    variants:
+      - name: excused_lp_redistribution
+        when: "An LP holds a SideLetter (status == EXECUTED) whose excused_purposes contains call.purpose."
+        difference: "That LP's commitment is removed from `participating`; its share is redistributed pro-rata among the remaining commitments rather than left unfunded."
+
+  - name: accrue_management_fee
+    trigger: "POST /funds/{id}/fee-accruals (period-based accrual) and the fee_offset variant on the same call"
+    algorithm: tiered_pricing
+    formula: |
+      # Management fee on committed capital, pro-rated by period day count (ACT/365),
+      # net of per-LP side-letter discounts, then reduced by portfolio fee offset.
+      days = (period_end - period_start) in whole days   # half-open [start, end)
+      gross_fee_cents = 0
+      for each Commitment c with status == ACTIVE on the fund:
+          eff_rate_bps = fund.mgmt_fee_rate_bps - sideletter_discount_bps(c.lp_id, fund.id)   # floored at 0
+          gross_fee_cents += round_half_up( c.committed_cents * eff_rate_bps / 10000 * days / 365 )
+      # gross_fee_cents is the per-commitment rounded sum (round PER COMMITMENT then sum,
+      # NOT sum-then-round — the order is pinned here and is observable in cents).
+    input_set: "Commitments with status == ACTIVE on the fund at period_end."
+    constants:
+      DAYS_PER_YEAR: 365
+    precision: "round_half_up to integer cents, applied PER COMMITMENT before summing"
+    variants:
+      - name: fee_offset
+        when: "fund.fee_offset_pct_bps > 0 and the fund has at least one CapitalCall with purpose == MANAGEMENT_FEE in the period."
+        difference: |
+          offset_applied_cents = min( gross_fee_cents,
+            round_half_up( sum(MANAGEMENT_FEE call.called_amount_cents in period) * fund.fee_offset_pct_bps / 10000 ) );
+          net_fee_cents = max(0, gross_fee_cents - offset_applied_cents).
+          Without the offset (base), offset_applied_cents = 0 and net_fee_cents == gross_fee_cents.
+
+  - name: distribution_waterfall
+    trigger: "POST /distribution-events (on declaration, splitting gross_amount_cents into LP/GP tiers)"
+    algorithm: waterfall_allocation
+    formula: |
+      # Four-tier American-style waterfall on cumulative fund economics.
+      # Evaluation order is FIXED top-to-bottom; each tier consumes from the running remainder.
+      paid_in       = fund.total_called_cents                 # cumulative contributed capital
+      prior_dist    = fund.total_distributed_cents            # before this event (DECLARED/PAID)
+      pref_accrued  = round_half_up( paid_in * fund.pref_rate_bps / 10000 * pref_years )  # simple, non-compounding
+      remaining     = event.gross_amount_cents
+      # Tier 1 — Return of Capital: repay LP paid-in not yet returned.
+      roc_due  = max(0, paid_in - prior_dist)
+      tier1    = min(remaining, roc_due);                 remaining -= tier1
+      # Tier 2 — Preferred Return: pay LP the accrued pref not yet covered by prior gains.
+      pref_due = max(0, pref_accrued - max(0, prior_dist - paid_in))
+      tier2    = min(remaining, pref_due);                remaining -= tier2
+      # Tier 3 — GP Catch-up: GP takes gp_catchup_rate_bps of the catch-up base
+      #          until GP holds carry_rate_bps of (tier2 + tier3).
+      catchup_target = round_half_up( (tier2) * fund.carry_rate_bps / (10000 - fund.carry_rate_bps) )
+      tier3    = min(remaining, round_half_up(catchup_target * fund.gp_catchup_rate_bps / 10000)); remaining -= tier3
+      # Tier 4 — Carry split: remainder split carry_rate_bps to GP, rest to LP.
+      tier4_gp = round_half_up( remaining * fund.carry_rate_bps / 10000 )
+      tier4_lp = remaining - tier4_gp
+      lp_share_cents = tier1 + tier2 + tier4_lp
+      gp_carry_cents = tier3 + tier4_gp
+      # Clawback: if AFTER this event cumulative LP receipts < cumulative pref floor,
+      # set clawback_flag on this event's allocations and reduce gp_carry by the shortfall
+      # (gp_carry_cents floored at 0); see clawback variant.
+    input_set: "Fund cumulative totals (total_called_cents, total_distributed_cents) at declaration time; pref_years derived from fund.vintage_year to event date."
+    constants:
+      BPS_DENOM: 10000
+    precision: "integer cents, round_half_up per tier; tiers evaluated strictly in order 1->2->3->4"
+    variants:
+      - name: clawback
+        when: "After applying tiers, cumulative LP receipts (prior LP + this event lp_share) < cumulative pref_accrued floor."
+        difference: |
+          shortfall = pref_accrued - (cumulative LP receipts including this event);
+          gp_carry_cents = max(0, gp_carry_cents - shortfall); the clawed-back amount is added to lp_share_cents;
+          every DistributionAllocation of this event gets clawback_flag = true.
+
+  - name: split_distribution_to_commitments
+    trigger: "POST /distribution-events (after waterfall, splitting lp_share_cents across commitments by paid-in)"
+    algorithm: waterfall_allocation
+    formula: |
+      # Distribute lp_share_cents across commitments pro-rata by drawn (paid-in) capital.
+      eligible = [c for c in Commitments(fund_id) if c.status IN {ACTIVE, DEFAULTED} and c.drawn_cents > 0]
+      total_drawn = sum(c.drawn_cents for c in eligible)
+      raw[c]   = lp_share_cents * c.drawn_cents / total_drawn
+      floor[c] = floor(raw[c])
+      leftover = lp_share_cents - sum(floor[c])
+      # Largest fractional remainder, ties by Commitment.created_at ASC (never id).
+      order = eligible sorted by (frac(raw[c]) DESC, c.created_at ASC)
+      amount_cents[c] = floor[c] + (1 if index(c, order) < leftover else 0)
+    input_set: "Commitments with status IN {ACTIVE, DEFAULTED} and drawn_cents > 0."
+    constants: {}
+    precision: "integer cents; largest-remainder; ties by created_at ASC"
+
+  - name: recycle_distribution
+    trigger: "POST /distribution-events/{id}/recall"
+    algorithm: aggregation
+    formula: |
+      # Recall a recyclable distribution back into unfunded commitments.
+      cap_total   = round_half_up( fund.recycling_cap_pct_bps * fund.total_committed_cents / 10000 )
+      headroom    = max(0, cap_total - fund.recycled_to_date_cents)
+      recallable  = min(event.lp_share_cents, headroom)
+      reject ERR_RECYCLING_CAP_EXCEEDED if recallable <= 0
+      # Restore each commitment's drawn_cents by the recalled portion of its own prior receipt
+      # for THIS event (pro-rata to that commitment's DistributionAllocation.amount_cents),
+      # never restoring more than that commitment actually drew.
+      for each DistributionAllocation a of event:
+          share = round_half_up( recallable * a.amount_cents / event.lp_share_cents )
+          share = min(share, Commitment(a.commitment_id).drawn_cents)   # never push drawn below 0
+          Commitment(a.commitment_id).drawn_cents -= share   # restores unfunded_cents
+      event.recycled_amount_cents = recallable
+    input_set: "DistributionAllocations of the event; fund recycling cap and recycled-to-date."
+    constants:
+      BPS_DENOM: 10000
+    precision: "integer cents, round_half_up on per-commitment restoration share"
+
+  - name: compute_lp_irr_summary
+    trigger: "GET /commitments/{id}/statement (LP statement / K-1 figures)"
+    algorithm: aggregation
+    formula: |
+      # LP statement figures for a single commitment.
+      paid_in        = commitment.drawn_cents
+      distributions  = commitment.distributed_cents
+      nav            = round_half_up( fund_nav_cents * commitment.committed_cents / fund.total_committed_cents )
+      dpi_bps        = (distributions * 10000 / paid_in) if paid_in > 0 else 0     # distributions / paid-in
+      tvpi_bps       = ((distributions + nav) * 10000 / paid_in) if paid_in > 0 else 0
+      # K-1 line items by distribution_type, summed over the LP's DistributionAllocations on PAID events:
+      k1_return_of_capital = sum(a.amount_cents for PAID events of type RETURN_OF_CAPITAL)
+      k1_capital_gain      = sum(a.amount_cents for PAID events of type CAPITAL_GAIN)
+      k1_income            = sum(a.amount_cents for PAID events of type INCOME)
+      ubti_flag            = (lp.is_tax_exempt == true) AND (k1_income > 0)
+      where fund_nav_cents = sum(inv.current_mark_cents for Investments on fund with status IN {ACTIVE, IMPAIRED})
+    input_set: "The commitment's drawn/distributed ledger plus the fund NAV from current marks."
+    constants:
+      BPS_DENOM: 10000
+    precision: "round_half_up to integer cents on nav; ratios in basis points (integer)"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "The acting role is permitted to perform this operation per the RBAC matrix."
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: "For LimitedPartnerUser ownership operations, X-User-ID equals the lp_id on the targeted Commitment/Statement."
+    error_id: ERR_NOT_COMMITMENT_OWNER
+    http_status: 403
+    applies_to: "GET /commitments/{id}/statement, POST /capital-call-allocations/{id}/fund"
+
+  - priority: 4
+    category: existence
+    check: "All path and FK-referenced resources exist (validated left-to-right)."
+    error_id: ERR_RESOURCE_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 5
+    category: business_constraint
+    check: "Request body contains all required fields with valid types and enum members."
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 7
+    category: business_referential
+    check: "A Commitment references a Fund and an LP that both exist; an Investment references a Fund and a PortfolioCompany; a SideLetter references a Fund and an LP."
+    error_id: ERR_INVALID_REFERENCE
+    http_status: 422
+    applies_to: "POST /commitments, POST /investments, POST /side-letters"
+
+  - priority: 8
+    category: business_temporal
+    check: "ManagementFeeAccrual.period_end > period_start; CapitalCall.due_date is a valid future-or-present date; ValuationMark.as_of_date not after request time."
+    error_id: ERR_INVALID_PERIOD
+    http_status: 422
+    applies_to: "POST /funds/{id}/fee-accruals, POST /capital-calls, POST /valuation-marks"
+
+  - priority: 9
+    category: business_temporal
+    check: "A new ManagementFeeAccrual period [start,end) must not overlap an existing non-REVERSED accrual on the same fund (half-open intervals; adjacency at the shared endpoint is allowed)."
+    error_id: ERR_FEE_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /funds/{id}/fee-accruals"
+
+  - priority: 10
+    category: business_temporal
+    check: "A ValuationMark.as_of_date must be strictly later than the as_of_date of the current FINAL mark on the same Investment (no back-dated marks superseding a newer one; equal dates collide)."
+    error_id: ERR_MARK_DATE_CONFLICT
+    http_status: 409
+    applies_to: "POST /valuation-marks/{id}/finalize"
+
+  - priority: 11
+    category: business_safety
+    check: "A SideLetter.mfn_rank must be unique per (fund_id) across SideLetters with status IN {PROPOSED, EXECUTED}."
+    error_id: ERR_MFN_RANK_TAKEN
+    http_status: 409
+    applies_to: "POST /side-letters"
+
+  - priority: 12
+    category: business_constraint
+    check: "A CapitalCallAllocation can be funded only with paid_amount_cents == allocated_amount_cents (full funding; partial funding not supported)."
+    error_id: ERR_PARTIAL_FUNDING_NOT_ALLOWED
+    http_status: 422
+    applies_to: "POST /capital-call-allocations/{id}/fund"
+
+  - priority: 13
+    category: business_fiscal
+    check: "A CapitalCall.called_amount_cents must not exceed the sum of unfunded_cents across participating (non-excused, ACTIVE) commitments."
+    error_id: ERR_CALL_EXCEEDS_UNFUNDED
+    http_status: 422
+    applies_to: "POST /capital-calls"
+
+  - priority: 14
+    category: business_fiscal
+    check: "A DistributionEvent.gross_amount_cents must not exceed realized proceeds available on the source Investment (realized_proceeds_cents minus already-distributed for that investment)."
+    error_id: ERR_DISTRIBUTION_EXCEEDS_PROCEEDS
+    http_status: 422
+    applies_to: "POST /distribution-events"
+
+  - priority: 15
+    category: business_fiscal
+    check: "A recall's recallable amount must be positive after applying the recycling cap (recycled_to_date + recall <= cap)."
+    error_id: ERR_RECYCLING_CAP_EXCEEDED
+    http_status: 422
+    applies_to: "POST /distribution-events/{id}/recall"
+
+  - priority: 16
+    category: state
+    check: "OCC: expected_fund_version must equal the current Fund.version."
+    error_id: ERR_STALE_FUND_VERSION
+    http_status: 412
+    applies_to: "POST /capital-calls, POST /distribution-events"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Fund ----
+  - method: POST
+    path: "/funds"
+    description: "Create a fund."
+    roles: [FundManager]
+    code: 201
+    input: ["name", "vintage_year", "target_size_cents", "mgmt_fee_rate_bps", "carry_rate_bps", "pref_rate_bps", "gp_catchup_rate_bps?", "recycling_cap_pct_bps?", "fee_offset_pct_bps?"]
+    output: Fund
+    side_effects: ["Fund created with status FORMING, version 1"]
+
+  - method: GET
+    path: "/funds/{id}"
+    description: "Read a fund with computed totals."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: []
+    output: Fund
+    side_effects: []
+
+  - method: GET
+    path: "/funds"
+    description: "List funds (paginated)."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: Fund[]
+    side_effects: []
+
+  - method: POST
+    path: "/funds/{id}/activate"
+    description: "Move fund FORMING -> INVESTING."
+    roles: [FundManager]
+    code: 200
+    input: []
+    output: Fund
+    side_effects: ["Fund.status -> INVESTING", "increments Fund.version by 1"]
+
+  - method: POST
+    path: "/funds/{id}/begin-harvest"
+    description: "Move fund INVESTING -> HARVESTING."
+    roles: [FundManager]
+    code: 200
+    input: []
+    output: Fund
+    side_effects: ["Fund.status -> HARVESTING", "increments Fund.version by 1"]
+
+  - method: POST
+    path: "/funds/{id}/wind-down"
+    description: "Move fund HARVESTING -> WOUND_DOWN; cascade-close ACTIVE commitments."
+    roles: [FundManager]
+    code: 200
+    input: []
+    output: Fund
+    side_effects: ["Fund.status -> WOUND_DOWN", "ACTIVE Commitments -> CLOSED", "increments Fund.version by 1"]
+
+  - method: GET
+    path: "/funds/{id}/nav"
+    description: "Computed read: fund NAV from current FINAL marks plus uncalled capital."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: []
+    output: "{ fund_nav_cents: integer, total_called_cents: integer, total_distributed_cents: integer, recycled_to_date_cents: integer }"
+    side_effects: []
+
+  # ---- LimitedPartner ----
+  - method: POST
+    path: "/limited-partners"
+    description: "Create an LP record."
+    roles: [FundAdministrator, ComplianceOfficer]
+    code: 201
+    input: ["legal_name", "lp_type", "tax_id_last4", "is_tax_exempt?"]
+    output: LimitedPartner
+    side_effects: ["LimitedPartner created"]
+
+  - method: GET
+    path: "/limited-partners/{id}"
+    description: "Read an LP."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: []
+    output: LimitedPartner
+    side_effects: []
+
+  # ---- Commitment ----
+  - method: POST
+    path: "/commitments"
+    description: "Create a commitment (PENDING) linking an LP to a fund."
+    roles: [FundManager, FundAdministrator]
+    code: 201
+    input: [fund_id, lp_id, committed_cents]
+    output: Commitment
+    side_effects: ["Commitment created status PENDING"]
+
+  - method: GET
+    path: "/commitments/{id}"
+    description: "Read a commitment with computed drawn/distributed/unfunded."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: []
+    output: Commitment
+    side_effects: []
+
+  - method: GET
+    path: "/commitments"
+    description: "List/filter commitments by fund_id or lp_id (reverse-reachability for Commitment FKs)."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: ["fund_id?", "lp_id?", "status?", "limit?", "offset?"]
+    output: Commitment[]
+    side_effects: []
+
+  - method: POST
+    path: "/commitments/{id}/accept"
+    description: "Accept a commitment PENDING -> ACTIVE."
+    roles: [FundManager]
+    code: 200
+    input: []
+    output: Commitment
+    side_effects: ["Commitment.status -> ACTIVE", "Fund.total_committed_cents recomputed"]
+
+  - method: POST
+    path: "/commitments/{id}/declare-default"
+    description: "Declare an ACTIVE commitment DEFAULTED (LP exceeded strike limit)."
+    roles: [FundManager]
+    code: 200
+    input: []
+    output: Commitment
+    side_effects: ["Commitment.status -> DEFAULTED", "PENDING allocations -> DEFAULTED (cascade)", "affected CapitalCalls re-evaluate to PARTIALLY_DEFAULTED"]
+
+  - method: GET
+    path: "/commitments/{id}/statement"
+    description: "Computed read: LP statement / K-1 figures for the commitment."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: []
+    output: "{ paid_in_cents: integer, distributed_cents: integer, nav_cents: integer, dpi_bps: integer, tvpi_bps: integer, k1_return_of_capital_cents: integer, k1_capital_gain_cents: integer, k1_income_cents: integer, ubti_flag: boolean }"
+    side_effects: []
+
+  # ---- CapitalCall ----
+  - method: POST
+    path: "/capital-calls"
+    description: "Issue a capital call against a fund; splits across participating commitments (OCC on Fund)."
+    roles: [FundManager]
+    code: 201
+    input: [fund_id, purpose, called_amount_cents, due_date, expected_fund_version]
+    output: CapitalCall
+    side_effects: ["CapitalCall created status ISSUED with next call_number", "CapitalCallAllocations created per allocate_capital_call", "increments Fund.version by 1"]
+
+  - method: GET
+    path: "/capital-calls/{id}"
+    description: "Read a capital call."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: []
+    output: CapitalCall
+    side_effects: []
+
+  - method: GET
+    path: "/capital-calls"
+    description: "List/filter capital calls by fund_id (reverse-reachability for CapitalCall.fund_id)."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer]
+    code: 200
+    input: ["fund_id?", "status?", "limit?", "offset?"]
+    output: CapitalCall[]
+    side_effects: []
+
+  - method: POST
+    path: "/capital-calls/{id}/cancel"
+    description: "Cancel an ISSUED call with no PAID allocations; waives all allocations."
+    roles: [FundManager]
+    code: 200
+    input: []
+    output: CapitalCall
+    side_effects: ["CapitalCall.status -> CANCELLED", "all allocations -> WAIVED"]
+
+  - method: GET
+    path: "/capital-calls/{id}/allocations"
+    description: "Sub-resource list of allocations for a call (reverse-reachability for CapitalCallAllocation.capital_call_id)."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: []
+    output: CapitalCallAllocation[]
+    side_effects: []
+
+  # ---- CapitalCallAllocation ----
+  - method: GET
+    path: "/capital-call-allocations/{id}"
+    description: "Read an allocation."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: []
+    output: CapitalCallAllocation
+    side_effects: []
+
+  - method: GET
+    path: "/capital-call-allocations"
+    description: "List/filter allocations by commitment_id (reverse-reachability for CapitalCallAllocation.commitment_id)."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: ["commitment_id?", "capital_call_id?", "status?", "limit?", "offset?"]
+    output: CapitalCallAllocation[]
+    side_effects: []
+
+  - method: POST
+    path: "/capital-call-allocations/{id}/fund"
+    description: "Fund an allocation in full (PENDING -> PAID); may settle the parent call."
+    roles: [FundAdministrator, LimitedPartnerUser]
+    code: 200
+    input: [paid_amount_cents]
+    output: CapitalCallAllocation
+    side_effects: ["allocation.status -> PAID", "Commitment.drawn_cents recomputed", "parent CapitalCall may transition to SETTLED (bubble up)"]
+
+  - method: POST
+    path: "/capital-call-allocations/{id}/default"
+    description: "Mark an allocation DEFAULTED (LP failed to fund); re-evaluates parent call."
+    roles: [FundAdministrator]
+    code: 200
+    input: []
+    output: CapitalCallAllocation
+    side_effects: ["allocation.status -> DEFAULTED", "owning LP.default_strike_count recomputed", "parent CapitalCall -> PARTIALLY_DEFAULTED or DEFAULTED (bubble up)"]
+
+  # ---- PortfolioCompany ----
+  - method: POST
+    path: "/portfolio-companies"
+    description: "Create a portfolio company."
+    roles: [FundManager]
+    code: 201
+    input: [name, sector]
+    output: PortfolioCompany
+    side_effects: ["PortfolioCompany created status PROSPECT"]
+
+  - method: GET
+    path: "/portfolio-companies/{id}"
+    description: "Read a portfolio company."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer]
+    code: 200
+    input: []
+    output: PortfolioCompany
+    side_effects: []
+
+  # ---- Investment ----
+  - method: POST
+    path: "/investments"
+    description: "Record an investment by a fund into a portfolio company."
+    roles: [FundManager]
+    code: 201
+    input: [fund_id, portfolio_company_id, cost_basis_cents, ownership_pct_bps]
+    output: Investment
+    side_effects: ["Investment created status ACTIVE", "PortfolioCompany.status -> HELD"]
+
+  - method: GET
+    path: "/investments/{id}"
+    description: "Read an investment with current_mark_cents."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: []
+    output: Investment
+    side_effects: []
+
+  - method: GET
+    path: "/investments"
+    description: "List/filter investments by fund_id or portfolio_company_id (reverse-reachability for Investment FKs)."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer]
+    code: 200
+    input: ["fund_id?", "portfolio_company_id?", "status?", "limit?", "offset?"]
+    output: Investment[]
+    side_effects: []
+
+  - method: POST
+    path: "/investments/{id}/realize"
+    description: "Mark an investment REALIZED with cash proceeds, enabling distributions."
+    roles: [FundManager]
+    code: 200
+    input: [realized_proceeds_cents]
+    output: Investment
+    side_effects: ["Investment.status -> REALIZED", "realized_proceeds_cents recorded", "PortfolioCompany.status -> EXITED"]
+
+  # ---- ValuationMark ----
+  - method: POST
+    path: "/valuation-marks"
+    description: "Create a DRAFT valuation mark for an investment."
+    roles: [FundAdministrator]
+    code: 201
+    input: [investment_id, as_of_date, fair_value_cents, methodology]
+    output: ValuationMark
+    side_effects: ["ValuationMark created status DRAFT"]
+
+  - method: GET
+    path: "/valuation-marks/{id}"
+    description: "Read a valuation mark."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer]
+    code: 200
+    input: []
+    output: ValuationMark
+    side_effects: []
+
+  - method: GET
+    path: "/valuation-marks"
+    description: "List/filter valuation marks by investment_id (reverse-reachability for ValuationMark.investment_id)."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer]
+    code: 200
+    input: ["investment_id?", "status?", "limit?", "offset?"]
+    output: ValuationMark[]
+    side_effects: []
+
+  - method: POST
+    path: "/valuation-marks/{id}/finalize"
+    description: "Finalize a DRAFT mark -> FINAL; supersede prior FINAL; update Investment.current_mark_cents."
+    roles: [FundAdministrator]
+    code: 200
+    input: []
+    output: ValuationMark
+    side_effects: ["mark.status -> FINAL", "prior FINAL mark -> SUPERSEDED", "Investment.current_mark_cents recomputed", "WRITE_OFF cascades Investment -> IMPAIRED, PortfolioCompany -> WRITTEN_OFF"]
+
+  # ---- ManagementFeeAccrual ----
+  - method: POST
+    path: "/funds/{id}/fee-accruals"
+    description: "Accrue a management fee for a period; computes gross/offset/net."
+    roles: [FundAdministrator]
+    code: 201
+    input: [period_start, period_end]
+    output: ManagementFeeAccrual
+    side_effects: ["ManagementFeeAccrual created status ACCRUED", "gross_fee_cents, offset_applied_cents, net_fee_cents computed"]
+
+  - method: GET
+    path: "/funds/{id}/fee-accruals"
+    description: "Sub-resource list of fee accruals for a fund (reverse-reachability for ManagementFeeAccrual.fund_id)."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ManagementFeeAccrual[]
+    side_effects: []
+
+  - method: GET
+    path: "/fee-accruals/{id}"
+    description: "Read a fee accrual."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer]
+    code: 200
+    input: []
+    output: ManagementFeeAccrual
+    side_effects: []
+
+  # ---- DistributionEvent ----
+  - method: POST
+    path: "/distribution-events"
+    description: "Declare a distribution; runs waterfall + commitment split (OCC on Fund)."
+    roles: [FundManager]
+    code: 201
+    input: ["fund_id", "source_investment_id", "gross_amount_cents", "distribution_type", "recyclable?", "expected_fund_version"]
+    output: DistributionEvent
+    side_effects: ["DistributionEvent created status DECLARED", "lp_share_cents/gp_carry_cents computed", "DistributionAllocations created", "increments Fund.version by 1"]
+
+  - method: GET
+    path: "/distribution-events/{id}"
+    description: "Read a distribution event with waterfall results."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: []
+    output: DistributionEvent
+    side_effects: []
+
+  - method: GET
+    path: "/distribution-events"
+    description: "List/filter distribution events by fund_id or source_investment_id (reverse-reachability for DistributionEvent FKs)."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer]
+    code: 200
+    input: ["fund_id?", "source_investment_id?", "status?", "limit?", "offset?"]
+    output: DistributionEvent[]
+    side_effects: []
+
+  - method: POST
+    path: "/distribution-events/{id}/pay"
+    description: "Pay a DECLARED distribution -> PAID; updates commitment ledgers."
+    roles: [FundAdministrator]
+    code: 200
+    input: []
+    output: DistributionEvent
+    side_effects: ["event.status -> PAID", "Commitment.distributed_cents recomputed", "Fund.total_distributed_cents recomputed"]
+
+  - method: POST
+    path: "/distribution-events/{id}/recall"
+    description: "Recall a PAID recyclable distribution into unfunded commitments (recycling)."
+    roles: [FundManager]
+    code: 200
+    input: []
+    output: DistributionEvent
+    side_effects: ["event.status -> RECALLED", "recycled_amount_cents set", "Commitment.drawn_cents reduced (unfunded restored)", "Fund.recycled_to_date_cents recomputed"]
+
+  - method: POST
+    path: "/distribution-events/{id}/reverse"
+    description: "Reverse a DECLARED distribution -> REVERSED; zero its allocations."
+    roles: [FundManager]
+    code: 200
+    input: []
+    output: DistributionEvent
+    side_effects: ["event.status -> REVERSED", "allocations.amount_cents -> 0"]
+
+  - method: GET
+    path: "/distribution-allocations/{id}"
+    description: "Read a distribution allocation."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: []
+    output: DistributionAllocation
+    side_effects: []
+
+  - method: GET
+    path: "/distribution-allocations"
+    description: "List/filter distribution allocations by commitment_id (reverse-reachability for DistributionAllocation.commitment_id)."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer, LimitedPartnerUser]
+    code: 200
+    input: ["commitment_id?", "distribution_event_id?", "limit?", "offset?"]
+    output: DistributionAllocation[]
+    side_effects: []
+
+  # ---- SideLetter ----
+  - method: POST
+    path: "/side-letters"
+    description: "Create a side letter (PROPOSED) granting LP-specific terms."
+    roles: [ComplianceOfficer]
+    code: 201
+    input: ["fund_id", "lp_id", "mfn_rank", "fee_discount_bps?", "excused_purposes?"]
+    output: SideLetter
+    side_effects: ["SideLetter created status PROPOSED"]
+
+  - method: GET
+    path: "/side-letters/{id}"
+    description: "Read a side letter."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer]
+    code: 200
+    input: []
+    output: SideLetter
+    side_effects: []
+
+  - method: GET
+    path: "/side-letters"
+    description: "List/filter side letters by fund_id or lp_id (reverse-reachability for SideLetter FKs)."
+    roles: [FundManager, FundAdministrator, ComplianceOfficer]
+    code: 200
+    input: ["fund_id?", "lp_id?", "status?", "limit?", "offset?"]
+    output: SideLetter[]
+    side_effects: []
+
+  - method: POST
+    path: "/side-letters/{id}/execute"
+    description: "Execute a PROPOSED side letter -> EXECUTED, activating its terms."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: SideLetter
+    side_effects: ["SideLetter.status -> EXECUTED"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing or malformed X-User-Role / X-User-ID headers."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for this operation per RBAC."
+  - id: ERR_NOT_COMMITMENT_OWNER
+    http: 403
+    condition: "LimitedPartnerUser acting on a commitment/statement not owned by the X-User-ID LP."
+  - id: ERR_RESOURCE_NOT_FOUND
+    http: 404
+    condition: "A path or FK-referenced resource does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, bad type, or invalid enum member."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not defined from the resource's current state."
+  - id: ERR_INVALID_REFERENCE
+    http: 422
+    condition: "FK in body references a non-existent or incompatible parent (e.g. Commitment LP/Fund mismatch)."
+  - id: ERR_INVALID_PERIOD
+    http: 422
+    condition: "period_end <= period_start, invalid due_date, or back-dated mark as_of_date."
+  - id: ERR_FEE_PERIOD_OVERLAP
+    http: 409
+    condition: "New fee-accrual period overlaps an existing non-REVERSED accrual on the same fund."
+  - id: ERR_MARK_DATE_CONFLICT
+    http: 409
+    condition: "Mark as_of_date not strictly later than the current FINAL mark on the investment."
+  - id: ERR_MFN_RANK_TAKEN
+    http: 409
+    condition: "Side-letter mfn_rank already used by a PROPOSED/EXECUTED side letter on the fund."
+  - id: ERR_PARTIAL_FUNDING_NOT_ALLOWED
+    http: 422
+    condition: "paid_amount_cents != allocated_amount_cents on a fund-allocation call."
+  - id: ERR_CALL_EXCEEDS_UNFUNDED
+    http: 422
+    condition: "Capital-call amount exceeds aggregate unfunded capacity of participating commitments."
+  - id: ERR_DISTRIBUTION_EXCEEDS_PROCEEDS
+    http: 422
+    condition: "Distribution gross amount exceeds available realized proceeds on the source investment."
+  - id: ERR_RECYCLING_CAP_EXCEEDED
+    http: 422
+    condition: "Recall would exceed the fund recycling cap (recallable <= 0)."
+  - id: ERR_STALE_FUND_VERSION
+    http: 412
+    condition: "expected_fund_version does not match current Fund.version (OCC)."
+  - id: ERR_SOURCE_NOT_REALIZED
+    http: 422
+    condition: "Distribution declared against an Investment whose status is not REALIZED."
+  - id: ERR_COMMITMENT_NOT_ACCEPTED
+    http: 409
+    condition: "Operation requires at least one ACTIVE commitment but none exists (e.g. fund activate, capital call with empty participant set)."
+  - id: ERR_NO_PARTICIPATING_COMMITMENTS
+    http: 422
+    condition: "Capital call or distribution split produced an empty participant set after excused-LP / drawn-capital filtering."
+  - id: ERR_WIND_DOWN_BLOCKED
+    http: 409
+    condition: "Fund wind-down blocked by an ISSUED capital call or an ACTIVE investment."
+  - id: ERR_VALIDATION_LIMIT
+    http: 422
+    condition: "A numeric input is out of its declared range (e.g. carry_rate_bps > 5000, ownership_pct_bps > 10000, negative cents)."
+  - id: ERR_PAGINATION_INVALID
+    http: 400
+    condition: "limit/offset out of the allowed pagination range."
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: FundManager
+    description: "GP-side fund operator: forms funds, runs capital calls, declares distributions, manages investments."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /funds"
+      - "POST /funds/{id}/activate"
+      - "POST /funds/{id}/begin-harvest"
+      - "POST /funds/{id}/wind-down"
+      - "POST /commitments/{id}/accept"
+      - "POST /commitments/{id}/declare-default"
+      - "POST /capital-calls"
+      - "POST /capital-calls/{id}/cancel"
+      - "POST /portfolio-companies"
+      - "POST /investments"
+      - "POST /investments/{id}/realize"
+      - "POST /distribution-events"
+      - "POST /distribution-events/{id}/recall"
+      - "POST /distribution-events/{id}/reverse"
+    shared_operations:
+      - "POST /commitments (with FundAdministrator)"
+      - "GET reads across funds/commitments/calls/investments/distributions"
+
+  - name: FundAdministrator
+    description: "Back-office accounting: funds allocations, defaults, fee accruals, valuation marks, distribution payment."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /capital-call-allocations/{id}/default"
+      - "POST /valuation-marks"
+      - "POST /valuation-marks/{id}/finalize"
+      - "POST /funds/{id}/fee-accruals"
+      - "POST /distribution-events/{id}/pay"
+      - "POST /limited-partners (with ComplianceOfficer)"
+    shared_operations:
+      - "POST /commitments (with FundManager)"
+      - "POST /capital-call-allocations/{id}/fund (with LimitedPartnerUser)"
+      - "GET reads across funds/commitments/calls/fees/marks"
+
+  - name: LimitedPartnerUser
+    description: "Investor-facing read access plus funding own capital-call allocations. X-User-ID is the LimitedPartner.id."
+    identity: "entity_backed:LimitedPartner"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /capital-call-allocations/{id}/fund (own commitment only)"
+      - "GET /commitments/{id}/statement (own commitment only)"
+      - "GET reads on own commitments, calls, distributions, statements"
+
+  - name: ComplianceOfficer
+    description: "Manages side letters and LP onboarding; read access for audit."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /side-letters"
+      - "POST /side-letters/{id}/execute"
+    shared_operations:
+      - "POST /limited-partners (with FundAdministrator)"
+      - "GET reads across funds/side-letters/commitments for audit"

@@ -1,0 +1,1276 @@
+# =============================================================================
+# Promotion & Coupon Engine — Scaffold (§1.0–§1.7)
+# Difficulty band: Expert (§0.4)
+# =============================================================================
+
+scenario: "Promotion & Coupon Engine: promo types (% off/BOGO/threshold), stacking & exclusion rules, single/multi-use code, eligibility (segment/first-order), budget cap & usage tracking, auto-apply best discount, schedule/blackout, abuse limit"
+
+domain_name: promotion-coupon-engine
+api_prefix: ""
+
+# -----------------------------------------------------------------------------
+# Complexity Profile (§0.1–§0.4)
+# -----------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - rate_threshold_triggers          # budget cap, abuse counts, tier breakpoints, stacking-discount ceiling
+    - derived_field_reconciliation     # budget_consumed_cents, redemption counters kept in sync with the ledger
+    - scheduled_actions                # active window + blackout windows gate eligibility against a settable clock
+    - optimistic_concurrency           # OCC on Promotion.version for budget-consuming carts; OCC on Cart.version for re-price/lock
+    - selector_policy                  # auto-apply best-discount picks one promotion from a candidate pool
+
+  entity_topology: graph
+  # Promotion <-> Promotion many-to-many via ExclusionRule (self-referential graph of mutual-exclusion edges);
+  # Cart references Promotions via CartApplication junction; Customer<->Segment many-to-many via SegmentMembership.
+
+  state_machine_shape: parallel
+  # Promotion lifecycle (DRAFT->ACTIVE->{PAUSED<->ACTIVE}->{EXHAUSTED,EXPIRED,ARCHIVED}) is cyclic (PAUSED<->ACTIVE);
+  # Cart carries two independent dimensions: pricing_status x checkout_status that evolve on different triggers.
+
+  relationship_patterns:
+    - one_to_many          # Promotion -> Coupon, Promotion -> BlackoutWindow, Cart -> CartLine, Cart -> CartApplication
+    - many_to_many         # Customer <-> Segment (SegmentMembership), Promotion <-> Promotion (ExclusionRule)
+    - self_referential     # ExclusionRule links two Promotions
+    - cross_aggregate      # CartApplication references Promotion + Coupon across aggregate boundaries
+
+  role_model: peer_roles
+  # MerchantAdmin owns promotion/coupon/segment configuration; Shopper owns their own Cart and redemptions;
+  # PlatformOperator runs the clock and budget-sweep operations.
+
+  consistency_model: immediate
+
+# -----------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — verbatim)
+# -----------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  # ---------------------------------------------------------------- Customer
+  - name: Customer
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: email, type: string, source: input, description: "Customer email (unique, case-insensitive)" }
+      - { name: display_name, type: string, source: input, description: "Display name" }
+      - { name: order_count, type: integer, source: computed, default: 0, description: "Number of CHECKED_OUT carts owned by this customer; drives first-order eligibility (order_count == 0 means first order)" }
+      - { name: lifetime_discount_cents, type: integer, source: computed, default: 0, description: "Sum of total_discount_cents over this customer's CHECKED_OUT carts" }
+
+  # ---------------------------------------------------------------- Segment
+  - name: Segment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: code, type: string, source: input, description: "Segment code (unique, e.g. VIP, NEW_REGION)" }
+      - { name: name, type: string, source: input, description: "Human-readable segment name" }
+      - { name: member_count, type: integer, source: computed, default: 0, description: "Count of ACTIVE SegmentMembership rows referencing this segment" }
+
+  # ---------------------------------------------- SegmentMembership (junction)
+  - name: SegmentMembership
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; the member" }
+      - { name: segment_id, type: string, source: input, description: "FK -> Segment.id; the segment joined" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | REVOKED — membership lifecycle", constraints: "one of ACTIVE, REVOKED" }
+
+  # ---------------------------------------------------------------- Promotion
+  - name: Promotion
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Promotion name" }
+      - { name: promo_type, type: enum, source: input, description: "PERCENT_OFF | BOGO | THRESHOLD", constraints: "one of PERCENT_OFF, BOGO, THRESHOLD" }
+      - { name: percent_off, type: number, source: input, description: "Discount fraction for PERCENT_OFF (0 < x <= 1); null for other types", default: null, constraints: "required when promo_type==PERCENT_OFF; 0 < percent_off <= 1" }
+      - { name: bogo_sku, type: string, source: input, description: "SKU the BOGO applies to; the cheapest of every pair of matching units on that SKU's line is free; null for other types", default: null, constraints: "required when promo_type==BOGO" }
+      - { name: threshold_tiers, type: array, source: input, description: "Array of {min_subtotal_cents, discount_cents} for THRESHOLD, ascending by min_subtotal_cents; null for other types", default: null, constraints: "required when promo_type==THRESHOLD; non-empty, strictly ascending min_subtotal_cents" }
+      - { name: stacking_class, type: enum, source: input, description: "EXCLUSIVE | STACKABLE — EXCLUSIVE may never combine with any other promotion on a cart; STACKABLE may combine subject to ExclusionRule edges and the stacking ceiling", constraints: "one of EXCLUSIVE, STACKABLE" }
+      - { name: max_stacked_discount_pct, type: number, source: input, description: "Ceiling on the SUM of stacked discounts as a fraction of cart subtotal when this promotion participates in a stack; null means no ceiling from this promotion", default: null, constraints: "0 < x <= 1 when present" }
+      - { name: eligibility_mode, type: enum, source: input, description: "ALL | SEGMENT | FIRST_ORDER — who may use the promotion", default: ALL, constraints: "one of ALL, SEGMENT, FIRST_ORDER" }
+      - { name: eligible_segment_id, type: string, source: input, description: "FK -> Segment.id; required when eligibility_mode==SEGMENT; null otherwise", default: null }
+      - { name: active_from, type: datetime, source: input, description: "Inclusive start of the active window (ISO 8601 UTC)" }
+      - { name: active_until, type: datetime, source: input, description: "Exclusive end of the active window (ISO 8601 UTC); must be > active_from" }
+      - { name: budget_cap_cents, type: integer, source: input, description: "Maximum total discount this promotion may ever fund; null means unlimited", default: null, constraints: "> 0 when present" }
+      - { name: budget_consumed_cents, type: integer, source: computed, default: 0, description: "Sum of discount_cents over all CONFIRMED CouponRedemption rows under this promotion; reconciled on every confirm/release" }
+      - { name: max_redemptions_per_customer, type: integer, source: input, description: "Abuse limit: max CONFIRMED redemptions of this promotion per customer; null means unlimited", default: null, constraints: "> 0 when present" }
+      - { name: status, type: enum, source: system, default: DRAFT, description: "DRAFT | ACTIVE | PAUSED | EXHAUSTED | EXPIRED | ARCHIVED", constraints: "one of DRAFT, ACTIVE, PAUSED, EXHAUSTED, EXPIRED, ARCHIVED" }
+
+  # ---------------------------------------------------------------- Coupon
+  - name: Coupon
+    parent: Promotion
+    common_fields: true
+    fields:
+      - { name: promotion_id, type: string, source: input, description: "FK -> Promotion.id; the promotion this code grants" }
+      - { name: code, type: string, source: input, description: "Coupon code string (unique, case-insensitive)" }
+      - { name: use_mode, type: enum, source: input, description: "SINGLE_USE (max one CONFIRMED redemption ever) | MULTI_USE (capped by max_total_redemptions)", constraints: "one of SINGLE_USE, MULTI_USE" }
+      - { name: max_total_redemptions, type: integer, source: input, description: "For MULTI_USE: maximum CONFIRMED redemptions across all customers; ignored (treated as 1) for SINGLE_USE", default: null, constraints: "> 0 when use_mode==MULTI_USE" }
+      - { name: redeemed_count, type: integer, source: computed, default: 0, description: "Count of CONFIRMED CouponRedemption rows referencing this coupon; reconciled on confirm/release" }
+      - { name: status, type: enum, source: system, default: ENABLED, description: "ENABLED | DISABLED | EXHAUSTED — EXHAUSTED set when redeemed_count reaches the cap", constraints: "one of ENABLED, DISABLED, EXHAUSTED" }
+
+  # ----------------------------------------------------------- BlackoutWindow
+  - name: BlackoutWindow
+    parent: Promotion
+    common_fields: false  # id, created_at only — immutable configuration record
+    fields:
+      - { name: promotion_id, type: string, source: input, description: "FK -> Promotion.id; the promotion this window suppresses" }
+      - { name: starts_at, type: datetime, source: input, description: "Inclusive start of the blackout interval (ISO 8601 UTC)" }
+      - { name: ends_at, type: datetime, source: input, description: "Exclusive end of the blackout interval (ISO 8601 UTC); must be > starts_at" }
+      - { name: reason, type: string, source: input, description: "Free-text reason for the blackout" }
+
+  # ----------------------------------------------------------- ExclusionRule
+  - name: ExclusionRule
+    parent: null
+    common_fields: false  # id, created_at only — immutable edge record
+    fields:
+      - { name: promotion_a_id, type: string, source: input, description: "FK -> Promotion.id; one endpoint of the mutual-exclusion edge" }
+      - { name: promotion_b_id, type: string, source: input, description: "FK -> Promotion.id; the other endpoint of the mutual-exclusion edge" }
+      - { name: note, type: string, source: input, description: "Why these two promotions may not co-apply" }
+
+  # ---------------------------------------------------------------- Cart
+  - name: Cart
+    parent: Customer
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; cart owner" }
+      - { name: subtotal_cents, type: integer, source: computed, default: 0, description: "Sum over CartLine of unit_price_cents * quantity" }
+      - { name: total_discount_cents, type: integer, source: computed, default: 0, description: "Sum of discount_cents over this cart's APPLIED CartApplication rows after the stacking ceiling is enforced" }
+      - { name: total_cents, type: integer, source: computed, default: 0, description: "= subtotal_cents - total_discount_cents (floored at 0)" }
+      - { name: pricing_status, type: enum, source: system, default: UNPRICED, description: "Independent dimension: UNPRICED | PRICED | STALE — repricing status of the cart", constraints: "one of UNPRICED, PRICED, STALE" }
+      - { name: checkout_status, type: enum, source: system, default: OPEN, description: "Independent dimension: OPEN | LOCKED | CHECKED_OUT | ABANDONED — checkout lifecycle", constraints: "one of OPEN, LOCKED, CHECKED_OUT, ABANDONED" }
+
+  # ---------------------------------------------------------------- CartLine
+  - name: CartLine
+    parent: Cart
+    common_fields: true
+    fields:
+      - { name: cart_id, type: string, source: input, description: "FK -> Cart.id; owning cart" }
+      - { name: sku, type: string, source: input, description: "Product SKU" }
+      - { name: unit_price_cents, type: integer, source: input, description: "Per-unit price in cents", constraints: "> 0" }
+      - { name: quantity, type: integer, source: input, description: "Number of units", constraints: ">= 1" }
+      - { name: line_total_cents, type: integer, source: computed, default: 0, description: "= unit_price_cents * quantity" }
+
+  # --------------------------------------------------------- CartApplication
+  - name: CartApplication
+    parent: Cart
+    common_fields: true
+    fields:
+      - { name: cart_id, type: string, source: input, description: "FK -> Cart.id; the cart this promotion is applied to" }
+      - { name: promotion_id, type: string, source: input, description: "FK -> Promotion.id; the applied promotion" }
+      - { name: coupon_id, type: string, source: input, description: "FK -> Coupon.id; the coupon code presented (null for AUTO_APPLY applications)", default: null }
+      - { name: source, type: enum, source: system, default: MANUAL, description: "MANUAL (coupon code presented) | AUTO_APPLY (server selected the best public promotion)", constraints: "one of MANUAL, AUTO_APPLY" }
+      - { name: raw_discount_cents, type: integer, source: computed, default: 0, description: "Discount this promotion would fund before the stacking ceiling is enforced" }
+      - { name: discount_cents, type: integer, source: computed, default: 0, description: "Final discount funded by this application after the stacking ceiling is enforced across the cart" }
+      - { name: status, type: enum, source: system, default: APPLIED, description: "APPLIED | REMOVED — whether this application currently contributes to the cart total", constraints: "one of APPLIED, REMOVED" }
+
+  # -------------------------------------------------------- CouponRedemption
+  - name: CouponRedemption
+    parent: null
+    common_fields: true
+    fields:
+      - { name: coupon_id, type: string, source: input, description: "FK -> Coupon.id; the redeemed coupon (null for AUTO_APPLY redemptions)", default: null }
+      - { name: promotion_id, type: string, source: input, description: "FK -> Promotion.id; the redeemed promotion" }
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; who redeemed" }
+      - { name: cart_id, type: string, source: input, description: "FK -> Cart.id; the cart at checkout" }
+      - { name: discount_cents, type: integer, source: computed, default: 0, description: "Discount funded by this redemption, copied from the corresponding CartApplication.discount_cents at confirm time" }
+      - { name: status, type: enum, source: system, default: RESERVED, description: "RESERVED (counts against caps provisionally during LOCK) | CONFIRMED (counts permanently after checkout) | RELEASED (rolled back, no longer counts)", constraints: "one of RESERVED, CONFIRMED, RELEASED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ------------------------------------------------------- Promotion (cyclic)
+  - entity: Promotion
+    initial_state: DRAFT
+    terminal_states: [ARCHIVED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /promotions/{promotionId}/activate"
+        actor: MerchantAdmin
+        preconditions:
+          - "type-specific config present (PERCENT_OFF -> percent_off; BOGO -> bogo_sku; THRESHOLD -> threshold_tiers) else ERR_PROMO_CONFIG_INVALID"
+          - "eligibility_mode==SEGMENT requires eligible_segment_id referencing an existing Segment else ERR_PROMO_CONFIG_INVALID"
+          - "active_until > active_from else ERR_INVALID_WINDOW"
+        side_effects: ["status -> ACTIVE; promotion becomes eligible for application when the clock is within [active_from, active_until)"]
+
+      - from: ACTIVE
+        to: PAUSED
+        trigger: "POST /promotions/{promotionId}/pause"
+        actor: MerchantAdmin
+        preconditions: []
+        side_effects: ["status -> PAUSED; new applications referencing this promotion are rejected with ERR_PROMO_NOT_REDEEMABLE; existing RESERVED redemptions are untouched"]
+
+      - from: PAUSED
+        to: ACTIVE
+        trigger: "POST /promotions/{promotionId}/activate"
+        actor: MerchantAdmin
+        preconditions:
+          - "clock is before active_until else ERR_INVALID_WINDOW"
+        side_effects: ["status -> ACTIVE; promotion redeemable again within window"]
+        note: "Cyclic edge: ACTIVE<->PAUSED revision loop."
+
+      - from: ACTIVE
+        to: EXHAUSTED
+        trigger: "system (automatic on CouponRedemption RESERVED->CONFIRMED that makes budget_consumed_cents reach budget_cap_cents)"
+        actor: system
+        preconditions:
+          - "budget_cap_cents is not null AND budget_consumed_cents == budget_cap_cents after the confirm"
+        side_effects: ["status -> EXHAUSTED; further applications rejected with ERR_PROMO_BUDGET_EXHAUSTED"]
+        note: "Bubble-up: a redemption confirm on a child mutates the parent promotion's derived budget_consumed_cents, which itself drives this auto-transition."
+
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /_clock/advance (system sweep) when clock >= active_until"
+        actor: system
+        preconditions:
+          - "current clock >= active_until"
+        side_effects: ["status -> EXPIRED; promotion no longer redeemable"]
+
+      - from: PAUSED
+        to: EXPIRED
+        trigger: "POST /_clock/advance (system sweep) when clock >= active_until"
+        actor: system
+        preconditions:
+          - "current clock >= active_until"
+        side_effects: ["status -> EXPIRED"]
+
+      - from: DRAFT
+        to: ARCHIVED
+        trigger: "POST /promotions/{promotionId}/archive"
+        actor: MerchantAdmin
+        preconditions: ["no CONFIRMED CouponRedemption exists under this promotion"]
+        side_effects: ["status -> ARCHIVED; all child coupons set to DISABLED"]
+
+      - from: PAUSED
+        to: ARCHIVED
+        trigger: "POST /promotions/{promotionId}/archive"
+        actor: MerchantAdmin
+        preconditions: ["no RESERVED CouponRedemption exists under this promotion else ERR_PROMO_HAS_RESERVATIONS"]
+        side_effects: ["status -> ARCHIVED; all child coupons set to DISABLED"]
+        note: "Cascade down: archive disables every child Coupon."
+
+      - from: EXPIRED
+        to: ARCHIVED
+        trigger: "POST /promotions/{promotionId}/archive"
+        actor: MerchantAdmin
+        preconditions: []
+        side_effects: ["status -> ARCHIVED; all child coupons set to DISABLED"]
+
+  # --------------------------------------------- Coupon (linear with auto-end)
+  - entity: Coupon
+    initial_state: ENABLED
+    terminal_states: [EXHAUSTED]
+    transitions:
+      - from: ENABLED
+        to: DISABLED
+        trigger: "POST /promotions/{promotionId}/coupons/{couponId}/disable OR parent promotion archived"
+        actor: MerchantAdmin
+        preconditions: []
+        side_effects: ["status -> DISABLED; new applications presenting this code rejected with ERR_COUPON_DISABLED"]
+
+      - from: DISABLED
+        to: ENABLED
+        trigger: "POST /promotions/{promotionId}/coupons/{couponId}/enable"
+        actor: MerchantAdmin
+        preconditions: ["parent promotion status != ARCHIVED else ERR_INVALID_STATE"]
+        side_effects: ["status -> ENABLED"]
+
+      - from: ENABLED
+        to: EXHAUSTED
+        trigger: "system (automatic on CouponRedemption RESERVED->CONFIRMED that makes redeemed_count reach the cap)"
+        actor: system
+        preconditions:
+          - "redeemed_count == (1 if use_mode==SINGLE_USE else max_total_redemptions) after the confirm"
+        side_effects: ["status -> EXHAUSTED; further applications presenting this code rejected with ERR_COUPON_EXHAUSTED"]
+        note: "Bubble-up: confirming a child redemption increments redeemed_count which drives this auto-transition."
+
+  # ----------------------- SegmentMembership (linear, revocable not reversible)
+  - entity: SegmentMembership
+    initial_state: ACTIVE
+    terminal_states: [REVOKED]
+    transitions:
+      - from: ACTIVE
+        to: REVOKED
+        trigger: "DELETE /segments/{segmentId}/members/{membershipId}"
+        actor: MerchantAdmin
+        preconditions: []
+        side_effects: ["status -> REVOKED; segment.member_count recomputed (decremented); customer loses SEGMENT eligibility for promotions keyed to this segment"]
+
+  # --------------- Cart.pricing_status (parallel dimension A — cyclic STALE loop)
+  - entity: Cart.pricing_status
+    initial_state: UNPRICED
+    terminal_states: []
+    transitions:
+      - from: UNPRICED
+        to: PRICED
+        trigger: "POST /carts/{cartId}/reprice"
+        actor: Shopper
+        preconditions: ["checkout_status == OPEN else ERR_CART_NOT_OPEN"]
+        side_effects:
+          - "recompute subtotal_cents from CartLine rows"
+          - "recompute raw_discount_cents per APPLIED CartApplication via §1.3 promo formulas"
+          - "enforce stacking ceiling (§1.3 stacking_ceiling) to set discount_cents per application and total_discount_cents on the cart"
+          - "total_cents = max(0, subtotal_cents - total_discount_cents)"
+
+      - from: PRICED
+        to: STALE
+        trigger: "system (automatic when a CartLine is added/updated/removed or a CartApplication is applied/removed)"
+        actor: system
+        preconditions: []
+        side_effects: ["pricing_status -> STALE; total fields retain their last computed values until the next reprice"]
+
+      - from: STALE
+        to: PRICED
+        trigger: "POST /carts/{cartId}/reprice"
+        actor: Shopper
+        preconditions: ["checkout_status == OPEN else ERR_CART_NOT_OPEN"]
+        side_effects: ["recompute as in UNPRICED->PRICED"]
+        note: "Cyclic edge: PRICED->STALE->PRICED repricing loop."
+
+  # ------ Cart.checkout_status (parallel dimension B — guarded by pricing + cross-entity)
+  - entity: Cart.checkout_status
+    initial_state: OPEN
+    terminal_states: [CHECKED_OUT, ABANDONED]
+    transitions:
+      - from: OPEN
+        to: LOCKED
+        trigger: "POST /carts/{cartId}/lock"
+        actor: Shopper
+        preconditions:
+          - "pricing_status == PRICED (cross-dimension guard) else ERR_CART_NOT_PRICED"
+          - "for every APPLIED CartApplication: its Promotion.status == ACTIVE AND clock within [active_from, active_until) AND clock not within any BlackoutWindow else ERR_PROMO_NOT_REDEEMABLE"
+        side_effects:
+          - "checkout_status -> LOCKED"
+          - "for each APPLIED CartApplication create a CouponRedemption (status RESERVED) with discount_cents copied from the application; reservations count provisionally against per-customer abuse limit, coupon cap, and promotion budget"
+        note: "Cross-entity guard: Cart lock depends on each referenced Promotion's state and window."
+
+      - from: LOCKED
+        to: OPEN
+        trigger: "POST /carts/{cartId}/unlock"
+        actor: Shopper
+        preconditions: []
+        side_effects:
+          - "checkout_status -> OPEN"
+          - "release all RESERVED CouponRedemption rows for this cart (status -> RELEASED); reservations no longer count against caps"
+        note: "Compensation: unlock reverses every reservation created by lock, restoring provisional counters."
+
+      - from: LOCKED
+        to: CHECKED_OUT
+        trigger: "POST /carts/{cartId}/checkout"
+        actor: Shopper
+        preconditions:
+          - "expected_cart_version matches Cart.version (OCC) else ERR_STALE_CART_VERSION"
+          - "every RESERVED redemption still within its promotion budget, coupon cap and per-customer abuse limit (re-checked against CONFIRMED counts) else the relevant cap error"
+        side_effects:
+          - "checkout_status -> CHECKED_OUT (terminal)"
+          - "each RESERVED CouponRedemption -> CONFIRMED; promotion.budget_consumed_cents += discount_cents; coupon.redeemed_count += 1"
+          - "owner Customer.order_count += 1 and Customer.lifetime_discount_cents += cart.total_discount_cents"
+          - "promotion auto-transition to EXHAUSTED if budget reached; coupon auto-transition to EXHAUSTED if cap reached"
+
+      - from: OPEN
+        to: ABANDONED
+        trigger: "POST /carts/{cartId}/abandon"
+        actor: Shopper
+        preconditions: []
+        side_effects: ["checkout_status -> ABANDONED (terminal); APPLIED CartApplication rows set to REMOVED"]
+
+      - from: LOCKED
+        to: ABANDONED
+        trigger: "POST /carts/{cartId}/abandon"
+        actor: Shopper
+        preconditions: []
+        side_effects: ["checkout_status -> ABANDONED (terminal); release all RESERVED redemptions (status -> RELEASED); APPLIED CartApplication rows set to REMOVED"]
+
+  # --------------------------------------------- CouponRedemption (lifecycle)
+  - entity: CouponRedemption
+    initial_state: RESERVED
+    terminal_states: [CONFIRMED, RELEASED]
+    transitions:
+      - from: RESERVED
+        to: CONFIRMED
+        trigger: "system (cart checkout)"
+        actor: system
+        preconditions: ["owning Cart checkout_status transitioning LOCKED->CHECKED_OUT"]
+        side_effects: ["promotion.budget_consumed_cents += discount_cents; coupon.redeemed_count += 1 (if coupon_id set)"]
+
+      - from: RESERVED
+        to: RELEASED
+        trigger: "system (cart unlock or abandon)"
+        actor: system
+        preconditions: []
+        side_effects: ["reservation no longer counts against any cap; no change to CONFIRMED-derived counters"]
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules (OCC on parent version — true CREATE-with-supersede races only)
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: checkout-stale-cart
+    parent_entity: Cart
+    write_endpoint: "POST /carts/{cartId}/checkout"
+    occ_field: "expected_cart_version"
+    description: |
+      Checking out a Cart whose version has advanced since the client last
+      observed it is rejected. A reprice, line edit, application change, or a
+      lock-released-relock between the client's read and this checkout bumps
+      Cart.version; the client's view is therefore stale and the confirm is
+      refused so the budget/abuse counters are never advanced against an
+      out-of-date discount snapshot.
+    error_id: ERR_STALE_CART_VERSION
+    http_status: 412
+
+  - rule_id: apply-budget-stale-promotion
+    parent_entity: Promotion
+    write_endpoint: "POST /carts/{cartId}/applications"
+    occ_field: "expected_promotion_version"
+    description: |
+      Applying a budget-capped Promotion to a Cart while carrying a stale
+      Promotion.version is rejected. Each confirmed redemption bumps the
+      promotion's version when budget_consumed_cents advances; a client that
+      last read the promotion before another shopper's checkout consumed budget
+      holds a stale view, and the application is refused so the new application
+      is priced against a fresh remaining-budget figure.
+    error_id: ERR_STALE_PROMOTION_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  # ------------------ 1) PERCENT_OFF discount — nested rounding order (mode b)
+  - name: percent_off_discount
+    trigger: "Cart reprice (UNPRICED->PRICED, STALE->PRICED) for each APPLIED CartApplication whose Promotion.promo_type==PERCENT_OFF"
+    algorithm: aggregation
+    formula: |
+      # Rounding order is PINNED: round per line item, THEN sum. (Not sum-then-round.)
+      raw_discount_cents = 0
+      for line in cart.CartLine:          # iterate lines in created_at ASC order
+        line_total = line.unit_price_cents * line.quantity
+        line_discount = round_half_up(line_total * promotion.percent_off)   # per-line rounding FIRST
+        raw_discount_cents += line_discount                                 # THEN sum
+      # raw_discount_cents is this application's pre-ceiling discount
+    input_set: "All CartLine rows of the cart (every line participates in PERCENT_OFF)."
+    constants: {}
+    precision: "Whole cents, round_half_up, applied per line BEFORE summation."
+    variants:
+      - name: per_line_then_sum
+        when: "always (the pinned order)"
+        difference: "Distinguished from the rejected sum-then-round order: e.g. lines [1005,2005] @10% -> per-line 101+201=302, whereas sum-then-round = round(3010*0.10)=301. The engine MUST yield 302."
+
+  # ------------------ 2) BOGO discount — combinatorial min/branch (mode a)
+  - name: bogo_discount
+    trigger: "Cart reprice for each APPLIED CartApplication whose Promotion.promo_type==BOGO"
+    algorithm: aggregation
+    formula: |
+      # >=3 inputs (bogo_sku, matching lines' unit_price/quantity) with min + floor branches.
+      matching = [l for l in cart.CartLine if l.sku == promotion.bogo_sku]
+      total_qty = sum(l.quantity for l in matching)
+      free_units = floor(total_qty / 2)                 # every 2nd unit is free
+      # the free units are the CHEAPEST units across matching lines:
+      unit_prices = flatten([l.unit_price_cents] * l.quantity for l in matching), sorted ASC, tie-break created_at ASC of the line
+      raw_discount_cents = sum(unit_prices[0 : free_units])    # cheapest free_units summed
+    input_set: "Only CartLine rows whose sku == promotion.bogo_sku."
+    constants: { PAIR_SIZE: 2 }
+    precision: "Whole cents; no rounding (prices are already integer cents)."
+    variants:
+      - name: cheapest_free
+        when: "always"
+        difference: "Cheapest-unit-free selection; never the most expensive. Tie among equal prices broken by line created_at ASC."
+
+  # ------------------ 3) THRESHOLD discount — tiered breakpoint (mode a, threshold)
+  - name: threshold_discount
+    trigger: "Cart reprice for each APPLIED CartApplication whose Promotion.promo_type==THRESHOLD"
+    algorithm: threshold
+    formula: |
+      # Select the HIGHEST tier whose min_subtotal_cents <= subtotal_cents (flat, not marginal).
+      eligible = [t for t in promotion.threshold_tiers if t.min_subtotal_cents <= cart.subtotal_cents]
+      if eligible is empty: raw_discount_cents = 0
+      else: raw_discount_cents = max(eligible, key=min_subtotal_cents).discount_cents
+    input_set: "cart.subtotal_cents (computed from all CartLine) vs promotion.threshold_tiers."
+    constants: {}
+    precision: "Whole cents; discounts are integer literals from the tier table."
+    variants:
+      - name: boundary_inclusive
+        when: "subtotal_cents exactly equals a tier's min_subtotal_cents"
+        difference: "Boundary is INCLUSIVE (>=): subtotal == min_subtotal_cents qualifies for that tier; subtotal == min-1 does not."
+
+  # ------------------ 4) Stacking ceiling — circular-looking dependency (mode c)
+  - name: stacking_ceiling
+    trigger: "Cart reprice, after every APPLIED CartApplication has its raw_discount_cents"
+    algorithm: waterfall_allocation
+    formula: |
+      # Evaluation order PINNED to break the apparent circularity (ceiling depends on
+      # total which depends on per-application discount which the ceiling caps):
+      # STEP 1: compute each application's raw_discount_cents (calcs 1-3) — independent of ceiling.
+      # STEP 2: ceiling_pct = min over APPLIED applications of their Promotion.max_stacked_discount_pct
+      #         (ignore nulls; if all null -> no ceiling).
+      # STEP 3: ceiling_cents = round_half_up(cart.subtotal_cents * ceiling_pct) if a ceiling exists else +inf.
+      # STEP 4: sum_raw = sum(raw_discount_cents over APPLIED applications).
+      #         if sum_raw <= ceiling_cents: discount_cents = raw_discount_cents for each application.
+      #         else: distribute ceiling_cents across applications in waterfall order
+      #               (Promotion.created_at ASC; tie-break Promotion.id is FORBIDDEN — use created_at):
+      #               each application gets min(its raw_discount_cents, remaining_ceiling);
+      #               remaining_ceiling -= that amount; the rounding remainder, if any, lands on the
+      #               FIRST application by created_at ASC.
+      # STEP 5: total_discount_cents = sum(discount_cents over APPLIED applications).
+      total_discount_cents = sum(application.discount_cents)
+    input_set: "All APPLIED CartApplication rows of the cart and their Promotions' max_stacked_discount_pct."
+    constants: {}
+    precision: "Whole cents, round_half_up for ceiling_cents; waterfall remainder lands on first application by created_at ASC."
+    variants:
+      - name: uncapped
+        when: "sum_raw <= ceiling_cents OR no ceiling exists"
+        difference: "discount_cents == raw_discount_cents for every application."
+      - name: capped_waterfall
+        when: "sum_raw > ceiling_cents"
+        difference: "Total clamped to ceiling_cents and waterfall-allocated across applications by Promotion.created_at ASC."
+
+  # ------------------ 5) Auto-apply best discount — selector policy
+  - name: auto_apply_best_discount
+    trigger: "POST /carts/{cartId}/auto-apply"
+    algorithm: forward_looking
+    formula: |
+      # Candidate set (eligibility filter, explicit predicates):
+      #   Promotion.status == ACTIVE
+      #   AND clock within [active_from, active_until)
+      #   AND clock NOT within any BlackoutWindow of the promotion
+      #   AND stacking_class == STACKABLE OR (no other CartApplication exists and stacking_class==EXCLUSIVE)
+      #   AND eligibility_mode satisfied by the cart's Customer:
+      #       ALL -> always; SEGMENT -> customer has ACTIVE SegmentMembership in eligible_segment_id;
+      #       FIRST_ORDER -> customer.order_count == 0
+      #   AND budget not exhausted: budget_cap_cents is null OR budget_consumed_cents < budget_cap_cents
+      #   AND promotion has at least one public/auto-applicable surface (a promotion with no coupon is auto-applicable;
+      #       coupon-gated promotions are excluded from auto-apply)
+      # Ranking expression (over entity fields, NOT id):
+      #   1. higher computed raw_discount_cents on THIS cart wins (descending)
+      #   2. tie-break: Promotion.created_at ASC (earliest created wins)
+      # Fallback: empty candidate set -> no application created, return cart unchanged with ERR none (200, empty applied list)
+      best = argmax_by(candidates, key=(raw_discount_cents DESC, created_at ASC))
+      create CartApplication(source=AUTO_APPLY, promotion_id=best.id, coupon_id=null) and reprice
+    input_set: "All Promotions in ACTIVE status whose windows and eligibility match the cart's Customer and clock."
+    constants: {}
+    precision: "Discount precision per the selected promo's own calc (1-3)."
+    variants:
+      - name: single_best
+        when: "candidate set non-empty"
+        difference: "Exactly one AUTO_APPLY application created — the highest raw_discount_cents, earliest created_at on tie."
+
+  # ------------------ 6) Budget consumption reconciliation — aggregation/derived
+  - name: budget_consumption
+    trigger: "CouponRedemption RESERVED->CONFIRMED (checkout) and RESERVED->RELEASED (unlock/abandon)"
+    algorithm: aggregation
+    formula: |
+      promotion.budget_consumed_cents = sum(r.discount_cents for r in CouponRedemption
+                                            where r.promotion_id == promotion.id and r.status == CONFIRMED)
+      # provisional headroom check at apply/lock time uses CONFIRMED + RESERVED:
+      committed = sum(discount_cents where status in {CONFIRMED, RESERVED})
+      remaining = (budget_cap_cents - committed) if budget_cap_cents is not null else +inf
+    input_set: "CouponRedemption rows under the promotion; CONFIRMED for the persisted derived field, CONFIRMED+RESERVED for headroom checks."
+    constants: {}
+    precision: "Whole cents."
+    variants:
+      - name: would_exceed
+        when: "apply/lock where committed + new_discount_cents > budget_cap_cents"
+        difference: "Rejected with ERR_PROMO_BUDGET_WOULD_EXCEED (pre-commit) — distinct from ERR_PROMO_BUDGET_EXHAUSTED (post-commit, budget already fully consumed)."
+
+  # ------------------ 7) Abuse-limit / usage counter — threshold on different metric
+  - name: usage_limit_check
+    trigger: "POST /carts/{cartId}/applications and Cart lock (reservation)"
+    algorithm: threshold
+    formula: |
+      # Per-customer abuse limit (count metric, distinct from budget's cents metric):
+      customer_uses = count(CouponRedemption where promotion_id==P.id and customer_id==C.id
+                            and status in {CONFIRMED, RESERVED})
+      if P.max_redemptions_per_customer is not null and customer_uses >= P.max_redemptions_per_customer:
+        reject ERR_ABUSE_LIMIT_EXCEEDED
+      # Coupon total cap:
+      coupon_uses = count(CouponRedemption where coupon_id==K.id and status in {CONFIRMED, RESERVED})
+      cap = 1 if K.use_mode==SINGLE_USE else K.max_total_redemptions
+      if coupon_uses >= cap: reject ERR_COUPON_EXHAUSTED
+    input_set: "CouponRedemption rows filtered by promotion+customer (abuse) or coupon (cap), status in {CONFIRMED, RESERVED}."
+    constants: { SINGLE_USE_CAP: 1 }
+    precision: "Integer counts."
+    variants:
+      - name: at_limit_boundary
+        when: "customer_uses == max_redemptions_per_customer"
+        difference: "Boundary is >= : the use that would make the count equal the limit is the last allowed; the NEXT (count already == limit) is rejected."
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "Path resources exist (Promotion, Coupon, Cart, CartLine, Segment, SegmentMembership), validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all path-scoped endpoints"
+
+  - priority: 4
+    category: business_referential
+    check: "Body foreign keys reference existing rows (customer_id, segment_id, promotion_id, coupon_id, cart_id, eligible_segment_id)"
+    error_id: ERR_FK_NOT_FOUND
+    http_status: 422
+    applies_to: "create/apply endpoints with FK body fields"
+
+  - priority: 5
+    category: business_constraint
+    check: "Required fields present and well-formed (enum members valid, percent_off in (0,1], quantity>=1, unit_price_cents>0, ascending threshold_tiers)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all create/update endpoints"
+
+  - priority: 6
+    category: business_constraint
+    check: "Uniqueness: Customer.email, Segment.code, Coupon.code (case-insensitive); duplicate (customer_id,segment_id) ACTIVE membership rejected"
+    error_id: ERR_DUPLICATE
+    http_status: 409
+    applies_to: "POST /customers, POST /segments, POST /promotions/{id}/coupons, POST /segments/{id}/members"
+
+  - priority: 7
+    category: business_constraint
+    check: "Promotion type-specific config valid at activation (PERCENT_OFF->percent_off, BOGO->bogo_sku, THRESHOLD->threshold_tiers; SEGMENT mode->eligible_segment_id)"
+    error_id: ERR_PROMO_CONFIG_INVALID
+    http_status: 422
+    applies_to: "POST /promotions/{promotionId}/activate"
+
+  - priority: 8
+    category: business_temporal
+    check: "active_until > active_from on create/activate; BlackoutWindow ends_at > starts_at; activate only while clock < active_until"
+    error_id: ERR_INVALID_WINDOW
+    http_status: 422
+    applies_to: "POST /promotions, POST /promotions/{id}/activate, POST /promotions/{id}/blackouts"
+
+  - priority: 9
+    category: state
+    check: "Target resource in a state that admits this transition (Promotion/Coupon/Cart dimensions per §1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 10
+    category: state
+    check: "Cart pricing/checkout cross-dimension guards: lock requires pricing_status==PRICED (ERR_CART_NOT_PRICED); reprice/apply require checkout_status==OPEN (ERR_CART_NOT_OPEN)"
+    error_id: ERR_CART_NOT_PRICED
+    http_status: 409
+    applies_to: "POST /carts/{id}/lock, POST /carts/{id}/reprice, POST /carts/{id}/applications"
+
+  - priority: 11
+    category: business_referential
+    check: "Promotion is redeemable at this moment: status==ACTIVE, clock within [active_from, active_until), clock NOT within any BlackoutWindow; coupon ENABLED"
+    error_id: ERR_PROMO_NOT_REDEEMABLE
+    http_status: 409
+    applies_to: "POST /carts/{id}/applications, POST /carts/{id}/auto-apply, POST /carts/{id}/lock"
+
+  - priority: 12
+    category: business_safety
+    check: "Eligibility satisfied: SEGMENT mode requires ACTIVE membership in eligible_segment_id; FIRST_ORDER requires customer.order_count==0"
+    error_id: ERR_NOT_ELIGIBLE
+    http_status: 403
+    applies_to: "POST /carts/{id}/applications, POST /carts/{id}/auto-apply"
+
+  - priority: 13
+    category: business_constraint
+    check: "Stacking legality: EXCLUSIVE promotion may not coexist with any other APPLIED application; STACKABLE pair must not be joined by an ExclusionRule edge"
+    error_id: ERR_STACKING_CONFLICT
+    http_status: 409
+    applies_to: "POST /carts/{id}/applications"
+
+  - priority: 14
+    category: business_constraint
+    check: "Coupon usage cap not yet reached at apply/lock (coupon_uses >= cap where cap=1 for SINGLE_USE else max_total_redemptions, counting CONFIRMED+RESERVED)"
+    error_id: ERR_COUPON_EXHAUSTED
+    http_status: 409
+    applies_to: "POST /carts/{id}/applications, POST /carts/{id}/lock"
+
+  - priority: 15
+    category: business_safety
+    check: "Per-customer abuse limit not yet reached (customer_uses >= max_redemptions_per_customer, counting CONFIRMED+RESERVED)"
+    error_id: ERR_ABUSE_LIMIT_EXCEEDED
+    http_status: 409
+    applies_to: "POST /carts/{id}/applications, POST /carts/{id}/lock"
+
+  - priority: 16
+    category: business_fiscal
+    check: "Promotion budget headroom: committed (CONFIRMED+RESERVED) + new_discount_cents must not exceed budget_cap_cents at apply/lock; new_discount_cents is the prospective discount computed from the cart's CURRENT CartLine state (§1.3) regardless of pricing_status"
+    error_id: ERR_PROMO_BUDGET_WOULD_EXCEED
+    http_status: 409
+    applies_to: "POST /carts/{id}/applications, POST /carts/{id}/lock"
+
+  - priority: 17
+    category: business_fiscal
+    check: "Promotion budget already fully consumed (budget_consumed_cents == budget_cap_cents, status EXHAUSTED)"
+    error_id: ERR_PROMO_BUDGET_EXHAUSTED
+    http_status: 409
+    applies_to: "POST /carts/{id}/applications, POST /carts/{id}/auto-apply"
+
+  - priority: 18
+    category: state
+    check: "OCC: expected_cart_version must equal Cart.version on checkout; expected_promotion_version must equal Promotion.version on budget-capped apply"
+    error_id: ERR_STALE_CART_VERSION
+    http_status: 412
+    applies_to: "POST /carts/{id}/checkout, POST /carts/{id}/applications"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ----------------------------------------------------------------- Customer
+  - method: POST
+    path: "/customers"
+    description: "Create a customer"
+    roles: [MerchantAdmin, Shopper]
+    code: 201
+    input: [email, display_name]
+    output: Customer
+    side_effects: ["order_count=0, lifetime_discount_cents=0"]
+
+  - method: GET
+    path: "/customers/{customerId}"
+    description: "Get a customer"
+    roles: [MerchantAdmin, Shopper]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  - method: GET
+    path: "/customers"
+    description: "List customers (paginated)"
+    roles: [MerchantAdmin]
+    code: 200
+    input: ["email?", "limit?", "offset?"]
+    output: Customer[]
+    side_effects: []
+
+  # ----------------------------------------------------------------- Segment
+  - method: POST
+    path: "/segments"
+    description: "Create a segment"
+    roles: [MerchantAdmin]
+    code: 201
+    input: [code, name]
+    output: Segment
+    side_effects: ["member_count=0"]
+
+  - method: GET
+    path: "/segments/{segmentId}"
+    description: "Get a segment"
+    roles: [MerchantAdmin, Shopper]
+    code: 200
+    input: []
+    output: Segment
+    side_effects: []
+
+  - method: POST
+    path: "/segments/{segmentId}/members"
+    description: "Add a customer to a segment (creates an ACTIVE SegmentMembership)"
+    roles: [MerchantAdmin]
+    code: 201
+    input: [customer_id]
+    output: SegmentMembership
+    side_effects: ["status=ACTIVE; segment.member_count recomputed"]
+
+  - method: GET
+    path: "/segments/{id}/members"
+    description: "List memberships under a segment (reverse-reachability for SegmentMembership.segment_id)"
+    roles: [MerchantAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: SegmentMembership[]
+    side_effects: []
+
+  - method: DELETE
+    path: "/segments/{segmentId}/members/{membershipId}"
+    description: "Revoke a membership (ACTIVE->REVOKED)"
+    roles: [MerchantAdmin]
+    code: 200
+    input: []
+    output: SegmentMembership
+    side_effects: ["status -> REVOKED; segment.member_count recomputed"]
+
+  - method: GET
+    path: "/segment-memberships/{membershipId}"
+    description: "Get a single membership by id"
+    roles: [MerchantAdmin, Shopper]
+    code: 200
+    input: []
+    output: SegmentMembership
+    side_effects: []
+
+  - method: GET
+    path: "/segment-memberships"
+    description: "List memberships filtered by customer or segment (reverse-reachability for SegmentMembership.customer_id and segment_id)"
+    roles: [MerchantAdmin]
+    code: 200
+    input: ["customer_id?", "segment_id?", "status?", "limit?", "offset?"]
+    output: SegmentMembership[]
+    side_effects: []
+
+  # ---------------------------------------------------------------- Promotion
+  - method: POST
+    path: "/promotions"
+    description: "Create a promotion in DRAFT"
+    roles: [MerchantAdmin]
+    code: 201
+    input: [name, promo_type, "percent_off?", "bogo_sku?", "threshold_tiers?", stacking_class, "max_stacked_discount_pct?", "eligibility_mode?", "eligible_segment_id?", active_from, active_until, "budget_cap_cents?", "max_redemptions_per_customer?"]
+    output: Promotion
+    side_effects: ["status=DRAFT; budget_consumed_cents=0"]
+
+  - method: GET
+    path: "/promotions/{promotionId}"
+    description: "Get a promotion"
+    roles: [MerchantAdmin, Shopper]
+    code: 200
+    input: []
+    output: Promotion
+    side_effects: []
+
+  - method: GET
+    path: "/promotions"
+    description: "List promotions (paginated, filterable by status)"
+    roles: [MerchantAdmin, Shopper]
+    code: 200
+    input: ["status?", "promo_type?", "eligible_segment_id?", "limit?", "offset?"]
+    output: Promotion[]
+    side_effects: []
+
+  - method: POST
+    path: "/promotions/{promotionId}/activate"
+    description: "Activate a promotion (DRAFT->ACTIVE or PAUSED->ACTIVE)"
+    roles: [MerchantAdmin]
+    code: 200
+    input: []
+    output: Promotion
+    side_effects: ["status -> ACTIVE"]
+
+  - method: POST
+    path: "/promotions/{promotionId}/pause"
+    description: "Pause an active promotion (ACTIVE->PAUSED)"
+    roles: [MerchantAdmin]
+    code: 200
+    input: []
+    output: Promotion
+    side_effects: ["status -> PAUSED"]
+
+  - method: POST
+    path: "/promotions/{promotionId}/archive"
+    description: "Archive a promotion (DRAFT/PAUSED/EXPIRED -> ARCHIVED)"
+    roles: [MerchantAdmin]
+    code: 200
+    input: []
+    output: Promotion
+    side_effects: ["status -> ARCHIVED; child coupons -> DISABLED"]
+
+  # ------------------------------------------------------------------- Coupon
+  - method: POST
+    path: "/promotions/{promotionId}/coupons"
+    description: "Create a coupon code under a promotion"
+    roles: [MerchantAdmin]
+    code: 201
+    input: [code, use_mode, "max_total_redemptions?"]
+    output: Coupon
+    side_effects: ["status=ENABLED; redeemed_count=0"]
+
+  - method: GET
+    path: "/promotions/{id}/coupons"
+    description: "List coupons under a promotion (reverse-reachability for Coupon.promotion_id)"
+    roles: [MerchantAdmin, Shopper]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Coupon[]
+    side_effects: []
+
+  - method: GET
+    path: "/promotions/{promotionId}/coupons/{couponId}"
+    description: "Get a coupon"
+    roles: [MerchantAdmin, Shopper]
+    code: 200
+    input: []
+    output: Coupon
+    side_effects: []
+
+  - method: POST
+    path: "/promotions/{promotionId}/coupons/{couponId}/disable"
+    description: "Disable a coupon (ENABLED->DISABLED)"
+    roles: [MerchantAdmin]
+    code: 200
+    input: []
+    output: Coupon
+    side_effects: ["status -> DISABLED"]
+
+  - method: POST
+    path: "/promotions/{promotionId}/coupons/{couponId}/enable"
+    description: "Enable a coupon (DISABLED->ENABLED)"
+    roles: [MerchantAdmin]
+    code: 200
+    input: []
+    output: Coupon
+    side_effects: ["status -> ENABLED"]
+
+  # --------------------------------------------------------- BlackoutWindow
+  - method: POST
+    path: "/promotions/{promotionId}/blackouts"
+    description: "Add a blackout window to a promotion"
+    roles: [MerchantAdmin]
+    code: 201
+    input: [starts_at, ends_at, "reason?"]
+    output: BlackoutWindow
+    side_effects: []
+
+  - method: GET
+    path: "/promotions/{id}/blackouts"
+    description: "List blackout windows under a promotion (reverse-reachability for BlackoutWindow.promotion_id)"
+    roles: [MerchantAdmin, Shopper]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: BlackoutWindow[]
+    side_effects: []
+
+  # --------------------------------------------------------- ExclusionRule
+  - method: POST
+    path: "/exclusion-rules"
+    description: "Create a mutual-exclusion edge between two promotions"
+    roles: [MerchantAdmin]
+    code: 201
+    input: [promotion_a_id, promotion_b_id, "note?"]
+    output: ExclusionRule
+    side_effects: []
+
+  - method: GET
+    path: "/exclusion-rules/{exclusionRuleId}"
+    description: "Get a single exclusion-rule edge by id"
+    roles: [MerchantAdmin, Shopper]
+    code: 200
+    input: []
+    output: ExclusionRule
+    side_effects: []
+
+  - method: GET
+    path: "/exclusion-rules"
+    description: "List exclusion-rule edges filtered by either endpoint (reverse-reachability for promotion_a_id and promotion_b_id)"
+    roles: [MerchantAdmin, Shopper]
+    code: 200
+    input: ["promotion_a_id?", "promotion_b_id?", "limit?", "offset?"]
+    output: ExclusionRule[]
+    side_effects: []
+
+  # ------------------------------------------------------------------- Cart
+  - method: POST
+    path: "/carts"
+    description: "Create a cart for a customer"
+    roles: [Shopper, MerchantAdmin]
+    code: 201
+    input: [customer_id]
+    output: Cart
+    side_effects: ["subtotal_cents=0, total_discount_cents=0, total_cents=0, pricing_status=UNPRICED, checkout_status=OPEN"]
+
+  - method: GET
+    path: "/carts/{cartId}"
+    description: "Get a cart"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: []
+    output: Cart
+    side_effects: []
+
+  - method: GET
+    path: "/carts"
+    description: "List carts filtered by customer (reverse-reachability for Cart.customer_id)"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: ["customer_id?", "checkout_status?", "limit?", "offset?"]
+    output: Cart[]
+    side_effects: []
+
+  - method: POST
+    path: "/carts/{cartId}/lines"
+    description: "Add a line to a cart"
+    roles: [Shopper, MerchantAdmin]
+    code: 201
+    input: [sku, unit_price_cents, quantity]
+    output: CartLine
+    side_effects: ["line_total_cents computed; cart.pricing_status -> STALE if previously PRICED"]
+
+  - method: GET
+    path: "/carts/{id}/lines"
+    description: "List lines under a cart (reverse-reachability for CartLine.cart_id)"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CartLine[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/carts/{cartId}/lines/{lineId}"
+    description: "Update a cart line (quantity and/or unit_price_cents)"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: ["unit_price_cents?", "quantity?"]
+    output: CartLine
+    side_effects: ["line_total_cents recomputed; cart.pricing_status -> STALE if previously PRICED"]
+
+  - method: DELETE
+    path: "/carts/{cartId}/lines/{lineId}"
+    description: "Remove a cart line"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: []
+    output: CartLine
+    side_effects: ["cart.pricing_status -> STALE if previously PRICED"]
+
+  - method: POST
+    path: "/carts/{cartId}/applications"
+    description: "Apply a coupon code (MANUAL) to a cart; for budget-capped promotions expected_promotion_version is required (OCC); a successful application records a provisional usage projection on the promotion and increments its version"
+    roles: [Shopper, MerchantAdmin]
+    code: 201
+    input: [code, "expected_promotion_version?"]
+    output: CartApplication
+    side_effects:
+      - "resolve coupon by code -> promotion; run redeemability, eligibility, stacking, coupon-cap, abuse, budget-headroom validations"
+      - "create CartApplication(source=MANUAL, status=APPLIED); cart.pricing_status -> STALE"
+      - "increments Promotion.version by 1 (the application records a provisional usage projection against the promotion)"
+
+  - method: GET
+    path: "/carts/{id}/applications"
+    description: "List applications under a cart (reverse-reachability for CartApplication.cart_id)"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: CartApplication[]
+    side_effects: []
+
+  - method: GET
+    path: "/cart-applications/{applicationId}"
+    description: "Get a single cart application by id"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: []
+    output: CartApplication
+    side_effects: []
+
+  - method: GET
+    path: "/cart-applications"
+    description: "List cart applications filtered by promotion or coupon (reverse-reachability for CartApplication.promotion_id and coupon_id)"
+    roles: [MerchantAdmin]
+    code: 200
+    input: ["promotion_id?", "coupon_id?", "cart_id?", "status?", "limit?", "offset?"]
+    output: CartApplication[]
+    side_effects: []
+
+  - method: DELETE
+    path: "/carts/{cartId}/applications/{applicationId}"
+    description: "Remove an application from a cart (APPLIED->REMOVED)"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: []
+    output: CartApplication
+    side_effects: ["status -> REMOVED; cart.pricing_status -> STALE"]
+
+  - method: POST
+    path: "/carts/{cartId}/auto-apply"
+    description: "Server selects and applies the single best public (coupon-less) promotion for this cart (§1.3 auto_apply_best_discount)"
+    roles: [Shopper, MerchantAdmin]
+    code: 201
+    input: []
+    output: CartApplication
+    side_effects: ["create CartApplication(source=AUTO_APPLY) for the best candidate; cart.pricing_status -> STALE; increments the selected Promotion.version by 1; empty candidate set -> no application, 200 with null data"]
+
+  - method: POST
+    path: "/carts/{cartId}/reprice"
+    description: "Reprice a cart (pricing_status UNPRICED/STALE -> PRICED); runs §1.3 discount + stacking-ceiling calcs"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: []
+    output: Cart
+    side_effects: ["recompute subtotal/discount/total; pricing_status -> PRICED"]
+
+  - method: POST
+    path: "/carts/{cartId}/lock"
+    description: "Lock a priced cart (OPEN->LOCKED); reserves redemptions"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: []
+    output: Cart
+    side_effects: ["checkout_status -> LOCKED; create RESERVED CouponRedemption per APPLIED application"]
+
+  - method: POST
+    path: "/carts/{cartId}/unlock"
+    description: "Unlock a locked cart (LOCKED->OPEN); releases reservations"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: []
+    output: Cart
+    side_effects: ["checkout_status -> OPEN; RESERVED redemptions -> RELEASED"]
+
+  - method: POST
+    path: "/carts/{cartId}/checkout"
+    description: "Check out a locked cart (LOCKED->CHECKED_OUT); confirms redemptions, advances budget/abuse counters (OCC on expected_cart_version)"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: [expected_cart_version]
+    output: Cart
+    side_effects:
+      - "checkout_status -> CHECKED_OUT; RESERVED redemptions -> CONFIRMED"
+      - "promotion.budget_consumed_cents += discount; coupon.redeemed_count += 1; customer.order_count += 1; customer.lifetime_discount_cents += total_discount_cents"
+      - "increments Cart.version by 1"
+      - "promotion/coupon auto-transition to EXHAUSTED when caps reached"
+
+  - method: POST
+    path: "/carts/{cartId}/abandon"
+    description: "Abandon a cart (OPEN/LOCKED->ABANDONED); releases reservations if locked"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: []
+    output: Cart
+    side_effects: ["checkout_status -> ABANDONED; RESERVED redemptions -> RELEASED; APPLIED applications -> REMOVED"]
+
+  - method: GET
+    path: "/carts/{id}/redemptions"
+    description: "List redemptions for a cart (reverse-reachability for CouponRedemption.cart_id)"
+    roles: [Shopper, MerchantAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: CouponRedemption[]
+    side_effects: []
+
+  - method: GET
+    path: "/redemptions/{redemptionId}"
+    description: "Get a single redemption by id"
+    roles: [MerchantAdmin, Shopper]
+    code: 200
+    input: []
+    output: CouponRedemption
+    side_effects: []
+
+  - method: GET
+    path: "/redemptions"
+    description: "List redemptions filtered by coupon, promotion or customer (reverse-reachability for CouponRedemption.coupon_id, promotion_id, customer_id)"
+    roles: [MerchantAdmin]
+    code: 200
+    input: ["coupon_id?", "promotion_id?", "customer_id?", "cart_id?", "status?", "limit?", "offset?"]
+    output: CouponRedemption[]
+    side_effects: []
+
+  # --------------------------------------------------- Test-driving (clock)
+  - method: POST
+    path: "/_clock/set"
+    description: "Set the system clock to an explicit UTC instant (test-driving)"
+    roles: [PlatformOperator]
+    code: 200
+    input: [now_utc]
+    output: null
+    side_effects: ["system clock set; promotions whose window has closed (clock >= active_until) auto-transition ACTIVE/PAUSED -> EXPIRED"]
+
+  - method: POST
+    path: "/_clock/advance"
+    description: "Advance the system clock by a number of seconds and run the expiry sweep (test-driving)"
+    roles: [PlatformOperator]
+    code: 200
+    input: [seconds]
+    output: null
+    side_effects: ["clock advanced; expiry sweep transitions windows-closed promotions to EXPIRED"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/invalid X-User-Role or X-User-ID headers" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Acting role not permitted for this operation" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path-referenced resource does not exist" }
+  - { id: ERR_FK_NOT_FOUND, http: 422, condition: "Body foreign key references a non-existent row" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing/malformed field, invalid enum, out-of-range numeric, non-ascending threshold_tiers" }
+  - { id: ERR_DUPLICATE, http: 409, condition: "Uniqueness violation (email, segment code, coupon code, or duplicate ACTIVE membership)" }
+  - { id: ERR_PROMO_CONFIG_INVALID, http: 422, condition: "Promotion type-specific config missing/invalid at activation" }
+  - { id: ERR_INVALID_WINDOW, http: 422, condition: "active_until <= active_from, blackout ends_at <= starts_at, or activation after active_until" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a state that admits the requested transition" }
+  - { id: ERR_CART_NOT_OPEN, http: 409, condition: "Cart checkout_status != OPEN for reprice/apply/line edit" }
+  - { id: ERR_CART_NOT_PRICED, http: 409, condition: "Cart pricing_status != PRICED at lock" }
+  - { id: ERR_PROMO_NOT_REDEEMABLE, http: 409, condition: "Promotion not ACTIVE, clock outside [active_from, active_until), clock inside a blackout, or coupon DISABLED" }
+  - { id: ERR_NOT_ELIGIBLE, http: 403, condition: "Customer fails SEGMENT or FIRST_ORDER eligibility" }
+  - { id: ERR_STACKING_CONFLICT, http: 409, condition: "EXCLUSIVE promotion combined with another, or STACKABLE pair joined by an ExclusionRule edge" }
+  - { id: ERR_COUPON_DISABLED, http: 409, condition: "Coupon presented is DISABLED" }
+  - { id: ERR_COUPON_EXHAUSTED, http: 409, condition: "Coupon usage cap reached (SINGLE_USE already used, or MULTI_USE max_total_redemptions reached)" }
+  - { id: ERR_ABUSE_LIMIT_EXCEEDED, http: 409, condition: "Per-customer redemption count would reach/exceed max_redemptions_per_customer" }
+  - { id: ERR_PROMO_BUDGET_WOULD_EXCEED, http: 409, condition: "committed + new discount would exceed budget_cap_cents (pre-commit)" }
+  - { id: ERR_PROMO_BUDGET_EXHAUSTED, http: 409, condition: "Promotion budget already fully consumed (EXHAUSTED)" }
+  - { id: ERR_PROMO_HAS_RESERVATIONS, http: 409, condition: "Archiving a PAUSED promotion with outstanding RESERVED redemptions" }
+  - { id: ERR_STALE_CART_VERSION, http: 412, condition: "expected_cart_version != Cart.version at checkout (OCC)" }
+  - { id: ERR_STALE_PROMOTION_VERSION, http: 412, condition: "expected_promotion_version != Promotion.version on budget-capped apply (OCC)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: MerchantAdmin
+    description: "Configures promotions, coupons, segments, memberships, blackouts and exclusion rules; may operate carts on a customer's behalf."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /segments — create segment"
+      - "POST /segments/{id}/members — add membership"
+      - "DELETE /segments/{id}/members/{membershipId} — revoke membership"
+      - "GET /segments/{id}/members — list memberships"
+      - "GET /segment-memberships — list memberships by customer"
+      - "POST /promotions — create promotion"
+      - "POST /promotions/{id}/activate — activate"
+      - "POST /promotions/{id}/pause — pause"
+      - "POST /promotions/{id}/archive — archive"
+      - "POST /promotions/{id}/coupons — create coupon"
+      - "POST /promotions/{id}/coupons/{couponId}/disable — disable coupon"
+      - "POST /promotions/{id}/coupons/{couponId}/enable — enable coupon"
+      - "POST /promotions/{id}/blackouts — add blackout"
+      - "POST /exclusion-rules — create exclusion edge"
+      - "GET /customers — list customers"
+      - "GET /redemptions — list redemptions (global)"
+    shared_operations:
+      - "POST /customers — create customer (shared with Shopper)"
+      - "GET /customers/{id}, GET /promotions, GET /promotions/{id}, GET /segments/{id}, GET /promotions/{id}/coupons, GET /promotions/{id}/coupons/{couponId}, GET /promotions/{id}/blackouts, GET /exclusion-rules"
+      - "all /carts operations (create, lines, applications, auto-apply, reprice, lock, unlock, checkout, abandon, redemptions list) — shared with Shopper"
+
+  - name: Shopper
+    description: "An end customer; owns their own carts and redemptions. X-User-ID identifies the acting Customer."
+    identity: "entity_backed:Customer"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /customers — create customer"
+      - "GET /customers/{id}"
+      - "POST /carts — create own cart"
+      - "GET /carts, GET /carts/{id}"
+      - "POST /carts/{id}/lines, PATCH /carts/{id}/lines/{lineId}, DELETE /carts/{id}/lines/{lineId}, GET /carts/{id}/lines"
+      - "POST /carts/{id}/applications, GET /carts/{id}/applications, DELETE /carts/{id}/applications/{applicationId}"
+      - "POST /carts/{id}/auto-apply, POST /carts/{id}/reprice, POST /carts/{id}/lock, POST /carts/{id}/unlock, POST /carts/{id}/checkout, POST /carts/{id}/abandon"
+      - "GET /carts/{id}/redemptions"
+      - "GET /promotions, GET /promotions/{id}, GET /segments/{id}, GET /promotions/{id}/coupons, GET /promotions/{id}/coupons/{couponId}, GET /promotions/{id}/blackouts, GET /exclusion-rules"
+
+  - name: PlatformOperator
+    description: "Operational role that drives the system clock and the expiry sweep; not tied to any persisted entity."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /_clock/set — set system clock"
+      - "POST /_clock/advance — advance clock and run expiry sweep"
+    shared_operations: []

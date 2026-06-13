@@ -1,0 +1,1595 @@
+# =============================================================================
+# SCAFFOLD.yaml — Subscription Box (recurring physical goods)
+# §1.0–§1.7. Difficulty tier: Expert.
+# §1.8 lives in SCAFFOLD_DIFFICULTY_DESIGN.yaml; §1.9 in SCAFFOLD_CORNER_DESIGN.yaml.
+# =============================================================================
+
+scenario: "Subscription Box (recurring physical goods): plan/cadence (monthly/quarterly), curation/skip/swap, billing & renewal date, prepaid multi-month, pause/cancel/win-back, shipping wave/cutoff, inventory allocation, gift subscription"
+
+domain_name: subscription-box
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: quota_allocation
+  secondary_archetype: workflow_orchestration
+  complexity_layers:
+    - dual_variant_calculation        # prepaid amortized refund vs. period-proration refund
+    - cascading_side_effects          # cancel/skip → release allocation → restock product → revoke shipment
+    - rate_threshold_triggers         # wave cutoff (>= vs >), prepaid term boundaries, win-back window
+    - optimistic_concurrency          # OCC on ShippingWave.version for allocation races
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (Subscription, ShippingWave, Allocation,
+  # Product all top-level); BoxSelection and BillingCycle are FK-linked children
+  # reachable as filtered lists, not URL-nested.
+
+  state_machine_shape: parallel
+  # Subscription carries two independent dimensions: lifecycle_status
+  # (ACTIVE/PAUSED/CANCELLED…) × billing_status (CURRENT/PAST_DUE/PREPAID_EXHAUSTED).
+  # ShippingWave is a linear pipeline; Allocation is branching-with-revert;
+  # Shipment is linear; BillingCycle has a compensation revert.
+
+  relationship_patterns:
+    - one_to_many        # Subscription has many BillingCycle / BoxSelection
+    - cross_aggregate    # Allocation links Subscription↔Product↔ShippingWave
+    - polymorphic        # WalletEntry.source_ref_id references Invoice or BillingCycle
+
+  role_model: peer_roles
+  # Subscriber owns own subscriptions; CurationAdmin owns Product/Plan/Wave;
+  # BillingOperator owns billing runs and refunds. Non-overlapping ownership.
+
+  consistency_model: immediate
+
+# -----------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# -----------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+
+  # --- Configuration -------------------------------------------------------
+  - name: SubscriptionPlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Plan display name, e.g. 'Coffee Monthly'."
+      - name: cadence
+        type: enum
+        source: input
+        description: "Billing/shipping cadence."
+        constraints: "one of {MONTHLY, QUARTERLY}"
+      - name: period_price_cents
+        type: integer
+        source: input
+        description: "Price charged per cadence period, in cents."
+        constraints: ">= 0"
+      - name: box_item_count
+        type: integer
+        source: input
+        description: "Number of curated product units placed into each box."
+        constraints: ">= 1"
+      - name: prepaid_terms_offered
+        type: array
+        source: input
+        description: "Allowed prepaid multi-period term lengths (count of periods)."
+        default: []
+        constraints: "each element integer >= 2; empty array = no prepaid offer"
+      - name: prepaid_discount_pct
+        type: number
+        source: input
+        description: "Fractional discount applied to the total prepaid amount, e.g. 0.10 for 10%."
+        default: 0
+        constraints: ">= 0 and < 1"
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle of the plan offering."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, RETIRED}"
+
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - name: sku
+        type: string
+        source: input
+        description: "Stock-keeping unit; uniqueness enforced (ERR_DUPLICATE_SKU)."
+      - name: name
+        type: string
+        source: input
+        description: "Product display name."
+      - name: on_hand_qty
+        type: integer
+        source: input
+        description: "Units physically in the warehouse, not yet reserved."
+        constraints: ">= 0"
+      - name: allocated_qty
+        type: integer
+        source: computed
+        description: "Units currently held by RESERVED allocations. on_hand_qty is the free pool; allocated_qty is the reserved pool. available = on_hand_qty - allocated_qty must stay >= 0."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Catalog state."
+        default: SELLABLE
+        constraints: "one of {SELLABLE, DISCONTINUED}"
+
+  # --- Actors --------------------------------------------------------------
+  - name: Subscriber
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Account email; uniqueness enforced (ERR_DUPLICATE_EMAIL)."
+      - name: full_name
+        type: string
+        source: input
+        description: "Account holder name."
+      - name: wallet_balance_cents
+        type: integer
+        source: computed
+        description: "Sum of all WalletEntry.amount_cents for this subscriber (CREDIT positive, DEBIT negative). Never negative."
+        default: 0
+
+  # --- Core lifecycle ------------------------------------------------------
+  - name: Subscription
+    parent: null
+    common_fields: true
+    fields:
+      - name: subscriber_id
+        type: string
+        source: input
+        description: "FK -> Subscriber.id; owner of this subscription."
+      - name: plan_id
+        type: string
+        source: input
+        description: "FK -> SubscriptionPlan.id; the plan this subscription follows."
+      - name: lifecycle_status
+        type: enum
+        source: system
+        description: "Lifecycle dimension (independent of billing_status)."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, PAUSED, CANCEL_SCHEDULED, CANCELLED, EXPIRED}"
+      - name: billing_status
+        type: enum
+        source: system
+        description: "Billing dimension (independent of lifecycle_status)."
+        default: CURRENT
+        constraints: "one of {CURRENT, PAST_DUE, PREPAID}"
+      - name: is_gift
+        type: boolean
+        source: system
+        description: "True when created via a GiftGrant redemption; gifts never auto-renew with charges."
+        default: false
+      - name: prepaid_periods_remaining
+        type: integer
+        source: computed
+        description: "Count of fully-paid future periods bought via a prepaid term; decremented each renewal. 0 for pay-as-you-go subscriptions."
+        default: 0
+      - name: prepaid_unit_value_cents
+        type: integer
+        source: computed
+        description: "Amortized value of one prepaid period = floor(prepaid_total_paid_cents / prepaid_term_length). Used by the AMORTIZED refund variant. 0 when not prepaid."
+        default: 0
+      - name: current_period_index
+        type: integer
+        source: computed
+        description: "1-based count of periods that have been billed/started for this subscription."
+        default: 0
+      - name: next_renewal_at
+        type: datetime
+        source: computed
+        description: "UTC instant of the next renewal/billing event. Advances by cadence on each renewal; null after CANCELLED/EXPIRED."
+      - name: paused_until
+        type: datetime
+        source: input
+        description: "When PAUSED, the UTC instant at which auto-resume occurs; null otherwise."
+        default: null
+      - name: pause_count_in_term
+        type: integer
+        source: computed
+        description: "Number of pauses taken since the start of the current 12-period term; resets at term boundary. Caps win-back/pause eligibility."
+        default: 0
+      - name: cancelled_at
+        type: datetime
+        source: computed
+        description: "UTC instant the subscription entered CANCELLED; anchors the 60-day win-back window. null otherwise."
+
+  - name: GiftGrant
+    parent: null
+    common_fields: true
+    fields:
+      - name: plan_id
+        type: string
+        source: input
+        description: "FK -> SubscriptionPlan.id; plan the gift confers."
+      - name: gifter_subscriber_id
+        type: string
+        source: input
+        description: "FK -> Subscriber.id; who purchased the gift."
+      - name: term_periods
+        type: integer
+        source: input
+        description: "Number of prepaid periods the gift covers."
+        constraints: ">= 1"
+      - name: recipient_email
+        type: string
+        source: input
+        description: "Email the redemption code is issued to."
+      - name: redemption_code
+        type: string
+        source: system
+        description: "Server-minted opaque code the recipient redeems."
+      - name: amount_paid_cents
+        type: integer
+        source: computed
+        description: "Charged to gifter at creation = plan.period_price_cents * term_periods (no prepaid discount on gifts)."
+      - name: status
+        type: enum
+        source: system
+        description: "Gift lifecycle."
+        default: ISSUED
+        constraints: "one of {ISSUED, REDEEMED, REVOKED}"
+      - name: redeemed_subscription_id
+        type: string
+        source: computed
+        description: "FK -> Subscription.id; set when REDEEMED; null otherwise."
+        default: null
+
+  - name: BillingCycle
+    parent: null
+    common_fields: true
+    fields:
+      - name: subscription_id
+        type: string
+        source: input
+        description: "FK -> Subscription.id; the subscription this cycle bills."
+      - name: period_index
+        type: integer
+        source: computed
+        description: "1-based period number this cycle covers."
+      - name: amount_charged_cents
+        type: integer
+        source: computed
+        description: "Amount actually charged for this period. 0 when covered by a prepaid period or a gift."
+      - name: funding_source
+        type: enum
+        source: computed
+        description: "How this period was funded."
+        constraints: "one of {CHARGE, PREPAID_DRAW, GIFT, WALLET}"
+      - name: status
+        type: enum
+        source: system
+        description: "Cycle settlement state."
+        default: PENDING
+        constraints: "one of {PENDING, PAID, FAILED, REVERSED}"
+      - name: charged_at
+        type: datetime
+        source: computed
+        description: "UTC instant the charge attempt was settled; null while PENDING."
+
+  - name: BoxSelection
+    parent: null
+    common_fields: true
+    fields:
+      - name: subscription_id
+        type: string
+        source: input
+        description: "FK -> Subscription.id; subscription this box belongs to."
+      - name: period_index
+        type: integer
+        source: input
+        description: "Period this selection curates; must equal subscription.current_period_index + 1 (the upcoming box)."
+      - name: product_ids
+        type: array
+        source: input
+        description: "Ordered list of Product.id chosen for this box. Length must equal plan.box_item_count unless skipped."
+        default: []
+      - name: decision
+        type: enum
+        source: system
+        description: "Curation decision for the period."
+        default: PENDING
+        constraints: "one of {PENDING, CURATED, SKIPPED, FINALIZED}"
+      - name: allocation_id
+        type: string
+        source: computed
+        description: "FK -> Allocation.id; the inventory reservation created when CURATED→FINALIZED at wave assignment; null while not yet allocated."
+        default: null
+
+  # --- Quota / fulfillment -------------------------------------------------
+  - name: ShippingWave
+    parent: null
+    common_fields: true
+    fields:
+      - name: cadence
+        type: enum
+        source: input
+        description: "Which cadence's subscriptions ship in this wave."
+        constraints: "one of {MONTHLY, QUARTERLY}"
+      - name: cutoff_at
+        type: datetime
+        source: input
+        description: "UTC cutoff. A FINALIZED box may join this wave only if the current clock is strictly before cutoff_at (clock < cutoff_at). At-or-after cutoff is rejected."
+      - name: ship_date
+        type: datetime
+        source: input
+        description: "UTC date the wave physically ships; must be strictly after cutoff_at."
+      - name: capacity
+        type: integer
+        source: input
+        description: "Maximum number of Allocations the wave can hold (box count)."
+        constraints: ">= 1"
+      - name: reserved_count
+        type: integer
+        source: computed
+        description: "Number of RESERVED allocations attached to this wave. reserved_count <= capacity invariant."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Wave lifecycle."
+        default: OPEN
+        constraints: "one of {OPEN, LOCKED, SHIPPED, CANCELLED}"
+
+  - name: Allocation
+    parent: null
+    common_fields: true
+    fields:
+      - name: subscription_id
+        type: string
+        source: input
+        description: "FK -> Subscription.id; subscription whose box this allocation fulfills."
+      - name: wave_id
+        type: string
+        source: input
+        description: "FK -> ShippingWave.id; wave this allocation joins."
+      - name: box_selection_id
+        type: string
+        source: input
+        description: "FK -> BoxSelection.id; the curated box being reserved."
+      - name: line_items
+        type: array
+        source: computed
+        description: "Array of { product_id, qty } snapshotting the products reserved; qty per distinct product_id in the box."
+        default: []
+      - name: status
+        type: enum
+        source: system
+        description: "Allocation lifecycle."
+        default: RESERVED
+        constraints: "one of {RESERVED, RELEASED, COMMITTED}"
+
+  - name: Shipment
+    parent: null
+    common_fields: true
+    fields:
+      - name: allocation_id
+        type: string
+        source: input
+        description: "FK -> Allocation.id; the committed allocation this shipment fulfills."
+      - name: wave_id
+        type: string
+        source: input
+        description: "FK -> ShippingWave.id; the wave that produced this shipment."
+      - name: subscription_id
+        type: string
+        source: input
+        description: "FK -> Subscription.id; recipient subscription."
+      - name: status
+        type: enum
+        source: system
+        description: "Shipment lifecycle."
+        default: PACKED
+        constraints: "one of {PACKED, DISPATCHED, DELIVERED}"
+
+  # --- Ledger / financial --------------------------------------------------
+  - name: WalletEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: subscriber_id
+        type: string
+        source: input
+        description: "FK -> Subscriber.id; owner of this ledger line."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Signed cents. Positive = CREDIT (refund/win-back grant), negative = DEBIT (wallet-funded period). Subscriber.wallet_balance_cents = sum of these."
+      - name: kind
+        type: enum
+        source: input
+        description: "Ledger reason."
+        constraints: "one of {REFUND_CREDIT, WINBACK_CREDIT, PERIOD_DEBIT, ADJUSTMENT}"
+      - name: source_ref_id
+        type: string
+        source: input
+        description: "Polymorphic reference; resolves to a BillingCycle.id for PERIOD_DEBIT, a Subscription.id for WINBACK_CREDIT, or an Invoice.id for REFUND_CREDIT — the target entity kind is implied by `kind`. Discoverable via GET /subscribers/{id}/wallet-entries; not a single-parent FK, so no canonical FK prefix."
+        default: null
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: subscriber_id
+        type: string
+        source: input
+        description: "FK -> Subscriber.id; party billed/refunded."
+      - name: subscription_id
+        type: string
+        source: input
+        description: "FK -> Subscription.id; subscription the invoice pertains to; null for gift-purchase invoices."
+        default: null
+      - name: gross_amount_cents
+        type: integer
+        source: computed
+        description: "Signed total. Positive = charge to the subscriber; negative = refund to the subscriber."
+      - name: kind
+        type: enum
+        source: computed
+        description: "Invoice reason."
+        constraints: "one of {PERIOD_CHARGE, PREPAID_CHARGE, GIFT_CHARGE, CANCEL_REFUND}"
+      - name: status
+        type: enum
+        source: system
+        description: "Invoice settlement."
+        default: SETTLED
+        constraints: "one of {SETTLED, VOID}"
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+
+  # ---- Subscription: PARALLEL dimensions ----------------------------------
+  # Dimension A: lifecycle_status   Dimension B: billing_status
+  - entity: Subscription
+    initial_state: ACTIVE          # lifecycle dimension initial; billing initial = CURRENT (or PREPAID if created prepaid)
+    terminal_states: [CANCELLED, EXPIRED]
+    transitions:
+
+      # lifecycle: ACTIVE -> PAUSED
+      - from: ACTIVE
+        to: PAUSED
+        trigger: "POST /subscriptions/{id}/pause"
+        actor: Subscriber
+        preconditions:
+          - "subscription.lifecycle_status == ACTIVE"
+          - "subscription.pause_count_in_term < 3 (ERR_PAUSE_LIMIT_REACHED at the 3rd existing pause, i.e. pause_count_in_term must be < 3 to allow another)"
+          - "paused_until (input) is strictly after current clock (ERR_INVALID_RESUME_DATE)"
+          - "no BoxSelection for current_period_index+1 is already FINALIZED into an OPEN/LOCKED wave (ERR_BOX_ALREADY_FINALIZED)"
+        side_effects:
+          - "set paused_until = input.paused_until"
+          - "increment pause_count_in_term by 1"
+          - "freeze next_renewal_at (renewal does not fire while PAUSED; it shifts forward by the pause duration on resume)"
+        note: "billing_status unchanged by pause."
+
+      # lifecycle: PAUSED -> ACTIVE (manual or auto on clock>=paused_until)
+      - from: PAUSED
+        to: ACTIVE
+        trigger: "POST /subscriptions/{id}/resume  OR  system: clock >= paused_until at wave-run"
+        actor: Subscriber | system
+        preconditions:
+          - "subscription.lifecycle_status == PAUSED"
+        side_effects:
+          - "next_renewal_at += (resume_instant - pause_start)  rounded to whole cadence periods forward so renewal lands on a future cadence boundary"
+          - "clear paused_until"
+
+      # lifecycle: ACTIVE -> CANCEL_SCHEDULED (cancel at period end, keep remaining prepaid/gift)
+      - from: ACTIVE
+        to: CANCEL_SCHEDULED
+        trigger: "POST /subscriptions/{id}/cancel  with effective='PERIOD_END'"
+        actor: Subscriber
+        preconditions:
+          - "subscription.lifecycle_status == ACTIVE"
+        side_effects:
+          - "set cancelled_at = current clock"
+          - "next_renewal_at preserved as the scheduled CANCELLED date"
+          - "no refund; remaining prepaid periods are forfeited at the scheduled date"
+
+      # lifecycle: ACTIVE -> CANCELLED (immediate cancel, may refund)
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /subscriptions/{id}/cancel  with effective='IMMEDIATE'"
+        actor: Subscriber
+        preconditions:
+          - "subscription.lifecycle_status == ACTIVE"
+        side_effects:
+          - "set cancelled_at = current clock; clear next_renewal_at"
+          - "compute refund via 'cancellation_refund' calculation (variant chosen by billing_status); CREATE Invoice(kind=CANCEL_REFUND, negative) and WalletEntry(kind=REFUND_CREDIT) for the refund amount"
+          - "CASCADE: any BoxSelection for an upcoming period that is FINALIZED into an OPEN/LOCKED wave is reverted (decision FINALIZED->SKIPPED); that revert RELEASES its Allocation (RESERVED->RELEASED); the release RESTOCKS each line item back to Product.on_hand pool and decrements ShippingWave.reserved_count"
+          - "billing_status set to CURRENT (prepaid value is consumed by the refund computation)"
+
+      # lifecycle: PAUSED -> CANCELLED (immediate cancel from pause)
+      - from: PAUSED
+        to: CANCELLED
+        trigger: "POST /subscriptions/{id}/cancel  with effective='IMMEDIATE'"
+        actor: Subscriber
+        preconditions:
+          - "subscription.lifecycle_status == PAUSED"
+        side_effects:
+          - "same refund + cascade side effects as ACTIVE->CANCELLED"
+
+      # lifecycle: CANCEL_SCHEDULED -> CANCELLED (system at scheduled date)
+      - from: CANCEL_SCHEDULED
+        to: CANCELLED
+        trigger: "system: clock >= scheduled cancellation next_renewal_at at wave-run"
+        actor: system
+        preconditions:
+          - "subscription.lifecycle_status == CANCEL_SCHEDULED"
+        side_effects:
+          - "clear next_renewal_at; forfeit remaining prepaid (no refund); billing_status set to CURRENT"
+
+      # lifecycle: CANCELLED -> ACTIVE (win-back reactivation)
+      - from: CANCELLED
+        to: ACTIVE
+        trigger: "POST /subscriptions/{id}/winback"
+        actor: Subscriber
+        preconditions:
+          - "subscription.lifecycle_status == CANCELLED"
+          - "current clock < cancelled_at + 60 days (ERR_WINBACK_WINDOW_CLOSED at exactly +60 days; the window is [cancelled_at, cancelled_at+60d))"
+          - "subscription.is_gift == false (gift subs cannot be win-back reactivated: ERR_GIFT_NOT_REACTIVATABLE)"
+          - "plan.status == ACTIVE (ERR_PLAN_RETIRED)"
+        side_effects:
+          - "lifecycle_status -> ACTIVE; billing_status -> CURRENT; clear cancelled_at"
+          - "set next_renewal_at = current clock + one cadence period"
+          - "GRANT one-time win-back credit: CREATE WalletEntry(kind=WINBACK_CREDIT, amount_cents = win-back grant per 'winback_credit' calc, source_ref_id = subscription.id)"
+
+      # billing: CURRENT -> PAST_DUE (charge failed at renewal)
+      - from: CURRENT
+        to: PAST_DUE
+        trigger: "system: renewal charge FAILED at wave-run"
+        actor: system
+        preconditions:
+          - "subscription.billing_status == CURRENT"
+          - "the renewal BillingCycle settled FAILED"
+        side_effects:
+          - "billing_status -> PAST_DUE; lifecycle_status unchanged"
+          - "any BoxSelection FINALIZED for the failed period reverts FINALIZED->SKIPPED, RELEASING its Allocation (cascade restock + wave reserved_count decrement)"
+
+      # billing: PAST_DUE -> CURRENT (retry charge succeeds)
+      - from: PAST_DUE
+        to: CURRENT
+        trigger: "POST /subscriptions/{id}/retry-charge"
+        actor: BillingOperator
+        preconditions:
+          - "subscription.billing_status == PAST_DUE"
+          - "the retried charge settles PAID"
+        side_effects:
+          - "billing_status -> CURRENT; the FAILED BillingCycle's replacement is PAID"
+
+      # billing: CURRENT -> PREPAID (prepaid term purchased)
+      - from: CURRENT
+        to: PREPAID
+        trigger: "POST /subscriptions/{id}/prepay"
+        actor: Subscriber
+        preconditions:
+          - "subscription.billing_status == CURRENT"
+          - "subscription.lifecycle_status == ACTIVE"
+          - "input.term_periods is a member of plan.prepaid_terms_offered (ERR_PREPAID_TERM_NOT_OFFERED)"
+        side_effects:
+          - "charge prepaid total via 'prepaid_charge' calc; CREATE Invoice(kind=PREPAID_CHARGE)"
+          - "set prepaid_periods_remaining = term_periods; set prepaid_unit_value_cents = floor(prepaid_total_paid_cents / term_periods)"
+          - "billing_status -> PREPAID"
+
+      # billing: PREPAID -> CURRENT (prepaid drained)
+      - from: PREPAID
+        to: CURRENT
+        trigger: "system: renewal draws the last prepaid period (prepaid_periods_remaining hits 0)"
+        actor: system
+        preconditions:
+          - "subscription.billing_status == PREPAID"
+          - "prepaid_periods_remaining == 1 before this draw"
+        side_effects:
+          - "prepaid_periods_remaining -> 0; prepaid_unit_value_cents -> 0; billing_status -> CURRENT"
+
+      # lifecycle: ACTIVE -> EXPIRED (gift term exhausted)
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system: gift subscription's last prepaid period drawn at wave-run"
+        actor: system
+        preconditions:
+          - "subscription.is_gift == true"
+          - "prepaid_periods_remaining == 1 before this draw"
+        side_effects:
+          - "lifecycle_status -> EXPIRED; clear next_renewal_at; no charge, no auto-renew"
+
+  # ---- ShippingWave: linear pipeline with guarded lock ---------------------
+  - entity: ShippingWave
+    initial_state: OPEN
+    terminal_states: [SHIPPED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: LOCKED
+        trigger: "POST /waves/{id}/lock"
+        actor: CurationAdmin
+        preconditions:
+          - "wave.status == OPEN"
+          - "current clock >= wave.cutoff_at (cannot lock before cutoff: ERR_CUTOFF_NOT_REACHED)"
+        side_effects:
+          - "wave.status -> LOCKED; no new Allocations may attach (allocation create requires OPEN)"
+
+      - from: LOCKED
+        to: SHIPPED
+        trigger: "POST /waves/{id}/ship"
+        actor: CurationAdmin
+        preconditions:
+          - "wave.status == LOCKED"
+          - "wave.reserved_count >= 1 (ERR_EMPTY_WAVE — cannot ship a wave with zero RESERVED allocations)"
+        side_effects:
+          - "for each RESERVED Allocation on the wave: Allocation RESERVED->COMMITTED; each committed line item DEDUCTS Product.on_hand_qty (units physically leave) and DECREMENTS Product.allocated_qty (no longer merely reserved); CREATE Shipment(status=PACKED); set linked BoxSelection.decision -> FINALIZED if not already"
+          - "wave.status -> SHIPPED"
+
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /waves/{id}/cancel"
+        actor: CurationAdmin
+        preconditions:
+          - "wave.status == OPEN"
+        side_effects:
+          - "CASCADE: every RESERVED Allocation on the wave is RELEASED (RESERVED->RELEASED), which RESTOCKS each line item to Product.on_hand pool and decrements Product.allocated_qty; the release reverts its BoxSelection FINALIZED->CURATED; wave.reserved_count -> 0"
+          - "wave.status -> CANCELLED"
+
+  # ---- Allocation: branching with revert (RESERVED -> RELEASED | COMMITTED)
+  - entity: Allocation
+    initial_state: RESERVED
+    terminal_states: [RELEASED, COMMITTED]
+    transitions:
+      - from: RESERVED
+        to: RELEASED
+        trigger: "POST /allocations/{id}/release  OR  cascade from subscription cancel / wave cancel / box swap / charge-failed"
+        actor: CurationAdmin | system
+        preconditions:
+          - "allocation.status == RESERVED"
+        side_effects:
+          - "for each line item: Product.allocated_qty -= qty (returns reserved units to the free pool); Product.on_hand_qty unchanged (units never left the warehouse)"
+          - "ShippingWave.reserved_count -= 1"
+          - "linked BoxSelection.decision FINALIZED->CURATED and BoxSelection.allocation_id -> null"
+      - from: RESERVED
+        to: COMMITTED
+        trigger: "cascade from POST /waves/{id}/ship"
+        actor: system
+        preconditions:
+          - "allocation.status == RESERVED"
+          - "wave.status transitioning to SHIPPED"
+        side_effects:
+          - "for each line item: Product.on_hand_qty -= qty AND Product.allocated_qty -= qty (units physically depart)"
+          - "CREATE Shipment(status=PACKED)"
+
+  # ---- Shipment: linear -----------------------------------------------------
+  - entity: Shipment
+    initial_state: PACKED
+    terminal_states: [DELIVERED]
+    transitions:
+      - from: PACKED
+        to: DISPATCHED
+        trigger: "POST /shipments/{id}/dispatch"
+        actor: CurationAdmin
+        preconditions: ["shipment.status == PACKED"]
+        side_effects: ["shipment.status -> DISPATCHED"]
+      - from: DISPATCHED
+        to: DELIVERED
+        trigger: "POST /shipments/{id}/deliver"
+        actor: CurationAdmin
+        preconditions: ["shipment.status == DISPATCHED"]
+        side_effects: ["shipment.status -> DELIVERED"]
+
+  # ---- BillingCycle: settlement with compensation revert -------------------
+  - entity: BillingCycle
+    initial_state: PENDING
+    terminal_states: [PAID, REVERSED]
+    transitions:
+      - from: PENDING
+        to: PAID
+        trigger: "system: charge settled at wave-run renewal, or POST /subscriptions/{id}/retry-charge"
+        actor: system | BillingOperator
+        preconditions: ["cycle.status == PENDING"]
+        side_effects:
+          - "set charged_at; if funding_source==CHARGE create Invoice(kind=PERIOD_CHARGE); if PREPAID_DRAW decrement subscription.prepaid_periods_remaining; if WALLET create WalletEntry(kind=PERIOD_DEBIT, negative)"
+      - from: PENDING
+        to: FAILED
+        trigger: "system: charge declined at wave-run renewal"
+        actor: system
+        preconditions: ["cycle.status == PENDING", "funding_source == CHARGE"]
+        side_effects:
+          - "subscription.billing_status CURRENT->PAST_DUE (cross-entity); cascade box revert per Subscription CURRENT->PAST_DUE"
+      - from: PAID
+        to: REVERSED
+        trigger: "cascade from immediate cancel within same period (compensation)"
+        actor: system
+        preconditions: ["cycle.status == PAID", "cycle.period_index == subscription.current_period_index"]
+        side_effects:
+          - "void the matching Invoice (status SETTLED->VOID); the refund is issued by the cancel refund computation, NOT double-counted here"
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules — OCC on parent version
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: allocation-create-stale-wave
+    parent_entity: ShippingWave
+    write_endpoint: "POST /allocations"
+    occ_field: "expected_wave_version"
+    description: |
+      Creating an Allocation against a ShippingWave whose version has advanced
+      since the client last observed it is rejected. A prior writer has attached
+      an allocation (legitimately consuming a capacity slot and bumping
+      wave.reserved_count + wave.version); the current writer's view of the wave —
+      and therefore of remaining capacity — is stale, so the create is refused on
+      a version mismatch rather than silently overbooking the wave.
+    error_id: ERR_STALE_WAVE_VERSION
+    http_status: 412
+
+  - rule_id: prepay-stale-subscription
+    parent_entity: Subscription
+    write_endpoint: "POST /subscriptions/{id}/prepay"
+    occ_field: "expected_subscription_version"
+    description: |
+      Purchasing a prepaid term against a Subscription whose version has advanced
+      since the client last observed it is rejected. Another writer may have just
+      moved the subscription into PREPAID or PAST_DUE (bumping version); the new
+      prepay would otherwise stack a second prepaid term on a now-different billing
+      state. The stale-version check refuses it deterministically.
+    error_id: ERR_STALE_SUBSCRIPTION_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+
+  # ---- DUAL-VARIANT #1: cancellation refund (Subscription domain) ----------
+  - name: cancellation_refund
+    trigger: "Subscription ACTIVE/PAUSED -> CANCELLED (immediate cancel)"
+    algorithm: forward_looking
+    formula: |
+      # Two variants diverge on identical inputs. Evaluation:
+      #   shipped_periods   = count of this subscription's BillingCycle with status==PAID
+      #                       AND a COMMITTED Allocation (a box that actually shipped)
+      #   unshipped_paid    = periods paid-for but not yet shipped
+      # PERIOD variant (billing_status==CURRENT, pay-as-you-go):
+      #   refund = sum over unshipped CURRENT-funded BillingCycle of amount_charged_cents
+      #            (full per-period price back for any period not yet shipped)
+      # AMORTIZED variant (billing_status==PREPAID):
+      #   refund = prepaid_periods_remaining * prepaid_unit_value_cents
+      #            where prepaid_unit_value_cents = floor(prepaid_total_paid_cents / prepaid_term_length)
+      #            (amortized, NOT full price — discount is forfeited proportionally)
+      refund_cents = VARIANT_RESULT  # see variants
+    input_set: "BillingCycle rows with status==PAID for this subscription; partitioned by whether their Allocation is COMMITTED (shipped) vs RESERVED/absent (unshipped)."
+    constants: {}
+    precision: "integer cents; floor on the amortized per-unit division, applied per-unit BEFORE multiplying by remaining count"
+    variants:
+      - name: period_proration
+        when: "billing_status == CURRENT at cancel time (pay-as-you-go)"
+        difference: "Full per-period price refunded for each unshipped paid period; shipped periods refund 0."
+      - name: prepaid_amortized
+        when: "billing_status == PREPAID at cancel time"
+        difference: "Refund = remaining_prepaid_periods * floor(prepaid_total / term_length); the bulk discount is NOT restored, so identical period counts refund LESS than the period_proration variant would for the same nominal price."
+
+  # ---- DUAL-VARIANT #2: subscriber loyalty / win-back credit (Subscriber domain)
+  - name: winback_credit
+    trigger: "Subscription CANCELLED -> ACTIVE (POST /subscriptions/{id}/winback)"
+    algorithm: weighted_scoring
+    formula: |
+      # Scores subscriber tenure to size a win-back grant (different entity domain
+      # than cancellation_refund: this is loyalty scoring on the Subscriber, not
+      # cost accounting on the Subscription).
+      committed = count of Shipment with status in {PACKED,DISPATCHED,DELIVERED}
+                  across ALL subscriptions owned by this subscriber
+      base = plan.period_price_cents
+      tenure_factor = min(committed, TENURE_CAP) * TENURE_WEIGHT   # capped
+      grant_cents = round_half_up(base * (BASE_GRANT_PCT + tenure_factor))
+      grant_cents = min(grant_cents, MAX_GRANT_CENTS)              # ceiling
+    input_set: "All Shipment rows for the subscriber's subscriptions (cross-subscription tenure)."
+    constants:
+      BASE_GRANT_PCT: 0.20
+      TENURE_WEIGHT: 0.05
+      TENURE_CAP: 6
+      MAX_GRANT_CENTS: 5000
+    precision: "round_half_up to integer cents; cap applied AFTER rounding"
+    variants:
+      - name: standard_winback
+        when: "subscriber has >=1 prior committed shipment"
+        difference: "Tenure factor contributes; grant scales with committed-box count up to the cap."
+      - name: cold_winback
+        when: "subscriber has 0 prior committed shipments (e.g., cancelled before any box shipped)"
+        difference: "tenure_factor = 0; grant = round_half_up(base * BASE_GRANT_PCT) only."
+
+  # ---- COMBINATORIAL (b) nested rounding, order pinned: prepaid charge -------
+  - name: prepaid_charge
+    trigger: "POST /subscriptions/{id}/prepay  AND gift purchase (gift uses no discount)"
+    algorithm: tiered_pricing
+    formula: |
+      # Order of operations is PINNED (mode (b) — round order matters):
+      #   gross = period_price_cents * term_periods           # exact, integer
+      #   discount_cents = floor(gross * prepaid_discount_pct) # FLOOR the discount, on the WHOLE gross
+      #   prepaid_total_paid_cents = gross - discount_cents
+      # We discount on the SUMMED gross then floor ONCE — NOT per-period
+      # (per-period floor then sum yields a different, larger discount loss).
+      prepaid_total_paid_cents = (period_price_cents * term_periods)
+                                 - floor((period_price_cents * term_periods) * prepaid_discount_pct)
+    input_set: "Single SubscriptionPlan + requested term_periods."
+    constants: {}
+    precision: "discount floored exactly once on the aggregate gross; total is integer cents"
+
+  # ---- COMBINATORIAL (a) >=3 inputs, nonlinear: wave allocation eligibility --
+  - name: allocation_fill
+    trigger: "POST /allocations (reserve a curated box into a wave)"
+    algorithm: waterfall_allocation
+    formula: |
+      # Determines whether a box can be reserved and snapshots line_items.
+      # Inputs (>=3): plan.box_item_count, the box's product_ids (with repeats),
+      # each Product's available = on_hand_qty - allocated_qty, and wave capacity.
+      # Distinct products collapse to {product_id: qty} via counting repeats.
+      # Nonlinear: reservation succeeds ONLY IF, for EVERY distinct product,
+      #   available >= requested_qty  AND  wave.reserved_count < wave.capacity.
+      # Allocation is all-or-nothing: a single short product rejects the whole box.
+      for each distinct product_id in box.product_ids:
+          requested_qty = count of that product_id in box.product_ids
+          available = product.on_hand_qty - product.allocated_qty
+          if available < requested_qty: REJECT ERR_INSUFFICIENT_INVENTORY
+      if wave.reserved_count >= wave.capacity: REJECT ERR_WAVE_CAPACITY_FULL
+      # else: for each distinct product, product.allocated_qty += requested_qty;
+      #       wave.reserved_count += 1; line_items = [{product_id, qty}...]
+      line_items = group_and_count(box.product_ids)
+    input_set: "box.product_ids; Product.on_hand_qty and allocated_qty for each; wave.capacity and reserved_count."
+    constants: {}
+    precision: "integer units; all-or-nothing — no partial box reservation"
+
+  # ---- AGGREGATION: subscriber wallet balance (derived field reconciliation)
+  - name: wallet_balance
+    trigger: "any WalletEntry created (refund, win-back, period debit, adjustment)"
+    algorithm: aggregation
+    formula: |
+      wallet_balance_cents = sum over WalletEntry.amount_cents
+                             WHERE subscriber_id == this subscriber
+      # CREDIT entries positive, DEBIT entries negative; invariant balance >= 0.
+    input_set: "All WalletEntry rows for the subscriber (no status filter — WalletEntry is append-only, immutable)."
+    constants: {}
+    precision: "integer cents; running sum recomputed on every entry insert"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this endpoint per §1.7; entity_backed roles acting on a resource they do not own are denied"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "every path/body-referenced resource exists, validated left-to-right in the path then body FKs"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 4
+    category: existence
+    check: "request body well-formed: required fields present, enums valid, integers within declared constraints"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all"
+
+  - priority: 5
+    category: state
+    check: "target resource is in a state from which the requested transition is defined (§1.2); for POST /allocations the referenced ShippingWave.status must be OPEN"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_<parent>_version equals the live parent.version"
+    error_id: ERR_STALE_WAVE_VERSION
+    http_status: 412
+    applies_to: "POST /allocations"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_subscription_version equals the live subscription.version"
+    error_id: ERR_STALE_SUBSCRIPTION_VERSION
+    http_status: 412
+    applies_to: "POST /subscriptions/{id}/prepay"
+
+  - priority: 7
+    category: business_referential
+    check: "Subscriber.email is unique across subscribers"
+    error_id: ERR_DUPLICATE_EMAIL
+    http_status: 409
+    applies_to: "POST /subscribers"
+
+  - priority: 7
+    category: business_referential
+    check: "Product.sku is unique across products"
+    error_id: ERR_DUPLICATE_SKU
+    http_status: 409
+    applies_to: "POST /products"
+
+  - priority: 8
+    category: business_constraint
+    check: "prepay term_periods must be a member of plan.prepaid_terms_offered"
+    error_id: ERR_PREPAID_TERM_NOT_OFFERED
+    http_status: 422
+    applies_to: "POST /subscriptions/{id}/prepay"
+
+  - priority: 8
+    category: business_constraint
+    check: "win-back requested while plan.status == RETIRED"
+    error_id: ERR_PLAN_RETIRED
+    http_status: 422
+    applies_to: "POST /subscriptions/{id}/winback"
+
+  - priority: 8
+    category: business_constraint
+    check: "win-back requested on a gift subscription (is_gift==true)"
+    error_id: ERR_GIFT_NOT_REACTIVATABLE
+    http_status: 422
+    applies_to: "POST /subscriptions/{id}/winback"
+
+  - priority: 8
+    category: business_constraint
+    check: "pause requested when pause_count_in_term has already reached 3 in the current term"
+    error_id: ERR_PAUSE_LIMIT_REACHED
+    http_status: 422
+    applies_to: "POST /subscriptions/{id}/pause"
+
+  - priority: 8
+    category: business_constraint
+    check: "box product_ids length must equal plan.box_item_count for a CURATED (non-skipped) box; redeem code must be ISSUED"
+    error_id: ERR_BOX_ITEM_COUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /subscriptions/{id}/box-selections"
+
+  - priority: 8
+    category: business_constraint
+    check: "gift redemption code is not in ISSUED status (already REDEEMED or REVOKED)"
+    error_id: ERR_GIFT_NOT_REDEEMABLE
+    http_status: 422
+    applies_to: "POST /gift-grants/redeem"
+
+  - priority: 8
+    category: business_constraint
+    check: "allocation create whose referenced BoxSelection is already FINALIZED (decision==FINALIZED, allocation_id set) — a box period slot may hold at most one non-RELEASED Allocation; double-occupancy of the same box period is rejected (point-exclusivity overlap)"
+    error_id: ERR_BOX_ALREADY_FINALIZED
+    http_status: 422
+    applies_to: "POST /allocations, PATCH /box-selections/{id}"
+
+  - priority: 9
+    category: business_temporal
+    check: "win-back requested at-or-after cancelled_at + 60 days"
+    error_id: ERR_WINBACK_WINDOW_CLOSED
+    http_status: 422
+    applies_to: "POST /subscriptions/{id}/winback"
+
+  - priority: 9
+    category: business_temporal
+    check: "allocation create when current clock >= wave.cutoff_at (cutoff passed)"
+    error_id: ERR_CUTOFF_PASSED
+    http_status: 422
+    applies_to: "POST /allocations"
+
+  - priority: 9
+    category: business_temporal
+    check: "wave lock attempted while current clock < wave.cutoff_at (cutoff not yet reached)"
+    error_id: ERR_CUTOFF_NOT_REACHED
+    http_status: 422
+    applies_to: "POST /waves/{id}/lock"
+
+  - priority: 9
+    category: business_temporal
+    check: "pause paused_until is at-or-before the current clock"
+    error_id: ERR_INVALID_RESUME_DATE
+    http_status: 422
+    applies_to: "POST /subscriptions/{id}/pause"
+
+  - priority: 10
+    category: business_safety
+    check: "ship a wave that has zero RESERVED allocations"
+    error_id: ERR_EMPTY_WAVE
+    http_status: 422
+    applies_to: "POST /waves/{id}/ship"
+
+  - priority: 10
+    category: business_safety
+    check: "allocation create whose box has a product whose available (on_hand - allocated) < requested qty for that product"
+    error_id: ERR_INSUFFICIENT_INVENTORY
+    http_status: 422
+    applies_to: "POST /allocations"
+
+  - priority: 11
+    category: business_fiscal
+    check: "allocation create when wave.reserved_count >= wave.capacity"
+    error_id: ERR_WAVE_CAPACITY_FULL
+    http_status: 422
+    applies_to: "POST /allocations"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+
+  # ---- Plans --------------------------------------------------------------
+  - method: POST
+    path: "/plans"
+    description: "Create a subscription plan."
+    roles: [CurationAdmin]
+    code: 201
+    input: [name, cadence, period_price_cents, box_item_count, "prepaid_terms_offered?", "prepaid_discount_pct?"]
+    output: SubscriptionPlan
+    side_effects: ["plan created in ACTIVE status"]
+  - method: GET
+    path: "/plans/{id}"
+    description: "Fetch a plan."
+    roles: [CurationAdmin, Subscriber, BillingOperator]
+    code: 200
+    input: []
+    output: SubscriptionPlan
+    side_effects: []
+  - method: GET
+    path: "/plans"
+    description: "List plans (paginated)."
+    roles: [CurationAdmin, Subscriber, BillingOperator]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: SubscriptionPlan[]
+    side_effects: []
+  - method: POST
+    path: "/plans/{id}/retire"
+    description: "Retire a plan (status ACTIVE->RETIRED)."
+    roles: [CurationAdmin]
+    code: 200
+    input: []
+    output: SubscriptionPlan
+    side_effects: ["plan.status -> RETIRED"]
+
+  # ---- Products / inventory ----------------------------------------------
+  - method: POST
+    path: "/products"
+    description: "Create a catalog product with initial on-hand inventory."
+    roles: [CurationAdmin]
+    code: 201
+    input: [sku, name, on_hand_qty]
+    output: Product
+    side_effects: ["product created SELLABLE; allocated_qty=0"]
+  - method: GET
+    path: "/products/{id}"
+    description: "Fetch a product (includes on_hand_qty, allocated_qty)."
+    roles: [CurationAdmin, Subscriber, BillingOperator]
+    code: 200
+    input: []
+    output: Product
+    side_effects: []
+  - method: GET
+    path: "/products"
+    description: "List products (paginated)."
+    roles: [CurationAdmin, Subscriber, BillingOperator]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: Product[]
+    side_effects: []
+  - method: POST
+    path: "/products/{id}/restock"
+    description: "Add units to on_hand_qty (admin inventory replenish)."
+    roles: [CurationAdmin]
+    code: 200
+    input: [add_qty]
+    output: Product
+    side_effects: ["product.on_hand_qty += add_qty"]
+  - method: POST
+    path: "/products/{id}/discontinue"
+    description: "Mark a product DISCONTINUED so it can no longer be curated into new boxes (existing RESERVED allocations are unaffected)."
+    roles: [CurationAdmin]
+    code: 200
+    input: []
+    output: Product
+    side_effects: ["product.status SELLABLE -> DISCONTINUED"]
+
+  # ---- Subscribers --------------------------------------------------------
+  - method: POST
+    path: "/subscribers"
+    description: "Register a subscriber."
+    roles: [Subscriber, CurationAdmin]
+    code: 201
+    input: [email, full_name]
+    output: Subscriber
+    side_effects: ["subscriber created; wallet_balance_cents=0"]
+  - method: GET
+    path: "/subscribers/{id}"
+    description: "Fetch a subscriber (includes wallet_balance_cents)."
+    roles: [Subscriber, CurationAdmin, BillingOperator]
+    code: 200
+    input: []
+    output: Subscriber
+    side_effects: []
+  - method: GET
+    path: "/subscribers/{id}/wallet-entries"
+    description: "List a subscriber's wallet ledger entries (reverse-reachability for WalletEntry.subscriber_id)."
+    roles: [Subscriber, CurationAdmin, BillingOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WalletEntry[]
+    side_effects: []
+  - method: POST
+    path: "/subscribers/{id}/wallet-entries"
+    description: "Admin posts a manual wallet adjustment (ADJUSTMENT kind)."
+    roles: [BillingOperator]
+    code: 201
+    input: [amount_cents, kind, "source_ref_id?"]
+    output: WalletEntry
+    side_effects: ["WalletEntry created; subscriber.wallet_balance_cents recomputed (wallet_balance calc)"]
+
+  # ---- Subscriptions ------------------------------------------------------
+  - method: POST
+    path: "/subscriptions"
+    description: "Create a pay-as-you-go subscription; bills the first period immediately."
+    roles: [Subscriber]
+    code: 201
+    input: [subscriber_id, plan_id]
+    output: Subscription
+    side_effects:
+      - "subscription created ACTIVE/CURRENT; current_period_index=1; next_renewal_at = clock + one cadence"
+      - "CREATE BillingCycle(period_index=1, funding_source=CHARGE, PAID); CREATE Invoice(kind=PERIOD_CHARGE)"
+  - method: GET
+    path: "/subscriptions/{id}"
+    description: "Fetch a subscription (both status dimensions, prepaid fields)."
+    roles: [Subscriber, CurationAdmin, BillingOperator]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects: []
+  - method: GET
+    path: "/subscriptions"
+    description: "List subscriptions; filter by subscriber_id (reverse-reachability for Subscription.subscriber_id) or plan_id (for Subscription.plan_id)."
+    roles: [Subscriber, CurationAdmin, BillingOperator]
+    code: 200
+    input: ["limit?", "offset?", "subscriber_id?", "plan_id?", "lifecycle_status?"]
+    output: Subscription[]
+    side_effects: []
+  - method: POST
+    path: "/subscriptions/{id}/pause"
+    description: "Pause an ACTIVE subscription until a future instant."
+    roles: [Subscriber]
+    code: 200
+    input: [paused_until]
+    output: Subscription
+    side_effects: ["lifecycle_status -> PAUSED; pause_count_in_term += 1; next_renewal_at frozen"]
+  - method: POST
+    path: "/subscriptions/{id}/resume"
+    description: "Manually resume a PAUSED subscription."
+    roles: [Subscriber]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects: ["lifecycle_status -> ACTIVE; next_renewal_at shifted forward; paused_until cleared"]
+  - method: POST
+    path: "/subscriptions/{id}/cancel"
+    description: "Cancel a subscription immediately or at period end."
+    roles: [Subscriber]
+    code: 200
+    input: [effective]
+    output: Subscription
+    side_effects:
+      - "effective=IMMEDIATE: lifecycle -> CANCELLED; compute cancellation_refund; CREATE Invoice(CANCEL_REFUND) + WalletEntry(REFUND_CREDIT); CASCADE revert FINALIZED boxes -> RELEASE allocations -> restock products -> decrement wave.reserved_count"
+      - "effective=PERIOD_END: lifecycle -> CANCEL_SCHEDULED; cancelled_at set; no refund"
+  - method: POST
+    path: "/subscriptions/{id}/winback"
+    description: "Reactivate a CANCELLED subscription within the win-back window."
+    roles: [Subscriber]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects: ["lifecycle -> ACTIVE; billing -> CURRENT; next_renewal_at reset; CREATE WalletEntry(WINBACK_CREDIT) via winback_credit calc"]
+  - method: POST
+    path: "/subscriptions/{id}/prepay"
+    description: "Purchase a prepaid multi-period term."
+    roles: [Subscriber]
+    code: 200
+    input: [term_periods, expected_subscription_version]
+    output: Subscription
+    side_effects:
+      - "charge prepaid_charge total; CREATE Invoice(PREPAID_CHARGE)"
+      - "billing_status -> PREPAID; prepaid_periods_remaining set; prepaid_unit_value_cents set"
+      - "increments Subscription.version by 1"
+  - method: POST
+    path: "/subscriptions/{id}/retry-charge"
+    description: "Retry a failed renewal charge on a PAST_DUE subscription."
+    roles: [BillingOperator]
+    code: 200
+    input: [outcome]
+    output: Subscription
+    side_effects: ["outcome=PAID: replacement BillingCycle PAID; billing_status PAST_DUE->CURRENT; outcome=FAILED: stays PAST_DUE"]
+
+  # ---- Box selections (skip / swap / curate) ------------------------------
+  - method: POST
+    path: "/subscriptions/{id}/box-selections"
+    description: "Curate or skip the upcoming box for a subscription."
+    roles: [Subscriber]
+    code: 201
+    input: [period_index, "product_ids?", "skip?"]
+    output: BoxSelection
+    side_effects: ["BoxSelection created; decision=CURATED (with product_ids) or SKIPPED (skip=true)"]
+  - method: GET
+    path: "/box-selections/{id}"
+    description: "Fetch a box selection."
+    roles: [Subscriber, CurationAdmin]
+    code: 200
+    input: []
+    output: BoxSelection
+    side_effects: []
+  - method: GET
+    path: "/box-selections"
+    description: "List box selections; filter by subscription_id (reverse-reachability for BoxSelection.subscription_id) or allocation_id (for BoxSelection.allocation_id)."
+    roles: [Subscriber, CurationAdmin]
+    code: 200
+    input: ["limit?", "offset?", "subscription_id?", "allocation_id?"]
+    output: BoxSelection[]
+    side_effects: []
+  - method: PATCH
+    path: "/box-selections/{id}"
+    description: "Swap the products of a PENDING/CURATED box, or flip skip, before it is FINALIZED into a wave."
+    roles: [Subscriber]
+    code: 200
+    input: ["product_ids?", "skip?"]
+    output: BoxSelection
+    side_effects: ["product_ids replaced; if previously FINALIZED with an allocation, swap is rejected (ERR_BOX_ALREADY_FINALIZED)"]
+
+  # ---- Shipping waves -----------------------------------------------------
+  - method: POST
+    path: "/waves"
+    description: "Open a shipping wave for a cadence with a cutoff and capacity."
+    roles: [CurationAdmin]
+    code: 201
+    input: [cadence, cutoff_at, ship_date, capacity]
+    output: ShippingWave
+    side_effects: ["wave created OPEN; reserved_count=0"]
+  - method: GET
+    path: "/waves/{id}"
+    description: "Fetch a wave."
+    roles: [CurationAdmin, Subscriber, BillingOperator]
+    code: 200
+    input: []
+    output: ShippingWave
+    side_effects: []
+  - method: GET
+    path: "/waves"
+    description: "List waves (paginated)."
+    roles: [CurationAdmin, Subscriber, BillingOperator]
+    code: 200
+    input: ["limit?", "offset?", "status?", "cadence?"]
+    output: ShippingWave[]
+    side_effects: []
+  - method: POST
+    path: "/waves/{id}/lock"
+    description: "Lock a wave once cutoff has passed (no further allocations)."
+    roles: [CurationAdmin]
+    code: 200
+    input: []
+    output: ShippingWave
+    side_effects: ["wave.status OPEN->LOCKED"]
+  - method: POST
+    path: "/waves/{id}/ship"
+    description: "Ship a locked wave: commit all reserved allocations, create shipments, deduct inventory."
+    roles: [CurationAdmin]
+    code: 200
+    input: []
+    output: ShippingWave
+    side_effects: ["each RESERVED Allocation->COMMITTED; Product.on_hand_qty and allocated_qty decremented; CREATE Shipment per allocation; BoxSelection->FINALIZED; wave->SHIPPED"]
+  - method: POST
+    path: "/waves/{id}/cancel"
+    description: "Cancel an OPEN wave: release all reserved allocations and restock."
+    roles: [CurationAdmin]
+    code: 200
+    input: []
+    output: ShippingWave
+    side_effects: ["each RESERVED Allocation->RELEASED; Product.allocated_qty decremented; BoxSelection reverted; reserved_count->0; wave->CANCELLED"]
+
+  # ---- Allocations --------------------------------------------------------
+  - method: POST
+    path: "/allocations"
+    description: "Reserve a curated box's products into an OPEN wave (OCC on wave.version)."
+    roles: [CurationAdmin]
+    code: 201
+    input: [subscription_id, wave_id, box_selection_id, expected_wave_version]
+    output: Allocation
+    side_effects:
+      - "allocation_fill calc: per-product available check + capacity check; all-or-nothing"
+      - "Product.allocated_qty += qty per line item; wave.reserved_count += 1; BoxSelection.decision->FINALIZED, allocation_id set"
+      - "increments ShippingWave.version by 1"
+  - method: GET
+    path: "/allocations/{id}"
+    description: "Fetch an allocation (line_items snapshot)."
+    roles: [CurationAdmin, Subscriber, BillingOperator]
+    code: 200
+    input: []
+    output: Allocation
+    side_effects: []
+  - method: GET
+    path: "/allocations"
+    description: "List allocations; filter by wave_id (reverse-reachability for Allocation.wave_id), subscription_id (for Allocation.subscription_id), or box_selection_id (for Allocation.box_selection_id)."
+    roles: [CurationAdmin, Subscriber, BillingOperator]
+    code: 200
+    input: ["limit?", "offset?", "wave_id?", "subscription_id?", "box_selection_id?"]
+    output: Allocation[]
+    side_effects: []
+  - method: POST
+    path: "/allocations/{id}/release"
+    description: "Manually release a RESERVED allocation (restock + box revert)."
+    roles: [CurationAdmin]
+    code: 200
+    input: []
+    output: Allocation
+    side_effects: ["allocation->RELEASED; Product.allocated_qty decremented; wave.reserved_count--; BoxSelection reverted"]
+
+  # ---- Shipments ----------------------------------------------------------
+  - method: GET
+    path: "/shipments/{id}"
+    description: "Fetch a shipment."
+    roles: [CurationAdmin, Subscriber, BillingOperator]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: []
+  - method: GET
+    path: "/shipments"
+    description: "List shipments; filter by allocation_id (reverse-reachability for Shipment.allocation_id), wave_id (for Shipment.wave_id), or subscription_id (for Shipment.subscription_id)."
+    roles: [CurationAdmin, Subscriber, BillingOperator]
+    code: 200
+    input: ["limit?", "offset?", "allocation_id?", "wave_id?", "subscription_id?"]
+    output: Shipment[]
+    side_effects: []
+  - method: POST
+    path: "/shipments/{id}/dispatch"
+    description: "Mark a packed shipment dispatched."
+    roles: [CurationAdmin]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: ["shipment.status PACKED->DISPATCHED"]
+  - method: POST
+    path: "/shipments/{id}/deliver"
+    description: "Mark a dispatched shipment delivered."
+    roles: [CurationAdmin]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: ["shipment.status DISPATCHED->DELIVERED"]
+
+  # ---- Billing cycles -----------------------------------------------------
+  - method: GET
+    path: "/billing-cycles/{id}"
+    description: "Fetch a billing cycle."
+    roles: [BillingOperator, Subscriber, CurationAdmin]
+    code: 200
+    input: []
+    output: BillingCycle
+    side_effects: []
+  - method: GET
+    path: "/billing-cycles"
+    description: "List billing cycles; filter by subscription_id (reverse-reachability for BillingCycle.subscription_id)."
+    roles: [BillingOperator, Subscriber, CurationAdmin]
+    code: 200
+    input: ["limit?", "offset?", "subscription_id?", "status?"]
+    output: BillingCycle[]
+    side_effects: []
+
+  # ---- Invoices -----------------------------------------------------------
+  - method: GET
+    path: "/invoices/{id}"
+    description: "Fetch an invoice."
+    roles: [BillingOperator, Subscriber, CurationAdmin]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+  - method: GET
+    path: "/invoices"
+    description: "List invoices; filter by subscriber_id (reverse-reachability for Invoice.subscriber_id) or subscription_id (for Invoice.subscription_id)."
+    roles: [BillingOperator, Subscriber, CurationAdmin]
+    code: 200
+    input: ["limit?", "offset?", "subscriber_id?", "subscription_id?"]
+    output: Invoice[]
+    side_effects: []
+
+  # ---- Gift grants --------------------------------------------------------
+  - method: POST
+    path: "/gift-grants"
+    description: "Purchase a gift subscription; charges the gifter, mints a redemption code."
+    roles: [Subscriber]
+    code: 201
+    input: [plan_id, gifter_subscriber_id, term_periods, recipient_email]
+    output: GiftGrant
+    side_effects: ["GiftGrant ISSUED; amount_paid_cents = period_price * term_periods; CREATE Invoice(GIFT_CHARGE)"]
+  - method: GET
+    path: "/gift-grants/{id}"
+    description: "Fetch a gift grant (includes redemption_code, redeemed_subscription_id)."
+    roles: [Subscriber, CurationAdmin]
+    code: 200
+    input: []
+    output: GiftGrant
+    side_effects: []
+  - method: GET
+    path: "/gift-grants"
+    description: "List gift grants; filter by gifter_subscriber_id (reverse-reachability for GiftGrant.gifter_subscriber_id), plan_id (for GiftGrant.plan_id), or redeemed_subscription_id (for GiftGrant.redeemed_subscription_id)."
+    roles: [Subscriber, CurationAdmin]
+    code: 200
+    input: ["limit?", "offset?", "gifter_subscriber_id?", "plan_id?", "redeemed_subscription_id?"]
+    output: GiftGrant[]
+    side_effects: []
+  - method: POST
+    path: "/gift-grants/redeem"
+    description: "Recipient redeems a gift code, creating a prepaid gift Subscription."
+    roles: [Subscriber]
+    code: 201
+    input: [redemption_code, subscriber_id]
+    output: Subscription
+    side_effects:
+      - "GiftGrant.status ISSUED->REDEEMED; redeemed_subscription_id set (reverse-reachability for GiftGrant.redeemed_subscription_id)"
+      - "CREATE Subscription is_gift=true, billing_status=PREPAID, prepaid_periods_remaining=term_periods, lifecycle ACTIVE, current_period_index=1, next_renewal_at=clock+cadence"
+  - method: POST
+    path: "/gift-grants/{id}/revoke"
+    description: "Revoke an unredeemed gift grant (refund gifter)."
+    roles: [BillingOperator]
+    code: 200
+    input: []
+    output: GiftGrant
+    side_effects: ["GiftGrant ISSUED->REVOKED; CREATE Invoice(CANCEL_REFUND, negative) + WalletEntry(REFUND_CREDIT) for amount_paid_cents to gifter"]
+
+  # ---- Test-driving clock + renewal run -----------------------------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the simulated current UTC instant (test-driving)."
+    roles: [CurationAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock set to to_iso8601"]
+  - method: POST
+    path: "/_renewal/run"
+    description: "Run the renewal/wave epoch at the current clock: auto-resume due pauses, draw prepaid/charge renewals, fail declined charges, expire exhausted gifts, fire CANCEL_SCHEDULED that are due."
+    roles: [CurationAdmin]
+    code: 200
+    input: ["subscription_id?", "charge_outcome?"]
+    output: null
+    side_effects:
+      - "for each due subscription: if PAUSED and clock>=paused_until -> resume; if billing CURRENT and renewal due -> CREATE BillingCycle (funding_source=CHARGE; charge_outcome decides PAID/FAILED); if PREPAID and is_gift==false -> CREATE BillingCycle(funding_source=PREPAID_DRAW, amount_charged_cents=0), decrement prepaid_periods_remaining; if PREPAID and is_gift==true -> CREATE BillingCycle(funding_source=GIFT, amount_charged_cents=0), decrement prepaid_periods_remaining; gift last-period -> EXPIRED; CANCEL_SCHEDULED due -> CANCELLED"
+      - "advances current_period_index, next_renewal_at for renewed subscriptions"
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID header."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Role not permitted for the endpoint, or entity_backed actor acting on a resource it does not own."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A path- or body-referenced resource does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Malformed body: missing required field, invalid enum, out-of-range integer."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition is not defined from the resource's current state."
+  - id: ERR_STALE_WAVE_VERSION
+    http: 412
+    condition: "expected_wave_version does not equal the live ShippingWave.version (OCC)."
+  - id: ERR_STALE_SUBSCRIPTION_VERSION
+    http: 412
+    condition: "expected_subscription_version does not equal the live Subscription.version (OCC)."
+  - id: ERR_DUPLICATE_EMAIL
+    http: 409
+    condition: "Subscriber.email already exists."
+  - id: ERR_DUPLICATE_SKU
+    http: 409
+    condition: "Product.sku already exists."
+  - id: ERR_PREPAID_TERM_NOT_OFFERED
+    http: 422
+    condition: "Prepay term_periods is not a member of plan.prepaid_terms_offered."
+  - id: ERR_PLAN_RETIRED
+    http: 422
+    condition: "Win-back requested on a subscription whose plan.status == RETIRED."
+  - id: ERR_GIFT_NOT_REACTIVATABLE
+    http: 422
+    condition: "Win-back requested on a gift subscription (is_gift==true)."
+  - id: ERR_PAUSE_LIMIT_REACHED
+    http: 422
+    condition: "Pause requested when pause_count_in_term has already reached 3 in the current term."
+  - id: ERR_BOX_ITEM_COUNT_MISMATCH
+    http: 422
+    condition: "Curated box product_ids length != plan.box_item_count."
+  - id: ERR_GIFT_NOT_REDEEMABLE
+    http: 422
+    condition: "Gift redemption code is not in ISSUED status."
+  - id: ERR_WINBACK_WINDOW_CLOSED
+    http: 422
+    condition: "Win-back requested at-or-after cancelled_at + 60 days."
+  - id: ERR_CUTOFF_PASSED
+    http: 422
+    condition: "Allocation create when current clock >= wave.cutoff_at."
+  - id: ERR_CUTOFF_NOT_REACHED
+    http: 422
+    condition: "Wave lock attempted while current clock < wave.cutoff_at."
+  - id: ERR_INVALID_RESUME_DATE
+    http: 422
+    condition: "Pause paused_until is at-or-before the current clock."
+  - id: ERR_BOX_ALREADY_FINALIZED
+    http: 422
+    condition: "Swap/skip attempted on a box already FINALIZED into a wave (has an allocation)."
+  - id: ERR_EMPTY_WAVE
+    http: 422
+    condition: "Ship a wave with zero RESERVED allocations."
+  - id: ERR_INSUFFICIENT_INVENTORY
+    http: 422
+    condition: "A box product's available (on_hand - allocated) is less than the requested qty."
+  - id: ERR_WAVE_CAPACITY_FULL
+    http: 422
+    condition: "Allocation create when wave.reserved_count >= wave.capacity."
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Subscriber
+    description: "Account holder; owns their own subscriptions, boxes, gifts, and wallet."
+    identity: "entity_backed:Subscriber"
+    exclusive_operations:
+      - "POST /subscriptions (own subscriber_id)"
+      - "POST /subscriptions/{id}/pause|resume|cancel|winback|prepay (own subscription)"
+      - "POST /subscriptions/{id}/box-selections, PATCH /box-selections/{id} (own subscription)"
+      - "POST /gift-grants, POST /gift-grants/redeem"
+    shared_operations:
+      - "POST /subscribers (self-register)"
+      - "GET reads on own/visible resources (plans, products, subscriptions, waves, allocations, shipments, invoices, billing-cycles, gift-grants)"
+
+  - name: CurationAdmin
+    description: "Operator who owns the catalog: plans, products, waves, allocations, shipments."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /plans, POST /plans/{id}/retire, POST /products, POST /products/{id}/restock"
+      - "POST /waves, POST /waves/{id}/lock|ship|cancel"
+      - "POST /allocations, POST /allocations/{id}/release"
+      - "POST /shipments/{id}/dispatch|deliver"
+      - "POST /_clock/set_current_utc, POST /_renewal/run"
+    shared_operations:
+      - "GET reads across catalog, fulfillment, and subscriptions"
+      - "POST /subscribers (admin-create on behalf)"
+
+  - name: BillingOperator
+    description: "Operator who owns billing settlement: retries, refunds, wallet adjustments, gift revocation."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /subscriptions/{id}/retry-charge"
+      - "POST /subscribers/{id}/wallet-entries"
+      - "POST /gift-grants/{id}/revoke"
+    shared_operations:
+      - "GET reads on invoices, billing-cycles, subscriptions, wallet-entries, gift-grants"

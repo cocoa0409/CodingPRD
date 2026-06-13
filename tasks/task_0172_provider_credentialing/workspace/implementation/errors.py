@@ -1,0 +1,53 @@
+"""Error catalog and APIError exception."""
+
+
+class APIError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Error catalog: error_id -> http_status
+ERRORS = {
+    "ERR_MISSING_OR_INVALID_USER_CONTEXT": 401,
+    "ERR_INSUFFICIENT_PERMISSIONS": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_REFERENCED_RESOURCE_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_CAQH_REQUIRED": 400,
+    "ERR_NO_LICENSE_ON_FILE": 409,
+    "ERR_RESOLUTION_NOTE_REQUIRED": 400,
+    "ERR_TERMINATION_REASON_REQUIRED": 400,
+    "ERR_STALE_VERSION": 412,
+    "ERR_APPLICATION_NOT_DRAFT": 409,
+    "ERR_APPLICATION_NOT_SUBMITTED": 409,
+    "ERR_APPLICATION_NOT_IN_VERIFICATION": 409,
+    "ERR_VERIFICATIONS_INCOMPLETE": 409,
+    "ERR_VERIFICATION_NOT_OPEN": 409,
+    "ERR_ITEM_NOT_REJECTED": 409,
+    "ERR_CREDENTIAL_LAPSED": 409,
+    "ERR_RECRED_NOT_DUE": 409,
+    "ERR_FILE_NOT_ASSEMBLING": 409,
+    "ERR_FILE_NOT_UNDER_REVIEW": 409,
+    "ERR_PROVIDER_NOT_READY": 409,
+    "ERR_ENROLLMENT_NOT_REQUESTED": 409,
+    "ERR_ENROLLMENT_NOT_SUBMITTED": 409,
+    "ERR_ENROLLMENT_NOT_ACTIVE": 409,
+    "ERR_SCREENING_NOT_OPEN": 409,
+    "ERR_PROVIDER_EXCLUDED": 403,
+    "ERR_PROVIDER_NOT_CLEARED": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_DUPLICATE_VOTE": 409,
+    "ERR_REVIEWER_ORG_MISMATCH": 409,
+    "ERR_QUORUM_NOT_MET": 409,
+    "ERR_REVIEW_OUTCOME_MISMATCH": 409,
+    "ERR_PANEL_AT_CAPACITY": 409,
+    "ERR_CREDENTIAL_INTERVAL_OVERLAP": 409,
+    "ERR_DUPLICATE_PAYER_ENROLLMENT": 409,
+}
+
+
+def err(error_id, message=None):
+    return APIError(error_id, ERRORS[error_id], message)

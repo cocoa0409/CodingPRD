@@ -1,0 +1,1484 @@
+scenario: "Optometry & Vision Plan: exam/refraction, eyewear/contact Rx, frame/lens lab order, VSP/EyeMed eligibility/allowance, materials vs exam benefit, dispensing/remake, recall reminder, medical vs routine billing"
+domain_name: optometry-vision-plan
+api_prefix: ""
+
+# =============================================================================
+# Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: "Ledger reconciliation"          # §0.1 — same clinical inputs, routine vs medical billing & materials/exam benefit pools yield divergent patient cost
+  secondary_archetype: "Compliance / audit"           # §0.1 — Rx expiry, remake windows, dispense gating, recall cadence
+  complexity_layers:                                   # §0.2
+    - dual_variant_calculation                         # routine-vs-medical claim; provisional-vs-final allowance reconciliation
+    - cascading_side_effects                            # remake & dispense cascades span Rx -> LabOrder -> Claim -> BenefitPool
+    - optimistic_concurrency                            # OCC on Eligibility.version for benefit-drawing LabOrder create-with-supersede
+    - derived_field_reconciliation                      # BenefitPool balances and Claim totals stay consistent with source draws
+
+  entity_topology: flat                                # peer entities linked by FK refs; no deep URL nesting (§0.3 PRIORITIZE)
+  state_machine_shape: cyclic                          # LabOrder remake loop (DISPENSED->REMAKE_REQUESTED->IN_LAB) + parallel Claim dimensions (§0.3 PRIORITIZE)
+
+  relationship_patterns:
+    - one_to_many                                       # Patient -> Encounter/Prescription; Eligibility -> BenefitPool
+    - cross_aggregate                                   # LabOrder draws against Eligibility's BenefitPool; Claim spans Encounter + Eligibility
+
+  role_model: peer_roles                               # Optometrist owns clinical Rx; Optician owns lab/dispense; Biller owns claims; FrontDesk owns scheduling/recall
+  consistency_model: immediate                          # all mutations + cascades atomic in the triggering request
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+
+  - name: Patient
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Patient legal name"
+      - name: date_of_birth
+        type: string
+        source: input
+        description: "ISO date YYYY-MM-DD; used for pediatric remake-allowance rule"
+        constraints: "must be a valid past date relative to system clock"
+      - name: plan_carrier
+        type: enum
+        source: input
+        description: "Vision plan carrier the patient is enrolled with"
+        constraints: "one of {VSP, EYEMED, NONE}; NONE means self-pay only"
+      - name: medical_insurance_on_file
+        type: boolean
+        source: input
+        description: "Whether a medical carrier is on file; gates medical billing route"
+        default: false
+      - name: recall_interval_months
+        type: integer
+        source: input
+        description: "Months between routine exams for recall scheduling"
+        default: 12
+        constraints: "1..36"
+      - name: last_routine_exam_date
+        type: string
+        source: computed
+        description: "ISO date of most recent FINALIZED routine Encounter; null if none"
+      - name: recall_due_date
+        type: string
+        source: computed
+        description: "last_routine_exam_date + recall_interval_months; null when last_routine_exam_date is null"
+      - name: outstanding_patient_balance_cents
+        type: integer
+        source: computed
+        description: "Sum of Claim.patient_responsibility_cents over this patient's Claims with claim_status IN {ADJUDICATED, SETTLED_PARTIAL} minus settlements; reconciled on every claim mutation"
+        default: 0
+
+  - name: Encounter
+    parent: null
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; the patient seen at this visit"
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> Provider.id; the Optometrist who conducts the exam"
+        constraints: "referenced Provider.role must be OPTOMETRIST"
+      - name: encounter_type
+        type: enum
+        source: input
+        description: "Clinical nature of the visit; drives routine-vs-medical billing route"
+        constraints: "one of {ROUTINE_VISION, MEDICAL_EYE}; ROUTINE_VISION draws the vision plan, MEDICAL_EYE draws medical insurance"
+      - name: chief_complaint_code
+        type: string
+        source: input
+        description: "Diagnosis/complaint code; codes starting with H (e.g. H40 glaucoma) are medical-eligible"
+        default: "Z01"
+      - name: exam_fee_cents
+        type: integer
+        source: input
+        description: "Provider's billed charge for the exam component"
+        constraints: ">= 0"
+      - name: refraction_fee_cents
+        type: integer
+        source: input
+        description: "Separately billed refraction charge; bundled into exam benefit for routine, often non-covered for medical"
+        constraints: ">= 0"
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Encounter lifecycle state"
+        constraints: "one of {OPEN, REFRACTED, FINALIZED, VOIDED}"
+      - name: refraction_recorded
+        type: boolean
+        source: computed
+        description: "True once a Prescription has been issued from this Encounter"
+        default: false
+
+  - name: Provider
+    parent: null
+    common_fields: false
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Provider name"
+      - name: role
+        type: enum
+        source: input
+        description: "Clinical role"
+        constraints: "one of {OPTOMETRIST, OPTICIAN}"
+      - name: npi
+        type: string
+        source: input
+        description: "10-digit National Provider Identifier"
+        constraints: "exactly 10 digits"
+
+  - name: Prescription
+    parent: null
+    common_fields: true
+    fields:
+      - name: encounter_id
+        type: string
+        source: input
+        description: "FK -> Encounter.id; the exam this Rx was written from"
+        constraints: "referenced Encounter.status must be REFRACTED or FINALIZED"
+      - name: patient_id
+        type: string
+        source: computed
+        description: "FK -> Patient.id; copied from the source Encounter"
+      - name: rx_type
+        type: enum
+        source: input
+        description: "Eyewear vs contact lens prescription"
+        constraints: "one of {EYEGLASS, CONTACT}"
+      - name: sphere_od
+        type: number
+        source: input
+        description: "Right-eye sphere power in diopters"
+        constraints: "-20.00..20.00, multiple of 0.25"
+      - name: sphere_os
+        type: number
+        source: input
+        description: "Left-eye sphere power in diopters"
+        constraints: "-20.00..20.00, multiple of 0.25"
+      - name: issue_date
+        type: string
+        source: input
+        description: "ISO date the Rx was written; basis for expiry"
+      - name: expiry_months
+        type: integer
+        source: computed
+        description: "Validity window: 24 for EYEGLASS, 12 for CONTACT"
+      - name: expiry_date
+        type: string
+        source: computed
+        description: "issue_date + expiry_months; an Rx is expired when system clock date > expiry_date"
+      - name: status
+        type: enum
+        source: system
+        description: "Rx lifecycle state"
+        constraints: "one of {ACTIVE, SUPERSEDED, EXPIRED, REVOKED}"
+
+  - name: Eligibility
+    parent: null
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; the patient this benefit period belongs to"
+      - name: carrier
+        type: enum
+        source: input
+        description: "Vision plan carrier underwriting this benefit period"
+        constraints: "one of {VSP, EYEMED}; must equal the patient's plan_carrier"
+      - name: benefit_period_start
+        type: string
+        source: input
+        description: "ISO date the 12-month benefit period opens"
+      - name: benefit_period_end
+        type: string
+        source: computed
+        description: "benefit_period_start + 12 months; eligibility is in-period when start <= clock date <= end"
+      - name: exam_copay_cents
+        type: integer
+        source: input
+        description: "Fixed patient copay applied when the exam benefit is consumed"
+        constraints: ">= 0"
+      - name: materials_allowance_cents
+        type: integer
+        source: input
+        description: "Total dollar allowance toward frame+lens materials for the period"
+        constraints: ">= 0"
+      - name: exam_benefit_available
+        type: boolean
+        source: computed
+        description: "True until the exam benefit is consumed by a routine Claim in this period"
+        default: true
+      - name: status
+        type: enum
+        source: system
+        description: "Eligibility lifecycle state"
+        constraints: "one of {ACTIVE, EXHAUSTED, TERMINATED}"
+
+  - name: BenefitPool
+    parent: null
+    common_fields: true
+    fields:
+      - name: eligibility_id
+        type: string
+        source: input
+        description: "FK -> Eligibility.id; the benefit period this pool belongs to"
+      - name: pool_type
+        type: enum
+        source: input
+        description: "Which benefit this pool tracks"
+        constraints: "one of {MATERIALS, EXAM}; exactly one pool of each type per Eligibility"
+      - name: allotted_cents
+        type: integer
+        source: computed
+        description: "Total capacity: copied from Eligibility.materials_allowance_cents for MATERIALS; Eligibility.exam_copay-equivalent slot (1 use) for EXAM"
+      - name: consumed_cents
+        type: integer
+        source: computed
+        description: "Sum of draws committed against this pool; reconciled on every draw and release"
+        default: 0
+      - name: remaining_cents
+        type: integer
+        source: computed
+        description: "allotted_cents - consumed_cents; never negative"
+        default: 0
+
+  - name: LabOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: prescription_id
+        type: string
+        source: input
+        description: "FK -> Prescription.id; the Rx this order fulfills"
+        constraints: "referenced Prescription.status must be ACTIVE and not expired"
+      - name: eligibility_id
+        type: string
+        source: input
+        description: "FK -> Eligibility.id; benefit period drawn against; null for self-pay orders"
+      - name: dispensing_optician_id
+        type: string
+        source: computed
+        description: "FK -> Provider.id; the Optician who dispensed; set at dispense, null before"
+      - name: expected_eligibility_version
+        type: integer
+        source: input
+        description: "OCC token: Eligibility.version the client last observed; required when eligibility_id is set"
+      - name: frame_charge_cents
+        type: integer
+        source: input
+        description: "Retail price of the chosen frame"
+        constraints: ">= 0"
+      - name: lens_charge_cents
+        type: integer
+        source: input
+        description: "Retail price of the lens package"
+        constraints: ">= 0"
+      - name: frame_brand_tier
+        type: enum
+        source: input
+        description: "Tier governing the carrier frame-allowance multiplier"
+        constraints: "one of {STANDARD, PREMIUM, DESIGNER}"
+        default: STANDARD
+      - name: materials_draw_cents
+        type: integer
+        source: computed
+        description: "Amount committed against the MATERIALS BenefitPool when the order is placed; 0 for self-pay"
+        default: 0
+      - name: patient_materials_cost_cents
+        type: integer
+        source: computed
+        description: "Patient out-of-pocket for materials after allowance and tier multiplier applied"
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Lab order lifecycle state"
+        constraints: "one of {PLACED, IN_LAB, DISPENSED, REMAKE_REQUESTED, CANCELLED}"
+      - name: remake_count
+        type: integer
+        source: computed
+        description: "Number of completed remake cycles on this order"
+        default: 0
+      - name: dispensed_at
+        type: string
+        source: computed
+        description: "ISO 8601 UTC timestamp the order was dispensed; basis for the 90-day remake window"
+
+  - name: Claim
+    parent: null
+    common_fields: true
+    fields:
+      - name: encounter_id
+        type: string
+        source: input
+        description: "FK -> Encounter.id; the visit being billed"
+        constraints: "referenced Encounter.status must be FINALIZED"
+      - name: eligibility_id
+        type: string
+        source: input
+        description: "FK -> Eligibility.id; vision benefit drawn for a ROUTINE_VISION claim; null for MEDICAL_EYE"
+      - name: billing_route
+        type: enum
+        source: computed
+        description: "ROUTINE (vision plan) or MEDICAL (medical insurance), derived from Encounter.encounter_type"
+        constraints: "one of {ROUTINE, MEDICAL}"
+      - name: billed_amount_cents
+        type: integer
+        source: computed
+        description: "Total billed = exam_fee + refraction_fee from the Encounter, route-adjusted"
+      - name: plan_paid_cents
+        type: integer
+        source: computed
+        description: "Amount the carrier (vision or medical) pays toward this claim"
+        default: 0
+      - name: patient_responsibility_cents
+        type: integer
+        source: computed
+        description: "Patient out-of-pocket after plan_paid; copay for routine, coinsurance for medical"
+        default: 0
+      - name: settled_cents
+        type: integer
+        source: computed
+        description: "Cumulative patient payments applied to this claim"
+        default: 0
+      - name: claim_status
+        type: enum
+        source: system
+        description: "Claim lifecycle state (financial dimension)"
+        constraints: "one of {DRAFT, ADJUDICATED, SETTLED_PARTIAL, SETTLED, DENIED, VOIDED}"
+      - name: submission_status
+        type: enum
+        source: system
+        description: "Carrier submission dimension, evolves independently of claim_status"
+        constraints: "one of {UNSUBMITTED, SUBMITTED, ACCEPTED, REJECTED}"
+
+  - name: RecallReminder
+    parent: null
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; the patient to remind"
+      - name: due_date
+        type: string
+        source: computed
+        description: "Copied from Patient.recall_due_date at generation time"
+      - name: channel
+        type: enum
+        source: input
+        description: "Outreach channel"
+        constraints: "one of {EMAIL, SMS, MAIL}"
+      - name: status
+        type: enum
+        source: system
+        description: "Reminder lifecycle state"
+        constraints: "one of {SCHEDULED, SENT, FULFILLED, CANCELLED}"
+
+  - name: ClockState
+    parent: null
+    common_fields: false
+    fields:
+      - name: current_utc
+        type: datetime
+        source: system
+        description: "Server simulated wall clock used for expiry, benefit-period, and remake-window math"
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+
+  # ---- Encounter: linear clinical pipeline with a void branch ----
+  - entity: Encounter
+    initial_state: OPEN
+    terminal_states: [FINALIZED, VOIDED]
+    transitions:
+      - from: OPEN
+        to: REFRACTED
+        trigger: "POST /patients/{patientId}/prescriptions (first Rx from this encounter)"
+        actor: Optometrist
+        preconditions:
+          - "Encounter.status == OPEN"
+          - "acting Provider.id == Encounter.provider_id and Provider.role == OPTOMETRIST"
+        side_effects:
+          - "set Encounter.refraction_recorded = true"
+          - "increments Encounter.version by 1"
+      - from: REFRACTED
+        to: FINALIZED
+        trigger: "POST /encounters/{encounterId}/finalize"
+        actor: Optometrist
+        preconditions:
+          - "Encounter.status == REFRACTED"
+        side_effects:
+          - "set Patient.last_routine_exam_date = clock date when encounter_type == ROUTINE_VISION"
+          - "recompute Patient.recall_due_date"
+          - "increments Encounter.version by 1"
+      - from: OPEN
+        to: VOIDED
+        trigger: "POST /encounters/{encounterId}/void"
+        actor: FrontDesk
+        preconditions:
+          - "Encounter.status == OPEN"
+          - "no Prescription references this Encounter"
+        side_effects:
+          - "increments Encounter.version by 1"
+
+  # ---- Prescription: cyclic supersede + expiry ----
+  - entity: Prescription
+    initial_state: ACTIVE
+    terminal_states: [REVOKED]
+    transitions:
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "POST /patients/{patientId}/prescriptions issuing a newer Rx of the same rx_type for the same patient"
+        actor: Optometrist
+        preconditions:
+          - "a newer ACTIVE Prescription of identical rx_type exists for the same patient_id"
+        side_effects:
+          - "older Prescription.status -> SUPERSEDED"
+          - "increments superseded Prescription.version by 1"
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system: clock date > Prescription.expiry_date, evaluated on read/use"
+        actor: system
+        preconditions:
+          - "clock date > expiry_date"
+        side_effects:
+          - "Prescription.status -> EXPIRED (no LabOrder may be placed against it)"
+      - from: ACTIVE
+        to: REVOKED
+        trigger: "POST /prescriptions/{prescriptionId}/revoke"
+        actor: Optometrist
+        preconditions:
+          - "Prescription.status == ACTIVE"
+          - "no LabOrder in {PLACED, IN_LAB} references this Prescription"
+        side_effects:
+          - "increments Prescription.version by 1"
+
+  # ---- LabOrder: CYCLIC remake loop (non-linear) ----
+  - entity: LabOrder
+    initial_state: PLACED
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: PLACED
+        to: IN_LAB
+        trigger: "POST /lab-orders/{labOrderId}/send-to-lab"
+        actor: Optician
+        preconditions:
+          - "LabOrder.status == PLACED"
+        side_effects:
+          - "increments LabOrder.version by 1"
+      - from: IN_LAB
+        to: DISPENSED
+        trigger: "POST /lab-orders/{labOrderId}/dispense"
+        actor: Optician
+        preconditions:
+          - "LabOrder.status == IN_LAB"
+          - "referenced Prescription.status == ACTIVE and not expired (cross-entity)"
+        side_effects:
+          - "set LabOrder.dispensed_at = clock now"
+          - "set LabOrder.dispensing_optician_id = acting Optician.id"
+          - "increments LabOrder.version by 1"
+      - from: DISPENSED
+        to: REMAKE_REQUESTED
+        trigger: "POST /lab-orders/{labOrderId}/request-remake"
+        actor: Optician
+        preconditions:
+          - "LabOrder.status == DISPENSED"
+          - "clock now <= dispensed_at + 90 days (REMAKE_WINDOW_DAYS)"
+          - "LabOrder.remake_count < MAX_REMAKES (2)"
+        side_effects:
+          - "no new materials draw — remake reuses the original benefit draw (conserved-quantity invariant)"
+          - "increments LabOrder.version by 1"
+      - from: REMAKE_REQUESTED
+        to: IN_LAB
+        trigger: "POST /lab-orders/{labOrderId}/send-to-lab"
+        actor: Optician
+        preconditions:
+          - "LabOrder.status == REMAKE_REQUESTED"
+        side_effects:
+          - "increments LabOrder.remake_count by 1"
+          - "increments LabOrder.version by 1"
+      - from: PLACED
+        to: CANCELLED
+        trigger: "POST /lab-orders/{labOrderId}/cancel"
+        actor: Optician
+        preconditions:
+          - "LabOrder.status == PLACED"
+        side_effects:
+          - "release materials_draw_cents back to the MATERIALS BenefitPool (consumed_cents -= materials_draw_cents)"
+          - "recompute BenefitPool.remaining_cents"
+          - "if Eligibility was EXHAUSTED and pool now has remaining_cents > 0, Eligibility.status -> ACTIVE (cross-entity bubble-up)"
+          - "increments LabOrder.version by 1"
+          - "increments Eligibility.version by 1"
+      - from: IN_LAB
+        to: CANCELLED
+        trigger: "POST /lab-orders/{labOrderId}/cancel"
+        actor: Optician
+        preconditions:
+          - "LabOrder.status == IN_LAB"
+        side_effects:
+          - "release materials_draw_cents back to the MATERIALS BenefitPool (consumed_cents -= materials_draw_cents)"
+          - "recompute BenefitPool.remaining_cents"
+          - "if Eligibility was EXHAUSTED and pool now has remaining_cents > 0, Eligibility.status -> ACTIVE (cross-entity bubble-up)"
+          - "increments LabOrder.version by 1"
+          - "increments Eligibility.version by 1"
+
+  # ---- Claim: PARALLEL dimensions (claim_status x submission_status) ----
+  - entity: Claim
+    initial_state: DRAFT
+    terminal_states: [SETTLED, DENIED, VOIDED]
+    transitions:
+      # financial dimension
+      - from: DRAFT
+        to: ADJUDICATED
+        trigger: "POST /claims/{claimId}/adjudicate"
+        actor: Biller
+        preconditions:
+          - "Claim.claim_status == DRAFT"
+          - "for ROUTINE: referenced Eligibility in-period and exam_benefit_available == true (cross-entity)"
+        side_effects:
+          - "compute billed_amount_cents, plan_paid_cents, patient_responsibility_cents via claim calc"
+          - "for ROUTINE: consume EXAM BenefitPool (set Eligibility.exam_benefit_available = false; EXAM pool consumed_cents = allotted_cents)"
+          - "recompute Patient.outstanding_patient_balance_cents"
+          - "increments Claim.version by 1; increments Eligibility.version by 1 for ROUTINE"
+      - from: ADJUDICATED
+        to: SETTLED_PARTIAL
+        trigger: "POST /claims/{claimId}/payments (payment < patient_responsibility)"
+        actor: Biller
+        preconditions:
+          - "Claim.claim_status == ADJUDICATED"
+          - "0 < amount_cents < (patient_responsibility_cents - settled_cents)"
+        side_effects:
+          - "increments Claim.settled_cents by amount_cents"
+          - "recompute Patient.outstanding_patient_balance_cents"
+          - "increments Claim.version by 1"
+      - from: SETTLED_PARTIAL
+        to: SETTLED
+        trigger: "POST /claims/{claimId}/payments (payment closes the balance)"
+        actor: Biller
+        preconditions:
+          - "Claim.claim_status == SETTLED_PARTIAL"
+          - "amount_cents == (patient_responsibility_cents - settled_cents)"
+        side_effects:
+          - "set settled_cents = patient_responsibility_cents"
+          - "recompute Patient.outstanding_patient_balance_cents"
+          - "increments Claim.version by 1"
+      - from: ADJUDICATED
+        to: SETTLED
+        trigger: "POST /claims/{claimId}/payments (payment equals full responsibility)"
+        actor: Biller
+        preconditions:
+          - "Claim.claim_status == ADJUDICATED"
+          - "amount_cents == patient_responsibility_cents and settled_cents == 0"
+        side_effects:
+          - "set settled_cents = patient_responsibility_cents"
+          - "recompute Patient.outstanding_patient_balance_cents"
+          - "increments Claim.version by 1"
+      - from: DRAFT
+        to: DENIED
+        trigger: "POST /claims/{claimId}/deny"
+        actor: Biller
+        preconditions:
+          - "Claim.claim_status == DRAFT"
+        side_effects:
+          - "increments Claim.version by 1"
+      - from: ADJUDICATED
+        to: VOIDED
+        trigger: "POST /claims/{claimId}/void"
+        actor: Biller
+        preconditions:
+          - "Claim.claim_status == ADJUDICATED and settled_cents == 0"
+        side_effects:
+          - "for ROUTINE: restore EXAM BenefitPool (Eligibility.exam_benefit_available = true; EXAM pool consumed_cents = 0) — compensating invariant"
+          - "recompute Patient.outstanding_patient_balance_cents (claim no longer contributes)"
+          - "increments Claim.version by 1; increments Eligibility.version by 1 for ROUTINE"
+      # submission dimension — evolves independently of claim_status
+      - from: UNSUBMITTED
+        to: SUBMITTED
+        trigger: "POST /claims/{claimId}/submit"
+        actor: Biller
+        preconditions:
+          - "Claim.claim_status IN {ADJUDICATED, SETTLED_PARTIAL, SETTLED}"
+          - "Claim.submission_status == UNSUBMITTED"
+        side_effects:
+          - "set submission_status = SUBMITTED"
+          - "increments Claim.version by 1"
+        note: "submission_status is a parallel dimension; submitting does not change claim_status"
+      - from: SUBMITTED
+        to: ACCEPTED
+        trigger: "POST /claims/{claimId}/carrier-ack (outcome=ACCEPTED)"
+        actor: Biller
+        preconditions:
+          - "Claim.submission_status == SUBMITTED"
+        side_effects:
+          - "set submission_status = ACCEPTED"
+          - "increments Claim.version by 1"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /claims/{claimId}/carrier-ack (outcome=REJECTED)"
+        actor: Biller
+        preconditions:
+          - "Claim.submission_status == SUBMITTED"
+        side_effects:
+          - "set submission_status = REJECTED"
+          - "increments Claim.version by 1"
+
+  # ---- Eligibility: drawdown lifecycle ----
+  - entity: Eligibility
+    initial_state: ACTIVE
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: ACTIVE
+        to: EXHAUSTED
+        trigger: "system: MATERIALS pool remaining_cents reaches 0 after a LabOrder draw"
+        actor: system
+        preconditions:
+          - "MATERIALS BenefitPool.remaining_cents == 0"
+        side_effects:
+          - "Eligibility.status -> EXHAUSTED (blocks further allowance-drawing LabOrders)"
+      - from: EXHAUSTED
+        to: ACTIVE
+        trigger: "system: LabOrder cancel releases draw, MATERIALS pool remaining_cents > 0"
+        actor: system
+        preconditions:
+          - "MATERIALS BenefitPool.remaining_cents > 0"
+        side_effects:
+          - "Eligibility.status -> ACTIVE (bubble-up from pool release)"
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /eligibilities/{eligibilityId}/terminate"
+        actor: FrontDesk
+        preconditions:
+          - "Eligibility.status IN {ACTIVE, EXHAUSTED}"
+          - "no LabOrder in {PLACED, IN_LAB, REMAKE_REQUESTED} references this Eligibility"
+        side_effects:
+          - "increments Eligibility.version by 1"
+
+  # ---- RecallReminder: linear outreach ----
+  - entity: RecallReminder
+    initial_state: SCHEDULED
+    terminal_states: [FULFILLED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: SENT
+        trigger: "POST /recall-reminders/{reminderId}/send"
+        actor: FrontDesk
+        preconditions:
+          - "RecallReminder.status == SCHEDULED"
+        side_effects:
+          - "increments RecallReminder.version by 1"
+      - from: SENT
+        to: FULFILLED
+        trigger: "system: a ROUTINE_VISION Encounter for this patient is FINALIZED after the reminder due_date"
+        actor: system
+        preconditions:
+          - "RecallReminder.status == SENT"
+          - "a ROUTINE_VISION Encounter for the same patient transitions to FINALIZED"
+        side_effects:
+          - "RecallReminder.status -> FULFILLED (cross-entity bubble-up from Encounter finalize)"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /recall-reminders/{reminderId}/cancel"
+        actor: FrontDesk
+        preconditions:
+          - "RecallReminder.status == SCHEDULED"
+        side_effects:
+          - "increments RecallReminder.version by 1"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: laborder-create-stale-eligibility
+    parent_entity: Eligibility
+    write_endpoint: "POST /lab-orders"
+    occ_field: "expected_eligibility_version"
+    description: |
+      Placing a LabOrder that draws against an Eligibility whose version has
+      advanced since the client last observed it is rejected. This captures the
+      case where another writer has already placed a benefit-drawing LabOrder
+      (which committed a MATERIALS draw and may have flipped the Eligibility to
+      EXHAUSTED) so the current writer's view of the remaining allowance is
+      stale; committing this draw against a stale view could oversubscribe the
+      MATERIALS pool.
+    error_id: ERR_STALE_ELIGIBILITY_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+
+  # ---- Dual-variant #1: claim cost — ROUTINE vs MEDICAL on the Claim/Encounter domain ----
+  - name: claim_adjudication_cost
+    trigger: "Claim DRAFT -> ADJUDICATED (POST /claims/{claimId}/adjudicate)"
+    algorithm: forward_looking
+    formula: |
+      billed = Encounter.exam_fee_cents + Encounter.refraction_fee_cents
+      if billing_route == ROUTINE:
+        # vision plan covers the exam slot; patient pays fixed copay; refraction bundled
+        plan_paid = max(0, billed - Eligibility.exam_copay_cents)
+        patient_responsibility = min(billed, Eligibility.exam_copay_cents)
+      else:  # MEDICAL
+        # medical insurance pays coinsurance on the exam ONLY; refraction is non-covered, full patient cost
+        covered = Encounter.exam_fee_cents
+        plan_paid = round_half_up(covered * MEDICAL_COINSURANCE_RATE)   # plan share
+        patient_coins = covered - plan_paid                              # patient share of covered
+        patient_responsibility = patient_coins + Encounter.refraction_fee_cents
+        billed = covered + Encounter.refraction_fee_cents
+    input_set: "the single Encounter referenced by the Claim; ROUTINE additionally reads the referenced Eligibility's exam_copay_cents"
+    constants:
+      MEDICAL_COINSURANCE_RATE: 0.80
+    precision: "integer cents; round_half_up on plan_paid before deriving patient share"
+    variants:
+      - name: routine_route
+        when: "Encounter.encounter_type == ROUTINE_VISION"
+        difference: "patient pays fixed exam_copay; refraction bundled into the covered exam benefit"
+      - name: medical_route
+        when: "Encounter.encounter_type == MEDICAL_EYE"
+        difference: "plan pays 80% coinsurance on exam_fee only; refraction_fee is fully patient-borne and added on top"
+
+  # ---- Dual-variant #2: materials cost — provisional (at placement) vs final (at dispense) on the LabOrder domain ----
+  - name: materials_cost_and_draw
+    trigger: "LabOrder creation (POST /lab-orders); re-evaluated as final at dispense (POST /lab-orders/{labOrderId}/dispense)"
+    algorithm: tiered_pricing
+    formula: |
+      retail = LabOrder.frame_charge_cents + LabOrder.lens_charge_cents
+      # carrier covers frame up to a tier-scaled cap, then full lens allowance from the MATERIALS pool
+      tier_mult = FRAME_TIER_MULT[frame_brand_tier]          # STANDARD 1.00, PREMIUM 1.20, DESIGNER 1.50
+      frame_cap = round_half_up(BASE_FRAME_ALLOWANCE_CENTS * tier_mult)
+      covered_frame = min(LabOrder.frame_charge_cents, frame_cap)
+      desired_draw = covered_frame + LabOrder.lens_charge_cents
+      # available room for THIS order = pool.remaining_cents PLUS this order's own
+      # currently-committed draw (0 at placement). On the final recompute the order's
+      # existing draw is conceptually returned to the pool before re-drawing, so a
+      # sibling cancellation that freed room can raise this order's final draw.
+      available = MATERIALS BenefitPool.remaining_cents + LabOrder.materials_draw_cents
+      draw = min(desired_draw, available)                    # cannot exceed available room
+      delta = draw - LabOrder.materials_draw_cents           # reconcile pool by the delta
+      MATERIALS BenefitPool.consumed_cents += delta
+      patient_materials = retail - draw
+    input_set: "the LabOrder's frame/lens charges and tier; the MATERIALS BenefitPool.remaining_cents of the linked Eligibility"
+    constants:
+      BASE_FRAME_ALLOWANCE_CENTS: 13000
+      FRAME_TIER_MULT: { STANDARD: 1.00, PREMIUM: 1.20, DESIGNER: 1.50 }
+    precision: "integer cents; round_half_up on frame_cap"
+    variants:
+      - name: provisional_at_placement
+        when: "computed at POST /lab-orders against the pool's remaining_cents at placement time"
+        difference: "materials_draw_cents committed and pool consumed_cents increased immediately; patient_materials_cost_cents is provisional"
+      - name: final_at_dispense
+        when: "recomputed at dispense if pool remaining changed since placement (e.g. a sibling order on the same pool cancelled, freeing room)"
+        difference: "draw is re-evaluated against current pool remaining; the delta between provisional and final draw is reconciled into the pool and patient_materials_cost_cents finalized"
+
+  # ---- Combinatorial mode (b): per-line rounding order on a multi-line settlement summary ----
+  - name: patient_statement_total
+    trigger: "GET /patients/{patientId}/statement (computed read)"
+    algorithm: aggregation
+    formula: |
+      # Pinned order: round EACH claim's outstanding to whole-dollar (display) FIRST, THEN sum.
+      # (round-then-sum) — distinct cents result from (sum-then-round); the scaffold pins round-then-sum.
+      per_claim_display = []
+      for c in Claims where claim_status IN {ADJUDICATED, SETTLED_PARTIAL}, ordered by created_at ASC:
+        outstanding = c.patient_responsibility_cents - c.settled_cents
+        per_claim_display.append( round_half_up(outstanding / 100) * 100 )   # to whole dollars in cents
+      statement_total_cents = sum(per_claim_display)
+    input_set: "the patient's Claims with claim_status IN {ADJUDICATED, SETTLED_PARTIAL}; DENIED/VOIDED/SETTLED/DRAFT excluded"
+    constants: {}
+    precision: "round each line to whole dollars (round_half_up), THEN sum; order is round-then-sum, pinned"
+
+  # ---- Combinatorial mode (c): circular-looking dependency, evaluation order pinned ----
+  - name: remake_surcharge
+    trigger: "LabOrder REMAKE_REQUESTED -> IN_LAB on the 2nd remake (POST /lab-orders/{labOrderId}/send-to-lab when remake_count would become 2)"
+    algorithm: threshold
+    formula: |
+      # surcharge depends on the post-increment remake_count, but remake_count is only
+      # advanced by THIS transition — evaluation order is pinned: (1) compute prospective
+      # new_count = remake_count + 1; (2) derive surcharge from new_count; (3) commit count.
+      new_count = LabOrder.remake_count + 1
+      if new_count >= SURCHARGE_REMAKE_THRESHOLD:   # >= 2
+        surcharge_cents = REMAKE_SURCHARGE_CENTS
+      else:
+        surcharge_cents = 0
+      # surcharge is added to patient_materials_cost_cents of the order (never to the benefit pool)
+    input_set: "the single LabOrder; pre-transition remake_count"
+    constants:
+      SURCHARGE_REMAKE_THRESHOLD: 2
+      REMAKE_SURCHARGE_CENTS: 2500
+    precision: "integer cents"
+
+  # ---- Recall date computation ----
+  - name: recall_due_computation
+    trigger: "Encounter REFRACTED -> FINALIZED for a ROUTINE_VISION encounter"
+    algorithm: aggregation
+    formula: |
+      last_routine_exam_date = clock date at finalize
+      recall_due_date = add_months(last_routine_exam_date, Patient.recall_interval_months)
+    input_set: "the finalized ROUTINE_VISION Encounter and the Patient.recall_interval_months"
+    constants: {}
+    precision: "date arithmetic, calendar months"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for the operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "every resource id in the path exists (validated left-to-right)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 4
+    category: existence
+    check: "every FK in the request body references an existing resource"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /encounters, POST /patients/{patientId}/prescriptions, POST /eligibilities, POST /lab-orders, POST /claims, POST /recall-reminders"
+
+  - priority: 5
+    category: business_constraint
+    check: "request body conforms to schema: required fields present, types valid, enum values legal, numeric ranges honored (e.g. sphere multiple of 0.25, npi 10 digits)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all POST/PATCH"
+
+  - priority: 6
+    category: state
+    check: "target resource is in a state from which this transition is legal"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints"
+
+  - priority: 7
+    category: business_referential
+    check: "Encounter.provider_id references a Provider whose role == OPTOMETRIST; dispense actor's Provider.role == OPTICIAN"
+    error_id: ERR_WRONG_PROVIDER_ROLE
+    http_status: 422
+    applies_to: "POST /encounters, POST /lab-orders/{labOrderId}/dispense"
+
+  - priority: 8
+    category: business_safety
+    check: "a LabOrder may not be placed or dispensed against an EXPIRED, SUPERSEDED, or REVOKED Prescription (clinical-safety: lenses must match a current Rx)"
+    error_id: ERR_PRESCRIPTION_NOT_DISPENSABLE
+    http_status: 409
+    applies_to: "POST /lab-orders, POST /lab-orders/{labOrderId}/dispense"
+
+  - priority: 9
+    category: business_safety
+    check: "a remake may only be requested within REMAKE_WINDOW_DAYS (90) of dispensed_at and while remake_count < MAX_REMAKES (2)"
+    error_id: ERR_REMAKE_WINDOW_CLOSED
+    http_status: 409
+    applies_to: "POST /lab-orders/{labOrderId}/request-remake"
+
+  - priority: 10
+    category: business_referential
+    check: "Eligibility.carrier must equal the patient's plan_carrier; a benefit-drawing LabOrder/Claim requires the patient to have plan_carrier != NONE"
+    error_id: ERR_CARRIER_MISMATCH
+    http_status: 422
+    applies_to: "POST /eligibilities, POST /lab-orders, POST /claims"
+
+  - priority: 11
+    category: business_temporal
+    check: "Eligibility must be in-period (benefit_period_start <= clock date <= benefit_period_end) for any draw; Claim ROUTINE requires exam_benefit_available == true"
+    error_id: ERR_BENEFIT_PERIOD_CLOSED
+    http_status: 409
+    applies_to: "POST /lab-orders, POST /claims/{claimId}/adjudicate"
+
+  - priority: 12
+    category: business_referential
+    check: "a MEDICAL_EYE encounter may only be billed MEDICAL when Patient.medical_insurance_on_file == true and chief_complaint_code starts with 'H'"
+    error_id: ERR_MEDICAL_BILLING_INELIGIBLE
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{claimId}/adjudicate"
+
+  - priority: 13
+    category: business_constraint
+    check: "OCC: expected_eligibility_version must equal current Eligibility.version on a benefit-drawing LabOrder create"
+    error_id: ERR_STALE_ELIGIBILITY_VERSION
+    http_status: 412
+    applies_to: "POST /lab-orders"
+
+  - priority: 14
+    category: business_fiscal
+    check: "a benefit-drawing LabOrder requires Eligibility.status == ACTIVE (MATERIALS pool has remaining_cents > 0); an EXHAUSTED period cannot start a new draw"
+    error_id: ERR_BENEFIT_EXHAUSTED
+    http_status: 409
+    applies_to: "POST /lab-orders"
+
+  - priority: 15
+    category: business_fiscal
+    check: "a claim payment amount_cents must be > 0 and must not exceed the remaining patient_responsibility (patient_responsibility_cents - settled_cents)"
+    error_id: ERR_PAYMENT_EXCEEDS_BALANCE
+    http_status: 422
+    applies_to: "POST /claims/{claimId}/payments"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+
+  # ---- Clock (test-driving) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server simulated clock (test-driving endpoint)"
+    roles: [FrontDesk]
+    code: 200
+    input: [to_iso8601]
+    output: ClockState
+    side_effects: ["set ClockState.current_utc; re-evaluates Rx expiry and benefit periods on subsequent reads"]
+
+  # ---- Provider ----
+  - method: POST
+    path: "/providers"
+    description: "Register a Provider (Optometrist or Optician)"
+    roles: [FrontDesk]
+    code: 201
+    input: [full_name, role, npi]
+    output: Provider
+    side_effects: []
+  - method: GET
+    path: "/providers/{providerId}"
+    description: "Get a Provider"
+    roles: [FrontDesk, Optometrist, Optician, Biller]
+    code: 200
+    input: []
+    output: Provider
+    side_effects: []
+  - method: GET
+    path: "/providers"
+    description: "List Providers"
+    roles: [FrontDesk, Optometrist, Optician, Biller]
+    code: 200
+    input: ["role?", "limit?", "offset?"]
+    output: Provider[]
+    side_effects: []
+
+  # ---- Patient ----
+  - method: POST
+    path: "/patients"
+    description: "Register a Patient"
+    roles: [FrontDesk]
+    code: 201
+    input: [full_name, date_of_birth, plan_carrier, "medical_insurance_on_file?", "recall_interval_months?"]
+    output: Patient
+    side_effects: ["last_routine_exam_date=null, recall_due_date=null, outstanding_patient_balance_cents=0"]
+  - method: GET
+    path: "/patients/{patientId}"
+    description: "Get a Patient (includes computed recall + balance fields)"
+    roles: [FrontDesk, Optometrist, Optician, Biller]
+    code: 200
+    input: []
+    output: Patient
+    side_effects: []
+  - method: GET
+    path: "/patients"
+    description: "List Patients"
+    roles: [FrontDesk, Biller]
+    code: 200
+    input: ["plan_carrier?", "limit?", "offset?"]
+    output: Patient[]
+    side_effects: []
+  - method: GET
+    path: "/patients/{patientId}/statement"
+    description: "Computed read: per-claim round-then-sum patient statement total"
+    roles: [FrontDesk, Biller]
+    code: 200
+    input: []
+    output: "{ patient_id: string, statement_total_cents: integer, line_count: integer }"
+    side_effects: []
+
+  # ---- Encounter ----
+  - method: POST
+    path: "/encounters"
+    description: "Open a clinical Encounter"
+    roles: [FrontDesk, Optometrist]
+    code: 201
+    input: [patient_id, provider_id, encounter_type, "chief_complaint_code?", exam_fee_cents, "refraction_fee_cents?"]
+    output: Encounter
+    side_effects: ["status=OPEN, refraction_recorded=false"]
+  - method: GET
+    path: "/encounters/{encounterId}"
+    description: "Get an Encounter"
+    roles: [FrontDesk, Optometrist, Biller]
+    code: 200
+    input: []
+    output: Encounter
+    side_effects: []
+  - method: GET
+    path: "/encounters"
+    description: "List Encounters, filterable by patient or provider"
+    roles: [FrontDesk, Optometrist, Biller]
+    code: 200
+    input: ["patient_id?", "provider_id?", "status?", "limit?", "offset?"]
+    output: Encounter[]
+    side_effects: []
+  - method: POST
+    path: "/encounters/{encounterId}/finalize"
+    description: "Finalize a REFRACTED encounter"
+    roles: [Optometrist]
+    code: 200
+    input: []
+    output: Encounter
+    side_effects:
+      - "status REFRACTED->FINALIZED"
+      - "for ROUTINE_VISION: set Patient.last_routine_exam_date, recompute Patient.recall_due_date (recall_due_computation)"
+      - "fulfill any SENT RecallReminder for this patient past due (bubble-up)"
+      - "increments Encounter.version by 1"
+  - method: POST
+    path: "/encounters/{encounterId}/void"
+    description: "Void an OPEN encounter with no Rx"
+    roles: [FrontDesk]
+    code: 200
+    input: []
+    output: Encounter
+    side_effects: ["status OPEN->VOIDED", "increments Encounter.version by 1"]
+
+  # ---- Prescription ----
+  - method: POST
+    path: "/patients/{patientId}/prescriptions"
+    description: "Issue a Prescription from a refracted encounter"
+    roles: [Optometrist]
+    code: 201
+    input: [encounter_id, rx_type, sphere_od, sphere_os, issue_date]
+    output: Prescription
+    side_effects:
+      - "status=ACTIVE; compute expiry_months (EYEGLASS 24 / CONTACT 12) and expiry_date"
+      - "set source Encounter.refraction_recorded=true; Encounter OPEN->REFRACTED"
+      - "supersede any prior ACTIVE Rx of identical rx_type for this patient (ACTIVE->SUPERSEDED)"
+  - method: GET
+    path: "/prescriptions/{prescriptionId}"
+    description: "Get a Prescription (status reflects expiry against clock)"
+    roles: [FrontDesk, Optometrist, Optician]
+    code: 200
+    input: []
+    output: Prescription
+    side_effects: []
+  - method: GET
+    path: "/patients/{patientId}/prescriptions"
+    description: "Reverse-reachability: list a patient's Prescriptions"
+    roles: [FrontDesk, Optometrist, Optician]
+    code: 200
+    input: ["rx_type?", "status?", "limit?", "offset?"]
+    output: Prescription[]
+    side_effects: []
+  - method: GET
+    path: "/prescriptions"
+    description: "List/filter Prescriptions by source encounter"
+    roles: [FrontDesk, Optometrist, Optician]
+    code: 200
+    input: ["encounter_id?", "patient_id?", "limit?", "offset?"]
+    output: Prescription[]
+    side_effects: []
+  - method: POST
+    path: "/prescriptions/{prescriptionId}/revoke"
+    description: "Revoke an ACTIVE Rx"
+    roles: [Optometrist]
+    code: 200
+    input: []
+    output: Prescription
+    side_effects: ["status ACTIVE->REVOKED", "increments Prescription.version by 1"]
+
+  # ---- Eligibility & BenefitPool ----
+  - method: POST
+    path: "/eligibilities"
+    description: "Open a vision benefit period; auto-creates MATERIALS + EXAM BenefitPools"
+    roles: [FrontDesk]
+    code: 201
+    input: [patient_id, carrier, benefit_period_start, exam_copay_cents, materials_allowance_cents]
+    output: Eligibility
+    side_effects:
+      - "status=ACTIVE; compute benefit_period_end (+12mo); exam_benefit_available=true"
+      - "create MATERIALS BenefitPool (allotted=materials_allowance_cents, consumed=0)"
+      - "create EXAM BenefitPool (allotted=1 exam slot, consumed=0)"
+  - method: GET
+    path: "/eligibilities/{eligibilityId}"
+    description: "Get an Eligibility"
+    roles: [FrontDesk, Optician, Biller]
+    code: 200
+    input: []
+    output: Eligibility
+    side_effects: []
+  - method: GET
+    path: "/eligibilities"
+    description: "Reverse-reachability: list Eligibilities, filterable by patient"
+    roles: [FrontDesk, Optician, Biller]
+    code: 200
+    input: ["patient_id?", "status?", "limit?", "offset?"]
+    output: Eligibility[]
+    side_effects: []
+  - method: GET
+    path: "/eligibilities/{eligibilityId}/benefit-pools"
+    description: "Reverse-reachability: the MATERIALS + EXAM pools of an Eligibility"
+    roles: [FrontDesk, Optician, Biller]
+    code: 200
+    input: ["pool_type?"]
+    output: BenefitPool[]
+    side_effects: []
+  - method: GET
+    path: "/benefit-pools/{benefitPoolId}"
+    description: "Get a single BenefitPool (balances)"
+    roles: [FrontDesk, Optician, Biller]
+    code: 200
+    input: []
+    output: BenefitPool
+    side_effects: []
+  - method: GET
+    path: "/benefit-pools"
+    description: "Reverse-reachability: list BenefitPools, filterable by eligibility"
+    roles: [FrontDesk, Optician, Biller]
+    code: 200
+    input: ["eligibility_id?", "pool_type?", "limit?", "offset?"]
+    output: BenefitPool[]
+    side_effects: []
+  - method: POST
+    path: "/eligibilities/{eligibilityId}/terminate"
+    description: "Terminate a benefit period"
+    roles: [FrontDesk]
+    code: 200
+    input: []
+    output: Eligibility
+    side_effects: ["status ->TERMINATED", "increments Eligibility.version by 1"]
+
+  # ---- LabOrder ----
+  - method: POST
+    path: "/lab-orders"
+    description: "Place a frame/lens lab order; draws the MATERIALS pool when eligibility_id is set"
+    roles: [Optician]
+    code: 201
+    input: [prescription_id, "eligibility_id?", "expected_eligibility_version?", frame_charge_cents, lens_charge_cents, "frame_brand_tier?"]
+    output: LabOrder
+    side_effects:
+      - "status=PLACED; remake_count=0"
+      - "compute materials_draw_cents + patient_materials_cost_cents (materials_cost_and_draw, provisional)"
+      - "for benefit draw: OCC-check expected_eligibility_version; MATERIALS pool consumed_cents += materials_draw_cents; recompute remaining_cents"
+      - "if MATERIALS pool remaining_cents==0: Eligibility ACTIVE->EXHAUSTED (bubble-up)"
+      - "increments Eligibility.version by 1 on a benefit draw"
+  - method: GET
+    path: "/lab-orders/{labOrderId}"
+    description: "Get a LabOrder"
+    roles: [FrontDesk, Optician, Biller]
+    code: 200
+    input: []
+    output: LabOrder
+    side_effects: []
+  - method: GET
+    path: "/lab-orders"
+    description: "Reverse-reachability: list LabOrders by prescription, eligibility, or dispensing optician"
+    roles: [FrontDesk, Optician, Biller]
+    code: 200
+    input: ["prescription_id?", "eligibility_id?", "dispensing_optician_id?", "status?", "limit?", "offset?"]
+    output: LabOrder[]
+    side_effects: []
+  - method: POST
+    path: "/lab-orders/{labOrderId}/send-to-lab"
+    description: "Send a PLACED or REMAKE_REQUESTED order to the lab"
+    roles: [Optician]
+    code: 200
+    input: []
+    output: LabOrder
+    side_effects:
+      - "PLACED->IN_LAB, or REMAKE_REQUESTED->IN_LAB (increments remake_count, applies remake_surcharge on 2nd remake)"
+      - "increments LabOrder.version by 1"
+  - method: POST
+    path: "/lab-orders/{labOrderId}/dispense"
+    description: "Dispense an IN_LAB order to the patient"
+    roles: [Optician]
+    code: 200
+    input: [dispensing_optician_id]
+    output: LabOrder
+    side_effects:
+      - "IN_LAB->DISPENSED; set dispensed_at, dispensing_optician_id"
+      - "recompute materials_cost_and_draw (final variant); reconcile pool delta"
+      - "increments LabOrder.version by 1"
+  - method: POST
+    path: "/lab-orders/{labOrderId}/request-remake"
+    description: "Request a remake within the 90-day window"
+    roles: [Optician]
+    code: 200
+    input: ["reason?"]
+    output: LabOrder
+    side_effects: ["DISPENSED->REMAKE_REQUESTED (no new draw)", "increments LabOrder.version by 1"]
+  - method: POST
+    path: "/lab-orders/{labOrderId}/cancel"
+    description: "Cancel a PLACED or IN_LAB order; releases the materials draw"
+    roles: [Optician]
+    code: 200
+    input: []
+    output: LabOrder
+    side_effects:
+      - "->CANCELLED; release materials_draw_cents to MATERIALS pool; recompute remaining_cents"
+      - "if Eligibility was EXHAUSTED and pool now >0: EXHAUSTED->ACTIVE (bubble-up)"
+      - "increments LabOrder.version by 1; increments Eligibility.version by 1 on a benefit order"
+
+  # ---- Claim ----
+  - method: POST
+    path: "/claims"
+    description: "Draft a claim for a FINALIZED encounter"
+    roles: [Biller]
+    code: 201
+    input: [encounter_id, "eligibility_id?"]
+    output: Claim
+    side_effects:
+      - "claim_status=DRAFT, submission_status=UNSUBMITTED"
+      - "derive billing_route from Encounter.encounter_type"
+  - method: GET
+    path: "/claims/{claimId}"
+    description: "Get a Claim"
+    roles: [FrontDesk, Biller]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: []
+  - method: GET
+    path: "/claims"
+    description: "Reverse-reachability: list Claims by encounter or eligibility"
+    roles: [FrontDesk, Biller]
+    code: 200
+    input: ["encounter_id?", "eligibility_id?", "claim_status?", "limit?", "offset?"]
+    output: Claim[]
+    side_effects: []
+  - method: POST
+    path: "/claims/{claimId}/adjudicate"
+    description: "Adjudicate a DRAFT claim (computes amounts, consumes exam benefit for ROUTINE)"
+    roles: [Biller]
+    code: 200
+    input: []
+    output: Claim
+    side_effects:
+      - "DRAFT->ADJUDICATED; compute billed/plan_paid/patient_responsibility (claim_adjudication_cost)"
+      - "for ROUTINE: Eligibility.exam_benefit_available=false, EXAM pool consumed; increments Eligibility.version by 1"
+      - "recompute Patient.outstanding_patient_balance_cents"
+      - "increments Claim.version by 1"
+  - method: POST
+    path: "/claims/{claimId}/payments"
+    description: "Apply a patient payment to an adjudicated claim"
+    roles: [Biller]
+    code: 200
+    input: [amount_cents]
+    output: Claim
+    side_effects:
+      - "increments settled_cents; ADJUDICATED->SETTLED_PARTIAL or ->SETTLED"
+      - "recompute Patient.outstanding_patient_balance_cents"
+      - "increments Claim.version by 1"
+  - method: POST
+    path: "/claims/{claimId}/deny"
+    description: "Deny a DRAFT claim"
+    roles: [Biller]
+    code: 200
+    input: ["reason?"]
+    output: Claim
+    side_effects: ["DRAFT->DENIED", "increments Claim.version by 1"]
+  - method: POST
+    path: "/claims/{claimId}/void"
+    description: "Void an unpaid adjudicated claim; restores exam benefit for ROUTINE"
+    roles: [Biller]
+    code: 200
+    input: []
+    output: Claim
+    side_effects:
+      - "ADJUDICATED->VOIDED; for ROUTINE restore exam_benefit_available=true and EXAM pool"
+      - "recompute Patient.outstanding_patient_balance_cents; increments Eligibility.version by 1 for ROUTINE"
+      - "increments Claim.version by 1"
+  - method: POST
+    path: "/claims/{claimId}/submit"
+    description: "Submit a claim to the carrier (submission dimension)"
+    roles: [Biller]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["submission_status UNSUBMITTED->SUBMITTED", "increments Claim.version by 1"]
+  - method: POST
+    path: "/claims/{claimId}/carrier-ack"
+    description: "Record carrier acknowledgement (submission dimension)"
+    roles: [Biller]
+    code: 200
+    input: [outcome]
+    output: Claim
+    side_effects: ["submission_status SUBMITTED->ACCEPTED or ->REJECTED", "increments Claim.version by 1"]
+
+  # ---- RecallReminder ----
+  - method: POST
+    path: "/recall-reminders"
+    description: "Schedule a recall reminder for a patient"
+    roles: [FrontDesk]
+    code: 201
+    input: [patient_id, channel]
+    output: RecallReminder
+    side_effects: ["status=SCHEDULED; due_date copied from Patient.recall_due_date"]
+  - method: GET
+    path: "/recall-reminders/{reminderId}"
+    description: "Get a RecallReminder"
+    roles: [FrontDesk]
+    code: 200
+    input: []
+    output: RecallReminder
+    side_effects: []
+  - method: GET
+    path: "/recall-reminders"
+    description: "Reverse-reachability: list RecallReminders by patient"
+    roles: [FrontDesk]
+    code: 200
+    input: ["patient_id?", "status?", "limit?", "offset?"]
+    output: RecallReminder[]
+    side_effects: []
+  - method: POST
+    path: "/recall-reminders/{reminderId}/send"
+    description: "Mark a scheduled reminder as sent"
+    roles: [FrontDesk]
+    code: 200
+    input: []
+    output: RecallReminder
+    side_effects: ["status SCHEDULED->SENT", "increments RecallReminder.version by 1"]
+  - method: POST
+    path: "/recall-reminders/{reminderId}/cancel"
+    description: "Cancel a scheduled reminder"
+    roles: [FrontDesk]
+    code: 200
+    input: []
+    output: RecallReminder
+    side_effects: ["status SCHEDULED->CANCELLED", "increments RecallReminder.version by 1"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/invalid X-User-Role or X-User-ID headers"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "acting role not permitted for this operation"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a path resource id does not exist"
+  - id: ERR_REFERENCE_NOT_FOUND
+    http: 404
+    condition: "a FK in the request body references a non-existent resource"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "schema violation: missing required field, bad type, illegal enum, out-of-range numeric, sphere not multiple of 0.25, npi not 10 digits"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "target resource not in a legal state for the requested transition"
+  - id: ERR_WRONG_PROVIDER_ROLE
+    http: 422
+    condition: "Encounter provider not OPTOMETRIST, or dispensing provider not OPTICIAN"
+  - id: ERR_PRESCRIPTION_NOT_DISPENSABLE
+    http: 409
+    condition: "LabOrder placed/dispensed against an EXPIRED, SUPERSEDED, or REVOKED Prescription"
+  - id: ERR_REMAKE_WINDOW_CLOSED
+    http: 409
+    condition: "remake requested after 90-day window or after MAX_REMAKES (2) reached"
+  - id: ERR_CARRIER_MISMATCH
+    http: 422
+    condition: "Eligibility.carrier != Patient.plan_carrier, or benefit draw attempted for a plan_carrier==NONE patient"
+  - id: ERR_BENEFIT_PERIOD_CLOSED
+    http: 409
+    condition: "Eligibility not in-period for a draw, or ROUTINE claim adjudicated when exam_benefit_available==false"
+  - id: ERR_MEDICAL_BILLING_INELIGIBLE
+    http: 422
+    condition: "MEDICAL route without medical_insurance_on_file==true or chief_complaint_code not starting with 'H'"
+  - id: ERR_STALE_ELIGIBILITY_VERSION
+    http: 412
+    condition: "expected_eligibility_version != current Eligibility.version on a benefit-drawing LabOrder create"
+  - id: ERR_BENEFIT_EXHAUSTED
+    http: 409
+    condition: "benefit-drawing LabOrder placed against an EXHAUSTED eligibility (MATERIALS pool remaining_cents==0)"
+  - id: ERR_PAYMENT_EXCEEDS_BALANCE
+    http: 422
+    condition: "claim payment amount_cents <= 0 or exceeds remaining patient_responsibility"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: FrontDesk
+    description: "Scheduling, patient/provider/eligibility registration, recall outreach"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /patients"
+      - "POST /providers"
+      - "POST /eligibilities"
+      - "POST /eligibilities/{eligibilityId}/terminate"
+      - "POST /encounters/{encounterId}/void"
+      - "POST /recall-reminders"
+      - "POST /recall-reminders/{reminderId}/send"
+      - "POST /recall-reminders/{reminderId}/cancel"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /encounters"
+      - "GET (most read endpoints)"
+  - name: Optometrist
+    description: "Conducts exams/refractions, writes and revokes prescriptions, finalizes encounters"
+    identity: "entity_backed:Provider"
+    exclusive_operations:
+      - "POST /patients/{patientId}/prescriptions"
+      - "POST /prescriptions/{prescriptionId}/revoke"
+      - "POST /encounters/{encounterId}/finalize"
+    shared_operations:
+      - "POST /encounters"
+      - "GET clinical reads"
+  - name: Optician
+    description: "Places/sends/dispenses lab orders, handles remakes and cancellations"
+    identity: "entity_backed:Provider"
+    exclusive_operations:
+      - "POST /lab-orders"
+      - "POST /lab-orders/{labOrderId}/send-to-lab"
+      - "POST /lab-orders/{labOrderId}/dispense"
+      - "POST /lab-orders/{labOrderId}/request-remake"
+      - "POST /lab-orders/{labOrderId}/cancel"
+    shared_operations:
+      - "GET lab/eligibility/prescription reads"
+  - name: Biller
+    description: "Drafts, adjudicates, settles, voids, submits claims; medical-vs-routine billing"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /claims"
+      - "POST /claims/{claimId}/adjudicate"
+      - "POST /claims/{claimId}/payments"
+      - "POST /claims/{claimId}/deny"
+      - "POST /claims/{claimId}/void"
+      - "POST /claims/{claimId}/submit"
+      - "POST /claims/{claimId}/carrier-ack"
+    shared_operations:
+      - "GET claim/patient/encounter reads"

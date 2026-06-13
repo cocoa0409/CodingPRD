@@ -1,0 +1,1637 @@
+scenario: "297. Pawn Shop Loan & Inventory: item appraisal & loan amount, interest/fee by state, loan term & extension/renewal, redemption, forfeiture to inventory after grace, resale pricing, police hold/reporting, layaway"
+domain_name: "pawn-shop-loan-inventory"
+api_prefix: "/pawn"
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+    - derived_field_reconciliation
+
+  entity_topology: hybrid
+  # PawnShop is the operating root (owns CashDrawer 1:1, StateRateSchedule config).
+  # Loan, InventoryItem, LayawayPlan are peer business resources linked by FK;
+  # FinanceTransaction and LayawayInstallment are append-only event children;
+  # PoliceHold is a cross-cutting association reachable from both PawnItem and InventoryItem.
+
+  state_machine_shape: branching
+  # Loan branches at term-end: {extend/renew loop} | {redeem -> terminal} | {forfeit -> spawn InventoryItem}.
+  # InventoryItem branches: {sell direct} | {layaway -> installments -> sell} | {reverse-forfeit compensation}.
+  # LayawayPlan is a cyclic deposit/installment loop with default-and-reinstate.
+  # Loan also carries a parallel police_hold_flag dimension that gates terminal transitions independently.
+
+  relationship_patterns:
+    - one_to_many        # PawnShop -> Loan; Loan -> FinanceTransaction; LayawayPlan -> LayawayInstallment
+    - cross_aggregate    # PoliceHold references either PawnItem or InventoryItem; Loan reads StateRateSchedule
+    - polymorphic        # PoliceHold.subject_kind selects which subject FK is populated
+
+  role_model: segregation_of_duties
+  # The Appraiser who set a PawnItem's appraised_value MUST NOT be the LoanOfficer who originates
+  # the Loan against it (four-eyes anti-fraud control). ShopManager holds override + resale authority.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 Entity-Relationship Table
+# =====================================================================
+entities:
+  - name: PawnShop
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Legal trading name of the shop branch."
+      - name: state_code
+        type: enum
+        source: input
+        description: "US state the branch operates in; selects the governing StateRateSchedule."
+        constraints: "one of {FL, TX, CA}"
+      - name: police_reporting_enabled
+        type: boolean
+        source: input
+        description: "When true, every Loan origination and forfeiture emits a reportable record and PawnItem police_report_status starts at PENDING_REPORT."
+        default: true
+      - name: cash_drawer_id
+        type: string
+        source: computed
+        description: "Denormalized convenience pointer to the CashDrawer minted for this shop at creation (1:1); the canonical FK lives on CashDrawer.shop_id. Resolve the drawer via GET /pawn/shops/{id}/drawer."
+
+  - name: StorageBin
+    parent: null
+    common_fields: true
+    fields:
+      - name: shop_id
+        type: string
+        source: input
+        description: "FK -> PawnShop.id; the shop this physical storage bin belongs to."
+      - name: label
+        type: string
+        source: input
+        description: "Human label for the bin (e.g. 'A-12')."
+      - name: capacity
+        type: integer
+        source: input
+        description: "Maximum number of pledged items the bin may hold CONCURRENTLY over any instant of a loan-occupation interval."
+        constraints: ">= 1"
+
+  - name: StateRateSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - name: state_code
+        type: enum
+        source: input
+        description: "US state this schedule governs; unique across schedules."
+        constraints: "one of {FL, TX, CA}; unique"
+      - name: monthly_interest_bps
+        type: integer
+        source: input
+        description: "Monthly finance interest rate in basis points applied to loan principal (e.g. 1000 = 10%/month)."
+        constraints: ">= 0"
+      - name: monthly_storage_fee_cents
+        type: integer
+        source: input
+        description: "Flat per-30-day-period storage/handling fee in cents, added on top of interest each period."
+        constraints: ">= 0"
+      - name: setup_fee_cents
+        type: integer
+        source: input
+        description: "One-time origination/ticket fee in cents, added to the payoff at redemption (not collected at disbursement)."
+        constraints: ">= 0"
+      - name: term_days
+        type: integer
+        source: input
+        description: "Length of the initial loan term in days before the grace window opens."
+        constraints: "> 0"
+      - name: grace_days
+        type: integer
+        source: input
+        description: "Days after term_end during which the loan stays redeemable before it may be forfeited."
+        constraints: ">= 0"
+      - name: max_principal_cents
+        type: integer
+        source: input
+        description: "Statutory cap on loan principal in this state; loan_amount is clamped to this value."
+        constraints: "> 0"
+      - name: max_periods_total
+        type: integer
+        source: input
+        description: "Statutory cap on the number of 30-day finance periods that may be charged on a single loan across its whole life (origination + extensions)."
+        constraints: ">= 1"
+      - name: loan_to_value_bps
+        type: integer
+        source: input
+        description: "Loan-to-value ratio in basis points used to derive the offered loan amount from the appraised value (e.g. 5000 = 50%)."
+        constraints: "> 0 and <= 10000"
+      - name: layaway_buffer_days
+        type: integer
+        source: input
+        description: "Mandatory restock cool-down gap in days between one layaway plan's end on an item and the next plan's reservation start (adjacency buffer)."
+        constraints: ">= 0"
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Customer legal name as shown on government ID."
+      - name: gov_id_number
+        type: string
+        source: input
+        description: "Government identification number recorded for police reporting; unique per shop."
+        constraints: "unique"
+      - name: is_flagged
+        type: boolean
+        source: system
+        description: "Set true when law enforcement places a hold naming this customer; blocks new originations."
+        default: false
+
+  - name: PawnItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: shop_id
+        type: string
+        source: input
+        description: "FK -> PawnShop.id; the shop that took in this item."
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the owner who brought the item in."
+      - name: description
+        type: string
+        source: input
+        description: "Free-text description of the pledged item (serial, make, model)."
+      - name: serial_number
+        type: string
+        source: input
+        description: "Manufacturer serial used for police-database matching; nullable."
+        default: null
+      - name: appraised_value_cents
+        type: integer
+        source: system
+        description: "Value set by the appraise action; null until appraised."
+        default: null
+      - name: appraised_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the Appraiser who set appraised_value_cents; used to enforce segregation of duties at origination."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle of the physical item."
+        default: "INTAKE"
+        constraints: "one of {INTAKE, APPRAISED, PLEDGED, REDEEMED, FORFEITED, RELEASED_TO_POLICE}"
+      - name: police_report_status
+        type: enum
+        source: system
+        description: "Police-reporting state of the item; PENDING_REPORT only when the shop has police_reporting_enabled."
+        default: "PENDING_REPORT"
+        constraints: "one of {NOT_REQUIRED, PENDING_REPORT, REPORTED}"
+
+  - name: Loan
+    parent: null
+    common_fields: true
+    fields:
+      - name: shop_id
+        type: string
+        source: input
+        description: "FK -> PawnShop.id; the originating shop."
+      - name: pawn_item_id
+        type: string
+        source: input
+        description: "FK -> PawnItem.id; collateral pledged for this loan (1:1)."
+      - name: storage_bin_id
+        type: string
+        source: input
+        description: "FK -> StorageBin.id; the bin assigned to hold the collateral for this loan's occupation interval [origination_at, grace_end_at)."
+      - name: customer_id
+        type: string
+        source: computed
+        description: "FK -> Customer.id; copied from the pledged PawnItem at origination."
+      - name: state_code
+        type: enum
+        source: computed
+        description: "Copied from the shop at origination; pins the StateRateSchedule that governs this loan for its whole life."
+        constraints: "one of {FL, TX, CA}"
+      - name: principal_cents
+        type: integer
+        source: computed
+        description: "Disbursed principal = min(floor(appraised_value_cents * loan_to_value_bps/10000), max_principal_cents)."
+      - name: setup_fee_cents
+        type: integer
+        source: computed
+        description: "Snapshotted setup fee from the governing schedule at origination."
+      - name: origination_at
+        type: datetime
+        source: computed
+        description: "Clock time when the loan was disbursed; the accrual baseline."
+      - name: term_end_at
+        type: datetime
+        source: computed
+        description: "origination_at + term_days; advances on each extension/renewal."
+      - name: grace_end_at
+        type: datetime
+        source: computed
+        description: "term_end_at + grace_days; on/after this instant the loan may be forfeited."
+      - name: periods_charged
+        type: integer
+        source: computed
+        description: "Count of 30-day finance periods already locked in by extensions/renewals; origination locks 0 (the live period is computed on demand). Caps the on-demand payoff at max_periods_total."
+        default: 0
+      - name: renewal_count
+        type: integer
+        source: system
+        description: "Number of times this loan was renewed (full re-term)."
+        default: 0
+      - name: police_hold_flag
+        type: boolean
+        source: system
+        description: "Parallel dimension set true by an active PoliceHold on the collateral; independently blocks redemption and forfeiture."
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: "Loan servicing lifecycle."
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, IN_GRACE, REDEEMED, FORFEITED, VOIDED, POLICE_HELD}"
+
+  - name: FinanceTransaction
+    parent: Loan
+    common_fields: false
+    fields:
+      - name: loan_id
+        type: string
+        source: input
+        description: "FK -> Loan.id; the loan this ledger entry belongs to."
+      - name: kind
+        type: enum
+        source: system
+        description: "Type of cash movement recorded against the loan."
+        constraints: "one of {DISBURSEMENT, EXTENSION_FEE, RENEWAL_FEE, REDEMPTION_PAYOFF, VOID_REVERSAL}"
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Signed cents: negative for shop cash out (DISBURSEMENT, VOID_REVERSAL), positive for shop cash in (fees, payoff)."
+      - name: periods_in_charge
+        type: integer
+        source: system
+        description: "Number of finance periods this entry settled (0 for DISBURSEMENT/VOID_REVERSAL)."
+        default: 0
+
+  - name: InventoryItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: shop_id
+        type: string
+        source: computed
+        description: "FK -> PawnShop.id; carried from the forfeited loan's shop."
+      - name: source_loan_id
+        type: string
+        source: computed
+        description: "FK -> Loan.id; the loan whose forfeiture created this item."
+      - name: pawn_item_id
+        type: string
+        source: computed
+        description: "FK -> PawnItem.id; the physical item now owned by the shop."
+      - name: cost_basis_cents
+        type: integer
+        source: computed
+        description: "Unrecovered debt at forfeiture (the forfeiture-moment payoff); floor_price is clamped to this."
+      - name: appraised_value_cents
+        type: integer
+        source: computed
+        description: "Carried from the PawnItem; the markup base for list_price."
+      - name: list_price_cents
+        type: integer
+        source: computed
+        description: "Forward-looking optimistic resale price = max(round_to_dollar(appraised_value_cents*(1+resale_markup_bps/10000)), cost_basis_cents)."
+      - name: floor_price_cents
+        type: integer
+        source: computed
+        description: "Cost-recovery pessimistic minimum acceptable price = cost_basis_cents."
+      - name: sold_price_cents
+        type: integer
+        source: system
+        description: "Actual price the item sold for; null until SOLD."
+        default: null
+      - name: last_layaway_end_at
+        type: datetime
+        source: system
+        description: "Clock instant a prior LayawayPlan on this item ended (DEFAULTED); a new plan's reservation start must be >= this + layaway_buffer_days (restock cool-down adjacency rule)."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Resale lifecycle of the forfeited item."
+        default: "AVAILABLE"
+        constraints: "one of {AVAILABLE, ON_LAYAWAY, SOLD, RECALLED}"
+
+  - name: LayawayPlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: inventory_item_id
+        type: string
+        source: input
+        description: "FK -> InventoryItem.id; the AVAILABLE item put on layaway (1:1 while active)."
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the layaway buyer."
+      - name: total_price_cents
+        type: integer
+        source: computed
+        description: "Snapshotted from the InventoryItem.list_price_cents at plan creation."
+      - name: deposit_cents
+        type: integer
+        source: computed
+        description: "Required up-front deposit = round_half_up(total_price_cents * deposit_bps/10000), paid at creation."
+      - name: installment_count
+        type: integer
+        source: input
+        description: "Number of equal installments scheduled after the deposit."
+        constraints: ">= 1 and <= 12"
+      - name: reserved_from_at
+        type: datetime
+        source: computed
+        description: "Clock instant the plan was created; start of the item's exclusive reservation interval [reserved_from_at, reserved_until_at] (closed)."
+      - name: reserved_until_at
+        type: datetime
+        source: input
+        description: "Buyer-chosen payment deadline; end of the closed reservation interval. Must be > reserved_from_at."
+      - name: paid_cents
+        type: integer
+        source: system
+        description: "Running sum of deposit + all posted installment payments."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Layaway lifecycle. The cancel endpoint always terminates the plan as DEFAULTED (the refund-minus-restocking path applies regardless of how far the buyer paid)."
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, DEFAULTED, COMPLETED}"
+
+  - name: LayawayInstallment
+    parent: LayawayPlan
+    common_fields: false
+    fields:
+      - name: layaway_plan_id
+        type: string
+        source: input
+        description: "FK -> LayawayPlan.id; the plan this scheduled installment belongs to."
+      - name: sequence
+        type: integer
+        source: system
+        description: "1-based position in the schedule; the final installment absorbs the rounding remainder."
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Scheduled amount = floor(remaining/installment_count) for all but the last, which carries the remainder."
+      - name: paid
+        type: boolean
+        source: system
+        description: "Whether this installment has been posted."
+        default: false
+
+  - name: PoliceHold
+    parent: null
+    common_fields: true
+    fields:
+      - name: subject_kind
+        type: enum
+        source: input
+        description: "Selects which subject FK is populated (polymorphic)."
+        constraints: "one of {PAWN_ITEM, INVENTORY_ITEM}"
+      - name: pawn_item_id
+        type: string
+        source: input
+        description: "FK -> PawnItem.id; populated when subject_kind is PAWN_ITEM, else null."
+        default: null
+      - name: inventory_item_id
+        type: string
+        source: input
+        description: "FK -> InventoryItem.id; populated when subject_kind is INVENTORY_ITEM, else null."
+        default: null
+      - name: case_number
+        type: string
+        source: input
+        description: "Law-enforcement case reference."
+      - name: status
+        type: enum
+        source: system
+        description: "Hold lifecycle."
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, RELEASED, EXECUTED}"
+
+  - name: CashDrawer
+    parent: PawnShop
+    common_fields: true
+    fields:
+      - name: shop_id
+        type: string
+        source: computed
+        description: "FK -> PawnShop.id; the shop this drawer belongs to (1:1)."
+      - name: balance_cents
+        type: integer
+        source: system
+        description: "Net cash position: decremented on disbursement, incremented on fee/payoff/layaway cash in, reversed on void."
+        default: 0
+
+  - name: ClockState
+    parent: null
+    common_fields: false
+    fields:
+      - name: current_utc
+        type: datetime
+        source: system
+        description: "The test-controllable simulated wall clock used for all term/grace/period math; defaults to a fixed epoch until set."
+        default: "2026-01-01T00:00:00.000Z"
+
+# =====================================================================
+# §1.2 State Machine Table
+# =====================================================================
+state_machines:
+  - entity: PawnItem
+    initial_state: INTAKE
+    terminal_states: [REDEEMED, FORFEITED, RELEASED_TO_POLICE]
+    transitions:
+      - from: INTAKE
+        to: APPRAISED
+        trigger: "POST /pawn/items/{id}/appraise"
+        actor: Appraiser
+        preconditions:
+          - "item.status == INTAKE"
+          - "appraised_value_cents > 0"
+        side_effects:
+          - "set item.appraised_value_cents = input value"
+          - "set item.appraised_by_user_id = X-User-ID"
+        note: "Records who appraised it, to enforce segregation of duties at origination."
+      - from: APPRAISED
+        to: PLEDGED
+        trigger: "POST /pawn/loans (origination references this item)"
+        actor: LoanOfficer
+        preconditions:
+          - "item.status == APPRAISED"
+          - "no ACTIVE PoliceHold names this item"
+          - "the named Customer is not flagged"
+          - "computed principal > 0"
+          - "chosen StorageBin has free capacity over [origination_at, grace_end_at) (bin_occupancy_overlap)"
+        side_effects:
+          - "create Loan in ACTIVE; assign storage_bin_id"
+          - "if shop.police_reporting_enabled then item.police_report_status stays PENDING_REPORT else set NOT_REQUIRED"
+      - from: PLEDGED
+        to: APPRAISED
+        trigger: "POST /pawn/loans/{id}/void"
+        actor: LoanOfficer
+        preconditions:
+          - "loan.status == ACTIVE"
+          - "no FinanceTransaction of kind in {EXTENSION_FEE, RENEWAL_FEE, REDEMPTION_PAYOFF} exists for the loan"
+        side_effects:
+          - "loan -> VOIDED"
+          - "item reverts to APPRAISED so it can be re-pledged"
+        note: "Compensation: undoes a same-session mis-origination."
+      - from: PLEDGED
+        to: REDEEMED
+        trigger: "POST /pawn/loans/{id}/redeem"
+        actor: LoanOfficer
+        preconditions:
+          - "loan.status in {ACTIVE, IN_GRACE}"
+          - "loan.police_hold_flag == false"
+        side_effects:
+          - "loan -> REDEEMED"
+      - from: PLEDGED
+        to: FORFEITED
+        trigger: "POST /pawn/loans/{id}/forfeit"
+        actor: ShopManager
+        preconditions:
+          - "loan.status == IN_GRACE"
+          - "clock.current_utc >= loan.grace_end_at"
+          - "loan.police_hold_flag == false"
+        side_effects:
+          - "loan -> FORFEITED; spawn InventoryItem (see Loan SM)"
+      - from: PLEDGED
+        to: RELEASED_TO_POLICE
+        trigger: "POST /pawn/police-holds/{id}/execute"
+        actor: LawEnforcement
+        preconditions:
+          - "an ACTIVE PoliceHold names this item"
+        side_effects:
+          - "hold -> EXECUTED; collateral surrendered; source loan (if ACTIVE/POLICE_HELD) -> VOIDED with VOID_REVERSAL"
+
+  - entity: Loan
+    initial_state: ACTIVE
+    terminal_states: [REDEEMED, FORFEITED, VOIDED]
+    transitions:
+      - from: ACTIVE
+        to: IN_GRACE
+        trigger: "system: clock advances to or past term_end_at (re-evaluated on any GET /pawn/loans/{id} and any servicing action)"
+        actor: system
+        preconditions:
+          - "clock.current_utc >= loan.term_end_at"
+          - "loan.status == ACTIVE"
+        side_effects:
+          - "loan.status -> IN_GRACE"
+        note: "Lazy auto-transition; recomputed on read so payoff/forfeit eligibility are observable without a cron."
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /pawn/loans/{id}/extend"
+        actor: LoanOfficer
+        preconditions:
+          - "loan.status in {ACTIVE, IN_GRACE}"
+          - "loan.police_hold_flag == false"
+          - "loan.periods_charged + 1 <= schedule.max_periods_total"
+          - "expected_loan_version matches loan.version"
+        side_effects:
+          - "collect EXTENSION_FEE = one live-period charge; drawer.balance_cents += fee"
+          - "append FinanceTransaction kind=EXTENSION_FEE amount=+fee periods_in_charge=1"
+          - "loan.periods_charged += 1"
+          - "loan.term_end_at += term_days; loan.grace_end_at += term_days; loan.origination baseline shifts so the live period restarts"
+          - "if loan.status was IN_GRACE then -> ACTIVE"
+          - "increments Loan.version by 1"
+        note: "Cyclic: extension keeps the loan ACTIVE across many rounds up to the period cap."
+      - from: IN_GRACE
+        to: ACTIVE
+        trigger: "POST /pawn/loans/{id}/renew"
+        actor: LoanOfficer
+        preconditions:
+          - "loan.status == IN_GRACE"
+          - "loan.police_hold_flag == false"
+          - "loan.periods_charged + (periods due to date) <= schedule.max_periods_total"
+          - "expected_loan_version matches loan.version"
+        side_effects:
+          - "collect RENEWAL_FEE = full accrued finance charge to date; drawer.balance_cents += fee"
+          - "append FinanceTransaction kind=RENEWAL_FEE"
+          - "loan.renewal_count += 1; loan.periods_charged += periods-due-to-date"
+          - "reset baseline: term_end_at = clock + term_days; grace_end_at = term_end_at + grace_days"
+          - "loan.status -> ACTIVE"
+          - "increments Loan.version by 1"
+        note: "Cyclic with a re-term; distinct from extend by paying ALL accrued charges and resetting the clock to now."
+      - from: ACTIVE
+        to: REDEEMED
+        trigger: "POST /pawn/loans/{id}/redeem"
+        actor: LoanOfficer
+        preconditions:
+          - "loan.status in {ACTIVE, IN_GRACE}"
+          - "loan.police_hold_flag == false"
+          - "redemption payoff paid in full"
+        side_effects:
+          - "append FinanceTransaction kind=REDEMPTION_PAYOFF amount=+payoff; drawer.balance_cents += payoff"
+          - "loan -> REDEEMED; PawnItem -> REDEEMED"
+      - from: IN_GRACE
+        to: REDEEMED
+        trigger: "POST /pawn/loans/{id}/redeem"
+        actor: LoanOfficer
+        preconditions:
+          - "loan.status == IN_GRACE"
+          - "loan.police_hold_flag == false"
+          - "redemption payoff paid in full"
+        side_effects:
+          - "append FinanceTransaction kind=REDEMPTION_PAYOFF; drawer.balance_cents += payoff; loan -> REDEEMED; PawnItem -> REDEEMED"
+      - from: IN_GRACE
+        to: FORFEITED
+        trigger: "POST /pawn/loans/{id}/forfeit"
+        actor: ShopManager
+        preconditions:
+          - "loan.status == IN_GRACE"
+          - "clock.current_utc >= loan.grace_end_at"
+          - "loan.police_hold_flag == false"
+        side_effects:
+          - "loan -> FORFEITED; PawnItem -> FORFEITED"
+          - "compute cost_basis = forfeiture-moment payoff (CASCADE link 1)"
+          - "spawn InventoryItem AVAILABLE with cost_basis, list_price, floor_price (CASCADE link 2)"
+          - "drawer.balance_cents unchanged (no cash moves at forfeiture)"
+        note: "Two-hop cascade: forfeit mutates Loan -> the Loan mutation computes cost_basis -> cost_basis drives the InventoryItem pricing."
+      - from: ACTIVE
+        to: POLICE_HELD
+        trigger: "POST /pawn/police-holds (subject_kind=PAWN_ITEM on this loan's collateral)"
+        actor: LawEnforcement
+        preconditions:
+          - "loan.status in {ACTIVE, IN_GRACE}"
+        side_effects:
+          - "set loan.police_hold_flag = true; loan.status -> POLICE_HELD"
+          - "freeze: redeem/extend/renew/forfeit all blocked while POLICE_HELD"
+        note: "Cross-entity guard: PoliceHold (entity B) state gates Loan (entity A) terminal transitions."
+      - from: IN_GRACE
+        to: POLICE_HELD
+        trigger: "POST /pawn/police-holds (subject_kind=PAWN_ITEM on this loan's collateral)"
+        actor: LawEnforcement
+        preconditions:
+          - "loan.status == IN_GRACE"
+        side_effects:
+          - "set loan.police_hold_flag = true; loan.status -> POLICE_HELD"
+      - from: POLICE_HELD
+        to: ACTIVE
+        trigger: "POST /pawn/police-holds/{id}/release"
+        actor: LawEnforcement
+        preconditions:
+          - "the hold on this collateral is ACTIVE"
+          - "no other ACTIVE PoliceHold names the collateral"
+        side_effects:
+          - "hold -> RELEASED; loan.police_hold_flag = false; loan.status -> ACTIVE (re-derived to IN_GRACE on next read if grace already open)"
+      - from: ACTIVE
+        to: VOIDED
+        trigger: "POST /pawn/loans/{id}/void"
+        actor: LoanOfficer
+        preconditions:
+          - "loan.status == ACTIVE"
+          - "no FinanceTransaction of kind in {EXTENSION_FEE, RENEWAL_FEE, REDEMPTION_PAYOFF} exists for the loan"
+        side_effects:
+          - "append FinanceTransaction kind=VOID_REVERSAL amount=+principal_cents (cash returns to drawer); drawer.balance_cents += principal_cents"
+          - "loan -> VOIDED; PawnItem -> APPRAISED"
+        note: "Compensating action for DISBURSEMENT: drawer returns to pre-origination balance (Rule 9 invariant)."
+
+  - entity: InventoryItem
+    initial_state: AVAILABLE
+    terminal_states: [SOLD, RECALLED]
+    transitions:
+      - from: AVAILABLE
+        to: SOLD
+        trigger: "POST /pawn/inventory/{id}/sell"
+        actor: ShopManager
+        preconditions:
+          - "item.status == AVAILABLE"
+          - "no ACTIVE PoliceHold names this inventory item"
+          - "sold_price_cents >= item.floor_price_cents"
+        side_effects:
+          - "set sold_price_cents; item -> SOLD; drawer.balance_cents += sold_price_cents"
+      - from: AVAILABLE
+        to: ON_LAYAWAY
+        trigger: "POST /pawn/layaway-plans (references this item)"
+        actor: ShopManager
+        preconditions:
+          - "item.status == AVAILABLE"
+          - "no ACTIVE PoliceHold names this inventory item"
+          - "reserved_from_at (= clock) >= item.last_layaway_end_at + layaway_buffer_days (layaway_reservation_overlap)"
+        side_effects:
+          - "item -> ON_LAYAWAY; create LayawayPlan ACTIVE; set reserved_from_at=clock; collect deposit; drawer.balance_cents += deposit"
+      - from: ON_LAYAWAY
+        to: SOLD
+        trigger: "system: final LayawayInstallment posted (LayawayPlan COMPLETED)"
+        actor: system
+        preconditions:
+          - "plan.paid_cents == plan.total_price_cents"
+        side_effects:
+          - "item -> SOLD; sold_price_cents = plan.total_price_cents"
+        note: "Bubble-up: LayawayPlan completion auto-sells the InventoryItem."
+      - from: ON_LAYAWAY
+        to: AVAILABLE
+        trigger: "POST /pawn/layaway-plans/{id}/cancel (plan -> DEFAULTED)"
+        actor: ShopManager
+        preconditions:
+          - "plan.status == ACTIVE"
+        side_effects:
+          - "item -> AVAILABLE; refund = max(0, plan.paid_cents - restocking_fee); drawer.balance_cents -= refund"
+        note: "Conditional cascade: restocking fee retained, remainder refunded."
+      - from: AVAILABLE
+        to: RECALLED
+        trigger: "POST /pawn/inventory/{id}/recall (reverse-forfeiture compensation)"
+        actor: ShopManager
+        preconditions:
+          - "item.status == AVAILABLE"
+          - "item.source_loan_id loan.status == FORFEITED"
+          - "no ACTIVE PoliceHold names this inventory item"
+        side_effects:
+          - "item -> RECALLED; source Loan -> IN_GRACE; PawnItem -> PLEDGED"
+        note: "Compensating action for forfeiture: undoes the forfeit so the loan is redeemable again; conserves the never-lost item count."
+
+  - entity: LayawayPlan
+    initial_state: ACTIVE
+    terminal_states: [COMPLETED, DEFAULTED]
+    transitions:
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /pawn/layaway-plans/{id}/installments"
+        actor: ShopManager
+        preconditions:
+          - "plan.status == ACTIVE"
+          - "the next unpaid scheduled installment exists"
+          - "payment amount == that installment.amount_cents"
+        side_effects:
+          - "mark installment paid; plan.paid_cents += amount; drawer.balance_cents += amount"
+        note: "Cyclic installment loop; stays ACTIVE until the final installment."
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "POST /pawn/layaway-plans/{id}/installments (the final installment)"
+        actor: ShopManager
+        preconditions:
+          - "plan.status == ACTIVE"
+          - "this is the last unpaid installment"
+          - "plan.paid_cents + amount == plan.total_price_cents"
+        side_effects:
+          - "mark installment paid; plan.paid_cents = total_price_cents; plan -> COMPLETED"
+          - "InventoryItem -> SOLD (bubble-up)"
+      - from: ACTIVE
+        to: DEFAULTED
+        trigger: "POST /pawn/layaway-plans/{id}/cancel (default after deadline)"
+        actor: ShopManager
+        preconditions:
+          - "plan.status == ACTIVE"
+        side_effects:
+          - "plan -> DEFAULTED; InventoryItem -> AVAILABLE; refund = max(0, paid_cents - restocking_fee); drawer.balance_cents -= refund"
+
+  - entity: PoliceHold
+    initial_state: ACTIVE
+    terminal_states: [RELEASED, EXECUTED]
+    transitions:
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /pawn/police-holds/{id}/release"
+        actor: LawEnforcement
+        preconditions:
+          - "hold.status == ACTIVE"
+        side_effects:
+          - "hold -> RELEASED; clear police_hold_flag on the linked Loan if no other ACTIVE hold remains"
+      - from: ACTIVE
+        to: EXECUTED
+        trigger: "POST /pawn/police-holds/{id}/execute"
+        actor: LawEnforcement
+        preconditions:
+          - "hold.status == ACTIVE"
+        side_effects:
+          - "hold -> EXECUTED; subject PawnItem -> RELEASED_TO_POLICE (or InventoryItem -> RECALLED then RELEASED_TO_POLICE on its PawnItem)"
+          - "if subject is PawnItem with an ACTIVE/POLICE_HELD source loan: loan -> VOIDED; append VOID_REVERSAL; drawer.balance_cents += principal_cents"
+
+# =====================================================================
+# §1.2.1 Concurrency Rules
+# =====================================================================
+concurrency_rules:
+  - rule_id: extend-stale-loan
+    parent_entity: Loan
+    write_endpoint: "POST /pawn/loans/{id}/extend"
+    occ_field: "expected_loan_version"
+    description: |
+      Extending a Loan whose version has advanced since the client last
+      observed it is rejected as a stale-version write. This captures the
+      case where another servicing write (a prior extension or renewal)
+      has already locked in a finance period and bumped the loan version,
+      so this client's view of periods_charged and the accrual baseline is
+      stale and re-applying its extension would double-charge a period.
+    error_id: ERR_STALE_LOAN_VERSION
+    http_status: 412
+
+  - rule_id: renew-stale-loan
+    parent_entity: Loan
+    write_endpoint: "POST /pawn/loans/{id}/renew"
+    occ_field: "expected_loan_version"
+    description: |
+      Renewing a Loan whose version has advanced since the client last
+      observed it is rejected. A renewal re-terms the loan and resets the
+      accrual baseline; if another servicing write has already moved the
+      loan forward, the client's renewal premise (the accrued charge it
+      computed) is stale and must be recomputed against the current loan.
+    error_id: ERR_STALE_LOAN_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 Calculation Rules Table
+# =====================================================================
+calculations:
+  - name: loan_amount_from_appraisal
+    trigger: "POST /pawn/loans origination"
+    algorithm: threshold
+    formula: |
+      ltv_value = floor(appraised_value_cents * loan_to_value_bps / 10000)
+      principal_cents = min(ltv_value, schedule.max_principal_cents)
+      reject if principal_cents <= 0
+    input_set: "the pledged PawnItem.appraised_value_cents and the loan's state StateRateSchedule"
+    constants:
+      BPS_DENOMINATOR: 10000
+    precision: "integer cents; floor on the LTV multiply, then min-clamp to the statutory cap"
+    variants: []
+
+  - name: redemption_payoff
+    trigger: "GET /pawn/loans/{id}/payoff and POST /pawn/loans/{id}/redeem"
+    algorithm: chronological
+    formula: |
+      elapsed_days = floor((clock.current_utc - loan.origination_at) / 1 day)
+      live_periods = clamp(ceil(elapsed_days / 30), min=1, max= schedule.max_periods_total - loan.periods_charged)
+      total_periods = loan.periods_charged + live_periods
+      per_period_charge = round_half_up(loan.principal_cents * schedule.monthly_interest_bps / 10000)
+                          + schedule.monthly_storage_fee_cents
+      payoff_cents = loan.principal_cents
+                   + loan.setup_fee_cents
+                   + total_periods * per_period_charge
+    input_set: "the loan, its snapshotted setup_fee, the governing schedule, and the simulated clock"
+    constants:
+      PERIOD_DAYS: 30
+      BPS_DENOMINATOR: 10000
+    precision: "round_half_up the interest portion PER PERIOD first, add the flat storage fee, THEN multiply by the period count and sum — round-per-period-then-multiply is pinned (it differs from round(principal*rate*periods))"
+    variants:
+      - name: extension_fee
+        when: "POST /pawn/loans/{id}/extend"
+        difference: "charges exactly ONE live period (per_period_charge) regardless of elapsed_days; does not include principal or setup_fee"
+      - name: renewal_fee
+        when: "POST /pawn/loans/{id}/renew"
+        difference: "charges live_periods * per_period_charge (all accrued periods to date) but NOT principal or setup_fee; resets the baseline to now"
+
+  - name: forfeiture_cost_basis
+    trigger: "POST /pawn/loans/{id}/forfeit (link 1 of the forfeiture cascade)"
+    algorithm: chronological
+    formula: |
+      cost_basis_cents = redemption_payoff evaluated at clock.current_utc == loan.grace_end_at-or-later
+                         (the unrecovered debt the shop is owed)
+    input_set: "the forfeiting loan at the forfeiture instant"
+    constants:
+      PERIOD_DAYS: 30
+    precision: "integer cents; reuses redemption_payoff's round-per-period rule"
+    variants: []
+
+  - name: resale_pricing
+    trigger: "POST /pawn/loans/{id}/forfeit (link 2 of the forfeiture cascade)"
+    algorithm: tiered_pricing
+    formula: |
+      markup_raw_cents = appraised_value_cents * (10000 + resale_markup_bps) / 10000
+      list_dollars = round_half_up(markup_raw_cents / 100)
+      list_price_cents = max(list_dollars * 100, cost_basis_cents)
+      floor_price_cents = cost_basis_cents
+    input_set: "the forfeited PawnItem.appraised_value_cents and the InventoryItem.cost_basis_cents"
+    constants:
+      RESALE_MARKUP_BPS: 3500
+      BPS_DENOMINATOR: 10000
+    precision: "round_half_up to the nearest whole DOLLAR (multiples of 100 cents); list clamped up to cost_basis to never sell below cost"
+    variants:
+      - name: list_price
+        when: "default sale price target"
+        difference: "FORWARD-LOOKING optimistic: appraisal markup; rounds to whole dollars; ignores realized debt except as a floor"
+      - name: floor_price
+        when: "minimum acceptable sale price (sell precondition)"
+        difference: "PESSIMISTIC cost-recovery: equals cost_basis_cents (realized debt); a sale below it is rejected"
+
+  - name: layaway_schedule
+    trigger: "POST /pawn/layaway-plans creation"
+    algorithm: waterfall_allocation
+    formula: |
+      total_price_cents = inventory_item.list_price_cents
+      deposit_cents = round_half_up(total_price_cents * deposit_bps / 10000)
+      remaining = total_price_cents - deposit_cents
+      base = floor(remaining / installment_count)
+      for seq in 1..installment_count-1: amount = base
+      final (seq == installment_count): amount = remaining - base * (installment_count - 1)
+    input_set: "the InventoryItem.list_price_cents and the requested installment_count"
+    constants:
+      DEPOSIT_BPS: 2000
+      BPS_DENOMINATOR: 10000
+    precision: "round_half_up the deposit; floor each non-final installment; the FINAL installment absorbs the remainder so the schedule sums exactly to total_price_cents"
+    variants: []
+
+  - name: layaway_default_refund
+    trigger: "POST /pawn/layaway-plans/{id}/cancel"
+    algorithm: aggregation
+    formula: |
+      restocking_fee_cents = round_half_up(plan.total_price_cents * restocking_bps / 10000)
+      refund_cents = max(0, plan.paid_cents - restocking_fee_cents)
+    input_set: "the plan.paid_cents (deposit + posted installments) and total_price_cents"
+    constants:
+      RESTOCKING_BPS: 1000
+      BPS_DENOMINATOR: 10000
+    precision: "round_half_up the restocking fee; refund floored at 0 (shop never pays out more than collected)"
+    variants: []
+
+  - name: drawer_balance
+    trigger: "every FinanceTransaction append and every layaway/sale cash movement (derived-field reconciliation)"
+    algorithm: aggregation
+    formula: |
+      balance_cents = sum over all FinanceTransaction.amount_cents for the shop's loans
+                    + sum of layaway deposits & installments posted (cash in)
+                    - sum of layaway refunds paid (cash out)
+                    + sum of inventory sale sold_price_cents (cash in)
+      INVARIANT (disbursement/void): for any loan, sum of its FinanceTransaction.amount_cents
+        across DISBURSEMENT (= -principal_cents) and VOID_REVERSAL (= +principal_cents) == 0.
+      INVARIANT (item conservation): for any shop, count(PawnItem in {PLEDGED}) +
+        count(InventoryItem in {AVAILABLE, ON_LAYAWAY}) is conserved by a forfeit+recall pair.
+    input_set: "all FinanceTransaction rows of the shop's loans plus layaway/sale movements"
+    constants: {}
+    precision: "integer cents; recomputed on every mutation that touches cash"
+    variants: []
+
+  - name: bin_occupancy_overlap
+    trigger: "POST /pawn/loans origination (StorageBin capacity gate)"
+    algorithm: interval_merge
+    formula: |
+      new_interval = [new.origination_at, new.grace_end_at)        # HALF-OPEN
+      occupants = Loan WHERE storage_bin_id == bin.id AND status IN {ACTIVE, IN_GRACE, POLICE_HELD}
+      concurrent = count(o in occupants WHERE intervals_overlap_half_open(o.[origination_at, grace_end_at), new_interval))
+      reject (ERR_BIN_CAPACITY_EXCEEDED) if concurrent + 1 > bin.capacity
+      # half-open: an occupant whose grace_end_at == new.origination_at does NOT overlap (touching endpoints are free)
+    input_set: "all non-terminal loans assigned to the same StorageBin"
+    constants: {}
+    precision: "integer count; HALF-OPEN [start, end) interval geometry — abutting intervals (one's end == other's start) are NOT a conflict"
+    variants:
+      - name: layaway_reservation_overlap
+        when: "POST /pawn/layaway-plans creation on an InventoryItem"
+        difference: "CLOSED single-occupant interval with an additive BUFFER: a new plan whose reserved_from_at is within last_layaway_end_at + layaway_buffer_days (inclusive of the buffer endpoint) conflicts — different interval semantics from the bin's half-open aggregate-capacity model"
+
+# =====================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =====================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except Anonymous-permitted endpoints"
+
+  - priority: 2
+    category: auth
+    check: "the acting role is permitted for this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "every path/body referenced resource exists (validated left-to-right in path, then FK bodies)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK inputs"
+
+  - priority: 4
+    category: business_referential
+    check: "request body fields are well-formed: required fields present, enums in range, integers non-negative where required"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all write endpoints"
+
+  - priority: 5
+    category: state
+    check: "target resource is in a state from which this transition is defined (§1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6
+    category: business_safety
+    check: "the acting LoanOfficer at origination is NOT the same X-User-ID that appraised the pledged item (segregation of duties)"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /pawn/loans"
+
+  - priority: 7
+    category: business_safety
+    check: "no ACTIVE PoliceHold names the collateral / inventory item being redeemed, forfeited, sold, recalled, or put on layaway; and the loan is not POLICE_HELD"
+    error_id: ERR_POLICE_HOLD_ACTIVE
+    http_status: 409
+    applies_to: "redeem, extend, renew, forfeit, sell, recall, create-layaway"
+
+  - priority: 8
+    category: business_safety
+    check: "the named Customer is not flagged by law enforcement when originating a new loan"
+    error_id: ERR_CUSTOMER_FLAGGED
+    http_status: 409
+    applies_to: "POST /pawn/loans"
+
+  - priority: 9
+    category: business_temporal
+    check: "origination is rejected when the chosen StorageBin's concurrent occupancy (count of non-terminal loans whose [origination_at, grace_end_at) half-open interval contains any instant shared with the new loan's interval) would reach capacity; aggregate-capacity, half-open interval semantics"
+    error_id: ERR_BIN_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /pawn/loans"
+
+  - priority: 10
+    category: business_temporal
+    check: "forfeiture is only permitted when clock.current_utc >= loan.grace_end_at"
+    error_id: ERR_GRACE_NOT_ELAPSED
+    http_status: 409
+    applies_to: "POST /pawn/loans/{id}/forfeit"
+
+  - priority: 11
+    category: business_constraint
+    check: "extension/renewal does not push total finance periods past schedule.max_periods_total"
+    error_id: ERR_PERIOD_CAP_EXCEEDED
+    http_status: 409
+    applies_to: "extend, renew"
+
+  - priority: 12
+    category: business_constraint
+    check: "void is rejected if any chargeable FinanceTransaction (EXTENSION_FEE/RENEWAL_FEE/REDEMPTION_PAYOFF) already exists for the loan"
+    error_id: ERR_LOAN_ALREADY_SERVICED
+    http_status: 409
+    applies_to: "POST /pawn/loans/{id}/void"
+
+  - priority: 13
+    category: business_constraint
+    check: "a sale price below the InventoryItem.floor_price_cents is rejected"
+    error_id: ERR_PRICE_BELOW_FLOOR
+    http_status: 422
+    applies_to: "POST /pawn/inventory/{id}/sell"
+
+  - priority: 14
+    category: business_temporal
+    check: "a new layaway on an item is rejected when reserved_from_at (= clock) is earlier than InventoryItem.last_layaway_end_at + layaway_buffer_days; exclusive single-occupant, closed interval with a mandatory adjacency buffer"
+    error_id: ERR_LAYAWAY_RESERVATION_CONFLICT
+    http_status: 409
+    applies_to: "POST /pawn/layaway-plans"
+
+  - priority: 15
+    category: business_constraint
+    check: "an installment payment must equal the next unpaid scheduled installment amount, and the schedule must not be exhausted"
+    error_id: ERR_INSTALLMENT_MISMATCH
+    http_status: 422
+    applies_to: "POST /pawn/layaway-plans/{id}/installments"
+
+  - priority: 16
+    category: business_fiscal
+    check: "the offered principal must be > 0 after the LTV+cap calculation (collateral too low to lend against)"
+    error_id: ERR_PRINCIPAL_NON_POSITIVE
+    http_status: 422
+    applies_to: "POST /pawn/loans"
+
+  - priority: 17
+    category: business_fiscal
+    check: "OCC: expected_loan_version must equal the current Loan.version for servicing writes"
+    error_id: ERR_STALE_LOAN_VERSION
+    http_status: 412
+    applies_to: "extend, renew"
+
+# =====================================================================
+# §1.5 API Endpoint Table
+# =====================================================================
+endpoints:
+  # ---- Config / shop setup ----
+  - method: POST
+    path: "/pawn/state-schedules"
+    description: "Create a state rate/fee schedule."
+    roles: [ShopManager]
+    code: 201
+    input: [state_code, monthly_interest_bps, monthly_storage_fee_cents, setup_fee_cents, term_days, grace_days, max_principal_cents, max_periods_total, loan_to_value_bps, layaway_buffer_days]
+    output: StateRateSchedule
+    side_effects: []
+
+  - method: GET
+    path: "/pawn/state-schedules"
+    description: "List state schedules (filterable by state_code)."
+    roles: [ShopManager, LoanOfficer, Appraiser]
+    code: 200
+    input: ["state_code?", "limit?", "offset?"]
+    output: StateRateSchedule[]
+    side_effects: []
+
+  - method: POST
+    path: "/pawn/shops"
+    description: "Create a shop branch; mints its 1:1 CashDrawer at balance 0."
+    roles: [ShopManager]
+    code: 201
+    input: [name, state_code, "police_reporting_enabled?"]
+    output: PawnShop
+    side_effects: ["create CashDrawer balance_cents=0 and link cash_drawer_id"]
+
+  - method: GET
+    path: "/pawn/shops/{id}"
+    description: "Fetch a shop."
+    roles: [ShopManager, LoanOfficer, Appraiser]
+    code: 200
+    input: []
+    output: PawnShop
+    side_effects: []
+
+  - method: GET
+    path: "/pawn/shops/{id}/drawer"
+    description: "Reverse-reachability: the shop's CashDrawer (array of 0..1)."
+    roles: [ShopManager, LoanOfficer]
+    code: 200
+    input: []
+    output: CashDrawer[]
+    side_effects: []
+
+  - method: GET
+    path: "/pawn/shops/{id}/loans"
+    description: "Reverse-reachability: loans of a shop (re-derives lazy IN_GRACE on read)."
+    roles: [ShopManager, LoanOfficer, Appraiser]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Loan[]
+    side_effects: ["lazy ACTIVE->IN_GRACE re-derivation per loan"]
+
+  - method: GET
+    path: "/pawn/shops/{id}/inventory"
+    description: "Reverse-reachability: inventory items of a shop."
+    roles: [ShopManager, LoanOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: InventoryItem[]
+    side_effects: []
+
+  # ---- Storage bins ----
+  - method: POST
+    path: "/pawn/storage-bins"
+    description: "Create a physical storage bin for a shop."
+    roles: [ShopManager]
+    code: 201
+    input: [shop_id, label, capacity]
+    output: StorageBin
+    side_effects: []
+
+  - method: GET
+    path: "/pawn/storage-bins/{id}"
+    description: "Fetch a storage bin."
+    roles: [ShopManager, LoanOfficer]
+    code: 200
+    input: []
+    output: StorageBin
+    side_effects: []
+
+  - method: GET
+    path: "/pawn/storage-bins"
+    description: "Reverse-reachability for StorageBin.shop_id: filter by shop_id."
+    roles: [ShopManager, LoanOfficer]
+    code: 200
+    input: ["shop_id?", "limit?", "offset?"]
+    output: StorageBin[]
+    side_effects: []
+
+  - method: GET
+    path: "/pawn/storage-bins/{id}/loans"
+    description: "Reverse-reachability for Loan.storage_bin_id: loans occupying this bin."
+    roles: [ShopManager, LoanOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Loan[]
+    side_effects: ["lazy ACTIVE->IN_GRACE re-derivation per loan"]
+
+  # ---- Customers & items ----
+  - method: POST
+    path: "/pawn/customers"
+    description: "Register a customer."
+    roles: [LoanOfficer, ShopManager]
+    code: 201
+    input: [full_name, gov_id_number]
+    output: Customer
+    side_effects: []
+
+  - method: GET
+    path: "/pawn/customers/{id}"
+    description: "Fetch a customer (shows is_flagged)."
+    roles: [LoanOfficer, ShopManager, LawEnforcement]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  - method: POST
+    path: "/pawn/items"
+    description: "Take in a physical item (INTAKE)."
+    roles: [LoanOfficer, ShopManager]
+    code: 201
+    input: [shop_id, customer_id, description, "serial_number?"]
+    output: PawnItem
+    side_effects: ["set police_report_status per shop.police_reporting_enabled"]
+
+  - method: GET
+    path: "/pawn/items/{id}"
+    description: "Fetch a pawn item."
+    roles: [LoanOfficer, ShopManager, Appraiser, LawEnforcement]
+    code: 200
+    input: []
+    output: PawnItem
+    side_effects: []
+
+  - method: GET
+    path: "/pawn/items"
+    description: "Reverse-reachability for PawnItem FKs: filter by shop_id and/or customer_id."
+    roles: [LoanOfficer, ShopManager, Appraiser, LawEnforcement]
+    code: 200
+    input: ["shop_id?", "customer_id?", "limit?", "offset?"]
+    output: PawnItem[]
+    side_effects: []
+
+  - method: POST
+    path: "/pawn/items/{id}/appraise"
+    description: "Appraiser sets appraised_value_cents (INTAKE -> APPRAISED)."
+    roles: [Appraiser]
+    code: 200
+    input: [appraised_value_cents]
+    output: PawnItem
+    side_effects: ["set appraised_value_cents; set appraised_by_user_id = X-User-ID"]
+
+  - method: POST
+    path: "/pawn/items/{id}/report-police"
+    description: "Mark the item as REPORTED to the police database (compliance step)."
+    roles: [ShopManager, LoanOfficer]
+    code: 200
+    input: []
+    output: PawnItem
+    side_effects: ["police_report_status PENDING_REPORT -> REPORTED"]
+
+  # ---- Loans ----
+  - method: POST
+    path: "/pawn/loans"
+    description: "Originate a loan against an APPRAISED item; computes principal, snapshots schedule, disburses cash, assigns a storage bin."
+    roles: [LoanOfficer]
+    code: 201
+    input: [shop_id, pawn_item_id, storage_bin_id]
+    output: Loan
+    side_effects:
+      - "compute principal via loan_amount_from_appraisal"
+      - "snapshot state_code, setup_fee_cents, term/grace timestamps from clock"
+      - "reject if the StorageBin's concurrent occupancy over [origination_at, grace_end_at) would exceed capacity (bin_capacity_overlap)"
+      - "PawnItem APPRAISED -> PLEDGED; copy customer_id; occupy storage_bin_id"
+      - "append FinanceTransaction DISBURSEMENT amount=-principal_cents; drawer.balance_cents -= principal_cents"
+
+  - method: GET
+    path: "/pawn/loans"
+    description: "Reverse-reachability for Loan FKs: filter by pawn_item_id, customer_id, storage_bin_id, or shop_id."
+    roles: [LoanOfficer, ShopManager, Appraiser]
+    code: 200
+    input: ["pawn_item_id?", "customer_id?", "storage_bin_id?", "shop_id?", "limit?", "offset?"]
+    output: Loan[]
+    side_effects: ["lazy ACTIVE->IN_GRACE re-derivation per loan"]
+
+  - method: GET
+    path: "/pawn/loans/{id}"
+    description: "Fetch a loan; re-derives lazy ACTIVE->IN_GRACE from the clock."
+    roles: [LoanOfficer, ShopManager, Appraiser]
+    code: 200
+    input: []
+    output: Loan
+    side_effects: ["lazy ACTIVE->IN_GRACE re-derivation"]
+
+  - method: GET
+    path: "/pawn/loans/{id}/payoff"
+    description: "Computed read: the current redemption payoff (redemption_payoff)."
+    roles: [LoanOfficer, ShopManager]
+    code: 200
+    input: []
+    output: "{ payoff_cents: integer, total_periods: integer, per_period_charge_cents: integer }"
+    side_effects: ["lazy ACTIVE->IN_GRACE re-derivation"]
+
+  - method: GET
+    path: "/pawn/loans/{id}/transactions"
+    description: "Reverse-reachability: the loan's FinanceTransaction ledger."
+    roles: [LoanOfficer, ShopManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: FinanceTransaction[]
+    side_effects: []
+
+  - method: POST
+    path: "/pawn/loans/{id}/extend"
+    description: "Extension: pay one live period, advance the term, stay ACTIVE."
+    roles: [LoanOfficer]
+    code: 200
+    input: [expected_loan_version]
+    output: Loan
+    side_effects:
+      - "append FinanceTransaction EXTENSION_FEE amount=+per_period_charge periods_in_charge=1"
+      - "periods_charged += 1; term_end_at/grace_end_at advance; baseline restarts; IN_GRACE -> ACTIVE"
+      - "drawer.balance_cents += fee; increments Loan.version by 1"
+
+  - method: POST
+    path: "/pawn/loans/{id}/renew"
+    description: "Renewal: pay all accrued charges to date, re-term to now, increment renewal_count."
+    roles: [LoanOfficer]
+    code: 200
+    input: [expected_loan_version]
+    output: Loan
+    side_effects:
+      - "append FinanceTransaction RENEWAL_FEE amount=+accrued; periods_charged += periods-due; renewal_count += 1"
+      - "term_end_at = clock + term_days; grace_end_at = term_end_at + grace_days; status -> ACTIVE"
+      - "drawer.balance_cents += fee; increments Loan.version by 1"
+
+  - method: POST
+    path: "/pawn/loans/{id}/redeem"
+    description: "Redeem: pay the full payoff; loan & item terminal REDEEMED."
+    roles: [LoanOfficer]
+    code: 200
+    input: []
+    output: Loan
+    side_effects:
+      - "append FinanceTransaction REDEMPTION_PAYOFF amount=+payoff; drawer.balance_cents += payoff"
+      - "loan -> REDEEMED; PawnItem -> REDEEMED"
+
+  - method: POST
+    path: "/pawn/loans/{id}/forfeit"
+    description: "Forfeit a grace-expired loan; spawns an InventoryItem (two-hop cascade)."
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: Loan
+    side_effects:
+      - "loan -> FORFEITED; PawnItem -> FORFEITED"
+      - "compute cost_basis = forfeiture_cost_basis"
+      - "spawn InventoryItem AVAILABLE with cost_basis/list_price/floor_price (resale_pricing)"
+
+  - method: POST
+    path: "/pawn/loans/{id}/void"
+    description: "Void an un-serviced loan; returns cash and reverts the item (compensation)."
+    roles: [LoanOfficer]
+    code: 200
+    input: []
+    output: Loan
+    side_effects:
+      - "append FinanceTransaction VOID_REVERSAL amount=+principal_cents; drawer.balance_cents += principal_cents"
+      - "loan -> VOIDED; PawnItem -> APPRAISED"
+
+  # ---- Inventory & resale ----
+  - method: GET
+    path: "/pawn/inventory/{id}"
+    description: "Fetch an inventory item (list_price/floor_price/status)."
+    roles: [ShopManager, LoanOfficer]
+    code: 200
+    input: []
+    output: InventoryItem
+    side_effects: []
+
+  - method: GET
+    path: "/pawn/inventory"
+    description: "Reverse-reachability for InventoryItem FKs: filter by shop_id, source_loan_id, or pawn_item_id."
+    roles: [ShopManager, LoanOfficer, LawEnforcement]
+    code: 200
+    input: ["shop_id?", "source_loan_id?", "pawn_item_id?", "limit?", "offset?"]
+    output: InventoryItem[]
+    side_effects: []
+
+  - method: POST
+    path: "/pawn/inventory/{id}/sell"
+    description: "Direct sale at or above floor_price; item -> SOLD."
+    roles: [ShopManager]
+    code: 200
+    input: [sold_price_cents]
+    output: InventoryItem
+    side_effects: ["set sold_price_cents; item -> SOLD; drawer.balance_cents += sold_price_cents"]
+
+  - method: POST
+    path: "/pawn/inventory/{id}/recall"
+    description: "Reverse-forfeiture: recall an AVAILABLE forfeited item back to its loan."
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: InventoryItem
+    side_effects: ["item -> RECALLED; source Loan -> IN_GRACE; PawnItem -> PLEDGED"]
+
+  # ---- Layaway ----
+  - method: POST
+    path: "/pawn/layaway-plans"
+    description: "Put an AVAILABLE inventory item on layaway; computes schedule; collects deposit; reserves the item for a closed interval."
+    roles: [ShopManager]
+    code: 201
+    input: [inventory_item_id, customer_id, installment_count, reserved_until_at]
+    output: LayawayPlan
+    side_effects:
+      - "set reserved_from_at = clock; reject if reserved_from_at < InventoryItem.last_layaway_end_at + layaway_buffer_days (layaway_reservation_overlap adjacency buffer)"
+      - "snapshot total_price_cents; compute deposit & installment schedule (layaway_schedule)"
+      - "InventoryItem -> ON_LAYAWAY; drawer.balance_cents += deposit; paid_cents = deposit"
+
+  - method: GET
+    path: "/pawn/layaway-plans/{id}"
+    description: "Fetch a layaway plan."
+    roles: [ShopManager, LoanOfficer]
+    code: 200
+    input: []
+    output: LayawayPlan
+    side_effects: []
+
+  - method: GET
+    path: "/pawn/layaway-plans"
+    description: "Reverse-reachability for LayawayPlan FKs: filter by inventory_item_id or customer_id."
+    roles: [ShopManager, LoanOfficer]
+    code: 200
+    input: ["inventory_item_id?", "customer_id?", "limit?", "offset?"]
+    output: LayawayPlan[]
+    side_effects: []
+
+  - method: GET
+    path: "/pawn/layaway-plans/{id}/installments"
+    description: "Reverse-reachability: scheduled installments of a plan."
+    roles: [ShopManager, LoanOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: LayawayInstallment[]
+    side_effects: []
+
+  - method: POST
+    path: "/pawn/layaway-plans/{id}/installments"
+    description: "Post the next scheduled installment; completes the plan & auto-sells on the final one."
+    roles: [ShopManager]
+    code: 200
+    input: [amount_cents]
+    output: LayawayPlan
+    side_effects:
+      - "mark next installment paid; paid_cents += amount; drawer.balance_cents += amount"
+      - "if final: plan -> COMPLETED; InventoryItem -> SOLD"
+
+  - method: POST
+    path: "/pawn/layaway-plans/{id}/cancel"
+    description: "Cancel/default a layaway; refund paid minus restocking; item back to AVAILABLE."
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: LayawayPlan
+    side_effects:
+      - "plan -> DEFAULTED; InventoryItem -> AVAILABLE; set InventoryItem.last_layaway_end_at = clock"
+      - "refund = max(0, paid_cents - restocking_fee) (layaway_default_refund); drawer.balance_cents -= refund"
+
+  # ---- Police holds ----
+  - method: POST
+    path: "/pawn/police-holds"
+    description: "Law enforcement places a hold on a PawnItem or InventoryItem; flags loan/customer."
+    roles: [LawEnforcement]
+    code: 201
+    input: [subject_kind, case_number, "pawn_item_id?", "inventory_item_id?"]
+    output: PoliceHold
+    side_effects:
+      - "if PAWN_ITEM with a live source loan: loan.police_hold_flag=true; loan -> POLICE_HELD; Customer.is_flagged=true"
+      - "if INVENTORY_ITEM: block sale/recall/layaway while ACTIVE"
+
+  - method: GET
+    path: "/pawn/police-holds/{id}"
+    description: "Fetch a police hold."
+    roles: [LawEnforcement, ShopManager]
+    code: 200
+    input: []
+    output: PoliceHold
+    side_effects: []
+
+  - method: GET
+    path: "/pawn/police-holds"
+    description: "Reverse-reachability for PoliceHold FKs: filter by pawn_item_id or inventory_item_id."
+    roles: [LawEnforcement, ShopManager]
+    code: 200
+    input: ["pawn_item_id?", "inventory_item_id?", "limit?", "offset?"]
+    output: PoliceHold[]
+    side_effects: []
+
+  - method: POST
+    path: "/pawn/police-holds/{id}/release"
+    description: "Release a hold; clears the loan flag if no other ACTIVE hold remains."
+    roles: [LawEnforcement]
+    code: 200
+    input: []
+    output: PoliceHold
+    side_effects: ["hold -> RELEASED; clear police_hold_flag; loan POLICE_HELD -> ACTIVE if applicable"]
+
+  - method: POST
+    path: "/pawn/police-holds/{id}/execute"
+    description: "Execute a hold: surrender the item to police; void the loan and return cash if applicable."
+    roles: [LawEnforcement]
+    code: 200
+    input: []
+    output: PoliceHold
+    side_effects:
+      - "hold -> EXECUTED; PawnItem -> RELEASED_TO_POLICE"
+      - "if live source loan: loan -> VOIDED; append VOID_REVERSAL; drawer.balance_cents += principal_cents"
+
+  # ---- Clock (test-driving) ----
+  - method: POST
+    path: "/pawn/_clock/set_current_utc"
+    description: "Test-driving endpoint: set the simulated clock used for all term/grace/period math."
+    roles: [ShopManager]
+    code: 200
+    input: [to_iso8601]
+    output: ClockState
+    side_effects: ["set ClockState.current_utc; does NOT itself transition loans (lazy re-derivation happens on next read/action)"]
+
+  - method: GET
+    path: "/pawn/_clock"
+    description: "Test-driving endpoint: read the simulated clock."
+    roles: [ShopManager, LoanOfficer]
+    code: 200
+    input: []
+    output: ClockState
+    side_effects: []
+
+# =====================================================================
+# §1.6 Error Code Catalog
+# =====================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/invalid X-User-Role or X-User-ID headers"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "the acting role is not permitted for this operation"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced resource (path id or FK) does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "missing required field, enum out of range, or negative integer where non-negative required"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "the target resource is not in a state from which this transition is defined"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "the originating LoanOfficer is the same user who appraised the pledged item"
+  - id: ERR_POLICE_HOLD_ACTIVE
+    http: 409
+    condition: "an ACTIVE PoliceHold names the collateral/inventory item, or the loan is POLICE_HELD, blocking the operation"
+  - id: ERR_CUSTOMER_FLAGGED
+    http: 409
+    condition: "originating a loan for a law-enforcement-flagged customer"
+  - id: ERR_GRACE_NOT_ELAPSED
+    http: 409
+    condition: "forfeiture attempted before clock.current_utc reaches grace_end_at"
+  - id: ERR_BIN_CAPACITY_EXCEEDED
+    http: 409
+    condition: "the chosen StorageBin has no free capacity over the new loan's [origination_at, grace_end_at) interval"
+  - id: ERR_LAYAWAY_RESERVATION_CONFLICT
+    http: 409
+    condition: "a new layaway starts before the prior plan's end plus the layaway_buffer_days adjacency gap"
+  - id: ERR_PERIOD_CAP_EXCEEDED
+    http: 409
+    condition: "extension/renewal would push total finance periods past max_periods_total"
+  - id: ERR_LOAN_ALREADY_SERVICED
+    http: 409
+    condition: "void attempted on a loan that already has a chargeable FinanceTransaction"
+  - id: ERR_PRICE_BELOW_FLOOR
+    http: 422
+    condition: "sale price is below the InventoryItem.floor_price_cents"
+  - id: ERR_INSTALLMENT_MISMATCH
+    http: 422
+    condition: "installment payment amount does not equal the next scheduled installment, or the schedule is exhausted"
+  - id: ERR_PRINCIPAL_NON_POSITIVE
+    http: 422
+    condition: "computed principal is <= 0 (collateral too low or zero LTV result)"
+  - id: ERR_STALE_LOAN_VERSION
+    http: 412
+    condition: "expected_loan_version does not match the current Loan.version on a servicing write"
+  - id: ERR_ITEM_NOT_APPRAISED
+    http: 409
+    condition: "loan origination references an item that has not been APPRAISED"
+  - id: ERR_DUPLICATE_GOV_ID
+    http: 409
+    condition: "customer gov_id_number already registered"
+  - id: ERR_DUPLICATE_SCHEDULE
+    http: 409
+    condition: "a StateRateSchedule already exists for the state_code"
+  - id: ERR_VALIDATION_PAGINATION
+    http: 422
+    condition: "limit/offset out of the allowed pagination range"
+
+# =====================================================================
+# §1.7 RBAC Matrix
+# =====================================================================
+roles:
+  - name: Appraiser
+    description: "Values intake items; sets appraised_value_cents. Barred from originating loans on items they appraised."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pawn/items/{id}/appraise"
+    shared_operations:
+      - "GET /pawn/items, GET /pawn/items/{id}, GET /pawn/loans/{id}, GET /pawn/shops/{id}, GET /pawn/shops/{id}/loans, GET /pawn/state-schedules"
+
+  - name: LoanOfficer
+    description: "Originates, extends, renews, redeems, and voids loans; registers customers and items."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pawn/loans"
+      - "POST /pawn/loans/{id}/extend"
+      - "POST /pawn/loans/{id}/renew"
+      - "POST /pawn/loans/{id}/redeem"
+      - "POST /pawn/loans/{id}/void"
+    shared_operations:
+      - "POST /pawn/customers, POST /pawn/items, POST /pawn/items/{id}/report-police, GET reads on shops/loans/items/inventory/layaway/drawer/payoff/transactions/clock"
+
+  - name: ShopManager
+    description: "Operator/admin: configures shops & schedules, forfeits loans, manages resale & layaway, sets the clock. Hierarchical superset of reads."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pawn/state-schedules"
+      - "POST /pawn/shops"
+      - "POST /pawn/loans/{id}/forfeit"
+      - "POST /pawn/inventory/{id}/sell"
+      - "POST /pawn/inventory/{id}/recall"
+      - "POST /pawn/layaway-plans"
+      - "POST /pawn/layaway-plans/{id}/installments"
+      - "POST /pawn/layaway-plans/{id}/cancel"
+      - "POST /pawn/_clock/set_current_utc"
+    shared_operations:
+      - "POST /pawn/customers, POST /pawn/items, POST /pawn/items/{id}/report-police, all GET reads"
+
+  - name: Customer
+    description: "The borrower/buyer entity; acts as the subject of loans and layaways. Persisted; identity-checked for ownership reads."
+    identity: "entity_backed:Customer"
+    exclusive_operations: []
+    shared_operations:
+      - "GET /pawn/customers/{id} (own record)"
+
+  - name: LawEnforcement
+    description: "Places, releases, and executes police holds; reads items and inventory for investigations."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pawn/police-holds"
+      - "POST /pawn/police-holds/{id}/release"
+      - "POST /pawn/police-holds/{id}/execute"
+    shared_operations:
+      - "GET /pawn/police-holds, GET /pawn/police-holds/{id}, GET /pawn/items/{id}, GET /pawn/inventory, GET /pawn/customers/{id}"

@@ -1,0 +1,904 @@
+# =============================================================================
+# PRD Benchmark Scaffold — Document Shredding & Records Storage
+# Difficulty band: Expert (§0.4)
+# Topology: FLAT — every entity is a top-level collection; FK links resolved via
+# filtered-list GETs. (§0.3 prioritizes flat topology.)
+# =============================================================================
+
+scenario: |
+  Document Shredding & Records Storage: pickup/drop-off/on-site shred, scheduled vs one-time purge, bin/console placement, weight/container billing, certificate of destruction, chain-of-custody, retention-box storage & retrieval, compliance (HIPAA/FACTA)
+
+domain_name: document-shredding-records-storage
+api_prefix: ""
+
+# -----------------------------------------------------------------------------
+# Complexity Profile
+# -----------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - dual_variant_calculation        # estimated vs actual weight billing; scheduled vs one-time purge rate
+    - cascading_side_effects          # custody/destruction -> certificate -> destruction-invoice chain
+    - optimistic_concurrency          # OCC on ServiceOrder.version for slot reschedule supersede
+    - rate_threshold_triggers         # weight*rate pricing, storage free-period boundary, rush multiplier
+
+  entity_topology: flat
+  # Every entity is its own top-level collection (/service-orders, /containers, ...). Parent links are
+  # FK fields resolved through filtered-list GETs (e.g. GET /containers?account_id=...). No URL nesting.
+
+  state_machine_shape: branching
+  # ServiceOrder forks SCHEDULED -> {ON_SITE_SHREDDED via on-site, PICKED_UP -> AT_PLANT -> DESTROYED
+  # via off-site} with divergent custody/certificate side-effects per branch; RetrievalRequest has a
+  # revert cycle (DELIVERED -> RETURN_PENDING -> {RETURNED | back to DELIVERED via refuse-return}).
+
+  relationship_patterns:
+    - one_to_many            # ServiceAccount -> Containers/Orders/Boxes; ServiceOrder -> CustodyEvents
+    - cross_aggregate        # ComplianceHold references either a RetentionBox or a ServiceOrder
+    - polymorphic            # CustodyEvent.subject and ComplianceHold.subject reference >1 entity type
+
+  role_model: segregation_of_duties
+  # The operator who takes custody (FieldTechnician, recorded as order.assigned_tech_id) cannot also be
+  # the operator who witnesses destruction (DestructionWitness): SoD enforced on /destroy.
+
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: ServiceAccount
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: business_name, type: string, source: input, description: "Customer business name" }
+      - { name: compliance_regime, type: enum, source: input, description: "Governs custody/certificate strictness", constraints: "one of {STANDARD, FACTA, HIPAA}" }
+      - { name: billing_email, type: string, source: input, description: "Invoice recipient address" }
+      - { name: current_period_index, type: integer, source: system, default: 0, description: "Deterministic billing clock; advances via POST /accounts/{id}/advance-period" }
+      - { name: storage_credit_cents, type: integer, source: computed, default: 0, description: "Account-level prepaid credit applied to storage invoices before cash due; never negative" }
+      - { name: status, type: enum, source: system, description: "Account lifecycle (see §1.2)", constraints: "one of {ACTIVE, SUSPENDED, CLOSED}" }
+
+  - name: ServiceLocation
+    parent: ServiceAccount
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> ServiceAccount.id" }
+      - { name: label, type: string, source: input, description: "Site label e.g. 'HQ 4th Floor'" }
+      - { name: address, type: string, source: input, description: "Street address for pickup/on-site service" }
+      - { name: secure_area, type: boolean, source: input, default: false, description: "True if site is a HIPAA-secured area" }
+
+  - name: RateCard
+    parent: ServiceAccount
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> ServiceAccount.id" }
+      - { name: scheduled_purge_rate_cents_per_kg, type: integer, source: input, description: "Per-kg rate for SCHEDULED orders; >= 0" }
+      - { name: onetime_purge_rate_cents_per_kg, type: integer, source: input, description: "Per-kg rate for ONE_TIME orders; >= 0" }
+      - { name: onsite_trip_fee_cents, type: integer, source: input, description: "Flat trip fee added once per ON_SITE order; >= 0" }
+      - { name: console_swap_fee_cents, type: integer, source: input, description: "Flat fee per CONSOLE container serviced; >= 0" }
+      - { name: storage_rate_cents_per_box_per_period, type: integer, source: input, description: "Recurring per-box storage charge per billing period; >= 0" }
+      - { name: retrieval_fee_cents, type: integer, source: input, description: "Flat fee per RetrievalRequest fulfilled; >= 0" }
+      - { name: rush_retrieval_multiplier_bps, type: integer, source: input, default: 15000, description: "Basis-point multiplier on retrieval_fee for RUSH (15000 = 1.5x); >= 10000" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> ACTIVE -> SUPERSEDED; only the ACTIVE card prices new work", constraints: "one of {DRAFT, ACTIVE, SUPERSEDED}" }
+
+  - name: Container
+    parent: ServiceAccount
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> ServiceAccount.id" }
+      - { name: location_id, type: string, source: input, description: "FK -> ServiceLocation.id; where the container is placed" }
+      - { name: container_type, type: enum, source: input, description: "Console (locked cabinet) or Bin (rolling toter)", constraints: "one of {CONSOLE, BIN}" }
+      - { name: capacity_kg, type: integer, source: input, description: "Nominal fill capacity in kg; must be > 0" }
+      - { name: tare_weight_kg, type: number, source: input, description: "Empty container weight in kg, subtracted from gross at weigh-in; >= 0" }
+      - { name: status, type: enum, source: system, description: "Container service lifecycle (see §1.2)", constraints: "one of {PLACED, SCHEDULED_FOR_SERVICE, IN_SERVICE, RETIRED}" }
+
+  - name: ServiceOrder
+    parent: ServiceAccount
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> ServiceAccount.id" }
+      - { name: location_id, type: string, source: input, description: "FK -> ServiceLocation.id; service site" }
+      - { name: service_mode, type: enum, source: input, description: "Determines custody branch and pricing", constraints: "one of {ON_SITE, OFF_SITE_PICKUP, DROP_OFF}" }
+      - { name: cadence, type: enum, source: input, description: "Pricing variant selector", constraints: "one of {SCHEDULED, ONE_TIME}" }
+      - { name: container_ids, type: array, source: input, required: false, description: "Container ids serviced; each must belong to this order's account_id and location_id" }
+      - { name: scheduled_slot_start, type: datetime, source: input, description: "ISO8601 UTC start of the service window" }
+      - { name: scheduled_slot_end, type: datetime, source: input, description: "ISO8601 UTC end; must be strictly > start" }
+      - { name: billed_weight_kg, type: number, source: computed, default: 0, description: "Net weight used for billing; estimated at create, actualized at weigh-in" }
+      - { name: order_charge_cents, type: integer, source: computed, default: 0, description: "Total destruction charge; provisional until weigh-in, final after" }
+      - { name: assigned_tech_id, type: string, source: input, required: false, description: "Opaque X-User-ID of the FieldTechnician who takes custody; pins the SoD counterparty" }
+      - { name: status, type: enum, source: system, description: "Branching lifecycle (see §1.2)", constraints: "one of {SCHEDULED, EN_ROUTE, ON_SITE_SHREDDED, PICKED_UP, AT_PLANT, DESTROYED, CANCELLED}" }
+
+  - name: WeightTicket
+    parent: ServiceOrder
+    common_fields: false   # id, created_at only — append-only immutable evidence
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> ServiceOrder.id" }
+      - { name: gross_weight_kg, type: number, source: input, description: "Scale gross weight at weigh-in, kg; must be >= 0" }
+      - { name: tare_total_kg, type: number, source: computed, description: "Sum of tare_weight_kg over the order's containers" }
+      - { name: net_weight_kg, type: number, source: computed, description: "max(gross_weight_kg - tare_total_kg, 0)" }
+      - { name: captured_by, type: string, source: system, description: "Opaque X-User-ID that recorded the weigh-in" }
+
+  - name: CustodyEvent
+    parent: ServiceOrder
+    common_fields: false   # id, created_at only — append-only tamper-evident chain
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> ServiceOrder.id" }
+      - { name: subject_type, type: enum, source: system, description: "Polymorphic custody subject discriminator", constraints: "one of {CONTAINER, RETENTION_BOX}" }
+      - { name: subject_id, type: string, source: system, description: "id of the Container or RetentionBox in custody (polymorphic by subject_type)" }
+      - { name: event_type, type: enum, source: system, description: "Chain-of-custody hop", constraints: "one of {SEALED, COLLECTED, IN_TRANSIT, RECEIVED_AT_PLANT, DESTROYED, RETURNED}" }
+      - { name: sequence_no, type: integer, source: system, description: "1-based monotonic index within the order's custody chain, ordered by created_at ASC then insertion" }
+      - { name: actor_id, type: string, source: system, description: "Opaque X-User-ID of the operator who logged the hop" }
+
+  - name: DestructionCertificate
+    parent: ServiceOrder
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> ServiceOrder.id" }
+      - { name: account_id, type: string, source: input, description: "FK -> ServiceAccount.id" }
+      - { name: certificate_no, type: string, source: system, description: "Server-minted serial, monotonic per account ordered by issuance created_at" }
+      - { name: destroyed_weight_kg, type: number, source: system, description: "Snapshot of order.billed_weight_kg at issuance" }
+      - { name: witnessed_by, type: string, source: system, description: "Opaque X-User-ID recorded at issuance (the on-site tech for on-site shred, the witness for plant destroy)" }
+      - { name: status, type: enum, source: system, description: "ISSUED -> VOIDED", constraints: "one of {ISSUED, VOIDED}" }
+
+  - name: DestructionInvoice
+    parent: ServiceOrder
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> ServiceOrder.id" }
+      - { name: account_id, type: string, source: input, description: "FK -> ServiceAccount.id" }
+      - { name: certificate_id, type: string, source: input, description: "FK -> DestructionCertificate.id" }
+      - { name: line_cents, type: integer, source: computed, description: "Snapshot of order.order_charge_cents (final) at certificate issuance" }
+      - { name: status, type: enum, source: system, description: "ISSUED -> PAID", constraints: "one of {ISSUED, PAID}" }
+
+  - name: RetentionBox
+    parent: ServiceAccount
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> ServiceAccount.id" }
+      - { name: location_id, type: string, source: input, description: "FK -> ServiceLocation.id; originating site of the contents" }
+      - { name: barcode, type: string, source: input, description: "Client-supplied barcode; unique per account among boxes whose status != DESTROYED" }
+      - { name: stored_at_period, type: integer, source: system, description: "account.current_period_index at ingest; storage billing baseline" }
+      - { name: free_periods, type: integer, source: input, default: 0, description: "Initial billing periods exempt from storage charges; must be >= 0" }
+      - { name: destroy_after_period, type: integer, source: input, required: false, description: "Earliest period at which purge is permitted; null = indefinite retention" }
+      - { name: status, type: enum, source: system, description: "Cyclic storage lifecycle (see §1.2)", constraints: "one of {INGESTED, STORED, OUT_FOR_RETRIEVAL, DESTROYED}" }
+
+  - name: RetrievalRequest
+    parent: RetentionBox
+    common_fields: true
+    fields:
+      - { name: box_id, type: string, source: input, description: "FK -> RetentionBox.id" }
+      - { name: account_id, type: string, source: input, description: "FK -> ServiceAccount.id" }
+      - { name: priority, type: enum, source: input, description: "Pricing/SLA selector", constraints: "one of {STANDARD, RUSH}" }
+      - { name: retrieval_charge_cents, type: integer, source: computed, default: 0, description: "Fee snapshot computed at fulfillment from the ACTIVE rate card" }
+      - { name: delivered_period, type: integer, source: system, default: -1, description: "account.current_period_index when fulfilled (DELIVERED); -1 until fulfilled; pins which StorageInvoice the charge lands on" }
+      - { name: requested_by, type: string, source: input, description: "Opaque X-User-ID of the requester" }
+      - { name: status, type: enum, source: system, description: "Branching+revert lifecycle (see §1.2)", constraints: "one of {PENDING, DELIVERED, RETURN_PENDING, RETURNED, REFUSED, CANCELLED}" }
+
+  - name: ComplianceHold
+    parent: ServiceAccount
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> ServiceAccount.id" }
+      - { name: subject_type, type: enum, source: input, description: "Polymorphic hold target discriminator", constraints: "one of {RETENTION_BOX, SERVICE_ORDER}" }
+      - { name: subject_id, type: string, source: input, description: "id of the held RetentionBox or ServiceOrder (polymorphic by subject_type)" }
+      - { name: reason, type: enum, source: input, description: "Legal/regulatory basis", constraints: "one of {LITIGATION_HOLD, AUDIT_HOLD, REGULATORY_FREEZE}" }
+      - { name: status, type: enum, source: system, description: "ACTIVE -> RELEASED; while ACTIVE the subject cannot be destroyed/purged", constraints: "one of {ACTIVE, RELEASED}" }
+
+  - name: StorageInvoice
+    parent: ServiceAccount
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> ServiceAccount.id" }
+      - { name: period_index, type: integer, source: system, description: "Billing period this invoice covers" }
+      - { name: storage_line_cents, type: integer, source: computed, description: "Per-box storage charges summed across billable boxes for the period" }
+      - { name: retrieval_line_cents, type: integer, source: computed, description: "Sum of retrieval_charge_cents for requests DELIVERED within the period" }
+      - { name: credit_applied_cents, type: integer, source: computed, description: "Account storage_credit_cents consumed against this invoice, capped at gross" }
+      - { name: amount_due_cents, type: integer, source: computed, description: "storage_line + retrieval_line - credit_applied; never negative" }
+      - { name: status, type: enum, source: system, description: "ISSUED -> PAID", constraints: "one of {ISSUED, PAID}" }
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: ServiceOrder
+    initial_state: SCHEDULED
+    terminal_states: [ON_SITE_SHREDDED, DESTROYED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: EN_ROUTE
+        trigger: "POST /service-orders/{orderId}/dispatch"
+        actor: FieldTechnician
+        preconditions:
+          - "Order in SCHEDULED (ERR_ORDER_NOT_SCHEDULED)"
+          - "service_mode in {ON_SITE, OFF_SITE_PICKUP} (ERR_DISPATCH_NOT_APPLICABLE; DROP_OFF orders never dispatch)"
+          - "No ACTIVE ComplianceHold whose subject_type==SERVICE_ORDER and subject_id==order.id (ERR_SUBJECT_ON_HOLD)"
+        side_effects:
+          - "Each container in container_ids transitions SCHEDULED_FOR_SERVICE -> IN_SERVICE"
+          - "Append one CustodyEvent {subject_type: CONTAINER, event_type: COLLECTED} per serviced container, sequence_no assigned 1-based"
+
+      - from: EN_ROUTE
+        to: ON_SITE_SHREDDED
+        trigger: "POST /service-orders/{orderId}/shred-on-site"
+        actor: FieldTechnician
+        preconditions:
+          - "Order in EN_ROUTE (ERR_ORDER_NOT_EN_ROUTE)"
+          - "service_mode == ON_SITE (ERR_MODE_NOT_ON_SITE)"
+          - "At least one WeightTicket exists for this order (ERR_WEIGH_IN_REQUIRED)"
+        side_effects:
+          - "billed_weight_kg := WeightTicket.net_weight_kg; recompute order_charge_cents (destruction_charge actual variant)"
+          - "Append CustodyEvent {subject_type: CONTAINER, event_type: DESTROYED} per serviced container"
+          - "Each serviced container IN_SERVICE -> PLACED"
+          - "CASCADE (3 hops): order finalized -> auto-issue DestructionCertificate {ISSUED, destroyed_weight_kg := billed_weight_kg} -> certificate issuance creates DestructionInvoice {line_cents := order_charge_cents}"
+
+      - from: EN_ROUTE
+        to: PICKED_UP
+        trigger: "POST /service-orders/{orderId}/confirm-pickup"
+        actor: FieldTechnician
+        preconditions:
+          - "Order in EN_ROUTE (ERR_ORDER_NOT_EN_ROUTE)"
+          - "service_mode == OFF_SITE_PICKUP (ERR_MODE_NOT_OFF_SITE)"
+        side_effects:
+          - "Append CustodyEvent {event_type: SEALED} then {event_type: IN_TRANSIT} per serviced container (two hops, SEALED before IN_TRANSIT)"
+
+      - from: SCHEDULED
+        to: PICKED_UP
+        trigger: "POST /service-orders/{orderId}/confirm-pickup"
+        actor: FieldTechnician
+        preconditions:
+          - "Order in SCHEDULED (ERR_ORDER_NOT_DROP_OFF_READY)"
+          - "service_mode == DROP_OFF (ERR_MODE_NOT_DROP_OFF)"
+          - "No ACTIVE ComplianceHold on this order (ERR_SUBJECT_ON_HOLD)"
+        side_effects:
+          - "Each container in container_ids transitions SCHEDULED_FOR_SERVICE -> IN_SERVICE"
+          - "Append CustodyEvent {event_type: SEALED} then {event_type: IN_TRANSIT} per serviced container"
+
+      - from: PICKED_UP
+        to: AT_PLANT
+        trigger: "POST /service-orders/{orderId}/receive-at-plant"
+        actor: PlantOperator
+        preconditions:
+          - "Order in PICKED_UP (ERR_ORDER_NOT_PICKED_UP)"
+          - "At least one WeightTicket exists for this order (ERR_WEIGH_IN_REQUIRED)"
+        side_effects:
+          - "billed_weight_kg := WeightTicket.net_weight_kg; recompute order_charge_cents (destruction_charge actual variant)"
+          - "Append CustodyEvent {event_type: RECEIVED_AT_PLANT} per serviced container"
+
+      - from: AT_PLANT
+        to: DESTROYED
+        trigger: "POST /service-orders/{orderId}/destroy"
+        actor: DestructionWitness
+        preconditions:
+          - "Order in AT_PLANT (ERR_ORDER_NOT_AT_PLANT)"
+          - "No ACTIVE ComplianceHold whose subject is this order (ERR_SUBJECT_ON_HOLD)"
+          - "Acting witness X-User-ID != order.assigned_tech_id (ERR_SEGREGATION_OF_DUTIES — collector cannot witness)"
+        side_effects:
+          - "Append CustodyEvent {event_type: DESTROYED} per serviced container"
+          - "Each serviced container IN_SERVICE -> PLACED"
+          - "CASCADE (3 hops): order final -> auto-issue DestructionCertificate {ISSUED} -> certificate issuance creates DestructionInvoice {line_cents := order_charge_cents}"
+
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /service-orders/{orderId}/cancel"
+        actor: AccountManager
+        preconditions:
+          - "Order in SCHEDULED or EN_ROUTE (ERR_ORDER_NOT_CANCELLABLE)"
+          - "No DestructionCertificate exists for this order (ERR_CERTIFICATE_ALREADY_ISSUED)"
+        side_effects:
+          - "Compensation: every serviced container reverts to PLACED (conserves the global placed-container count vs. pre-dispatch)"
+          - "order_charge_cents := 0; billed_weight_kg := 0 (conserves: provisional charge fully reversed)"
+
+      - from: EN_ROUTE
+        to: CANCELLED
+        trigger: "POST /service-orders/{orderId}/cancel"
+        actor: AccountManager
+        preconditions:
+          - "Order in SCHEDULED or EN_ROUTE (ERR_ORDER_NOT_CANCELLABLE)"
+          - "No DestructionCertificate exists for this order (ERR_CERTIFICATE_ALREADY_ISSUED)"
+        side_effects:
+          - "Compensation: every serviced container reverts to PLACED (conserves the global placed-container count vs. pre-dispatch)"
+          - "order_charge_cents := 0; billed_weight_kg := 0 (conserves: provisional charge fully reversed)"
+
+  - entity: RetentionBox
+    initial_state: INGESTED
+    terminal_states: [DESTROYED]
+    transitions:
+      - from: INGESTED
+        to: STORED
+        trigger: "POST /retention-boxes/{boxId}/shelve"
+        actor: PlantOperator
+        preconditions:
+          - "Box in INGESTED (ERR_BOX_NOT_INGESTED)"
+        side_effects:
+          - "Box enters the storage-billable set (subject to free-period boundary)"
+
+      - from: STORED
+        to: OUT_FOR_RETRIEVAL
+        trigger: "POST /retrieval-requests/{requestId}/fulfill (drives the box)"
+        actor: PlantOperator
+        preconditions:
+          - "Box in STORED (ERR_BOX_NOT_STORED)"
+          - "No ACTIVE ComplianceHold whose subject is this box (ERR_SUBJECT_ON_HOLD)"
+        side_effects:
+          - "Box stays storage-billable (still charged while out — only DESTROYED leaves the billable set)"
+
+      - from: OUT_FOR_RETRIEVAL
+        to: STORED
+        trigger: "POST /retrieval-requests/{requestId}/return (drives the box)"
+        actor: PlantOperator
+        preconditions:
+          - "Box in OUT_FOR_RETRIEVAL (ERR_BOX_NOT_OUT)"
+        side_effects: []
+
+      - from: STORED
+        to: DESTROYED
+        trigger: "POST /retention-boxes/{boxId}/purge"
+        actor: AccountManager
+        preconditions:
+          - "Box in STORED (ERR_BOX_NOT_STORED)"
+          - "No ACTIVE ComplianceHold whose subject is this box (ERR_SUBJECT_ON_HOLD — checked before retention schedule)"
+          - "account.current_period_index >= box.destroy_after_period when destroy_after_period set (ERR_RETENTION_NOT_ELAPSED)"
+        side_effects:
+          - "Box removed from storage-billable set"
+          - "barcode freed for reuse (uniqueness enforced only among non-DESTROYED boxes)"
+
+  - entity: RetrievalRequest
+    initial_state: PENDING
+    terminal_states: [RETURNED, CANCELLED]
+    transitions:
+      - from: PENDING
+        to: DELIVERED
+        trigger: "POST /retrieval-requests/{requestId}/fulfill"
+        actor: PlantOperator
+        preconditions:
+          - "Request in PENDING (ERR_REQUEST_NOT_PENDING)"
+          - "Box in STORED (ERR_BOX_NOT_STORED)"
+          - "No ACTIVE ComplianceHold on the box (ERR_SUBJECT_ON_HOLD)"
+        side_effects:
+          - "retrieval_charge_cents := retrieval_charge calc (rush multiplier if RUSH) from ACTIVE rate card"
+          - "delivered_period := account.current_period_index"
+          - "Box STORED -> OUT_FOR_RETRIEVAL"
+
+      - from: PENDING
+        to: CANCELLED
+        trigger: "POST /retrieval-requests/{requestId}/cancel"
+        actor: AccountManager
+        preconditions:
+          - "Request in PENDING (ERR_REQUEST_NOT_CANCELLABLE)"
+        side_effects: []
+
+      - from: DELIVERED
+        to: RETURN_PENDING
+        trigger: "POST /retrieval-requests/{requestId}/start-return"
+        actor: AccountManager
+        preconditions:
+          - "Request in DELIVERED (ERR_REQUEST_NOT_DELIVERED)"
+        side_effects: []
+
+      - from: RETURN_PENDING
+        to: RETURNED
+        trigger: "POST /retrieval-requests/{requestId}/return"
+        actor: PlantOperator
+        preconditions:
+          - "Request in RETURN_PENDING (ERR_RETURN_NOT_PENDING)"
+        side_effects:
+          - "Box OUT_FOR_RETRIEVAL -> STORED"
+
+      - from: RETURN_PENDING
+        to: DELIVERED
+        trigger: "POST /retrieval-requests/{requestId}/refuse-return"
+        actor: PlantOperator
+        preconditions:
+          - "Request in RETURN_PENDING (ERR_RETURN_NOT_PENDING)"
+        side_effects:
+          - "Cycle back to DELIVERED: box stays OUT_FOR_RETRIEVAL (return refused, e.g. seal broken); customer must restart return"
+
+  - entity: ComplianceHold
+    initial_state: ACTIVE
+    terminal_states: [RELEASED]
+    transitions:
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /compliance-holds/{holdId}/release"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Hold in ACTIVE (ERR_HOLD_NOT_ACTIVE)"
+        side_effects:
+          - "Subject becomes destroyable/purgeable again (gating removed)"
+
+  - entity: ServiceAccount
+    initial_state: ACTIVE
+    terminal_states: [CLOSED]
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /accounts/{accountId}/suspend"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Account in ACTIVE (ERR_ACCOUNT_NOT_ACTIVE)"
+        side_effects:
+          - "New ServiceOrder / RetrievalRequest creation blocked while SUSPENDED"
+
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /accounts/{accountId}/reactivate"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Account in SUSPENDED (ERR_ACCOUNT_NOT_SUSPENDED)"
+        side_effects: []
+
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /accounts/{accountId}/close"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Account in ACTIVE or SUSPENDED (ERR_ACCOUNT_NOT_CLOSABLE)"
+          - "No RetentionBox in INGESTED/STORED/OUT_FOR_RETRIEVAL (ERR_OUTSTANDING_BOXES)"
+          - "No ServiceOrder in a non-terminal state (ERR_OUTSTANDING_ORDERS)"
+        side_effects: []
+
+      - from: SUSPENDED
+        to: CLOSED
+        trigger: "POST /accounts/{accountId}/close"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Account in ACTIVE or SUSPENDED (ERR_ACCOUNT_NOT_CLOSABLE)"
+          - "No RetentionBox in INGESTED/STORED/OUT_FOR_RETRIEVAL (ERR_OUTSTANDING_BOXES)"
+          - "No ServiceOrder in a non-terminal state (ERR_OUTSTANDING_ORDERS)"
+        side_effects: []
+
+# -----------------------------------------------------------------------------
+# 1.2.1 Concurrency Rules
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: order-reschedule-stale
+    parent_entity: ServiceOrder
+    write_endpoint: "POST /service-orders/{orderId}/reschedule"
+    occ_field: "expected_serviceorder_version"
+    description: |
+      Rescheduling a ServiceOrder to a new slot against an order whose version has
+      advanced since the client last observed it is rejected on a stale-version
+      check. This captures the case where another writer has already rescheduled
+      the order (legitimately superseding the prior slot), so the current writer's
+      observed slot is stale; the rule resolves which reschedule defines the live slot.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: destruction_charge
+    trigger: "ServiceOrder creation (provisional/estimated); recomputed final/actual at shred-on-site and receive-at-plant"
+    algorithm: tiered_pricing
+    formula: |
+      per_kg_rate = (cadence == SCHEDULED) ? rate.scheduled_purge_rate_cents_per_kg
+                                           : rate.onetime_purge_rate_cents_per_kg     # ONE_TIME
+      weight_charge_cents = round_half_up(billed_weight_kg * per_kg_rate)             # integer cents
+      trip_fee_cents      = (service_mode == ON_SITE) ? rate.onsite_trip_fee_cents : 0
+      console_fee_cents   = rate.console_swap_fee_cents * (count of CONSOLE-type containers in container_ids)
+      order_charge_cents  = weight_charge_cents + trip_fee_cents + console_fee_cents
+      # Evaluation order is pinned: weight_charge first (depends on billed_weight_kg + cadence-selected rate),
+      # then trip_fee (mode), then console_fee (container_type count), then sum. The cadence branch and the
+      # mode branch are independent inputs; both feed the final sum.
+    input_set: "ACTIVE RateCard only; container_ids filtered to container_type==CONSOLE for console_fee; billed_weight_kg source differs by variant"
+    constants: {}
+    precision: "round_half_up on the (billed_weight_kg * per_kg_rate) product to integer cents; fees are integer cents"
+    variants:
+      - name: estimated
+        when: "At ServiceOrder creation, before any WeightTicket exists"
+        difference: "billed_weight_kg := sum of capacity_kg across container_ids (nominal estimate); order_charge_cents is PROVISIONAL"
+      - name: actual
+        when: "At shred-on-site (ON_SITE) or receive-at-plant (OFF_SITE_PICKUP / DROP_OFF) weigh-in"
+        difference: "billed_weight_kg := WeightTicket.net_weight_kg (gross minus summed tare); order_charge_cents is FINAL, replacing the estimate"
+
+  - name: retrieval_charge
+    trigger: "RetrievalRequest fulfillment (PENDING -> DELIVERED)"
+    algorithm: threshold
+    formula: |
+      base_cents = ACTIVE RateCard.retrieval_fee_cents
+      if priority == RUSH:
+        retrieval_charge_cents = round_half_up(base_cents * rate.rush_retrieval_multiplier_bps / 10000)
+      else:  # STANDARD
+        retrieval_charge_cents = base_cents
+    input_set: "ACTIVE RateCard at fulfillment time; priority from the request"
+    constants:
+      BPS_DENOMINATOR: 10000
+    precision: "integer cents, round_half_up on the bps product"
+
+  - name: net_weight
+    trigger: "WeightTicket creation (weigh-in)"
+    algorithm: aggregation
+    formula: |
+      tare_total_kg = sum of Container.tare_weight_kg for every container in the parent order's container_ids
+      net_weight_kg = max(gross_weight_kg - tare_total_kg, 0)
+    input_set: "All containers listed in the parent order's container_ids, regardless of each container's current status"
+    constants: {}
+    precision: "3 decimal places kg, round_half_up; floored at 0"
+
+  - name: storage_invoice_total
+    trigger: "POST /accounts/{accountId}/advance-period (period close): emit the invoice for the closing period, THEN increment current_period_index"
+    algorithm: aggregation
+    formula: |
+      Let P = account.current_period_index BEFORE the increment (the period being closed).
+      billable_boxes = RetentionBox where:
+          status IN {STORED, OUT_FOR_RETRIEVAL}                 # INGESTED and DESTROYED excluded
+          AND P >= (stored_at_period + free_periods)            # free-period boundary, INCLUSIVE (>=)
+      storage_line_cents   = rate.storage_rate_cents_per_box_per_period * count(billable_boxes)
+      retrieval_line_cents = sum of RetrievalRequest.retrieval_charge_cents
+                             for requests with delivered_period == P                # priced when fulfilled
+      gross_cents          = storage_line_cents + retrieval_line_cents
+      credit_applied_cents = min(account.storage_credit_cents, gross_cents)
+      amount_due_cents     = gross_cents - credit_applied_cents                      # never negative
+    input_set: "RetentionBox set filtered by status and the inclusive free-period boundary; RetrievalRequest set filtered by delivered_period == P"
+    constants: {}
+    precision: "integer cents"
+    variants:
+      - name: with_credit
+        when: "account.storage_credit_cents > 0 at period close"
+        difference: "credit_applied_cents = min(credit, gross); account.storage_credit_cents -= credit_applied_cents (conserved: credit_applied + credit_remaining == credit_before)"
+      - name: without_credit
+        when: "account.storage_credit_cents == 0 at period close"
+        difference: "credit_applied_cents == 0; amount_due_cents == gross_cents"
+
+  - name: destruction_invoice_total
+    trigger: "DestructionCertificate issuance (cascade hop from shred-on-site / destroy)"
+    algorithm: aggregation
+    formula: |
+      DestructionInvoice.line_cents = order_charge_cents (FINAL/actual variant) of the certified ServiceOrder
+    input_set: "The single certified order at issuance"
+    constants: {}
+    precision: "integer cents"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and well-formed"
+    error_id: ERR_MISSING_AUTH_CONTEXT
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role permitted for this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "All path/body resource ids exist (validated left-to-right); polymorphic subject_id resolves under subject_type"
+    error_id: "ERR_*_NOT_FOUND (ERR_ACCOUNT_NOT_FOUND, ERR_ORDER_NOT_FOUND, ERR_BOX_NOT_FOUND, ERR_REQUEST_NOT_FOUND, ERR_NOT_FOUND)"
+    http_status: 404
+    applies_to: all resource endpoints
+
+  - priority: 4
+    category: state
+    check: "OCC: when expected_serviceorder_version supplied on reschedule it must equal current ServiceOrder.version (checked before slot conflict)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /service-orders/{orderId}/reschedule"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined (see §1.2)"
+    error_id: "ERR_*_NOT_<STATE> (transition-specific id from §1.2)"
+    http_status: 409
+    applies_to: all transition endpoints
+
+  - priority: 6
+    category: business_safety
+    check: "Subject (order or box) has no ACTIVE ComplianceHold before destroy/purge/dispatch/fulfill"
+    error_id: ERR_SUBJECT_ON_HOLD
+    http_status: 409
+    applies_to: "dispatch, destroy, purge, fulfill, confirm-pickup(drop-off)"
+
+  - priority: 7
+    category: business_safety
+    check: "Segregation of duties: the DestructionWitness X-User-ID signing /destroy must differ from order.assigned_tech_id (the collector)"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 409
+    applies_to: "POST /service-orders/{orderId}/destroy"
+
+  - priority: 8
+    category: business_temporal
+    check: "Retention schedule elapsed: account.current_period_index >= box.destroy_after_period (when set) before purge"
+    error_id: ERR_RETENTION_NOT_ELAPSED
+    http_status: 409
+    applies_to: "POST /retention-boxes/{boxId}/purge"
+
+  - priority: 9
+    category: business_temporal
+    check: "Container slot conflict: a new/rescheduled order's window must not overlap another non-terminal order that shares any container_id. Interval geometry: HALF-OPEN [start,end) — touching endpoints (a.end == b.start) do NOT overlap."
+    error_id: ERR_SLOT_CONFLICT
+    http_status: 409
+    applies_to: "POST /service-orders (create), POST /service-orders/{orderId}/reschedule"
+
+  - priority: 10
+    category: business_temporal
+    check: "On-site buffer conflict: two ON_SITE orders at the SAME location_id whose buffered windows overlap are rejected. Interval geometry: CLOSED with BUFFER — order window expands to [start - ONSITE_BUFFER_MINUTES, end + ONSITE_BUFFER_MINUTES] and overlap is CLOSED (touching buffered endpoints DO conflict). ONSITE_BUFFER_MINUTES = 30. Only non-terminal ON_SITE orders are considered."
+    error_id: ERR_ONSITE_BUFFER_CONFLICT
+    http_status: 409
+    applies_to: "POST /service-orders (create), POST /service-orders/{orderId}/reschedule"
+
+  - priority: 11
+    category: business_constraint
+    check: "Field-value sanity: gross_weight_kg >= 0; capacity_kg > 0; tare_weight_kg >= 0; free_periods >= 0; rush_multiplier_bps >= 10000; scheduled_slot_end > scheduled_slot_start; enum members valid"
+    error_id: ERR_INVALID_FIELD_VALUE
+    http_status: 422
+    applies_to: "all create endpoints, weigh-in, reschedule"
+
+  - priority: 12
+    category: business_referential
+    check: "Every container in container_ids belongs to the order's account_id AND location_id"
+    error_id: ERR_CONTAINER_LOCATION_MISMATCH
+    http_status: 409
+    applies_to: "POST /service-orders (create)"
+
+  - priority: 13
+    category: business_referential
+    check: "RetentionBox barcode unique among the account's boxes whose status != DESTROYED"
+    error_id: ERR_DUPLICATE_BARCODE
+    http_status: 409
+    applies_to: "POST /retention-boxes (create)"
+
+  - priority: 14
+    category: business_constraint
+    check: "Account must be ACTIVE to create a new ServiceOrder or RetrievalRequest"
+    error_id: ERR_ACCOUNT_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /service-orders (create), POST /retrieval-requests (create)"
+
+  - priority: 15
+    category: business_constraint
+    check: "A pricing operation requires an ACTIVE RateCard on the account (order create, weigh-in finalize, retrieval fulfill, period close)"
+    error_id: ERR_NO_ACTIVE_RATE_CARD
+    http_status: 409
+    applies_to: "POST /service-orders (create), shred-on-site, receive-at-plant, fulfill, advance-period"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ----- ServiceAccount -----
+  - { method: POST, path: "/accounts", description: "Create a service account", roles: [ComplianceOfficer], code: 201,
+      input: [business_name, compliance_regime, billing_email], output: ServiceAccount, side_effects: ["status := ACTIVE", "current_period_index := 0", "storage_credit_cents := 0"] }
+  - { method: GET, path: "/accounts/{id}", description: "Get a service account", roles: [ComplianceOfficer, AccountManager], code: 200, input: [], output: ServiceAccount, side_effects: [] }
+  - { method: GET, path: "/accounts", description: "List service accounts (paginated)", roles: [ComplianceOfficer], code: 200, input: ["status?", "limit?", "offset?"], output: "ServiceAccount[]", side_effects: [] }
+  - { method: POST, path: "/accounts/{id}/credit", description: "Add prepaid storage credit (cents)", roles: [ComplianceOfficer], code: 200,
+      input: [amount_cents], output: ServiceAccount, side_effects: ["storage_credit_cents += amount_cents"] }
+  - { method: POST, path: "/accounts/{id}/advance-period", description: "Close current billing period: emit StorageInvoice for the closing period, then increment current_period_index", roles: [ComplianceOfficer], code: 201,
+      input: [], output: StorageInvoice, side_effects: ["compute storage_invoice_total for closing period", "decrement account.storage_credit_cents by credit_applied_cents", "current_period_index += 1"] }
+  - { method: POST, path: "/accounts/{id}/suspend", description: "Suspend account (ACTIVE -> SUSPENDED)", roles: [ComplianceOfficer], code: 200, input: [], output: ServiceAccount, side_effects: ["status -> SUSPENDED"] }
+  - { method: POST, path: "/accounts/{id}/reactivate", description: "Reactivate account (SUSPENDED -> ACTIVE)", roles: [ComplianceOfficer], code: 200, input: [], output: ServiceAccount, side_effects: ["status -> ACTIVE"] }
+  - { method: POST, path: "/accounts/{id}/close", description: "Close account", roles: [ComplianceOfficer], code: 200, input: [], output: ServiceAccount, side_effects: ["status -> CLOSED"] }
+
+  # ----- ServiceLocation -----
+  - { method: POST, path: "/locations", description: "Create a service location", roles: [AccountManager, ComplianceOfficer], code: 201,
+      input: [account_id, label, address, "secure_area?"], output: ServiceLocation, side_effects: [] }
+  - { method: GET, path: "/locations/{id}", description: "Get a service location", roles: [AccountManager, ComplianceOfficer], code: 200, input: [], output: ServiceLocation, side_effects: [] }
+  - { method: GET, path: "/locations", description: "List locations, filterable by account_id (reverse-reachability for ServiceLocation.account_id)", roles: [AccountManager, ComplianceOfficer], code: 200,
+      input: ["account_id?", "limit?", "offset?"], output: "ServiceLocation[]", side_effects: [] }
+
+  # ----- RateCard -----
+  - { method: POST, path: "/rate-cards", description: "Create a rate card in DRAFT", roles: [ComplianceOfficer], code: 201,
+      input: [account_id, scheduled_purge_rate_cents_per_kg, onetime_purge_rate_cents_per_kg, onsite_trip_fee_cents, console_swap_fee_cents, storage_rate_cents_per_box_per_period, retrieval_fee_cents, "rush_retrieval_multiplier_bps?"],
+      output: RateCard, side_effects: ["status := DRAFT"] }
+  - { method: GET, path: "/rate-cards/{id}", description: "Get a rate card", roles: [ComplianceOfficer, AccountManager], code: 200, input: [], output: RateCard, side_effects: [] }
+  - { method: GET, path: "/rate-cards", description: "List rate cards, filterable by account_id (reverse-reachability for RateCard.account_id)", roles: [ComplianceOfficer, AccountManager], code: 200,
+      input: ["account_id?", "status?", "limit?", "offset?"], output: "RateCard[]", side_effects: [] }
+  - { method: POST, path: "/rate-cards/{id}/activate", description: "Activate a rate card; supersede the prior ACTIVE one on the account", roles: [ComplianceOfficer], code: 200,
+      input: [], output: RateCard, side_effects: ["this card -> ACTIVE", "previously ACTIVE card on same account -> SUPERSEDED"] }
+
+  # ----- Container -----
+  - { method: POST, path: "/containers", description: "Place a bin/console at a location", roles: [AccountManager, FieldTechnician], code: 201,
+      input: [account_id, location_id, container_type, capacity_kg, tare_weight_kg], output: Container, side_effects: ["status := PLACED"] }
+  - { method: GET, path: "/containers/{id}", description: "Get a container", roles: [AccountManager, FieldTechnician, ComplianceOfficer], code: 200, input: [], output: Container, side_effects: [] }
+  - { method: GET, path: "/containers", description: "List containers, filterable by account_id and location_id (reverse-reachability for Container.account_id and Container.location_id)", roles: [AccountManager, FieldTechnician, ComplianceOfficer], code: 200,
+      input: ["account_id?", "location_id?", "status?", "limit?", "offset?"], output: "Container[]", side_effects: [] }
+  - { method: POST, path: "/containers/{id}/retire", description: "Retire a container (-> RETIRED, terminal)", roles: [AccountManager], code: 200, input: [], output: Container, side_effects: ["status -> RETIRED"] }
+
+  # ----- ServiceOrder -----
+  - { method: POST, path: "/service-orders", description: "Create a service order (provisional charge via destruction_charge estimated variant)", roles: [AccountManager, FieldTechnician], code: 201,
+      input: [account_id, location_id, service_mode, cadence, "container_ids?", scheduled_slot_start, scheduled_slot_end, "assigned_tech_id?"],
+      output: ServiceOrder, side_effects: ["status := SCHEDULED", "billed_weight_kg := sum container capacity_kg (estimate)", "order_charge_cents := destruction_charge(estimated)", "each container -> SCHEDULED_FOR_SERVICE"] }
+  - { method: GET, path: "/service-orders/{id}", description: "Get a service order", roles: [AccountManager, FieldTechnician, PlantOperator, DestructionWitness, ComplianceOfficer], code: 200, input: [], output: ServiceOrder, side_effects: [] }
+  - { method: GET, path: "/service-orders", description: "List service orders, filterable by account_id and location_id (reverse-reachability for ServiceOrder.account_id and ServiceOrder.location_id)", roles: [AccountManager, FieldTechnician, PlantOperator, ComplianceOfficer], code: 200,
+      input: ["account_id?", "location_id?", "status?", "limit?", "offset?"], output: "ServiceOrder[]", side_effects: [] }
+  - { method: POST, path: "/service-orders/{id}/reschedule", description: "Reschedule the slot (OCC-guarded)", roles: [AccountManager], code: 200,
+      input: [expected_serviceorder_version, scheduled_slot_start, scheduled_slot_end], output: ServiceOrder, side_effects: ["slot updated", "increments ServiceOrder.version by 1"] }
+  - { method: POST, path: "/service-orders/{id}/dispatch", description: "Dispatch field tech (SCHEDULED -> EN_ROUTE)", roles: [FieldTechnician], code: 200,
+      input: [], output: ServiceOrder, side_effects: ["containers -> IN_SERVICE", "CustodyEvent COLLECTED per container"] }
+  - { method: POST, path: "/service-orders/{id}/weigh-in", description: "Record a WeightTicket for the order", roles: [FieldTechnician, PlantOperator], code: 201,
+      input: [gross_weight_kg], output: WeightTicket, side_effects: ["compute net_weight_kg via net_weight calc"] }
+  - { method: GET, path: "/weight-tickets/{id}", description: "Get a weight ticket", roles: [FieldTechnician, PlantOperator, ComplianceOfficer], code: 200, input: [], output: WeightTicket, side_effects: [] }
+  - { method: GET, path: "/weight-tickets", description: "List weight tickets, filterable by order_id (reverse-reachability for WeightTicket.order_id)", roles: [FieldTechnician, PlantOperator, ComplianceOfficer], code: 200,
+      input: ["order_id?", "limit?", "offset?"], output: "WeightTicket[]", side_effects: [] }
+  - { method: POST, path: "/service-orders/{id}/shred-on-site", description: "On-site shred branch (EN_ROUTE -> ON_SITE_SHREDDED)", roles: [FieldTechnician], code: 200,
+      input: [], output: ServiceOrder, side_effects: ["order_charge_cents final", "auto-issue DestructionCertificate", "DestructionInvoice created", "containers -> PLACED"] }
+  - { method: POST, path: "/service-orders/{id}/confirm-pickup", description: "Off-site pickup / drop-off intake (-> PICKED_UP)", roles: [FieldTechnician], code: 200,
+      input: [], output: ServiceOrder, side_effects: ["CustodyEvent SEALED then IN_TRANSIT per container"] }
+  - { method: POST, path: "/service-orders/{id}/receive-at-plant", description: "Plant intake (PICKED_UP -> AT_PLANT)", roles: [PlantOperator], code: 200,
+      input: [], output: ServiceOrder, side_effects: ["order_charge_cents final", "CustodyEvent RECEIVED_AT_PLANT per container"] }
+  - { method: POST, path: "/service-orders/{id}/destroy", description: "Witnessed plant destruction (AT_PLANT -> DESTROYED; SoD enforced)", roles: [DestructionWitness], code: 200,
+      input: [witnessed_by], output: ServiceOrder, side_effects: ["CustodyEvent DESTROYED per container", "auto-issue DestructionCertificate", "DestructionInvoice created", "containers -> PLACED"] }
+  - { method: POST, path: "/service-orders/{id}/cancel", description: "Cancel order (compensation: revert containers, zero charge)", roles: [AccountManager], code: 200,
+      input: [], output: ServiceOrder, side_effects: ["containers revert to PLACED", "order_charge_cents := 0", "billed_weight_kg := 0"] }
+
+  # ----- CustodyEvent -----
+  - { method: GET, path: "/custody-events/{id}", description: "Get a single custody event", roles: [FieldTechnician, PlantOperator, DestructionWitness, ComplianceOfficer], code: 200, input: [], output: CustodyEvent, side_effects: [] }
+  - { method: GET, path: "/custody-events", description: "Chain-of-custody log, filterable by order_id (reverse-reachability for CustodyEvent.order_id)", roles: [FieldTechnician, PlantOperator, DestructionWitness, ComplianceOfficer], code: 200,
+      input: ["order_id?", "limit?", "offset?"], output: "CustodyEvent[]", side_effects: [] }
+
+  # ----- DestructionCertificate -----
+  - { method: GET, path: "/certificates/{id}", description: "Get a certificate of destruction", roles: [AccountManager, ComplianceOfficer], code: 200, input: [], output: DestructionCertificate, side_effects: [] }
+  - { method: GET, path: "/certificates", description: "List certificates, filterable by order_id and account_id (reverse-reachability for DestructionCertificate.order_id and .account_id)", roles: [AccountManager, ComplianceOfficer], code: 200,
+      input: ["order_id?", "account_id?", "status?", "limit?", "offset?"], output: "DestructionCertificate[]", side_effects: [] }
+  - { method: POST, path: "/certificates/{id}/void", description: "Void an issued certificate (ISSUED -> VOIDED)", roles: [ComplianceOfficer], code: 200, input: [], output: DestructionCertificate, side_effects: ["status -> VOIDED"] }
+
+  # ----- DestructionInvoice -----
+  - { method: GET, path: "/destruction-invoices/{id}", description: "Get a destruction invoice", roles: [ComplianceOfficer, AccountManager], code: 200, input: [], output: DestructionInvoice, side_effects: [] }
+  - { method: GET, path: "/destruction-invoices", description: "List destruction invoices, filterable by order_id, account_id, certificate_id (reverse-reachability for all three FKs)", roles: [ComplianceOfficer, AccountManager], code: 200,
+      input: ["order_id?", "account_id?", "certificate_id?", "status?", "limit?", "offset?"], output: "DestructionInvoice[]", side_effects: [] }
+  - { method: POST, path: "/destruction-invoices/{id}/pay", description: "Mark a destruction invoice paid (ISSUED -> PAID)", roles: [ComplianceOfficer], code: 200, input: [], output: DestructionInvoice, side_effects: ["status -> PAID"] }
+
+  # ----- RetentionBox -----
+  - { method: POST, path: "/retention-boxes", description: "Ingest a retention box", roles: [AccountManager, PlantOperator], code: 201,
+      input: [account_id, location_id, barcode, "free_periods?", "destroy_after_period?"], output: RetentionBox, side_effects: ["status := INGESTED", "stored_at_period := account.current_period_index"] }
+  - { method: GET, path: "/retention-boxes/{id}", description: "Get a retention box", roles: [AccountManager, PlantOperator, ComplianceOfficer], code: 200, input: [], output: RetentionBox, side_effects: [] }
+  - { method: GET, path: "/retention-boxes", description: "List retention boxes, filterable by account_id and location_id (reverse-reachability for RetentionBox.account_id and .location_id)", roles: [AccountManager, PlantOperator, ComplianceOfficer], code: 200,
+      input: ["account_id?", "location_id?", "status?", "limit?", "offset?"], output: "RetentionBox[]", side_effects: [] }
+  - { method: POST, path: "/retention-boxes/{id}/shelve", description: "Shelve an ingested box (INGESTED -> STORED)", roles: [PlantOperator], code: 200, input: [], output: RetentionBox, side_effects: ["status -> STORED"] }
+  - { method: POST, path: "/retention-boxes/{id}/purge", description: "Purge a stored box (STORED -> DESTROYED)", roles: [AccountManager], code: 200, input: [], output: RetentionBox, side_effects: ["status -> DESTROYED", "barcode freed"] }
+
+  # ----- RetrievalRequest -----
+  - { method: POST, path: "/retrieval-requests", description: "Open a retrieval request against a box", roles: [AccountManager], code: 201,
+      input: [box_id, account_id, priority, requested_by], output: RetrievalRequest, side_effects: ["status := PENDING", "delivered_period := -1"] }
+  - { method: GET, path: "/retrieval-requests/{id}", description: "Get a retrieval request", roles: [AccountManager, PlantOperator, ComplianceOfficer], code: 200, input: [], output: RetrievalRequest, side_effects: [] }
+  - { method: GET, path: "/retrieval-requests", description: "List retrieval requests, filterable by box_id and account_id (reverse-reachability for RetrievalRequest.box_id and .account_id)", roles: [AccountManager, PlantOperator, ComplianceOfficer], code: 200,
+      input: ["box_id?", "account_id?", "status?", "limit?", "offset?"], output: "RetrievalRequest[]", side_effects: [] }
+  - { method: POST, path: "/retrieval-requests/{id}/fulfill", description: "Fulfill a retrieval (PENDING -> DELIVERED; charge snapshot)", roles: [PlantOperator], code: 200,
+      input: [], output: RetrievalRequest, side_effects: ["retrieval_charge_cents := retrieval_charge calc", "delivered_period := account.current_period_index", "box STORED -> OUT_FOR_RETRIEVAL"] }
+  - { method: POST, path: "/retrieval-requests/{id}/start-return", description: "Begin box return (DELIVERED -> RETURN_PENDING)", roles: [AccountManager], code: 200, input: [], output: RetrievalRequest, side_effects: [] }
+  - { method: POST, path: "/retrieval-requests/{id}/return", description: "Complete box return (RETURN_PENDING -> RETURNED)", roles: [PlantOperator], code: 200, input: [], output: RetrievalRequest, side_effects: ["box OUT_FOR_RETRIEVAL -> STORED"] }
+  - { method: POST, path: "/retrieval-requests/{id}/refuse-return", description: "Refuse return (RETURN_PENDING -> DELIVERED; box stays out)", roles: [PlantOperator], code: 200, input: [], output: RetrievalRequest, side_effects: ["cycle back to DELIVERED"] }
+  - { method: POST, path: "/retrieval-requests/{id}/cancel", description: "Cancel a pending retrieval (PENDING -> CANCELLED)", roles: [AccountManager], code: 200, input: [], output: RetrievalRequest, side_effects: [] }
+
+  # ----- ComplianceHold -----
+  - { method: POST, path: "/compliance-holds", description: "Place a litigation/audit/regulatory hold on a box or order", roles: [ComplianceOfficer], code: 201,
+      input: [account_id, subject_type, subject_id, reason], output: ComplianceHold, side_effects: ["status := ACTIVE"] }
+  - { method: GET, path: "/compliance-holds/{id}", description: "Get a compliance hold", roles: [ComplianceOfficer, AccountManager], code: 200, input: [], output: ComplianceHold, side_effects: [] }
+  - { method: GET, path: "/compliance-holds", description: "List compliance holds, filterable by account_id and subject_id (reverse-reachability for ComplianceHold.account_id)", roles: [ComplianceOfficer, AccountManager], code: 200,
+      input: ["account_id?", "subject_id?", "status?", "limit?", "offset?"], output: "ComplianceHold[]", side_effects: [] }
+  - { method: POST, path: "/compliance-holds/{id}/release", description: "Release a hold (ACTIVE -> RELEASED)", roles: [ComplianceOfficer], code: 200, input: [], output: ComplianceHold, side_effects: ["status -> RELEASED"] }
+
+  # ----- StorageInvoice -----
+  - { method: GET, path: "/storage-invoices/{id}", description: "Get a storage invoice", roles: [ComplianceOfficer, AccountManager], code: 200, input: [], output: StorageInvoice, side_effects: [] }
+  - { method: GET, path: "/storage-invoices", description: "List storage invoices, filterable by account_id (reverse-reachability for StorageInvoice.account_id)", roles: [ComplianceOfficer, AccountManager], code: 200,
+      input: ["account_id?", "period_index?", "status?", "limit?", "offset?"], output: "StorageInvoice[]", side_effects: [] }
+  - { method: POST, path: "/storage-invoices/{id}/pay", description: "Mark a storage invoice paid (ISSUED -> PAID)", roles: [ComplianceOfficer], code: 200, input: [], output: StorageInvoice, side_effects: ["status -> PAID"] }
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_MISSING_AUTH_CONTEXT, http: 401, condition: "X-User-ID or X-User-Role header absent/malformed" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Acting role not permitted for the operation" }
+  - { id: ERR_ACCOUNT_NOT_FOUND, http: 404, condition: "Account id in path/body does not exist" }
+  - { id: ERR_ORDER_NOT_FOUND, http: 404, condition: "ServiceOrder id does not exist" }
+  - { id: ERR_BOX_NOT_FOUND, http: 404, condition: "RetentionBox id does not exist" }
+  - { id: ERR_REQUEST_NOT_FOUND, http: 404, condition: "RetrievalRequest id does not exist" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Other referenced resource (location, container, rate card, certificate, invoice, hold) not found, or polymorphic subject_id unresolved" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_serviceorder_version != current ServiceOrder.version on reschedule" }
+  - { id: ERR_ORDER_NOT_SCHEDULED, http: 409, condition: "dispatch on an order not in SCHEDULED" }
+  - { id: ERR_ORDER_NOT_EN_ROUTE, http: 409, condition: "shred-on-site or off-site confirm-pickup on an order not in EN_ROUTE" }
+  - { id: ERR_ORDER_NOT_DROP_OFF_READY, http: 409, condition: "drop-off confirm-pickup on an order not in SCHEDULED" }
+  - { id: ERR_ORDER_NOT_PICKED_UP, http: 409, condition: "receive-at-plant on an order not in PICKED_UP" }
+  - { id: ERR_ORDER_NOT_AT_PLANT, http: 409, condition: "destroy on an order not in AT_PLANT" }
+  - { id: ERR_ORDER_NOT_CANCELLABLE, http: 409, condition: "cancel on an order not in SCHEDULED or EN_ROUTE" }
+  - { id: ERR_DISPATCH_NOT_APPLICABLE, http: 409, condition: "dispatch on a DROP_OFF order (no dispatch hop)" }
+  - { id: ERR_MODE_NOT_ON_SITE, http: 409, condition: "shred-on-site on an order whose service_mode != ON_SITE" }
+  - { id: ERR_MODE_NOT_OFF_SITE, http: 409, condition: "confirm-pickup from EN_ROUTE on an order whose service_mode != OFF_SITE_PICKUP" }
+  - { id: ERR_MODE_NOT_DROP_OFF, http: 409, condition: "confirm-pickup from SCHEDULED on an order whose service_mode != DROP_OFF" }
+  - { id: ERR_WEIGH_IN_REQUIRED, http: 409, condition: "shred-on-site or receive-at-plant with no WeightTicket recorded" }
+  - { id: ERR_CERTIFICATE_ALREADY_ISSUED, http: 409, condition: "cancel attempted after a DestructionCertificate exists for the order" }
+  - { id: ERR_SUBJECT_ON_HOLD, http: 409, condition: "destroy/purge/dispatch/fulfill/drop-off-pickup on a subject with an ACTIVE ComplianceHold" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 409, condition: "destroy witnessed by the same user id recorded as order.assigned_tech_id" }
+  - { id: ERR_RETENTION_NOT_ELAPSED, http: 409, condition: "purge before account.current_period_index >= box.destroy_after_period" }
+  - { id: ERR_SLOT_CONFLICT, http: 409, condition: "order window (half-open [start,end)) overlaps a non-terminal order sharing a container" }
+  - { id: ERR_ONSITE_BUFFER_CONFLICT, http: 409, condition: "two ON_SITE orders at the same location have buffered (closed) windows that overlap within ONSITE_BUFFER_MINUTES" }
+  - { id: ERR_BOX_NOT_INGESTED, http: 409, condition: "shelve on a box not in INGESTED" }
+  - { id: ERR_BOX_NOT_STORED, http: 409, condition: "purge or fulfill on a box not in STORED" }
+  - { id: ERR_BOX_NOT_OUT, http: 409, condition: "return on a box not in OUT_FOR_RETRIEVAL" }
+  - { id: ERR_REQUEST_NOT_PENDING, http: 409, condition: "fulfill on a request not in PENDING" }
+  - { id: ERR_REQUEST_NOT_DELIVERED, http: 409, condition: "start-return on a request not in DELIVERED" }
+  - { id: ERR_RETURN_NOT_PENDING, http: 409, condition: "return or refuse-return on a request not in RETURN_PENDING" }
+  - { id: ERR_REQUEST_NOT_CANCELLABLE, http: 409, condition: "cancel on a request not in PENDING" }
+  - { id: ERR_HOLD_NOT_ACTIVE, http: 409, condition: "release on a hold not in ACTIVE" }
+  - { id: ERR_ACCOUNT_NOT_ACTIVE, http: 409, condition: "create order/request or suspend on an account not in ACTIVE" }
+  - { id: ERR_ACCOUNT_NOT_SUSPENDED, http: 409, condition: "reactivate on an account not in SUSPENDED" }
+  - { id: ERR_ACCOUNT_NOT_CLOSABLE, http: 409, condition: "close on an account not in ACTIVE/SUSPENDED" }
+  - { id: ERR_OUTSTANDING_BOXES, http: 409, condition: "close with boxes still in INGESTED/STORED/OUT_FOR_RETRIEVAL" }
+  - { id: ERR_OUTSTANDING_ORDERS, http: 409, condition: "close with service orders in a non-terminal state" }
+  - { id: ERR_CONTAINER_LOCATION_MISMATCH, http: 409, condition: "a container in container_ids belongs to a different account or location than the order" }
+  - { id: ERR_DUPLICATE_BARCODE, http: 409, condition: "retention box barcode already used by a non-DESTROYED box on the account" }
+  - { id: ERR_INVALID_FIELD_VALUE, http: 422, condition: "negative weight, non-positive capacity, negative free_periods, rush_multiplier_bps < 10000, slot_end <= slot_start, or invalid enum member" }
+  - { id: ERR_NO_ACTIVE_RATE_CARD, http: 409, condition: "pricing operation (order create, weigh-in finalize, retrieval fulfill, period close) with no ACTIVE rate card on the account" }
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: ComplianceOfficer
+    description: "Owns accounts, rate cards, compliance holds, certificate voids, billing periods, invoices"
+    identity: opaque
+    exclusive_operations:
+      - "POST /accounts, /accounts/{id}/suspend, /reactivate, /close"
+      - "POST /rate-cards, /rate-cards/{id}/activate"
+      - "POST /accounts/{id}/credit, /accounts/{id}/advance-period"
+      - "POST /compliance-holds, /compliance-holds/{id}/release"
+      - "POST /certificates/{id}/void"
+      - "POST /storage-invoices/{id}/pay, /destruction-invoices/{id}/pay"
+    shared_operations:
+      - "GET reads across accounts, orders, boxes, requests, certificates, custody-events, invoices, holds"
+
+  - name: AccountManager
+    description: "Customer-facing operator: locations, orders, retrieval requests, purges, cancellations"
+    identity: opaque
+    exclusive_operations:
+      - "POST /locations"
+      - "POST /service-orders/{id}/reschedule"
+      - "POST /service-orders/{id}/cancel"
+      - "POST /retention-boxes/{id}/purge"
+      - "POST /retrieval-requests, /retrieval-requests/{id}/cancel, /start-return"
+      - "POST /containers/{id}/retire"
+    shared_operations:
+      - "POST /service-orders, /containers, /retention-boxes (with peers)"
+      - "GET account-scoped reads"
+
+  - name: FieldTechnician
+    description: "Takes physical custody: container placement, dispatch, weigh-in, on-site shred, pickup. Custody-taker side of SoD."
+    identity: opaque
+    exclusive_operations:
+      - "POST /service-orders/{id}/dispatch"
+      - "POST /service-orders/{id}/shred-on-site"
+      - "POST /service-orders/{id}/confirm-pickup"
+    shared_operations:
+      - "POST /service-orders, /containers (with AccountManager)"
+      - "POST /service-orders/{id}/weigh-in (with PlantOperator)"
+      - "GET orders/containers/custody-events/weight-tickets"
+
+  - name: PlantOperator
+    description: "Plant-side custody and storage: receive-at-plant, weigh-in, shelve, retrieval fulfill/return, box ingest"
+    identity: opaque
+    exclusive_operations:
+      - "POST /service-orders/{id}/receive-at-plant"
+      - "POST /retention-boxes/{id}/shelve"
+      - "POST /retrieval-requests/{id}/fulfill, /return, /refuse-return"
+    shared_operations:
+      - "POST /service-orders/{id}/weigh-in (with FieldTechnician)"
+      - "POST /retention-boxes (with AccountManager)"
+      - "GET orders/boxes/requests/custody-events"
+
+  - name: DestructionWitness
+    description: "Independent witness who signs final destruction. Witness side of SoD — must not equal the custody-taker."
+    identity: opaque
+    exclusive_operations:
+      - "POST /service-orders/{id}/destroy"
+    shared_operations:
+      - "GET orders/custody-events/certificates"

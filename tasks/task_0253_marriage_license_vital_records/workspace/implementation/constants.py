@@ -1,0 +1,48 @@
+"""Domain constants (SCAFFOLD 1.3 calculation rules)."""
+
+# waiting_period_window
+WAITING_PERIOD_HOURS = 72
+
+# validity_window
+VALIDITY_WINDOW_DAYS = 90
+
+# certified_copy_fee_calc
+FIRST_TIER_COPIES = 3
+FIRST_TIER_CENTS = 1500
+ADDITIONAL_COPY_CENTS = 900
+CONFIDENTIAL_SURCHARGE_CENTS = 2500
+
+# amendment_fee_calc
+CLERICAL_BASE_CENTS = 2000
+SUBSTANTIVE_BASE_CENTS = 5000
+EXPEDITE_PCT = "0.15"
+RESUBMIT_PENALTY_PCT = "0.10"
+MAX_AMENDMENT_RESUBMITS = 2
+
+# waiver_cap_calc
+BASE_POVERTY_CENTS = 130000
+PER_PERSON_POVERTY_CENTS = 45000
+DEEP_NEED_RATIO = 0.50
+FULL_WAIVER_CAP_CENTS = 6000
+PARTIAL_WAIVER_CAP_CENTS = 3000
+
+# applicant_age_years
+MIN_AGE_NO_CONSENT = 18
+MIN_AGE_WITH_CONSENT = 16
+
+# remarriage_wait_check
+REMARRIAGE_WAIT_DAYS = 30
+
+# return_filing_window
+RETURN_FILING_DAYS = 10
+
+# fixed_action_fees
+LICENSE_FEE_CENTS = 9000
+LATE_RETURN_SURCHARGE_CENTS = 2000
+APOSTILLE_FEE_CENTS = 4000
+
+# officiant_ceremony_overlap
+OFFICIANT_BUFFER_MINUTES = 60
+
+# Recognized roles (PRD 2.1)
+ROLES = {"Applicant", "Officiant", "Clerk", "Registrar", "WaiverOfficer"}

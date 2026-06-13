@@ -1,0 +1,1376 @@
+# =============================================================================
+# Traffic Citation Payment & Traffic School — benchmark seed tables (Expert tier)
+# =============================================================================
+scenario: |
+  Traffic Citation Payment & Traffic School: citation lookup, fine + court/surcharge
+  fees, installment plan, contest/hearing request, traffic-school eligibility & point
+  reduction, late penalty/collections referral, license-hold release, failure-to-appear
+  warrant
+
+domain_name: traffic-citation-traffic-school
+api_prefix: ""   # flat topology — each entity collection sits at the root (/citations, /drivers, ...)
+
+# -----------------------------------------------------------------------------
+# Complexity Profile
+# -----------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: "Ledger reconciliation"
+  secondary_archetype: "Compliance / audit"
+  complexity_layers:
+    - "Dual-variant calculation"      # forward-looking installment schedule balance vs chronological payment-applied citation balance
+    - "Cascading side effects"        # citation PAID -> release license hold -> re-derive license_status -> re-evaluate point suspension; FTA -> warrant -> FTA hold
+    - "Rate / threshold triggers"     # late penalty at appear_by breach; collections referral at collections_age_days; point suspension at point_suspension_threshold
+    - "Optimistic concurrency"        # installment-plan create-with-supersede guarded by OCC on Citation.version
+
+  entity_topology: flat
+  # Peer entities joined by FK fields. Only Jurisdiction is the logical root
+  # (carried as jurisdiction_id on Driver); every other entity is addressed at a
+  # flat collection (/citations/{id}, /drivers/{id}, /payments/{id}, ...) and
+  # linked by foreign keys, not URL nesting.
+
+  state_machine_shape: branching
+  # Citation carries TWO independent state dimensions on one row: financial_status
+  # (DRAFT->ASSESSED->PARTIALLY_PAID->PAID|VOID) and adjudication_status
+  # (NONE->CONTESTED->DISMISSED|UPHELD). The ContestRequest machine is cyclic
+  # (HEARING_SET -> CONTINUANCE -> HEARING_SET, up to 2 loops).
+
+  relationship_patterns:
+    - one_to_many        # Citation->CitationCharge, InstallmentPlan->Installment, Driver->PointLedgerEntry
+    - cross_aggregate    # Citation transitions gated by Driver/hold state; LicenseHold spans Driver+Citation
+
+  role_model: peer_roles
+  # Driver self-services own citations; CourtClerk runs court ops; HearingOfficer
+  # adjudicates contests; DmvAdmin owns license holds & point ledger.
+
+  consistency_model: immediate
+
+# =============================================================================
+# Table 1: Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Jurisdiction
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Court / jurisdiction name" }
+      - { name: state_code, type: string, source: input, description: "Two-letter state code, e.g. CA" }
+      - { name: base_court_fee_cents, type: integer, source: input, description: "Flat court fee added to every citation at assessment" }
+      - { name: surcharge_pct, type: number, source: input, description: "State surcharge as a fraction of total base fine, e.g. 0.20 = 20%" }
+      - { name: late_penalty_cents, type: integer, source: input, description: "Flat late penalty added once when a citation passes its appear_by date unresolved" }
+      - { name: installment_setup_fee_cents, type: integer, source: input, description: "One-time fee folded into an InstallmentPlan principal at activation" }
+      - { name: min_installment_cents, type: integer, source: input, description: "Minimum per-installment base; plan rejected if computed base falls below this" }
+      - { name: collections_age_days, type: integer, source: input, default: 30, description: "Days after appear_by at which an unresolved citation is eligible for collections referral" }
+      - { name: collections_fee_pct, type: number, source: input, description: "Collections agency fee as a fraction of outstanding balance at referral, e.g. 0.25" }
+      - { name: traffic_school_fee_cents, type: integer, source: input, description: "Administrative fee added to the citation when a traffic-school enrollment opens" }
+      - { name: school_eligible_max_points, type: integer, source: input, default: 1, description: "Max total points a citation's charges may carry to remain school-eligible" }
+      - { name: school_cooldown_months, type: integer, source: input, default: 18, description: "Driver may complete traffic school at most once per this many months" }
+      - { name: point_suspension_threshold, type: integer, source: input, default: 4, description: "Driver point_balance >= this within the rolling window triggers automatic POINT_SUSPENSION" }
+      - { name: point_window_months, type: integer, source: input, default: 12, description: "Rolling window over which ACTIVE point ledger entries are summed for suspension" }
+
+  - name: Driver
+    parent: Jurisdiction
+    common_fields: true
+    fields:
+      - { name: jurisdiction_id, type: string, source: input, description: "FK -> Jurisdiction.id" }
+      - { name: license_number, type: string, source: input, description: "Driver license number; unique within jurisdiction" }
+      - { name: full_name, type: string, source: input, description: "Driver full name" }
+      - { name: license_status, type: enum, source: computed, description: "VALID | HELD | SUSPENDED — derived from OPEN LicenseHold rows (see calc license_status)", constraints: "VALID, HELD, SUSPENDED" }
+      - { name: point_balance, type: integer, source: computed, description: "Sum of ACTIVE PointLedgerEntry.points within the rolling point window (see calc driver_point_balance)" }
+      - { name: fta_warrant_active, type: boolean, source: computed, default: false, description: "True when the driver has >=1 ACTIVE Warrant" }
+
+  - name: Citation
+    parent: null
+    common_fields: true
+    fields:
+      - { name: driver_id, type: string, source: input, description: "FK -> Driver.id" }
+      - { name: citation_number, type: string, source: input, description: "Public citation number; unique within jurisdiction" }
+      - { name: issued_at, type: datetime, source: input, description: "ISO 8601 UTC date/time the officer issued the citation; also the point-effective date" }
+      - { name: appear_by, type: datetime, source: input, description: "ISO 8601 UTC deadline to pay or appear; drives late penalty / collections / FTA" }
+      - { name: base_fine_cents, type: integer, source: computed, default: 0, description: "Sum of CitationCharge.base_fine_cents over all charges (0 until charges added)" }
+      - { name: assessed_total_cents, type: integer, source: computed, default: 0, description: "Frozen statutory total at assessment: base_fine + court fee + surcharge (see calc assessed_total)" }
+      - { name: penalty_cents, type: integer, source: computed, default: 0, description: "Accumulated late penalty + collections fee + traffic_school_fee added after assessment" }
+      - { name: amount_paid_cents, type: integer, source: computed, default: 0, description: "Sum of POSTED Payment.amount_cents for this citation" }
+      - { name: balance_cents, type: integer, source: computed, default: 0, description: "assessed_total_cents + penalty_cents - amount_paid_cents (chronological balance, see calc citation_balance)" }
+      - { name: financial_status, type: enum, source: system, description: "DRAFT | ASSESSED | PARTIALLY_PAID | PAID | VOID — fee/payment dimension", constraints: "DRAFT, ASSESSED, PARTIALLY_PAID, PAID, VOID" }
+      - { name: adjudication_status, type: enum, source: system, description: "NONE | CONTESTED | DISMISSED | UPHELD — independent contest/hearing dimension", constraints: "NONE, CONTESTED, DISMISSED, UPHELD" }
+      - { name: disposition, type: enum, source: system, default: OPEN, description: "OPEN | CLOSED — closure once PAID, DISMISSED, or VOID", constraints: "OPEN, CLOSED" }
+      - { name: late_penalty_applied, type: boolean, source: system, default: false, description: "Guard so the flat late penalty is added at most once" }
+      - { name: collections_referred, type: boolean, source: system, default: false, description: "Guard so the collections fee is added at most once" }
+
+  - name: CitationCharge
+    parent: Citation
+    common_fields: true
+    fields:
+      - { name: citation_id, type: string, source: input, description: "FK -> Citation.id" }
+      - { name: violation_code, type: string, source: input, description: "Vehicle-code section, e.g. VC22350" }
+      - { name: description, type: string, source: input, description: "Human-readable violation description" }
+      - { name: base_fine_cents, type: integer, source: input, description: "Statutory base fine for this charge in cents" }
+      - { name: points, type: integer, source: input, description: "DMV demerit points this charge carries (0, 1, or 2)" }
+
+  - name: InstallmentPlan
+    parent: Citation
+    common_fields: true
+    fields:
+      - { name: citation_id, type: string, source: input, description: "FK -> Citation.id" }
+      - { name: term_count, type: integer, source: input, description: "Number of monthly installments requested (2..12)" }
+      - { name: first_due_at, type: datetime, source: input, description: "ISO 8601 UTC due date of the first installment" }
+      - { name: principal_cents, type: integer, source: computed, description: "Citation balance_cents at activation plus installment_setup_fee_cents (frozen)" }
+      - { name: installment_cents, type: integer, source: computed, description: "Nominal per-installment base = floor(principal_cents / term_count); remainder folds into the final installment (see calc installment_schedule)" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | COMPLETED | DEFAULTED | SUPERSEDED | CANCELLED", constraints: "ACTIVE, COMPLETED, DEFAULTED, SUPERSEDED, CANCELLED" }
+
+  - name: Installment
+    parent: InstallmentPlan
+    common_fields: true
+    fields:
+      - { name: installment_plan_id, type: string, source: input, description: "FK -> InstallmentPlan.id" }
+      - { name: sequence_no, type: integer, source: system, description: "1-based position in the schedule" }
+      - { name: due_at, type: datetime, source: system, description: "ISO 8601 UTC due date for this installment" }
+      - { name: amount_cents, type: integer, source: system, description: "Scheduled amount for this installment" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | PAID | MISSED", constraints: "SCHEDULED, PAID, MISSED" }
+
+  - name: Payment
+    parent: Citation
+    common_fields: true
+    fields:
+      - { name: citation_id, type: string, source: input, description: "FK -> Citation.id" }
+      - { name: amount_cents, type: integer, source: input, description: "Tendered amount in cents (> 0)" }
+      - { name: method, type: enum, source: input, description: "CARD | CASH | CHECK", constraints: "CARD, CASH, CHECK" }
+      - { name: installment_id, type: string, source: input, required: false, description: "FK -> Installment.id (omit for a free-form payment against the citation balance)" }
+      - { name: status, type: enum, source: system, description: "POSTED | REVERSED", constraints: "POSTED, REVERSED" }
+      - { name: posted_at, type: datetime, source: system, description: "ISO 8601 UTC timestamp the payment posted (server clock); chronological ordering key" }
+
+  - name: ContestRequest
+    parent: Citation
+    common_fields: true
+    fields:
+      - { name: citation_id, type: string, source: input, description: "FK -> Citation.id" }
+      - { name: grounds, type: string, source: input, description: "Driver's stated grounds for contest" }
+      - { name: hearing_at, type: datetime, source: system, required: false, description: "ISO 8601 UTC scheduled hearing time (set when HEARING_SET)" }
+      - { name: continuance_count, type: integer, source: system, default: 0, description: "Number of granted continuances (cyclic loop counter)" }
+      - { name: status, type: enum, source: system, description: "REQUESTED | HEARING_SET | CONTINUANCE | DISMISSED | UPHELD | FTA", constraints: "REQUESTED, HEARING_SET, CONTINUANCE, DISMISSED, UPHELD, FTA" }
+
+  - name: TrafficSchoolEnrollment
+    parent: Citation
+    common_fields: true
+    fields:
+      - { name: citation_id, type: string, source: input, description: "FK -> Citation.id" }
+      - { name: driver_id, type: string, source: system, description: "FK -> Driver.id" }
+      - { name: eligible_points, type: integer, source: computed, description: "Total points across the citation's charges, frozen at enrollment" }
+      - { name: completion_due_at, type: datetime, source: input, description: "ISO 8601 UTC deadline to complete the course" }
+      - { name: points_reduced, type: integer, source: computed, default: 0, description: "Points masked from the point ledger on completion (see calc point_reduction)" }
+      - { name: status, type: enum, source: system, description: "ENROLLED | COMPLETED | FAILED", constraints: "ENROLLED, COMPLETED, FAILED" }
+
+  - name: LicenseHold
+    parent: Driver
+    common_fields: true
+    fields:
+      - { name: driver_id, type: string, source: input, description: "FK -> Driver.id" }
+      - { name: citation_id, type: string, source: input, required: false, description: "FK -> Citation.id (the citation that caused the hold; null for POINT_SUSPENSION)" }
+      - { name: hold_type, type: enum, source: system, description: "FTA_HOLD | NONPAYMENT_HOLD | POINT_SUSPENSION", constraints: "FTA_HOLD, NONPAYMENT_HOLD, POINT_SUSPENSION" }
+      - { name: status, type: enum, source: system, description: "OPEN | RELEASED", constraints: "OPEN, RELEASED" }
+      - { name: released_at, type: datetime, source: system, required: false, description: "ISO 8601 UTC timestamp the hold was released" }
+
+  - name: CollectionsReferral
+    parent: Citation
+    common_fields: true
+    fields:
+      - { name: citation_id, type: string, source: input, description: "FK -> Citation.id" }
+      - { name: outstanding_at_referral_cents, type: integer, source: system, description: "Citation balance_cents at the moment of referral (basis for the collections fee)" }
+      - { name: collections_fee_cents, type: integer, source: computed, description: "round_half_up(outstanding_at_referral_cents * collections_fee_pct) (see calc collections_fee)" }
+      - { name: status, type: enum, source: system, description: "REFERRED | RECALLED", constraints: "REFERRED, RECALLED" }
+
+  - name: Warrant
+    parent: Citation
+    common_fields: true
+    fields:
+      - { name: citation_id, type: string, source: input, description: "FK -> Citation.id" }
+      - { name: driver_id, type: string, source: input, description: "FK -> Driver.id" }
+      - { name: reason, type: enum, source: system, description: "FTA_HEARING | FTA_APPEAR", constraints: "FTA_HEARING, FTA_APPEAR" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | QUASHED", constraints: "ACTIVE, QUASHED" }
+      - { name: quashed_at, type: datetime, source: system, required: false, description: "ISO 8601 UTC timestamp the warrant was quashed" }
+
+  - name: PointLedgerEntry
+    parent: Driver
+    common_fields: false
+    fields:
+      - { name: driver_id, type: string, source: input, description: "FK -> Driver.id" }
+      - { name: citation_id, type: string, source: input, description: "FK -> Citation.id" }
+      - { name: points, type: integer, source: system, description: "Demerit points posted for this citation" }
+      - { name: effective_at, type: datetime, source: system, description: "ISO 8601 UTC point-effective date (drives the rolling window; equals citation issued_at)" }
+      - { name: state, type: enum, source: system, description: "ACTIVE | MASKED — MASKED entries are excluded from point_balance after a traffic-school reduction", constraints: "ACTIVE, MASKED" }
+
+# =============================================================================
+# Table 2: State Machine Table
+# =============================================================================
+state_machines:
+  # --- Citation: financial dimension ---
+  - entity: Citation
+    initial_state: DRAFT
+    terminal_states: [VOID]
+    note: |
+      Citation carries TWO independent dimensions on the same row: financial_status
+      (this machine) and adjudication_status (the ContestRequest machine below). They
+      evolve independently — a citation can be PARTIALLY_PAID while CONTESTED.
+      disposition flips to CLOSED when financial_status==PAID OR adjudication_status==DISMISSED
+      OR financial_status==VOID.
+    transitions:
+      - from: DRAFT
+        to: ASSESSED
+        trigger: "POST /citations/{cid}/assess"
+        actor: CourtClerk
+        preconditions:
+          - "Citation has >=1 CitationCharge (else ERR_NO_CHARGES)"
+          - "financial_status == DRAFT (else ERR_INVALID_STATE)"
+        side_effects:
+          - "Compute base_fine_cents = sum(CitationCharge.base_fine_cents)"
+          - "Freeze assessed_total_cents via calc assessed_total"
+          - "Set balance_cents = assessed_total_cents; financial_status = ASSESSED"
+          - "increments Citation.version by 1"
+
+      - from: ASSESSED
+        to: PARTIALLY_PAID
+        trigger: "POST /citations/{cid}/payments (payment leaves balance_cents > 0)"
+        actor: Driver
+        preconditions:
+          - "0 < Payment.amount_cents <= balance_cents (else ERR_OVERPAYMENT)"
+          - "Citation.disposition == OPEN (else ERR_INVALID_STATE)"
+        side_effects:
+          - "Append POSTED Payment; recompute amount_paid_cents and balance_cents (calc citation_balance)"
+          - "financial_status = PARTIALLY_PAID"
+          - "increments Citation.version by 1"
+
+      - from: PARTIALLY_PAID
+        to: PARTIALLY_PAID
+        trigger: "POST /citations/{cid}/payments (payment leaves balance_cents > 0)"
+        actor: Driver
+        preconditions:
+          - "0 < Payment.amount_cents <= balance_cents (else ERR_OVERPAYMENT)"
+        side_effects:
+          - "Recompute amount_paid_cents and balance_cents"
+          - "increments Citation.version by 1"
+
+      - from: ASSESSED
+        to: PAID
+        trigger: "POST /citations/{cid}/payments (payment drives balance_cents to 0)"
+        actor: Driver
+        preconditions:
+          - "Payment.amount_cents == balance_cents (greater => ERR_OVERPAYMENT)"
+          - "Citation.disposition == OPEN (else ERR_INVALID_STATE)"
+        side_effects:
+          - "Recompute balance_cents -> 0; financial_status = PAID; disposition = CLOSED"
+          - "CASCADE depth-3: OPEN NONPAYMENT_HOLD/FTA_HOLD LicenseHold for this citation -> RELEASED; releasing the hold re-derives Driver.license_status; that re-derivation re-evaluates Driver point suspension (calc driver_point_balance)"
+          - "CASCADE: ACTIVE Warrant for this citation -> QUASHED; Driver.fta_warrant_active re-derived"
+          - "Mark any ACTIVE InstallmentPlan COMPLETED and remaining SCHEDULED Installments PAID"
+          - "increments Citation.version by 1"
+
+      - from: PARTIALLY_PAID
+        to: PAID
+        trigger: "POST /citations/{cid}/payments (payment drives balance_cents to 0)"
+        actor: Driver
+        preconditions:
+          - "Payment.amount_cents == balance_cents"
+        side_effects:
+          - "financial_status = PAID; disposition = CLOSED"
+          - "CASCADE depth-3: OPEN NONPAYMENT_HOLD/FTA_HOLD -> RELEASED; Driver.license_status re-derived; point suspension re-evaluated"
+          - "CASCADE: ACTIVE Warrant for this citation -> QUASHED"
+          - "increments Citation.version by 1"
+
+      - from: DRAFT
+        to: VOID
+        trigger: "POST /citations/{cid}/void"
+        actor: CourtClerk
+        preconditions:
+          - "No POSTED Payment exists for this citation (else ERR_HAS_PAYMENTS)"
+        side_effects:
+          - "financial_status = VOID; disposition = CLOSED"
+          - "increments Citation.version by 1"
+
+      - from: ASSESSED
+        to: VOID
+        trigger: "POST /citations/{cid}/void"
+        actor: CourtClerk
+        preconditions:
+          - "No POSTED Payment exists (else ERR_HAS_PAYMENTS)"
+          - "adjudication_status != UPHELD (else ERR_INVALID_STATE)"
+        side_effects:
+          - "financial_status = VOID; disposition = CLOSED"
+          - "CASCADE: OPEN LicenseHold for this citation -> RELEASED; ACTIVE Warrant -> QUASHED"
+          - "increments Citation.version by 1"
+
+      - from: ASSESSED
+        to: ASSESSED
+        trigger: "POST /citations/{cid}/apply-late-penalty (clock past appear_by)"
+        actor: CourtClerk
+        preconditions:
+          - "now >= appear_by (else ERR_NOT_YET_LATE)"
+          - "late_penalty_applied == false (else ERR_PENALTY_ALREADY_APPLIED)"
+          - "financial_status IN {ASSESSED, PARTIALLY_PAID} (else ERR_INVALID_STATE)"
+        side_effects:
+          - "penalty_cents += jurisdiction.late_penalty_cents; late_penalty_applied = true"
+          - "Recompute balance_cents; CASCADE: open one NONPAYMENT_HOLD LicenseHold for this citation if none OPEN -> Driver.license_status re-derived to HELD"
+          - "increments Citation.version by 1"
+
+      - from: PARTIALLY_PAID
+        to: PARTIALLY_PAID
+        trigger: "POST /citations/{cid}/apply-late-penalty (clock past appear_by)"
+        actor: CourtClerk
+        preconditions:
+          - "now >= appear_by (else ERR_NOT_YET_LATE)"
+          - "late_penalty_applied == false (else ERR_PENALTY_ALREADY_APPLIED)"
+        side_effects:
+          - "penalty_cents += jurisdiction.late_penalty_cents; late_penalty_applied = true; recompute balance_cents"
+          - "CASCADE: open NONPAYMENT_HOLD if none OPEN; Driver.license_status re-derived"
+          - "increments Citation.version by 1"
+
+  # --- ContestRequest (adjudication track; cyclic) ---
+  - entity: ContestRequest
+    initial_state: REQUESTED
+    terminal_states: [DISMISSED, UPHELD, FTA]
+    note: |
+      Cyclic: HEARING_SET -> CONTINUANCE -> HEARING_SET may repeat (max 2 continuances).
+      Creating a ContestRequest sets Citation.adjudication_status = CONTESTED. DISMISSED
+      sets adjudication_status = DISMISSED (disposition CLOSED, balance->0). UPHELD sets
+      adjudication_status = UPHELD and posts the citation's points to the DMV ledger.
+    transitions:
+      - from: REQUESTED
+        to: HEARING_SET
+        trigger: "POST /contest-requests/{rid}/schedule"
+        actor: CourtClerk
+        preconditions:
+          - "hearing_at is in the future relative to the server clock (else ERR_INVALID_HEARING_DATE)"
+        side_effects:
+          - "Set hearing_at; status = HEARING_SET"
+
+      - from: HEARING_SET
+        to: CONTINUANCE
+        trigger: "POST /contest-requests/{rid}/continue"
+        actor: HearingOfficer
+        preconditions:
+          - "continuance_count < 2 (else ERR_CONTINUANCE_LIMIT)"
+        side_effects:
+          - "continuance_count += 1; status = CONTINUANCE; clear hearing_at"
+
+      - from: CONTINUANCE
+        to: HEARING_SET
+        trigger: "POST /contest-requests/{rid}/schedule"
+        actor: CourtClerk
+        preconditions:
+          - "new hearing_at is in the future (else ERR_INVALID_HEARING_DATE)"
+        side_effects:
+          - "Set hearing_at; status = HEARING_SET"
+
+      - from: HEARING_SET
+        to: DISMISSED
+        trigger: "POST /contest-requests/{rid}/decide (verdict=DISMISS)"
+        actor: HearingOfficer
+        preconditions:
+          - "status == HEARING_SET (else ERR_INVALID_STATE)"
+        side_effects:
+          - "status = DISMISSED; Citation.adjudication_status = DISMISSED; Citation.disposition = CLOSED"
+          - "CASCADE: Citation.balance_cents = 0 (charges vacated); financial_status untouched unless already PAID"
+          - "CASCADE: OPEN LicenseHold for this citation -> RELEASED; ACTIVE Warrant -> QUASHED; no points posted"
+
+      - from: HEARING_SET
+        to: UPHELD
+        trigger: "POST /contest-requests/{rid}/decide (verdict=UPHOLD)"
+        actor: HearingOfficer
+        preconditions:
+          - "status == HEARING_SET (else ERR_INVALID_STATE)"
+        side_effects:
+          - "status = UPHELD; Citation.adjudication_status = UPHELD"
+          - "CASCADE depth-2: post one PointLedgerEntry (state=ACTIVE) per charge with points>0; the new entries re-evaluate Driver point suspension (calc driver_point_balance) and may open a POINT_SUSPENSION LicenseHold -> Driver.license_status re-derived to SUSPENDED"
+
+      - from: HEARING_SET
+        to: FTA
+        trigger: "POST /contest-requests/{rid}/fail-to-appear (clock past hearing_at)"
+        actor: CourtClerk
+        preconditions:
+          - "now > hearing_at (else ERR_NOT_YET_LATE)"
+          - "status == HEARING_SET (else ERR_INVALID_STATE)"
+        side_effects:
+          - "status = FTA; Citation.adjudication_status stays CONTESTED"
+          - "CASCADE depth-3: create ACTIVE Warrant (reason=FTA_HEARING); the warrant opens an FTA_HOLD LicenseHold; that hold re-derives Driver.license_status to HELD"
+
+  # --- TrafficSchoolEnrollment ---
+  - entity: TrafficSchoolEnrollment
+    initial_state: ENROLLED
+    terminal_states: [COMPLETED, FAILED]
+    transitions:
+      - from: ENROLLED
+        to: COMPLETED
+        trigger: "POST /enrollments/{eid}/complete"
+        actor: CourtClerk
+        preconditions:
+          - "now <= completion_due_at (else ERR_SCHOOL_DEADLINE_PASSED)"
+          - "Citation.financial_status == PAID (else ERR_FINE_UNPAID)"
+        side_effects:
+          - "status = COMPLETED; freeze points_reduced via calc point_reduction"
+          - "CASCADE depth-2: mask matching PointLedgerEntry rows for this citation (state -> MASKED); the masking re-evaluates Driver point suspension and may RELEASE a POINT_SUSPENSION hold -> Driver.license_status re-derived"
+
+      - from: ENROLLED
+        to: FAILED
+        trigger: "POST /enrollments/{eid}/fail (clock past completion_due_at)"
+        actor: CourtClerk
+        preconditions:
+          - "now > completion_due_at (else ERR_NOT_YET_LATE)"
+        side_effects:
+          - "status = FAILED; no points masked"
+
+  # --- InstallmentPlan ---
+  - entity: InstallmentPlan
+    initial_state: ACTIVE
+    terminal_states: [COMPLETED, DEFAULTED, SUPERSEDED, CANCELLED]
+    note: |
+      A new plan create supersedes a prior ACTIVE plan on the same citation
+      (re-financing). The create is OCC-guarded on Citation.version — see §1.2.1.
+    transitions:
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "POST /citations/{cid}/installment-plans (a new ACTIVE plan is created)"
+        actor: Driver
+        preconditions:
+          - "expected_citation_version matches Citation.version (else ERR_STALE_VERSION)"
+        side_effects:
+          - "Prior ACTIVE plan -> SUPERSEDED; its SCHEDULED Installments -> MISSED"
+          - "increments Citation.version by 1"
+
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "system (last SCHEDULED Installment marked PAID via a payment, or citation reaches PAID)"
+        actor: system
+        preconditions:
+          - "All Installments PAID OR Citation.financial_status == PAID"
+        side_effects:
+          - "status = COMPLETED"
+
+      - from: ACTIVE
+        to: DEFAULTED
+        trigger: "POST /installment-plans/{pid}/mark-default (an installment past due_at unpaid)"
+        actor: CourtClerk
+        preconditions:
+          - "At least one Installment past due_at with status SCHEDULED (else ERR_NOT_YET_LATE)"
+        side_effects:
+          - "status = DEFAULTED; matching past-due Installments -> MISSED"
+          - "CASCADE: open a NONPAYMENT_HOLD LicenseHold for this citation if none OPEN; Driver.license_status re-derived to HELD"
+
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /installment-plans/{pid}/cancel"
+        actor: Driver
+        preconditions:
+          - "No POSTED Payment is allocated to any of this plan's Installments (else ERR_HAS_PAYMENTS)"
+        side_effects:
+          - "status = CANCELLED; SCHEDULED Installments -> MISSED"
+
+  # --- CollectionsReferral ---
+  - entity: CollectionsReferral
+    initial_state: REFERRED
+    terminal_states: [RECALLED]
+    transitions:
+      - from: REFERRED
+        to: RECALLED
+        trigger: "system (citation reaches PAID, VOID, or adjudication DISMISSED)"
+        actor: system
+        preconditions:
+          - "Citation.disposition == CLOSED"
+        side_effects:
+          - "status = RECALLED"
+
+  # --- LicenseHold ---
+  - entity: LicenseHold
+    initial_state: OPEN
+    terminal_states: [RELEASED]
+    note: "Holds are opened by cascades (late penalty, FTA, plan default, point suspension) and released by cascades (payment, dismissal, school completion) or by an explicit DMV release."
+    transitions:
+      - from: OPEN
+        to: RELEASED
+        trigger: "POST /license-holds/{hid}/release"
+        actor: DmvAdmin
+        preconditions:
+          - "For NONPAYMENT_HOLD/FTA_HOLD: the linked Citation.disposition == CLOSED (else ERR_HOLD_CONDITION_UNMET)"
+          - "For POINT_SUSPENSION: Driver.point_balance < jurisdiction.point_suspension_threshold (else ERR_HOLD_CONDITION_UNMET)"
+        side_effects:
+          - "status = RELEASED; set released_at; Driver.license_status re-derived (calc license_status)"
+
+  # --- Warrant ---
+  - entity: Warrant
+    initial_state: ACTIVE
+    terminal_states: [QUASHED]
+    transitions:
+      - from: ACTIVE
+        to: QUASHED
+        trigger: "POST /warrants/{wid}/quash"
+        actor: CourtClerk
+        preconditions:
+          - "Citation.disposition == CLOSED OR the ContestRequest has a future hearing_at re-scheduled (else ERR_HOLD_CONDITION_UNMET)"
+        side_effects:
+          - "status = QUASHED; set quashed_at; Driver.fta_warrant_active re-derived"
+
+# =============================================================================
+# Concurrency Rules (§1.2.1)
+# =============================================================================
+concurrency_rules:
+  - rule_id: plan-create-stale-citation
+    parent_entity: Citation
+    write_endpoint: "POST /citations/{cid}/installment-plans"
+    occ_field: "expected_citation_version"
+    description: |
+      Creating an InstallmentPlan against a Citation whose version has advanced
+      since the client last observed it is rejected. A new plan legitimately
+      supersedes the prior ACTIVE plan, so a create that still carries the
+      pre-supersede version is acting on a stale view of the citation (its
+      balance, penalty, or prior plan changed) and is refused on the
+      stale-version check.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# Table 3: Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: assessed_total
+    trigger: "Citation assess (DRAFT -> ASSESSED)"
+    algorithm: aggregation
+    formula: |
+      base_fine_cents = sum(CitationCharge.base_fine_cents for all charges on the citation)
+      court_fee_cents  = jurisdiction.base_court_fee_cents
+      surcharge_cents  = round_half_up(base_fine_cents * jurisdiction.surcharge_pct)
+      assessed_total_cents = base_fine_cents + court_fee_cents + surcharge_cents
+      # Surcharge is computed on base_fine ONLY (not on the court fee). Pinned
+      # evaluation order: surcharge is rounded BEFORE adding the integer court fee,
+      # so the court fee never sits inside the rounding boundary.
+    input_set: "All CitationCharge rows under the citation (no status filter; charges immutable after creation)"
+    constants: {}
+    precision: "cents; round_half_up on the surcharge term only; other terms are exact integer cents"
+
+  - name: citation_balance
+    trigger: "Any Payment post, late penalty, collections fee, school fee, dismissal"
+    algorithm: chronological
+    formula: |
+      amount_paid_cents = sum(p.amount_cents for p in Payment
+                              where p.citation_id == citation.id and p.status == POSTED)
+      balance_cents = assessed_total_cents + penalty_cents - amount_paid_cents
+      # Chronological running accumulator over POSTED payments (posted_at ASC). This
+      # is the AUTHORITATIVE balance the citation displays and pays down. Dismissal
+      # forces balance_cents = 0 directly (charges vacated).
+    input_set: "POSTED payments only; REVERSED payments excluded"
+    constants: {}
+    precision: "integer cents"
+
+  - name: installment_schedule
+    trigger: "InstallmentPlan create (activation)"
+    algorithm: waterfall_allocation
+    formula: |
+      principal_cents = citation.balance_cents (snapshot at activation) + jurisdiction.installment_setup_fee_cents
+      base = floor(principal_cents / term_count)
+      remainder = principal_cents - (base * term_count)
+      # Forward-looking schedule: each of the first (term_count-1) installments is `base`;
+      # the FINAL installment absorbs the entire remainder (base + remainder), NOT spread.
+      installment_cents = base
+      for seq in 1..term_count:
+        amount = base + (remainder if seq == term_count else 0)
+        due_at = first_due_at + (seq-1) months
+      # Rejection: if base < jurisdiction.min_installment_cents -> ERR_INSTALLMENT_TOO_SMALL
+    input_set: "Single citation; balance_cents snapshot at activation"
+    constants: {}
+    precision: "integer cents; floor on the per-installment base; remainder to the final installment"
+    variants:
+      - name: schedule_balance
+        when: "Displayed plan schedule (sum of scheduled Installment.amount_cents)"
+        difference: "Forward-looking: equals principal_cents exactly by construction (base*(n-1) + base + remainder)."
+      - name: applied_balance
+        when: "Citation.balance_cents after real payments post against installments"
+        difference: "Chronological: reflects only POSTED payments; diverges from the schedule when an installment is missed or partially paid. The schedule never mutates; the citation balance does."
+
+  - name: driver_point_balance
+    trigger: "PointLedgerEntry posted (UPHELD), masked (school completion), or on-demand re-evaluation"
+    algorithm: threshold
+    formula: |
+      window_start = now - jurisdiction.point_window_months months
+      active = [e for e in PointLedgerEntry
+                where e.driver_id == driver.id and e.state == ACTIVE
+                and e.effective_at >= window_start]
+      point_balance = sum(e.points for e in active)
+      # Suspension boundary is INCLUSIVE (>=):
+      if point_balance >= jurisdiction.point_suspension_threshold:
+        open a POINT_SUSPENSION LicenseHold if none OPEN -> Driver.license_status = SUSPENDED
+      else:
+        any OPEN POINT_SUSPENSION hold becomes releasable
+    input_set: "ACTIVE PointLedgerEntry within the rolling window; MASKED entries excluded"
+    constants: {}
+    precision: "integer points; threshold comparison uses >= (threshold value suspends; threshold-1 does not)"
+
+  - name: point_reduction
+    trigger: "TrafficSchoolEnrollment complete (ENROLLED -> COMPLETED)"
+    algorithm: aggregation
+    formula: |
+      candidate = sum(e.points for e in PointLedgerEntry
+                      where e.citation_id == enrollment.citation_id and e.state == ACTIVE)
+      points_reduced = min(enrollment.eligible_points, candidate)
+      # Mask `points_reduced` worth of this citation's ACTIVE entries (flip ACTIVE -> MASKED).
+      # If candidate == 0 (no points posted yet — e.g. citation paid without contest),
+      # points_reduced = 0 and nothing is masked.
+    input_set: "ACTIVE PointLedgerEntry rows for the enrollment's citation"
+    constants: {}
+    precision: "integer points"
+
+  - name: collections_fee
+    trigger: "CollectionsReferral create (citation aged past collections_age_days, unresolved)"
+    algorithm: threshold
+    formula: |
+      age_days = floor((now - citation.appear_by) / 86400 seconds)
+      eligible = age_days >= jurisdiction.collections_age_days
+                 and citation.disposition == OPEN
+                 and citation.balance_cents > 0
+      # Boundary: age_days strictly >= collections_age_days (day N refers; day N-1 does not).
+      outstanding_at_referral_cents = citation.balance_cents
+      collections_fee_cents = round_half_up(outstanding_at_referral_cents * jurisdiction.collections_fee_pct)
+      # Side effect: citation.penalty_cents += collections_fee_cents (once; collections_referred guard),
+      # then balance_cents recomputed via citation_balance.
+    input_set: "Single citation; balance snapshot at referral"
+    constants: {}
+    precision: "cents; round_half_up on the fee term"
+
+  - name: license_status
+    trigger: "Any LicenseHold open/release; recomputed on demand"
+    algorithm: aggregation
+    formula: |
+      open_holds = [h for h in LicenseHold where h.driver_id == driver.id and h.status == OPEN]
+      if any(h.hold_type == POINT_SUSPENSION for h in open_holds): license_status = SUSPENDED
+      elif len(open_holds) > 0: license_status = HELD
+      else: license_status = VALID
+      # SUSPENDED outranks HELD: a point suspension dominates a nonpayment/FTA hold.
+    input_set: "OPEN LicenseHold rows for the driver"
+    constants: {}
+    precision: "enum"
+
+# =============================================================================
+# Table 4: Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and valid"
+    error_id: ERR_MISSING_AUTH
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Role permitted for this endpoint per §1.7"
+    error_id: ERR_FORBIDDEN_FOR_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "Path resources exist, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all resource endpoints
+
+  - priority: 4
+    category: business_referential
+    check: "Driver acting on a citation/plan/enrollment must own it (X-User-ID == Citation.driver_id)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Driver-initiated payment, plan, contest, enrollment, cancel endpoints"
+
+  - priority: 5
+    category: state
+    check: "Target resource in correct state for the transition (financial_status / adjudication_status / plan status / hold status)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: all state transition endpoints
+
+  - priority: 6
+    category: business_temporal
+    check: "Time-gated transitions require the server clock to have crossed the relevant deadline"
+    error_id: ERR_NOT_YET_LATE
+    http_status: 409
+    applies_to: "apply-late-penalty, fail-to-appear, mark-default, enrollment fail"
+
+  - priority: 7
+    category: business_safety
+    check: "A LicenseHold may not be released while its release condition is unmet (citation not CLOSED, or point_balance still >= threshold); warrant may not be quashed while its condition is unmet"
+    error_id: ERR_HOLD_CONDITION_UNMET
+    http_status: 409
+    applies_to: "license-hold release, warrant quash"
+
+  - priority: 8
+    category: business_constraint
+    check: "Traffic-school eligibility: citation charge points total <= school_eligible_max_points, no prior completion within school_cooldown_months, citation not VOID, adjudication_status != CONTESTED/DISMISSED"
+    error_id: ERR_SCHOOL_INELIGIBLE
+    http_status: 409
+    applies_to: "POST enrollments (create)"
+
+  - priority: 9
+    category: business_constraint
+    check: "School completion attempted after completion_due_at"
+    error_id: ERR_SCHOOL_DEADLINE_PASSED
+    http_status: 409
+    applies_to: "enrollment complete"
+
+  - priority: 10
+    category: business_constraint
+    check: "School completion requires the fine to be fully PAID first"
+    error_id: ERR_FINE_UNPAID
+    http_status: 409
+    applies_to: "enrollment complete"
+
+  - priority: 11
+    category: business_constraint
+    check: "Installment term_count in [2,12] and computed per-installment base >= jurisdiction.min_installment_cents"
+    error_id: ERR_INSTALLMENT_TOO_SMALL
+    http_status: 409
+    applies_to: "POST installment-plans"
+
+  - priority: 12
+    category: business_fiscal
+    check: "Payment.amount_cents must be > 0 and <= citation.balance_cents (no overpayment)"
+    error_id: ERR_OVERPAYMENT
+    http_status: 409
+    applies_to: "POST payments"
+
+  - priority: 13
+    category: business_referential
+    check: "Voiding a citation requires no POSTED payment; cancelling a plan requires no POSTED payment on its installments"
+    error_id: ERR_HAS_PAYMENTS
+    http_status: 409
+    applies_to: "citation void, plan cancel"
+
+  - priority: 14
+    category: business_constraint
+    check: "Citation must have >=1 CitationCharge before assessment"
+    error_id: ERR_NO_CHARGES
+    http_status: 409
+    applies_to: "citation assess"
+
+  - priority: 15
+    category: business_temporal
+    check: "ContestRequest hearing_at must be in the future relative to the server clock"
+    error_id: ERR_INVALID_HEARING_DATE
+    http_status: 409
+    applies_to: "contest-request schedule"
+
+  - priority: 16
+    category: business_constraint
+    check: "A ContestRequest may not exceed 2 granted continuances"
+    error_id: ERR_CONTINUANCE_LIMIT
+    http_status: 409
+    applies_to: "contest-request continue"
+
+  - priority: 17
+    category: business_constraint
+    check: "Late penalty / collections fee may each be applied at most once (guards)"
+    error_id: ERR_PENALTY_ALREADY_APPLIED
+    http_status: 409
+    applies_to: "apply-late-penalty, collections referral"
+
+  - priority: 18
+    category: business_constraint
+    check: "A second ContestRequest on a citation already CONTESTED/DISMISSED/UPHELD is rejected"
+    error_id: ERR_ALREADY_CONTESTED
+    http_status: 409
+    applies_to: "POST contest-requests"
+
+  - priority: 19
+    category: business_constraint
+    check: "Collections referral requires the citation aged >= collections_age_days past appear_by, disposition OPEN, balance_cents > 0"
+    error_id: ERR_NOT_YET_LATE
+    http_status: 409
+    applies_to: "POST collections-referrals"
+
+  - priority: 20
+    category: existence
+    check: "Request body well-formed: required fields present, enum values valid, numeric fields non-negative where required, and citation_number/license_number unique within jurisdiction. Logically evaluated right after auth (before resource existence) but listed last to keep priority handles stable."
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST/PATCH endpoints with a request body"
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# Table 5: API Endpoint Table  (flat topology)
+# =============================================================================
+endpoints:
+  # --- Test-driving clock ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server clock for deterministic time-gated tests"
+    roles: [CourtClerk, DmvAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["Server clock advanced to the given instant"]
+
+  # --- Jurisdiction ---
+  - method: POST
+    path: "/jurisdictions"
+    description: "Create a jurisdiction with its fee schedule and thresholds"
+    roles: [CourtClerk, DmvAdmin]
+    code: 201
+    input: [name, state_code, base_court_fee_cents, surcharge_pct, late_penalty_cents, installment_setup_fee_cents, min_installment_cents, "collections_age_days?", collections_fee_pct, traffic_school_fee_cents, "school_eligible_max_points?", "school_cooldown_months?", "point_suspension_threshold?", "point_window_months?"]
+    output: Jurisdiction
+    side_effects: []
+
+  - method: GET
+    path: "/jurisdictions/{jid}"
+    description: "Get a jurisdiction"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: Jurisdiction
+    side_effects: []
+
+  # --- Driver ---
+  - method: POST
+    path: "/drivers"
+    description: "Register a driver in a jurisdiction"
+    roles: [CourtClerk, DmvAdmin]
+    code: 201
+    input: [jurisdiction_id, license_number, full_name]
+    output: Driver
+    side_effects: ["license_status=VALID, point_balance=0, fta_warrant_active=false"]
+
+  - method: GET
+    path: "/drivers/{did}"
+    description: "Get a driver (license_status, point_balance, fta_warrant_active computed)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: Driver
+    side_effects: []
+
+  - method: GET
+    path: "/drivers"
+    description: "List/filter drivers (reverse-reachability for Driver.jurisdiction_id)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: ["jurisdiction_id?", "license_number?"]
+    output: "Driver[]"
+    side_effects: []
+
+  # --- Citation ---
+  - method: POST
+    path: "/citations"
+    description: "Create a draft citation"
+    roles: [CourtClerk]
+    code: 201
+    input: [driver_id, citation_number, issued_at, appear_by]
+    output: Citation
+    side_effects: ["financial_status=DRAFT, adjudication_status=NONE, disposition=OPEN, version=1"]
+
+  - method: GET
+    path: "/citations/{cid}"
+    description: "Look up a citation (computed balance and statuses)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: Citation
+    side_effects: []
+
+  - method: GET
+    path: "/citations"
+    description: "List/look up citations (reverse-reachability for Citation.driver_id)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: ["driver_id?", "citation_number?", "financial_status?"]
+    output: "Citation[]"
+    side_effects: []
+
+  - method: POST
+    path: "/citations/{cid}/assess"
+    description: "Freeze the statutory total and move DRAFT -> ASSESSED"
+    roles: [CourtClerk]
+    code: 200
+    input: []
+    output: Citation
+    side_effects: ["Compute assessed_total_cents (calc assessed_total); balance_cents=assessed_total_cents; financial_status=ASSESSED; version+1"]
+
+  - method: POST
+    path: "/citations/{cid}/void"
+    description: "Void a citation (DRAFT or ASSESSED, no payments)"
+    roles: [CourtClerk]
+    code: 200
+    input: []
+    output: Citation
+    side_effects: ["financial_status=VOID; disposition=CLOSED; cascade release holds / quash warrants; version+1"]
+
+  - method: POST
+    path: "/citations/{cid}/apply-late-penalty"
+    description: "Apply the flat late penalty after appear_by (clock-gated)"
+    roles: [CourtClerk]
+    code: 200
+    input: []
+    output: Citation
+    side_effects: ["penalty_cents += late_penalty_cents; late_penalty_applied=true; recompute balance; open NONPAYMENT_HOLD; version+1"]
+
+  # --- CitationCharge ---
+  - method: POST
+    path: "/charges"
+    description: "Add a charge (violation line item) to a draft citation"
+    roles: [CourtClerk]
+    code: 201
+    input: [citation_id, violation_code, description, base_fine_cents, points]
+    output: CitationCharge
+    side_effects: ["Recompute Citation.base_fine_cents"]
+
+  - method: GET
+    path: "/charges/{chid}"
+    description: "Get a charge"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: CitationCharge
+    side_effects: []
+
+  - method: GET
+    path: "/charges"
+    description: "List charges (reverse-reachability for CitationCharge.citation_id)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: ["citation_id?"]
+    output: "CitationCharge[]"
+    side_effects: []
+
+  # --- Payment ---
+  - method: POST
+    path: "/citations/{cid}/payments"
+    description: "Post a payment against the citation (optionally against an installment)"
+    roles: [Driver, CourtClerk]
+    code: 201
+    input: [amount_cents, method, "installment_id?"]
+    output: Payment
+    side_effects: ["status=POSTED; recompute amount_paid_cents/balance_cents (calc citation_balance); advance financial_status; cascade on PAID (release holds, quash warrants, complete plan); version+1"]
+
+  - method: GET
+    path: "/payments/{pid}"
+    description: "Get a payment"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+
+  - method: GET
+    path: "/payments"
+    description: "List payments (reverse-reachability for Payment.citation_id)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: ["citation_id?", "installment_id?"]
+    output: "Payment[]"
+    side_effects: []
+
+  # --- Installment plan ---
+  - method: POST
+    path: "/citations/{cid}/installment-plans"
+    description: "Create (and activate) an installment plan; supersedes a prior ACTIVE plan (OCC on Citation.version)"
+    roles: [Driver, CourtClerk]
+    code: 201
+    input: [term_count, first_due_at, expected_citation_version]
+    output: InstallmentPlan
+    side_effects: ["Freeze principal_cents & build schedule (calc installment_schedule); status=ACTIVE; supersede prior ACTIVE plan; increments Citation.version by 1"]
+
+  - method: GET
+    path: "/installment-plans/{pid}"
+    description: "Get an installment plan"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: InstallmentPlan
+    side_effects: []
+
+  - method: GET
+    path: "/installment-plans"
+    description: "List installment plans (reverse-reachability for InstallmentPlan.citation_id)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: ["citation_id?", "status?"]
+    output: "InstallmentPlan[]"
+    side_effects: []
+
+  - method: POST
+    path: "/installment-plans/{pid}/mark-default"
+    description: "Mark an installment plan DEFAULTED after a missed due date (clock-gated)"
+    roles: [CourtClerk]
+    code: 200
+    input: []
+    output: InstallmentPlan
+    side_effects: ["status=DEFAULTED; past-due Installments -> MISSED; cascade open NONPAYMENT_HOLD"]
+
+  - method: POST
+    path: "/installment-plans/{pid}/cancel"
+    description: "Cancel an active installment plan (no payments allocated to it)"
+    roles: [Driver, CourtClerk]
+    code: 200
+    input: []
+    output: InstallmentPlan
+    side_effects: ["status=CANCELLED; SCHEDULED Installments -> MISSED"]
+
+  # --- Installment ---
+  - method: GET
+    path: "/installments/{iid}"
+    description: "Get an installment"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: Installment
+    side_effects: []
+
+  - method: GET
+    path: "/installments"
+    description: "List installments (reverse-reachability for Installment.installment_plan_id)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: ["installment_plan_id?"]
+    output: "Installment[]"
+    side_effects: []
+
+  # --- Contest / hearing ---
+  - method: POST
+    path: "/citations/{cid}/contest-requests"
+    description: "Driver files a contest; sets Citation.adjudication_status=CONTESTED"
+    roles: [Driver]
+    code: 201
+    input: [grounds]
+    output: ContestRequest
+    side_effects: ["status=REQUESTED; Citation.adjudication_status=CONTESTED"]
+
+  - method: GET
+    path: "/contest-requests/{rid}"
+    description: "Get a contest request"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: ContestRequest
+    side_effects: []
+
+  - method: GET
+    path: "/contest-requests"
+    description: "List contest requests (reverse-reachability for ContestRequest.citation_id)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: ["citation_id?"]
+    output: "ContestRequest[]"
+    side_effects: []
+
+  - method: POST
+    path: "/contest-requests/{rid}/schedule"
+    description: "Schedule (or re-schedule from CONTINUANCE) a hearing"
+    roles: [CourtClerk]
+    code: 200
+    input: [hearing_at]
+    output: ContestRequest
+    side_effects: ["status=HEARING_SET; set hearing_at"]
+
+  - method: POST
+    path: "/contest-requests/{rid}/continue"
+    description: "Grant a continuance (cyclic; max 2)"
+    roles: [HearingOfficer]
+    code: 200
+    input: []
+    output: ContestRequest
+    side_effects: ["continuance_count+1; status=CONTINUANCE; clear hearing_at"]
+
+  - method: POST
+    path: "/contest-requests/{rid}/decide"
+    description: "Hearing officer rules DISMISS or UPHOLD"
+    roles: [HearingOfficer]
+    code: 200
+    input: [verdict]
+    output: ContestRequest
+    side_effects: ["DISMISS: adjudication_status=DISMISSED, balance->0, release holds, quash warrants. UPHOLD: adjudication_status=UPHELD, post PointLedgerEntry per charge, re-evaluate point suspension"]
+
+  - method: POST
+    path: "/contest-requests/{rid}/fail-to-appear"
+    description: "Record failure to appear after hearing_at (clock-gated); creates warrant + FTA hold"
+    roles: [CourtClerk]
+    code: 200
+    input: []
+    output: ContestRequest
+    side_effects: ["status=FTA; create ACTIVE Warrant(FTA_HEARING); cascade open FTA_HOLD"]
+
+  # --- Traffic school ---
+  - method: POST
+    path: "/citations/{cid}/enrollments"
+    description: "Enroll in traffic school (eligibility checked); adds traffic_school_fee to the citation"
+    roles: [Driver, CourtClerk]
+    code: 201
+    input: [completion_due_at]
+    output: TrafficSchoolEnrollment
+    side_effects: ["status=ENROLLED; freeze eligible_points; penalty_cents += traffic_school_fee_cents; recompute balance; version+1"]
+
+  - method: GET
+    path: "/enrollments/{eid}"
+    description: "Get a traffic-school enrollment"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: TrafficSchoolEnrollment
+    side_effects: []
+
+  - method: GET
+    path: "/enrollments"
+    description: "List enrollments (reverse-reachability for TrafficSchoolEnrollment.citation_id and .driver_id)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: ["citation_id?", "driver_id?"]
+    output: "TrafficSchoolEnrollment[]"
+    side_effects: []
+
+  - method: POST
+    path: "/enrollments/{eid}/complete"
+    description: "Mark course completed; masks citation points (point reduction)"
+    roles: [CourtClerk]
+    code: 200
+    input: []
+    output: TrafficSchoolEnrollment
+    side_effects: ["status=COMPLETED; freeze points_reduced (calc point_reduction); mask PointLedgerEntry rows; re-evaluate point suspension; possibly release POINT_SUSPENSION hold"]
+
+  - method: POST
+    path: "/enrollments/{eid}/fail"
+    description: "Mark course failed after completion_due_at (clock-gated)"
+    roles: [CourtClerk]
+    code: 200
+    input: []
+    output: TrafficSchoolEnrollment
+    side_effects: ["status=FAILED"]
+
+  # --- Collections ---
+  - method: POST
+    path: "/citations/{cid}/collections-referrals"
+    description: "Refer an aged unpaid citation to collections; adds collections fee (clock-gated)"
+    roles: [CourtClerk]
+    code: 201
+    input: []
+    output: CollectionsReferral
+    side_effects: ["status=REFERRED; freeze outstanding_at_referral_cents; collections_fee_cents (calc collections_fee); penalty_cents += fee; collections_referred=true; recompute balance; version+1"]
+
+  - method: GET
+    path: "/collections-referrals/{crid}"
+    description: "Get a collections referral"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: CollectionsReferral
+    side_effects: []
+
+  - method: GET
+    path: "/collections-referrals"
+    description: "List collections referrals (reverse-reachability for CollectionsReferral.citation_id)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: ["citation_id?"]
+    output: "CollectionsReferral[]"
+    side_effects: []
+
+  # --- License holds (DMV) ---
+  - method: GET
+    path: "/license-holds/{hid}"
+    description: "Get a license hold"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: LicenseHold
+    side_effects: []
+
+  - method: GET
+    path: "/license-holds"
+    description: "List license holds (reverse-reachability for LicenseHold.driver_id and .citation_id)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: ["driver_id?", "citation_id?", "status?"]
+    output: "LicenseHold[]"
+    side_effects: []
+
+  - method: POST
+    path: "/license-holds/{hid}/release"
+    description: "DMV releases a hold once its condition is met"
+    roles: [DmvAdmin]
+    code: 200
+    input: []
+    output: LicenseHold
+    side_effects: ["status=RELEASED; set released_at; Driver.license_status re-derived"]
+
+  # --- Warrants ---
+  - method: GET
+    path: "/warrants/{wid}"
+    description: "Get a warrant"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: Warrant
+    side_effects: []
+
+  - method: GET
+    path: "/warrants"
+    description: "List warrants (reverse-reachability for Warrant.citation_id and .driver_id)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: ["citation_id?", "driver_id?", "status?"]
+    output: "Warrant[]"
+    side_effects: []
+
+  - method: POST
+    path: "/warrants/{wid}/quash"
+    description: "Quash a warrant once its condition is met"
+    roles: [CourtClerk]
+    code: 200
+    input: []
+    output: Warrant
+    side_effects: ["status=QUASHED; set quashed_at; Driver.fta_warrant_active re-derived"]
+
+  # --- Point ledger (DMV) ---
+  - method: GET
+    path: "/point-ledger/{pleid}"
+    description: "Get a point ledger entry"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: []
+    output: PointLedgerEntry
+    side_effects: []
+
+  - method: GET
+    path: "/point-ledger"
+    description: "List point ledger entries (reverse-reachability for PointLedgerEntry.driver_id and .citation_id)"
+    roles: [CourtClerk, DmvAdmin, HearingOfficer, Driver]
+    code: 200
+    input: ["driver_id?", "citation_id?", "state?"]
+    output: "PointLedgerEntry[]"
+    side_effects: []
+
+# =============================================================================
+# Table 6: Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_MISSING_AUTH
+    http: 401
+    condition: "X-User-ID or X-User-Role header missing or malformed"
+  - id: ERR_FORBIDDEN_FOR_ROLE
+    http: 403
+    condition: "Caller role not permitted for this endpoint"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Driver acting on a citation/plan/enrollment they do not own"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Path resource does not exist"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Resource not in a valid state for the requested transition"
+  - id: ERR_NO_CHARGES
+    http: 409
+    condition: "Assessment attempted on a citation with zero charges"
+  - id: ERR_OVERPAYMENT
+    http: 409
+    condition: "Payment amount is <= 0 or exceeds the citation balance"
+  - id: ERR_HAS_PAYMENTS
+    http: 409
+    condition: "Void/cancel blocked because POSTED payments exist"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_citation_version does not match Citation.version (OCC, plan supersede)"
+  - id: ERR_NOT_YET_LATE
+    http: 409
+    condition: "Time-gated action attempted before its deadline (appear_by / hearing_at / due_at / completion_due_at / collections age)"
+  - id: ERR_PENALTY_ALREADY_APPLIED
+    http: 409
+    condition: "Late penalty or collections fee already applied to this citation"
+  - id: ERR_INVALID_HEARING_DATE
+    http: 409
+    condition: "Requested hearing_at is not in the future"
+  - id: ERR_CONTINUANCE_LIMIT
+    http: 409
+    condition: "More than 2 continuances requested on a contest"
+  - id: ERR_ALREADY_CONTESTED
+    http: 409
+    condition: "A contest already exists / citation already adjudicated"
+  - id: ERR_SCHOOL_INELIGIBLE
+    http: 409
+    condition: "Citation points exceed school cap, cooldown not elapsed, or citation contested/void"
+  - id: ERR_FINE_UNPAID
+    http: 409
+    condition: "School completion attempted before the fine is fully PAID"
+  - id: ERR_SCHOOL_DEADLINE_PASSED
+    http: 409
+    condition: "School completion attempted after completion_due_at"
+  - id: ERR_INSTALLMENT_TOO_SMALL
+    http: 409
+    condition: "Computed per-installment base below min_installment_cents, or term_count out of [2,12]"
+  - id: ERR_HOLD_CONDITION_UNMET
+    http: 409
+    condition: "License-hold release or warrant quash attempted while the underlying condition is unmet"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Malformed body, missing required field, bad enum, or duplicate citation_number/license_number"
+
+# =============================================================================
+# Table 7: RBAC Matrix
+# =============================================================================
+roles:
+  - name: Driver
+    description: "A licensed driver acting on their own citations: lookup, pay, request installment plan, file contest, enroll in traffic school, cancel own plan"
+    identity: "entity_backed:Driver"
+    exclusive_operations:
+      - "POST /citations/{cid}/contest-requests — File a contest"
+    shared_operations:
+      - "POST /citations/{cid}/payments — Pay (shared with CourtClerk)"
+      - "POST /citations/{cid}/installment-plans — Request plan (shared with CourtClerk)"
+      - "POST /installment-plans/{pid}/cancel — Cancel own plan (shared with CourtClerk)"
+      - "POST /citations/{cid}/enrollments — Enroll in school (shared with CourtClerk)"
+      - "GET read endpoints (jurisdiction, driver, citation, charge, payment, plan, installment, enrollment, contest, hold, warrant, point-ledger, collections-referral)"
+
+  - name: CourtClerk
+    description: "Court operations: create jurisdictions/drivers/citations/charges, assess, void, apply late penalty, schedule hearings, mark FTA, refer collections, mark plan default, complete/fail school, quash warrants, set clock"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /citations — Create citation"
+      - "POST /charges — Add charge"
+      - "POST /citations/{cid}/assess — Assess"
+      - "POST /citations/{cid}/void — Void"
+      - "POST /citations/{cid}/apply-late-penalty — Apply late penalty"
+      - "POST /contest-requests/{rid}/schedule — Schedule hearing"
+      - "POST /contest-requests/{rid}/fail-to-appear — Record FTA"
+      - "POST /installment-plans/{pid}/mark-default — Default a plan"
+      - "POST /citations/{cid}/collections-referrals — Refer to collections"
+      - "POST /enrollments/{eid}/complete — Complete school"
+      - "POST /enrollments/{eid}/fail — Fail school"
+      - "POST /warrants/{wid}/quash — Quash warrant"
+    shared_operations:
+      - "POST /jurisdictions — Create jurisdiction (shared with DmvAdmin)"
+      - "POST /drivers — Register driver (shared with DmvAdmin)"
+      - "POST /_clock/set_current_utc — Set clock (shared with DmvAdmin)"
+      - "POST /citations/{cid}/payments — Pay on behalf of driver (shared with Driver)"
+      - "POST /citations/{cid}/installment-plans — Create plan (shared with Driver)"
+      - "POST /installment-plans/{pid}/cancel — Cancel plan (shared with Driver)"
+      - "POST /citations/{cid}/enrollments — Enroll (shared with Driver)"
+      - "GET read endpoints"
+
+  - name: HearingOfficer
+    description: "Adjudicates contests: grant continuances, decide dismiss/uphold"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /contest-requests/{rid}/continue — Grant continuance"
+      - "POST /contest-requests/{rid}/decide — Decide dismiss/uphold"
+    shared_operations:
+      - "GET read endpoints"
+
+  - name: DmvAdmin
+    description: "DMV operations: register drivers, release license holds, view point ledger; create jurisdictions; set clock"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /license-holds/{hid}/release — Release license hold"
+    shared_operations:
+      - "POST /jurisdictions — Create jurisdiction (shared with CourtClerk)"
+      - "POST /drivers — Register driver (shared with CourtClerk)"
+      - "POST /_clock/set_current_utc — Set clock (shared with CourtClerk)"
+      - "GET read endpoints"

@@ -1,0 +1,1625 @@
+scenario: "Catering Order & Event Management: menu/package per headcount, lead-time/order cutoff, dietary & allergen counts, delivery/setup/staffing add-on, deposit & final-count guarantee, tax/gratuity/service fee, change/cancellation window, multi-stop"
+domain_name: "catering-event-management"
+api_prefix: "/catering"
+
+complexity_profile:
+  primary_archetype: "Pricing engine"
+  secondary_archetype: "Ledger reconciliation"
+  complexity_layers:
+    - dual_variant_calculation        # provisional (booked headcount) vs final (guaranteed-count) invoice; deposit-credited cancellation refund vs forfeit
+    - cascading_side_effects          # confirm order -> lock package version + reserve staffing pool + create delivery legs + debit client deposit ledger
+    - rate_threshold_triggers         # lead-time/cutoff breakpoints, gratuity-included tiers, final-count guarantee floor, cancellation-window refund tiers
+    - optimistic_concurrency          # CREATE-with-supersede of a change-request quote against a stale Order.version
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (Order, EventPackage, AddOnLine, DeliveryLeg,
+  # ChangeRequest, DepositLedgerEntry, StaffingReservation, Client, Venue, ServiceRoute).
+  # No nesting of business resources inside URL paths beyond the standard
+  # /<collection>/{id}/<action> action segments. Cross-entity references are FK fields,
+  # not parent/child URL trees.
+
+  state_machine_shape: parallel
+  # An Order carries TWO independent state dimensions that evolve on the same row:
+  #   lifecycle_status  (DRAFT -> CONFIRMED -> GUARANTEED -> FULFILLED, plus CANCELLED)
+  #   settlement_status (UNBILLED -> DEPOSIT_HELD -> INVOICED -> SETTLED, plus REFUNDED/FORFEITED)
+  # ChangeRequest is cyclic (PROPOSED -> COUNTERED -> PROPOSED revision loop -> ACCEPTED/REJECTED).
+  # ServiceRoute is compound (route posture derived from its DeliveryLeg children).
+
+  relationship_patterns:
+    - one_to_many        # Order has many AddOnLine, DeliveryLeg, ChangeRequest, DepositLedgerEntry
+    - cross_aggregate    # Order references Client, EventPackage, Venue, ServiceRoute across aggregate boundaries
+    - self_referential   # DeliveryLeg.preceding_leg_id chains the legs of a multi-stop route into an ordered linked list
+
+  role_model: peer_roles
+  # CateringAdmin owns packages/venues/routes/clock (operator surface);
+  # Client owns its own Orders and ChangeRequests (entity_backed);
+  # SalesCoordinator confirms/guarantees/invoices orders and reviews change requests;
+  # EventCaptain marks fulfillment and dispatches delivery legs.
+
+  consistency_model: immediate
+  # Every mutation is atomic within its request. Derived fields (order totals,
+  # deposit balance, route posture, package-version lock) are recomputed inside the
+  # same request that triggers them; no asynchronous reconciliation.
+
+# ---------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: Client
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation including cascaded side effects."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; increments by 1 on every mutation."
+      - name: company_name
+        type: string
+        source: input
+        description: "Client organization name."
+      - name: billing_email
+        type: string
+        source: input
+        description: "Email used on invoices; must be unique across active Clients."
+        constraints: "unique among Client rows whose status IN {ACTIVE}"
+      - name: tax_exempt
+        type: boolean
+        source: input
+        description: "When true, sales tax is not levied on this Client's orders."
+        default: false
+      - name: gratuity_policy
+        type: enum
+        source: input
+        description: "Whether gratuity is auto-applied (INCLUDED) or left to the client (OPTIONAL)."
+        default: "INCLUDED"
+        constraints: "enum: INCLUDED | OPTIONAL"
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle of the client account."
+        default: "ACTIVE"
+        constraints: "enum: ACTIVE | SUSPENDED"
+
+  - name: EventPackage
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; increments by 1 on every mutation. This is the package's catalog version, snapshotted onto an Order at confirmation."
+      - name: name
+        type: string
+        source: input
+        description: "Menu package display name."
+      - name: per_head_cents
+        type: integer
+        source: input
+        description: "Base price per guest in integer cents at the smallest tier (before volume tiering)."
+        constraints: ">= 0"
+      - name: min_headcount
+        type: integer
+        source: input
+        description: "Minimum guests this package may be ordered for."
+        constraints: ">= 1"
+      - name: lead_time_hours
+        type: integer
+        source: input
+        description: "Minimum hours between order-confirmation time and event_start that this package requires."
+        constraints: ">= 0"
+      - name: volume_tiers
+        type: array
+        source: input
+        description: "Ordered breakpoints [{min_headcount, per_head_cents}] giving a lower per-head rate above each headcount breakpoint. Evaluated as a step (marginal) schedule; see calc package_headcount_charge."
+        constraints: "each entry per_head_cents <= base per_head_cents; min_headcount strictly increasing"
+      - name: allergen_flags
+        type: array
+        source: input
+        description: "Allergens present in this package's menu, e.g. ['NUT','DAIRY','GLUTEN']. Used to validate dietary-count requests against capacity."
+        default: []
+      - name: status
+        type: enum
+        source: system
+        description: "Catalog availability."
+        default: "ACTIVE"
+        constraints: "enum: ACTIVE | RETIRED"
+
+  - name: Venue
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; increments by 1 on every mutation."
+      - name: name
+        type: string
+        source: input
+        description: "Venue display name."
+      - name: tax_rate_bps
+        type: integer
+        source: input
+        description: "Sales-tax rate in basis points for this venue's jurisdiction (e.g. 875 = 8.75%)."
+        constraints: ">= 0 and <= 2000"
+      - name: service_fee_bps
+        type: integer
+        source: input
+        description: "Service fee in basis points applied to the food+addon subtotal for events at this venue."
+        constraints: ">= 0 and <= 5000"
+      - name: max_overlapping_events
+        type: integer
+        source: input
+        description: "Maximum number of CONFIRMED-or-later non-cancelled Orders whose service window overlaps at this venue."
+        constraints: ">= 1"
+
+  - name: ServiceRoute
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation including cascaded child-driven recompute."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; increments by 1 on every mutation."
+      - name: route_date
+        type: datetime
+        source: input
+        description: "Calendar date (UTC midnight) this route runs; all legs scheduled on this route share this date."
+      - name: vehicle_capacity_legs
+        type: integer
+        source: input
+        description: "Maximum number of DeliveryLeg children that may be DISPATCHED on this route."
+        constraints: ">= 1"
+      - name: posture
+        type: enum
+        source: computed
+        description: "Derived from child DeliveryLeg states: OPEN while any leg PLANNED; ROLLING once any leg DISPATCHED and none FAILED; CLOSED once all legs DELIVERED; BLOCKED if any leg FAILED. See calc route_posture."
+        default: "OPEN"
+        constraints: "enum: OPEN | ROLLING | CLOSED | BLOCKED"
+      - name: dispatched_leg_count
+        type: integer
+        source: computed
+        description: "Count of child DeliveryLeg rows in state DISPATCHED or DELIVERED. Maintained on every leg transition."
+        default: 0
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits. Used as the deterministic tie-break for venue-overlap and route-dispatch ordering."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation including cascaded side effects."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; increments by 1 on every mutation. OCC anchor for change-request supersede."
+      - name: client_id
+        type: string
+        source: input
+        description: "FK -> Client.id; the client who owns this order."
+      - name: package_id
+        type: string
+        source: input
+        description: "FK -> EventPackage.id; the menu package ordered."
+      - name: venue_id
+        type: string
+        source: input
+        description: "FK -> Venue.id; where the event is held (tax/service-fee jurisdiction)."
+      - name: route_id
+        type: string
+        source: input
+        description: "FK -> ServiceRoute.id; the multi-stop route this order's delivery legs ride on. Null until a delivery leg is created."
+        default: null
+      - name: booked_headcount
+        type: integer
+        source: input
+        description: "Guest count at booking/confirmation time; drives the provisional charge."
+        constraints: ">= EventPackage.min_headcount"
+      - name: guaranteed_headcount
+        type: integer
+        source: input
+        description: "Final guaranteed guest count locked at the guarantee step; drives the final invoice. Null until GUARANTEED."
+        default: null
+      - name: event_start
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC start of the catered event."
+      - name: event_end
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC end of the catered event; must be after event_start."
+      - name: locked_package_version
+        type: integer
+        source: computed
+        description: "EventPackage.version snapshotted at confirmation; pins pricing against later catalog edits."
+        default: null
+      - name: dietary_counts
+        type: object
+        source: input
+        description: "Map of dietary tag -> guest count, e.g. {'VEGAN':10,'NUT_FREE':5}. Sum across tags must not exceed the order's effective headcount; see validation V13."
+        default: {}
+      - name: lifecycle_status
+        type: enum
+        source: system
+        description: "Provisioning dimension. Independent of settlement_status."
+        default: "DRAFT"
+        constraints: "enum: DRAFT | CONFIRMED | GUARANTEED | FULFILLED | CANCELLED"
+      - name: settlement_status
+        type: enum
+        source: system
+        description: "Money dimension. Evolves independently of lifecycle_status on the same row."
+        default: "UNBILLED"
+        constraints: "enum: UNBILLED | DEPOSIT_HELD | INVOICED | SETTLED | REFUNDED | FORFEITED"
+      - name: provisional_total_cents
+        type: integer
+        source: computed
+        description: "Estimated grand total computed at confirmation from booked_headcount; see calc order_grand_total (variant provisional)."
+        default: 0
+      - name: final_total_cents
+        type: integer
+        source: computed
+        description: "Invoiced grand total computed at invoicing from the guarantee floor; see calc order_grand_total (variant final). Null until INVOICED."
+        default: null
+      - name: deposit_due_cents
+        type: integer
+        source: computed
+        description: "Deposit required at confirmation; see calc deposit_amount."
+        default: 0
+
+  - name: AddOnLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits. Deterministic ordering key for add-on summation."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; increments by 1 on every mutation."
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; the order this add-on belongs to."
+      - name: kind
+        type: enum
+        source: input
+        description: "Add-on category."
+        constraints: "enum: DELIVERY | SETUP | STAFFING"
+      - name: unit_cents
+        type: integer
+        source: input
+        description: "Price per unit in integer cents."
+        constraints: ">= 0"
+      - name: quantity
+        type: integer
+        source: input
+        description: "For STAFFING this is the number of staff; for SETUP/DELIVERY the number of units."
+        constraints: ">= 1"
+      - name: per_head_scaled
+        type: boolean
+        source: input
+        description: "When true, the effective quantity is recomputed as ceil(effective_headcount / staff_ratio) at invoice time (staffing that scales with guests); when false, quantity is fixed."
+        default: false
+      - name: staff_ratio
+        type: integer
+        source: input
+        description: "Guests served per staff unit when per_head_scaled is true; ignored otherwise."
+        default: null
+        constraints: "when per_head_scaled true: >= 1"
+
+  - name: DeliveryLeg
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits. Deterministic dispatch ordering key within a route."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; increments by 1 on every mutation."
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; the order whose food this leg delivers."
+      - name: route_id
+        type: string
+        source: input
+        description: "FK -> ServiceRoute.id; the route this leg rides on."
+      - name: preceding_leg_id
+        type: string
+        source: input
+        description: "FK -> DeliveryLeg.id; the leg immediately before this one on the same route (null for the first stop). Forms the route's ordered linked list."
+        default: null
+      - name: window_start
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC earliest arrival at this stop."
+      - name: window_end
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC latest arrival at this stop; must be after window_start."
+      - name: stop_status
+        type: enum
+        source: system
+        description: "Leg lifecycle."
+        default: "PLANNED"
+        constraints: "enum: PLANNED | DISPATCHED | DELIVERED | FAILED"
+
+  - name: StaffingReservation
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; increments by 1 on every mutation."
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; the order that reserved staff."
+      - name: reserved_staff
+        type: integer
+        source: computed
+        description: "Number of staff reserved from the global pool when the order confirmed; equals the sum of STAFFING AddOnLine effective quantities at confirmation."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Whether the reservation is currently holding pool capacity."
+        default: "HELD"
+        constraints: "enum: HELD | RELEASED"
+
+  - name: ChangeRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; increments by 1 on every mutation."
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; the order this change targets."
+      - name: requested_headcount
+        type: integer
+        source: input
+        description: "New headcount the client proposes; recomputes provisional charge if accepted."
+        constraints: ">= EventPackage.min_headcount"
+      - name: requested_event_start
+        type: datetime
+        source: input
+        description: "New proposed event_start (may be unchanged from the order's current value)."
+      - name: counter_headcount
+        type: integer
+        source: input
+        description: "Headcount the coordinator counters with during negotiation; null until COUNTERED."
+        default: null
+      - name: change_fee_cents
+        type: integer
+        source: computed
+        description: "Fee assessed on acceptance based on how close to event_start the change lands; see calc change_fee."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Negotiation lifecycle (cyclic)."
+        default: "PROPOSED"
+        constraints: "enum: PROPOSED | COUNTERED | ACCEPTED | REJECTED"
+
+  - name: DepositLedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits. Append-only ordering key; balances replay in created_at ASC, id-independent."
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; the order whose deposit ledger this entry belongs to."
+      - name: entry_type
+        type: enum
+        source: input
+        description: "Ledger movement type."
+        constraints: "enum: DEPOSIT_HOLD | DEPOSIT_APPLY | REFUND | FORFEIT | CHANGE_FEE_DEBIT"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Signed integer cents: positive moves money toward the caterer (HOLD, FORFEIT, CHANGE_FEE_DEBIT), negative returns it to the client (REFUND, partial DEPOSIT_APPLY reversal). The running sum across an order's entries is its deposit balance."
+      - name: reason
+        type: string
+        source: input
+        description: "Human-readable note recorded with the movement."
+        default: ""
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: Order
+    dimension: lifecycle_status
+    initial_state: DRAFT
+    terminal_states: [FULFILLED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: CONFIRMED
+        trigger: "POST /catering/orders/{id}/confirm"
+        actor: SalesCoordinator
+        preconditions:
+          - "Order.lifecycle_status == DRAFT"
+          - "EventPackage.status == ACTIVE"
+          - "booked_headcount >= EventPackage.min_headcount"
+          - "(event_start - current_utc) >= EventPackage.lead_time_hours hours (lead-time/cutoff gate)"
+          - "count of non-CANCELLED Orders at this venue whose [event_start,event_end) overlaps < Venue.max_overlapping_events (this order excluded from the count)"
+        side_effects:
+          - "set locked_package_version = EventPackage.version (pins pricing)"
+          - "compute provisional_total_cents via calc order_grand_total variant=provisional"
+          - "compute deposit_due_cents via calc deposit_amount"
+          - "settlement_status: UNBILLED -> DEPOSIT_HELD (parallel dimension)"
+          - "append DepositLedgerEntry{entry_type:DEPOSIT_HOLD, amount_cents:+deposit_due_cents}"
+          - "create StaffingReservation{status:HELD, reserved_staff = sum of STAFFING AddOnLine effective quantities}; debit global staffing pool"
+          - "increments Order.version by 1"
+      - from: CONFIRMED
+        to: GUARANTEED
+        trigger: "POST /catering/orders/{id}/guarantee"
+        actor: SalesCoordinator
+        preconditions:
+          - "Order.lifecycle_status == CONFIRMED"
+          - "guaranteed_headcount provided and >= EventPackage.min_headcount"
+          - "no ChangeRequest for this order in status IN {PROPOSED, COUNTERED} (open negotiation blocks guarantee)"
+          - "current_utc < event_start (cannot guarantee a past event)"
+        side_effects:
+          - "set guaranteed_headcount from request body"
+          - "increments Order.version by 1"
+        note: "Final-count guarantee floor enforced at invoice, not here; see calc effective_headcount."
+      - from: GUARANTEED
+        to: FULFILLED
+        trigger: "POST /catering/orders/{id}/fulfill"
+        actor: EventCaptain
+        preconditions:
+          - "Order.lifecycle_status == GUARANTEED"
+          - "settlement_status == SETTLED (invoice must be paid before fulfillment closes)"
+          - "every DeliveryLeg for this order is in stop_status DELIVERED"
+        side_effects:
+          - "release StaffingReservation: status HELD -> RELEASED, credit reserved_staff back to global pool"
+          - "increments Order.version by 1"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /catering/orders/{id}/cancel"
+        actor: Client
+        preconditions:
+          - "Order.lifecycle_status == DRAFT"
+        side_effects:
+          - "increments Order.version by 1"
+        note: "DRAFT orders hold no deposit; settlement_status stays UNBILLED and no refund ledger entry is written."
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /catering/orders/{id}/cancel"
+        actor: Client
+        preconditions:
+          - "Order.lifecycle_status == CONFIRMED"
+        side_effects:
+          - "compute refund via calc cancellation_settlement (refund tier by hours-to-event)"
+          - "if refund_fraction > 0: settlement_status DEPOSIT_HELD -> REFUNDED; append DepositLedgerEntry{REFUND, amount_cents = -refunded_cents} and DepositLedgerEntry{FORFEIT, amount_cents = +forfeited_cents} when forfeited_cents>0"
+          - "if refund_fraction == 0: settlement_status DEPOSIT_HELD -> FORFEITED; append DepositLedgerEntry{FORFEIT, amount_cents = +deposit_due_cents}"
+          - "release StaffingReservation: status HELD -> RELEASED, credit reserved_staff back to global pool"
+          - "cascade: every PLANNED DeliveryLeg for this order -> FAILED (see DeliveryLeg machine); each FAILED leg recomputes its ServiceRoute.posture"
+          - "increments Order.version by 1"
+      - from: GUARANTEED
+        to: CANCELLED
+        trigger: "POST /catering/orders/{id}/cancel"
+        actor: Client
+        preconditions:
+          - "Order.lifecycle_status == GUARANTEED"
+          - "settlement_status != SETTLED (a settled order cannot be cancelled, only refunded by admin out of band)"
+        side_effects:
+          - "compute refund via calc cancellation_settlement"
+          - "settlement transitions and ledger entries identical to CONFIRMED->CANCELLED"
+          - "release StaffingReservation: status HELD -> RELEASED, credit reserved_staff back to global pool"
+          - "cascade: every PLANNED DeliveryLeg for this order -> FAILED; each recomputes its ServiceRoute.posture"
+          - "increments Order.version by 1"
+
+  - entity: Order
+    dimension: settlement_status
+    initial_state: UNBILLED
+    terminal_states: [SETTLED, REFUNDED, FORFEITED]
+    transitions:
+      - from: DEPOSIT_HELD
+        to: INVOICED
+        trigger: "POST /catering/orders/{id}/invoice"
+        actor: SalesCoordinator
+        preconditions:
+          - "Order.lifecycle_status == GUARANTEED"
+          - "settlement_status == DEPOSIT_HELD"
+        side_effects:
+          - "compute final_total_cents via calc order_grand_total variant=final (uses effective_headcount = max(guaranteed_headcount, guarantee floor))"
+          - "append DepositLedgerEntry{DEPOSIT_APPLY, amount_cents = -deposit_due_cents} (deposit credited toward invoice)"
+          - "increments Order.version by 1"
+      - from: INVOICED
+        to: SETTLED
+        trigger: "POST /catering/orders/{id}/settle"
+        actor: SalesCoordinator
+        preconditions:
+          - "settlement_status == INVOICED"
+          - "running deposit-ledger balance for this order == final_total_cents (full payment recorded)"
+        side_effects:
+          - "increments Order.version by 1"
+        note: "Settlement requires the client to have recorded payment via POST /catering/orders/{id}/payments so the ledger balance equals final_total_cents."
+      - from: UNBILLED
+        to: DEPOSIT_HELD
+        trigger: "system: Order CONFIRMED (lifecycle DRAFT->CONFIRMED)"
+        actor: system
+        preconditions:
+          - "lifecycle transition DRAFT->CONFIRMED succeeded"
+        side_effects:
+          - "see lifecycle DRAFT->CONFIRMED side_effects"
+        note: "Parallel-dimension coupling: this settlement transition fires as a side effect of the lifecycle confirm, never independently."
+
+  - entity: ChangeRequest
+    initial_state: PROPOSED
+    terminal_states: [ACCEPTED, REJECTED]
+    transitions:
+      - from: PROPOSED
+        to: COUNTERED
+        trigger: "POST /catering/change-requests/{id}/counter"
+        actor: SalesCoordinator
+        preconditions:
+          - "ChangeRequest.status == PROPOSED"
+          - "parent Order.lifecycle_status IN {CONFIRMED, GUARANTEED}"
+        side_effects:
+          - "set counter_headcount from request body"
+          - "increments ChangeRequest.version by 1"
+      - from: COUNTERED
+        to: PROPOSED
+        trigger: "POST /catering/change-requests/{id}/revise"
+        actor: Client
+        preconditions:
+          - "ChangeRequest.status == COUNTERED"
+        side_effects:
+          - "set requested_headcount from request body (client revises in response to counter)"
+          - "clear counter_headcount to null"
+          - "increments ChangeRequest.version by 1"
+        note: "Cyclic loop: PROPOSED -> COUNTERED -> PROPOSED may repeat any number of rounds."
+      - from: PROPOSED
+        to: ACCEPTED
+        trigger: "POST /catering/change-requests/{id}/accept"
+        actor: SalesCoordinator
+        preconditions:
+          - "ChangeRequest.status == PROPOSED"
+          - "parent Order.lifecycle_status IN {CONFIRMED, GUARANTEED}"
+          - "expected_order_version matches parent Order.version (OCC: the quote is computed against the order the client last saw)"
+          - "requested_headcount >= EventPackage.min_headcount"
+        side_effects:
+          - "compute change_fee_cents via calc change_fee"
+          - "set Order.booked_headcount = requested_headcount; set Order.event_start = requested_event_start"
+          - "recompute Order.provisional_total_cents via calc order_grand_total variant=provisional"
+          - "recompute Order.deposit_due_cents via calc deposit_amount; append DepositLedgerEntry{DEPOSIT_HOLD, amount_cents = +(new_deposit - old_deposit)} for the delta (may be negative)"
+          - "append DepositLedgerEntry{CHANGE_FEE_DEBIT, amount_cents = +change_fee_cents}"
+          - "cascade: if Order is GUARANTEED, revert Order.lifecycle_status GUARANTEED -> CONFIRMED (headcount changed, guarantee invalidated) and clear guaranteed_headcount; that revert itself bumps Order.version"
+          - "increments Order.version by 1 (in addition to any cascade bump)"
+          - "increments ChangeRequest.version by 1"
+      - from: COUNTERED
+        to: ACCEPTED
+        trigger: "POST /catering/change-requests/{id}/accept"
+        actor: Client
+        preconditions:
+          - "ChangeRequest.status == COUNTERED"
+          - "expected_order_version matches parent Order.version"
+        side_effects:
+          - "compute change_fee_cents via calc change_fee using counter_headcount as the effective new headcount"
+          - "set Order.booked_headcount = counter_headcount"
+          - "recompute provisional_total_cents, deposit_due_cents and append the same ledger deltas as PROPOSED->ACCEPTED"
+          - "cascade: if Order is GUARANTEED, revert to CONFIRMED and clear guaranteed_headcount"
+          - "increments Order.version (plus cascade bump) and ChangeRequest.version by 1"
+      - from: PROPOSED
+        to: REJECTED
+        trigger: "POST /catering/change-requests/{id}/reject"
+        actor: SalesCoordinator
+        preconditions:
+          - "ChangeRequest.status == PROPOSED"
+        side_effects:
+          - "increments ChangeRequest.version by 1"
+        note: "No order mutation; order keeps its current headcount and totals."
+      - from: COUNTERED
+        to: REJECTED
+        trigger: "POST /catering/change-requests/{id}/reject"
+        actor: Client
+        preconditions:
+          - "ChangeRequest.status == COUNTERED"
+        side_effects:
+          - "increments ChangeRequest.version by 1"
+
+  - entity: DeliveryLeg
+    initial_state: PLANNED
+    terminal_states: [DELIVERED, FAILED]
+    transitions:
+      - from: PLANNED
+        to: DISPATCHED
+        trigger: "POST /catering/delivery-legs/{id}/dispatch"
+        actor: EventCaptain
+        preconditions:
+          - "DeliveryLeg.stop_status == PLANNED"
+          - "parent Order.lifecycle_status == GUARANTEED (only guaranteed orders ship)"
+          - "preceding_leg_id is null OR the preceding leg's stop_status IN {DISPATCHED, DELIVERED} (legs dispatch in route order)"
+          - "ServiceRoute.dispatched_leg_count < ServiceRoute.vehicle_capacity_legs (vehicle not full)"
+          - "no other DeliveryLeg already DISPATCHED on this route whose [window_start,window_end] overlaps this leg's window inclusively at the endpoints (a single vehicle cannot be at two stops in overlapping windows)"
+        side_effects:
+          - "ServiceRoute.dispatched_leg_count += 1"
+          - "recompute ServiceRoute.posture via calc route_posture (OPEN -> ROLLING)"
+          - "increments DeliveryLeg.version and ServiceRoute.version by 1"
+      - from: DISPATCHED
+        to: DELIVERED
+        trigger: "POST /catering/delivery-legs/{id}/deliver"
+        actor: EventCaptain
+        preconditions:
+          - "DeliveryLeg.stop_status == DISPATCHED"
+        side_effects:
+          - "recompute ServiceRoute.posture via calc route_posture (CLOSED if all legs DELIVERED)"
+          - "increments DeliveryLeg.version and ServiceRoute.version by 1"
+      - from: DISPATCHED
+        to: FAILED
+        trigger: "POST /catering/delivery-legs/{id}/fail"
+        actor: EventCaptain
+        preconditions:
+          - "DeliveryLeg.stop_status == DISPATCHED"
+        side_effects:
+          - "ServiceRoute.dispatched_leg_count -= 1"
+          - "recompute ServiceRoute.posture via calc route_posture (BLOCKED while any leg FAILED)"
+          - "increments DeliveryLeg.version and ServiceRoute.version by 1"
+      - from: PLANNED
+        to: FAILED
+        trigger: "system: parent Order cancelled (CONFIRMED/GUARANTEED -> CANCELLED)"
+        actor: system
+        preconditions:
+          - "DeliveryLeg.stop_status == PLANNED"
+          - "parent Order transitioned to CANCELLED"
+        side_effects:
+          - "recompute ServiceRoute.posture via calc route_posture"
+          - "increments DeliveryLeg.version and ServiceRoute.version by 1"
+        note: "Cascade leg of order cancellation; dispatched_leg_count not decremented because PLANNED legs were never counted."
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: change-request-accept-stale-order
+    parent_entity: Order
+    write_endpoint: "POST /catering/change-requests/{id}/accept"
+    occ_field: "expected_order_version"
+    description: |
+      Accepting a ChangeRequest computes a new quote (change fee, deposit delta,
+      provisional total) against the Order as the client last observed it. If the
+      Order's version has advanced since — because an earlier ChangeRequest was
+      already accepted (which legitimately superseded the headcount and totals the
+      current request was quoted against) — the acceptance is rejected as stale.
+      Each accepted change supersedes the prior order state, so a second acceptance
+      carrying the pre-supersede version is operating on numbers that no longer hold.
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: package_headcount_charge
+    trigger: "evaluated inside order_grand_total whenever provisional or final total is computed"
+    algorithm: tiered_pricing
+    formula: |
+      # Marginal (step) tiering: each guest is billed at the rate of the highest
+      # volume_tier whose min_headcount <= the guest's 1-based index, falling back
+      # to base per_head_cents below the first tier. Tiers sorted by min_headcount ASC.
+      #   tiers = [{min_headcount: 0, per_head_cents: base}] ++ EventPackage.volume_tiers
+      #   charge = 0
+      #   for i in 1..headcount:
+      #       rate = per_head_cents of the tier with the greatest min_headcount <= i
+      #       charge += rate
+      #   return charge   # integer cents, exact (no rounding; all inputs are cents)
+    input_set: "Single EventPackage (the order's locked package) and a headcount integer; no cross-entity aggregation."
+    constants:
+      ABSENT_TIER_RATE: "base per_head_cents"
+    precision: "integer cents, exact"
+    variants:
+      - name: provisional
+        when: "computed at confirmation and on change-accept"
+        difference: "headcount = Order.booked_headcount"
+      - name: final
+        when: "computed at invoicing"
+        difference: "headcount = effective_headcount = max(guaranteed_headcount, ceil(booked_headcount * GUARANTEE_FLOOR_PCT/100))"
+
+  - name: order_grand_total
+    trigger: "POST /catering/orders/{id}/confirm (provisional); POST /catering/orders/{id}/invoice (final); change-request accept (provisional recompute)"
+    algorithm: aggregation
+    formula: |
+      # Evaluation order is PINNED (circular-looking: service_fee and gratuity both
+      # key off the food+addon subtotal, tax keys off subtotal too, gratuity tier
+      # keys off the subtotal band — compute in this exact order):
+      #   1. food         = package_headcount_charge(package, headcount)
+      #   2. addon_sum    = SUM over AddOnLine of effective_quantity * unit_cents,
+      #                     iterated in created_at ASC (id-independent). For final
+      #                     variant, STAFFING lines with per_head_scaled=true use
+      #                     effective_quantity = ceil(effective_headcount / staff_ratio);
+      #                     all other lines and the provisional variant use the stored quantity.
+      #   3. subtotal     = food + addon_sum
+      #   4. service_fee  = round_half_up(subtotal * Venue.service_fee_bps / 10000)
+      #   5. tax          = 0 if Client.tax_exempt else round_half_up(subtotal * Venue.tax_rate_bps / 10000)
+      #                     # tax is on subtotal ONLY, NOT on service_fee or gratuity
+      #   6. gratuity     = 0 if Client.gratuity_policy == OPTIONAL
+      #                     else round_half_up(subtotal * gratuity_bps / 10000),
+      #                     where gratuity_bps = GRATUITY_LARGE_BPS if subtotal >= GRATUITY_TIER_CENTS
+      #                                          else GRATUITY_BASE_BPS
+      #   7. grand_total  = subtotal + service_fee + tax + gratuity   # integer cents
+      # ROUNDING ORDER IS PINNED: each of service_fee, tax, gratuity is rounded to
+      # whole cents INDEPENDENTLY (round-per-component then sum), NOT summed-then-rounded.
+    input_set: "Order, its locked EventPackage (provisional uses live package only before lock; final uses locked_package_version pricing), Venue, Client, and all AddOnLine where order_id == Order.id."
+    constants:
+      GRATUITY_BASE_BPS: 1800
+      GRATUITY_LARGE_BPS: 2200
+      GRATUITY_TIER_CENTS: 5000000
+      GUARANTEE_FLOOR_PCT: 90
+    precision: "integer cents; round_half_up per component before summation"
+    variants:
+      - name: provisional
+        when: "confirmation and change-accept recompute"
+        difference: "headcount = booked_headcount; addon STAFFING quantities are the stored values; writes Order.provisional_total_cents"
+      - name: final
+        when: "invoicing"
+        difference: "headcount = effective_headcount (guarantee floor); per_head_scaled STAFFING lines recomputed; writes Order.final_total_cents"
+
+  - name: effective_headcount
+    trigger: "computed at invoicing as the billing headcount"
+    algorithm: threshold
+    formula: |
+      floor_count       = ceil(Order.booked_headcount * GUARANTEE_FLOOR_PCT / 100)   # 90% floor, rounded UP
+      effective         = max(Order.guaranteed_headcount, floor_count)
+      # Final-count guarantee: the client is billed for at least 90% of the headcount
+      # booked at confirmation even if they guarantee fewer guests. Boundary: a guarantee
+      # exactly equal to floor_count bills the guarantee; one below bills the floor.
+    input_set: "Single Order (booked_headcount and guaranteed_headcount)."
+    constants:
+      GUARANTEE_FLOOR_PCT: 90
+    precision: "integer guests, ceil on the floor computation"
+
+  - name: deposit_amount
+    trigger: "POST /catering/orders/{id}/confirm; recomputed on change-accept"
+    algorithm: threshold
+    formula: |
+      base_deposit = round_half_up(provisional_total_cents * DEPOSIT_PCT / 100)
+      # Lead-time surcharge tier: rush bookings demand a larger deposit.
+      hours_out    = (Order.event_start - current_utc) in whole hours, floor
+      deposit      = base_deposit
+      if hours_out < RUSH_HOURS:
+          deposit  = round_half_up(provisional_total_cents * DEPOSIT_RUSH_PCT / 100)
+      deposit      = max(deposit, DEPOSIT_FLOOR_CENTS)   # never below an absolute floor
+    input_set: "Single Order's provisional_total_cents and event_start vs current_utc."
+    constants:
+      DEPOSIT_PCT: 25
+      DEPOSIT_RUSH_PCT: 50
+      RUSH_HOURS: 72
+      DEPOSIT_FLOOR_CENTS: 10000
+    precision: "integer cents, round_half_up"
+
+  - name: cancellation_settlement
+    trigger: "POST /catering/orders/{id}/cancel from CONFIRMED or GUARANTEED"
+    algorithm: threshold
+    formula: |
+      hours_out = (Order.event_start - current_utc) in whole hours, floor
+      # Refund tiers by cancellation window (boundaries are >=, evaluated top-down):
+      #   hours_out >= FULL_REFUND_HOURS (168) -> refund_fraction = 1.00  (full deposit returned)
+      #   hours_out >= HALF_REFUND_HOURS (72)  -> refund_fraction = 0.50
+      #   else (inside 72h)                    -> refund_fraction = 0.00  (full forfeit)
+      refunded_cents  = round_half_up(Order.deposit_due_cents * refund_fraction)
+      forfeited_cents = Order.deposit_due_cents - refunded_cents
+      # Invariant: refunded_cents + forfeited_cents == deposit_due_cents (conserved).
+    input_set: "Single Order's deposit_due_cents and event_start vs current_utc."
+    constants:
+      FULL_REFUND_HOURS: 168
+      HALF_REFUND_HOURS: 72
+    precision: "integer cents, round_half_up on refund; forfeit = deposit - refund (no independent rounding, preserves conservation)"
+
+  - name: change_fee
+    trigger: "change-request accept (PROPOSED->ACCEPTED or COUNTERED->ACCEPTED)"
+    algorithm: threshold
+    formula: |
+      hours_out = (Order.event_start - current_utc) in whole hours, floor
+      headcount_delta = abs(new_headcount - Order.booked_headcount)   # new = requested or counter
+      # Base fee scales with how late the change lands and how big the swing is:
+      if hours_out >= CHANGE_FREE_HOURS (336):
+          fee = 0
+      elif hours_out >= CHANGE_TIER_HOURS (72):
+          fee = CHANGE_BASE_CENTS + headcount_delta * CHANGE_PER_HEAD_CENTS
+      else:   # inside 72h, rush change
+          fee = round_half_up((CHANGE_BASE_CENTS + headcount_delta * CHANGE_PER_HEAD_CENTS) * CHANGE_RUSH_MULT)
+    input_set: "Single Order (event_start, booked_headcount) and the change's new headcount."
+    constants:
+      CHANGE_FREE_HOURS: 336
+      CHANGE_TIER_HOURS: 72
+      CHANGE_BASE_CENTS: 5000
+      CHANGE_PER_HEAD_CENTS: 150
+      CHANGE_RUSH_MULT: 1.5
+    precision: "integer cents, round_half_up after multiplier"
+
+  - name: route_posture
+    trigger: "any DeliveryLeg transition (dispatch, deliver, fail, cascade-fail) on the route"
+    algorithm: aggregation
+    formula: |
+      legs = DeliveryLeg where route_id == ServiceRoute.id
+      if any leg.stop_status == FAILED:          posture = BLOCKED
+      elif legs nonempty and all DELIVERED:       posture = CLOSED
+      elif any leg.stop_status == DISPATCHED:     posture = ROLLING
+      else:                                        posture = OPEN
+      # Precedence: BLOCKED > CLOSED > ROLLING > OPEN. dispatched_leg_count is
+      # maintained separately (count of DISPATCHED|DELIVERED legs).
+    input_set: "All DeliveryLeg where route_id == ServiceRoute.id (no status filter; every leg considered)."
+    constants: {}
+    precision: "exact enum"
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (Ordered by Priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except Anonymous-permitted reads"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to invoke this endpoint per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: "For entity_backed Client actions, X-User-ID equals the target resource's client_id (ownership)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Client-acted order/change-request endpoints"
+
+  - priority: 4
+    category: existence
+    check: "Every path/body FK (order, package, venue, route, client, change-request, delivery-leg, preceding-leg) resolves, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints referencing a resource id"
+
+  - priority: 5
+    category: business_constraint
+    check: "Request body contains all required fields with correct types and enum membership"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a valid state for this transition (lifecycle, settlement, change-request, or leg dimension)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints (confirm, guarantee, fulfill, cancel, invoice, settle, counter, revise, accept, reject, dispatch, deliver, fail)"
+
+  - priority: 7
+    category: business_referential
+    check: "On confirm: EventPackage.status == ACTIVE (a RETIRED package cannot be confirmed against)"
+    error_id: ERR_PACKAGE_RETIRED
+    http_status: 409
+    applies_to: "POST /catering/orders/{id}/confirm"
+
+  - priority: 8
+    category: business_temporal
+    check: "On confirm: (event_start - current_utc) >= EventPackage.lead_time_hours (order cutoff / lead-time gate)"
+    error_id: ERR_LEAD_TIME_VIOLATED
+    http_status: 409
+    applies_to: "POST /catering/orders/{id}/confirm"
+
+  - priority: 9
+    category: business_temporal
+    check: "On dispatch: no other DISPATCHED DeliveryLeg on the same route has a window inclusively overlapping this leg's [window_start,window_end] (single-vehicle interval conflict)"
+    error_id: ERR_LEG_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /catering/delivery-legs/{id}/dispatch"
+
+  - priority: 10
+    category: business_temporal
+    check: "On confirm: count of non-CANCELLED Orders at this venue whose [event_start,event_end) half-open interval overlaps this order's window must be < Venue.max_overlapping_events (venue capacity, adjacency allowed)"
+    error_id: ERR_VENUE_OVERBOOKED
+    http_status: 409
+    applies_to: "POST /catering/orders/{id}/confirm"
+
+  - priority: 11
+    category: business_constraint
+    check: "On dispatch: preceding_leg_id is null OR preceding leg stop_status IN {DISPATCHED, DELIVERED} (route ordering); and ServiceRoute.dispatched_leg_count < vehicle_capacity_legs"
+    error_id: ERR_LEG_OUT_OF_ORDER
+    http_status: 409
+    applies_to: "POST /catering/delivery-legs/{id}/dispatch"
+
+  - priority: 12
+    category: business_constraint
+    check: "On guarantee or change-accept: requested/guaranteed headcount >= EventPackage.min_headcount"
+    error_id: ERR_BELOW_MIN_HEADCOUNT
+    http_status: 422
+    applies_to: "POST /catering/orders/{id}/guarantee, POST /catering/change-requests/{id}/accept, POST /catering/orders, POST /catering/change-requests"
+
+  - priority: 13
+    category: business_constraint
+    check: "On order create / add-on create / change-accept: sum of dietary_counts values <= effective headcount in scope (booked at create, guaranteed at guarantee); and every dietary tag corresponding to an allergen is compatible with EventPackage.allergen_flags capacity"
+    error_id: ERR_DIETARY_EXCEEDS_HEADCOUNT
+    http_status: 422
+    applies_to: "POST /catering/orders, PATCH /catering/orders/{id}, POST /catering/orders/{id}/guarantee"
+
+  - priority: 14
+    category: business_constraint
+    check: "On guarantee: no ChangeRequest for the order in status IN {PROPOSED, COUNTERED} (open negotiation blocks guarantee)"
+    error_id: ERR_OPEN_CHANGE_REQUEST
+    http_status: 409
+    applies_to: "POST /catering/orders/{id}/guarantee"
+
+  - priority: 15
+    category: state
+    check: "OCC: on change-accept, expected_order_version must equal parent Order.version"
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+    applies_to: "POST /catering/change-requests/{id}/accept"
+
+  - priority: 16
+    category: business_fiscal
+    check: "On settle: running deposit-ledger balance for the order must equal final_total_cents (full payment recorded)"
+    error_id: ERR_BALANCE_UNPAID
+    http_status: 409
+    applies_to: "POST /catering/orders/{id}/settle"
+
+  - priority: 17
+    category: business_fiscal
+    check: "On staffing add-on confirm: requested STAFFING reserved_staff <= remaining global staffing pool capacity"
+    error_id: ERR_STAFF_POOL_EXHAUSTED
+    http_status: 409
+    applies_to: "POST /catering/orders/{id}/confirm"
+
+  - priority: 18
+    category: business_constraint
+    check: "billing_email unique among ACTIVE Clients on create"
+    error_id: ERR_DUPLICATE_EMAIL
+    http_status: 409
+    applies_to: "POST /catering/clients"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # ---- Clients ----
+  - method: POST
+    path: "/catering/clients"
+    description: "Register a client account."
+    roles: [CateringAdmin]
+    code: 201
+    input: [company_name, billing_email, "tax_exempt?", "gratuity_policy?"]
+    output: Client
+    side_effects: ["create Client status=ACTIVE"]
+  - method: GET
+    path: "/catering/clients/{id}"
+    description: "Fetch a client."
+    roles: [CateringAdmin, Client, SalesCoordinator]
+    code: 200
+    input: []
+    output: Client
+    side_effects: []
+  - method: GET
+    path: "/catering/clients"
+    description: "List clients (paginated)."
+    roles: [CateringAdmin, SalesCoordinator]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: Client[]
+    side_effects: []
+
+  # ---- Packages ----
+  - method: POST
+    path: "/catering/packages"
+    description: "Create a menu package."
+    roles: [CateringAdmin]
+    code: 201
+    input: [name, per_head_cents, min_headcount, lead_time_hours, "volume_tiers?", "allergen_flags?"]
+    output: EventPackage
+    side_effects: ["create EventPackage status=ACTIVE version=1"]
+  - method: GET
+    path: "/catering/packages/{id}"
+    description: "Fetch a package."
+    roles: [CateringAdmin, Client, SalesCoordinator]
+    code: 200
+    input: []
+    output: EventPackage
+    side_effects: []
+  - method: GET
+    path: "/catering/packages"
+    description: "List packages (paginated)."
+    roles: [CateringAdmin, Client, SalesCoordinator]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: EventPackage[]
+    side_effects: []
+  - method: POST
+    path: "/catering/packages/{id}/retire"
+    description: "Retire a package (no longer orderable)."
+    roles: [CateringAdmin]
+    code: 200
+    input: [expected_package_version]
+    output: EventPackage
+    side_effects: ["status ACTIVE -> RETIRED", "increments EventPackage.version by 1"]
+
+  # ---- Venues ----
+  - method: POST
+    path: "/catering/venues"
+    description: "Create a venue with tax/service-fee jurisdiction."
+    roles: [CateringAdmin]
+    code: 201
+    input: [name, tax_rate_bps, service_fee_bps, max_overlapping_events]
+    output: Venue
+    side_effects: ["create Venue"]
+  - method: GET
+    path: "/catering/venues/{id}"
+    description: "Fetch a venue."
+    roles: [CateringAdmin, Client, SalesCoordinator]
+    code: 200
+    input: []
+    output: Venue
+    side_effects: []
+
+  # ---- Service Routes ----
+  - method: POST
+    path: "/catering/routes"
+    description: "Create a multi-stop service route."
+    roles: [CateringAdmin]
+    code: 201
+    input: [route_date, vehicle_capacity_legs]
+    output: ServiceRoute
+    side_effects: ["create ServiceRoute posture=OPEN dispatched_leg_count=0"]
+  - method: GET
+    path: "/catering/routes/{id}"
+    description: "Fetch a route with derived posture."
+    roles: [CateringAdmin, EventCaptain, SalesCoordinator]
+    code: 200
+    input: []
+    output: ServiceRoute
+    side_effects: []
+  - method: GET
+    path: "/catering/routes/{id}/delivery-legs"
+    description: "List the delivery legs riding on this route (reverse-reachability for DeliveryLeg.route_id)."
+    roles: [CateringAdmin, EventCaptain, SalesCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: DeliveryLeg[]
+    side_effects: []
+
+  # ---- Orders ----
+  - method: POST
+    path: "/catering/orders"
+    description: "Create a draft order."
+    roles: [Client, SalesCoordinator]
+    code: 201
+    input: [client_id, package_id, venue_id, booked_headcount, event_start, event_end, "dietary_counts?"]
+    output: Order
+    side_effects: ["create Order lifecycle_status=DRAFT settlement_status=UNBILLED"]
+  - method: GET
+    path: "/catering/orders/{id}"
+    description: "Fetch an order with both status dimensions and computed totals."
+    roles: [CateringAdmin, Client, SalesCoordinator, EventCaptain]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+  - method: GET
+    path: "/catering/orders"
+    description: "List orders, filterable by client/package/venue/route (reverse-reachability for those FKs)."
+    roles: [CateringAdmin, SalesCoordinator]
+    code: 200
+    input: ["limit?", "offset?", "client_id?", "package_id?", "venue_id?", "route_id?", "lifecycle_status?", "settlement_status?"]
+    output: Order[]
+    side_effects: []
+  - method: PATCH
+    path: "/catering/orders/{id}"
+    description: "Edit a DRAFT order's mutable fields (headcount, dietary counts, windows)."
+    roles: [Client, SalesCoordinator]
+    code: 200
+    input: [expected_order_version, "booked_headcount?", "event_start?", "event_end?", "dietary_counts?"]
+    output: Order
+    side_effects: ["update fields if lifecycle_status==DRAFT", "increments Order.version by 1"]
+  - method: POST
+    path: "/catering/orders/{id}/confirm"
+    description: "Confirm a draft order: lock package version, price provisionally, hold deposit, reserve staff."
+    roles: [SalesCoordinator]
+    code: 200
+    input: [expected_order_version]
+    output: Order
+    side_effects:
+      - "lifecycle DRAFT -> CONFIRMED; settlement UNBILLED -> DEPOSIT_HELD"
+      - "set locked_package_version; compute provisional_total_cents and deposit_due_cents"
+      - "append DepositLedgerEntry DEPOSIT_HOLD; create StaffingReservation HELD; debit staff pool"
+      - "increments Order.version by 1"
+  - method: POST
+    path: "/catering/orders/{id}/guarantee"
+    description: "Lock the guaranteed headcount."
+    roles: [SalesCoordinator]
+    code: 200
+    input: [expected_order_version, guaranteed_headcount]
+    output: Order
+    side_effects: ["lifecycle CONFIRMED -> GUARANTEED; set guaranteed_headcount", "increments Order.version by 1"]
+  - method: POST
+    path: "/catering/orders/{id}/invoice"
+    description: "Issue the final invoice using the guarantee floor."
+    roles: [SalesCoordinator]
+    code: 200
+    input: [expected_order_version]
+    output: Order
+    side_effects:
+      - "settlement DEPOSIT_HELD -> INVOICED; compute final_total_cents (effective_headcount)"
+      - "append DepositLedgerEntry DEPOSIT_APPLY"
+      - "increments Order.version by 1"
+  - method: POST
+    path: "/catering/orders/{id}/payments"
+    description: "Record a client payment against the order's deposit ledger."
+    roles: [Client, SalesCoordinator]
+    code: 200
+    input: [expected_order_version, amount_cents]
+    output: Order
+    side_effects: ["append DepositLedgerEntry DEPOSIT_APPLY with amount_cents = +amount_cents (payment moves balance toward final_total_cents)", "increments Order.version by 1"]
+  - method: POST
+    path: "/catering/orders/{id}/settle"
+    description: "Mark the order settled once the ledger balance equals final_total_cents."
+    roles: [SalesCoordinator]
+    code: 200
+    input: [expected_order_version]
+    output: Order
+    side_effects: ["settlement INVOICED -> SETTLED", "increments Order.version by 1"]
+  - method: POST
+    path: "/catering/orders/{id}/fulfill"
+    description: "Close out a delivered, settled event; release staffing."
+    roles: [EventCaptain]
+    code: 200
+    input: [expected_order_version]
+    output: Order
+    side_effects: ["lifecycle GUARANTEED -> FULFILLED", "release StaffingReservation; credit staff pool", "increments Order.version by 1"]
+  - method: POST
+    path: "/catering/orders/{id}/cancel"
+    description: "Cancel an order; computes refund/forfeit, releases staff, fails planned legs."
+    roles: [Client]
+    code: 200
+    input: [expected_order_version]
+    output: Order
+    side_effects:
+      - "lifecycle -> CANCELLED"
+      - "compute cancellation_settlement; settlement -> REFUNDED or FORFEITED; append REFUND/FORFEIT ledger entries"
+      - "release StaffingReservation; credit staff pool"
+      - "cascade PLANNED DeliveryLeg -> FAILED; recompute each ServiceRoute.posture"
+      - "increments Order.version by 1"
+
+  # ---- Order sub-resources (reverse-reachability) ----
+  - method: GET
+    path: "/catering/orders/{id}/add-ons"
+    description: "List the add-on lines on an order (reverse-reachability for AddOnLine.order_id)."
+    roles: [CateringAdmin, Client, SalesCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: AddOnLine[]
+    side_effects: []
+  - method: GET
+    path: "/catering/orders/{id}/delivery-legs"
+    description: "List the delivery legs of an order (reverse-reachability for DeliveryLeg.order_id)."
+    roles: [CateringAdmin, Client, SalesCoordinator, EventCaptain]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: DeliveryLeg[]
+    side_effects: []
+  - method: GET
+    path: "/catering/orders/{id}/change-requests"
+    description: "List the change requests against an order (reverse-reachability for ChangeRequest.order_id)."
+    roles: [CateringAdmin, Client, SalesCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ChangeRequest[]
+    side_effects: []
+  - method: GET
+    path: "/catering/orders/{id}/ledger"
+    description: "List the deposit ledger entries of an order in created_at ASC (reverse-reachability for DepositLedgerEntry.order_id)."
+    roles: [CateringAdmin, Client, SalesCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: DepositLedgerEntry[]
+    side_effects: []
+  - method: GET
+    path: "/catering/orders/{id}/staffing-reservation"
+    description: "List the staffing reservation(s) of an order (reverse-reachability for StaffingReservation.order_id; 0 or 1)."
+    roles: [CateringAdmin, SalesCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: StaffingReservation[]
+    side_effects: []
+
+  # ---- Add-on lines ----
+  - method: POST
+    path: "/catering/orders/{id}/add-ons"
+    description: "Attach a delivery/setup/staffing add-on to a DRAFT order."
+    roles: [Client, SalesCoordinator]
+    code: 201
+    input: [kind, unit_cents, quantity, "per_head_scaled?", "staff_ratio?"]
+    output: AddOnLine
+    side_effects: ["create AddOnLine with order_id = path id (only while order DRAFT)"]
+  - method: GET
+    path: "/catering/add-ons/{id}"
+    description: "Fetch an add-on line."
+    roles: [CateringAdmin, Client, SalesCoordinator]
+    code: 200
+    input: []
+    output: AddOnLine
+    side_effects: []
+
+  # ---- Delivery legs ----
+  - method: POST
+    path: "/catering/delivery-legs"
+    description: "Schedule a delivery leg for an order on a route; assigns/sets order.route_id."
+    roles: [CateringAdmin, SalesCoordinator]
+    code: 201
+    input: [order_id, route_id, window_start, window_end, "preceding_leg_id?"]
+    output: DeliveryLeg
+    side_effects: ["create DeliveryLeg stop_status=PLANNED", "set Order.route_id = route_id if null", "recompute ServiceRoute.posture"]
+  - method: GET
+    path: "/catering/delivery-legs/{id}"
+    description: "Fetch a delivery leg."
+    roles: [CateringAdmin, EventCaptain, SalesCoordinator]
+    code: 200
+    input: []
+    output: DeliveryLeg
+    side_effects: []
+  - method: GET
+    path: "/catering/delivery-legs"
+    description: "List delivery legs, filterable by order/route/preceding leg (reverse-reachability for the self-referential preceding_leg_id FK and order_id/route_id FKs)."
+    roles: [CateringAdmin, EventCaptain, SalesCoordinator]
+    code: 200
+    input: ["limit?", "offset?", "order_id?", "route_id?", "preceding_leg_id?", "stop_status?"]
+    output: DeliveryLeg[]
+    side_effects: []
+  - method: POST
+    path: "/catering/delivery-legs/{id}/dispatch"
+    description: "Dispatch a planned leg (route order + vehicle capacity + window conflict enforced)."
+    roles: [EventCaptain]
+    code: 200
+    input: [expected_route_version]
+    output: DeliveryLeg
+    side_effects: ["stop_status PLANNED -> DISPATCHED", "ServiceRoute.dispatched_leg_count += 1; recompute posture", "increments ServiceRoute.version by 1"]
+  - method: POST
+    path: "/catering/delivery-legs/{id}/deliver"
+    description: "Mark a dispatched leg delivered."
+    roles: [EventCaptain]
+    code: 200
+    input: [expected_route_version]
+    output: DeliveryLeg
+    side_effects: ["stop_status DISPATCHED -> DELIVERED", "recompute ServiceRoute.posture", "increments ServiceRoute.version by 1"]
+  - method: POST
+    path: "/catering/delivery-legs/{id}/fail"
+    description: "Mark a dispatched leg failed; route becomes BLOCKED."
+    roles: [EventCaptain]
+    code: 200
+    input: [expected_route_version]
+    output: DeliveryLeg
+    side_effects: ["stop_status DISPATCHED -> FAILED", "dispatched_leg_count -= 1; recompute posture -> BLOCKED", "increments ServiceRoute.version by 1"]
+
+  # ---- Change requests ----
+  - method: POST
+    path: "/catering/change-requests"
+    description: "Open a change request against a confirmed/guaranteed order."
+    roles: [Client]
+    code: 201
+    input: [order_id, requested_headcount, requested_event_start]
+    output: ChangeRequest
+    side_effects: ["create ChangeRequest status=PROPOSED"]
+  - method: GET
+    path: "/catering/change-requests/{id}"
+    description: "Fetch a change request."
+    roles: [CateringAdmin, Client, SalesCoordinator]
+    code: 200
+    input: []
+    output: ChangeRequest
+    side_effects: []
+  - method: POST
+    path: "/catering/change-requests/{id}/counter"
+    description: "Coordinator counters a proposed change with a different headcount."
+    roles: [SalesCoordinator]
+    code: 200
+    input: [counter_headcount]
+    output: ChangeRequest
+    side_effects: ["status PROPOSED -> COUNTERED; set counter_headcount", "increments ChangeRequest.version by 1"]
+  - method: POST
+    path: "/catering/change-requests/{id}/revise"
+    description: "Client revises a countered change back into PROPOSED."
+    roles: [Client]
+    code: 200
+    input: [requested_headcount]
+    output: ChangeRequest
+    side_effects: ["status COUNTERED -> PROPOSED; set requested_headcount; clear counter_headcount", "increments ChangeRequest.version by 1"]
+  - method: POST
+    path: "/catering/change-requests/{id}/accept"
+    description: "Accept a change (OCC against the order); recompute totals, deposit delta, change fee; revert guarantee if needed."
+    roles: [Client, SalesCoordinator]
+    code: 200
+    input: [expected_order_version]
+    output: ChangeRequest
+    side_effects:
+      - "status -> ACCEPTED; compute change_fee_cents"
+      - "apply new headcount/event_start to Order; recompute provisional_total_cents and deposit_due_cents"
+      - "append DepositLedgerEntry DEPOSIT_HOLD (delta) and CHANGE_FEE_DEBIT"
+      - "cascade: GUARANTEED order reverts to CONFIRMED; clear guaranteed_headcount"
+      - "increments Order.version (plus cascade bump) and ChangeRequest.version by 1"
+  - method: POST
+    path: "/catering/change-requests/{id}/reject"
+    description: "Reject a change; order unchanged."
+    roles: [SalesCoordinator, Client]
+    code: 200
+    input: []
+    output: ChangeRequest
+    side_effects: ["status -> REJECTED", "increments ChangeRequest.version by 1"]
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/catering/_clock/set_current_utc"
+    description: "Set the server's current UTC clock for lead-time, cutoff, deposit-rush, cancellation-window and change-fee computations."
+    roles: [CateringAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock set to to_iso8601 for all subsequent time-relative calculations"]
+  - method: POST
+    path: "/catering/_staff-pool/set_capacity"
+    description: "Set the global staffing pool's total capacity (test/admin operator surface)."
+    roles: [CateringAdmin]
+    code: 200
+    input: [total_staff]
+    output: null
+    side_effects: ["global staffing pool total capacity set; remaining recomputed as total minus currently HELD reservations"]
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing or malformed X-User-Role / X-User-ID headers."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for this endpoint."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Client acting on an order/change-request whose client_id != X-User-ID."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced resource id does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, wrong type, or invalid enum value."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Transition attempted from a state that does not permit it (any dimension)."
+  - id: ERR_PACKAGE_RETIRED
+    http: 409
+    condition: "Confirming an order against a RETIRED EventPackage."
+  - id: ERR_LEAD_TIME_VIOLATED
+    http: 409
+    condition: "Confirm attempted with (event_start - current_utc) < package lead_time_hours."
+  - id: ERR_LEG_WINDOW_CONFLICT
+    http: 409
+    condition: "Dispatch collides with another DISPATCHED leg's window on the same route (inclusive overlap)."
+  - id: ERR_VENUE_OVERBOOKED
+    http: 409
+    condition: "Confirm would push overlapping non-cancelled orders at the venue to >= max_overlapping_events."
+  - id: ERR_LEG_OUT_OF_ORDER
+    http: 409
+    condition: "Dispatch out of route order, or vehicle leg capacity exceeded."
+  - id: ERR_BELOW_MIN_HEADCOUNT
+    http: 422
+    condition: "Headcount below the package's min_headcount on create/guarantee/change-accept."
+  - id: ERR_DIETARY_EXCEEDS_HEADCOUNT
+    http: 422
+    condition: "Sum of dietary_counts exceeds the in-scope headcount."
+  - id: ERR_OPEN_CHANGE_REQUEST
+    http: 409
+    condition: "Guarantee attempted while an open (PROPOSED/COUNTERED) change request exists."
+  - id: ERR_STALE_ORDER_VERSION
+    http: 412
+    condition: "expected_order_version on change-accept does not match the order's current version."
+  - id: ERR_BALANCE_UNPAID
+    http: 409
+    condition: "Settle attempted while ledger balance != final_total_cents."
+  - id: ERR_STAFF_POOL_EXHAUSTED
+    http: 409
+    condition: "Confirm's staffing reservation exceeds remaining global staff pool."
+  - id: ERR_DUPLICATE_EMAIL
+    http: 409
+    condition: "billing_email already used by an ACTIVE client."
+  - id: ERR_INVALID_PAYMENT
+    http: 422
+    condition: "Payment amount_cents <= 0 or would push ledger balance above final_total_cents."
+  - id: ERR_VALIDATION_WINDOW
+    http: 422
+    condition: "event_end <= event_start, or a delivery-leg window_end <= window_start."
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: CateringAdmin
+    description: "Operator surface: catalog (packages, venues, routes), client registration, clock, staff-pool capacity."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /catering/clients"
+      - "POST /catering/packages"
+      - "POST /catering/packages/{id}/retire"
+      - "POST /catering/venues"
+      - "POST /catering/routes"
+      - "POST /catering/_clock/set_current_utc"
+      - "POST /catering/_staff-pool/set_capacity"
+    shared_operations:
+      - "GET reads on clients, packages, venues, routes, orders, add-ons, delivery-legs, change-requests, ledger, staffing-reservation"
+
+  - name: Client
+    description: "End customer: owns its own orders, add-ons, change requests, payments, cancellations."
+    identity: "entity_backed:Client"
+    exclusive_operations:
+      - "POST /catering/orders/{id}/cancel"
+      - "POST /catering/change-requests"
+      - "POST /catering/change-requests/{id}/revise"
+    shared_operations:
+      - "POST /catering/orders (also SalesCoordinator)"
+      - "PATCH /catering/orders/{id} (also SalesCoordinator)"
+      - "POST /catering/orders/{id}/add-ons (also SalesCoordinator)"
+      - "POST /catering/orders/{id}/payments (also SalesCoordinator)"
+      - "POST /catering/change-requests/{id}/accept (also SalesCoordinator)"
+      - "POST /catering/change-requests/{id}/reject (also SalesCoordinator)"
+      - "GET reads scoped to own orders and their sub-resources"
+
+  - name: SalesCoordinator
+    description: "Sales/ops staff: confirm, guarantee, invoice, settle orders; counter/accept/reject changes."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /catering/orders/{id}/confirm"
+      - "POST /catering/orders/{id}/guarantee"
+      - "POST /catering/orders/{id}/invoice"
+      - "POST /catering/orders/{id}/settle"
+      - "POST /catering/change-requests/{id}/counter"
+    shared_operations:
+      - "POST /catering/orders (also Client)"
+      - "PATCH /catering/orders/{id} (also Client)"
+      - "POST /catering/orders/{id}/add-ons (also Client)"
+      - "POST /catering/orders/{id}/payments (also Client)"
+      - "POST /catering/delivery-legs (also CateringAdmin)"
+      - "POST /catering/change-requests/{id}/accept (also Client)"
+      - "POST /catering/change-requests/{id}/reject (also Client)"
+      - "GET reads"
+
+  - name: EventCaptain
+    description: "Field ops: dispatch/deliver/fail delivery legs, fulfill delivered+settled orders."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /catering/orders/{id}/fulfill"
+      - "POST /catering/delivery-legs/{id}/dispatch"
+      - "POST /catering/delivery-legs/{id}/deliver"
+      - "POST /catering/delivery-legs/{id}/fail"
+    shared_operations:
+      - "GET reads on orders, routes, delivery-legs"

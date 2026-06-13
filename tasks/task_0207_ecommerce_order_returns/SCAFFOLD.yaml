@@ -1,0 +1,1611 @@
+scenario: |
+  E-commerce Order & Returns (RMA): cart/checkout, inventory reservation, split shipment/backorder, return authorization & reason, restocking fee, refund vs store credit, exchange, return-window/final-sale rules
+
+domain_name: ecommerce-order-returns
+api_prefix: ""    # multi-root flat/hybrid topology: customers, products, warehouses, inventory, orders, shipments, returns are peer top-level collections
+
+complexity_profile:
+  primary_archetype: quota_allocation          # finite inventory reserved → committed → released across warehouses
+  secondary_archetype: event_sourcing          # order/refund lifecycle; returns replay against the order ledger
+  complexity_layers:
+    - dual_variant_calculation                 # cash refund vs store-credit (bonus) on the same return
+    - cascading_side_effects                    # ship → reservation commit → inventory decrement → order fulfillment re-derive
+    - optimistic_concurrency                    # OCC on Order.version (checkout cart→order) and ReturnAuthorization.version
+    - derived_field_reconciliation              # Order.fulfillment_status / Customer lifetime ledgers stay consistent
+
+  entity_topology: hybrid
+  # Order is a parent with OrderLine / Shipment / ReturnAuthorization children, but Reservation, Refund,
+  # CreditLedgerEntry, Warehouse, Product and Customer are cross-aggregate peers linked by FK.
+
+  state_machine_shape: parallel
+  # Order carries TWO independent state dimensions: payment_status × fulfillment_status.
+  # ReturnAuthorization is branching (APPROVED forks into REFUNDED / EXCHANGED / restocked).
+
+  relationship_patterns:
+    - one_to_many        # Order→OrderLine, Order→Shipment, ReturnAuthorization→ReturnLine
+    - many_to_many       # OrderLine↔Warehouse via Reservation; ShipmentLine references Reservation
+    - cross_aggregate    # Reservation links OrderLine to Warehouse+Product; Refund links RMA to Order+Customer
+
+  role_model: peer_roles
+  # Customer owns own carts/orders/returns; WarehouseOperator owns shipments/inventory; StoreAdmin configures
+  # catalog & inventory and performs RMA decisions (opaque operator).
+
+  consistency_model: immediate
+  # All cascades (commit/decrement/re-derive/ledger) resolve atomically inside the triggering request.
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: login/contact email; unique
+        constraints: "unique across Customer"
+      - name: full_name
+        type: string
+        source: input
+        description: display name
+      - name: store_credit_cents
+        type: integer
+        source: computed
+        description: "current redeemable store-credit balance in cents; equals sum of CreditLedgerEntry.amount_cents for this customer; never negative"
+        default: 0
+      - name: lifetime_purchased_cents
+        type: integer
+        source: computed
+        description: "sum of Order.captured_total_cents over this customer's orders whose payment_status == CAPTURED (lifetime); excludes carts and voided orders"
+        default: 0
+      - name: lifetime_refunded_cents
+        type: integer
+        source: computed
+        description: "sum of Refund.amount_cents over this customer's refunds whose status == SETTLED (lifetime, all destinations)"
+        default: 0
+      - name: return_risk_score
+        type: number
+        source: computed
+        description: "lifetime return-rate risk score = lifetime_refunded_cents / lifetime_purchased_cents, 4 decimals; 0 when purchased is 0; see calc customer_return_risk"
+        default: 0
+
+  - name: Warehouse
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: short warehouse code; unique
+        constraints: "unique across Warehouse"
+      - name: name
+        type: string
+        source: input
+        description: warehouse display name
+      - name: fulfillment_priority
+        type: integer
+        source: input
+        description: "reservation waterfall rank; lower number is filled first (priority 1 before priority 2)"
+        constraints: ">= 1"
+      - name: accepts_returns
+        type: boolean
+        source: input
+        description: "whether restocked returns may be routed back to this warehouse"
+        default: true
+
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - name: sku
+        type: string
+        source: input
+        description: stock-keeping unit; unique
+        constraints: "unique across Product"
+      - name: title
+        type: string
+        source: input
+        description: product display title
+      - name: unit_price_cents
+        type: integer
+        source: input
+        description: "current catalog price in cents (price is snapshotted onto OrderLine at add-to-cart)"
+        constraints: ">= 0"
+      - name: tax_rate_bps
+        type: integer
+        source: input
+        description: "sales-tax rate in basis points applied to this product's line subtotal (e.g. 875 = 8.75%)"
+        constraints: ">= 0"
+      - name: restocking_fee_bps
+        type: integer
+        source: input
+        description: "restocking fee in basis points charged on cash refunds for this product (e.g. 1500 = 15%)"
+        default: 0
+        constraints: "0..10000"
+      - name: return_window_days
+        type: integer
+        source: input
+        description: "number of days after a shipment is DELIVERED during which a return may be authorized; inclusive of the boundary day"
+        constraints: ">= 0"
+      - name: final_sale
+        type: boolean
+        source: input
+        description: "when true, lines of this product can never be returned or exchanged"
+        default: false
+
+  - name: InventoryItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; the stocked product"
+      - name: warehouse_id
+        type: string
+        source: input
+        description: "FK -> Warehouse.id; where this stock sits"
+      - name: on_hand_qty
+        type: integer
+        source: input
+        description: "physical units present in this warehouse for this product"
+        constraints: ">= 0"
+      - name: reserved_qty
+        type: integer
+        source: computed
+        description: "sum of Reservation.qty for this (product, warehouse) whose status == HELD or COMMITTED; never exceeds on_hand_qty"
+        default: 0
+      - name: available_qty
+        type: integer
+        source: computed
+        description: "on_hand_qty - reserved_qty; the quantity reservable right now; floored at 0"
+        default: 0
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the cart/order owner"
+      - name: payment_status
+        type: enum
+        source: computed
+        description: "payment dimension; one of CART, AUTHORIZED, CAPTURED, VOIDED, PARTIALLY_REFUNDED, REFUNDED"
+        default: CART
+        constraints: "CART|AUTHORIZED|CAPTURED|VOIDED|PARTIALLY_REFUNDED|REFUNDED"
+      - name: fulfillment_status
+        type: enum
+        source: computed
+        description: "fulfillment dimension; one of UNFULFILLED, PARTIALLY_SHIPPED, SHIPPED, PARTIALLY_DELIVERED, DELIVERED, BACKORDERED"
+        default: UNFULFILLED
+        constraints: "UNFULFILLED|PARTIALLY_SHIPPED|SHIPPED|PARTIALLY_DELIVERED|DELIVERED|BACKORDERED"
+      - name: promo_flat_cents
+        type: integer
+        source: input
+        description: "flat promotional discount in cents applied to the order subtotal at checkout (0 if none)"
+        default: 0
+        constraints: ">= 0"
+      - name: subtotal_cents
+        type: integer
+        source: computed
+        description: "sum over OrderLine of (unit_price_cents_snapshot * qty); see calc order_totals"
+        default: 0
+      - name: discounted_subtotal_cents
+        type: integer
+        source: computed
+        description: "max(0, subtotal_cents - promo_flat_cents); drives shipping tier and is the captured base; see calc order_totals"
+        default: 0
+      - name: tax_total_cents
+        type: integer
+        source: computed
+        description: "per-line tax rounded then summed (round-per-line-then-sum order pinned); see calc order_totals"
+        default: 0
+      - name: shipping_fee_cents
+        type: integer
+        source: computed
+        description: "tiered shipping fee selected from discounted_subtotal_cents; see calc order_totals"
+        default: 0
+      - name: grand_total_cents
+        type: integer
+        source: computed
+        description: "discounted_subtotal_cents + tax_total_cents + shipping_fee_cents; the amount authorized/captured"
+        default: 0
+      - name: captured_total_cents
+        type: integer
+        source: computed
+        description: "grand_total_cents at the moment of capture, frozen; 0 until payment captured"
+        default: 0
+
+  - name: OrderLine
+    parent: Order
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; owning cart/order"
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; the purchased product"
+      - name: qty
+        type: integer
+        source: input
+        description: "ordered quantity for this line"
+        constraints: ">= 1"
+      - name: unit_price_cents_snapshot
+        type: integer
+        source: computed
+        description: "Product.unit_price_cents copied at add-to-cart; immune to later catalog price edits"
+      - name: tax_rate_bps_snapshot
+        type: integer
+        source: computed
+        description: "Product.tax_rate_bps copied at add-to-cart"
+      - name: line_tax_cents
+        type: integer
+        source: computed
+        description: "round_half_up(unit_price_cents_snapshot * qty * tax_rate_bps_snapshot / 10000); per-line tax; see calc order_totals"
+        default: 0
+      - name: reserved_qty
+        type: integer
+        source: computed
+        description: "sum of Reservation.qty for this line whose status == HELD or COMMITTED"
+        default: 0
+      - name: backordered_qty
+        type: integer
+        source: computed
+        description: "qty - reserved_qty at checkout; units that could not be reserved from any warehouse"
+        default: 0
+      - name: shipped_qty
+        type: integer
+        source: computed
+        description: "sum of ShipmentLine.qty across this line's shipments whose Shipment.status IN {SHIPPED, DELIVERED}"
+        default: 0
+      - name: returned_qty
+        type: integer
+        source: computed
+        description: "sum of ReturnLine.qty for this line whose ReturnAuthorization.status IN {APPROVED, REFUNDED, EXCHANGED, RESTOCKED}"
+        default: 0
+
+  - name: Reservation
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_line_id
+        type: string
+        source: input
+        description: "FK -> OrderLine.id; the line this reservation serves"
+      - name: warehouse_id
+        type: string
+        source: input
+        description: "FK -> Warehouse.id; the warehouse holding the units"
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; denormalized for inventory math"
+      - name: qty
+        type: integer
+        source: input
+        description: "units held against this warehouse for this line"
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: computed
+        description: "HELD (reserved, not yet shipped) | COMMITTED (shipped, on_hand decremented) | RELEASED (cancelled/voided, returned to available)"
+        default: HELD
+        constraints: "HELD|COMMITTED|RELEASED"
+
+  - name: Shipment
+    parent: Order
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; the order being fulfilled"
+      - name: warehouse_id
+        type: string
+        source: input
+        description: "FK -> Warehouse.id; the warehouse shipping this parcel"
+      - name: status
+        type: enum
+        source: computed
+        description: "PENDING (created, not yet dispatched) | SHIPPED | DELIVERED | CANCELLED"
+        default: PENDING
+        constraints: "PENDING|SHIPPED|DELIVERED|CANCELLED"
+      - name: shipped_at
+        type: datetime
+        source: computed
+        description: "UTC timestamp set when status moves to SHIPPED; null otherwise"
+        default: null
+      - name: delivered_at
+        type: datetime
+        source: computed
+        description: "UTC timestamp set when status moves to DELIVERED; anchors the return window; null otherwise"
+        default: null
+
+  - name: ShipmentLine
+    parent: Shipment
+    common_fields: true
+    fields:
+      - name: shipment_id
+        type: string
+        source: input
+        description: "FK -> Shipment.id; owning parcel"
+      - name: reservation_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id; the HELD reservation being committed into this parcel"
+      - name: order_line_id
+        type: string
+        source: input
+        description: "FK -> OrderLine.id; denormalized for fulfillment math"
+      - name: qty
+        type: integer
+        source: input
+        description: "units of the reservation shipped in this parcel (must equal the reservation's qty)"
+        constraints: ">= 1"
+
+  - name: ReturnAuthorization
+    parent: Order
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; the order being returned against"
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; denormalized owner for ledger math"
+      - name: status
+        type: enum
+        source: computed
+        description: "REQUESTED | APPROVED | REJECTED | REFUNDED | EXCHANGED | RESTOCKED | CANCELLED"
+        default: REQUESTED
+        constraints: "REQUESTED|APPROVED|REJECTED|REFUNDED|EXCHANGED|RESTOCKED|CANCELLED"
+      - name: reason
+        type: enum
+        source: input
+        description: "DEFECTIVE | WRONG_ITEM | NO_LONGER_WANTED | ARRIVED_LATE; DEFECTIVE/WRONG_ITEM waive the restocking fee"
+        constraints: "DEFECTIVE|WRONG_ITEM|NO_LONGER_WANTED|ARRIVED_LATE"
+      - name: resolution
+        type: enum
+        source: input
+        description: "requested resolution: REFUND | STORE_CREDIT | EXCHANGE"
+        constraints: "REFUND|STORE_CREDIT|EXCHANGE"
+      - name: refund_subtotal_cents
+        type: integer
+        source: computed
+        description: "sum over ReturnLine of returnable subtotal (unit_price_cents_snapshot * return_qty); see calc return_settlement"
+        default: 0
+      - name: restocking_fee_cents
+        type: integer
+        source: computed
+        description: "total restocking fee withheld across return lines; 0 when reason waives it or resolution != REFUND; see calc return_settlement"
+        default: 0
+      - name: settlement_cents
+        type: integer
+        source: computed
+        description: "final amount issued: cash refund (REFUND), bonus store credit (STORE_CREDIT), or exchange delta sign-magnitude; see calc return_settlement"
+        default: 0
+
+  - name: ReturnLine
+    parent: ReturnAuthorization
+    common_fields: true
+    fields:
+      - name: return_authorization_id
+        type: string
+        source: input
+        description: "FK -> ReturnAuthorization.id; owning RMA"
+      - name: order_line_id
+        type: string
+        source: input
+        description: "FK -> OrderLine.id; the line being returned"
+      - name: return_qty
+        type: integer
+        source: input
+        description: "units returned from this order line"
+        constraints: ">= 1"
+      - name: exchange_product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; required only when the RMA resolution is EXCHANGE; the replacement product"
+        default: null
+
+  - name: Refund
+    parent: null
+    common_fields: true
+    fields:
+      - name: return_authorization_id
+        type: string
+        source: input
+        description: "FK -> ReturnAuthorization.id; the settled RMA"
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; denormalized order"
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; denormalized recipient"
+      - name: destination
+        type: enum
+        source: computed
+        description: "ORIGINAL_PAYMENT (cash back) | STORE_CREDIT; copied from the RMA resolution"
+        constraints: "ORIGINAL_PAYMENT|STORE_CREDIT"
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "money moved by this refund in cents; equals ReturnAuthorization.settlement_cents"
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: computed
+        description: "SETTLED (terminal; created already settled in the immediate-consistency model)"
+        default: SETTLED
+        constraints: "SETTLED"
+
+  - name: CreditLedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; account whose balance moves"
+      - name: refund_id
+        type: string
+        source: input
+        description: "FK -> Refund.id; the refund that issued this credit (null for non-refund adjustments)"
+        default: null
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "signed delta to store_credit_cents; positive = credit granted, negative = credit redeemed"
+      - name: kind
+        type: enum
+        source: input
+        description: "REFUND_CREDIT (from a STORE_CREDIT refund) | ADMIN_ADJUSTMENT | REDEMPTION"
+        constraints: "REFUND_CREDIT|ADMIN_ADJUSTMENT|REDEMPTION"
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ----- Order: PARALLEL state dimensions (payment_status × fulfillment_status) -----
+  - entity: Order
+    initial_state: "CART / UNFULFILLED"
+    terminal_states: ["VOIDED / *", "REFUNDED / DELIVERED"]
+    transitions:
+      # ---- payment dimension ----
+      - from: "payment_status=CART"
+        to: "payment_status=AUTHORIZED"
+        trigger: "POST /orders/{id}/checkout"
+        actor: Customer
+        preconditions:
+          - "order has >= 1 OrderLine"
+          - "payment_status == CART"
+          - "expected_order_version matches Order.version (OCC)"
+        side_effects:
+          - "recompute calc order_totals → subtotal_cents, discounted_subtotal_cents, tax_total_cents, shipping_fee_cents, grand_total_cents"
+          - "run calc reservation_waterfall for every OrderLine → create Reservation rows (status HELD) per warehouse; set OrderLine.reserved_qty and OrderLine.backordered_qty"
+          - "InventoryItem.reserved_qty and InventoryItem.available_qty recomputed for each touched (product, warehouse)"
+          - "if any OrderLine.backordered_qty > 0 set fulfillment_status=BACKORDERED else fulfillment_status=UNFULFILLED"
+          - "increments Order.version by 1"
+      - from: "payment_status=AUTHORIZED"
+        to: "payment_status=CAPTURED"
+        trigger: "POST /orders/{id}/capture-payment"
+        actor: StoreAdmin
+        preconditions:
+          - "payment_status == AUTHORIZED"
+        side_effects:
+          - "set captured_total_cents = grand_total_cents"
+          - "Customer.lifetime_purchased_cents recomputed (this order now counts) → Customer.return_risk_score recomputed"
+          - "increments Order.version by 1"
+      - from: "payment_status=AUTHORIZED"
+        to: "payment_status=VOIDED"
+        trigger: "POST /orders/{id}/void"
+        actor: StoreAdmin
+        preconditions:
+          - "payment_status == AUTHORIZED"
+          - "no Shipment with status IN {SHIPPED, DELIVERED} exists for the order"
+        side_effects:
+          - "every HELD Reservation for the order → status=RELEASED (COMPENSATION of checkout's hold)"
+          - "InventoryItem.reserved_qty / available_qty recomputed for each released (product, warehouse) — held quantity returns to available"
+          - "fulfillment cleared; order is terminal"
+          - "increments Order.version by 1"
+      - from: "payment_status=CAPTURED"
+        to: "payment_status=PARTIALLY_REFUNDED"
+        trigger: "system: a Refund with destination ORIGINAL_PAYMENT settles and total settled < captured_total_cents"
+        actor: system
+        preconditions:
+          - "payment_status == CAPTURED or PARTIALLY_REFUNDED"
+          - "sum of ORIGINAL_PAYMENT Refund.amount_cents for order < captured_total_cents"
+        side_effects:
+          - "no further field writes here; bubble-up from Refund settlement (see ReturnAuthorization REFUNDED transition)"
+      - from: "payment_status=PARTIALLY_REFUNDED"
+        to: "payment_status=REFUNDED"
+        trigger: "system: cumulative ORIGINAL_PAYMENT Refund.amount_cents reaches captured_total_cents"
+        actor: system
+        preconditions:
+          - "sum of ORIGINAL_PAYMENT Refund.amount_cents for order == captured_total_cents"
+        side_effects:
+          - "order payment fully refunded"
+      # ---- fulfillment dimension (independent axis) — bubble-up from the Shipment state machine ----
+      - from: "fulfillment_status=UNFULFILLED|BACKORDERED|PARTIALLY_SHIPPED"
+        to: "fulfillment_status=PARTIALLY_SHIPPED|SHIPPED"
+        trigger: "system: bubble-up when a child Shipment moves PENDING→SHIPPED (see Shipment state machine)"
+        actor: system
+        preconditions:
+          - "at least one child Shipment of the order is now SHIPPED"
+        side_effects:
+          - "OrderLine.shipped_qty recomputed for each line"
+          - "Order.fulfillment_status re-derived: SHIPPED if every non-backordered unit shipped, else PARTIALLY_SHIPPED"
+      - from: "fulfillment_status=PARTIALLY_SHIPPED|SHIPPED"
+        to: "fulfillment_status=PARTIALLY_DELIVERED|DELIVERED"
+        trigger: "system: bubble-up when a child Shipment moves SHIPPED→DELIVERED (see Shipment state machine)"
+        actor: system
+        preconditions:
+          - "at least one child Shipment of the order is now DELIVERED"
+        side_effects:
+          - "Order.fulfillment_status re-derived: DELIVERED if every shipped unit delivered, else PARTIALLY_DELIVERED"
+
+  # ----- Shipment: linear lifecycle with a cancel branch from PENDING -----
+  - entity: Shipment
+    initial_state: PENDING
+    terminal_states: [DELIVERED, CANCELLED]
+    transitions:
+      - from: PENDING
+        to: SHIPPED
+        trigger: "POST /shipments/{id}/ship"
+        actor: WarehouseOperator
+        preconditions:
+          - "Shipment.status == PENDING"
+          - "parent Order.payment_status == CAPTURED (cannot ship before capture) — cross-entity guard"
+          - "every ShipmentLine.reservation_id references a HELD Reservation belonging to the order"
+        side_effects:
+          - "each referenced Reservation → status=COMMITTED (CASCADE link 1)"
+          - "each committed Reservation decrements its InventoryItem.on_hand_qty by Reservation.qty (CASCADE link 2)"
+          - "InventoryItem.available_qty recomputed for each touched item (CASCADE link 3)"
+          - "OrderLine.shipped_qty recomputed; Order.fulfillment_status re-derived (bubble-up to the Order machine)"
+          - "Shipment.status=SHIPPED; Shipment.shipped_at set to current clock"
+      - from: SHIPPED
+        to: DELIVERED
+        trigger: "POST /shipments/{id}/deliver"
+        actor: WarehouseOperator
+        preconditions:
+          - "Shipment.status == SHIPPED"
+        side_effects:
+          - "Shipment.status=DELIVERED; Shipment.delivered_at set to current clock (anchors return window)"
+          - "Order.fulfillment_status re-derived (bubble-up to the Order machine)"
+      - from: PENDING
+        to: CANCELLED
+        trigger: "POST /shipments/{id}/cancel"
+        actor: WarehouseOperator
+        preconditions:
+          - "Shipment.status == PENDING"
+        side_effects:
+          - "Shipment.status=CANCELLED; its ShipmentLines are removed; the referenced Reservations remain HELD (re-shippable, NOT released)"
+
+  # ----- Reservation: HELD → {COMMITTED | RELEASED} (allocation lifecycle) -----
+  - entity: Reservation
+    initial_state: HELD
+    terminal_states: [COMMITTED, RELEASED]
+    transitions:
+      - from: HELD
+        to: COMMITTED
+        trigger: "system: parent Shipment moves PENDING→SHIPPED (the reservation is committed into the parcel)"
+        actor: system
+        preconditions:
+          - "Reservation.status == HELD"
+          - "a ShipmentLine references this reservation and its Shipment is being shipped"
+        side_effects:
+          - "decrement InventoryItem.on_hand_qty by Reservation.qty; InventoryItem.available_qty recomputed"
+      - from: HELD
+        to: RELEASED
+        trigger: "system: parent Order is voided (POST /orders/{id}/void) while the reservation is still HELD"
+        actor: system
+        preconditions:
+          - "Reservation.status == HELD"
+          - "parent Order.payment_status transitions AUTHORIZED→VOIDED"
+        side_effects:
+          - "held quantity returns to InventoryItem.available_qty (COMPENSATION of the checkout hold); on_hand_qty unchanged"
+
+  # ----- ReturnAuthorization: BRANCHING fork (APPROVED → {REFUNDED | EXCHANGED | RESTOCKED}) -----
+  - entity: ReturnAuthorization
+    initial_state: REQUESTED
+    terminal_states: [REJECTED, REFUNDED, EXCHANGED, RESTOCKED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: REQUESTED
+        trigger: "POST /orders/{id}/returns"
+        actor: Customer
+        preconditions:
+          - "Order.payment_status == CAPTURED"
+          - "every ReturnLine.order_line belongs to Order {id}"
+          - "for each ReturnLine: return_qty <= (OrderLine.returned_qty-complement) i.e. return_qty + already-returned <= shipped_qty"
+          - "for each ReturnLine: Product.final_sale == false (validation business_constraint)"
+          - "for each ReturnLine: at least one Shipment carrying that line is DELIVERED and current_clock <= delivered_at + Product.return_window_days days (return window open)"
+          - "if resolution == EXCHANGE every ReturnLine.exchange_product_id is non-null and references a non-final-sale Product"
+        side_effects:
+          - "create ReturnAuthorization (REQUESTED) and its ReturnLine rows"
+          - "recompute calc return_settlement (preview) → refund_subtotal_cents, restocking_fee_cents, settlement_cents"
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /returns/{id}/approve"
+        actor: StoreAdmin
+        preconditions:
+          - "status == REQUESTED"
+          - "expected_return_version matches ReturnAuthorization.version (OCC)"
+        side_effects:
+          - "recompute calc return_settlement (locked) → settlement_cents frozen for the chosen resolution"
+          - "increments ReturnAuthorization.version by 1"
+      - from: REQUESTED
+        to: REJECTED
+        trigger: "POST /returns/{id}/reject"
+        actor: StoreAdmin
+        preconditions:
+          - "status == REQUESTED"
+        side_effects:
+          - "RMA terminal; no ledger movement; OrderLine.returned_qty unaffected"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /returns/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "status == REQUESTED"
+          - "acting Customer owns the RMA (X-User-ID == ReturnAuthorization.customer_id)"
+        side_effects:
+          - "RMA terminal; no ledger movement"
+      - from: APPROVED
+        to: REFUNDED
+        trigger: "POST /returns/{id}/settle"
+        actor: StoreAdmin
+        preconditions:
+          - "status == APPROVED"
+          - "resolution IN {REFUND, STORE_CREDIT}"
+        side_effects:
+          - "create Refund (status SETTLED): destination=ORIGINAL_PAYMENT if resolution==REFUND else STORE_CREDIT; amount_cents=settlement_cents (CASCADE link 1)"
+          - "if destination==STORE_CREDIT create CreditLedgerEntry (kind REFUND_CREDIT, amount_cents=+settlement_cents) → Customer.store_credit_cents recomputed (CASCADE link 2)"
+          - "OrderLine.returned_qty recomputed for each returned line (units now count as returned)"
+          - "Customer.lifetime_refunded_cents recomputed → Customer.return_risk_score recomputed (CASCADE link 3)"
+          - "if destination==ORIGINAL_PAYMENT bubble-up Order.payment_status: PARTIALLY_REFUNDED or REFUNDED per cumulative refunded vs captured_total_cents"
+      - from: APPROVED
+        to: EXCHANGED
+        trigger: "POST /returns/{id}/settle"
+        actor: StoreAdmin
+        preconditions:
+          - "status == APPROVED"
+          - "resolution == EXCHANGE"
+          - "every ReturnLine.exchange_product_id reserved-checkable: target Product has available_qty >= return_qty in some warehouse"
+        side_effects:
+          - "settlement_cents = exchange delta (see calc return_settlement variant exchange)"
+          - "if delta < 0 (store owes customer) create CreditLedgerEntry (kind REFUND_CREDIT, amount_cents=+abs(delta)) and Refund(destination STORE_CREDIT) → Customer.store_credit_cents recomputed"
+          - "if delta > 0 (customer owes store) no credit; settlement recorded as positive owed amount (collected on original payment)"
+          - "OrderLine.returned_qty recomputed; exchange product reservation created (HELD) for the replacement"
+      - from: APPROVED
+        to: RESTOCKED
+        trigger: "POST /returns/{id}/restock"
+        actor: WarehouseOperator
+        preconditions:
+          - "status == APPROVED"
+          - "the RMA has already produced a Refund (resolution REFUND or STORE_CREDIT settled) OR resolution is RESTOCK-only"
+          - "target Warehouse.accepts_returns == true"
+        side_effects:
+          - "for each ReturnLine increment InventoryItem.on_hand_qty by return_qty at the chosen accepts_returns warehouse"
+          - "InventoryItem.available_qty recomputed"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (true races only — OCC on parent.version)
+# =============================================================================
+concurrency_rules:
+  - rule_id: checkout-stale-order
+    parent_entity: Order
+    write_endpoint: "POST /orders/{id}/checkout"
+    occ_field: "expected_order_version"
+    description: |
+      Checking out an Order (CART) whose version has advanced since the client
+      last observed it is rejected. A line was added/removed (each mutation bumps
+      Order.version and changes the totals the client is about to authorize), so
+      the client's view of the cart is stale and the authorize amount it carries
+      no longer matches the server's recomputed grand_total_cents.
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+  - rule_id: approve-stale-return
+    parent_entity: ReturnAuthorization
+    write_endpoint: "POST /returns/{id}/approve"
+    occ_field: "expected_return_version"
+    description: |
+      Approving a ReturnAuthorization whose version has advanced since the client
+      last observed it is rejected. Another operator may have already approved (or
+      otherwise mutated) the RMA, advancing its version and locking a settlement
+      figure; the current approver's view is therefore stale.
+    error_id: ERR_STALE_RETURN_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: order_totals
+    trigger: "POST /orders/{id}/checkout (recomputed on the CART→AUTHORIZED transition)"
+    algorithm: tiered_pricing
+    formula: |
+      # Evaluation order is pinned and load-bearing.
+      # (1) line subtotals from snapshots:
+      for each OrderLine L: L.line_subtotal = L.unit_price_cents_snapshot * L.qty
+      subtotal_cents = sum(L.line_subtotal for L in order.lines)
+      # (2) flat promo applied to subtotal, floored at 0; THIS drives the shipping tier and is the captured base:
+      discounted_subtotal_cents = max(0, subtotal_cents - promo_flat_cents)
+      # (3) per-line tax on the FULL (pre-discount) line subtotal, ROUND PER LINE then SUM (pinned order):
+      for each OrderLine L:
+        L.line_tax_cents = round_half_up(L.line_subtotal * L.tax_rate_bps_snapshot / 10000)
+      tax_total_cents = sum(L.line_tax_cents for L in order.lines)   # NOT round(sum(...))
+      # (4) tiered shipping selected from discounted_subtotal_cents (boundaries inclusive on the LOW side):
+      if   discounted_subtotal_cents <  FREE_SHIP_LOW:  shipping_fee_cents = SHIP_STANDARD
+      elif discounted_subtotal_cents <  FREE_SHIP_HIGH: shipping_fee_cents = SHIP_REDUCED
+      else:                                              shipping_fee_cents = 0
+      # (5) grand total:
+      grand_total_cents = discounted_subtotal_cents + tax_total_cents + shipping_fee_cents
+    input_set: "all OrderLine rows of the order; promo_flat_cents from the order; tax/price from line snapshots"
+    constants:
+      FREE_SHIP_LOW: 5000        # discounted_subtotal < 5000 → standard shipping
+      FREE_SHIP_HIGH: 10000      # 5000 <= discounted_subtotal < 10000 → reduced; >= 10000 → free
+      SHIP_STANDARD: 999
+      SHIP_REDUCED: 499
+    precision: "integer cents; per-line tax round_half_up, summed AFTER rounding"
+    variants:
+      - name: rounding_order_pinned
+        when: "whenever multiple lines carry fractional-cent tax"
+        difference: "round-per-line-then-sum can differ from sum-then-round by 1+ cent; this calc pins round-per-line-then-sum"
+
+  - name: reservation_waterfall
+    trigger: "POST /orders/{id}/checkout — once per OrderLine during the CART→AUTHORIZED side effects"
+    algorithm: waterfall_allocation
+    formula: |
+      # Allocate L.qty across warehouses in waterfall order until satisfied or exhausted.
+      remaining = L.qty
+      candidates = InventoryItem rows for L.product_id with available_qty > 0
+      # ordering: fulfillment_priority ASC, then created_at ASC (NEVER id) as the deterministic tie-break
+      order candidates by (Warehouse.fulfillment_priority ASC, InventoryItem.created_at ASC)
+      for inv in candidates:
+        take = min(remaining, inv.available_qty)
+        if take > 0:
+          create Reservation(order_line=L, warehouse=inv.warehouse, product=L.product, qty=take, status=HELD)
+          remaining -= take
+        if remaining == 0: break
+      L.reserved_qty = L.qty - remaining
+      L.backordered_qty = remaining     # > 0 → the order is BACKORDERED
+    input_set: "InventoryItem rows for the line's product with available_qty > 0 at checkout time"
+    constants: {}
+    precision: "integer units; no rounding"
+    variants:
+      - name: single_warehouse_full
+        when: "the highest-priority warehouse alone has available_qty >= L.qty"
+        difference: "exactly one HELD Reservation is created; no split"
+      - name: split_across_warehouses
+        when: "no single warehouse covers L.qty but the cumulative available across warehouses does"
+        difference: "two or more HELD Reservations created, filling higher-priority warehouses first"
+      - name: partial_backorder
+        when: "cumulative available across all warehouses < L.qty"
+        difference: "reserved_qty = total available, backordered_qty = shortfall, order becomes BACKORDERED"
+
+  - name: return_settlement
+    trigger: "POST /orders/{id}/returns (preview), re-locked on POST /returns/{id}/approve, money moved on settle"
+    algorithm: aggregation
+    formula: |
+      # Per ReturnLine RL (order_line OL):
+      #   returnable_subtotal = OL.unit_price_cents_snapshot * RL.return_qty
+      #   allocated_tax       = round_half_up(OL.line_tax_cents * RL.return_qty / OL.qty)
+      #   line_promo          = round_half_up(order.promo_flat_cents * (OL.unit_price_cents_snapshot*OL.qty) / order.subtotal_cents)
+      #   qty_promo           = round_half_up(line_promo * RL.return_qty / OL.qty)
+      #   fee_waived          = (RMA.reason IN {DEFECTIVE, WRONG_ITEM}) OR (RMA.resolution != REFUND)
+      #   line_restock_fee    = 0 if fee_waived else round_half_up(returnable_subtotal * Product.restocking_fee_bps / 10000)
+      refund_subtotal_cents  = sum(returnable_subtotal over lines)
+      restocking_fee_cents   = sum(line_restock_fee over lines)
+      base_refund            = sum(returnable_subtotal + allocated_tax - qty_promo over lines)
+      # Shipping is NEVER refunded (final).
+      if RMA.resolution == REFUND:
+        settlement_cents = max(0, base_refund - restocking_fee_cents)        # cash to ORIGINAL_PAYMENT
+      elif RMA.resolution == STORE_CREDIT:
+        settlement_cents = round_half_up((base_refund) * (10000 + STORE_CREDIT_BONUS_BPS) / 10000)  # fee waived + bonus
+      # EXCHANGE handled by variant below.
+    input_set: "ReturnLine rows of the RMA; their OrderLine snapshots; order.promo_flat_cents and order.subtotal_cents; Product.restocking_fee_bps"
+    constants:
+      STORE_CREDIT_BONUS_BPS: 500     # store credit pays out 5% more than the cash base AND waives restocking fee
+    precision: "integer cents; round_half_up at each pinned allocation step (allocated_tax, qty_promo, line_restock_fee, bonus)"
+    variants:
+      - name: cash_refund
+        when: "RMA.resolution == REFUND"
+        difference: "restocking fee withheld unless reason waives it; shipping not refunded; pays to ORIGINAL_PAYMENT"
+      - name: store_credit_bonus
+        when: "RMA.resolution == STORE_CREDIT"
+        difference: "restocking fee always waived AND a 5% bonus applied → strictly larger payout than cash for identical inputs"
+      - name: exchange
+        when: "RMA.resolution == EXCHANGE"
+        difference: |
+          settlement_cents = sum(exchange_product.unit_price_cents * return_qty) - refund_subtotal_cents
+          (positive = customer owes store, collected on original payment; negative = store owes customer, issued as STORE_CREDIT;
+          restocking fee never applies to exchanges)
+
+  - name: customer_return_risk
+    trigger: "recomputed on payment capture (lifetime_purchased change) and on refund settlement (lifetime_refunded change)"
+    algorithm: weighted_scoring
+    formula: |
+      if lifetime_purchased_cents == 0:
+        return_risk_score = 0.0
+      else:
+        return_risk_score = round(lifetime_refunded_cents / lifetime_purchased_cents, 4)
+      # tier label (used by the high-risk return gate validation):
+      #   score >= HIGH_RISK_THRESHOLD → HIGH risk
+    input_set: "Customer.lifetime_purchased_cents and Customer.lifetime_refunded_cents (lifetime, terminal states only)"
+    constants:
+      HIGH_RISK_THRESHOLD: 0.5        # score >= 0.5 → high-risk; new no-fault returns auto-require admin approval (always do anyway)
+    precision: "ratio rounded to 4 decimal places, round_half_up"
+    variants:
+      - name: lifetime
+        when: "default risk evaluation"
+        difference: "denominator and numerator span the customer's entire history (terminal-state rows only)"
+      - name: trailing_window
+        when: "GET /customers/{id}/risk?window_days=90"
+        difference: |
+          numerator/denominator restricted to Orders captured within the trailing window and Refunds settled within it
+          (Order.created_at / Refund.created_at >= current_clock - window_days); produces a DIFFERENT score than lifetime
+          for the same customer — a recent burst of returns scores higher in the window than lifetime-averaged
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /customers and POST /_clock/set_current_utc"
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: auth
+    check: "entity_backed role acting on a resource it does not own (Customer.X-User-ID != resource.customer_id; WarehouseOperator acting on a shipment whose warehouse it is not bound to is allowed — operators are global)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /orders/{id}/checkout, POST /orders/{id}/lines, POST /orders/{id}/returns, POST /returns/{id}/cancel"
+  - priority: 4
+    category: existence
+    check: "every path/body id resolves to an existing resource, validated left-to-right in the path then body FKs"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all id-bearing endpoints"
+  - priority: 5
+    category: existence
+    check: "request body contains all required fields with correct types and enum members"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+  - priority: 6
+    category: state
+    check: "target resource is in a state from which the requested transition is defined (e.g. checkout requires payment_status==CART; ship requires Shipment PENDING; settle requires RMA APPROVED)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 7
+    category: state
+    check: "OCC: expected_<parent>_version matches the parent's current version"
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+    applies_to: "POST /orders/{id}/checkout (Order); POST /returns/{id}/approve uses ERR_STALE_RETURN_VERSION"
+  - priority: 8
+    category: business_safety
+    check: "no ReturnLine references a Product with final_sale==true (final-sale items are never returnable/exchangeable)"
+    error_id: ERR_FINAL_SALE_NOT_RETURNABLE
+    http_status: 422
+    applies_to: "POST /orders/{id}/returns"
+  - priority: 9
+    category: business_temporal
+    check: "the return window is open: for each ReturnLine some Shipment carrying it is DELIVERED and current_clock <= delivered_at + Product.return_window_days days (boundary inclusive)"
+    error_id: ERR_RETURN_WINDOW_CLOSED
+    http_status: 422
+    applies_to: "POST /orders/{id}/returns"
+  - priority: 10
+    category: business_constraint
+    check: "ship cannot precede capture: Order.payment_status == CAPTURED before any Shipment may SHIP"
+    error_id: ERR_PAYMENT_NOT_CAPTURED
+    http_status: 409
+    applies_to: "POST /shipments/{id}/ship"
+  - priority: 11
+    category: business_constraint
+    check: "ReturnLine.return_qty + already-returned qty for that order line must not exceed OrderLine.shipped_qty (cannot return more than was delivered)"
+    error_id: ERR_RETURN_QTY_EXCEEDS_SHIPPED
+    http_status: 422
+    applies_to: "POST /orders/{id}/returns"
+  - priority: 12
+    category: business_constraint
+    check: "EXCHANGE resolution requires every ReturnLine.exchange_product_id non-null, referencing a non-final-sale Product"
+    error_id: ERR_EXCHANGE_TARGET_REQUIRED
+    http_status: 422
+    applies_to: "POST /orders/{id}/returns"
+  - priority: 13
+    category: business_constraint
+    check: "a ShipmentLine.qty must equal its referenced Reservation.qty and the Reservation must be HELD and belong to the order; warehouse of shipment must match reservation warehouse"
+    error_id: ERR_RESERVATION_MISMATCH
+    http_status: 422
+    applies_to: "POST /orders/{id}/shipments"
+  - priority: 14
+    category: business_referential
+    check: "an EXCHANGE settle requires the exchange Product to have available_qty >= return_qty in at least one warehouse"
+    error_id: ERR_EXCHANGE_OUT_OF_STOCK
+    http_status: 422
+    applies_to: "POST /returns/{id}/settle"
+  - priority: 15
+    category: business_fiscal
+    check: "store-credit redemption / negative CreditLedgerEntry must not drive Customer.store_credit_cents below 0"
+    error_id: ERR_INSUFFICIENT_STORE_CREDIT
+    http_status: 422
+    applies_to: "POST /customers/{id}/credit-adjustments"
+  - priority: 16
+    category: business_constraint
+    check: "restock requires the chosen warehouse to have accepts_returns==true"
+    error_id: ERR_WAREHOUSE_REJECTS_RETURNS
+    http_status: 422
+    applies_to: "POST /returns/{id}/restock"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ----- Customers -----
+  - method: POST
+    path: "/customers"
+    description: "register a customer"
+    roles: [Anonymous, StoreAdmin]
+    code: 201
+    input: [email, full_name]
+    output: Customer
+    side_effects: ["store_credit_cents=0, lifetime ledgers=0, return_risk_score=0"]
+  - method: GET
+    path: "/customers/{id}"
+    description: "fetch a customer with computed ledgers and risk score"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/customers/{id}/risk"
+    description: "computed read: lifetime or trailing-window return-risk score"
+    roles: [StoreAdmin]
+    code: 200
+    input: ["window_days?"]
+    output: Customer
+    side_effects: ["recompute calc customer_return_risk (lifetime or trailing_window variant)"]
+  - method: GET
+    path: "/customers/{id}/orders"
+    description: "list a customer's orders (reverse-reachability for Order.customer_id)"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Order[]
+    side_effects: []
+  - method: GET
+    path: "/customers/{id}/credit-entries"
+    description: "list a customer's credit ledger entries (reverse-reachability for CreditLedgerEntry.customer_id)"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CreditLedgerEntry[]
+    side_effects: []
+  - method: GET
+    path: "/customers/{id}/refunds"
+    description: "list a customer's refunds (reverse-reachability for Refund.customer_id)"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Refund[]
+    side_effects: []
+  - method: GET
+    path: "/customers/{id}/returns"
+    description: "list a customer's RMAs across orders (reverse-reachability for ReturnAuthorization.customer_id)"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ReturnAuthorization[]
+    side_effects: []
+  - method: POST
+    path: "/customers/{id}/credit-adjustments"
+    description: "admin adjusts store credit or records a redemption (signed amount_cents)"
+    roles: [StoreAdmin]
+    code: 201
+    input: [amount_cents, kind]
+    output: CreditLedgerEntry
+    side_effects: ["create CreditLedgerEntry; Customer.store_credit_cents recomputed; reject if it would go negative"]
+
+  # ----- Warehouses & inventory -----
+  - method: POST
+    path: "/warehouses"
+    description: "create a warehouse"
+    roles: [StoreAdmin]
+    code: 201
+    input: ["code", "name", "fulfillment_priority", "accepts_returns?"]
+    output: Warehouse
+    side_effects: []
+  - method: GET
+    path: "/warehouses/{id}"
+    description: "fetch a warehouse"
+    roles: [StoreAdmin, WarehouseOperator]
+    code: 200
+    input: []
+    output: Warehouse
+    side_effects: []
+  - method: GET
+    path: "/warehouses/{id}/inventory"
+    description: "list inventory items in a warehouse (reverse-reachability for InventoryItem.warehouse_id)"
+    roles: [StoreAdmin, WarehouseOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: InventoryItem[]
+    side_effects: []
+  - method: GET
+    path: "/warehouses/{id}/shipments"
+    description: "list shipments dispatched from a warehouse (reverse-reachability for Shipment.warehouse_id)"
+    roles: [StoreAdmin, WarehouseOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Shipment[]
+    side_effects: []
+  - method: GET
+    path: "/warehouses/{id}/reservations"
+    description: "list reservations held at a warehouse (reverse-reachability for Reservation.warehouse_id)"
+    roles: [StoreAdmin, WarehouseOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+
+  # ----- Products & inventory items -----
+  - method: POST
+    path: "/products"
+    description: "create a product"
+    roles: [StoreAdmin]
+    code: 201
+    input: ["sku", "title", "unit_price_cents", "tax_rate_bps", "restocking_fee_bps?", "return_window_days", "final_sale?"]
+    output: Product
+    side_effects: []
+  - method: GET
+    path: "/products/{id}"
+    description: "fetch a product"
+    roles: [Anonymous, Customer, StoreAdmin, WarehouseOperator]
+    code: 200
+    input: []
+    output: Product
+    side_effects: []
+  - method: GET
+    path: "/products/{id}/inventory"
+    description: "list inventory items for a product across warehouses (reverse-reachability for InventoryItem.product_id)"
+    roles: [StoreAdmin, WarehouseOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: InventoryItem[]
+    side_effects: []
+  - method: GET
+    path: "/products/{id}/reservations"
+    description: "list reservations for a product (reverse-reachability for Reservation.product_id)"
+    roles: [StoreAdmin, WarehouseOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+  - method: GET
+    path: "/products/{id}/order-lines"
+    description: "list order lines that purchased this product (reverse-reachability for OrderLine.product_id)"
+    roles: [StoreAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: OrderLine[]
+    side_effects: []
+  - method: GET
+    path: "/products/{id}/return-lines"
+    description: "list return lines naming this product as exchange target (reverse-reachability for ReturnLine.exchange_product_id)"
+    roles: [StoreAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ReturnLine[]
+    side_effects: []
+  - method: POST
+    path: "/inventory"
+    description: "create/stock an InventoryItem for a (product, warehouse)"
+    roles: [StoreAdmin, WarehouseOperator]
+    code: 201
+    input: [product_id, warehouse_id, on_hand_qty]
+    output: InventoryItem
+    side_effects: ["reserved_qty=0; available_qty=on_hand_qty"]
+  - method: GET
+    path: "/inventory/{id}"
+    description: "fetch an inventory item with computed reserved/available"
+    roles: [StoreAdmin, WarehouseOperator]
+    code: 200
+    input: []
+    output: InventoryItem
+    side_effects: []
+  - method: GET
+    path: "/reservations/{id}"
+    description: "fetch a single reservation with its status (HELD/COMMITTED/RELEASED)"
+    roles: [StoreAdmin, WarehouseOperator]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+  - method: GET
+    path: "/reservations/{id}/shipment-lines"
+    description: "list shipment lines that committed a reservation (reverse-reachability for ShipmentLine.reservation_id)"
+    roles: [StoreAdmin, WarehouseOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ShipmentLine[]
+    side_effects: []
+
+  # ----- Orders / cart -----
+  - method: POST
+    path: "/orders"
+    description: "create an empty cart for a customer"
+    roles: [Customer, StoreAdmin]
+    code: 201
+    input: ["customer_id", "promo_flat_cents?"]
+    output: Order
+    side_effects: ["payment_status=CART, fulfillment_status=UNFULFILLED, all totals 0"]
+  - method: GET
+    path: "/orders/{id}"
+    description: "fetch an order with both status dimensions and computed totals"
+    roles: [Customer, StoreAdmin, WarehouseOperator]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+  - method: POST
+    path: "/orders/{id}/lines"
+    description: "add a line to a CART order; snapshots product price & tax"
+    roles: [Customer, StoreAdmin]
+    code: 201
+    input: [product_id, qty]
+    output: OrderLine
+    side_effects: ["snapshot unit_price_cents & tax_rate_bps; increments Order.version by 1"]
+  - method: GET
+    path: "/orders/{id}/lines"
+    description: "list order lines (reverse-reachability for OrderLine.order_id)"
+    roles: [Customer, StoreAdmin, WarehouseOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: OrderLine[]
+    side_effects: []
+  - method: GET
+    path: "/order-lines/{id}"
+    description: "fetch a single order line with snapshots and computed reserved/shipped/returned quantities"
+    roles: [Customer, StoreAdmin, WarehouseOperator]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects: []
+  - method: GET
+    path: "/order-lines/{id}/reservations"
+    description: "list reservations serving an order line (reverse-reachability for Reservation.order_line_id); optional warehouse_id filter to pick the reservation held at a specific warehouse"
+    roles: [StoreAdmin, WarehouseOperator]
+    code: 200
+    input: ["warehouse_id?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+  - method: GET
+    path: "/order-lines/{id}/shipment-lines"
+    description: "list shipment lines fulfilling an order line (reverse-reachability for ShipmentLine.order_line_id)"
+    roles: [StoreAdmin, WarehouseOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ShipmentLine[]
+    side_effects: []
+  - method: GET
+    path: "/order-lines/{id}/return-lines"
+    description: "list return lines against an order line (reverse-reachability for ReturnLine.order_line_id)"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ReturnLine[]
+    side_effects: []
+  - method: POST
+    path: "/orders/{id}/checkout"
+    description: "checkout: price the cart, reserve inventory via waterfall, authorize payment (OCC on Order.version)"
+    roles: [Customer]
+    code: 200
+    input: [expected_order_version]
+    output: Order
+    side_effects:
+      - "recompute calc order_totals"
+      - "run calc reservation_waterfall per line → create HELD Reservations; set reserved/backordered"
+      - "InventoryItem.reserved_qty/available_qty recomputed"
+      - "payment_status=AUTHORIZED; fulfillment_status=BACKORDERED if any backorder else UNFULFILLED"
+      - "increments Order.version by 1"
+  - method: POST
+    path: "/orders/{id}/capture-payment"
+    description: "capture an authorized order's payment"
+    roles: [StoreAdmin]
+    code: 200
+    input: []
+    output: Order
+    side_effects:
+      - "payment_status=CAPTURED; captured_total_cents=grand_total_cents"
+      - "Customer.lifetime_purchased_cents & return_risk_score recomputed"
+      - "increments Order.version by 1"
+  - method: POST
+    path: "/orders/{id}/void"
+    description: "void an authorized (not-yet-shipped) order; releases all HELD reservations"
+    roles: [StoreAdmin]
+    code: 200
+    input: []
+    output: Order
+    side_effects:
+      - "every HELD Reservation → RELEASED (compensation)"
+      - "InventoryItem.reserved_qty/available_qty recomputed (held qty returns to available)"
+      - "payment_status=VOIDED; increments Order.version by 1"
+  - method: GET
+    path: "/orders/{id}/refunds"
+    description: "list refunds issued against an order (reverse-reachability for Refund.order_id)"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Refund[]
+    side_effects: []
+
+  # ----- Shipments (split shipment) -----
+  - method: POST
+    path: "/orders/{id}/shipments"
+    description: "create a PENDING shipment for an order from one warehouse, attaching ShipmentLines to HELD reservations"
+    roles: [WarehouseOperator, StoreAdmin]
+    code: 201
+    input: [warehouse_id, lines]
+    output: Shipment
+    side_effects: ["create Shipment(PENDING) and its ShipmentLines bound to HELD Reservations of that warehouse"]
+  - method: GET
+    path: "/orders/{id}/shipments"
+    description: "list shipments of an order (reverse-reachability for Shipment.order_id)"
+    roles: [Customer, StoreAdmin, WarehouseOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Shipment[]
+    side_effects: []
+  - method: GET
+    path: "/shipments/{id}"
+    description: "fetch a shipment"
+    roles: [Customer, StoreAdmin, WarehouseOperator]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: []
+  - method: GET
+    path: "/shipments/{id}/lines"
+    description: "list shipment lines (reverse-reachability for ShipmentLine.shipment_id)"
+    roles: [Customer, StoreAdmin, WarehouseOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ShipmentLine[]
+    side_effects: []
+  - method: POST
+    path: "/shipments/{id}/ship"
+    description: "dispatch a PENDING shipment: commit reservations, decrement on_hand, re-derive fulfillment"
+    roles: [WarehouseOperator]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects:
+      - "each referenced Reservation → COMMITTED"
+      - "decrement InventoryItem.on_hand_qty per committed reservation; available_qty recomputed"
+      - "OrderLine.shipped_qty recomputed; Order.fulfillment_status re-derived (PARTIALLY_SHIPPED/SHIPPED)"
+      - "Shipment.status=SHIPPED; shipped_at set"
+  - method: POST
+    path: "/shipments/{id}/deliver"
+    description: "mark a SHIPPED shipment DELIVERED; stamps delivered_at (anchors return window)"
+    roles: [WarehouseOperator]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects:
+      - "Shipment.status=DELIVERED; delivered_at=current clock"
+      - "Order.fulfillment_status re-derived (PARTIALLY_DELIVERED/DELIVERED)"
+  - method: POST
+    path: "/shipments/{id}/cancel"
+    description: "cancel a PENDING shipment; detaches its ShipmentLines, reservations stay HELD"
+    roles: [WarehouseOperator]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: ["Shipment.status=CANCELLED; ShipmentLines removed; reservations remain HELD"]
+
+  # ----- Returns / RMA -----
+  - method: POST
+    path: "/orders/{id}/returns"
+    description: "open an RMA against a CAPTURED order (reason, resolution, lines); previews settlement"
+    roles: [Customer, StoreAdmin]
+    code: 201
+    input: [reason, resolution, lines]
+    output: ReturnAuthorization
+    side_effects: ["create ReturnAuthorization(REQUESTED) + ReturnLines; preview calc return_settlement"]
+  - method: GET
+    path: "/orders/{id}/returns"
+    description: "list RMAs of an order (reverse-reachability for ReturnAuthorization.order_id)"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ReturnAuthorization[]
+    side_effects: []
+  - method: GET
+    path: "/returns/{id}"
+    description: "fetch an RMA with computed settlement figures"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: []
+    output: ReturnAuthorization
+    side_effects: []
+  - method: GET
+    path: "/returns/{id}/lines"
+    description: "list return lines (reverse-reachability for ReturnLine.return_authorization_id)"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ReturnLine[]
+    side_effects: []
+  - method: GET
+    path: "/returns/{id}/refunds"
+    description: "list refunds produced by an RMA (reverse-reachability for Refund.return_authorization_id)"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Refund[]
+    side_effects: []
+  - method: GET
+    path: "/refunds/{id}"
+    description: "fetch a single refund with destination and amount"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: []
+    output: Refund
+    side_effects: []
+  - method: GET
+    path: "/refunds/{id}/credit-entries"
+    description: "list credit ledger entries issued by a refund (reverse-reachability for CreditLedgerEntry.refund_id)"
+    roles: [Customer, StoreAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CreditLedgerEntry[]
+    side_effects: []
+  - method: POST
+    path: "/returns/{id}/approve"
+    description: "admin approves a REQUESTED RMA; locks settlement (OCC on ReturnAuthorization.version)"
+    roles: [StoreAdmin]
+    code: 200
+    input: [expected_return_version]
+    output: ReturnAuthorization
+    side_effects: ["status=APPROVED; lock calc return_settlement; increments ReturnAuthorization.version by 1"]
+  - method: POST
+    path: "/returns/{id}/reject"
+    description: "admin rejects a REQUESTED RMA"
+    roles: [StoreAdmin]
+    code: 200
+    input: []
+    output: ReturnAuthorization
+    side_effects: ["status=REJECTED (terminal); no ledger movement"]
+  - method: POST
+    path: "/returns/{id}/cancel"
+    description: "customer cancels their own REQUESTED RMA"
+    roles: [Customer]
+    code: 200
+    input: []
+    output: ReturnAuthorization
+    side_effects: ["status=CANCELLED (terminal); no ledger movement"]
+  - method: POST
+    path: "/returns/{id}/settle"
+    description: "settle an APPROVED RMA: create Refund (cash/credit) or exchange delta; move ledgers"
+    roles: [StoreAdmin]
+    code: 200
+    input: []
+    output: ReturnAuthorization
+    side_effects:
+      - "REFUND/STORE_CREDIT: create Refund(SETTLED); STORE_CREDIT also creates CreditLedgerEntry → store_credit_cents recomputed"
+      - "EXCHANGE: compute delta; negative delta issues STORE_CREDIT credit; create HELD reservation for exchange product"
+      - "OrderLine.returned_qty recomputed; Customer.lifetime_refunded_cents & return_risk_score recomputed"
+      - "ORIGINAL_PAYMENT refunds bubble-up Order.payment_status (PARTIALLY_REFUNDED/REFUNDED)"
+  - method: POST
+    path: "/returns/{id}/restock"
+    description: "warehouse operator restocks returned units of a settled-or-approved RMA into an accepts_returns warehouse"
+    roles: [WarehouseOperator]
+    code: 200
+    input: [warehouse_id]
+    output: ReturnAuthorization
+    side_effects: ["status=RESTOCKED; increment InventoryItem.on_hand_qty by return_qty; available_qty recomputed"]
+
+  # ----- Test-driving clock -----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "test-driving: set the server's current UTC clock used for delivered_at and return-window math"
+    roles: [StoreAdmin, Anonymous]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["current_clock set to to_iso8601"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/invalid X-User-Role or X-User-ID on a protected endpoint"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "acting role not permitted for the operation per RBAC"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "entity_backed Customer acting on an order/return it does not own"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a path or body id does not resolve to an existing resource"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "missing required field, wrong type, or invalid enum member"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "transition not defined from the resource's current state (e.g. checkout when not CART, settle when not APPROVED)"
+  - id: ERR_STALE_ORDER_VERSION
+    http: 412
+    condition: "expected_order_version != Order.version on checkout (OCC)"
+  - id: ERR_STALE_RETURN_VERSION
+    http: 412
+    condition: "expected_return_version != ReturnAuthorization.version on approve (OCC)"
+  - id: ERR_FINAL_SALE_NOT_RETURNABLE
+    http: 422
+    condition: "an RMA line references a Product with final_sale==true"
+  - id: ERR_RETURN_WINDOW_CLOSED
+    http: 422
+    condition: "no delivered shipment for the line, or current_clock > delivered_at + return_window_days"
+  - id: ERR_PAYMENT_NOT_CAPTURED
+    http: 409
+    condition: "shipping attempted before Order.payment_status == CAPTURED"
+  - id: ERR_RETURN_QTY_EXCEEDS_SHIPPED
+    http: 422
+    condition: "return_qty + already-returned exceeds OrderLine.shipped_qty"
+  - id: ERR_EXCHANGE_TARGET_REQUIRED
+    http: 422
+    condition: "EXCHANGE resolution with a null/final-sale exchange_product_id on any line"
+  - id: ERR_RESERVATION_MISMATCH
+    http: 422
+    condition: "ShipmentLine qty != reservation qty, reservation not HELD, or warehouse mismatch"
+  - id: ERR_EXCHANGE_OUT_OF_STOCK
+    http: 422
+    condition: "exchange settle when the exchange product has insufficient available_qty"
+  - id: ERR_INSUFFICIENT_STORE_CREDIT
+    http: 422
+    condition: "a credit adjustment/redemption would drive store_credit_cents below 0"
+  - id: ERR_WAREHOUSE_REJECTS_RETURNS
+    http: 422
+    condition: "restock targeted at a warehouse whose accepts_returns==false"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "generic business-rule violation not covered by a more specific code (e.g. promo_flat_cents negative, qty < 1)"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Anonymous
+    description: "unauthenticated visitor; can browse the catalog and self-register"
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "POST /customers"
+      - "GET /products/{id}"
+      - "POST /_clock/set_current_utc"
+  - name: Customer
+    description: "shopper who owns their own carts, orders and returns"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /orders/{id}/checkout"
+      - "POST /returns/{id}/cancel"
+    shared_operations:
+      - "POST /orders"
+      - "POST /orders/{id}/lines"
+      - "POST /orders/{id}/returns"
+      - "GET /orders/{id}"
+      - "GET /orders/{id}/lines"
+      - "GET /orders/{id}/shipments"
+      - "GET /orders/{id}/returns"
+      - "GET /returns/{id}"
+      - "GET /returns/{id}/lines"
+      - "GET /returns/{id}/refunds"
+      - "GET /customers/{id}"
+      - "GET /customers/{id}/orders"
+      - "GET /customers/{id}/credit-entries"
+      - "GET /customers/{id}/refunds"
+      - "GET /products/{id}"
+      - "GET /shipments/{id}"
+      - "GET /shipments/{id}/lines"
+  - name: WarehouseOperator
+    description: "fulfillment operator who manages inventory, shipments and restocking; global (not bound to one warehouse)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /shipments/{id}/ship"
+      - "POST /shipments/{id}/deliver"
+      - "POST /shipments/{id}/cancel"
+      - "POST /returns/{id}/restock"
+    shared_operations:
+      - "POST /inventory"
+      - "POST /orders/{id}/shipments"
+      - "GET /warehouses/{id}"
+      - "GET /warehouses/{id}/inventory"
+      - "GET /warehouses/{id}/shipments"
+      - "GET /warehouses/{id}/reservations"
+      - "GET /products/{id}"
+      - "GET /products/{id}/inventory"
+      - "GET /products/{id}/reservations"
+      - "GET /inventory/{id}"
+      - "GET /orders/{id}"
+      - "GET /orders/{id}/lines"
+      - "GET /orders/{id}/shipments"
+      - "GET /shipments/{id}"
+      - "GET /shipments/{id}/lines"
+  - name: StoreAdmin
+    description: "store operator who configures catalog/warehouses, captures/voids payment, and decides RMAs"
+    identity: opaque
+    exclusive_operations:
+      - "POST /warehouses"
+      - "POST /products"
+      - "POST /orders/{id}/capture-payment"
+      - "POST /orders/{id}/void"
+      - "POST /returns/{id}/approve"
+      - "POST /returns/{id}/reject"
+      - "POST /returns/{id}/settle"
+      - "POST /customers/{id}/credit-adjustments"
+      - "GET /customers/{id}/risk"
+    shared_operations:
+      - "POST /customers"
+      - "POST /inventory"
+      - "POST /orders"
+      - "POST /orders/{id}/lines"
+      - "POST /orders/{id}/returns"
+      - "POST /orders/{id}/shipments"
+      - "GET /customers/{id}"
+      - "GET /customers/{id}/orders"
+      - "GET /customers/{id}/credit-entries"
+      - "GET /customers/{id}/refunds"
+      - "GET /warehouses/{id}"
+      - "GET /warehouses/{id}/inventory"
+      - "GET /warehouses/{id}/shipments"
+      - "GET /warehouses/{id}/reservations"
+      - "GET /products/{id}"
+      - "GET /products/{id}/inventory"
+      - "GET /products/{id}/reservations"
+      - "GET /inventory/{id}"
+      - "GET /orders/{id}"
+      - "GET /orders/{id}/lines"
+      - "GET /orders/{id}/shipments"
+      - "GET /shipments/{id}"
+      - "GET /shipments/{id}/lines"
+      - "GET /orders/{id}/returns"
+      - "GET /returns/{id}"
+      - "GET /returns/{id}/lines"
+      - "GET /returns/{id}/refunds"
+      - "POST /_clock/set_current_utc"

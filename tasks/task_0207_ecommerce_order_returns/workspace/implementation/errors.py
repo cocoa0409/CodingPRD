@@ -1,0 +1,35 @@
+"""Error definitions and the ApiError exception carrying error_id + http_status."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Error catalogue (id -> http status). Mirrors PRD §5.
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_FORBIDDEN_ROLE = ("ERR_FORBIDDEN_ROLE", 403)
+ERR_NOT_RESOURCE_OWNER = ("ERR_NOT_RESOURCE_OWNER", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_INVALID_REQUEST = ("ERR_INVALID_REQUEST", 400)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_STALE_ORDER_VERSION = ("ERR_STALE_ORDER_VERSION", 412)
+ERR_STALE_RETURN_VERSION = ("ERR_STALE_RETURN_VERSION", 412)
+ERR_FINAL_SALE_NOT_RETURNABLE = ("ERR_FINAL_SALE_NOT_RETURNABLE", 422)
+ERR_RETURN_WINDOW_CLOSED = ("ERR_RETURN_WINDOW_CLOSED", 422)
+ERR_PAYMENT_NOT_CAPTURED = ("ERR_PAYMENT_NOT_CAPTURED", 409)
+ERR_RETURN_QTY_EXCEEDS_SHIPPED = ("ERR_RETURN_QTY_EXCEEDS_SHIPPED", 422)
+ERR_EXCHANGE_TARGET_REQUIRED = ("ERR_EXCHANGE_TARGET_REQUIRED", 422)
+ERR_RESERVATION_MISMATCH = ("ERR_RESERVATION_MISMATCH", 422)
+ERR_EXCHANGE_OUT_OF_STOCK = ("ERR_EXCHANGE_OUT_OF_STOCK", 422)
+ERR_INSUFFICIENT_STORE_CREDIT = ("ERR_INSUFFICIENT_STORE_CREDIT", 422)
+ERR_WAREHOUSE_REJECTS_RETURNS = ("ERR_WAREHOUSE_REJECTS_RETURNS", 422)
+ERR_VALIDATION = ("ERR_VALIDATION", 422)
+
+
+def err(spec, message=None):
+    """Build an ApiError from a (error_id, http_status) spec tuple."""
+    return ApiError(spec[0], spec[1], message)

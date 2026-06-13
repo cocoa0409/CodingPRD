@@ -1,0 +1,1262 @@
+# =============================================================================
+# PRD Benchmark Scaffold — Personal Chef & In-Home Dining Booking
+# Difficulty target: Expert (§0.4)
+# =============================================================================
+
+scenario: |
+  Personal Chef & In-Home Dining Booking: menu & dietary/allergen, party size &
+  event date, ingredient cost & grocery markup, deposit & balance,
+  kitchen/equipment requirements, travel-fee zone, reschedule/cancellation,
+  recurring meal-prep plan
+
+domain_name: personal-chef-dining
+api_prefix: /
+# Flat topology: every entity is its own top-level collection (/chefs, /clients,
+# /bookings, /menus, /travel-zones, /availability-blocks, /grocery-runs,
+# /payments, /reschedule-requests, /recurring-plans). Children link to parents
+# by FK body fields and are discovered via filtered-list GETs (e.g.
+# GET /menus?chef_id=...). api_prefix is the common root "/" because the
+# collections are peers, not nested under a single resource.
+
+# -----------------------------------------------------------------------------
+# Complexity Profile (§0.1–§0.3)
+# -----------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: temporal_windowing
+  complexity_layers:
+    - dual_variant_calculation        # estimated vs actual ingredient cost; projected vs settled chef score
+    - cascading_side_effects          # cancel → void grocery run → recompute totals; pause plan → suspend bookings → release holds
+    - rate_threshold_triggers         # tiered grocery markup; lead-time refund tiers; small-party labor surcharge
+    - optimistic_concurrency          # OCC on Chef.version for booking creation (slot supersede)
+
+  entity_topology: flat
+  # Every entity is a peer top-level collection; children reference parents by FK
+  # body fields and are discovered via filtered-list GETs. No nested URL paths.
+
+  state_machine_shape: parallel
+  # Booking carries two independent state axes (lifecycle_status × payment_status);
+  # RecurringPlan is cyclic (ACTIVE↔PAUSED); RescheduleRequest is branching.
+
+  relationship_patterns:
+    - one_to_many        # Chef → Menu/Zone/Availability/Booking; Booking → Payment/GroceryRun/RescheduleRequest
+    - flat_references    # Booking → Chef, Client, MenuPackage, TravelZone, RecurringPlan (all FK body fields)
+    - cross_aggregate    # Booking transitions gated on Chef state; GroceryRun gated on Booking state
+
+  role_model: peer_roles
+  # Chef owns its catalog + accepts/declines/cancels/completes its bookings;
+  # Client books/cancels/reschedules its own bookings; PlatformAdmin is operational.
+
+  consistency_model: immediate
+  # All derived fields (quote totals, balances, chef scores, availability holds)
+  # are reconciled atomically within the request that mutates their source.
+
+# -----------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# -----------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Chef
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: display_name, type: string, source: input, description: "Public chef/business name" }
+      - { name: home_base_zip, type: string, source: input, description: "Base ZIP the chef dispatches from" }
+      - { name: equipment_inventory, type: array, source: input, default: [], description: "Equipment the chef brings; array of capability tokens e.g. SOUS_VIDE, COMMERCIAL_GRILL, BLAST_CHILLER" }
+      - { name: prep_buffer_minutes, type: integer, source: input, default: 90, description: "Minutes of on-site prep before guests arrive; widens the occupied window for overlap checks", constraints: "integer >= 0" }
+      - { name: max_bookings_per_day, type: integer, source: input, default: 2, description: "Hard cap on confirmed/in-progress bookings sharing a single event calendar date", constraints: "integer >= 1" }
+      - { name: status, type: enum, source: system, description: "Lifecycle state machine value", constraints: "DRAFT | ACTIVE | SUSPENDED" }
+      - { name: completed_bookings_count, type: integer, source: computed, default: 0, description: "Count of this chef's Bookings whose lifecycle_status == COMPLETED; bumped on each completion" }
+      - { name: settled_reliability_score, type: integer, source: computed, default: 50, description: "Chronological reliability score over terminal bookings only; base 50, see calculations.chef_settled_reliability" }
+      - { name: projected_reliability_score, type: integer, source: computed, default: 50, description: "Forward-looking reliability score including CONFIRMED/IN_PREP bookings as provisional completions; base 50, see calculations.chef_projected_reliability" }
+      - { name: captured_payments_cents, type: integer, source: computed, default: 0, description: "Running sum of all Payment.amount_cents with status CAPTURED across this chef's bookings" }
+      - { name: refunded_payments_cents, type: integer, source: computed, default: 0, description: "Running sum of all Payment.refunded_cents across this chef's bookings" }
+      - { name: payout_accrued_cents, type: integer, source: computed, default: 0, description: "Chef earnings invariant: captured_payments_cents - refunded_payments_cents; see calculations.chef_payout_invariant" }
+      - { name: active_booking_count, type: integer, source: computed, default: 0, description: "Count of this chef's Bookings whose lifecycle_status IN {CONFIRMED, IN_PREP}; the conserved capacity quantity" }
+
+  - name: MenuPackage
+    parent: null
+    common_fields: true
+    fields:
+      - { name: chef_id, type: string, source: input, description: "FK -> Chef.id; owning chef (provided in create body)" }
+      - { name: title, type: string, source: input, description: "Menu package name" }
+      - { name: base_price_per_guest_cents, type: integer, source: input, description: "Chef labor/menu price per guest, in cents", constraints: "integer >= 0" }
+      - { name: estimated_ingredient_per_guest_cents, type: integer, source: input, description: "Estimated raw ingredient cost per guest, in cents (pre-markup)", constraints: "integer >= 0" }
+      - { name: min_party_size, type: integer, source: input, default: 2, description: "Smallest party this menu may be booked for (inclusive)", constraints: "integer >= 1" }
+      - { name: max_party_size, type: integer, source: input, default: 12, description: "Largest party this menu may be booked for (inclusive)", constraints: "integer >= min_party_size" }
+      - { name: allergen_tags, type: array, source: input, default: [], description: "Allergens inherently present in this menu; tokens from {PEANUT, TREE_NUT, SHELLFISH, DAIRY, GLUTEN, EGG, SOY}" }
+      - { name: required_equipment, type: array, source: input, default: [], description: "Equipment tokens the kitchen/chef must supply to execute this menu" }
+      - { name: is_listed, type: boolean, source: system, default: false, description: "True once published; only listed menus may be booked. Set by publish action" }
+
+  - name: TravelZone
+    parent: null
+    common_fields: true
+    fields:
+      - { name: chef_id, type: string, source: input, description: "FK -> Chef.id; owning chef (provided in create body)" }
+      - { name: zone_code, type: string, source: input, description: "Stable zone label e.g. ZONE_A; unique per chef", constraints: "unique within (chef_id, zone_code)" }
+      - { name: zip_prefixes, type: array, source: input, description: "ZIP prefixes covered by this zone; a booking's service_zip must prefix-match exactly one of the chef's zones" }
+      - { name: travel_fee_cents, type: integer, source: input, description: "Flat travel fee charged for events served in this zone, in cents", constraints: "integer >= 0" }
+
+  - name: AvailabilityBlock
+    parent: null
+    common_fields: true
+    fields:
+      - { name: chef_id, type: string, source: input, description: "FK -> Chef.id; owning chef (provided in create body for BLACKOUT; copied from booking for BOOKING_HOLD)" }
+      - { name: kind, type: enum, source: system, default: "BLACKOUT", description: "BLACKOUT = chef-declared unavailable window (the only kind clients create); BOOKING_HOLD = system-minted hold reserving the booking's occupied window", constraints: "BLACKOUT | BOOKING_HOLD" }
+      - { name: booking_id, type: string, source: system, default: null, description: "FK -> Booking.id; set only for BOOKING_HOLD blocks, null for BLACKOUT" }
+      - { name: window_start_utc, type: datetime, source: input, description: "Inclusive start of occupied interval (half-open [start,end)); for BOOKING_HOLD = event_start minus chef.prep_buffer_minutes" }
+      - { name: window_end_utc, type: datetime, source: input, description: "Exclusive end of occupied interval; for BOOKING_HOLD = event_end" }
+      - { name: status, type: enum, source: system, default: "HELD", description: "HELD = occupies the calendar; RELEASED = no longer occupies (set when owning booking is cancelled/declined)", constraints: "HELD | RELEASED" }
+
+  - name: Client
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Client full name" }
+      - { name: email, type: string, source: input, description: "Contact email; unique", constraints: "unique" }
+      - { name: allergen_restrictions, type: array, source: input, default: [], description: "Allergens the client must avoid; tokens from {PEANUT, TREE_NUT, SHELLFISH, DAIRY, GLUTEN, EGG, SOY}" }
+      - { name: dietary_pattern, type: enum, source: input, default: "OMNIVORE", description: "Client dietary pattern", constraints: "OMNIVORE | VEGETARIAN | VEGAN | PESCATARIAN" }
+
+  - name: Booking
+    parent: null
+    common_fields: true
+    fields:
+      - { name: chef_id, type: string, source: input, description: "FK -> Chef.id; the booked chef" }
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id; the booking client (owner)" }
+      - { name: menu_package_id, type: string, source: input, description: "FK -> MenuPackage.id; the booked menu" }
+      - { name: travel_zone_id, type: string, source: computed, description: "FK -> TravelZone.id; resolved at creation from service_zip via the chef's zones" }
+      - { name: recurring_plan_id, type: string, source: system, default: null, description: "FK -> RecurringPlan.id; set when this booking was spawned by a plan, else null" }
+      - { name: party_size, type: integer, source: input, description: "Confirmed guest count", constraints: "integer >= 1" }
+      - { name: service_zip, type: string, source: input, description: "Event location ZIP; must prefix-match exactly one of the chef's TravelZones" }
+      - { name: event_start_utc, type: datetime, source: input, description: "Guest-facing event start (UTC)" }
+      - { name: event_end_utc, type: datetime, source: input, description: "Guest-facing event end (UTC); must be > event_start_utc" }
+      - { name: event_date, type: string, source: computed, description: "Calendar date (YYYY-MM-DD, UTC) derived from event_start_utc; used for max_bookings_per_day capacity" }
+      - { name: locked_markup_rate, type: number, source: computed, description: "Grocery markup rate selected at confirmation from the estimated ingredient subtotal tier; frozen for this booking; see calculations.grocery_markup_selection" }
+      - { name: labor_total_cents, type: integer, source: computed, default: 0, description: "Chef labor subtotal incl. small-party surcharge; see calculations.labor_subtotal" }
+      - { name: estimated_grocery_total_cents, type: integer, source: computed, default: 0, description: "Marked-up estimated ingredient total at confirmation; see calculations.estimated_grocery_total" }
+      - { name: actual_grocery_total_cents, type: integer, source: computed, default: 0, description: "Marked-up actual ingredient total after grocery run finalized; see calculations.actual_grocery_total" }
+      - { name: travel_fee_cents, type: integer, source: computed, default: 0, description: "Copied from the resolved TravelZone.travel_fee_cents at creation" }
+      - { name: quote_total_cents, type: integer, source: computed, default: 0, description: "labor_total + (actual if finalized else estimated) grocery total + travel_fee; see calculations.quote_total" }
+      - { name: deposit_due_cents, type: integer, source: computed, default: 0, description: "round_half_up(quote_total_at_confirmation * DEPOSIT_PCT); frozen at confirmation" }
+      - { name: balance_due_cents, type: integer, source: computed, default: 0, description: "quote_total_cents - amount_captured_cents; recomputed on every quote change and payment" }
+      - { name: amount_captured_cents, type: integer, source: computed, default: 0, description: "Sum of this booking's Payment.amount_cents with status CAPTURED" }
+      - { name: amount_refunded_cents, type: integer, source: computed, default: 0, description: "Sum of this booking's Payment.refunded_cents" }
+      - { name: lifecycle_status, type: enum, source: system, description: "Booking lifecycle axis (independent of payment_status)", constraints: "REQUESTED | CONFIRMED | IN_PREP | COMPLETED | DECLINED | CANCELLED" }
+      - { name: payment_status, type: enum, source: system, default: "UNPAID", description: "Booking payment axis (independent of lifecycle_status)", constraints: "UNPAID | DEPOSIT_PAID | PAID_IN_FULL | REFUNDED" }
+      - { name: cancellation_refund_rate, type: number, source: computed, default: 0, description: "Lead-time refund fraction applied on cancellation; see calculations.cancellation_refund" }
+
+  - name: GroceryRun
+    parent: null
+    common_fields: true
+    fields:
+      - { name: booking_id, type: string, source: input, description: "FK -> Booking.id; 1:1 owning booking (provided in create body)" }
+      - { name: raw_actual_subtotal_cents, type: integer, source: computed, default: 0, description: "Sum of line_items[].actual_cost_cents (pre-markup)" }
+      - { name: line_items, type: array, source: input, description: "Array of {label, actual_cost_cents}; actual ingredient receipts" }
+      - { name: status, type: enum, source: system, default: "OPEN", description: "OPEN = editable, FINALIZED = locked and applied to booking, VOIDED = reversed by booking cancellation", constraints: "OPEN | FINALIZED | VOIDED" }
+
+  - name: Payment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: booking_id, type: string, source: input, description: "FK -> Booking.id; owning booking (provided in create body)" }
+      - { name: kind, type: enum, source: input, description: "DEPOSIT or BALANCE", constraints: "DEPOSIT | BALANCE" }
+      - { name: amount_cents, type: integer, source: input, description: "Amount captured by this payment, in cents", constraints: "integer >= 1" }
+      - { name: refunded_cents, type: integer, source: computed, default: 0, description: "Amount refunded back from this payment (set on cancellation refund)" }
+      - { name: status, type: enum, source: system, default: "CAPTURED", description: "CAPTURED on creation; REFUNDED once fully/partially refunded", constraints: "CAPTURED | REFUNDED" }
+
+  - name: RecurringPlan
+    parent: null
+    common_fields: true
+    fields:
+      - { name: chef_id, type: string, source: input, description: "FK -> Chef.id; the chef serving the plan" }
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id; plan owner (client)" }
+      - { name: menu_package_id, type: string, source: input, description: "FK -> MenuPackage.id; menu repeated each occurrence" }
+      - { name: party_size, type: integer, source: input, description: "Party size for every spawned occurrence", constraints: "integer >= 1" }
+      - { name: service_zip, type: string, source: input, description: "Event ZIP for every spawned occurrence" }
+      - { name: weekday, type: integer, source: input, description: "Day of week occurrences land on, 0=Monday..6=Sunday", constraints: "integer 0..6" }
+      - { name: event_start_time_utc, type: string, source: input, description: "HH:MM:SS UTC time-of-day each occurrence starts" }
+      - { name: duration_minutes, type: integer, source: input, description: "Event duration in minutes for each occurrence", constraints: "integer >= 1" }
+      - { name: cadence_weeks, type: integer, source: input, default: 1, description: "Weeks between occurrences (1 = weekly, 2 = biweekly)", constraints: "integer >= 1" }
+      - { name: occurrences_generated, type: integer, source: computed, default: 0, description: "Count of Bookings spawned by this plan to date" }
+      - { name: status, type: enum, source: system, description: "Plan lifecycle (cyclic ACTIVE↔PAUSED)", constraints: "ACTIVE | PAUSED | CANCELLED" }
+
+  - name: RescheduleRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: booking_id, type: string, source: input, description: "FK -> Booking.id; the booking proposed for reschedule (provided in create body)" }
+      - { name: proposed_event_start_utc, type: datetime, source: input, description: "Proposed new event start (UTC)" }
+      - { name: proposed_event_end_utc, type: datetime, source: input, description: "Proposed new event end (UTC); must be > proposed_event_start_utc" }
+      - { name: requested_by_role, type: enum, source: system, description: "Which party initiated; affects nothing fiscal but recorded", constraints: "CLIENT | CHEF" }
+      - { name: status, type: enum, source: system, default: "PROPOSED", description: "Branching: PROPOSED → {ACCEPTED, REJECTED, WITHDRAWN}", constraints: "PROPOSED | ACCEPTED | REJECTED | WITHDRAWN" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- Chef lifecycle (linear with revert) ----
+  - entity: Chef
+    initial_state: DRAFT
+    terminal_states: []
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /chefs/{chefId}/activate"
+        actor: Chef
+        preconditions:
+          - "At least one MenuPackage with is_listed == true exists for this chef (ERR_NO_LISTED_MENU)"
+          - "At least one TravelZone exists for this chef (ERR_NO_TRAVEL_ZONE)"
+        side_effects:
+          - "status → ACTIVE; chef may now receive booking confirmations"
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /chefs/{chefId}/suspend"
+        actor: PlatformAdmin
+        preconditions: []
+        side_effects:
+          - "status → SUSPENDED; blocks new booking confirmations (cross-entity gate, does not touch existing CONFIRMED bookings)"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /chefs/{chefId}/activate"
+        actor: PlatformAdmin
+        preconditions:
+          - "At least one MenuPackage with is_listed == true exists (ERR_NO_LISTED_MENU)"
+        side_effects:
+          - "status → ACTIVE"
+
+  # ---- Booking lifecycle axis (parallel dimension #1) ----
+  - entity: Booking
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, DECLINED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: CONFIRMED
+        trigger: "POST /bookings/{bookingId}/confirm"
+        actor: Chef
+        preconditions:
+          - "Acting chef owns this booking (X-User-ID == booking.chef_id) (ERR_NOT_RESOURCE_OWNER)"
+          - "Chef.status == ACTIVE (cross-entity: ERR_CHEF_NOT_ACTIVE)"
+          - "expected_chef_version matches Chef.version (ERR_STALE_VERSION)"
+          - "Client.allergen_restrictions ∩ MenuPackage.allergen_tags == ∅ (ERR_ALLERGEN_CONFLICT)"
+          - "MenuPackage.required_equipment ⊆ Chef.equipment_inventory (ERR_EQUIPMENT_UNAVAILABLE)"
+          - "party_size within [MenuPackage.min_party_size, MenuPackage.max_party_size] (ERR_PARTY_SIZE_OUT_OF_RANGE)"
+          - "The booking's occupied window [event_start - prep_buffer, event_end) does not overlap any HELD AvailabilityBlock of the chef (ERR_CHEF_TIME_CONFLICT)"
+          - "Count of chef's bookings in {CONFIRMED, IN_PREP} sharing event_date < Chef.max_bookings_per_day (ERR_DAILY_CAPACITY_EXCEEDED)"
+        side_effects:
+          - "lifecycle_status → CONFIRMED"
+          - "locked_markup_rate set from estimated ingredient subtotal tier (calculations.grocery_markup_selection)"
+          - "labor_total_cents, estimated_grocery_total_cents, travel_fee_cents, quote_total_cents computed; deposit_due_cents frozen (calculations.quote_total, calculations.deposit_amount)"
+          - "balance_due_cents = quote_total_cents - amount_captured_cents"
+          - "A BOOKING_HOLD AvailabilityBlock minted (status HELD) over [event_start - prep_buffer, event_end)"
+          - "Chef.active_booking_count incremented; Chef.projected_reliability_score recomputed (calculations.chef_projected_reliability)"
+          - "increments Chef.version by 1"
+      - from: REQUESTED
+        to: DECLINED
+        trigger: "POST /bookings/{bookingId}/decline"
+        actor: Chef
+        preconditions:
+          - "Acting chef owns this booking (ERR_NOT_RESOURCE_OWNER)"
+        side_effects:
+          - "lifecycle_status → DECLINED (terminal); no hold was ever minted so none released"
+      - from: CONFIRMED
+        to: IN_PREP
+        trigger: "POST /bookings/{bookingId}/start-prep"
+        actor: Chef
+        preconditions:
+          - "Acting chef owns this booking (ERR_NOT_RESOURCE_OWNER)"
+          - "A FINALIZED GroceryRun exists for this booking (ERR_GROCERY_RUN_NOT_FINALIZED)"
+        side_effects:
+          - "lifecycle_status → IN_PREP"
+      - from: IN_PREP
+        to: COMPLETED
+        trigger: "POST /bookings/{bookingId}/complete"
+        actor: Chef
+        preconditions:
+          - "Acting chef owns this booking (ERR_NOT_RESOURCE_OWNER)"
+          - "payment_status == PAID_IN_FULL (ERR_BALANCE_OUTSTANDING)"
+        side_effects:
+          - "lifecycle_status → COMPLETED (terminal)"
+          - "BOOKING_HOLD AvailabilityBlock remains (consumed historical occupancy) — Chef.active_booking_count decremented"
+          - "Chef.completed_bookings_count incremented"
+          - "Chef.settled_reliability_score and projected_reliability_score recomputed (calculations.chef_settled_reliability, calculations.chef_projected_reliability)"
+      - from: [REQUESTED, CONFIRMED, IN_PREP]
+        to: CANCELLED
+        trigger: "POST /bookings/{bookingId}/cancel"
+        actor: Client
+        preconditions:
+          - "Acting client owns this booking (X-User-ID == booking.client_id) (ERR_NOT_RESOURCE_OWNER)"
+        side_effects:
+          - "cancellation_refund_rate set from lead time (calculations.cancellation_refund)"
+          - "Each CAPTURED Payment refunded by round_half_up(amount_cents * cancellation_refund_rate); Payment.refunded_cents set, status → REFUNDED when fully refunded; payment_status → REFUNDED if any refund issued"
+          - "HOP-2: If a FINALIZED GroceryRun exists it transitions to VOIDED, which zeroes actual_grocery_total_cents and re-pins quote_total_cents to the estimated grocery basis (calculations.quote_total)"
+          - "If the booking was CONFIRMED/IN_PREP, its BOOKING_HOLD AvailabilityBlock → RELEASED and Chef.active_booking_count decremented (capacity restored)"
+          - "lifecycle_status → CANCELLED (terminal)"
+          - "Chef.captured/refunded/payout recomputed (calculations.chef_payout_invariant); projected_reliability_score recomputed"
+
+  # ---- Booking payment axis (parallel dimension #2, independent of lifecycle) ----
+  - entity: Booking
+    state_field: payment_status
+    initial_state: UNPAID
+    terminal_states: [REFUNDED]
+    transitions:
+      - from: UNPAID
+        to: DEPOSIT_PAID
+        trigger: "POST /payments (booking_id, kind=DEPOSIT)"
+        actor: Client
+        preconditions:
+          - "lifecycle_status == CONFIRMED (ERR_BOOKING_NOT_CONFIRMED)"
+          - "amount_cents == deposit_due_cents (ERR_DEPOSIT_AMOUNT_MISMATCH)"
+        side_effects:
+          - "Payment minted CAPTURED; amount_captured_cents += amount; balance_due_cents recomputed"
+          - "payment_status → DEPOSIT_PAID; Chef.captured_payments_cents and payout_accrued_cents recomputed"
+      - from: DEPOSIT_PAID
+        to: PAID_IN_FULL
+        trigger: "POST /payments (booking_id, kind=BALANCE)"
+        actor: Client
+        preconditions:
+          - "A FINALIZED GroceryRun exists (balance only billable once actual cost known) (ERR_GROCERY_RUN_NOT_FINALIZED)"
+          - "amount_cents == balance_due_cents (ERR_BALANCE_AMOUNT_MISMATCH)"
+        side_effects:
+          - "Payment minted CAPTURED; amount_captured_cents += amount; balance_due_cents → 0"
+          - "payment_status → PAID_IN_FULL; Chef.captured_payments_cents and payout_accrued_cents recomputed"
+      - from: [DEPOSIT_PAID, PAID_IN_FULL]
+        to: REFUNDED
+        trigger: "system (booking cancellation refund)"
+        actor: system
+        preconditions:
+          - "Booking lifecycle cancellation issued at least one refund (refund_rate > 0)"
+        side_effects:
+          - "payment_status → REFUNDED; amount_refunded_cents set"
+
+  # ---- GroceryRun (linear with void compensation) ----
+  - entity: GroceryRun
+    initial_state: OPEN
+    terminal_states: [VOIDED]
+    transitions:
+      - from: OPEN
+        to: FINALIZED
+        trigger: "POST /grocery-runs/{groceryRunId}/finalize"
+        actor: Chef
+        preconditions:
+          - "Acting chef owns the parent booking (ERR_NOT_RESOURCE_OWNER)"
+          - "Parent booking lifecycle_status == CONFIRMED (cross-entity: ERR_BOOKING_NOT_CONFIRMED)"
+          - "line_items is non-empty (ERR_GROCERY_RUN_EMPTY)"
+        side_effects:
+          - "raw_actual_subtotal_cents = sum(line_items.actual_cost_cents)"
+          - "actual_grocery_total_cents computed by per-line round-then-sum (calculations.actual_grocery_total) and written to parent Booking"
+          - "Booking.quote_total_cents re-pinned to actual grocery basis (calculations.quote_total); balance_due_cents recomputed"
+          - "status → FINALIZED"
+      - from: FINALIZED
+        to: VOIDED
+        trigger: "system (parent booking cancelled — cascade HOP-2)"
+        actor: system
+        preconditions:
+          - "Parent booking transitioned to CANCELLED"
+        side_effects:
+          - "status → VOIDED; Booking.actual_grocery_total_cents → 0; quote_total re-pinned to estimated basis"
+
+  # ---- RecurringPlan (cyclic ACTIVE↔PAUSED) ----
+  - entity: RecurringPlan
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: PAUSED
+        trigger: "POST /recurring-plans/{planId}/pause"
+        actor: Client
+        preconditions:
+          - "Acting client owns the plan (ERR_NOT_RESOURCE_OWNER)"
+        side_effects:
+          - "status → PAUSED"
+          - "HOP-1→2: every spawned child Booking still in REQUESTED → CANCELLED with refund_rate 0 (none paid); each such child that held a hold has its BOOKING_HOLD → RELEASED (depth-2 cascade)"
+      - from: PAUSED
+        to: ACTIVE
+        trigger: "POST /recurring-plans/{planId}/resume"
+        actor: Client
+        preconditions:
+          - "Acting client owns the plan (ERR_NOT_RESOURCE_OWNER)"
+        side_effects:
+          - "status → ACTIVE; future generate calls allowed again"
+      - from: [ACTIVE, PAUSED]
+        to: CANCELLED
+        trigger: "POST /recurring-plans/{planId}/cancel"
+        actor: Client
+        preconditions:
+          - "Acting client owns the plan (ERR_NOT_RESOURCE_OWNER)"
+        side_effects:
+          - "status → CANCELLED (terminal); no further occurrences may be generated"
+
+  # ---- RescheduleRequest (branching PROPOSED → {ACCEPTED, REJECTED, WITHDRAWN}) ----
+  - entity: RescheduleRequest
+    initial_state: PROPOSED
+    terminal_states: [ACCEPTED, REJECTED, WITHDRAWN]
+    transitions:
+      - from: PROPOSED
+        to: ACCEPTED
+        trigger: "POST /reschedule-requests/{requestId}/accept"
+        actor: Chef
+        preconditions:
+          - "Acting chef owns the parent booking (ERR_NOT_RESOURCE_OWNER)"
+          - "Parent booking lifecycle_status == CONFIRMED (ERR_BOOKING_NOT_CONFIRMED)"
+          - "Proposed window [proposed_start - prep_buffer, proposed_end) does not overlap any HELD AvailabilityBlock of the chef EXCEPT this booking's own current hold (ERR_CHEF_TIME_CONFLICT)"
+        side_effects:
+          - "Booking.event_start_utc/event_end_utc/event_date updated to proposed window"
+          - "Booking's existing BOOKING_HOLD window moved to the proposed window (released old, minted new HELD over proposed)"
+          - "status → ACCEPTED (terminal); sibling PROPOSED requests on same booking → WITHDRAWN"
+      - from: PROPOSED
+        to: REJECTED
+        trigger: "POST /reschedule-requests/{requestId}/reject"
+        actor: Chef
+        preconditions:
+          - "Acting chef owns the parent booking (ERR_NOT_RESOURCE_OWNER)"
+        side_effects:
+          - "status → REJECTED (terminal); booking window unchanged"
+      - from: PROPOSED
+        to: WITHDRAWN
+        trigger: "POST /reschedule-requests/{requestId}/withdraw"
+        actor: Client
+        preconditions:
+          - "Acting client owns the parent booking (ERR_NOT_RESOURCE_OWNER)"
+        side_effects:
+          - "status → WITHDRAWN (terminal)"
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: booking-confirm-stale-chef
+    parent_entity: Chef
+    write_endpoint: "POST /bookings/{bookingId}/confirm"
+    occ_field: "expected_chef_version"
+    description: |
+      Confirming a booking against a Chef whose version has advanced since the
+      client last observed it is rejected. Each successful confirmation mints a
+      BOOKING_HOLD and bumps the chef's daily/availability occupancy (advancing
+      Chef.version); a confirmation carrying a now-stale expected_chef_version is
+      rejected so a slot that was legitimately taken by a prior confirmation
+      cannot be double-booked on an outdated view of the chef's calendar.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: labor_subtotal
+    trigger: "Booking confirm transition (REQUESTED→CONFIRMED)"
+    algorithm: threshold
+    formula: |
+      if party_size < SMALL_PARTY_THRESHOLD:
+        per_guest = round_half_up(menu.base_price_per_guest_cents * SMALL_PARTY_SURCHARGE)
+      else:
+        per_guest = menu.base_price_per_guest_cents
+      labor_total_cents = per_guest * party_size
+    input_set: "menu.base_price_per_guest_cents, booking.party_size"
+    constants:
+      SMALL_PARTY_THRESHOLD: 4
+      SMALL_PARTY_SURCHARGE: 1.20
+    precision: "integer cents, round_half_up on the per-guest surcharge BEFORE multiplying by party_size"
+    note: "Boundary: party_size == 4 takes the base rate (no surcharge); party_size == 3 takes the surcharge."
+
+  - name: grocery_markup_selection
+    trigger: "Booking confirm transition; rate frozen into Booking.locked_markup_rate"
+    algorithm: tiered_pricing
+    formula: |
+      ingredient_subtotal = menu.estimated_ingredient_per_guest_cents * party_size
+      if ingredient_subtotal < TIER1_CEILING:        locked_markup_rate = RATE_LOW_VOLUME
+      elif ingredient_subtotal < TIER2_CEILING:       locked_markup_rate = RATE_MID_VOLUME
+      else:                                           locked_markup_rate = RATE_HIGH_VOLUME
+    input_set: "menu.estimated_ingredient_per_guest_cents, booking.party_size"
+    constants:
+      TIER1_CEILING: 20000
+      TIER2_CEILING: 50000
+      RATE_LOW_VOLUME: 0.25
+      RATE_MID_VOLUME: 0.18
+      RATE_HIGH_VOLUME: 0.12
+    precision: "rate is exact (0.25/0.18/0.12); whole-subtotal rate selection, NOT marginal/tiered slabs"
+    note: |
+      Boundary: subtotal == 20000 selects RATE_MID_VOLUME (>= TIER1_CEILING uses mid),
+      subtotal == 19999 selects RATE_LOW_VOLUME. This is mode (a) of Rule 2:
+      >=3 inputs feeding a conditional tier selection that then drives downstream totals.
+
+  - name: estimated_grocery_total
+    trigger: "Booking confirm; recomputed if a FINALIZED GroceryRun is later VOIDED (cancellation)"
+    algorithm: aggregation
+    formula: |
+      ingredient_subtotal = menu.estimated_ingredient_per_guest_cents * party_size
+      estimated_grocery_total_cents = round_half_up(ingredient_subtotal * (1 + locked_markup_rate))
+    input_set: "menu.estimated_ingredient_per_guest_cents, party_size, locked_markup_rate"
+    precision: "integer cents, round_half_up applied ONCE to the whole marked-up subtotal"
+    variants:
+      - name: estimated
+        when: "at confirmation, and after a FINALIZED grocery run is VOIDED"
+        difference: "uses the menu's per-guest estimate; this is the provisional ingredient basis"
+
+  - name: actual_grocery_total
+    trigger: "GroceryRun finalize transition (OPEN→FINALIZED)"
+    algorithm: aggregation
+    formula: |
+      # MODE (b): round PER LINE then sum — order is pinned and explicit.
+      raw_actual_subtotal = sum(li.actual_cost_cents for li in line_items)
+      rate = booking.locked_markup_rate                       # frozen at confirmation
+      actual_grocery_total_cents = sum(
+        round_half_up(li.actual_cost_cents * (1 + rate)) for li in line_items
+      )
+      # NOT round_half_up(raw_actual_subtotal * (1 + rate)) — the two differ by rounding drift.
+    input_set: "GroceryRun.line_items[].actual_cost_cents, booking.locked_markup_rate"
+    precision: "integer cents; round_half_up applied PER LINE ITEM, then summed (round-then-sum). Line iteration order is created order of line_items as submitted."
+    variants:
+      - name: actual
+        when: "after a FINALIZED grocery run exists"
+        difference: "uses receipt line items with per-line rounding; this is the finalized ingredient basis that supersedes the estimate in quote_total"
+    note: |
+      This is Rule 2 mode (b): per-line round-then-sum is pinned; sum-then-round is the
+      forbidden alternative that yields a different cent total (e.g. 7614 vs 7613).
+
+  - name: quote_total
+    trigger: "Booking confirm; GroceryRun finalize; GroceryRun void on cancellation"
+    algorithm: aggregation
+    formula: |
+      grocery_basis = actual_grocery_total_cents if a FINALIZED GroceryRun exists
+                      else estimated_grocery_total_cents
+      quote_total_cents = labor_total_cents + grocery_basis + travel_fee_cents
+      balance_due_cents = quote_total_cents - amount_captured_cents
+    input_set: "labor_total_cents, estimated/actual grocery total, travel_fee_cents, amount_captured_cents"
+    precision: "integer cents; pure addition, no rounding"
+    note: "Evaluation order pinned (Rule 2 mode c support): grocery_basis selection precedes the sum; balance derives from the freshly computed quote, never a stale one."
+
+  - name: deposit_amount
+    trigger: "Booking confirm; frozen into Booking.deposit_due_cents"
+    algorithm: threshold
+    formula: |
+      deposit_due_cents = round_half_up(quote_total_cents_at_confirmation * DEPOSIT_PCT)
+    input_set: "quote_total_cents computed at confirmation (estimated grocery basis)"
+    constants:
+      DEPOSIT_PCT: 0.30
+    precision: "integer cents, round_half_up; computed once at confirmation from the ESTIMATED-basis quote and never re-derived even if actuals change"
+    note: "deposit is pinned at confirmation; only balance_due_cents tracks the actual-cost quote afterward."
+
+  - name: cancellation_refund
+    trigger: "Booking cancel transition (→CANCELLED)"
+    algorithm: threshold
+    formula: |
+      lead_days = floor((event_start_utc - now_utc) / 86400 seconds)   # whole days
+      if lead_days >= FULL_REFUND_DAYS:        cancellation_refund_rate = 1.00
+      elif lead_days >= HALF_REFUND_DAYS:      cancellation_refund_rate = 0.50
+      else:                                    cancellation_refund_rate = 0.00
+      for each CAPTURED Payment p of the booking:
+        p.refunded_cents = round_half_up(p.amount_cents * cancellation_refund_rate)
+    input_set: "booking.event_start_utc, system clock, booking's CAPTURED Payments"
+    constants:
+      FULL_REFUND_DAYS: 14
+      HALF_REFUND_DAYS: 7
+    precision: "integer cents, round_half_up per payment"
+    note: |
+      Boundary (Rule 6): lead_days == 14 → full refund; lead_days == 13 → half; lead_days == 7 → half;
+      lead_days == 6 → zero. Distinct metric (lead-time days) and distinct endpoint (POST .../cancel)
+      from the party-size boundary in labor_subtotal.
+
+  - name: chef_settled_reliability
+    trigger: "Booking complete, decline, and cancel transitions; recompute on the chef"
+    algorithm: chronological
+    formula: |
+      score = BASE_SCORE
+      # process this chef's TERMINAL bookings in event_start_utc ascending; tie-break created_at ascending (never id)
+      for b in chef_bookings where lifecycle_status IN {COMPLETED, DECLINED, CANCELLED}
+              ordered by (event_start_utc ASC, created_at ASC):
+        if   b.lifecycle_status == COMPLETED: score += COMPLETE_BONUS
+        elif b.lifecycle_status == DECLINED:  score += DECLINE_PENALTY   # chef declined a request
+        elif b.lifecycle_status == CANCELLED: score += 0                 # client-initiated cancel: neutral to chef
+      settled_reliability_score = clamp(score, SCORE_FLOOR, SCORE_CEILING)
+    input_set: "this chef's bookings filtered to terminal lifecycle states, ordered chronologically by event_start_utc"
+    constants:
+      BASE_SCORE: 50
+      COMPLETE_BONUS: 10
+      DECLINE_PENALTY: -8
+      SCORE_FLOOR: 0
+      SCORE_CEILING: 100
+    note: "Settled variant: only TERMINAL bookings count; chronological accumulation with explicit created_at tie-break (no id used)."
+
+  - name: chef_projected_reliability
+    trigger: "Booking confirm, complete, decline, cancel transitions; recompute on the chef"
+    algorithm: forward_looking
+    formula: |
+      settled_basis = (the chronological accumulation of chef_settled_reliability BEFORE the final clamp)
+      projected_reliability_score = clamp(
+        settled_basis + (count of this chef's bookings in {CONFIRMED, IN_PREP}) * CONFIRMED_PROVISIONAL_BONUS,
+        SCORE_FLOOR, SCORE_CEILING )
+    input_set: "settled terminal bookings (pre-clamp basis) PLUS forward-looking CONFIRMED/IN_PREP bookings"
+    constants:
+      BASE_SCORE: 50
+      COMPLETE_BONUS: 10
+      DECLINE_PENALTY: -8
+      CONFIRMED_PROVISIONAL_BONUS: 10
+      SCORE_FLOOR: 0
+      SCORE_CEILING: 100
+    variants:
+      - name: projected
+        when: "any time CONFIRMED/IN_PREP bookings exist"
+        difference: "optimistically counts not-yet-completed CONFIRMED/IN_PREP bookings as if they will complete; diverges from settled whenever such bookings exist"
+    note: |
+      Rule 1 dual-variant on the Chef domain (distinct from the Booking ingredient
+      est-vs-actual dual variant): projected (forward-looking) vs settled (chronological)
+      produce different scores for the same chef whenever CONFIRMED/IN_PREP bookings exist.
+      With BASE_SCORE 50 (below the 100 ceiling) the two variants are observably distinct.
+
+  - name: chef_payout_invariant
+    trigger: "Any Payment capture and any cancellation refund"
+    algorithm: aggregation
+    formula: |
+      captured_payments_cents  = sum(p.amount_cents   for p in chef_payments where p.status IN {CAPTURED, REFUNDED})
+      refunded_payments_cents  = sum(p.refunded_cents for p in chef_payments)
+      payout_accrued_cents     = captured_payments_cents - refunded_payments_cents
+      INVARIANT: payout_accrued_cents == captured_payments_cents - refunded_payments_cents  (always; conserved money quantity)
+    input_set: "all Payments across this chef's bookings"
+    precision: "integer cents; pure sums"
+    note: "Rule 9 conserved quantity #1 (money): a cancel-refund pair never makes payout_accrued drift from captured - refunded."
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and well-formed"
+    error_id: ERR_MISSING_AUTH_CONTEXT
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "X-User-Role is one of the declared roles AND is permitted for this operation"
+    error_id: ERR_UNAUTHORIZED_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "Path resource ids exist, validated left-to-right (chefId, then menuId/zoneId/bookingId, then nested requestId/grocery-run)"
+    error_id: "ERR_CHEF_NOT_FOUND / ERR_MENU_NOT_FOUND / ERR_ZONE_NOT_FOUND / ERR_BOOKING_NOT_FOUND / ERR_CLIENT_NOT_FOUND / ERR_PLAN_NOT_FOUND / ERR_RESCHEDULE_NOT_FOUND / ERR_GROCERY_RUN_NOT_FOUND"
+    http_status: 404
+    applies_to: all endpoints with path ids
+
+  - priority: 4
+    category: existence
+    check: "Referenced FK bodies exist (chef_id, client_id, menu_package_id on booking/plan create)"
+    error_id: "ERR_CHEF_NOT_FOUND / ERR_CLIENT_NOT_FOUND / ERR_MENU_NOT_FOUND"
+    http_status: 404
+    applies_to: "POST /bookings, POST /recurring-plans"
+
+  - priority: 5
+    category: business_referential
+    check: "Acting user owns the resource they mutate (chef owns booking on confirm/decline/start-prep/complete/grocery; client owns booking on cancel/reschedule-withdraw and owns plan)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "ownership-scoped mutations"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a legal source state for the requested transition (and OCC parent version, where the endpoint declares expected_chef_version, matches before any business check)"
+    error_id: "ERR_INVALID_STATE / ERR_STALE_VERSION / ERR_BOOKING_NOT_CONFIRMED / ERR_GROCERY_RUN_NOT_FINALIZED"
+    http_status: "409 (state) / 412 (stale version)"
+    applies_to: "all transition endpoints"
+
+  - priority: 7
+    category: business_safety
+    check: "Client.allergen_restrictions and MenuPackage.allergen_tags are disjoint (allergen safety precedes any temporal/fiscal check on confirm)"
+    error_id: ERR_ALLERGEN_CONFLICT
+    http_status: 422
+    applies_to: "POST /bookings/{bookingId}/confirm"
+
+  - priority: 8
+    category: business_constraint
+    check: "MenuPackage.required_equipment is a subset of Chef.equipment_inventory"
+    error_id: ERR_EQUIPMENT_UNAVAILABLE
+    http_status: 422
+    applies_to: "POST /bookings/{bookingId}/confirm"
+
+  - priority: 9
+    category: business_constraint
+    check: "party_size within [menu.min_party_size, menu.max_party_size]; service_zip prefix-matches exactly one chef TravelZone"
+    error_id: "ERR_PARTY_SIZE_OUT_OF_RANGE / ERR_ZIP_OUTSIDE_SERVICE_AREA"
+    http_status: 422
+    applies_to: "POST /bookings, POST /bookings/{bookingId}/confirm"
+
+  - priority: 10
+    category: business_temporal
+    check: "On confirm/reschedule-accept the occupied window [start - prep_buffer, end) does not overlap a HELD AvailabilityBlock (half-open interval semantics, buffer-widened); reschedule excludes the booking's own current hold"
+    error_id: ERR_CHEF_TIME_CONFLICT
+    http_status: 409
+    applies_to: "POST /bookings/{bookingId}/confirm, POST /reschedule-requests/{requestId}/accept"
+
+  - priority: 11
+    category: business_constraint
+    check: "Count of chef bookings in {CONFIRMED, IN_PREP} sharing the same event_date is below Chef.max_bookings_per_day (closed-day aggregate-capacity semantics)"
+    error_id: ERR_DAILY_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /bookings/{bookingId}/confirm"
+
+  - priority: 12
+    category: business_fiscal
+    check: "Payment amount equals the exact due amount (deposit == deposit_due_cents; balance == balance_due_cents); balance billable only after FINALIZED grocery run; completion requires PAID_IN_FULL"
+    error_id: "ERR_DEPOSIT_AMOUNT_MISMATCH / ERR_BALANCE_AMOUNT_MISMATCH / ERR_BALANCE_OUTSTANDING"
+    http_status: 402
+    applies_to: "POST /payments, POST /bookings/{bookingId}/complete"
+
+  - priority: 13
+    category: business_constraint
+    check: "Field-shape validation: required fields present, enums in range, event_end_utc > event_start_utc, max_party_size >= min_party_size, weekday in 0..6"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all create/update endpoints
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---------- Chef ----------
+  - method: POST
+    path: "/chefs"
+    description: "Register a new chef (DRAFT)"
+    roles: [Chef, PlatformAdmin]
+    code: 201
+    input: [display_name, home_base_zip, "equipment_inventory?", "prep_buffer_minutes?", "max_bookings_per_day?"]
+    output: Chef
+    side_effects: ["status=DRAFT; all computed scores/counters initialized (settled_reliability_score=50, projected_reliability_score=50, counts=0)"]
+
+  - method: GET
+    path: "/chefs"
+    description: "List chefs (paginated)"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: "Chef[]"
+    side_effects: []
+
+  - method: GET
+    path: "/chefs/{chefId}"
+    description: "Get a chef incl. computed scores and payout invariant fields"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: []
+    output: Chef
+    side_effects: []
+
+  - method: POST
+    path: "/chefs/{chefId}/activate"
+    description: "Activate chef (DRAFT->ACTIVE or SUSPENDED->ACTIVE)"
+    roles: [Chef, PlatformAdmin]
+    code: 200
+    input: []
+    output: Chef
+    side_effects: ["status -> ACTIVE; increments Chef.version by 1"]
+
+  - method: POST
+    path: "/chefs/{chefId}/suspend"
+    description: "Suspend chef (ACTIVE->SUSPENDED)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Chef
+    side_effects: ["status -> SUSPENDED; increments Chef.version by 1"]
+
+  # ---------- MenuPackage (flat collection; FK chef_id) ----------
+  - method: POST
+    path: "/menus"
+    description: "Create a menu package (unlisted)"
+    roles: [Chef]
+    code: 201
+    input: [chef_id, title, base_price_per_guest_cents, estimated_ingredient_per_guest_cents, "min_party_size?", "max_party_size?", "allergen_tags?", "required_equipment?"]
+    output: MenuPackage
+    side_effects: ["is_listed=false"]
+
+  - method: GET
+    path: "/menus"
+    description: "List menu packages; filter by chef_id (reverse-reachability for MenuPackage.chef_id)"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "chef_id?", "is_listed?"]
+    output: "MenuPackage[]"
+    side_effects: []
+
+  - method: GET
+    path: "/menus/{menuId}"
+    description: "Get a menu package"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: []
+    output: MenuPackage
+    side_effects: []
+
+  - method: POST
+    path: "/menus/{menuId}/publish"
+    description: "Publish a menu package (is_listed=true)"
+    roles: [Chef]
+    code: 200
+    input: []
+    output: MenuPackage
+    side_effects: ["is_listed=true"]
+
+  # ---------- TravelZone (flat collection; FK chef_id) ----------
+  - method: POST
+    path: "/travel-zones"
+    description: "Create a travel zone with flat fee"
+    roles: [Chef]
+    code: 201
+    input: [chef_id, zone_code, zip_prefixes, travel_fee_cents]
+    output: TravelZone
+    side_effects: []
+
+  - method: GET
+    path: "/travel-zones"
+    description: "List travel zones; filter by chef_id (reverse-reachability for TravelZone.chef_id)"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "chef_id?"]
+    output: "TravelZone[]"
+    side_effects: []
+
+  - method: GET
+    path: "/travel-zones/{zoneId}"
+    description: "Get a travel zone"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: []
+    output: TravelZone
+    side_effects: []
+
+  # ---------- AvailabilityBlock (flat collection; FK chef_id, booking_id) ----------
+  - method: POST
+    path: "/availability-blocks"
+    description: "Create a BLACKOUT availability block for a chef"
+    roles: [Chef]
+    code: 201
+    input: [chef_id, window_start_utc, window_end_utc]
+    output: AvailabilityBlock
+    side_effects: ["kind=BLACKOUT, status=HELD, booking_id=null"]
+
+  - method: GET
+    path: "/availability-blocks"
+    description: "List availability blocks; filter by chef_id or booking_id (reverse-reachability for AvailabilityBlock.chef_id AND AvailabilityBlock.booking_id)"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "chef_id?", "booking_id?", "status?", "kind?"]
+    output: "AvailabilityBlock[]"
+    side_effects: []
+
+  - method: GET
+    path: "/availability-blocks/{blockId}"
+    description: "Get an availability block"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: []
+    output: AvailabilityBlock
+    side_effects: []
+
+  # ---------- Client ----------
+  - method: POST
+    path: "/clients"
+    description: "Register a client"
+    roles: [Client, PlatformAdmin]
+    code: 201
+    input: [full_name, email, "allergen_restrictions?", "dietary_pattern?"]
+    output: Client
+    side_effects: []
+
+  - method: GET
+    path: "/clients/{clientId}"
+    description: "Get a client"
+    roles: [Client, Chef, PlatformAdmin]
+    code: 200
+    input: []
+    output: Client
+    side_effects: []
+
+  # ---------- Booking ----------
+  - method: POST
+    path: "/bookings"
+    description: "Create a booking request (REQUESTED). Resolves travel_zone_id & travel_fee_cents from service_zip; validates party-size range & zip coverage; quote computed later at confirm"
+    roles: [Client]
+    code: 201
+    input: [chef_id, client_id, menu_package_id, party_size, service_zip, event_start_utc, event_end_utc]
+    output: Booking
+    side_effects: ["lifecycle_status=REQUESTED, payment_status=UNPAID; travel_zone_id & travel_fee_cents & event_date resolved"]
+
+  - method: GET
+    path: "/bookings"
+    description: "List bookings; filter by chef_id / client_id / recurring_plan_id (reverse-reachability for Booking.chef_id, Booking.client_id, Booking.recurring_plan_id)"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "chef_id?", "client_id?", "recurring_plan_id?", "menu_package_id?", "travel_zone_id?", "lifecycle_status?", "event_date?"]
+    output: "Booking[]"
+    side_effects: []
+
+  - method: GET
+    path: "/bookings/{bookingId}"
+    description: "Get a booking incl. all computed totals"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: []
+
+  - method: POST
+    path: "/bookings/{bookingId}/confirm"
+    description: "Chef confirms a REQUESTED booking; runs full validation cascade and freezes the quote/deposit. OCC-guarded on Chef.version"
+    roles: [Chef]
+    code: 200
+    input: [expected_chef_version]
+    output: Booking
+    side_effects:
+      - "lifecycle_status -> CONFIRMED; computes labor/markup/estimated-grocery/travel/quote/deposit; balance recomputed"
+      - "mints HELD BOOKING_HOLD AvailabilityBlock over [event_start - prep_buffer, event_end)"
+      - "Chef.active_booking_count++; projected_reliability_score recomputed"
+      - "increments Chef.version by 1"
+
+  - method: POST
+    path: "/bookings/{bookingId}/decline"
+    description: "Chef declines a REQUESTED booking"
+    roles: [Chef]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: ["lifecycle_status -> DECLINED"]
+
+  - method: POST
+    path: "/bookings/{bookingId}/cancel"
+    description: "Client cancels a REQUESTED/CONFIRMED/IN_PREP booking; computes lead-time refund, refunds payments, voids any finalized grocery run, releases the hold"
+    roles: [Client]
+    code: 200
+    input: []
+    output: Booking
+    side_effects:
+      - "cancellation_refund_rate set; CAPTURED payments refunded; payment_status -> REFUNDED if any refund"
+      - "FINALIZED GroceryRun -> VOIDED (HOP-2); actual_grocery_total -> 0; quote re-pinned to estimate"
+      - "BOOKING_HOLD -> RELEASED; Chef.active_booking_count restored; payout invariant & projected score recomputed"
+      - "lifecycle_status -> CANCELLED"
+
+  - method: POST
+    path: "/bookings/{bookingId}/start-prep"
+    description: "Chef moves a CONFIRMED booking to IN_PREP (requires FINALIZED grocery run)"
+    roles: [Chef]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: ["lifecycle_status -> IN_PREP"]
+
+  - method: POST
+    path: "/bookings/{bookingId}/complete"
+    description: "Chef completes an IN_PREP booking (requires PAID_IN_FULL)"
+    roles: [Chef]
+    code: 200
+    input: []
+    output: Booking
+    side_effects:
+      - "lifecycle_status -> COMPLETED; Chef.completed_bookings_count++, active_booking_count--"
+      - "settled & projected reliability scores recomputed"
+
+  # ---------- Payment (flat collection; FK booking_id) ----------
+  - method: POST
+    path: "/payments"
+    description: "Client makes a DEPOSIT or BALANCE payment (exact-amount). Advances the booking payment_status axis"
+    roles: [Client]
+    code: 201
+    input: [booking_id, kind, amount_cents]
+    output: Payment
+    side_effects:
+      - "Payment minted CAPTURED; booking.amount_captured_cents += amount; balance recomputed"
+      - "payment_status -> DEPOSIT_PAID or PAID_IN_FULL; Chef captured/payout recomputed"
+
+  - method: GET
+    path: "/payments"
+    description: "List payments; filter by booking_id (reverse-reachability for Payment.booking_id)"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "booking_id?"]
+    output: "Payment[]"
+    side_effects: []
+
+  - method: GET
+    path: "/payments/{paymentId}"
+    description: "Get a payment"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+
+  # ---------- GroceryRun (flat collection; FK booking_id; 1:1) ----------
+  - method: POST
+    path: "/grocery-runs"
+    description: "Open the grocery run for a CONFIRMED booking with receipt line items (chef only)"
+    roles: [Chef]
+    code: 201
+    input: [booking_id, line_items]
+    output: GroceryRun
+    side_effects: ["status=OPEN; raw_actual_subtotal_cents computed but NOT yet applied to booking quote"]
+
+  - method: GET
+    path: "/grocery-runs"
+    description: "List grocery runs; filter by booking_id (reverse-reachability for GroceryRun.booking_id; 1:1 -> array of 0-1)"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "booking_id?", "status?"]
+    output: "GroceryRun[]"
+    side_effects: []
+
+  - method: GET
+    path: "/grocery-runs/{groceryRunId}"
+    description: "Get a grocery run"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: []
+    output: GroceryRun
+    side_effects: []
+
+  - method: POST
+    path: "/grocery-runs/{groceryRunId}/finalize"
+    description: "Finalize the OPEN grocery run: computes per-line round-then-sum actual total and re-pins the booking quote/balance"
+    roles: [Chef]
+    code: 200
+    input: []
+    output: GroceryRun
+    side_effects:
+      - "status -> FINALIZED; Booking.actual_grocery_total_cents written; quote_total & balance recomputed to actual basis"
+
+  # ---------- RescheduleRequest (flat collection; FK booking_id) ----------
+  - method: POST
+    path: "/reschedule-requests"
+    description: "Propose a reschedule of a CONFIRMED booking (Client or Chef)"
+    roles: [Client, Chef]
+    code: 201
+    input: [booking_id, proposed_event_start_utc, proposed_event_end_utc]
+    output: RescheduleRequest
+    side_effects: ["status=PROPOSED; requested_by_role set from X-User-Role"]
+
+  - method: GET
+    path: "/reschedule-requests"
+    description: "List reschedule requests; filter by booking_id (reverse-reachability for RescheduleRequest.booking_id)"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "booking_id?", "status?"]
+    output: "RescheduleRequest[]"
+    side_effects: []
+
+  - method: GET
+    path: "/reschedule-requests/{requestId}"
+    description: "Get a reschedule request"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: []
+    output: RescheduleRequest
+    side_effects: []
+
+  - method: POST
+    path: "/reschedule-requests/{requestId}/accept"
+    description: "Chef accepts a PROPOSED reschedule; moves booking window & hold; withdraws sibling proposals"
+    roles: [Chef]
+    code: 200
+    input: []
+    output: RescheduleRequest
+    side_effects: ["status -> ACCEPTED; booking window & BOOKING_HOLD moved; sibling PROPOSED -> WITHDRAWN"]
+
+  - method: POST
+    path: "/reschedule-requests/{requestId}/reject"
+    description: "Chef rejects a PROPOSED reschedule"
+    roles: [Chef]
+    code: 200
+    input: []
+    output: RescheduleRequest
+    side_effects: ["status -> REJECTED"]
+
+  - method: POST
+    path: "/reschedule-requests/{requestId}/withdraw"
+    description: "Client withdraws their own PROPOSED reschedule"
+    roles: [Client]
+    code: 200
+    input: []
+    output: RescheduleRequest
+    side_effects: ["status -> WITHDRAWN"]
+
+  # ---------- RecurringPlan ----------
+  - method: POST
+    path: "/recurring-plans"
+    description: "Create a recurring meal-prep plan (ACTIVE)"
+    roles: [Client]
+    code: 201
+    input: [chef_id, client_id, menu_package_id, party_size, service_zip, weekday, event_start_time_utc, duration_minutes, "cadence_weeks?"]
+    output: RecurringPlan
+    side_effects: ["status=ACTIVE; occurrences_generated=0"]
+
+  - method: GET
+    path: "/recurring-plans"
+    description: "List recurring plans; filter by chef_id / client_id / menu_package_id (reverse-reachability for RecurringPlan.chef_id, RecurringPlan.client_id, RecurringPlan.menu_package_id)"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "chef_id?", "client_id?", "menu_package_id?", "status?"]
+    output: "RecurringPlan[]"
+    side_effects: []
+
+  - method: GET
+    path: "/recurring-plans/{planId}"
+    description: "Get a recurring plan"
+    roles: [Chef, Client, PlatformAdmin]
+    code: 200
+    input: []
+    output: RecurringPlan
+    side_effects: []
+
+  - method: POST
+    path: "/recurring-plans/{planId}/generate-occurrence"
+    description: "Spawn the next Booking occurrence from an ACTIVE plan for a given anchor date (REQUESTED, recurring_plan_id set)"
+    roles: [Client]
+    code: 201
+    input: [occurrence_date]
+    output: Booking
+    side_effects: ["new Booking REQUESTED with recurring_plan_id set; occurrences_generated++; event window derived from plan time-of-day + duration on occurrence_date"]
+
+  - method: POST
+    path: "/recurring-plans/{planId}/pause"
+    description: "Pause an ACTIVE plan; cascade-cancels its still-REQUESTED child bookings (depth-2)"
+    roles: [Client]
+    code: 200
+    input: []
+    output: RecurringPlan
+    side_effects: ["status -> PAUSED; each REQUESTED child Booking -> CANCELLED (refund_rate 0); any held child hold -> RELEASED"]
+
+  - method: POST
+    path: "/recurring-plans/{planId}/resume"
+    description: "Resume a PAUSED plan"
+    roles: [Client]
+    code: 200
+    input: []
+    output: RecurringPlan
+    side_effects: ["status -> ACTIVE"]
+
+  - method: POST
+    path: "/recurring-plans/{planId}/cancel"
+    description: "Cancel a plan (terminal)"
+    roles: [Client]
+    code: 200
+    input: []
+    output: RecurringPlan
+    side_effects: ["status -> CANCELLED"]
+
+  # ---------- Test-driving clock ----------
+  - method: POST
+    path: "/_clock/set"
+    description: "Test-driving endpoint: pin the system clock used by cancellation lead-time and reliability ordering"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [now_utc]
+    output: null
+    side_effects: ["system clock fixed to now_utc for all subsequent lead-time / temporal computations"]
+
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # ---- auth ----
+  - { id: ERR_MISSING_AUTH_CONTEXT, http: 401, condition: "X-User-ID or X-User-Role header missing or malformed" }
+  - { id: ERR_UNAUTHORIZED_ROLE, http: 403, condition: "Role not permitted for this operation" }
+  - { id: ERR_NOT_RESOURCE_OWNER, http: 403, condition: "Acting user is not the owner (chef_id/client_id) of the resource being mutated" }
+  # ---- not found ----
+  - { id: ERR_CHEF_NOT_FOUND, http: 404, condition: "Chef id does not exist" }
+  - { id: ERR_MENU_NOT_FOUND, http: 404, condition: "MenuPackage id does not exist" }
+  - { id: ERR_ZONE_NOT_FOUND, http: 404, condition: "TravelZone id does not exist" }
+  - { id: ERR_CLIENT_NOT_FOUND, http: 404, condition: "Client id does not exist" }
+  - { id: ERR_BOOKING_NOT_FOUND, http: 404, condition: "Booking id does not exist" }
+  - { id: ERR_PLAN_NOT_FOUND, http: 404, condition: "RecurringPlan id does not exist" }
+  - { id: ERR_RESCHEDULE_NOT_FOUND, http: 404, condition: "RescheduleRequest id does not exist" }
+  - { id: ERR_GROCERY_RUN_NOT_FOUND, http: 404, condition: "GroceryRun does not exist for the booking" }
+  # ---- request shape ----
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, bad enum, event_end<=event_start, max_party_size<min_party_size, weekday out of 0..6, or other shape error" }
+  # ---- state / concurrency ----
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a legal source state for the requested transition" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_chef_version does not match the chef's current version (OCC)" }
+  - { id: ERR_CHEF_NOT_ACTIVE, http: 409, condition: "Confirm requires the chef to be ACTIVE" }
+  - { id: ERR_BOOKING_NOT_CONFIRMED, http: 409, condition: "Operation requires the parent booking to be CONFIRMED" }
+  - { id: ERR_GROCERY_RUN_NOT_FINALIZED, http: 409, condition: "Operation requires a FINALIZED grocery run (start-prep, balance payment)" }
+  - { id: ERR_GROCERY_RUN_EMPTY, http: 422, condition: "Cannot finalize a grocery run with no line items" }
+  # ---- business: safety/constraint/temporal ----
+  - { id: ERR_ALLERGEN_CONFLICT, http: 422, condition: "Client allergen restriction intersects the menu's allergen tags" }
+  - { id: ERR_EQUIPMENT_UNAVAILABLE, http: 422, condition: "Menu required_equipment not a subset of chef equipment_inventory" }
+  - { id: ERR_PARTY_SIZE_OUT_OF_RANGE, http: 422, condition: "party_size outside [menu.min_party_size, menu.max_party_size]" }
+  - { id: ERR_ZIP_OUTSIDE_SERVICE_AREA, http: 422, condition: "service_zip does not prefix-match exactly one chef TravelZone" }
+  - { id: ERR_CHEF_TIME_CONFLICT, http: 409, condition: "Occupied window overlaps a HELD AvailabilityBlock (buffer-widened half-open interval)" }
+  - { id: ERR_DAILY_CAPACITY_EXCEEDED, http: 409, condition: "Chef already at max_bookings_per_day for the event_date" }
+  - { id: ERR_NO_LISTED_MENU, http: 409, condition: "Chef activation requires at least one listed menu" }
+  - { id: ERR_NO_TRAVEL_ZONE, http: 409, condition: "Chef activation requires at least one travel zone" }
+  # ---- business: fiscal ----
+  - { id: ERR_DEPOSIT_AMOUNT_MISMATCH, http: 402, condition: "Deposit payment amount != deposit_due_cents" }
+  - { id: ERR_BALANCE_AMOUNT_MISMATCH, http: 402, condition: "Balance payment amount != balance_due_cents" }
+  - { id: ERR_BALANCE_OUTSTANDING, http: 402, condition: "Completion requires payment_status == PAID_IN_FULL" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Chef
+    description: "Service provider; owns its catalog (menus, zones, availability) and the bookings made against it; confirms/declines/preps/completes bookings and manages grocery runs"
+    identity: "entity_backed:Chef"
+    exclusive_operations:
+      - "POST /menus — create menu"
+      - "POST /menus/{menuId}/publish — publish menu"
+      - "POST /travel-zones — create travel zone"
+      - "POST /availability-blocks — create blackout"
+      - "POST /bookings/{bookingId}/confirm — confirm booking"
+      - "POST /bookings/{bookingId}/decline — decline booking"
+      - "POST /bookings/{bookingId}/start-prep — start prep"
+      - "POST /bookings/{bookingId}/complete — complete booking"
+      - "POST /grocery-runs — open grocery run"
+      - "POST /grocery-runs/{groceryRunId}/finalize — finalize grocery run"
+      - "POST /reschedule-requests/{requestId}/accept — accept reschedule"
+      - "POST /reschedule-requests/{requestId}/reject — reject reschedule"
+    shared_operations:
+      - "POST /chefs — register chef (also PlatformAdmin)"
+      - "POST /chefs/{chefId}/activate — activate (also PlatformAdmin)"
+      - "POST /reschedule-requests — propose reschedule (also Client)"
+      - "GET endpoints (chefs, menus, travel-zones, availability-blocks, clients, bookings, payments, grocery-runs, reschedule-requests, recurring-plans)"
+
+  - name: Client
+    description: "Customer; registers, books chefs, pays deposit/balance, cancels/reschedules own bookings, owns recurring meal-prep plans"
+    identity: "entity_backed:Client"
+    exclusive_operations:
+      - "POST /bookings — create booking"
+      - "POST /bookings/{bookingId}/cancel — cancel own booking"
+      - "POST /payments — pay deposit/balance"
+      - "POST /reschedule-requests/{requestId}/withdraw — withdraw own proposal"
+      - "POST /recurring-plans — create plan"
+      - "POST /recurring-plans/{planId}/generate-occurrence — spawn occurrence"
+      - "POST /recurring-plans/{planId}/pause — pause plan"
+      - "POST /recurring-plans/{planId}/resume — resume plan"
+      - "POST /recurring-plans/{planId}/cancel — cancel plan"
+    shared_operations:
+      - "POST /clients — register client (also PlatformAdmin)"
+      - "POST /reschedule-requests — propose reschedule (also Chef)"
+      - "GET endpoints (chefs, menus, travel-zones, availability-blocks, clients, bookings, payments, grocery-runs, reschedule-requests, recurring-plans)"
+
+  - name: PlatformAdmin
+    description: "Operational role; suspends/activates chefs, registers entities, controls the test clock; not tied to any persisted entity"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /chefs/{chefId}/suspend — suspend chef"
+      - "POST /_clock/set — pin system clock"
+    shared_operations:
+      - "POST /chefs — register chef (also Chef)"
+      - "POST /chefs/{chefId}/activate — activate (also Chef)"
+      - "POST /clients — register client (also Client)"
+      - "GET endpoints (all read endpoints)"

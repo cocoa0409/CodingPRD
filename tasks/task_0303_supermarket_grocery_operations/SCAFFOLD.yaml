@@ -1,0 +1,1229 @@
+# =============================================================================
+# Scaffold: supermarket-grocery-operations (Expert)
+# =============================================================================
+
+scenario: |
+  Supermarket / Grocery Store Operations: department & SKU/PLU, perishable shrink & date rotation (FEFO),
+  weekly-ad price & promotion, reorder point & DSD receiving, scale/weighed items, loyalty & digital coupon,
+  cycle count, end-of-day reconciliation
+
+domain_name: supermarket-grocery-operations
+api_prefix: /
+# Flat topology: every entity is a top-level collection (e.g. /products, /shipments,
+# /sales). The api_prefix is the root "/", not a single resource path, because no one
+# entity owns the URL tree.
+
+# Money is represented in integer cents throughout. Weights are in integer milli-units
+# (e.g. milli-pounds) to avoid floating point. Quantities for each-sold items are integers.
+complexity_profile:
+  primary_archetype: Ledger reconciliation
+  secondary_archetype: Pricing engine
+  complexity_layers:
+    - dual_variant_calculation       # perpetual book-value vs counted value; FEFO depletion vs receipt-cost average
+    - cascading_side_effects         # finalize sale -> deplete lots FEFO -> product on-hand recompute -> reorder flag -> shrink ledger
+    - rate_threshold_triggers        # reorder point >= boundary; loyalty tier breakpoints; promo minimum-spend boundary
+    - optimistic_concurrency         # OCC on Product.version for receiving/price-effective changes
+    - derived_field_reconciliation   # Product.on_hand_qty and on_hand_value denormalized from lots
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys. Products, lots, shipments, price plans, promotions,
+  # members, coupons, sales, cycle counts, and EOD reconciliations are all top-level resources
+  # connected by FK references, not nested URL ownership.
+
+  state_machine_shape: parallel
+  # Sale carries two independent state dimensions (tender_status x fulfillment_status).
+  # InventoryLot has a branching+cyclic shape (ACTIVE<->QUARANTINED, plus pull/expire branches).
+  # Shipment and CycleCount add branching fork-join shapes.
+
+  relationship_patterns:
+    - one_to_many        # Product -> InventoryLot; Shipment -> ShipmentLine; SalesTransaction -> SaleLineItem
+    - many_to_many       # LoyaltyMember <-> DigitalCoupon via ClippedCoupon
+    - cross_aggregate    # SaleLineItem depletes InventoryLot rows of a Product across aggregate boundary
+
+  role_model: peer_roles
+  # ReceivingClerk owns DSD receiving; PriceManager owns price/promo; Cashier owns POS sales;
+  # InventoryAuditor owns cycle counts and EOD reconciliation; StoreManager has override authority
+  # on a narrow set of operations; LoyaltyMember acts on its own clipped coupons.
+
+  consistency_model: immediate
+  # All denormalized fields (on_hand_qty, on_hand_value, reorder_flagged, points_balance)
+  # are reconciled atomically within the triggering request.
+
+# =============================================================================
+# Table 1.0: Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# Table 1.1: Entity-Relationship Table
+# =============================================================================
+entities:
+  # ---- Department: configuration; rarely changes; carries OCC version ----
+  - name: Department
+    parent: null
+    common_fields: true
+    fields:
+      - { name: code, type: string, source: input, description: "Department short code, e.g. PRODUCE, DAIRY, GROCERY", constraints: "unique across all departments; uppercase A-Z and underscore" }
+      - { name: name, type: string, source: input, description: "Human-readable department name" }
+      - { name: shrink_alert_bps, type: integer, source: input, default: 200, description: "Shrink threshold in basis points (200 = 2.00%) above which a department is flagged at EOD", constraints: ">= 0 and <= 10000" }
+
+  # ---- Product: SKU/PLU catalog item; ACTIVE/DISCONTINUED lifecycle ----
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - { name: department_id, type: string, source: input, description: "FK -> Department.id; the owning department" }
+      - { name: sku, type: string, source: input, description: "Scannable SKU for each-sold items; required when sell_by_weight=false", constraints: "unique across products when present; null for weighed items" }
+      - { name: plu, type: string, source: input, description: "PLU code for scale/weighed items; required when sell_by_weight=true", constraints: "unique across products when present; null for each-sold items" }
+      - { name: name, type: string, source: input, description: "Product display name" }
+      - { name: sell_by_weight, type: boolean, source: input, default: false, description: "True for scale/weighed items (priced per unit weight); false for each-sold items" }
+      - { name: unit_price_cents, type: integer, source: input, description: "Base everyday price: per-each (each-sold) or per-pound i.e. per 1000 milli-units (weighed), in integer cents", constraints: ">= 0" }
+      - { name: is_perishable, type: boolean, source: input, default: false, description: "True if lots carry expiration dates and participate in FEFO/shrink" }
+      - { name: reorder_point_qty, type: integer, source: input, default: 0, description: "On-hand quantity at or below which the product is flagged for reorder (each-sold: each count; weighed: whole milli-units)", constraints: ">= 0" }
+      - { name: on_hand_qty, type: integer, source: computed, description: "Read-only: sum of remaining_qty over the product's lots in ACTIVE or QUARANTINED state" }
+      - { name: on_hand_value_cents, type: integer, source: computed, description: "Read-only: sum over ACTIVE/QUARANTINED lots of remaining_qty * lot.unit_cost_cents / 1000 (weighed) or remaining_qty * unit_cost_cents (each), book cost" }
+      - { name: reorder_flagged, type: boolean, source: computed, description: "Read-only: true when on_hand_qty <= reorder_point_qty" }
+      - { name: status, type: enum, source: system, description: "ACTIVE -> DISCONTINUED", default: "ACTIVE", constraints: "ACTIVE, DISCONTINUED" }
+
+  # ---- InventoryLot: FEFO batch with expiration; branching+cyclic lifecycle ----
+  - name: InventoryLot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the product this lot stocks" }
+      - { name: shipment_id, type: string, source: system, description: "FK -> Shipment.id; the receiving shipment that created this lot (null for cycle-count seed lots)" }
+      - { name: received_qty, type: integer, source: input, description: "Quantity received into the lot (each count or milli-units for weighed)", constraints: "> 0" }
+      - { name: remaining_qty, type: integer, source: computed, description: "Read-only: received_qty minus depleted minus pulled; never below 0" }
+      - { name: unit_cost_cents, type: integer, source: input, description: "Per-each or per-pound (per 1000 milli-units) book cost in cents for this lot", constraints: ">= 0" }
+      - { name: expiration_date, type: datetime, source: input, description: "Lot expiration as ISO 8601 UTC date-time; required when product.is_perishable=true, else null" }
+      - { name: status, type: enum, source: system, description: "ACTIVE -> QUARANTINED -> ACTIVE (cycle); ACTIVE/QUARANTINED -> DEPLETED|EXPIRED|PULLED", default: "ACTIVE", constraints: "ACTIVE, QUARANTINED, DEPLETED, EXPIRED, PULLED" }
+
+  # ---- Shipment: DSD receiving; branching fork-join lifecycle ----
+  - name: Shipment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: vendor_name, type: string, source: input, description: "Direct-store-delivery vendor name" }
+      - { name: reference_code, type: string, source: input, description: "Vendor delivery reference / invoice number", constraints: "unique across shipments" }
+      - { name: expected_total_cents, type: integer, source: input, description: "Vendor-stated invoice total in cents used to gate receiving", constraints: ">= 0" }
+      - { name: received_total_cents, type: integer, source: computed, description: "Read-only: sum over lines of accepted_qty * unit_cost_cents/(1000 if weighed else 1)" }
+      - { name: variance_cents, type: integer, source: computed, description: "Read-only: received_total_cents - expected_total_cents (signed)" }
+      - { name: status, type: enum, source: system, description: "PENDING -> RECEIVING -> {RECEIVED | REJECTED}", default: "PENDING", constraints: "PENDING, RECEIVING, RECEIVED, REJECTED" }
+
+  # ---- ShipmentLine: one product per shipment line ----
+  - name: ShipmentLine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: shipment_id, type: string, source: input, description: "FK -> Shipment.id; the parent shipment" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the product delivered on this line" }
+      - { name: ordered_qty, type: integer, source: input, description: "Quantity the line was expected to deliver (each or milli-units)", constraints: "> 0" }
+      - { name: accepted_qty, type: integer, source: input, default: 0, description: "Quantity accepted at receiving; defaults to ordered_qty when line is accepted without a count override", constraints: ">= 0" }
+      - { name: unit_cost_cents, type: integer, source: input, description: "Per-each or per-pound book cost for this line in cents", constraints: ">= 0" }
+      - { name: expiration_date, type: datetime, source: input, description: "Lot expiration for the created lot; required when the product is perishable, else null" }
+      - { name: status, type: enum, source: system, description: "OPEN -> {ACCEPTED | SHORT}", default: "OPEN", constraints: "OPEN, ACCEPTED, SHORT" }
+
+  # ---- PricePlan: weekly-ad effective price window ----
+  - name: PricePlan
+    parent: null
+    common_fields: true
+    fields:
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the product this ad price applies to" }
+      - { name: ad_price_cents, type: integer, source: input, description: "Weekly-ad price (per-each or per-pound) in cents", constraints: ">= 0" }
+      - { name: effective_start, type: datetime, source: input, description: "Inclusive start of the ad window, ISO 8601 UTC" }
+      - { name: effective_end, type: datetime, source: input, description: "Exclusive end of the ad window, ISO 8601 UTC; must be strictly after effective_start" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED -> ACTIVE -> EXPIRED; SCHEDULED/ACTIVE -> CANCELLED", default: "SCHEDULED", constraints: "SCHEDULED, ACTIVE, EXPIRED, CANCELLED" }
+
+  # ---- Promotion: promo definition; stackable flag, window, BOGO/percent/fixed ----
+  - name: Promotion
+    parent: null
+    common_fields: true
+    fields:
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the product this promotion targets" }
+      - { name: promo_type, type: enum, source: input, description: "PERCENT_OFF | BOGO | FIXED_OFF", constraints: "PERCENT_OFF, BOGO, FIXED_OFF" }
+      - { name: percent_off_bps, type: integer, source: input, description: "Discount in basis points for PERCENT_OFF (1000 = 10.00%); null otherwise", constraints: ">= 0 and <= 10000 when present" }
+      - { name: fixed_off_cents, type: integer, source: input, description: "Per-eligible-unit cents off for FIXED_OFF; null otherwise", constraints: ">= 0 when present" }
+      - { name: min_qty, type: integer, source: input, default: 1, description: "Minimum eligible quantity required for the promo to apply (each-sold only)", constraints: ">= 1" }
+      - { name: stackable, type: boolean, source: input, default: false, description: "Whether this promotion may stack on top of an active weekly-ad price" }
+      - { name: effective_start, type: datetime, source: input, description: "Inclusive promo window start, ISO 8601 UTC" }
+      - { name: effective_end, type: datetime, source: input, description: "Exclusive promo window end, ISO 8601 UTC; must be strictly after effective_start" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED -> ACTIVE -> EXPIRED; SCHEDULED/ACTIVE -> CANCELLED", default: "SCHEDULED", constraints: "SCHEDULED, ACTIVE, EXPIRED, CANCELLED" }
+
+  # ---- LoyaltyMember: loyalty account ----
+  - name: LoyaltyMember
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Member email; login identity", constraints: "unique across members" }
+      - { name: full_name, type: string, source: input, description: "Member full name" }
+      - { name: points_balance, type: integer, source: computed, description: "Read-only: lifetime accrued points minus redeemed; never below 0", default: 0 }
+      - { name: tier, type: enum, source: computed, description: "Read-only loyalty tier derived from lifetime_spend_cents thresholds: BASIC | SILVER | GOLD", default: "BASIC", constraints: "BASIC, SILVER, GOLD" }
+      - { name: lifetime_spend_cents, type: integer, source: computed, description: "Read-only: cumulative net finalized spend in cents", default: 0 }
+      - { name: status, type: enum, source: system, description: "ACTIVE -> SUSPENDED -> ACTIVE (cycle); ACTIVE/SUSPENDED -> CLOSED", default: "ACTIVE", constraints: "ACTIVE, SUSPENDED, CLOSED" }
+
+  # ---- DigitalCoupon: coupon definition; configuration ----
+  - name: DigitalCoupon
+    parent: null
+    common_fields: true
+    fields:
+      - { name: code, type: string, source: input, description: "Coupon code shoppers clip", constraints: "unique across coupons" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the product the coupon discounts" }
+      - { name: discount_cents, type: integer, source: input, description: "Flat cents off applied once per qualifying transaction", constraints: "> 0" }
+      - { name: min_spend_cents, type: integer, source: input, default: 0, description: "Minimum transaction subtotal in cents required for the coupon to redeem", constraints: ">= 0" }
+      - { name: stackable, type: boolean, source: input, default: false, description: "Whether the coupon may stack on top of an active promotion for the same product" }
+      - { name: effective_start, type: datetime, source: input, description: "Inclusive coupon validity start, ISO 8601 UTC" }
+      - { name: effective_end, type: datetime, source: input, description: "Exclusive coupon validity end, ISO 8601 UTC; must be strictly after effective_start" }
+
+  # ---- ClippedCoupon: member-coupon junction; CLIPPED/REDEEMED/EXPIRED ----
+  - name: ClippedCoupon
+    parent: null
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: input, description: "FK -> LoyaltyMember.id; the member who clipped" }
+      - { name: coupon_id, type: string, source: input, description: "FK -> DigitalCoupon.id; the clipped coupon" }
+      - { name: redeemed_in_sale_id, type: string, source: system, description: "Backref to the SalesTransaction.id that redeemed this clip (null until redeemed); discoverable on the clip read, not a queryable relationship" }
+      - { name: status, type: enum, source: system, description: "CLIPPED -> REDEEMED; CLIPPED -> EXPIRED", default: "CLIPPED", constraints: "CLIPPED, REDEEMED, EXPIRED" }
+
+  # ---- SalesTransaction: POS sale; PARALLEL state dimensions (tender x fulfillment) ----
+  - name: SalesTransaction
+    parent: null
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: input, description: "FK -> LoyaltyMember.id; optional loyalty member on the sale (null for anonymous)" }
+      - { name: clipped_coupon_id, type: string, source: input, description: "FK -> ClippedCoupon.id; optional single coupon clip applied at finalize (null if none)" }
+      - { name: subtotal_cents, type: integer, source: computed, description: "Read-only: sum of line extended_price_cents before coupon" }
+      - { name: coupon_discount_cents, type: integer, source: computed, description: "Read-only: coupon discount applied at finalize (0 until finalized or if no coupon)" }
+      - { name: total_cents, type: integer, source: computed, description: "Read-only: subtotal_cents - coupon_discount_cents; never below 0" }
+      - { name: cogs_cents, type: integer, source: computed, description: "Read-only: book cost of goods depleted via FEFO across all line items" }
+      - { name: points_earned, type: integer, source: computed, description: "Read-only: loyalty points earned at finalize (0 until finalized or anonymous)" }
+      - { name: tender_status, type: enum, source: system, description: "Tender dimension: UNPAID -> PAID -> REFUNDED", default: "UNPAID", constraints: "UNPAID, PAID, REFUNDED" }
+      - { name: fulfillment_status, type: enum, source: system, description: "Fulfillment dimension: OPEN -> FINALIZED -> VOIDED", default: "OPEN", constraints: "OPEN, FINALIZED, VOIDED" }
+
+  # ---- SaleLineItem: line within a sale ----
+  - name: SaleLineItem
+    parent: null
+    common_fields: true
+    fields:
+      - { name: sale_id, type: string, source: input, description: "FK -> SalesTransaction.id; the parent sale" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the scanned product" }
+      - { name: quantity, type: integer, source: input, description: "Each count for each-sold products; required when product.sell_by_weight=false", constraints: "> 0 when present" }
+      - { name: weight_milli, type: integer, source: input, description: "Weight in milli-units for weighed products; required when product.sell_by_weight=true", constraints: "> 0 when present" }
+      - { name: unit_price_applied_cents, type: integer, source: computed, description: "Read-only: effective per-unit price after ad price selection (per-each or per-pound)" }
+      - { name: extended_price_cents, type: integer, source: computed, description: "Read-only: line price after ad + promotion, before transaction coupon" }
+      - { name: promo_id_applied, type: string, source: computed, description: "Read-only: FK -> Promotion.id of the promotion applied to this line, or null" }
+
+  # ---- CycleCount: physical count session; branching lifecycle; variance adjustments ----
+  - name: CycleCount
+    parent: null
+    common_fields: true
+    fields:
+      - { name: department_id, type: string, source: input, description: "FK -> Department.id; department being counted" }
+      - { name: counted_qty, type: integer, source: input, description: "Operator-entered physical count for the single product under count (set at submit)", default: 0 }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the single product this cycle count reconciles" }
+      - { name: book_qty_snapshot, type: integer, source: computed, description: "Read-only: product.on_hand_qty captured when the count is submitted" }
+      - { name: variance_qty, type: integer, source: computed, description: "Read-only: counted_qty - book_qty_snapshot (signed)" }
+      - { name: shrink_value_cents, type: integer, source: computed, description: "Read-only: book value of negative variance written off at reconcile (0 if variance >= 0)" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> SUBMITTED -> {RECONCILED | CANCELLED}", default: "DRAFT", constraints: "DRAFT, SUBMITTED, RECONCILED, CANCELLED" }
+
+  # ---- EndOfDayReconciliation: daily close; ledger reconciliation ----
+  - name: EndOfDayReconciliation
+    parent: null
+    common_fields: true
+    fields:
+      - { name: department_id, type: string, source: input, description: "FK -> Department.id; department being closed" }
+      - { name: business_date, type: datetime, source: input, description: "The business date (ISO 8601 UTC) being reconciled" }
+      - { name: opening_value_cents, type: integer, source: computed, description: "Read-only: department on-hand book value snapshot at open" }
+      - { name: cogs_total_cents, type: integer, source: computed, description: "Read-only: sum of cogs_cents across sales of the department's products finalized in the window" }
+      - { name: shrink_total_cents, type: integer, source: computed, description: "Read-only: sum of shrink (cycle-count write-offs + expired/pulled lot value) in the window" }
+      - { name: sales_total_cents, type: integer, source: computed, description: "Read-only: sum of total_cents across sales of the department's products finalized in the window" }
+      - { name: closing_value_cents, type: integer, source: computed, description: "Read-only: department on-hand book value snapshot at close" }
+      - { name: shrink_bps, type: integer, source: computed, description: "Read-only: shrink_total_cents * 10000 / opening_value_cents, floor; 0 when opening_value_cents == 0" }
+      - { name: shrink_alert, type: boolean, source: computed, description: "Read-only: true when shrink_bps >= department.shrink_alert_bps" }
+      - { name: status, type: enum, source: system, description: "OPEN -> CLOSED", default: "OPEN", constraints: "OPEN, CLOSED" }
+
+# =============================================================================
+# Table 1.2: State Machine Table
+# =============================================================================
+state_machines:
+  # ---------------------------------------------------------------------------
+  # Shipment — DSD receiving: branching fork-join (RECEIVED vs REJECTED)
+  # ---------------------------------------------------------------------------
+  - entity: Shipment
+    initial_state: PENDING
+    terminal_states: [RECEIVED, REJECTED]
+    transitions:
+      - from: PENDING
+        to: RECEIVING
+        trigger: "POST /shipments/{id}/start-receiving"
+        actor: ReceivingClerk
+        preconditions:
+          - "Shipment in PENDING (ERR_SHIPMENT_NOT_PENDING)"
+          - "Shipment has >= 1 ShipmentLine in OPEN (ERR_SHIPMENT_EMPTY)"
+        side_effects: []
+      - from: RECEIVING
+        to: RECEIVED
+        trigger: "POST /shipments/{id}/receive"
+        actor: ReceivingClerk
+        preconditions:
+          - "Shipment in RECEIVING (ERR_SHIPMENT_NOT_RECEIVING)"
+          - "Every referenced Product is ACTIVE (ERR_PRODUCT_DISCONTINUED)"
+          - "abs(received_total_cents - expected_total_cents)*10000/expected_total_cents <= RECEIVE_VARIANCE_TOLERANCE_BPS (=500) unless override_variance=true by StoreManager (ERR_RECEIVE_VARIANCE_EXCEEDED)"
+        side_effects:
+          - "Each ShipmentLine with accepted_qty > 0: create one InventoryLot (status ACTIVE, shipment_id=this) with received_qty=accepted_qty, unit_cost_cents, expiration_date from the line; line -> ACCEPTED if accepted_qty == ordered_qty else SHORT"
+          - "Each accepted lot creation triggers Product.on_hand_qty + Product.on_hand_value_cents recompute (calculation: product_inventory_rollup) on that lot's Product"
+          - "That recompute itself triggers Product.reorder_flagged recompute (calculation: reorder_flag): a lot that lifts on_hand_qty above reorder_point_qty clears the flag"
+          - "increments Shipment.version by 1"
+        note: "OCC convention: expected_product_version is checked against the Product referenced by the FIRST (lowest created_at) ShipmentLine. The OCC tests use single-product shipments so the check is unambiguous; a shipment whose lines reference >1 distinct product still validates expected_product_version against that first line's product only."
+      - from: RECEIVING
+        to: REJECTED
+        trigger: "POST /shipments/{id}/reject"
+        actor: ReceivingClerk
+        preconditions:
+          - "Shipment in RECEIVING (ERR_SHIPMENT_NOT_RECEIVING)"
+        side_effects:
+          - "All ShipmentLines remain OPEN; no lots created; no inventory change"
+          - "increments Shipment.version by 1"
+
+  # ---------------------------------------------------------------------------
+  # InventoryLot — branching + cyclic: ACTIVE<->QUARANTINED, plus PULLED/EXPIRED/DEPLETED
+  # ---------------------------------------------------------------------------
+  - entity: InventoryLot
+    initial_state: ACTIVE
+    terminal_states: [DEPLETED, EXPIRED, PULLED]
+    transitions:
+      - from: ACTIVE
+        to: QUARANTINED
+        trigger: "POST /inventory-lots/{id}/quarantine"
+        actor: InventoryAuditor
+        preconditions:
+          - "Lot in ACTIVE (ERR_LOT_NOT_ACTIVE)"
+        side_effects:
+          - "Lot stays counted in on_hand_qty but is skipped by FEFO sale depletion while QUARANTINED"
+          - "Product.on_hand_value_cents unchanged (quarantine does not write off value)"
+      - from: QUARANTINED
+        to: ACTIVE
+        trigger: "POST /inventory-lots/{id}/release"
+        actor: InventoryAuditor
+        preconditions:
+          - "Lot in QUARANTINED (ERR_LOT_NOT_QUARANTINED)"
+        side_effects:
+          - "Lot re-enters FEFO eligibility"
+      - from: ACTIVE
+        to: DEPLETED
+        trigger: "system (FEFO depletion during sale finalize reduces remaining_qty to 0)"
+        actor: system
+        preconditions:
+          - "remaining_qty reached 0 via sale depletion"
+        side_effects:
+          - "Lot no longer contributes to on_hand_qty/on_hand_value_cents"
+      - from: ACTIVE
+        to: PULLED
+        trigger: "POST /inventory-lots/{id}/pull"
+        actor: InventoryAuditor
+        preconditions:
+          - "Lot in ACTIVE or QUARANTINED (ERR_LOT_NOT_PULLABLE)"
+        side_effects:
+          - "remaining_qty written off to 0; pulled value = remaining_qty * unit_cost (per-each or per-pound) recorded as shrink"
+          - "triggers Product.on_hand_qty + on_hand_value_cents recompute (product_inventory_rollup)"
+          - "that recompute triggers Product.reorder_flagged recompute (reorder_flag): dropping on_hand_qty to/below reorder_point_qty sets the flag"
+      - from: QUARANTINED
+        to: PULLED
+        trigger: "POST /inventory-lots/{id}/pull"
+        actor: InventoryAuditor
+        preconditions:
+          - "Lot in ACTIVE or QUARANTINED (ERR_LOT_NOT_PULLABLE)"
+        side_effects:
+          - "Same write-off + product rollup + reorder recompute cascade as ACTIVE -> PULLED"
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /_clock/advance then system sweep, or POST /inventory-lots/{id}/expire"
+        actor: InventoryAuditor
+        preconditions:
+          - "Lot in ACTIVE or QUARANTINED (ERR_LOT_NOT_EXPIRABLE)"
+          - "expiration_date is non-null and <= current clock (ERR_LOT_NOT_EXPIRED_YET)"
+        side_effects:
+          - "remaining_qty written off to 0; expired value recorded as shrink"
+          - "triggers Product.on_hand_qty + on_hand_value_cents recompute (product_inventory_rollup)"
+          - "that recompute triggers Product.reorder_flagged recompute (reorder_flag)"
+      - from: QUARANTINED
+        to: EXPIRED
+        trigger: "POST /inventory-lots/{id}/expire"
+        actor: InventoryAuditor
+        preconditions:
+          - "Lot in ACTIVE or QUARANTINED (ERR_LOT_NOT_EXPIRABLE)"
+          - "expiration_date is non-null and <= current clock (ERR_LOT_NOT_EXPIRED_YET)"
+        side_effects:
+          - "Same write-off + product rollup + reorder recompute cascade as ACTIVE -> EXPIRED"
+
+  # ---------------------------------------------------------------------------
+  # PricePlan — linear with cancel branch + auto activation/expiry
+  # ---------------------------------------------------------------------------
+  - entity: PricePlan
+    initial_state: SCHEDULED
+    terminal_states: [EXPIRED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: ACTIVE
+        trigger: "system (clock reaches effective_start; evaluated at price selection time)"
+        actor: system
+        preconditions:
+          - "current clock >= effective_start and < effective_end"
+        side_effects: []
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system (clock reaches effective_end)"
+        actor: system
+        preconditions:
+          - "current clock >= effective_end"
+        side_effects: []
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /price-plans/{id}/cancel"
+        actor: PriceManager
+        preconditions:
+          - "PricePlan in SCHEDULED or ACTIVE (ERR_PRICE_PLAN_NOT_CANCELLABLE)"
+        side_effects: []
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /price-plans/{id}/cancel"
+        actor: PriceManager
+        preconditions:
+          - "PricePlan in SCHEDULED or ACTIVE (ERR_PRICE_PLAN_NOT_CANCELLABLE)"
+        side_effects: []
+
+  # ---------------------------------------------------------------------------
+  # Promotion — same lifecycle shape as PricePlan (independent entity pair)
+  # ---------------------------------------------------------------------------
+  - entity: Promotion
+    initial_state: SCHEDULED
+    terminal_states: [EXPIRED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: ACTIVE
+        trigger: "system (clock reaches effective_start; evaluated at price selection time)"
+        actor: system
+        preconditions:
+          - "current clock >= effective_start and < effective_end"
+        side_effects: []
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system (clock reaches effective_end)"
+        actor: system
+        preconditions:
+          - "current clock >= effective_end"
+        side_effects: []
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /promotions/{id}/cancel"
+        actor: PriceManager
+        preconditions:
+          - "Promotion in SCHEDULED or ACTIVE (ERR_PROMOTION_NOT_CANCELLABLE)"
+        side_effects: []
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /promotions/{id}/cancel"
+        actor: PriceManager
+        preconditions:
+          - "Promotion in SCHEDULED or ACTIVE (ERR_PROMOTION_NOT_CANCELLABLE)"
+        side_effects: []
+
+  # ---------------------------------------------------------------------------
+  # SalesTransaction — PARALLEL: tender_status x fulfillment_status independent
+  # ---------------------------------------------------------------------------
+  - entity: SalesTransaction
+    initial_state: OPEN            # fulfillment_status initial; tender_status initial is UNPAID
+    terminal_states: [VOIDED]      # fulfillment terminal; FINALIZED is non-terminal because REFUND can follow on tender axis
+    transitions:
+      # ---- fulfillment dimension ----
+      - from: OPEN
+        to: FINALIZED
+        trigger: "POST /sales/{id}/finalize"
+        actor: Cashier
+        preconditions:
+          - "fulfillment_status == OPEN (ERR_SALE_NOT_OPEN)"
+          - "Sale has >= 1 SaleLineItem (ERR_SALE_EMPTY)"
+          - "If member_id set, the LoyaltyMember.status == ACTIVE (ERR_MEMBER_NOT_ACTIVE)"
+          - "For each line, sufficient FEFO-eligible (ACTIVE, non-expired) on_hand exists across the product's lots (ERR_INSUFFICIENT_STOCK)"
+          - "If clipped_coupon_id set: clip belongs to member_id, clip.status==CLIPPED, coupon window covers clock, subtotal_cents >= coupon.min_spend_cents (ERR_COUPON_NOT_REDEEMABLE)"
+        side_effects:
+          - "Per line: select effective unit price (calculation: effective_unit_price), apply promotion (calculation: line_extended_price), set unit_price_applied_cents/extended_price_cents/promo_id_applied"
+          - "subtotal_cents = sum of line extended_price_cents; coupon_discount_cents computed; total_cents = subtotal - coupon_discount (calculation: transaction_total)"
+          - "FEFO depletion: for each line, deplete the product's lots in FEFO order (calculation: fefo_depletion); reduce remaining_qty; lots reaching 0 -> DEPLETED; accumulate cogs_cents"
+          - "Each depleted Product gets on_hand_qty + on_hand_value_cents recompute (product_inventory_rollup); that recompute triggers reorder_flag recompute (a product dropping to/below reorder_point_qty sets reorder_flagged)"
+          - "If clipped_coupon_id set: clip -> REDEEMED, redeemed_in_sale_id=this sale"
+          - "If member_id set: points_earned computed (loyalty_points_accrual); LoyaltyMember.points_balance += points_earned; lifetime_spend_cents += total_cents; tier recomputed (loyalty_tier)"
+        note: "fulfillment_status OPEN -> FINALIZED. tender_status remains on its own axis; finalize does NOT change tender_status."
+      - from: OPEN
+        to: VOIDED
+        trigger: "POST /sales/{id}/void"
+        actor: Cashier
+        preconditions:
+          - "fulfillment_status == OPEN (ERR_SALE_NOT_OPEN)"
+        side_effects:
+          - "No inventory or ledger effect (nothing was depleted while OPEN)"
+      # ---- tender dimension (independent axis) ----
+      - from: UNPAID
+        to: PAID
+        trigger: "POST /sales/{id}/pay"
+        actor: Cashier
+        preconditions:
+          - "tender_status == UNPAID (ERR_SALE_NOT_UNPAID)"
+          - "fulfillment_status == FINALIZED (ERR_SALE_NOT_FINALIZED)"
+        side_effects:
+          - "tender_status -> PAID; no inventory change"
+        note: "Parallel dimension: pay gates on the fulfillment axis being FINALIZED but advances only the tender axis."
+      - from: PAID
+        to: REFUNDED
+        trigger: "POST /sales/{id}/refund"
+        actor: StoreManager
+        preconditions:
+          - "tender_status == PAID (ERR_SALE_NOT_PAID)"
+        side_effects:
+          - "tender_status -> REFUNDED (compensation): for each line, restock depleted lots in reverse FEFO order recreating remaining_qty on the SAME lots up to received_qty; lots restored from DEPLETED to ACTIVE as needed"
+          - "Each restocked Product gets on_hand_qty + on_hand_value_cents recompute (product_inventory_rollup); that recompute triggers reorder_flag recompute (clearing the flag if on_hand rises above reorder_point_qty)"
+          - "If clipped_coupon_id set: clip reverts REDEEMED -> CLIPPED, redeemed_in_sale_id cleared"
+          - "If member_id set: reverse loyalty: points_balance -= points_earned (floor 0), lifetime_spend_cents -= total_cents, tier recomputed (loyalty_tier)"
+        note: "Compensation invariant compensating_invariant must hold: after pay+refund the product's on_hand_qty and on_hand_value_cents equal their pre-finalize values, and member points_balance/lifetime_spend return to pre-finalize."
+
+  # ---------------------------------------------------------------------------
+  # LoyaltyMember — cyclic suspend/reactivate + close
+  # ---------------------------------------------------------------------------
+  - entity: LoyaltyMember
+    initial_state: ACTIVE
+    terminal_states: [CLOSED]
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /members/{id}/suspend"
+        actor: StoreManager
+        preconditions:
+          - "Member in ACTIVE (ERR_MEMBER_NOT_ACTIVE)"
+        side_effects: []
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /members/{id}/reactivate"
+        actor: StoreManager
+        preconditions:
+          - "Member in SUSPENDED (ERR_MEMBER_NOT_SUSPENDED)"
+        side_effects: []
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /members/{id}/close"
+        actor: StoreManager
+        preconditions:
+          - "Member in ACTIVE or SUSPENDED (ERR_MEMBER_NOT_CLOSEABLE)"
+        side_effects:
+          - "All ClippedCoupons of this member in CLIPPED -> EXPIRED (cannot be redeemed)"
+      - from: SUSPENDED
+        to: CLOSED
+        trigger: "POST /members/{id}/close"
+        actor: StoreManager
+        preconditions:
+          - "Member in ACTIVE or SUSPENDED (ERR_MEMBER_NOT_CLOSEABLE)"
+        side_effects:
+          - "All ClippedCoupons of this member in CLIPPED -> EXPIRED"
+
+  # ---------------------------------------------------------------------------
+  # CycleCount — branching: SUBMITTED -> RECONCILED | CANCELLED
+  # ---------------------------------------------------------------------------
+  - entity: CycleCount
+    initial_state: DRAFT
+    terminal_states: [RECONCILED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /cycle-counts/{id}/submit"
+        actor: InventoryAuditor
+        preconditions:
+          - "CycleCount in DRAFT (ERR_CYCLE_COUNT_NOT_DRAFT)"
+          - "counted_qty provided and >= 0 (ERR_INVALID_REQUEST)"
+        side_effects:
+          - "book_qty_snapshot = product.on_hand_qty at submit; variance_qty = counted_qty - book_qty_snapshot (calculation: cycle_count_variance)"
+      - from: SUBMITTED
+        to: RECONCILED
+        trigger: "POST /cycle-counts/{id}/reconcile"
+        actor: InventoryAuditor
+        preconditions:
+          - "CycleCount in SUBMITTED (ERR_CYCLE_COUNT_NOT_SUBMITTED)"
+        side_effects:
+          - "If variance_qty < 0 (count short): deplete |variance_qty| from the product's lots in FEFO order; shrink_value_cents = book value of depleted units (calculation: cycle_count_shrink); lots reaching 0 -> DEPLETED"
+          - "If variance_qty > 0 (count over): create one adjustment InventoryLot (ACTIVE, shipment_id=null) with received_qty=variance_qty at unit_cost_cents = product's most-recent ACTIVE lot unit_cost_cents (or product.unit_price_cents if no lot); shrink_value_cents = 0"
+          - "triggers Product.on_hand_qty + on_hand_value_cents recompute (product_inventory_rollup)"
+          - "that recompute triggers Product.reorder_flagged recompute (reorder_flag)"
+      - from: SUBMITTED
+        to: CANCELLED
+        trigger: "POST /cycle-counts/{id}/cancel"
+        actor: InventoryAuditor
+        preconditions:
+          - "CycleCount in DRAFT or SUBMITTED (ERR_CYCLE_COUNT_NOT_CANCELLABLE)"
+        side_effects:
+          - "No inventory adjustment"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /cycle-counts/{id}/cancel"
+        actor: InventoryAuditor
+        preconditions:
+          - "CycleCount in DRAFT or SUBMITTED (ERR_CYCLE_COUNT_NOT_CANCELLABLE)"
+        side_effects:
+          - "No inventory adjustment"
+
+  # ---------------------------------------------------------------------------
+  # EndOfDayReconciliation — linear close
+  # ---------------------------------------------------------------------------
+  - entity: EndOfDayReconciliation
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /eod-reconciliations/{id}/close"
+        actor: InventoryAuditor
+        preconditions:
+          - "Reconciliation in OPEN (ERR_EOD_NOT_OPEN)"
+          - "No CycleCount for the department in SUBMITTED (unreconciled) state (ERR_EOD_OPEN_CYCLE_COUNTS)"
+        side_effects:
+          - "closing_value_cents snapshot = department on-hand book value now; cogs_total/sales_total/shrink_total summed over the window (calculation: eod_rollup)"
+          - "shrink_bps + shrink_alert computed (calculation: eod_shrink_alert)"
+
+  # ---------------------------------------------------------------------------
+  # Product — linear lifecycle ACTIVE -> DISCONTINUED
+  # ---------------------------------------------------------------------------
+  - entity: Product
+    initial_state: ACTIVE
+    terminal_states: [DISCONTINUED]
+    transitions:
+      - from: ACTIVE
+        to: DISCONTINUED
+        trigger: "POST /products/{id}/discontinue"
+        actor: StoreManager
+        preconditions:
+          - "Product in ACTIVE (ERR_PRODUCT_DISCONTINUED when already DISCONTINUED)"
+        side_effects:
+          - "No inventory change; existing lots remain but a DISCONTINUED product's lines are rejected at receive (ERR_PRODUCT_DISCONTINUED)"
+          - "increments Product.version by 1"
+
+  # ---------------------------------------------------------------------------
+  # ClippedCoupon — branching: CLIPPED -> {REDEEMED | EXPIRED}, with REDEEMED -> CLIPPED on refund
+  # ---------------------------------------------------------------------------
+  - entity: ClippedCoupon
+    initial_state: CLIPPED
+    terminal_states: [EXPIRED]
+    transitions:
+      - from: CLIPPED
+        to: REDEEMED
+        trigger: "system (POST /sales/{id}/finalize with this clip as clipped_coupon_id)"
+        actor: system
+        preconditions:
+          - "clip belongs to the sale's member and is CLIPPED; coupon redeemable (ERR_COUPON_NOT_REDEEMABLE)"
+        side_effects:
+          - "redeemed_in_sale_id set to the finalizing sale"
+      - from: REDEEMED
+        to: CLIPPED
+        trigger: "system (POST /sales/{id}/refund of the sale that redeemed this clip)"
+        actor: system
+        preconditions:
+          - "the sale being refunded had redeemed this clip"
+        side_effects:
+          - "redeemed_in_sale_id cleared (compensation)"
+      - from: CLIPPED
+        to: EXPIRED
+        trigger: "system (cascade from POST /members/{id}/close on the owning member)"
+        actor: system
+        preconditions:
+          - "owning member transitions to CLOSED"
+        side_effects: []
+
+# =============================================================================
+# Table 1.2.1: Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: receive-stale-product
+    parent_entity: Product
+    write_endpoint: "POST /shipments/{id}/receive"
+    occ_field: "expected_product_version"
+    description: |
+      Receiving a shipment whose line targets a Product whose version has advanced
+      since the clerk last observed it is rejected. A receive legitimately creates a
+      new lot and recomputes the Product's denormalized on_hand_qty/on_hand_value/reorder
+      fields (bumping its version); a second receive that still carries the pre-recompute
+      version observed a stale Product and is rejected. The receive body pins the version
+      the clerk read for the single product on the shipment's line.
+    error_id: ERR_STALE_PRODUCT_VERSION
+    http_status: 412
+  - rule_id: price-plan-create-stale-product
+    parent_entity: Product
+    write_endpoint: "POST /price-plans"
+    occ_field: "expected_product_version"
+    description: |
+      Creating a PricePlan against a Product whose version has advanced since the price
+      manager last observed it is rejected. A new ad price legitimately supersedes the
+      product's effective pricing and the create bumps Product.version; a create still
+      carrying the prior version observed a stale Product (its everyday price or status
+      may have changed) and is rejected.
+    error_id: ERR_STALE_PRODUCT_VERSION
+    http_status: 412
+
+# =============================================================================
+# Table 1.3: Calculation Rules Table
+# =============================================================================
+calculations:
+  # ---- (1) effective unit price: weekly-ad window selection ----
+  - name: effective_unit_price
+    trigger: "POST /sales/{id}/finalize — per line, before promotion"
+    algorithm: threshold
+    formula: |
+      # Per-unit base price (per-each for each-sold, per-pound for weighed).
+      candidates = PricePlans for line.product_id with
+                   effective_start <= clock < effective_end   # half-open window
+      if candidates is non-empty:
+        # Choose the lowest ad_price_cents; tie-break by effective_start DESC,
+        # then created_at ASC (never id).
+        unit_price_applied_cents = min ad_price_cents among candidates,
+          tie-break (effective_start DESC, created_at ASC)
+      else:
+        unit_price_applied_cents = product.unit_price_cents
+    input_set: "PricePlans whose half-open [effective_start, effective_end) covers the clock; status SCHEDULED or ACTIVE both qualify since selection is purely window-based; CANCELLED/EXPIRED excluded"
+    precision: "integer cents; no rounding needed (prices are cents)"
+    note: "Weighed items: unit_price_applied_cents is per-pound (per 1000 milli-units)."
+
+  # ---- (2) line extended price: promo application + nested rounding (mode b) ----
+  - name: line_extended_price
+    trigger: "POST /sales/{id}/finalize — per line, after effective_unit_price"
+    algorithm: tiered_pricing
+    formula: |
+      # Compute gross then apply at most one promotion for the line's product.
+      if product.sell_by_weight:
+        gross_cents = round_half_up(unit_price_applied_cents * weight_milli / 1000)   # per-line rounding pinned HERE
+      else:
+        gross_cents = unit_price_applied_cents * quantity
+      promo = the active Promotion for product_id with
+              effective_start <= clock < effective_end, eligible (each-sold: quantity >= min_qty),
+              and (stackable OR no ad PricePlan was applied to this line);
+              choose by largest computed discount, tie-break effective_start DESC then created_at ASC
+      if no eligible promo:
+        extended_price_cents = gross_cents; promo_id_applied = null
+      else if promo.promo_type == PERCENT_OFF:
+        discount = round_half_up(gross_cents * promo.percent_off_bps / 10000)
+        extended_price_cents = gross_cents - discount
+      else if promo.promo_type == FIXED_OFF:   # each-sold only
+        discount = min(gross_cents, promo.fixed_off_cents * quantity)
+        extended_price_cents = gross_cents - discount
+      else if promo.promo_type == BOGO:         # each-sold only, buy-one-get-one-free
+        free_units = floor(quantity / 2)
+        discount = free_units * unit_price_applied_cents
+        extended_price_cents = gross_cents - discount
+      extended_price_cents = max(0, extended_price_cents)
+    constants:
+      ROUNDING: round_half_up
+    precision: "round per line item, THEN sum across lines for subtotal (per-line-then-sum is pinned; never sum-then-round)"
+    note: "Mode (b) nested rounding: weighed gross is rounded per line; PERCENT_OFF discount is rounded per line; subtotal sums already-rounded line totals."
+    variants:
+      - name: stacked_with_ad
+        when: "promo.stackable == true and an ad PricePlan was applied to the line"
+        difference: "promo discount computed off the ad price (gross uses unit_price_applied_cents = ad price), so discount base is the already-reduced price"
+      - name: promo_only
+        when: "promo.stackable == false and no ad PricePlan covered the line"
+        difference: "promo discount computed off the everyday price (gross uses unit_price_applied_cents = product.unit_price_cents)"
+
+  # ---- (3) transaction total: circular-looking total<->coupon dependency (mode c) ----
+  - name: transaction_total
+    trigger: "POST /sales/{id}/finalize — after all lines priced"
+    algorithm: aggregation
+    formula: |
+      subtotal_cents = sum over lines of extended_price_cents
+      # coupon eligibility is keyed on subtotal, and the discount reduces total —
+      # evaluation order is pinned: subtotal first, then coupon, then total.
+      if clipped_coupon_id is null:
+        coupon_discount_cents = 0
+      else:
+        coupon = the coupon behind the clip
+        # gate is checked against subtotal_cents (PRE-coupon), not total
+        if subtotal_cents >= coupon.min_spend_cents
+           and clock in [coupon.effective_start, coupon.effective_end)
+           and (coupon.stackable OR no line on this sale had a promo_id_applied for coupon.product_id):
+          coupon_discount_cents = min(coupon.discount_cents, subtotal_cents)
+        else:
+          reject ERR_COUPON_NOT_REDEEMABLE
+      total_cents = max(0, subtotal_cents - coupon_discount_cents)
+    input_set: "All SaleLineItems of the sale (already priced)"
+    precision: "integer cents"
+    note: "Mode (c) pinned evaluation order: subtotal -> coupon gate on subtotal -> total. Computing the gate against total would be circular."
+
+  # ---- (4) FEFO depletion (forward, expiration-ordered) — depletion variant ----
+  - name: fefo_depletion
+    trigger: "POST /sales/{id}/finalize and POST /cycle-counts/{id}/reconcile (short variance) and POST /inventory-lots pull/expire"
+    algorithm: chronological
+    formula: |
+      # First-Expired-First-Out: deplete the demand quantity from the product's
+      # eligible lots ordered by expiration soonest first.
+      eligible = product's lots in status ACTIVE with (expiration_date is null OR expiration_date > clock)
+      order eligible by: expiration_date ASC (nulls last), then created_at ASC, then sku/plu n/a -> created_at  # never id
+      remaining_demand = quantity (each) or weight_milli (weighed)
+      cogs_cents = 0
+      for lot in order:
+        take = min(lot.remaining_qty, remaining_demand)
+        lot.remaining_qty -= take
+        remaining_demand -= take
+        if product.sell_by_weight:
+          cogs_cents += round_half_up(take * lot.unit_cost_cents / 1000)
+        else:
+          cogs_cents += take * lot.unit_cost_cents
+        if lot.remaining_qty == 0: lot -> DEPLETED
+        if remaining_demand == 0: break
+      if remaining_demand > 0: reject ERR_INSUFFICIENT_STOCK   # checked as precondition before mutation
+    input_set: "Lots in ACTIVE only (QUARANTINED skipped); non-expired (expiration_date null or > clock)"
+    precision: "round_half_up per lot for weighed cogs, then sum"
+    note: "Dual-variant subject 1 of dual_variant_calc: FEFO (expiration-ordered) cogs. QUARANTINED lots count toward on_hand_qty but are NOT FEFO-eligible — ERR_INSUFFICIENT_STOCK can fire even when on_hand_qty appears sufficient."
+
+  # ---- (5) product inventory rollup (book value) — average-vs-FEFO dual subject ----
+  - name: product_inventory_rollup
+    trigger: "any InventoryLot remaining_qty change (receive, sale depletion, pull, expire, cycle-count reconcile, refund restock)"
+    algorithm: aggregation
+    formula: |
+      on_hand_qty = sum of remaining_qty over lots in status ACTIVE or QUARANTINED
+      on_hand_value_cents = sum over those lots of:
+        if product.sell_by_weight: round_half_up(remaining_qty * lot.unit_cost_cents / 1000)
+        else:                      remaining_qty * lot.unit_cost_cents
+    input_set: "Lots in ACTIVE or QUARANTINED (DEPLETED/EXPIRED/PULLED excluded)"
+    precision: "round_half_up per lot for weighed, then sum"
+    note: "Dual-variant subject 2 differs from fefo_depletion in BOTH entity domain (book value over all on-hand lots vs cogs over depleted lots only) AND input set (ACTIVE+QUARANTINED vs ACTIVE non-expired). Reconciles the denormalized Product fields."
+
+  # ---- (6) reorder flag threshold (>= vs <=) — boundary ----
+  - name: reorder_flag
+    trigger: "any change to Product.on_hand_qty (cascaded from product_inventory_rollup)"
+    algorithm: threshold
+    formula: |
+      reorder_flagged = (on_hand_qty <= reorder_point_qty)
+    input_set: "Product.on_hand_qty (post-rollup) vs Product.reorder_point_qty"
+    precision: "integer comparison; boundary: on_hand_qty == reorder_point_qty FLAGS (<=)"
+    note: "Boundary precision: equality flags. on_hand_qty = reorder_point_qty + 1 does NOT flag; on_hand_qty = reorder_point_qty flags."
+
+  # ---- (7) loyalty points accrual — threshold/tiered ----
+  - name: loyalty_points_accrual
+    trigger: "POST /sales/{id}/finalize when member_id is set"
+    algorithm: tiered_pricing
+    formula: |
+      # Points per whole dollar of total_cents, multiplied by tier rate.
+      base_points = floor(total_cents / 100)             # 1 point per whole dollar
+      tier at finalize (BEFORE this sale's lifetime update) determines multiplier:
+        BASIC  -> x1.0
+        SILVER -> x1.5
+        GOLD   -> x2.0
+      points_earned = floor(base_points * tier_multiplier)
+    constants:
+      POINTS_PER_DOLLAR: 1
+      SILVER_MULT_BPS: 15000      # 1.5x in bps
+      GOLD_MULT_BPS: 20000        # 2.0x in bps
+    precision: "floor to integer points"
+    note: "Tier read is the member's tier at the START of finalize, before lifetime_spend is incremented by this sale."
+
+  # ---- (8) loyalty tier (threshold breakpoints) — second dual-variant subject vs points ----
+  - name: loyalty_tier
+    trigger: "after LoyaltyMember.lifetime_spend_cents changes (finalize accrual, refund reversal)"
+    algorithm: threshold
+    formula: |
+      if lifetime_spend_cents >= GOLD_THRESHOLD_CENTS:   tier = GOLD
+      elif lifetime_spend_cents >= SILVER_THRESHOLD_CENTS: tier = SILVER
+      else: tier = BASIC
+    constants:
+      SILVER_THRESHOLD_CENTS: 50000     # $500
+      GOLD_THRESHOLD_CENTS: 200000      # $2000
+    precision: "integer comparison; boundary: lifetime_spend_cents == threshold promotes (>=)"
+    note: "Boundary precision: exactly SILVER_THRESHOLD_CENTS reaches SILVER (>=)."
+
+  # ---- (9) cycle count variance ----
+  - name: cycle_count_variance
+    trigger: "POST /cycle-counts/{id}/submit"
+    algorithm: aggregation
+    formula: |
+      book_qty_snapshot = product.on_hand_qty at submit time
+      variance_qty = counted_qty - book_qty_snapshot
+    input_set: "Single product's current on_hand_qty"
+    precision: "integer"
+
+  # ---- (10) cycle count shrink write-off ----
+  - name: cycle_count_shrink
+    trigger: "POST /cycle-counts/{id}/reconcile when variance_qty < 0"
+    algorithm: chronological
+    formula: |
+      # Short count: deplete |variance_qty| from lots FEFO; shrink = book value depleted.
+      shrink_value_cents = cogs_cents of the FEFO depletion of |variance_qty| units (see fefo_depletion)
+      # Over count (variance_qty > 0): shrink_value_cents = 0; a positive adjustment lot is created.
+    input_set: "FEFO-eligible lots of the product"
+    precision: "round_half_up per lot for weighed, then sum"
+    note: "Reuses fefo_depletion ordering for the negative-variance case."
+
+  # ---- (11) EOD rollup ----
+  - name: eod_rollup
+    trigger: "POST /eod-reconciliations/{id}/close"
+    algorithm: aggregation
+    formula: |
+      window = [reconciliation.created_at, clock)   # half-open: sales/shrink with created_at in [open, close)
+      dept_products = Products with department_id == reconciliation.department_id
+      sales_in_window = SalesTransactions whose fulfillment_status == FINALIZED,
+                        created_at in window, and that have >= 1 line on a dept_product
+      sales_total_cents = sum of total_cents over sales_in_window
+      cogs_total_cents = sum of cogs_cents over sales_in_window
+      shrink_total_cents = sum over the window of:
+        + CycleCount.shrink_value_cents for dept cycle counts RECONCILED in window
+        + pulled/expired lot write-off value for dept lots that became PULLED/EXPIRED in window
+      closing_value_cents = current department on-hand book value (sum of dept products' on_hand_value_cents)
+    input_set: "FINALIZED sales, RECONCILED cycle counts, and PULLED/EXPIRED lots with created_at/updated_at in the half-open window"
+    precision: "integer cents"
+    note: "Aggregate selection: source entities pinned with explicit status filter and half-open [open, close) window."
+
+  # ---- (12) EOD shrink alert (boundary) ----
+  - name: eod_shrink_alert
+    trigger: "POST /eod-reconciliations/{id}/close — after eod_rollup"
+    algorithm: threshold
+    formula: |
+      if opening_value_cents == 0: shrink_bps = 0
+      else: shrink_bps = floor(shrink_total_cents * 10000 / opening_value_cents)
+      shrink_alert = (shrink_bps >= department.shrink_alert_bps)
+    input_set: "shrink_total_cents and opening_value_cents from eod_rollup; department.shrink_alert_bps"
+    precision: "floor to integer bps; boundary: shrink_bps == shrink_alert_bps alerts (>=)"
+    note: "Boundary precision: equality alerts."
+
+# =============================================================================
+# Table 1.4: Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and X-User-Role is a declared role"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this operation per the RBAC matrix; entity_backed roles acting on own resource must match X-User-ID to the resource owner FK"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "Every resource id in the path exists; FK references in the body resolve. Validated left-to-right in the path."
+    error_id: "ERR_{RESOURCE}_NOT_FOUND (ERR_PRODUCT_NOT_FOUND, ERR_DEPARTMENT_NOT_FOUND, ERR_LOT_NOT_FOUND, ERR_SHIPMENT_NOT_FOUND, ERR_SHIPMENT_LINE_NOT_FOUND, ERR_PRICE_PLAN_NOT_FOUND, ERR_PROMOTION_NOT_FOUND, ERR_MEMBER_NOT_FOUND, ERR_COUPON_NOT_FOUND, ERR_CLIPPED_COUPON_NOT_FOUND, ERR_SALE_NOT_FOUND, ERR_LINE_ITEM_NOT_FOUND, ERR_CYCLE_COUNT_NOT_FOUND, ERR_EOD_NOT_FOUND)"
+    http_status: 404
+    applies_to: all endpoints with a path id or FK body field
+
+  - priority: 4
+    category: business_constraint
+    check: "Request body well-formed: required fields present, types correct, enums in range, integers within declared constraints (>=0, >0, bps ranges). Includes conditional-required: sku required when sell_by_weight=false, plu required when sell_by_weight=true, expiration_date required for perishable lots, quantity for each-sold lines, weight_milli for weighed lines."
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all write endpoints
+
+  - priority: 5
+    category: business_referential
+    check: "Uniqueness: Department.code, Product.sku, Product.plu, Shipment.reference_code, LoyaltyMember.email, DigitalCoupon.code unique; a member cannot clip the same coupon twice while a prior clip is CLIPPED"
+    error_id: ERR_DUPLICATE_RESOURCE
+    http_status: 409
+    applies_to: "POST /departments, POST /products, POST /shipments, POST /members, POST /coupons, POST /members/{id}/clip"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a state that permits this transition (per §1.2 from-state and preconditions)"
+    error_id: "varies (ERR_SALE_NOT_OPEN, ERR_SHIPMENT_NOT_PENDING, ERR_SHIPMENT_NOT_RECEIVING, ERR_LOT_NOT_ACTIVE, ERR_LOT_NOT_QUARANTINED, ERR_LOT_NOT_PULLABLE, ERR_LOT_NOT_EXPIRABLE, ERR_PRICE_PLAN_NOT_CANCELLABLE, ERR_PROMOTION_NOT_CANCELLABLE, ERR_MEMBER_NOT_ACTIVE, ERR_MEMBER_NOT_SUSPENDED, ERR_MEMBER_NOT_CLOSEABLE, ERR_CYCLE_COUNT_NOT_DRAFT, ERR_CYCLE_COUNT_NOT_SUBMITTED, ERR_CYCLE_COUNT_NOT_CANCELLABLE, ERR_SALE_NOT_FINALIZED, ERR_SALE_NOT_UNPAID, ERR_SALE_NOT_PAID, ERR_EOD_NOT_OPEN)"
+    http_status: 409
+    applies_to: all state-transition endpoints
+
+  - priority: 7
+    category: business_temporal
+    check: "Window validity: PricePlan/Promotion/DigitalCoupon effective_end must be strictly after effective_start; lot expire requires expiration_date <= clock"
+    error_id: ERR_INVALID_WINDOW
+    http_status: 422
+    applies_to: "POST /price-plans, POST /promotions, POST /coupons, POST /inventory-lots/{id}/expire"
+
+  - priority: 8
+    category: business_safety
+    check: "A weighed product may not be sold by each-count and an each-sold product may not be sold by weight; line unit type must match product.sell_by_weight"
+    error_id: ERR_LINE_UNIT_MISMATCH
+    http_status: 422
+    applies_to: "POST /sales/{id}/line-items"
+
+  - priority: 9
+    category: business_constraint
+    check: "Lot expiry not yet due: expire/sweep on a lot whose expiration_date > clock is rejected"
+    error_id: ERR_LOT_NOT_EXPIRED_YET
+    http_status: 409
+    applies_to: "POST /inventory-lots/{id}/expire"
+
+  - priority: 10
+    category: business_constraint
+    check: "Coupon redeemability at finalize: clip belongs to the sale's member, clip CLIPPED, coupon window covers clock, subtotal_cents >= min_spend_cents, stacking rule satisfied"
+    error_id: ERR_COUPON_NOT_REDEEMABLE
+    http_status: 422
+    applies_to: "POST /sales/{id}/finalize"
+
+  - priority: 11
+    category: business_constraint
+    check: "FEFO stock sufficiency: each line's demand can be met from the product's FEFO-eligible (ACTIVE, non-expired) lots; QUARANTINED/expired lots excluded even though they count toward on_hand_qty"
+    error_id: ERR_INSUFFICIENT_STOCK
+    http_status: 409
+    applies_to: "POST /sales/{id}/finalize"
+
+  - priority: 12
+    category: business_fiscal
+    check: "Receiving variance gate: abs(received_total_cents - expected_total_cents) * 10000 / expected_total_cents must be <= RECEIVE_VARIANCE_TOLERANCE_BPS (=500, i.e. 5.00%) unless StoreManager sets override_variance=true. When expected_total_cents == 0 any nonzero received total exceeds tolerance."
+    error_id: ERR_RECEIVE_VARIANCE_EXCEEDED
+    http_status: 422
+    applies_to: "POST /shipments/{id}/receive"
+
+  - priority: 13
+    category: business_constraint
+    check: "OCC: when expected_<parent>_version provided and does not equal the current parent version, reject (precedes the success path's version bump)"
+    error_id: ERR_STALE_PRODUCT_VERSION
+    http_status: 412
+    applies_to: "POST /shipments/{id}/receive, POST /price-plans"
+
+# =============================================================================
+# Table 1.5: API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Department ----
+  - { method: POST, path: "/departments", description: "Create a department", roles: [StoreManager], code: 201, input: [code, name, "shrink_alert_bps?"], output: Department, side_effects: [] }
+  - { method: GET, path: "/departments", description: "List departments", roles: [StoreManager, PriceManager, ReceivingClerk, InventoryAuditor, Cashier], code: 200, input: ["limit?", "offset?"], output: "Department[]", side_effects: [] }
+  - { method: GET, path: "/departments/{id}", description: "Get a department", roles: [StoreManager, PriceManager, ReceivingClerk, InventoryAuditor, Cashier], code: 200, input: [], output: Department, side_effects: [] }
+
+  # ---- Product ----
+  - method: POST
+    path: "/products"
+    description: "Create a SKU/PLU product in a department"
+    roles: [StoreManager, PriceManager]
+    code: 201
+    input: [department_id, name, "sku?", "plu?", "sell_by_weight?", unit_price_cents, "is_perishable?", "reorder_point_qty?"]
+    output: Product
+    side_effects: ["on_hand_qty=0, on_hand_value_cents=0, reorder_flagged computed (on_hand 0 <= reorder_point => true unless reorder_point<0 impossible), status ACTIVE"]
+  - { method: GET, path: "/products", description: "List products; filter by department_id, status, reorder_flagged", roles: [StoreManager, PriceManager, ReceivingClerk, InventoryAuditor, Cashier], code: 200, input: ["department_id?", "status?", "reorder_flagged?", "limit?", "offset?"], output: "Product[]", side_effects: [] }
+  - { method: GET, path: "/products/{id}", description: "Get a product with computed inventory fields", roles: [StoreManager, PriceManager, ReceivingClerk, InventoryAuditor, Cashier], code: 200, input: [], output: Product, side_effects: [] }
+  - { method: POST, path: "/products/{id}/discontinue", description: "Discontinue a product", roles: [StoreManager], code: 200, input: [], output: Product, side_effects: ["status ACTIVE -> DISCONTINUED"] }
+  - { method: GET, path: "/products/{id}/price-plans", description: "List a product's price plans (reverse-reachability for PricePlan.product_id)", roles: [StoreManager, PriceManager, Cashier], code: 200, input: ["status?", "limit?", "offset?"], output: "PricePlan[]", side_effects: [] }
+  - { method: GET, path: "/products/{id}/promotions", description: "List a product's promotions (reverse-reachability for Promotion.product_id)", roles: [StoreManager, PriceManager, Cashier], code: 200, input: ["status?", "limit?", "offset?"], output: "Promotion[]", side_effects: [] }
+
+  # ---- Shipment + ShipmentLine (DSD receiving) ----
+  - { method: POST, path: "/shipments", description: "Create a DSD shipment header", roles: [ReceivingClerk, StoreManager], code: 201, input: [vendor_name, reference_code, expected_total_cents], output: Shipment, side_effects: ["status PENDING"] }
+  - { method: GET, path: "/shipments", description: "List shipments; filter by status", roles: [ReceivingClerk, StoreManager, InventoryAuditor], code: 200, input: ["status?", "limit?", "offset?"], output: "Shipment[]", side_effects: [] }
+  - { method: GET, path: "/shipments/{id}", description: "Get a shipment with computed totals/variance", roles: [ReceivingClerk, StoreManager, InventoryAuditor], code: 200, input: [], output: Shipment, side_effects: [] }
+  - { method: POST, path: "/shipments/{id}/lines", description: "Add a line to a PENDING shipment", roles: [ReceivingClerk, StoreManager], code: 201, input: [product_id, ordered_qty, unit_cost_cents, "accepted_qty?", "expiration_date?"], output: ShipmentLine, side_effects: ["status OPEN"] }
+  - { method: GET, path: "/shipment-lines/{id}", description: "Get a shipment line", roles: [ReceivingClerk, StoreManager, InventoryAuditor], code: 200, input: [], output: ShipmentLine, side_effects: [] }
+  - { method: GET, path: "/shipment-lines", description: "List shipment lines (reverse-reachability for ShipmentLine.shipment_id and ShipmentLine.product_id)", roles: [ReceivingClerk, StoreManager, InventoryAuditor], code: 200, input: ["shipment_id?", "product_id?", "status?", "limit?", "offset?"], output: "ShipmentLine[]", side_effects: [] }
+  - { method: POST, path: "/shipments/{id}/start-receiving", description: "Begin receiving (PENDING -> RECEIVING)", roles: [ReceivingClerk], code: 200, input: [], output: Shipment, side_effects: ["status -> RECEIVING"] }
+  - method: POST
+    path: "/shipments/{id}/receive"
+    description: "Complete receiving: create lots, recompute product inventory, gate variance and OCC"
+    roles: [ReceivingClerk, StoreManager]
+    code: 200
+    input: [expected_product_version, "override_variance?"]
+    output: Shipment
+    side_effects:
+      - "OCC: reject if expected_product_version != current Product.version of the (single) lined product"
+      - "status RECEIVING -> RECEIVED; create one InventoryLot per accepted line"
+      - "recompute each affected Product on_hand_qty/on_hand_value_cents (product_inventory_rollup); cascade reorder_flag recompute"
+      - "increments Product.version by 1; increments Shipment.version by 1"
+  - { method: POST, path: "/shipments/{id}/reject", description: "Reject receiving (RECEIVING -> REJECTED)", roles: [ReceivingClerk, StoreManager], code: 200, input: [], output: Shipment, side_effects: ["status -> REJECTED; no lots", "increments Shipment.version by 1"] }
+
+  # ---- InventoryLot ----
+  - { method: GET, path: "/inventory-lots", description: "List inventory lots (reverse-reachability for InventoryLot.product_id and InventoryLot.shipment_id)", roles: [StoreManager, ReceivingClerk, InventoryAuditor, Cashier], code: 200, input: ["product_id?", "shipment_id?", "status?", "limit?", "offset?"], output: "InventoryLot[]", side_effects: [] }
+  - { method: GET, path: "/inventory-lots/{id}", description: "Get a lot", roles: [StoreManager, ReceivingClerk, InventoryAuditor, Cashier], code: 200, input: [], output: InventoryLot, side_effects: [] }
+  - { method: POST, path: "/inventory-lots/{id}/quarantine", description: "Quarantine an ACTIVE lot", roles: [InventoryAuditor, StoreManager], code: 200, input: [], output: InventoryLot, side_effects: ["status ACTIVE -> QUARANTINED; lot skipped by FEFO while quarantined"] }
+  - { method: POST, path: "/inventory-lots/{id}/release", description: "Release a QUARANTINED lot back to ACTIVE", roles: [InventoryAuditor, StoreManager], code: 200, input: [], output: InventoryLot, side_effects: ["status QUARANTINED -> ACTIVE"] }
+  - { method: POST, path: "/inventory-lots/{id}/pull", description: "Pull (write off) a lot as shrink", roles: [InventoryAuditor, StoreManager], code: 200, input: [], output: InventoryLot, side_effects: ["status -> PULLED; remaining_qty -> 0; product_inventory_rollup; reorder_flag cascade"] }
+  - { method: POST, path: "/inventory-lots/{id}/expire", description: "Expire a lot whose expiration_date <= clock", roles: [InventoryAuditor, StoreManager], code: 200, input: [], output: InventoryLot, side_effects: ["status -> EXPIRED; remaining_qty -> 0; product_inventory_rollup; reorder_flag cascade"] }
+
+  # ---- PricePlan ----
+  - method: POST
+    path: "/price-plans"
+    description: "Schedule a weekly-ad price for a product (OCC on Product.version)"
+    roles: [PriceManager, StoreManager]
+    code: 201
+    input: [product_id, ad_price_cents, effective_start, effective_end, expected_product_version]
+    output: PricePlan
+    side_effects:
+      - "OCC: reject if expected_product_version != current Product.version"
+      - "status SCHEDULED; increments Product.version by 1"
+  - { method: GET, path: "/price-plans/{id}", description: "Get a price plan", roles: [PriceManager, StoreManager, Cashier], code: 200, input: [], output: PricePlan, side_effects: [] }
+  - { method: POST, path: "/price-plans/{id}/cancel", description: "Cancel a price plan", roles: [PriceManager, StoreManager], code: 200, input: [], output: PricePlan, side_effects: ["status -> CANCELLED"] }
+
+  # ---- Promotion ----
+  - { method: POST, path: "/promotions", description: "Schedule a promotion for a product", roles: [PriceManager, StoreManager], code: 201, input: [product_id, promo_type, "percent_off_bps?", "fixed_off_cents?", "min_qty?", "stackable?", effective_start, effective_end], output: Promotion, side_effects: ["status SCHEDULED"] }
+  - { method: GET, path: "/promotions/{id}", description: "Get a promotion", roles: [PriceManager, StoreManager, Cashier], code: 200, input: [], output: Promotion, side_effects: [] }
+  - { method: POST, path: "/promotions/{id}/cancel", description: "Cancel a promotion", roles: [PriceManager, StoreManager], code: 200, input: [], output: Promotion, side_effects: ["status -> CANCELLED"] }
+
+  # ---- LoyaltyMember + DigitalCoupon + ClippedCoupon ----
+  - { method: POST, path: "/members", description: "Create a loyalty member", roles: [StoreManager, Cashier], code: 201, input: [email, full_name], output: LoyaltyMember, side_effects: ["points_balance 0, tier BASIC, lifetime_spend_cents 0, status ACTIVE"] }
+  - { method: GET, path: "/members/{id}", description: "Get a member with computed loyalty fields", roles: [StoreManager, Cashier, LoyaltyMember], code: 200, input: [], output: LoyaltyMember, side_effects: [] }
+  - { method: POST, path: "/members/{id}/suspend", description: "Suspend a member", roles: [StoreManager], code: 200, input: [], output: LoyaltyMember, side_effects: ["status ACTIVE -> SUSPENDED"] }
+  - { method: POST, path: "/members/{id}/reactivate", description: "Reactivate a suspended member", roles: [StoreManager], code: 200, input: [], output: LoyaltyMember, side_effects: ["status SUSPENDED -> ACTIVE"] }
+  - { method: POST, path: "/members/{id}/close", description: "Close a member; expire its clipped coupons", roles: [StoreManager], code: 200, input: [], output: LoyaltyMember, side_effects: ["status -> CLOSED; member's CLIPPED coupons -> EXPIRED"] }
+  - { method: POST, path: "/members/{id}/clip", description: "Member clips a digital coupon", roles: [LoyaltyMember, Cashier, StoreManager], code: 201, input: [coupon_id], output: ClippedCoupon, side_effects: ["status CLIPPED"] }
+  - { method: GET, path: "/members/{id}/clipped-coupons", description: "List a member's clipped coupons (reverse-reachability for ClippedCoupon.member_id)", roles: [LoyaltyMember, Cashier, StoreManager], code: 200, input: ["status?", "limit?", "offset?"], output: "ClippedCoupon[]", side_effects: [] }
+  - { method: GET, path: "/clipped-coupons/{id}", description: "Get a clipped coupon", roles: [LoyaltyMember, Cashier, StoreManager], code: 200, input: [], output: ClippedCoupon, side_effects: [] }
+  - { method: POST, path: "/coupons", description: "Create a digital coupon definition", roles: [PriceManager, StoreManager], code: 201, input: [code, product_id, discount_cents, "min_spend_cents?", "stackable?", effective_start, effective_end], output: DigitalCoupon, side_effects: [] }
+  - { method: GET, path: "/coupons", description: "List digital coupons (reverse-reachability for DigitalCoupon.product_id)", roles: [PriceManager, StoreManager, Cashier], code: 200, input: ["product_id?", "limit?", "offset?"], output: "DigitalCoupon[]", side_effects: [] }
+  - { method: GET, path: "/coupons/{id}", description: "Get a coupon", roles: [PriceManager, StoreManager, Cashier], code: 200, input: [], output: DigitalCoupon, side_effects: [] }
+  - { method: GET, path: "/coupons/{id}/clipped-coupons", description: "List clips of a coupon (reverse-reachability for ClippedCoupon.coupon_id)", roles: [PriceManager, StoreManager, Cashier], code: 200, input: ["status?", "limit?", "offset?"], output: "ClippedCoupon[]", side_effects: [] }
+
+  # ---- SalesTransaction + SaleLineItem ----
+  - { method: POST, path: "/sales", description: "Open a POS sale", roles: [Cashier, StoreManager], code: 201, input: ["member_id?"], output: SalesTransaction, side_effects: ["tender_status UNPAID, fulfillment_status OPEN"] }
+  - { method: GET, path: "/sales", description: "List sales; filter by tender_status, fulfillment_status, member_id, clipped_coupon_id (reverse-reachability for SalesTransaction.member_id and SalesTransaction.clipped_coupon_id)", roles: [Cashier, StoreManager, InventoryAuditor], code: 200, input: ["member_id?", "clipped_coupon_id?", "tender_status?", "fulfillment_status?", "limit?", "offset?"], output: "SalesTransaction[]", side_effects: [] }
+  - { method: GET, path: "/sales/{id}", description: "Get a sale with computed totals/cogs/points", roles: [Cashier, StoreManager, InventoryAuditor], code: 200, input: [], output: SalesTransaction, side_effects: [] }
+  - { method: POST, path: "/sales/{id}/line-items", description: "Add a line item to an OPEN sale", roles: [Cashier, StoreManager], code: 201, input: [product_id, "quantity?", "weight_milli?"], output: SaleLineItem, side_effects: ["line created; pricing computed at finalize"] }
+  - { method: GET, path: "/sale-line-items/{id}", description: "Get a sale line item", roles: [Cashier, StoreManager, InventoryAuditor], code: 200, input: [], output: SaleLineItem, side_effects: [] }
+  - { method: GET, path: "/sale-line-items", description: "List sale line items (reverse-reachability for SaleLineItem.sale_id and SaleLineItem.product_id)", roles: [Cashier, StoreManager, InventoryAuditor], code: 200, input: ["sale_id?", "product_id?", "limit?", "offset?"], output: "SaleLineItem[]", side_effects: [] }
+  - method: POST
+    path: "/sales/{id}/finalize"
+    description: "Finalize a sale: price lines, apply coupon, deplete FEFO, accrue loyalty"
+    roles: [Cashier, StoreManager]
+    code: 200
+    input: ["clipped_coupon_id?"]
+    output: SalesTransaction
+    side_effects:
+      - "fulfillment_status OPEN -> FINALIZED; compute effective_unit_price, line_extended_price, transaction_total"
+      - "FEFO deplete lots (fefo_depletion) accumulating cogs_cents; lots reaching 0 -> DEPLETED"
+      - "cascade product_inventory_rollup -> reorder_flag on each depleted product"
+      - "if clipped_coupon_id: clip -> REDEEMED; if member: accrue loyalty_points_accrual, update lifetime_spend, loyalty_tier"
+  - { method: POST, path: "/sales/{id}/void", description: "Void an OPEN sale", roles: [Cashier, StoreManager], code: 200, input: [], output: SalesTransaction, side_effects: ["fulfillment_status OPEN -> VOIDED; no inventory effect"] }
+  - { method: POST, path: "/sales/{id}/pay", description: "Tender a FINALIZED sale (UNPAID -> PAID)", roles: [Cashier, StoreManager], code: 200, input: [], output: SalesTransaction, side_effects: ["tender_status UNPAID -> PAID"] }
+  - { method: POST, path: "/sales/{id}/refund", description: "Refund a PAID sale: restock lots, reverse loyalty + coupon", roles: [StoreManager], code: 200, input: [], output: SalesTransaction, side_effects: ["tender_status PAID -> REFUNDED; restock lots reverse-FEFO; product_inventory_rollup + reorder_flag cascade; reverse loyalty; clip REDEEMED -> CLIPPED"] }
+
+  # ---- CycleCount ----
+  - { method: POST, path: "/cycle-counts", description: "Open a cycle count for a department + product", roles: [InventoryAuditor, StoreManager], code: 201, input: [department_id, product_id], output: CycleCount, side_effects: ["status DRAFT"] }
+  - { method: GET, path: "/cycle-counts/{id}", description: "Get a cycle count", roles: [InventoryAuditor, StoreManager], code: 200, input: [], output: CycleCount, side_effects: [] }
+  - { method: GET, path: "/cycle-counts", description: "List cycle counts; filter by department_id, product_id, status (reverse-reachability for CycleCount.department_id and CycleCount.product_id)", roles: [InventoryAuditor, StoreManager], code: 200, input: ["department_id?", "product_id?", "status?", "limit?", "offset?"], output: "CycleCount[]", side_effects: [] }
+  - { method: POST, path: "/cycle-counts/{id}/submit", description: "Submit the physical count (DRAFT -> SUBMITTED)", roles: [InventoryAuditor, StoreManager], code: 200, input: [counted_qty], output: CycleCount, side_effects: ["snapshot book_qty; compute variance_qty"] }
+  - { method: POST, path: "/cycle-counts/{id}/reconcile", description: "Reconcile variance (SUBMITTED -> RECONCILED): adjust lots, write off shrink", roles: [InventoryAuditor, StoreManager], code: 200, input: [], output: CycleCount, side_effects: ["short: FEFO deplete |variance|, shrink_value_cents; over: create adjustment lot; product_inventory_rollup + reorder_flag cascade"] }
+  - { method: POST, path: "/cycle-counts/{id}/cancel", description: "Cancel a cycle count", roles: [InventoryAuditor, StoreManager], code: 200, input: [], output: CycleCount, side_effects: ["status -> CANCELLED; no adjustment"] }
+
+  # ---- EndOfDayReconciliation ----
+  - { method: POST, path: "/eod-reconciliations", description: "Open a department EOD reconciliation; snapshot opening value", roles: [InventoryAuditor, StoreManager], code: 201, input: [department_id, business_date], output: EndOfDayReconciliation, side_effects: ["opening_value_cents snapshot; status OPEN"] }
+  - { method: GET, path: "/eod-reconciliations/{id}", description: "Get an EOD reconciliation", roles: [InventoryAuditor, StoreManager], code: 200, input: [], output: EndOfDayReconciliation, side_effects: [] }
+  - { method: GET, path: "/eod-reconciliations", description: "List EOD reconciliations; filter by department_id, status", roles: [InventoryAuditor, StoreManager], code: 200, input: ["department_id?", "status?", "limit?", "offset?"], output: "EndOfDayReconciliation[]", side_effects: [] }
+  - { method: POST, path: "/eod-reconciliations/{id}/close", description: "Close the day: roll up sales/cogs/shrink, compute shrink alert", roles: [InventoryAuditor, StoreManager], code: 200, input: [], output: EndOfDayReconciliation, side_effects: ["eod_rollup + eod_shrink_alert; status -> CLOSED"] }
+
+  # ---- Test-driving clock endpoint ----
+  - { method: POST, path: "/_clock/advance", description: "Test-driving: set the server's current UTC clock to an absolute ISO 8601 instant", roles: [StoreManager], code: 200, input: [to_iso8601], output: "{ current_utc: datetime }", side_effects: ["server clock set; price/promo/coupon window evaluation and lot expiry use this clock"] }
+
+# =============================================================================
+# Table 1.6: Error Code Catalog
+# =============================================================================
+errors:
+  # ---- Auth ----
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 401, condition: "X-User-ID or X-User-Role header missing or X-User-Role not a declared role" }
+  - { id: ERR_UNAUTHORIZED, http: 403, condition: "Acting role not permitted for the operation, or entity_backed role acting on a resource it does not own" }
+  # ---- Not found ----
+  - { id: ERR_DEPARTMENT_NOT_FOUND, http: 404, condition: "Department id does not exist" }
+  - { id: ERR_PRODUCT_NOT_FOUND, http: 404, condition: "Product id does not exist" }
+  - { id: ERR_LOT_NOT_FOUND, http: 404, condition: "InventoryLot id does not exist" }
+  - { id: ERR_SHIPMENT_NOT_FOUND, http: 404, condition: "Shipment id does not exist" }
+  - { id: ERR_SHIPMENT_LINE_NOT_FOUND, http: 404, condition: "ShipmentLine id does not exist" }
+  - { id: ERR_PRICE_PLAN_NOT_FOUND, http: 404, condition: "PricePlan id does not exist" }
+  - { id: ERR_PROMOTION_NOT_FOUND, http: 404, condition: "Promotion id does not exist" }
+  - { id: ERR_MEMBER_NOT_FOUND, http: 404, condition: "LoyaltyMember id does not exist" }
+  - { id: ERR_COUPON_NOT_FOUND, http: 404, condition: "DigitalCoupon id does not exist" }
+  - { id: ERR_CLIPPED_COUPON_NOT_FOUND, http: 404, condition: "ClippedCoupon id does not exist" }
+  - { id: ERR_SALE_NOT_FOUND, http: 404, condition: "SalesTransaction id does not exist" }
+  - { id: ERR_LINE_ITEM_NOT_FOUND, http: 404, condition: "SaleLineItem id does not exist" }
+  - { id: ERR_CYCLE_COUNT_NOT_FOUND, http: 404, condition: "CycleCount id does not exist" }
+  - { id: ERR_EOD_NOT_FOUND, http: 404, condition: "EndOfDayReconciliation id does not exist" }
+  # ---- Request shape / referential ----
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing/typed-wrong field, enum out of range, integer constraint violated, or conditional-required field absent (sku/plu/expiration_date/quantity/weight_milli)" }
+  - { id: ERR_DUPLICATE_RESOURCE, http: 409, condition: "Uniqueness violation (department code, sku, plu, shipment reference, member email, coupon code, or duplicate live clip)" }
+  - { id: ERR_INVALID_WINDOW, http: 422, condition: "effective_end not strictly after effective_start on price-plan/promotion/coupon" }
+  # ---- State ----
+  - { id: ERR_SHIPMENT_NOT_PENDING, http: 409, condition: "start-receiving requires shipment in PENDING" }
+  - { id: ERR_SHIPMENT_EMPTY, http: 409, condition: "start-receiving requires >= 1 OPEN line" }
+  - { id: ERR_SHIPMENT_NOT_RECEIVING, http: 409, condition: "receive/reject requires shipment in RECEIVING" }
+  - { id: ERR_PRODUCT_DISCONTINUED, http: 409, condition: "receive targets a DISCONTINUED product" }
+  - { id: ERR_LOT_NOT_ACTIVE, http: 409, condition: "quarantine requires lot in ACTIVE" }
+  - { id: ERR_LOT_NOT_QUARANTINED, http: 409, condition: "release requires lot in QUARANTINED" }
+  - { id: ERR_LOT_NOT_PULLABLE, http: 409, condition: "pull requires lot in ACTIVE or QUARANTINED" }
+  - { id: ERR_LOT_NOT_EXPIRABLE, http: 409, condition: "expire requires lot in ACTIVE or QUARANTINED" }
+  - { id: ERR_LOT_NOT_EXPIRED_YET, http: 409, condition: "expire on a lot whose expiration_date > current clock" }
+  - { id: ERR_PRICE_PLAN_NOT_CANCELLABLE, http: 409, condition: "cancel requires price plan in SCHEDULED or ACTIVE" }
+  - { id: ERR_PROMOTION_NOT_CANCELLABLE, http: 409, condition: "cancel requires promotion in SCHEDULED or ACTIVE" }
+  - { id: ERR_MEMBER_NOT_ACTIVE, http: 409, condition: "operation requires member in ACTIVE (suspend; finalize with member)" }
+  - { id: ERR_MEMBER_NOT_SUSPENDED, http: 409, condition: "reactivate requires member in SUSPENDED" }
+  - { id: ERR_MEMBER_NOT_CLOSEABLE, http: 409, condition: "close requires member in ACTIVE or SUSPENDED" }
+  - { id: ERR_SALE_NOT_OPEN, http: 409, condition: "finalize/void/add-line requires sale fulfillment_status OPEN" }
+  - { id: ERR_SALE_EMPTY, http: 409, condition: "finalize requires >= 1 line item" }
+  - { id: ERR_SALE_NOT_FINALIZED, http: 409, condition: "pay requires fulfillment_status FINALIZED" }
+  - { id: ERR_SALE_NOT_UNPAID, http: 409, condition: "pay requires tender_status UNPAID" }
+  - { id: ERR_SALE_NOT_PAID, http: 409, condition: "refund requires tender_status PAID" }
+  - { id: ERR_CYCLE_COUNT_NOT_DRAFT, http: 409, condition: "submit requires cycle count in DRAFT" }
+  - { id: ERR_CYCLE_COUNT_NOT_SUBMITTED, http: 409, condition: "reconcile requires cycle count in SUBMITTED" }
+  - { id: ERR_CYCLE_COUNT_NOT_CANCELLABLE, http: 409, condition: "cancel requires cycle count in DRAFT or SUBMITTED" }
+  - { id: ERR_EOD_NOT_OPEN, http: 409, condition: "close requires reconciliation in OPEN" }
+  - { id: ERR_EOD_OPEN_CYCLE_COUNTS, http: 409, condition: "close blocked while the department has a SUBMITTED (unreconciled) cycle count" }
+  # ---- Business ----
+  - { id: ERR_LINE_UNIT_MISMATCH, http: 422, condition: "line provides quantity for a weighed product or weight_milli for an each-sold product" }
+  - { id: ERR_COUPON_NOT_REDEEMABLE, http: 422, condition: "clip not owned/not CLIPPED, coupon window/min-spend/stacking rule not satisfied at finalize" }
+  - { id: ERR_INSUFFICIENT_STOCK, http: 409, condition: "a line's demand exceeds the product's FEFO-eligible (ACTIVE, non-expired) on-hand" }
+  - { id: ERR_RECEIVE_VARIANCE_EXCEEDED, http: 422, condition: "received_total_cents outside RECEIVE_VARIANCE_TOLERANCE_BPS of expected_total_cents without StoreManager override_variance" }
+  - { id: ERR_STALE_PRODUCT_VERSION, http: 412, condition: "expected_product_version does not match current Product.version on receive or price-plan create" }
+
+# =============================================================================
+# Table 1.7: RBAC Matrix
+# =============================================================================
+roles:
+  - name: StoreManager
+    description: "Store manager: superset operator with override authority (variance override, refunds, member lifecycle). Operational, not a persisted shopper."
+    identity: opaque
+    exclusive_operations:
+      - "POST /departments — create department"
+      - "POST /products/{id}/discontinue — discontinue product"
+      - "POST /members/{id}/suspend, /reactivate, /close — member lifecycle"
+      - "POST /sales/{id}/refund — refund a paid sale (sets override_variance on receive)"
+      - "POST /_clock/advance — advance test clock"
+    shared_operations:
+      - "All ReceivingClerk, PriceManager, Cashier, InventoryAuditor operations (override superset)"
+  - name: ReceivingClerk
+    description: "Receives DSD shipments and creates lots."
+    identity: opaque
+    exclusive_operations:
+      - "POST /shipments/{id}/start-receiving — begin receiving"
+    shared_operations:
+      - "POST /shipments, POST /shipments/{id}/lines, POST /shipments/{id}/receive, POST /shipments/{id}/reject"
+      - "GET shipments, products, inventory-lots"
+  - name: PriceManager
+    description: "Owns weekly-ad pricing, promotions, and coupon definitions."
+    identity: opaque
+    exclusive_operations:
+      - "POST /price-plans/{id}/cancel, POST /promotions/{id}/cancel — cancel pricing"
+    shared_operations:
+      - "POST /products, POST /price-plans, POST /promotions, POST /coupons"
+      - "GET products, price-plans, promotions, coupons"
+  - name: Cashier
+    description: "Operates POS sales and clips coupons on a shopper's behalf."
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "POST /sales, POST /sales/{id}/line-items, POST /sales/{id}/finalize, /void, /pay"
+      - "POST /members, POST /members/{id}/clip"
+      - "GET sales, members, products, price-plans, promotions, coupons, clipped-coupons"
+  - name: InventoryAuditor
+    description: "Owns cycle counts, EOD reconciliation, and lot quarantine/pull/expire."
+    identity: opaque
+    exclusive_operations:
+      - "POST /cycle-counts/* — cycle count lifecycle"
+      - "POST /eod-reconciliations/* — EOD lifecycle"
+    shared_operations:
+      - "POST /inventory-lots/{id}/quarantine, /release, /pull, /expire"
+      - "GET inventory-lots, products, shipments, sales, cycle-counts, eod-reconciliations"
+  - name: LoyaltyMember
+    description: "A shopper acting on its own loyalty account: clip coupons, view own clips/account."
+    identity: "entity_backed:LoyaltyMember"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /members/{id}/clip (own account only; X-User-ID must equal member id)"
+      - "GET /members/{id}, GET /members/{id}/clipped-coupons, GET /clipped-coupons/{id} (own resources)"

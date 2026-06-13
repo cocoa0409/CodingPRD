@@ -1,0 +1,53 @@
+"""Error IDs and HTTP status mapping (PRD section 5 — Error Code Catalogue).
+
+The mapping is registered with the framework so validate_error() can auto-check
+the HTTP status of any error response.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN_ROLE = "ERR_FORBIDDEN_ROLE"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_REFERENTIAL_MISMATCH = "ERR_REFERENTIAL_MISMATCH"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_OUTSIDE_WINDOW = "ERR_OUTSIDE_WINDOW"
+    ERR_PERMIT_NOT_VERIFIED = "ERR_PERMIT_NOT_VERIFIED"
+    ERR_CATEGORY_NOT_ALLOWED = "ERR_CATEGORY_NOT_ALLOWED"
+    ERR_BOOTH_OCCUPIED = "ERR_BOOTH_OCCUPIED"
+    ERR_TOKEN_OVERDRAW = "ERR_TOKEN_OVERDRAW"
+    ERR_STALE_BOOTH_VERSION = "ERR_STALE_BOOTH_VERSION"
+    ERR_DUPLICATE = "ERR_DUPLICATE"
+    ERR_NO_HEALTH_PERMIT = "ERR_NO_HEALTH_PERMIT"
+    ERR_WAITLIST_NOT_HEAD = "ERR_WAITLIST_NOT_HEAD"
+    ERR_DAY_NOT_OPEN = "ERR_DAY_NOT_OPEN"
+    ERR_VALIDATION_BOUNDS = "ERR_VALIDATION_BOUNDS"
+    ERR_SALES_NOT_PRESENT = "ERR_SALES_NOT_PRESENT"
+
+
+HTTP_STATUS_CODES: dict[str, int] = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN_ROLE: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_REQUEST: 422,
+    ApiErrorId.ERR_REFERENTIAL_MISMATCH: 422,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_OUTSIDE_WINDOW: 409,
+    ApiErrorId.ERR_PERMIT_NOT_VERIFIED: 409,
+    ApiErrorId.ERR_CATEGORY_NOT_ALLOWED: 409,
+    ApiErrorId.ERR_BOOTH_OCCUPIED: 409,
+    ApiErrorId.ERR_TOKEN_OVERDRAW: 409,
+    ApiErrorId.ERR_STALE_BOOTH_VERSION: 412,
+    ApiErrorId.ERR_DUPLICATE: 409,
+    ApiErrorId.ERR_NO_HEALTH_PERMIT: 409,
+    ApiErrorId.ERR_WAITLIST_NOT_HEAD: 409,
+    ApiErrorId.ERR_DAY_NOT_OPEN: 409,
+    ApiErrorId.ERR_VALIDATION_BOUNDS: 422,
+    ApiErrorId.ERR_SALES_NOT_PRESENT: 409,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(HTTP_STATUS_CODES)

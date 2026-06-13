@@ -1,0 +1,1360 @@
+scenario: "Airport Parking Reservation: lot/garage inventory, daily/hourly/valet rate, reservation & prepay discount, shuttle scheduling, overstay charge, in/out privileges, oversized/EV stall, no-show/cancellation."
+domain_name: airport-parking-reservation
+api_prefix: /
+
+# Expert difficulty. Primary archetype: Quota / allocation (finite typed-stall
+# inventory reserved → committed → released across overlapping intervals).
+# Secondary archetype: Pricing engine (daily/hourly/valet tiers, prepay discount,
+# overstay surcharge, dual provisional-vs-final cost).
+complexity_profile:
+  primary_archetype: quota_allocation
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - optimistic_concurrency        # OCC on Lot.version for stall-pool create-with-supersede races
+    - cascading_side_effects        # check-in/check-out/cancel cascade across Reservation → Lot → StallHold → ShuttleTrip
+    - dual_variant_calculation      # provisional quote at reservation vs final settlement at check-out
+    - rate_threshold_triggers       # prepay-window discount boundary, overstay grace boundary
+    - derived_field_reconciliation  # Lot.available_<class>_count denormalized from active StallHolds
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (Lot, RatePlan, Reservation, StallHold,
+  # ShuttleTrip, Customer, Vehicle, PaymentTxn, CancellationPolicy). No deep
+  # URL nesting; children carry parent ids in the body.
+
+  state_machine_shape: parallel
+  # Reservation carries two independent state dimensions: occupancy_status
+  # (BOOKED→CHECKED_IN→CHECKED_OUT…) and settlement_status (UNSETTLED→AUTHORIZED→
+  # SETTLED / REFUNDED), which evolve on different triggers. StallHold and
+  # ShuttleTrip add their own cyclic / branching machines.
+
+  relationship_patterns:
+    - one_to_many        # Lot 1—* StallHold; Customer 1—* Reservation; Reservation 1—* PaymentTxn
+    - cross_aggregate    # Reservation references Lot, RatePlan, Vehicle, ShuttleTrip across aggregates
+
+  role_model: peer_roles
+  # Customer owns own reservations/vehicles; LotOperator owns lot inventory,
+  # rate plans, shuttle ops, and gate (check-in/out) actions; FacilityAdmin is
+  # operational superset for clock/inventory seeding and refunds.
+
+  consistency_model: immediate
+  # All mutations atomic within a single request; denormalized availability
+  # counters reconciled in-band on every StallHold create/release.
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Login/contact email; unique across Customers (case-insensitive)."
+        constraints: "unique; non-empty"
+      - name: full_name
+        type: string
+        source: input
+        description: "Customer display name."
+      - name: no_show_strikes
+        type: integer
+        source: computed
+        description: "Running count of NO_SHOW reservations for this customer; incremented when a Reservation auto-transitions BOOKED→NO_SHOW. Used by the prepay-eligibility gate."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Account standing. ACTIVE on creation; flips to SUSPENDED when no_show_strikes reaches NO_SHOW_SUSPEND_THRESHOLD (3); restored to ACTIVE by FacilityAdmin reinstatement."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED}"
+
+  - name: Vehicle
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the owner of this vehicle."
+      - name: plate
+        type: string
+        source: input
+        description: "License plate; unique per (customer_id, plate)."
+        constraints: "unique within owner"
+      - name: size_class
+        type: enum
+        source: input
+        description: "Physical footprint class used for stall-class eligibility."
+        constraints: "one of {STANDARD, OVERSIZED}"
+      - name: is_ev
+        type: boolean
+        source: input
+        description: "Whether the vehicle requires an EV-charging stall."
+        default: false
+
+  - name: Lot
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Lot/garage display name."
+      - name: kind
+        type: enum
+        source: input
+        description: "Facility kind; drives whether VALET service is offered."
+        constraints: "one of {SURFACE_LOT, GARAGE, VALET_GARAGE}"
+      - name: standard_capacity
+        type: integer
+        source: input
+        description: "Total STANDARD stall count in this lot."
+        constraints: ">= 0"
+      - name: oversized_capacity
+        type: integer
+        source: input
+        description: "Total OVERSIZED stall count."
+        constraints: ">= 0"
+      - name: ev_capacity
+        type: integer
+        source: input
+        description: "Total EV-charging stall count."
+        constraints: ">= 0"
+      - name: available_standard_count
+        type: integer
+        source: computed
+        description: "standard_capacity minus count of StallHolds on this lot with stall_class=STANDARD and status in {HELD, OCCUPIED}. Reconciled on every StallHold create/release."
+      - name: available_oversized_count
+        type: integer
+        source: computed
+        description: "oversized_capacity minus active OVERSIZED StallHolds (status in {HELD, OCCUPIED})."
+      - name: available_ev_count
+        type: integer
+        source: computed
+        description: "ev_capacity minus active EV StallHolds (status in {HELD, OCCUPIED})."
+      - name: in_out_allowed
+        type: boolean
+        source: input
+        description: "Whether this lot grants in/out re-entry privileges (a vehicle may exit and re-enter under one reservation)."
+        default: false
+
+  - name: RatePlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: lot_id
+        type: string
+        source: input
+        description: "FK -> Lot.id; the lot this rate plan prices."
+      - name: rate_mode
+        type: enum
+        source: input
+        description: "Pricing mode this plan applies."
+        constraints: "one of {DAILY, HOURLY, VALET}"
+      - name: hourly_cents
+        type: integer
+        source: input
+        description: "Per-hour rate in cents (HOURLY/VALET base hour rate; ignored for DAILY)."
+        default: 0
+        constraints: ">= 0"
+      - name: daily_cap_cents
+        type: integer
+        source: input
+        description: "Per-calendar-day cap in cents. For DAILY mode this is the flat daily rate; for HOURLY mode it caps cumulative hourly charges per day."
+        constraints: ">= 0"
+      - name: valet_surcharge_cents
+        type: integer
+        source: input
+        description: "Flat per-reservation valet service surcharge in cents; applies only when rate_mode=VALET."
+        default: 0
+        constraints: ">= 0"
+      - name: oversized_multiplier_bps
+        type: integer
+        source: input
+        description: "Basis-points multiplier applied to base charge when the assigned stall_class is OVERSIZED (10000 = 1.0x = no surcharge)."
+        default: 10000
+        constraints: ">= 10000"
+      - name: ev_surcharge_cents_per_day
+        type: integer
+        source: input
+        description: "Flat per-day surcharge in cents added when stall_class=EV."
+        default: 0
+        constraints: ">= 0"
+      - name: active
+        type: boolean
+        source: computed
+        description: "Whether this plan may be quoted. true on creation; set false by RatePlan retirement. Retired plans already pinned on a Reservation continue to settle at the pinned snapshot."
+        default: true
+
+  - name: CancellationPolicy
+    parent: null
+    common_fields: true
+    fields:
+      - name: lot_id
+        type: string
+        source: input
+        description: "FK -> Lot.id; the lot this policy governs."
+      - name: free_cancel_hours
+        type: integer
+        source: input
+        description: "Hours before scheduled_start within which a cancellation is still fully refundable. Cancellation strictly earlier than this window → full refund."
+        constraints: ">= 0"
+      - name: late_cancel_fee_bps
+        type: integer
+        source: input
+        description: "Basis points of the prepaid amount retained as a fee when cancelling inside the free-cancel window (but before scheduled_start). 0 = no fee."
+        default: 0
+        constraints: ">= 0; <= 10000"
+      - name: prepay_discount_bps
+        type: integer
+        source: input
+        description: "Basis-points discount granted on the provisional quote when the customer prepays at reservation time AND scheduled_start is at least PREPAY_MIN_LEAD_HOURS in the future."
+        default: 0
+        constraints: ">= 0; <= 10000"
+
+  - name: Reservation
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the booking customer."
+      - name: lot_id
+        type: string
+        source: input
+        description: "FK -> Lot.id; the lot reserved."
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the vehicle to be parked. Must belong to customer_id."
+      - name: rate_plan_id
+        type: string
+        source: input
+        description: "FK -> RatePlan.id; the plan quoted. Must belong to lot_id and be active at reservation time."
+      - name: shuttle_trip_id
+        type: string
+        source: system
+        description: "FK -> ShuttleTrip.id; the shuttle assigned to this reservation, or null. Set by assign-shuttle, cleared on release/cancel/no-show/trip-cancel."
+        default: null
+      - name: stall_class
+        type: enum
+        source: computed
+        description: "Stall class allocated, derived from the vehicle: EV if Vehicle.is_ev; else OVERSIZED if Vehicle.size_class=OVERSIZED; else STANDARD."
+        constraints: "one of {STANDARD, OVERSIZED, EV}"
+      - name: scheduled_start
+        type: datetime
+        source: input
+        description: "Planned arrival instant (ISO 8601 UTC)."
+      - name: scheduled_end
+        type: datetime
+        source: input
+        description: "Planned departure instant (ISO 8601 UTC). Must be strictly after scheduled_start."
+      - name: actual_in
+        type: datetime
+        source: system
+        description: "Instant the vehicle checked in (gate-in). Null until check-in."
+        default: null
+      - name: actual_out
+        type: datetime
+        source: system
+        description: "Instant the vehicle checked out (final gate-out). Null until check-out."
+        default: null
+      - name: prepaid
+        type: boolean
+        source: input
+        description: "Whether the customer elected to prepay at reservation time."
+        default: false
+      - name: occupancy_status
+        type: enum
+        source: computed
+        description: "Occupancy dimension of the reservation lifecycle."
+        default: BOOKED
+        constraints: "one of {BOOKED, CHECKED_IN, OUT_TEMP, CHECKED_OUT, NO_SHOW, CANCELLED}"
+      - name: settlement_status
+        type: enum
+        source: computed
+        description: "Independent financial dimension of the reservation lifecycle."
+        default: UNSETTLED
+        constraints: "one of {UNSETTLED, AUTHORIZED, SETTLED, REFUNDED}"
+      - name: rate_snapshot
+        type: object
+        source: computed
+        description: "Frozen copy of the RatePlan pricing fields (rate_mode, hourly_cents, daily_cap_cents, valet_surcharge_cents, oversized_multiplier_bps, ev_surcharge_cents_per_day) captured at reservation creation; settlement uses this snapshot, not the live plan."
+      - name: provisional_quote_cents
+        type: integer
+        source: computed
+        description: "Estimated cost computed at reservation time over [scheduled_start, scheduled_end) via the provisional variant of compute_parking_charge, after prepay discount."
+      - name: final_charge_cents
+        type: integer
+        source: computed
+        description: "Authoritative cost computed at check-out over [actual_in, actual_out) via the final variant of compute_parking_charge, including overstay surcharge. Null until check-out."
+        default: null
+      - name: overstay_cents
+        type: integer
+        source: computed
+        description: "Portion of final_charge_cents attributable to occupancy beyond scheduled_end plus grace. 0 when no overstay."
+        default: 0
+
+  - name: StallHold
+    parent: null
+    common_fields: true
+    fields:
+      - name: lot_id
+        type: string
+        source: input
+        description: "FK -> Lot.id; the lot whose inventory this hold consumes."
+      - name: reservation_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id; the reservation this hold backs."
+      - name: stall_class
+        type: enum
+        source: computed
+        description: "Stall class consumed; copied from the backing Reservation.stall_class."
+        constraints: "one of {STANDARD, OVERSIZED, EV}"
+      - name: hold_start
+        type: datetime
+        source: computed
+        description: "Interval start of the occupation; equals Reservation.scheduled_start while HELD, rewritten to Reservation.actual_in on OCCUPIED."
+      - name: hold_end
+        type: datetime
+        source: computed
+        description: "Interval end of the occupation; equals Reservation.scheduled_end while HELD, extended to actual departure on release."
+      - name: status
+        type: enum
+        source: computed
+        description: "Hold lifecycle."
+        default: HELD
+        constraints: "one of {HELD, OCCUPIED, RELEASED}"
+
+  - name: ShuttleTrip
+    parent: null
+    common_fields: true
+    fields:
+      - name: lot_id
+        type: string
+        source: input
+        description: "FK -> Lot.id; the lot this shuttle serves."
+      - name: depart_at
+        type: datetime
+        source: input
+        description: "Scheduled departure instant of the shuttle run (ISO 8601 UTC)."
+      - name: seat_capacity
+        type: integer
+        source: input
+        description: "Total passenger seats on this run."
+        constraints: ">= 1"
+      - name: seats_taken
+        type: integer
+        source: computed
+        description: "Count of reservations assigned to this trip; incremented on assignment, decremented on release. Must never exceed seat_capacity."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Trip lifecycle."
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, BOARDING, DEPARTED, CANCELLED}"
+
+  - name: PaymentTxn
+    parent: null
+    common_fields: false
+    fields:
+      - name: reservation_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id; the reservation this transaction belongs to."
+      - name: kind
+        type: enum
+        source: computed
+        description: "Transaction kind."
+        constraints: "one of {AUTHORIZATION, CAPTURE, REFUND, FEE_RETAIN}"
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "Signed amount in cents. AUTHORIZATION/CAPTURE/FEE_RETAIN are positive (money owed/taken); REFUND is positive magnitude returned. The sign convention is encoded in kind."
+      - name: note
+        type: string
+        source: computed
+        description: "Human-readable reason (e.g., 'prepay capture', 'overstay capture', 'late-cancel fee retained')."
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- Reservation: occupancy dimension (parallel with settlement) ----
+  - entity: Reservation
+    initial_state: BOOKED
+    terminal_states: [CHECKED_OUT, NO_SHOW, CANCELLED]
+    transitions:
+      - from: BOOKED
+        to: CHECKED_IN
+        trigger: "POST /reservations/{id}/check-in"
+        actor: LotOperator
+        preconditions:
+          - "Reservation.occupancy_status == BOOKED"
+          - "current_utc >= scheduled_start - CHECKIN_EARLY_GRACE_MIN minutes"
+          - "the backing StallHold.status == HELD (a stall is still reserved)"
+          - "Customer.status == ACTIVE"
+        side_effects:
+          - "set actual_in = current_utc"
+          - "transition backing StallHold HELD→OCCUPIED; rewrite StallHold.hold_start = actual_in"
+          - "Lot availability counters are unchanged (HELD and OCCUPIED both consume inventory)"
+          - "if settlement_status == UNSETTLED, leave it (pay-on-exit); if AUTHORIZED (prepaid), leave it"
+      - from: CHECKED_IN
+        to: OUT_TEMP
+        trigger: "POST /reservations/{id}/gate-exit"
+        actor: LotOperator
+        preconditions:
+          - "Reservation.occupancy_status == CHECKED_IN"
+          - "Lot.in_out_allowed == true for the reservation's lot"
+        side_effects:
+          - "record a temporary exit; StallHold stays OCCUPIED (the stall is retained during the in/out trip)"
+          - "no charge is finalized; final_charge_cents stays null"
+        note: "In/out privilege: a temporary exit that retains the stall. Lots without in_out_allowed reject this with ERR_IN_OUT_NOT_ALLOWED."
+      - from: OUT_TEMP
+        to: CHECKED_IN
+        trigger: "POST /reservations/{id}/gate-reentry"
+        actor: LotOperator
+        preconditions:
+          - "Reservation.occupancy_status == OUT_TEMP"
+        side_effects:
+          - "vehicle re-enters under the same reservation and stall"
+        note: "Cyclic edge: CHECKED_IN→OUT_TEMP→CHECKED_IN may repeat any number of times under in/out privileges."
+      - from: CHECKED_IN
+        to: CHECKED_OUT
+        trigger: "POST /reservations/{id}/check-out"
+        actor: LotOperator
+        preconditions:
+          - "Reservation.occupancy_status == CHECKED_IN"
+        side_effects:
+          - "set actual_out = current_utc"
+          - "run compute_parking_charge (final variant) over [actual_in, actual_out); set final_charge_cents and overstay_cents"
+          - "transition backing StallHold OCCUPIED→RELEASED; set StallHold.hold_end = actual_out → recompute Lot available_<class>_count (cascade hop 2)"
+          - "release the assigned ShuttleTrip seat if any: ShuttleTrip.seats_taken -= 1 (cascade hop 3)"
+          - "drive settlement: if prepaid (settlement_status AUTHORIZED) capture the snapshot quote and capture any overstay delta; else AUTHORIZE then SETTLE final_charge_cents (settlement machine)"
+      - from: BOOKED
+        to: NO_SHOW
+        trigger: "POST /_clock/advance (system sweep) or POST /reservations/{id}/mark-no-show"
+        actor: system
+        preconditions:
+          - "Reservation.occupancy_status == BOOKED"
+          - "current_utc >= scheduled_start + NO_SHOW_GRACE_MIN minutes"
+        side_effects:
+          - "release backing StallHold HELD→RELEASED → recompute Lot available_<class>_count (cascade hop 2)"
+          - "release any assigned ShuttleTrip seat: ShuttleTrip.seats_taken -= 1 (cascade hop 3)"
+          - "increment Customer.no_show_strikes by 1; if it reaches NO_SHOW_SUSPEND_THRESHOLD set Customer.status=SUSPENDED (cascade hop 4 on the Customer aggregate)"
+          - "settlement: if prepaid, retain NO_SHOW_RETAIN_BPS of prepaid amount as FEE_RETAIN and REFUND the remainder (settlement machine); if not prepaid, no charge"
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /reservations/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "Reservation.occupancy_status == BOOKED"
+          - "current_utc < scheduled_start"
+        side_effects:
+          - "release backing StallHold HELD→RELEASED → recompute Lot available_<class>_count (cascade hop 2)"
+          - "release any assigned ShuttleTrip seat: ShuttleTrip.seats_taken -= 1 (cascade hop 3)"
+          - "run compute_cancellation_settlement to determine refund vs retained fee; drive settlement machine accordingly"
+
+  # ---- Reservation: settlement dimension (parallel) ----
+  - entity: Reservation
+    initial_state: UNSETTLED
+    terminal_states: [SETTLED, REFUNDED]
+    transitions:
+      - from: UNSETTLED
+        to: AUTHORIZED
+        trigger: "POST /reservations (with prepaid=true) — automatic at creation"
+        actor: system
+        preconditions:
+          - "Reservation just created with prepaid == true"
+          - "Customer.status == ACTIVE"
+          - "Customer.no_show_strikes < NO_SHOW_SUSPEND_THRESHOLD"
+        side_effects:
+          - "create PaymentTxn(kind=AUTHORIZATION, amount=provisional_quote_cents, note='prepay authorization')"
+        note: "Pay-on-exit reservations skip this and stay UNSETTLED until check-out."
+      - from: AUTHORIZED
+        to: SETTLED
+        trigger: "POST /reservations/{id}/check-out — automatic"
+        actor: system
+        preconditions:
+          - "Reservation.occupancy_status transitioned to CHECKED_OUT in the same request"
+        side_effects:
+          - "create PaymentTxn(kind=CAPTURE, amount=min(provisional_quote_cents, final_charge_cents), note='prepay capture')"
+          - "if final_charge_cents > provisional_quote_cents, create PaymentTxn(kind=CAPTURE, amount=final_charge_cents - provisional_quote_cents, note='overstay capture') — the prepay discount does NOT apply to the overstay delta"
+          - "if final_charge_cents < provisional_quote_cents, create PaymentTxn(kind=REFUND, amount=provisional_quote_cents - final_charge_cents, note='early-departure refund')"
+      - from: UNSETTLED
+        to: SETTLED
+        trigger: "POST /reservations/{id}/check-out — automatic (pay-on-exit)"
+        actor: system
+        preconditions:
+          - "Reservation.prepaid == false"
+          - "Reservation.occupancy_status transitioned to CHECKED_OUT in the same request"
+        side_effects:
+          - "create PaymentTxn(kind=CAPTURE, amount=final_charge_cents, note='pay-on-exit capture')"
+      - from: AUTHORIZED
+        to: REFUNDED
+        trigger: "POST /reservations/{id}/cancel or no-show sweep — automatic"
+        actor: system
+        preconditions:
+          - "Reservation.occupancy_status transitioned to CANCELLED or NO_SHOW in the same request"
+        side_effects:
+          - "create PaymentTxn(kind=FEE_RETAIN, amount=retained_fee_cents) when the policy/no-show retains a fee"
+          - "create PaymentTxn(kind=REFUND, amount=provisional_quote_cents - retained_fee_cents) for the remainder"
+        note: "Invariant: FEE_RETAIN.amount + REFUND.amount == provisional_quote_cents (see compensating_invariant)."
+
+  # ---- StallHold: cyclic-via-class machine (HELD→OCCUPIED→RELEASED) ----
+  - entity: StallHold
+    initial_state: HELD
+    terminal_states: [RELEASED]
+    transitions:
+      - from: HELD
+        to: OCCUPIED
+        trigger: "POST /reservations/{id}/check-in — automatic"
+        actor: system
+        preconditions:
+          - "backing Reservation transitions BOOKED→CHECKED_IN in the same request"
+        side_effects:
+          - "rewrite hold_start = Reservation.actual_in"
+          - "Lot available_<class>_count unchanged (both HELD and OCCUPIED consume inventory)"
+      - from: HELD
+        to: RELEASED
+        trigger: "no-show sweep or cancel — automatic"
+        actor: system
+        preconditions:
+          - "backing Reservation transitions BOOKED→{NO_SHOW|CANCELLED}"
+        side_effects:
+          - "recompute Lot.available_<class>_count += 1 for this stall_class"
+      - from: OCCUPIED
+        to: RELEASED
+        trigger: "POST /reservations/{id}/check-out — automatic"
+        actor: system
+        preconditions:
+          - "backing Reservation transitions CHECKED_IN→CHECKED_OUT"
+        side_effects:
+          - "set hold_end = Reservation.actual_out"
+          - "recompute Lot.available_<class>_count += 1 for this stall_class"
+
+  # ---- ShuttleTrip: branching machine ----
+  - entity: ShuttleTrip
+    initial_state: SCHEDULED
+    terminal_states: [DEPARTED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: BOARDING
+        trigger: "POST /shuttle-trips/{id}/open-boarding"
+        actor: LotOperator
+        preconditions:
+          - "ShuttleTrip.status == SCHEDULED"
+          - "current_utc >= depart_at - BOARDING_OPEN_LEAD_MIN minutes"
+        side_effects:
+          - "no seat changes; trip now accepts board confirmations"
+      - from: BOARDING
+        to: DEPARTED
+        trigger: "POST /shuttle-trips/{id}/depart"
+        actor: LotOperator
+        preconditions:
+          - "ShuttleTrip.status == BOARDING"
+        side_effects:
+          - "trip leaves; assigned reservations remain assigned (seat counts frozen)"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /shuttle-trips/{id}/cancel"
+        actor: LotOperator
+        preconditions:
+          - "ShuttleTrip.status == SCHEDULED"
+        side_effects:
+          - "for every Reservation assigned to this trip, clear its shuttle assignment (set shuttle_trip_id null) and decrement seats_taken to 0"
+        note: "Branch divergence: cancel from SCHEDULED detaches riders; cancel is not permitted from BOARDING/DEPARTED."
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: reservation-create-stale-lot
+    parent_entity: Lot
+    write_endpoint: "POST /reservations"
+    occ_field: "expected_lot_version"
+    description: |
+      Creating a Reservation pins a stall in the Lot's typed inventory, which
+      advances Lot.version (the availability counters are denormalized on the
+      Lot). A create that carries a Lot version older than the Lot's current
+      version is rejected: the client's view of remaining stalls is stale,
+      because another reservation has since consumed inventory on the same lot.
+    error_id: ERR_STALE_LOT_VERSION
+    http_status: 412
+
+  - rule_id: shuttle-assign-stale-trip
+    parent_entity: ShuttleTrip
+    write_endpoint: "POST /reservations/{id}/assign-shuttle"
+    occ_field: "expected_shuttle_trip_version"
+    description: |
+      Assigning a Reservation to a ShuttleTrip consumes a seat and advances
+      ShuttleTrip.version. An assign that carries a ShuttleTrip version older
+      than the trip's current version is rejected: the client's view of
+      remaining seats is stale because another assignment has since taken a
+      seat on the same trip.
+    error_id: ERR_STALE_SHUTTLE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: compute_parking_charge
+    trigger: "Provisional variant: on POST /reservations (over [scheduled_start, scheduled_end)). Final variant: on POST /reservations/{id}/check-out (over [actual_in, actual_out))."
+    algorithm: tiered_pricing
+    formula: |
+      # Inputs come from rate_snapshot (frozen RatePlan fields) and the interval
+      # [t_start, t_end). stall_class is the Reservation's allocated class.
+      #
+      # Step 1 — duration decomposition (evaluation order is PINNED):
+      #   total_minutes = ceil_to_minute(t_end - t_start)           # round partial minute UP
+      #   full_days     = floor(total_minutes / 1440)
+      #   rem_minutes   = total_minutes - full_days * 1440
+      #   rem_hours     = ceil(rem_minutes / 60)                    # partial hour rounds UP to a full hour
+      #
+      # Step 2 — base charge by rate_mode:
+      #   if rate_mode == DAILY:
+      #       billable_days = full_days + (1 if rem_minutes > 0 else 0)
+      #       base = billable_days * daily_cap_cents
+      #   if rate_mode == HOURLY:
+      #       # each calendar-day block is min(hours_that_day * hourly_cents, daily_cap_cents)
+      #       base = full_days * min(24 * hourly_cents, daily_cap_cents)
+      #              + min(rem_hours * hourly_cents, daily_cap_cents)
+      #   if rate_mode == VALET:
+      #       base = full_days * min(24 * hourly_cents, daily_cap_cents)
+      #              + min(rem_hours * hourly_cents, daily_cap_cents)
+      #              + valet_surcharge_cents          # flat, once per reservation
+      #
+      # Step 3 — class surcharges applied to base (order PINNED: oversized multiplier
+      #          FIRST, then EV per-day flat add):
+      #   if stall_class == OVERSIZED:
+      #       base = round_half_up(base * oversized_multiplier_bps / 10000)
+      #   if stall_class == EV:
+      #       billable_days_for_ev = full_days + (1 if rem_minutes > 0 else 0)
+      #       base = base + billable_days_for_ev * ev_surcharge_cents_per_day
+      #
+      # Step 4 — gross_charge_cents = base
+    input_set: "Single Reservation and its rate_snapshot; the time interval differs per variant. No cross-reservation aggregation."
+    constants:
+      MINUTES_PER_DAY: 1440
+      MINUTES_PER_HOUR: 60
+    precision: "integer cents; round_half_up only where a multiplier produces a fraction"
+    variants:
+      - name: provisional
+        when: "At reservation creation."
+        difference: "Interval is [scheduled_start, scheduled_end); result stored as the pre-discount basis for provisional_quote_cents. Overstay is NOT considered (the planned interval cannot overstay itself)."
+      - name: final
+        when: "At check-out."
+        difference: "Interval is [actual_in, actual_out); adds overstay surcharge via compute_overstay_surcharge when actual_out exceeds scheduled_end + grace. Result is final_charge_cents (the authoritative bill)."
+
+  - name: compute_overstay_surcharge
+    trigger: "On POST /reservations/{id}/check-out, after the final base charge is computed."
+    algorithm: threshold
+    formula: |
+      # grace_end = scheduled_end + OVERSTAY_GRACE_MIN minutes
+      # if actual_out <= grace_end:
+      #     overstay_cents = 0
+      # else:
+      #     overstay_minutes = ceil_to_minute(actual_out - grace_end)   # partial minute UP
+      #     overstay_hours   = ceil(overstay_minutes / 60)              # partial hour UP
+      #     # overstay billed at a PENALTY hourly rate, independent of the daily cap:
+      #     overstay_cents = overstay_hours * round_half_up(hourly_cents * OVERSTAY_RATE_BPS / 10000)
+      #     # the snapshot's hourly_cents is used even for DAILY plans (DAILY plans
+      #     # fall back to OVERSTAY_FALLBACK_HOURLY_CENTS when hourly_cents == 0)
+      # final_charge_cents = gross_charge_cents (from compute_parking_charge final) + overstay_cents
+    input_set: "Single Reservation; interval beyond scheduled_end + grace."
+    constants:
+      OVERSTAY_GRACE_MIN: 59
+      OVERSTAY_RATE_BPS: 15000
+      OVERSTAY_FALLBACK_HOURLY_CENTS: 500
+      MINUTES_PER_HOUR: 60
+    precision: "integer cents; round_half_up on the per-hour penalty rate, then multiply by whole overstay_hours"
+    variants:
+      - name: within_grace
+        when: "actual_out <= scheduled_end + OVERSTAY_GRACE_MIN."
+        difference: "overstay_cents == 0; final equals base."
+      - name: beyond_grace
+        when: "actual_out > scheduled_end + OVERSTAY_GRACE_MIN."
+        difference: "Penalty hours billed at 1.5x the snapshot hourly rate; the daily cap does NOT apply to overstay."
+
+  - name: compute_prepay_discount
+    trigger: "On POST /reservations when prepaid == true."
+    algorithm: threshold
+    formula: |
+      # lead_minutes = scheduled_start - current_utc   (in minutes)
+      # eligible = prepaid == true
+      #            AND lead_minutes >= PREPAY_MIN_LEAD_HOURS * 60
+      #            AND Customer.no_show_strikes < NO_SHOW_SUSPEND_THRESHOLD
+      # gross = compute_parking_charge(provisional)         # pre-discount basis
+      # if eligible:
+      #     discount_cents = round_half_up(gross * CancellationPolicy.prepay_discount_bps / 10000)
+      # else:
+      #     discount_cents = 0
+      # provisional_quote_cents = gross - discount_cents
+    input_set: "Single Reservation, its lot's CancellationPolicy, the booking Customer, and the clock."
+    constants:
+      PREPAY_MIN_LEAD_HOURS: 24
+    precision: "integer cents; round_half_up on the discount, subtract from gross"
+    variants:
+      - name: discount_applied
+        when: "prepaid AND lead >= 24h AND strikes < 3."
+        difference: "provisional_quote_cents reduced by prepay_discount_bps of gross."
+      - name: discount_withheld
+        when: "prepaid but lead < 24h, OR not prepaid, OR strikes >= 3."
+        difference: "provisional_quote_cents == gross (no discount); a prepaid-but-too-late booking still authorizes the full gross."
+
+  - name: compute_cancellation_settlement
+    trigger: "On POST /reservations/{id}/cancel (occupancy BOOKED→CANCELLED)."
+    algorithm: threshold
+    formula: |
+      # Applies only when prepaid == true (pay-on-exit cancellations refund nothing
+      # because nothing was authorized).
+      # policy = CancellationPolicy for the reservation's lot
+      # hours_to_start = (scheduled_start - current_utc) / 60   (minutes→hours)
+      # if hours_to_start >= policy.free_cancel_hours:
+      #     # strictly outside (or exactly at) the free-cancel window → full refund
+      #     retained_fee_cents = 0
+      # else:
+      #     # inside the free-cancel window but before scheduled_start → retain fee
+      #     retained_fee_cents = round_half_up(provisional_quote_cents * policy.late_cancel_fee_bps / 10000)
+      # refund_cents = provisional_quote_cents - retained_fee_cents
+      # Invariant: retained_fee_cents + refund_cents == provisional_quote_cents
+    input_set: "Single Reservation, its lot's CancellationPolicy, and the clock."
+    constants: {}
+    precision: "integer cents; round_half_up on the fee, refund is the exact complement"
+    variants:
+      - name: free_cancel
+        when: "hours_to_start >= free_cancel_hours."
+        difference: "retained_fee_cents == 0; full refund of provisional_quote_cents."
+      - name: late_cancel
+        when: "0 < hours_to_start < free_cancel_hours."
+        difference: "retained_fee_cents == late_cancel_fee_bps of the quote; refund is the complement."
+
+  - name: compute_no_show_settlement
+    trigger: "On BOOKED→NO_SHOW (clock sweep via POST /_clock/advance, or POST /reservations/{id}/mark-no-show)."
+    algorithm: threshold
+    formula: |
+      # Applies only when prepaid == true (pay-on-exit no-shows owe nothing).
+      # retained_fee_cents = round_half_up(provisional_quote_cents * NO_SHOW_RETAIN_BPS / 10000)
+      # refund_cents       = provisional_quote_cents - retained_fee_cents
+      # Invariant: retained_fee_cents + refund_cents == provisional_quote_cents.
+      #
+      # Strike side: Customer.no_show_strikes += 1; if no_show_strikes >=
+      #   NO_SHOW_SUSPEND_THRESHOLD then Customer.status = SUSPENDED.
+      # The no-show sweep eligibility is current_utc >= scheduled_start +
+      #   NO_SHOW_GRACE_MIN minutes (a BOOKED reservation past grace).
+    input_set: "Single Reservation and its booking Customer."
+    constants:
+      NO_SHOW_RETAIN_BPS: 5000
+      NO_SHOW_SUSPEND_THRESHOLD: 3
+      NO_SHOW_GRACE_MIN: 30
+      CHECKIN_EARLY_GRACE_MIN: 120
+      BOARDING_OPEN_LEAD_MIN: 30
+    precision: "integer cents; round_half_up on the retained fee, refund is the exact complement"
+    variants:
+      - name: prepaid_no_show
+        when: "prepaid == true."
+        difference: "retain NO_SHOW_RETAIN_BPS of the quote, refund the complement; strike incremented."
+      - name: pay_on_exit_no_show
+        when: "prepaid == false."
+        difference: "no money moves; strike still incremented."
+
+  - name: compute_lot_availability
+    trigger: "On every StallHold create (reservation create), and on every StallHold status change to RELEASED (check-out, no-show, cancel)."
+    algorithm: aggregation
+    formula: |
+      # For the affected Lot and each class C in {STANDARD, OVERSIZED, EV}:
+      #   active_holds_C = count(StallHold
+      #                          WHERE lot_id == Lot.id
+      #                            AND stall_class == C
+      #                            AND status IN {HELD, OCCUPIED})
+      #   available_<C>_count = capacity_C - active_holds_C
+      # available counters are clamped at >= 0 (a correct implementation never
+      # lets active_holds exceed capacity because reservation create checks first).
+    input_set: "All StallHolds for one Lot with status in {HELD, OCCUPIED}; grouped by stall_class. Tie-break not applicable (pure count). RELEASED holds excluded."
+    constants: {}
+    precision: "integer counts"
+    variants:
+      - name: on_hold_created
+        when: "A new StallHold is created (reservation booked)."
+        difference: "active_holds for the booked class increases by 1; available decreases by 1."
+      - name: on_hold_released
+        when: "A StallHold flips to RELEASED."
+        difference: "active_holds decreases by 1; available increases by 1."
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this operation per §1.7 RBAC."
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: auth
+    check: "For Customer-owned operations (cancel, assign-shuttle, vehicle ops), X-User-ID equals the resource's customer_id (ownership)."
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /reservations/{id}/cancel, POST /reservations/{id}/assign-shuttle, POST /vehicles, GET /customers/{id}/reservations"
+
+  - priority: 4
+    category: existence
+    check: "All path and FK-referenced resources exist (Lot, RatePlan, Reservation, Vehicle, Customer, ShuttleTrip, StallHold), validated left-to-right."
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 5
+    category: business_referential
+    check: "On reservation create: vehicle_id's Vehicle.customer_id == body customer_id; rate_plan_id's RatePlan.lot_id == body lot_id."
+    error_id: ERR_CROSS_REFERENCE_MISMATCH
+    http_status: 422
+    applies_to: "POST /reservations"
+
+  - priority: 6
+    category: business_constraint
+    check: "On reservation create: RatePlan.active == true; RatePlan.rate_mode==VALET implies Lot.kind==VALET_GARAGE."
+    error_id: ERR_RATE_PLAN_NOT_QUOTABLE
+    http_status: 422
+    applies_to: "POST /reservations"
+
+  - priority: 7
+    category: business_temporal
+    check: "On reservation create: scheduled_end strictly after scheduled_start; scheduled_start strictly after current_utc."
+    error_id: ERR_INVALID_INTERVAL
+    http_status: 422
+    applies_to: "POST /reservations"
+
+  - priority: 8
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined (occupancy/settlement/StallHold/ShuttleTrip machines)."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /reservations/{id}/check-in, .../check-out, .../gate-exit, .../gate-reentry, .../cancel, POST /shuttle-trips/{id}/open-boarding, .../depart, .../cancel"
+
+  - priority: 9
+    category: state
+    check: "Customer.status == ACTIVE when booking or prepaying (suspended customers cannot book)."
+    error_id: ERR_CUSTOMER_SUSPENDED
+    http_status: 409
+    applies_to: "POST /reservations"
+
+  - priority: 10
+    category: business_constraint
+    check: "gate-exit requires the reservation's Lot.in_out_allowed == true."
+    error_id: ERR_IN_OUT_NOT_ALLOWED
+    http_status: 409
+    applies_to: "POST /reservations/{id}/gate-exit"
+
+  - priority: 11
+    category: business_temporal
+    check: "On reservation create with prepaid==true, OCC: expected_lot_version must equal the live Lot.version."
+    error_id: ERR_STALE_LOT_VERSION
+    http_status: 412
+    applies_to: "POST /reservations"
+
+  - priority: 12
+    category: business_temporal
+    check: "On assign-shuttle, OCC: expected_shuttle_trip_version must equal the live ShuttleTrip.version."
+    error_id: ERR_STALE_SHUTTLE_VERSION
+    http_status: 412
+    applies_to: "POST /reservations/{id}/assign-shuttle"
+
+  - priority: 13
+    category: business_constraint
+    check: "On reservation create: the requested stall_class (derived from the vehicle) has available_<class>_count >= 1 on the lot (capacity check, fiscal/quota last among constraints but before seat assignment)."
+    error_id: ERR_NO_STALL_AVAILABLE
+    http_status: 409
+    applies_to: "POST /reservations"
+
+  - priority: 14
+    category: business_constraint
+    check: "On assign-shuttle: the ShuttleTrip serves the reservation's lot, is in SCHEDULED/BOARDING, and seats_taken < seat_capacity."
+    error_id: ERR_SHUTTLE_FULL
+    http_status: 409
+    applies_to: "POST /reservations/{id}/assign-shuttle"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Customer ----
+  - method: POST
+    path: /customers
+    description: "Register a customer account."
+    roles: [FacilityAdmin]
+    code: 201
+    input: [email, full_name]
+    output: Customer
+    side_effects: ["Customer created with status=ACTIVE, no_show_strikes=0"]
+
+  - method: GET
+    path: /customers/{id}
+    description: "Fetch a customer."
+    roles: [FacilityAdmin, Customer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  - method: POST
+    path: /customers/{id}/reinstate
+    description: "Clear no-show strikes and restore a SUSPENDED customer to ACTIVE."
+    roles: [FacilityAdmin]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["set status=ACTIVE; reset no_show_strikes=0; increments Customer.version by 1"]
+
+  - method: GET
+    path: /customers/{id}/reservations
+    description: "List reservations belonging to a customer (FK reverse-reachability for Reservation.customer_id)."
+    roles: [FacilityAdmin, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+
+  - method: GET
+    path: /customers/{id}/vehicles
+    description: "List vehicles belonging to a customer (FK reverse-reachability for Vehicle.customer_id)."
+    roles: [FacilityAdmin, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Vehicle[]
+    side_effects: []
+
+  # ---- Vehicle ----
+  - method: POST
+    path: /vehicles
+    description: "Register a vehicle for a customer."
+    roles: [Customer, FacilityAdmin]
+    code: 201
+    input: ["customer_id", "plate", "size_class", "is_ev?"]
+    output: Vehicle
+    side_effects: ["Vehicle created"]
+
+  - method: GET
+    path: /vehicles/{id}
+    description: "Fetch a vehicle."
+    roles: [Customer, FacilityAdmin]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: []
+
+  # ---- Lot ----
+  - method: POST
+    path: /lots
+    description: "Create a lot/garage with typed capacities."
+    roles: [FacilityAdmin]
+    code: 201
+    input: ["name", "kind", "standard_capacity", "oversized_capacity", "ev_capacity", "in_out_allowed?"]
+    output: Lot
+    side_effects: ["available_<class>_count initialized to the matching capacity"]
+
+  - method: GET
+    path: /lots/{id}
+    description: "Fetch a lot including live availability counters."
+    roles: [FacilityAdmin, LotOperator, Customer]
+    code: 200
+    input: []
+    output: Lot
+    side_effects: []
+
+  - method: GET
+    path: /lots
+    description: "List lots."
+    roles: [FacilityAdmin, LotOperator, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Lot[]
+    side_effects: []
+
+  - method: GET
+    path: /lots/{id}/rate-plans
+    description: "List rate plans for a lot (FK reverse-reachability for RatePlan.lot_id)."
+    roles: [FacilityAdmin, LotOperator, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RatePlan[]
+    side_effects: []
+
+  - method: GET
+    path: /lots/{id}/cancellation-policies
+    description: "List cancellation policies for a lot (FK reverse-reachability for CancellationPolicy.lot_id)."
+    roles: [FacilityAdmin, LotOperator, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CancellationPolicy[]
+    side_effects: []
+
+  - method: GET
+    path: /lots/{id}/stall-holds
+    description: "List stall holds on a lot (FK reverse-reachability for StallHold.lot_id)."
+    roles: [FacilityAdmin, LotOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: StallHold[]
+    side_effects: []
+
+  - method: GET
+    path: /lots/{id}/shuttle-trips
+    description: "List shuttle trips for a lot (FK reverse-reachability for ShuttleTrip.lot_id)."
+    roles: [FacilityAdmin, LotOperator, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ShuttleTrip[]
+    side_effects: []
+
+  # ---- RatePlan ----
+  - method: POST
+    path: /rate-plans
+    description: "Create a rate plan for a lot."
+    roles: [FacilityAdmin, LotOperator]
+    code: 201
+    input: ["lot_id", "rate_mode", "hourly_cents?", "daily_cap_cents", "valet_surcharge_cents?", "oversized_multiplier_bps?", "ev_surcharge_cents_per_day?"]
+    output: RatePlan
+    side_effects: ["RatePlan created with active=true"]
+
+  - method: GET
+    path: /rate-plans/{id}
+    description: "Fetch a rate plan."
+    roles: [FacilityAdmin, LotOperator, Customer]
+    code: 200
+    input: []
+    output: RatePlan
+    side_effects: []
+
+  - method: POST
+    path: /rate-plans/{id}/retire
+    description: "Retire a rate plan so it can no longer be quoted on new reservations."
+    roles: [FacilityAdmin, LotOperator]
+    code: 200
+    input: []
+    output: RatePlan
+    side_effects: ["set active=false; increments RatePlan.version by 1"]
+
+  # ---- CancellationPolicy ----
+  - method: POST
+    path: /cancellation-policies
+    description: "Create a cancellation policy for a lot."
+    roles: [FacilityAdmin, LotOperator]
+    code: 201
+    input: ["lot_id", "free_cancel_hours", "late_cancel_fee_bps?", "prepay_discount_bps?"]
+    output: CancellationPolicy
+    side_effects: ["CancellationPolicy created"]
+
+  # ---- ShuttleTrip ----
+  - method: POST
+    path: /shuttle-trips
+    description: "Schedule a shuttle run for a lot."
+    roles: [FacilityAdmin, LotOperator]
+    code: 201
+    input: [lot_id, depart_at, seat_capacity]
+    output: ShuttleTrip
+    side_effects: ["ShuttleTrip created with status=SCHEDULED, seats_taken=0"]
+
+  - method: GET
+    path: /shuttle-trips/{id}
+    description: "Fetch a shuttle trip."
+    roles: [FacilityAdmin, LotOperator, Customer]
+    code: 200
+    input: []
+    output: ShuttleTrip
+    side_effects: []
+
+  - method: POST
+    path: /shuttle-trips/{id}/open-boarding
+    description: "Open boarding on a scheduled trip."
+    roles: [LotOperator, FacilityAdmin]
+    code: 200
+    input: []
+    output: ShuttleTrip
+    side_effects: ["status SCHEDULED→BOARDING; increments ShuttleTrip.version by 1"]
+
+  - method: POST
+    path: /shuttle-trips/{id}/depart
+    description: "Depart a boarding trip."
+    roles: [LotOperator, FacilityAdmin]
+    code: 200
+    input: []
+    output: ShuttleTrip
+    side_effects: ["status BOARDING→DEPARTED; increments ShuttleTrip.version by 1"]
+
+  - method: POST
+    path: /shuttle-trips/{id}/cancel
+    description: "Cancel a scheduled trip and detach all assigned riders."
+    roles: [LotOperator, FacilityAdmin]
+    code: 200
+    input: []
+    output: ShuttleTrip
+    side_effects: ["status SCHEDULED→CANCELLED; clears shuttle_trip_id on assigned reservations; seats_taken→0; increments ShuttleTrip.version by 1"]
+
+  # ---- Reservation ----
+  - method: POST
+    path: /reservations
+    description: "Book a reservation: derive stall_class from the vehicle, hold a typed stall, snapshot the rate, quote provisionally (with prepay discount if prepaid), and authorize payment if prepaid."
+    roles: [Customer, FacilityAdmin]
+    code: 201
+    input: ["customer_id", "lot_id", "vehicle_id", "rate_plan_id", "scheduled_start", "scheduled_end", "prepaid?", "expected_lot_version"]
+    output: Reservation
+    side_effects:
+      - "derive stall_class from Vehicle; create StallHold(status=HELD) → compute_lot_availability decrements available_<class>_count (increments Lot.version by 1)"
+      - "snapshot RatePlan into rate_snapshot; run compute_parking_charge(provisional) and compute_prepay_discount → set provisional_quote_cents"
+      - "if prepaid: settlement UNSETTLED→AUTHORIZED, create PaymentTxn(AUTHORIZATION)"
+
+  - method: GET
+    path: /reservations/{id}
+    description: "Fetch a reservation including both status dimensions and pricing fields."
+    roles: [Customer, LotOperator, FacilityAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+
+  - method: GET
+    path: /reservations
+    description: "List reservations, optionally filtered by lot_id, vehicle_id, rate_plan_id, or shuttle_trip_id (FK reverse-reachability for those FKs)."
+    roles: [FacilityAdmin, LotOperator]
+    code: 200
+    input: ["lot_id?", "vehicle_id?", "rate_plan_id?", "shuttle_trip_id?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+
+  - method: GET
+    path: /reservations/{id}/payment-txns
+    description: "List payment transactions for a reservation (FK reverse-reachability for PaymentTxn.reservation_id)."
+    roles: [Customer, LotOperator, FacilityAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PaymentTxn[]
+    side_effects: []
+
+  - method: GET
+    path: /reservations/{id}/stall-holds
+    description: "List stall holds backing a reservation (FK reverse-reachability for StallHold.reservation_id)."
+    roles: [Customer, LotOperator, FacilityAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: StallHold[]
+    side_effects: []
+
+  - method: POST
+    path: /reservations/{id}/assign-shuttle
+    description: "Assign the reservation to a shuttle trip serving its lot (consumes a seat under OCC on the trip)."
+    roles: [Customer, FacilityAdmin]
+    code: 200
+    input: [shuttle_trip_id, expected_shuttle_trip_version]
+    output: Reservation
+    side_effects: ["set shuttle_trip_id; ShuttleTrip.seats_taken += 1; increments ShuttleTrip.version by 1"]
+
+  - method: POST
+    path: /reservations/{id}/check-in
+    description: "Gate-in: mark arrival, occupy the held stall."
+    roles: [LotOperator, FacilityAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["occupancy BOOKED→CHECKED_IN; set actual_in; StallHold HELD→OCCUPIED"]
+
+  - method: POST
+    path: /reservations/{id}/gate-exit
+    description: "Temporary exit under in/out privileges; retains the stall."
+    roles: [LotOperator, FacilityAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["occupancy CHECKED_IN→OUT_TEMP; StallHold stays OCCUPIED"]
+
+  - method: POST
+    path: /reservations/{id}/gate-reentry
+    description: "Re-entry after a temporary exit."
+    roles: [LotOperator, FacilityAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["occupancy OUT_TEMP→CHECKED_IN"]
+
+  - method: POST
+    path: /reservations/{id}/check-out
+    description: "Final gate-out: compute final charge + overstay, release stall and shuttle seat, settle payment."
+    roles: [LotOperator, FacilityAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects:
+      - "occupancy CHECKED_IN→CHECKED_OUT; set actual_out"
+      - "run compute_parking_charge(final) + compute_overstay_surcharge → final_charge_cents, overstay_cents"
+      - "StallHold OCCUPIED→RELEASED → compute_lot_availability increments available_<class>_count"
+      - "release assigned ShuttleTrip seat (seats_taken -= 1) if any"
+      - "settlement: AUTHORIZED→SETTLED (capture/refund delta) or UNSETTLED→SETTLED (pay-on-exit capture); create PaymentTxn rows"
+
+  - method: POST
+    path: /reservations/{id}/cancel
+    description: "Customer cancels a BOOKED reservation; releases inventory + seat and settles refund per policy."
+    roles: [Customer, FacilityAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects:
+      - "occupancy BOOKED→CANCELLED"
+      - "StallHold HELD→RELEASED → compute_lot_availability increments available_<class>_count"
+      - "release assigned ShuttleTrip seat if any"
+      - "run compute_cancellation_settlement; if prepaid create FEE_RETAIN + REFUND PaymentTxns, settlement AUTHORIZED→REFUNDED"
+
+  - method: POST
+    path: /reservations/{id}/mark-no-show
+    description: "Operator manually marks a past-grace BOOKED reservation as no-show (same effect as the clock sweep)."
+    roles: [LotOperator, FacilityAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects:
+      - "occupancy BOOKED→NO_SHOW"
+      - "StallHold HELD→RELEASED → compute_lot_availability increments available_<class>_count"
+      - "release assigned ShuttleTrip seat if any"
+      - "Customer.no_show_strikes += 1; if it reaches 3, Customer.status→SUSPENDED"
+      - "settlement: if prepaid retain NO_SHOW_RETAIN_BPS and refund remainder (AUTHORIZED→REFUNDED)"
+
+  # ---- Test-driving (clock) ----
+  - method: POST
+    path: /_clock/set
+    description: "Test-driving endpoint: set the server's current UTC clock to an absolute instant."
+    roles: [FacilityAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: datetime }"
+    side_effects: ["server clock set to to_iso8601 for all subsequent time-dependent logic"]
+
+  - method: POST
+    path: /_clock/advance
+    description: "Test-driving endpoint: advance the clock by N minutes and run the no-show sweep over all BOOKED reservations past their grace window."
+    roles: [FacilityAdmin]
+    code: 200
+    input: [minutes]
+    output: "{ current_utc: datetime, swept_no_show_count: integer }"
+    side_effects: ["clock advances; each eligible BOOKED reservation auto-transitions to NO_SHOW with full no-show cascade"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for the operation."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Customer acting on a reservation/vehicle whose customer_id != X-User-ID."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A path or FK-referenced resource does not exist."
+  - id: ERR_CROSS_REFERENCE_MISMATCH
+    http: 422
+    condition: "vehicle_id not owned by customer_id, or rate_plan_id not on lot_id."
+  - id: ERR_RATE_PLAN_NOT_QUOTABLE
+    http: 422
+    condition: "RatePlan inactive, or VALET plan on a non-VALET_GARAGE lot."
+  - id: ERR_INVALID_INTERVAL
+    http: 422
+    condition: "scheduled_end not strictly after scheduled_start, or scheduled_start not strictly after current_utc."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not defined from the resource's current state (occupancy/settlement/StallHold/ShuttleTrip)."
+  - id: ERR_CUSTOMER_SUSPENDED
+    http: 409
+    condition: "Booking/prepay attempted while Customer.status == SUSPENDED."
+  - id: ERR_IN_OUT_NOT_ALLOWED
+    http: 409
+    condition: "gate-exit on a reservation whose lot has in_out_allowed == false."
+  - id: ERR_STALE_LOT_VERSION
+    http: 412
+    condition: "expected_lot_version != live Lot.version on reservation create."
+  - id: ERR_STALE_SHUTTLE_VERSION
+    http: 412
+    condition: "expected_shuttle_trip_version != live ShuttleTrip.version on assign-shuttle."
+  - id: ERR_NO_STALL_AVAILABLE
+    http: 409
+    condition: "available_<class>_count == 0 for the derived stall_class on the lot."
+  - id: ERR_SHUTTLE_FULL
+    http: 409
+    condition: "ShuttleTrip seats_taken == seat_capacity, trip not serving the lot, or trip not in SCHEDULED/BOARDING."
+  - id: ERR_VALIDATION
+    http: 400
+    condition: "Malformed body: missing required field, wrong type, or invalid enum value."
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Customer
+    description: "End user who books and manages their own parking reservations and vehicles."
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /reservations/{id}/cancel (own reservation)"
+      - "POST /reservations/{id}/assign-shuttle (own reservation)"
+    shared_operations:
+      - "POST /vehicles (own)"
+      - "POST /reservations (own)"
+      - "GET /reservations/{id}"
+      - "GET /customers/{id}/reservations (own)"
+      - "GET /customers/{id}/vehicles (own)"
+      - "GET /lots, GET /lots/{id}, GET /rate-plans/{id}, GET /shuttle-trips/{id}"
+
+  - name: LotOperator
+    description: "Facility gate/ops staff: manages lot inventory observation, rate plans, shuttle ops, and gate (check-in/out/exit/reentry) actions."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /reservations/{id}/check-in"
+      - "POST /reservations/{id}/gate-exit"
+      - "POST /reservations/{id}/gate-reentry"
+      - "POST /reservations/{id}/check-out"
+      - "POST /reservations/{id}/mark-no-show"
+      - "POST /shuttle-trips/{id}/open-boarding"
+      - "POST /shuttle-trips/{id}/depart"
+      - "POST /shuttle-trips/{id}/cancel"
+    shared_operations:
+      - "POST /rate-plans, POST /rate-plans/{id}/retire"
+      - "POST /cancellation-policies, POST /shuttle-trips"
+      - "GET /lots/{id}/stall-holds, GET /reservations"
+
+  - name: FacilityAdmin
+    description: "Operational superset: seeds customers/lots, sets the clock, reinstates customers, and can perform any LotOperator or Customer-on-behalf operation and refunds."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /customers, POST /customers/{id}/reinstate"
+      - "POST /lots"
+      - "POST /_clock/set, POST /_clock/advance"
+    shared_operations:
+      - "all LotOperator operations"
+      - "POST /reservations, POST /reservations/{id}/cancel, POST /reservations/{id}/assign-shuttle, POST /vehicles (on behalf, ownership check bypassed)"

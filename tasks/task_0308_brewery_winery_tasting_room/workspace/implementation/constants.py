@@ -1,0 +1,46 @@
+"""Domain constants from PRD §3 and SCAFFOLD §1.3 calculations."""
+
+ROLES = {"ComplianceOfficer", "CellarManager", "ClubManager", "TastingRoomStaff", "Member"}
+
+AGE_MINIMUM_YEARS = 21  # PRD §2.8
+
+# --- excise_accrual (PRD §3.3) ---
+LITERS_PER_GALLON = 3.78541
+WINE_ABV_TIER1_MAX = 14.0
+WINE_RATE_TIER1_CENTS_PER_GAL = 107
+WINE_RATE_TIER2_CENTS_PER_GAL = 157
+GALLONS_PER_BEER_BARREL = 31.0
+BEER_RATE_CENTS_PER_BARREL = 1800
+CIDER_RATE_CENTS_PER_GAL = 23
+
+# --- loyalty_points_accrual (PRD §3.7, §3.9) ---
+CENTS_PER_POINT = 100
+REDEEM_CENTS_PER_POINT = 5
+LOYALTY_MULT = {"SILVER": 1, "GOLD": 2, "PLATINUM": 3}
+
+# --- shipment_pricing (PRD §3.7) ---
+TIER_DISCOUNT_PCT = {"SILVER": 0.05, "GOLD": 0.10, "PLATINUM": 0.15}
+VOLUME_KICKER_BOTTLES = 12
+VOLUME_KICKER_PCT = 0.05
+MAX_DISCOUNT_PCT = 0.18
+
+# --- ship_state_limit_check (PRD §3.8) ---
+LITERS_PER_9L_CASE = 9.0
+DEFAULT_STATE_CASE_LIMIT = 24.0
+STATE_CASE_LIMITS = {"CA": 24.0, "NY": 36.0, "TX": 9.0, "PA": 0.0}
+
+# --- distribution_invoice (PRD §3.11) ---
+BOTTLES_PER_CASE = 12
+WHOLESALE_PCT = 0.50
+FREIGHT_TIER_THRESHOLD_CENTS = 50000
+FREIGHT_LOW_CENTS = 2500
+FREIGHT_HIGH_CENTS = 1500
+
+# --- event_deposit (PRD §3.10) ---
+EVENT_DEPOSIT_PER_GUEST_CENTS = 1500
+
+# enum constraint sets
+BEVERAGE_CLASSES = {"WINE", "BEER", "CIDER"}
+TIERS = {"SILVER", "GOLD", "PLATINUM"}
+LINE_KINDS = {"FLIGHT", "BOTTLE", "GLASS"}
+BILLING_STATUSES = {"CURRENT", "PAST_DUE"}

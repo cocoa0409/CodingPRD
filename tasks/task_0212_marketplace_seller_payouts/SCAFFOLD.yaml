@@ -1,0 +1,1926 @@
+scenario: |
+  Online Marketplace Seller Payouts: seller onboarding (KYC/W-9), order/commission/fee
+  schedule, payout schedule & reserve hold, refund/chargeback clawback, 1099-K reporting,
+  dispute/A-to-Z claim, balance statement, payout method
+domain_name: marketplace-seller-payouts
+api_prefix: /
+# Flat topology: each entity owns a top-level collection (/sellers, /orders,
+# /refunds, /payouts, ...). There is no single nesting prefix; api_prefix is the
+# root. Sub-resource reverse-reachability GETs live under /sellers/{id}/... and
+# filtered-list GETs (e.g. GET /orders?seller_id=...) cover cross-aggregate FKs.
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - dual_variant_calculation
+    - cascading_side_effects
+    - rate_threshold_triggers
+    - optimistic_concurrency
+    - derived_field_reconciliation
+
+  entity_topology: flat
+  # Peer entities (Seller, Order, Refund, Chargeback, Dispute, Payout, TaxForm,
+  # Reserve, PayoutMethod, FeeSchedule, LedgerEntry, BalanceStatement) linked by
+  # foreign keys, not URL nesting. Each is addressed at its own top-level
+  # collection; cross-references travel in request bodies / filter params.
+
+  state_machine_shape: parallel
+  # Order carries two independent state dimensions that evolve on different
+  # triggers (settlement_status: PENDING→AVAILABLE→PAID and
+  # clawback_status: NONE→REFUND_CLAWED / CHARGEBACK_CLAWED). Dispute is cyclic
+  # (UNDER_REVIEW→SELLER_RESPONDED→UNDER_REVIEW). Seller is posture-like
+  # (account_status gates child operations). Payout is linear-with-revert.
+
+  relationship_patterns:
+    - one_to_many       # Seller → Orders, Seller → Payouts, Seller → LedgerEntries
+    - cross_aggregate   # Refund/Chargeback reference an Order across aggregates
+    - polymorphic       # LedgerEntry.source_type references Order|Refund|Chargeback|Payout|Reserve
+
+  role_model: segregation_of_duties
+  # The PlatformReviewer who approves a Seller's KYC cannot be the
+  # PlatformFinance operator who releases that Seller's payout (recorded via
+  # X-User-ID on the audit fields). Seller acts only on its own resources.
+
+  consistency_model: immediate
+  # Every mutation and its cascade (ledger postings, balance recompute, reserve
+  # adjustment, order status flips) are atomic within the triggering request.
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Seller
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: Legal business or individual name as it appears on the W-9.
+      - name: email
+        type: string
+        source: input
+        description: Contact email; unique across sellers.
+        constraints: unique; non-empty
+      - name: country_code
+        type: enum
+        source: input
+        description: ISO-3166 alpha-2 country of the seller.
+        constraints: one of {US, CA, GB, DE, AU}
+      - name: tax_classification
+        type: enum
+        source: input
+        description: W-9 tax classification submitted at onboarding.
+        constraints: one of {INDIVIDUAL, SOLE_PROP, C_CORP, S_CORP, LLC, PARTNERSHIP}
+      - name: tin_last4
+        type: string
+        source: input
+        description: Last four digits of the taxpayer identification number from the W-9.
+        constraints: exactly 4 digits
+      - name: kyc_status
+        type: enum
+        source: system
+        description: KYC review posture; gates onboarding completion.
+        default: PENDING
+        constraints: one of {PENDING, IN_REVIEW, APPROVED, REJECTED}
+      - name: w9_status
+        type: enum
+        source: system
+        description: W-9 collection posture; APPROVED requires kyc_status APPROVED.
+        default: NOT_SUBMITTED
+        constraints: one of {NOT_SUBMITTED, SUBMITTED, APPROVED}
+      - name: account_status
+        type: enum
+        source: computed
+        description: |
+          Derived onboarding/standing posture that gates child operations
+          (orders may attach; payouts may release). ONBOARDING until both
+          kyc_status==APPROVED and w9_status==APPROVED and a verified
+          PayoutMethod exists, then ACTIVE. SUSPENDED freezes payout release
+          but still accrues ledger postings. CLOSED is terminal.
+        default: ONBOARDING
+        constraints: one of {ONBOARDING, ACTIVE, SUSPENDED, CLOSED}
+      - name: risk_tier
+        type: enum
+        source: computed
+        description: |
+          Risk band derived from seller_risk_score (see §1.3). Determines the
+          rolling-reserve percentage applied at payout time.
+        default: STANDARD
+        constraints: one of {STANDARD, ELEVATED, HIGH}
+      - name: seller_risk_score
+        type: number
+        source: computed
+        description: Weighted risk score in [0,100]; see calculations.seller_risk_score.
+        default: 0
+      - name: available_balance_cents
+        type: integer
+        source: computed
+        description: |
+          Sum of LedgerEntry.amount_cents for this seller whose hold_state==AVAILABLE,
+          minus reserve_held_cents. Reconciled on every ledger posting. May be negative.
+        default: 0
+      - name: pending_balance_cents
+        type: integer
+        source: computed
+        description: |
+          Sum of LedgerEntry.amount_cents whose hold_state==PENDING (order proceeds
+          not yet matured). Reconciled on every ledger posting and on maturation.
+        default: 0
+      - name: reserve_held_cents
+        type: integer
+        source: computed
+        description: Current rolling-reserve amount withheld; mirrors the open Reserve row.
+        default: 0
+      - name: ytd_gross_cents
+        type: integer
+        source: computed
+        description: |
+          Year-to-date gross transaction volume used for 1099-K threshold testing;
+          sum of Order.gross_amount_cents for AVAILABLE/PAID settlement orders in the tax year.
+        default: 0
+      - name: ytd_transaction_count
+        type: integer
+        source: computed
+        description: Year-to-date count of settled orders used for legacy 1099-K threshold.
+        default: 0
+      - name: kyc_reviewer_id
+        type: string
+        source: system
+        description: X-User-ID of the PlatformReviewer who set kyc_status to APPROVED/REJECTED.
+        default: null
+
+  - name: PayoutMethod
+    parent: null
+    common_fields: true
+    fields:
+      - name: seller_id
+        type: string
+        source: input
+        description: FK -> Seller.id; the owning seller.
+      - name: method_type
+        type: enum
+        source: input
+        description: Disbursement rail.
+        constraints: one of {ACH, WIRE, PAYPAL}
+      - name: account_last4
+        type: string
+        source: input
+        description: Last four digits of the destination account.
+        constraints: exactly 4 digits
+      - name: currency
+        type: enum
+        source: input
+        description: Settlement currency for this method.
+        constraints: one of {USD, CAD, GBP, EUR}
+      - name: verification_status
+        type: enum
+        source: system
+        description: Micro-deposit verification posture.
+        default: UNVERIFIED
+        constraints: one of {UNVERIFIED, VERIFIED, FAILED}
+      - name: micro_deposit_code
+        type: string
+        source: system
+        description: Server-issued code the seller must echo back to verify the method.
+        default: null
+      - name: is_default
+        type: boolean
+        source: computed
+        description: |
+          True for exactly one VERIFIED method per seller — the latest VERIFIED
+          method (by created_at ASC, last wins). Payouts disburse to the default.
+        default: false
+
+  - name: FeeSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - name: category
+        type: enum
+        source: input
+        description: Product category this schedule prices.
+        constraints: one of {ELECTRONICS, APPAREL, MEDIA, GROCERY, HANDMADE}
+      - name: commission_bps
+        type: integer
+        source: input
+        description: Commission rate in basis points (e.g., 1500 = 15%).
+        constraints: 0..5000
+      - name: fixed_fee_cents
+        type: integer
+        source: input
+        description: Per-order fixed platform fee in cents.
+        constraints: ">= 0"
+      - name: payment_processing_bps
+        type: integer
+        source: input
+        description: Payment-processing rate in basis points applied to gross.
+        constraints: 0..1000
+      - name: payment_processing_fixed_cents
+        type: integer
+        source: input
+        description: Fixed per-order payment-processing fee in cents.
+        constraints: ">= 0"
+      - name: reserve_pct_standard
+        type: integer
+        source: input
+        description: Rolling-reserve percentage (whole percent) for STANDARD-tier sellers.
+        constraints: 0..100
+      - name: reserve_pct_elevated
+        type: integer
+        source: input
+        description: Rolling-reserve percentage for ELEVATED-tier sellers.
+        constraints: 0..100
+      - name: reserve_pct_high
+        type: integer
+        source: input
+        description: Rolling-reserve percentage for HIGH-tier sellers.
+        constraints: 0..100
+      - name: maturation_days
+        type: integer
+        source: input
+        description: Days from order settlement until proceeds move PENDING→AVAILABLE.
+        constraints: 0..90
+      - name: is_active
+        type: boolean
+        source: computed
+        description: |
+          True for exactly one schedule per category — the latest by created_at ASC
+          (last wins). Orders price against the active schedule for their category.
+        default: true
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - name: seller_id
+        type: string
+        source: input
+        description: FK -> Seller.id; the seller fulfilling this order.
+      - name: fee_schedule_id
+        type: string
+        source: system
+        description: FK -> FeeSchedule.id; the active schedule pinned at order creation.
+      - name: category
+        type: enum
+        source: input
+        description: Product category; selects the active FeeSchedule.
+        constraints: one of {ELECTRONICS, APPAREL, MEDIA, GROCERY, HANDMADE}
+      - name: gross_amount_cents
+        type: integer
+        source: input
+        description: Buyer-paid gross amount in cents (item + shipping).
+        constraints: ">= 1"
+      - name: commission_cents
+        type: integer
+        source: computed
+        description: Platform commission; see calculations.order_net_earnings.
+        default: 0
+      - name: platform_fee_cents
+        type: integer
+        source: computed
+        description: Fixed platform fee copied from the pinned schedule.
+        default: 0
+      - name: processing_fee_cents
+        type: integer
+        source: computed
+        description: Payment-processing fee; see calculations.order_net_earnings.
+        default: 0
+      - name: net_earnings_cents
+        type: integer
+        source: computed
+        description: |
+          Seller net proceeds for this order. Provisional at SETTLED, finalized
+          (recomputed against any partial refunds) at maturation. See §1.3.
+        default: 0
+      - name: settlement_status
+        type: enum
+        source: system
+        description: |
+          Funds-availability dimension. PENDING at settlement, AVAILABLE after
+          maturation, PAID once included in a released payout. Independent of
+          clawback_status.
+        default: PENDING
+        constraints: one of {PENDING, AVAILABLE, PAID}
+      - name: clawback_status
+        type: enum
+        source: system
+        description: |
+          Reversal dimension, independent of settlement_status. NONE until a
+          refund or chargeback reverses proceeds.
+        default: NONE
+        constraints: one of {NONE, REFUND_CLAWED, CHARGEBACK_CLAWED}
+      - name: refunded_amount_cents
+        type: integer
+        source: computed
+        description: Cumulative buyer-facing refund amount applied to this order.
+        default: 0
+      - name: settled_at
+        type: datetime
+        source: system
+        description: Clock timestamp when the order moved to SETTLED/PENDING.
+        default: null
+      - name: matured_at
+        type: datetime
+        source: system
+        description: Clock timestamp when proceeds moved PENDING→AVAILABLE.
+        default: null
+
+  - name: LedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: seller_id
+        type: string
+        source: input
+        description: FK -> Seller.id; owning seller of this ledger movement.
+      - name: source_type
+        type: enum
+        source: system
+        description: Polymorphic origin of the posting.
+        constraints: one of {ORDER_PROCEEDS, REFUND_CLAWBACK, CHARGEBACK_CLAWBACK, CHARGEBACK_FEE, RESERVE_HOLD, RESERVE_RELEASE, PAYOUT}
+      - name: source_id
+        type: string
+        source: system
+        description: |
+          FK -> Order.id; identifier of the originating Order, Refund, Chargeback,
+          Payout, or Reserve depending on source_type (polymorphic; Order is the
+          canonical FK target for reverse-reachability).
+      - name: amount_cents
+        type: integer
+        source: system
+        description: Signed amount; positive credits the seller, negative debits.
+      - name: hold_state
+        type: enum
+        source: system
+        description: |
+          PENDING while immature, AVAILABLE once matured, REVERSED when a later
+          clawback voids the original credit (the reversal posts a new entry; the
+          original entry's hold_state flips to REVERSED).
+        default: PENDING
+        constraints: one of {PENDING, AVAILABLE, REVERSED}
+      - name: memo
+        type: string
+        source: system
+        description: Human-readable description of the posting.
+
+  - name: Reserve
+    parent: null
+    common_fields: true
+    fields:
+      - name: seller_id
+        type: string
+        source: input
+        description: FK -> Seller.id; the seller whose funds are reserved.
+      - name: reserve_status
+        type: enum
+        source: system
+        description: OPEN while withholding, RELEASED once the hold window elapses.
+        default: OPEN
+        constraints: one of {OPEN, RELEASED}
+      - name: held_amount_cents
+        type: integer
+        source: computed
+        description: Amount currently withheld; see calculations.reserve_hold.
+        default: 0
+      - name: reserve_pct_applied
+        type: integer
+        source: system
+        description: Reserve percentage actually applied, pinned from risk_tier at open time.
+      - name: release_due_at
+        type: datetime
+        source: system
+        description: Clock timestamp at/after which the reserve may be released.
+        default: null
+      - name: released_at
+        type: datetime
+        source: system
+        description: Clock timestamp when the reserve was released.
+        default: null
+
+  - name: Refund
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; the order being refunded.
+      - name: seller_id
+        type: string
+        source: system
+        description: FK -> Seller.id; copied from the order for ledger ownership.
+      - name: refund_amount_cents
+        type: integer
+        source: input
+        description: Buyer-facing refund amount in cents (may be partial).
+        constraints: ">= 1"
+      - name: reason
+        type: enum
+        source: input
+        description: Refund reason code.
+        constraints: one of {BUYER_REMORSE, NOT_AS_DESCRIBED, DAMAGED, NOT_RECEIVED}
+      - name: refund_status
+        type: enum
+        source: system
+        description: Lifecycle of the refund clawback.
+        default: REQUESTED
+        constraints: one of {REQUESTED, APPLIED, VOIDED}
+      - name: commission_returned_cents
+        type: integer
+        source: computed
+        description: |
+          Portion of commission returned to the seller proportional to the
+          refunded fraction; see calculations.refund_clawback.
+        default: 0
+      - name: clawback_cents
+        type: integer
+        source: computed
+        description: Net amount debited from the seller; see calculations.refund_clawback.
+        default: 0
+
+  - name: Chargeback
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; the disputed order.
+      - name: seller_id
+        type: string
+        source: system
+        description: FK -> Seller.id; copied from the order for ledger ownership.
+      - name: chargeback_status
+        type: enum
+        source: system
+        description: Lifecycle of the chargeback clawback.
+        default: RECEIVED
+        constraints: one of {RECEIVED, REPRESENTED, WON, LOST}
+      - name: dispute_fee_cents
+        type: integer
+        source: computed
+        description: Flat non-refundable chargeback fee debited on receipt; see §1.3.
+        default: 0
+      - name: clawback_cents
+        type: integer
+        source: computed
+        description: |
+          Full gross reversed (no commission proportionality, unlike a refund);
+          see calculations.chargeback_clawback.
+        default: 0
+      - name: representment_due_at
+        type: datetime
+        source: system
+        description: Clock deadline by which the seller must represent evidence.
+        default: null
+
+  - name: Dispute
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; the order an A-to-Z claim is filed against.
+      - name: seller_id
+        type: string
+        source: system
+        description: FK -> Seller.id; copied from the order.
+      - name: claim_type
+        type: enum
+        source: input
+        description: A-to-Z claim category.
+        constraints: one of {ITEM_NOT_RECEIVED, ITEM_NOT_AS_DESCRIBED, RETURN_NOT_REFUNDED}
+      - name: dispute_status
+        type: enum
+        source: system
+        description: |
+          Cyclic A-to-Z lifecycle. UNDER_REVIEW→SELLER_RESPONDED→UNDER_REVIEW
+          may repeat; terminates in GRANTED (buyer wins, seller debited) or
+          DENIED (seller wins).
+        default: FILED
+        constraints: one of {FILED, UNDER_REVIEW, SELLER_RESPONDED, GRANTED, DENIED}
+      - name: response_round
+        type: integer
+        source: computed
+        description: Count of seller response rounds; increments each SELLER_RESPONDED entry.
+        default: 0
+      - name: granted_amount_cents
+        type: integer
+        source: computed
+        description: Amount debited from the seller when a claim is GRANTED (full gross).
+        default: 0
+
+  - name: Payout
+    parent: null
+    common_fields: true
+    fields:
+      - name: seller_id
+        type: string
+        source: input
+        description: FK -> Seller.id; the seller being paid.
+      - name: payout_method_id
+        type: string
+        source: system
+        description: FK -> PayoutMethod.id; the default VERIFIED method at release time.
+      - name: payout_status
+        type: enum
+        source: system
+        description: Lifecycle of the payout disbursement.
+        default: SCHEDULED
+        constraints: one of {SCHEDULED, RELEASED, FAILED, REVERSED}
+      - name: gross_available_cents
+        type: integer
+        source: computed
+        description: Seller available_balance_cents observed at schedule time (pre-reserve view).
+        default: 0
+      - name: reserve_withheld_cents
+        type: integer
+        source: computed
+        description: Reserve withheld for this payout; see calculations.payout_amount.
+        default: 0
+      - name: payout_amount_cents
+        type: integer
+        source: computed
+        description: Net disbursed amount; see calculations.payout_amount.
+        default: 0
+      - name: order_ids
+        type: array
+        source: computed
+        description: Ids of the AVAILABLE orders swept into this payout, in created_at ASC order.
+        default: []
+      - name: finance_user_id
+        type: string
+        source: system
+        description: X-User-ID of the PlatformFinance operator who released the payout.
+        default: null
+
+  - name: TaxForm
+    parent: null
+    common_fields: true
+    fields:
+      - name: seller_id
+        type: string
+        source: input
+        description: FK -> Seller.id; the seller the 1099-K covers.
+      - name: tax_year
+        type: integer
+        source: input
+        description: Calendar year the form reports.
+        constraints: 2020..2030
+      - name: gross_reported_cents
+        type: integer
+        source: computed
+        description: Gross 1099-K amount; see calculations.form_1099k_gross.
+        default: 0
+      - name: transaction_count
+        type: integer
+        source: computed
+        description: Count of settled orders in the tax year at issuance.
+        default: 0
+      - name: threshold_basis
+        type: enum
+        source: computed
+        description: |
+          Which threshold rule triggered issuance. FEDERAL_5000 (>= $5,000 gross),
+          LEGACY_20K_200 (>= $20,000 gross AND >= 200 transactions). NONE means a
+          form was force-issued below threshold.
+        default: NONE
+        constraints: one of {FEDERAL_5000, LEGACY_20K_200, NONE}
+      - name: form_status
+        type: enum
+        source: system
+        description: Issuance lifecycle.
+        default: DRAFT
+        constraints: one of {DRAFT, ISSUED, CORRECTED}
+
+  - name: BalanceStatement
+    parent: null
+    common_fields: false
+    fields:
+      - name: seller_id
+        type: string
+        source: input
+        description: FK -> Seller.id; the seller the statement covers.
+      - name: period_year
+        type: integer
+        source: input
+        description: Statement period year.
+        constraints: 2020..2030
+      - name: period_month
+        type: integer
+        source: input
+        description: Statement period month.
+        constraints: 1..12
+      - name: opening_balance_cents
+        type: integer
+        source: computed
+        description: available_balance_cents at the start of the period (sum of prior AVAILABLE postings).
+        default: 0
+      - name: closing_balance_cents
+        type: integer
+        source: computed
+        description: available_balance_cents at the end of the period.
+        default: 0
+      - name: total_credits_cents
+        type: integer
+        source: computed
+        description: Sum of positive LedgerEntry.amount_cents posted in the period.
+        default: 0
+      - name: total_debits_cents
+        type: integer
+        source: computed
+        description: Sum of negative LedgerEntry.amount_cents posted in the period.
+        default: 0
+      - name: total_payouts_cents
+        type: integer
+        source: computed
+        description: Sum of PAYOUT-source debits posted in the period.
+        default: 0
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Seller
+    initial_state: ONBOARDING        # account_status dimension
+    terminal_states: [CLOSED]
+    transitions:
+      - from: ONBOARDING
+        to: ONBOARDING
+        trigger: "POST /sellers/{id}/kyc/decision (approve)"
+        actor: PlatformReviewer
+        preconditions:
+          - "seller.kyc_status == IN_REVIEW"
+          - "acting reviewer recorded in kyc_reviewer_id"
+        side_effects:
+          - "set kyc_status = APPROVED"
+          - "record kyc_reviewer_id = X-User-ID"
+          - "recompute account_status: stays ONBOARDING until w9_status==APPROVED AND a VERIFIED PayoutMethod exists"
+        note: "kyc approval alone does not activate; account_status is compound (see recompute rule)."
+      - from: ONBOARDING
+        to: ACTIVE
+        trigger: "POST /sellers/{id}/w9/approve (system recompute after final precondition met)"
+        actor: PlatformReviewer
+        preconditions:
+          - "seller.kyc_status == APPROVED"
+          - "seller.w9_status == SUBMITTED"
+          - "seller has >= 1 PayoutMethod with verification_status == VERIFIED"
+        side_effects:
+          - "set w9_status = APPROVED"
+          - "recompute account_status = ACTIVE (all three onboarding gates satisfied)"
+          - "open initial Reserve row with reserve_pct_applied pinned from risk_tier (cross-entity create)"
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /sellers/{id}/suspend"
+        actor: PlatformReviewer
+        preconditions:
+          - "seller.account_status == ACTIVE"
+        side_effects:
+          - "set account_status = SUSPENDED"
+          - "freeze payout release (no new Payout may move to RELEASED while SUSPENDED)"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /sellers/{id}/reinstate"
+        actor: PlatformReviewer
+        preconditions:
+          - "seller.account_status == SUSPENDED"
+        side_effects:
+          - "set account_status = ACTIVE"
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /sellers/{id}/close"
+        actor: PlatformReviewer
+        preconditions:
+          - "seller.account_status IN {ACTIVE, SUSPENDED}"
+          - "seller has no Order in settlement_status PENDING or AVAILABLE (all PAID or none)"
+        side_effects:
+          - "set account_status = CLOSED"
+          - "release any OPEN Reserve (Reserve OPEN→RELEASED; posts RESERVE_RELEASE LedgerEntry)"
+      - from: SUSPENDED
+        to: CLOSED
+        trigger: "POST /sellers/{id}/close"
+        actor: PlatformReviewer
+        preconditions:
+          - "seller.account_status == SUSPENDED"
+          - "seller has no Order in settlement_status PENDING or AVAILABLE"
+        side_effects:
+          - "set account_status = CLOSED"
+          - "release any OPEN Reserve"
+
+  - entity: PayoutMethod
+    initial_state: UNVERIFIED
+    terminal_states: [FAILED]
+    transitions:
+      - from: UNVERIFIED
+        to: VERIFIED
+        trigger: "POST /payout-methods/{id}/verify"
+        actor: Seller
+        preconditions:
+          - "payout_method.verification_status == UNVERIFIED"
+          - "submitted micro_deposit_code matches the server-issued code"
+        side_effects:
+          - "set verification_status = VERIFIED"
+          - "recompute is_default across the seller's VERIFIED methods (latest by created_at wins)"
+          - "if this completes the third onboarding gate while kyc/w9 already APPROVED, recompute seller.account_status = ACTIVE"
+      - from: UNVERIFIED
+        to: FAILED
+        trigger: "POST /payout-methods/{id}/verify (wrong code 3rd time)"
+        actor: Seller
+        preconditions:
+          - "payout_method.verification_status == UNVERIFIED"
+          - "submitted micro_deposit_code does not match AND prior failed attempts == 2"
+        side_effects:
+          - "set verification_status = FAILED"
+
+  - entity: Order
+    initial_state: PENDING           # settlement_status dimension (parallel with clawback_status)
+    terminal_states: [PAID]
+    transitions:
+      - from: PENDING
+        to: AVAILABLE
+        trigger: "POST /_clock/advance (maturation sweep) — settlement dimension"
+        actor: system
+        preconditions:
+          - "order.settlement_status == PENDING"
+          - "current_utc >= order.settled_at + active schedule maturation_days"
+          - "order.clawback_status == NONE (a clawed order does not mature normally)"
+        side_effects:
+          - "recompute net_earnings_cents finalizing against refunded_amount_cents (final variant)"
+          - "flip the order's ORDER_PROCEEDS LedgerEntry hold_state PENDING→AVAILABLE"
+          - "set matured_at = current_utc"
+          - "reconcile seller.available_balance_cents and pending_balance_cents"
+      - from: AVAILABLE
+        to: PAID
+        trigger: "POST /payouts/{id}/release (settlement dimension)"
+        actor: PlatformFinance
+        preconditions:
+          - "order.settlement_status == AVAILABLE"
+          - "order included in the payout sweep"
+        side_effects:
+          - "set settlement_status = PAID"
+
+  - entity: Order_clawback     # parallel clawback_status dimension on the same Order row
+    initial_state: NONE
+    terminal_states: []
+    transitions:
+      - from: NONE
+        to: REFUND_CLAWED
+        trigger: "POST /refunds/{id}/apply"
+        actor: PlatformFinance
+        preconditions:
+          - "order.clawback_status == NONE"
+          - "order.settlement_status IN {PENDING, AVAILABLE} (a PAID order cannot be refund-clawed; see chargeback path)"
+        side_effects:
+          - "set order.clawback_status = REFUND_CLAWED"
+          - "post REFUND_CLAWBACK LedgerEntry (negative clawback_cents)"
+          - "increment order.refunded_amount_cents; recompute order.net_earnings_cents"
+          - "reconcile seller.available_balance_cents / pending_balance_cents"
+      - from: NONE
+        to: CHARGEBACK_CLAWED
+        trigger: "POST /chargebacks/{id} (receipt) → LOST or direct"
+        actor: PlatformFinance
+        preconditions:
+          - "order.clawback_status == NONE"
+        side_effects:
+          - "set order.clawback_status = CHARGEBACK_CLAWED"
+          - "post CHARGEBACK_FEE LedgerEntry (negative dispute_fee_cents)"
+          - "on LOST: post CHARGEBACK_CLAWBACK LedgerEntry (negative full gross)"
+
+  - entity: Refund
+    initial_state: REQUESTED
+    terminal_states: [APPLIED, VOIDED]
+    transitions:
+      - from: REQUESTED
+        to: APPLIED
+        trigger: "POST /refunds/{id}/apply"
+        actor: PlatformFinance
+        preconditions:
+          - "refund.refund_status == REQUESTED"
+          - "linked Order.clawback_status == NONE"
+          - "refund_amount_cents <= (Order.gross_amount_cents - Order.refunded_amount_cents)"
+          - "linked Order.settlement_status IN {PENDING, AVAILABLE}"
+        side_effects:
+          - "compute commission_returned_cents and clawback_cents (refund_clawback calc)"
+          - "post REFUND_CLAWBACK LedgerEntry; mark original ORDER_PROCEEDS entry REVERSED if full refund"
+          - "drive Order_clawback NONE→REFUND_CLAWED"
+          - "reconcile seller balances"
+      - from: REQUESTED
+        to: VOIDED
+        trigger: "POST /refunds/{id}/void"
+        actor: PlatformFinance
+        preconditions:
+          - "refund.refund_status == REQUESTED"
+        side_effects:
+          - "set refund_status = VOIDED (no ledger posting)"
+
+  - entity: Chargeback
+    initial_state: RECEIVED
+    terminal_states: [WON, LOST]
+    transitions:
+      - from: RECEIVED
+        to: REPRESENTED
+        trigger: "POST /chargebacks/{id}/represent"
+        actor: Seller
+        preconditions:
+          - "chargeback.chargeback_status == RECEIVED"
+          - "current_utc <= representment_due_at"
+        side_effects:
+          - "set chargeback_status = REPRESENTED"
+      - from: REPRESENTED
+        to: WON
+        trigger: "POST /chargebacks/{id}/decision (issuer rules for seller)"
+        actor: PlatformFinance
+        preconditions:
+          - "chargeback.chargeback_status == REPRESENTED"
+        side_effects:
+          - "set chargeback_status = WON"
+          - "reverse CHARGEBACK_CLAWBACK if previously posted; dispute_fee_cents is NOT refunded"
+      - from: REPRESENTED
+        to: LOST
+        trigger: "POST /chargebacks/{id}/decision (issuer rules for buyer)"
+        actor: PlatformFinance
+        preconditions:
+          - "chargeback.chargeback_status == REPRESENTED"
+        side_effects:
+          - "set chargeback_status = LOST"
+          - "compute clawback_cents (chargeback_clawback calc); post CHARGEBACK_CLAWBACK LedgerEntry (negative full gross)"
+          - "drive Order_clawback NONE→CHARGEBACK_CLAWED"
+          - "reconcile seller balances"
+      - from: RECEIVED
+        to: LOST
+        trigger: "POST /chargebacks/{id}/decision (no representment by deadline)"
+        actor: PlatformFinance
+        preconditions:
+          - "chargeback.chargeback_status == RECEIVED"
+          - "current_utc > representment_due_at"
+        side_effects:
+          - "set chargeback_status = LOST"
+          - "compute clawback_cents; post CHARGEBACK_CLAWBACK LedgerEntry (negative full gross)"
+          - "drive Order_clawback NONE→CHARGEBACK_CLAWED"
+          - "reconcile seller balances"
+
+  - entity: Dispute
+    initial_state: FILED
+    terminal_states: [GRANTED, DENIED]
+    transitions:
+      - from: FILED
+        to: UNDER_REVIEW
+        trigger: "POST /disputes/{id}/open-review"
+        actor: PlatformReviewer
+        preconditions:
+          - "dispute.dispute_status == FILED"
+        side_effects:
+          - "set dispute_status = UNDER_REVIEW"
+      - from: UNDER_REVIEW
+        to: SELLER_RESPONDED
+        trigger: "POST /disputes/{id}/respond"
+        actor: Seller
+        preconditions:
+          - "dispute.dispute_status == UNDER_REVIEW"
+        side_effects:
+          - "set dispute_status = SELLER_RESPONDED"
+          - "increment response_round by 1"
+      - from: SELLER_RESPONDED
+        to: UNDER_REVIEW
+        trigger: "POST /disputes/{id}/open-review (request more info — cycle)"
+        actor: PlatformReviewer
+        preconditions:
+          - "dispute.dispute_status == SELLER_RESPONDED"
+          - "response_round < 3"
+        side_effects:
+          - "set dispute_status = UNDER_REVIEW"
+        note: "Cyclic edge — UNDER_REVIEW↔SELLER_RESPONDED may repeat until response_round reaches 3."
+      - from: UNDER_REVIEW
+        to: GRANTED
+        trigger: "POST /disputes/{id}/decision (buyer wins)"
+        actor: PlatformReviewer
+        preconditions:
+          - "dispute.dispute_status == UNDER_REVIEW"
+        side_effects:
+          - "set dispute_status = GRANTED"
+          - "compute granted_amount_cents = Order.gross_amount_cents"
+          - "post REFUND_CLAWBACK LedgerEntry (negative full gross) if Order not already clawed"
+          - "drive Order_clawback NONE→REFUND_CLAWED"
+          - "reconcile seller balances"
+      - from: SELLER_RESPONDED
+        to: DENIED
+        trigger: "POST /disputes/{id}/decision (seller wins)"
+        actor: PlatformReviewer
+        preconditions:
+          - "dispute.dispute_status == SELLER_RESPONDED"
+        side_effects:
+          - "set dispute_status = DENIED (no ledger posting)"
+
+  - entity: Payout
+    initial_state: SCHEDULED
+    terminal_states: [RELEASED, REVERSED]
+    transitions:
+      - from: SCHEDULED
+        to: RELEASED
+        trigger: "POST /payouts/{id}/release"
+        actor: PlatformFinance
+        preconditions:
+          - "payout.payout_status == SCHEDULED"
+          - "seller.account_status == ACTIVE (not SUSPENDED/CLOSED/ONBOARDING)"
+          - "expected_seller_version matches seller.version (OCC)"
+          - "acting PlatformFinance X-User-ID != seller.kyc_reviewer_id (segregation of duties)"
+          - "seller has a VERIFIED default PayoutMethod"
+        side_effects:
+          - "compute payout_amount_cents and reserve_withheld_cents (payout_amount calc)"
+          - "post PAYOUT LedgerEntry (negative payout_amount_cents)"
+          - "post RESERVE_HOLD LedgerEntry (negative reserve_withheld_cents) and open/extend Reserve"
+          - "flip all swept Orders settlement_status AVAILABLE→PAID (cascade)"
+          - "increment seller.version by 1; reconcile seller balances"
+          - "record finance_user_id = X-User-ID"
+      - from: SCHEDULED
+        to: FAILED
+        trigger: "POST /payouts/{id}/mark-failed (disbursement bounced)"
+        actor: PlatformFinance
+        preconditions:
+          - "payout.payout_status == SCHEDULED"
+        side_effects:
+          - "set payout_status = FAILED (no ledger posting)"
+      - from: RELEASED
+        to: REVERSED
+        trigger: "POST /payouts/{id}/reverse (disbursement clawed by bank)"
+        actor: PlatformFinance
+        preconditions:
+          - "payout.payout_status == RELEASED"
+        side_effects:
+          - "post PAYOUT reversal LedgerEntry (positive payout_amount_cents) — restores available balance"
+          - "flip swept Orders settlement_status PAID→AVAILABLE (compensation cascade)"
+          - "release the RESERVE_HOLD posted for this payout (positive reserve_withheld_cents); Reserve OPEN→RELEASED"
+          - "reconcile seller balances — net effect on available_balance_cents must be zero"
+
+  - entity: TaxForm
+    initial_state: DRAFT
+    terminal_states: []
+    transitions:
+      - from: DRAFT
+        to: ISSUED
+        trigger: "POST /tax-forms/{id}/issue"
+        actor: PlatformFinance
+        preconditions:
+          - "tax_form.form_status == DRAFT"
+        side_effects:
+          - "compute gross_reported_cents, transaction_count, threshold_basis (form_1099k_gross calc)"
+          - "set form_status = ISSUED"
+      - from: ISSUED
+        to: CORRECTED
+        trigger: "POST /tax-forms/{id}/correct"
+        actor: PlatformFinance
+        preconditions:
+          - "tax_form.form_status == ISSUED"
+        side_effects:
+          - "recompute gross_reported_cents and transaction_count from current settled orders"
+          - "set form_status = CORRECTED"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: payout-release-stale-seller
+    parent_entity: Seller
+    write_endpoint: "POST /payouts/{id}/release"
+    occ_field: "expected_seller_version"
+    description: |
+      Releasing a Payout sweeps every AVAILABLE order into a single disbursement
+      and advances the seller's version. Releasing against a Seller whose version
+      has advanced since the client last observed it is rejected: another release
+      (or a clawback that flipped balances) has already swept or reversed orders,
+      so this release's view of available_balance_cents is stale. The loser sees a
+      version mismatch, not a state error, because under product semantics a second
+      release could legitimately sweep newly-AVAILABLE orders.
+    error_id: ERR_STALE_SELLER_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: order_net_earnings
+    trigger: "Order creation (provisional); maturation sweep PENDING→AVAILABLE (final)"
+    algorithm: forward_looking
+    formula: |
+      # All intermediate fees rounded to whole cents BEFORE summation
+      # (round-per-component, then sum — pinned order).
+      commission_cents      = round_half_up(gross_amount_cents * commission_bps / 10000)
+      platform_fee_cents    = schedule.fixed_fee_cents
+      processing_fee_cents  = round_half_up(gross_amount_cents * payment_processing_bps / 10000)
+                              + payment_processing_fixed_cents
+      # PROVISIONAL (at creation): no refunds considered.
+      net_earnings_cents    = gross_amount_cents - commission_cents
+                              - platform_fee_cents - processing_fee_cents
+      # FINAL (at maturation): subtract the seller's share already clawed by refunds.
+      # net_share_of_refund = refunded_amount_cents
+      #   - round_half_up(refunded_amount_cents * commission_bps / 10000)
+      # final_net = provisional_net - net_share_of_refund   (processing/platform fees are NOT returned)
+    input_set: "Single Order plus its pinned FeeSchedule; refunded_amount_cents at maturation only."
+    constants:
+      ROUNDING: round_half_up
+    precision: "whole cents, round_half_up, round each fee component before summing"
+    variants:
+      - name: provisional
+        when: "computed at Order creation, before any refund"
+        difference: "refunded_amount_cents treated as 0; net = gross - commission - platform - processing"
+      - name: final
+        when: "computed at maturation (PENDING→AVAILABLE)"
+        difference: |
+          subtracts the seller's net share of any refund:
+          refunded_amount_cents - round_half_up(refunded_amount_cents*commission_bps/10000).
+          Processing and platform fees are NOT returned, so provisional and final
+          differ by exactly the refunded gross minus its proportional commission.
+
+  - name: seller_risk_score
+    trigger: "Order/Refund/Chargeback/Dispute mutations affecting a seller; recomputed on each posting"
+    algorithm: weighted_scoring
+    formula: |
+      # Weighted multi-factor score in [0,100], rounded at the END (sum-then-round).
+      chargeback_rate = (count Chargeback where seller_id=S and chargeback_status IN {RECEIVED,REPRESENTED,LOST})
+                        / max(1, count Order where seller_id=S)
+      refund_rate     = (count Refund where seller_id=S and refund_status=APPLIED)
+                        / max(1, count Order where seller_id=S)
+      dispute_rate    = (count Dispute where seller_id=S and dispute_status=GRANTED)
+                        / max(1, count Order where seller_id=S)
+      raw = 100 * (W_CB*chargeback_rate + W_REF*refund_rate + W_DISP*dispute_rate)
+      seller_risk_score = round_half_up( min(100, raw) )   # round once, at the end
+      # risk_tier mapping (derived field, threshold semantics):
+      #   score <  20            -> STANDARD
+      #   20 <= score <  50      -> ELEVATED
+      #   score >= 50            -> HIGH
+    input_set: "All Orders, APPLIED Refunds, non-WON Chargebacks, GRANTED Disputes for the seller."
+    constants:
+      W_CB: 0.6
+      W_REF: 0.25
+      W_DISP: 0.15
+    precision: "score rounded once at the end (sum-then-round), round_half_up"
+    variants:
+      - name: instantaneous
+        when: "displayed on the seller record after each posting"
+        difference: "uses current counts"
+
+  - name: refund_clawback
+    trigger: "POST /refunds/{id}/apply"
+    algorithm: aggregation
+    formula: |
+      # Refund returns the buyer-facing amount; the platform returns a
+      # proportional share of commission to the seller, but KEEPS processing &
+      # platform fees. Order is pinned: compute commission_returned FIRST, then
+      # clawback = refund_amount - commission_returned.
+      commission_returned_cents = round_half_up(refund_amount_cents * order.commission_bps / 10000)
+      clawback_cents            = refund_amount_cents - commission_returned_cents
+      # LedgerEntry amount_cents = -clawback_cents
+    input_set: "Single Refund and its linked Order's pinned commission_bps."
+    constants:
+      ROUNDING: round_half_up
+    precision: "whole cents, round_half_up; commission_returned computed before clawback"
+
+  - name: chargeback_clawback
+    trigger: "Chargeback transition to LOST"
+    algorithm: aggregation
+    formula: |
+      # A chargeback reverses the FULL gross with NO commission returned to the
+      # seller (unlike a refund), and ALSO levies a flat non-refundable fee on
+      # receipt. Two separate ledger postings:
+      dispute_fee_cents = CHARGEBACK_FEE_CENTS            # posted on Chargeback receipt
+      clawback_cents    = order.gross_amount_cents        # posted on LOST (full gross, no proportionality)
+      # Total seller debit if LOST = dispute_fee_cents + clawback_cents
+      # (the fee is NOT recovered even if a later represent WINs).
+    input_set: "Single Chargeback and its linked Order.gross_amount_cents."
+    constants:
+      CHARGEBACK_FEE_CENTS: 1500
+    precision: "whole cents; no rounding needed (integer cents)"
+
+  - name: payout_amount
+    trigger: "POST /payouts/{id}/release"
+    algorithm: waterfall_allocation
+    formula: |
+      # Waterfall over a fixed available pool, ordered buckets:
+      #  1) gross_available = sum LedgerEntry.amount_cents for seller where
+      #     hold_state == AVAILABLE  (already net of any AVAILABLE clawback debits)
+      #  2) reserve_withheld = round_half_up(gross_available * reserve_pct_applied / 100)
+      #     where reserve_pct_applied is selected from the active FeeSchedule by
+      #     seller.risk_tier: STANDARD->reserve_pct_standard, ELEVATED->reserve_pct_elevated,
+      #     HIGH->reserve_pct_high  (tiered selection by state).
+      #  3) payout_amount = gross_available - reserve_withheld
+      #  Boundary: if gross_available <= 0, reject with ERR_NOTHING_TO_PAY (no payout).
+      #  Swept orders = every Order with settlement_status==AVAILABLE and
+      #    clawback_status==NONE, ordered created_at ASC.
+      gross_available_cents   = sum_available_ledger(seller)
+      reserve_withheld_cents  = round_half_up(gross_available_cents * reserve_pct / 100)
+      payout_amount_cents     = gross_available_cents - reserve_withheld_cents
+    input_set: "All AVAILABLE LedgerEntries for the seller; active FeeSchedule reserve pcts; seller.risk_tier."
+    constants:
+      ROUNDING: round_half_up
+    precision: "whole cents, round_half_up on the reserve only; payout is the exact remainder"
+    variants:
+      - name: standard_tier
+        when: "seller.risk_tier == STANDARD"
+        difference: "reserve_pct = schedule.reserve_pct_standard"
+      - name: elevated_tier
+        when: "seller.risk_tier == ELEVATED"
+        difference: "reserve_pct = schedule.reserve_pct_elevated"
+      - name: high_tier
+        when: "seller.risk_tier == HIGH"
+        difference: "reserve_pct = schedule.reserve_pct_high"
+
+  - name: form_1099k_gross
+    trigger: "POST /tax-forms/{id}/issue and /correct"
+    algorithm: threshold
+    formula: |
+      # Gross = sum of Order.gross_amount_cents for orders settled (settlement_status
+      # IN {AVAILABLE, PAID}) in the tax year. Refunds/chargebacks do NOT reduce
+      # 1099-K gross (IRS gross-volume rule).
+      gross_reported_cents = sum(Order.gross_amount_cents
+                                 where seller_id=S
+                                 and year(settled_at)==tax_year
+                                 and settlement_status IN {AVAILABLE, PAID})
+      transaction_count    = count(those orders)
+      # Threshold selection (boundary precision, >= not >):
+      #   if gross_reported_cents >= 500000  (= $5,000)  -> FEDERAL_5000
+      #   elif gross_reported_cents >= 2000000 AND transaction_count >= 200 -> LEGACY_20K_200
+      #   else -> NONE  (issuing a sub-threshold form is allowed but flagged NONE)
+    input_set: "All AVAILABLE/PAID Orders for the seller whose settled_at year equals tax_year."
+    constants:
+      FEDERAL_THRESHOLD_CENTS: 500000
+      LEGACY_THRESHOLD_CENTS: 2000000
+      LEGACY_TXN_THRESHOLD: 200
+    precision: "integer cents; threshold comparisons use >= (inclusive)"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Role permitted for this operation per §1.7 RBAC"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: auth
+    check: "Acting PlatformFinance releasing a payout is not the same user who approved the seller's KYC (segregation of duties)"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /payouts/{id}/release"
+
+  - priority: 4
+    category: existence
+    check: "Path/body-referenced resources exist (left-to-right)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 5
+    category: business_referential
+    check: "Seller acting on a resource owns it (X-User-ID == resource.seller_id)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "seller-scoped endpoints"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: all
+
+  - priority: 7
+    category: state
+    check: "Seller.account_status == ACTIVE when releasing a payout (not SUSPENDED/ONBOARDING/CLOSED)"
+    error_id: ERR_SELLER_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /payouts/{id}/release"
+
+  - priority: 8
+    category: business_constraint
+    check: "expected_seller_version matches seller.version on payout release (OCC)"
+    error_id: ERR_STALE_SELLER_VERSION
+    http_status: 412
+    applies_to: "POST /payouts/{id}/release"
+
+  - priority: 9
+    category: business_safety
+    check: "1099-K threshold gate: issuing a TaxForm whose computed threshold_basis is NONE is blocked unless force=true"
+    error_id: ERR_BELOW_1099K_THRESHOLD
+    http_status: 422
+    applies_to: "POST /tax-forms/{id}/issue"
+
+  - priority: 10
+    category: business_constraint
+    check: "Refund amount does not exceed remaining unrefunded gross (gross - refunded_amount)"
+    error_id: ERR_REFUND_EXCEEDS_REMAINING
+    http_status: 422
+    applies_to: "POST /refunds/{id}/apply"
+
+  - priority: 11
+    category: business_referential
+    check: "Order is not already clawed (clawback_status == NONE) before a refund applies"
+    error_id: ERR_ORDER_ALREADY_CLAWED
+    http_status: 409
+    applies_to: "POST /refunds/{id}/apply"
+
+  - priority: 12
+    category: business_temporal
+    check: "Chargeback representment submitted on/before representment_due_at"
+    error_id: ERR_REPRESENTMENT_WINDOW_CLOSED
+    http_status: 422
+    applies_to: "POST /chargebacks/{id}/represent"
+
+  - priority: 13
+    category: business_constraint
+    check: "Dispute cycle bound: cannot re-open review once response_round has reached 3"
+    error_id: ERR_DISPUTE_ROUND_EXHAUSTED
+    http_status: 422
+    applies_to: "POST /disputes/{id}/open-review"
+
+  - priority: 14
+    category: business_fiscal
+    check: "Payout release requires gross_available_cents > 0"
+    error_id: ERR_NOTHING_TO_PAY
+    http_status: 422
+    applies_to: "POST /payouts/{id}/release"
+
+  - priority: 15
+    category: business_constraint
+    check: "PayoutMethod verification requires a default-method-eligible seller and a matching micro_deposit_code"
+    error_id: ERR_BAD_MICRO_DEPOSIT_CODE
+    http_status: 422
+    applies_to: "POST /payout-methods/{id}/verify"
+
+  - priority: 16
+    category: business_constraint
+    check: "Seller cannot be CLOSED while any Order is settlement_status PENDING or AVAILABLE"
+    error_id: ERR_OPEN_BALANCE_BLOCKS_CLOSE
+    http_status: 409
+    applies_to: "POST /sellers/{id}/close"
+
+  - priority: 17
+    category: business_constraint
+    check: "Required body fields present and well-typed (enums in range, amounts >= 1)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Seller onboarding ----
+  - method: POST
+    path: "/sellers"
+    description: "Register a seller (KYC starts PENDING, W-9 NOT_SUBMITTED)."
+    roles: [PlatformReviewer]
+    code: 201
+    input: [legal_name, email, country_code, tax_classification, tin_last4]
+    output: Seller
+    side_effects: ["kyc_status=PENDING, w9_status=NOT_SUBMITTED, account_status=ONBOARDING"]
+
+  - method: GET
+    path: "/sellers/{id}"
+    description: "Fetch a seller with all computed balances."
+    roles: [PlatformReviewer, PlatformFinance, Seller]
+    code: 200
+    input: []
+    output: Seller
+    side_effects: []
+
+  - method: GET
+    path: "/sellers"
+    description: "List sellers (paginated, filterable by account_status)."
+    roles: [PlatformReviewer, PlatformFinance]
+    code: 200
+    input: ["account_status?", "kyc_status?", "limit?", "offset?"]
+    output: Seller[]
+    side_effects: []
+
+  - method: POST
+    path: "/sellers/{id}/kyc/submit"
+    description: "Move KYC PENDING→IN_REVIEW (seller submits KYC docs)."
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Seller
+    side_effects: ["kyc_status=IN_REVIEW"]
+
+  - method: POST
+    path: "/sellers/{id}/kyc/decision"
+    description: "Reviewer approves/rejects KYC; records kyc_reviewer_id."
+    roles: [PlatformReviewer]
+    code: 200
+    input: [decision]
+    output: Seller
+    side_effects: ["kyc_status=APPROVED|REJECTED", "record kyc_reviewer_id", "recompute account_status"]
+
+  - method: POST
+    path: "/sellers/{id}/w9/submit"
+    description: "Seller submits W-9 (w9_status NOT_SUBMITTED→SUBMITTED)."
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Seller
+    side_effects: ["w9_status=SUBMITTED"]
+
+  - method: POST
+    path: "/sellers/{id}/w9/approve"
+    description: "Reviewer approves W-9; activates seller if all onboarding gates met."
+    roles: [PlatformReviewer]
+    code: 200
+    input: []
+    output: Seller
+    side_effects: ["w9_status=APPROVED", "recompute account_status (→ACTIVE if gated)", "open initial Reserve"]
+
+  - method: POST
+    path: "/sellers/{id}/suspend"
+    description: "Suspend an ACTIVE seller (freezes payout release)."
+    roles: [PlatformReviewer]
+    code: 200
+    input: []
+    output: Seller
+    side_effects: ["account_status=SUSPENDED"]
+
+  - method: POST
+    path: "/sellers/{id}/reinstate"
+    description: "Reinstate a SUSPENDED seller."
+    roles: [PlatformReviewer]
+    code: 200
+    input: []
+    output: Seller
+    side_effects: ["account_status=ACTIVE"]
+
+  - method: POST
+    path: "/sellers/{id}/close"
+    description: "Close a seller; blocked if open balances exist."
+    roles: [PlatformReviewer]
+    code: 200
+    input: []
+    output: Seller
+    side_effects: ["account_status=CLOSED", "release OPEN Reserve"]
+
+  - method: GET
+    path: "/sellers/{id}/ledger-entries"
+    description: "List a seller's ledger entries (reverse-reachability for LedgerEntry.seller_id)."
+    roles: [PlatformReviewer, PlatformFinance, Seller]
+    code: 200
+    input: ["hold_state?", "source_type?", "limit?", "offset?"]
+    output: LedgerEntry[]
+    side_effects: []
+
+  - method: GET
+    path: "/ledger-entries/{id}"
+    description: "Fetch a single ledger entry by id."
+    roles: [PlatformReviewer, PlatformFinance, Seller]
+    code: 200
+    input: []
+    output: LedgerEntry
+    side_effects: []
+
+  - method: GET
+    path: "/ledger-entries"
+    description: "List ledger entries (filter by source_id — reverse-reachability for LedgerEntry.source_id; also by seller_id)."
+    roles: [PlatformReviewer, PlatformFinance, Seller]
+    code: 200
+    input: ["source_id?", "seller_id?", "source_type?", "hold_state?", "limit?", "offset?"]
+    output: LedgerEntry[]
+    side_effects: []
+
+  - method: GET
+    path: "/sellers/{id}/reserves"
+    description: "List a seller's reserves (reverse-reachability for Reserve.seller_id)."
+    roles: [PlatformReviewer, PlatformFinance, Seller]
+    code: 200
+    input: ["reserve_status?", "limit?", "offset?"]
+    output: Reserve[]
+    side_effects: []
+
+  # ---- Payout methods ----
+  - method: POST
+    path: "/payout-methods"
+    description: "Add a payout method (UNVERIFIED; server issues micro_deposit_code)."
+    roles: [Seller]
+    code: 201
+    input: [seller_id, method_type, account_last4, currency]
+    output: PayoutMethod
+    side_effects: ["verification_status=UNVERIFIED", "issue micro_deposit_code"]
+
+  - method: GET
+    path: "/payout-methods/{id}"
+    description: "Fetch a payout method (exposes micro_deposit_code to the owning seller)."
+    roles: [Seller, PlatformReviewer, PlatformFinance]
+    code: 200
+    input: []
+    output: PayoutMethod
+    side_effects: []
+
+  - method: GET
+    path: "/payout-methods"
+    description: "List payout methods (filterable by seller_id — reverse-reachability for PayoutMethod.seller_id)."
+    roles: [Seller, PlatformReviewer, PlatformFinance]
+    code: 200
+    input: ["seller_id?", "verification_status?", "limit?", "offset?"]
+    output: PayoutMethod[]
+    side_effects: []
+
+  - method: POST
+    path: "/payout-methods/{id}/verify"
+    description: "Verify a method by echoing the micro_deposit_code."
+    roles: [Seller]
+    code: 200
+    input: [micro_deposit_code]
+    output: PayoutMethod
+    side_effects: ["verification_status=VERIFIED|FAILED", "recompute is_default", "maybe activate seller"]
+
+  # ---- Fee schedule ----
+  - method: POST
+    path: "/fee-schedules"
+    description: "Create a fee schedule for a category (latest becomes active)."
+    roles: [PlatformFinance]
+    code: 201
+    input: [category, commission_bps, fixed_fee_cents, payment_processing_bps, payment_processing_fixed_cents, reserve_pct_standard, reserve_pct_elevated, reserve_pct_high, maturation_days]
+    output: FeeSchedule
+    side_effects: ["is_active=true; supersedes prior schedule for the category"]
+
+  - method: GET
+    path: "/fee-schedules/{id}"
+    description: "Fetch a fee schedule."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: []
+    output: FeeSchedule
+    side_effects: []
+
+  - method: GET
+    path: "/fee-schedules"
+    description: "List fee schedules (filter by category)."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: ["category?", "limit?", "offset?"]
+    output: FeeSchedule[]
+    side_effects: []
+
+  # ---- Orders ----
+  - method: POST
+    path: "/orders"
+    description: "Create an order; prices against the active FeeSchedule and posts provisional proceeds."
+    roles: [PlatformFinance]
+    code: 201
+    input: [seller_id, category, gross_amount_cents]
+    output: Order
+    side_effects: ["pin fee_schedule_id", "compute provisional net_earnings_cents", "post ORDER_PROCEEDS LedgerEntry (PENDING)", "settlement_status=PENDING", "set settled_at", "recompute balances & risk score"]
+
+  - method: GET
+    path: "/orders/{id}"
+    description: "Fetch an order."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+
+  - method: GET
+    path: "/orders"
+    description: "List orders (filter by seller_id — reverse-reachability for Order.seller_id and fee_schedule_id)."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: ["seller_id?", "fee_schedule_id?", "settlement_status?", "clawback_status?", "limit?", "offset?"]
+    output: Order[]
+    side_effects: []
+
+  # ---- Refunds ----
+  - method: POST
+    path: "/refunds"
+    description: "Create a refund request against an order."
+    roles: [PlatformFinance, Seller]
+    code: 201
+    input: [order_id, refund_amount_cents, reason]
+    output: Refund
+    side_effects: ["copy seller_id from order", "refund_status=REQUESTED"]
+
+  - method: GET
+    path: "/refunds/{id}"
+    description: "Fetch a refund."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: []
+    output: Refund
+    side_effects: []
+
+  - method: GET
+    path: "/refunds"
+    description: "List refunds (filter by order_id — reverse-reachability for Refund.order_id and seller_id)."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: ["order_id?", "seller_id?", "refund_status?", "limit?", "offset?"]
+    output: Refund[]
+    side_effects: []
+
+  - method: POST
+    path: "/refunds/{id}/apply"
+    description: "Apply a refund: clawback ledger posting, order clawback flip, balance reconcile."
+    roles: [PlatformFinance]
+    code: 200
+    input: []
+    output: Refund
+    side_effects: ["compute clawback", "post REFUND_CLAWBACK LedgerEntry", "Order_clawback NONE→REFUND_CLAWED", "recompute net_earnings, balances, risk score"]
+
+  - method: POST
+    path: "/refunds/{id}/void"
+    description: "Void a REQUESTED refund (no ledger effect)."
+    roles: [PlatformFinance]
+    code: 200
+    input: []
+    output: Refund
+    side_effects: ["refund_status=VOIDED"]
+
+  # ---- Chargebacks ----
+  - method: POST
+    path: "/chargebacks"
+    description: "Record an incoming chargeback; posts the flat dispute fee immediately."
+    roles: [PlatformFinance]
+    code: 201
+    input: [order_id]
+    output: Chargeback
+    side_effects: ["copy seller_id", "chargeback_status=RECEIVED", "compute dispute_fee_cents", "post CHARGEBACK_FEE LedgerEntry", "set representment_due_at", "recompute balances & risk score"]
+
+  - method: GET
+    path: "/chargebacks/{id}"
+    description: "Fetch a chargeback."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: []
+    output: Chargeback
+    side_effects: []
+
+  - method: GET
+    path: "/chargebacks"
+    description: "List chargebacks (filter by order_id — reverse-reachability for Chargeback.order_id and seller_id)."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: ["order_id?", "seller_id?", "chargeback_status?", "limit?", "offset?"]
+    output: Chargeback[]
+    side_effects: []
+
+  - method: POST
+    path: "/chargebacks/{id}/represent"
+    description: "Seller submits representment evidence (within the window)."
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Chargeback
+    side_effects: ["chargeback_status=REPRESENTED"]
+
+  - method: POST
+    path: "/chargebacks/{id}/decision"
+    description: "Issuer decision WON/LOST; LOST posts the full-gross clawback."
+    roles: [PlatformFinance]
+    code: 200
+    input: [outcome]
+    output: Chargeback
+    side_effects: ["chargeback_status=WON|LOST", "on LOST: post CHARGEBACK_CLAWBACK, Order_clawback→CHARGEBACK_CLAWED, reconcile"]
+
+  # ---- Disputes (A-to-Z) ----
+  - method: POST
+    path: "/disputes"
+    description: "File an A-to-Z claim against an order."
+    roles: [PlatformReviewer, PlatformFinance]
+    code: 201
+    input: [order_id, claim_type]
+    output: Dispute
+    side_effects: ["copy seller_id", "dispute_status=FILED", "response_round=0"]
+
+  - method: GET
+    path: "/disputes/{id}"
+    description: "Fetch a dispute."
+    roles: [PlatformReviewer, PlatformFinance, Seller]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: []
+
+  - method: GET
+    path: "/disputes"
+    description: "List disputes (filter by order_id — reverse-reachability for Dispute.order_id and seller_id)."
+    roles: [PlatformReviewer, PlatformFinance, Seller]
+    code: 200
+    input: ["order_id?", "seller_id?", "dispute_status?", "limit?", "offset?"]
+    output: Dispute[]
+    side_effects: []
+
+  - method: POST
+    path: "/disputes/{id}/open-review"
+    description: "Move a dispute into UNDER_REVIEW (cyclic from SELLER_RESPONDED, round-bounded)."
+    roles: [PlatformReviewer]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["dispute_status=UNDER_REVIEW"]
+
+  - method: POST
+    path: "/disputes/{id}/respond"
+    description: "Seller responds; increments response_round."
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["dispute_status=SELLER_RESPONDED", "response_round += 1"]
+
+  - method: POST
+    path: "/disputes/{id}/decision"
+    description: "Resolve a dispute GRANTED (buyer wins, seller debited) or DENIED."
+    roles: [PlatformReviewer]
+    code: 200
+    input: [outcome]
+    output: Dispute
+    side_effects: ["dispute_status=GRANTED|DENIED", "on GRANTED: post REFUND_CLAWBACK full gross, Order_clawback→REFUND_CLAWED, reconcile"]
+
+  # ---- Payouts ----
+  - method: POST
+    path: "/payouts"
+    description: "Schedule a payout for a seller (snapshots available balance; no disbursement yet)."
+    roles: [PlatformFinance]
+    code: 201
+    input: [seller_id]
+    output: Payout
+    side_effects: ["payout_status=SCHEDULED", "snapshot gross_available_cents", "compute order_ids sweep set"]
+
+  - method: GET
+    path: "/payouts/{id}"
+    description: "Fetch a payout."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: []
+
+  - method: GET
+    path: "/payouts"
+    description: "List payouts (filter by seller_id — reverse-reachability for Payout.seller_id and payout_method_id)."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: ["seller_id?", "payout_method_id?", "payout_status?", "limit?", "offset?"]
+    output: Payout[]
+    side_effects: []
+
+  - method: POST
+    path: "/payouts/{id}/release"
+    description: "Release a scheduled payout (OCC on seller.version, segregation of duties, reserve hold)."
+    roles: [PlatformFinance]
+    code: 200
+    input: [expected_seller_version]
+    output: Payout
+    side_effects: ["compute payout_amount & reserve_withheld", "post PAYOUT + RESERVE_HOLD LedgerEntries", "sweep Orders AVAILABLE→PAID", "increment seller.version", "record finance_user_id"]
+
+  - method: POST
+    path: "/payouts/{id}/mark-failed"
+    description: "Mark a scheduled payout FAILED (disbursement bounced)."
+    roles: [PlatformFinance]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: ["payout_status=FAILED"]
+
+  - method: POST
+    path: "/payouts/{id}/reverse"
+    description: "Reverse a RELEASED payout (bank clawback); compensating cascade restores balances."
+    roles: [PlatformFinance]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: ["post PAYOUT reversal LedgerEntry", "Orders PAID→AVAILABLE", "release reserve hold", "reconcile (net zero on available)"]
+
+  # ---- Tax forms (1099-K) ----
+  - method: POST
+    path: "/tax-forms"
+    description: "Create a draft 1099-K for a seller + tax year."
+    roles: [PlatformFinance]
+    code: 201
+    input: [seller_id, tax_year]
+    output: TaxForm
+    side_effects: ["form_status=DRAFT"]
+
+  - method: GET
+    path: "/tax-forms/{id}"
+    description: "Fetch a tax form."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: []
+    output: TaxForm
+    side_effects: []
+
+  - method: GET
+    path: "/tax-forms"
+    description: "List tax forms (filter by seller_id — reverse-reachability for TaxForm.seller_id)."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: ["seller_id?", "tax_year?", "form_status?", "limit?", "offset?"]
+    output: TaxForm[]
+    side_effects: []
+
+  - method: POST
+    path: "/tax-forms/{id}/issue"
+    description: "Issue a 1099-K (computes gross & threshold_basis; below-threshold blocked unless force)."
+    roles: [PlatformFinance]
+    code: 200
+    input: ["force?"]
+    output: TaxForm
+    side_effects: ["compute gross_reported_cents, transaction_count, threshold_basis", "form_status=ISSUED"]
+
+  - method: POST
+    path: "/tax-forms/{id}/correct"
+    description: "Correct an issued 1099-K (recompute from current settled orders)."
+    roles: [PlatformFinance]
+    code: 200
+    input: []
+    output: TaxForm
+    side_effects: ["recompute gross & count", "form_status=CORRECTED"]
+
+  # ---- Balance statement ----
+  - method: POST
+    path: "/balance-statements"
+    description: "Generate a monthly balance statement for a seller (computed from ledger)."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 201
+    input: [seller_id, period_year, period_month]
+    output: BalanceStatement
+    side_effects: ["compute opening/closing/credits/debits/payouts from LedgerEntries in the period"]
+
+  - method: GET
+    path: "/balance-statements/{id}"
+    description: "Fetch a balance statement."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: []
+    output: BalanceStatement
+    side_effects: []
+
+  - method: GET
+    path: "/balance-statements"
+    description: "List balance statements (filter by seller_id — reverse-reachability for BalanceStatement.seller_id)."
+    roles: [PlatformFinance, PlatformReviewer, Seller]
+    code: 200
+    input: ["seller_id?", "period_year?", "period_month?", "limit?", "offset?"]
+    output: BalanceStatement[]
+    side_effects: []
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the simulated current UTC clock (test-driving)."
+    roles: [PlatformFinance, PlatformReviewer]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["sets server clock used by maturation, representment windows, reserve release"]
+
+  - method: POST
+    path: "/_clock/advance"
+    description: "Advance the clock to a timestamp and run the maturation sweep (PENDING→AVAILABLE) and reserve-release sweep."
+    roles: [PlatformFinance, PlatformReviewer]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["matures eligible Orders (final net recompute, ledger flip)", "releases due Reserves", "reconciles balances"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID header."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Role not permitted for this operation."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "PlatformFinance releasing a payout is the same user who approved that seller's KYC."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Seller acting on a resource they do not own (X-User-ID != resource.seller_id)."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced resource does not exist."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not defined from the resource's current state."
+  - id: ERR_SELLER_NOT_ACTIVE
+    http: 409
+    condition: "Payout release attempted while seller.account_status != ACTIVE."
+  - id: ERR_STALE_SELLER_VERSION
+    http: 412
+    condition: "expected_seller_version does not match seller.version on payout release (OCC)."
+  - id: ERR_BELOW_1099K_THRESHOLD
+    http: 422
+    condition: "Issuing a TaxForm whose computed threshold_basis is NONE without force=true."
+  - id: ERR_REFUND_EXCEEDS_REMAINING
+    http: 422
+    condition: "Refund amount exceeds (Order.gross_amount_cents - Order.refunded_amount_cents)."
+  - id: ERR_ORDER_ALREADY_CLAWED
+    http: 409
+    condition: "Refund applied to an Order whose clawback_status != NONE."
+  - id: ERR_REPRESENTMENT_WINDOW_CLOSED
+    http: 422
+    condition: "Chargeback representment submitted after representment_due_at."
+  - id: ERR_DISPUTE_ROUND_EXHAUSTED
+    http: 422
+    condition: "open-review requested when dispute response_round has reached 3."
+  - id: ERR_NOTHING_TO_PAY
+    http: 422
+    condition: "Payout release with gross_available_cents <= 0."
+  - id: ERR_BAD_MICRO_DEPOSIT_CODE
+    http: 422
+    condition: "PayoutMethod verify with a non-matching micro_deposit_code."
+  - id: ERR_OPEN_BALANCE_BLOCKS_CLOSE
+    http: 409
+    condition: "Seller close attempted while an Order is settlement_status PENDING or AVAILABLE."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, out-of-range enum, or amount < 1."
+  - id: ERR_NO_VERIFIED_PAYOUT_METHOD
+    http: 422
+    condition: "Payout release attempted when the seller has no VERIFIED default PayoutMethod."
+  - id: ERR_VALIDATION_PAGINATION
+    http: 400
+    condition: "limit/offset out of bounds (limit 1..100, offset >= 0)."
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Seller
+    description: "A marketplace seller acting on their own onboarding, payout methods, refunds, representments, and dispute responses."
+    identity: "entity_backed:Seller"
+    exclusive_operations:
+      - "POST /sellers/{id}/kyc/submit"
+      - "POST /sellers/{id}/w9/submit"
+      - "POST /payout-methods (create own)"
+      - "POST /payout-methods/{id}/verify"
+      - "POST /chargebacks/{id}/represent"
+      - "POST /disputes/{id}/respond"
+    shared_operations:
+      - "POST /refunds (with PlatformFinance)"
+      - "GET own sellers/orders/refunds/chargebacks/disputes/payouts/ledger/reserves/tax-forms/balance-statements"
+
+  - name: PlatformReviewer
+    description: "Compliance operator who onboards sellers, decides KYC/W-9, opens/closes accounts, and adjudicates disputes."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /sellers"
+      - "POST /sellers/{id}/kyc/decision"
+      - "POST /sellers/{id}/w9/approve"
+      - "POST /sellers/{id}/suspend"
+      - "POST /sellers/{id}/reinstate"
+      - "POST /sellers/{id}/close"
+      - "POST /disputes/{id}/open-review"
+      - "POST /disputes/{id}/decision"
+    shared_operations:
+      - "POST /disputes (with PlatformFinance)"
+      - "GET read endpoints"
+
+  - name: PlatformFinance
+    description: "Finance operator who manages fee schedules, orders, applies refunds/chargebacks, runs payouts, issues 1099-Ks. Cannot release a payout for a seller they KYC-approved."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /fee-schedules"
+      - "POST /orders"
+      - "POST /refunds/{id}/apply"
+      - "POST /refunds/{id}/void"
+      - "POST /chargebacks"
+      - "POST /chargebacks/{id}/decision"
+      - "POST /payouts"
+      - "POST /payouts/{id}/release"
+      - "POST /payouts/{id}/mark-failed"
+      - "POST /payouts/{id}/reverse"
+      - "POST /tax-forms"
+      - "POST /tax-forms/{id}/issue"
+      - "POST /tax-forms/{id}/correct"
+    shared_operations:
+      - "POST /refunds (with Seller)"
+      - "POST /disputes (with PlatformReviewer)"
+      - "POST /balance-statements"
+      - "POST /_clock/set_current_utc, POST /_clock/advance"
+      - "GET read endpoints"

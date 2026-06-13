@@ -1,0 +1,1726 @@
+scenario: "P2P Money Transfer (Venmo/Zelle/Cash App style): linked bank/debit, send/request/split, instant vs standard payout fee, daily/weekly send limits, risk hold & review, dispute/reversal, balance withdrawal, recipient verification"
+
+domain_name: p2p-money-transfer
+api_prefix: /
+# Flat topology: peer collections sit directly at the root (/accounts, /transfers,
+# /withdrawals, /disputes, /money-requests, /split-requests, /risk-holds, /reversals,
+# /funding-sources, /recipient-verifications). No single nesting root, so api_prefix is "/".
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: ledger_reconciliation
+  complexity_layers:
+    - rate_threshold_triggers      # daily AND weekly cumulative send limits with reset windows
+    - cascading_side_effects       # dispute -> reversal -> ledger -> balance -> risk-score cascade
+    - dual_variant_calculation     # instant vs standard payout fee on Withdrawal; provisional vs final on Split
+    - optimistic_concurrency       # OCC on Account.version for withdrawal + transfer-supersede races
+
+  entity_topology: flat
+  # Peer entities (Account, Transfer, Withdrawal, Dispute, MoneyRequest, SplitRequest)
+  # linked by foreign keys, not URL nesting. FundingSource / SplitParticipant /
+  # LedgerEntry / RiskHold / RecipientVerification hang off parents by FK.
+
+  state_machine_shape: branching
+  # Transfer forks at risk gate: SENT -> {SETTLED | HELD}; HELD -> {SETTLED | REVERSED}
+  # with divergent side-effect sets per branch. Dispute is cyclic (OPEN -> NEEDS_INFO -> OPEN).
+
+  relationship_patterns:
+    - one_to_many        # Account 1:* FundingSource, SplitRequest 1:* SplitParticipant
+    - cross_aggregate    # Transfer references sender Account and recipient Account; Dispute -> Transfer
+    - polymorphic        # LedgerEntry.source_ref_id points at Transfer | Withdrawal | Reversal (typed by source_kind)
+
+  role_model: peer_roles
+  # AccountHolder owns own Account/FundingSource/Transfer; ComplianceOfficer reviews holds/disputes;
+  # PlatformAdmin operates configuration + test-driving surface. Segregation: the AccountHolder who
+  # is party to a Transfer cannot resolve its own Dispute or release its own RiskHold.
+
+  consistency_model: immediate
+  # Every balance / ledger / limit-window / risk-score mutation is atomic within the request.
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Login / contact email; unique across all Accounts (case-insensitive)."
+        constraints: "unique; non-empty"
+      - name: display_name
+        type: string
+        source: input
+        description: "Human-readable name shown to counterparties."
+      - name: status
+        type: enum
+        source: system
+        description: "Account lifecycle state."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, FROZEN}; FROZEN is terminal"
+      - name: available_balance_cents
+        type: integer
+        source: computed
+        description: "Spendable balance in cents = settled credits - settled debits - held_balance_cents. Never negative."
+        default: 0
+        constraints: ">= 0"
+      - name: held_balance_cents
+        type: integer
+        source: computed
+        description: "Sum of amount_cents of this Account's Transfers (as sender) currently in HELD plus pending Withdrawals not yet PAID. Funds reserved, not spendable."
+        default: 0
+        constraints: ">= 0"
+      - name: risk_score
+        type: integer
+        source: computed
+        description: "Cumulative risk score in [0,100]. Raised by chargebacks/holds, lowered by clean resolution. Drives risk_tier and hold gating."
+        default: 0
+        constraints: "0 <= risk_score <= 100"
+      - name: risk_tier
+        type: enum
+        source: computed
+        description: "Derived band over risk_score: LOW if <30, ELEVATED if 30..69, HIGH if >=70."
+        default: LOW
+        constraints: "one of {LOW, ELEVATED, HIGH}"
+      - name: daily_send_limit_cents
+        type: integer
+        source: input
+        description: "Per-rolling-24h ceiling on outbound sends for this Account."
+        default: 250000
+        constraints: ">= 0"
+      - name: weekly_send_limit_cents
+        type: integer
+        source: input
+        description: "Per-rolling-7d ceiling on outbound sends for this Account."
+        default: 1000000
+        constraints: ">= weekly >= daily expected but not enforced"
+      - name: is_recipient_verified
+        type: boolean
+        source: computed
+        description: "True once this Account has at least one RecipientVerification in CONFIRMED state. Gates being a transfer recipient above the unverified cap."
+        default: false
+
+  - name: FundingSource
+    parent: Account
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the owning Account."
+      - name: kind
+        type: enum
+        source: input
+        description: "Funding instrument type."
+        constraints: "one of {BANK, DEBIT}"
+      - name: last4
+        type: string
+        source: input
+        description: "Last four digits of the instrument, for display."
+        constraints: "exactly 4 digits"
+      - name: status
+        type: enum
+        source: system
+        description: "Verification lifecycle of the instrument."
+        default: PENDING
+        constraints: "one of {PENDING, VERIFIED, REMOVED}; REMOVED is terminal"
+      - name: micro_deposit_code
+        type: string
+        source: system
+        description: "Server-minted 4-char code the holder must echo back to verify a BANK source (micro-deposit simulation)."
+      - name: is_default_payout
+        type: boolean
+        source: computed
+        description: "True for exactly one VERIFIED FundingSource per Account: the earliest-VERIFIED (by created_at ASC) one used as default withdrawal destination."
+        default: false
+
+  - name: RecipientVerification
+    parent: Account
+    common_fields: false
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the Account being verified as a recipient."
+      - name: channel
+        type: enum
+        source: input
+        description: "Verification channel."
+        constraints: "one of {EMAIL, SMS}"
+      - name: status
+        type: enum
+        source: system
+        description: "Verification state."
+        default: PENDING
+        constraints: "one of {PENDING, CONFIRMED, EXPIRED}; CONFIRMED and EXPIRED terminal"
+      - name: confirm_token
+        type: string
+        source: system
+        description: "Server-minted token the holder echoes back to confirm. Single-use."
+      - name: expires_at
+        type: datetime
+        source: system
+        description: "Token expiry = created_at + 24h. Confirming at/after expires_at fails."
+
+  - name: Transfer
+    parent: null
+    common_fields: true
+    fields:
+      - name: sender_account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the paying Account."
+      - name: recipient_account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the receiving Account."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Transfer amount in cents."
+        constraints: ">= 1"
+      - name: memo
+        type: string
+        source: input
+        description: "Free-text note."
+        default: ""
+      - name: status
+        type: enum
+        source: system
+        description: "Transfer lifecycle."
+        default: SENT
+        constraints: "one of {SENT, HELD, SETTLED, REVERSED, CANCELLED}; SETTLED, REVERSED, CANCELLED terminal"
+      - name: risk_flagged
+        type: boolean
+        source: computed
+        description: "True iff the risk gate at send time routed this Transfer to HELD instead of SETTLED."
+        default: false
+      - name: hold_id
+        type: string
+        source: computed
+        description: "Back-reference to the RiskHold created for this Transfer (inverse of the authoritative RiskHold.transfer_id FK); set when routed to HELD, else null. Discover holds via GET /risk-holds?transfer_id."
+      - name: source_money_request_id
+        type: string
+        source: input
+        description: "FK -> MoneyRequest.id; set when this Transfer fulfills a MoneyRequest, else null."
+        default: null
+      - name: settled_at
+        type: datetime
+        source: system
+        description: "Timestamp the Transfer reached SETTLED; null otherwise. Used as the chronological key for dispute eligibility window."
+
+  - name: MoneyRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: requester_account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the Account asking to be paid."
+      - name: payer_account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the Account asked to pay."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Requested amount in cents."
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: system
+        description: "Request lifecycle."
+        default: PENDING
+        constraints: "one of {PENDING, FULFILLED, DECLINED, CANCELLED}; FULFILLED, DECLINED, CANCELLED terminal"
+
+  - name: SplitRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: organizer_account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the Account that paid the bill and is collecting shares."
+      - name: total_amount_cents
+        type: integer
+        source: input
+        description: "Full bill amount to split, in cents."
+        constraints: ">= participant count (so each share >= 1)"
+      - name: split_mode
+        type: enum
+        source: input
+        description: "How shares are derived."
+        constraints: "one of {EVEN, WEIGHTED}"
+      - name: status
+        type: enum
+        source: system
+        description: "Split lifecycle; auto-derived from participant states."
+        default: OPEN
+        constraints: "one of {OPEN, PARTIALLY_SETTLED, SETTLED, CANCELLED}; SETTLED, CANCELLED terminal"
+      - name: collected_amount_cents
+        type: integer
+        source: computed
+        description: "Sum of share_amount_cents over participants in PAID state."
+        default: 0
+
+  - name: SplitParticipant
+    parent: SplitRequest
+    common_fields: true
+    fields:
+      - name: split_request_id
+        type: string
+        source: input
+        description: "FK -> SplitRequest.id; the owning split."
+      - name: participant_account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the Account owing a share."
+      - name: weight
+        type: integer
+        source: input
+        description: "Relative weight for WEIGHTED splits; ignored for EVEN."
+        default: 1
+        constraints: ">= 1"
+      - name: share_amount_cents
+        type: integer
+        source: computed
+        description: "This participant's owed share in cents, derived per split_mode with remainder allocation."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Participant share state."
+        default: OWED
+        constraints: "one of {OWED, PAID, FORGIVEN}; PAID, FORGIVEN terminal"
+      - name: settled_transfer_id
+        type: string
+        source: computed
+        description: "Back-reference to the Transfer that paid this share (inverse convenience pointer; the Transfer carries the authoritative sender/recipient FKs); set when status -> PAID, else null. Discover the participant's spawned transfer via GET /transfers?sender_account_id=participant_account_id."
+        default: null
+
+  - name: RiskHold
+    parent: null
+    common_fields: true
+    fields:
+      - name: transfer_id
+        type: string
+        source: input
+        description: "FK -> Transfer.id; the held Transfer under review."
+      - name: reason_code
+        type: enum
+        source: system
+        description: "Why the hold fired."
+        constraints: "one of {HIGH_TIER, LARGE_AMOUNT, UNVERIFIED_RECIPIENT}"
+      - name: status
+        type: enum
+        source: system
+        description: "Review lifecycle."
+        default: PENDING_REVIEW
+        constraints: "one of {PENDING_REVIEW, CLEARED, BLOCKED}; CLEARED, BLOCKED terminal"
+      - name: reviewer_user_id
+        type: string
+        source: system
+        description: "Opaque ComplianceOfficer X-User-ID that resolved the hold; null while PENDING_REVIEW."
+
+  - name: Dispute
+    parent: null
+    common_fields: true
+    fields:
+      - name: transfer_id
+        type: string
+        source: input
+        description: "FK -> Transfer.id; the SETTLED Transfer being disputed."
+      - name: opener_account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the sender Account that opened the dispute."
+      - name: reason
+        type: enum
+        source: input
+        description: "Dispute reason."
+        constraints: "one of {UNAUTHORIZED, NOT_RECEIVED, DUPLICATE}"
+      - name: status
+        type: enum
+        source: system
+        description: "Dispute lifecycle (cyclic via NEEDS_INFO)."
+        default: OPEN
+        constraints: "one of {OPEN, NEEDS_INFO, UPHELD, DENIED}; UPHELD, DENIED terminal"
+      - name: resolver_user_id
+        type: string
+        source: system
+        description: "Opaque ComplianceOfficer X-User-ID that resolved the dispute; null until terminal."
+      - name: reversal_id
+        type: string
+        source: computed
+        description: "Back-reference to the Reversal created when this dispute is UPHELD (inverse of the authoritative Reversal.dispute_id FK); else null. Discover via GET /reversals?dispute_id."
+        default: null
+
+  - name: Reversal
+    parent: null
+    common_fields: true
+    fields:
+      - name: transfer_id
+        type: string
+        source: input
+        description: "FK -> Transfer.id; the Transfer whose funds are being clawed back."
+      - name: dispute_id
+        type: string
+        source: input
+        description: "FK -> Dispute.id; the UPHELD dispute that authorized this reversal."
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "Amount clawed back = the original Transfer.amount_cents (full reversal only)."
+      - name: status
+        type: enum
+        source: system
+        description: "Reversal settlement state."
+        default: APPLIED
+        constraints: "one of {APPLIED}; created already-applied (atomic), terminal"
+
+  - name: Withdrawal
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the Account cashing out."
+      - name: funding_source_id
+        type: string
+        source: input
+        description: "FK -> FundingSource.id; the VERIFIED payout destination."
+      - name: gross_amount_cents
+        type: integer
+        source: input
+        description: "Requested cash-out amount before fee, in cents."
+        constraints: ">= 1"
+      - name: speed
+        type: enum
+        source: input
+        description: "Payout speed; selects the fee formula variant."
+        constraints: "one of {INSTANT, STANDARD}"
+      - name: fee_cents
+        type: integer
+        source: computed
+        description: "Payout fee in cents; INSTANT charges a percentage fee with a floor, STANDARD is free."
+        default: 0
+      - name: net_amount_cents
+        type: integer
+        source: computed
+        description: "Amount actually paid to the funding source = gross_amount_cents - fee_cents."
+      - name: status
+        type: enum
+        source: system
+        description: "Withdrawal lifecycle."
+        default: REQUESTED
+        constraints: "one of {REQUESTED, PAID, FAILED, CANCELLED}; PAID, FAILED, CANCELLED terminal"
+
+  - name: LedgerEntry
+    parent: Account
+    common_fields: false
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the Account whose balance this entry moves."
+      - name: direction
+        type: enum
+        source: system
+        description: "Sign of the movement."
+        constraints: "one of {CREDIT, DEBIT}"
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Absolute movement size in cents."
+        constraints: ">= 1"
+      - name: source_kind
+        type: enum
+        source: system
+        description: "Polymorphic discriminator for source_ref_id."
+        constraints: "one of {TRANSFER, WITHDRAWAL, REVERSAL, ADJUSTMENT}"
+      - name: source_ref_id
+        type: string
+        source: system
+        description: "Polymorphic reference to the originating action: holds Transfer.id when source_kind=TRANSFER, Withdrawal.id when WITHDRAWAL, Reversal.id when REVERSAL, null when ADJUSTMENT. Typed by source_kind; not a single-parent FK."
+      - name: memo
+        type: string
+        source: system
+        description: "Human-readable ledger note."
+        default: ""
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Account
+    initial_state: ACTIVE
+    terminal_states: [FROZEN]
+    transitions:
+      - from: ACTIVE
+        to: FROZEN
+        trigger: "POST /accounts/{id}/freeze"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Account.status == ACTIVE"
+        side_effects:
+          - "set status = FROZEN (terminal); subsequent sends/withdrawals/credits are rejected with ERR_ACCOUNT_FROZEN"
+        note: "Compliance freeze is one-way; a FROZEN Account cannot transact."
+
+  - entity: Transfer
+    initial_state: SENT
+    terminal_states: [SETTLED, REVERSED, CANCELLED]
+    transitions:
+      - from: SENT
+        to: SETTLED
+        trigger: "POST /transfers (risk gate passes: not held)"
+        actor: system
+        preconditions:
+          - "sender Account.status == ACTIVE"
+          - "risk gate (calc transfer_risk_gate) returns route=SETTLE"
+        side_effects:
+          - "set settled_at = now"
+          - "create LedgerEntry DEBIT amount_cents on sender (source_kind=TRANSFER)"
+          - "create LedgerEntry CREDIT amount_cents on recipient (source_kind=TRANSFER)"
+          - "advance sender LimitWindow daily_used_cents and weekly_used_cents by amount_cents (calc limit_window_accumulate)"
+          - "recompute sender available_balance_cents and recipient available_balance_cents"
+        note: "Happy-path branch of the risk fork."
+      - from: SENT
+        to: HELD
+        trigger: "POST /transfers (risk gate routes to HOLD)"
+        actor: system
+        preconditions:
+          - "sender Account.status == ACTIVE"
+          - "risk gate (calc transfer_risk_gate) returns route=HOLD"
+        side_effects:
+          - "set risk_flagged = true"
+          - "create RiskHold(transfer_id, reason_code, status=PENDING_REVIEW) and set hold_id"
+          - "create LedgerEntry DEBIT amount_cents on sender (source_kind=TRANSFER) — funds leave available, move to held"
+          - "recompute sender available_balance_cents and held_balance_cents (held rises by amount_cents)"
+          - "advance sender LimitWindow daily_used_cents and weekly_used_cents by amount_cents (calc limit_window_accumulate)"
+        note: "Risk fork — funds held, recipient NOT yet credited."
+      - from: HELD
+        to: SETTLED
+        trigger: "system event: owning RiskHold transitions PENDING_REVIEW -> CLEARED"
+        actor: system
+        preconditions:
+          - "owning RiskHold.status == CLEARED"
+        side_effects:
+          - "set settled_at = now"
+          - "create LedgerEntry CREDIT amount_cents on recipient (source_kind=TRANSFER)"
+          - "recompute sender held_balance_cents (drops by amount_cents) and recipient available_balance_cents"
+        note: "Cascade hop 2 of clear-hold chain: RiskHold.CLEARED -> Transfer.SETTLED -> recipient credit."
+      - from: HELD
+        to: REVERSED
+        trigger: "system event: owning RiskHold transitions PENDING_REVIEW -> BLOCKED"
+        actor: system
+        preconditions:
+          - "owning RiskHold.status == BLOCKED"
+        side_effects:
+          - "create LedgerEntry CREDIT amount_cents on sender (source_kind=REVERSAL) — refund the debit"
+          - "recompute sender held_balance_cents (drops by amount_cents) and available_balance_cents (rises by amount_cents)"
+          - "raise sender Account.risk_score by RISK_BLOCK_DELTA (calc risk_score_update) and recompute risk_tier"
+          - "rewind sender LimitWindow daily_used_cents and weekly_used_cents by amount_cents (compensating; calc limit_window_accumulate reverse)"
+        note: "Blocked hold refunds sender and is the compensating inverse of the SENT->HELD accumulation."
+      - from: SENT
+        to: CANCELLED
+        trigger: "POST /transfers/{id}/cancel"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder is the sender"
+          - "Transfer.status == SENT and risk_flagged == false"
+        side_effects:
+          - "no ledger movement existed for an un-settled SENT (SENT auto-settles in same request, so this applies only when a future async SENT exists); reverse any DEBIT/CREDIT created"
+        note: "Guard rail; reachable only for the modeled SENT pre-settlement instant."
+
+  - entity: RiskHold
+    initial_state: PENDING_REVIEW
+    terminal_states: [CLEARED, BLOCKED]
+    transitions:
+      - from: PENDING_REVIEW
+        to: CLEARED
+        trigger: "POST /risk-holds/{id}/clear"
+        actor: ComplianceOfficer
+        preconditions:
+          - "RiskHold.status == PENDING_REVIEW"
+          - "acting ComplianceOfficer X-User-ID is NOT the sender or recipient Account.id of the held Transfer (segregation of duties)"
+        side_effects:
+          - "set reviewer_user_id = acting user"
+          - "cascade: drive owning Transfer HELD -> SETTLED (credits recipient)"
+        note: "Cascade hop 1 of clear chain."
+      - from: PENDING_REVIEW
+        to: BLOCKED
+        trigger: "POST /risk-holds/{id}/block"
+        actor: ComplianceOfficer
+        preconditions:
+          - "RiskHold.status == PENDING_REVIEW"
+          - "acting ComplianceOfficer X-User-ID is NOT the sender or recipient Account.id of the held Transfer (segregation of duties)"
+        side_effects:
+          - "set reviewer_user_id = acting user"
+          - "cascade: drive owning Transfer HELD -> REVERSED (refunds sender, raises sender risk_score)"
+        note: "Cascade hop 1 of block chain."
+
+  - entity: Dispute
+    initial_state: OPEN
+    terminal_states: [UPHELD, DENIED]
+    transitions:
+      - from: OPEN
+        to: NEEDS_INFO
+        trigger: "POST /disputes/{id}/request-info"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Dispute.status == OPEN"
+          - "acting ComplianceOfficer X-User-ID is NOT the opener_account_id and NOT the recipient_account_id of the disputed Transfer (segregation of duties)"
+        side_effects:
+          - "append audit memo; no balance movement"
+        note: "Cyclic edge out."
+      - from: NEEDS_INFO
+        to: OPEN
+        trigger: "POST /disputes/{id}/provide-info"
+        actor: AccountHolder
+        preconditions:
+          - "Dispute.status == NEEDS_INFO"
+          - "acting AccountHolder is the opener_account_id"
+        side_effects:
+          - "append audit memo; no balance movement"
+        note: "Cyclic edge back — OPEN <-> NEEDS_INFO loop."
+      - from: OPEN
+        to: UPHELD
+        trigger: "POST /disputes/{id}/uphold"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Dispute.status == OPEN"
+          - "disputed Transfer.status == SETTLED"
+          - "acting ComplianceOfficer X-User-ID is NOT the opener_account_id and NOT the recipient_account_id of the disputed Transfer (segregation of duties)"
+        side_effects:
+          - "create Reversal(transfer_id, dispute_id, amount_cents=Transfer.amount_cents, status=APPLIED) and set reversal_id"
+          - "cascade: drive disputed Transfer SETTLED -> REVERSED"
+          - "create LedgerEntry DEBIT amount_cents on recipient (source_kind=REVERSAL)"
+          - "create LedgerEntry CREDIT amount_cents on opener/sender (source_kind=REVERSAL)"
+          - "raise recipient Account.risk_score by RISK_CHARGEBACK_DELTA (calc risk_score_update) and recompute risk_tier"
+          - "recompute opener and recipient available_balance_cents"
+        note: "Cascade hop 1 of dispute-uphold chain (depth-3): Dispute->Transfer->Reversal/ledger/risk."
+      - from: OPEN
+        to: DENIED
+        trigger: "POST /disputes/{id}/deny"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Dispute.status == OPEN"
+          - "acting ComplianceOfficer X-User-ID is NOT the opener_account_id and NOT the recipient_account_id of the disputed Transfer (segregation of duties)"
+        side_effects:
+          - "no balance movement"
+          - "lower opener Account.risk_score by RISK_DENIED_DELTA, floored at 0 (calc risk_score_update) and recompute risk_tier"
+        note: "Frivolous-dispute compensation on the opener."
+
+  - entity: Withdrawal
+    initial_state: REQUESTED
+    terminal_states: [PAID, FAILED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: PAID
+        trigger: "POST /withdrawals with speed=INSTANT (settles atomically in the create request)"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder is the Account owner"
+          - "Account.status == ACTIVE"
+          - "FundingSource.status == VERIFIED and belongs to Account"
+          - "Account.available_balance_cents >= gross_amount_cents"
+          - "expected_account_version matches Account.version (OCC)"
+          - "speed == INSTANT"
+        side_effects:
+          - "compute fee_cents and net_amount_cents (calc withdrawal_fee)"
+          - "create LedgerEntry DEBIT gross_amount_cents on Account (source_kind=WITHDRAWAL)"
+          - "recompute Account.available_balance_cents"
+          - "increment Account.version by 1"
+        note: "INSTANT withdrawals post immediately to PAID. A STANDARD withdrawal instead REMAINS in the initial REQUESTED state on creation, but the create request still performs the OCC check, debits gross, computes fee_cents=0, and increments Account.version by 1 (see POST /withdrawals side_effects). The OCC version bump therefore happens on EVERY successful POST /withdrawals regardless of speed."
+      - from: REQUESTED
+        to: PAID
+        trigger: "POST /withdrawals/{id}/settle (standard payout batch posts the funds)"
+        actor: PlatformAdmin
+        preconditions:
+          - "Withdrawal.status == REQUESTED"
+        side_effects:
+          - "no balance change — gross was already debited at creation; mark net paid to funding source"
+        note: "STANDARD withdrawals rest in REQUESTED until the payout batch settles them to PAID."
+      - from: REQUESTED
+        to: FAILED
+        trigger: "POST /withdrawals/{id}/fail"
+        actor: PlatformAdmin
+        preconditions:
+          - "Withdrawal.status == REQUESTED"
+        side_effects:
+          - "create LedgerEntry CREDIT gross_amount_cents on Account (source_kind=ADJUSTMENT) — refund the debit taken at creation"
+          - "recompute Account.available_balance_cents"
+        note: "Payout-rail failure compensation (refund of gross)."
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /withdrawals/{id}/cancel"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder is the Account owner"
+          - "Withdrawal.status == REQUESTED"
+        side_effects:
+          - "create LedgerEntry CREDIT gross_amount_cents on Account (source_kind=ADJUSTMENT) — refund the debit taken at creation"
+          - "recompute Account.available_balance_cents"
+        note: "Holder cancels a pending STANDARD withdrawal before payout posts."
+
+  - entity: MoneyRequest
+    initial_state: PENDING
+    terminal_states: [FULFILLED, DECLINED, CANCELLED]
+    transitions:
+      - from: PENDING
+        to: FULFILLED
+        trigger: "POST /money-requests/{id}/pay"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder is the payer_account_id"
+          - "MoneyRequest.status == PENDING"
+        side_effects:
+          - "create Transfer(sender=payer, recipient=requester, amount=amount_cents, source_money_request_id=this) which runs the Transfer SENT branch"
+          - "set status = FULFILLED"
+        note: "Cross-entity: MoneyRequest payment spawns a Transfer."
+      - from: PENDING
+        to: DECLINED
+        trigger: "POST /money-requests/{id}/decline"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder is the payer_account_id"
+          - "MoneyRequest.status == PENDING"
+        side_effects:
+          - "no balance movement"
+      - from: PENDING
+        to: CANCELLED
+        trigger: "POST /money-requests/{id}/cancel"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder is the requester_account_id"
+          - "MoneyRequest.status == PENDING"
+        side_effects:
+          - "no balance movement"
+
+  - entity: SplitParticipant
+    initial_state: OWED
+    terminal_states: [PAID, FORGIVEN]
+    transitions:
+      - from: OWED
+        to: PAID
+        trigger: "POST /split-requests/{id}/participants/{pid}/pay"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder is the participant_account_id"
+          - "SplitParticipant.status == OWED"
+          - "owning SplitRequest.status IN {OPEN, PARTIALLY_SETTLED}"
+        side_effects:
+          - "create Transfer(sender=participant, recipient=organizer, amount=share_amount_cents) running the SENT branch; set settled_transfer_id"
+          - "bubble up: recompute SplitRequest.collected_amount_cents and re-derive SplitRequest.status (calc split_status_rollup)"
+        note: "Cascade hop 1 of split-pay chain: participant PAID -> SplitRequest rollup -> possible SETTLED."
+      - from: OWED
+        to: FORGIVEN
+        trigger: "POST /split-requests/{id}/participants/{pid}/forgive"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder is the organizer_account_id"
+          - "SplitParticipant.status == OWED"
+        side_effects:
+          - "bubble up: re-derive SplitRequest.status (calc split_status_rollup) — FORGIVEN shares excluded from outstanding"
+        note: "Organizer waives a share."
+
+  - entity: SplitRequest
+    initial_state: OPEN
+    terminal_states: [SETTLED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: PARTIALLY_SETTLED
+        trigger: "system event: first participant -> PAID while others remain OWED"
+        actor: system
+        preconditions:
+          - "at least one SplitParticipant PAID and at least one still OWED"
+        side_effects:
+          - "recompute collected_amount_cents"
+      - from: PARTIALLY_SETTLED
+        to: SETTLED
+        trigger: "system event: all SplitParticipants reach PAID or FORGIVEN"
+        actor: system
+        preconditions:
+          - "every SplitParticipant.status IN {PAID, FORGIVEN}"
+          - "at least one SplitParticipant PAID"
+        side_effects:
+          - "freeze collected_amount_cents"
+      - from: OPEN
+        to: SETTLED
+        trigger: "system event: all SplitParticipants reach PAID or FORGIVEN directly"
+        actor: system
+        preconditions:
+          - "every SplitParticipant.status IN {PAID, FORGIVEN}"
+          - "at least one SplitParticipant PAID"
+        side_effects:
+          - "freeze collected_amount_cents"
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /split-requests/{id}/cancel"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder is the organizer_account_id"
+          - "no SplitParticipant has status PAID"
+        side_effects:
+          - "set all OWED participants to FORGIVEN"
+
+  - entity: FundingSource
+    initial_state: PENDING
+    terminal_states: [REMOVED]
+    transitions:
+      - from: PENDING
+        to: VERIFIED
+        trigger: "POST /funding-sources/{id}/verify"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder owns the parent Account"
+          - "FundingSource.status == PENDING"
+          - "submitted code == micro_deposit_code"
+        side_effects:
+          - "recompute Account default-payout designation (calc default_payout_selector)"
+      - from: VERIFIED
+        to: REMOVED
+        trigger: "DELETE /funding-sources/{id}"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder owns the parent Account"
+          - "FundingSource.status == VERIFIED"
+          - "no Withdrawal in REQUESTED referencing this FundingSource"
+        side_effects:
+          - "recompute Account default-payout designation (calc default_payout_selector)"
+      - from: PENDING
+        to: REMOVED
+        trigger: "DELETE /funding-sources/{id}"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder owns the parent Account"
+          - "FundingSource.status == PENDING"
+        side_effects: []
+
+  - entity: RecipientVerification
+    initial_state: PENDING
+    terminal_states: [CONFIRMED, EXPIRED]
+    transitions:
+      - from: PENDING
+        to: CONFIRMED
+        trigger: "POST /recipient-verifications/{id}/confirm"
+        actor: AccountHolder
+        preconditions:
+          - "acting AccountHolder owns the parent Account"
+          - "RecipientVerification.status == PENDING"
+          - "submitted token == confirm_token"
+          - "now < expires_at"
+        side_effects:
+          - "set parent Account.is_recipient_verified = true"
+      - from: PENDING
+        to: EXPIRED
+        trigger: "POST /recipient-verifications/{id}/confirm (token correct but now >= expires_at)"
+        actor: AccountHolder
+        preconditions:
+          - "RecipientVerification.status == PENDING"
+          - "now >= expires_at"
+        side_effects:
+          - "no change to Account.is_recipient_verified"
+        note: "Boundary edge: confirmation at/after expiry transitions to EXPIRED, not CONFIRMED."
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: withdrawal-stale-account-version
+    parent_entity: Account
+    write_endpoint: "POST /withdrawals"
+    occ_field: "expected_account_version"
+    description: |
+      Creating a Withdrawal against an Account whose version has advanced since
+      the client last observed it is rejected on a stale-version basis. A prior
+      Withdrawal (or any balance-moving action) already bumped Account.version,
+      so the current request's debit would be computed against an out-of-date
+      balance view; the stale-version check rejects it before any ledger movement.
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: withdrawal_fee
+    trigger: "Withdrawal REQUESTED -> PAID (POST /withdrawals)"
+    algorithm: tiered_pricing
+    formula: |
+      # Dual variant on speed. Percentage fee with an absolute floor, INSTANT only.
+      if speed == STANDARD:
+          fee_cents = 0
+      else:  # INSTANT
+          pct_fee = ceil(gross_amount_cents * INSTANT_FEE_RATE_BPS / 10000)   # round UP to whole cent
+          fee_cents = max(pct_fee, INSTANT_FEE_FLOOR_CENTS)
+          fee_cents = min(fee_cents, INSTANT_FEE_CAP_CENTS)                    # cap applied AFTER floor
+      net_amount_cents = gross_amount_cents - fee_cents
+    input_set: "single Withdrawal row; no aggregation"
+    constants:
+      INSTANT_FEE_RATE_BPS: 175          # 1.75%
+      INSTANT_FEE_FLOOR_CENTS: 25        # minimum 25c on any INSTANT
+      INSTANT_FEE_CAP_CENTS: 1500        # cap 15.00 USD
+    precision: "integer cents; pct rounds half-up to whole cent via ceil-on-fraction; floor then cap order pinned (max first, then min)"
+    variants:
+      - name: instant
+        when: "speed == INSTANT"
+        difference: "charges max(ceil(gross*1.75%), 25c) capped at 1500c"
+      - name: standard
+        when: "speed == STANDARD"
+        difference: "fee_cents == 0, net == gross"
+
+  - name: risk_score_update
+    trigger: "RiskHold->BLOCKED (sender), Dispute->UPHELD (recipient/chargeback), Dispute->DENIED (opener)"
+    algorithm: weighted_scoring
+    formula: |
+      # Risk scoring on Account — a DIFFERENT entity domain than withdrawal_fee.
+      # Additive deltas, clamped to [0,100]. Direction depends on event.
+      new = old_risk_score + delta            # delta signed per event below
+      risk_score = max(0, min(100, new))      # floor 0, ceiling 100
+      # risk_tier re-derived: LOW if risk_score<30, ELEVATED if 30<=rs<=69, HIGH if rs>=70
+    input_set: "single Account row; delta selected by triggering event"
+    constants:
+      RISK_BLOCK_DELTA: 20               # +20 when a hold on the sender is BLOCKED
+      RISK_CHARGEBACK_DELTA: 35          # +35 to recipient when a dispute is UPHELD
+      RISK_DENIED_DELTA: -10             # -10 to opener when their dispute is DENIED (floored at 0)
+    precision: "integer; clamp to [0,100]; tier thresholds use >= (30 inclusive ELEVATED, 70 inclusive HIGH)"
+    variants:
+      - name: increase
+        when: "BLOCK or CHARGEBACK event"
+        difference: "delta positive, ceiling at 100"
+      - name: decrease
+        when: "DENIED event"
+        difference: "delta negative, floor at 0"
+
+  - name: split_share_allocation
+    trigger: "POST /split-requests (computes each SplitParticipant.share_amount_cents at creation)"
+    algorithm: waterfall_allocation
+    formula: |
+      # Combinatorial nested-rounding: distribute total_amount_cents across N
+      # participants with a remainder that MUST be allocated deterministically.
+      if split_mode == EVEN:
+          base = floor(total_amount_cents / N)        # N = participant count
+          remainder = total_amount_cents - base * N   # 0 <= remainder < N
+          # The 'remainder' cents go ONE EACH to the first 'remainder' participants
+          # ordered by created_at ASC (NOT by id). Pinned order is mandatory.
+          for i, p in enumerate(participants_sorted_by_created_at_asc):
+              p.share_amount_cents = base + (1 if i < remainder else 0)
+      else:  # WEIGHTED
+          W = sum(weight over participants)
+          # Largest-remainder method: floor each, then hand out leftover cents
+          # to the largest fractional remainders, ties broken by created_at ASC.
+          raw_i = total_amount_cents * weight_i / W
+          floor_i = floor(raw_i)
+          leftover = total_amount_cents - sum(floor_i)
+          rank participants by (raw_i - floor_i) DESC, then created_at ASC
+          give +1 cent to the top 'leftover' participants
+          p.share_amount_cents = floor_i + (1 if ranked within leftover else 0)
+      # Invariant: sum(share_amount_cents) == total_amount_cents EXACTLY.
+    input_set: "all SplitParticipants of the SplitRequest at creation time"
+    constants: {}
+    precision: "integer cents; remainder distributed by largest-remainder, tie-break created_at ASC; SUM == total exactly"
+
+  - name: transfer_limit_check
+    trigger: "POST /transfers and POST /money-requests/{id}/pay — pre-flight before SENT"
+    algorithm: threshold
+    formula: |
+      # Combinatorial: >=3 inputs with nested-min boundary across TWO windows.
+      # Rolling windows anchored on the request clock 'now'.
+      daily_used  = sum(Transfer.amount_cents WHERE sender == this AND status IN {SENT,HELD,SETTLED}
+                        AND created_at >= now - 24h)
+      weekly_used = sum(Transfer.amount_cents WHERE sender == this AND status IN {SENT,HELD,SETTLED}
+                        AND created_at >= now - 7d)
+      daily_remaining  = daily_send_limit_cents  - daily_used
+      weekly_remaining = weekly_send_limit_cents - weekly_used
+      effective_remaining = min(daily_remaining, weekly_remaining)
+      # Boundary: a send of exactly effective_remaining is ALLOWED (<=). One cent over is rejected.
+      allowed = amount_cents <= effective_remaining
+      # Which limit is reported in the error depends on WHICH remaining is smaller:
+      breached = "DAILY" if daily_remaining <= weekly_remaining else "WEEKLY"
+    input_set: "sender's Transfers in {SENT,HELD,SETTLED} within each rolling window; REVERSED/CANCELLED excluded; BLOCKED-hold reversals rewind usage"
+    constants:
+      DAILY_WINDOW_HOURS: 24
+      WEEKLY_WINDOW_DAYS: 7
+    precision: "integer cents; window boundary half-open [now-window, now]; comparison uses <= for allow (exactly-at-limit allowed)"
+    variants:
+      - name: daily_binding
+        when: "daily_remaining <= weekly_remaining"
+        difference: "ERR_DAILY_LIMIT_EXCEEDED reported when amount > effective_remaining"
+      - name: weekly_binding
+        when: "weekly_remaining < daily_remaining"
+        difference: "ERR_WEEKLY_LIMIT_EXCEEDED reported when amount > effective_remaining"
+
+  - name: transfer_risk_gate
+    trigger: "POST /transfers — decides SENT->SETTLED vs SENT->HELD"
+    algorithm: threshold
+    formula: |
+      # Combinatorial branch selection over >=3 inputs; evaluation order pinned.
+      # First matching rule (top-down) sets route=HOLD and reason_code; else SETTLE.
+      if sender.risk_tier == HIGH:
+          route = HOLD; reason_code = HIGH_TIER
+      elif amount_cents >= LARGE_AMOUNT_THRESHOLD_CENTS:
+          route = HOLD; reason_code = LARGE_AMOUNT
+      elif recipient.is_recipient_verified == false
+           and amount_cents > UNVERIFIED_RECIPIENT_CAP_CENTS:
+          route = HOLD; reason_code = UNVERIFIED_RECIPIENT
+      else:
+          route = SETTLE; reason_code = null
+    input_set: "single Transfer plus sender.risk_tier and recipient.is_recipient_verified at send time"
+    constants:
+      LARGE_AMOUNT_THRESHOLD_CENTS: 100000     # 1000.00 USD: >= triggers HOLD
+      UNVERIFIED_RECIPIENT_CAP_CENTS: 5000     # 50.00 USD: > cap to unverified recipient triggers HOLD
+    precision: "integer cents; LARGE uses >= (100000 holds), UNVERIFIED uses > (exactly 5000 to unverified is allowed); rule order fixed: HIGH_TIER > LARGE_AMOUNT > UNVERIFIED_RECIPIENT"
+
+  - name: split_status_rollup
+    trigger: "SplitParticipant -> PAID or -> FORGIVEN; SplitRequest re-derives status (bubble-up)"
+    algorithm: aggregation
+    formula: |
+      collected_amount_cents = sum(share_amount_cents WHERE status == PAID)
+      n_paid     = count(participants WHERE status == PAID)
+      n_terminal = count(participants WHERE status IN {PAID, FORGIVEN})
+      N          = count(all participants)
+      if n_terminal == N and n_paid >= 1:
+          status = SETTLED
+      elif n_paid >= 1:
+          status = PARTIALLY_SETTLED
+      else:
+          status = OPEN
+    input_set: "all participants of the SplitRequest; PAID drives collected, FORGIVEN counts as terminal but not collected"
+    constants: {}
+    precision: "integer cents"
+
+  - name: default_payout_selector
+    trigger: "FundingSource -> VERIFIED or -> REMOVED; Account re-derives is_default_payout"
+    algorithm: chronological
+    formula: |
+      # Selector with explicit candidate set / ranking / tie-break / empty fallback.
+      candidates = FundingSource WHERE account_id == this AND status == VERIFIED
+      if candidates is empty:
+          no default payout source for this Account   # empty-pool fallback
+      else:
+          chosen = min(candidates BY created_at ASC)   # earliest verified; created_at, NOT id
+          chosen.is_default_payout = true; all others false
+    input_set: "VERIFIED FundingSources of one Account"
+    constants: {}
+    precision: "tie-break created_at ASC; never id"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /accounts (registration) and /_* test endpoints"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "All path/body referenced resources exist, validated left-to-right in path then body FKs"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 4
+    category: auth
+    check: "For entity_backed AccountHolder ops, X-User-ID equals the owning Account.id of the target resource (ownership)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "AccountHolder-scoped mutations (transfers, withdrawals, funding-sources, money-requests pay/cancel, split pay/forgive)"
+
+  - priority: 5
+    category: business_safety
+    check: "Segregation of duties: ComplianceOfficer resolving a RiskHold/Dispute must not be the sender/recipient/opener Account.id of the underlying Transfer"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /risk-holds/{id}/clear, /block; POST /disputes/{id}/uphold, /deny, /request-info"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 7
+    category: state
+    check: "Sender/Account is not FROZEN; FROZEN accounts cannot send, withdraw, or be credited"
+    error_id: ERR_ACCOUNT_FROZEN
+    http_status: 409
+    applies_to: "POST /transfers, POST /withdrawals, POST /money-requests/{id}/pay, split pay"
+
+  - priority: 8
+    category: business_referential
+    check: "Recipient/payee Account is distinct from sender (no self-transfer); funding source belongs to acting Account"
+    error_id: ERR_SELF_TRANSFER
+    http_status: 422
+    applies_to: "POST /transfers, POST /money-requests"
+
+  - priority: 9
+    category: business_constraint
+    check: "RecipientVerification confirm token matches and not expired; FundingSource verify code matches"
+    error_id: ERR_VERIFICATION_TOKEN_INVALID
+    http_status: 422
+    applies_to: "POST /recipient-verifications/{id}/confirm, POST /funding-sources/{id}/verify"
+
+  - priority: 10
+    category: business_referential
+    check: "Withdrawal funding_source_id references a VERIFIED FundingSource owned by the Account"
+    error_id: ERR_FUNDING_SOURCE_NOT_VERIFIED
+    http_status: 422
+    applies_to: "POST /withdrawals"
+
+  - priority: 11
+    category: business_temporal
+    check: "At most one live RecipientVerification per (Account, channel): creating a new one while a prior is still PENDING and now < its expires_at is rejected (non-overlapping live verification windows)"
+    error_id: ERR_VERIFICATION_ALREADY_PENDING
+    http_status: 409
+    applies_to: "POST /recipient-verifications"
+
+  - priority: 12
+    category: business_temporal
+    check: "Dispute may only be opened on a SETTLED Transfer and within DISPUTE_WINDOW_DAYS=60 of Transfer.settled_at (now <= settled_at + 60d, inclusive); a non-SETTLED transfer or a now beyond the window is rejected"
+    error_id: ERR_DISPUTE_WINDOW_CLOSED
+    http_status: 422
+    applies_to: "POST /disputes"
+
+  - priority: 13
+    category: business_constraint
+    check: "Rolling daily send limit not exceeded by this amount (daily binding window)"
+    error_id: ERR_DAILY_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /transfers, POST /money-requests/{id}/pay"
+
+  - priority: 14
+    category: business_constraint
+    check: "Rolling weekly send limit not exceeded by this amount (weekly binding window)"
+    error_id: ERR_WEEKLY_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /transfers, POST /money-requests/{id}/pay"
+
+  - priority: 15
+    category: business_fiscal
+    check: "Account.available_balance_cents >= amount_cents (transfer) or >= gross_amount_cents (withdrawal); insufficient funds rejected"
+    error_id: ERR_INSUFFICIENT_FUNDS
+    http_status: 422
+    applies_to: "POST /transfers, POST /withdrawals, POST /money-requests/{id}/pay, split pay"
+
+  - priority: 16
+    category: state
+    check: "OCC: expected_account_version equals current Account.version (withdrawal write)"
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+    applies_to: "POST /withdrawals"
+
+  - priority: 17
+    category: business_constraint
+    check: "Split has >= 2 participants, total_amount_cents >= participant count (each share >= 1), no duplicate participant_account_id, and weight >= 1 on WEIGHTED"
+    error_id: ERR_SPLIT_PARTICIPANT_INVALID
+    http_status: 422
+    applies_to: "POST /split-requests"
+
+  - priority: 18
+    category: business_constraint
+    check: "Required body fields present, types valid, enum values in declared set, amounts >= 1"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all writes"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Account ----
+  - method: POST
+    path: "/accounts"
+    description: "Register a new Account (wallet)."
+    roles: [Anonymous, PlatformAdmin]
+    code: 201
+    input: [email, display_name, "daily_send_limit_cents?", "weekly_send_limit_cents?"]
+    output: Account
+    side_effects: ["mint id; status=ACTIVE; balances=0; risk_score=0; risk_tier=LOW"]
+
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Fetch an Account with computed balances, risk_score, risk_tier."
+    roles: [AccountHolder, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Account
+
+  - method: GET
+    path: "/accounts"
+    description: "List accounts (paginated)."
+    roles: [ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "status?", "risk_tier?"]
+    output: Account[]
+
+  - method: GET
+    path: "/accounts/{id}/ledger"
+    description: "List an Account's LedgerEntries (reverse-reachability for LedgerEntry.account_id)."
+    roles: [AccountHolder, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: LedgerEntry[]
+
+  - method: GET
+    path: "/accounts/{id}/funding-sources"
+    description: "List an Account's FundingSources (reverse-reachability for FundingSource.account_id)."
+    roles: [AccountHolder, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: FundingSource[]
+
+  - method: GET
+    path: "/accounts/{id}/recipient-verifications"
+    description: "List an Account's RecipientVerifications (reverse-reachability for RecipientVerification.account_id)."
+    roles: [AccountHolder, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RecipientVerification[]
+
+  - method: GET
+    path: "/accounts/{id}/split-participations"
+    description: "List the SplitParticipant shares this Account owes/owns across all splits (reverse-reachability for SplitParticipant.participant_account_id)."
+    roles: [AccountHolder, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: SplitParticipant[]
+
+  - method: POST
+    path: "/accounts/{id}/freeze"
+    description: "Freeze an Account (compliance action)."
+    roles: [ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["status=FROZEN (terminal)"]
+
+  # ---- FundingSource ----
+  - method: POST
+    path: "/funding-sources"
+    description: "Link a bank/debit funding source to the acting Account."
+    roles: [AccountHolder]
+    code: 201
+    input: [account_id, kind, last4]
+    output: FundingSource
+    side_effects: ["status=PENDING; mint micro_deposit_code"]
+
+  - method: GET
+    path: "/funding-sources/{id}"
+    description: "Fetch a FundingSource (includes micro_deposit_code for owner)."
+    roles: [AccountHolder, PlatformAdmin]
+    code: 200
+    input: []
+    output: FundingSource
+
+  - method: POST
+    path: "/funding-sources/{id}/verify"
+    description: "Verify a funding source by echoing the micro-deposit code."
+    roles: [AccountHolder]
+    code: 200
+    input: [code]
+    output: FundingSource
+    side_effects: ["status=VERIFIED; recompute Account default-payout designation (calc default_payout_selector)"]
+
+  - method: DELETE
+    path: "/funding-sources/{id}"
+    description: "Remove a funding source."
+    roles: [AccountHolder]
+    code: 200
+    input: []
+    output: FundingSource
+    side_effects: ["status=REMOVED; recompute default-payout designation"]
+
+  # ---- RecipientVerification ----
+  - method: POST
+    path: "/recipient-verifications"
+    description: "Start recipient verification for the acting Account."
+    roles: [AccountHolder]
+    code: 201
+    input: [account_id, channel]
+    output: RecipientVerification
+    side_effects: ["status=PENDING; mint confirm_token; expires_at=created_at+24h"]
+
+  - method: POST
+    path: "/recipient-verifications/{id}/confirm"
+    description: "Confirm recipient verification by echoing the token (boundary: at/after expiry -> EXPIRED)."
+    roles: [AccountHolder]
+    code: 200
+    input: [token]
+    output: RecipientVerification
+    side_effects: ["if token valid and now<expires_at: status=CONFIRMED, Account.is_recipient_verified=true; if now>=expires_at: status=EXPIRED"]
+
+  # ---- Transfer ----
+  - method: POST
+    path: "/transfers"
+    description: "Send money. Runs limit check, risk gate (SETTLE vs HOLD), and ledger postings."
+    roles: [AccountHolder]
+    code: 201
+    input: [sender_account_id, recipient_account_id, amount_cents, "memo?"]
+    output: Transfer
+    side_effects:
+      - "transfer_limit_check (daily+weekly); transfer_risk_gate (SETTLE vs HOLD)"
+      - "ledger DEBIT sender + (CREDIT recipient if SETTLE | RiskHold + held funds if HOLD)"
+      - "advance sender LimitWindow daily/weekly usage; recompute balances"
+
+  - method: GET
+    path: "/transfers/{id}"
+    description: "Fetch a Transfer."
+    roles: [AccountHolder, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Transfer
+
+  - method: GET
+    path: "/transfers"
+    description: "List/filter Transfers (reverse-reachability for Transfer.sender_account_id, recipient_account_id, source_money_request_id)."
+    roles: [AccountHolder, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "sender_account_id?", "recipient_account_id?", "source_money_request_id?", "status?"]
+    output: Transfer[]
+
+  - method: POST
+    path: "/transfers/{id}/cancel"
+    description: "Cancel a not-yet-flagged SENT Transfer."
+    roles: [AccountHolder]
+    code: 200
+    input: []
+    output: Transfer
+    side_effects: ["status=CANCELLED; reverse any pending ledger entries"]
+
+  # ---- MoneyRequest ----
+  - method: POST
+    path: "/money-requests"
+    description: "Request money from a payer Account."
+    roles: [AccountHolder]
+    code: 201
+    input: [requester_account_id, payer_account_id, amount_cents]
+    output: MoneyRequest
+    side_effects: ["status=PENDING"]
+
+  - method: GET
+    path: "/money-requests/{id}"
+    description: "Fetch a MoneyRequest."
+    roles: [AccountHolder, PlatformAdmin]
+    code: 200
+    input: []
+    output: MoneyRequest
+
+  - method: GET
+    path: "/money-requests"
+    description: "List/filter MoneyRequests (reverse-reachability for requester_account_id, payer_account_id)."
+    roles: [AccountHolder, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "requester_account_id?", "payer_account_id?", "status?"]
+    output: MoneyRequest[]
+
+  - method: POST
+    path: "/money-requests/{id}/pay"
+    description: "Payer fulfills a request, spawning a Transfer."
+    roles: [AccountHolder]
+    code: 200
+    input: ["memo?"]
+    output: MoneyRequest
+    side_effects: ["spawn Transfer(payer->requester); status=FULFILLED; Transfer runs limit+risk gate"]
+
+  - method: POST
+    path: "/money-requests/{id}/decline"
+    description: "Payer declines a request."
+    roles: [AccountHolder]
+    code: 200
+    input: []
+    output: MoneyRequest
+    side_effects: ["status=DECLINED"]
+
+  - method: POST
+    path: "/money-requests/{id}/cancel"
+    description: "Requester cancels their own request."
+    roles: [AccountHolder]
+    code: 200
+    input: []
+    output: MoneyRequest
+    side_effects: ["status=CANCELLED"]
+
+  # ---- SplitRequest / SplitParticipant ----
+  - method: POST
+    path: "/split-requests"
+    description: "Create a split bill with participants; computes each share."
+    roles: [AccountHolder]
+    code: 201
+    input: [organizer_account_id, total_amount_cents, split_mode, participants]
+    output: SplitRequest
+    side_effects: ["create SplitParticipants; run split_share_allocation; status=OPEN"]
+
+  - method: GET
+    path: "/split-requests/{id}"
+    description: "Fetch a SplitRequest with collected_amount_cents."
+    roles: [AccountHolder, PlatformAdmin]
+    code: 200
+    input: []
+    output: SplitRequest
+
+  - method: GET
+    path: "/split-requests"
+    description: "List/filter SplitRequests (reverse-reachability for organizer_account_id)."
+    roles: [AccountHolder, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "organizer_account_id?", "status?"]
+    output: SplitRequest[]
+
+  - method: GET
+    path: "/split-requests/{id}/participants"
+    description: "List a split's participants (reverse-reachability for SplitParticipant.split_request_id and participant_account_id)."
+    roles: [AccountHolder, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "participant_account_id?"]
+    output: SplitParticipant[]
+
+  - method: POST
+    path: "/split-requests/{id}/participants/{pid}/pay"
+    description: "Participant pays their share, spawning a Transfer; bubbles up split status."
+    roles: [AccountHolder]
+    code: 200
+    input: ["memo?"]
+    output: SplitParticipant
+    side_effects: ["spawn Transfer(participant->organizer); status=PAID; split_status_rollup"]
+
+  - method: POST
+    path: "/split-requests/{id}/participants/{pid}/forgive"
+    description: "Organizer forgives a participant's share."
+    roles: [AccountHolder]
+    code: 200
+    input: []
+    output: SplitParticipant
+    side_effects: ["status=FORGIVEN; split_status_rollup"]
+
+  - method: POST
+    path: "/split-requests/{id}/cancel"
+    description: "Organizer cancels a split with no paid shares."
+    roles: [AccountHolder]
+    code: 200
+    input: []
+    output: SplitRequest
+    side_effects: ["status=CANCELLED; OWED participants -> FORGIVEN"]
+
+  # ---- RiskHold ----
+  - method: GET
+    path: "/risk-holds/{id}"
+    description: "Fetch a RiskHold."
+    roles: [ComplianceOfficer, PlatformAdmin, AccountHolder]
+    code: 200
+    input: []
+    output: RiskHold
+
+  - method: GET
+    path: "/risk-holds"
+    description: "List/filter RiskHolds (reverse-reachability for RiskHold.transfer_id)."
+    roles: [ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "transfer_id?", "status?"]
+    output: RiskHold[]
+
+  - method: POST
+    path: "/risk-holds/{id}/clear"
+    description: "Compliance clears a hold; cascades the Transfer to SETTLED."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: RiskHold
+    side_effects: ["status=CLEARED; cascade Transfer HELD->SETTLED (credit recipient)"]
+
+  - method: POST
+    path: "/risk-holds/{id}/block"
+    description: "Compliance blocks a hold; cascades the Transfer to REVERSED, refunds sender, raises sender risk."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: RiskHold
+    side_effects: ["status=BLOCKED; cascade Transfer HELD->REVERSED; refund sender; risk_score_update +20; rewind limit usage"]
+
+  # ---- Dispute ----
+  - method: POST
+    path: "/disputes"
+    description: "Open a dispute on a SETTLED Transfer within the dispute window."
+    roles: [AccountHolder]
+    code: 201
+    input: [transfer_id, opener_account_id, reason]
+    output: Dispute
+    side_effects: ["status=OPEN"]
+
+  - method: GET
+    path: "/disputes/{id}"
+    description: "Fetch a Dispute."
+    roles: [AccountHolder, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Dispute
+
+  - method: GET
+    path: "/disputes"
+    description: "List/filter Disputes (reverse-reachability for Dispute.transfer_id and opener_account_id)."
+    roles: [AccountHolder, ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "transfer_id?", "opener_account_id?", "status?"]
+    output: Dispute[]
+
+  - method: POST
+    path: "/disputes/{id}/request-info"
+    description: "Compliance requests more info (OPEN->NEEDS_INFO)."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["status=NEEDS_INFO"]
+
+  - method: POST
+    path: "/disputes/{id}/provide-info"
+    description: "Opener provides info (NEEDS_INFO->OPEN)."
+    roles: [AccountHolder]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["status=OPEN"]
+
+  - method: POST
+    path: "/disputes/{id}/uphold"
+    description: "Compliance upholds; creates Reversal, cascades Transfer to REVERSED, claws funds, raises recipient risk."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["status=UPHELD; create Reversal; cascade Transfer SETTLED->REVERSED; ledger DEBIT recipient + CREDIT opener; risk_score_update +35 on recipient"]
+
+  - method: POST
+    path: "/disputes/{id}/deny"
+    description: "Compliance denies; penalizes opener risk (floored)."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["status=DENIED; risk_score_update -10 on opener (floored at 0)"]
+
+  # ---- Reversal (read) ----
+  - method: GET
+    path: "/reversals/{id}"
+    description: "Fetch a Reversal."
+    roles: [ComplianceOfficer, PlatformAdmin, AccountHolder]
+    code: 200
+    input: []
+    output: Reversal
+
+  - method: GET
+    path: "/reversals"
+    description: "List/filter Reversals (reverse-reachability for Reversal.transfer_id and dispute_id)."
+    roles: [ComplianceOfficer, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "transfer_id?", "dispute_id?"]
+    output: Reversal[]
+
+  # ---- Withdrawal ----
+  - method: POST
+    path: "/withdrawals"
+    description: "Cash out to a VERIFIED funding source. OCC-guarded by expected_account_version; computes fee. INSTANT posts to PAID in this request; STANDARD rests in REQUESTED for the payout batch."
+    roles: [AccountHolder]
+    code: 201
+    input: [account_id, funding_source_id, gross_amount_cents, speed, expected_account_version]
+    output: Withdrawal
+    side_effects:
+      - "OCC check expected_account_version == Account.version (else ERR_STALE_ACCOUNT_VERSION)"
+      - "withdrawal_fee (fee_cents + net_amount_cents); ledger DEBIT gross_amount_cents (source_kind=WITHDRAWAL); recompute available_balance_cents"
+      - "increments Account.version by 1"
+      - "status = PAID when speed=INSTANT, else status = REQUESTED (STANDARD)"
+
+  - method: GET
+    path: "/withdrawals/{id}"
+    description: "Fetch a Withdrawal with fee/net."
+    roles: [AccountHolder, PlatformAdmin]
+    code: 200
+    input: []
+    output: Withdrawal
+
+  - method: GET
+    path: "/withdrawals"
+    description: "List/filter Withdrawals (reverse-reachability for Withdrawal.account_id and funding_source_id)."
+    roles: [AccountHolder, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?", "account_id?", "funding_source_id?", "status?"]
+    output: Withdrawal[]
+
+  - method: POST
+    path: "/withdrawals/{id}/settle"
+    description: "Standard payout batch posts a REQUESTED withdrawal to PAID (no balance change; gross already debited)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Withdrawal
+    side_effects: ["status=PAID; no ledger movement"]
+
+  - method: POST
+    path: "/withdrawals/{id}/cancel"
+    description: "Holder cancels a REQUESTED (STANDARD) withdrawal; refunds gross."
+    roles: [AccountHolder]
+    code: 200
+    input: []
+    output: Withdrawal
+    side_effects: ["status=CANCELLED; ledger CREDIT gross (ADJUSTMENT); recompute balance"]
+
+  - method: POST
+    path: "/withdrawals/{id}/fail"
+    description: "Admin marks a withdrawal as failed at the payout rail; refunds gross."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Withdrawal
+    side_effects: ["status=FAILED; ledger CREDIT gross (ADJUSTMENT); recompute balance"]
+
+  # ---- Test-driving (clock + balance seeding) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving: pin the server clock to a fixed UTC instant for rolling-window and expiry tests."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server 'now' fixed at to_iso8601"]
+
+  - method: POST
+    path: "/_ledger/seed_credit"
+    description: "Test-driving: credit an Account's balance directly (simulates an external inbound deposit) so transfers/withdrawals have funds."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [account_id, amount_cents, "memo?"]
+    output: LedgerEntry
+    side_effects: ["create LedgerEntry CREDIT (source_kind=ADJUSTMENT); recompute Account.available_balance_cents; increments Account.version by 1"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID on a protected endpoint."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for the operation."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "AccountHolder acting on a resource not owned by their Account.id."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "ComplianceOfficer resolving a hold/dispute is a party (sender/recipient/opener) to the underlying Transfer."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced path id or FK body field does not resolve to an existing resource."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not defined from the resource's current state."
+  - id: ERR_ACCOUNT_FROZEN
+    http: 409
+    condition: "Account is FROZEN and cannot send, withdraw, pay, or be credited."
+  - id: ERR_SELF_TRANSFER
+    http: 422
+    condition: "sender_account_id == recipient_account_id (or requester == payer)."
+  - id: ERR_VERIFICATION_TOKEN_INVALID
+    http: 422
+    condition: "Recipient-verification token / funding-source code mismatch or token expired window mishandled."
+  - id: ERR_FUNDING_SOURCE_NOT_VERIFIED
+    http: 422
+    condition: "Withdrawal funding source is not VERIFIED or not owned by the Account."
+  - id: ERR_DISPUTE_WINDOW_CLOSED
+    http: 422
+    condition: "Dispute opened on a non-SETTLED Transfer or after DISPUTE_WINDOW_DAYS past settled_at."
+  - id: ERR_DAILY_LIMIT_EXCEEDED
+    http: 422
+    condition: "Send would exceed rolling 24h daily limit and daily is the binding window."
+  - id: ERR_WEEKLY_LIMIT_EXCEEDED
+    http: 422
+    condition: "Send would exceed rolling 7d weekly limit and weekly is the binding window."
+  - id: ERR_INSUFFICIENT_FUNDS
+    http: 422
+    condition: "available_balance_cents < requested amount (transfer/withdrawal/split pay)."
+  - id: ERR_STALE_ACCOUNT_VERSION
+    http: 412
+    condition: "expected_account_version != current Account.version on a withdrawal write (OCC)."
+  - id: ERR_SPLIT_PARTICIPANT_INVALID
+    http: 422
+    condition: "Split has <2 participants, total < participant count, duplicate participant, or weight < 1 on WEIGHTED."
+  - id: ERR_FUNDING_SOURCE_IN_USE
+    http: 409
+    condition: "Removing a FundingSource referenced by a REQUESTED Withdrawal."
+  - id: ERR_VERIFICATION_ALREADY_PENDING
+    http: 409
+    condition: "A new RecipientVerification for the same (Account, channel) while a prior is still PENDING and within its live window (now < expires_at)."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, bad type, unknown enum, or amount < 1."
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Anonymous
+    description: "Unauthenticated caller; may only register an Account."
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "POST /accounts (registration)"
+
+  - name: AccountHolder
+    description: "An end user acting as their own Account; owns funding sources, transfers, requests, splits, withdrawals, disputes."
+    identity: "entity_backed:Account"
+    exclusive_operations:
+      - "POST /funding-sources, /funding-sources/{id}/verify, DELETE /funding-sources/{id}"
+      - "POST /recipient-verifications, /recipient-verifications/{id}/confirm"
+      - "POST /transfers, /transfers/{id}/cancel"
+      - "POST /money-requests, /money-requests/{id}/pay|decline|cancel"
+      - "POST /split-requests, participant pay|forgive, /split-requests/{id}/cancel"
+      - "POST /disputes, /disputes/{id}/provide-info"
+      - "POST /withdrawals, /withdrawals/{id}/cancel"
+    shared_operations:
+      - "GET own Account, ledger, funding-sources, recipient-verifications, transfers, disputes, risk-holds (read), reversals (read)"
+
+  - name: ComplianceOfficer
+    description: "Operator who reviews risk holds and adjudicates disputes; cannot transact on behalf of accounts."
+    identity: opaque
+    exclusive_operations:
+      - "POST /risk-holds/{id}/clear, /risk-holds/{id}/block"
+      - "POST /disputes/{id}/request-info, /uphold, /deny"
+      - "POST /accounts/{id}/freeze"
+    shared_operations:
+      - "GET /accounts, /accounts/{id}, /transfers, /disputes, /risk-holds, /reversals"
+
+  - name: PlatformAdmin
+    description: "Operational superuser for configuration, payout-rail failure handling, and test-driving."
+    identity: opaque
+    exclusive_operations:
+      - "POST /withdrawals/{id}/fail, POST /withdrawals/{id}/settle"
+      - "POST /_clock/set_current_utc, POST /_ledger/seed_credit"
+    shared_operations:
+      - "POST /accounts; GET all read endpoints; POST /accounts/{id}/freeze"

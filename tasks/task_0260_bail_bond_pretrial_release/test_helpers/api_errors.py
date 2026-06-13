@@ -1,0 +1,69 @@
+"""Error IDs and HTTP status mapping for the Bail Bond & Pretrial Release API (PRD §5).
+
+After defining the mapping it is registered with the framework so validate_error()
+auto-checks the HTTP status code for each error_id.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    # auth
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN_ROLE = "ERR_FORBIDDEN_ROLE"
+    # existence
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_FK_NOT_FOUND = "ERR_FK_NOT_FOUND"
+    # request validation
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_VALIDATION = "ERR_VALIDATION"
+    # uniqueness
+    ERR_DUPLICATE_CASE_NUMBER = "ERR_DUPLICATE_CASE_NUMBER"
+    ERR_DUPLICATE_SERIAL = "ERR_DUPLICATE_SERIAL"
+    # state / OCC
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    # business referential
+    ERR_BOND_TYPE_NOT_ALLOWED = "ERR_BOND_TYPE_NOT_ALLOWED"
+    ERR_GPS_NOT_REQUIRED = "ERR_GPS_NOT_REQUIRED"
+    ERR_DOCKET_OVERLAP = "ERR_DOCKET_OVERLAP"
+    ERR_DEVICE_SLOT_OCCUPIED = "ERR_DEVICE_SLOT_OCCUPIED"
+    ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+    # business temporal
+    ERR_GRACE_EXPIRED = "ERR_GRACE_EXPIRED"
+    ERR_GRACE_NOT_EXPIRED = "ERR_GRACE_NOT_EXPIRED"
+    ERR_TIMING_VIOLATION = "ERR_TIMING_VIOLATION"
+    # business fiscal
+    ERR_INSUFFICIENT_INDEMNITY = "ERR_INSUFFICIENT_INDEMNITY"
+    ERR_INSUFFICIENT_COLLATERAL = "ERR_INSUFFICIENT_COLLATERAL"
+    ERR_CREDIT_LIMIT_EXCEEDED = "ERR_CREDIT_LIMIT_EXCEEDED"
+    ERR_INVALID_REMISSION = "ERR_INVALID_REMISSION"
+
+
+HTTP_STATUS_CODES: dict[str, int] = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN_ROLE: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_FK_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_REQUEST: 400,
+    ApiErrorId.ERR_VALIDATION: 422,
+    ApiErrorId.ERR_DUPLICATE_CASE_NUMBER: 409,
+    ApiErrorId.ERR_DUPLICATE_SERIAL: 409,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_BOND_TYPE_NOT_ALLOWED: 409,
+    ApiErrorId.ERR_GPS_NOT_REQUIRED: 409,
+    ApiErrorId.ERR_DOCKET_OVERLAP: 409,
+    ApiErrorId.ERR_DEVICE_SLOT_OCCUPIED: 409,
+    ApiErrorId.ERR_SEGREGATION_OF_DUTIES: 403,
+    ApiErrorId.ERR_GRACE_EXPIRED: 409,
+    ApiErrorId.ERR_GRACE_NOT_EXPIRED: 409,
+    ApiErrorId.ERR_TIMING_VIOLATION: 409,
+    ApiErrorId.ERR_INSUFFICIENT_INDEMNITY: 409,
+    ApiErrorId.ERR_INSUFFICIENT_COLLATERAL: 409,
+    ApiErrorId.ERR_CREDIT_LIMIT_EXCEEDED: 409,
+    ApiErrorId.ERR_INVALID_REMISSION: 400,
+}
+
+# Register with the framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(HTTP_STATUS_CODES)

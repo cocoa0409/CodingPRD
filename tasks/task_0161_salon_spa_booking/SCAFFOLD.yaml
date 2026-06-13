@@ -1,0 +1,1415 @@
+scenario: |
+  Salon & Spa Booking: stylist/service catalog/duration, appointment buffer/double-booking,
+  chair/room resource, commission vs booth rent, retail product inventory, no-show/deposit,
+  package/membership, tip split
+
+domain_name: salon-spa-booking
+api_prefix: ""
+
+# ---------------------------------------------------------------------------
+# Step 0: Complexity Profile
+# ---------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: temporal_windowing          # appointment intervals on stylist + chair/room resources
+  secondary_archetype: pricing_engine            # commission vs booth rent, tip split, member/package pricing
+  complexity_layers:
+    - optimistic_concurrency                     # OCC on Stylist.version (book against a stale schedule) and Salon.version (clock advance)
+    - cascading_side_effects                     # checkout fans into commission + inventory + tip split + package decrement
+    - rate_threshold_triggers                    # no-show strike thresholds, membership discount tiers
+    - derived_field_reconciliation               # ProductSku.qty_on_hand, PackagePurchase.sessions_remaining, Client.no_show_strikes
+
+  entity_topology: flat                          # peer entities joined by FK; appointments reference stylist/resource/service/client by id, no URL nesting
+  state_machine_shape: branching                 # Appointment forks (NO_SHOW vs COMPLETED vs CANCELLED) with divergent side-effect sets; Membership has revert (PAST_DUE -> ACTIVE)
+  relationship_patterns:
+    - one_to_many                                # Salon -> Stylist/Resource/Service; Client -> Appointment
+    - many_to_many                               # Appointment is the junction of Stylist x Resource x Service x Client
+    - cross_aggregate                            # Checkout ledger reads Appointment, Stylist, Membership, PackagePurchase, ProductSku
+  role_model: peer_roles                         # FrontDesk books/checks out, Stylist marks own appts, Client self-books, SalonOwner configures catalog
+  consistency_model: immediate                   # all cascades atomic within the triggering request
+
+# ---------------------------------------------------------------------------
+# 1.0 Response Envelope (FIXED — verbatim)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# 1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: Salon
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: Salon display name.
+        constraints: non-empty
+      - name: timezone
+        type: string
+        source: input
+        description: IANA timezone for interpreting business hours (informational; all stored times are UTC).
+        default: "UTC"
+      - name: no_show_fee_pct
+        type: number
+        source: input
+        description: Fraction of an appointment's quoted service price forfeited as a no-show fee, charged against the held deposit. e.g. 0.50 = 50%.
+        default: 0.50
+        constraints: 0 <= no_show_fee_pct <= 1
+      - name: no_show_suspend_threshold
+        type: integer
+        source: input
+        description: Number of accumulated no-show strikes on a Client at or above which the Client is auto-suspended from self-booking.
+        default: 3
+        constraints: ">= 1"
+      - name: tip_split_policy
+        type: enum
+        source: input
+        description: How a Checkout distributes the appointment tip. DIRECT = full tip to the serving stylist; POOLED = tip divided evenly across all ACTIVE stylists in the salon.
+        default: "DIRECT"
+        constraints: one of {DIRECT, POOLED}
+      - name: current_utc
+        type: datetime
+        source: system
+        description: Salon's mutable simulated wall clock (ISO 8601 UTC). Defaults to created_at; advanced only via POST /salons/{id}/_clock/advance. All temporal checks read this field, never the host clock.
+
+  - name: Stylist
+    parent: null
+    common_fields: true
+    fields:
+      - name: salon_id
+        type: string
+        source: input
+        description: "FK -> Salon.id"
+      - name: full_name
+        type: string
+        source: input
+        description: Stylist display name.
+        constraints: non-empty
+      - name: status
+        type: enum
+        source: input
+        description: Employment status. ACTIVE stylists may be booked; INACTIVE stylists cannot. Controls tip-pool membership.
+        default: "ACTIVE"
+        constraints: one of {ACTIVE, INACTIVE}
+      - name: compensation_model
+        type: enum
+        source: input
+        description: COMMISSION = stylist earns commission_pct of service revenue, salon keeps remainder. BOOTH_RENT = stylist keeps full service revenue minus a flat per-appointment booth-rent fee owed to the salon.
+        constraints: one of {COMMISSION, BOOTH_RENT}
+      - name: commission_pct
+        type: number
+        source: input
+        description: Commission fraction of service revenue paid to the stylist when compensation_model == COMMISSION. Ignored for BOOTH_RENT.
+        default: 0.40
+        constraints: 0 <= commission_pct <= 1
+      - name: booth_rent_per_appt_cents
+        type: integer
+        source: input
+        description: Flat fee in cents the stylist owes the salon per completed appointment when compensation_model == BOOTH_RENT. Ignored for COMMISSION.
+        default: 1500
+        constraints: ">= 0"
+      - name: buffer_minutes
+        type: integer
+        source: input
+        description: Minutes of mandatory turnaround padding reserved before AND after every appointment served by this stylist; two appointments collide if their buffer-padded intervals overlap.
+        default: 10
+        constraints: ">= 0"
+
+  - name: Resource
+    parent: null
+    common_fields: true
+    fields:
+      - name: salon_id
+        type: string
+        source: input
+        description: "FK -> Salon.id"
+      - name: label
+        type: string
+        source: input
+        description: Physical resource label, e.g. "Chair 3" or "Facial Room A".
+        constraints: non-empty
+      - name: resource_type
+        type: enum
+        source: input
+        description: CHAIR for styling stations, ROOM for treatment rooms. Informational; both behave as single-occupancy.
+        constraints: one of {CHAIR, ROOM}
+      - name: status
+        type: enum
+        source: input
+        description: ACTIVE resources may be booked; OUT_OF_SERVICE resources cannot.
+        default: "ACTIVE"
+        constraints: one of {ACTIVE, OUT_OF_SERVICE}
+
+  - name: Service
+    parent: null
+    common_fields: true
+    fields:
+      - name: salon_id
+        type: string
+        source: input
+        description: "FK -> Salon.id"
+      - name: name
+        type: string
+        source: input
+        description: Service name, e.g. "Women's Cut", "60-min Massage".
+        constraints: non-empty
+      - name: duration_minutes
+        type: integer
+        source: input
+        description: Scheduled chair/room occupancy duration in minutes (excludes stylist buffer).
+        constraints: ">= 1"
+      - name: base_price_cents
+        type: integer
+        source: input
+        description: List price in cents charged for the service before membership discount or package coverage.
+        constraints: ">= 0"
+      - name: deposit_pct
+        type: number
+        source: input
+        description: Fraction of base_price_cents collected as a refundable hold when an appointment is booked. 0 = no deposit required.
+        default: 0.0
+        constraints: 0 <= deposit_pct <= 1
+      - name: requires_room
+        type: boolean
+        source: input
+        description: When true, the appointment's Resource MUST have resource_type == ROOM; when false, the Resource MUST be a CHAIR.
+        default: false
+
+  - name: Client
+    parent: null
+    common_fields: true
+    fields:
+      - name: salon_id
+        type: string
+        source: input
+        description: "FK -> Salon.id"
+      - name: full_name
+        type: string
+        source: input
+        description: Client display name.
+        constraints: non-empty
+      - name: email
+        type: string
+        source: input
+        description: Client contact email; unique per salon (case-insensitive) among non-archived clients.
+        constraints: non-empty; unique within salon for status != ARCHIVED
+      - name: status
+        type: enum
+        source: input
+        description: ACTIVE clients may self-book. SUSPENDED clients (auto-set when no_show_strikes >= Salon.no_show_suspend_threshold) cannot self-book but may still be booked by FrontDesk. ARCHIVED clients are soft-deleted.
+        default: "ACTIVE"
+        constraints: one of {ACTIVE, SUSPENDED, ARCHIVED}
+      - name: no_show_strikes
+        type: integer
+        source: computed
+        description: Running count of appointments this client failed to attend (incremented on each BOOKED/CONFIRMED -> NO_SHOW transition, decremented when a no-show is reversed via dispute). Drives auto-suspension.
+        default: 0
+      - name: wallet_credit_cents
+        type: integer
+        source: computed
+        description: Store credit balance in cents (e.g. from forfeited-then-refunded deposits or dispute resolutions). Never negative.
+        default: 0
+
+  - name: MembershipPlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: salon_id
+        type: string
+        source: input
+        description: "FK -> Salon.id"
+      - name: name
+        type: string
+        source: input
+        description: Plan name, e.g. "Gold".
+        constraints: non-empty
+      - name: monthly_fee_cents
+        type: integer
+        source: input
+        description: Recurring fee in cents (informational for pricing math; not auto-billed by this system).
+        constraints: ">= 0"
+      - name: service_discount_pct
+        type: number
+        source: input
+        description: Fraction discounted off a service's base price for active members on this plan. e.g. 0.20 = 20% off.
+        constraints: 0 <= service_discount_pct <= 1
+      - name: retail_discount_pct
+        type: number
+        source: input
+        description: Fraction discounted off retail product unit prices for active members on this plan.
+        default: 0.0
+        constraints: 0 <= retail_discount_pct <= 1
+
+  - name: Membership
+    parent: null
+    common_fields: true
+    fields:
+      - name: client_id
+        type: string
+        source: input
+        description: "FK -> Client.id"
+      - name: plan_id
+        type: string
+        source: input
+        description: "FK -> MembershipPlan.id"
+      - name: status
+        type: enum
+        source: computed
+        description: ACTIVE membership grants plan discounts. PAST_DUE (a payment lapse) suspends discounts but is reversible back to ACTIVE. CANCELLED is terminal and grants no discounts.
+        default: "ACTIVE"
+        constraints: one of {ACTIVE, PAST_DUE, CANCELLED}
+
+  - name: Package
+    parent: null
+    common_fields: true
+    fields:
+      - name: salon_id
+        type: string
+        source: input
+        description: "FK -> Salon.id"
+      - name: service_id
+        type: string
+        source: input
+        description: "FK -> Service.id; the single service whose sessions this package prepays."
+      - name: session_count
+        type: integer
+        source: input
+        description: Number of prepaid service sessions the package grants on purchase.
+        constraints: ">= 1"
+      - name: price_cents
+        type: integer
+        source: input
+        description: Total price in cents paid for all sessions; per-session cost = ceil(price_cents / session_count) using banker-free round-half-up at the cents level (see calc package_session_value).
+        constraints: ">= 0"
+
+  - name: PackagePurchase
+    parent: null
+    common_fields: true
+    fields:
+      - name: client_id
+        type: string
+        source: input
+        description: "FK -> Client.id"
+      - name: package_id
+        type: string
+        source: input
+        description: "FK -> Package.id"
+      - name: sessions_remaining
+        type: integer
+        source: computed
+        description: Prepaid sessions not yet consumed. Initialized to Package.session_count; decremented when an appointment redeems a session at checkout; restored when such an appointment is later voided/no-showed. Never negative.
+      - name: status
+        type: enum
+        source: computed
+        description: ACTIVE while sessions_remaining > 0; EXHAUSTED when sessions_remaining reaches 0.
+        default: "ACTIVE"
+        constraints: one of {ACTIVE, EXHAUSTED}
+
+  - name: Appointment
+    parent: null
+    common_fields: true
+    fields:
+      - name: salon_id
+        type: string
+        source: input
+        description: "FK -> Salon.id"
+      - name: client_id
+        type: string
+        source: input
+        description: "FK -> Client.id"
+      - name: stylist_id
+        type: string
+        source: input
+        description: "FK -> Stylist.id; the serving stylist (drives buffer overlap + payout)."
+      - name: resource_id
+        type: string
+        source: input
+        description: "FK -> Resource.id; the chair/room occupied (drives single-occupancy overlap)."
+      - name: service_id
+        type: string
+        source: input
+        description: "FK -> Service.id"
+      - name: package_purchase_id
+        type: string
+        source: input
+        description: "FK -> PackagePurchase.id; optional. When present the appointment redeems a prepaid session of the matching service instead of charging base price."
+        default: null
+      - name: start_utc
+        type: datetime
+        source: input
+        description: Appointment start (ISO 8601 UTC). Chair/room occupancy interval is [start_utc, start_utc + Service.duration_minutes).
+        constraints: must be strictly after Salon.current_utc at booking time
+      - name: end_utc
+        type: datetime
+        source: computed
+        description: Computed as start_utc + Service.duration_minutes. Stylist buffer interval is [start_utc - buffer, end_utc + buffer).
+      - name: status
+        type: enum
+        source: computed
+        description: Lifecycle state (see §1.2).
+        default: "BOOKED"
+        constraints: one of {BOOKED, CONFIRMED, COMPLETED, NO_SHOW, CANCELLED}
+      - name: quoted_service_price_cents
+        type: integer
+        source: computed
+        description: Service charge snapshotted at booking time after membership discount (package-covered appointments quote 0). Frozen at booking; not re-priced if membership later changes. Drives deposit + no-show fee.
+      - name: deposit_held_cents
+        type: integer
+        source: computed
+        description: Refundable hold collected at booking = round_half_up(quoted_service_price_cents * Service.deposit_pct). 0 when no deposit required.
+
+  - name: ProductSku
+    parent: null
+    common_fields: true
+    fields:
+      - name: salon_id
+        type: string
+        source: input
+        description: "FK -> Salon.id"
+      - name: sku
+        type: string
+        source: input
+        description: Stock-keeping code, unique per salon.
+        constraints: non-empty; unique within salon
+      - name: name
+        type: string
+        source: input
+        description: Retail product name.
+        constraints: non-empty
+      - name: unit_price_cents
+        type: integer
+        source: input
+        description: Retail list price per unit in cents before any member discount.
+        constraints: ">= 0"
+      - name: qty_on_hand
+        type: integer
+        source: computed
+        description: Units currently in inventory. Decremented when a ProductSale is recorded at checkout; restored when that sale is voided. Never negative.
+
+  - name: Checkout
+    parent: null
+    common_fields: true
+    fields:
+      - name: appointment_id
+        type: string
+        source: input
+        description: "FK -> Appointment.id; the completed appointment being settled (1:1)."
+      - name: tip_cents
+        type: integer
+        source: input
+        description: Gratuity in cents entered at checkout, distributed per Salon.tip_split_policy.
+        default: 0
+        constraints: ">= 0"
+      - name: service_revenue_cents
+        type: integer
+        source: computed
+        description: Net service revenue recognized = quoted_service_price_cents for charged appointments, or PackagePurchase per-session value for package-redeemed appointments.
+      - name: retail_revenue_cents
+        type: integer
+        source: computed
+        description: Sum over child ProductSale.line_total_cents.
+      - name: stylist_service_earning_cents
+        type: integer
+        source: computed
+        description: Stylist's share of service_revenue_cents per compensation_model (see calc stylist_service_earning).
+      - name: salon_service_earning_cents
+        type: integer
+        source: computed
+        description: Salon's share of service_revenue_cents = service_revenue_cents - stylist_service_earning_cents.
+      - name: stylist_tip_cents
+        type: integer
+        source: computed
+        description: Tip allocated to THIS appointment's stylist per tip_split_policy (see calc tip_distribution).
+      - name: status
+        type: enum
+        source: computed
+        description: SETTLED on creation; VOIDED after a void reverses all side effects.
+        default: "SETTLED"
+        constraints: one of {SETTLED, VOIDED}
+
+  - name: ProductSale
+    parent: null
+    common_fields: false
+    fields:
+      - name: checkout_id
+        type: string
+        source: input
+        description: "FK -> Checkout.id; the checkout this retail line belongs to."
+      - name: product_sku_id
+        type: string
+        source: input
+        description: "FK -> ProductSku.id"
+      - name: quantity
+        type: integer
+        source: input
+        description: Units sold on this line.
+        constraints: ">= 1"
+      - name: line_total_cents
+        type: integer
+        source: computed
+        description: quantity * effective unit price (member retail discount applied if the appointment's client has an ACTIVE membership), see calc retail_line_total.
+
+# ---------------------------------------------------------------------------
+# 1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: Appointment
+    initial_state: BOOKED
+    terminal_states: [COMPLETED, NO_SHOW, CANCELLED]
+    transitions:
+      - from: BOOKED
+        to: CONFIRMED
+        trigger: "POST /appointments/{id}/confirm"
+        actor: FrontDesk
+        preconditions:
+          - "Appointment.status == BOOKED"
+          - "Client.status != ARCHIVED"
+        side_effects:
+          - "set Appointment.status = CONFIRMED"
+          - "increments Appointment.version by 1"
+        note: "Optional acknowledgement step; CONFIRMED behaves like BOOKED for all other transitions."
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /appointments/{id}/cancel"
+        actor: FrontDesk
+        preconditions:
+          - "Appointment.status IN {BOOKED, CONFIRMED}"
+          - "Salon.current_utc < Appointment.start_utc (cancellation before start)"
+        side_effects:
+          - "set Appointment.status = CANCELLED"
+          - "refund Appointment.deposit_held_cents to Client.wallet_credit_cents (cascade: Client.wallet_credit_cents += deposit_held_cents; Client.updated_at refreshed; Client.version +1)"
+          - "if package_purchase_id present: restore one session (cascade: PackagePurchase.sessions_remaining += 1 -> if was EXHAUSTED set PackagePurchase.status = ACTIVE; PackagePurchase.version +1)"
+          - "increments Appointment.version by 1"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /appointments/{id}/cancel"
+        actor: FrontDesk
+        preconditions:
+          - "Appointment.status IN {BOOKED, CONFIRMED}"
+          - "Salon.current_utc < Appointment.start_utc (cancellation before start)"
+        side_effects:
+          - "set Appointment.status = CANCELLED"
+          - "refund Appointment.deposit_held_cents to Client.wallet_credit_cents (cascade)"
+          - "if package_purchase_id present: restore one session (cascade)"
+          - "increments Appointment.version by 1"
+      - from: BOOKED
+        to: NO_SHOW
+        trigger: "POST /appointments/{id}/no-show"
+        actor: FrontDesk
+        preconditions:
+          - "Appointment.status IN {BOOKED, CONFIRMED}"
+          - "Salon.current_utc >= Appointment.start_utc (the slot has begun)"
+        side_effects:
+          - "set Appointment.status = NO_SHOW"
+          - "compute no_show_fee = round_half_up(quoted_service_price_cents * Salon.no_show_fee_pct); forfeit min(no_show_fee, deposit_held_cents) from the held deposit; refund the remainder (deposit_held_cents - forfeited) to Client.wallet_credit_cents (cascade: Client.wallet_credit_cents += remainder; Client.version +1)"
+          - "increment Client.no_show_strikes by 1 (cascade on Client; Client.version +1)"
+          - "if Client.no_show_strikes >= Salon.no_show_suspend_threshold AND Client.status == ACTIVE: set Client.status = SUSPENDED (second-order cascade, same request; Client.version +1 once total for the no-show update batch)"
+          - "if package_purchase_id present: restore one session (cascade: PackagePurchase.sessions_remaining += 1 -> status maybe ACTIVE; PackagePurchase.version +1)"
+          - "increments Appointment.version by 1"
+        note: "Depth-3 cascade: no-show -> Client.no_show_strikes++ -> Client.status SUSPENDED. Strikes change is the trigger for the suspend, not the original no-show action."
+      - from: CONFIRMED
+        to: NO_SHOW
+        trigger: "POST /appointments/{id}/no-show"
+        actor: FrontDesk
+        preconditions:
+          - "Appointment.status IN {BOOKED, CONFIRMED}"
+          - "Salon.current_utc >= Appointment.start_utc"
+        side_effects:
+          - "set Appointment.status = NO_SHOW"
+          - "forfeit/refund deposit as in BOOKED->NO_SHOW (cascade on Client.wallet_credit_cents)"
+          - "increment Client.no_show_strikes by 1; conditional auto-suspend (cascade)"
+          - "if package_purchase_id present: restore one session (cascade)"
+          - "increments Appointment.version by 1"
+      - from: BOOKED
+        to: COMPLETED
+        trigger: "POST /checkouts (creating the Checkout for this appointment)"
+        actor: FrontDesk
+        preconditions:
+          - "Appointment.status IN {BOOKED, CONFIRMED}"
+          - "Salon.current_utc >= Appointment.start_utc"
+          - "no SETTLED Checkout already exists for this appointment"
+        side_effects:
+          - "set Appointment.status = COMPLETED"
+          - "create Checkout (SETTLED) computing service_revenue, stylist/salon split, tip split, retail lines"
+          - "if package_purchase_id present: redeem one session (cascade: PackagePurchase.sessions_remaining -= 1 -> if reaches 0 set PackagePurchase.status = EXHAUSTED; PackagePurchase.version +1)"
+          - "for each ProductSale line: decrement ProductSku.qty_on_hand by quantity (cascade per sku; ProductSku.version +1)"
+          - "release the held deposit toward the service charge (deposit_held_cents applied, not refunded)"
+          - "increments Appointment.version by 1"
+        note: "Checkout creation is the COMPLETE trigger; the Checkout is the ledger event."
+      - from: CONFIRMED
+        to: COMPLETED
+        trigger: "POST /checkouts (creating the Checkout for this appointment)"
+        actor: FrontDesk
+        preconditions:
+          - "Appointment.status IN {BOOKED, CONFIRMED}"
+          - "Salon.current_utc >= Appointment.start_utc"
+          - "no SETTLED Checkout already exists for this appointment"
+        side_effects:
+          - "set Appointment.status = COMPLETED"
+          - "create Checkout (SETTLED) with full revenue/tip/retail computation"
+          - "if package_purchase_id present: redeem one session (cascade)"
+          - "for each ProductSale line: decrement ProductSku.qty_on_hand (cascade)"
+          - "increments Appointment.version by 1"
+
+  - entity: Checkout
+    initial_state: SETTLED
+    terminal_states: [VOIDED]
+    transitions:
+      - from: SETTLED
+        to: VOIDED
+        trigger: "POST /checkouts/{id}/void"
+        actor: SalonOwner
+        preconditions:
+          - "Checkout.status == SETTLED"
+        side_effects:
+          - "set Checkout.status = VOIDED"
+          - "for each child ProductSale: restore ProductSku.qty_on_hand += quantity (cascade per sku; ProductSku.version +1) — compensating action, total units conserved"
+          - "if the appointment redeemed a package session: restore PackagePurchase.sessions_remaining += 1 -> status ACTIVE if was EXHAUSTED (cascade; PackagePurchase.version +1) — sessions conserved"
+          - "set Appointment.status = NO_SHOW and apply the BOOKED->NO_SHOW deposit/strike cascade (cascade: Client.no_show_strikes +1, conditional suspend, deposit forfeit/refund) — voiding a completed visit reclassifies it as a missed visit"
+          - "increments Checkout.version by 1"
+        note: "Void is the compensating transition; it reverses inventory and package side-effects of COMPLETE and re-routes the appointment to NO_SHOW."
+
+  - entity: Membership
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: PAST_DUE
+        trigger: "POST /memberships/{id}/lapse"
+        actor: SalonOwner
+        preconditions:
+          - "Membership.status == ACTIVE"
+        side_effects:
+          - "set Membership.status = PAST_DUE (discounts suspended; future appointment quotes priced as non-member)"
+          - "increments Membership.version by 1"
+      - from: PAST_DUE
+        to: ACTIVE
+        trigger: "POST /memberships/{id}/reinstate"
+        actor: SalonOwner
+        preconditions:
+          - "Membership.status == PAST_DUE"
+        side_effects:
+          - "set Membership.status = ACTIVE (discounts restored)"
+          - "increments Membership.version by 1"
+        note: "Revert edge — ACTIVE <-> PAST_DUE forms a cycle (Rule 3 non-linear shape)."
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /memberships/{id}/cancel"
+        actor: SalonOwner
+        preconditions:
+          - "Membership.status IN {ACTIVE, PAST_DUE}"
+        side_effects:
+          - "set Membership.status = CANCELLED"
+          - "increments Membership.version by 1"
+      - from: PAST_DUE
+        to: CANCELLED
+        trigger: "POST /memberships/{id}/cancel"
+        actor: SalonOwner
+        preconditions:
+          - "Membership.status IN {ACTIVE, PAST_DUE}"
+        side_effects:
+          - "set Membership.status = CANCELLED"
+          - "increments Membership.version by 1"
+
+# ---------------------------------------------------------------------------
+# 1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: booking-create-stale-stylist
+    parent_entity: Stylist
+    write_endpoint: "POST /appointments"
+    occ_field: "expected_stylist_version"
+    description: |
+      Booking an appointment against a Stylist whose version has advanced since the
+      client last observed the stylist's schedule is rejected. A prior booking for the
+      same stylist bumps Stylist.version (the serving stylist's schedule changed);
+      a second booking still carrying the older expected_stylist_version is therefore
+      operating on a stale view of that stylist's availability and is rejected.
+    error_id: ERR_STALE_STYLIST_VERSION
+    http_status: 412
+  - rule_id: clock-advance-stale-salon
+    parent_entity: Salon
+    write_endpoint: "POST /salons/{id}/_clock/advance"
+    occ_field: "expected_salon_version"
+    description: |
+      Advancing a Salon's simulated clock while carrying an expected_salon_version that
+      no longer matches is rejected. Each successful clock advance bumps Salon.version;
+      a second advance request built on the older observed version is stale and rejected,
+      preventing two independent advances from compounding on a view that has moved on.
+    error_id: ERR_STALE_SALON_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# 1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: appointment_service_quote
+    trigger: "POST /appointments (booking) — snapshots quoted_service_price_cents and deposit_held_cents"
+    algorithm: threshold
+    formula: |
+      # Membership discount is applied ONLY when the client has an ACTIVE membership at booking time.
+      if package_purchase_id is present:
+          # package-covered appointment: no service charge, deposit waived
+          quoted_service_price_cents = 0
+      else:
+          base = Service.base_price_cents
+          m = the client's Membership with status == ACTIVE on this salon (at most one), else none
+          if m is not None:
+              disc_pct = m.plan.service_discount_pct
+              # round the discounted price half-up at the cents level
+              quoted_service_price_cents = round_half_up(base * (1 - disc_pct))
+          else:
+              quoted_service_price_cents = base
+      deposit_held_cents = round_half_up(quoted_service_price_cents * Service.deposit_pct)
+    input_set: "The single ACTIVE Membership for this client (PAST_DUE/CANCELLED memberships are ignored); the booked Service; the optional PackagePurchase."
+    constants: {}
+    precision: "round_half_up at the cents level (integer cents result)"
+    variants:
+      - name: member_quote
+        when: "client has a Membership with status == ACTIVE at booking time and no package is used"
+        difference: "base price reduced by plan.service_discount_pct before rounding; produces a strictly lower quote than non_member_quote for the same Service when discount > 0"
+      - name: non_member_quote
+        when: "client has no ACTIVE membership (none, PAST_DUE, or CANCELLED) and no package is used"
+        difference: "quoted_service_price_cents == Service.base_price_cents (no discount)"
+
+  - name: stylist_service_earning
+    trigger: "POST /checkouts (completing an appointment) — computes Checkout.stylist_service_earning_cents and salon_service_earning_cents"
+    algorithm: aggregation
+    formula: |
+      rev = service_revenue_cents   # see service_revenue_recognized
+      if Stylist.compensation_model == COMMISSION:
+          stylist_service_earning_cents = round_half_up(rev * Stylist.commission_pct)
+          salon_service_earning_cents   = rev - stylist_service_earning_cents
+      elif Stylist.compensation_model == BOOTH_RENT:
+          # stylist keeps full service revenue minus a flat booth-rent fee owed to the salon;
+          # the salon's earning is exactly the booth rent (clamped to available revenue)
+          booth = min(Stylist.booth_rent_per_appt_cents, rev)
+          salon_service_earning_cents   = booth
+          stylist_service_earning_cents = rev - booth
+    input_set: "The single Stylist serving the Appointment; the recognized service_revenue_cents for this checkout."
+    constants: {}
+    precision: "round_half_up at the cents level"
+    variants:
+      - name: commission_split
+        when: "Stylist.compensation_model == COMMISSION"
+        difference: "stylist earns commission_pct of revenue; salon keeps the complement. For rev=10000, pct=0.40 -> stylist 4000, salon 6000."
+      - name: booth_rent_split
+        when: "Stylist.compensation_model == BOOTH_RENT"
+        difference: "stylist keeps revenue minus flat booth_rent_per_appt_cents; salon earns only the booth rent. For rev=10000, rent=1500 -> stylist 8500, salon 1500. Same revenue, different split than commission_split."
+
+  - name: service_revenue_recognized
+    trigger: "POST /checkouts — computes Checkout.service_revenue_cents"
+    algorithm: aggregation
+    formula: |
+      if Appointment.package_purchase_id is present:
+          service_revenue_cents = package_session_value(Package)   # per-session prepaid value
+      else:
+          service_revenue_cents = Appointment.quoted_service_price_cents   # snapshot from booking
+    input_set: "The Appointment's frozen quote OR its package's per-session value; never re-priced against current membership."
+    constants: {}
+    precision: "integer cents"
+
+  - name: package_session_value
+    trigger: "POST /checkouts for a package-redeemed appointment; also at package purchase for display"
+    algorithm: aggregation
+    formula: |
+      # Evaluation order is pinned: the per-session value is the package total divided
+      # by its session count, rounded half-up at the cents level ONCE.
+      per_session = round_half_up(Package.price_cents / Package.session_count)
+    input_set: "The Package referenced by the redeeming PackagePurchase."
+    constants: {}
+    precision: "round_half_up at the cents level; division performed before rounding"
+
+  - name: tip_distribution
+    trigger: "POST /checkouts — computes Checkout.stylist_tip_cents"
+    algorithm: aggregation
+    formula: |
+      # Salon.tip_split_policy decides the algorithm; rounding ORDER is pinned.
+      if Salon.tip_split_policy == DIRECT:
+          stylist_tip_cents = Checkout.tip_cents   # full tip to the serving stylist
+      elif Salon.tip_split_policy == POOLED:
+          # POOLED: divide evenly across all ACTIVE stylists in the salon, INCLUDING the server.
+          # Pinned order: compute the floor share per stylist FIRST, then assign the
+          # integer remainder cents one-by-one to stylists ordered by created_at ASC
+          # (the serving stylist receives a remainder cent only if its created_at rank
+          # falls within the first `remainder` stylists). The value reported for THIS
+          # checkout's stylist is that stylist's resulting share.
+          n = count of Stylist where salon_id == this salon AND status == ACTIVE
+          base_share = floor(Checkout.tip_cents / n)
+          remainder = Checkout.tip_cents - base_share * n
+          ranked = ACTIVE stylists sorted by created_at ASC (id NEVER used)
+          # the first `remainder` stylists in `ranked` get base_share + 1; the rest get base_share
+          stylist_tip_cents = base_share + (1 if serving stylist's rank < remainder else 0)
+    input_set: "ACTIVE stylists in the salon at checkout time; the entered tip_cents; the serving stylist's created_at rank."
+    constants: {}
+    precision: "integer cents; floor share computed first, remainder distributed by created_at ASC (NOT id)"
+    variants:
+      - name: direct_tip
+        when: "Salon.tip_split_policy == DIRECT"
+        difference: "serving stylist gets the entire tip; other stylists get 0."
+      - name: pooled_tip
+        when: "Salon.tip_split_policy == POOLED"
+        difference: "tip floored evenly across ACTIVE stylists; remainder cents to earliest-created stylists. For tip=1000 across 3 stylists -> shares 334/333/333 by created_at order. Same tip, different per-stylist result than direct_tip."
+
+  - name: retail_line_total
+    trigger: "POST /checkouts with retail lines — computes ProductSale.line_total_cents and Checkout.retail_revenue_cents"
+    algorithm: aggregation
+    formula: |
+      # ROUNDING ORDER IS PINNED: discount and round happen PER LINE, then lines are summed.
+      # (round-per-line-then-sum, NOT sum-then-round.)
+      member_active = client has a Membership with status == ACTIVE at checkout time
+      for each ProductSale line:
+          unit = ProductSku.unit_price_cents
+          if member_active:
+              eff_unit = round_half_up(unit * (1 - membership.plan.retail_discount_pct))
+          else:
+              eff_unit = unit
+          line_total_cents = eff_unit * quantity        # eff_unit already integer cents
+      retail_revenue_cents = sum over lines of line_total_cents
+    input_set: "All ProductSale lines on the checkout; the client's ACTIVE membership (if any) for retail discount."
+    constants: {}
+    precision: "round_half_up the per-unit discounted price at cents level, multiply by quantity, THEN sum lines (per-line rounding, pinned order)"
+
+# ---------------------------------------------------------------------------
+# 1.4 Validation Rules Table (ordered by priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "the acting role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "all path/body referenced resources exist (salon, then nested/referenced entities left-to-right); Client/Stylist/Resource/Service/Package belong to the salon in the path"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 4
+    category: state
+    check: "target entity is in a state permitting the requested transition (see §1.2 preconditions); e.g. checkout requires Appointment in {BOOKED, CONFIRMED}, void requires Checkout SETTLED"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "/appointments/*/confirm, /appointments/*/cancel, /appointments/*/no-show, /checkouts, /checkouts/*/void, /memberships/*/lapse, /memberships/*/reinstate, /memberships/*/cancel"
+  - priority: 5
+    category: business_referential
+    check: "Service.requires_room consistency: a CHAIR service must reference a CHAIR resource and a ROOM service a ROOM resource; package_purchase_id (if present) must belong to the booking client and reference a Package whose service_id == the booked service_id"
+    error_id: ERR_RESOURCE_TYPE_MISMATCH
+    http_status: 422
+    applies_to: "POST /appointments"
+  - priority: 6
+    category: business_constraint
+    check: "the booking Client is permitted to be booked: self-booking by a SUSPENDED or ARCHIVED Client (acting as Client) is rejected; FrontDesk may book SUSPENDED but not ARCHIVED clients"
+    error_id: ERR_CLIENT_NOT_BOOKABLE
+    http_status: 422
+    applies_to: "POST /appointments"
+  - priority: 7
+    category: business_temporal
+    check: "start_utc is strictly after Salon.current_utc (no booking in the past or at exactly now)"
+    error_id: ERR_BOOKING_IN_PAST
+    http_status: 422
+    applies_to: "POST /appointments"
+  - priority: 8
+    category: business_constraint
+    check: "referenced Stylist.status == ACTIVE and Resource.status == ACTIVE at booking time"
+    error_id: ERR_RESOURCE_INACTIVE
+    http_status: 422
+    applies_to: "POST /appointments"
+  - priority: 9
+    category: business_temporal
+    check: "the serving Stylist has no overlapping appointment: the buffer-padded interval [start - buffer, end + buffer) must not overlap any non-terminal (BOOKED/CONFIRMED) appointment's buffer-padded interval for the same stylist"
+    error_id: ERR_STYLIST_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /appointments"
+  - priority: 10
+    category: business_temporal
+    check: "the Resource (chair/room) is single-occupancy: the bare occupancy interval [start, end) must not overlap any non-terminal appointment's [start, end) for the same resource (no buffer applied to resources; adjacency at the exact boundary is allowed)"
+    error_id: ERR_RESOURCE_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /appointments"
+  - priority: 11
+    category: business_constraint
+    check: "if package_purchase_id present, PackagePurchase.status == ACTIVE and sessions_remaining >= 1"
+    error_id: ERR_PACKAGE_EXHAUSTED
+    http_status: 422
+    applies_to: "POST /appointments"
+  - priority: 12
+    category: business_constraint
+    check: "checkout retail lines must not oversell: for each line, ProductSku.qty_on_hand >= quantity (checked against running on-hand within the request)"
+    error_id: ERR_INSUFFICIENT_STOCK
+    http_status: 422
+    applies_to: "POST /checkouts"
+  - priority: 13
+    category: business_constraint
+    check: "exactly one SETTLED Checkout per appointment; a second checkout for the same appointment is rejected"
+    error_id: ERR_ALREADY_CHECKED_OUT
+    http_status: 409
+    applies_to: "POST /checkouts"
+  - priority: 14
+    category: business_constraint
+    check: "OCC: expected_stylist_version (book) / expected_salon_version (clock advance) must match the current parent version"
+    error_id: ERR_STALE_STYLIST_VERSION
+    http_status: 412
+    applies_to: "POST /appointments, POST /salons/{id}/_clock/advance"
+  - priority: 15
+    category: business_constraint
+    check: "request body field-level validity: required fields present, enum members valid, numbers in declared ranges, email unique per salon for non-archived clients, sku unique per salon"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST/PATCH"
+
+# ---------------------------------------------------------------------------
+# 1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # ---- Salon ----
+  - method: POST
+    path: "/salons"
+    description: "Create a salon (tenant root)."
+    roles: [SalonOwner]
+    code: 201
+    input: ["name", "timezone?", "no_show_fee_pct?", "no_show_suspend_threshold?", "tip_split_policy?"]
+    output: Salon
+    side_effects: ["current_utc initialized to created_at"]
+  - method: GET
+    path: "/salons/{id}"
+    description: "Fetch a salon."
+    roles: [SalonOwner, FrontDesk, Stylist, Client]
+    code: 200
+    input: []
+    output: Salon
+    side_effects: []
+  - method: POST
+    path: "/salons/{id}/_clock/advance"
+    description: "Test-driving clock control: set the salon's simulated current_utc to a future timestamp. OCC-guarded on Salon.version."
+    roles: [SalonOwner]
+    code: 200
+    input: [to_iso8601, expected_salon_version]
+    output: Salon
+    side_effects: ["set Salon.current_utc = to_iso8601", "increments Salon.version by 1"]
+
+  # ---- Stylist ----
+  - method: POST
+    path: "/stylists"
+    description: "Create a stylist."
+    roles: [SalonOwner]
+    code: 201
+    input: ["salon_id", "full_name", "compensation_model", "status?", "commission_pct?", "booth_rent_per_appt_cents?", "buffer_minutes?"]
+    output: Stylist
+    side_effects: []
+  - method: GET
+    path: "/stylists/{id}"
+    description: "Fetch a stylist."
+    roles: [SalonOwner, FrontDesk, Stylist, Client]
+    code: 200
+    input: []
+    output: Stylist
+    side_effects: []
+  - method: GET
+    path: "/stylists"
+    description: "List stylists in a salon (paginated; optional status filter)."
+    roles: [SalonOwner, FrontDesk, Stylist, Client]
+    code: 200
+    input: ["salon_id?", "status?", "limit?", "offset?"]
+    output: Stylist[]
+    side_effects: []
+  - method: PATCH
+    path: "/stylists/{id}"
+    description: "Update a stylist's status or compensation config."
+    roles: [SalonOwner]
+    code: 200
+    input: ["status?", "compensation_model?", "commission_pct?", "booth_rent_per_appt_cents?", "buffer_minutes?"]
+    output: Stylist
+    side_effects: ["increments Stylist.version by 1"]
+
+  # ---- Resource ----
+  - method: POST
+    path: "/resources"
+    description: "Create a chair or room."
+    roles: [SalonOwner]
+    code: 201
+    input: ["salon_id", "label", "resource_type", "status?"]
+    output: Resource
+    side_effects: []
+  - method: GET
+    path: "/resources/{id}"
+    description: "Fetch a resource."
+    roles: [SalonOwner, FrontDesk, Stylist, Client]
+    code: 200
+    input: []
+    output: Resource
+    side_effects: []
+  - method: GET
+    path: "/resources"
+    description: "List resources (paginated; optional resource_type/status filter)."
+    roles: [SalonOwner, FrontDesk, Stylist, Client]
+    code: 200
+    input: ["salon_id?", "resource_type?", "status?", "limit?", "offset?"]
+    output: Resource[]
+    side_effects: []
+
+  # ---- Service ----
+  - method: POST
+    path: "/services"
+    description: "Create a catalog service."
+    roles: [SalonOwner]
+    code: 201
+    input: ["salon_id", "name", "duration_minutes", "base_price_cents", "deposit_pct?", "requires_room?"]
+    output: Service
+    side_effects: []
+  - method: GET
+    path: "/services/{id}"
+    description: "Fetch a service."
+    roles: [SalonOwner, FrontDesk, Stylist, Client]
+    code: 200
+    input: []
+    output: Service
+    side_effects: []
+  - method: GET
+    path: "/services"
+    description: "List services (paginated)."
+    roles: [SalonOwner, FrontDesk, Stylist, Client]
+    code: 200
+    input: ["salon_id?", "limit?", "offset?"]
+    output: Service[]
+    side_effects: []
+
+  # ---- Client ----
+  - method: POST
+    path: "/clients"
+    description: "Register a client. May be created by FrontDesk/SalonOwner or self-registered as Client."
+    roles: [SalonOwner, FrontDesk, Client]
+    code: 201
+    input: ["salon_id", "full_name", "email", "status?"]
+    output: Client
+    side_effects: []
+  - method: GET
+    path: "/clients/{id}"
+    description: "Fetch a client (includes no_show_strikes, wallet_credit_cents)."
+    roles: [SalonOwner, FrontDesk, Stylist, Client]
+    code: 200
+    input: []
+    output: Client
+    side_effects: []
+  - method: GET
+    path: "/clients"
+    description: "List clients (paginated; optional status filter; archived excluded unless status=ARCHIVED)."
+    roles: [SalonOwner, FrontDesk]
+    code: 200
+    input: ["salon_id?", "status?", "limit?", "offset?"]
+    output: Client[]
+    side_effects: []
+  - method: POST
+    path: "/clients/{id}/dispute-no-show"
+    description: "Reverse the most recent NO_SHOW strike for a client (decrement no_show_strikes, lift auto-suspension if it drops below threshold, credit any forfeited fee to wallet)."
+    roles: [SalonOwner]
+    code: 200
+    input: [appointment_id]
+    output: Client
+    side_effects: ["decrement Client.no_show_strikes by 1 (floor 0)", "if no_show_strikes < Salon.no_show_suspend_threshold and status == SUSPENDED: set status = ACTIVE", "credit forfeited no-show fee for the cited appointment to wallet_credit_cents", "increments Client.version by 1"]
+
+  # ---- MembershipPlan ----
+  - method: POST
+    path: "/membership-plans"
+    description: "Create a membership plan."
+    roles: [SalonOwner]
+    code: 201
+    input: ["salon_id", "name", "monthly_fee_cents", "service_discount_pct", "retail_discount_pct?"]
+    output: MembershipPlan
+    side_effects: []
+  - method: GET
+    path: "/membership-plans/{id}"
+    description: "Fetch a membership plan."
+    roles: [SalonOwner, FrontDesk, Client]
+    code: 200
+    input: []
+    output: MembershipPlan
+    side_effects: []
+  - method: GET
+    path: "/membership-plans"
+    description: "List membership plans (paginated)."
+    roles: [SalonOwner, FrontDesk, Client]
+    code: 200
+    input: ["salon_id?", "limit?", "offset?"]
+    output: MembershipPlan[]
+    side_effects: []
+
+  # ---- Membership ----
+  - method: POST
+    path: "/memberships"
+    description: "Enroll a client in a plan (ACTIVE)."
+    roles: [SalonOwner, FrontDesk]
+    code: 201
+    input: [client_id, plan_id]
+    output: Membership
+    side_effects: []
+  - method: GET
+    path: "/memberships/{id}"
+    description: "Fetch a membership."
+    roles: [SalonOwner, FrontDesk, Client]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: []
+  - method: GET
+    path: "/memberships"
+    description: "List memberships (paginated; optional client_id / plan_id / status filter)."
+    roles: [SalonOwner, FrontDesk, Client]
+    code: 200
+    input: ["client_id?", "plan_id?", "status?", "limit?", "offset?"]
+    output: Membership[]
+    side_effects: []
+  - method: POST
+    path: "/memberships/{id}/lapse"
+    description: "Mark a membership PAST_DUE (suspend discounts)."
+    roles: [SalonOwner]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["set status = PAST_DUE", "increments Membership.version by 1"]
+  - method: POST
+    path: "/memberships/{id}/reinstate"
+    description: "Restore a PAST_DUE membership to ACTIVE."
+    roles: [SalonOwner]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["set status = ACTIVE", "increments Membership.version by 1"]
+  - method: POST
+    path: "/memberships/{id}/cancel"
+    description: "Cancel a membership (terminal)."
+    roles: [SalonOwner]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["set status = CANCELLED", "increments Membership.version by 1"]
+
+  # ---- Package ----
+  - method: POST
+    path: "/packages"
+    description: "Create a prepaid package for one service."
+    roles: [SalonOwner]
+    code: 201
+    input: ["salon_id", "service_id", "session_count", "price_cents"]
+    output: Package
+    side_effects: []
+  - method: GET
+    path: "/packages/{id}"
+    description: "Fetch a package (per-session value derivable)."
+    roles: [SalonOwner, FrontDesk, Client]
+    code: 200
+    input: []
+    output: Package
+    side_effects: []
+  - method: GET
+    path: "/packages"
+    description: "List packages (paginated; optional service_id filter)."
+    roles: [SalonOwner, FrontDesk, Client]
+    code: 200
+    input: ["salon_id?", "service_id?", "limit?", "offset?"]
+    output: Package[]
+    side_effects: []
+
+  # ---- PackagePurchase ----
+  - method: POST
+    path: "/package-purchases"
+    description: "A client purchases a package (sessions_remaining initialized to session_count)."
+    roles: [SalonOwner, FrontDesk, Client]
+    code: 201
+    input: ["client_id", "package_id"]
+    output: PackagePurchase
+    side_effects: ["sessions_remaining = Package.session_count", "status = ACTIVE"]
+  - method: GET
+    path: "/package-purchases/{id}"
+    description: "Fetch a package purchase (sessions_remaining)."
+    roles: [SalonOwner, FrontDesk, Client]
+    code: 200
+    input: []
+    output: PackagePurchase
+    side_effects: []
+  - method: GET
+    path: "/package-purchases"
+    description: "List package purchases (paginated; optional client_id / package_id filter)."
+    roles: [SalonOwner, FrontDesk, Client]
+    code: 200
+    input: ["client_id?", "package_id?", "limit?", "offset?"]
+    output: PackagePurchase[]
+    side_effects: []
+
+  # ---- ProductSku ----
+  - method: POST
+    path: "/product-skus"
+    description: "Create a retail SKU with starting inventory."
+    roles: [SalonOwner]
+    code: 201
+    input: ["salon_id", "sku", "name", "unit_price_cents", "qty_on_hand"]
+    output: ProductSku
+    side_effects: []
+  - method: GET
+    path: "/product-skus/{id}"
+    description: "Fetch a SKU (qty_on_hand)."
+    roles: [SalonOwner, FrontDesk]
+    code: 200
+    input: []
+    output: ProductSku
+    side_effects: []
+  - method: GET
+    path: "/product-skus"
+    description: "List SKUs (paginated)."
+    roles: [SalonOwner, FrontDesk]
+    code: 200
+    input: ["salon_id?", "limit?", "offset?"]
+    output: ProductSku[]
+    side_effects: []
+  - method: POST
+    path: "/product-skus/{id}/restock"
+    description: "Add units to a SKU's on-hand inventory."
+    roles: [SalonOwner]
+    code: 200
+    input: [quantity]
+    output: ProductSku
+    side_effects: ["qty_on_hand += quantity", "increments ProductSku.version by 1"]
+
+  # ---- Appointment ----
+  - method: POST
+    path: "/appointments"
+    description: "Book an appointment. OCC-guarded on Stylist.version. Snapshots quote + deposit."
+    roles: [SalonOwner, FrontDesk, Client]
+    code: 201
+    input: ["salon_id", "client_id", "stylist_id", "resource_id", "service_id", "start_utc", "expected_stylist_version", "package_purchase_id?"]
+    output: Appointment
+    side_effects: ["compute quoted_service_price_cents + deposit_held_cents (calc appointment_service_quote)", "compute end_utc", "status = BOOKED", "increments Stylist.version by 1"]
+  - method: GET
+    path: "/appointments/{id}"
+    description: "Fetch an appointment."
+    roles: [SalonOwner, FrontDesk, Stylist, Client]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: []
+  - method: GET
+    path: "/appointments"
+    description: "List appointments (paginated; optional client_id / stylist_id / resource_id / status filter)."
+    roles: [SalonOwner, FrontDesk, Stylist, Client]
+    code: 200
+    input: ["salon_id?", "client_id?", "stylist_id?", "resource_id?", "service_id?", "package_purchase_id?", "status?", "limit?", "offset?"]
+    output: Appointment[]
+    side_effects: []
+  - method: POST
+    path: "/appointments/{id}/confirm"
+    description: "Acknowledge a booked appointment."
+    roles: [SalonOwner, FrontDesk]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["status = CONFIRMED", "increments Appointment.version by 1"]
+  - method: POST
+    path: "/appointments/{id}/cancel"
+    description: "Cancel before start; refund deposit; restore package session."
+    roles: [SalonOwner, FrontDesk, Client]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["status = CANCELLED", "refund deposit to wallet", "restore package session if any", "increments Appointment.version by 1"]
+  - method: POST
+    path: "/appointments/{id}/no-show"
+    description: "Mark a no-show after start; forfeit fee from deposit; strike + conditional suspend."
+    roles: [SalonOwner, FrontDesk]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["status = NO_SHOW", "forfeit no-show fee, refund remainder to wallet", "Client.no_show_strikes++ -> conditional suspend", "restore package session if any", "increments Appointment.version by 1"]
+
+  # ---- Checkout ----
+  - method: POST
+    path: "/checkouts"
+    description: "Complete an appointment: create the settled checkout, compute revenue/split/tip/retail, redeem package, decrement inventory."
+    roles: [SalonOwner, FrontDesk]
+    code: 201
+    input: ["appointment_id", "tip_cents?", "retail_lines?"]
+    output: Checkout
+    side_effects: ["Appointment.status = COMPLETED", "compute service_revenue/stylist+salon split/tip split/retail", "redeem package session if any", "decrement ProductSku.qty_on_hand per line", "increments Appointment.version by 1"]
+  - method: GET
+    path: "/checkouts/{id}"
+    description: "Fetch a checkout (all computed money fields)."
+    roles: [SalonOwner, FrontDesk, Stylist]
+    code: 200
+    input: []
+    output: Checkout
+    side_effects: []
+  - method: GET
+    path: "/checkouts"
+    description: "List checkouts (paginated; optional appointment_id / status filter)."
+    roles: [SalonOwner, FrontDesk, Stylist]
+    code: 200
+    input: ["appointment_id?", "status?", "limit?", "offset?"]
+    output: Checkout[]
+    side_effects: []
+  - method: POST
+    path: "/checkouts/{id}/void"
+    description: "Void a settled checkout: restore inventory + package session, reclassify appointment as NO_SHOW (compensating action)."
+    roles: [SalonOwner]
+    code: 200
+    input: []
+    output: Checkout
+    side_effects: ["status = VOIDED", "restore ProductSku.qty_on_hand per line", "restore package session if any", "Appointment.status = NO_SHOW + strike cascade", "increments Checkout.version by 1"]
+  - method: GET
+    path: "/checkouts/{id}/product-sales"
+    description: "List the retail line items recorded under a checkout."
+    roles: [SalonOwner, FrontDesk, Stylist]
+    code: 200
+    input: []
+    output: ProductSale[]
+    side_effects: []
+  - method: GET
+    path: "/product-sales/{id}"
+    description: "Fetch a single product sale line."
+    roles: [SalonOwner, FrontDesk]
+    code: 200
+    input: []
+    output: ProductSale
+    side_effects: []
+  - method: GET
+    path: "/product-sales"
+    description: "List product sales (paginated; optional checkout_id / product_sku_id filter)."
+    roles: [SalonOwner, FrontDesk]
+    code: 200
+    input: ["checkout_id?", "product_sku_id?", "limit?", "offset?"]
+    output: ProductSale[]
+    side_effects: []
+
+# ---------------------------------------------------------------------------
+# 1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID header."
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Authenticated role lacks permission for this operation (per §1.7), or an entity_backed actor targets a resource it does not own."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced salon/stylist/resource/service/client/plan/membership/package/package-purchase/appointment/checkout does not exist or belongs to a different salon."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target entity is not in a state that permits the requested transition (e.g. checkout on a COMPLETED appointment, void on a VOIDED checkout, cancel after start, no-show before start, reinstate a non-PAST_DUE membership)."
+  - id: ERR_RESOURCE_TYPE_MISMATCH
+    http: 422
+    condition: "Service.requires_room vs Resource.resource_type mismatch, or package_purchase_id references a package whose service_id != booked service or a purchase not owned by the client."
+  - id: ERR_CLIENT_NOT_BOOKABLE
+    http: 422
+    condition: "Booking a Client whose status forbids it: self-book by SUSPENDED/ARCHIVED client, or any booking of an ARCHIVED client."
+  - id: ERR_BOOKING_IN_PAST
+    http: 422
+    condition: "start_utc is not strictly after Salon.current_utc."
+  - id: ERR_RESOURCE_INACTIVE
+    http: 422
+    condition: "Referenced Stylist is INACTIVE or Resource is OUT_OF_SERVICE at booking time."
+  - id: ERR_STYLIST_DOUBLE_BOOKED
+    http: 409
+    condition: "The serving stylist's buffer-padded interval overlaps an existing non-terminal appointment for that stylist."
+  - id: ERR_RESOURCE_DOUBLE_BOOKED
+    http: 409
+    condition: "The chair/room's occupancy interval overlaps an existing non-terminal appointment for that resource."
+  - id: ERR_PACKAGE_EXHAUSTED
+    http: 422
+    condition: "package_purchase_id references a purchase with status EXHAUSTED or sessions_remaining < 1."
+  - id: ERR_INSUFFICIENT_STOCK
+    http: 422
+    condition: "A checkout retail line requests more units than ProductSku.qty_on_hand (cumulative within the request)."
+  - id: ERR_ALREADY_CHECKED_OUT
+    http: 409
+    condition: "A SETTLED Checkout already exists for the appointment."
+  - id: ERR_STALE_STYLIST_VERSION
+    http: 412
+    condition: "expected_stylist_version on booking does not match current Stylist.version."
+  - id: ERR_STALE_SALON_VERSION
+    http: 412
+    condition: "expected_salon_version on clock advance does not match current Salon.version."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Malformed body: missing required field, invalid enum, out-of-range number, non-unique email/sku, negative quantity, or pagination param out of bounds."
+  - id: ERR_DISPUTE_TARGET_INVALID
+    http: 422
+    condition: "dispute-no-show cites an appointment that is not a NO_SHOW belonging to this client, or the client has no strikes to reverse."
+
+# ---------------------------------------------------------------------------
+# 1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: SalonOwner
+    description: "Owner/operator. Configures catalog (services, resources, stylists, plans, packages, SKUs), runs clock, voids checkouts, manages memberships and disputes."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /salons"
+      - "POST /stylists"
+      - "PATCH /stylists/{id}"
+      - "POST /resources"
+      - "POST /services"
+      - "POST /membership-plans"
+      - "POST /packages"
+      - "POST /product-skus"
+      - "POST /product-skus/{id}/restock"
+      - "POST /salons/{id}/_clock/advance"
+      - "POST /memberships/{id}/lapse"
+      - "POST /memberships/{id}/reinstate"
+      - "POST /memberships/{id}/cancel"
+      - "POST /checkouts/{id}/void"
+      - "POST /clients/{id}/dispute-no-show"
+    shared_operations:
+      - "POST /clients"
+      - "POST /memberships"
+      - "POST /package-purchases"
+      - "POST /appointments"
+      - "POST /appointments/{id}/confirm"
+      - "POST /appointments/{id}/cancel"
+      - "POST /appointments/{id}/no-show"
+      - "POST /checkouts"
+      - "all GET reads"
+  - name: FrontDesk
+    description: "Desk staff. Books/confirms/cancels/no-shows appointments, runs checkouts, registers clients, enrolls memberships, sells packages. Cannot configure catalog or void/dispute."
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /clients"
+      - "POST /memberships"
+      - "POST /package-purchases"
+      - "POST /appointments"
+      - "POST /appointments/{id}/confirm"
+      - "POST /appointments/{id}/cancel"
+      - "POST /appointments/{id}/no-show"
+      - "POST /checkouts"
+      - "all GET reads"
+  - name: Stylist
+    description: "Service provider. Read-only access to own and salon schedule/checkouts. Cannot book or check out (peer role, non-overlapping write surface)."
+    identity: "entity_backed:Stylist"
+    exclusive_operations: []
+    shared_operations:
+      - "all GET reads (appointments, checkouts, stylists, resources, services)"
+  - name: Client
+    description: "End customer. Self-registers, buys packages, self-books and self-cancels own appointments (only when ACTIVE). Acts only on own resources."
+    identity: "entity_backed:Client"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /clients"
+      - "POST /package-purchases"
+      - "POST /appointments"
+      - "POST /appointments/{id}/cancel"
+      - "own GET reads (own appointments, own memberships, own package-purchases, catalog)"

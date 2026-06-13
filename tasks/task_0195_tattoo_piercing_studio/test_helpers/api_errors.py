@@ -1,0 +1,53 @@
+"""Error IDs and HTTP status mapping (PRD §5 Error Code Catalogue).
+
+Registers the mapping with the framework so validate_error() can auto-check
+HTTP status codes from the error_id alone.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_CLIENT_NOT_VERIFIED = "ERR_CLIENT_NOT_VERIFIED"
+    ERR_UNDERAGE = "ERR_UNDERAGE"
+    ERR_WAIVER_MISSING = "ERR_WAIVER_MISSING"
+    ERR_INVALID_PRICING = "ERR_INVALID_PRICING"
+    ERR_REQUEST_NOT_APPROVED = "ERR_REQUEST_NOT_APPROVED"
+    ERR_INVALID_INTERVAL = "ERR_INVALID_INTERVAL"
+    ERR_ARTIST_DOUBLE_BOOKED = "ERR_ARTIST_DOUBLE_BOOKED"
+    ERR_CHAIR_UNAVAILABLE = "ERR_CHAIR_UNAVAILABLE"
+    ERR_DEPOSIT_NOT_PAYABLE = "ERR_DEPOSIT_NOT_PAYABLE"
+    ERR_DEPOSIT_NOT_MET = "ERR_DEPOSIT_NOT_MET"
+    ERR_TOUCHUP_PARENT_NOT_COMPLETED = "ERR_TOUCHUP_PARENT_NOT_COMPLETED"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    ERR_VALIDATION = "ERR_VALIDATION"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_REQUEST: 400,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_CLIENT_NOT_VERIFIED: 422,
+    ApiErrorId.ERR_UNDERAGE: 422,
+    ApiErrorId.ERR_WAIVER_MISSING: 422,
+    ApiErrorId.ERR_INVALID_PRICING: 422,
+    ApiErrorId.ERR_REQUEST_NOT_APPROVED: 422,
+    ApiErrorId.ERR_INVALID_INTERVAL: 422,
+    ApiErrorId.ERR_ARTIST_DOUBLE_BOOKED: 409,
+    ApiErrorId.ERR_CHAIR_UNAVAILABLE: 409,
+    ApiErrorId.ERR_DEPOSIT_NOT_PAYABLE: 422,
+    ApiErrorId.ERR_DEPOSIT_NOT_MET: 422,
+    ApiErrorId.ERR_TOUCHUP_PARENT_NOT_COMPLETED: 422,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_VALIDATION: 422,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

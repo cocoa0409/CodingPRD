@@ -1,0 +1,1630 @@
+scenario: "Butcher Shop & Custom Meat Counter: case inventory by cut & weight, custom-cut/grind order, holiday pre-order, weight-based pricing & shrink, dry-age locker tracking, half/quarter-animal share, sausage/recipe batch, food-safety temp log"
+domain_name: butcher-shop-meat-counter
+api_prefix: ""
+
+# =============================================================================
+# Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: quota_allocation
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - dual_variant_calculation        # estimated (ordered-weight) price vs final (catch-weight) price
+    - cascading_side_effects          # temp excursion -> locker quarantine -> aged lots ON_HOLD -> blocked orders
+    - derived_field_reconciliation    # InventoryLot.remaining_weight_g, AnimalShare.remaining_*_g
+    - optimistic_concurrency          # CREATE-with-supersede draw against a lot's version
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (InventoryLot, CustomOrder, AnimalShare,
+  # DryAgeLocker, SausageBatch, etc.). Sub-resources used only for append-only
+  # logs (temp readings, lot draws) and reverse-reachability GETs.
+
+  state_machine_shape: branching
+  # CustomOrder: fork into FILLED vs SHORT_FILLED with divergent side-effect sets,
+  # plus a CANCELLED revert branch. DryAgeLocker is posture-driven (quarantine
+  # gates its lots). AnimalShare has an aggregate/compound bubble-up to FULLY_CLAIMED.
+
+  relationship_patterns:
+    - one_to_many        # AnimalShare -> ShareClaim; DryAgeLocker -> TempReading; CustomOrder -> OrderLine
+    - many_to_many       # SausageBatch consumes many InventoryLot via BatchInput; OrderLine draws from InventoryLot
+    - cross_aggregate    # CustomOrder line draws from InventoryLot across aggregate boundary
+
+  role_model: peer_roles
+  # CounterClerk takes/fills orders; Butcher operates cuts/grinds/batches/aging;
+  # ShiftManager owns pricing config, holiday capacity, quarantine release;
+  # Customer is entity-backed and owns own orders/claims; SafetyOfficer logs temps.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Customer display name."
+      - name: phone
+        type: string
+        source: input
+        description: "Contact phone; used for pre-order pickup notification."
+      - name: loyalty_tier
+        type: enum
+        source: input
+        default: STANDARD
+        description: "Pricing tier."
+        constraints: "one of {STANDARD, PREFERRED, WHOLESALE}"
+      - name: store_credit_cents
+        type: integer
+        source: system
+        default: 0
+        description: "Refundable store credit balance in cents; credited on deposit refunds and overcharge corrections."
+
+  - name: CutType
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: "Short cut code, e.g. RIBEYE, GROUND_CHUCK."
+        constraints: "unique across CutType; uppercase alphanumeric+underscore"
+      - name: species
+        type: enum
+        source: input
+        description: "Animal species this cut belongs to."
+        constraints: "one of {BEEF, PORK, LAMB, POULTRY}"
+      - name: base_price_cents_per_kg
+        type: integer
+        source: input
+        description: "List price per kilogram in cents before tier discount and shrink."
+        constraints: ">= 1"
+      - name: is_grind
+        type: boolean
+        source: input
+        default: false
+        description: "True if this cut is produced by grinding (affects shrink rule selection)."
+      - name: requires_dry_age
+        type: boolean
+        source: input
+        default: false
+        description: "True if a lot of this cut must complete dry-aging before sale."
+
+  - name: PricingPolicy
+    parent: null
+    common_fields: true
+    fields:
+      - name: shrink_pct_whole_cut
+        type: number
+        source: input
+        description: "Fractional shrink applied to whole-cut catch weight, e.g. 0.04 = 4%."
+        constraints: ">= 0 and < 1"
+      - name: shrink_pct_grind
+        type: number
+        source: input
+        description: "Fractional shrink applied to grind catch weight."
+        constraints: ">= 0 and < 1"
+      - name: preferred_discount_pct
+        type: number
+        source: input
+        description: "Discount fraction for PREFERRED tier, e.g. 0.10."
+        constraints: ">= 0 and < 1"
+      - name: wholesale_discount_pct
+        type: number
+        source: input
+        description: "Discount fraction for WHOLESALE tier."
+        constraints: ">= 0 and < 1"
+      - name: bulk_threshold_g
+        type: integer
+        source: input
+        description: "Catch-weight grams at or above which the bulk rate applies."
+        constraints: ">= 1"
+      - name: bulk_extra_discount_pct
+        type: number
+        source: input
+        description: "Additional discount fraction applied to the portion at/above bulk_threshold_g."
+        constraints: ">= 0 and < 1"
+      - name: is_active
+        type: boolean
+        source: system
+        default: false
+        description: "True for the single active policy; ShiftManager activation deactivates the prior one."
+
+  - name: InventoryLot
+    parent: null
+    common_fields: true
+    fields:
+      - name: cut_type_id
+        type: string
+        source: input
+        description: "FK -> CutType.id; the cut this lot holds."
+      - name: source_share_id
+        type: string
+        source: input
+        default: null
+        description: "FK -> AnimalShare.id; set when this lot was broken out of a whole-animal share, else null."
+      - name: received_weight_g
+        type: integer
+        source: input
+        description: "Grams received into the case/locker."
+        constraints: ">= 1"
+      - name: remaining_weight_g
+        type: integer
+        source: computed
+        description: "received_weight_g minus sum of committed LotDraw.weight_g for non-reverted draws; reconciled on every draw and reversal."
+      - name: lot_status
+        type: enum
+        source: system
+        default: AVAILABLE
+        description: "Lifecycle state."
+        constraints: "one of {AVAILABLE, AGING, ON_HOLD, DEPLETED, DISCARDED}"
+      - name: locker_id
+        type: string
+        source: input
+        default: null
+        description: "FK -> DryAgeLocker.id; non-null while AGING in a locker, else null."
+      - name: aging_started_at
+        type: datetime
+        source: system
+        default: null
+        description: "UTC timestamp aging began; set on transition to AGING."
+      - name: aging_target_days
+        type: integer
+        source: input
+        default: 0
+        description: "Days the lot must age before it may return to AVAILABLE."
+        constraints: ">= 0"
+
+  - name: DryAgeLocker
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Locker label, e.g. LOCKER-A."
+        constraints: "unique across DryAgeLocker"
+      - name: capacity_g
+        type: integer
+        source: input
+        description: "Maximum grams of aging product the locker holds."
+        constraints: ">= 1"
+      - name: occupied_g
+        type: integer
+        source: computed
+        default: 0
+        description: "Sum of received_weight_g over InventoryLot with locker_id == this and lot_status == AGING; reconciled on every aging start/stop."
+      - name: min_temp_c
+        type: number
+        source: input
+        description: "Inclusive lower bound of the safe temperature band in Celsius."
+      - name: max_temp_c
+        type: number
+        source: input
+        description: "Inclusive upper bound of the safe temperature band in Celsius."
+        constraints: "max_temp_c >= min_temp_c"
+      - name: locker_status
+        type: enum
+        source: system
+        default: OPERATIONAL
+        description: "Posture; QUARANTINED gates all aging lots inside it."
+        constraints: "one of {OPERATIONAL, QUARANTINED}"
+      - name: last_excursion_at
+        type: datetime
+        source: system
+        default: null
+        description: "UTC timestamp of the most recent out-of-band reading that quarantined the locker."
+
+  - name: TempReading
+    parent: DryAgeLocker
+    common_fields: false
+    fields:
+      - name: locker_id
+        type: string
+        source: input
+        description: "FK -> DryAgeLocker.id; the locker this reading belongs to."
+      - name: temp_c
+        type: number
+        source: input
+        description: "Measured temperature in Celsius."
+      - name: reading_at
+        type: datetime
+        source: input
+        description: "UTC timestamp the reading was taken (client-supplied; append-only)."
+      - name: in_band
+        type: boolean
+        source: computed
+        description: "True iff min_temp_c <= temp_c <= max_temp_c for the parent locker at log time."
+      - name: triggered_quarantine
+        type: boolean
+        source: computed
+        description: "True iff this reading caused the locker to transition OPERATIONAL -> QUARANTINED."
+
+  - name: AnimalShare
+    parent: null
+    common_fields: true
+    fields:
+      - name: species
+        type: enum
+        source: input
+        description: "Animal species."
+        constraints: "one of {BEEF, PORK, LAMB, POULTRY}"
+      - name: carcass_weight_g
+        type: integer
+        source: input
+        description: "Hanging carcass weight in grams available to divide into shares."
+        constraints: ">= 1"
+      - name: deposit_cents
+        type: integer
+        source: input
+        description: "Deposit per WHOLE-equivalent unit; quarter pays 1/4, half pays 1/2."
+        constraints: ">= 0"
+      - name: claimed_fraction_x4
+        type: integer
+        source: computed
+        default: 0
+        description: "Sum of claimed fractions expressed in quarter units (HALF=2, QUARTER=1) over non-reverted ShareClaim; reconciled on claim/cancel."
+      - name: remaining_carcass_g
+        type: integer
+        source: computed
+        description: "carcass_weight_g * (4 - claimed_fraction_x4) / 4, floored to integer grams; reconciled on every claim/cancel."
+      - name: share_status
+        type: enum
+        source: system
+        default: OPEN
+        description: "Lifecycle; FULLY_CLAIMED when claimed_fraction_x4 == 4."
+        constraints: "one of {OPEN, FULLY_CLAIMED, BROKEN_DOWN, CANCELLED}"
+
+  - name: ShareClaim
+    parent: null
+    common_fields: true
+    fields:
+      - name: animal_share_id
+        type: string
+        source: input
+        description: "FK -> AnimalShare.id; the share being claimed."
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the claiming customer."
+      - name: fraction
+        type: enum
+        source: input
+        description: "Portion claimed."
+        constraints: "one of {QUARTER, HALF}"
+      - name: deposit_paid_cents
+        type: integer
+        source: computed
+        description: "deposit_cents * (1 for QUARTER, 2 for HALF) charged at claim; refunded to store credit on cancel."
+      - name: claim_status
+        type: enum
+        source: system
+        default: ACTIVE
+        description: "Lifecycle."
+        constraints: "one of {ACTIVE, CANCELLED}"
+
+  - name: CustomOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the ordering customer."
+      - name: order_kind
+        type: enum
+        source: input
+        description: "STANDARD fills immediately from the case; HOLIDAY is a dated pre-order against capacity."
+        constraints: "one of {STANDARD, HOLIDAY}"
+      - name: pickup_date
+        type: datetime
+        source: input
+        default: null
+        description: "Required for HOLIDAY orders; the holiday pickup day."
+      - name: holiday_window_id
+        type: string
+        source: input
+        default: null
+        description: "FK -> HolidayWindow.id; non-null for HOLIDAY orders, else null."
+      - name: deposit_cents
+        type: integer
+        source: computed
+        default: 0
+        description: "For HOLIDAY orders: HOLIDAY_DEPOSIT_RATE * estimated_total_cents, round_half_up; charged on placement; 0 for STANDARD."
+      - name: estimated_total_cents
+        type: integer
+        source: computed
+        description: "Sum over OrderLine of est_line_cents at placement (ordered-weight pricing)."
+      - name: final_total_cents
+        type: integer
+        source: computed
+        default: null
+        description: "Sum over OrderLine of final_line_cents after all lines drawn (catch-weight pricing); null until filled."
+      - name: order_status
+        type: enum
+        source: system
+        default: PLACED
+        description: "Lifecycle."
+        constraints: "one of {PLACED, CONFIRMED, FILLED, SHORT_FILLED, CANCELLED}"
+
+  - name: OrderLine
+    parent: CustomOrder
+    common_fields: true
+    fields:
+      - name: custom_order_id
+        type: string
+        source: input
+        description: "FK -> CustomOrder.id; the parent order."
+      - name: cut_type_id
+        type: string
+        source: input
+        description: "FK -> CutType.id; the requested cut."
+      - name: ordered_weight_g
+        type: integer
+        source: input
+        description: "Requested grams for this line."
+        constraints: ">= 1"
+      - name: catch_weight_g
+        type: integer
+        source: system
+        default: null
+        description: "Actual grams cut/weighed at fill time; set when the line is drawn from a lot."
+      - name: est_line_cents
+        type: integer
+        source: computed
+        description: "Estimated price using ordered_weight_g at placement (ordered-weight pricing)."
+      - name: final_line_cents
+        type: integer
+        source: computed
+        default: null
+        description: "Final price using catch_weight_g and shrink at fill (catch-weight pricing); null until drawn."
+      - name: drawn_lot_id
+        type: string
+        source: input
+        default: null
+        description: "FK -> InventoryLot.id; the lot this line was filled from; null until drawn."
+      - name: line_status
+        type: enum
+        source: system
+        default: PENDING
+        description: "Lifecycle."
+        constraints: "one of {PENDING, DRAWN, SHORTED}"
+
+  - name: LotDraw
+    parent: InventoryLot
+    common_fields: true
+    fields:
+      - name: inventory_lot_id
+        type: string
+        source: input
+        description: "FK -> InventoryLot.id; the lot drawn from."
+      - name: order_line_id
+        type: string
+        source: input
+        default: null
+        description: "FK -> OrderLine.id; the order line satisfied, or null for a batch-input draw."
+      - name: batch_input_id
+        type: string
+        source: input
+        default: null
+        description: "FK -> BatchInput.id; the sausage batch input satisfied, or null for an order-line draw."
+      - name: weight_g
+        type: integer
+        source: input
+        description: "Grams committed from the lot by this draw."
+        constraints: ">= 1"
+      - name: draw_status
+        type: enum
+        source: system
+        default: COMMITTED
+        description: "COMMITTED reduces remaining_weight_g; REVERTED restores it."
+        constraints: "one of {COMMITTED, REVERTED}"
+
+  - name: SausageBatch
+    parent: null
+    common_fields: true
+    fields:
+      - name: recipe_name
+        type: string
+        source: input
+        description: "Sausage recipe label."
+      - name: output_cut_type_id
+        type: string
+        source: input
+        description: "FK -> CutType.id; the cut produced (must have is_grind == true)."
+      - name: planned_output_g
+        type: integer
+        source: input
+        description: "Target grams of finished sausage."
+        constraints: ">= 1"
+      - name: actual_yield_g
+        type: integer
+        source: computed
+        default: null
+        description: "Sum of BatchInput.weight_g over the batch times (1 - shrink_pct_grind), floored; set when produced."
+      - name: batch_status
+        type: enum
+        source: system
+        default: DRAFT
+        description: "Lifecycle."
+        constraints: "one of {DRAFT, RESERVED, PRODUCED, CANCELLED}"
+
+  - name: BatchInput
+    parent: SausageBatch
+    common_fields: true
+    fields:
+      - name: sausage_batch_id
+        type: string
+        source: input
+        description: "FK -> SausageBatch.id; the parent batch."
+      - name: inventory_lot_id
+        type: string
+        source: input
+        description: "FK -> InventoryLot.id; the lot contributing meat to the batch."
+      - name: weight_g
+        type: integer
+        source: input
+        description: "Grams of this lot allocated to the batch."
+        constraints: ">= 1"
+
+  - name: HolidayWindow
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Holiday label, e.g. THANKSGIVING_2026."
+        constraints: "unique across HolidayWindow"
+      - name: pickup_date
+        type: datetime
+        source: input
+        description: "The single pickup day for this window."
+      - name: capacity_g
+        type: integer
+        source: input
+        description: "Total grams of pre-orders the shop can fulfill this window."
+        constraints: ">= 1"
+      - name: committed_g
+        type: integer
+        source: computed
+        default: 0
+        description: "Sum of estimated ordered grams over CustomOrder with this holiday_window_id and order_status IN {PLACED, CONFIRMED, FILLED, SHORT_FILLED}; reconciled on placement/cancel."
+      - name: cutoff_at
+        type: datetime
+        source: input
+        description: "UTC timestamp after which no new HOLIDAY orders may be placed against this window."
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: InventoryLot
+    initial_state: AVAILABLE
+    terminal_states: [DEPLETED, DISCARDED]
+    transitions:
+      - from: AVAILABLE
+        to: AGING
+        trigger: "POST /inventory-lots/{id}/start-aging"
+        actor: Butcher
+        preconditions:
+          - "CutType.requires_dry_age == true for this lot's cut_type_id"
+          - "target DryAgeLocker.locker_status == OPERATIONAL"
+          - "DryAgeLocker.occupied_g + InventoryLot.received_weight_g <= DryAgeLocker.capacity_g"
+          - "remaining_weight_g == received_weight_g (no draws taken yet)"
+        side_effects:
+          - "set locker_id to target locker; set aging_started_at = current UTC"
+          - "recompute DryAgeLocker.occupied_g (add received_weight_g)"
+        note: "Buffered capacity check is inclusive at equality (<=)."
+      - from: AGING
+        to: AVAILABLE
+        trigger: "POST /inventory-lots/{id}/complete-aging"
+        actor: Butcher
+        preconditions:
+          - "DryAgeLocker.locker_status == OPERATIONAL (lot's locker not quarantined)"
+          - "elapsed days since aging_started_at >= aging_target_days using current clock"
+        side_effects:
+          - "clear locker_id; recompute DryAgeLocker.occupied_g (subtract received_weight_g)"
+      - from: AGING
+        to: ON_HOLD
+        trigger: "system: locker quarantined by out-of-band TempReading"
+        actor: system
+        preconditions:
+          - "lot's locker_id == quarantined locker.id"
+        side_effects:
+          - "lot becomes unavailable for draws while ON_HOLD"
+        note: "Cascade hop 2 of the temp-excursion chain (locker QUARANTINED -> aging lots ON_HOLD)."
+      - from: ON_HOLD
+        to: AGING
+        trigger: "system: locker released by ShiftManager"
+        actor: system
+        preconditions:
+          - "lot's locker released to OPERATIONAL"
+        side_effects:
+          - "lot resumes aging; aging_started_at unchanged"
+      - from: ON_HOLD
+        to: DISCARDED
+        trigger: "POST /inventory-lots/{id}/discard"
+        actor: ShiftManager
+        preconditions: []
+        side_effects:
+          - "clear locker_id; recompute DryAgeLocker.occupied_g (subtract received_weight_g)"
+          - "set remaining_weight_g = 0"
+      - from: AVAILABLE
+        to: DEPLETED
+        trigger: "system: a LotDraw reduces remaining_weight_g to 0"
+        actor: system
+        preconditions:
+          - "remaining_weight_g == 0 after the committed draw"
+        side_effects:
+          - "lot can no longer be drawn from"
+        note: "Bubble-up: triggered by OrderLine draw or BatchInput draw."
+
+  - entity: DryAgeLocker
+    initial_state: OPERATIONAL
+    terminal_states: []
+    transitions:
+      - from: OPERATIONAL
+        to: QUARANTINED
+        trigger: "POST /dry-age-lockers/{id}/temp-readings (out-of-band reading)"
+        actor: SafetyOfficer
+        preconditions:
+          - "reading temp_c < min_temp_c OR temp_c > max_temp_c"
+        side_effects:
+          - "set last_excursion_at = reading.reading_at; set TempReading.triggered_quarantine = true"
+          - "cascade: every InventoryLot with locker_id == this and lot_status == AGING transitions AGING -> ON_HOLD"
+        note: "Cascade hop 1 of temp-excursion chain (reading -> locker QUARANTINED -> lots ON_HOLD)."
+      - from: QUARANTINED
+        to: OPERATIONAL
+        trigger: "POST /dry-age-lockers/{id}/release"
+        actor: ShiftManager
+        preconditions:
+          - "expected_dry_age_locker_version matches current version"
+        side_effects:
+          - "cascade: every InventoryLot with locker_id == this and lot_status == ON_HOLD transitions ON_HOLD -> AGING"
+
+  - entity: AnimalShare
+    initial_state: OPEN
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: OPEN
+        to: FULLY_CLAIMED
+        trigger: "system: a ShareClaim brings claimed_fraction_x4 to 4"
+        actor: system
+        preconditions:
+          - "claimed_fraction_x4 == 4 after the claim"
+        side_effects:
+          - "recompute remaining_carcass_g (becomes 0)"
+        note: "Compound bubble-up from ShareClaim creations."
+      - from: FULLY_CLAIMED
+        to: OPEN
+        trigger: "system: a ShareClaim cancel drops claimed_fraction_x4 below 4"
+        actor: system
+        preconditions:
+          - "claimed_fraction_x4 < 4 after the cancel"
+        side_effects:
+          - "recompute remaining_carcass_g (> 0)"
+        note: "Cyclic revert: OPEN <-> FULLY_CLAIMED as claims are added/cancelled."
+      - from: FULLY_CLAIMED
+        to: BROKEN_DOWN
+        trigger: "POST /animal-shares/{id}/break-down"
+        actor: Butcher
+        preconditions:
+          - "share_status == FULLY_CLAIMED"
+        side_effects:
+          - "spawn InventoryLot rows (source_share_id = this share) per the break-down payload"
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /animal-shares/{id}/cancel"
+        actor: ShiftManager
+        preconditions:
+          - "claimed_fraction_x4 == 0 (no active claims)"
+        side_effects: []
+
+  - entity: ShareClaim
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /share-claims/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "parent AnimalShare.share_status IN {OPEN, FULLY_CLAIMED} (not BROKEN_DOWN, not CANCELLED)"
+        side_effects:
+          - "refund deposit_paid_cents to Customer.store_credit_cents"
+          - "decrement AnimalShare.claimed_fraction_x4 by the claim's quarter units; recompute remaining_carcass_g"
+          - "if share was FULLY_CLAIMED and now claimed_fraction_x4 < 4, bubble share FULLY_CLAIMED -> OPEN"
+        note: "Compensation: forward claim charged deposit + raised fraction; cancel refunds + lowers fraction (conserves carcass grams)."
+
+  - entity: CustomOrder
+    initial_state: PLACED
+    terminal_states: [FILLED, SHORT_FILLED, CANCELLED]
+    transitions:
+      - from: PLACED
+        to: CONFIRMED
+        trigger: "POST /custom-orders/{id}/confirm"
+        actor: CounterClerk
+        preconditions:
+          - "order has >= 1 OrderLine"
+          - "for HOLIDAY orders: current clock <= HolidayWindow.cutoff_at"
+        side_effects:
+          - "order locked for fulfillment; no new lines may be added"
+      - from: CONFIRMED
+        to: FILLED
+        trigger: "POST /custom-orders/{id}/fill"
+        actor: Butcher
+        preconditions:
+          - "every OrderLine.line_status == DRAWN"
+        side_effects:
+          - "recompute final_total_cents = sum of final_line_cents (catch-weight pricing)"
+          - "if final_total_cents < deposit_cents (HOLIDAY), refund the difference to Customer.store_credit_cents"
+        note: "Branch A of the fork: all lines drawn -> FILLED."
+      - from: CONFIRMED
+        to: SHORT_FILLED
+        trigger: "POST /custom-orders/{id}/fill"
+        actor: Butcher
+        preconditions:
+          - ">= 1 OrderLine.line_status == SHORTED AND >= 1 OrderLine.line_status == DRAWN"
+        side_effects:
+          - "recompute final_total_cents = sum of final_line_cents over DRAWN lines only (SHORTED lines contribute 0)"
+          - "refund (deposit_cents - final_total_cents) to Customer.store_credit_cents when positive (HOLIDAY)"
+        note: "Branch B of the fork: divergent side-effect set — SHORTED lines excluded from final total."
+      - from: PLACED
+        to: CANCELLED
+        trigger: "POST /custom-orders/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "order_status == PLACED"
+        side_effects:
+          - "refund deposit_cents to Customer.store_credit_cents (HOLIDAY)"
+          - "recompute HolidayWindow.committed_g (subtract this order's ordered grams) for HOLIDAY orders"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /custom-orders/{id}/cancel"
+        actor: CounterClerk
+        preconditions:
+          - "no OrderLine.line_status == DRAWN (nothing drawn yet)"
+        side_effects:
+          - "refund deposit_cents to Customer.store_credit_cents (HOLIDAY)"
+          - "recompute HolidayWindow.committed_g (subtract this order's ordered grams) for HOLIDAY orders"
+
+  - entity: OrderLine
+    initial_state: PENDING
+    terminal_states: [DRAWN, SHORTED]
+    transitions:
+      - from: PENDING
+        to: DRAWN
+        trigger: "POST /order-lines/{id}/draw"
+        actor: Butcher
+        preconditions:
+          - "parent CustomOrder.order_status == CONFIRMED"
+          - "target InventoryLot.lot_status == AVAILABLE"
+          - "target InventoryLot.cut_type_id == this line's cut_type_id"
+          - "InventoryLot.remaining_weight_g >= catch_weight_g supplied in the draw"
+          - "expected_inventory_lot_version matches the lot's current version"
+        side_effects:
+          - "create COMMITTED LotDraw(weight_g = catch_weight_g); reduce InventoryLot.remaining_weight_g; increment InventoryLot.version"
+          - "set catch_weight_g, drawn_lot_id; recompute final_line_cents (catch-weight pricing)"
+          - "if InventoryLot.remaining_weight_g == 0, bubble lot AVAILABLE -> DEPLETED"
+      - from: PENDING
+        to: SHORTED
+        trigger: "POST /order-lines/{id}/short"
+        actor: Butcher
+        preconditions:
+          - "parent CustomOrder.order_status == CONFIRMED"
+        side_effects:
+          - "set final_line_cents = 0; line excluded from final order total"
+        note: "Used when no lot can satisfy the line; drives the order toward SHORT_FILLED."
+
+  - entity: SausageBatch
+    initial_state: DRAFT
+    terminal_states: [PRODUCED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: RESERVED
+        trigger: "POST /sausage-batches/{id}/reserve"
+        actor: Butcher
+        preconditions:
+          - "batch has >= 1 BatchInput"
+          - "for each BatchInput: InventoryLot.lot_status == AVAILABLE AND remaining_weight_g >= BatchInput.weight_g"
+        side_effects:
+          - "for each BatchInput: create COMMITTED LotDraw(weight_g = BatchInput.weight_g); reduce that lot's remaining_weight_g; increment that lot's version"
+          - "for each lot reduced to remaining_weight_g == 0: bubble AVAILABLE -> DEPLETED"
+      - from: RESERVED
+        to: PRODUCED
+        trigger: "POST /sausage-batches/{id}/produce"
+        actor: Butcher
+        preconditions:
+          - "batch_status == RESERVED"
+        side_effects:
+          - "recompute actual_yield_g = floor(sum(BatchInput.weight_g) * (1 - shrink_pct_grind))"
+          - "create a new InventoryLot(cut_type_id = output_cut_type_id, received_weight_g = actual_yield_g, lot_status = AVAILABLE)"
+      - from: RESERVED
+        to: CANCELLED
+        trigger: "POST /sausage-batches/{id}/cancel"
+        actor: Butcher
+        preconditions:
+          - "batch_status == RESERVED"
+        side_effects:
+          - "for each COMMITTED LotDraw of this batch: set draw_status = REVERTED; restore that lot's remaining_weight_g; if lot was DEPLETED and now remaining_weight_g > 0, revert DEPLETED -> AVAILABLE; increment that lot's version"
+        note: "Compensation: reserve committed draws; cancel reverts them (conserves lot grams)."
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /sausage-batches/{id}/cancel"
+        actor: Butcher
+        preconditions:
+          - "batch_status == DRAFT"
+        side_effects: []
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: lot-draw-stale-version
+    parent_entity: InventoryLot
+    write_endpoint: "POST /order-lines/{id}/draw"
+    occ_field: "expected_inventory_lot_version"
+    description: |
+      Drawing an OrderLine's catch weight from an InventoryLot whose version has
+      advanced since the client last observed it is rejected. A prior draw (for a
+      different order line or a sausage batch) legitimately reduces the lot's
+      remaining_weight_g and bumps its version; the current writer's view of the
+      lot is therefore stale and the committed grams it expected may no longer be
+      available.
+    error_id: ERR_STALE_LOT_VERSION
+    http_status: 412
+
+  - rule_id: locker-release-stale-version
+    parent_entity: DryAgeLocker
+    write_endpoint: "POST /dry-age-lockers/{id}/release"
+    occ_field: "expected_dry_age_locker_version"
+    description: |
+      Releasing a QUARANTINED DryAgeLocker whose version has advanced since the
+      client last observed it is rejected. A subsequent out-of-band TempReading or
+      another release attempt bumps the locker's version; releasing against a stale
+      view would resume aging on lots that a newer excursion may have re-held.
+    error_id: ERR_STALE_LOCKER_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: estimated_line_price
+    trigger: "on OrderLine creation (ordered-weight pricing); also re-summed on CustomOrder placement into estimated_total_cents"
+    algorithm: tiered_pricing
+    formula: |
+      # ESTIMATE variant: uses ordered_weight_g, applies NO shrink.
+      tier_pct = 0 if loyalty_tier == STANDARD
+                 else preferred_discount_pct if PREFERRED
+                 else wholesale_discount_pct  # WHOLESALE
+      # Bulk tier: portion at/above bulk_threshold_g gets bulk_extra_discount_pct
+      # applied AFTER the tier discount (multiplicative stacking on the bulk grams).
+      base_per_g = base_price_cents_per_kg / 1000.0
+      if ordered_weight_g >= bulk_threshold_g:
+          below_g = bulk_threshold_g - 1            # grams strictly below threshold
+          # NOTE: threshold boundary is INCLUSIVE — grams from bulk_threshold_g up get bulk rate.
+          bulk_g  = ordered_weight_g - (bulk_threshold_g)
+          normal_g = ordered_weight_g - bulk_g
+          normal_part = normal_g * base_per_g * (1 - tier_pct)
+          bulk_part   = bulk_g   * base_per_g * (1 - tier_pct) * (1 - bulk_extra_discount_pct)
+          est_line_cents = round_half_up(normal_part + bulk_part)   # round per line
+      else:
+          est_line_cents = round_half_up(ordered_weight_g * base_per_g * (1 - tier_pct))
+    input_set: "single OrderLine + its CutType + active PricingPolicy + ordering Customer.loyalty_tier"
+    constants:
+      G_PER_KG: 1000
+    precision: "round_half_up to whole cents per line, THEN sum lines for the order total"
+    variants:
+      - name: estimate
+        when: "at order placement / line creation"
+        difference: "uses ordered_weight_g; applies no shrink"
+
+  - name: final_line_price
+    trigger: "on OrderLine draw (POST /order-lines/{id}/draw); re-summed into final_total_cents on order fill"
+    algorithm: tiered_pricing
+    formula: |
+      # FINAL variant: uses catch_weight_g, applies shrink BEFORE pricing.
+      shrink = shrink_pct_grind if CutType.is_grind else shrink_pct_whole_cut
+      billable_g = floor(catch_weight_g * (1 - shrink))   # shrink reduces billable grams
+      tier_pct = 0 if STANDARD else preferred_discount_pct if PREFERRED else wholesale_discount_pct
+      base_per_g = base_price_cents_per_kg / 1000.0
+      if billable_g >= bulk_threshold_g:
+          bulk_g   = billable_g - (bulk_threshold_g)
+          normal_g = billable_g - bulk_g
+          normal_part = normal_g * base_per_g * (1 - tier_pct)
+          bulk_part   = bulk_g   * base_per_g * (1 - tier_pct) * (1 - bulk_extra_discount_pct)
+          final_line_cents = round_half_up(normal_part + bulk_part)
+      else:
+          final_line_cents = round_half_up(billable_g * base_per_g * (1 - tier_pct))
+    input_set: "single OrderLine (catch_weight_g) + its CutType + active PricingPolicy + Customer.loyalty_tier"
+    constants:
+      G_PER_KG: 1000
+    precision: "round_half_up to whole cents per line, THEN sum DRAWN lines for final_total_cents"
+    variants:
+      - name: final
+        when: "at line draw / order fill"
+        difference: "uses catch_weight_g reduced by shrink; SHORTED lines contribute 0 cents"
+
+  - name: holiday_deposit
+    trigger: "on HOLIDAY CustomOrder placement"
+    algorithm: threshold
+    formula: |
+      # deposit is a fixed fraction of the ESTIMATED total, rounded once on the total.
+      deposit_cents = round_half_up(estimated_total_cents * HOLIDAY_DEPOSIT_RATE)
+    input_set: "the order's estimated_total_cents (sum of est_line_cents over its lines)"
+    constants:
+      HOLIDAY_DEPOSIT_RATE: 0.25
+    precision: "round_half_up on the order-level total (NOT per line)"
+    variants: []
+
+  - name: holiday_capacity_committed
+    trigger: "on HOLIDAY CustomOrder placement and on its cancel"
+    algorithm: aggregation
+    formula: |
+      # committed_g = sum of ordered grams over live holiday orders in this window.
+      committed_g = sum(
+        sum(line.ordered_weight_g for line in order.lines)
+        for order in CustomOrder
+        if order.holiday_window_id == window.id
+        and order.order_status IN {PLACED, CONFIRMED, FILLED, SHORT_FILLED}
+      )
+      # acceptance gate at placement (INCLUSIVE at equality):
+      reject if committed_g_after_placement > HolidayWindow.capacity_g
+    input_set: "all CustomOrder with this holiday_window_id and order_status NOT IN {CANCELLED}"
+    constants: {}
+    precision: "integer grams; tie at capacity_g exactly is ACCEPTED (committed_g == capacity_g is allowed)"
+    variants: []
+
+  - name: share_remaining_carcass
+    trigger: "on ShareClaim creation and cancel (recompute AnimalShare.remaining_carcass_g)"
+    algorithm: aggregation
+    formula: |
+      # claimed_fraction_x4 in quarter units: QUARTER=1, HALF=2.
+      claimed_fraction_x4 = sum(
+        (1 if c.fraction == QUARTER else 2)
+        for c in ShareClaim
+        if c.animal_share_id == share.id and c.claim_status == ACTIVE
+      )
+      remaining_carcass_g = floor(carcass_weight_g * (4 - claimed_fraction_x4) / 4)
+      # acceptance gate at claim (INCLUSIVE): a claim is allowed only if
+      # claimed_fraction_x4 + requested_units <= 4.
+    input_set: "all ACTIVE ShareClaim for this AnimalShare"
+    constants:
+      WHOLE_UNITS: 4
+    precision: "integer grams, floor; over-claim past 4 quarter-units is rejected"
+    variants: []
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: auth
+    check: "for Customer-owned operations, X-User-ID equals the resource's customer_id"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /custom-orders/{id}/cancel, POST /share-claims/{id}/cancel"
+
+  - priority: 4
+    category: existence
+    check: "all path and FK-referenced resources exist (validated left-to-right in path)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 5
+    category: state
+    check: "target resource is in a state from which the requested transition is defined"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6
+    category: state
+    check: "lot draw target InventoryLot.lot_status == AVAILABLE (not AGING/ON_HOLD/DEPLETED/DISCARDED)"
+    error_id: ERR_LOT_NOT_AVAILABLE
+    http_status: 409
+    applies_to: "POST /order-lines/{id}/draw, POST /sausage-batches/{id}/reserve"
+
+  - priority: 7
+    category: business_safety
+    check: "cannot complete-aging a lot whose locker is QUARANTINED, nor draw from an ON_HOLD lot"
+    error_id: ERR_LOCKER_QUARANTINED
+    http_status: 409
+    applies_to: "POST /inventory-lots/{id}/complete-aging, POST /order-lines/{id}/draw, POST /sausage-batches/{id}/reserve"
+
+  - priority: 8
+    category: business_safety
+    check: "complete-aging requires elapsed days since aging_started_at >= aging_target_days (current clock)"
+    error_id: ERR_AGING_NOT_COMPLETE
+    http_status: 409
+    applies_to: "POST /inventory-lots/{id}/complete-aging"
+
+  - priority: 9
+    category: business_temporal
+    check: "HOLIDAY order placement and confirm require current clock <= HolidayWindow.cutoff_at"
+    error_id: ERR_WINDOW_CUTOFF_PASSED
+    http_status: 422
+    applies_to: "POST /custom-orders, POST /custom-orders/{id}/confirm"
+
+  - priority: 10
+    category: business_referential
+    check: "OrderLine draw: lot's cut_type_id must equal the line's cut_type_id"
+    error_id: ERR_CUT_TYPE_MISMATCH
+    http_status: 422
+    applies_to: "POST /order-lines/{id}/draw"
+
+  - priority: 11
+    category: business_referential
+    check: "SausageBatch output_cut_type_id must reference a CutType with is_grind == true"
+    error_id: ERR_OUTPUT_NOT_GRIND
+    http_status: 422
+    applies_to: "POST /sausage-batches"
+
+  - priority: 12
+    category: business_constraint
+    check: "ShareClaim fraction would push claimed_fraction_x4 above 4 quarter-units"
+    error_id: ERR_SHARE_OVERCOMMITTED
+    http_status: 409
+    applies_to: "POST /share-claims"
+
+  - priority: 13
+    category: business_constraint
+    check: "start-aging: DryAgeLocker.occupied_g + lot.received_weight_g would exceed capacity_g"
+    error_id: ERR_LOCKER_OVER_CAPACITY
+    http_status: 409
+    applies_to: "POST /inventory-lots/{id}/start-aging"
+
+  - priority: 14
+    category: business_constraint
+    check: "lot draw / batch reserve: requested weight_g exceeds InventoryLot.remaining_weight_g"
+    error_id: ERR_INSUFFICIENT_LOT_WEIGHT
+    http_status: 409
+    applies_to: "POST /order-lines/{id}/draw, POST /sausage-batches/{id}/reserve"
+
+  - priority: 15
+    category: business_fiscal
+    check: "HOLIDAY order placement: window committed_g + this order's ordered grams would exceed capacity_g"
+    error_id: ERR_HOLIDAY_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /custom-orders"
+
+  - priority: 16
+    category: state
+    check: "OCC: expected_<parent>_version must match the parent's current version"
+    error_id: ERR_STALE_LOT_VERSION
+    http_status: 412
+    applies_to: "POST /order-lines/{id}/draw"
+
+  - priority: 17
+    category: state
+    check: "OCC: expected_dry_age_locker_version must match the locker's current version"
+    error_id: ERR_STALE_LOCKER_VERSION
+    http_status: 412
+    applies_to: "POST /dry-age-lockers/{id}/release"
+
+  - priority: 18
+    category: business_constraint
+    check: "request body field presence/type/enum-membership/range conforms to the entity field constraints"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Customer ----
+  - method: POST
+    path: "/customers"
+    description: "Register a customer."
+    roles: [CounterClerk, ShiftManager]
+    code: 201
+    input: [full_name, phone, "loyalty_tier?"]
+    output: Customer
+    side_effects: ["store_credit_cents initialized to 0"]
+  - method: GET
+    path: "/customers/{id}"
+    description: "Fetch a customer (includes store_credit_cents)."
+    roles: [CounterClerk, ShiftManager, Customer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  # ---- CutType ----
+  - method: POST
+    path: "/cut-types"
+    description: "Create a cut type."
+    roles: [ShiftManager]
+    code: 201
+    input: [code, species, base_price_cents_per_kg, "is_grind?", "requires_dry_age?"]
+    output: CutType
+    side_effects: []
+  - method: GET
+    path: "/cut-types/{id}"
+    description: "Fetch a cut type."
+    roles: [CounterClerk, ShiftManager, Butcher, Customer]
+    code: 200
+    input: []
+    output: CutType
+    side_effects: []
+  - method: GET
+    path: "/cut-types"
+    description: "List cut types."
+    roles: [CounterClerk, ShiftManager, Butcher, Customer]
+    code: 200
+    input: ["species?", "limit?", "offset?"]
+    output: CutType[]
+    side_effects: []
+
+  # ---- PricingPolicy ----
+  - method: POST
+    path: "/pricing-policies"
+    description: "Create and activate a pricing policy; deactivates the prior active policy."
+    roles: [ShiftManager]
+    code: 201
+    input: [shrink_pct_whole_cut, shrink_pct_grind, preferred_discount_pct, wholesale_discount_pct, bulk_threshold_g, bulk_extra_discount_pct]
+    output: PricingPolicy
+    side_effects: ["set is_active = true on the new policy; set is_active = false on the previously active policy"]
+  - method: GET
+    path: "/pricing-policies/{id}"
+    description: "Fetch a pricing policy."
+    roles: [ShiftManager, CounterClerk, Butcher]
+    code: 200
+    input: []
+    output: PricingPolicy
+    side_effects: []
+
+  # ---- InventoryLot ----
+  - method: POST
+    path: "/inventory-lots"
+    description: "Receive a lot into the case."
+    roles: [Butcher, ShiftManager]
+    code: 201
+    input: [cut_type_id, received_weight_g, "aging_target_days?", "source_share_id?"]
+    output: InventoryLot
+    side_effects: ["remaining_weight_g initialized to received_weight_g; lot_status = AVAILABLE"]
+  - method: GET
+    path: "/inventory-lots/{id}"
+    description: "Fetch a lot (includes remaining_weight_g, lot_status)."
+    roles: [Butcher, ShiftManager, CounterClerk]
+    code: 200
+    input: []
+    output: InventoryLot
+    side_effects: []
+  - method: GET
+    path: "/inventory-lots"
+    description: "List lots; filter by cut_type_id, locker_id, source_share_id, or status."
+    roles: [Butcher, ShiftManager, CounterClerk]
+    code: 200
+    input: ["cut_type_id?", "locker_id?", "source_share_id?", "lot_status?", "limit?", "offset?"]
+    output: InventoryLot[]
+    side_effects: []
+  - method: POST
+    path: "/inventory-lots/{id}/start-aging"
+    description: "Move an AVAILABLE lot into a locker to begin dry-aging."
+    roles: [Butcher]
+    code: 200
+    input: [locker_id]
+    output: InventoryLot
+    side_effects: ["lot AVAILABLE -> AGING; set aging_started_at; recompute DryAgeLocker.occupied_g"]
+  - method: POST
+    path: "/inventory-lots/{id}/complete-aging"
+    description: "Return an aged lot to the case once the target days elapsed."
+    roles: [Butcher]
+    code: 200
+    input: []
+    output: InventoryLot
+    side_effects: ["lot AGING -> AVAILABLE; clear locker_id; recompute DryAgeLocker.occupied_g"]
+  - method: POST
+    path: "/inventory-lots/{id}/discard"
+    description: "Discard an ON_HOLD lot (e.g. after a temp excursion)."
+    roles: [ShiftManager]
+    code: 200
+    input: []
+    output: InventoryLot
+    side_effects: ["lot ON_HOLD -> DISCARDED; set remaining_weight_g = 0; recompute DryAgeLocker.occupied_g"]
+  - method: GET
+    path: "/inventory-lots/{id}/draws"
+    description: "List the LotDraw rows committed/reverted against this lot."
+    roles: [Butcher, ShiftManager]
+    code: 200
+    input: ["draw_status?", "limit?", "offset?"]
+    output: LotDraw[]
+    side_effects: []
+
+  # ---- DryAgeLocker ----
+  - method: POST
+    path: "/dry-age-lockers"
+    description: "Create a dry-age locker."
+    roles: [ShiftManager]
+    code: 201
+    input: [name, capacity_g, min_temp_c, max_temp_c]
+    output: DryAgeLocker
+    side_effects: ["locker_status = OPERATIONAL; occupied_g = 0"]
+  - method: GET
+    path: "/dry-age-lockers/{id}"
+    description: "Fetch a locker (includes occupied_g, locker_status)."
+    roles: [Butcher, ShiftManager, SafetyOfficer]
+    code: 200
+    input: []
+    output: DryAgeLocker
+    side_effects: []
+  - method: POST
+    path: "/dry-age-lockers/{id}/temp-readings"
+    description: "Append a food-safety temperature reading; out-of-band readings quarantine the locker and hold its aging lots."
+    roles: [SafetyOfficer]
+    code: 201
+    input: [temp_c, reading_at]
+    output: TempReading
+    side_effects: ["compute in_band; if out-of-band: locker OPERATIONAL -> QUARANTINED, set last_excursion_at, cascade aging lots AGING -> ON_HOLD, set triggered_quarantine = true"]
+  - method: GET
+    path: "/dry-age-lockers/{id}/temp-readings"
+    description: "List temperature readings for a locker (append-only log)."
+    roles: [SafetyOfficer, ShiftManager, Butcher]
+    code: 200
+    input: ["in_band?", "limit?", "offset?"]
+    output: TempReading[]
+    side_effects: []
+  - method: POST
+    path: "/dry-age-lockers/{id}/release"
+    description: "Release a QUARANTINED locker back to OPERATIONAL; resumes its held lots. OCC-guarded."
+    roles: [ShiftManager]
+    code: 200
+    input: [expected_dry_age_locker_version]
+    output: DryAgeLocker
+    side_effects: ["locker QUARANTINED -> OPERATIONAL; cascade ON_HOLD lots -> AGING; increment DryAgeLocker.version by 1"]
+
+  # ---- AnimalShare / ShareClaim ----
+  - method: POST
+    path: "/animal-shares"
+    description: "Open a whole-animal share for fractional claiming."
+    roles: [ShiftManager, Butcher]
+    code: 201
+    input: [species, carcass_weight_g, deposit_cents]
+    output: AnimalShare
+    side_effects: ["share_status = OPEN; claimed_fraction_x4 = 0; remaining_carcass_g = carcass_weight_g"]
+  - method: GET
+    path: "/animal-shares/{id}"
+    description: "Fetch a share (includes claimed_fraction_x4, remaining_carcass_g)."
+    roles: [ShiftManager, Butcher, Customer, CounterClerk]
+    code: 200
+    input: []
+    output: AnimalShare
+    side_effects: []
+  - method: POST
+    path: "/animal-shares/{id}/break-down"
+    description: "Break a FULLY_CLAIMED share into InventoryLot rows."
+    roles: [Butcher]
+    code: 200
+    input: [lots]
+    output: AnimalShare
+    side_effects: ["share FULLY_CLAIMED -> BROKEN_DOWN; spawn InventoryLot rows with source_share_id = this share"]
+  - method: POST
+    path: "/animal-shares/{id}/cancel"
+    description: "Cancel an OPEN, unclaimed share."
+    roles: [ShiftManager]
+    code: 200
+    input: []
+    output: AnimalShare
+    side_effects: ["share OPEN -> CANCELLED"]
+  - method: POST
+    path: "/share-claims"
+    description: "Claim a fraction (QUARTER/HALF) of an open share; charges deposit."
+    roles: [Customer, CounterClerk]
+    code: 201
+    input: [animal_share_id, customer_id, fraction]
+    output: ShareClaim
+    side_effects: ["charge deposit_paid_cents; increment AnimalShare.claimed_fraction_x4; recompute remaining_carcass_g; if fraction hits 4, bubble share OPEN -> FULLY_CLAIMED"]
+  - method: GET
+    path: "/share-claims/{id}"
+    description: "Fetch a share claim."
+    roles: [Customer, CounterClerk, ShiftManager]
+    code: 200
+    input: []
+    output: ShareClaim
+    side_effects: []
+  - method: GET
+    path: "/share-claims"
+    description: "List share claims; filter by animal_share_id or customer_id."
+    roles: [Customer, CounterClerk, ShiftManager]
+    code: 200
+    input: ["animal_share_id?", "customer_id?", "limit?", "offset?"]
+    output: ShareClaim[]
+    side_effects: []
+  - method: POST
+    path: "/share-claims/{id}/cancel"
+    description: "Cancel an active claim; refunds deposit to store credit and frees the fraction."
+    roles: [Customer]
+    code: 200
+    input: []
+    output: ShareClaim
+    side_effects: ["claim ACTIVE -> CANCELLED; refund deposit_paid_cents to store credit; decrement AnimalShare.claimed_fraction_x4; recompute remaining_carcass_g; bubble FULLY_CLAIMED -> OPEN if fraction falls below 4"]
+
+  # ---- HolidayWindow ----
+  - method: POST
+    path: "/holiday-windows"
+    description: "Create a holiday pre-order window with a capacity quota."
+    roles: [ShiftManager]
+    code: 201
+    input: [name, pickup_date, capacity_g, cutoff_at]
+    output: HolidayWindow
+    side_effects: ["committed_g = 0"]
+  - method: GET
+    path: "/holiday-windows/{id}"
+    description: "Fetch a holiday window (includes committed_g)."
+    roles: [ShiftManager, CounterClerk, Customer]
+    code: 200
+    input: []
+    output: HolidayWindow
+    side_effects: []
+  - method: GET
+    path: "/custom-orders"
+    description: "List custom orders; filter by customer_id or holiday_window_id."
+    roles: [CounterClerk, ShiftManager, Customer, Butcher]
+    code: 200
+    input: ["customer_id?", "holiday_window_id?", "order_status?", "limit?", "offset?"]
+    output: CustomOrder[]
+    side_effects: []
+
+  # ---- CustomOrder / OrderLine ----
+  - method: POST
+    path: "/custom-orders"
+    description: "Place a STANDARD or HOLIDAY order; HOLIDAY charges a deposit and reserves capacity."
+    roles: [Customer, CounterClerk]
+    code: 201
+    input: [customer_id, order_kind, lines, "holiday_window_id?", "pickup_date?"]
+    output: CustomOrder
+    side_effects: ["create OrderLine rows; compute est_line_cents + estimated_total_cents; for HOLIDAY: compute deposit_cents, charge it, recompute HolidayWindow.committed_g"]
+  - method: GET
+    path: "/custom-orders/{id}"
+    description: "Fetch an order (includes estimated_total_cents, final_total_cents, deposit_cents)."
+    roles: [Customer, CounterClerk, ShiftManager, Butcher]
+    code: 200
+    input: []
+    output: CustomOrder
+    side_effects: []
+  - method: GET
+    path: "/custom-orders/{id}/order-lines"
+    description: "List the order's lines."
+    roles: [Customer, CounterClerk, ShiftManager, Butcher]
+    code: 200
+    input: ["line_status?", "limit?", "offset?"]
+    output: OrderLine[]
+    side_effects: []
+  - method: POST
+    path: "/custom-orders/{id}/confirm"
+    description: "Confirm an order for fulfillment (locks lines)."
+    roles: [CounterClerk]
+    code: 200
+    input: []
+    output: CustomOrder
+    side_effects: ["order PLACED -> CONFIRMED"]
+  - method: POST
+    path: "/custom-orders/{id}/fill"
+    description: "Finalize a confirmed order; branches to FILLED (all drawn) or SHORT_FILLED (some shorted)."
+    roles: [Butcher]
+    code: 200
+    input: []
+    output: CustomOrder
+    side_effects: ["recompute final_total_cents over DRAWN lines; refund deposit overage to store credit; order CONFIRMED -> FILLED or SHORT_FILLED"]
+  - method: POST
+    path: "/custom-orders/{id}/cancel"
+    description: "Cancel a PLACED or undrawn-CONFIRMED order; refunds deposit and frees holiday capacity."
+    roles: [Customer, CounterClerk]
+    code: 200
+    input: []
+    output: CustomOrder
+    side_effects: ["order -> CANCELLED; refund deposit_cents to store credit; recompute HolidayWindow.committed_g"]
+  - method: GET
+    path: "/order-lines/{id}"
+    description: "Fetch an order line (includes catch_weight_g, est/final line cents)."
+    roles: [Customer, CounterClerk, ShiftManager, Butcher]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects: []
+  - method: GET
+    path: "/order-lines"
+    description: "List order lines; filter by custom_order_id, cut_type_id, or drawn_lot_id for reverse reachability."
+    roles: [Customer, CounterClerk, ShiftManager, Butcher]
+    code: 200
+    input: ["custom_order_id?", "cut_type_id?", "drawn_lot_id?", "line_status?", "limit?", "offset?"]
+    output: OrderLine[]
+    side_effects: []
+  - method: POST
+    path: "/order-lines/{id}/draw"
+    description: "Fill a line from a lot at a measured catch weight; OCC-guarded on the lot."
+    roles: [Butcher]
+    code: 200
+    input: [drawn_lot_id, catch_weight_g, expected_inventory_lot_version]
+    output: OrderLine
+    side_effects: ["line PENDING -> DRAWN; create COMMITTED LotDraw; reduce lot.remaining_weight_g; increment lot.version; compute final_line_cents; bubble lot -> DEPLETED if remaining hits 0"]
+  - method: POST
+    path: "/order-lines/{id}/short"
+    description: "Mark a line as shorted when no lot can satisfy it."
+    roles: [Butcher]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects: ["line PENDING -> SHORTED; final_line_cents = 0"]
+
+  # ---- SausageBatch / BatchInput ----
+  - method: POST
+    path: "/sausage-batches"
+    description: "Create a draft sausage batch producing a grind cut."
+    roles: [Butcher]
+    code: 201
+    input: [recipe_name, output_cut_type_id, planned_output_g]
+    output: SausageBatch
+    side_effects: ["batch_status = DRAFT"]
+  - method: GET
+    path: "/sausage-batches/{id}"
+    description: "Fetch a batch (includes actual_yield_g, batch_status)."
+    roles: [Butcher, ShiftManager]
+    code: 200
+    input: []
+    output: SausageBatch
+    side_effects: []
+  - method: GET
+    path: "/sausage-batches"
+    description: "List sausage batches; filter by output_cut_type_id for reverse reachability."
+    roles: [Butcher, ShiftManager]
+    code: 200
+    input: ["output_cut_type_id?", "batch_status?", "limit?", "offset?"]
+    output: SausageBatch[]
+    side_effects: []
+  - method: POST
+    path: "/sausage-batches/{id}/inputs"
+    description: "Add a lot input to a draft batch."
+    roles: [Butcher]
+    code: 201
+    input: [inventory_lot_id, weight_g]
+    output: BatchInput
+    side_effects: []
+  - method: GET
+    path: "/sausage-batches/{id}/inputs"
+    description: "List the batch's lot inputs."
+    roles: [Butcher, ShiftManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: BatchInput[]
+    side_effects: []
+  - method: POST
+    path: "/sausage-batches/{id}/reserve"
+    description: "Reserve the batch: commit draws against all input lots."
+    roles: [Butcher]
+    code: 200
+    input: []
+    output: SausageBatch
+    side_effects: ["batch DRAFT -> RESERVED; create COMMITTED LotDraw per input; reduce each lot's remaining_weight_g; increment each lot's version; bubble depleted lots"]
+  - method: POST
+    path: "/sausage-batches/{id}/produce"
+    description: "Produce the batch: compute yield (shrink), create the output lot."
+    roles: [Butcher]
+    code: 200
+    input: []
+    output: SausageBatch
+    side_effects: ["batch RESERVED -> PRODUCED; compute actual_yield_g; create AVAILABLE output InventoryLot"]
+  - method: POST
+    path: "/sausage-batches/{id}/cancel"
+    description: "Cancel a draft/reserved batch; reverts any committed input draws."
+    roles: [Butcher]
+    code: 200
+    input: []
+    output: SausageBatch
+    side_effects: ["batch -> CANCELLED; revert COMMITTED LotDraws; restore lot remaining_weight_g; revert DEPLETED lots; increment each lot's version"]
+
+  # ---- Reverse-reachability lists + single reads for log/junction children ----
+  - method: GET
+    path: "/lot-draws/{id}"
+    description: "Fetch a single LotDraw row."
+    roles: [Butcher, ShiftManager]
+    code: 200
+    input: []
+    output: LotDraw
+    side_effects: []
+  - method: GET
+    path: "/lot-draws"
+    description: "List LotDraw rows; filter by inventory_lot_id, order_line_id, or batch_input_id for reverse reachability."
+    roles: [Butcher, ShiftManager]
+    code: 200
+    input: ["inventory_lot_id?", "order_line_id?", "batch_input_id?", "draw_status?", "limit?", "offset?"]
+    output: LotDraw[]
+    side_effects: []
+  - method: GET
+    path: "/batch-inputs/{id}"
+    description: "Fetch a single BatchInput row."
+    roles: [Butcher, ShiftManager]
+    code: 200
+    input: []
+    output: BatchInput
+    side_effects: []
+  - method: GET
+    path: "/batch-inputs"
+    description: "List BatchInput rows; filter by inventory_lot_id or sausage_batch_id for reverse reachability."
+    roles: [Butcher, ShiftManager]
+    code: 200
+    input: ["inventory_lot_id?", "sausage_batch_id?", "limit?", "offset?"]
+    output: BatchInput[]
+    side_effects: []
+  - method: GET
+    path: "/temp-readings/{id}"
+    description: "Fetch a single TempReading row."
+    roles: [SafetyOfficer, ShiftManager, Butcher]
+    code: 200
+    input: []
+    output: TempReading
+    side_effects: []
+
+  # ---- Test-driving endpoint ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's notion of current UTC time (test-driving; gates aging completion and holiday cutoffs)."
+    roles: [ShiftManager]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock set to the supplied instant"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID header."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for this operation."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Customer acting on an order/claim whose customer_id != X-User-ID."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A path or FK-referenced resource does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, bad type, enum value out of set, or numeric out of range."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not defined from the resource's current state."
+  - id: ERR_LOT_NOT_AVAILABLE
+    http: 409
+    condition: "Draw/reserve target InventoryLot is not AVAILABLE."
+  - id: ERR_LOCKER_QUARANTINED
+    http: 409
+    condition: "Operation blocked because the relevant locker is QUARANTINED or the lot is ON_HOLD."
+  - id: ERR_AGING_NOT_COMPLETE
+    http: 409
+    condition: "complete-aging called before aging_target_days elapsed."
+  - id: ERR_WINDOW_CUTOFF_PASSED
+    http: 422
+    condition: "HOLIDAY order placed/confirmed after the window cutoff_at."
+  - id: ERR_CUT_TYPE_MISMATCH
+    http: 422
+    condition: "Draw lot's cut_type_id differs from the order line's cut_type_id."
+  - id: ERR_OUTPUT_NOT_GRIND
+    http: 422
+    condition: "SausageBatch output_cut_type_id references a CutType with is_grind == false."
+  - id: ERR_SHARE_OVERCOMMITTED
+    http: 409
+    condition: "ShareClaim would push claimed_fraction_x4 above 4 quarter-units."
+  - id: ERR_LOCKER_OVER_CAPACITY
+    http: 409
+    condition: "start-aging would push locker occupied_g above capacity_g."
+  - id: ERR_INSUFFICIENT_LOT_WEIGHT
+    http: 409
+    condition: "Requested weight_g exceeds InventoryLot.remaining_weight_g."
+  - id: ERR_HOLIDAY_CAPACITY_EXCEEDED
+    http: 409
+    condition: "HOLIDAY order would push window committed_g above capacity_g."
+  - id: ERR_STALE_LOT_VERSION
+    http: 412
+    condition: "expected_inventory_lot_version != InventoryLot.version on draw."
+  - id: ERR_STALE_LOCKER_VERSION
+    http: 412
+    condition: "expected_dry_age_locker_version != DryAgeLocker.version on release."
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Customer
+    description: "End customer; places own orders, claims animal shares, cancels own orders/claims."
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /share-claims/{id}/cancel"
+    shared_operations:
+      - "POST /custom-orders (own)"
+      - "POST /custom-orders/{id}/cancel (own)"
+      - "POST /share-claims (own)"
+      - "GET own orders, claims, shares, cut-types"
+
+  - name: CounterClerk
+    description: "Front-counter staff; registers customers, takes and confirms orders, cancels undrawn orders."
+    identity: opaque
+    exclusive_operations:
+      - "POST /customers"
+      - "POST /custom-orders/{id}/confirm"
+    shared_operations:
+      - "POST /custom-orders (on behalf of a customer)"
+      - "POST /share-claims (on behalf of a customer)"
+      - "POST /custom-orders/{id}/cancel"
+      - "GET orders, lines, lots, shares, windows, customers"
+
+  - name: Butcher
+    description: "Back-of-house; receives lots, runs aging, draws/short lines, fills orders, breaks down shares, runs sausage batches."
+    identity: opaque
+    exclusive_operations:
+      - "POST /inventory-lots/{id}/start-aging"
+      - "POST /inventory-lots/{id}/complete-aging"
+      - "POST /order-lines/{id}/draw"
+      - "POST /order-lines/{id}/short"
+      - "POST /custom-orders/{id}/fill"
+      - "POST /animal-shares/{id}/break-down"
+      - "POST /sausage-batches and /sausage-batches/{id}/(inputs|reserve|produce|cancel)"
+    shared_operations:
+      - "POST /inventory-lots"
+      - "POST /animal-shares"
+      - "GET lots, lockers, batches, orders, lines"
+
+  - name: ShiftManager
+    description: "Manager; owns pricing config, lockers, holiday windows, quarantine release, lot discard, share cancellation."
+    identity: opaque
+    exclusive_operations:
+      - "POST /cut-types"
+      - "POST /pricing-policies"
+      - "POST /dry-age-lockers"
+      - "POST /dry-age-lockers/{id}/release"
+      - "POST /holiday-windows"
+      - "POST /inventory-lots/{id}/discard"
+      - "POST /animal-shares/{id}/cancel"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /customers"
+      - "POST /inventory-lots"
+      - "POST /animal-shares"
+      - "GET everything"
+
+  - name: SafetyOfficer
+    description: "Food-safety inspector; logs temperature readings (which may quarantine a locker)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /dry-age-lockers/{id}/temp-readings"
+    shared_operations:
+      - "GET /dry-age-lockers/{id} and its temp-readings"

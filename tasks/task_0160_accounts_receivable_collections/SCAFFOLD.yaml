@@ -1,0 +1,1672 @@
+# =============================================================================
+# SCAFFOLD.yaml — Accounts Receivable & Collections
+# Difficulty band: Expert (§0.4)
+# =============================================================================
+
+scenario: "Accounts Receivable & Collections: invoice/aging bucket, dunning sequence, payment application/short-pay, dispute/deduction, credit limit/hold, promise-to-pay, write-off/bad debt, statement, cash forecasting"
+
+domain_name: accounts-receivable-collections
+api_prefix: /ar
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  secondary_archetype: posture_driven_gating
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+
+  entity_topology: flat
+  # Peer entities (Customer, Invoice, Payment, Dispute, PromiseToPay, WriteOff,
+  # Statement, CashForecast, DunningPause) linked by foreign keys; no nesting of
+  # business identity in URL paths. PaymentApplication is a junction entity.
+
+  state_machine_shape: parallel
+  # Customer carries two independent dimensions (credit_status × collection_stage);
+  # Dispute is cyclic (reopen loop); Invoice is branching-with-revert.
+
+  relationship_patterns:
+    - one_to_many        # Customer 1—* Invoice; Invoice 1—* Dispute; Payment 1—* PaymentApplication
+    - many_to_many       # Payment *—* Invoice realised through PaymentApplication junction
+    - cross_aggregate    # WriteOff/Dispute reference Invoice across aggregate boundary
+
+  role_model: segregation_of_duties
+  # The AR clerk who applies cash cannot also approve a write-off; the collections
+  # agent who runs dunning cannot resolve the dispute they would benefit from.
+
+  consistency_model: immediate
+  # All cascades (payment->invoice->customer posture) resolve atomically within
+  # the triggering request; derived fields are recomputed before the response.
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: legal name of the account
+      - name: currency
+        type: enum
+        source: input
+        description: ISO currency of all invoices for this customer
+        default: USD
+        constraints: one of {USD, EUR, GBP}
+      - name: credit_limit_cents
+        type: integer
+        source: input
+        description: maximum total exposure the customer may carry, in minor units
+        constraints: integer >= 0
+      - name: credit_status
+        type: enum
+        source: computed
+        description: >-
+          credit dimension of the parallel state machine; recomputed whenever
+          exposure or bad debt changes
+        default: GOOD
+        constraints: one of {GOOD, WATCH, HOLD}
+      - name: collection_stage
+        type: enum
+        source: computed
+        description: >-
+          collections dimension of the parallel state machine; advanced by
+          dunning, promise-break, and write-off events
+        default: CURRENT
+        constraints: one of {CURRENT, DUNNING, COLLECTIONS, WRITEOFF}
+      - name: exposure_cents
+        type: integer
+        source: computed
+        description: >-
+          sum over the customer's OPEN and PARTIAL invoices of
+          (balance_cents - disputed_amount_cents); the credit-check denominator
+      - name: total_open_balance_cents
+        type: integer
+        source: computed
+        description: >-
+          sum of balance_cents over the customer's OPEN, PARTIAL and DISPUTED
+          invoices; conserved quantity for the payment-reversal invariant
+      - name: bad_debt_total_cents
+        type: integer
+        source: computed
+        description: cumulative amount written off as bad debt for this customer
+      - name: manual_hold
+        type: boolean
+        source: computed
+        description: >-
+          true when an AR_MANAGER placed an explicit hold; forces credit_status
+          HOLD regardless of exposure until explicitly released
+        default: false
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: FK -> Customer.id; the account that owes this invoice
+      - name: invoice_date
+        type: datetime
+        source: input
+        description: date the invoice was issued (ISO 8601 UTC, ms precision)
+      - name: due_date
+        type: datetime
+        source: input
+        description: date payment is contractually due (ISO 8601 UTC, ms precision)
+        constraints: must be >= invoice_date
+      - name: face_amount_cents
+        type: integer
+        source: input
+        description: original billed amount in minor units
+        constraints: integer >= 1
+      - name: balance_cents
+        type: integer
+        source: computed
+        description: >-
+          face_amount_cents minus all applied payment amounts minus write-off
+          amount; decremented by payment application and write-off
+      - name: disputed_amount_cents
+        type: integer
+        source: computed
+        description: >-
+          amount currently under an OPEN or UNDER_REVIEW dispute; subtracted
+          from balance to yield the dunnable balance
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: lifecycle state of the invoice
+        default: OPEN
+        constraints: one of {OPEN, PARTIAL, DISPUTED, PAID, WRITTEN_OFF}
+      - name: aging_bucket
+        type: enum
+        source: computed
+        description: >-
+          aging classification at the system clock; recomputed on read and on
+          dunning runs (see calculations.aging_bucket_assignment)
+        constraints: one of {CURRENT, B1_30, B31_60, B61_90, B91_PLUS}
+      - name: dunning_stage_index
+        type: integer
+        source: computed
+        description: >-
+          index into the DunningSequence steps reached for this invoice; 0 = no
+          notice sent yet
+        default: 0
+
+  - name: Payment
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: FK -> Customer.id; the account that remitted the cash
+      - name: amount_cents
+        type: integer
+        source: input
+        description: total cash received in minor units
+        constraints: integer >= 1
+      - name: received_at
+        type: datetime
+        source: input
+        description: timestamp the cash was received (ISO 8601 UTC, ms precision)
+      - name: applied_cents
+        type: integer
+        source: computed
+        description: portion of amount_cents allocated to invoices so far
+        default: 0
+      - name: unapplied_cents
+        type: integer
+        source: computed
+        description: amount_cents minus applied_cents; the on-account remainder
+      - name: status
+        type: enum
+        source: computed
+        description: >-
+          application lifecycle of the cash receipt; reversing an application
+          returns the payment to UNAPPLIED or PARTIALLY_APPLIED (there is no
+          distinct REVERSED payment state — reversal is tracked per
+          PaymentApplication.reversed)
+        default: UNAPPLIED
+        constraints: one of {UNAPPLIED, PARTIALLY_APPLIED, FULLY_APPLIED}
+
+  - name: PaymentApplication
+    parent: null
+    common_fields: true
+    fields:
+      - name: payment_id
+        type: string
+        source: input
+        description: FK -> Payment.id; the cash receipt being allocated
+      - name: invoice_id
+        type: string
+        source: input
+        description: FK -> Invoice.id; the invoice the cash is applied to
+      - name: applied_cents
+        type: integer
+        source: input
+        description: amount of the payment allocated to this invoice
+        constraints: integer >= 1
+      - name: short_pay_cents
+        type: integer
+        source: computed
+        description: >-
+          when the application is flagged as settling the invoice in full,
+          the gap (invoice.balance_cents - applied_cents) booked as a short pay
+        default: 0
+      - name: reversed
+        type: boolean
+        source: computed
+        description: true once an un-apply reverses this allocation
+        default: false
+
+  - name: Dispute
+    parent: null
+    common_fields: true
+    fields:
+      - name: invoice_id
+        type: string
+        source: input
+        description: FK -> Invoice.id; the invoice the deduction is raised against
+      - name: amount_cents
+        type: integer
+        source: input
+        description: disputed/deducted amount in minor units
+        constraints: integer >= 1
+      - name: reason_code
+        type: enum
+        source: input
+        description: classification of the deduction
+        constraints: one of {PRICING, SHORTAGE, DAMAGE, DUPLICATE, QUALITY}
+      - name: status
+        type: enum
+        source: computed
+        description: cyclic lifecycle of the dispute
+        default: OPEN
+        constraints: one of {OPEN, UNDER_REVIEW, RESOLVED_CREDIT, REJECTED, WITHDRAWN}
+      - name: resolution_credit_cents
+        type: integer
+        source: computed
+        description: >-
+          amount credited off the invoice when resolved in the customer's favour;
+          0 until RESOLVED_CREDIT
+        default: 0
+      - name: reopen_count
+        type: integer
+        source: computed
+        description: number of times this dispute has cycled back to UNDER_REVIEW
+        default: 0
+
+  - name: PromiseToPay
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: FK -> Customer.id; the account making the commitment
+      - name: promised_amount_cents
+        type: integer
+        source: input
+        description: amount the customer commits to pay
+        constraints: integer >= 1
+      - name: coverage_start
+        type: datetime
+        source: input
+        description: inclusive start of the window this promise covers (ISO 8601 UTC)
+      - name: coverage_end
+        type: datetime
+        source: input
+        description: >-
+          exclusive end of the half-open coverage window [coverage_start,
+          coverage_end); promised payment is due strictly before this instant
+        constraints: must be > coverage_start
+      - name: status
+        type: enum
+        source: computed
+        description: lifecycle of the promise
+        default: ACTIVE
+        constraints: one of {ACTIVE, KEPT, BROKEN, CANCELLED}
+      - name: applied_payment_cents
+        type: integer
+        source: computed
+        description: payments received within the coverage window credited to this promise
+        default: 0
+
+  - name: WriteOff
+    parent: null
+    common_fields: true
+    fields:
+      - name: invoice_id
+        type: string
+        source: input
+        description: FK -> Invoice.id; the invoice being charged off
+      - name: amount_cents
+        type: integer
+        source: input
+        description: amount to write off (must equal the invoice dunnable balance)
+        constraints: integer >= 1
+      - name: reason_code
+        type: enum
+        source: input
+        description: bad-debt classification
+        constraints: one of {UNCOLLECTIBLE, SETTLEMENT, BANKRUPTCY, SMALL_BALANCE}
+      - name: approved
+        type: boolean
+        source: computed
+        description: true once an AR_MANAGER approves; false leaves the write-off pending
+        default: false
+
+  - name: DunningSequence
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: label of the dunning policy
+      - name: active
+        type: boolean
+        source: input
+        description: whether new dunning runs use this sequence
+        default: true
+      - name: steps
+        type: array
+        source: input
+        description: >-
+          ordered steps; each {min_days_overdue:int, channel:enum, severity:int};
+          step index = dunning_stage_index reached at that aging
+        constraints: non-empty; min_days_overdue strictly increasing across steps
+
+  - name: DunningNotice
+    parent: null
+    common_fields: false
+    fields:
+      - name: invoice_id
+        type: string
+        source: input
+        description: FK -> Invoice.id; the invoice the notice targets
+      - name: sequence_id
+        type: string
+        source: input
+        description: FK -> DunningSequence.id; the policy that produced the notice
+      - name: step_index
+        type: integer
+        source: system
+        description: which step of the sequence fired (1-based)
+      - name: severity
+        type: integer
+        source: system
+        description: severity copied from the fired step
+      - name: priority_score
+        type: number
+        source: computed
+        description: >-
+          collection-priority score computed at emission time
+          (see calculations.collection_priority_score)
+
+  - name: DunningPause
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: FK -> Customer.id; the account whose dunning is suppressed
+      - name: pause_start
+        type: datetime
+        source: input
+        description: inclusive start of the suppression window (ISO 8601 UTC)
+      - name: pause_end
+        type: datetime
+        source: input
+        description: >-
+          inclusive end of the closed suppression window [pause_start, pause_end];
+          dunning notices are suppressed on both endpoints
+        constraints: must be >= pause_start
+      - name: status
+        type: enum
+        source: computed
+        description: >-
+          clock-derived lifecycle: SCHEDULED when now < pause_start, ACTIVE when
+          pause_start <= now <= pause_end, EXPIRED when now > pause_end
+        default: SCHEDULED
+        constraints: one of {SCHEDULED, ACTIVE, EXPIRED}
+
+  - name: Statement
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: FK -> Customer.id; the account the statement is cut for
+      - name: period_end
+        type: datetime
+        source: input
+        description: closing date of the statement period (ISO 8601 UTC)
+      - name: opening_balance_cents
+        type: integer
+        source: computed
+        description: total_open_balance_cents at the prior statement's period_end
+      - name: new_charges_cents
+        type: integer
+        source: computed
+        description: sum of face_amount_cents for invoices issued within the period
+      - name: finance_charge_cents
+        type: integer
+        source: computed
+        description: >-
+          per-invoice finance charge summed across overdue invoices
+          (see calculations.statement_finance_charge)
+      - name: closing_balance_cents
+        type: integer
+        source: computed
+        description: opening + new_charges + finance_charge - payments in period
+
+  - name: CashForecast
+    parent: null
+    common_fields: false
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: >-
+          query parameter naming the Customer to forecast; CashForecast is an
+          ephemeral computed projection returned only by GET /ar/cash-forecast
+          (never persisted, so no stored foreign key and no reverse-reachability GET)
+      - name: horizon_days
+        type: integer
+        source: input
+        description: number of days forward the forecast projects
+        constraints: integer between 1 and 365
+      - name: method
+        type: enum
+        source: input
+        description: which forecasting algorithm to run
+        constraints: one of {EXPECTED, CONSERVATIVE}
+      - name: projected_cents
+        type: number
+        source: computed
+        description: >-
+          projected collectable cash over the horizon
+          (see calculations.cash_forecast)
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+
+  # ---- Invoice: branching with revert (DISPUTED side-branch) -------------
+  - entity: Invoice
+    initial_state: OPEN
+    terminal_states: [PAID, WRITTEN_OFF]
+    transitions:
+      - from: OPEN
+        to: PARTIAL
+        trigger: "POST /ar/payments/{id}/applications"
+        actor: AR_CLERK
+        preconditions:
+          - "invoice.status == OPEN"
+          - "0 < application.applied_cents < invoice.balance_cents"
+        side_effects:
+          - "decrement invoice.balance_cents by application.applied_cents"
+          - "recompute Customer.exposure_cents, Customer.total_open_balance_cents"
+          - "recompute Customer.credit_status (see calculations.credit_status_eval)"
+
+      - from: OPEN
+        to: PAID
+        trigger: "POST /ar/payments/{id}/applications"
+        actor: AR_CLERK
+        preconditions:
+          - "invoice.status == OPEN"
+          - "application.applied_cents == invoice.balance_cents OR settle_in_full flag with applied_cents <= balance_cents"
+        side_effects:
+          - "set invoice.balance_cents = 0 (booking short_pay_cents = balance - applied_cents when settle_in_full)"
+          - "recompute Customer.exposure_cents, Customer.total_open_balance_cents"
+          - "CASCADE: when all customer invoices are PAID/WRITTEN_OFF and no overdue remains, recompute Customer.credit_status then Customer.collection_stage (see calculations.collection_stage_eval)"
+
+      - from: PARTIAL
+        to: PAID
+        trigger: "POST /ar/payments/{id}/applications"
+        actor: AR_CLERK
+        preconditions:
+          - "invoice.status == PARTIAL"
+          - "application.applied_cents == invoice.balance_cents OR settle_in_full flag with applied_cents <= balance_cents"
+        side_effects:
+          - "set invoice.balance_cents = 0"
+          - "recompute Customer.exposure_cents, Customer.total_open_balance_cents, Customer.credit_status, Customer.collection_stage"
+
+      - from: PARTIAL
+        to: PARTIAL
+        trigger: "POST /ar/payments/{id}/applications"
+        actor: AR_CLERK
+        preconditions:
+          - "invoice.status == PARTIAL"
+          - "0 < application.applied_cents < invoice.balance_cents"
+        side_effects:
+          - "decrement invoice.balance_cents by application.applied_cents"
+          - "recompute Customer derived fields"
+
+      - from: OPEN
+        to: DISPUTED
+        trigger: "POST /ar/disputes (when dispute.amount_cents == invoice.balance_cents)"
+        actor: COLLECTIONS_AGENT
+        preconditions:
+          - "invoice.status == OPEN"
+          - "dispute.amount_cents <= invoice.balance_cents"
+        side_effects:
+          - "set invoice.disputed_amount_cents = dispute.amount_cents"
+          - "set invoice.dunning_stage_index = 0 (dunning suspended while fully disputed)"
+          - "recompute Customer.exposure_cents (excludes disputed amount)"
+
+      - from: PARTIAL
+        to: DISPUTED
+        trigger: "POST /ar/disputes (when dispute.amount_cents == invoice.balance_cents)"
+        actor: COLLECTIONS_AGENT
+        preconditions:
+          - "invoice.status == PARTIAL"
+          - "dispute.amount_cents == invoice.balance_cents"
+        side_effects:
+          - "set invoice.disputed_amount_cents = dispute.amount_cents"
+          - "recompute Customer.exposure_cents"
+
+      - from: DISPUTED
+        to: OPEN
+        trigger: "POST /ar/disputes/{id}/reject  (dispute REJECTED) OR POST /ar/disputes/{id}/withdraw"
+        actor: AR_MANAGER
+        preconditions:
+          - "invoice.status == DISPUTED"
+          - "the resolving dispute covered the full balance"
+        side_effects:
+          - "set invoice.disputed_amount_cents = 0"
+          - "restore invoice to OPEN (dunnable balance = balance again)"
+          - "recompute Customer.exposure_cents, Customer.credit_status"
+
+      - from: DISPUTED
+        to: PAID
+        trigger: "POST /ar/disputes/{id}/resolve (RESOLVED_CREDIT for full balance)"
+        actor: AR_MANAGER
+        preconditions:
+          - "invoice.status == DISPUTED"
+          - "dispute.resolution_credit_cents == invoice.balance_cents"
+        side_effects:
+          - "set invoice.balance_cents = 0, invoice.disputed_amount_cents = 0"
+          - "recompute Customer derived fields and posture cascade"
+
+      - from: OPEN
+        to: WRITTEN_OFF
+        trigger: "POST /ar/write-offs/{id}/approve"
+        actor: AR_MANAGER
+        preconditions:
+          - "invoice.status IN {OPEN, PARTIAL}"
+          - "invoice has NO dispute in {OPEN, UNDER_REVIEW} (cross-entity: Dispute)"
+          - "write_off.amount_cents == invoice.balance_cents - invoice.disputed_amount_cents"
+        side_effects:
+          - "set invoice.balance_cents = 0"
+          - "CASCADE: increment Customer.bad_debt_total_cents; recompute Customer.exposure_cents; recompute Customer.credit_status; then advance Customer.collection_stage toward WRITEOFF"
+
+      - from: PARTIAL
+        to: WRITTEN_OFF
+        trigger: "POST /ar/write-offs/{id}/approve"
+        actor: AR_MANAGER
+        preconditions:
+          - "invoice.status == PARTIAL"
+          - "invoice has NO dispute in {OPEN, UNDER_REVIEW}"
+          - "write_off.amount_cents == invoice.balance_cents - invoice.disputed_amount_cents"
+        side_effects:
+          - "set invoice.balance_cents = 0; CASCADE to Customer.bad_debt_total_cents, exposure, credit_status, collection_stage"
+
+  # ---- Payment: linear-with-compensation ---------------------------------
+  - entity: Payment
+    initial_state: UNAPPLIED
+    terminal_states: []
+    transitions:
+      - from: UNAPPLIED
+        to: PARTIALLY_APPLIED
+        trigger: "POST /ar/payments/{id}/applications"
+        actor: AR_CLERK
+        preconditions:
+          - "payment.status IN {UNAPPLIED, PARTIALLY_APPLIED}"
+          - "application.applied_cents <= payment.unapplied_cents"
+        side_effects:
+          - "increment payment.applied_cents; recompute payment.unapplied_cents"
+          - "create PaymentApplication; apply to invoice (see Invoice transitions)"
+
+      - from: PARTIALLY_APPLIED
+        to: FULLY_APPLIED
+        trigger: "POST /ar/payments/{id}/applications"
+        actor: AR_CLERK
+        preconditions:
+          - "application.applied_cents == payment.unapplied_cents"
+        side_effects:
+          - "payment.unapplied_cents = 0"
+
+      - from: PARTIALLY_APPLIED
+        to: UNAPPLIED
+        trigger: "POST /ar/payments/{id}/applications/{appId}/reverse"
+        actor: AR_CLERK
+        preconditions:
+          - "the target PaymentApplication.reversed == false"
+        side_effects:
+          - "COMPENSATION: set application.reversed = true; restore invoice.balance_cents by application.applied_cents; revert invoice.status if it had reached PAID/PARTIAL; decrement payment.applied_cents; recompute Customer.total_open_balance_cents and credit_status"
+
+      - from: FULLY_APPLIED
+        to: PARTIALLY_APPLIED
+        trigger: "POST /ar/payments/{id}/applications/{appId}/reverse"
+        actor: AR_CLERK
+        preconditions:
+          - "the target PaymentApplication.reversed == false"
+        side_effects:
+          - "COMPENSATION: restore invoice balance and customer derived fields (invariant: total_open_balance_cents returns to its pre-application value)"
+
+  # ---- Dispute: cyclic (reopen loop) -------------------------------------
+  - entity: Dispute
+    initial_state: OPEN
+    terminal_states: [RESOLVED_CREDIT, REJECTED, WITHDRAWN]
+    transitions:
+      - from: OPEN
+        to: UNDER_REVIEW
+        trigger: "POST /ar/disputes/{id}/start-review"
+        actor: AR_MANAGER
+        preconditions:
+          - "dispute.status == OPEN"
+        side_effects:
+          - "no balance change; invoice remains DISPUTED-or-flagged"
+
+      - from: UNDER_REVIEW
+        to: RESOLVED_CREDIT
+        trigger: "POST /ar/disputes/{id}/resolve"
+        actor: AR_MANAGER
+        preconditions:
+          - "dispute.status == UNDER_REVIEW"
+          - "resolve_credit_cents <= dispute.amount_cents"
+        side_effects:
+          - "set dispute.resolution_credit_cents; decrement invoice.balance_cents by resolution_credit_cents; clear invoice.disputed_amount_cents; recompute Customer derived fields"
+
+      - from: UNDER_REVIEW
+        to: REJECTED
+        trigger: "POST /ar/disputes/{id}/reject"
+        actor: AR_MANAGER
+        preconditions:
+          - "dispute.status == UNDER_REVIEW"
+        side_effects:
+          - "clear invoice.disputed_amount_cents; restore invoice dunnable balance; recompute Customer.exposure_cents and credit_status"
+
+      - from: RESOLVED_CREDIT
+        to: UNDER_REVIEW
+        trigger: "POST /ar/disputes/{id}/reopen"
+        actor: AR_MANAGER
+        preconditions:
+          - "dispute.status IN {RESOLVED_CREDIT, REJECTED}"
+          - "invoice.status NOT IN {PAID, WRITTEN_OFF}"
+        side_effects:
+          - "increment dispute.reopen_count; re-apply invoice.disputed_amount_cents = dispute.amount_cents; recompute Customer.exposure_cents"
+
+      - from: REJECTED
+        to: UNDER_REVIEW
+        trigger: "POST /ar/disputes/{id}/reopen"
+        actor: AR_MANAGER
+        preconditions:
+          - "dispute.status == REJECTED"
+          - "invoice.status NOT IN {PAID, WRITTEN_OFF}"
+        side_effects:
+          - "increment dispute.reopen_count; re-apply invoice.disputed_amount_cents; recompute Customer.exposure_cents"
+
+      - from: OPEN
+        to: WITHDRAWN
+        trigger: "POST /ar/disputes/{id}/withdraw"
+        actor: COLLECTIONS_AGENT
+        preconditions:
+          - "dispute.status IN {OPEN, UNDER_REVIEW}"
+        side_effects:
+          - "clear invoice.disputed_amount_cents; restore invoice dunnable balance; recompute Customer.exposure_cents (invariant: dunnable_balance + disputed_amount conserved across withdraw)"
+
+  # ---- PromiseToPay: linear with break/keep + supersede ------------------
+  - entity: PromiseToPay
+    initial_state: ACTIVE
+    terminal_states: [KEPT, BROKEN, CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: KEPT
+        trigger: "POST /ar/promises/{id}/evaluate (system clock past coverage_end, applied_payment_cents >= promised_amount_cents)"
+        actor: system
+        preconditions:
+          - "promise.status == ACTIVE"
+          - "now >= promise.coverage_end"
+          - "promise.applied_payment_cents >= promise.promised_amount_cents"
+        side_effects:
+          - "if customer has no other broken promise and no overdue, recompute Customer.collection_stage toward CURRENT"
+
+      - from: ACTIVE
+        to: BROKEN
+        trigger: "POST /ar/promises/{id}/evaluate (system clock past coverage_end, shortfall remains)"
+        actor: system
+        preconditions:
+          - "promise.status == ACTIVE"
+          - "now >= promise.coverage_end"
+          - "promise.applied_payment_cents < promise.promised_amount_cents"
+        side_effects:
+          - "CASCADE: advance Customer.collection_stage one step toward COLLECTIONS (DUNNING->COLLECTIONS); set Customer.credit_status WATCH if currently GOOD"
+
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /ar/promises/{id}/cancel"
+        actor: COLLECTIONS_AGENT
+        note: "non-ACTIVE target -> ERR_PROMISE_ALREADY_RESOLVED (validation priority 18), not ERR_INVALID_STATE"
+        preconditions:
+          - "promise.status == ACTIVE"
+        side_effects:
+          - "no posture change"
+
+  # ---- Customer: PARALLEL state dimensions (credit_status × collection_stage)
+  - entity: Customer
+    initial_state: "credit_status=GOOD; collection_stage=CURRENT"
+    terminal_states: []
+    transitions:
+      # credit_status dimension
+      - from: "credit_status=GOOD"
+        to: "credit_status=WATCH"
+        trigger: "system recompute after exposure change (see calculations.credit_status_eval)"
+        actor: system
+        preconditions:
+          - "exposure_cents >= CREDIT_WATCH_PCT * credit_limit_cents AND exposure_cents < credit_limit_cents"
+          - "manual_hold == false"
+        side_effects:
+          - "credit_status becomes WATCH; new invoices still allowed"
+      - from: "credit_status=WATCH"
+        to: "credit_status=HOLD"
+        trigger: "system recompute OR POST /ar/customers/{id}/hold"
+        actor: system | AR_MANAGER
+        preconditions:
+          - "exposure_cents >= credit_limit_cents OR manual_hold == true"
+        side_effects:
+          - "credit_status becomes HOLD; new invoice creation rejected with ERR_CREDIT_HOLD"
+      - from: "credit_status=HOLD"
+        to: "credit_status=GOOD"
+        trigger: "system recompute after payment OR POST /ar/customers/{id}/release-hold"
+        actor: system | AR_MANAGER
+        preconditions:
+          - "exposure_cents < CREDIT_WATCH_PCT * credit_limit_cents AND manual_hold == false"
+        side_effects:
+          - "credit_status returns to GOOD"
+      # collection_stage dimension (independent)
+      - from: "collection_stage=CURRENT"
+        to: "collection_stage=DUNNING"
+        trigger: "POST /ar/dunning-runs (first notice emitted for an overdue invoice)"
+        actor: COLLECTIONS_AGENT
+        preconditions:
+          - "at least one invoice reached aging_bucket B1_30 or worse with no active DunningPause"
+        side_effects:
+          - "collection_stage becomes DUNNING"
+      - from: "collection_stage=DUNNING"
+        to: "collection_stage=COLLECTIONS"
+        trigger: "promise break (Dispute/Promise cascade) OR aging into B61_90"
+        actor: system
+        preconditions:
+          - "a PromiseToPay transitioned to BROKEN OR an invoice reached B61_90"
+        side_effects:
+          - "collection_stage becomes COLLECTIONS"
+      - from: "collection_stage=COLLECTIONS"
+        to: "collection_stage=WRITEOFF"
+        trigger: "write-off approved (cascade from Invoice OPEN->WRITTEN_OFF)"
+        actor: system
+        preconditions:
+          - "an invoice for this customer transitioned to WRITTEN_OFF"
+        side_effects:
+          - "collection_stage becomes WRITEOFF"
+      - from: "collection_stage=DUNNING"
+        to: "collection_stage=CURRENT"
+        trigger: "system recompute after full payment of all overdue invoices"
+        actor: system
+        preconditions:
+          - "no invoice for this customer is in aging_bucket worse than CURRENT"
+        side_effects:
+          - "collection_stage returns to CURRENT"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: promise-create-stale-customer
+    parent_entity: Customer
+    write_endpoint: "POST /ar/promises"
+    occ_field: "expected_customer_version"
+    description: |
+      Creating a PromiseToPay against a Customer whose version has advanced since
+      the client last observed it is rejected. The client reads the customer's
+      active-promise calendar, judges its new window non-overlapping, and submits
+      with the version it observed. If another writer has already added a promise
+      to that customer (legitimately advancing Customer.version, which the create
+      side-effect increments), the late create — still presenting the prior
+      version — is rejected as stale before its own non-overlap judgement can be
+      trusted. Both creates would individually pass the overlap check against the
+      state each client observed, so OCC on Customer.version is the only
+      deterministic serialiser; the loser sees ERR_STALE_VERSION.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+
+  - name: aging_bucket_assignment
+    trigger: "on Invoice read, on POST /ar/dunning-runs, and on statement generation"
+    algorithm: threshold
+    formula: |
+      days_overdue = floor((now - reference_date) / 86_400_000)   # whole UTC days
+      if invoice.status IN {PAID, WRITTEN_OFF}: bucket = CURRENT
+      elif days_overdue < 1:        bucket = CURRENT
+      elif days_overdue <= 30:      bucket = B1_30
+      elif days_overdue <= 60:      bucket = B31_60
+      elif days_overdue <= 90:      bucket = B61_90
+      else:                         bucket = B91_PLUS
+      # Boundary is INCLUSIVE on the upper edge: days_overdue == 30 -> B1_30,
+      # days_overdue == 31 -> B31_60.
+    input_set: "one invoice; reference_date selected by variant"
+    constants:
+      DAY_MS: 86400000
+    precision: "integer days, floor"
+    variants:
+      - name: due_date_basis
+        when: "default basis used for dunning and credit decisions"
+        difference: "reference_date = invoice.due_date"
+      - name: invoice_date_basis
+        when: "alternative basis used by the statement aging report"
+        difference: "reference_date = invoice.invoice_date (always >= due_date_basis days)"
+
+  - name: cash_forecast
+    trigger: "GET /ar/cash-forecast"
+    algorithm: forward_looking
+    formula: |
+      horizon_end = now + horizon_days (whole days).
+      Candidate invoices = the customer's invoices in {OPEN, PARTIAL, DISPUTED}
+      with dunnable = balance_cents - disputed_amount_cents > 0. (Already-overdue
+      invoices ARE candidates — collections forecasts the cash still to be
+      recovered, not new billings.)
+      For each candidate invoice:
+        EXPECTED:      an invoice is "covered" when an ACTIVE PromiseToPay's
+                       half-open window [coverage_start, coverage_end) both
+                       contains the invoice's due_date AND has coverage_end <=
+                       horizon_end. A covered invoice contributes
+                       min(promise.promised_amount_cents, dunnable); an uncovered
+                       invoice contributes 0. Each ACTIVE promise covers at most
+                       the single matching invoice (no double counting).
+        CONSERVATIVE:  contribution = dunnable * COLLECT_PROB[aging_bucket(due_date_basis)];
+                       promises are ignored.
+      projected_cents = round_half_up(sum of contributions, whole cents)
+    input_set: "customer's {OPEN,PARTIAL,DISPUTED} invoices with positive dunnable; ACTIVE promises (EXPECTED only)"
+    constants:
+      COLLECT_PROB: { CURRENT: 1.0, B1_30: 0.90, B31_60: 0.70, B61_90: 0.40, B91_PLUS: 0.10 }
+    precision: "round_half_up to whole cents"
+    variants:
+      - name: EXPECTED
+        when: "method == EXPECTED"
+        difference: "promise-driven; ignores aging decay, uses committed amounts capped at dunnable"
+      - name: CONSERVATIVE
+        when: "method == CONSERVATIVE"
+        difference: "aging-decay driven; ignores promises, applies COLLECT_PROB by aging bucket"
+
+  - name: collection_priority_score
+    trigger: "on POST /ar/dunning-runs, computed per candidate invoice to pick the targets"
+    algorithm: weighted_scoring
+    formula: |
+      score = W_BAL  * min(dunnable / 100000.0, 10.0)        # capped balance weight
+            + W_AGE  * AGE_WEIGHT[aging_bucket(due_date_basis)]
+            + W_STAGE* STAGE_WEIGHT[customer.collection_stage]
+            - W_PTP  * (1 if customer has an ACTIVE PromiseToPay covering today else 0)
+      dunnable = invoice.balance_cents - invoice.disputed_amount_cents
+      # >=3 inputs (balance, aging, stage, promise flag) with nested min and a
+      # conditional subtraction -> non-linear interaction (mode a).
+    input_set: "one invoice plus its customer's stage and active promise"
+    constants:
+      W_BAL: 1.0
+      W_AGE: 2.0
+      W_STAGE: 1.5
+      W_PTP: 3.0
+      AGE_WEIGHT: { CURRENT: 0.0, B1_30: 1.0, B31_60: 2.0, B61_90: 3.0, B91_PLUS: 4.0 }
+      STAGE_WEIGHT: { CURRENT: 0.0, DUNNING: 1.0, COLLECTIONS: 2.0, WRITEOFF: 0.0 }
+    precision: "round_half_up to 2 decimals"
+    variants: []
+
+  - name: statement_finance_charge
+    trigger: "POST /ar/customers/{id}/statements"
+    algorithm: aggregation
+    formula: |
+      # NESTED ROUNDING ORDER IS PINNED: round PER INVOICE, then sum.
+      finance_charge_cents = 0
+      for each invoice with aging_bucket(due_date_basis) worse than CURRENT
+          and status IN {OPEN, PARTIAL, DISPUTED}:
+          dunnable = invoice.balance_cents - invoice.disputed_amount_cents
+          per_inv = round_half_up(dunnable * MONTHLY_RATE)   # round HERE, per invoice
+          finance_charge_cents += per_inv
+      # The "sum then round" alternative is explicitly NOT used and yields a
+      # different cent total when multiple invoices each carry a half-cent.
+    input_set: "customer's overdue non-terminal invoices at period_end"
+    constants:
+      MONTHLY_RATE: 0.015
+    precision: "round_half_up per invoice, then integer sum"
+    variants:
+      - name: per_invoice_then_sum
+        when: "the pinned, authoritative order"
+        difference: "rounds each invoice's charge before summing"
+
+  - name: payment_waterfall_application
+    trigger: "POST /ar/payments/{id}/auto-apply"
+    algorithm: waterfall_allocation
+    formula: |
+      remaining = payment.unapplied_cents
+      # Order invoices by (aging_bucket DESC: B91_PLUS first), then due_date ASC,
+      # then created_at ASC as the deterministic final tie-break. id is NEVER used.
+      candidates = customer's invoices in {OPEN, PARTIAL} sorted by that key
+      for inv in candidates:
+        if remaining == 0: break
+        dunnable = inv.balance_cents - inv.disputed_amount_cents
+        if dunnable <= 0: continue
+        take = min(remaining, dunnable)
+        create PaymentApplication(payment, inv, take)
+        remaining -= take
+      payment.unapplied_cents = remaining   # leftover stays on account
+    input_set: "customer's OPEN/PARTIAL invoices; oldest-aging first"
+    constants: {}
+    precision: "integer cents; no rounding (amounts are minor units)"
+    variants:
+      - name: oldest_aging_first
+        when: "default auto-apply policy"
+        difference: "fills the most-overdue dunnable invoice before younger ones"
+
+  - name: credit_status_eval
+    trigger: "after any change to Customer.exposure_cents (payment, write-off, dispute, new invoice)"
+    algorithm: threshold
+    formula: |
+      if customer.manual_hold: credit_status = HOLD
+      elif exposure_cents >= credit_limit_cents: credit_status = HOLD
+      elif exposure_cents >= round_half_up(CREDIT_WATCH_PCT * credit_limit_cents): credit_status = WATCH
+      else: credit_status = GOOD
+      # BOUNDARY (>=): exposure exactly == credit_limit_cents -> HOLD (not WATCH).
+    input_set: "single customer's exposure and limit"
+    constants:
+      CREDIT_WATCH_PCT: 0.80
+    precision: "integer cents; threshold uses >="
+    variants: []
+
+  - name: collection_stage_eval
+    trigger: "after dunning run, promise break/keep, write-off, or full payment"
+    algorithm: aggregation
+    formula: |
+      worst = worst aging_bucket(due_date_basis) over the customer's
+              {OPEN, PARTIAL, DISPUTED} invoices (CURRENT if none)
+      has_broken_promise = exists PromiseToPay in BROKEN with no later KEPT promise
+      has_writeoff       = exists invoice in WRITTEN_OFF for this customer
+      if has_writeoff:                              stage = WRITEOFF
+      elif worst == CURRENT and not has_broken_promise: stage = CURRENT
+      elif has_broken_promise or worst == B61_90 or worst == B91_PLUS: stage = COLLECTIONS
+      else:                                         stage = DUNNING
+      # Independent of credit_status (parallel dimension).
+    input_set: "customer's invoices, promises, write-offs"
+    constants: {}
+    precision: "enum result"
+    variants: []
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except GET /ar/health"
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this operation per §1.7 RBAC"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "every path/body id (customer_id, invoice_id, payment_id, dispute_id, sequence_id) refers to an existing resource, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all id-bearing endpoints"
+
+  - priority: 4
+    category: existence
+    check: "request body parses and all required fields per §1.5 input are present and correctly typed"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+
+  - priority: 5
+    category: existence
+    check: "enum-typed fields carry a declared member (currency, reason_code, method, channel)"
+    error_id: ERR_INVALID_ENUM
+    http_status: 422
+    applies_to: "all write endpoints with enum inputs"
+
+  - priority: 6
+    category: state
+    check: "target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints EXCEPT POST /ar/promises/{id}/evaluate and POST /ar/promises/{id}/cancel (those use the domain-specific ERR_PROMISE_ALREADY_RESOLVED at priority 18)"
+
+  - priority: 7
+    category: state
+    check: "OCC: expected_customer_version on POST /ar/promises equals Customer.version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /ar/promises"
+
+  - priority: 8
+    category: business_safety
+    check: "an Invoice with a Dispute in {OPEN, UNDER_REVIEW} cannot be written off"
+    error_id: ERR_DISPUTE_BLOCKS_WRITEOFF
+    http_status: 409
+    applies_to: "POST /ar/write-offs, POST /ar/write-offs/{id}/approve"
+
+  - priority: 9
+    category: business_safety
+    check: "segregation of duties: the X-User-ID who created a write-off cannot be the X-User-ID who approves it"
+    error_id: ERR_SOD_VIOLATION
+    http_status: 403
+    applies_to: "POST /ar/write-offs/{id}/approve"
+
+  - priority: 10
+    category: business_referential
+    check: "Payment.customer_id must equal the Invoice.customer_id when applying a payment to an invoice"
+    error_id: ERR_CUSTOMER_MISMATCH
+    http_status: 409
+    applies_to: "POST /ar/payments/{id}/applications, POST /ar/payments/{id}/auto-apply"
+
+  - priority: 11
+    category: business_constraint
+    check: "dispute.amount_cents must not exceed the invoice dunnable balance (balance_cents - existing disputed_amount_cents)"
+    error_id: ERR_DISPUTE_EXCEEDS_BALANCE
+    http_status: 422
+    applies_to: "POST /ar/disputes"
+
+  - priority: 12
+    category: business_temporal
+    check: "a new ACTIVE PromiseToPay coverage window [start,end) must not overlap another ACTIVE promise window for the same customer (adjacency end==start allowed)"
+    error_id: ERR_PROMISE_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /ar/promises"
+
+  - priority: 13
+    category: business_temporal
+    check: "a new DunningPause closed window [start,end] must keep a 1-day buffer from every existing DunningPause for the same customer (windows whose gap is <= 1 day, inclusive, collide)"
+    error_id: ERR_PAUSE_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /ar/dunning-pauses"
+
+  - priority: 14
+    category: business_constraint
+    check: "payment application applied_cents must not exceed the payment's unapplied_cents"
+    error_id: ERR_OVER_APPLICATION
+    http_status: 422
+    applies_to: "POST /ar/payments/{id}/applications"
+
+  - priority: 15
+    category: business_constraint
+    check: "payment application applied_cents must not exceed the invoice dunnable balance (unless settle_in_full short-pay flag set, where applied_cents <= dunnable)"
+    error_id: ERR_APPLY_EXCEEDS_INVOICE
+    http_status: 422
+    applies_to: "POST /ar/payments/{id}/applications"
+
+  - priority: 16
+    category: business_constraint
+    check: "write_off.amount_cents must equal the invoice dunnable balance exactly"
+    error_id: ERR_WRITEOFF_AMOUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /ar/write-offs"
+
+  - priority: 17
+    category: business_fiscal
+    check: >-
+      creating a new Invoice is rejected when the Customer's credit_status is
+      HOLD at request time (either manual_hold is active, or current
+      exposure_cents >= credit_limit_cents). The new invoice's own face_amount is
+      NOT pre-added before this gate — a customer at exactly exposure==limit-1
+      that the new invoice would push to the limit is still allowed; the resulting
+      HOLD only blocks the NEXT invoice.
+    error_id: ERR_CREDIT_HOLD
+    http_status: 402
+    applies_to: "POST /ar/invoices"
+
+  - priority: 18
+    category: state
+    check: "promise evaluate/cancel target must be in ACTIVE state (domain-specific state guard distinct from generic ERR_INVALID_STATE)"
+    error_id: ERR_PROMISE_ALREADY_RESOLVED
+    http_status: 409
+    applies_to: "POST /ar/promises/{id}/evaluate, POST /ar/promises/{id}/cancel"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+
+  # ---- Customer -----------------------------------------------------------
+  - method: POST
+    path: "/ar/customers"
+    description: "create a customer account with a credit limit"
+    roles: [AR_MANAGER]
+    code: 201
+    input: [name, "currency?", credit_limit_cents]
+    output: Customer
+    side_effects: ["credit_status initialised GOOD; collection_stage initialised CURRENT"]
+
+  - method: GET
+    path: "/ar/customers/{id}"
+    description: "fetch a customer with computed exposure, posture, balances"
+    roles: [AR_MANAGER, AR_CLERK, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["recompute exposure_cents, total_open_balance_cents, credit_status before responding"]
+
+  - method: GET
+    path: "/ar/customers"
+    description: "list customers (paginated, filterable)"
+    roles: [AR_MANAGER, AR_CLERK, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: ["credit_status?", "collection_stage?", "limit?", "offset?"]
+    output: Customer[]
+    side_effects: []
+
+  - method: POST
+    path: "/ar/customers/{id}/hold"
+    description: "AR_MANAGER places a manual credit hold"
+    roles: [AR_MANAGER]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["set manual_hold=true; recompute credit_status -> HOLD"]
+
+  - method: POST
+    path: "/ar/customers/{id}/release-hold"
+    description: "AR_MANAGER releases a manual credit hold"
+    roles: [AR_MANAGER]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["set manual_hold=false; recompute credit_status from exposure"]
+
+  - method: GET
+    path: "/ar/customers/{id}/statements"
+    description: "list statements cut for a customer (FK reverse-reachability: Statement.customer_id)"
+    roles: [AR_MANAGER, AR_CLERK, AUDITOR]
+    code: 200
+    input: []
+    output: Statement[]
+    side_effects: []
+
+  - method: GET
+    path: "/ar/customers/{id}/dunning-pauses"
+    description: "list dunning pauses for a customer (FK reverse-reachability: DunningPause.customer_id)"
+    roles: [AR_MANAGER, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: []
+    output: DunningPause[]
+    side_effects: []
+
+  # ---- Invoice ------------------------------------------------------------
+  - method: POST
+    path: "/ar/invoices"
+    description: "create an invoice; runs credit check against the customer"
+    roles: [AR_CLERK, AR_MANAGER]
+    code: 201
+    input: [customer_id, invoice_date, due_date, face_amount_cents]
+    output: Invoice
+    side_effects: ["recompute Customer.exposure_cents and credit_status; reject with ERR_CREDIT_HOLD if customer on HOLD"]
+
+  - method: GET
+    path: "/ar/invoices/{id}"
+    description: "fetch one invoice with computed balance and aging_bucket"
+    roles: [AR_MANAGER, AR_CLERK, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["recompute aging_bucket (due_date basis) at the system clock"]
+
+  - method: GET
+    path: "/ar/invoices"
+    description: "list invoices, filterable by customer/status/aging (FK reverse-reachability: Invoice.customer_id)"
+    roles: [AR_MANAGER, AR_CLERK, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: ["customer_id?", "status?", "aging_bucket?", "limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+
+  - method: GET
+    path: "/ar/invoices/{id}/disputes"
+    description: "list disputes raised against an invoice (FK reverse-reachability: Dispute.invoice_id)"
+    roles: [AR_MANAGER, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: []
+    output: Dispute[]
+    side_effects: []
+
+  - method: GET
+    path: "/ar/invoices/{id}/write-offs"
+    description: "list write-offs booked against an invoice (FK reverse-reachability: WriteOff.invoice_id)"
+    roles: [AR_MANAGER, AUDITOR]
+    code: 200
+    input: []
+    output: WriteOff[]
+    side_effects: []
+
+  - method: GET
+    path: "/ar/invoices/{id}/payment-applications"
+    description: "list applications posted to an invoice (FK reverse-reachability: PaymentApplication.invoice_id)"
+    roles: [AR_MANAGER, AR_CLERK, AUDITOR]
+    code: 200
+    input: []
+    output: PaymentApplication[]
+    side_effects: []
+
+  - method: GET
+    path: "/ar/invoices/{id}/dunning-notices"
+    description: "list dunning notices emitted for an invoice (FK reverse-reachability: DunningNotice.invoice_id)"
+    roles: [AR_MANAGER, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: []
+    output: DunningNotice[]
+    side_effects: []
+
+  # ---- Payment + application ---------------------------------------------
+  - method: POST
+    path: "/ar/payments"
+    description: "record a cash receipt for a customer"
+    roles: [AR_CLERK, AR_MANAGER]
+    code: 201
+    input: [customer_id, amount_cents, received_at]
+    output: Payment
+    side_effects: ["payment created UNAPPLIED; unapplied_cents = amount_cents"]
+
+  - method: GET
+    path: "/ar/payments/{id}"
+    description: "fetch a payment with applied/unapplied split"
+    roles: [AR_MANAGER, AR_CLERK, AUDITOR]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+
+  - method: GET
+    path: "/ar/payments"
+    description: "list payments, filterable by customer (FK reverse-reachability: Payment.customer_id)"
+    roles: [AR_MANAGER, AR_CLERK, AUDITOR]
+    code: 200
+    input: ["customer_id?", "status?", "limit?", "offset?"]
+    output: Payment[]
+    side_effects: []
+
+  - method: POST
+    path: "/ar/payments/{id}/applications"
+    description: "manually apply part of a payment to one invoice (short-pay supported)"
+    roles: [AR_CLERK]
+    code: 201
+    input: [invoice_id, applied_cents, "settle_in_full?"]
+    output: PaymentApplication
+    side_effects: ["decrement invoice.balance_cents; advance Invoice + Payment states; recompute Customer posture (cascade)"]
+
+  - method: POST
+    path: "/ar/payments/{id}/auto-apply"
+    description: "auto-apply the unapplied balance across invoices via the oldest-aging-first waterfall"
+    roles: [AR_CLERK]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: ["create PaymentApplications per calculations.payment_waterfall_application; cascade Invoice + Customer recompute"]
+
+  - method: GET
+    path: "/ar/payments/{id}/applications"
+    description: "list applications of a payment (FK reverse-reachability: PaymentApplication.payment_id)"
+    roles: [AR_MANAGER, AR_CLERK, AUDITOR]
+    code: 200
+    input: []
+    output: PaymentApplication[]
+    side_effects: []
+
+  - method: POST
+    path: "/ar/payments/{id}/applications/{appId}/reverse"
+    description: "reverse (un-apply) one application; compensating restore of invoice balance"
+    roles: [AR_CLERK]
+    code: 200
+    input: []
+    output: PaymentApplication
+    side_effects: ["mark application reversed; restore invoice.balance_cents; revert invoice/payment status; recompute Customer posture (invariant: total_open_balance restored)"]
+
+  # ---- Dispute / deduction -----------------------------------------------
+  - method: POST
+    path: "/ar/disputes"
+    description: "raise a dispute/deduction against an invoice"
+    roles: [COLLECTIONS_AGENT, AR_MANAGER]
+    code: 201
+    input: [invoice_id, amount_cents, reason_code]
+    output: Dispute
+    side_effects: ["set invoice.disputed_amount_cents; if full balance, Invoice -> DISPUTED; recompute Customer.exposure_cents"]
+
+  - method: GET
+    path: "/ar/disputes/{id}"
+    description: "fetch a dispute"
+    roles: [AR_MANAGER, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: []
+
+  - method: POST
+    path: "/ar/disputes/{id}/start-review"
+    description: "move a dispute OPEN -> UNDER_REVIEW"
+    roles: [AR_MANAGER]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["dispute.status = UNDER_REVIEW"]
+
+  - method: POST
+    path: "/ar/disputes/{id}/resolve"
+    description: "resolve a dispute with a credit in the customer's favour"
+    roles: [AR_MANAGER]
+    code: 200
+    input: [resolve_credit_cents]
+    output: Dispute
+    side_effects: ["set resolution_credit_cents; decrement invoice.balance_cents; clear disputed_amount; cascade Customer recompute"]
+
+  - method: POST
+    path: "/ar/disputes/{id}/reject"
+    description: "reject a dispute; restore the invoice dunnable balance"
+    roles: [AR_MANAGER]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["clear invoice.disputed_amount_cents; restore invoice; recompute Customer.exposure_cents + credit_status"]
+
+  - method: POST
+    path: "/ar/disputes/{id}/reopen"
+    description: "reopen a resolved/rejected dispute back to UNDER_REVIEW"
+    roles: [AR_MANAGER]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["increment reopen_count; re-apply invoice.disputed_amount_cents; recompute Customer.exposure_cents"]
+
+  - method: POST
+    path: "/ar/disputes/{id}/withdraw"
+    description: "collections agent withdraws their own dispute"
+    roles: [COLLECTIONS_AGENT]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["clear disputed_amount; restore invoice; recompute Customer.exposure_cents (conserved: dunnable + disputed)"]
+
+  # ---- Promise to pay -----------------------------------------------------
+  - method: POST
+    path: "/ar/promises"
+    description: "record a promise to pay; window must not overlap an existing ACTIVE promise; OCC on Customer.version serialises concurrent creators"
+    roles: [COLLECTIONS_AGENT]
+    code: 201
+    input: [customer_id, promised_amount_cents, coverage_start, coverage_end, expected_customer_version]
+    output: PromiseToPay
+    side_effects: ["reject if window overlaps an ACTIVE promise (ERR_PROMISE_WINDOW_OVERLAP) or expected_customer_version is stale (ERR_STALE_VERSION); on success increments Customer.version by 1; recompute collection_stage"]
+
+  - method: GET
+    path: "/ar/promises/{id}"
+    description: "fetch a promise"
+    roles: [AR_MANAGER, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: []
+    output: PromiseToPay
+    side_effects: []
+
+  - method: GET
+    path: "/ar/promises"
+    description: "list promises, filterable by customer (FK reverse-reachability: PromiseToPay.customer_id)"
+    roles: [AR_MANAGER, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: ["customer_id?", "status?", "limit?", "offset?"]
+    output: PromiseToPay[]
+    side_effects: []
+
+  - method: POST
+    path: "/ar/promises/{id}/cancel"
+    description: "cancel an active promise"
+    roles: [COLLECTIONS_AGENT]
+    code: 200
+    input: []
+    output: PromiseToPay
+    side_effects: ["promise.status = CANCELLED"]
+
+  - method: POST
+    path: "/ar/promises/{id}/evaluate"
+    description: "system evaluation of a promise against the clock and credited payments"
+    roles: [AR_MANAGER, COLLECTIONS_AGENT]
+    code: 200
+    input: []
+    output: PromiseToPay
+    side_effects: ["KEPT or BROKEN per applied_payment_cents vs promised; cascade collection_stage on BROKEN"]
+
+  # ---- Write-off / bad debt ----------------------------------------------
+  - method: POST
+    path: "/ar/write-offs"
+    description: "create a pending write-off against an invoice"
+    roles: [COLLECTIONS_AGENT, AR_MANAGER]
+    code: 201
+    input: [invoice_id, amount_cents, reason_code]
+    output: WriteOff
+    side_effects: ["validate amount == dunnable balance; reject if dispute open; write-off stays pending (approved=false)"]
+
+  - method: POST
+    path: "/ar/write-offs/{id}/approve"
+    description: "AR_MANAGER approves a write-off (segregation of duties enforced)"
+    roles: [AR_MANAGER]
+    code: 200
+    input: []
+    output: WriteOff
+    side_effects: ["set approved=true; Invoice -> WRITTEN_OFF; cascade bad_debt_total, exposure, credit_status, collection_stage"]
+
+  - method: GET
+    path: "/ar/write-offs/{id}"
+    description: "fetch a write-off"
+    roles: [AR_MANAGER, AUDITOR]
+    code: 200
+    input: []
+    output: WriteOff
+    side_effects: []
+
+  # ---- Dunning ------------------------------------------------------------
+  - method: POST
+    path: "/ar/dunning-sequences"
+    description: "define an ordered dunning policy"
+    roles: [AR_MANAGER]
+    code: 201
+    input: [name, "active?", steps]
+    output: DunningSequence
+    side_effects: []
+
+  - method: GET
+    path: "/ar/dunning-sequences/{id}"
+    description: "fetch a dunning sequence"
+    roles: [AR_MANAGER, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: []
+    output: DunningSequence
+    side_effects: []
+
+  - method: GET
+    path: "/ar/dunning-sequences/{id}/notices"
+    description: "list notices produced by a sequence (FK reverse-reachability: DunningNotice.sequence_id)"
+    roles: [AR_MANAGER, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: []
+    output: DunningNotice[]
+    side_effects: []
+
+  - method: POST
+    path: "/ar/dunning-runs"
+    description: "run a dunning sequence against a customer's overdue invoices; emits notices for the highest-priority targets"
+    roles: [COLLECTIONS_AGENT]
+    code: 201
+    input: [customer_id, sequence_id]
+    output: DunningNotice[]
+    side_effects: ["emit DunningNotice per eligible invoice (skipping invoices under active DunningPause); advance dunning_stage_index; collection_stage CURRENT -> DUNNING; compute priority_score per notice"]
+
+  - method: POST
+    path: "/ar/dunning-pauses"
+    description: "schedule a dunning suppression window for a customer"
+    roles: [COLLECTIONS_AGENT, AR_MANAGER]
+    code: 201
+    input: [customer_id, pause_start, pause_end]
+    output: DunningPause
+    side_effects: ["validate 1-day buffer from other pauses; window stored SCHEDULED"]
+
+  # ---- Statement + forecast ----------------------------------------------
+  - method: POST
+    path: "/ar/customers/{id}/statements"
+    description: "cut a statement for a customer at a period end, with finance charge"
+    roles: [AR_MANAGER, AR_CLERK]
+    code: 201
+    input: [period_end]
+    output: Statement
+    side_effects: ["compute opening/new_charges/finance_charge/closing per calculations.statement_finance_charge"]
+
+  - method: GET
+    path: "/ar/statements/{id}"
+    description: "fetch a statement"
+    roles: [AR_MANAGER, AR_CLERK, AUDITOR]
+    code: 200
+    input: []
+    output: Statement
+    side_effects: []
+
+  - method: GET
+    path: "/ar/cash-forecast"
+    description: "compute a cash-collection forecast for a customer over a horizon"
+    roles: [AR_MANAGER, COLLECTIONS_AGENT, AUDITOR]
+    code: 200
+    input: [customer_id, horizon_days, method]
+    output: CashForecast
+    side_effects: ["run calculations.cash_forecast for the chosen method"]
+
+  # ---- Test-driving -------------------------------------------------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "test-driving: set the server's current UTC instant for aging/promise evaluation"
+    roles: [AR_MANAGER]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["all subsequent aging_bucket and promise.coverage_end comparisons use this clock"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing or malformed X-User-Role / X-User-ID headers"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "acting role lacks permission for the operation"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced customer/invoice/payment/dispute/sequence/promise id does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "missing required body field or malformed JSON"
+  - id: ERR_INVALID_ENUM
+    http: 422
+    condition: "enum field carries a value outside its declared member set"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested transition is not defined from the resource's current state"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_customer_version does not match the customer's current version (OCC)"
+  - id: ERR_DISPUTE_BLOCKS_WRITEOFF
+    http: 409
+    condition: "attempt to write off an invoice that has a dispute in {OPEN, UNDER_REVIEW}"
+  - id: ERR_SOD_VIOLATION
+    http: 403
+    condition: "the X-User-ID approving a write-off is the same one that created it (segregation of duties)"
+  - id: ERR_CUSTOMER_MISMATCH
+    http: 409
+    condition: "payment.customer_id differs from the invoice's customer_id during application"
+  - id: ERR_DISPUTE_EXCEEDS_BALANCE
+    http: 422
+    condition: "dispute.amount_cents exceeds the invoice's dunnable balance"
+  - id: ERR_PROMISE_WINDOW_OVERLAP
+    http: 409
+    condition: "new ACTIVE promise coverage window overlaps another ACTIVE promise for the customer"
+  - id: ERR_PAUSE_WINDOW_CONFLICT
+    http: 409
+    condition: "new dunning pause window is within the 1-day buffer of an existing non-CANCELLED pause"
+  - id: ERR_OVER_APPLICATION
+    http: 422
+    condition: "payment application applied_cents exceeds the payment's unapplied_cents"
+  - id: ERR_APPLY_EXCEEDS_INVOICE
+    http: 422
+    condition: "payment application applied_cents exceeds the invoice dunnable balance"
+  - id: ERR_WRITEOFF_AMOUNT_MISMATCH
+    http: 422
+    condition: "write_off.amount_cents does not equal the invoice dunnable balance"
+  - id: ERR_CREDIT_HOLD
+    http: 402
+    condition: "creating an invoice for a customer whose credit_status is HOLD"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "a field-level constraint is violated (e.g., due_date < invoice_date, coverage_end <= coverage_start, horizon_days out of range, negative amount)"
+  - id: ERR_PAGINATION_INVALID
+    http: 400
+    condition: "limit/offset out of the [1,100]/[0,..] bounds defined in the response envelope"
+  - id: ERR_PROMISE_ALREADY_RESOLVED
+    http: 409
+    condition: "evaluate/cancel called on a promise not in ACTIVE state"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: AR_MANAGER
+    description: "supervises the AR function: customers, credit holds, write-off approval, dispute adjudication, statements"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /ar/customers"
+      - "POST /ar/customers/{id}/hold"
+      - "POST /ar/customers/{id}/release-hold"
+      - "POST /ar/disputes/{id}/start-review"
+      - "POST /ar/disputes/{id}/resolve"
+      - "POST /ar/disputes/{id}/reject"
+      - "POST /ar/disputes/{id}/reopen"
+      - "POST /ar/write-offs/{id}/approve"
+      - "POST /ar/dunning-sequences"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /ar/invoices"
+      - "POST /ar/payments"
+      - "POST /ar/disputes"
+      - "POST /ar/write-offs"
+      - "POST /ar/dunning-pauses"
+      - "POST /ar/customers/{id}/statements"
+      - "POST /ar/promises/{id}/evaluate"
+      - "all GET reads"
+
+  - name: AR_CLERK
+    description: "cash application desk: records payments, applies/short-pays/reverses, cuts invoices and statements"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /ar/payments/{id}/applications"
+      - "POST /ar/payments/{id}/auto-apply"
+      - "POST /ar/payments/{id}/applications/{appId}/reverse"
+    shared_operations:
+      - "POST /ar/invoices"
+      - "POST /ar/payments"
+      - "POST /ar/customers/{id}/statements"
+      - "GET reads on customers/invoices/payments/applications/statements"
+
+  - name: COLLECTIONS_AGENT
+    description: "drives dunning, disputes, promises, and pauses; cannot apply cash or approve write-offs"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /ar/dunning-runs"
+      - "POST /ar/promises"
+      - "POST /ar/promises/{id}/cancel"
+      - "POST /ar/disputes/{id}/withdraw"
+    shared_operations:
+      - "POST /ar/disputes"
+      - "POST /ar/write-offs"
+      - "POST /ar/dunning-pauses"
+      - "POST /ar/promises/{id}/evaluate"
+      - "GET reads on customers/invoices/disputes/promises/notices/forecast"
+
+  - name: AUDITOR
+    description: "read-only oversight across the entire AR ledger"
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations:
+      - "all GET reads"
