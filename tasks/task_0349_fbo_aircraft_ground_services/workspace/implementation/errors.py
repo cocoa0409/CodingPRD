@@ -1,0 +1,37 @@
+"""Error classes and error ID constants (PRD §5 error catalogue)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Error catalogue — PRD §5
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_FORBIDDEN_ROLE = ("ERR_FORBIDDEN_ROLE", 403)
+ERR_NOT_RESOURCE_OWNER = ("ERR_NOT_RESOURCE_OWNER", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_PRODUCT_MISMATCH = ("ERR_PRODUCT_MISMATCH", 422)
+ERR_WEIGHT_CLASS_REJECTED = ("ERR_WEIGHT_CLASS_REJECTED", 422)
+ERR_DEICE_FIELDS_REQUIRED = ("ERR_DEICE_FIELDS_REQUIRED", 422)
+ERR_SPOT_TOW_BUFFER_CONFLICT = ("ERR_SPOT_TOW_BUFFER_CONFLICT", 409)
+ERR_SPOT_WINDOW_CONFLICT = ("ERR_SPOT_WINDOW_CONFLICT", 409)
+ERR_SLOT_OVERLAP = ("ERR_SLOT_OVERLAP", 409)
+ERR_INVALID_INTERVAL = ("ERR_INVALID_INTERVAL", 422)
+ERR_DUPLICATE_RESOURCE = ("ERR_DUPLICATE_RESOURCE", 409)
+ERR_STALE_VERSION = ("ERR_STALE_VERSION", 412)
+ERR_OVERPAYMENT = ("ERR_OVERPAYMENT", 422)
+ERR_SPOT_OUT_OF_SERVICE = ("ERR_SPOT_OUT_OF_SERVICE", 409)
+ERR_CONTRACT_EXPIRED = ("ERR_CONTRACT_EXPIRED", 422)
+ERR_VISIT_NOT_SERVICEABLE = ("ERR_VISIT_NOT_SERVICEABLE", 409)
+ERR_MISSING_FIELD = ("ERR_MISSING_FIELD", 400)
+ERR_VALIDATION = ("ERR_VALIDATION", 422)
+
+
+def err(code_tuple, message=None):
+    error_id, http_status = code_tuple
+    return ApiError(error_id, http_status, message)

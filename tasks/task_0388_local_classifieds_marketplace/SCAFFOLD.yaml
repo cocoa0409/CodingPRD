@@ -1,0 +1,1841 @@
+scenario: |
+  388. Local Classifieds & Marketplace (Craigslist/FB style): listing & category,
+  in-app messaging & offer, local pickup/meetup scheduling, price negotiation,
+  flag/spam moderation, saved search & alert, renewal/expiration, safe-trade verification
+
+domain_name: local-classifieds-marketplace
+api_prefix: /
+# Flat topology: peer top-level collections (/members, /listings, /offers, /meetups,
+# /flags, /conversations, /saved-searches, /safe-trade-spots) all sit at the root, so
+# the api_prefix is the root path rather than any single collection.
+
+complexity_profile:
+  primary_archetype: Multi-party negotiation
+  secondary_archetype: Temporal windowing
+  complexity_layers:
+    - Cascading side effects
+    - Derived field reconciliation
+    - Optimistic concurrency
+    - Rate / threshold triggers
+
+  entity_topology: flat
+  # Peer entities (Listing, Offer, Conversation, Meetup, Flag, SavedSearch, ...)
+  # linked by foreign keys; no nested-ownership URL trees. Listing is the hub
+  # other peers reference, but each peer is a top-level resource.
+
+  state_machine_shape: cyclic
+  # Offer negotiation loops buyer<->seller counteroffer rounds (cyclic), Listing
+  # carries two independent status dimensions (publication x sale), Meetup is
+  # branching with revert. Mix of cyclic + parallel + branching, never a pure
+  # linear pipeline.
+
+  relationship_patterns:
+    - one_to_many       # Listing -> Offer, Listing -> Flag, Member -> SavedSearch
+    - cross_aggregate   # Offer references both Listing and a Conversation; Meetup references an accepted Offer and a SafeTradeSpot
+    - polymorphic       # Flag.target_type can reference Listing or Member
+
+  role_model: peer_roles
+  # Seller owns Listings; Buyer makes Offers / books Meetups; Moderator owns the
+  # moderation surface (flags, bans). Plus an opaque PlatformAdmin for config and
+  # the test clock. Non-overlapping ownership of resource types.
+
+  consistency_model: immediate
+  # All mutations atomic in a single request; derived fields (offer_count,
+  # active_flag_count, trust_score) recomputed synchronously within the request.
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Member
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Unique login email."
+        constraints: "Unique across all Members; non-empty."
+      - name: display_name
+        type: string
+        source: input
+        description: "Public handle shown on listings and offers."
+      - name: role_kind
+        type: enum
+        source: input
+        description: "Whether this member primarily transacts as a seller, buyer, or both."
+        default: "BOTH"
+        constraints: "One of {SELLER, BUYER, BOTH}. Does NOT grant Moderator/Admin powers (those are header roles)."
+      - name: status
+        type: enum
+        source: system
+        description: "Account standing; see Member state machine."
+        default: "ACTIVE"
+        constraints: "One of {ACTIVE, SUSPENDED, BANNED}."
+      - name: phone_verified
+        type: boolean
+        source: system
+        description: "True once the member has completed safe-trade phone verification."
+        default: false
+      - name: verification_code
+        type: string
+        source: system
+        description: "Server-issued one-time code minted by request-verification; matched by confirm-verification."
+        default: null
+      - name: trust_score
+        type: number
+        source: computed
+        description: "Derived 0-100 reputation. Recomputed by calc compute_trust_score on every flag-resolution and verification change. See §1.3."
+        default: 50
+      - name: upheld_flag_count
+        type: integer
+        source: computed
+        description: "Count of Flags targeting this member that were resolved UPHELD. Maintained by flag resolution side effects."
+        default: 0
+      - name: active_listing_count
+        type: integer
+        source: computed
+        description: "Count of this member's Listings whose publication_status == ACTIVE. Maintained by Listing publication transitions. Gated against MAX_ACTIVE_LISTINGS."
+        default: 0
+
+  - name: Category
+    parent: null
+    common_fields: false
+    fields:
+      - name: slug
+        type: string
+        source: input
+        description: "URL-safe category identifier (e.g. 'furniture')."
+        constraints: "Unique; lowercase kebab-case; non-empty."
+      - name: name
+        type: string
+        source: input
+        description: "Human-readable category name."
+      - name: requires_phone_verified_seller
+        type: boolean
+        source: input
+        description: "If true, a Listing in this category can only be published by a Member with phone_verified == true."
+        default: false
+      - name: max_price_cents
+        type: integer
+        source: input
+        description: "Upper bound (inclusive) for listing price in this category; 0 means unbounded."
+        default: 0
+        constraints: ">= 0."
+
+  - name: Listing
+    parent: null
+    common_fields: true
+    fields:
+      - name: seller_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the owning seller. Set at creation; immutable."
+      - name: category_slug
+        type: string
+        source: input
+        description: "FK -> Category.slug; the listing's category."
+      - name: title
+        type: string
+        source: input
+        description: "Short item title."
+        constraints: "Non-empty; <= 120 chars."
+      - name: description
+        type: string
+        source: input
+        description: "Long-form item description."
+      - name: ask_price_cents
+        type: integer
+        source: input
+        description: "Seller's listed asking price in cents. May be lowered by repricing; raised on relist."
+        constraints: ">= 1; must be <= Category.max_price_cents when that cap is non-zero."
+      - name: min_acceptable_price_cents
+        type: integer
+        source: input
+        description: "Private floor; offers strictly below this are auto-rejected by the system. Never returned to buyers."
+        constraints: ">= 1 and <= ask_price_cents."
+      - name: publication_status
+        type: enum
+        source: system
+        description: "Publication dimension of the Listing state machine. See §1.2."
+        default: "DRAFT"
+        constraints: "One of {DRAFT, ACTIVE, EXPIRED, REMOVED}."
+      - name: sale_status
+        type: enum
+        source: system
+        description: "Sale dimension of the Listing state machine, independent of publication_status. See §1.2."
+        default: "AVAILABLE"
+        constraints: "One of {AVAILABLE, RESERVED, SOLD}."
+      - name: expires_at
+        type: datetime
+        source: system
+        description: "When publication auto-expires. Set on publish to current clock + LISTING_TTL_DAYS; advanced by renew."
+        default: null
+      - name: renewal_count
+        type: integer
+        source: system
+        description: "Number of times this listing has been renewed. Capped by MAX_RENEWALS."
+        default: 0
+      - name: open_offer_count
+        type: integer
+        source: computed
+        description: "Count of this listing's Offers in status {PROPOSED, COUNTERED}. Maintained by Offer transition side effects. See §1.3."
+        default: 0
+      - name: active_flag_count
+        type: integer
+        source: computed
+        description: "Count of OPEN Flags targeting this listing. Maintained by Flag transition side effects; gates auto-hide at SPAM_FLAG_THRESHOLD. See §1.3."
+        default: 0
+      - name: accepted_offer_id
+        type: string
+        source: system
+        description: "FK -> Offer.id; set when an offer is accepted and the listing is reserved; cleared if that offer/meetup is abandoned."
+        default: null
+
+  - name: Conversation
+    parent: null
+    common_fields: true
+    fields:
+      - name: listing_id
+        type: string
+        source: input
+        description: "FK -> Listing.id; the listing being discussed."
+      - name: buyer_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the buyer who opened the conversation."
+      - name: seller_id
+        type: string
+        source: system
+        description: "FK -> Member.id; copied from the listing's seller_id at creation."
+      - name: status
+        type: enum
+        source: system
+        description: "One of {OPEN, CLOSED}. CLOSED when the listing is SOLD or REMOVED."
+        default: "OPEN"
+        constraints: "One of {OPEN, CLOSED}."
+      - name: message_count
+        type: integer
+        source: computed
+        description: "Count of Messages in this conversation. Maintained by message-send side effects."
+        default: 0
+
+  - name: Message
+    parent: null
+    common_fields: false
+    fields:
+      - name: conversation_id
+        type: string
+        source: input
+        description: "FK -> Conversation.id; the thread this message belongs to."
+      - name: sender_id
+        type: string
+        source: input
+        description: "FK -> Member.id; must be the conversation's buyer_id or seller_id."
+      - name: body
+        type: string
+        source: input
+        description: "Message text."
+        constraints: "Non-empty; <= 2000 chars."
+
+  - name: Offer
+    parent: null
+    common_fields: true
+    fields:
+      - name: conversation_id
+        type: string
+        source: input
+        description: "FK -> Conversation.id; offers are scoped to a conversation thread."
+      - name: listing_id
+        type: string
+        source: system
+        description: "FK -> Listing.id; copied from the conversation at creation."
+      - name: buyer_id
+        type: string
+        source: system
+        description: "FK -> Member.id; copied from the conversation at creation."
+      - name: seller_id
+        type: string
+        source: system
+        description: "FK -> Member.id; copied from the conversation at creation."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Current offer amount in cents (most recent round)."
+        constraints: ">= 1."
+      - name: last_actor_side
+        type: enum
+        source: system
+        description: "Which side made the most recent move; the OTHER side is the one entitled to respond next."
+        default: "BUYER"
+        constraints: "One of {BUYER, SELLER}."
+      - name: round_count
+        type: integer
+        source: system
+        description: "Number of counteroffer rounds so far. Each counter increments it; capped by MAX_NEGOTIATION_ROUNDS."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Offer negotiation state. See §1.2 (cyclic)."
+        default: "PROPOSED"
+        constraints: "One of {PROPOSED, COUNTERED, ACCEPTED, REJECTED, WITHDRAWN, EXPIRED}."
+      - name: expires_at
+        type: datetime
+        source: system
+        description: "When this offer round auto-expires. Set to current clock + OFFER_TTL_HOURS on every propose/counter; cleared on terminal."
+        default: null
+
+  - name: SafeTradeSpot
+    parent: null
+    common_fields: false
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Public name of the safe-trade location (e.g. 'Central Police Station Lobby')."
+      - name: is_police_verified
+        type: boolean
+        source: input
+        description: "True for police-station-grade spots that satisfy high-value safe-trade gating."
+        default: false
+      - name: open_minute_of_day
+        type: integer
+        source: input
+        description: "Daily open time as minutes since midnight (UTC), inclusive."
+        constraints: "0 <= open_minute_of_day < close_minute_of_day <= 1440."
+      - name: close_minute_of_day
+        type: integer
+        source: input
+        description: "Daily close time as minutes since midnight (UTC), exclusive."
+        constraints: "open_minute_of_day < close_minute_of_day <= 1440."
+
+  - name: Meetup
+    parent: null
+    common_fields: true
+    fields:
+      - name: offer_id
+        type: string
+        source: input
+        description: "FK -> Offer.id; the accepted offer this meetup fulfills."
+      - name: listing_id
+        type: string
+        source: system
+        description: "FK -> Listing.id; copied from the offer at creation."
+      - name: spot_id
+        type: string
+        source: input
+        description: "FK -> SafeTradeSpot.id; where the exchange happens."
+      - name: buyer_id
+        type: string
+        source: system
+        description: "FK -> Member.id; copied from the offer."
+      - name: seller_id
+        type: string
+        source: system
+        description: "FK -> Member.id; copied from the offer."
+      - name: start_at
+        type: datetime
+        source: input
+        description: "Proposed meetup start (UTC), inclusive."
+      - name: end_at
+        type: datetime
+        source: input
+        description: "Proposed meetup end (UTC), exclusive. Must be > start_at."
+      - name: status
+        type: enum
+        source: system
+        description: "Meetup lifecycle. See §1.2 (branching with revert)."
+        default: "PROPOSED"
+        constraints: "One of {PROPOSED, CONFIRMED, COMPLETED, CANCELLED, NO_SHOW}."
+
+  - name: Flag
+    parent: null
+    common_fields: true
+    fields:
+      - name: reporter_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the member who raised the flag."
+      - name: target_type
+        type: enum
+        source: input
+        description: "Polymorphic target kind."
+        constraints: "One of {LISTING, MEMBER}."
+      - name: target_listing_id
+        type: string
+        source: input
+        description: "FK -> Listing.id; present iff target_type == LISTING."
+        default: null
+      - name: target_member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; present iff target_type == MEMBER."
+        default: null
+      - name: reason
+        type: enum
+        source: input
+        description: "Why the target was flagged."
+        constraints: "One of {SPAM, PROHIBITED, SCAM, MISCATEGORIZED, OTHER}."
+      - name: status
+        type: enum
+        source: system
+        description: "Moderation state. See §1.2 (branching)."
+        default: "OPEN"
+        constraints: "One of {OPEN, UPHELD, DISMISSED}."
+      - name: resolution_note
+        type: string
+        source: input
+        description: "Moderator note recorded at resolution time."
+        default: null
+
+  - name: SavedSearch
+    parent: null
+    common_fields: true
+    fields:
+      - name: owner_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the member who owns this saved search."
+      - name: category_slug
+        type: string
+        source: input
+        description: "FK -> Category.slug; the category filter for alerts."
+      - name: keyword
+        type: string
+        source: input
+        description: "Case-insensitive substring matched against Listing.title for alerts."
+        default: null
+      - name: max_price_cents
+        type: integer
+        source: input
+        description: "Only listings with ask_price_cents <= this value generate alerts; 0 means no price cap."
+        default: 0
+        constraints: ">= 0."
+      - name: alert_count
+        type: integer
+        source: computed
+        description: "Count of Alerts generated for this saved search. Maintained by listing-publish alert fan-out. See §1.3."
+        default: 0
+
+  - name: Alert
+    parent: null
+    common_fields: false
+    fields:
+      - name: saved_search_id
+        type: string
+        source: system
+        description: "FK -> SavedSearch.id; the saved search that matched."
+      - name: listing_id
+        type: string
+        source: system
+        description: "FK -> Listing.id; the newly-published listing that triggered the alert."
+      - name: matched_at
+        type: datetime
+        source: system
+        description: "Clock value when the alert was generated."
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Member
+    initial_state: ACTIVE
+    terminal_states: [BANNED]
+    note: "status dimension. ACTIVE<->SUSPENDED is a revert cycle; BANNED is terminal."
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /members/{id}/suspend"
+        actor: Moderator
+        preconditions:
+          - "member.status == ACTIVE"
+        side_effects:
+          - "All of this member's Listings with publication_status == ACTIVE transition to REMOVED (cascade); each such removal closes its OPEN Conversations and EXPIRES the listing's PROPOSED/COUNTERED Offers (transitive cascade — see §1.4/§1.3)."
+          - "increments Member.version by 1"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /members/{id}/reinstate"
+        actor: Moderator
+        preconditions:
+          - "member.status == SUSPENDED"
+        side_effects:
+          - "Listings are NOT automatically re-published; seller must re-publish manually."
+          - "increments Member.version by 1"
+      - from: ACTIVE
+        to: BANNED
+        trigger: "POST /members/{id}/ban"
+        actor: Moderator
+        preconditions:
+          - "member.status IN {ACTIVE, SUSPENDED}"
+          - "member.upheld_flag_count >= BAN_UPHELD_THRESHOLD"
+        side_effects:
+          - "All of this member's Listings with publication_status IN {DRAFT, ACTIVE, EXPIRED} transition to REMOVED (cascade); each removal closes OPEN Conversations and EXPIRES open Offers (transitive cascade)."
+          - "increments Member.version by 1"
+      - from: SUSPENDED
+        to: BANNED
+        trigger: "POST /members/{id}/ban"
+        actor: Moderator
+        preconditions:
+          - "member.status IN {ACTIVE, SUSPENDED}"
+          - "member.upheld_flag_count >= BAN_UPHELD_THRESHOLD"
+        side_effects:
+          - "Same cascade as ACTIVE->BANNED."
+          - "increments Member.version by 1"
+
+  - entity: Listing
+    initial_state: DRAFT
+    terminal_states: [REMOVED]
+    note: |
+      Parallel dimensions on ONE entity: publication_status {DRAFT, ACTIVE, EXPIRED, REMOVED}
+      evolves independently of sale_status {AVAILABLE, RESERVED, SOLD}. Transitions below are
+      grouped by dimension. publication_status==ACTIVE is required for offers/meetups;
+      sale_status gates reservation. REMOVED is the only globally terminal publication state.
+    transitions:
+      # ---- publication dimension ----
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /listings/{id}/publish"
+        actor: Seller
+        preconditions:
+          - "listing.publication_status == DRAFT"
+          - "seller.status == ACTIVE"
+          - "seller.active_listing_count < MAX_ACTIVE_LISTINGS"
+          - "if category.requires_phone_verified_seller then seller.phone_verified == true"
+          - "category.max_price_cents == 0 OR listing.ask_price_cents <= category.max_price_cents"
+        side_effects:
+          - "set expires_at = current_clock + LISTING_TTL_DAYS"
+          - "increment seller.active_listing_count by 1; recompute is denormalized counter"
+          - "alert fan-out: for every SavedSearch whose category_slug == listing.category_slug AND (keyword is null OR case-insensitive substring of listing.title) AND (max_price_cents == 0 OR listing.ask_price_cents <= max_price_cents), create one Alert and increment that SavedSearch.alert_count (cascade)."
+          - "increments Listing.version by 1"
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /_clock/advance (system sweep when current_clock >= expires_at) or POST /listings/{id}/expire"
+        actor: system
+        preconditions:
+          - "listing.publication_status == ACTIVE"
+          - "current_clock >= listing.expires_at"
+        side_effects:
+          - "decrement seller.active_listing_count by 1"
+          - "all OPEN Conversations on this listing remain OPEN (buyers may still message); open Offers EXPIRE (cascade — see Offer machine)."
+          - "increments Listing.version by 1"
+      - from: EXPIRED
+        to: ACTIVE
+        trigger: "POST /listings/{id}/renew"
+        actor: Seller
+        preconditions:
+          - "listing.publication_status == EXPIRED"
+          - "listing.sale_status != SOLD"
+          - "listing.renewal_count < MAX_RENEWALS"
+          - "seller.status == ACTIVE"
+          - "seller.active_listing_count < MAX_ACTIVE_LISTINGS"
+        side_effects:
+          - "set expires_at = current_clock + LISTING_TTL_DAYS"
+          - "increment renewal_count by 1"
+          - "increment seller.active_listing_count by 1"
+          - "increments Listing.version by 1"
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /listings/{id}/renew"
+        actor: Seller
+        preconditions:
+          - "listing.publication_status == ACTIVE"
+          - "listing.sale_status != SOLD"
+          - "listing.renewal_count < MAX_RENEWALS"
+        side_effects:
+          - "set expires_at = current_clock + LISTING_TTL_DAYS (extends TTL in place)"
+          - "increment renewal_count by 1"
+          - "active_listing_count unchanged (already counted)"
+          - "increments Listing.version by 1"
+      - from: ACTIVE
+        to: REMOVED
+        trigger: "POST /listings/{id}/remove (seller) OR auto-hide when active_flag_count >= SPAM_FLAG_THRESHOLD OR Member suspend/ban cascade"
+        actor: Seller | Moderator | system
+        preconditions:
+          - "listing.publication_status == ACTIVE"
+        side_effects:
+          - "decrement seller.active_listing_count by 1"
+          - "set sale_status to its current value (sale dimension frozen); clear accepted_offer_id"
+          - "all OPEN Conversations on this listing -> CLOSED (cascade)"
+          - "all Offers on this listing in {PROPOSED, COUNTERED} -> EXPIRED (transitive cascade); any PROPOSED/CONFIRMED Meetup on this listing -> CANCELLED"
+          - "increments Listing.version by 1"
+      - from: EXPIRED
+        to: REMOVED
+        trigger: "POST /listings/{id}/remove OR Member ban cascade"
+        actor: Seller | Moderator | system
+        preconditions:
+          - "listing.publication_status == EXPIRED"
+        side_effects:
+          - "active_listing_count unchanged (already decremented at expiry)"
+          - "all OPEN Conversations on this listing -> CLOSED (cascade)"
+          - "increments Listing.version by 1"
+      - from: DRAFT
+        to: REMOVED
+        trigger: "POST /listings/{id}/remove"
+        actor: Seller
+        preconditions:
+          - "listing.publication_status == DRAFT"
+        side_effects:
+          - "active_listing_count unchanged (draft was never counted)"
+          - "increments Listing.version by 1"
+      # ---- sale dimension ----
+      - from: AVAILABLE
+        to: RESERVED
+        trigger: "POST /offers/{id}/accept (seller accepts a buyer offer)"
+        actor: Seller
+        preconditions:
+          - "listing.publication_status == ACTIVE"
+          - "listing.sale_status == AVAILABLE"
+        side_effects:
+          - "set accepted_offer_id = the accepted offer's id"
+          - "the accepted Offer -> ACCEPTED; all OTHER Offers on this listing in {PROPOSED, COUNTERED} -> REJECTED (cascade)"
+          - "increments Listing.version by 1"
+      - from: RESERVED
+        to: AVAILABLE
+        trigger: "POST /meetups/{id}/cancel OR POST /meetups/{id}/no-show (the reserved meetup falls through)"
+        actor: Seller | Buyer | Moderator
+        preconditions:
+          - "listing.sale_status == RESERVED"
+          - "the meetup being cancelled/no-showed references the accepted_offer_id"
+        side_effects:
+          - "clear accepted_offer_id"
+          - "the previously ACCEPTED Offer -> WITHDRAWN (compensation; conserves the open-vs-terminal offer ledger — see §1.3 compute_open_offer_count)"
+          - "increments Listing.version by 1"
+      - from: RESERVED
+        to: SOLD
+        trigger: "POST /meetups/{id}/complete"
+        actor: Seller
+        preconditions:
+          - "listing.sale_status == RESERVED"
+          - "the completing meetup references the accepted_offer_id and is CONFIRMED"
+        side_effects:
+          - "all OPEN Conversations on this listing -> CLOSED (cascade)"
+          - "publication_status forced to REMOVED if currently ACTIVE/EXPIRED (item is gone); active_listing_count decremented if it was ACTIVE"
+          - "increments Listing.version by 1"
+
+  - entity: Offer
+    initial_state: PROPOSED
+    terminal_states: [ACCEPTED, REJECTED, WITHDRAWN, EXPIRED]
+    note: |
+      Cyclic negotiation. PROPOSED -> COUNTERED -> COUNTERED -> ... alternating sides,
+      capped by MAX_NEGOTIATION_ROUNDS. Either side can WITHDRAW/REJECT; seller can ACCEPT.
+    transitions:
+      - from: PROPOSED
+        to: COUNTERED
+        trigger: "POST /offers/{id}/counter"
+        actor: Seller | Buyer
+        preconditions:
+          - "offer.status IN {PROPOSED, COUNTERED}"
+          - "the actor is the side that did NOT make the last move (actor side != offer.last_actor_side)"
+          - "offer.round_count < MAX_NEGOTIATION_ROUNDS"
+          - "listing.publication_status == ACTIVE AND listing.sale_status == AVAILABLE"
+          - "new amount_cents >= listing.min_acceptable_price_cents when actor is seller is NOT required; min-floor only auto-rejects buyer PROPOSE/counter (see auto-reject side effect)"
+        side_effects:
+          - "set amount_cents = request amount; flip last_actor_side to the actor's side; increment round_count by 1; set expires_at = current_clock + OFFER_TTL_HOURS"
+          - "increment listing.open_offer_count only if the offer was previously terminal (it was not; no change for PROPOSED->COUNTERED)"
+          - "increments Offer.version by 1"
+      - from: COUNTERED
+        to: COUNTERED
+        trigger: "POST /offers/{id}/counter"
+        actor: Seller | Buyer
+        preconditions:
+          - "offer.status == COUNTERED"
+          - "actor side != offer.last_actor_side"
+          - "offer.round_count < MAX_NEGOTIATION_ROUNDS"
+          - "listing.publication_status == ACTIVE AND listing.sale_status == AVAILABLE"
+        side_effects:
+          - "set amount_cents; flip last_actor_side; increment round_count; refresh expires_at"
+          - "increments Offer.version by 1"
+      - from: PROPOSED
+        to: ACCEPTED
+        trigger: "POST /offers/{id}/accept"
+        actor: Seller
+        preconditions:
+          - "offer.status IN {PROPOSED, COUNTERED}"
+          - "the responding side is the seller (actor side != last_actor_side, and actor is the listing's seller)"
+          - "listing.sale_status == AVAILABLE"
+        side_effects:
+          - "Listing.sale_status -> RESERVED; listing.accepted_offer_id = this offer; sibling open Offers -> REJECTED (cascade); decrement listing.open_offer_count to reflect this and rejected siblings leaving the open set"
+          - "increments Offer.version by 1"
+      - from: COUNTERED
+        to: ACCEPTED
+        trigger: "POST /offers/{id}/accept"
+        actor: Seller | Buyer
+        preconditions:
+          - "offer.status == COUNTERED"
+          - "the actor is the side that did NOT make the last move (the one entitled to respond)"
+          - "listing.sale_status == AVAILABLE"
+        side_effects:
+          - "Listing.sale_status -> RESERVED; listing.accepted_offer_id = this offer; sibling open Offers -> REJECTED (cascade)"
+          - "increments Offer.version by 1"
+      - from: PROPOSED
+        to: REJECTED
+        trigger: "POST /offers/{id}/reject OR system auto-reject when amount_cents < listing.min_acceptable_price_cents at propose time"
+        actor: Seller | system
+        preconditions:
+          - "offer.status IN {PROPOSED, COUNTERED}"
+        side_effects:
+          - "decrement listing.open_offer_count by 1"
+          - "clear expires_at"
+          - "increments Offer.version by 1"
+      - from: COUNTERED
+        to: REJECTED
+        trigger: "POST /offers/{id}/reject"
+        actor: Seller | Buyer
+        preconditions:
+          - "offer.status == COUNTERED"
+          - "actor side != last_actor_side"
+        side_effects:
+          - "decrement listing.open_offer_count by 1; clear expires_at"
+          - "increments Offer.version by 1"
+      - from: PROPOSED
+        to: WITHDRAWN
+        trigger: "POST /offers/{id}/withdraw"
+        actor: Buyer
+        preconditions:
+          - "offer.status IN {PROPOSED, COUNTERED}"
+          - "actor is the buyer (offer.buyer_id == X-User-ID)"
+        side_effects:
+          - "decrement listing.open_offer_count by 1; clear expires_at"
+          - "increments Offer.version by 1"
+      - from: COUNTERED
+        to: WITHDRAWN
+        trigger: "POST /offers/{id}/withdraw"
+        actor: Buyer
+        preconditions:
+          - "offer.status == COUNTERED"
+          - "actor is the buyer"
+        side_effects:
+          - "decrement listing.open_offer_count by 1; clear expires_at"
+          - "increments Offer.version by 1"
+      - from: PROPOSED
+        to: EXPIRED
+        trigger: "POST /_clock/advance sweep (current_clock >= offer.expires_at) OR cascade from listing removal/expiry/member suspend"
+        actor: system
+        preconditions:
+          - "offer.status IN {PROPOSED, COUNTERED}"
+          - "current_clock >= offer.expires_at OR triggered by listing/member cascade"
+        side_effects:
+          - "decrement listing.open_offer_count by 1; clear expires_at"
+          - "increments Offer.version by 1"
+      - from: COUNTERED
+        to: EXPIRED
+        trigger: "POST /_clock/advance sweep OR cascade"
+        actor: system
+        preconditions:
+          - "offer.status == COUNTERED"
+          - "current_clock >= offer.expires_at OR cascade"
+        side_effects:
+          - "decrement listing.open_offer_count by 1; clear expires_at"
+          - "increments Offer.version by 1"
+      - from: ACCEPTED
+        to: WITHDRAWN
+        trigger: "system compensation when the reserving meetup is cancelled/no-showed (see Listing RESERVED->AVAILABLE)"
+        actor: system
+        preconditions:
+          - "offer.status == ACCEPTED"
+          - "listing.accepted_offer_id == offer.id"
+        side_effects:
+          - "open_offer_count unchanged (an ACCEPTED offer was never in the open set; the count was already decremented at acceptance)"
+          - "increments Offer.version by 1"
+
+  - entity: Meetup
+    initial_state: PROPOSED
+    terminal_states: [COMPLETED, CANCELLED, NO_SHOW]
+    note: "Branching with revert. PROPOSED -> CONFIRMED -> COMPLETED is the happy path; CANCELLED and NO_SHOW are compensating branches that revert the listing reservation."
+    transitions:
+      - from: PROPOSED
+        to: CONFIRMED
+        trigger: "POST /meetups/{id}/confirm"
+        actor: Seller | Buyer
+        preconditions:
+          - "meetup.status == PROPOSED"
+          - "the actor is the side that did NOT propose the meetup (the counterparty confirms)"
+          - "listing.sale_status == RESERVED AND listing.accepted_offer_id == meetup.offer_id"
+          - "no temporal overlap with another CONFIRMED meetup on the same spot_id (see §1.4 resource_temporal_overlap)"
+          - "[start_minute_of_day, end_minute_of_day) within [spot.open_minute_of_day, spot.close_minute_of_day)"
+          - "if listing.ask_price_cents >= HIGH_VALUE_THRESHOLD then spot.is_police_verified == true"
+        side_effects:
+          - "increments Meetup.version by 1"
+      - from: PROPOSED
+        to: CANCELLED
+        trigger: "POST /meetups/{id}/cancel"
+        actor: Seller | Buyer | Moderator
+        preconditions:
+          - "meetup.status == PROPOSED"
+        side_effects:
+          - "if this meetup references listing.accepted_offer_id: Listing.sale_status RESERVED->AVAILABLE (compensation); clear accepted_offer_id; ACCEPTED Offer -> WITHDRAWN (transitive compensation)"
+          - "increments Meetup.version by 1"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /meetups/{id}/cancel"
+        actor: Seller | Buyer | Moderator
+        preconditions:
+          - "meetup.status == CONFIRMED"
+        side_effects:
+          - "Listing.sale_status RESERVED->AVAILABLE (compensation); clear accepted_offer_id; ACCEPTED Offer -> WITHDRAWN (transitive compensation)"
+          - "increments Meetup.version by 1"
+      - from: CONFIRMED
+        to: COMPLETED
+        trigger: "POST /meetups/{id}/complete"
+        actor: Seller
+        preconditions:
+          - "meetup.status == CONFIRMED"
+          - "actor is the listing's seller"
+          - "listing.sale_status == RESERVED AND listing.accepted_offer_id == meetup.offer_id"
+        side_effects:
+          - "Listing.sale_status RESERVED->SOLD (cascade); publication_status -> REMOVED if ACTIVE/EXPIRED; close OPEN Conversations; recompute both buyer and seller trust_score (transaction completed bumps reputation — see §1.3)"
+          - "increments Meetup.version by 1"
+      - from: CONFIRMED
+        to: NO_SHOW
+        trigger: "POST /meetups/{id}/no-show"
+        actor: Seller | Buyer
+        preconditions:
+          - "meetup.status == CONFIRMED"
+          - "current_clock >= meetup.end_at"
+        side_effects:
+          - "Listing.sale_status RESERVED->AVAILABLE (compensation); clear accepted_offer_id; ACCEPTED Offer -> WITHDRAWN (transitive compensation)"
+          - "increments Meetup.version by 1"
+
+  - entity: Flag
+    initial_state: OPEN
+    terminal_states: [UPHELD, DISMISSED]
+    note: "Branching: OPEN forks to UPHELD or DISMISSED with divergent side-effect sets."
+    transitions:
+      - from: OPEN
+        to: UPHELD
+        trigger: "POST /flags/{id}/uphold"
+        actor: Moderator
+        preconditions:
+          - "flag.status == OPEN"
+        side_effects:
+          - "if target_type == LISTING: decrement that listing's active_flag_count by 1; increment the listing's seller.upheld_flag_count by 1; recompute seller.trust_score"
+          - "if target_type == MEMBER: increment target member's upheld_flag_count by 1; recompute that member's trust_score"
+          - "increments Flag.version by 1"
+      - from: OPEN
+        to: DISMISSED
+        trigger: "POST /flags/{id}/dismiss"
+        actor: Moderator
+        preconditions:
+          - "flag.status == OPEN"
+        side_effects:
+          - "if target_type == LISTING: decrement that listing's active_flag_count by 1 (no upheld_flag_count change, no trust change)"
+          - "increments Flag.version by 1"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: offer-accept-stale-listing
+    parent_entity: Listing
+    write_endpoint: "POST /offers/{id}/accept"
+    occ_field: "expected_listing_version"
+    description: |
+      Accepting an Offer reserves its Listing (sale_status AVAILABLE -> RESERVED) and
+      rejects every sibling open Offer. This legitimately supersedes any other accept:
+      a second accept of a DIFFERENT sibling offer on the same listing would, under the
+      natural product semantics, also try to reserve the still-AVAILABLE listing. The
+      loser's view of the Listing is stale once the first accept advanced
+      Listing.version, so the second accept carrying the pre-acceptance
+      expected_listing_version is rejected with a stale-version error.
+    error_id: ERR_STALE_LISTING_VERSION
+    http_status: 412
+
+  - rule_id: meetup-create-stale-offer
+    parent_entity: Offer
+    write_endpoint: "POST /meetups"
+    occ_field: "expected_offer_version"
+    description: |
+      Scheduling a Meetup against an ACCEPTED Offer pins that offer as the reservation's
+      basis. Creating a Meetup legitimately supersedes a prior abandoned scheduling
+      attempt for the same offer. If the Offer's version advanced since the client read
+      it (e.g., a compensation withdrew-and-re-accepted), the client's expected_offer_version
+      is stale and the create is rejected.
+    error_id: ERR_STALE_OFFER_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: compute_trust_score
+    trigger: "Recomputed on every Flag uphold targeting the member (or their listing), on phone verification confirm, and on Meetup completion involving the member."
+    algorithm: weighted_scoring
+    formula: |
+      # trust_score is a 0-100 reputation derived from three signals.
+      # Evaluation order is fixed: compute raw, then clamp.
+      base = BASE_TRUST                                   # 50
+      verification_bonus = VERIFY_BONUS if member.phone_verified else 0   # +20 if verified
+      flag_penalty = member.upheld_flag_count * UPHELD_PENALTY            # -15 each
+      completion_bonus = min(completed_sale_count(member), COMPLETION_CAP) * COMPLETION_BONUS
+      #   completed_sale_count(member) = count of Meetups in status COMPLETED
+      #     where member is buyer_id OR seller_id. COMPLETION_CAP = 5; COMPLETION_BONUS = +6.
+      raw = base + verification_bonus + completion_bonus - flag_penalty
+      trust_score = max(TRUST_FLOOR, min(TRUST_CEIL, raw))    # clamp to [0, 100]
+    input_set: "member.phone_verified (boolean), member.upheld_flag_count (integer >=0), and the count of COMPLETED Meetups where the member is buyer_id or seller_id."
+    constants:
+      BASE_TRUST: 50
+      VERIFY_BONUS: 20
+      UPHELD_PENALTY: 15
+      COMPLETION_BONUS: 6
+      COMPLETION_CAP: 5
+      TRUST_FLOOR: 0
+      TRUST_CEIL: 100
+    precision: "integer points; no fractional rounding (all terms integer)."
+    variants:
+      - name: provisional_at_verification
+        when: "Recomputed immediately at phone-verification confirm, before any sale completes."
+        difference: "verification_bonus flips 0 -> 20; completion_bonus reflects only sales completed so far."
+      - name: final_after_completion
+        when: "Recomputed after a Meetup completes for this member."
+        difference: "completion_bonus increases by COMPLETION_BONUS (until COMPLETION_CAP), producing a higher score than the provisional value for identical flag/verification inputs."
+
+  - name: compute_open_offer_count
+    trigger: "Maintained as a denormalized counter on Listing; reconciled on every Offer transition into or out of {PROPOSED, COUNTERED} and on acceptance cascades."
+    algorithm: aggregation
+    formula: |
+      # Conserved-quantity invariant (compensating action — see §1.9):
+      # At all times, listing.open_offer_count MUST equal
+      #   count( Offer where Offer.listing_id == listing.id AND Offer.status IN {PROPOSED, COUNTERED} ).
+      # The denormalized counter is updated by deltas, never recomputed from scratch:
+      #   propose new offer:            +1
+      #   counter (open -> open):        0   (stays in the open set)
+      #   accept:                       -1 for the accepted offer leaving the open set,
+      #                                 -1 for EACH sibling auto-rejected.
+      #   reject / withdraw / expire:   -1
+      #   ACCEPTED -> WITHDRAWN (comp):   0  (an ACCEPTED offer was already out of the open set)
+      # Forward action (accept) + compensating action (meetup cancel -> offer withdraw)
+      # MUST leave open_offer_count exactly where acceptance left it (the conserved quantity
+      # is the open-offer ledger; the accepted offer never re-enters the open set).
+    input_set: "Offers belonging to one Listing, filtered to status IN {PROPOSED, COUNTERED}."
+    constants: {}
+    precision: "exact integer count; counter must equal the filtered count at all times."
+
+  - name: compute_meetup_overlap_minutes
+    trigger: "Evaluated at POST /meetups/{id}/confirm to detect temporal collisions on a SafeTradeSpot, and at POST /meetups to validate spot operating-hours containment."
+    algorithm: interval_merge
+    formula: |
+      # Treat each meetup as a half-open interval [start_at, end_at) in absolute UTC.
+      # Two intervals A and B COLLIDE iff  A.start_at < B.end_at AND B.start_at < A.end_at.
+      # Half-open semantics: A meetup ending exactly at 14:00 and another starting at 14:00
+      # DO NOT collide (adjacency allowed, zero overlap). This is the strict-inequality rule.
+      #
+      # Operating-hours containment (evaluated against minute-of-day on the SafeTradeSpot):
+      #   start_minute_of_day = (start_at UTC hour*60 + minute); end_minute_of_day likewise.
+      #   The meetup fits iff  open_minute_of_day <= start_minute_of_day
+      #                   AND  end_minute_of_day <= close_minute_of_day.
+      #   (Meetups may not span midnight: require start_at and end_at fall on the same UTC date.)
+      collision = (A.start_at < B.end_at) AND (B.start_at < A.start_at == false ... ) # see boolean above
+      overlap_minutes = max(0, (min(A.end_at, B.end_at) - max(A.start_at, B.start_at)) in minutes)
+    input_set: "For collision: all OTHER Meetups on the same spot_id in status CONFIRMED (PROPOSED meetups do not block; COMPLETED/CANCELLED/NO_SHOW do not block). For containment: the single candidate meetup vs its spot's window."
+    constants:
+      HIGH_VALUE_THRESHOLD: 50000
+    precision: "minute granularity; overlap_minutes is a non-negative integer; collision is a boolean."
+
+  - name: compute_min_floor_autoreject
+    trigger: "Evaluated at POST /offers (buyer proposes) and on any buyer-side counter."
+    algorithm: threshold
+    formula: |
+      # The seller's private floor auto-rejects lowball buyer offers WITHOUT a manual reject.
+      # Boundary is INCLUSIVE on acceptance: an offer exactly AT the floor is allowed.
+      #   if actor_is_buyer AND amount_cents < listing.min_acceptable_price_cents:
+      #        offer is created/updated then immediately transitioned to REJECTED (status REJECTED, open_offer_count NOT incremented net)
+      #   else: offer proceeds normally (PROPOSED or COUNTERED).
+      # Seller-side counters are NOT subject to the floor (the seller may counter at any amount).
+      # Distinction vs ask cap: amount_cents has NO upper auto-reject; a buyer may offer above ask.
+    input_set: "A single proposed/countered Offer amount_cents vs its Listing.min_acceptable_price_cents; actor side."
+    constants: {}
+    precision: "exact integer cents; comparison is strict `<` (floor itself is acceptable)."
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except GET list/detail public reads"
+
+  - priority: 2
+    category: auth
+    check: "The acting role is permitted to call this endpoint per §1.7 RBAC."
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all mutating endpoints"
+
+  - priority: 3
+    category: auth
+    check: "For ownership-scoped ops, X-User-ID equals the relevant owner FK (seller_id for listing ops; buyer_id/seller_id for conversation/offer; reporter ownership not required). A non-owner Member is rejected."
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "listing mutate, offer counter/withdraw, message send, meetup confirm/complete"
+
+  - priority: 4
+    category: existence
+    check: "Every path/body FK (listing_id, conversation_id, offer_id, spot_id, category_slug, member id) resolves to an existing resource, validated left-to-right."
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints referencing a resource"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined in §1.2 (e.g. publish requires DRAFT; counter requires PROPOSED/COUNTERED; confirm requires PROPOSED meetup)."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 6
+    category: state
+    check: "OCC: when the endpoint takes expected_<parent>_version, it must equal the current parent version, else stale."
+    error_id: ERR_STALE_LISTING_VERSION
+    http_status: 412
+    applies_to: "POST /offers/{id}/accept (expected_listing_version), POST /meetups (expected_offer_version -> ERR_STALE_OFFER_VERSION)"
+
+  - priority: 7
+    category: business_safety
+    check: "Member acting as actor is not BANNED, and for publish/renew the seller.status == ACTIVE (SUSPENDED sellers cannot publish/renew)."
+    error_id: ERR_MEMBER_NOT_ACTIVE
+    http_status: 403
+    applies_to: "publish, renew, offer create/counter, meetup create, message send"
+
+  - priority: 8
+    category: business_safety
+    check: "High-value safe-trade gating: confirming a meetup whose listing.ask_price_cents >= HIGH_VALUE_THRESHOLD requires spot.is_police_verified == true."
+    error_id: ERR_SPOT_NOT_POLICE_VERIFIED
+    http_status: 422
+    applies_to: "POST /meetups/{id}/confirm"
+
+  - priority: 9
+    category: business_safety
+    check: "Category phone-verification gating: publishing a listing in a category with requires_phone_verified_seller == true requires seller.phone_verified == true."
+    error_id: ERR_SELLER_NOT_PHONE_VERIFIED
+    http_status: 422
+    applies_to: "POST /listings/{id}/publish"
+
+  - priority: 10
+    category: business_temporal
+    check: "Meetup operating-hours containment: [start_minute_of_day, end_minute_of_day) must fall within [spot.open_minute_of_day, spot.close_minute_of_day); start_at and end_at must be the same UTC date; end_at > start_at."
+    error_id: ERR_OUTSIDE_SPOT_HOURS
+    http_status: 422
+    applies_to: "POST /meetups"
+
+  - priority: 11
+    category: business_temporal
+    check: "Meetup confirm overlap: the candidate interval [start_at, end_at) must not collide (half-open, strict inequality) with any other CONFIRMED meetup on the same spot_id."
+    error_id: ERR_SPOT_TIME_CONFLICT
+    http_status: 409
+    applies_to: "POST /meetups/{id}/confirm"
+
+  - priority: 12
+    category: business_constraint
+    check: "Negotiation turn order: the actor on a counter/accept must be the side that did NOT make the last move (actor side != offer.last_actor_side)."
+    error_id: ERR_NOT_YOUR_TURN
+    http_status: 409
+    applies_to: "POST /offers/{id}/counter, POST /offers/{id}/accept"
+
+  - priority: 13
+    category: business_constraint
+    check: "Negotiation round cap: a counter is rejected when offer.round_count >= MAX_NEGOTIATION_ROUNDS."
+    error_id: ERR_MAX_ROUNDS_REACHED
+    http_status: 409
+    applies_to: "POST /offers/{id}/counter"
+
+  - priority: 14
+    category: business_constraint
+    check: "Active-listing cap: publish/renew rejected when seller.active_listing_count >= MAX_ACTIVE_LISTINGS."
+    error_id: ERR_ACTIVE_LISTING_LIMIT
+    http_status: 409
+    applies_to: "POST /listings/{id}/publish, POST /listings/{id}/renew"
+
+  - priority: 15
+    category: business_constraint
+    check: "Renewal cap: renew rejected when listing.renewal_count >= MAX_RENEWALS."
+    error_id: ERR_MAX_RENEWALS_REACHED
+    http_status: 409
+    applies_to: "POST /listings/{id}/renew"
+
+  - priority: 16
+    category: business_constraint
+    check: "Category price cap: at create/publish, ask_price_cents must be <= category.max_price_cents when that cap is non-zero."
+    error_id: ERR_PRICE_EXCEEDS_CATEGORY_CAP
+    http_status: 422
+    applies_to: "POST /listings, POST /listings/{id}/publish, PATCH /listings/{id}"
+
+  - priority: 17
+    category: business_referential
+    check: "Conversation participant: a message sender_id and an offer creator must be the conversation's buyer_id or seller_id; an outsider Member cannot post."
+    error_id: ERR_NOT_CONVERSATION_PARTICIPANT
+    http_status: 403
+    applies_to: "POST /messages, POST /offers"
+
+  - priority: 18
+    category: business_referential
+    check: "Self-trade ban: a Member cannot open a conversation or make an offer on their own listing (buyer_id != listing.seller_id)."
+    error_id: ERR_CANNOT_TRADE_OWN_LISTING
+    http_status: 422
+    applies_to: "POST /conversations, POST /offers"
+
+  - priority: 19
+    category: business_fiscal
+    check: "Offer floor relationship: min_acceptable_price_cents must be >= 1 and <= ask_price_cents at listing create/reprice."
+    error_id: ERR_FLOOR_ABOVE_ASK
+    http_status: 422
+    applies_to: "POST /listings, PATCH /listings/{id}"
+
+  - priority: 20
+    category: business_constraint
+    check: "Required input fields present and well-typed; enum values within declared sets; integer fields >= declared minimums."
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all create/update endpoints"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Members ----
+  - method: POST
+    path: "/members"
+    description: "Register a member."
+    roles: [Anonymous]
+    code: 201
+    input: [email, display_name, "role_kind?"]
+    output: Member
+    side_effects: ["trust_score initialized to BASE_TRUST (50)"]
+
+  - method: GET
+    path: "/members"
+    description: "List members (filterable)."
+    roles: [Anonymous, Moderator, PlatformAdmin]
+    code: 200
+    input: ["email?", "status?", "limit?", "offset?"]
+    output: Member[]
+    side_effects: []
+
+  - method: GET
+    path: "/members/{id}"
+    description: "Get a member (includes trust_score, upheld_flag_count, active_listing_count)."
+    roles: [Anonymous, Member, Moderator, PlatformAdmin]
+    code: 200
+    input: []
+    output: Member
+    side_effects: []
+
+  - method: POST
+    path: "/members/{id}/request-verification"
+    description: "Begin safe-trade phone verification; mints verification_code."
+    roles: [Member]
+    code: 200
+    input: []
+    output: Member
+    side_effects: ["set verification_code to a server-issued code; returns it in response.data.verification_code"]
+
+  - method: POST
+    path: "/members/{id}/confirm-verification"
+    description: "Confirm phone verification by submitting the code."
+    roles: [Member]
+    code: 200
+    input: [verification_code]
+    output: Member
+    side_effects: ["set phone_verified = true; clear verification_code; recompute trust_score (compute_trust_score, +VERIFY_BONUS); increments Member.version by 1"]
+
+  - method: POST
+    path: "/members/{id}/suspend"
+    description: "Moderator suspends a member."
+    roles: [Moderator]
+    code: 200
+    input: []
+    output: Member
+    side_effects: ["status ACTIVE->SUSPENDED; cascade REMOVE active listings; close conversations; expire open offers; increments Member.version by 1"]
+
+  - method: POST
+    path: "/members/{id}/reinstate"
+    description: "Moderator reinstates a suspended member."
+    roles: [Moderator]
+    code: 200
+    input: []
+    output: Member
+    side_effects: ["status SUSPENDED->ACTIVE; increments Member.version by 1"]
+
+  - method: POST
+    path: "/members/{id}/ban"
+    description: "Moderator bans a member (requires upheld_flag_count >= BAN_UPHELD_THRESHOLD)."
+    roles: [Moderator]
+    code: 200
+    input: []
+    output: Member
+    side_effects: ["status ->BANNED; cascade REMOVE all listings; close conversations; expire open offers; increments Member.version by 1"]
+
+  # ---- Categories ----
+  - method: POST
+    path: "/categories"
+    description: "Create a category (admin config)."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [slug, name, "requires_phone_verified_seller?", "max_price_cents?"]
+    output: Category
+    side_effects: []
+
+  - method: GET
+    path: "/categories"
+    description: "List categories."
+    roles: [Anonymous, Member, Moderator, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Category[]
+    side_effects: []
+
+  # ---- Listings ----
+  - method: POST
+    path: "/listings"
+    description: "Create a listing in DRAFT."
+    roles: [Seller]
+    code: 201
+    input: [seller_id, category_slug, title, description, ask_price_cents, min_acceptable_price_cents]
+    output: Listing
+    side_effects: ["publication_status=DRAFT, sale_status=AVAILABLE; validate floor<=ask and category cap"]
+
+  - method: GET
+    path: "/listings"
+    description: "List/search listings (public). Filter by category, status, price; supports keyword on title."
+    roles: [Anonymous, Member, Moderator, PlatformAdmin]
+    code: 200
+    input: ["seller_id?", "category_slug?", "publication_status?", "sale_status?", "max_price_cents?", "keyword?", "accepted_offer_id?", "limit?", "offset?"]
+    output: Listing[]
+    side_effects: []
+
+  - method: GET
+    path: "/listings/{id}"
+    description: "Get a listing (min_acceptable_price_cents omitted for non-seller readers)."
+    roles: [Anonymous, Member, Moderator, PlatformAdmin]
+    code: 200
+    input: []
+    output: Listing
+    side_effects: []
+
+  - method: PATCH
+    path: "/listings/{id}"
+    description: "Seller edits title/description/ask_price_cents/min_acceptable_price_cents (reprice). Cannot raise floor above ask."
+    roles: [Seller]
+    code: 200
+    input: ["title?", "description?", "ask_price_cents?", "min_acceptable_price_cents?"]
+    output: Listing
+    side_effects: ["re-validate floor<=ask and category cap; increments Listing.version by 1"]
+
+  - method: POST
+    path: "/listings/{id}/publish"
+    description: "Publish a DRAFT listing (DRAFT->ACTIVE)."
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Listing
+    side_effects: ["set expires_at; increment seller.active_listing_count; alert fan-out to matching SavedSearches; increments Listing.version by 1"]
+
+  - method: POST
+    path: "/listings/{id}/renew"
+    description: "Renew a listing (EXPIRED->ACTIVE or extend ACTIVE in place)."
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Listing
+    side_effects: ["set expires_at; increment renewal_count; increment active_listing_count if was EXPIRED; increments Listing.version by 1"]
+
+  - method: POST
+    path: "/listings/{id}/expire"
+    description: "Force-expire an ACTIVE listing now (operator/seller)."
+    roles: [Seller, PlatformAdmin]
+    code: 200
+    input: []
+    output: Listing
+    side_effects: ["ACTIVE->EXPIRED; decrement active_listing_count; expire open offers (cascade); increments Listing.version by 1"]
+
+  - method: POST
+    path: "/listings/{id}/remove"
+    description: "Remove a listing (seller delist or moderator takedown)."
+    roles: [Seller, Moderator]
+    code: 200
+    input: []
+    output: Listing
+    side_effects: ["->REMOVED; decrement active_listing_count if was ACTIVE; close conversations; expire open offers; cancel open meetups (transitive cascade); increments Listing.version by 1"]
+
+  - method: GET
+    path: "/listings/{id}/offers"
+    description: "List offers on a listing (reverse-reachability for Offer.listing_id; seller/admin only)."
+    roles: [Seller, Moderator, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Offer[]
+    side_effects: []
+
+  - method: GET
+    path: "/listings/{id}/flags"
+    description: "List flags targeting a listing (reverse-reachability for Flag.target_listing_id)."
+    roles: [Moderator, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Flag[]
+    side_effects: []
+
+  - method: GET
+    path: "/listings/{id}/conversations"
+    description: "List conversations on a listing (reverse-reachability for Conversation.listing_id; seller/admin)."
+    roles: [Seller, Moderator, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Conversation[]
+    side_effects: []
+
+  # ---- Conversations & Messages ----
+  - method: POST
+    path: "/conversations"
+    description: "Buyer opens a conversation on a listing."
+    roles: [Buyer]
+    code: 201
+    input: [listing_id, buyer_id]
+    output: Conversation
+    side_effects: ["copy seller_id from listing; status OPEN; reject self-trade"]
+
+  - method: GET
+    path: "/conversations"
+    description: "List conversations filtered by listing or participant."
+    roles: [Member, Moderator, PlatformAdmin]
+    code: 200
+    input: ["listing_id?", "buyer_id?", "seller_id?", "status?", "limit?", "offset?"]
+    output: Conversation[]
+    side_effects: []
+
+  - method: GET
+    path: "/conversations/{id}"
+    description: "Get a conversation."
+    roles: [Member, Moderator, PlatformAdmin]
+    code: 200
+    input: []
+    output: Conversation
+    side_effects: []
+
+  - method: POST
+    path: "/messages"
+    description: "Send a message in a conversation (participant only)."
+    roles: [Member]
+    code: 201
+    input: [conversation_id, sender_id, body]
+    output: Message
+    side_effects: ["increment conversation.message_count"]
+
+  - method: GET
+    path: "/conversations/{id}/messages"
+    description: "List messages in a conversation (reverse-reachability for Message.conversation_id)."
+    roles: [Member, Moderator, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Message[]
+    side_effects: []
+
+  - method: GET
+    path: "/messages"
+    description: "List messages filtered by conversation or sender (reverse-reachability for Message.conversation_id and Message.sender_id)."
+    roles: [Member, Moderator, PlatformAdmin]
+    code: 200
+    input: ["conversation_id?", "sender_id?", "limit?", "offset?"]
+    output: Message[]
+    side_effects: []
+
+  - method: GET
+    path: "/messages/{id}"
+    description: "Get a single message (also anchors the message-collection segment for Message.sender_id reverse-reachability)."
+    roles: [Member, Moderator, PlatformAdmin]
+    code: 200
+    input: []
+    output: Message
+    side_effects: []
+
+  - method: GET
+    path: "/conversations/{id}/offers"
+    description: "List offers in a conversation (reverse-reachability for Offer.conversation_id)."
+    roles: [Member, Moderator, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Offer[]
+    side_effects: []
+
+  # ---- Offers ----
+  - method: POST
+    path: "/offers"
+    description: "Buyer proposes an offer within a conversation."
+    roles: [Buyer]
+    code: 201
+    input: [conversation_id, amount_cents]
+    output: Offer
+    side_effects: ["copy listing_id/buyer_id/seller_id from conversation; status PROPOSED, last_actor_side=BUYER, round_count=0; set expires_at; auto-reject (status REJECTED) if amount < listing.min_acceptable_price_cents (compute_min_floor_autoreject); else increment listing.open_offer_count"]
+
+  - method: GET
+    path: "/offers"
+    description: "List offers filtered by conversation/listing/participant (reverse-reachability for Offer.conversation_id, Offer.listing_id, Offer.buyer_id, Offer.seller_id)."
+    roles: [Member, Moderator, PlatformAdmin]
+    code: 200
+    input: ["conversation_id?", "listing_id?", "buyer_id?", "seller_id?", "status?", "limit?", "offset?"]
+    output: Offer[]
+    side_effects: []
+
+  - method: GET
+    path: "/offers/{id}"
+    description: "Get an offer."
+    roles: [Member, Moderator, PlatformAdmin]
+    code: 200
+    input: []
+    output: Offer
+    side_effects: []
+
+  - method: POST
+    path: "/offers/{id}/counter"
+    description: "Counter an offer (the side entitled to respond moves)."
+    roles: [Seller, Buyer]
+    code: 200
+    input: [amount_cents]
+    output: Offer
+    side_effects: ["status ->COUNTERED; set amount_cents; flip last_actor_side; increment round_count; refresh expires_at; buyer-side counters below floor auto-reject; increments Offer.version by 1"]
+
+  - method: POST
+    path: "/offers/{id}/accept"
+    description: "Accept an offer; reserves the listing and rejects siblings (OCC on listing)."
+    roles: [Seller, Buyer]
+    code: 200
+    input: [expected_listing_version]
+    output: Offer
+    side_effects: ["offer ->ACCEPTED; listing.sale_status AVAILABLE->RESERVED; set accepted_offer_id; sibling open offers ->REJECTED (cascade); reconcile open_offer_count; increments Listing.version by 1; increments Offer.version by 1"]
+
+  - method: POST
+    path: "/offers/{id}/reject"
+    description: "Reject an offer (responding side declines)."
+    roles: [Seller, Buyer]
+    code: 200
+    input: []
+    output: Offer
+    side_effects: ["status ->REJECTED; decrement listing.open_offer_count; clear expires_at; increments Offer.version by 1"]
+
+  - method: POST
+    path: "/offers/{id}/withdraw"
+    description: "Buyer withdraws their offer."
+    roles: [Buyer]
+    code: 200
+    input: []
+    output: Offer
+    side_effects: ["status ->WITHDRAWN; decrement listing.open_offer_count; clear expires_at; increments Offer.version by 1"]
+
+  # ---- SafeTradeSpots ----
+  - method: POST
+    path: "/safe-trade-spots"
+    description: "Create a safe-trade spot (admin config)."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [name, "is_police_verified?", open_minute_of_day, close_minute_of_day]
+    output: SafeTradeSpot
+    side_effects: []
+
+  - method: GET
+    path: "/safe-trade-spots"
+    description: "List safe-trade spots."
+    roles: [Anonymous, Member, Moderator, PlatformAdmin]
+    code: 200
+    input: ["is_police_verified?", "limit?", "offset?"]
+    output: SafeTradeSpot[]
+    side_effects: []
+
+  - method: GET
+    path: "/safe-trade-spots/{id}"
+    description: "Get a safe-trade spot (also anchors the spot-collection segment for Meetup.spot_id reverse-reachability)."
+    roles: [Anonymous, Member, Moderator, PlatformAdmin]
+    code: 200
+    input: []
+    output: SafeTradeSpot
+    side_effects: []
+
+  # ---- Meetups ----
+  - method: POST
+    path: "/meetups"
+    description: "Buyer/seller proposes a meetup against an ACCEPTED offer (OCC on offer)."
+    roles: [Seller, Buyer]
+    code: 201
+    input: [offer_id, spot_id, start_at, end_at, expected_offer_version]
+    output: Meetup
+    side_effects: ["copy listing_id/buyer_id/seller_id from offer; status PROPOSED; validate operating-hours containment; OCC against offer.version"]
+
+  - method: GET
+    path: "/meetups"
+    description: "List meetups filtered by offer/listing/spot/participant (reverse-reachability for Meetup.listing_id, Meetup.buyer_id, Meetup.seller_id)."
+    roles: [Member, Moderator, PlatformAdmin]
+    code: 200
+    input: ["offer_id?", "listing_id?", "spot_id?", "buyer_id?", "seller_id?", "status?", "limit?", "offset?"]
+    output: Meetup[]
+    side_effects: []
+
+  - method: GET
+    path: "/meetups/{id}"
+    description: "Get a meetup."
+    roles: [Member, Moderator, PlatformAdmin]
+    code: 200
+    input: []
+    output: Meetup
+    side_effects: []
+
+  - method: GET
+    path: "/offers/{id}/meetups"
+    description: "List meetups for an offer (reverse-reachability for Meetup.offer_id)."
+    roles: [Member, Moderator, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Meetup[]
+    side_effects: []
+
+  - method: GET
+    path: "/safe-trade-spots/{id}/meetups"
+    description: "List meetups at a spot (reverse-reachability for Meetup.spot_id)."
+    roles: [Member, Moderator, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Meetup[]
+    side_effects: []
+
+  - method: POST
+    path: "/meetups/{id}/confirm"
+    description: "Counterparty confirms a proposed meetup (overlap + hours + high-value gating)."
+    roles: [Seller, Buyer]
+    code: 200
+    input: []
+    output: Meetup
+    side_effects: ["status PROPOSED->CONFIRMED; overlap check vs CONFIRMED meetups at spot; high-value police-verified gating; increments Meetup.version by 1"]
+
+  - method: POST
+    path: "/meetups/{id}/complete"
+    description: "Seller marks the meetup completed; finalizes the sale."
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Meetup
+    side_effects: ["status ->COMPLETED; listing.sale_status RESERVED->SOLD; publication ->REMOVED; close conversations; recompute buyer+seller trust_score; increments Meetup.version by 1"]
+
+  - method: POST
+    path: "/meetups/{id}/cancel"
+    description: "Either party (or moderator) cancels a meetup; reverts the reservation."
+    roles: [Seller, Buyer, Moderator]
+    code: 200
+    input: []
+    output: Meetup
+    side_effects: ["status ->CANCELLED; if references accepted_offer_id: listing RESERVED->AVAILABLE; clear accepted_offer_id; ACCEPTED offer ->WITHDRAWN (compensation); increments Meetup.version by 1"]
+
+  - method: POST
+    path: "/meetups/{id}/no-show"
+    description: "Report a no-show after end_at; reverts the reservation."
+    roles: [Seller, Buyer]
+    code: 200
+    input: []
+    output: Meetup
+    side_effects: ["status CONFIRMED->NO_SHOW; listing RESERVED->AVAILABLE; clear accepted_offer_id; ACCEPTED offer ->WITHDRAWN (compensation); increments Meetup.version by 1"]
+
+  # ---- Flags / Moderation ----
+  - method: POST
+    path: "/flags"
+    description: "Report a listing or member (polymorphic target)."
+    roles: [Member]
+    code: 201
+    input: [reporter_id, target_type, "target_listing_id?", "target_member_id?", reason]
+    output: Flag
+    side_effects: ["status OPEN; if target_type==LISTING increment listing.active_flag_count; auto-hide listing (->REMOVED) when active_flag_count >= SPAM_FLAG_THRESHOLD (cascade)"]
+
+  - method: GET
+    path: "/flags"
+    description: "List flags (moderation queue)."
+    roles: [Moderator, PlatformAdmin]
+    code: 200
+    input: ["status?", "target_type?", "target_member_id?", "reporter_id?", "limit?", "offset?"]
+    output: Flag[]
+    side_effects: []
+
+  - method: GET
+    path: "/flags/{id}"
+    description: "Get a flag."
+    roles: [Moderator, PlatformAdmin]
+    code: 200
+    input: []
+    output: Flag
+    side_effects: []
+
+  - method: GET
+    path: "/members/{id}/flags"
+    description: "List flags targeting a member (reverse-reachability for Flag.target_member_id)."
+    roles: [Moderator, PlatformAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Flag[]
+    side_effects: []
+
+  - method: POST
+    path: "/flags/{id}/uphold"
+    description: "Moderator upholds a flag; penalizes the target's reputation."
+    roles: [Moderator]
+    code: 200
+    input: ["resolution_note?"]
+    output: Flag
+    side_effects: ["status ->UPHELD; decrement listing.active_flag_count if listing; increment target.upheld_flag_count; recompute trust_score; increments Flag.version by 1"]
+
+  - method: POST
+    path: "/flags/{id}/dismiss"
+    description: "Moderator dismisses a flag; no reputation impact."
+    roles: [Moderator]
+    code: 200
+    input: ["resolution_note?"]
+    output: Flag
+    side_effects: ["status ->DISMISSED; decrement listing.active_flag_count if listing; increments Flag.version by 1"]
+
+  # ---- Saved Searches & Alerts ----
+  - method: POST
+    path: "/saved-searches"
+    description: "Member saves a search for alerting."
+    roles: [Member]
+    code: 201
+    input: [owner_id, category_slug, "keyword?", "max_price_cents?"]
+    output: SavedSearch
+    side_effects: ["alert_count initialized to 0"]
+
+  - method: GET
+    path: "/saved-searches"
+    description: "List saved searches (filter by owner; reverse-reachability for SavedSearch.owner_id)."
+    roles: [Member, PlatformAdmin]
+    code: 200
+    input: ["owner_id?", "category_slug?", "limit?", "offset?"]
+    output: SavedSearch[]
+    side_effects: []
+
+  - method: GET
+    path: "/saved-searches/{id}"
+    description: "Get a saved search (also anchors the saved-search-collection segment for Alert.saved_search_id reverse-reachability)."
+    roles: [Member, PlatformAdmin]
+    code: 200
+    input: []
+    output: SavedSearch
+    side_effects: []
+
+  - method: GET
+    path: "/saved-searches/{id}/alerts"
+    description: "List alerts generated for a saved search (reverse-reachability for Alert.saved_search_id)."
+    roles: [Member, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Alert[]
+    side_effects: []
+
+  - method: GET
+    path: "/listings/{id}/alerts"
+    description: "List alerts generated by a listing's publication (reverse-reachability for Alert.listing_id)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Alert[]
+    side_effects: []
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set"
+    description: "Set the server's current UTC clock to an absolute timestamp (test-driving)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["sets current_clock; does NOT run sweeps"]
+
+  - method: POST
+    path: "/_clock/advance"
+    description: "Advance current clock to a timestamp and run expiry sweeps (listings past expires_at -> EXPIRED with cascades; offers past expires_at -> EXPIRED)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["set current_clock; sweep ACTIVE listings whose expires_at<=clock to EXPIRED (cascade open offers ->EXPIRED); sweep open offers whose expires_at<=clock to EXPIRED; increments affected entities' version by 1"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing or malformed X-User-Role / X-User-ID on an endpoint that requires auth."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role is not in the endpoint's authorized roles."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Member acts on a resource they do not own (e.g., non-seller mutating a listing; non-buyer withdrawing an offer)."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced resource (member, listing, conversation, offer, meetup, spot, category, flag, saved search) does not exist."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition is not defined from the resource's current state."
+  - id: ERR_STALE_LISTING_VERSION
+    http: 412
+    condition: "expected_listing_version on offer accept does not match Listing.version (OCC)."
+  - id: ERR_STALE_OFFER_VERSION
+    http: 412
+    condition: "expected_offer_version on meetup create does not match Offer.version (OCC)."
+  - id: ERR_MEMBER_NOT_ACTIVE
+    http: 403
+    condition: "Acting member is SUSPENDED or BANNED for an operation requiring ACTIVE standing."
+  - id: ERR_SPOT_NOT_POLICE_VERIFIED
+    http: 422
+    condition: "Confirming a high-value meetup (listing.ask_price_cents >= HIGH_VALUE_THRESHOLD) at a non-police-verified spot."
+  - id: ERR_SELLER_NOT_PHONE_VERIFIED
+    http: 422
+    condition: "Publishing in a category that requires phone-verified sellers while seller.phone_verified == false."
+  - id: ERR_OUTSIDE_SPOT_HOURS
+    http: 422
+    condition: "Meetup window falls outside the spot's operating hours, spans midnight, or end_at <= start_at."
+  - id: ERR_SPOT_TIME_CONFLICT
+    http: 409
+    condition: "Confirming a meetup whose interval collides (half-open) with another CONFIRMED meetup at the same spot."
+  - id: ERR_NOT_YOUR_TURN
+    http: 409
+    condition: "Counter/accept attempted by the side that made the last move."
+  - id: ERR_MAX_ROUNDS_REACHED
+    http: 409
+    condition: "Counter attempted when offer.round_count >= MAX_NEGOTIATION_ROUNDS."
+  - id: ERR_ACTIVE_LISTING_LIMIT
+    http: 409
+    condition: "Publish/renew when seller.active_listing_count >= MAX_ACTIVE_LISTINGS."
+  - id: ERR_MAX_RENEWALS_REACHED
+    http: 409
+    condition: "Renew when listing.renewal_count >= MAX_RENEWALS."
+  - id: ERR_PRICE_EXCEEDS_CATEGORY_CAP
+    http: 422
+    condition: "ask_price_cents exceeds the category's non-zero max_price_cents."
+  - id: ERR_NOT_CONVERSATION_PARTICIPANT
+    http: 403
+    condition: "Message sender or offer creator is neither the conversation's buyer nor its seller."
+  - id: ERR_CANNOT_TRADE_OWN_LISTING
+    http: 422
+    condition: "A member opens a conversation or offers on their own listing."
+  - id: ERR_FLOOR_ABOVE_ASK
+    http: 422
+    condition: "min_acceptable_price_cents > ask_price_cents (or < 1) at listing create/reprice."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, bad type, out-of-range integer, or invalid enum value."
+  - id: ERR_BAN_THRESHOLD_NOT_MET
+    http: 409
+    condition: "Ban attempted while target's upheld_flag_count < BAN_UPHELD_THRESHOLD."
+  - id: ERR_VERIFICATION_CODE_MISMATCH
+    http: 422
+    condition: "confirm-verification submitted a code that does not match the member's minted verification_code."
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Anonymous
+    description: "Unauthenticated public reader; can browse listings, categories, spots, and register."
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /members (register)"
+      - "GET /listings, GET /listings/{id}"
+      - "GET /categories, GET /safe-trade-spots"
+      - "GET /members, GET /members/{id}"
+
+  - name: Seller
+    description: "A Member acting as the owner of listings; manages listing lifecycle and responds to offers."
+    identity: "entity_backed:Member"
+    exclusive_operations:
+      - "POST /listings"
+      - "PATCH /listings/{id}"
+      - "POST /listings/{id}/publish"
+      - "POST /listings/{id}/renew"
+      - "POST /listings/{id}/expire"
+    shared_operations:
+      - "POST /listings/{id}/remove (with Moderator)"
+      - "POST /offers/{id}/counter, POST /offers/{id}/accept, POST /offers/{id}/reject (with Buyer)"
+      - "POST /meetups, POST /meetups/{id}/confirm (with Buyer)"
+      - "POST /meetups/{id}/complete"
+      - "POST /meetups/{id}/cancel, POST /meetups/{id}/no-show (with Buyer/Moderator)"
+      - "GET /listings/{id}/offers, GET /listings/{id}/conversations"
+
+  - name: Buyer
+    description: "A Member acting as a buyer; opens conversations, makes/negotiates offers, schedules meetups."
+    identity: "entity_backed:Member"
+    exclusive_operations:
+      - "POST /conversations"
+      - "POST /offers"
+      - "POST /offers/{id}/withdraw"
+    shared_operations:
+      - "POST /offers/{id}/counter, POST /offers/{id}/accept, POST /offers/{id}/reject (with Seller)"
+      - "POST /meetups, POST /meetups/{id}/confirm (with Seller)"
+      - "POST /meetups/{id}/cancel, POST /meetups/{id}/no-show (with Seller/Moderator)"
+
+  - name: Member
+    description: "Any authenticated member (the generic authenticated identity used for messaging, flagging, saved searches, and verification — Seller and Buyer are role facets of the same Member entity)."
+    identity: "entity_backed:Member"
+    exclusive_operations:
+      - "POST /messages"
+      - "POST /flags"
+      - "POST /saved-searches"
+      - "POST /members/{id}/request-verification"
+      - "POST /members/{id}/confirm-verification"
+    shared_operations:
+      - "GET /conversations, GET /conversations/{id}, GET /conversations/{id}/messages, GET /conversations/{id}/offers"
+      - "GET /offers/{id}, GET /meetups/{id}, GET /saved-searches, GET /saved-searches/{id}/alerts"
+      - "GET /offers/{id}/meetups, GET /safe-trade-spots/{id}/meetups"
+
+  - name: Moderator
+    description: "Operational role owning the moderation surface: resolves flags, suspends/bans members, takes down listings."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /members/{id}/suspend, POST /members/{id}/reinstate, POST /members/{id}/ban"
+      - "POST /flags/{id}/uphold, POST /flags/{id}/dismiss"
+      - "GET /flags, GET /flags/{id}, GET /listings/{id}/flags, GET /members/{id}/flags"
+    shared_operations:
+      - "POST /listings/{id}/remove (with Seller)"
+      - "POST /meetups/{id}/cancel (with Seller/Buyer)"
+
+  - name: PlatformAdmin
+    description: "Opaque operator for configuration (categories, safe-trade spots) and the test clock."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /categories"
+      - "POST /safe-trade-spots"
+      - "POST /_clock/set, POST /_clock/advance"
+      - "GET /listings/{id}/alerts"
+    shared_operations:
+      - "POST /listings/{id}/expire (with Seller)"
+
+# =============================================================================
+# Constants reference (used across §1.2/§1.3/§1.4)
+# =============================================================================
+constants_reference:
+  MAX_ACTIVE_LISTINGS: 3
+  MAX_RENEWALS: 2
+  LISTING_TTL_DAYS: 30
+  OFFER_TTL_HOURS: 48
+  MAX_NEGOTIATION_ROUNDS: 5
+  SPAM_FLAG_THRESHOLD: 3
+  BAN_UPHELD_THRESHOLD: 2
+  HIGH_VALUE_THRESHOLD: 50000
+  BASE_TRUST: 50
+  VERIFY_BONUS: 20
+  UPHELD_PENALTY: 15
+  COMPLETION_BONUS: 6
+  COMPLETION_CAP: 5
+  TRUST_FLOOR: 0
+  TRUST_CEIL: 100

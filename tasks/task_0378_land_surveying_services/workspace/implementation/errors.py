@@ -1,0 +1,36 @@
+"""Error classes and error ID constants (from PRD §5 / scaffold §1.6)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Error catalog: error_id -> http_status
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_FORBIDDEN_ROLE = ("ERR_FORBIDDEN_ROLE", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_INVALID_REQUEST = ("ERR_INVALID_REQUEST", 400)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_STALE_ORDER_VERSION = ("ERR_STALE_ORDER_VERSION", 412)
+ERR_ROLE_MISMATCH = ("ERR_ROLE_MISMATCH", 422)
+ERR_SEGREGATION_VIOLATION = ("ERR_SEGREGATION_VIOLATION", 422)
+ERR_SEAL_NOT_LICENSED = ("ERR_SEAL_NOT_LICENSED", 422)
+ERR_CLOSURE_OUT_OF_TOLERANCE = ("ERR_CLOSURE_OUT_OF_TOLERANCE", 422)
+ERR_TITLE_NOT_CLEAR = ("ERR_TITLE_NOT_CLEAR", 422)
+ERR_INVALID_WINDOW = ("ERR_INVALID_WINDOW", 422)
+ERR_CREW_DOUBLE_BOOKED = ("ERR_CREW_DOUBLE_BOOKED", 409)
+ERR_INSTRUMENT_UNAVAILABLE = ("ERR_INSTRUMENT_UNAVAILABLE", 409)
+ERR_INSTRUMENT_OUT_OF_CALIBRATION = ("ERR_INSTRUMENT_OUT_OF_CALIBRATION", 422)
+ERR_DUPLICATE_ASSET_TAG = ("ERR_DUPLICATE_ASSET_TAG", 409)
+ERR_PAYMENT_EXCEEDS_BALANCE = ("ERR_PAYMENT_EXCEEDS_BALANCE", 422)
+ERR_DUPLICATE_CHILD = ("ERR_DUPLICATE_CHILD", 409)
+ERR_VALIDATION = ("ERR_VALIDATION", 422)
+
+
+def err(code_tuple, message=None):
+    error_id, http_status = code_tuple
+    return ApiError(error_id, http_status, message)

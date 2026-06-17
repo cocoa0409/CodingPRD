@@ -1,0 +1,1566 @@
+scenario: "FBO & Aircraft Ground Services: fuel order (Jet-A/Avgas) & tankering, hangar/tie-down assignment & billing, transient parking & ramp fee, lavatory/GPU/de-ice service, crew car & catering, fuel-volume discount/contract, into-plane reconciliation, slot/PPR"
+domain_name: fbo-aircraft-ground-services
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: temporal_windowing
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - derived_field_reconciliation
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (operator_id, aircraft_id, stay_id, ...).
+  # No nested-ownership URL trees; all resources are top-level with FK references.
+
+  state_machine_shape: parallel
+  # FuelOrder carries two independent state axes (logistics_status x reconciliation_status).
+  # ServiceVisit (the ground-handling stay) has a branching fork-join shape.
+  # RampSlot has a cyclic revoke/re-request loop. Several machines are guarded by sibling state.
+
+  relationship_patterns:
+    - one_to_many        # Operator -> Aircraft, ServiceVisit -> RampService
+    - flat_with_references  # FuelOrder, ParkingAssignment reference ServiceVisit + Aircraft by FK
+    - cross_aggregate    # Invoice aggregates lines across FuelOrder / ParkingAssignment / RampService
+
+  role_model: peer_roles
+  # OpsDispatcher owns scheduling/parking/slots; FuelTech owns fuel + into-plane;
+  # Operator is the entity-backed customer acting on its own aircraft/visits;
+  # BillingClerk owns invoicing; LineManager is the hierarchical override.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Operator
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: Aircraft operator / flight department legal name.
+      - name: contact_email
+        type: string
+        source: input
+        description: Billing/contact email for the operator account.
+      - name: account_status
+        type: enum
+        source: system
+        description: Lifecycle of the operator account; gates new business.
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED}; SUSPENDED set when an Invoice goes PAST_DUE"
+      - name: jeta_month_cumulative_gallons
+        type: integer
+        source: computed
+        description: "Running cumulative Jet-A gallons DELIVERED (into-plane ticket posted) to this operator within the current billing month; resets via POST /_clock/advance_month. Drives the tiered volume discount."
+        default: 0
+      - name: open_invoice_balance_cents
+        type: integer
+        source: computed
+        description: "Sum over this operator's Invoices in status {ISSUED, PAST_DUE} of (total_cents - paid_cents). Recomputed on every Invoice mutation."
+        default: 0
+
+  - name: Aircraft
+    parent: null
+    common_fields: true
+    fields:
+      - name: operator_id
+        type: string
+        source: input
+        description: "FK -> Operator.id; the operator that owns/operates this tail."
+      - name: tail_number
+        type: string
+        source: input
+        description: Registration / tail number, unique per operator.
+        constraints: "unique within operator_id"
+      - name: fuel_type
+        type: enum
+        source: input
+        description: Fuel the aircraft burns; constrains which FuelOrder product is allowed.
+        constraints: "one of {JET_A, AVGAS}"
+      - name: mtow_lb
+        type: integer
+        source: input
+        description: Maximum takeoff weight in pounds; selects the ramp/parking weight class.
+        constraints: ">= 1"
+      - name: weight_class
+        type: enum
+        source: computed
+        description: "Derived from mtow_lb: LIGHT if mtow_lb < 12500, MID if < 41000, else HEAVY."
+        constraints: "one of {LIGHT, MID, HEAVY}"
+
+  - name: FuelContract
+    parent: null
+    common_fields: true
+    fields:
+      - name: operator_id
+        type: string
+        source: input
+        description: "FK -> Operator.id; the operator this volume contract applies to."
+      - name: product
+        type: enum
+        source: input
+        description: Which fuel product the contract prices.
+        constraints: "one of {JET_A, AVGAS}"
+      - name: base_price_cents_per_gal
+        type: integer
+        source: input
+        description: Posted base price (cents per gallon) before volume discount.
+        constraints: ">= 1"
+      - name: tankering_fee_cents_per_gal
+        type: integer
+        source: input
+        description: Flat handling fee (cents per gallon) charged on TANKERING orders (no product cost, no volume discount).
+        constraints: ">= 0"
+      - name: contract_status
+        type: enum
+        source: system
+        description: Whether the contract is usable when pricing a fuel order.
+        default: ACTIVE
+        constraints: "one of {ACTIVE, EXPIRED}; EXPIRED set by POST /fuel-contracts/{id}/expire"
+
+  - name: ServiceVisit
+    parent: null
+    common_fields: true
+    fields:
+      - name: operator_id
+        type: string
+        source: input
+        description: "FK -> Operator.id; the operator whose aircraft is on the ground for this visit."
+      - name: aircraft_id
+        type: string
+        source: input
+        description: "FK -> Aircraft.id; the tail physically on the ground for this visit."
+      - name: arrival_utc
+        type: datetime
+        source: input
+        description: Scheduled/actual on-ground arrival timestamp (ISO 8601 UTC).
+      - name: departure_utc
+        type: datetime
+        source: input
+        description: Scheduled on-ground departure timestamp; must be strictly after arrival_utc.
+      - name: nights
+        type: integer
+        source: computed
+        description: "ceil((departure_utc - arrival_utc) / 24h), minimum 1; drives parking/ramp fee night count."
+        default: 1
+      - name: status
+        type: enum
+        source: system
+        description: Branching fork-join lifecycle of the ground-handling stay.
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, ON_GROUND, SERVICING, READY_FOR_DEPARTURE, DEPARTED, CANCELLED}"
+      - name: services_outstanding
+        type: integer
+        source: computed
+        description: "Count of this visit's RampService rows whose status NOT IN {COMPLETED, CANCELLED}; visit may move to READY_FOR_DEPARTURE only when this is 0."
+        default: 0
+
+  - name: ParkingAssignment
+    parent: null
+    common_fields: true
+    fields:
+      - name: service_visit_id
+        type: string
+        source: input
+        description: "FK -> ServiceVisit.id; the stay this parking occupies a spot for."
+      - name: spot_id
+        type: string
+        source: input
+        description: "FK -> ParkingSpot.id; the physical spot occupied."
+      - name: occupy_start_utc
+        type: datetime
+        source: input
+        description: Start of the half-open occupation interval [occupy_start_utc, occupy_end_utc).
+      - name: occupy_end_utc
+        type: datetime
+        source: input
+        description: End of the occupation interval; must be strictly after occupy_start_utc.
+      - name: status
+        type: enum
+        source: system
+        description: Occupation lifecycle.
+        default: HELD
+        constraints: "one of {HELD, OCCUPIED, RELEASED}"
+      - name: fee_cents
+        type: integer
+        source: computed
+        description: "Parking/ramp fee for this assignment in cents; computed by parking_ramp_fee on transition to OCCUPIED; 0 while HELD."
+        default: 0
+
+  - name: ParkingSpot
+    parent: null
+    common_fields: true
+    fields:
+      - name: label
+        type: string
+        source: input
+        description: Human label, e.g. "H1" or "TD-12".
+        constraints: "unique across all spots"
+      - name: spot_type
+        type: enum
+        source: input
+        description: Kind of spot; HANGAR uses tow-buffer overlap, TIE_DOWN and RAMP use half-open overlap.
+        constraints: "one of {HANGAR, TIE_DOWN, RAMP}"
+      - name: max_weight_class
+        type: enum
+        source: input
+        description: Heaviest aircraft weight class this spot accepts.
+        constraints: "one of {LIGHT, MID, HEAVY}; HEAVY accepts all, MID accepts {LIGHT,MID}, LIGHT accepts {LIGHT}"
+      - name: spot_status
+        type: enum
+        source: system
+        description: Whether the spot is offerable.
+        default: AVAILABLE
+        constraints: "one of {AVAILABLE, OUT_OF_SERVICE}; toggled by POST /parking-spots/{id}/out-of-service"
+
+  - name: FuelOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: service_visit_id
+        type: string
+        source: input
+        description: "FK -> ServiceVisit.id; the stay this uplift serves."
+      - name: aircraft_id
+        type: string
+        source: input
+        description: "FK -> Aircraft.id; the tail being fueled; product must equal aircraft.fuel_type."
+      - name: fuel_contract_id
+        type: string
+        source: input
+        description: "FK -> FuelContract.id; the contract whose pricing applies; product/operator must match."
+      - name: product
+        type: enum
+        source: input
+        description: Fuel product ordered.
+        constraints: "one of {JET_A, AVGAS}"
+      - name: ordered_gallons
+        type: integer
+        source: input
+        description: Gallons requested on the order.
+        constraints: ">= 1"
+      - name: tankering
+        type: boolean
+        source: input
+        description: "If true, fuel is uplifted off-field; FBO charges only tankering_fee_cents_per_gal and grants no volume discount."
+        default: false
+      - name: logistics_status
+        type: enum
+        source: system
+        description: First independent state axis — physical fulfillment of the uplift.
+        default: REQUESTED
+        constraints: "one of {REQUESTED, DISPATCHED, FUELED, CANCELLED}"
+      - name: reconciliation_status
+        type: enum
+        source: system
+        description: Second independent state axis — into-plane ticket reconciliation; evolves independently of logistics_status.
+        default: NOT_STARTED
+        constraints: "one of {NOT_STARTED, RECONCILED, IN_REVIEW, ADJUSTED}"
+      - name: priced_amount_cents
+        type: integer
+        source: computed
+        description: "Cost in cents from fuel_order_cost, pinned at DISPATCHED time using ordered_gallons; 0 while REQUESTED."
+        default: 0
+
+  - name: IntoPlaneTicket
+    parent: null
+    common_fields: true
+    fields:
+      - name: fuel_order_id
+        type: string
+        source: input
+        description: "FK -> FuelOrder.id; the order this delivery ticket reconciles; order must be FUELED."
+      - name: delivered_gallons
+        type: integer
+        source: input
+        description: Actual gallons pumped per the truck meter.
+        constraints: ">= 0"
+      - name: variance_gallons
+        type: integer
+        source: computed
+        description: "delivered_gallons - fuel_order.ordered_gallons; signed."
+        default: 0
+      - name: variance_pct
+        type: number
+        source: computed
+        description: "round(variance_gallons / ordered_gallons * 100, 2)."
+        default: 0
+      - name: outcome
+        type: enum
+        source: computed
+        description: "RECONCILED if abs(variance_pct) <= 2.00 else FLAGGED; drives the order's reconciliation_status."
+        constraints: "one of {RECONCILED, FLAGGED}"
+
+  - name: RampService
+    parent: null
+    common_fields: true
+    fields:
+      - name: service_visit_id
+        type: string
+        source: input
+        description: "FK -> ServiceVisit.id; the stay requesting this ground service."
+      - name: service_type
+        type: enum
+        source: input
+        description: Which ground service is requested.
+        constraints: "one of {LAVATORY, GPU, DE_ICE, CREW_CAR, CATERING}"
+      - name: status
+        type: enum
+        source: system
+        description: Service request lifecycle.
+        default: REQUESTED
+        constraints: "one of {REQUESTED, IN_PROGRESS, COMPLETED, CANCELLED}"
+      - name: deice_fluid_gallons
+        type: integer
+        source: input
+        description: For DE_ICE only — fluid gallons applied; required iff service_type == DE_ICE.
+        default: 0
+        constraints: ">= 0"
+      - name: deice_fluid_type
+        type: enum
+        source: input
+        description: For DE_ICE only — fluid blend.
+        constraints: "one of {TYPE_I, TYPE_IV}; required iff service_type == DE_ICE"
+      - name: deice_holdover_minutes
+        type: integer
+        source: input
+        description: For DE_ICE only — minutes the crew held on the pad after application.
+        default: 0
+        constraints: ">= 0"
+      - name: charge_cents
+        type: integer
+        source: computed
+        description: "Service charge in cents; for DE_ICE computed by deice_service_charge on transition to COMPLETED; flat fee otherwise; 0 until COMPLETED."
+        default: 0
+
+  - name: RampSlot
+    parent: null
+    common_fields: true
+    fields:
+      - name: service_visit_id
+        type: string
+        source: input
+        description: "FK -> ServiceVisit.id; the stay this PPR/slot reservation is for."
+      - name: pad_id
+        type: string
+        source: input
+        description: "FK -> ParkingSpot.id; the RAMP-type pad whose movement window is reserved."
+      - name: window_start_utc
+        type: datetime
+        source: input
+        description: Start of the requested half-open movement window [window_start_utc, window_end_utc).
+      - name: window_end_utc
+        type: datetime
+        source: input
+        description: End of the requested window; must be strictly after window_start_utc.
+      - name: status
+        type: enum
+        source: system
+        description: PPR lifecycle; supports a revoke/re-request cycle.
+        default: REQUESTED
+        constraints: "one of {REQUESTED, APPROVED, REVOKED, USED}"
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: operator_id
+        type: string
+        source: input
+        description: "FK -> Operator.id; the operator billed."
+      - name: service_visit_id
+        type: string
+        source: input
+        description: "FK -> ServiceVisit.id; the departed stay being billed."
+      - name: total_cents
+        type: integer
+        source: computed
+        description: "Sum of invoice_total over all billable lines (FuelOrder.priced_amount_cents where logistics_status != CANCELLED, ParkingAssignment.fee_cents where status==OCCUPIED, RampService.charge_cents where status==COMPLETED) for the visit."
+        default: 0
+      - name: paid_cents
+        type: integer
+        source: input
+        description: Amount paid so far in cents; accumulated by POST /invoices/{id}/pay.
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Invoice lifecycle.
+        default: ISSUED
+        constraints: "one of {ISSUED, PAID, PAST_DUE, VOID}"
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: ServiceVisit
+    initial_state: SCHEDULED
+    terminal_states: [DEPARTED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: ON_GROUND
+        trigger: "POST /service-visits/{id}/arrive"
+        actor: OpsDispatcher
+        preconditions:
+          - "visit.status == SCHEDULED"
+          - "operator.account_status == ACTIVE"
+        side_effects:
+          - "set arrival_utc to the provided/now timestamp"
+      - from: ON_GROUND
+        to: SERVICING
+        trigger: "POST /service-visits/{id}/start-servicing"
+        actor: OpsDispatcher
+        preconditions:
+          - "visit.status == ON_GROUND"
+          - "at least one ParkingAssignment for this visit is in status OCCUPIED"
+        side_effects: []
+      - from: SERVICING
+        to: READY_FOR_DEPARTURE
+        trigger: "POST /service-visits/{id}/mark-ready"
+        actor: OpsDispatcher
+        preconditions:
+          - "visit.status == SERVICING"
+          - "visit.services_outstanding == 0 (every RampService COMPLETED or CANCELLED)"
+          - "no FuelOrder for this visit has logistics_status IN {REQUESTED, DISPATCHED}"
+        side_effects: []
+      - from: READY_FOR_DEPARTURE
+        to: DEPARTED
+        trigger: "POST /service-visits/{id}/depart"
+        actor: OpsDispatcher
+        preconditions:
+          - "visit.status == READY_FOR_DEPARTURE"
+          - "no RampSlot for this visit is in status APPROVED with window_end_utc in the future (an APPROVED slot must be USED or REVOKED first)"
+        side_effects:
+          - "FORK-JOIN JOIN: create one Invoice for this visit (status ISSUED); compute Invoice.total_cents via invoice_total; recompute operator.open_invoice_balance_cents"
+          - "any RampSlot for this visit in status APPROVED whose window has passed transitions to USED"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /service-visits/{id}/cancel"
+        actor: OpsDispatcher
+        preconditions:
+          - "visit.status == SCHEDULED"
+        side_effects:
+          - "CASCADE: every ParkingAssignment for this visit in status {HELD, OCCUPIED} -> RELEASED; every RampSlot in {REQUESTED, APPROVED} -> REVOKED"
+      - from: ON_GROUND
+        to: CANCELLED
+        trigger: "POST /service-visits/{id}/cancel"
+        actor: OpsDispatcher
+        preconditions:
+          - "visit.status == ON_GROUND"
+          - "no FuelOrder for this visit has logistics_status == FUELED"
+        side_effects:
+          - "CASCADE (depth 3): visit CANCELLED -> every non-terminal ParkingAssignment for this visit RELEASED -> each released assignment frees its ParkingSpot occupation window; every non-terminal RampService -> CANCELLED; every RampSlot in {REQUESTED, APPROVED} -> REVOKED"
+
+  - entity: FuelOrder
+    initial_state: REQUESTED
+    terminal_states: [CANCELLED]
+    note: "PARALLEL DIMENSIONS — logistics_status and reconciliation_status evolve on independent axes on the same row. The transitions below are partitioned by axis."
+    transitions:
+      # --- logistics axis ---
+      - from: REQUESTED
+        to: DISPATCHED
+        trigger: "POST /fuel-orders/{id}/dispatch"
+        actor: FuelTech
+        preconditions:
+          - "logistics_status == REQUESTED"
+          - "parent ServiceVisit.status IN {ON_GROUND, SERVICING}"
+          - "fuel_contract.contract_status == ACTIVE"
+          - "fuel_order.product == aircraft.fuel_type AND fuel_order.product == fuel_contract.product"
+        side_effects:
+          - "compute priced_amount_cents via fuel_order_cost using ordered_gallons (volume-discounted for non-tankering, flat tankering fee otherwise)"
+      - from: DISPATCHED
+        to: FUELED
+        trigger: "POST /fuel-orders/{id}/complete-fueling"
+        actor: FuelTech
+        preconditions:
+          - "logistics_status == DISPATCHED"
+        side_effects:
+          - "LEDGER SYNC (non-tankering only): add ordered_gallons to operator.jeta_month_cumulative_gallons when product == JET_A (this advances the operator's volume tier for subsequent orders)"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /fuel-orders/{id}/cancel"
+        actor: FuelTech
+        preconditions:
+          - "logistics_status == REQUESTED"
+        side_effects: []
+      - from: DISPATCHED
+        to: CANCELLED
+        trigger: "POST /fuel-orders/{id}/cancel"
+        actor: FuelTech
+        preconditions:
+          - "logistics_status == DISPATCHED"
+        side_effects:
+          - "reset priced_amount_cents to 0"
+      # --- reconciliation axis (independent) ---
+      - from: NOT_STARTED
+        to: RECONCILED
+        trigger: "POST /into-plane-tickets (delivered within tolerance)"
+        actor: FuelTech
+        preconditions:
+          - "logistics_status == FUELED"
+          - "reconciliation_status == NOT_STARTED"
+          - "resulting IntoPlaneTicket.outcome == RECONCILED (abs(variance_pct) <= 2.00)"
+        side_effects:
+          - "create IntoPlaneTicket; set its variance_gallons/variance_pct/outcome via into_plane_reconciliation"
+      - from: NOT_STARTED
+        to: IN_REVIEW
+        trigger: "POST /into-plane-tickets (delivered outside tolerance)"
+        actor: FuelTech
+        preconditions:
+          - "logistics_status == FUELED"
+          - "reconciliation_status == NOT_STARTED"
+          - "resulting IntoPlaneTicket.outcome == FLAGGED (abs(variance_pct) > 2.00)"
+        side_effects:
+          - "create IntoPlaneTicket with outcome FLAGGED"
+      - from: IN_REVIEW
+        to: ADJUSTED
+        trigger: "POST /fuel-orders/{id}/adjust-billing"
+        actor: BillingClerk
+        preconditions:
+          - "reconciliation_status == IN_REVIEW"
+        side_effects:
+          - "COMPENSATING RE-PRICE (depth 3 cascade): re-run fuel_order_cost using the ticket's delivered_gallons, overwrite priced_amount_cents -> if this order's parent visit already has an Invoice (status ISSUED), recompute that Invoice.total_cents -> recompute operator.open_invoice_balance_cents. Conserves the invariant invoice_billed_consistency."
+
+  - entity: ParkingAssignment
+    initial_state: HELD
+    terminal_states: [RELEASED]
+    transitions:
+      - from: HELD
+        to: OCCUPIED
+        trigger: "POST /parking-assignments/{id}/occupy"
+        actor: OpsDispatcher
+        preconditions:
+          - "assignment.status == HELD"
+          - "parent ServiceVisit.status IN {ON_GROUND, SERVICING}"
+          - "spot.spot_status == AVAILABLE"
+        side_effects:
+          - "compute fee_cents via parking_ramp_fee (weight class x nights)"
+      - from: HELD
+        to: RELEASED
+        trigger: "POST /parking-assignments/{id}/release"
+        actor: OpsDispatcher
+        preconditions:
+          - "assignment.status == HELD"
+        side_effects:
+          - "free the spot's occupation window so it no longer blocks overlap checks"
+      - from: OCCUPIED
+        to: RELEASED
+        trigger: "POST /parking-assignments/{id}/release"
+        actor: OpsDispatcher
+        preconditions:
+          - "assignment.status == OCCUPIED"
+        side_effects:
+          - "free the spot's occupation window so it no longer blocks overlap checks"
+          - "fee_cents is retained for billing"
+
+  - entity: RampService
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: IN_PROGRESS
+        trigger: "POST /ramp-services/{id}/start"
+        actor: LineManager
+        preconditions:
+          - "service.status == REQUESTED"
+          - "parent ServiceVisit.status == SERVICING"
+        side_effects: []
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /ramp-services/{id}/complete"
+        actor: LineManager
+        preconditions:
+          - "service.status == IN_PROGRESS"
+        side_effects:
+          - "compute charge_cents (deice_service_charge for DE_ICE, flat fee otherwise)"
+          - "BUBBLE UP: decrement parent ServiceVisit.services_outstanding by 1"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /ramp-services/{id}/cancel"
+        actor: LineManager
+        preconditions:
+          - "service.status == REQUESTED"
+        side_effects:
+          - "BUBBLE UP: decrement parent ServiceVisit.services_outstanding by 1"
+      - from: IN_PROGRESS
+        to: CANCELLED
+        trigger: "POST /ramp-services/{id}/cancel"
+        actor: LineManager
+        preconditions:
+          - "service.status == IN_PROGRESS"
+        side_effects:
+          - "BUBBLE UP: decrement parent ServiceVisit.services_outstanding by 1"
+
+  - entity: RampSlot
+    initial_state: REQUESTED
+    terminal_states: [USED]
+    note: "CYCLIC — an APPROVED slot may be REVOKED and the visit may then re-request a fresh slot, forming REQUESTED->APPROVED->REVOKED and then a new REQUESTED row; the same RampSlot may also be re-requested REVOKED->REQUESTED."
+    transitions:
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /ramp-slots/{id}/approve"
+        actor: OpsDispatcher
+        preconditions:
+          - "slot.status == REQUESTED"
+          - "parent ServiceVisit.status IN {SCHEDULED, ON_GROUND, SERVICING}"
+          - "no other RampSlot on the same pad_id in status APPROVED whose window half-open-overlaps this window"
+        side_effects: []
+      - from: APPROVED
+        to: REVOKED
+        trigger: "POST /ramp-slots/{id}/revoke"
+        actor: OpsDispatcher
+        preconditions:
+          - "slot.status == APPROVED"
+        side_effects:
+          - "free the pad's approved-window so it no longer blocks overlap checks"
+      - from: REVOKED
+        to: REQUESTED
+        trigger: "POST /ramp-slots/{id}/re-request"
+        actor: Operator
+        preconditions:
+          - "slot.status == REVOKED"
+          - "parent ServiceVisit.status NOT IN {DEPARTED, CANCELLED}"
+        side_effects: []
+      - from: APPROVED
+        to: USED
+        trigger: "POST /ramp-slots/{id}/use"
+        actor: OpsDispatcher
+        preconditions:
+          - "slot.status == APPROVED"
+          - "parent ServiceVisit.status IN {ON_GROUND, SERVICING, READY_FOR_DEPARTURE}"
+        side_effects:
+          - "free the pad's approved-window"
+
+  - entity: Invoice
+    initial_state: ISSUED
+    terminal_states: [PAID, VOID]
+    transitions:
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /invoices/{id}/pay (paid_cents reaches total_cents)"
+        actor: BillingClerk
+        preconditions:
+          - "invoice.status == ISSUED"
+          - "invoice.paid_cents + payment_cents >= invoice.total_cents"
+        side_effects:
+          - "add payment_cents to paid_cents; recompute operator.open_invoice_balance_cents"
+      - from: ISSUED
+        to: PAST_DUE
+        trigger: "POST /invoices/{id}/mark-past-due"
+        actor: BillingClerk
+        preconditions:
+          - "invoice.status == ISSUED"
+        side_effects:
+          - "CROSS-ENTITY: set operator.account_status = SUSPENDED"
+      - from: PAST_DUE
+        to: PAID
+        trigger: "POST /invoices/{id}/pay (paid_cents reaches total_cents)"
+        actor: BillingClerk
+        preconditions:
+          - "invoice.status == PAST_DUE"
+          - "invoice.paid_cents + payment_cents >= invoice.total_cents"
+        side_effects:
+          - "add payment_cents to paid_cents; recompute operator.open_invoice_balance_cents; if operator now has zero ISSUED/PAST_DUE invoices with positive balance, set operator.account_status = ACTIVE"
+      - from: ISSUED
+        to: VOID
+        trigger: "POST /invoices/{id}/void"
+        actor: LineManager
+        preconditions:
+          - "invoice.status == ISSUED"
+        side_effects:
+          - "recompute operator.open_invoice_balance_cents (this invoice drops out)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: invoice-pay-stale-version
+    parent_entity: Invoice
+    write_endpoint: "POST /invoices/{id}/pay"
+    occ_field: "expected_invoice_version"
+    description: |
+      Posting a payment against an Invoice whose version has advanced since the
+      client last observed it is rejected. This captures the case where a prior
+      payment (or an adjust-billing re-price that recomputed total_cents) already
+      mutated the invoice, so the current writer's view of paid_cents/total_cents
+      is stale and applying its delta would over- or under-credit the balance.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: visit-occupy-stale-version
+    parent_entity: ParkingAssignment
+    write_endpoint: "POST /parking-assignments/{id}/occupy"
+    occ_field: "expected_assignment_version"
+    description: |
+      Confirming occupation of a ParkingAssignment whose version has advanced
+      since the client last observed it is rejected. This captures the case where
+      another operator action already released or re-priced the assignment, so
+      occupying on the stale view would double-book the spot's window.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: fuel_order_cost
+    trigger: "FuelOrder REQUESTED -> DISPATCHED (POST /fuel-orders/{id}/dispatch); also re-run on FuelOrder IN_REVIEW -> ADJUSTED with delivered_gallons"
+    algorithm: tiered_pricing
+    formula: |
+      IF tankering == true:
+        priced_amount_cents = ordered_gallons * fuel_contract.tankering_fee_cents_per_gal
+        # flat fee; NO product cost, NO volume discount, tier untouched
+      ELSE:
+        base = fuel_contract.base_price_cents_per_gal
+        prev = operator.jeta_month_cumulative_gallons   # cumulative BEFORE this order
+        # MARGINAL pricing: each gallon priced by the cumulative tier it falls in.
+        cost = 0
+        for g in [prev .. prev + ordered_gallons - 1]:   # integer gallon index
+          if   g < TIER1_CEIL: disc = 0
+          elif g < TIER2_CEIL: disc = TIER2_DISCOUNT_CENTS
+          else:                disc = TIER3_DISCOUNT_CENTS
+          cost += (base - disc)
+        priced_amount_cents = cost
+      # AVGAS orders never advance the JET_A tier and use disc=0 at all tiers
+      # (AVGAS contract base only); only JET_A non-tankering orders move the tier.
+    input_set: "Single FuelOrder plus its operator's jeta_month_cumulative_gallons snapshot taken at DISPATCH time (cumulative reflects only orders already FUELED this month)."
+    constants:
+      TIER1_CEIL: 5000
+      TIER2_CEIL: 20000
+      TIER2_DISCOUNT_CENTS: 5
+      TIER3_DISCOUNT_CENTS: 12
+    precision: "integer cents; no rounding needed (all inputs are integer cents/gallons)"
+    variants:
+      - name: volume_discounted
+        when: "tankering == false"
+        difference: "Marginal tiered discount keyed on the operator's running cumulative JET_A gallons; crosses tier boundaries mid-order."
+      - name: tankered_flat
+        when: "tankering == true"
+        difference: "Flat tankering_fee_cents_per_gal * ordered_gallons; ignores base price and volume tier entirely."
+
+  - name: parking_ramp_fee
+    trigger: "ParkingAssignment HELD -> OCCUPIED (POST /parking-assignments/{id}/occupy)"
+    algorithm: tiered_pricing
+    formula: |
+      per_night = RAMP_RATE_CENTS[aircraft.weight_class]   # via ServiceVisit.aircraft_id
+      nights    = parent ServiceVisit.nights
+      # PINNED ROUNDING ORDER: round each night's fee to whole cents, THEN sum.
+      # (Rates are already whole cents so this equals per_night * nights, but the
+      #  order is fixed so future fractional rates are well-defined.)
+      fee_cents = 0
+      for n in [1 .. nights]:
+        fee_cents += round_half_up(per_night)
+      # WAIVER: if the same operator has >= WAIVER_MIN_GAL JET_A gallons delivered
+      # (sum of IntoPlaneTicket.delivered_gallons over FUELED non-tankering JET_A
+      #  FuelOrders for this visit) at occupy time, ramp fee is WAIVED to 0 only
+      # for spot_type == RAMP (transient ramp). HANGAR/TIE_DOWN never waive.
+      if spot.spot_type == RAMP and visit_delivered_jeta_gallons >= WAIVER_MIN_GAL:
+        fee_cents = 0
+    input_set: "One ParkingAssignment, its ParkingSpot, the parent ServiceVisit (nights, aircraft weight_class), and the sum of delivered JET_A gallons on this visit's FUELED non-tankering orders."
+    constants:
+      RAMP_RATE_CENTS: { LIGHT: 7500, MID: 15000, HEAVY: 32500 }
+      WAIVER_MIN_GAL: 200
+    precision: "integer cents, round_half_up per night then sum"
+    variants:
+      - name: standard_fee
+        when: "spot_type IN {HANGAR, TIE_DOWN} OR visit_delivered_jeta_gallons < WAIVER_MIN_GAL"
+        difference: "Full weight-class rate times nights."
+      - name: ramp_waived
+        when: "spot_type == RAMP AND visit_delivered_jeta_gallons >= WAIVER_MIN_GAL"
+        difference: "Fee forced to 0 cents."
+
+  - name: into_plane_reconciliation
+    trigger: "FuelOrder reconciliation NOT_STARTED -> {RECONCILED|IN_REVIEW} (POST /into-plane-tickets)"
+    algorithm: threshold
+    formula: |
+      variance_gallons = delivered_gallons - fuel_order.ordered_gallons
+      variance_pct     = round_half_up(variance_gallons / fuel_order.ordered_gallons * 100, 2)
+      if abs(variance_pct) <= TOLERANCE_PCT:   # boundary: exactly 2.00 reconciles (<=)
+        outcome = RECONCILED
+      else:
+        outcome = FLAGGED
+    input_set: "One IntoPlaneTicket vs its FuelOrder.ordered_gallons; order must be FUELED."
+    constants:
+      TOLERANCE_PCT: 2.00
+    precision: "variance_pct: 2 decimal places, round_half_up"
+
+  - name: deice_service_charge
+    trigger: "RampService(DE_ICE) IN_PROGRESS -> COMPLETED (POST /ramp-services/{id}/complete)"
+    algorithm: weighted_scoring
+    formula: |
+      # >= 3 inputs with non-linear interaction (nested max + type multiplier).
+      base_cents = deice_fluid_gallons * FLUID_RATE_CENTS * DILUTION[deice_fluid_type]
+      surcharge_cents = max(0, deice_holdover_minutes - FREE_HOLDOVER_MIN) * HOLDOVER_RATE_CENTS_PER_MIN
+      charge_cents = round_half_up(base_cents) + surcharge_cents
+    input_set: "One DE_ICE RampService row (fluid gallons, fluid type, holdover minutes)."
+    constants:
+      FLUID_RATE_CENTS: 1800
+      DILUTION: { TYPE_I: 1.0, TYPE_IV: 1.4 }
+      FREE_HOLDOVER_MIN: 15
+      HOLDOVER_RATE_CENTS_PER_MIN: 400
+    precision: "integer cents; round_half_up the fluid base term before adding the (integer) surcharge — PINNED ORDER"
+
+  - name: invoice_total
+    trigger: "ServiceVisit READY_FOR_DEPARTURE -> DEPARTED (POST /service-visits/{id}/depart); re-run on FuelOrder IN_REVIEW -> ADJUSTED"
+    algorithm: aggregation
+    formula: |
+      total_cents =
+          sum( fo.priced_amount_cents
+               for fo in FuelOrders where fo.service_visit_id == visit.id
+                                      and fo.logistics_status != CANCELLED )
+        + sum( pa.fee_cents
+               for pa in ParkingAssignments where pa.service_visit_id == visit.id
+                                              and pa.status == OCCUPIED )
+        + sum( rs.charge_cents
+               for rs in RampServices where rs.service_visit_id == visit.id
+                                        and rs.status == COMPLETED )
+    input_set: "All FuelOrders (logistics_status != CANCELLED), OCCUPIED ParkingAssignments, and COMPLETED RampServices whose service_visit_id == this visit."
+    constants: {}
+    precision: "integer cents; pure sum, no rounding"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to perform this operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: auth
+    check: "For Operator-role acting on a resource, X-User-ID equals the operator_id owning the aircraft/visit/slot acted upon"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Operator-role endpoints (re-request slot, read own resources)"
+
+  - priority: 4
+    category: existence
+    check: "Every resource referenced in the path or as an FK in the body exists (validated left-to-right)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which this transition is defined"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6
+    category: business_referential
+    check: "FuelOrder.product == aircraft.fuel_type AND == fuel_contract.product AND fuel_contract.operator_id == aircraft.operator_id"
+    error_id: ERR_PRODUCT_MISMATCH
+    http_status: 422
+    applies_to: "POST /fuel-orders, POST /fuel-orders/{id}/dispatch"
+
+  - priority: 7
+    category: business_referential
+    check: "ParkingSpot.max_weight_class accepts aircraft.weight_class (HEAVY accepts all; MID accepts {LIGHT,MID}; LIGHT accepts {LIGHT})"
+    error_id: ERR_WEIGHT_CLASS_REJECTED
+    http_status: 422
+    applies_to: "POST /parking-assignments"
+
+  - priority: 8
+    category: business_safety
+    check: "DE_ICE RampService must carry deice_fluid_type and deice_fluid_gallons >= 1 and deice_holdover_minutes >= 0; non-DE_ICE must NOT carry de-ice fields"
+    error_id: ERR_DEICE_FIELDS_REQUIRED
+    http_status: 422
+    applies_to: "POST /ramp-services"
+
+  - priority: 9
+    category: business_temporal
+    check: "On POST /parking-assignments occupy of a HANGAR spot, the [occupy_start, occupy_end) window plus a 30-minute tow buffer must not collide with any OCCUPIED assignment's window on the same spot (closed-with-buffer overlap)"
+    error_id: ERR_SPOT_TOW_BUFFER_CONFLICT
+    http_status: 409
+    applies_to: "POST /parking-assignments/{id}/occupy (HANGAR spots)"
+
+  - priority: 10
+    category: business_temporal
+    check: "On POST /parking-assignments occupy of a TIE_DOWN/RAMP spot, the [occupy_start, occupy_end) window must not half-open-overlap any OCCUPIED assignment's window on the same spot (adjacency allowed)"
+    error_id: ERR_SPOT_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /parking-assignments/{id}/occupy (TIE_DOWN/RAMP spots)"
+
+  - priority: 11
+    category: business_temporal
+    check: "On POST /ramp-slots/{id}/approve, the [window_start, window_end) must not half-open-overlap any APPROVED RampSlot on the same pad_id (adjacency allowed)"
+    error_id: ERR_SLOT_OVERLAP
+    http_status: 409
+    applies_to: "POST /ramp-slots/{id}/approve"
+
+  - priority: 12
+    category: business_constraint
+    check: "ServiceVisit.departure_utc strictly after arrival_utc; ParkingAssignment/RampSlot end strictly after start"
+    error_id: ERR_INVALID_INTERVAL
+    http_status: 422
+    applies_to: "POST /service-visits, POST /parking-assignments, POST /ramp-slots"
+
+  - priority: 13
+    category: business_constraint
+    check: "Aircraft.tail_number unique within its operator_id; ParkingSpot.label globally unique"
+    error_id: ERR_DUPLICATE_RESOURCE
+    http_status: 409
+    applies_to: "POST /aircraft, POST /parking-spots"
+
+  - priority: 14
+    category: state
+    check: "Optimistic-concurrency: expected_<parent>_version equals the live parent.version on OCC-guarded writes"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /invoices/{id}/pay, POST /parking-assignments/{id}/occupy"
+
+  - priority: 15
+    category: business_fiscal
+    check: "On POST /invoices/{id}/pay, payment_cents >= 1 and paid_cents + payment_cents must not exceed total_cents"
+    error_id: ERR_OVERPAYMENT
+    http_status: 422
+    applies_to: "POST /invoices/{id}/pay"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Operator ----
+  - method: POST
+    path: "/operators"
+    description: Register an operator account.
+    roles: [BillingClerk, LineManager]
+    code: 201
+    input: [legal_name, contact_email]
+    output: Operator
+    side_effects: ["account_status=ACTIVE; jeta_month_cumulative_gallons=0; open_invoice_balance_cents=0"]
+  - method: GET
+    path: "/operators/{id}"
+    description: Fetch an operator (includes computed cumulative gallons + open balance).
+    roles: [OpsDispatcher, FuelTech, BillingClerk, LineManager, Operator]
+    code: 200
+    input: []
+    output: Operator
+    side_effects: []
+
+  # ---- Aircraft ----
+  - method: POST
+    path: "/aircraft"
+    description: Register an aircraft under an operator.
+    roles: [OpsDispatcher, LineManager, Operator]
+    code: 201
+    input: [operator_id, tail_number, fuel_type, mtow_lb]
+    output: Aircraft
+    side_effects: ["compute weight_class from mtow_lb"]
+  - method: GET
+    path: "/aircraft/{id}"
+    description: Fetch an aircraft.
+    roles: [OpsDispatcher, FuelTech, LineManager, Operator]
+    code: 200
+    input: []
+    output: Aircraft
+    side_effects: []
+  - method: GET
+    path: "/aircraft"
+    description: List aircraft, optionally filtered by operator.
+    roles: [OpsDispatcher, FuelTech, BillingClerk, LineManager, Operator]
+    code: 200
+    input: ["operator_id?", "limit?", "offset?"]
+    output: Aircraft[]
+    side_effects: []
+
+  # ---- FuelContract ----
+  - method: POST
+    path: "/fuel-contracts"
+    description: Create a fuel volume contract for an operator+product.
+    roles: [BillingClerk, LineManager]
+    code: 201
+    input: [operator_id, product, base_price_cents_per_gal, tankering_fee_cents_per_gal]
+    output: FuelContract
+    side_effects: ["contract_status=ACTIVE"]
+  - method: GET
+    path: "/fuel-contracts/{id}"
+    description: Fetch a fuel contract.
+    roles: [FuelTech, BillingClerk, LineManager, Operator]
+    code: 200
+    input: []
+    output: FuelContract
+    side_effects: []
+  - method: GET
+    path: "/fuel-contracts"
+    description: List fuel contracts, filterable by operator.
+    roles: [FuelTech, BillingClerk, LineManager, Operator]
+    code: 200
+    input: ["operator_id?", "limit?", "offset?"]
+    output: FuelContract[]
+    side_effects: []
+  - method: POST
+    path: "/fuel-contracts/{id}/expire"
+    description: Expire a contract so it can no longer price new orders.
+    roles: [BillingClerk, LineManager]
+    code: 200
+    input: []
+    output: FuelContract
+    side_effects: ["contract_status=EXPIRED"]
+
+  # ---- ServiceVisit ----
+  - method: POST
+    path: "/service-visits"
+    description: Schedule a ground-handling visit for an aircraft.
+    roles: [OpsDispatcher, LineManager, Operator]
+    code: 201
+    input: [operator_id, aircraft_id, arrival_utc, departure_utc]
+    output: ServiceVisit
+    side_effects: ["compute nights; status=SCHEDULED; services_outstanding=0"]
+  - method: GET
+    path: "/service-visits/{id}"
+    description: Fetch a visit.
+    roles: [OpsDispatcher, FuelTech, BillingClerk, LineManager, Operator]
+    code: 200
+    input: []
+    output: ServiceVisit
+    side_effects: []
+  - method: GET
+    path: "/service-visits"
+    description: List visits, filterable by operator or aircraft.
+    roles: [OpsDispatcher, FuelTech, BillingClerk, LineManager, Operator]
+    code: 200
+    input: ["operator_id?", "aircraft_id?", "status?", "limit?", "offset?"]
+    output: ServiceVisit[]
+    side_effects: []
+  - method: POST
+    path: "/service-visits/{id}/arrive"
+    description: Mark the aircraft on the ground.
+    roles: [OpsDispatcher, LineManager]
+    code: 200
+    input: ["arrival_utc?"]
+    output: ServiceVisit
+    side_effects: ["SCHEDULED->ON_GROUND"]
+  - method: POST
+    path: "/service-visits/{id}/start-servicing"
+    description: Begin servicing once a spot is occupied.
+    roles: [OpsDispatcher, LineManager]
+    code: 200
+    input: []
+    output: ServiceVisit
+    side_effects: ["ON_GROUND->SERVICING"]
+  - method: POST
+    path: "/service-visits/{id}/mark-ready"
+    description: Mark ready for departure once services/fuel are settled.
+    roles: [OpsDispatcher, LineManager]
+    code: 200
+    input: []
+    output: ServiceVisit
+    side_effects: ["SERVICING->READY_FOR_DEPARTURE"]
+  - method: POST
+    path: "/service-visits/{id}/depart"
+    description: Depart and generate the visit invoice (fork-join JOIN).
+    roles: [OpsDispatcher, LineManager]
+    code: 200
+    input: []
+    output: ServiceVisit
+    side_effects: ["READY_FOR_DEPARTURE->DEPARTED; create Invoice; compute invoice_total; recompute operator.open_invoice_balance_cents; pass any APPROVED slots to USED"]
+  - method: POST
+    path: "/service-visits/{id}/cancel"
+    description: Cancel a visit (cascade releases parking, cancels services, revokes slots).
+    roles: [OpsDispatcher, LineManager]
+    code: 200
+    input: []
+    output: ServiceVisit
+    side_effects: ["{SCHEDULED,ON_GROUND}->CANCELLED; cascade release/cancel/revoke children"]
+
+  # ---- ParkingSpot ----
+  - method: POST
+    path: "/parking-spots"
+    description: Create a hangar/tie-down/ramp spot.
+    roles: [OpsDispatcher, LineManager]
+    code: 201
+    input: [label, spot_type, max_weight_class]
+    output: ParkingSpot
+    side_effects: ["spot_status=AVAILABLE"]
+  - method: GET
+    path: "/parking-spots/{id}"
+    description: Fetch a spot.
+    roles: [OpsDispatcher, LineManager, Operator]
+    code: 200
+    input: []
+    output: ParkingSpot
+    side_effects: []
+  - method: GET
+    path: "/parking-spots"
+    description: List spots.
+    roles: [OpsDispatcher, LineManager, Operator]
+    code: 200
+    input: ["spot_type?", "spot_status?", "limit?", "offset?"]
+    output: ParkingSpot[]
+    side_effects: []
+  - method: POST
+    path: "/parking-spots/{id}/out-of-service"
+    description: Toggle a spot out of service.
+    roles: [OpsDispatcher, LineManager]
+    code: 200
+    input: []
+    output: ParkingSpot
+    side_effects: ["spot_status=OUT_OF_SERVICE"]
+
+  # ---- ParkingAssignment ----
+  - method: POST
+    path: "/parking-assignments"
+    description: Hold a spot for a visit's occupation window.
+    roles: [OpsDispatcher, LineManager]
+    code: 201
+    input: [service_visit_id, spot_id, occupy_start_utc, occupy_end_utc]
+    output: ParkingAssignment
+    side_effects: ["status=HELD; fee_cents=0"]
+  - method: GET
+    path: "/parking-assignments/{id}"
+    description: Fetch a parking assignment.
+    roles: [OpsDispatcher, BillingClerk, LineManager, Operator]
+    code: 200
+    input: []
+    output: ParkingAssignment
+    side_effects: []
+  - method: GET
+    path: "/parking-assignments"
+    description: List parking assignments, filterable by visit or spot.
+    roles: [OpsDispatcher, BillingClerk, LineManager, Operator]
+    code: 200
+    input: ["service_visit_id?", "spot_id?", "status?", "limit?", "offset?"]
+    output: ParkingAssignment[]
+    side_effects: []
+  - method: POST
+    path: "/parking-assignments/{id}/occupy"
+    description: Confirm occupation (computes fee; OCC-guarded; overlap-checked).
+    roles: [OpsDispatcher, LineManager]
+    code: 200
+    input: [expected_assignment_version]
+    output: ParkingAssignment
+    side_effects: ["HELD->OCCUPIED; compute parking_ramp_fee; increments ParkingAssignment.version by 1"]
+  - method: POST
+    path: "/parking-assignments/{id}/release"
+    description: Release the spot occupation window.
+    roles: [OpsDispatcher, LineManager]
+    code: 200
+    input: []
+    output: ParkingAssignment
+    side_effects: ["{HELD,OCCUPIED}->RELEASED; free spot window"]
+
+  # ---- FuelOrder ----
+  - method: POST
+    path: "/fuel-orders"
+    description: Request a fuel uplift for a visit.
+    roles: [FuelTech, OpsDispatcher, Operator]
+    code: 201
+    input: [service_visit_id, aircraft_id, fuel_contract_id, product, ordered_gallons, "tankering?"]
+    output: FuelOrder
+    side_effects: ["logistics_status=REQUESTED; reconciliation_status=NOT_STARTED; priced_amount_cents=0"]
+  - method: GET
+    path: "/fuel-orders/{id}"
+    description: Fetch a fuel order (both state axes).
+    roles: [FuelTech, OpsDispatcher, BillingClerk, LineManager, Operator]
+    code: 200
+    input: []
+    output: FuelOrder
+    side_effects: []
+  - method: GET
+    path: "/fuel-orders"
+    description: List fuel orders, filterable by visit, aircraft, or contract.
+    roles: [FuelTech, OpsDispatcher, BillingClerk, LineManager, Operator]
+    code: 200
+    input: ["service_visit_id?", "aircraft_id?", "fuel_contract_id?", "logistics_status?", "limit?", "offset?"]
+    output: FuelOrder[]
+    side_effects: []
+  - method: POST
+    path: "/fuel-orders/{id}/dispatch"
+    description: Dispatch the truck; prices the order (volume-discounted or tankered).
+    roles: [FuelTech]
+    code: 200
+    input: []
+    output: FuelOrder
+    side_effects: ["REQUESTED->DISPATCHED; compute fuel_order_cost -> priced_amount_cents"]
+  - method: POST
+    path: "/fuel-orders/{id}/complete-fueling"
+    description: Mark fueling complete (advances operator JET_A cumulative tier).
+    roles: [FuelTech]
+    code: 200
+    input: []
+    output: FuelOrder
+    side_effects: ["DISPATCHED->FUELED; LEDGER SYNC operator.jeta_month_cumulative_gallons += ordered_gallons (JET_A non-tankering)"]
+  - method: POST
+    path: "/fuel-orders/{id}/cancel"
+    description: Cancel an un-fueled order.
+    roles: [FuelTech, OpsDispatcher]
+    code: 200
+    input: []
+    output: FuelOrder
+    side_effects: ["{REQUESTED,DISPATCHED}->CANCELLED; reset priced_amount_cents to 0 from DISPATCHED"]
+  - method: POST
+    path: "/fuel-orders/{id}/adjust-billing"
+    description: Resolve a flagged reconciliation by re-pricing on delivered gallons (cascade to invoice).
+    roles: [BillingClerk]
+    code: 200
+    input: []
+    output: FuelOrder
+    side_effects: ["reconciliation IN_REVIEW->ADJUSTED; re-run fuel_order_cost on delivered_gallons; recompute Invoice.total_cents; recompute operator.open_invoice_balance_cents"]
+
+  # ---- IntoPlaneTicket ----
+  - method: POST
+    path: "/into-plane-tickets"
+    description: Post a delivery ticket; reconciles the fuel order's reconciliation axis.
+    roles: [FuelTech]
+    code: 201
+    input: [fuel_order_id, delivered_gallons]
+    output: IntoPlaneTicket
+    side_effects: ["compute into_plane_reconciliation; set FuelOrder.reconciliation_status to RECONCILED or IN_REVIEW"]
+  - method: GET
+    path: "/into-plane-tickets/{id}"
+    description: Fetch a delivery ticket.
+    roles: [FuelTech, BillingClerk, LineManager]
+    code: 200
+    input: []
+    output: IntoPlaneTicket
+    side_effects: []
+  - method: GET
+    path: "/into-plane-tickets"
+    description: List delivery tickets, filterable by fuel order (reverse-reachability for IntoPlaneTicket.fuel_order_id).
+    roles: [FuelTech, BillingClerk, LineManager]
+    code: 200
+    input: ["fuel_order_id?", "outcome?", "limit?", "offset?"]
+    output: IntoPlaneTicket[]
+    side_effects: []
+
+  # ---- RampService ----
+  - method: POST
+    path: "/ramp-services"
+    description: Request a ground service (lav/GPU/de-ice/crew car/catering) for a visit.
+    roles: [OpsDispatcher, LineManager, Operator]
+    code: 201
+    input: [service_visit_id, service_type, "deice_fluid_gallons?", "deice_fluid_type?", "deice_holdover_minutes?"]
+    output: RampService
+    side_effects: ["status=REQUESTED; increment parent ServiceVisit.services_outstanding by 1"]
+  - method: GET
+    path: "/ramp-services/{id}"
+    description: Fetch a ramp service.
+    roles: [OpsDispatcher, FuelTech, BillingClerk, LineManager, Operator]
+    code: 200
+    input: []
+    output: RampService
+    side_effects: []
+  - method: GET
+    path: "/ramp-services"
+    description: List ramp services, filterable by visit.
+    roles: [OpsDispatcher, FuelTech, BillingClerk, LineManager, Operator]
+    code: 200
+    input: ["service_visit_id?", "service_type?", "status?", "limit?", "offset?"]
+    output: RampService[]
+    side_effects: []
+  - method: POST
+    path: "/ramp-services/{id}/start"
+    description: Begin the service.
+    roles: [LineManager, OpsDispatcher]
+    code: 200
+    input: []
+    output: RampService
+    side_effects: ["REQUESTED->IN_PROGRESS"]
+  - method: POST
+    path: "/ramp-services/{id}/complete"
+    description: Complete the service; compute charge; bubble-up to visit counter.
+    roles: [LineManager, OpsDispatcher]
+    code: 200
+    input: []
+    output: RampService
+    side_effects: ["IN_PROGRESS->COMPLETED; compute charge_cents; decrement ServiceVisit.services_outstanding"]
+  - method: POST
+    path: "/ramp-services/{id}/cancel"
+    description: Cancel a service; bubble-up to visit counter.
+    roles: [LineManager, OpsDispatcher]
+    code: 200
+    input: []
+    output: RampService
+    side_effects: ["{REQUESTED,IN_PROGRESS}->CANCELLED; decrement ServiceVisit.services_outstanding"]
+
+  # ---- RampSlot ----
+  - method: POST
+    path: "/ramp-slots"
+    description: Request a PPR/slot window on a RAMP pad for a visit.
+    roles: [OpsDispatcher, LineManager, Operator]
+    code: 201
+    input: [service_visit_id, pad_id, window_start_utc, window_end_utc]
+    output: RampSlot
+    side_effects: ["status=REQUESTED"]
+  - method: GET
+    path: "/ramp-slots/{id}"
+    description: Fetch a ramp slot.
+    roles: [OpsDispatcher, LineManager, Operator]
+    code: 200
+    input: []
+    output: RampSlot
+    side_effects: []
+  - method: GET
+    path: "/ramp-slots"
+    description: List ramp slots, filterable by visit or pad.
+    roles: [OpsDispatcher, LineManager, Operator]
+    code: 200
+    input: ["service_visit_id?", "pad_id?", "status?", "limit?", "offset?"]
+    output: RampSlot[]
+    side_effects: []
+  - method: POST
+    path: "/ramp-slots/{id}/approve"
+    description: Approve the slot (overlap-checked against other APPROVED slots on the pad).
+    roles: [OpsDispatcher, LineManager]
+    code: 200
+    input: []
+    output: RampSlot
+    side_effects: ["REQUESTED->APPROVED"]
+  - method: POST
+    path: "/ramp-slots/{id}/revoke"
+    description: Revoke an approved slot (frees the pad window).
+    roles: [OpsDispatcher, LineManager]
+    code: 200
+    input: []
+    output: RampSlot
+    side_effects: ["APPROVED->REVOKED; free pad window"]
+  - method: POST
+    path: "/ramp-slots/{id}/re-request"
+    description: Re-request a revoked slot (cyclic loop back to REQUESTED).
+    roles: [Operator, OpsDispatcher]
+    code: 200
+    input: []
+    output: RampSlot
+    side_effects: ["REVOKED->REQUESTED"]
+  - method: POST
+    path: "/ramp-slots/{id}/use"
+    description: Consume an approved slot at movement time.
+    roles: [OpsDispatcher, LineManager]
+    code: 200
+    input: []
+    output: RampSlot
+    side_effects: ["APPROVED->USED; free pad window"]
+
+  # ---- Invoice ----
+  - method: GET
+    path: "/invoices/{id}"
+    description: Fetch an invoice.
+    roles: [BillingClerk, LineManager, Operator]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+  - method: GET
+    path: "/invoices"
+    description: List invoices, filterable by operator or visit (reverse-reachability for Invoice.operator_id and Invoice.service_visit_id).
+    roles: [BillingClerk, LineManager, Operator]
+    code: 200
+    input: ["operator_id?", "service_visit_id?", "status?", "limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+  - method: POST
+    path: "/invoices/{id}/pay"
+    description: Apply a payment (OCC-guarded; rejects overpayment).
+    roles: [BillingClerk]
+    code: 200
+    input: [payment_cents, expected_invoice_version]
+    output: Invoice
+    side_effects: ["add payment_cents to paid_cents; {ISSUED,PAST_DUE}->PAID when fully paid; recompute operator.open_invoice_balance_cents; increments Invoice.version by 1"]
+  - method: POST
+    path: "/invoices/{id}/mark-past-due"
+    description: Flag an invoice past due (suspends the operator).
+    roles: [BillingClerk]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["ISSUED->PAST_DUE; set operator.account_status=SUSPENDED"]
+  - method: POST
+    path: "/invoices/{id}/void"
+    description: Void an issued invoice.
+    roles: [LineManager]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["ISSUED->VOID; recompute operator.open_invoice_balance_cents"]
+
+  # ---- test-driving clock ----
+  - method: POST
+    path: "/_clock/advance_month"
+    description: "Test-driving endpoint — roll the billing month forward; resets every operator's jeta_month_cumulative_gallons to 0."
+    roles: [LineManager]
+    code: 200
+    input: []
+    output: "null"
+    side_effects: ["reset all Operator.jeta_month_cumulative_gallons to 0"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for this operation."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Operator-role caller acting on a resource owned by a different operator_id."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced resource (path id or FK in body) does not exist."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Transition not defined from the resource's current state."
+  - id: ERR_PRODUCT_MISMATCH
+    http: 422
+    condition: "FuelOrder.product disagrees with aircraft.fuel_type or contract.product, or contract operator differs."
+  - id: ERR_WEIGHT_CLASS_REJECTED
+    http: 422
+    condition: "Aircraft weight_class exceeds the spot's max_weight_class."
+  - id: ERR_DEICE_FIELDS_REQUIRED
+    http: 422
+    condition: "DE_ICE service missing required de-ice fields, or a non-DE_ICE service supplying de-ice fields."
+  - id: ERR_SPOT_TOW_BUFFER_CONFLICT
+    http: 409
+    condition: "HANGAR occupy window collides with another OCCUPIED window within the 30-minute tow buffer."
+  - id: ERR_SPOT_WINDOW_CONFLICT
+    http: 409
+    condition: "TIE_DOWN/RAMP occupy window half-open-overlaps another OCCUPIED window on the same spot."
+  - id: ERR_SLOT_OVERLAP
+    http: 409
+    condition: "Slot approve window half-open-overlaps an APPROVED slot on the same pad."
+  - id: ERR_INVALID_INTERVAL
+    http: 422
+    condition: "End timestamp not strictly after start timestamp."
+  - id: ERR_DUPLICATE_RESOURCE
+    http: 409
+    condition: "Duplicate tail_number within operator, or duplicate ParkingSpot.label."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_<parent>_version does not equal the live parent.version on an OCC-guarded write."
+  - id: ERR_OVERPAYMENT
+    http: 422
+    condition: "Payment would push paid_cents above total_cents, or payment_cents < 1."
+  - id: ERR_SPOT_OUT_OF_SERVICE
+    http: 409
+    condition: "Occupy attempted on a spot whose spot_status == OUT_OF_SERVICE."
+  - id: ERR_CONTRACT_EXPIRED
+    http: 422
+    condition: "Dispatch attempted against a FuelContract whose contract_status == EXPIRED."
+  - id: ERR_VISIT_NOT_SERVICEABLE
+    http: 409
+    condition: "Operation requires the parent ServiceVisit to be in a servicing-capable state but it is not."
+  - id: ERR_MISSING_FIELD
+    http: 400
+    condition: "A required input field is absent or malformed."
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "A field value violates a declared constraint (e.g., ordered_gallons < 1, mtow_lb < 1)."
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: OpsDispatcher
+    description: "Owns scheduling: visits, parking holds/occupy/release, slot lifecycle."
+    identity: opaque
+    exclusive_operations:
+      - "POST /service-visits/{id}/arrive"
+      - "POST /service-visits/{id}/start-servicing"
+      - "POST /service-visits/{id}/mark-ready"
+      - "POST /service-visits/{id}/depart"
+      - "POST /service-visits/{id}/cancel"
+      - "POST /parking-assignments"
+      - "POST /parking-assignments/{id}/occupy"
+      - "POST /parking-assignments/{id}/release"
+      - "POST /parking-spots"
+      - "POST /parking-spots/{id}/out-of-service"
+      - "POST /ramp-slots/{id}/approve"
+      - "POST /ramp-slots/{id}/revoke"
+      - "POST /ramp-slots/{id}/use"
+    shared_operations:
+      - "POST /service-visits"
+      - "POST /aircraft"
+      - "POST /fuel-orders"
+      - "POST /fuel-orders/{id}/cancel"
+      - "POST /ramp-services"
+      - "POST /ramp-services/{id}/start"
+      - "POST /ramp-services/{id}/complete"
+      - "POST /ramp-services/{id}/cancel"
+      - "POST /ramp-slots"
+      - "POST /ramp-slots/{id}/re-request"
+      - "GET (reads)"
+
+  - name: FuelTech
+    description: "Owns fuel logistics + into-plane reconciliation."
+    identity: opaque
+    exclusive_operations:
+      - "POST /fuel-orders/{id}/dispatch"
+      - "POST /fuel-orders/{id}/complete-fueling"
+      - "POST /into-plane-tickets"
+    shared_operations:
+      - "POST /fuel-orders"
+      - "POST /fuel-orders/{id}/cancel"
+      - "GET (reads)"
+
+  - name: BillingClerk
+    description: "Owns operators, contracts, invoicing, billing adjustments."
+    identity: opaque
+    exclusive_operations:
+      - "POST /operators"
+      - "POST /fuel-contracts"
+      - "POST /fuel-contracts/{id}/expire"
+      - "POST /fuel-orders/{id}/adjust-billing"
+      - "POST /invoices/{id}/pay"
+      - "POST /invoices/{id}/mark-past-due"
+    shared_operations:
+      - "GET (reads)"
+
+  - name: LineManager
+    description: "Hierarchical override: may perform any OpsDispatcher/FuelTech/BillingClerk op plus voids and clock control."
+    identity: opaque
+    exclusive_operations:
+      - "POST /invoices/{id}/void"
+      - "POST /_clock/advance_month"
+    shared_operations:
+      - "POST /operators"
+      - "POST /fuel-contracts"
+      - "POST /fuel-contracts/{id}/expire"
+      - "POST /service-visits (+ all visit transitions)"
+      - "POST /parking-spots (+ out-of-service)"
+      - "POST /parking-assignments (+ occupy/release)"
+      - "POST /ramp-services (+ start/complete/cancel)"
+      - "POST /ramp-slots (+ approve/revoke/use)"
+      - "GET (reads)"
+
+  - name: Operator
+    description: "Entity-backed customer; manages own aircraft/visits, requests services/slots/fuel, re-requests revoked slots, reads own resources."
+    identity: "entity_backed:Operator"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /aircraft"
+      - "POST /service-visits"
+      - "POST /fuel-orders"
+      - "POST /ramp-services"
+      - "POST /ramp-slots"
+      - "POST /ramp-slots/{id}/re-request"
+      - "GET (own reads)"

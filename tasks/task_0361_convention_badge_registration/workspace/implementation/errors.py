@@ -1,0 +1,44 @@
+"""Error classes and error-id constants (PRD §5 catalogue)."""
+
+
+class ApiError(Exception):
+    """Carries the machine-readable error_id, message, and HTTP status."""
+
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# --- Error catalogue (PRD §5) ---
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_FORBIDDEN = ("ERR_FORBIDDEN", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_ATTENDEE_BANNED = ("ERR_ATTENDEE_BANNED", 403)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_PICKUP_WINDOW_CLOSED = ("ERR_PICKUP_WINDOW_CLOSED", 409)
+ERR_REFUND_WINDOW_CLOSED = ("ERR_REFUND_WINDOW_CLOSED", 409)
+ERR_SESSION_TIME_CONFLICT = ("ERR_SESSION_TIME_CONFLICT", 409)
+ERR_VIP_REQUIRED = ("ERR_VIP_REQUIRED", 409)
+ERR_BOOTH_TIME_CONFLICT = ("ERR_BOOTH_TIME_CONFLICT", 409)
+ERR_TRANSFER_LIMIT = ("ERR_TRANSFER_LIMIT", 409)
+ERR_DUPLICATE_WAITLIST = ("ERR_DUPLICATE_WAITLIST", 409)
+ERR_POSTURE_BLOCKED = ("ERR_POSTURE_BLOCKED", 409)
+ERR_TIER_SOLD_OUT = ("ERR_TIER_SOLD_OUT", 409)
+ERR_CAPACITY_EXCEEDED = ("ERR_CAPACITY_EXCEEDED", 409)
+ERR_SESSION_FULL = ("ERR_SESSION_FULL", 409)
+ERR_STALE_CONVENTION_VERSION = ("ERR_STALE_CONVENTION_VERSION", 412)
+ERR_STALE_SESSION_VERSION = ("ERR_STALE_SESSION_VERSION", 412)
+ERR_STALE_ATTENDEE_VERSION = ("ERR_STALE_ATTENDEE_VERSION", 412)
+ERR_INVALID_REQUEST = ("ERR_INVALID_REQUEST", 422)
+ERR_DUPLICATE_EMAIL = ("ERR_DUPLICATE_EMAIL", 409)
+ERR_DUPLICATE_BOOTH_CODE = ("ERR_DUPLICATE_BOOTH_CODE", 409)
+ERR_EMPTY_ORDER = ("ERR_EMPTY_ORDER", 422)
+ERR_LOTTERY_NOT_WON = ("ERR_LOTTERY_NOT_WON", 409)
+
+
+def err(spec, message=None):
+    """Build an ApiError from a (error_id, http_status) spec tuple."""
+    error_id, http_status = spec
+    return ApiError(error_id, http_status, message)

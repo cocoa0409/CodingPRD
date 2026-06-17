@@ -1,0 +1,15 @@
+"""Domain thresholds — numeric constants from PRD calculations (§3)."""
+
+# Program policy-ratio defaults (PRD §3.1)
+DEFAULT_SAP_WARNING_MIN_PACE_PCT = 0.667
+DEFAULT_SAP_PROBATION_MIN_PACE_PCT = 0.5
+DEFAULT_LICENSURE_MIN_ATTENDANCE_PCT = 0.9
+
+# Pagination defaults (PRD §2.3)
+PAGINATION_DEFAULT_LIMIT = 10
+PAGINATION_MIN_LIMIT = 1
+PAGINATION_MAX_LIMIT = 100
+PAGINATION_DEFAULT_OFFSET = 0
+
+# STATE_TABLE stepped retain rates (PRD §3.7)
+STATE_TABLE_STEPS = {0.10: 0.00, 0.25: 0.25, 0.50: 0.50, 0.75: 0.75, 1.00: 1.00}

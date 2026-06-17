@@ -1,0 +1,76 @@
+"""Error classes and error ID constants.
+
+Every error_id and HTTP status traces to the PRD §5 Error Code Catalogue
+and SCAFFOLD §1.6.
+"""
+
+
+class ApiError(Exception):
+    """Domain error carrying error_id, message, and http_status."""
+
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Auth
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"           # 401
+ERR_FORBIDDEN_ROLE = "ERR_FORBIDDEN_ROLE"             # 403
+ERR_NOT_OWNER = "ERR_NOT_OWNER"                       # 403
+
+# Existence
+ERR_WORK_ORDER_NOT_FOUND = "ERR_WORK_ORDER_NOT_FOUND"  # 404
+ERR_RESOURCE_NOT_FOUND = "ERR_RESOURCE_NOT_FOUND"      # 404
+ERR_FK_NOT_FOUND = "ERR_FK_NOT_FOUND"                  # 404
+
+# State
+ERR_INVALID_STATE = "ERR_INVALID_STATE"                          # 409
+ERR_STALE_WORK_ORDER_VERSION = "ERR_STALE_WORK_ORDER_VERSION"    # 412
+ERR_MATERIALS_OUTSTANDING = "ERR_MATERIALS_OUTSTANDING"          # 409
+ERR_PRODUCTION_NOT_COMPLETE = "ERR_PRODUCTION_NOT_COMPLETE"      # 409
+
+# Business
+ERR_LINE_ITEM_FIELDS_INVALID = "ERR_LINE_ITEM_FIELDS_INVALID"    # 422
+ERR_CATALOG_ITEM_UNAVAILABLE = "ERR_CATALOG_ITEM_UNAVAILABLE"    # 422
+ERR_INVALID_WINDOW = "ERR_INVALID_WINDOW"                        # 422
+ERR_DUPLICATE_SHOP_DAY = "ERR_DUPLICATE_SHOP_DAY"                # 409
+ERR_CAPACITY_EXCEEDED = "ERR_CAPACITY_EXCEEDED"                  # 409
+ERR_DELIVERY_WINDOW_CONFLICT = "ERR_DELIVERY_WINDOW_CONFLICT"    # 409
+ERR_DEPOSIT_TOO_LOW = "ERR_DEPOSIT_TOO_LOW"                      # 422
+ERR_SETTLEMENT_MISMATCH = "ERR_SETTLEMENT_MISMATCH"              # 422
+ERR_ORDER_NOT_COMPLETED = "ERR_ORDER_NOT_COMPLETED"             # 409
+
+# Generic
+ERR_INVALID_PAGINATION = "ERR_INVALID_PAGINATION"  # 400
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"        # 400
+
+
+HTTP_STATUS = {
+    ERR_UNAUTHENTICATED: 401,
+    ERR_FORBIDDEN_ROLE: 403,
+    ERR_NOT_OWNER: 403,
+    ERR_WORK_ORDER_NOT_FOUND: 404,
+    ERR_RESOURCE_NOT_FOUND: 404,
+    ERR_FK_NOT_FOUND: 404,
+    ERR_INVALID_STATE: 409,
+    ERR_STALE_WORK_ORDER_VERSION: 412,
+    ERR_MATERIALS_OUTSTANDING: 409,
+    ERR_PRODUCTION_NOT_COMPLETE: 409,
+    ERR_LINE_ITEM_FIELDS_INVALID: 422,
+    ERR_CATALOG_ITEM_UNAVAILABLE: 422,
+    ERR_INVALID_WINDOW: 422,
+    ERR_DUPLICATE_SHOP_DAY: 409,
+    ERR_CAPACITY_EXCEEDED: 409,
+    ERR_DELIVERY_WINDOW_CONFLICT: 409,
+    ERR_DEPOSIT_TOO_LOW: 422,
+    ERR_SETTLEMENT_MISMATCH: 422,
+    ERR_ORDER_NOT_COMPLETED: 409,
+    ERR_INVALID_PAGINATION: 400,
+    ERR_INVALID_REQUEST: 400,
+}
+
+
+def err(error_id, message=None):
+    return ApiError(error_id, HTTP_STATUS[error_id], message)

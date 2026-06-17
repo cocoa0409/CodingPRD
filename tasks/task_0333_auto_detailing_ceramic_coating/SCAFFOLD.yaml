@@ -1,0 +1,1572 @@
+scenario: "333. Auto Detailing & Ceramic Coating: package tiers (wash/full/ceramic), vehicle-size pricing, add-on (engine/pet-hair/headlight), mobile vs shop-bay scheduling, prep & cure time, membership/recurring, before/after photo, rework guarantee"
+domain_name: auto-detailing-ceramic-coating
+api_prefix: /detailing
+
+complexity_profile:
+  primary_archetype: temporal_windowing
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - derived_field_reconciliation
+    - rate_threshold_triggers
+
+  entity_topology: flat
+  # Peer entities (Customer, Appointment, ServiceBay, MobileUnit, ReworkClaim) linked
+  # purely by foreign keys in request bodies; configuration entities (PackageCatalog,
+  # VehicleSizeRate, AddOn) are flat catalogs. The only nested URL is the photo/add-on
+  # sub-resource under an Appointment. No deep ownership tree.
+
+  state_machine_shape: parallel
+  # Appointment carries TWO independent state dimensions on one row:
+  #   work_status   (BOOKED -> CHECKED_IN -> IN_PREP -> IN_SERVICE -> CURING -> READY -> RELEASED, with CANCELLED/NO_SHOW)
+  #   payment_status (UNPAID -> DEPOSIT_HELD -> PAID -> REFUNDED), evolving on its own axis.
+  # Membership has a revision cycle (cyclic), and ReworkClaim has a branching approve/reject shape.
+
+  relationship_patterns:
+    - one_to_many   # Customer -> Appointments; Appointment -> JobPhotos / AppointmentAddOns
+    - cross_aggregate  # Appointment references ServiceBay OR MobileUnit; ReworkClaim references original Appointment + spawns a new one
+    - self_referential # ReworkClaim.original_appointment_id and the spawned rework appointment reference back
+
+  role_model: peer_roles
+  # Customer owns own appointments/membership; Detailer performs work + photos;
+  # Scheduler owns resource/catalog config and approves rework; ShopManager is the
+  # hierarchical override with refund + override authority.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 Entity-Relationship Table
+# =====================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: login + contact email; unique across customers
+        constraints: unique, non-empty, must contain '@'
+      - name: full_name
+        type: string
+        source: input
+        description: customer display name
+        constraints: non-empty
+      - name: membership_id
+        type: string
+        source: system
+        description: "denormalized back-pointer holding the id of this customer's currently-ACTIVE Membership (the authoritative FK is Membership.customer_id, discoverable via GET /detailing/customers/{id}/memberships); set on membership activation, cleared to null when the membership lapses or is cancelled; at most one non-terminal Membership per customer"
+        default: null
+      - name: loyalty_tier
+        type: enum
+        source: computed
+        description: "derived from chronological lifetime spend (calc customer_loyalty_tier, chronological variant); one of BRONZE/SILVER/GOLD"
+        constraints: "enum BRONZE|SILVER|GOLD; default BRONZE on create"
+        default: BRONZE
+      - name: chronological_lifetime_spend_cents
+        type: integer
+        source: computed
+        description: "sum of final_total_cents over this customer's Appointments whose payment_status==PAID; recomputed on every appointment payment transition (calc customer_loyalty_tier chronological variant)"
+        default: 0
+      - name: projected_lifetime_spend_cents
+        type: integer
+        source: computed
+        description: "forward-looking spend: chronological_lifetime_spend_cents PLUS provisional_total_cents of Appointments whose work_status IN {BOOKED, CHECKED_IN, IN_PREP, IN_SERVICE, CURING, READY} (calc customer_loyalty_tier forward variant)"
+        default: 0
+
+  - name: Membership
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the subscriber"
+        constraints: required
+      - name: status
+        type: enum
+        source: system
+        description: membership lifecycle state (see §1.2)
+        constraints: "enum PENDING_PAYMENT|ACTIVE|PAST_DUE|CANCELLED|LAPSED; initial PENDING_PAYMENT"
+        default: PENDING_PAYMENT
+      - name: monthly_fee_cents
+        type: integer
+        source: system
+        description: monthly recurring fee, frozen from the active membership plan at signup
+        constraints: "fixed at 4900"
+        default: 4900
+      - name: cycle_start_utc
+        type: datetime
+        source: system
+        description: ISO8601 UTC start of the current 30-day billing cycle; advances on each successful renewal
+      - name: cycle_anchor_day
+        type: integer
+        source: system
+        description: day-of-cycle baseline used by proration; cycle length is fixed CYCLE_DAYS=30
+        default: 30
+      - name: wash_credit_value_cents
+        type: integer
+        source: system
+        description: "frozen member-discounted WASH price at the subscriber's default vehicle_size, computed at activation; a granted credit is worth this many cents against a package subtotal"
+      - name: default_vehicle_size
+        type: enum
+        source: input
+        description: vehicle size used to value the recurring wash credit and to seed default appointments
+        constraints: "enum SEDAN|SUV|TRUCK|XL; required"
+      - name: credits_granted_total
+        type: integer
+        source: computed
+        description: "running count of wash credits ever granted across all cycles (calc membership_credit_ledger)"
+        default: 0
+      - name: credits_consumed_total
+        type: integer
+        source: computed
+        description: "running count of credits applied to appointments (calc membership_credit_ledger)"
+        default: 0
+      - name: credits_expired_total
+        type: integer
+        source: computed
+        description: "running count of credits that lapsed unused at cycle rollover (calc membership_credit_ledger)"
+        default: 0
+      - name: credits_remaining
+        type: integer
+        source: computed
+        description: "currently usable credit count = credits_granted_total - credits_consumed_total - credits_expired_total (calc membership_credit_ledger); MUST be >= 0"
+        default: 0
+
+  - name: ServiceBay
+    parent: null
+    common_fields: true
+    fields:
+      - name: bay_code
+        type: string
+        source: input
+        description: human-readable bay identifier
+        constraints: unique, non-empty
+      - name: status
+        type: enum
+        source: system
+        description: bay availability state
+        constraints: "enum AVAILABLE|MAINTENANCE; default AVAILABLE"
+        default: AVAILABLE
+      - name: supports_ceramic
+        type: boolean
+        source: input
+        description: whether this bay is climate-controlled enough to cure ceramic coatings
+        default: false
+
+  - name: MobileUnit
+    parent: null
+    common_fields: true
+    fields:
+      - name: unit_code
+        type: string
+        source: input
+        description: mobile crew/van identifier
+        constraints: unique, non-empty
+      - name: status
+        type: enum
+        source: system
+        description: mobile unit availability state
+        constraints: "enum AVAILABLE|MAINTENANCE; default AVAILABLE"
+        default: AVAILABLE
+      - name: travel_buffer_minutes
+        type: integer
+        source: input
+        description: minimum gap required between two jobs on this unit, for travel/setup
+        constraints: "integer >= 0; default 30"
+        default: 30
+
+  - name: PackageCatalog
+    parent: null
+    common_fields: false
+    fields:
+      - name: tier
+        type: enum
+        source: input
+        description: package tier key
+        constraints: "enum WASH|FULL|CERAMIC; unique"
+      - name: base_price_cents
+        type: integer
+        source: input
+        description: SEDAN-baseline package price in cents before size multiplier and discounts
+        constraints: "integer > 0"
+      - name: prep_minutes
+        type: integer
+        source: input
+        description: preparation minutes before service begins
+        constraints: "integer >= 0"
+      - name: service_minutes
+        type: integer
+        source: input
+        description: active service minutes
+        constraints: "integer > 0"
+      - name: cure_minutes
+        type: integer
+        source: input
+        description: post-service cure minutes during which the vehicle cannot be released (0 for WASH/FULL, 1440 for CERAMIC)
+        constraints: "integer >= 0"
+      - name: guarantee_days
+        type: integer
+        source: input
+        description: rework-guarantee window length in days for this tier (WASH 0, FULL 7, CERAMIC 90)
+        constraints: "integer >= 0"
+
+  - name: VehicleSizeRate
+    parent: null
+    common_fields: false
+    fields:
+      - name: vehicle_size
+        type: enum
+        source: input
+        description: vehicle size key
+        constraints: "enum SEDAN|SUV|TRUCK|XL; unique"
+      - name: size_multiplier_bps
+        type: integer
+        source: input
+        description: "multiplier on the package base price, in basis points (SEDAN 10000, SUV 13000, TRUCK 15000, XL 17500)"
+        constraints: "integer >= 10000"
+
+  - name: AddOn
+    parent: null
+    common_fields: false
+    fields:
+      - name: addon_code
+        type: enum
+        source: input
+        description: add-on key
+        constraints: "enum ENGINE_BAY|PET_HAIR|HEADLIGHT; unique"
+      - name: price_cents
+        type: integer
+        source: input
+        description: flat add-on price in cents, NOT scaled by vehicle size and NOT discounted by membership
+        constraints: "integer > 0"
+      - name: extra_minutes
+        type: integer
+        source: input
+        description: minutes this add-on adds to service_minutes when present
+        constraints: "integer >= 0"
+
+  - name: Appointment
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the vehicle owner being serviced"
+        constraints: required
+      - name: tier
+        type: enum
+        source: input
+        description: package tier requested
+        constraints: "enum WASH|FULL|CERAMIC; required"
+      - name: vehicle_size
+        type: enum
+        source: input
+        description: size of the vehicle for this appointment
+        constraints: "enum SEDAN|SUV|TRUCK|XL; required"
+      - name: location_mode
+        type: enum
+        source: input
+        description: where the work happens
+        constraints: "enum SHOP|MOBILE; required"
+      - name: service_bay_id
+        type: string
+        source: input
+        description: "FK -> ServiceBay.id; required when location_mode==SHOP, MUST be null when MOBILE"
+        default: null
+      - name: mobile_unit_id
+        type: string
+        source: input
+        description: "FK -> MobileUnit.id; required when location_mode==MOBILE, MUST be null when SHOP"
+        default: null
+      - name: scheduled_start_utc
+        type: datetime
+        source: input
+        description: ISO8601 UTC start instant of the resource occupancy
+        constraints: required
+      - name: occupancy_end_utc
+        type: datetime
+        source: computed
+        description: "computed resource-release instant: SHOP = start + prep + service + addon_extra + cure; MOBILE = start + prep + service + addon_extra (crew leaves before cure) (calc occupancy_window)"
+      - name: vehicle_release_utc
+        type: datetime
+        source: computed
+        description: "earliest instant the customer may take the vehicle: start + prep + service + addon_extra + cure for both modes (calc occupancy_window)"
+      - name: use_membership_credit
+        type: boolean
+        source: input
+        description: whether to apply one membership wash credit to the package subtotal of this appointment
+        default: false
+      - name: work_status
+        type: enum
+        source: system
+        description: work-progress dimension (see §1.2)
+        constraints: "enum BOOKED|CHECKED_IN|IN_PREP|IN_SERVICE|CURING|READY|RELEASED|CANCELLED|NO_SHOW; initial BOOKED"
+        default: BOOKED
+      - name: payment_status
+        type: enum
+        source: system
+        description: payment dimension, evolves independently of work_status (see §1.2)
+        constraints: "enum UNPAID|DEPOSIT_HELD|PAID|REFUNDED; initial UNPAID"
+        default: UNPAID
+      - name: is_member_at_booking
+        type: boolean
+        source: system
+        description: snapshot of whether the customer had an ACTIVE membership at the moment of booking; freezes the provisional price's discount eligibility
+      - name: credit_applied_cents
+        type: integer
+        source: computed
+        description: "membership credit value applied to the package subtotal of THIS appointment; 0 unless use_membership_credit and an ACTIVE membership with credits_remaining>0 (calc appointment_total)"
+        default: 0
+      - name: provisional_total_cents
+        type: integer
+        source: computed
+        description: "price quoted at booking using is_member_at_booking and ALL requested add-ons (calc appointment_total, provisional variant)"
+      - name: final_total_cents
+        type: integer
+        source: computed
+        description: "price billed at completion using current membership state and only PERFORMED add-ons (calc appointment_total, final variant); equals provisional_total_cents until completion recomputes it"
+      - name: amount_charged_cents
+        type: integer
+        source: system
+        description: total cents captured from the customer so far (deposit + remainder)
+        default: 0
+      - name: amount_refunded_cents
+        type: integer
+        source: system
+        description: total cents refunded to the customer
+        default: 0
+      - name: outstanding_balance_cents
+        type: integer
+        source: computed
+        description: "final_total_cents - credit_applied_cents - amount_charged_cents + amount_refunded_cents; the conserved payment quantity (calc payment_ledger)"
+        default: 0
+      - name: spawned_from_rework_claim_id
+        type: string
+        source: system
+        description: "FK -> ReworkClaim.id; non-null when this appointment was created by an approved rework claim (then it is zero-cost)"
+        default: null
+
+  - name: AppointmentAddOn
+    parent: null
+    common_fields: true
+    fields:
+      - name: appointment_id
+        type: string
+        source: input
+        description: "FK -> Appointment.id; the appointment this add-on line belongs to"
+        constraints: required
+      - name: addon_code
+        type: enum
+        source: input
+        description: which add-on
+        constraints: "enum ENGINE_BAY|PET_HAIR|HEADLIGHT; required; unique per (appointment_id, addon_code)"
+      - name: price_cents_snapshot
+        type: integer
+        source: system
+        description: AddOn.price_cents copied at line creation, frozen against later catalog edits
+      - name: extra_minutes_snapshot
+        type: integer
+        source: system
+        description: AddOn.extra_minutes copied at line creation
+      - name: line_status
+        type: enum
+        source: system
+        description: whether this add-on was actually performed; SKIPPED lines are excluded from final_total
+        constraints: "enum REQUESTED|PERFORMED|SKIPPED; initial REQUESTED"
+        default: REQUESTED
+
+  - name: JobPhoto
+    parent: null
+    common_fields: true
+    fields:
+      - name: appointment_id
+        type: string
+        source: input
+        description: "FK -> Appointment.id; the appointment documented"
+        constraints: required
+      - name: phase
+        type: enum
+        source: input
+        description: BEFORE photo (required before IN_SERVICE) or AFTER photo (required before READY)
+        constraints: "enum BEFORE|AFTER; required"
+      - name: image_url
+        type: string
+        source: input
+        description: stored image reference
+        constraints: non-empty
+
+  - name: ReworkClaim
+    parent: null
+    common_fields: true
+    fields:
+      - name: original_appointment_id
+        type: string
+        source: input
+        description: "FK -> Appointment.id; the completed (RELEASED) appointment the customer is unhappy with"
+        constraints: required
+      - name: reason
+        type: string
+        source: input
+        description: customer description of the defect
+        constraints: non-empty
+      - name: status
+        type: enum
+        source: system
+        description: rework-claim lifecycle (branching, see §1.2)
+        constraints: "enum SUBMITTED|APPROVED|REJECTED|FULFILLED; initial SUBMITTED"
+        default: SUBMITTED
+      - name: rework_appointment_id
+        type: string
+        source: system
+        description: "FK -> Appointment.id; the zero-cost appointment spawned when the claim is APPROVED"
+        default: null
+      - name: filed_within_window
+        type: boolean
+        source: computed
+        description: "whether the claim was submitted strictly before original_appointment.vehicle_release_utc + guarantee_days (calc guarantee_window_check)"
+
+# =====================================================================
+# §1.2 State Machine Table
+# =====================================================================
+state_machines:
+  # ---- Appointment: WORK dimension (parallel with payment) ----
+  - entity: Appointment
+    dimension: work_status
+    initial_state: BOOKED
+    terminal_states: [RELEASED, CANCELLED, NO_SHOW]
+    transitions:
+      - from: BOOKED
+        to: CHECKED_IN
+        trigger: "POST /detailing/appointments/{id}/check-in"
+        actor: Detailer
+        preconditions:
+          - "appointment.work_status == BOOKED"
+          - "now (server clock) >= scheduled_start_utc - 60 minutes"
+          - "the assigned ServiceBay.status==AVAILABLE (SHOP) or MobileUnit.status==AVAILABLE (MOBILE)"
+        side_effects:
+          - "set work_status = CHECKED_IN"
+          - "increments Appointment.version by 1"
+      - from: BOOKED
+        to: NO_SHOW
+        trigger: "POST /detailing/appointments/{id}/mark-no-show"
+        actor: Scheduler
+        preconditions:
+          - "appointment.work_status == BOOKED"
+          - "now >= scheduled_start_utc + 30 minutes"
+        side_effects:
+          - "set work_status = NO_SHOW"
+          - "if payment_status==DEPOSIT_HELD, the held deposit is forfeited: set amount_refunded_cents unchanged, payment_status stays DEPOSIT_HELD (no refund)"
+          - "release the resource occupancy window so the slot is reusable"
+          - "increments Appointment.version by 1"
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /detailing/appointments/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "appointment.work_status == BOOKED"
+          - "spawned_from_rework_claim_id == null (rework appointments cannot be self-cancelled by the customer)"
+        side_effects:
+          - "set work_status = CANCELLED"
+          - "if payment_status==DEPOSIT_HELD, cascade: refund the full deposit -> amount_refunded_cents += amount_charged_cents, payment_status -> REFUNDED, then recompute outstanding_balance_cents, then recompute the customer's projected_lifetime_spend_cents and loyalty_tier (this appointment leaves the projected set)"
+          - "release the resource occupancy window"
+          - "increments Appointment.version by 1"
+      - from: CHECKED_IN
+        to: IN_PREP
+        trigger: "POST /detailing/appointments/{id}/start-prep"
+        actor: Detailer
+        preconditions:
+          - "appointment.work_status == CHECKED_IN"
+          - "a JobPhoto with phase==BEFORE exists for this appointment"
+        side_effects:
+          - "set work_status = IN_PREP"
+          - "increments Appointment.version by 1"
+      - from: IN_PREP
+        to: IN_SERVICE
+        trigger: "POST /detailing/appointments/{id}/start-service"
+        actor: Detailer
+        preconditions:
+          - "appointment.work_status == IN_PREP"
+        side_effects:
+          - "set work_status = IN_SERVICE"
+          - "increments Appointment.version by 1"
+      - from: IN_SERVICE
+        to: CURING
+        trigger: "POST /detailing/appointments/{id}/finish-service"
+        actor: Detailer
+        preconditions:
+          - "appointment.work_status == IN_SERVICE"
+          - "a JobPhoto with phase==AFTER exists for this appointment"
+          - "tier == CERAMIC (only ceramic has a cure phase)"
+        side_effects:
+          - "set work_status = CURING"
+          - "increments Appointment.version by 1"
+      - from: IN_SERVICE
+        to: READY
+        trigger: "POST /detailing/appointments/{id}/finish-service"
+        actor: Detailer
+        preconditions:
+          - "appointment.work_status == IN_SERVICE"
+          - "a JobPhoto with phase==AFTER exists for this appointment"
+          - "tier != CERAMIC"
+        side_effects:
+          - "set work_status = READY"
+          - "FINAL-PRICE CASCADE (chain hop 1): recompute final_total_cents via calc appointment_total final variant (current membership state + only PERFORMED add-on lines)"
+          - "chain hop 2: recompute outstanding_balance_cents from the new final_total_cents (calc payment_ledger)"
+          - "increments Appointment.version by 1"
+      - from: CURING
+        to: READY
+        trigger: "POST /detailing/appointments/{id}/finish-cure"
+        actor: Detailer
+        preconditions:
+          - "appointment.work_status == CURING"
+          - "now >= vehicle_release_utc"
+        side_effects:
+          - "set work_status = READY"
+          - "FINAL-PRICE CASCADE (chain hop 1): recompute final_total_cents via calc appointment_total final variant"
+          - "chain hop 2: recompute outstanding_balance_cents from the new final_total_cents (calc payment_ledger)"
+          - "increments Appointment.version by 1"
+      - from: READY
+        to: RELEASED
+        trigger: "POST /detailing/appointments/{id}/release"
+        actor: Detailer
+        preconditions:
+          - "appointment.work_status == READY"
+          - "payment_status == PAID (outstanding_balance_cents == 0) OR spawned_from_rework_claim_id != null"
+        side_effects:
+          - "set work_status = RELEASED"
+          - "RELEASE CASCADE (chain hop 1): recompute the customer's chronological_lifetime_spend_cents (this appointment's final_total_cents now counts only if payment_status==PAID)"
+          - "chain hop 2: recompute the customer's loyalty_tier from the new chronological_lifetime_spend_cents (calc customer_loyalty_tier chronological variant); if it rises to a higher band, the customer's loyalty_tier field is updated"
+          - "increments Appointment.version by 1"
+
+  # ---- Appointment: PAYMENT dimension (parallel) ----
+  - entity: Appointment
+    dimension: payment_status
+    initial_state: UNPAID
+    terminal_states: [REFUNDED]
+    transitions:
+      - from: UNPAID
+        to: DEPOSIT_HELD
+        trigger: "POST /detailing/appointments/{id}/capture-deposit"
+        actor: Customer
+        preconditions:
+          - "appointment.payment_status == UNPAID"
+          - "appointment.work_status NOT IN {CANCELLED, NO_SHOW, RELEASED}"
+          - "deposit_cents (body) == round_half_up(provisional_total_cents * DEPOSIT_BPS / 10000)"
+        side_effects:
+          - "amount_charged_cents += deposit_cents"
+          - "set payment_status = DEPOSIT_HELD"
+          - "recompute outstanding_balance_cents (calc payment_ledger)"
+          - "increments Appointment.version by 1"
+      - from: UNPAID
+        to: PAID
+        trigger: "POST /detailing/appointments/{id}/pay"
+        actor: Customer
+        preconditions:
+          - "appointment.payment_status == UNPAID"
+          - "appointment.work_status == READY"
+          - "amount_cents (body) == outstanding_balance_cents (which equals final_total_cents - credit_applied_cents at this point)"
+        side_effects:
+          - "amount_charged_cents += amount_cents"
+          - "set payment_status = PAID"
+          - "recompute outstanding_balance_cents -> 0 (calc payment_ledger)"
+          - "increments Appointment.version by 1"
+      - from: DEPOSIT_HELD
+        to: PAID
+        trigger: "POST /detailing/appointments/{id}/pay"
+        actor: Customer
+        preconditions:
+          - "appointment.payment_status == DEPOSIT_HELD"
+          - "appointment.work_status == READY"
+          - "amount_cents (body) == outstanding_balance_cents (remainder after deposit + credit)"
+        side_effects:
+          - "amount_charged_cents += amount_cents"
+          - "set payment_status = PAID"
+          - "recompute outstanding_balance_cents -> 0 (calc payment_ledger)"
+          - "increments Appointment.version by 1"
+      - from: PAID
+        to: REFUNDED
+        trigger: "POST /detailing/appointments/{id}/refund"
+        actor: ShopManager
+        preconditions:
+          - "appointment.payment_status == PAID"
+        side_effects:
+          - "amount_refunded_cents += amount_charged_cents (full refund — COMPENSATING action for the pay/deposit captures)"
+          - "set payment_status = REFUNDED"
+          - "recompute outstanding_balance_cents (calc payment_ledger) — the payment-conservation invariant must hold afterward"
+          - "REFUND CASCADE: recompute the customer's chronological_lifetime_spend_cents (this appointment no longer PAID) and loyalty_tier"
+          - "increments Appointment.version by 1"
+
+  # ---- Membership: cyclic (renewal loop) ----
+  - entity: Membership
+    initial_state: PENDING_PAYMENT
+    terminal_states: [CANCELLED, LAPSED]
+    transitions:
+      - from: PENDING_PAYMENT
+        to: ACTIVE
+        trigger: "POST /detailing/memberships/{id}/activate"
+        actor: Customer
+        preconditions:
+          - "membership.status == PENDING_PAYMENT"
+        side_effects:
+          - "set status = ACTIVE"
+          - "set cycle_start_utc = now"
+          - "compute and freeze wash_credit_value_cents = member-discounted WASH price at default_vehicle_size"
+          - "grant 1 wash credit: credits_granted_total += 1, recompute credits_remaining (calc membership_credit_ledger)"
+          - "set Customer.membership_id = this membership id; recompute Customer.is_member eligibility for future bookings"
+          - "increments Membership.version by 1"
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /detailing/memberships/{id}/renew (cyclic — new billing cycle)"
+        actor: system
+        preconditions:
+          - "membership.status == ACTIVE"
+          - "now >= cycle_start_utc + CYCLE_DAYS days"
+        side_effects:
+          - "expire any unconsumed credit from the prior cycle: credits_expired_total += credits_remaining_before_grant, then grant 1 new credit credits_granted_total += 1 (calc membership_credit_ledger); credits_remaining recomputed"
+          - "advance cycle_start_utc by CYCLE_DAYS days"
+          - "increments Membership.version by 1"
+      - from: ACTIVE
+        to: PAST_DUE
+        trigger: "POST /detailing/memberships/{id}/mark-past-due"
+        actor: Scheduler
+        preconditions:
+          - "membership.status == ACTIVE"
+          - "now >= cycle_start_utc + CYCLE_DAYS days (renewal payment failed)"
+        side_effects:
+          - "set status = PAST_DUE"
+          - "increments Membership.version by 1"
+      - from: PAST_DUE
+        to: ACTIVE
+        trigger: "POST /detailing/memberships/{id}/activate (cure past-due — cyclic back to ACTIVE)"
+        actor: Customer
+        preconditions:
+          - "membership.status == PAST_DUE"
+        side_effects:
+          - "set status = ACTIVE"
+          - "advance cycle_start_utc by CYCLE_DAYS days, grant 1 credit (calc membership_credit_ledger)"
+          - "increments Membership.version by 1"
+      - from: PAST_DUE
+        to: LAPSED
+        trigger: "POST /detailing/memberships/{id}/lapse"
+        actor: Scheduler
+        preconditions:
+          - "membership.status == PAST_DUE"
+          - "now >= cycle_start_utc + CYCLE_DAYS days (grace exhausted)"
+        side_effects:
+          - "set status = LAPSED"
+          - "expire all remaining credits: credits_expired_total += credits_remaining, recompute credits_remaining -> 0 (calc membership_credit_ledger)"
+          - "MEMBERSHIP-LAPSE CASCADE: clear Customer.membership_id -> null so future bookings price as non-member"
+          - "increments Membership.version by 1"
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /detailing/memberships/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "membership.status == ACTIVE"
+          - "expected_membership_version (body) matches membership.version"
+        side_effects:
+          - "set status = CANCELLED"
+          - "expire all remaining credits: credits_expired_total += credits_remaining, recompute credits_remaining -> 0 (calc membership_credit_ledger)"
+          - "clear Customer.membership_id -> null"
+          - "increments Membership.version by 1"
+
+  # ---- ReworkClaim: branching approve/reject ----
+  - entity: ReworkClaim
+    initial_state: SUBMITTED
+    terminal_states: [REJECTED, FULFILLED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /detailing/rework-claims/{id}/approve"
+        actor: Scheduler
+        preconditions:
+          - "claim.status == SUBMITTED"
+          - "filed_within_window == true (guarantee_window_check passed)"
+          - "original_appointment.work_status == RELEASED"
+        side_effects:
+          - "set status = APPROVED"
+          - "REWORK-SPAWN CASCADE (chain hop 1): create a new Appointment cloning tier/vehicle_size/location_mode/resource of the original, work_status=BOOKED, spawned_from_rework_claim_id=this claim; its provisional_total_cents and final_total_cents are 0 (zero-cost guarantee)"
+          - "chain hop 2: the spawned Appointment's payment_status is forced PAID with outstanding_balance_cents==0 (nothing owed), so it is releasable without payment"
+          - "set rework_appointment_id = spawned appointment id"
+          - "increments ReworkClaim.version by 1"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /detailing/rework-claims/{id}/reject"
+        actor: Scheduler
+        preconditions:
+          - "claim.status == SUBMITTED"
+        side_effects:
+          - "set status = REJECTED"
+          - "increments ReworkClaim.version by 1"
+      - from: APPROVED
+        to: FULFILLED
+        trigger: "POST /detailing/rework-claims/{id}/mark-fulfilled (system, on rework appointment RELEASED)"
+        actor: system
+        preconditions:
+          - "claim.status == APPROVED"
+          - "the spawned rework Appointment.work_status == RELEASED"
+        side_effects:
+          - "set status = FULFILLED"
+          - "increments ReworkClaim.version by 1"
+
+# =====================================================================
+# §1.2.1 Concurrency Rules
+# =====================================================================
+concurrency_rules:
+  - rule_id: appointment-create-stale-bay
+    parent_entity: ServiceBay
+    write_endpoint: "POST /detailing/appointments"
+    occ_field: "expected_service_bay_version"
+    description: |
+      Booking a SHOP appointment against a ServiceBay whose version has advanced
+      since the client last observed it is rejected. A prior write may have flipped
+      the bay to MAINTENANCE or booked an overlapping slot on it; the booking the
+      client is sending was composed against a stale view of the bay, so it is
+      rejected on the version check before any overlap arithmetic runs.
+    error_id: ERR_STALE_BAY_VERSION
+    http_status: 412
+  - rule_id: rework-claim-approve-stale-claim
+    parent_entity: ReworkClaim
+    write_endpoint: "POST /detailing/rework-claims/{id}/approve"
+    occ_field: "expected_claim_version"
+    description: |
+      Approving a ReworkClaim whose version has advanced since the client last read
+      it is rejected. The spawn cascade legitimately mutates the claim (sets
+      rework_appointment_id and bumps version); a second approve still carrying the
+      pre-spawn version is rejected, preventing a duplicate zero-cost appointment.
+    error_id: ERR_STALE_CLAIM_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 Calculation Rules Table
+# =====================================================================
+calculations:
+  - name: appointment_total
+    trigger: "on POST /detailing/appointments (provisional variant); on the IN_SERVICE->READY and CURING->READY work transitions (final variant)"
+    algorithm: tiered_pricing
+    formula: |
+      # EVALUATION ORDER IS PINNED (circular-looking: credit depends on package subtotal,
+      # which depends on discount, which depends on member flag). Order:
+      #   1. pkg_raw       = round_half_up(PackageCatalog[tier].base_price_cents
+      #                                    * VehicleSizeRate[vehicle_size].size_multiplier_bps / 10000)
+      #   2. member_discount = round_half_up(pkg_raw * MEMBER_DISCOUNT_BPS / 10000) if member_flag else 0
+      #   3. pkg_net       = pkg_raw - member_discount
+      #   4. credit_applied_cents = min(membership.wash_credit_value_cents, pkg_net)
+      #                             if (use_membership_credit AND membership ACTIVE AND credits_remaining>0)
+      #                             else 0      # credit offsets package only, never add-ons
+      #   5. addon_total   = sum over add-on lines in the active set of price_cents_snapshot
+      #                      (ROUND-ORDER PINNED: each add-on price is already an integer cent
+      #                       snapshot; sum is exact — no per-line rounding ambiguity)
+      #   6. total = (pkg_net - credit_applied_cents) + addon_total
+      #   provisional_total_cents reports BEFORE credit (credit_applied_cents tracked separately):
+      #     provisional_total_cents = pkg_net + addon_total
+      #     final_total_cents       = pkg_net + addon_total   (credit subtracted into outstanding via payment_ledger)
+    input_set: |
+      provisional variant: member_flag = is_member_at_booking; add-on set = ALL AppointmentAddOn lines
+        (line_status==REQUESTED at booking time).
+      final variant: member_flag = (Customer.membership_id != null AND that Membership.status==ACTIVE NOW);
+        add-on set = only AppointmentAddOn lines with line_status==PERFORMED.
+    constants:
+      MEMBER_DISCOUNT_BPS: 1500
+    precision: "integer cents, round_half_up at each multiplication step (steps 1 and 2); sums are exact"
+    variants:
+      - name: provisional
+        when: "computed at booking (POST /detailing/appointments)"
+        difference: "uses is_member_at_booking snapshot and all REQUESTED add-on lines"
+      - name: final
+        when: "recomputed when work_status reaches READY (from IN_SERVICE or CURING)"
+        difference: "uses CURRENT membership-active state and only PERFORMED add-on lines; if membership lapsed since booking or an add-on was SKIPPED, final_total_cents < provisional_total_cents"
+
+  - name: customer_loyalty_tier
+    trigger: "chronological variant recomputed on Appointment READY->RELEASED, PAID->REFUNDED, and on pay/deposit transitions; forward variant recomputed on appointment create/cancel/no-show and on every work transition"
+    algorithm: threshold
+    formula: |
+      chronological_lifetime_spend_cents = sum( a.final_total_cents
+          for a in customer's Appointments where a.payment_status == PAID )
+      projected_lifetime_spend_cents = chronological_lifetime_spend_cents
+          + sum( a.provisional_total_cents
+                 for a in customer's Appointments
+                 where a.work_status IN {BOOKED,CHECKED_IN,IN_PREP,IN_SERVICE,CURING,READY}
+                 AND a.payment_status != PAID )      # avoid double-counting PAID appts
+      # loyalty_tier is driven by the CHRONOLOGICAL spend only:
+      loyalty_tier = GOLD   if chronological_lifetime_spend_cents >= GOLD_THRESHOLD_CENTS
+                     SILVER if chronological_lifetime_spend_cents >= SILVER_THRESHOLD_CENTS
+                     BRONZE otherwise
+    input_set: "chronological: PAID appointments only; forward: PAID plus all non-terminal-work non-PAID appointments by provisional total"
+    constants:
+      SILVER_THRESHOLD_CENTS: 50000
+      GOLD_THRESHOLD_CENTS: 150000
+    precision: "integer cents; threshold comparison is >= (at-threshold qualifies)"
+    variants:
+      - name: chronological
+        when: "drives the persisted loyalty_tier field"
+        difference: "counts only realized (PAID) spend; refunds remove an appointment from the sum"
+      - name: forward
+        when: "drives projected_lifetime_spend_cents (a what-if used for membership upsell)"
+        difference: "also counts the provisional total of in-flight non-PAID appointments; can place the customer a band higher than the realized tier"
+
+  - name: occupancy_window
+    trigger: "on POST /detailing/appointments and when an AppointmentAddOn line is added (recompute extra minutes)"
+    algorithm: interval_merge
+    formula: |
+      addon_extra = sum( line.extra_minutes_snapshot for line in REQUESTED add-on lines )
+      busy_minutes = PackageCatalog[tier].prep_minutes
+                   + PackageCatalog[tier].service_minutes
+                   + addon_extra
+      cure_minutes = PackageCatalog[tier].cure_minutes
+      vehicle_release_utc = scheduled_start_utc + (busy_minutes + cure_minutes) minutes  # both modes
+      if location_mode == SHOP:
+          occupancy_end_utc = scheduled_start_utc + (busy_minutes + cure_minutes) minutes  # bay blocked through cure
+      else: # MOBILE
+          occupancy_end_utc = scheduled_start_utc + busy_minutes minutes                  # crew leaves before cure
+    input_set: "this appointment's tier/size add-on lines and scheduled_start_utc"
+    constants: {}
+    precision: "whole minutes; datetime arithmetic in UTC"
+
+  - name: bay_overlap_check
+    trigger: "on POST /detailing/appointments with location_mode==SHOP, and on /check-in resource re-validation"
+    algorithm: interval_merge
+    formula: |
+      # SHOP bay interval is HALF-OPEN [scheduled_start_utc, occupancy_end_utc).
+      # Reject if the candidate interval overlaps any existing non-terminal-work
+      # appointment on the SAME service_bay_id:
+      #   conflict iff  candidate.start < existing.occupancy_end_utc
+      #            AND  existing.start  < candidate.occupancy_end_utc
+      # Adjacency (candidate.start == existing.occupancy_end_utc) does NOT conflict.
+    input_set: "existing Appointments on the same service_bay_id whose work_status NOT IN {CANCELLED, NO_SHOW, RELEASED}"
+    constants: {}
+    precision: "minute-resolution datetime comparison; strict '<' so touching boundaries are allowed"
+
+  - name: mobile_overlap_check
+    trigger: "on POST /detailing/appointments with location_mode==MOBILE"
+    algorithm: interval_merge
+    formula: |
+      # MOBILE interval uses a TRAVEL BUFFER: two jobs on the same unit need a gap
+      # of at least MobileUnit.travel_buffer_minutes between them. Expand each interval
+      # by the buffer on the SECOND side and test overlap:
+      #   conflict iff  candidate.start < existing.occupancy_end_utc + buffer
+      #            AND  existing.start  < candidate.occupancy_end_utc + buffer
+      # A gap of EXACTLY buffer minutes is allowed (>= boundary, no conflict).
+    input_set: "existing Appointments on the same mobile_unit_id whose work_status NOT IN {CANCELLED, NO_SHOW, RELEASED}"
+    constants: {}
+    precision: "minute resolution; gap >= travel_buffer_minutes is allowed, gap < buffer conflicts"
+
+  - name: membership_credit_ledger
+    trigger: "on membership activate/renew/lapse/cancel and on appointment booking that consumes a credit"
+    algorithm: aggregation
+    formula: |
+      credits_remaining = credits_granted_total - credits_consumed_total - credits_expired_total
+      # INVARIANT (conserved quantity): credits_granted_total
+      #   == credits_consumed_total + credits_expired_total + credits_remaining  at all times.
+      # consume: on booking with use_membership_credit and credits_remaining>0:
+      #          credits_consumed_total += 1
+      # expire:  on renew (unconsumed prior-cycle credit), lapse, cancel: credits_expired_total += credits_remaining_before
+    input_set: "the single Membership row's counters"
+    constants:
+      CREDITS_PER_CYCLE: 1
+    precision: "integer counts; credits_remaining MUST never go negative"
+
+  - name: payment_ledger
+    trigger: "on every payment_status transition and on the final-price cascade (READY)"
+    algorithm: aggregation
+    formula: |
+      outstanding_balance_cents = final_total_cents
+                                - credit_applied_cents
+                                - amount_charged_cents
+                                + amount_refunded_cents
+      # PAYMENT-CONSERVATION INVARIANT (conserved quantity, cents):
+      #   amount_charged_cents - amount_refunded_cents + outstanding_balance_cents
+      #     == final_total_cents - credit_applied_cents     at all times.
+      # A full refund (PAID->REFUNDED) sets amount_refunded_cents = amount_charged_cents,
+      # restoring outstanding_balance_cents to (final_total_cents - credit_applied_cents)
+      # with zero net cash retained — no drift.
+    input_set: "the single Appointment row's money fields"
+    constants:
+      DEPOSIT_BPS: 2000
+    precision: "integer cents; deposit = round_half_up(provisional_total_cents * DEPOSIT_BPS / 10000)"
+
+  - name: guarantee_window_check
+    trigger: "on POST /detailing/rework-claims (compute filed_within_window) and on rework-claim approve"
+    algorithm: threshold
+    formula: |
+      window_end_utc = original_appointment.vehicle_release_utc
+                       + PackageCatalog[original_appointment.tier].guarantee_days days
+      filed_within_window = (claim.created_at < window_end_utc)   # STRICT '<': at boundary => expired
+    input_set: "the original appointment's vehicle_release_utc and its tier's guarantee_days"
+    constants: {}
+    precision: "instant comparison in UTC; strict '<' — a claim filed AT window_end_utc is OUT of window"
+
+# =====================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =====================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "the role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: auth
+    check: "for entity_backed Customer acting on its own resource, X-User-ID equals the resource's customer_id"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Customer-owned appointment/membership operations"
+  - priority: 4
+    category: existence
+    check: "all path-referenced resources exist (validated left-to-right)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all /{id} paths"
+  - priority: 5
+    category: existence
+    check: "all FK body fields reference existing resources (customer_id, service_bay_id, mobile_unit_id, appointment_id, original_appointment_id)"
+    error_id: ERR_FK_NOT_FOUND
+    http_status: 404
+    applies_to: "create endpoints with FK bodies"
+  - priority: 6
+    category: business_constraint
+    check: "request body well-formed: required fields present, enum values legal, numbers in range, email contains '@'"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all
+  - priority: 7
+    category: business_constraint
+    check: "location/resource coherence: SHOP requires service_bay_id and null mobile_unit_id; MOBILE requires mobile_unit_id and null service_bay_id"
+    error_id: ERR_RESOURCE_MODE_MISMATCH
+    http_status: 422
+    applies_to: "POST /detailing/appointments"
+  - priority: 8
+    category: business_constraint
+    check: "CERAMIC tier in SHOP mode requires the chosen ServiceBay.supports_ceramic==true"
+    error_id: ERR_BAY_NO_CERAMIC
+    http_status: 422
+    applies_to: "POST /detailing/appointments"
+  - priority: 9
+    category: business_referential
+    check: "for SHOP bookings, the OCC expected_service_bay_version matches the ServiceBay.version (stale view rejected before overlap math)"
+    error_id: ERR_STALE_BAY_VERSION
+    http_status: 412
+    applies_to: "POST /detailing/appointments (SHOP)"
+  - priority: 10
+    category: state
+    check: "the chosen resource is usable: ServiceBay.status==AVAILABLE or MobileUnit.status==AVAILABLE"
+    error_id: ERR_RESOURCE_UNAVAILABLE
+    http_status: 409
+    applies_to: "POST /detailing/appointments"
+  - priority: 11
+    category: business_temporal
+    check: "SHOP booking does not overlap an existing non-terminal appointment on the same bay (half-open interval, calc bay_overlap_check)"
+    error_id: ERR_BAY_TIME_CONFLICT
+    http_status: 409
+    applies_to: "POST /detailing/appointments (SHOP)"
+  - priority: 12
+    category: business_temporal
+    check: "MOBILE booking respects the travel buffer on the same unit (calc mobile_overlap_check)"
+    error_id: ERR_MOBILE_BUFFER_CONFLICT
+    http_status: 409
+    applies_to: "POST /detailing/appointments (MOBILE)"
+  - priority: 13
+    category: state
+    check: "the work_status / payment_status transition is legal from the current state per §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all appointment / membership / rework action endpoints"
+  - priority: 14
+    category: state
+    check: "BEFORE photo exists before start-prep; AFTER photo exists before finish-service"
+    error_id: ERR_PHOTO_REQUIRED
+    http_status: 409
+    applies_to: "POST /appointments/{id}/start-prep, /finish-service"
+  - priority: 15
+    category: business_safety
+    check: "finish-cure cannot complete before now >= vehicle_release_utc (cure not elapsed)"
+    error_id: ERR_CURE_NOT_ELAPSED
+    http_status: 409
+    applies_to: "POST /appointments/{id}/finish-cure"
+  - priority: 16
+    category: state
+    check: "membership credit can only be applied when membership ACTIVE and credits_remaining>0"
+    error_id: ERR_NO_CREDIT_AVAILABLE
+    http_status: 409
+    applies_to: "POST /detailing/appointments (use_membership_credit==true)"
+  - priority: 17
+    category: business_referential
+    check: "rework-claim approve OCC expected_claim_version matches ReworkClaim.version"
+    error_id: ERR_STALE_CLAIM_VERSION
+    http_status: 412
+    applies_to: "POST /detailing/rework-claims/{id}/approve"
+  - priority: 18
+    category: business_temporal
+    check: "rework claim filed strictly before original_appointment.vehicle_release_utc + guarantee_days (calc guarantee_window_check)"
+    error_id: ERR_GUARANTEE_EXPIRED
+    http_status: 409
+    applies_to: "POST /detailing/rework-claims, /approve"
+  - priority: 19
+    category: business_fiscal
+    check: "deposit/pay amount equals the exact required amount (deposit==round_half_up(provisional*DEPOSIT_BPS/10000); pay==outstanding_balance_cents)"
+    error_id: ERR_PAYMENT_AMOUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /appointments/{id}/capture-deposit, /pay"
+  - priority: 20
+    category: business_fiscal
+    check: "release requires outstanding_balance_cents==0 (PAID) unless the appointment was spawned by a rework claim"
+    error_id: ERR_BALANCE_OUTSTANDING
+    http_status: 409
+    applies_to: "POST /appointments/{id}/release"
+
+# =====================================================================
+# §1.5 API Endpoint Table
+# =====================================================================
+endpoints:
+  # ---- Customer ----
+  - method: POST
+    path: "/detailing/customers"
+    description: register a customer
+    roles: [Scheduler, ShopManager]
+    code: 201
+    input: [email, full_name]
+    output: Customer
+    side_effects: ["loyalty_tier=BRONZE, spends=0"]
+  - method: GET
+    path: "/detailing/customers/{id}"
+    description: read a customer (with computed loyalty fields)
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/detailing/customers"
+    description: list customers
+    roles: [Scheduler, ShopManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Customer[]
+    side_effects: []
+  - method: GET
+    path: "/detailing/customers/{id}/appointments"
+    description: list a customer's appointments (FK reverse-reachability for Appointment.customer_id)
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Appointment[]
+    side_effects: []
+  - method: GET
+    path: "/detailing/customers/{id}/memberships"
+    description: list a customer's memberships (FK reverse-reachability for Membership.customer_id)
+    roles: [Customer, Scheduler, ShopManager]
+    code: 200
+    input: []
+    output: Membership[]
+    side_effects: []
+
+  # ---- Catalog / config ----
+  - method: POST
+    path: "/detailing/packages"
+    description: create a package tier catalog row
+    roles: [Scheduler, ShopManager]
+    code: 201
+    input: [tier, base_price_cents, prep_minutes, service_minutes, cure_minutes, guarantee_days]
+    output: PackageCatalog
+    side_effects: []
+  - method: GET
+    path: "/detailing/packages"
+    description: list package tiers
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PackageCatalog[]
+    side_effects: []
+  - method: POST
+    path: "/detailing/vehicle-size-rates"
+    description: create a vehicle-size multiplier row
+    roles: [Scheduler, ShopManager]
+    code: 201
+    input: [vehicle_size, size_multiplier_bps]
+    output: VehicleSizeRate
+    side_effects: []
+  - method: GET
+    path: "/detailing/vehicle-size-rates"
+    description: list size rates
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: VehicleSizeRate[]
+    side_effects: []
+  - method: POST
+    path: "/detailing/addons"
+    description: create an add-on catalog row
+    roles: [Scheduler, ShopManager]
+    code: 201
+    input: [addon_code, price_cents, extra_minutes]
+    output: AddOn
+    side_effects: []
+  - method: GET
+    path: "/detailing/addons"
+    description: list add-ons
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: AddOn[]
+    side_effects: []
+
+  # ---- Resources ----
+  - method: POST
+    path: "/detailing/service-bays"
+    description: create a shop bay
+    roles: [Scheduler, ShopManager]
+    code: 201
+    input: [bay_code, "supports_ceramic?"]
+    output: ServiceBay
+    side_effects: []
+  - method: GET
+    path: "/detailing/service-bays/{id}"
+    description: read a bay
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: []
+    output: ServiceBay
+    side_effects: []
+  - method: GET
+    path: "/detailing/service-bays"
+    description: list bays
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ServiceBay[]
+    side_effects: []
+  - method: POST
+    path: "/detailing/service-bays/{id}/set-status"
+    description: flip bay AVAILABLE<->MAINTENANCE (bumps bay version for OCC)
+    roles: [Scheduler, ShopManager]
+    code: 200
+    input: [status]
+    output: ServiceBay
+    side_effects: ["increments ServiceBay.version by 1"]
+  - method: POST
+    path: "/detailing/mobile-units"
+    description: create a mobile unit
+    roles: [Scheduler, ShopManager]
+    code: 201
+    input: [unit_code, "travel_buffer_minutes?"]
+    output: MobileUnit
+    side_effects: []
+  - method: GET
+    path: "/detailing/mobile-units/{id}"
+    description: read a mobile unit
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: []
+    output: MobileUnit
+    side_effects: []
+  - method: GET
+    path: "/detailing/mobile-units"
+    description: list mobile units
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: MobileUnit[]
+    side_effects: []
+
+  # ---- Membership ----
+  - method: POST
+    path: "/detailing/memberships"
+    description: create a membership (PENDING_PAYMENT)
+    roles: [Customer, Scheduler, ShopManager]
+    code: 201
+    input: [customer_id, default_vehicle_size]
+    output: Membership
+    side_effects: []
+  - method: GET
+    path: "/detailing/memberships/{id}"
+    description: read a membership (with credit ledger)
+    roles: [Customer, Scheduler, ShopManager]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: []
+  - method: POST
+    path: "/detailing/memberships/{id}/activate"
+    description: activate (PENDING_PAYMENT->ACTIVE) or cure past-due (PAST_DUE->ACTIVE)
+    roles: [Customer, Scheduler, ShopManager]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["freeze wash_credit_value_cents, grant credit, set Customer.membership_id", "increments Membership.version by 1"]
+  - method: POST
+    path: "/detailing/memberships/{id}/renew"
+    description: roll the billing cycle forward (ACTIVE->ACTIVE)
+    roles: [Scheduler, ShopManager]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["expire prior credit, grant new credit, advance cycle_start_utc", "increments Membership.version by 1"]
+  - method: POST
+    path: "/detailing/memberships/{id}/mark-past-due"
+    description: ACTIVE->PAST_DUE on renewal payment failure
+    roles: [Scheduler, ShopManager]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["increments Membership.version by 1"]
+  - method: POST
+    path: "/detailing/memberships/{id}/lapse"
+    description: PAST_DUE->LAPSED; cascade clears Customer.membership_id
+    roles: [Scheduler, ShopManager]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["expire credits, clear Customer.membership_id", "increments Membership.version by 1"]
+  - method: POST
+    path: "/detailing/memberships/{id}/cancel"
+    description: ACTIVE->CANCELLED (OCC on membership version)
+    roles: [Customer, ShopManager]
+    code: 200
+    input: [expected_membership_version]
+    output: Membership
+    side_effects: ["expire credits, clear Customer.membership_id", "increments Membership.version by 1"]
+
+  # ---- Appointment ----
+  - method: POST
+    path: "/detailing/appointments"
+    description: book an appointment; computes provisional total, occupancy window, overlap checks
+    roles: [Customer, Scheduler, ShopManager]
+    code: 201
+    input: [customer_id, tier, vehicle_size, location_mode, scheduled_start_utc, "service_bay_id?", "mobile_unit_id?", "use_membership_credit?", "expected_service_bay_version?"]
+    output: Appointment
+    side_effects: ["compute provisional_total_cents & final_total_cents & occupancy_end_utc & vehicle_release_utc & is_member_at_booking", "if use_membership_credit consume 1 credit (calc membership_credit_ledger)", "recompute customer projected_lifetime_spend_cents", "for SHOP: increments ServiceBay.version by 1"]
+  - method: GET
+    path: "/detailing/appointments/{id}"
+    description: read an appointment (all computed money + schedule fields)
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: []
+  - method: GET
+    path: "/detailing/appointments"
+    description: list appointments, filterable by resource and customer (FK reverse-reachability for service_bay_id, mobile_unit_id, spawned_from_rework_claim_id)
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: ["customer_id?", "service_bay_id?", "mobile_unit_id?", "spawned_from_rework_claim_id?", "limit?", "offset?"]
+    output: Appointment[]
+    side_effects: []
+  - method: POST
+    path: "/detailing/appointments/{id}/addons"
+    description: add an add-on line to a BOOKED appointment; recomputes occupancy window and provisional total
+    roles: [Customer, Scheduler, ShopManager]
+    code: 201
+    input: [addon_code]
+    output: AppointmentAddOn
+    side_effects: ["snapshot price/extra minutes, recompute occupancy_window & provisional_total_cents on the appointment", "increments Appointment.version by 1"]
+  - method: GET
+    path: "/detailing/appointments/{id}/addons"
+    description: list add-on lines (FK reverse-reachability for AppointmentAddOn.appointment_id)
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: []
+    output: AppointmentAddOn[]
+    side_effects: []
+  - method: POST
+    path: "/detailing/appointments/{id}/addons/{addon_code}/set-line-status"
+    description: mark an add-on line PERFORMED or SKIPPED during service
+    roles: [Detailer]
+    code: 200
+    input: [line_status]
+    output: AppointmentAddOn
+    side_effects: ["increments Appointment.version by 1"]
+  - method: POST
+    path: "/detailing/appointments/{id}/photos"
+    description: attach a BEFORE or AFTER job photo
+    roles: [Detailer]
+    code: 201
+    input: [phase, image_url]
+    output: JobPhoto
+    side_effects: []
+  - method: GET
+    path: "/detailing/appointments/{id}/photos"
+    description: list job photos (FK reverse-reachability for JobPhoto.appointment_id)
+    roles: [Customer, Scheduler, ShopManager, Detailer]
+    code: 200
+    input: []
+    output: JobPhoto[]
+    side_effects: []
+  - method: POST
+    path: "/detailing/appointments/{id}/check-in"
+    description: BOOKED->CHECKED_IN
+    roles: [Detailer]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["increments Appointment.version by 1"]
+  - method: POST
+    path: "/detailing/appointments/{id}/start-prep"
+    description: CHECKED_IN->IN_PREP (requires BEFORE photo)
+    roles: [Detailer]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["increments Appointment.version by 1"]
+  - method: POST
+    path: "/detailing/appointments/{id}/start-service"
+    description: IN_PREP->IN_SERVICE
+    roles: [Detailer]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["increments Appointment.version by 1"]
+  - method: POST
+    path: "/detailing/appointments/{id}/finish-service"
+    description: IN_SERVICE->CURING (ceramic) or IN_SERVICE->READY (non-ceramic, with final-price cascade)
+    roles: [Detailer]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["AFTER photo required; non-ceramic recompute final_total_cents + outstanding (cascade)", "increments Appointment.version by 1"]
+  - method: POST
+    path: "/detailing/appointments/{id}/finish-cure"
+    description: CURING->READY (requires cure elapsed; final-price cascade)
+    roles: [Detailer]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["recompute final_total_cents + outstanding (cascade)", "increments Appointment.version by 1"]
+  - method: POST
+    path: "/detailing/appointments/{id}/release"
+    description: READY->RELEASED (requires PAID or rework-spawned); release cascade updates loyalty
+    roles: [Detailer, ShopManager]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["recompute customer chronological_lifetime_spend_cents & loyalty_tier (cascade)", "if spawned_from_rework_claim_id set, mark the claim FULFILLED", "increments Appointment.version by 1"]
+  - method: POST
+    path: "/detailing/appointments/{id}/cancel"
+    description: BOOKED->CANCELLED (deposit refund cascade if held)
+    roles: [Customer, ShopManager]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["refund deposit if held, recompute projected_lifetime_spend_cents & loyalty_tier", "increments Appointment.version by 1"]
+  - method: POST
+    path: "/detailing/appointments/{id}/mark-no-show"
+    description: BOOKED->NO_SHOW (deposit forfeited)
+    roles: [Scheduler, ShopManager]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["increments Appointment.version by 1"]
+  - method: POST
+    path: "/detailing/appointments/{id}/capture-deposit"
+    description: UNPAID->DEPOSIT_HELD (exact deposit amount)
+    roles: [Customer, ShopManager]
+    code: 200
+    input: [deposit_cents]
+    output: Appointment
+    side_effects: ["amount_charged_cents += deposit, recompute outstanding", "increments Appointment.version by 1"]
+  - method: POST
+    path: "/detailing/appointments/{id}/pay"
+    description: UNPAID/DEPOSIT_HELD -> PAID (exact remaining balance); requires READY
+    roles: [Customer, ShopManager]
+    code: 200
+    input: [amount_cents]
+    output: Appointment
+    side_effects: ["amount_charged_cents += amount, outstanding->0, recompute chronological spend on later release", "increments Appointment.version by 1"]
+  - method: POST
+    path: "/detailing/appointments/{id}/refund"
+    description: PAID->REFUNDED (full refund, compensating action)
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["amount_refunded_cents += amount_charged_cents, recompute outstanding & customer chronological spend & loyalty (cascade)", "increments Appointment.version by 1"]
+
+  # ---- Rework guarantee ----
+  - method: POST
+    path: "/detailing/rework-claims"
+    description: file a rework claim against a RELEASED appointment; computes filed_within_window
+    roles: [Customer, ShopManager]
+    code: 201
+    input: [original_appointment_id, reason]
+    output: ReworkClaim
+    side_effects: ["compute filed_within_window (calc guarantee_window_check)"]
+  - method: GET
+    path: "/detailing/rework-claims/{id}"
+    description: read a rework claim
+    roles: [Customer, Scheduler, ShopManager]
+    code: 200
+    input: []
+    output: ReworkClaim
+    side_effects: []
+  - method: GET
+    path: "/detailing/rework-claims"
+    description: list rework claims (FK reverse-reachability for original_appointment_id, rework_appointment_id)
+    roles: [Customer, Scheduler, ShopManager]
+    code: 200
+    input: ["original_appointment_id?", "rework_appointment_id?", "limit?", "offset?"]
+    output: ReworkClaim[]
+    side_effects: []
+  - method: POST
+    path: "/detailing/rework-claims/{id}/approve"
+    description: SUBMITTED->APPROVED; spawns a zero-cost rework appointment (OCC on claim version)
+    roles: [Scheduler, ShopManager]
+    code: 200
+    input: [expected_claim_version]
+    output: ReworkClaim
+    side_effects: ["spawn zero-cost Appointment (PAID), set rework_appointment_id", "increments ReworkClaim.version by 1"]
+  - method: POST
+    path: "/detailing/rework-claims/{id}/reject"
+    description: SUBMITTED->REJECTED
+    roles: [Scheduler, ShopManager]
+    code: 200
+    input: []
+    output: ReworkClaim
+    side_effects: ["increments ReworkClaim.version by 1"]
+
+  # ---- Test-driving (clock) ----
+  - method: POST
+    path: "/detailing/_clock/set_current_utc"
+    description: set the server's current UTC instant (test-driving; gates time-based transitions and window checks)
+    roles: [Scheduler, ShopManager]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock advances to the supplied instant"]
+
+# =====================================================================
+# §1.6 Error Code Catalog
+# =====================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/unknown X-User-Role or X-User-ID headers"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "role not permitted for this operation"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Customer acting on an appointment/membership whose customer_id != X-User-ID"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "path-referenced resource does not exist"
+  - id: ERR_FK_NOT_FOUND
+    http: 404
+    condition: "a foreign-key body field references a non-existent resource"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "malformed body: missing required field, illegal enum, out-of-range number, email without '@'"
+  - id: ERR_RESOURCE_MODE_MISMATCH
+    http: 422
+    condition: "SHOP without bay (or with mobile unit) / MOBILE without unit (or with bay)"
+  - id: ERR_BAY_NO_CERAMIC
+    http: 422
+    condition: "CERAMIC booked into a SHOP bay whose supports_ceramic==false"
+  - id: ERR_STALE_BAY_VERSION
+    http: 412
+    condition: "SHOP booking carries an expected_service_bay_version older than the bay's current version"
+  - id: ERR_RESOURCE_UNAVAILABLE
+    http: 409
+    condition: "chosen ServiceBay/MobileUnit is in MAINTENANCE"
+  - id: ERR_BAY_TIME_CONFLICT
+    http: 409
+    condition: "SHOP booking overlaps an existing non-terminal appointment on the same bay (half-open interval)"
+  - id: ERR_MOBILE_BUFFER_CONFLICT
+    http: 409
+    condition: "MOBILE booking violates the travel buffer on the same unit (gap < travel_buffer_minutes)"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested work_status/payment_status/membership/rework transition illegal from current state"
+  - id: ERR_PHOTO_REQUIRED
+    http: 409
+    condition: "start-prep without a BEFORE photo, or finish-service without an AFTER photo"
+  - id: ERR_CURE_NOT_ELAPSED
+    http: 409
+    condition: "finish-cure attempted before now >= vehicle_release_utc"
+  - id: ERR_NO_CREDIT_AVAILABLE
+    http: 409
+    condition: "use_membership_credit set but membership not ACTIVE or credits_remaining==0"
+  - id: ERR_STALE_CLAIM_VERSION
+    http: 412
+    condition: "rework approve carries an expected_claim_version older than the claim's current version"
+  - id: ERR_GUARANTEE_EXPIRED
+    http: 409
+    condition: "rework claim filed at/after the guarantee window end (calc guarantee_window_check false)"
+  - id: ERR_PAYMENT_AMOUNT_MISMATCH
+    http: 422
+    condition: "deposit/pay amount does not equal the exact required amount"
+  - id: ERR_BALANCE_OUTSTANDING
+    http: 409
+    condition: "release attempted with outstanding_balance_cents>0 on a non-rework appointment"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "pagination params out of range (limit<1 or >100, offset<0) or other generic param validation"
+
+# =====================================================================
+# §1.7 RBAC Matrix
+# =====================================================================
+roles:
+  - name: Customer
+    description: "vehicle owner; books, pays, cancels own appointments; owns own membership; files rework claims"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "cancel own appointment (BOOKED->CANCELLED)"
+    shared_operations:
+      - "create appointment (own customer_id)"
+      - "capture-deposit / pay own appointment"
+      - "create/activate/cancel own membership"
+      - "file rework claim"
+      - "read own resources and catalogs"
+  - name: Detailer
+    description: "performs the work: check-in through release, attaches photos, marks add-on lines"
+    identity: "opaque"
+    exclusive_operations:
+      - "attach JobPhoto"
+      - "set add-on line_status PERFORMED/SKIPPED"
+      - "check-in, start-prep, start-service, finish-service, finish-cure"
+    shared_operations:
+      - "release appointment"
+      - "read appointments / catalogs"
+  - name: Scheduler
+    description: "owns catalog + resource config; approves/rejects rework; marks no-show and membership billing transitions"
+    identity: "opaque"
+    exclusive_operations:
+      - "create/configure packages, vehicle-size-rates, addons, service-bays, mobile-units"
+      - "set bay status, renew/mark-past-due/lapse membership"
+      - "mark-no-show, approve/reject rework claim"
+    shared_operations:
+      - "register customer"
+      - "create appointment / membership on behalf of customer"
+      - "set server clock"
+      - "read all resources"
+  - name: ShopManager
+    description: "hierarchical override: superset of operational roles plus refund + cancel authority"
+    identity: "opaque"
+    exclusive_operations:
+      - "refund a PAID appointment (PAID->REFUNDED)"
+    shared_operations:
+      - "every Scheduler operation"
+      - "release / cancel any appointment"
+      - "cancel any membership"
+      - "approve/reject rework"
+      - "capture-deposit / pay on behalf of customer"

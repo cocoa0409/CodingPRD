@@ -1,0 +1,1655 @@
+scenario: "Plumbing Service & Dispatch: service call (leak/drain/water-heater/repipe) & dispatch, flat-rate book & estimate, technician/route & ETA, parts/truck-stock inventory, permit & inspection, emergency/after-hours, membership/maintenance plan, warranty/callback"
+domain_name: plumbing-service-dispatch
+api_prefix: /plumbing
+
+complexity_profile:
+  primary_archetype: workflow_orchestration
+  secondary_archetype: temporal_windowing
+  complexity_layers:
+    - cascading_side_effects
+    - dual_variant_calculation
+    - optimistic_concurrency
+    - rate_threshold_triggers
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (ServiceJob is the hub; Estimate, DispatchAssignment,
+  # Permit, Invoice, Callback all reference it by FK; no nesting in URL paths beyond /service-jobs/{id}/...).
+
+  state_machine_shape: cyclic
+  # ServiceJob reopens via Callback (COMPLETED -> REOPENED -> IN_PROGRESS -> COMPLETED), Estimate
+  # revises (PRESENTED -> REVISED -> PRESENTED), Permit reapplies on a failed inspection.
+
+  relationship_patterns:
+    - one_to_many        # ServiceJob has many Estimates / DispatchAssignments / Permits; Estimate has many EstimateLines
+    - cross_aggregate    # EstimateLine references FlatRateItem / Part across aggregate boundaries; TruckStock references Technician + Part
+    - self_referential   # Callback.original_job_id and the reopen of the same ServiceJob form a job-to-job lineage
+
+  role_model: peer_roles
+  # Dispatcher owns dispatch, Technician owns field execution + estimates, Customer owns approvals + callbacks,
+  # OfficeManager owns configuration + invoicing + overrides. Non-overlapping resource ownership.
+
+  consistency_model: immediate
+
+# ----------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — emitted verbatim)
+# ----------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ----------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ----------------------------------------------------------------------------
+entities:
+
+  - name: MembershipPlan
+    parent: null
+    common_fields: false
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: server-minted UUID, identity only
+      - name: created_at
+        type: datetime
+        source: system
+        description: ISO 8601 UTC, three fractional digits
+      - name: tier_code
+        type: enum
+        source: input
+        description: plan tier identifier
+        constraints: one of {NONE, SILVER, GOLD}; unique across MembershipPlan
+      - name: name
+        type: string
+        source: input
+        description: human-readable plan name
+      - name: labor_discount_pct
+        type: number
+        source: input
+        description: fraction discount applied to flat-rate labor subtotal (e.g., 0.20 for GOLD)
+        constraints: ">= 0 and <= 1"
+      - name: waives_trip_fee
+        type: boolean
+        source: input
+        description: when true, trip fee is unconditionally waived for members on this plan
+      - name: annual_fee_cents
+        type: integer
+        source: input
+        description: yearly membership cost in cents
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: customer full name
+      - name: service_address
+        type: string
+        source: input
+        description: street address where service is performed
+      - name: membership_plan_id
+        type: string
+        source: input
+        description: "FK -> MembershipPlan.id; nullable. When null, customer is treated as tier NONE."
+        default: null
+      - name: credit_limit_cents
+        type: integer
+        source: input
+        description: maximum total of authorized (committed) estimate amounts, in cents
+        default: 100000
+      - name: committed_credit_cents
+        type: integer
+        source: computed
+        description: sum of authorized_amount_cents across this customer's jobs whose authorized estimate is still committed; increases on estimate approval, released on decline/cancel
+        default: 0
+
+  - name: Technician
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: technician full name
+      - name: skill_level
+        type: integer
+        source: input
+        description: competency rank; a flat-rate item with skill_required > this cannot be assigned to this technician
+        constraints: ">= 1 and <= 5"
+      - name: licensed_for_permits
+        type: boolean
+        source: input
+        description: whether this technician may be assigned to jobs that require a permit
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: availability state
+        default: AVAILABLE
+        constraints: one of {AVAILABLE, ON_CALL, OFF_DUTY}
+      - name: lifetime_completed_count
+        type: integer
+        source: computed
+        description: count of DISTINCT ServiceJobs this technician has driven to COMPLETED (lifetime); incremented by 1 the first time a given job reaches COMPLETED and never re-incremented when that same job is reopened and re-completed
+        default: 0
+      - name: lifetime_callback_count
+        type: integer
+        source: computed
+        description: count of Callbacks filed (any status) against jobs this technician completed (lifetime); incremented by 1 on each Callback creation whose original job this technician completed
+        default: 0
+      - name: needs_restock_skus
+        type: integer
+        source: computed
+        description: count of this technician's TruckStock rows currently flagged needs_restock=true
+        default: 0
+
+  - name: Inspector
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: inspector full name
+      - name: jurisdiction
+        type: string
+        source: input
+        description: municipal jurisdiction code this inspector serves; must match the permit jurisdiction
+      - name: max_daily_inspections
+        type: integer
+        source: input
+        description: aggregate capacity — maximum InspectionVisits this inspector may hold on any single scheduled_date
+        constraints: ">= 1"
+        default: 4
+
+  - name: FlatRateItem
+    parent: null
+    common_fields: false
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: server-minted UUID, identity only
+      - name: created_at
+        type: datetime
+        source: system
+        description: ISO 8601 UTC, three fractional digits
+      - name: code
+        type: string
+        source: input
+        description: flat-rate book code (e.g., "WH-REPLACE-40")
+        constraints: unique across FlatRateItem
+      - name: category
+        type: enum
+        source: input
+        description: service category this item belongs to
+        constraints: one of {LEAK, DRAIN, WATER_HEATER, REPIPE, GENERAL}
+      - name: base_price_cents
+        type: integer
+        source: input
+        description: normal-hours labor price in cents (before after-hours multiplier and membership discount)
+        constraints: ">= 0"
+      - name: skill_required
+        type: integer
+        source: input
+        description: minimum Technician.skill_level required to perform this item
+        constraints: ">= 1 and <= 5"
+      - name: requires_permit
+        type: boolean
+        source: input
+        description: when true, any job whose approved estimate contains this item requires a Permit before COMPLETED
+        default: false
+
+  - name: Part
+    parent: null
+    common_fields: false
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: server-minted UUID, identity only
+      - name: created_at
+        type: datetime
+        source: system
+        description: ISO 8601 UTC, three fractional digits
+      - name: sku
+        type: string
+        source: input
+        description: stock keeping unit
+        constraints: unique across Part
+      - name: name
+        type: string
+        source: input
+        description: part description
+      - name: list_price_cents
+        type: integer
+        source: input
+        description: price charged to customer per unit, in cents (not affected by after-hours multiplier or membership discount)
+        constraints: ">= 0"
+
+  - name: TruckStock
+    parent: null
+    common_fields: true
+    fields:
+      - name: technician_id
+        type: string
+        source: input
+        description: "FK -> Technician.id; the truck this stock lives on"
+      - name: part_id
+        type: string
+        source: input
+        description: "FK -> Part.id; the stocked part"
+      - name: quantity
+        type: integer
+        source: system
+        description: units currently on the truck; decremented on job completion consumption, incremented on restock and on callback-reopen reversal
+        constraints: ">= 0"
+        default: 0
+      - name: reorder_point
+        type: integer
+        source: input
+        description: threshold at or below which needs_restock flips true
+        constraints: ">= 0"
+        default: 2
+      - name: needs_restock
+        type: boolean
+        source: computed
+        description: true when quantity <= reorder_point
+        default: false
+
+  - name: ServiceJob
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the customer requesting service"
+      - name: category
+        type: enum
+        source: input
+        description: service category requested
+        constraints: one of {LEAK, DRAIN, WATER_HEATER, REPIPE}
+      - name: priority
+        type: enum
+        source: input
+        description: scheduling priority; EMERGENCY adds a flat surcharge
+        default: STANDARD
+        constraints: one of {STANDARD, EMERGENCY}
+      - name: window_start
+        type: datetime
+        source: input
+        description: requested service window start (ISO 8601 UTC); used to derive after_hours
+        default: null
+      - name: after_hours
+        type: boolean
+        source: computed
+        description: true when the confirmed DispatchAssignment window_start hour (UTC) is >= AFTER_HOURS_CUTOFF_HOUR or on a weekend; selects the 1.5x labor multiplier at estimate time
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: job lifecycle state
+        default: RECEIVED
+        constraints: one of {RECEIVED, DISPATCHED, EN_ROUTE, ON_SITE, AUTHORIZED, IN_PROGRESS, COMPLETED, REOPENED, CANCELLED}
+      - name: authorized_estimate_id
+        type: string
+        source: computed
+        description: "FK -> Estimate.id; the currently APPROVED estimate that committed customer credit; null until an estimate is approved"
+        default: null
+      - name: authorized_amount_cents
+        type: integer
+        source: computed
+        description: estimate_total_cents of the approved estimate; the amount committed against Customer.credit_limit_cents; 0 when no estimate approved
+        default: 0
+      - name: completed_at
+        type: datetime
+        source: system
+        description: ISO 8601 UTC timestamp set when status enters COMPLETED; used by rolling-callback-rate window ordering
+        default: null
+
+  - name: DispatchAssignment
+    parent: null
+    common_fields: true
+    fields:
+      - name: job_id
+        type: string
+        source: input
+        description: "FK -> ServiceJob.id; the job being dispatched"
+      - name: technician_id
+        type: string
+        source: input
+        description: "FK -> Technician.id; the assigned technician"
+      - name: window_start
+        type: datetime
+        source: input
+        description: ISO 8601 UTC start of the on-site window
+      - name: window_end
+        type: datetime
+        source: input
+        description: ISO 8601 UTC end of the on-site window; must be strictly after window_start
+      - name: eta
+        type: datetime
+        source: input
+        description: estimated arrival time within the window
+      - name: status
+        type: enum
+        source: system
+        description: assignment lifecycle state
+        default: PROPOSED
+        constraints: one of {PROPOSED, CONFIRMED, EN_ROUTE, ON_SITE, CLOSED, CANCELLED}
+
+  - name: Estimate
+    parent: null
+    common_fields: true
+    fields:
+      - name: job_id
+        type: string
+        source: input
+        description: "FK -> ServiceJob.id; the job this estimate prices"
+      - name: status
+        type: enum
+        source: system
+        description: estimate lifecycle state
+        default: DRAFT
+        constraints: one of {DRAFT, PRESENTED, REVISED, APPROVED, DECLINED, CONSUMED}
+      - name: labor_subtotal_cents
+        type: integer
+        source: computed
+        description: sum of per-line-rounded FLAT_RATE line_total_cents (after-hours multiplier applied per line, then rounded per line, then summed)
+        default: 0
+      - name: parts_subtotal_cents
+        type: integer
+        source: computed
+        description: sum of per-line-rounded PART line_total_cents
+        default: 0
+      - name: discount_cents
+        type: integer
+        source: computed
+        description: membership labor discount, capped at MAX_DISCOUNT_CENTS
+        default: 0
+      - name: trip_fee_cents
+        type: integer
+        source: computed
+        description: trip fee after waiver decision (0 when waived)
+        default: 0
+      - name: emergency_surcharge_cents
+        type: integer
+        source: computed
+        description: EMERGENCY_SURCHARGE_CENTS when job priority EMERGENCY, else 0
+        default: 0
+      - name: estimate_total_cents
+        type: integer
+        source: computed
+        description: (labor_subtotal - discount) + parts_subtotal + trip_fee + emergency_surcharge
+        default: 0
+
+  - name: EstimateLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: estimate_id
+        type: string
+        source: input
+        description: "FK -> Estimate.id; the owning estimate"
+      - name: line_type
+        type: enum
+        source: input
+        description: whether this line prices labor or a part
+        constraints: one of {FLAT_RATE, PART}
+      - name: flat_rate_item_id
+        type: string
+        source: input
+        description: "FK -> FlatRateItem.id; required when line_type=FLAT_RATE, else null"
+        default: null
+      - name: part_id
+        type: string
+        source: input
+        description: "FK -> Part.id; required when line_type=PART, else null"
+        default: null
+      - name: quantity
+        type: integer
+        source: input
+        description: number of units for this line
+        constraints: ">= 1"
+      - name: unit_price_cents
+        type: integer
+        source: computed
+        description: for FLAT_RATE = round(base_price * after_hours_multiplier); for PART = list_price_cents
+        default: 0
+      - name: line_total_cents
+        type: integer
+        source: computed
+        description: round(unit_price_cents * quantity) per line (rounding applied at line level before estimate summation)
+        default: 0
+
+  - name: Permit
+    parent: null
+    common_fields: true
+    fields:
+      - name: job_id
+        type: string
+        source: input
+        description: "FK -> ServiceJob.id; the job this permit covers"
+      - name: jurisdiction
+        type: string
+        source: input
+        description: municipal jurisdiction code; an InspectionVisit's inspector must serve this jurisdiction
+      - name: status
+        type: enum
+        source: system
+        description: permit lifecycle state
+        default: APPLIED
+        constraints: one of {APPLIED, ISSUED, INSPECTION_SCHEDULED, PASSED, FAILED, VOIDED}
+      - name: reapply_count
+        type: integer
+        source: computed
+        description: number of times this permit cycled FAILED -> ISSUED (reapplied after a failed inspection)
+        default: 0
+
+  - name: InspectionVisit
+    parent: null
+    common_fields: true
+    fields:
+      - name: permit_id
+        type: string
+        source: input
+        description: "FK -> Permit.id; the permit being inspected"
+      - name: inspector_id
+        type: string
+        source: input
+        description: "FK -> Inspector.id; the assigned inspector"
+      - name: scheduled_date
+        type: string
+        source: input
+        description: calendar date (YYYY-MM-DD) of the inspection; inspector daily capacity is counted per this date
+      - name: result
+        type: enum
+        source: system
+        description: inspection outcome
+        default: PENDING
+        constraints: one of {PENDING, PASSED, FAILED}
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: job_id
+        type: string
+        source: input
+        description: "FK -> ServiceJob.id; the completed job being invoiced"
+      - name: status
+        type: enum
+        source: system
+        description: invoice lifecycle state
+        default: FINALIZED
+        constraints: one of {FINALIZED, VOIDED}
+      - name: final_labor_cents
+        type: integer
+        source: computed
+        description: labor subtotal recomputed at finalization from the approved estimate's FLAT_RATE lines (after-hours and discount re-applied with the membership tier captured at invoice time)
+        default: 0
+      - name: final_parts_cents
+        type: integer
+        source: computed
+        description: parts subtotal recomputed from ACTUAL units consumed (units_consumed per part) at list_price_cents, not the estimated quantities
+        default: 0
+      - name: final_total_cents
+        type: integer
+        source: computed
+        description: (final_labor - discount) + final_parts + trip_fee + emergency_surcharge, recomputed at finalization
+        default: 0
+
+  - name: Callback
+    parent: null
+    common_fields: true
+    fields:
+      - name: original_job_id
+        type: string
+        source: input
+        description: "FK -> ServiceJob.id; the COMPLETED job the customer is reporting a warranty issue against"
+      - name: reason
+        type: string
+        source: input
+        description: customer-reported defect description
+      - name: status
+        type: enum
+        source: system
+        description: callback lifecycle state
+        default: OPEN
+        constraints: one of {OPEN, ACCEPTED, REJECTED, RESOLVED}
+      - name: within_warranty
+        type: boolean
+        source: computed
+        description: true when filed within WARRANTY_DAYS of the original job's completed_at; gates whether reopen is free of charge
+        default: false
+
+# ----------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ----------------------------------------------------------------------------
+state_machines:
+
+  - entity: ServiceJob
+    initial_state: RECEIVED
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: RECEIVED
+        to: DISPATCHED
+        trigger: "POST /plumbing/dispatch-assignments (first PROPOSED assignment for the job is CONFIRMED) — see DispatchAssignment CONFIRMED transition side effect"
+        actor: Dispatcher
+        preconditions: ["job.status == RECEIVED"]
+        side_effects:
+          - "set ServiceJob.after_hours = (confirmed assignment window_start hour UTC >= AFTER_HOURS_CUTOFF_HOUR) OR (window_start is a Saturday/Sunday UTC)"
+        note: "after_hours is frozen at confirmation time and drives the labor multiplier used by all subsequent estimates"
+      - from: DISPATCHED
+        to: EN_ROUTE
+        trigger: "POST /plumbing/dispatch-assignments/{id}/depart"
+        actor: Technician
+        preconditions: ["the job's CONFIRMED assignment belongs to the acting technician", "assignment.status == CONFIRMED"]
+        side_effects: ["set DispatchAssignment.status = EN_ROUTE"]
+      - from: EN_ROUTE
+        to: ON_SITE
+        trigger: "POST /plumbing/dispatch-assignments/{id}/arrive"
+        actor: Technician
+        preconditions: ["assignment.status == EN_ROUTE"]
+        side_effects: ["set DispatchAssignment.status = ON_SITE"]
+      - from: ON_SITE
+        to: AUTHORIZED
+        trigger: "POST /plumbing/estimates/{id}/approve (customer approves a PRESENTED estimate)"
+        actor: Customer
+        preconditions:
+          - "job.status == ON_SITE"
+          - "estimate.status == PRESENTED"
+          - "Customer.credit_limit_cents - Customer.committed_credit_cents >= estimate.estimate_total_cents (cross-entity fiscal)"
+        side_effects:
+          - "set ServiceJob.authorized_estimate_id = estimate.id"
+          - "set ServiceJob.authorized_amount_cents = estimate.estimate_total_cents"
+          - "increment Customer.committed_credit_cents by estimate.estimate_total_cents (CONSERVED: credit)"
+          - "set Estimate.status = APPROVED"
+          - "if any FLAT_RATE line's FlatRateItem.requires_permit == true, auto-create one Permit{job_id, jurisdiction=Customer-derived, status=APPLIED} (cascade)"
+      - from: AUTHORIZED
+        to: IN_PROGRESS
+        trigger: "POST /plumbing/service-jobs/{id}/start-work"
+        actor: Technician
+        preconditions:
+          - "job.status == AUTHORIZED"
+          - "job.authorized_estimate_id is not null AND that Estimate.status == APPROVED (cross-entity state dependency: ServiceJob requires Estimate)"
+        side_effects: []
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /plumbing/service-jobs/{id}/complete"
+        actor: Technician
+        preconditions:
+          - "job.status == IN_PROGRESS"
+          - "if a Permit exists for this job, that Permit.status == PASSED (cross-entity state dependency: ServiceJob requires Permit)"
+          - "every consumed part has TruckStock.quantity >= units_consumed for the acting technician (cannot over-consume)"
+        side_effects:
+          - "set ServiceJob.completed_at = current UTC"
+          - "set Estimate(authorized).status = CONSUMED (cascade link 1)"
+          - "for each consumed Part, decrement the technician's TruckStock.quantity by units_consumed (cascade link 2)"
+          - "for each TruckStock row whose quantity <= reorder_point, set needs_restock=true and increment Technician.needs_restock_skus (cascade link 3)"
+          - "increment Technician.lifetime_completed_count by 1 ONLY if this job has never been COMPLETED before (first completion); a reopened job re-completing does NOT re-increment"
+          - "create Invoice{job_id, status=FINALIZED} and compute final_* fields (dual-variant FINAL)"
+      - from: COMPLETED
+        to: REOPENED
+        trigger: "POST /plumbing/callbacks/{id}/accept (OfficeManager accepts a within-warranty callback)"
+        actor: OfficeManager
+        preconditions:
+          - "callback.status == OPEN"
+          - "callback.within_warranty == true"
+          - "original job.status == COMPLETED"
+        side_effects:
+          - "set Callback.status = ACCEPTED"
+          - "set ServiceJob.status = REOPENED"
+          - "set Invoice.status = VOIDED (compensation)"
+          - "for each Part the voided invoice consumed, increment the technician's TruckStock.quantity by the consumed units (CONSERVED: truck-stock units restored); recompute needs_restock and Technician.needs_restock_skus"
+          - "release Customer.committed_credit_cents by job.authorized_amount_cents (CONSERVED: credit released)"
+      - from: REOPENED
+        to: IN_PROGRESS
+        trigger: "POST /plumbing/service-jobs/{id}/start-work"
+        actor: Technician
+        preconditions: ["job.status == REOPENED", "job.authorized_estimate_id Estimate.status in {APPROVED, CONSUMED}"]
+        side_effects: ["set Estimate(authorized).status = APPROVED (re-arm for a fresh completion)"]
+        note: "cyclic — a reopened job returns to IN_PROGRESS and can be COMPLETED again"
+      - from: RECEIVED
+        to: CANCELLED
+        trigger: "POST /plumbing/service-jobs/{id}/cancel"
+        actor: Dispatcher
+        preconditions: ["job.status in {RECEIVED, DISPATCHED, EN_ROUTE, ON_SITE, AUTHORIZED}"]
+        side_effects:
+          - "if job.authorized_amount_cents > 0, release Customer.committed_credit_cents by that amount and reset authorized_amount_cents=0 (CONSERVED: credit released)"
+          - "set any non-terminal DispatchAssignment for the job to CANCELLED (conditional cascade — terminal assignments untouched)"
+          - "set any PRESENTED/APPROVED Estimate for the job to DECLINED"
+      - from: AUTHORIZED
+        to: CANCELLED
+        trigger: "POST /plumbing/service-jobs/{id}/cancel"
+        actor: Dispatcher
+        preconditions: ["job.status in {RECEIVED, DISPATCHED, EN_ROUTE, ON_SITE, AUTHORIZED}"]
+        side_effects:
+          - "release Customer.committed_credit_cents by job.authorized_amount_cents and reset authorized_amount_cents=0 (CONSERVED: credit released)"
+          - "set any non-terminal DispatchAssignment for the job to CANCELLED"
+          - "set the APPROVED Estimate for the job to DECLINED"
+
+  - entity: DispatchAssignment
+    initial_state: PROPOSED
+    terminal_states: [CLOSED, CANCELLED]
+    transitions:
+      - from: PROPOSED
+        to: CONFIRMED
+        trigger: "POST /plumbing/dispatch-assignments/{id}/confirm"
+        actor: Dispatcher
+        preconditions:
+          - "assignment.status == PROPOSED"
+          - "Technician.status in {AVAILABLE, ON_CALL} (cross-entity state dependency: DispatchAssignment requires Technician)"
+          - "Technician.skill_level >= max skill_required across the job's intended flat-rate work (business_safety)"
+          - "if the job requires a permit, Technician.licensed_for_permits == true (business_referential)"
+          - "no other CONFIRMED/EN_ROUTE/ON_SITE assignment for this technician overlaps [window_start, window_end) expanded by TRAVEL_BUFFER_MINUTES on each side (business_temporal)"
+        side_effects:
+          - "set DispatchAssignment.status = CONFIRMED"
+          - "if job.status == RECEIVED, transition job RECEIVED -> DISPATCHED and freeze ServiceJob.after_hours"
+      - from: CONFIRMED
+        to: EN_ROUTE
+        trigger: "POST /plumbing/dispatch-assignments/{id}/depart"
+        actor: Technician
+        preconditions: ["assignment.status == CONFIRMED", "acting technician owns this assignment"]
+        side_effects: ["transition job DISPATCHED -> EN_ROUTE"]
+      - from: EN_ROUTE
+        to: ON_SITE
+        trigger: "POST /plumbing/dispatch-assignments/{id}/arrive"
+        actor: Technician
+        preconditions: ["assignment.status == EN_ROUTE"]
+        side_effects: ["transition job EN_ROUTE -> ON_SITE"]
+      - from: ON_SITE
+        to: CLOSED
+        trigger: "system: ServiceJob enters COMPLETED"
+        actor: system
+        preconditions: ["job.status transitions to COMPLETED"]
+        side_effects: []
+      - from: PROPOSED
+        to: CANCELLED
+        trigger: "POST /plumbing/dispatch-assignments/{id}/cancel or job cancellation cascade"
+        actor: Dispatcher
+        preconditions: ["assignment.status in {PROPOSED, CONFIRMED, EN_ROUTE, ON_SITE}"]
+        side_effects: []
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /plumbing/dispatch-assignments/{id}/cancel or job cancellation cascade"
+        actor: Dispatcher
+        preconditions: ["assignment.status in {PROPOSED, CONFIRMED, EN_ROUTE, ON_SITE}"]
+        side_effects: ["free the technician's time window for re-dispatch"]
+
+  - entity: Estimate
+    initial_state: DRAFT
+    terminal_states: [DECLINED, CONSUMED]
+    transitions:
+      - from: DRAFT
+        to: PRESENTED
+        trigger: "POST /plumbing/estimates/{id}/present"
+        actor: Technician
+        preconditions:
+          - "estimate.status == DRAFT"
+          - "estimate has at least one EstimateLine (non-empty set — empty estimates cannot be presented)"
+          - "job.status == ON_SITE"
+        side_effects: ["recompute all computed line and estimate totals (provisional variant)"]
+      - from: PRESENTED
+        to: APPROVED
+        trigger: "POST /plumbing/estimates/{id}/approve"
+        actor: Customer
+        preconditions:
+          - "estimate.status == PRESENTED"
+          - "acting Customer owns the job (job.customer_id == X-User-ID)"
+          - "Customer available credit >= estimate_total_cents"
+        side_effects: ["transition job ON_SITE -> AUTHORIZED with that transition's full side-effect set (credit commit, permit auto-create)"]
+      - from: PRESENTED
+        to: DECLINED
+        trigger: "POST /plumbing/estimates/{id}/decline"
+        actor: Customer
+        preconditions: ["estimate.status in {PRESENTED, REVISED}"]
+        side_effects: []
+      - from: PRESENTED
+        to: REVISED
+        trigger: "POST /plumbing/estimates/{id}/revise"
+        actor: Technician
+        preconditions: ["estimate.status == PRESENTED"]
+        side_effects: ["allow EstimateLine mutations again; mark status REVISED"]
+      - from: REVISED
+        to: PRESENTED
+        trigger: "POST /plumbing/estimates/{id}/present"
+        actor: Technician
+        preconditions: ["estimate.status == REVISED", "estimate has at least one EstimateLine"]
+        side_effects: ["recompute all computed totals (cyclic revision loop)"]
+      - from: APPROVED
+        to: CONSUMED
+        trigger: "system: ServiceJob enters COMPLETED"
+        actor: system
+        preconditions: ["job.status transitions to COMPLETED", "this is the job's authorized estimate"]
+        side_effects: []
+
+  - entity: Permit
+    initial_state: APPLIED
+    terminal_states: [PASSED, VOIDED]
+    transitions:
+      - from: APPLIED
+        to: ISSUED
+        trigger: "POST /plumbing/permits/{id}/issue"
+        actor: OfficeManager
+        preconditions: ["permit.status == APPLIED"]
+        side_effects: []
+      - from: ISSUED
+        to: INSPECTION_SCHEDULED
+        trigger: "POST /plumbing/permits/{id}/inspections (schedule an InspectionVisit)"
+        actor: OfficeManager
+        preconditions:
+          - "permit.status == ISSUED"
+          - "Inspector.jurisdiction == permit.jurisdiction (business_referential)"
+          - "Inspector holds < max_daily_inspections PENDING InspectionVisits on scheduled_date (business_temporal aggregate capacity)"
+        side_effects: ["create InspectionVisit{result=PENDING}"]
+      - from: INSPECTION_SCHEDULED
+        to: PASSED
+        trigger: "POST /plumbing/inspections/{id}/record (result=PASSED)"
+        actor: OfficeManager
+        preconditions: ["inspection.result == PENDING"]
+        side_effects: ["set InspectionVisit.result = PASSED"]
+      - from: INSPECTION_SCHEDULED
+        to: FAILED
+        trigger: "POST /plumbing/inspections/{id}/record (result=FAILED)"
+        actor: OfficeManager
+        preconditions: ["inspection.result == PENDING"]
+        side_effects: ["set InspectionVisit.result = FAILED"]
+      - from: FAILED
+        to: ISSUED
+        trigger: "POST /plumbing/permits/{id}/issue"
+        actor: OfficeManager
+        preconditions: ["permit.status == FAILED"]
+        side_effects: ["increment Permit.reapply_count by 1 (cyclic — reapply after a failed inspection)"]
+      - from: APPLIED
+        to: VOIDED
+        trigger: "system: job cancellation cascade"
+        actor: system
+        preconditions: ["job.status transitions to CANCELLED"]
+        side_effects: []
+
+  - entity: Callback
+    initial_state: OPEN
+    terminal_states: [REJECTED, RESOLVED]
+    transitions:
+      - from: OPEN
+        to: ACCEPTED
+        trigger: "POST /plumbing/callbacks/{id}/accept"
+        actor: OfficeManager
+        preconditions: ["callback.status == OPEN", "callback.within_warranty == true", "original job.status == COMPLETED"]
+        side_effects: ["transition original ServiceJob COMPLETED -> REOPENED with that transition's full side-effect set"]
+      - from: OPEN
+        to: REJECTED
+        trigger: "POST /plumbing/callbacks/{id}/reject"
+        actor: OfficeManager
+        preconditions: ["callback.status == OPEN"]
+        side_effects: []
+      - from: ACCEPTED
+        to: RESOLVED
+        trigger: "system: the reopened ServiceJob re-enters COMPLETED"
+        actor: system
+        preconditions: ["original job re-completes after REOPENED"]
+        side_effects: ["set Callback.status = RESOLVED"]
+
+# ----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: estimate-create-stale-job
+    parent_entity: ServiceJob
+    write_endpoint: "POST /plumbing/service-jobs/{id}/estimates"
+    occ_field: "expected_job_version"
+    description: |
+      Creating a new Estimate against a ServiceJob whose version has advanced
+      since the client last observed it is rejected with a stale-version error.
+      This captures the case where another writer has already created a DRAFT
+      estimate (which legitimately supersedes the prior estimate workflow for
+      the job) and bumped the job version, so the current writer's view of the
+      job is stale.
+    error_id: ERR_STALE_JOB_VERSION
+    http_status: 412
+  - rule_id: dispatch-create-stale-job
+    parent_entity: ServiceJob
+    write_endpoint: "POST /plumbing/dispatch-assignments"
+    occ_field: "expected_job_version"
+    description: |
+      Creating a new DispatchAssignment against a ServiceJob whose version has
+      advanced since the client last observed it is rejected. This captures the
+      re-dispatch case where another writer has already proposed an assignment
+      (legitimately superseding the prior dispatch plan) and bumped the job
+      version, making the current writer's view stale.
+    error_id: ERR_STALE_JOB_VERSION
+    http_status: 412
+
+# ----------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ----------------------------------------------------------------------------
+calculations:
+
+  - name: estimate_provisional_total
+    trigger: "Estimate present transition (DRAFT->PRESENTED and REVISED->PRESENTED)"
+    algorithm: tiered_pricing
+    formula: |
+      # Combinatorial mode (a): >=3 inputs, conditional branches, tier selection, caps.
+      # Step 1 — per-line unit prices & line totals (rounding pinned at line level):
+      for each EstimateLine:
+        if line_type == FLAT_RATE:
+          unit_price_cents = round_half_up(FlatRateItem.base_price_cents * after_hours_multiplier)
+        else: # PART
+          unit_price_cents = Part.list_price_cents
+        line_total_cents = round_half_up(unit_price_cents * quantity)   # ROUND PER LINE
+      # where after_hours_multiplier = AFTER_HOURS_MULT if ServiceJob.after_hours else 1.0
+      # Step 2 — subtotals (sum of already-rounded lines; NEVER re-round the sum):
+      labor_subtotal_cents = sum(line_total_cents for FLAT_RATE lines)
+      parts_subtotal_cents = sum(line_total_cents for PART lines)
+      # Step 3 — membership labor discount (only labor, capped):
+      pct = MembershipPlan.labor_discount_pct of Customer's plan (0 if plan null/NONE)
+      discount_cents = min(round_half_up(labor_subtotal_cents * pct), MAX_DISCOUNT_CENTS)
+      labor_after_cents = labor_subtotal_cents - discount_cents
+      # Step 4 — trip fee waiver (mode c: waiver keyed on post-discount labor tier):
+      waive = MembershipPlan.waives_trip_fee OR (labor_after_cents >= TRIP_WAIVE_THRESHOLD_CENTS)
+      trip_fee_cents = 0 if waive else TRIP_FEE_BASE_CENTS
+      # Step 5 — emergency surcharge:
+      emergency_surcharge_cents = EMERGENCY_SURCHARGE_CENTS if ServiceJob.priority==EMERGENCY else 0
+      # Step 6 — total:
+      estimate_total_cents = labor_after_cents + parts_subtotal_cents + trip_fee_cents + emergency_surcharge_cents
+    input_set: "all EstimateLines of the estimate; ServiceJob.after_hours and priority; Customer's MembershipPlan (NONE if null)"
+    constants:
+      AFTER_HOURS_MULT: 1.5
+      MAX_DISCOUNT_CENTS: 15000
+      TRIP_FEE_BASE_CENTS: 8900
+      TRIP_WAIVE_THRESHOLD_CENTS: 50000
+      EMERGENCY_SURCHARGE_CENTS: 12000
+    precision: "integer cents; round_half_up at each per-line multiplication and at the discount; NEVER round the subtotal sum"
+    variants:
+      - name: provisional
+        when: "computed at estimate present time"
+        difference: "uses estimated EstimateLine quantities; this is the amount that commits customer credit on approval"
+
+  - name: invoice_final_total
+    trigger: "ServiceJob complete transition (IN_PROGRESS->COMPLETED) — Invoice creation side effect"
+    algorithm: chronological
+    formula: |
+      # Dual-variant FINAL: same pricing skeleton as estimate_provisional_total BUT operates on
+      # ACTUAL consumed quantities and the membership tier captured at invoice time.
+      # final_labor_cents recomputed from the approved estimate's FLAT_RATE lines (after-hours mult + discount).
+      # final_parts_cents = sum over distinct consumed Parts of round_half_up(Part.list_price_cents * units_consumed)
+      #   where units_consumed is the actual units drawn from TruckStock at completion (may be < estimated quantity).
+      # discount_cents, trip_fee_cents, emergency_surcharge_cents recomputed with the SAME constants and rules,
+      # using labor_after at invoice time for the trip-fee waiver decision.
+      final_total_cents = (final_labor_cents - discount_cents) + final_parts_cents + trip_fee_cents + emergency_surcharge_cents
+    input_set: "the job's APPROVED estimate FLAT_RATE lines + the actual consumed-part quantities recorded at completion; Customer's plan at invoice time"
+    constants:
+      AFTER_HOURS_MULT: 1.5
+      MAX_DISCOUNT_CENTS: 15000
+      TRIP_FEE_BASE_CENTS: 8900
+      TRIP_WAIVE_THRESHOLD_CENTS: 50000
+      EMERGENCY_SURCHARGE_CENTS: 12000
+    precision: "integer cents; round_half_up per line; never round subtotals"
+    variants:
+      - name: final
+        when: "computed at job completion"
+        difference: "uses ACTUAL consumed part quantities (from TruckStock draw) instead of the estimate's projected quantities, so final_parts_cents and final_total_cents diverge from the provisional estimate whenever consumed != estimated"
+
+  - name: technician_callback_rate
+    trigger: "GET /plumbing/technicians/{id}/callback-rate (computed read)"
+    algorithm: aggregation
+    formula: |
+      # Dual-variant risk scoring on Technician (different entity domain than cost accounting).
+      # "this technician's completed jobs" = ServiceJobs that have reached COMPLETED at least once and whose
+      #   completing technician (the one who fired the COMPLETED transition) is this technician.
+      # "a job has a callback" = at least one Callback row exists with original_job_id == that job (ANY status).
+      lifetime_callback_rate = (lifetime_callback_count) / (lifetime_completed_count)   # 4 dp, 0 if denom 0
+      # rolling: consider this technician's last ROLLING_WINDOW completed jobs ordered by
+      #   ServiceJob.completed_at DESC, tie-break created_at DESC; take the most recent ROLLING_WINDOW.
+      window_jobs = top ROLLING_WINDOW of this technician's completed jobs by (completed_at DESC, created_at DESC)
+      rolling_denom = min(ROLLING_WINDOW, lifetime_completed_count)
+      rolling_callback_rate = (count of window_jobs that have at least one Callback) / rolling_denom   # 4 dp, 0 if denom 0
+    input_set: "all distinct COMPLETED jobs of the technician (lifetime) and the most recent ROLLING_WINDOW of them by completed_at DESC, created_at DESC (rolling), with their Callbacks of any status"
+    constants:
+      ROLLING_WINDOW: 5
+    precision: "4 decimal places, round_half_up; rate is 0.0 when denominator is 0"
+    variants:
+      - name: lifetime
+        when: "all-time"
+        difference: "denominator is lifetime_completed_count over the technician's entire history"
+      - name: rolling
+        when: "recency-weighted"
+        difference: "denominator is min(5, lifetime_completed_count); numerator counts callbacks only among the 5 most recent completions, so a technician improving over time scores lower on rolling than lifetime for identical data"
+
+  - name: callback_warranty_check
+    trigger: "POST /plumbing/callbacks (Callback creation)"
+    algorithm: threshold
+    formula: |
+      days_elapsed = floor((callback.created_at - original_job.completed_at) / 86400 seconds, UTC)
+      within_warranty = (days_elapsed <= WARRANTY_DAYS)   # boundary: exactly WARRANTY_DAYS is still within
+    input_set: "the original job's completed_at and the callback's created_at"
+    constants:
+      WARRANTY_DAYS: 90
+    precision: "integer days, floor; <= boundary is inclusive"
+    variants:
+      - name: within
+        when: "days_elapsed <= 90"
+        difference: "within_warranty=true → callback is acceptable and reopen is free"
+
+# ----------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority)
+# ----------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "acting role is permitted to perform this operation per §1.7 RBAC"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: existence
+    check: "every path/body referenced resource exists (validated left-to-right in path, then body FKs)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+  - priority: 4
+    category: existence
+    check: "request body parses, required fields present, enum/type/range constraints hold"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all
+  - priority: 5
+    category: state
+    check: "target resource is in a valid state for this transition (e.g., job ON_SITE for approve, estimate PRESENTED, assignment CONFIRMED)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 6
+    category: state
+    check: "OCC: expected_job_version equals the current ServiceJob.version on estimate-create and dispatch-create"
+    error_id: ERR_STALE_JOB_VERSION
+    http_status: 412
+    applies_to: "POST /plumbing/service-jobs/{id}/estimates, POST /plumbing/dispatch-assignments"
+  - priority: 7
+    category: business_safety
+    check: "Technician.skill_level >= max FlatRateItem.skill_required for the job's intended work on confirm"
+    error_id: ERR_SKILL_INSUFFICIENT
+    http_status: 409
+    applies_to: "POST /plumbing/dispatch-assignments/{id}/confirm"
+  - priority: 8
+    category: business_referential
+    check: "if the job requires a permit, the technician on confirm has licensed_for_permits==true; an InspectionVisit's inspector jurisdiction == permit.jurisdiction"
+    error_id: ERR_LICENSE_REQUIRED
+    http_status: 409
+    applies_to: "POST /plumbing/dispatch-assignments/{id}/confirm, POST /plumbing/permits/{id}/inspections"
+  - priority: 9
+    category: business_temporal
+    check: "no CONFIRMED/EN_ROUTE/ON_SITE assignment for the technician overlaps the requested window expanded by TRAVEL_BUFFER_MINUTES on each side (half-open [start,end))"
+    error_id: ERR_TECH_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /plumbing/dispatch-assignments/{id}/confirm"
+  - priority: 10
+    category: business_temporal
+    check: "inspector has < max_daily_inspections PENDING InspectionVisits on the requested scheduled_date (aggregate capacity)"
+    error_id: ERR_INSPECTOR_CAPACITY_FULL
+    http_status: 409
+    applies_to: "POST /plumbing/permits/{id}/inspections"
+  - priority: 11
+    category: business_constraint
+    check: "estimate has at least one EstimateLine before it can be presented (non-empty)"
+    error_id: ERR_EMPTY_ESTIMATE
+    http_status: 409
+    applies_to: "POST /plumbing/estimates/{id}/present"
+  - priority: 12
+    category: business_constraint
+    check: "at completion, each consumed Part's TruckStock.quantity >= units_consumed for the acting technician (no over-consumption)"
+    error_id: ERR_INSUFFICIENT_STOCK
+    http_status: 409
+    applies_to: "POST /plumbing/service-jobs/{id}/complete"
+  - priority: 13
+    category: business_constraint
+    check: "a Callback may only be filed against a COMPLETED job, and accept requires within_warranty==true"
+    error_id: ERR_WARRANTY_EXPIRED
+    http_status: 409
+    applies_to: "POST /plumbing/callbacks/{id}/accept"
+  - priority: 14
+    category: business_fiscal
+    check: "Customer available credit (credit_limit_cents - committed_credit_cents) >= estimate_total_cents on approve"
+    error_id: ERR_CREDIT_LIMIT_EXCEEDED
+    http_status: 409
+    applies_to: "POST /plumbing/estimates/{id}/approve"
+
+# ----------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ----------------------------------------------------------------------------
+endpoints:
+
+  # --- Configuration (OfficeManager) ---
+  - method: POST
+    path: "/plumbing/membership-plans"
+    description: "create a membership plan tier"
+    roles: [OfficeManager]
+    code: 201
+    input: [tier_code, name, labor_discount_pct, waives_trip_fee, annual_fee_cents]
+    output: MembershipPlan
+    side_effects: []
+  - method: GET
+    path: "/plumbing/membership-plans/{id}"
+    description: "read a membership plan"
+    roles: [OfficeManager, Dispatcher, Technician, Customer]
+    code: 200
+    input: []
+    output: MembershipPlan
+    side_effects: []
+  - method: POST
+    path: "/plumbing/flat-rate-items"
+    description: "add a flat-rate book item"
+    roles: [OfficeManager]
+    code: 201
+    input: [code, category, base_price_cents, skill_required, "requires_permit?"]
+    output: FlatRateItem
+    side_effects: []
+  - method: GET
+    path: "/plumbing/flat-rate-items/{id}"
+    description: "read a flat-rate item"
+    roles: [OfficeManager, Dispatcher, Technician, Customer]
+    code: 200
+    input: []
+    output: FlatRateItem
+    side_effects: []
+  - method: POST
+    path: "/plumbing/parts"
+    description: "add a part to the catalog"
+    roles: [OfficeManager]
+    code: 201
+    input: [sku, name, list_price_cents]
+    output: Part
+    side_effects: []
+  - method: GET
+    path: "/plumbing/parts/{id}"
+    description: "read a part"
+    roles: [OfficeManager, Dispatcher, Technician, Customer]
+    code: 200
+    input: []
+    output: Part
+    side_effects: []
+
+  # --- Customers ---
+  - method: POST
+    path: "/plumbing/customers"
+    description: "create a customer"
+    roles: [OfficeManager, Dispatcher]
+    code: 201
+    input: [name, service_address, "membership_plan_id?", "credit_limit_cents?"]
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/plumbing/customers/{id}"
+    description: "read a customer including committed_credit_cents"
+    roles: [OfficeManager, Dispatcher, Technician, Customer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/plumbing/customers"
+    description: "list customers filtered by membership_plan_id (reverse-reachability for Customer.membership_plan_id)"
+    roles: [OfficeManager, Dispatcher]
+    code: 200
+    input: ["membership_plan_id?", "limit?", "offset?"]
+    output: Customer[]
+    side_effects: []
+  - method: PATCH
+    path: "/plumbing/customers/{id}"
+    description: "office manager adjusts credit limit or membership plan"
+    roles: [OfficeManager]
+    code: 200
+    input: ["credit_limit_cents?", "membership_plan_id?"]
+    output: Customer
+    side_effects: ["increments Customer.version by 1"]
+
+  # --- Technicians ---
+  - method: POST
+    path: "/plumbing/technicians"
+    description: "create a technician"
+    roles: [OfficeManager]
+    code: 201
+    input: [name, skill_level, "licensed_for_permits?"]
+    output: Technician
+    side_effects: []
+  - method: GET
+    path: "/plumbing/technicians/{id}"
+    description: "read a technician"
+    roles: [OfficeManager, Dispatcher, Technician, Customer]
+    code: 200
+    input: []
+    output: Technician
+    side_effects: []
+  - method: POST
+    path: "/plumbing/technicians/{id}/set-status"
+    description: "set technician availability status"
+    roles: [OfficeManager, Dispatcher]
+    code: 200
+    input: [status]
+    output: Technician
+    side_effects: ["increments Technician.version by 1"]
+  - method: GET
+    path: "/plumbing/technicians/{id}/callback-rate"
+    description: "computed read: lifetime and rolling callback rates"
+    roles: [OfficeManager, Dispatcher]
+    code: 200
+    input: []
+    output: "{ lifetime_callback_rate: number, rolling_callback_rate: number, lifetime_completed_count: integer, lifetime_callback_count: integer }"
+    side_effects: ["runs technician_callback_rate calculation"]
+  - method: GET
+    path: "/plumbing/technicians/{id}/truck-stock"
+    description: "list TruckStock rows for a technician (reverse-reachability for TruckStock.technician_id)"
+    roles: [OfficeManager, Dispatcher, Technician]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TruckStock[]
+    side_effects: []
+
+  # --- Truck stock ---
+  - method: POST
+    path: "/plumbing/truck-stock"
+    description: "create or restock a TruckStock row for a technician+part (sets quantity)"
+    roles: [OfficeManager]
+    code: 201
+    input: [technician_id, part_id, quantity, "reorder_point?"]
+    output: TruckStock
+    side_effects: ["recompute needs_restock; recompute Technician.needs_restock_skus"]
+  - method: GET
+    path: "/plumbing/truck-stock"
+    description: "list TruckStock filtered by part_id (reverse-reachability for TruckStock.part_id)"
+    roles: [OfficeManager, Dispatcher, Technician]
+    code: 200
+    input: ["part_id?", "technician_id?", "limit?", "offset?"]
+    output: TruckStock[]
+    side_effects: []
+  - method: GET
+    path: "/plumbing/truck-stock/{id}"
+    description: "read a TruckStock row"
+    roles: [OfficeManager, Dispatcher, Technician]
+    code: 200
+    input: []
+    output: TruckStock
+    side_effects: []
+
+  # --- Inspectors ---
+  - method: POST
+    path: "/plumbing/inspectors"
+    description: "create an inspector"
+    roles: [OfficeManager]
+    code: 201
+    input: [name, jurisdiction, "max_daily_inspections?"]
+    output: Inspector
+    side_effects: []
+  - method: GET
+    path: "/plumbing/inspectors/{id}"
+    description: "read an inspector"
+    roles: [OfficeManager, Dispatcher]
+    code: 200
+    input: []
+    output: Inspector
+    side_effects: []
+
+  # --- Service jobs ---
+  - method: POST
+    path: "/plumbing/service-jobs"
+    description: "create a service call/work order"
+    roles: [Dispatcher, OfficeManager]
+    code: 201
+    input: [customer_id, category, "priority?", "window_start?"]
+    output: ServiceJob
+    side_effects: []
+  - method: GET
+    path: "/plumbing/service-jobs/{id}"
+    description: "read a service job including computed totals and status"
+    roles: [OfficeManager, Dispatcher, Technician, Customer]
+    code: 200
+    input: []
+    output: ServiceJob
+    side_effects: []
+  - method: GET
+    path: "/plumbing/service-jobs"
+    description: "list service jobs filtered by customer_id or authorized_estimate_id (reverse-reachability for ServiceJob.customer_id and ServiceJob.authorized_estimate_id)"
+    roles: [OfficeManager, Dispatcher, Customer]
+    code: 200
+    input: ["customer_id?", "authorized_estimate_id?", "status?", "limit?", "offset?"]
+    output: ServiceJob[]
+    side_effects: []
+  - method: POST
+    path: "/plumbing/service-jobs/{id}/start-work"
+    description: "technician starts work (AUTHORIZED/REOPENED -> IN_PROGRESS)"
+    roles: [Technician]
+    code: 200
+    input: []
+    output: ServiceJob
+    side_effects: ["state transition; increments ServiceJob.version by 1"]
+  - method: POST
+    path: "/plumbing/service-jobs/{id}/complete"
+    description: "technician completes job (IN_PROGRESS -> COMPLETED) with actual consumed parts"
+    roles: [Technician]
+    code: 200
+    input: [consumed_parts]
+    output: ServiceJob
+    side_effects:
+      - "estimate->CONSUMED; truck-stock decrement cascade; needs_restock recompute; lifetime_completed_count++; Invoice finalization (invoice_final_total); set completed_at; increments ServiceJob.version by 1"
+  - method: POST
+    path: "/plumbing/service-jobs/{id}/cancel"
+    description: "dispatcher cancels job (pre-completion) -> CANCELLED with credit release and assignment/estimate/permit cascade"
+    roles: [Dispatcher, OfficeManager]
+    code: 200
+    input: []
+    output: ServiceJob
+    side_effects: ["credit release; assignment cascade; estimate decline; permit void; increments ServiceJob.version by 1"]
+
+  # --- Dispatch assignments ---
+  - method: POST
+    path: "/plumbing/dispatch-assignments"
+    description: "propose a dispatch assignment for a job; OCC-guarded by expected_job_version"
+    roles: [Dispatcher]
+    code: 201
+    input: [job_id, technician_id, window_start, window_end, eta, expected_job_version]
+    output: DispatchAssignment
+    side_effects: ["creates PROPOSED assignment; increments ServiceJob.version by 1"]
+  - method: GET
+    path: "/plumbing/dispatch-assignments/{id}"
+    description: "read a dispatch assignment"
+    roles: [OfficeManager, Dispatcher, Technician]
+    code: 200
+    input: []
+    output: DispatchAssignment
+    side_effects: []
+  - method: GET
+    path: "/plumbing/dispatch-assignments"
+    description: "list assignments filtered by job_id or technician_id (reverse-reachability for DispatchAssignment.job_id and technician_id)"
+    roles: [OfficeManager, Dispatcher, Technician]
+    code: 200
+    input: ["job_id?", "technician_id?", "status?", "limit?", "offset?"]
+    output: DispatchAssignment[]
+    side_effects: []
+  - method: POST
+    path: "/plumbing/dispatch-assignments/{id}/confirm"
+    description: "confirm a proposed assignment (skill/license/overlap checks); cascades job RECEIVED->DISPATCHED and freezes after_hours"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: DispatchAssignment
+    side_effects: ["assignment->CONFIRMED; job DISPATCHED; freeze after_hours; increments DispatchAssignment.version and ServiceJob.version by 1"]
+  - method: POST
+    path: "/plumbing/dispatch-assignments/{id}/depart"
+    description: "technician departs (CONFIRMED->EN_ROUTE; job->EN_ROUTE)"
+    roles: [Technician]
+    code: 200
+    input: []
+    output: DispatchAssignment
+    side_effects: ["assignment->EN_ROUTE; job->EN_ROUTE; version increments"]
+  - method: POST
+    path: "/plumbing/dispatch-assignments/{id}/arrive"
+    description: "technician arrives (EN_ROUTE->ON_SITE; job->ON_SITE)"
+    roles: [Technician]
+    code: 200
+    input: []
+    output: DispatchAssignment
+    side_effects: ["assignment->ON_SITE; job->ON_SITE; version increments"]
+  - method: POST
+    path: "/plumbing/dispatch-assignments/{id}/cancel"
+    description: "cancel a non-terminal assignment"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: DispatchAssignment
+    side_effects: ["assignment->CANCELLED; version increments"]
+
+  # --- Estimates ---
+  - method: POST
+    path: "/plumbing/service-jobs/{id}/estimates"
+    description: "create a DRAFT estimate against a job; OCC-guarded by expected_job_version"
+    roles: [Technician]
+    code: 201
+    input: [expected_job_version]
+    output: Estimate
+    side_effects: ["creates DRAFT estimate; increments ServiceJob.version by 1"]
+  - method: GET
+    path: "/plumbing/service-jobs/{id}/estimates"
+    description: "list estimates for a job (reverse-reachability for Estimate.job_id)"
+    roles: [OfficeManager, Dispatcher, Technician, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Estimate[]
+    side_effects: []
+  - method: GET
+    path: "/plumbing/estimates/{id}"
+    description: "read an estimate with all computed totals"
+    roles: [OfficeManager, Dispatcher, Technician, Customer]
+    code: 200
+    input: []
+    output: Estimate
+    side_effects: []
+  - method: POST
+    path: "/plumbing/estimates/{id}/lines"
+    description: "add a line to a DRAFT or REVISED estimate"
+    roles: [Technician]
+    code: 201
+    input: [line_type, "flat_rate_item_id?", "part_id?", quantity]
+    output: EstimateLine
+    side_effects: []
+  - method: GET
+    path: "/plumbing/estimates/{id}/lines"
+    description: "list estimate lines for an estimate (reverse-reachability for EstimateLine.estimate_id)"
+    roles: [OfficeManager, Dispatcher, Technician, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: EstimateLine[]
+    side_effects: []
+  - method: GET
+    path: "/plumbing/estimate-lines/{id}"
+    description: "read a single estimate line"
+    roles: [OfficeManager, Dispatcher, Technician, Customer]
+    code: 200
+    input: []
+    output: EstimateLine
+    side_effects: []
+  - method: GET
+    path: "/plumbing/estimate-lines"
+    description: "list estimate lines filtered by flat_rate_item_id, part_id, or estimate_id (reverse-reachability for EstimateLine.flat_rate_item_id and EstimateLine.part_id)"
+    roles: [OfficeManager, Dispatcher, Technician]
+    code: 200
+    input: ["estimate_id?", "flat_rate_item_id?", "part_id?", "limit?", "offset?"]
+    output: EstimateLine[]
+    side_effects: []
+  - method: POST
+    path: "/plumbing/estimates/{id}/present"
+    description: "present estimate to customer (DRAFT/REVISED -> PRESENTED); computes provisional totals"
+    roles: [Technician]
+    code: 200
+    input: []
+    output: Estimate
+    side_effects: ["recompute estimate_provisional_total; version increments"]
+  - method: POST
+    path: "/plumbing/estimates/{id}/revise"
+    description: "reopen a PRESENTED estimate for edits (PRESENTED -> REVISED)"
+    roles: [Technician]
+    code: 200
+    input: []
+    output: Estimate
+    side_effects: ["version increments"]
+  - method: POST
+    path: "/plumbing/estimates/{id}/approve"
+    description: "customer approves estimate (PRESENTED -> APPROVED); cascades job ON_SITE->AUTHORIZED, commits credit, auto-creates permit"
+    roles: [Customer]
+    code: 200
+    input: []
+    output: Estimate
+    side_effects: ["job->AUTHORIZED; credit commit; permit auto-create; version increments"]
+  - method: POST
+    path: "/plumbing/estimates/{id}/decline"
+    description: "customer declines estimate (PRESENTED/REVISED -> DECLINED)"
+    roles: [Customer]
+    code: 200
+    input: []
+    output: Estimate
+    side_effects: ["version increments"]
+
+  # --- Permits & inspections ---
+  - method: GET
+    path: "/plumbing/service-jobs/{id}/permits"
+    description: "list permits for a job (reverse-reachability for Permit.job_id)"
+    roles: [OfficeManager, Dispatcher, Technician]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Permit[]
+    side_effects: []
+  - method: GET
+    path: "/plumbing/permits/{id}"
+    description: "read a permit"
+    roles: [OfficeManager, Dispatcher, Technician]
+    code: 200
+    input: []
+    output: Permit
+    side_effects: []
+  - method: POST
+    path: "/plumbing/permits/{id}/issue"
+    description: "issue a permit (APPLIED->ISSUED) or reissue after failure (FAILED->ISSUED, reapply_count++)"
+    roles: [OfficeManager]
+    code: 200
+    input: []
+    output: Permit
+    side_effects: ["version increments; reapply_count++ on FAILED->ISSUED"]
+  - method: POST
+    path: "/plumbing/permits/{id}/inspections"
+    description: "schedule an inspection (ISSUED->INSPECTION_SCHEDULED); checks jurisdiction match and inspector daily capacity"
+    roles: [OfficeManager]
+    code: 201
+    input: [inspector_id, scheduled_date]
+    output: InspectionVisit
+    side_effects: ["create InspectionVisit PENDING; permit->INSPECTION_SCHEDULED; version increments"]
+  - method: GET
+    path: "/plumbing/permits/{id}/inspections"
+    description: "list inspection visits for a permit (reverse-reachability for InspectionVisit.permit_id)"
+    roles: [OfficeManager, Dispatcher, Technician]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: InspectionVisit[]
+    side_effects: []
+  - method: GET
+    path: "/plumbing/inspections"
+    description: "list inspection visits filtered by inspector_id (reverse-reachability for InspectionVisit.inspector_id)"
+    roles: [OfficeManager, Dispatcher]
+    code: 200
+    input: ["inspector_id?", "scheduled_date?", "result?", "limit?", "offset?"]
+    output: InspectionVisit[]
+    side_effects: []
+  - method: GET
+    path: "/plumbing/inspections/{id}"
+    description: "read an inspection visit"
+    roles: [OfficeManager, Dispatcher, Technician]
+    code: 200
+    input: []
+    output: InspectionVisit
+    side_effects: []
+  - method: POST
+    path: "/plumbing/inspections/{id}/record"
+    description: "record inspection result (PASSED -> permit PASSED; FAILED -> permit FAILED)"
+    roles: [OfficeManager]
+    code: 200
+    input: [result]
+    output: InspectionVisit
+    side_effects: ["set result; permit->PASSED or FAILED; version increments"]
+
+  # --- Invoices ---
+  - method: GET
+    path: "/plumbing/service-jobs/{id}/invoices"
+    description: "list invoices for a job (reverse-reachability for Invoice.job_id)"
+    roles: [OfficeManager, Dispatcher, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+  - method: GET
+    path: "/plumbing/invoices/{id}"
+    description: "read an invoice with final totals"
+    roles: [OfficeManager, Dispatcher, Customer]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+
+  # --- Callbacks ---
+  - method: POST
+    path: "/plumbing/callbacks"
+    description: "customer files a warranty callback against a completed job; computes within_warranty"
+    roles: [Customer]
+    code: 201
+    input: [original_job_id, reason]
+    output: Callback
+    side_effects: ["runs callback_warranty_check", "increment lifetime_callback_count by 1 on the technician who completed original_job_id"]
+  - method: GET
+    path: "/plumbing/callbacks/{id}"
+    description: "read a callback"
+    roles: [OfficeManager, Dispatcher, Customer]
+    code: 200
+    input: []
+    output: Callback
+    side_effects: []
+  - method: GET
+    path: "/plumbing/service-jobs/{id}/callbacks"
+    description: "list callbacks against a job (reverse-reachability for Callback.original_job_id)"
+    roles: [OfficeManager, Dispatcher, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Callback[]
+    side_effects: []
+  - method: POST
+    path: "/plumbing/callbacks/{id}/accept"
+    description: "office manager accepts a within-warranty callback; cascades job COMPLETED->REOPENED with invoice void, stock restore, credit release"
+    roles: [OfficeManager]
+    code: 200
+    input: []
+    output: Callback
+    side_effects: ["job->REOPENED; invoice void; truck-stock restore; credit release; lifetime_callback_count++; version increments"]
+  - method: POST
+    path: "/plumbing/callbacks/{id}/reject"
+    description: "office manager rejects a callback (OPEN->REJECTED)"
+    roles: [OfficeManager]
+    code: 200
+    input: []
+    output: Callback
+    side_effects: ["version increments"]
+
+  # --- Test-driving (clock control for time-gated warranty/after-hours setups) ---
+  - method: POST
+    path: "/plumbing/_clock/set"
+    description: "test-driving: set the server's current UTC clock to a fixed instant"
+    roles: [OfficeManager]
+    code: 200
+    input: [to_iso8601]
+    output: "null"
+    side_effects: ["all subsequent created_at / completed_at / now() reads use this instant until changed"]
+
+# ----------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ----------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing or malformed X-User-Role / X-User-ID headers"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "acting role not permitted for this operation, or acting Customer/Technician not the owner of the targeted resource"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced resource (path id or body FK) does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "missing required field, bad enum/type, out-of-range value, or line_type/ref mismatch (FLAT_RATE without flat_rate_item_id, PART without part_id)"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "target resource not in a valid state for the requested transition"
+  - id: ERR_STALE_JOB_VERSION
+    http: 412
+    condition: "expected_job_version does not equal the current ServiceJob.version on estimate-create or dispatch-create"
+  - id: ERR_SKILL_INSUFFICIENT
+    http: 409
+    condition: "technician skill_level below the max skill_required of the job's intended flat-rate work on confirm"
+  - id: ERR_LICENSE_REQUIRED
+    http: 409
+    condition: "permit-requiring job assigned to a technician without licensed_for_permits, or inspector jurisdiction mismatch with permit jurisdiction"
+  - id: ERR_TECH_DOUBLE_BOOKED
+    http: 409
+    condition: "requested assignment window (expanded by travel buffer) overlaps an existing CONFIRMED/EN_ROUTE/ON_SITE assignment for the technician"
+  - id: ERR_INSPECTOR_CAPACITY_FULL
+    http: 409
+    condition: "inspector already holds max_daily_inspections PENDING visits on the requested scheduled_date"
+  - id: ERR_EMPTY_ESTIMATE
+    http: 409
+    condition: "attempt to present an estimate that has no EstimateLines"
+  - id: ERR_INSUFFICIENT_STOCK
+    http: 409
+    condition: "a consumed part's TruckStock.quantity is below the units claimed consumed at completion"
+  - id: ERR_WARRANTY_EXPIRED
+    http: 409
+    condition: "callback accept attempted when within_warranty is false, or callback filed against a non-COMPLETED job"
+  - id: ERR_CREDIT_LIMIT_EXCEEDED
+    http: 409
+    condition: "estimate_total_cents exceeds the customer's available credit (credit_limit_cents - committed_credit_cents) on approve"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "semantically invalid combination not caught earlier (e.g., window_end <= window_start, negative quantity after type pass)"
+
+# ----------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ----------------------------------------------------------------------------
+roles:
+  - name: OfficeManager
+    description: "back-office operator: configures plans/flat-rate book/parts/inspectors, manages truck stock, issues permits and records inspections, accepts/rejects callbacks, adjusts customer credit, reads invoices"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /plumbing/membership-plans"
+      - "POST /plumbing/flat-rate-items"
+      - "POST /plumbing/parts"
+      - "POST /plumbing/technicians"
+      - "POST /plumbing/inspectors"
+      - "POST /plumbing/truck-stock"
+      - "PATCH /plumbing/customers/{id}"
+      - "POST /plumbing/permits/{id}/issue"
+      - "POST /plumbing/permits/{id}/inspections"
+      - "POST /plumbing/inspections/{id}/record"
+      - "POST /plumbing/callbacks/{id}/accept"
+      - "POST /plumbing/callbacks/{id}/reject"
+      - "POST /plumbing/_clock/set"
+    shared_operations:
+      - "POST /plumbing/customers (with Dispatcher)"
+      - "POST /plumbing/service-jobs (with Dispatcher)"
+      - "POST /plumbing/service-jobs/{id}/cancel (with Dispatcher)"
+      - "POST /plumbing/technicians/{id}/set-status (with Dispatcher)"
+      - "GET reads across the system"
+  - name: Dispatcher
+    description: "creates jobs and customers, proposes/confirms/cancels dispatch assignments, manages technician status and routing"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /plumbing/dispatch-assignments"
+      - "POST /plumbing/dispatch-assignments/{id}/confirm"
+      - "POST /plumbing/dispatch-assignments/{id}/cancel"
+    shared_operations:
+      - "POST /plumbing/customers (with OfficeManager)"
+      - "POST /plumbing/service-jobs (with OfficeManager)"
+      - "POST /plumbing/service-jobs/{id}/cancel (with OfficeManager)"
+      - "POST /plumbing/technicians/{id}/set-status (with OfficeManager)"
+      - "GET reads across the system"
+  - name: Technician
+    description: "field worker: drives the assignment depart/arrive flow, builds and presents estimates, starts and completes jobs, consumes truck stock"
+    identity: "entity_backed:Technician"
+    exclusive_operations:
+      - "POST /plumbing/dispatch-assignments/{id}/depart"
+      - "POST /plumbing/dispatch-assignments/{id}/arrive"
+      - "POST /plumbing/service-jobs/{id}/start-work"
+      - "POST /plumbing/service-jobs/{id}/complete"
+      - "POST /plumbing/service-jobs/{id}/estimates"
+      - "POST /plumbing/estimates/{id}/lines"
+      - "POST /plumbing/estimates/{id}/present"
+      - "POST /plumbing/estimates/{id}/revise"
+    shared_operations:
+      - "GET reads across the system (own and related resources)"
+  - name: Customer
+    description: "the service requester: approves or declines presented estimates on own jobs, files warranty callbacks"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /plumbing/estimates/{id}/approve"
+      - "POST /plumbing/estimates/{id}/decline"
+      - "POST /plumbing/callbacks"
+    shared_operations:
+      - "GET reads of own jobs, estimates, invoices, callbacks"

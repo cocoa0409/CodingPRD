@@ -1,0 +1,1315 @@
+scenario: |
+  Upholstery & Furniture Refinishing: item intake & condition photo, fabric/finish selection & yardage, estimate & approval, parts/foam order, work scheduling & turnaround, rush, pickup/delivery, warranty
+
+domain_name: upholstery-refinishing
+api_prefix: /
+
+# =============================================================================
+# Complexity Profile (§0.1–§0.4) — Expert tier
+# =============================================================================
+complexity_profile:
+  primary_archetype: workflow_orchestration
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - dual_variant_calculation        # estimate (forward-looking) vs final invoice (chronological actuals)
+    - cascading_side_effects          # approval -> material orders -> shop capacity; cancel -> refund + capacity release
+    - optimistic_concurrency          # OCC on WorkOrder.version for estimate-supersede creates
+    - rate_threshold_triggers         # rush surcharge breakpoints on turnaround days; reupholstery foam-density threshold
+    - derived_field_reconciliation    # WorkOrder.balance_due / materials_committed_cents reconciled against children
+
+  entity_topology: flat
+  # Peer entities linked by FK references; no nested ownership URLs. WorkOrder is the
+  # hub; LineItem, Estimate, MaterialOrder, ShopDay, FulfillmentLeg, WarrantyClaim,
+  # FabricSku, FoamSpec, ConditionPhoto reference it (or each other) by FK.
+
+  state_machine_shape: cyclic
+  # WorkOrder estimate loop: ESTIMATING -> AWAITING_APPROVAL -> (REVISION_REQUESTED -> ESTIMATING)*
+  # plus branching (approve vs decline) and compound bubble-up from MaterialOrder/FulfillmentLeg.
+
+  relationship_patterns:
+    - one_to_many        # WorkOrder -> LineItem, WorkOrder -> Estimate (versions), WorkOrder -> MaterialOrder
+    - cross_aggregate    # MaterialOrder references FabricSku/FoamSpec catalog; FulfillmentLeg references ShopDay
+    - self_referential   # Estimate.supersedes_estimate_id -> Estimate.id (revision chain)
+
+  role_model: peer_roles
+  # IntakeClerk owns item intake/condition; Estimator owns estimate authoring/approval routing;
+  # ShopManager owns material orders, scheduling, fulfillment; Customer approves/declines/requests
+  # revision and files warranty claims. ShopManager is the operational superset for shop resources
+  # but cannot author estimates or approve on the customer's behalf.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Customer name" }
+      - { name: email, type: string, source: input, description: "Contact email; unique per active customer" }
+      - { name: phone, type: string, source: input, description: "Contact phone" }
+      - { name: store_credit_cents, type: integer, source: computed, default: 0, description: "Refundable store credit balance in cents; debited on WALLET refunds, credited on cancellations. Never negative." }
+
+  - name: FabricSku
+    parent: null
+    common_fields: true
+    fields:
+      - { name: sku_code, type: string, source: input, description: "Catalog code; unique among LISTED FabricSku" }
+      - { name: name, type: string, source: input, description: "Display name (e.g., 'Belgian Linen Slate')" }
+      - { name: price_cents_per_yard, type: integer, source: input, description: "Fabric price in cents per linear yard", constraints: ">= 0" }
+      - { name: roll_width_inches, type: integer, source: input, description: "Bolt width in inches (e.g., 54)", constraints: "> 0" }
+      - { name: in_stock_yards, type: number, source: input, default: 0, description: "Yards currently on the shelf; debited when a MaterialOrder reserves from stock" }
+      - { name: status, type: enum, source: system, default: "LISTED", description: "LISTED | DISCONTINUED. Only LISTED may be selected on a new LineItem.", constraints: "LISTED, DISCONTINUED" }
+
+  - name: FoamSpec
+    parent: null
+    common_fields: true
+    fields:
+      - { name: grade_code, type: string, source: input, description: "Foam grade code; unique among LISTED FoamSpec" }
+      - { name: density_lb, type: number, source: input, description: "Foam density in lb/ft3; drives HIGH_DENSITY threshold", constraints: "> 0" }
+      - { name: price_cents_per_board_foot, type: integer, source: input, description: "Foam price in cents per board-foot", constraints: ">= 0" }
+      - { name: status, type: enum, source: system, default: "LISTED", description: "LISTED | DISCONTINUED. Only LISTED may be selected on a reupholstery LineItem.", constraints: "LISTED, DISCONTINUED" }
+
+  - name: WorkOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; the owning customer" }
+      - { name: service_type, type: enum, source: input, description: "REUPHOLSTERY | REFINISH | REPAIR. Drives which LineItem fields are required and which calculation branch applies.", constraints: "REUPHOLSTERY, REFINISH, REPAIR" }
+      - { name: rush_requested, type: boolean, source: input, default: false, description: "Whether customer requested rush turnaround at intake" }
+      - { name: promised_turnaround_days, type: integer, source: computed, description: "Committed turnaround in calendar days; set when the active estimate is approved (rush vs standard band). Null until approval." }
+      - { name: estimate_total_cents, type: integer, source: computed, default: 0, description: "Total of the currently ACTIVE estimate; 0 until first estimate authored. Mirrors Estimate.total_cents of the active version." }
+      - { name: final_invoice_cents, type: integer, source: computed, default: 0, description: "Chronological final invoice computed at completion from actual MaterialOrder finalized costs + labor; 0 until completion." }
+      - { name: amount_paid_cents, type: integer, source: computed, default: 0, description: "Sum of approved deposit + settlement payments recorded against this order" }
+      - { name: balance_due_cents, type: integer, source: computed, default: 0, description: "Derived: final_invoice_cents - amount_paid_cents once invoiced, else estimate_total_cents - amount_paid_cents. Reconciled on every payment and on cost finalization." }
+      - { name: materials_committed_cents, type: integer, source: computed, default: 0, description: "Sum of provisional_cost_cents over this order's MaterialOrders in {ORDERED, RECEIVED}; reconciled on material order state changes." }
+      - { name: status, type: enum, source: system, default: "INTAKE", description: "INTAKE | ESTIMATING | AWAITING_APPROVAL | REVISION_REQUESTED | APPROVED | IN_PRODUCTION | READY_FOR_FULFILLMENT | COMPLETED | DECLINED | CANCELLED", constraints: "INTAKE, ESTIMATING, AWAITING_APPROVAL, REVISION_REQUESTED, APPROVED, IN_PRODUCTION, READY_FOR_FULFILLMENT, COMPLETED, DECLINED, CANCELLED" }
+      - { name: active_estimate_id, type: string, source: computed, description: "Denormalized pointer to the id of the current ACTIVE Estimate version (discoverable via GET /work-orders/{id}/estimates), or null before first authored. Not a child FK; updated on each new estimate version." }
+      - { name: completed_at, type: datetime, source: computed, description: "ISO 8601 timestamp stamped when status -> COMPLETED; null otherwise. Anchors the warranty coverage window." }
+
+  - name: ConditionPhoto
+    parent: null
+    common_fields: false
+    fields:
+      - { name: work_order_id, type: string, source: input, description: "FK -> WorkOrder.id; the item this photo documents" }
+      - { name: image_uri, type: string, source: input, description: "Stored image reference" }
+      - { name: damage_note, type: string, source: input, default: "", description: "Free-text condition note (tears, stains, frame damage)" }
+      - { name: sequence_no, type: integer, source: system, description: "1-based intake order, assigned server-side by created_at ASC among photos of the same work order" }
+
+  - name: LineItem
+    parent: null
+    common_fields: true
+    fields:
+      - { name: work_order_id, type: string, source: input, description: "FK -> WorkOrder.id; the order this piece belongs to" }
+      - { name: piece_label, type: string, source: input, description: "Human label (e.g., 'Sofa - 3 cushion')" }
+      - { name: fabric_sku_id, type: string, source: input, description: "FK -> FabricSku.id; selected fabric. Required when WorkOrder.service_type==REUPHOLSTERY, must be null otherwise." }
+      - { name: foam_spec_id, type: string, source: input, description: "FK -> FoamSpec.id; selected foam. Optional; only meaningful for REUPHOLSTERY." }
+      - { name: yardage_required, type: number, source: input, description: "Linear yards of fabric needed; required and > 0 for REUPHOLSTERY, must be 0 for REFINISH/REPAIR", constraints: ">= 0" }
+      - { name: board_feet_required, type: number, source: input, default: 0, description: "Board-feet of foam needed; > 0 only when a foam_spec_id is set", constraints: ">= 0" }
+      - { name: labor_hours, type: number, source: input, description: "Estimated labor hours for this piece", constraints: "> 0" }
+      - { name: piece_subtotal_cents, type: integer, source: computed, default: 0, description: "Computed per-piece subtotal (labor + fabric + foam); refreshed whenever an estimate version is authored." }
+
+  - name: Estimate
+    parent: null
+    common_fields: true
+    fields:
+      - { name: work_order_id, type: string, source: input, description: "FK -> WorkOrder.id; the order being quoted" }
+      - { name: supersedes_estimate_id, type: string, source: input, description: "FK -> Estimate.id; the prior version this revision replaces, or null for the first version" }
+      - { name: version_no, type: integer, source: system, description: "1-based version index; increments per authored revision on the same order" }
+      - { name: labor_total_cents, type: integer, source: computed, description: "Sum of per-piece labor cost across LineItems at authoring time" }
+      - { name: materials_total_cents, type: integer, source: computed, description: "Sum of per-piece fabric + foam cost across LineItems at authoring time" }
+      - { name: rush_surcharge_cents, type: integer, source: computed, description: "Rush surcharge applied to this estimate (0 if not rush)" }
+      - { name: total_cents, type: integer, source: computed, description: "labor_total_cents + materials_total_cents + rush_surcharge_cents" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | SUPERSEDED | APPROVED | DECLINED. At most one ACTIVE/APPROVED per work order.", constraints: "ACTIVE, SUPERSEDED, APPROVED, DECLINED" }
+
+  - name: MaterialOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: work_order_id, type: string, source: input, description: "FK -> WorkOrder.id; the order these materials serve" }
+      - { name: fabric_sku_id, type: string, source: input, description: "FK -> FabricSku.id; ordered fabric, or null for a foam-only order" }
+      - { name: foam_spec_id, type: string, source: input, description: "FK -> FoamSpec.id; ordered foam, or null for a fabric-only order" }
+      - { name: yards_ordered, type: number, source: input, default: 0, description: "Linear yards of fabric to procure", constraints: ">= 0" }
+      - { name: board_feet_ordered, type: number, source: input, default: 0, description: "Board-feet of foam to procure", constraints: ">= 0" }
+      - { name: provisional_cost_cents, type: integer, source: computed, description: "Forward-looking cost at order time using catalog prices" }
+      - { name: finalized_cost_cents, type: integer, source: computed, default: 0, description: "Actual cost recorded at receipt; may differ from provisional via received_unit_price overrides. 0 until RECEIVED." }
+      - { name: received_fabric_price_cents_per_yard, type: integer, source: input, default: 0, description: "Actual per-yard price at receipt; supplied on the receive call, used to compute finalized_cost_cents for fabric." }
+      - { name: received_foam_price_cents_per_board_foot, type: integer, source: input, default: 0, description: "Actual per-board-foot price at receipt; supplied on the receive call, used to compute finalized_cost_cents for foam." }
+      - { name: status, type: enum, source: system, default: "ORDERED", description: "ORDERED | RECEIVED | CANCELLED", constraints: "ORDERED, RECEIVED, CANCELLED" }
+
+  - name: ShopDay
+    parent: null
+    common_fields: true
+    fields:
+      - { name: work_date, type: string, source: input, description: "Calendar date YYYY-MM-DD; unique among non-cancelled ShopDays" }
+      - { name: labor_capacity_hours, type: number, source: input, description: "Total labor-hour capacity available that day", constraints: "> 0" }
+      - { name: booked_hours, type: number, source: computed, default: 0, description: "Sum of labor_hours over WorkOrders scheduled onto this day (via FulfillmentLeg of kind PRODUCTION); reconciled on schedule/unschedule." }
+      - { name: status, type: enum, source: system, default: "OPEN", description: "OPEN | FULL | CLOSED. Auto-flips to FULL when booked_hours >= labor_capacity_hours.", constraints: "OPEN, FULL, CLOSED" }
+
+  - name: FulfillmentLeg
+    parent: null
+    common_fields: true
+    fields:
+      - { name: work_order_id, type: string, source: input, description: "FK -> WorkOrder.id; the order this leg moves/produces" }
+      - { name: shop_day_id, type: string, source: input, description: "FK -> ShopDay.id; the production day this leg books, or null for PICKUP/DELIVERY legs" }
+      - { name: kind, type: enum, source: input, description: "PRODUCTION | PICKUP | DELIVERY. PRODUCTION books shop capacity; PICKUP/DELIVERY are logistics legs.", constraints: "PRODUCTION, PICKUP, DELIVERY" }
+      - { name: scheduled_window_start, type: string, source: input, description: "ISO 8601 window start for PICKUP/DELIVERY; null for PRODUCTION" }
+      - { name: scheduled_window_end, type: string, source: input, description: "ISO 8601 window end for PICKUP/DELIVERY; must be > start; null for PRODUCTION" }
+      - { name: status, type: enum, source: system, default: "PLANNED", description: "PLANNED | DISPATCHED | COMPLETED | CANCELLED", constraints: "PLANNED, DISPATCHED, COMPLETED, CANCELLED" }
+
+  - name: WarrantyClaim
+    parent: null
+    common_fields: true
+    fields:
+      - { name: work_order_id, type: string, source: input, description: "FK -> WorkOrder.id; the completed order under warranty" }
+      - { name: defect_note, type: string, source: input, description: "Description of the reported defect" }
+      - { name: filed_at, type: string, source: input, description: "ISO 8601 timestamp the claim was filed (clock-driven; supplied so coverage window is deterministic)" }
+      - { name: covered, type: boolean, source: computed, description: "True iff filed_at is within WARRANTY_DAYS of the order's completion date" }
+      - { name: status, type: enum, source: system, default: "OPEN", description: "OPEN | APPROVED | DENIED | RESOLVED", constraints: "OPEN, APPROVED, DENIED, RESOLVED" }
+
+  - name: Payment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: work_order_id, type: string, source: input, description: "FK -> WorkOrder.id; the order this payment applies to" }
+      - { name: kind, type: enum, source: input, description: "DEPOSIT | SETTLEMENT | REFUND. DEPOSIT at approval, SETTLEMENT at completion, REFUND on cancellation.", constraints: "DEPOSIT, SETTLEMENT, REFUND" }
+      - { name: amount_cents, type: integer, source: input, description: "Payment amount in cents", constraints: "> 0" }
+      - { name: refund_destination, type: enum, source: input, default: "ORIGINAL", description: "ORIGINAL | WALLET; only meaningful for REFUND kind", constraints: "ORIGINAL, WALLET" }
+      - { name: status, type: enum, source: system, default: "RECORDED", description: "RECORDED. Payments are append-only; reversals are modeled as a new REFUND Payment, never by voiding.", constraints: "RECORDED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: WorkOrder
+    initial_state: INTAKE
+    terminal_states: [COMPLETED, DECLINED, CANCELLED]
+    transitions:
+      - from: INTAKE
+        to: ESTIMATING
+        trigger: "POST /work-orders/{id}/line-items (first line item added) — system advances order"
+        actor: IntakeClerk
+        preconditions:
+          - "WorkOrder.status == INTAKE"
+          - "At least one ConditionPhoto exists for this work order"
+          - "The line item satisfies service-type field rules (§1.4 priority 30/31)"
+        side_effects:
+          - "WorkOrder.status -> ESTIMATING"
+          - "LineItem.piece_subtotal_cents computed via per_piece_subtotal calculation"
+        note: "Subsequent line items added while ESTIMATING do not change status; they recompute affected subtotals only."
+
+      - from: ESTIMATING
+        to: AWAITING_APPROVAL
+        trigger: "POST /work-orders/{id}/estimates"
+        actor: Estimator
+        preconditions:
+          - "WorkOrder.status IN {ESTIMATING, REVISION_REQUESTED}"
+          - "At least one LineItem exists"
+          - "If supersedes_estimate_id given, it names the current ACTIVE estimate of this order"
+        side_effects:
+          - "New Estimate created with version_no = prior max + 1, status ACTIVE; any prior ACTIVE estimate -> SUPERSEDED"
+          - "WorkOrder.active_estimate_id -> new Estimate.id"
+          - "WorkOrder.estimate_total_cents -> Estimate.total_cents (estimate_total calculation, forward-looking variant)"
+          - "WorkOrder.balance_due_cents reconciled (balance_due calculation)"
+          - "WorkOrder.status -> AWAITING_APPROVAL"
+
+      - from: REVISION_REQUESTED
+        to: AWAITING_APPROVAL
+        trigger: "POST /work-orders/{id}/estimates"
+        actor: Estimator
+        preconditions:
+          - "WorkOrder.status == REVISION_REQUESTED"
+          - "supersedes_estimate_id names the current ACTIVE estimate"
+        side_effects:
+          - "New Estimate version authored (as above); prior ACTIVE -> SUPERSEDED"
+          - "WorkOrder.status -> AWAITING_APPROVAL"
+        note: "Cyclic revision loop: AWAITING_APPROVAL -> REVISION_REQUESTED -> AWAITING_APPROVAL may repeat."
+
+      - from: AWAITING_APPROVAL
+        to: REVISION_REQUESTED
+        trigger: "POST /work-orders/{id}/request-revision"
+        actor: Customer
+        preconditions:
+          - "WorkOrder.status == AWAITING_APPROVAL"
+          - "Acting Customer owns this work order"
+        side_effects:
+          - "WorkOrder.status -> REVISION_REQUESTED"
+        note: "Active estimate stays ACTIVE until the next version supersedes it."
+
+      - from: AWAITING_APPROVAL
+        to: APPROVED
+        trigger: "POST /work-orders/{id}/approve"
+        actor: Customer
+        preconditions:
+          - "WorkOrder.status == AWAITING_APPROVAL"
+          - "Acting Customer owns this work order"
+          - "expected_work_order_version matches WorkOrder.version (OCC)"
+          - "deposit_amount_cents >= ceil(estimate_total_cents * DEPOSIT_PCT)"
+        side_effects:
+          - "Active Estimate.status -> APPROVED"
+          - "WorkOrder.promised_turnaround_days set (rush band if rush_requested else standard band) via turnaround calculation"
+          - "A DEPOSIT Payment (RECORDED) is created for deposit_amount_cents; WorkOrder.amount_paid_cents += deposit_amount_cents"
+          - "WorkOrder.balance_due_cents reconciled"
+          - "WorkOrder.status -> APPROVED"
+          - "increments WorkOrder.version by 1"
+
+      - from: AWAITING_APPROVAL
+        to: DECLINED
+        trigger: "POST /work-orders/{id}/decline"
+        actor: Customer
+        preconditions:
+          - "WorkOrder.status == AWAITING_APPROVAL"
+          - "Acting Customer owns this work order"
+        side_effects:
+          - "Active Estimate.status -> DECLINED"
+          - "WorkOrder.status -> DECLINED"
+
+      - from: APPROVED
+        to: IN_PRODUCTION
+        trigger: "POST /fulfillment-legs (first PRODUCTION leg scheduled onto a ShopDay)"
+        actor: ShopManager
+        preconditions:
+          - "WorkOrder.status == APPROVED"
+          - "Every MaterialOrder for this order is in {RECEIVED, CANCELLED} (no ORDERED material outstanding)"
+          - "Target ShopDay.status == OPEN and booked_hours + sum(LineItem.labor_hours) <= labor_capacity_hours"
+        side_effects:
+          - "FulfillmentLeg(kind=PRODUCTION) created PLANNED"
+          - "ShopDay.booked_hours += sum(this order's LineItem.labor_hours) (shop_capacity calculation)"
+          - "If ShopDay.booked_hours >= labor_capacity_hours then ShopDay.status -> FULL"
+          - "WorkOrder.status -> IN_PRODUCTION"
+
+      - from: IN_PRODUCTION
+        to: READY_FOR_FULFILLMENT
+        trigger: "POST /work-orders/{id}/finish-production"
+        actor: ShopManager
+        preconditions:
+          - "WorkOrder.status == IN_PRODUCTION"
+          - "The PRODUCTION FulfillmentLeg.status == COMPLETED"
+        side_effects:
+          - "WorkOrder.final_invoice_cents computed via final_invoice calculation (chronological actuals variant)"
+          - "WorkOrder.balance_due_cents reconciled against final_invoice_cents"
+          - "WorkOrder.status -> READY_FOR_FULFILLMENT"
+
+      - from: READY_FOR_FULFILLMENT
+        to: COMPLETED
+        trigger: "POST /work-orders/{id}/complete"
+        actor: ShopManager
+        preconditions:
+          - "WorkOrder.status == READY_FOR_FULFILLMENT"
+          - "A DELIVERY or PICKUP FulfillmentLeg for this order is COMPLETED"
+          - "WorkOrder.balance_due_cents <= 0 after the settlement payment recorded in this call"
+          - "settlement_amount_cents == balance_due_cents prior to this call"
+        side_effects:
+          - "A SETTLEMENT Payment (RECORDED) created for settlement_amount_cents; WorkOrder.amount_paid_cents += settlement_amount_cents"
+          - "WorkOrder.balance_due_cents reconciled to 0"
+          - "WorkOrder.completed_at stamped (ISO 8601) — anchors warranty window"
+          - "WorkOrder.status -> COMPLETED"
+
+      - from: APPROVED
+        to: CANCELLED
+        trigger: "POST /work-orders/{id}/cancel"
+        actor: ShopManager
+        preconditions:
+          - "WorkOrder.status IN {APPROVED, IN_PRODUCTION}"
+          - "expected_work_order_version matches WorkOrder.version (OCC)"
+        side_effects:
+          - "Every ORDERED MaterialOrder -> CANCELLED; its reserved in_stock_yards returned to FabricSku.in_stock_yards (compensation)"
+          - "WorkOrder.materials_committed_cents reconciled to 0"
+          - "Every PLANNED PRODUCTION FulfillmentLeg -> CANCELLED; the booked ShopDay.booked_hours decremented (shop_capacity release); if ShopDay was FULL it reverts to OPEN"
+          - "A REFUND Payment (RECORDED) created for amount_paid_cents to refund_destination; if WALLET, Customer.store_credit_cents += amount_paid_cents"
+          - "WorkOrder.amount_paid_cents reconciled to 0; balance_due_cents reconciled"
+          - "WorkOrder.status -> CANCELLED"
+          - "increments WorkOrder.version by 1"
+        note: "Compensating cancellation MUST conserve fabric yards (refund invariant) and store-credit (refund invariant)."
+
+      - from: IN_PRODUCTION
+        to: CANCELLED
+        trigger: "POST /work-orders/{id}/cancel"
+        actor: ShopManager
+        preconditions:
+          - "WorkOrder.status == IN_PRODUCTION"
+          - "expected_work_order_version matches WorkOrder.version (OCC)"
+        side_effects:
+          - "Same compensation chain as APPROVED -> CANCELLED"
+          - "increments WorkOrder.version by 1"
+
+  - entity: MaterialOrder
+    initial_state: ORDERED
+    terminal_states: [RECEIVED, CANCELLED]
+    transitions:
+      - from: ORDERED
+        to: RECEIVED
+        trigger: "POST /material-orders/{id}/receive"
+        actor: ShopManager
+        preconditions:
+          - "MaterialOrder.status == ORDERED"
+          - "Parent WorkOrder.status IN {APPROVED, IN_PRODUCTION}"
+        side_effects:
+          - "MaterialOrder.finalized_cost_cents computed from received unit prices (material_finalized_cost calculation)"
+          - "Parent WorkOrder.materials_committed_cents recomputed (stays committed while RECEIVED)"
+      - from: ORDERED
+        to: CANCELLED
+        trigger: "POST /material-orders/{id}/cancel OR cascaded from WorkOrder cancel"
+        actor: ShopManager
+        preconditions:
+          - "MaterialOrder.status == ORDERED"
+        side_effects:
+          - "Reserved fabric yards (yards_ordered against in-stock reservation) returned to FabricSku.in_stock_yards (compensation)"
+          - "Parent WorkOrder.materials_committed_cents decremented by this order's provisional_cost_cents"
+
+  - entity: FulfillmentLeg
+    initial_state: PLANNED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: DISPATCHED
+        trigger: "POST /fulfillment-legs/{id}/dispatch"
+        actor: ShopManager
+        preconditions:
+          - "FulfillmentLeg.status == PLANNED"
+          - "For PICKUP/DELIVERY: scheduled_window_start/end present and end > start"
+        side_effects:
+          - "FulfillmentLeg.status -> DISPATCHED"
+      - from: DISPATCHED
+        to: COMPLETED
+        trigger: "POST /fulfillment-legs/{id}/complete"
+        actor: ShopManager
+        preconditions:
+          - "FulfillmentLeg.status == DISPATCHED"
+        side_effects:
+          - "FulfillmentLeg.status -> COMPLETED"
+          - "For PRODUCTION legs: enables WorkOrder finish-production precondition"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /fulfillment-legs/{id}/cancel OR cascaded from WorkOrder cancel"
+        actor: ShopManager
+        preconditions:
+          - "FulfillmentLeg.status == PLANNED"
+        side_effects:
+          - "For PRODUCTION legs: ShopDay.booked_hours decremented; if was FULL revert to OPEN (shop_capacity release)"
+
+  - entity: ShopDay
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: FULL
+        trigger: "system: PRODUCTION FulfillmentLeg booking pushes booked_hours >= labor_capacity_hours"
+        actor: system
+        preconditions:
+          - "booked_hours >= labor_capacity_hours after a PRODUCTION leg books"
+        side_effects:
+          - "ShopDay.status -> FULL"
+      - from: FULL
+        to: OPEN
+        trigger: "system: PRODUCTION FulfillmentLeg cancel drops booked_hours below capacity"
+        actor: system
+        preconditions:
+          - "booked_hours < labor_capacity_hours after a PRODUCTION leg release"
+        side_effects:
+          - "ShopDay.status -> OPEN"
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /shop-days/{id}/close"
+        actor: ShopManager
+        preconditions:
+          - "ShopDay.status IN {OPEN, FULL}"
+        side_effects:
+          - "ShopDay.status -> CLOSED; no further PRODUCTION legs may book this day"
+      - from: FULL
+        to: CLOSED
+        trigger: "POST /shop-days/{id}/close"
+        actor: ShopManager
+        preconditions:
+          - "ShopDay.status IN {OPEN, FULL}"
+        side_effects:
+          - "ShopDay.status -> CLOSED"
+
+  - entity: WarrantyClaim
+    initial_state: OPEN
+    terminal_states: [DENIED, RESOLVED]
+    transitions:
+      - from: OPEN
+        to: APPROVED
+        trigger: "POST /warranty-claims/{id}/approve"
+        actor: ShopManager
+        preconditions:
+          - "WarrantyClaim.status == OPEN"
+          - "WarrantyClaim.covered == true"
+        side_effects:
+          - "WarrantyClaim.status -> APPROVED"
+      - from: OPEN
+        to: DENIED
+        trigger: "POST /warranty-claims/{id}/deny"
+        actor: ShopManager
+        preconditions:
+          - "WarrantyClaim.status == OPEN"
+        side_effects:
+          - "WarrantyClaim.status -> DENIED"
+        note: "An out-of-window claim (covered==false) may only be DENIED, never APPROVED."
+      - from: APPROVED
+        to: RESOLVED
+        trigger: "POST /warranty-claims/{id}/resolve"
+        actor: ShopManager
+        preconditions:
+          - "WarrantyClaim.status == APPROVED"
+        side_effects:
+          - "WarrantyClaim.status -> RESOLVED"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: estimate-supersede-stale-work-order
+    parent_entity: WorkOrder
+    write_endpoint: "POST /work-orders/{id}/estimates"
+    occ_field: "expected_work_order_version"
+    description: |
+      Authoring a new Estimate version against a WorkOrder whose version has
+      advanced since the client last observed it is rejected with a stale-version
+      error. A new estimate legitimately supersedes the prior ACTIVE estimate; if
+      another writer has already authored a superseding version (bumping the
+      WorkOrder version), the current writer's view of which estimate it is
+      superseding is stale, so the write must be rejected rather than fork the
+      revision chain.
+    error_id: ERR_STALE_WORK_ORDER_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: per_piece_subtotal
+    trigger: "On LineItem create and on each estimate authoring (recompute affected LineItems)"
+    algorithm: aggregation
+    formula: |
+      labor_cost   = round(labor_hours * LABOR_RATE_CENTS_PER_HOUR)
+      fabric_cost  = (service_type == REUPHOLSTERY)
+                     ? round(yardage_required * FabricSku.price_cents_per_yard)
+                     : 0
+      foam_cost    = (foam_spec_id != null)
+                     ? round(board_feet_required * FoamSpec.price_cents_per_board_foot)
+                     : 0
+      piece_subtotal_cents = labor_cost + fabric_cost + foam_cost
+    input_set: "Single LineItem; uses the LineItem's own fabric/foam catalog references at compute time."
+    constants:
+      LABOR_RATE_CENTS_PER_HOUR: 6500
+    precision: "integer cents; round_half_up on each cost term BEFORE summation (round-per-term, then sum)"
+
+  - name: estimate_total
+    trigger: "On POST /work-orders/{id}/estimates (estimate authoring)"
+    algorithm: forward_looking
+    formula: |
+      labor_total_cents     = sum over LineItems of round(labor_hours * LABOR_RATE_CENTS_PER_HOUR)
+      materials_total_cents = sum over LineItems of (fabric_cost + foam_cost)   # per per_piece_subtotal terms
+      base                  = labor_total_cents + materials_total_cents
+      # Rush surcharge: tiered on labor_total, only when WorkOrder.rush_requested
+      if rush_requested:
+        if   labor_total_cents <= RUSH_TIER1_CENTS: rush_surcharge_cents = round(labor_total_cents * RUSH_PCT_LOW)
+        else:                                       rush_surcharge_cents = round(RUSH_TIER1_CENTS * RUSH_PCT_LOW)
+                                                  + round((labor_total_cents - RUSH_TIER1_CENTS) * RUSH_PCT_HIGH)
+      else:
+        rush_surcharge_cents = 0
+      total_cents = base + rush_surcharge_cents
+    input_set: "All LineItems of the work order at authoring time (forward-looking: catalog prices, not yet-received actuals)."
+    constants:
+      LABOR_RATE_CENTS_PER_HOUR: 6500
+      RUSH_TIER1_CENTS: 50000
+      RUSH_PCT_LOW: 0.15
+      RUSH_PCT_HIGH: 0.30
+    precision: "integer cents; tiered terms each rounded before summing; round_half_up"
+    variants:
+      - name: forward_looking_estimate
+        when: "At estimate authoring; reflects WorkOrder.estimate_total_cents"
+        difference: "Uses catalog FabricSku.price_cents_per_yard / FoamSpec.price_cents_per_board_foot (projected), NOT received actuals."
+
+  - name: final_invoice
+    trigger: "On POST /work-orders/{id}/finish-production (IN_PRODUCTION -> READY_FOR_FULFILLMENT)"
+    algorithm: chronological
+    formula: |
+      labor_total_cents = sum over LineItems of round(labor_hours * LABOR_RATE_CENTS_PER_HOUR)
+      # Chronological actuals: walk this order's RECEIVED MaterialOrders in created_at ASC,
+      # accumulating finalized_cost_cents (actual received prices).
+      materials_actual_cents = sum over MaterialOrders WHERE status == RECEIVED of finalized_cost_cents
+      rush_surcharge_cents   = approved Estimate.rush_surcharge_cents   # carried from the approved estimate
+      final_invoice_cents    = labor_total_cents + materials_actual_cents + rush_surcharge_cents
+    input_set: "LineItems (labor) + MaterialOrders WHERE status==RECEIVED (actual material cost), processed created_at ASC. CANCELLED material orders excluded."
+    constants:
+      LABOR_RATE_CENTS_PER_HOUR: 6500
+    precision: "integer cents; round_half_up"
+    variants:
+      - name: chronological_actuals
+        when: "At production finish; reflects WorkOrder.final_invoice_cents"
+        difference: "Replaces projected catalog material cost with the chronological sum of RECEIVED MaterialOrder.finalized_cost_cents — diverges from estimate_total when received prices differ from catalog."
+
+  - name: material_finalized_cost
+    trigger: "On POST /material-orders/{id}/receive (ORDERED -> RECEIVED)"
+    algorithm: aggregation
+    formula: |
+      fabric_part = round(yards_ordered * received_fabric_price_cents_per_yard)
+      foam_part   = round(board_feet_ordered * received_foam_price_cents_per_board_foot)
+      finalized_cost_cents = fabric_part + foam_part
+    input_set: "Single MaterialOrder at receipt; received unit prices override catalog provisional prices."
+    constants: {}
+    precision: "integer cents; round_half_up per term BEFORE summation"
+    variants:
+      - name: provisional_at_order
+        when: "At MaterialOrder create"
+        difference: "provisional_cost_cents uses catalog prices: round(yards_ordered*FabricSku.price_cents_per_yard)+round(board_feet_ordered*FoamSpec.price_cents_per_board_foot)."
+      - name: finalized_at_receipt
+        when: "At receive"
+        difference: "finalized_cost_cents uses the received_* override prices; provisional vs finalized delta flows into final_invoice."
+
+  - name: turnaround
+    trigger: "On POST /work-orders/{id}/approve (set WorkOrder.promised_turnaround_days)"
+    algorithm: threshold
+    formula: |
+      total_labor_hours = sum over LineItems of labor_hours
+      base_band_days = STANDARD_BASE_DAYS + ceil(total_labor_hours / HOURS_PER_DAY)
+      promised_turnaround_days = rush_requested
+        ? max(RUSH_FLOOR_DAYS, ceil(base_band_days * RUSH_COMPRESS))
+        : base_band_days
+    input_set: "All LineItems' labor_hours at approval time."
+    constants:
+      STANDARD_BASE_DAYS: 3
+      HOURS_PER_DAY: 8
+      RUSH_COMPRESS: 0.5
+      RUSH_FLOOR_DAYS: 2
+    precision: "integer days; ceil where shown"
+
+  - name: warranty_coverage
+    trigger: "On POST /work-orders/{id}/warranty-claims (claim filing)"
+    algorithm: threshold
+    formula: |
+      completion_date = parent WorkOrder.completed_at (set at COMPLETED)
+      days_elapsed    = floor((filed_at - completion_date) / 86400 seconds)
+      covered = (parent WorkOrder.status == COMPLETED) AND (days_elapsed <= WARRANTY_DAYS)
+    input_set: "Single WarrantyClaim vs its parent WorkOrder completion timestamp."
+    constants:
+      WARRANTY_DAYS: 90
+    precision: "integer days, floor; boundary at exactly WARRANTY_DAYS days is COVERED (<=), day WARRANTY_DAYS+1 is NOT"
+
+  - name: shop_capacity
+    trigger: "On PRODUCTION FulfillmentLeg create (book) and on PRODUCTION leg cancel (release)"
+    algorithm: aggregation
+    formula: |
+      order_hours = sum over the WorkOrder's LineItems of labor_hours
+      on book:    ShopDay.booked_hours += order_hours
+      on release: ShopDay.booked_hours -= order_hours
+      ShopDay.status = (booked_hours >= labor_capacity_hours) ? FULL : OPEN   # recomputed each change, unless CLOSED
+    input_set: "All PRODUCTION FulfillmentLegs booked onto the ShopDay; release subtracts exactly what booking added."
+    constants: {}
+    precision: "labor hours as number; status flip uses >= (boundary: booked==capacity => FULL)"
+
+  - name: balance_due
+    trigger: "On estimate authoring, approval (deposit), receipt finalization, production finish (invoice), settlement, and cancel refund"
+    algorithm: aggregation
+    formula: |
+      invoiced = (WorkOrder.final_invoice_cents > 0)
+      basis    = invoiced ? final_invoice_cents : estimate_total_cents
+      balance_due_cents = basis - amount_paid_cents
+      # Deposit gate at approval (validation priority 50): required_deposit = ceil(estimate_total_cents * DEPOSIT_PCT)
+      required_deposit_cents = ceil(estimate_total_cents * DEPOSIT_PCT)
+    input_set: "Single WorkOrder; basis switches from estimate to final invoice once production finishes."
+    constants:
+      DEPOSIT_PCT: 0.30
+    precision: "integer cents; required_deposit uses ceil; may be negative pre-settlement guard but settlement requires settlement_amount == balance_due so it lands at 0"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: "For Customer-acting endpoints (approve/decline/request-revision/warranty-claim), X-User-ID equals WorkOrder.customer_id"
+    error_id: ERR_NOT_OWNER
+    http_status: 403
+    applies_to: "POST /work-orders/{id}/approve, POST /work-orders/{id}/decline, POST /work-orders/{id}/request-revision, POST /work-orders/{id}/warranty-claims"
+
+  - priority: 10
+    category: existence
+    check: "Path-referenced resource exists (validated left-to-right in path)"
+    error_id: ERR_WORK_ORDER_NOT_FOUND
+    http_status: 404
+    applies_to: "all /work-orders/{id}/* endpoints"
+
+  - priority: 11
+    category: existence
+    check: "Referenced child/peer resource (estimate, material order, fulfillment leg, warranty claim, shop day) exists"
+    error_id: ERR_RESOURCE_NOT_FOUND
+    http_status: 404
+    applies_to: "all /{collection}/{id}/* endpoints"
+
+  - priority: 12
+    category: business_referential
+    check: "FK body fields reference existing resources (customer_id, fabric_sku_id, foam_spec_id, work_order_id, shop_day_id)"
+    error_id: ERR_FK_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /work-orders, POST /work-orders/{id}/line-items, POST /material-orders, POST /fulfillment-legs, POST /condition-photos"
+
+  - priority: 20
+    category: state
+    check: "Target resource is in a valid state for the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 21
+    category: state
+    check: "OCC: expected_work_order_version matches WorkOrder.version on approve/cancel/estimate-author"
+    error_id: ERR_STALE_WORK_ORDER_VERSION
+    http_status: 412
+    applies_to: "POST /work-orders/{id}/approve, POST /work-orders/{id}/cancel, POST /work-orders/{id}/estimates"
+
+  - priority: 22
+    category: state
+    check: "Cross-entity: order may move APPROVED->IN_PRODUCTION only if NO MaterialOrder of this order is still ORDERED"
+    error_id: ERR_MATERIALS_OUTSTANDING
+    http_status: 409
+    applies_to: "POST /fulfillment-legs (PRODUCTION kind)"
+
+  - priority: 23
+    category: state
+    check: "Cross-entity: order may move IN_PRODUCTION->READY_FOR_FULFILLMENT only if its PRODUCTION FulfillmentLeg is COMPLETED"
+    error_id: ERR_PRODUCTION_NOT_COMPLETE
+    http_status: 409
+    applies_to: "POST /work-orders/{id}/finish-production"
+
+  - priority: 30
+    category: business_constraint
+    check: "REUPHOLSTERY line item requires fabric_sku_id set and yardage_required > 0; REFINISH/REPAIR require fabric_sku_id null and yardage_required == 0"
+    error_id: ERR_LINE_ITEM_FIELDS_INVALID
+    http_status: 422
+    applies_to: "POST /work-orders/{id}/line-items"
+
+  - priority: 31
+    category: business_constraint
+    check: "Selected FabricSku/FoamSpec must be LISTED (not DISCONTINUED); board_feet_required > 0 only when foam_spec_id set"
+    error_id: ERR_CATALOG_ITEM_UNAVAILABLE
+    http_status: 422
+    applies_to: "POST /work-orders/{id}/line-items, POST /material-orders"
+
+  - priority: 32
+    category: business_temporal
+    check: "FulfillmentLeg of PICKUP/DELIVERY kind requires scheduled_window_end > scheduled_window_start"
+    error_id: ERR_INVALID_WINDOW
+    http_status: 422
+    applies_to: "POST /fulfillment-legs"
+
+  - priority: 33
+    category: business_constraint
+    check: "ShopDay uniqueness: at most one non-CANCELLED ShopDay per work_date"
+    error_id: ERR_DUPLICATE_SHOP_DAY
+    http_status: 409
+    applies_to: "POST /shop-days"
+
+  - priority: 40
+    category: business_safety
+    check: "PRODUCTION FulfillmentLeg cannot book onto a ShopDay whose booked_hours + order labor_hours > labor_capacity_hours, nor onto a CLOSED/FULL day. Interval semantics: AGGREGATE-CAPACITY occupation — the day is a capacity pool; rejection when cumulative booked labor-hours over all non-CANCELLED PRODUCTION legs would exceed labor_capacity_hours."
+    error_id: ERR_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /fulfillment-legs (PRODUCTION kind)"
+
+  - priority: 41
+    category: business_temporal
+    check: "DELIVERY FulfillmentLeg window collides with another non-CANCELLED DELIVERY leg (single shop delivery crew). Interval semantics: HALF-OPEN [start, end) geometric overlap — two delivery windows conflict iff existing.start < new.end AND new.start < existing.end; windows that merely touch at an endpoint (new.start == existing.end) do NOT conflict."
+    error_id: ERR_DELIVERY_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /fulfillment-legs (DELIVERY kind)"
+
+  - priority: 50
+    category: business_fiscal
+    check: "Approval deposit_amount_cents must be >= ceil(estimate_total_cents * DEPOSIT_PCT)"
+    error_id: ERR_DEPOSIT_TOO_LOW
+    http_status: 422
+    applies_to: "POST /work-orders/{id}/approve"
+
+  - priority: 51
+    category: business_fiscal
+    check: "Settlement settlement_amount_cents must exactly equal current balance_due_cents (no over/underpayment)"
+    error_id: ERR_SETTLEMENT_MISMATCH
+    http_status: 422
+    applies_to: "POST /work-orders/{id}/complete"
+
+  - priority: 60
+    category: business_constraint
+    check: "Warranty claim may be filed only on a COMPLETED work order; coverage is computed but filing on non-completed order is rejected"
+    error_id: ERR_ORDER_NOT_COMPLETED
+    http_status: 409
+    applies_to: "POST /work-orders/{id}/warranty-claims"
+
+  - priority: 70
+    category: business_constraint
+    check: "Pagination params within bounds (limit 1..100, offset >= 0)"
+    error_id: ERR_INVALID_PAGINATION
+    http_status: 400
+    applies_to: "all list endpoints"
+
+  - priority: 71
+    category: business_constraint
+    check: "Required body fields present and well-typed; enum values valid"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST/PATCH endpoints"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ----- Customer -----
+  - method: POST
+    path: "/customers"
+    description: "Register a customer"
+    roles: [IntakeClerk, ShopManager]
+    code: 201
+    input: ["full_name", "email", "phone"]
+    output: Customer
+    side_effects: ["store_credit_cents initialized to 0"]
+
+  - method: GET
+    path: "/customers/{id}"
+    description: "Fetch a customer"
+    roles: [IntakeClerk, ShopManager, Estimator, Customer]
+    code: 200
+    input: []
+    output: Customer
+
+  - method: GET
+    path: "/customers/{id}/work-orders"
+    description: "List a customer's work orders (FK reverse-reachability for WorkOrder.customer_id)"
+    roles: [IntakeClerk, ShopManager, Estimator, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WorkOrder[]
+
+  # ----- Catalog: FabricSku / FoamSpec -----
+  - method: POST
+    path: "/fabric-skus"
+    description: "Create a fabric SKU"
+    roles: [ShopManager]
+    code: 201
+    input: ["sku_code", "name", "price_cents_per_yard", "roll_width_inches", "in_stock_yards?"]
+    output: FabricSku
+    side_effects: ["status defaults LISTED"]
+
+  - method: GET
+    path: "/fabric-skus/{id}"
+    description: "Fetch a fabric SKU"
+    roles: [ShopManager, Estimator, IntakeClerk]
+    code: 200
+    input: []
+    output: FabricSku
+
+  - method: POST
+    path: "/fabric-skus/{id}/discontinue"
+    description: "Mark a fabric SKU DISCONTINUED"
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: FabricSku
+    side_effects: ["status -> DISCONTINUED"]
+
+  - method: POST
+    path: "/foam-specs"
+    description: "Create a foam spec"
+    roles: [ShopManager]
+    code: 201
+    input: ["grade_code", "density_lb", "price_cents_per_board_foot"]
+    output: FoamSpec
+    side_effects: ["status defaults LISTED"]
+
+  - method: GET
+    path: "/foam-specs/{id}"
+    description: "Fetch a foam spec"
+    roles: [ShopManager, Estimator, IntakeClerk]
+    code: 200
+    input: []
+    output: FoamSpec
+
+  - method: POST
+    path: "/foam-specs/{id}/discontinue"
+    description: "Mark a foam spec DISCONTINUED"
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: FoamSpec
+    side_effects: ["status -> DISCONTINUED"]
+
+  # ----- WorkOrder intake -----
+  - method: POST
+    path: "/work-orders"
+    description: "Open a work order at intake"
+    roles: [IntakeClerk]
+    code: 201
+    input: ["customer_id", "service_type", "rush_requested?"]
+    output: WorkOrder
+    side_effects: ["status INTAKE; estimate/invoice/balance counters 0"]
+
+  - method: GET
+    path: "/work-orders/{id}"
+    description: "Fetch a work order (computed balances, status, active_estimate_id)"
+    roles: [IntakeClerk, ShopManager, Estimator, Customer]
+    code: 200
+    input: []
+    output: WorkOrder
+
+  - method: GET
+    path: "/work-orders"
+    description: "List work orders with filters"
+    roles: [IntakeClerk, ShopManager, Estimator]
+    code: 200
+    input: ["status?", "customer_id?", "limit?", "offset?"]
+    output: WorkOrder[]
+
+  - method: POST
+    path: "/condition-photos"
+    description: "Attach a condition photo to a work order at intake"
+    roles: [IntakeClerk]
+    code: 201
+    input: ["work_order_id", "image_uri", "damage_note?"]
+    output: ConditionPhoto
+    side_effects: ["sequence_no assigned by created_at ASC among the order's photos"]
+
+  - method: GET
+    path: "/condition-photos/{id}"
+    description: "Fetch a single condition photo"
+    roles: [IntakeClerk, ShopManager, Estimator, Customer]
+    code: 200
+    input: []
+    output: ConditionPhoto
+
+  - method: GET
+    path: "/condition-photos"
+    description: "List condition photos, filterable by work order (FK reverse-reachability for ConditionPhoto.work_order_id)"
+    roles: [IntakeClerk, ShopManager, Estimator, Customer]
+    code: 200
+    input: ["work_order_id?", "limit?", "offset?"]
+    output: ConditionPhoto[]
+
+  - method: POST
+    path: "/work-orders/{id}/line-items"
+    description: "Add a piece line item; first one advances INTAKE->ESTIMATING"
+    roles: [IntakeClerk]
+    code: 201
+    input: ["piece_label", "fabric_sku_id?", "foam_spec_id?", "yardage_required", "board_feet_required?", "labor_hours"]
+    output: LineItem
+    side_effects: ["piece_subtotal_cents computed (per_piece_subtotal); first item: WorkOrder.status -> ESTIMATING"]
+
+  - method: GET
+    path: "/work-orders/{id}/line-items"
+    description: "List a work order's line items (FK reverse-reachability for LineItem.work_order_id)"
+    roles: [IntakeClerk, ShopManager, Estimator, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: LineItem[]
+
+  - method: GET
+    path: "/line-items/{id}"
+    description: "Fetch a single line item"
+    roles: [IntakeClerk, ShopManager, Estimator, Customer]
+    code: 200
+    input: []
+    output: LineItem
+
+  - method: GET
+    path: "/line-items"
+    description: "List line items filterable by catalog item (FK reverse-reachability for LineItem.fabric_sku_id and LineItem.foam_spec_id)"
+    roles: [IntakeClerk, ShopManager, Estimator]
+    code: 200
+    input: ["work_order_id?", "fabric_sku_id?", "foam_spec_id?", "limit?", "offset?"]
+    output: LineItem[]
+
+  # ----- Estimate authoring + approval loop -----
+  - method: POST
+    path: "/work-orders/{id}/estimates"
+    description: "Author an estimate version (forward-looking); supersedes prior ACTIVE; advances to AWAITING_APPROVAL"
+    roles: [Estimator]
+    code: 201
+    input: ["expected_work_order_version", "supersedes_estimate_id?"]
+    output: Estimate
+    side_effects: ["estimate_total computed; prior ACTIVE -> SUPERSEDED; WorkOrder.active_estimate_id/estimate_total_cents/balance_due_cents reconciled; WorkOrder.status -> AWAITING_APPROVAL; increments WorkOrder.version by 1"]
+
+  - method: GET
+    path: "/estimates/{id}"
+    description: "Fetch an estimate version"
+    roles: [Estimator, ShopManager, Customer, IntakeClerk]
+    code: 200
+    input: []
+    output: Estimate
+
+  - method: GET
+    path: "/work-orders/{id}/estimates"
+    description: "List a work order's estimate versions (FK reverse-reachability for Estimate.work_order_id)"
+    roles: [Estimator, ShopManager, Customer, IntakeClerk]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Estimate[]
+
+  - method: GET
+    path: "/estimates"
+    description: "List estimates filterable by supersedes link (FK reverse-reachability for Estimate.supersedes_estimate_id)"
+    roles: [Estimator, ShopManager]
+    code: 200
+    input: ["supersedes_estimate_id?", "work_order_id?", "limit?", "offset?"]
+    output: Estimate[]
+
+  - method: POST
+    path: "/work-orders/{id}/request-revision"
+    description: "Customer requests a revised estimate"
+    roles: [Customer]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["status AWAITING_APPROVAL -> REVISION_REQUESTED"]
+
+  - method: POST
+    path: "/work-orders/{id}/approve"
+    description: "Customer approves the active estimate, pays deposit, commits turnaround"
+    roles: [Customer]
+    code: 200
+    input: ["expected_work_order_version", "deposit_amount_cents"]
+    output: WorkOrder
+    side_effects: ["active Estimate APPROVED; promised_turnaround_days (turnaround calc); DEPOSIT Payment recorded; amount_paid_cents/balance_due_cents reconciled; status -> APPROVED; increments WorkOrder.version by 1"]
+
+  - method: POST
+    path: "/work-orders/{id}/decline"
+    description: "Customer declines the active estimate"
+    roles: [Customer]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["active Estimate DECLINED; status -> DECLINED"]
+
+  # ----- Material orders -----
+  - method: POST
+    path: "/material-orders"
+    description: "Place a parts/foam/fabric order against an approved work order"
+    roles: [ShopManager]
+    code: 201
+    input: ["work_order_id", "fabric_sku_id?", "foam_spec_id?", "yards_ordered?", "board_feet_ordered?"]
+    output: MaterialOrder
+    side_effects: ["provisional_cost_cents computed (material_finalized_cost provisional variant); if yards reserved from stock, FabricSku.in_stock_yards debited; WorkOrder.materials_committed_cents += provisional_cost_cents"]
+
+  - method: GET
+    path: "/material-orders/{id}"
+    description: "Fetch a material order"
+    roles: [ShopManager, Estimator]
+    code: 200
+    input: []
+    output: MaterialOrder
+
+  - method: GET
+    path: "/material-orders"
+    description: "List material orders filterable by work order / catalog item (FK reverse-reachability for MaterialOrder.work_order_id, MaterialOrder.fabric_sku_id, MaterialOrder.foam_spec_id)"
+    roles: [ShopManager, Estimator]
+    code: 200
+    input: ["work_order_id?", "fabric_sku_id?", "foam_spec_id?", "status?", "limit?", "offset?"]
+    output: MaterialOrder[]
+
+  - method: POST
+    path: "/material-orders/{id}/receive"
+    description: "Receive a material order; record actual prices and finalize cost"
+    roles: [ShopManager]
+    code: 200
+    input: ["received_fabric_price_cents_per_yard?", "received_foam_price_cents_per_board_foot?"]
+    output: MaterialOrder
+    side_effects: ["finalized_cost_cents computed (material_finalized_cost finalized variant); WorkOrder.materials_committed_cents reconciled; status -> RECEIVED"]
+
+  - method: POST
+    path: "/material-orders/{id}/cancel"
+    description: "Cancel an ORDERED material order; release reserved stock"
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: MaterialOrder
+    side_effects: ["reserved FabricSku.in_stock_yards returned; WorkOrder.materials_committed_cents decremented; status -> CANCELLED"]
+
+  # ----- Shop scheduling & fulfillment -----
+  - method: POST
+    path: "/shop-days"
+    description: "Open a production day with labor capacity"
+    roles: [ShopManager]
+    code: 201
+    input: ["work_date", "labor_capacity_hours"]
+    output: ShopDay
+    side_effects: ["status OPEN; booked_hours 0"]
+
+  - method: GET
+    path: "/shop-days/{id}"
+    description: "Fetch a shop day with booked/capacity"
+    roles: [ShopManager, Estimator]
+    code: 200
+    input: []
+    output: ShopDay
+
+  - method: GET
+    path: "/shop-days"
+    description: "List shop days"
+    roles: [ShopManager, Estimator]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ShopDay[]
+
+  - method: POST
+    path: "/shop-days/{id}/close"
+    description: "Close a shop day (holiday/maintenance); blocks further PRODUCTION bookings"
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: ShopDay
+    side_effects: ["status OPEN|FULL -> CLOSED"]
+
+  - method: POST
+    path: "/fulfillment-legs"
+    description: "Create a production/pickup/delivery leg; PRODUCTION books shop capacity & advances order to IN_PRODUCTION"
+    roles: [ShopManager]
+    code: 201
+    input: ["work_order_id", "kind", "shop_day_id?", "scheduled_window_start?", "scheduled_window_end?"]
+    output: FulfillmentLeg
+    side_effects: ["PRODUCTION: ShopDay.booked_hours += order labor (shop_capacity); ShopDay FULL if at/over capacity; WorkOrder APPROVED -> IN_PRODUCTION"]
+
+  - method: GET
+    path: "/fulfillment-legs/{id}"
+    description: "Fetch a fulfillment leg"
+    roles: [ShopManager, Estimator, Customer]
+    code: 200
+    input: []
+    output: FulfillmentLeg
+
+  - method: GET
+    path: "/fulfillment-legs"
+    description: "List fulfillment legs filterable by work order or shop day (FK reverse-reachability for FulfillmentLeg.work_order_id and FulfillmentLeg.shop_day_id)"
+    roles: [ShopManager, Estimator, Customer]
+    code: 200
+    input: ["work_order_id?", "shop_day_id?", "kind?", "status?", "limit?", "offset?"]
+    output: FulfillmentLeg[]
+
+  - method: POST
+    path: "/fulfillment-legs/{id}/dispatch"
+    description: "Dispatch a planned leg"
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: FulfillmentLeg
+    side_effects: ["status PLANNED -> DISPATCHED"]
+
+  - method: POST
+    path: "/fulfillment-legs/{id}/complete"
+    description: "Complete a dispatched leg"
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: FulfillmentLeg
+    side_effects: ["status DISPATCHED -> COMPLETED; PRODUCTION leg enables finish-production"]
+
+  - method: POST
+    path: "/fulfillment-legs/{id}/cancel"
+    description: "Cancel a planned leg; release any booked shop capacity"
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: FulfillmentLeg
+    side_effects: ["PRODUCTION: ShopDay.booked_hours decremented, FULL->OPEN if applicable; status -> CANCELLED"]
+
+  - method: POST
+    path: "/work-orders/{id}/finish-production"
+    description: "Mark production finished; compute final invoice (chronological actuals)"
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["final_invoice computed; balance_due reconciled; status IN_PRODUCTION -> READY_FOR_FULFILLMENT"]
+
+  - method: POST
+    path: "/work-orders/{id}/complete"
+    description: "Settle balance and complete (after pickup/delivery)"
+    roles: [ShopManager]
+    code: 200
+    input: ["settlement_amount_cents"]
+    output: WorkOrder
+    side_effects: ["SETTLEMENT Payment recorded; amount_paid/balance_due reconciled to 0; status READY_FOR_FULFILLMENT -> COMPLETED; completion timestamp stamped"]
+
+  - method: POST
+    path: "/work-orders/{id}/cancel"
+    description: "Cancel an approved/in-production order; compensating refund + material/capacity release"
+    roles: [ShopManager]
+    code: 200
+    input: ["expected_work_order_version", "refund_destination?"]
+    output: WorkOrder
+    side_effects: ["ORDERED material orders CANCELLED & stock returned; PLANNED production legs CANCELLED & capacity released; REFUND Payment for amount_paid; WALLET credits store_credit_cents; counters reconciled; status -> CANCELLED; increments WorkOrder.version by 1"]
+
+  - method: GET
+    path: "/work-orders/{id}/payments"
+    description: "List a work order's payments (FK reverse-reachability for Payment.work_order_id)"
+    roles: [ShopManager, Estimator, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Payment[]
+
+  # ----- Test-driving clock (controls completed_at stamping for deterministic warranty windows) -----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server clock used to stamp WorkOrder.completed_at (test-driving; deterministic warranty window)"
+    roles: [ShopManager]
+    code: 200
+    input: ["to_iso8601"]
+    output: null
+    side_effects: ["server current-UTC clock set to to_iso8601; subsequent completed_at stamps use it"]
+
+  # ----- Warranty -----
+  - method: POST
+    path: "/work-orders/{id}/warranty-claims"
+    description: "File a warranty claim on a completed order; coverage computed from filing date"
+    roles: [Customer]
+    code: 201
+    input: ["defect_note", "filed_at"]
+    output: WarrantyClaim
+    side_effects: ["covered computed (warranty_coverage); status OPEN"]
+
+  - method: GET
+    path: "/warranty-claims/{id}"
+    description: "Fetch a warranty claim"
+    roles: [Customer, ShopManager]
+    code: 200
+    input: []
+    output: WarrantyClaim
+
+  - method: GET
+    path: "/work-orders/{id}/warranty-claims"
+    description: "List a work order's warranty claims (FK reverse-reachability for WarrantyClaim.work_order_id)"
+    roles: [Customer, ShopManager, Estimator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WarrantyClaim[]
+
+  - method: POST
+    path: "/warranty-claims/{id}/approve"
+    description: "Approve a covered warranty claim"
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: WarrantyClaim
+    side_effects: ["status OPEN -> APPROVED (requires covered==true)"]
+
+  - method: POST
+    path: "/warranty-claims/{id}/deny"
+    description: "Deny a warranty claim"
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: WarrantyClaim
+    side_effects: ["status OPEN -> DENIED"]
+
+  - method: POST
+    path: "/warranty-claims/{id}/resolve"
+    description: "Resolve an approved warranty claim"
+    roles: [ShopManager]
+    code: 200
+    input: []
+    output: WarrantyClaim
+    side_effects: ["status APPROVED -> RESOLVED"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing X-User-Role or X-User-ID header" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Acting role not permitted for this operation" }
+  - { id: ERR_NOT_OWNER, http: 403, condition: "Customer acting on a work order they do not own" }
+  - { id: ERR_WORK_ORDER_NOT_FOUND, http: 404, condition: "Work order id in path does not exist" }
+  - { id: ERR_RESOURCE_NOT_FOUND, http: 404, condition: "Estimate/material-order/fulfillment-leg/warranty-claim/shop-day/customer/fabric-sku/foam-spec id does not exist" }
+  - { id: ERR_FK_NOT_FOUND, http: 404, condition: "A foreign-key body field references a non-existent resource" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a valid state for the requested transition" }
+  - { id: ERR_STALE_WORK_ORDER_VERSION, http: 412, condition: "expected_work_order_version does not match WorkOrder.version (OCC)" }
+  - { id: ERR_MATERIALS_OUTSTANDING, http: 409, condition: "PRODUCTION leg attempted while a MaterialOrder is still ORDERED" }
+  - { id: ERR_PRODUCTION_NOT_COMPLETE, http: 409, condition: "finish-production attempted while the PRODUCTION leg is not COMPLETED" }
+  - { id: ERR_LINE_ITEM_FIELDS_INVALID, http: 422, condition: "Line item fabric/yardage fields violate the service_type rules" }
+  - { id: ERR_CATALOG_ITEM_UNAVAILABLE, http: 422, condition: "Selected FabricSku/FoamSpec is DISCONTINUED, or board_feet>0 without a foam spec" }
+  - { id: ERR_INVALID_WINDOW, http: 422, condition: "PICKUP/DELIVERY leg window end not after start" }
+  - { id: ERR_DUPLICATE_SHOP_DAY, http: 409, condition: "A non-cancelled ShopDay already exists for the work_date" }
+  - { id: ERR_CAPACITY_EXCEEDED, http: 409, condition: "PRODUCTION leg would exceed ShopDay labor capacity, or day is FULL/CLOSED" }
+  - { id: ERR_DELIVERY_WINDOW_CONFLICT, http: 409, condition: "DELIVERY leg window half-open-overlaps an existing non-CANCELLED DELIVERY leg" }
+  - { id: ERR_DEPOSIT_TOO_LOW, http: 422, condition: "Deposit below the required ceil(estimate_total * DEPOSIT_PCT)" }
+  - { id: ERR_SETTLEMENT_MISMATCH, http: 422, condition: "Settlement amount does not equal current balance_due_cents" }
+  - { id: ERR_ORDER_NOT_COMPLETED, http: 409, condition: "Warranty claim filed on a non-COMPLETED work order" }
+  - { id: ERR_INVALID_PAGINATION, http: 400, condition: "limit/offset outside allowed bounds" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing/ill-typed required body field or invalid enum value" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: IntakeClerk
+    description: "Front-desk staff who open work orders, attach condition photos, and add piece line items."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /work-orders (open intake)"
+      - "POST /condition-photos"
+      - "POST /work-orders/{id}/line-items"
+    shared_operations:
+      - "POST /customers (shared with ShopManager)"
+      - "GET reads on customers, work orders, line items, estimates, catalog"
+
+  - name: Estimator
+    description: "Authors estimate versions and reads catalog/material/scheduling data. Cannot approve on the customer's behalf."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /work-orders/{id}/estimates"
+    shared_operations:
+      - "GET reads on work orders, estimates, line items, material orders, shop days, fulfillment legs, payments, warranty claims"
+
+  - name: ShopManager
+    description: "Operates the shop: catalog management, material orders, scheduling, fulfillment, completion, cancellation, warranty adjudication."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /fabric-skus, /foam-specs and their /discontinue"
+      - "POST /material-orders and /receive, /cancel"
+      - "POST /shop-days"
+      - "POST /fulfillment-legs and /dispatch, /complete, /cancel"
+      - "POST /work-orders/{id}/finish-production"
+      - "POST /work-orders/{id}/complete"
+      - "POST /work-orders/{id}/cancel"
+      - "POST /warranty-claims/{id}/approve, /deny, /resolve"
+    shared_operations:
+      - "POST /customers (shared with IntakeClerk)"
+      - "GET reads across all resources"
+
+  - name: Customer
+    description: "The owning customer. Approves/declines/requests revision on own estimates and files warranty claims."
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /work-orders/{id}/approve"
+      - "POST /work-orders/{id}/decline"
+      - "POST /work-orders/{id}/request-revision"
+      - "POST /work-orders/{id}/warranty-claims"
+    shared_operations:
+      - "GET reads on own work orders, estimates, line items, fulfillment legs, payments, warranty claims"

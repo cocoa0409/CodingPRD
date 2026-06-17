@@ -1,0 +1,56 @@
+"""Business constants — values traced verbatim from PRD §3 and SCAFFOLD constants_reference."""
+
+MAX_ACTIVE_LISTINGS = 3       # §3.3 active-listing cap of 3
+MAX_RENEWALS = 2              # §3.3 renewal cap of 2
+LISTING_TTL_DAYS = 30         # §3.3 listing time-to-live of 30 days
+OFFER_TTL_HOURS = 48          # §3.5 offer time-to-live of 48 hours
+MAX_NEGOTIATION_ROUNDS = 5    # §3.5 negotiation round cap of 5
+SPAM_FLAG_THRESHOLD = 3       # §3.7 spam-flag threshold of 3
+BAN_UPHELD_THRESHOLD = 2      # §3.1 ban threshold of 2
+HIGH_VALUE_THRESHOLD = 50000  # §3.6 high-value threshold of 50000 cents
+
+# trust_score constants (§3.1 / §1.3)
+BASE_TRUST = 50
+VERIFY_BONUS = 20
+UPHELD_PENALTY = 15
+COMPLETION_BONUS = 6
+COMPLETION_CAP = 5
+TRUST_FLOOR = 0
+TRUST_CEIL = 100
+
+# Pagination defaults (§2.3 / response_envelope.pagination_defaults)
+PAGINATION_DEFAULT_LIMIT = 10
+PAGINATION_MIN_LIMIT = 1
+PAGINATION_MAX_LIMIT = 100
+PAGINATION_DEFAULT_OFFSET = 0
+
+# Role values (§2.1), spelled exactly.
+ROLE_ANONYMOUS = "Anonymous"
+ROLE_SELLER = "Seller"
+ROLE_BUYER = "Buyer"
+ROLE_MEMBER = "Member"
+ROLE_MODERATOR = "Moderator"
+ROLE_PLATFORM_ADMIN = "PlatformAdmin"
+
+ALL_ROLES = {
+    ROLE_ANONYMOUS,
+    ROLE_SELLER,
+    ROLE_BUYER,
+    ROLE_MEMBER,
+    ROLE_MODERATOR,
+    ROLE_PLATFORM_ADMIN,
+}
+
+# Enum value sets
+ROLE_KIND_VALUES = {"SELLER", "BUYER", "BOTH"}
+MEMBER_STATUS_VALUES = {"ACTIVE", "SUSPENDED", "BANNED"}
+LISTING_PUB_VALUES = {"DRAFT", "ACTIVE", "EXPIRED", "REMOVED"}
+LISTING_SALE_VALUES = {"AVAILABLE", "RESERVED", "SOLD"}
+CONVERSATION_STATUS_VALUES = {"OPEN", "CLOSED"}
+OFFER_STATUS_VALUES = {"PROPOSED", "COUNTERED", "ACCEPTED", "REJECTED", "WITHDRAWN", "EXPIRED"}
+OFFER_OPEN_STATES = {"PROPOSED", "COUNTERED"}
+ACTOR_SIDE_VALUES = {"BUYER", "SELLER"}
+MEETUP_STATUS_VALUES = {"PROPOSED", "CONFIRMED", "COMPLETED", "CANCELLED", "NO_SHOW"}
+FLAG_TARGET_TYPE_VALUES = {"LISTING", "MEMBER"}
+FLAG_REASON_VALUES = {"SPAM", "PROHIBITED", "SCAM", "MISCATEGORIZED", "OTHER"}
+FLAG_STATUS_VALUES = {"OPEN", "UPHELD", "DISMISSED"}

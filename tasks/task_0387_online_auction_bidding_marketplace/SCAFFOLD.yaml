@@ -1,0 +1,1603 @@
+scenario: "387. Online Auction & Bidding Marketplace (eBay style): listing (auction/buy-now), bid increment & proxy bid, reserve & sniping extension, watch/offer, winning & checkout, seller fees, feedback/rating, dispute/return"
+domain_name: online-auction-bidding-marketplace
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: Multi-party negotiation
+  secondary_archetype: Temporal windowing
+  complexity_layers:
+    - Optimistic concurrency
+    - Cascading side effects
+    - Dual-variant calculation
+    - Rate / threshold triggers
+
+  entity_topology: graph
+  # Listing is the hub; Bid, Watch, Offer, Order reference Listing AND Account by FK.
+  # Feedback is polymorphic-ish (rater/ratee are both Accounts), Dispute references Order,
+  # SellerFeeInvoice references Order. No nested URL ownership — all peers linked by FK.
+
+  state_machine_shape: parallel
+  # Listing has a lifecycle (DRAFT->ACTIVE->ENDED->...); Order has parallel payment_status
+  # x fulfillment_status dimensions; Offer has its own cyclic counter loop;
+  # Dispute has a branching resolve/reject machine.
+
+  relationship_patterns:
+    - one_to_many        # Listing -> Bid, Listing -> Watch, Listing -> Offer
+    - many_to_many       # Account <-> Account via Feedback (rater/ratee)
+    - polymorphic        # Feedback.role pins whether the rater is buyer or seller of the Order
+    - cross_aggregate    # SellerFeeInvoice debits Account.fee_balance_cents across aggregates
+
+  role_model: peer_roles
+  # Seller owns listings & invoices; Buyer owns bids/offers/orders; PlatformAdmin operates
+  # disputes & clock. Seller and Buyer are both Account-backed but own disjoint resources.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 Entity-Relationship Table
+# =====================================================================
+entities:
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: login identifier, unique across all Accounts
+        constraints: unique; non-empty
+      - name: display_name
+        type: string
+        source: input
+        description: public name shown on listings and feedback
+      - name: roles
+        type: array
+        source: input
+        description: subset of {SELLER, BUYER}; an account may hold both
+        constraints: non-empty; values in {SELLER, BUYER}
+      - name: fee_balance_cents
+        type: integer
+        source: computed
+        description: running unpaid seller-fee ledger = sum of SellerFeeInvoice.amount_cents for this seller with settlement_status == INVOICED (PAID and CREDITED invoices contribute 0). Recomputed on every invoice create/settle/credit/recompute. Conserved-quantity anchor for compensating invariants.
+        default: 0
+      - name: feedback_score
+        type: integer
+        source: computed
+        description: net reputation = count(Feedback where ratee_account_id==this and rating==POSITIVE) - count(Feedback where ratee_account_id==this and rating==NEGATIVE). NEUTRAL contributes 0.
+        default: 0
+      - name: standing
+        type: enum
+        source: computed
+        description: GOOD when fee_balance_cents <= FEE_SUSPEND_THRESHOLD_CENTS (3000); SUSPENDED when fee_balance_cents > FEE_SUSPEND_THRESHOLD_CENTS. Gates the seller's ability to publish new listings.
+        default: GOOD
+        constraints: values in {GOOD, SUSPENDED}
+      - name: status
+        type: enum
+        source: system
+        description: ACTIVE on create; CLOSED after admin closure. CLOSED accounts cannot act.
+        default: ACTIVE
+        constraints: values in {ACTIVE, CLOSED}
+
+  - name: Listing
+    parent: null
+    common_fields: true
+    fields:
+      - name: seller_account_id
+        type: string
+        source: input
+        description: FK -> Account.id; the selling account, must hold SELLER role
+      - name: title
+        type: string
+        source: input
+        description: item title
+      - name: format
+        type: enum
+        source: input
+        description: AUCTION (bids accepted) or BUY_NOW (fixed price only) or HYBRID (auction with buy-now option that disappears after the first bid)
+        constraints: values in {AUCTION, BUY_NOW, HYBRID}
+      - name: start_price_cents
+        type: integer
+        source: input
+        description: opening auction price; first valid bid must be >= start_price_cents. Ignored for BUY_NOW.
+        constraints: AUCTION/HYBRID require >= 1; BUY_NOW ignores
+      - name: buy_now_price_cents
+        type: integer
+        source: input
+        description: fixed purchase price for BUY_NOW/HYBRID. Required for BUY_NOW and HYBRID; must be null for AUCTION. For HYBRID must be > start_price_cents.
+        constraints: required when format IN {BUY_NOW, HYBRID}
+      - name: reserve_price_cents
+        type: integer
+        source: input
+        description: hidden reserve; auction with a reserve only awards a winner when the high bid >= reserve_price_cents. Null means no reserve. Forbidden for BUY_NOW.
+        default: null
+        constraints: when set must be >= start_price_cents
+      - name: accepts_offers
+        type: boolean
+        source: input
+        description: when true, buyers may submit Offers against this listing (BUY_NOW/HYBRID only)
+        default: false
+      - name: scheduled_end_at
+        type: datetime
+        source: input
+        description: auction close time (UTC). Required for AUCTION/HYBRID, ignored for BUY_NOW.
+        constraints: must be strictly after created_at
+      - name: effective_end_at
+        type: datetime
+        source: computed
+        description: actual close time after any anti-sniping extensions; initialized to scheduled_end_at on publish, pushed forward by SNIPE_EXTENSION_SECONDS on each late bid.
+      - name: highest_bid_id
+        type: string
+        source: computed
+        description: computed denormalized pointer to the current winning Bid.id (highest current_price_cents), null until first bid; resolve the Bid via GET /bids/{id}. Not an ownership FK.
+        default: null
+      - name: current_price_cents
+        type: integer
+        source: computed
+        description: visible auction price = the second-highest proxy max plus one increment, or start_price_cents when only one bidder, per the proxy-bid resolution calculation. Null for pure BUY_NOW.
+        default: null
+      - name: bid_count
+        type: integer
+        source: computed
+        description: number of distinct accepted Bid rows on this listing
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: listing lifecycle state
+        default: DRAFT
+        constraints: values in {DRAFT, ACTIVE, ENDED_MET, ENDED_RESERVE_NOT_MET, ENDED_NO_BIDS, SOLD, CANCELLED}
+      - name: winner_account_id
+        type: string
+        source: computed
+        description: computed denormalized pointer to the winning Account.id, set when the listing ends with a met reserve or a buy-now/offer purchase; null otherwise; resolve via GET /accounts/{id}. Not an ownership FK.
+        default: null
+      - name: sold_price_cents
+        type: integer
+        source: computed
+        description: final sale price (winning bid current_price_cents, buy_now_price_cents, or accepted offer amount); null until SOLD/ENDED_MET
+        default: null
+
+  - name: Bid
+    parent: null
+    common_fields: true
+    fields:
+      - name: listing_id
+        type: string
+        source: input
+        description: FK -> Listing.id; the auction being bid on
+      - name: bidder_account_id
+        type: string
+        source: input
+        description: FK -> Account.id; the bidding account, must hold BUYER role and not be the seller
+      - name: max_proxy_cents
+        type: integer
+        source: input
+        description: the bidder's secret maximum (proxy ceiling); the system bids on their behalf up to this amount
+        constraints: must be >= current minimum acceptable bid
+      - name: current_price_cents
+        type: integer
+        source: computed
+        description: the amount this bid is actually committed to right now (<= max_proxy_cents), set by the proxy-bid resolution calculation
+      - name: is_winning
+        type: boolean
+        source: computed
+        description: true for exactly one Bid per ACTIVE/ENDED listing (the one referenced by Listing.highest_bid_id)
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: ACCEPTED on success; OUTBID when superseded; RETRACTED if the bidder retracts (only allowed > BID_RETRACT_LOCKOUT_SECONDS before effective_end_at and only if not currently winning)
+        default: ACCEPTED
+        constraints: values in {ACCEPTED, OUTBID, RETRACTED}
+
+  - name: Watch
+    parent: null
+    common_fields: false
+    fields:
+      - name: listing_id
+        type: string
+        source: input
+        description: FK -> Listing.id; the watched listing
+      - name: watcher_account_id
+        type: string
+        source: input
+        description: FK -> Account.id; the account watching
+      - name: active
+        type: boolean
+        source: system
+        description: true while watching; set false on unwatch (soft delete). Unique (listing_id, watcher_account_id) among active==true rows.
+        default: true
+
+  - name: Offer
+    parent: null
+    common_fields: true
+    fields:
+      - name: listing_id
+        type: string
+        source: input
+        description: FK -> Listing.id; must be a listing with accepts_offers==true
+      - name: buyer_account_id
+        type: string
+        source: input
+        description: FK -> Account.id; the offering buyer, must hold BUYER role and not be the seller
+      - name: amount_cents
+        type: integer
+        source: input
+        description: the buyer's offered price; on a SELLER counter this becomes the seller's counter amount
+        constraints: must be >= 1 and < listing.buy_now_price_cents
+      - name: round_no
+        type: integer
+        source: computed
+        description: negotiation round counter; starts at 1 on submit, increments by 1 on each counter (buyer or seller). Capped at OFFER_MAX_ROUNDS.
+        default: 1
+      - name: last_actor
+        type: enum
+        source: computed
+        description: who made the standing amount; BUYER on submit/buyer-counter, SELLER on seller-counter
+        default: BUYER
+        constraints: values in {BUYER, SELLER}
+      - name: status
+        type: enum
+        source: system
+        description: offer negotiation state
+        default: PENDING
+        constraints: values in {PENDING, COUNTERED, ACCEPTED, DECLINED, EXPIRED, WITHDRAWN}
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - name: listing_id
+        type: string
+        source: input
+        description: FK -> Listing.id; the listing that produced this order
+      - name: buyer_account_id
+        type: string
+        source: input
+        description: FK -> Account.id; the winning buyer
+      - name: seller_account_id
+        type: string
+        source: input
+        description: FK -> Account.id; copied from the listing's seller at order creation
+      - name: source
+        type: enum
+        source: system
+        description: how the order was created — AUCTION_WIN, BUY_NOW, or OFFER_ACCEPT
+        constraints: values in {AUCTION_WIN, BUY_NOW, OFFER_ACCEPT}
+      - name: item_price_cents
+        type: integer
+        source: system
+        description: the agreed item price (winning bid, buy-now price, or accepted offer)
+      - name: shipping_cents
+        type: integer
+        source: input
+        description: shipping charge entered at checkout; defaults to listing-independent flat value
+        default: 0
+      - name: total_cents
+        type: integer
+        source: computed
+        description: order grand total = item_price_cents + shipping_cents (buyer-facing); see order-total calculation
+      - name: payment_status
+        type: enum
+        source: system
+        description: independent payment dimension
+        default: UNPAID
+        constraints: values in {UNPAID, PAID, REFUNDED, PARTIALLY_REFUNDED}
+      - name: fulfillment_status
+        type: enum
+        source: system
+        description: independent fulfillment dimension; evolves separately from payment_status
+        default: AWAITING_PAYMENT
+        constraints: values in {AWAITING_PAYMENT, READY_TO_SHIP, SHIPPED, DELIVERED, RETURNED, CANCELLED}
+      - name: paid_amount_cents
+        type: integer
+        source: computed
+        description: cumulative captured payment minus cumulative refunds; conserved-quantity anchor for the refund invariant
+        default: 0
+
+  - name: SellerFeeInvoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; the order this final-value fee is charged against
+      - name: seller_account_id
+        type: string
+        source: input
+        description: FK -> Account.id; the seller charged
+      - name: gross_item_cents
+        type: integer
+        source: system
+        description: snapshot of order.item_price_cents at invoice time
+      - name: fvf_rate_basis_points
+        type: integer
+        source: system
+        description: snapshot of the final-value-fee rate (basis points) applied at invoice time
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: the final-value fee owed; see seller-fee calculation (tiered, with insertion fee and cap)
+      - name: settlement_status
+        type: enum
+        source: system
+        description: INVOICED when raised; PAID after settlement; CREDITED when fully reversed by a fee credit (compensation)
+        default: INVOICED
+        constraints: values in {INVOICED, PAID, CREDITED}
+
+  - name: Payment
+    parent: null
+    common_fields: false
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; the order this payment event belongs to
+      - name: kind
+        type: enum
+        source: system
+        description: CHARGE when the buyer pays; REFUND when money is returned (dispute refund or return). Append-only event log; Order.paid_amount_cents is the running sum of CHARGE.amount_cents minus REFUND.amount_cents.
+        constraints: values in {CHARGE, REFUND}
+      - name: amount_cents
+        type: integer
+        source: system
+        description: positive cents moved by this event (CHARGE adds, REFUND subtracts from paid_amount_cents)
+        constraints: amount_cents >= 1
+
+  - name: Feedback
+    parent: null
+    common_fields: false
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; feedback is tied to a completed order
+      - name: rater_account_id
+        type: string
+        source: input
+        description: FK -> Account.id; the account leaving feedback
+      - name: ratee_account_id
+        type: string
+        source: input
+        description: FK -> Account.id; the account being rated (the rater's counterparty on the order)
+      - name: role
+        type: enum
+        source: system
+        description: BUYER when the rater is the order's buyer rating the seller; SELLER when the rater is the order's seller rating the buyer. Pinned from the order; unique (order_id, role).
+        constraints: values in {BUYER, SELLER}
+      - name: rating
+        type: enum
+        source: input
+        description: POSITIVE, NEUTRAL, or NEGATIVE
+        constraints: values in {POSITIVE, NEUTRAL, NEGATIVE}
+      - name: comment
+        type: string
+        source: input
+        description: free-text comment
+        default: ""
+
+  - name: Dispute
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; the order under dispute
+      - name: opener_account_id
+        type: string
+        source: input
+        description: FK -> Account.id; the buyer opening the dispute
+      - name: reason
+        type: enum
+        source: input
+        description: ITEM_NOT_RECEIVED, NOT_AS_DESCRIBED, or DAMAGED
+        constraints: values in {ITEM_NOT_RECEIVED, NOT_AS_DESCRIBED, DAMAGED}
+      - name: requested_amount_cents
+        type: integer
+        source: input
+        description: refund amount the buyer requests; must be <= order.paid_amount_cents
+        constraints: 1 <= requested_amount_cents <= order.paid_amount_cents
+      - name: resolved_amount_cents
+        type: integer
+        source: computed
+        description: amount actually refunded on resolution (admin may approve full or partial)
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: dispute lifecycle
+        default: OPEN
+        constraints: values in {OPEN, SELLER_RESPONDED, ESCALATED, RESOLVED_REFUND, RESOLVED_NO_REFUND, CLOSED}
+
+# =====================================================================
+# §1.2 State Machine Table
+# =====================================================================
+state_machines:
+  - entity: Listing
+    initial_state: DRAFT
+    terminal_states: [ENDED_RESERVE_NOT_MET, ENDED_NO_BIDS, SOLD, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /listings/{id}/publish"
+        actor: Seller
+        preconditions:
+          - "acting Seller owns the listing (seller_account_id == X-User-ID)"
+          - "seller Account.standing == GOOD (fee_balance_cents <= FEE_SUSPEND_THRESHOLD_CENTS)"
+          - "seller Account.status == ACTIVE"
+          - "for AUCTION/HYBRID: scheduled_end_at strictly after current clock"
+        side_effects:
+          - "set effective_end_at = scheduled_end_at (AUCTION/HYBRID); null for BUY_NOW"
+          - "set current_price_cents = start_price_cents for AUCTION/HYBRID"
+          - "increments Listing.version by 1"
+        note: "Cross-entity gate: publish depends on the seller Account's standing (cross_entity_state_dependency: Listing->Account)."
+      - from: ACTIVE
+        to: ENDED_MET
+        trigger: "POST /_clock/advance (auction reaches effective_end_at) — system close with bids and reserve met"
+        actor: system
+        preconditions:
+          - "current clock >= effective_end_at"
+          - "bid_count >= 1"
+          - "reserve_price_cents is null OR highest bid current_price_cents >= reserve_price_cents"
+        side_effects:
+          - "set winner_account_id = winning Bid.bidder_account_id"
+          - "set sold_price_cents = winning Bid.current_price_cents"
+          - "cascade: create Order(source=AUCTION_WIN, item_price_cents=sold_price_cents) -> Order creation cascades a SellerFeeInvoice (depth-3 chain)"
+          - "increments Listing.version by 1"
+        note: "ENDED_MET is a transient bridge: it always cascades into Order creation; the listing then moves to SOLD when the order exists."
+      - from: ENDED_MET
+        to: SOLD
+        trigger: "system continuation of the auction-close cascade once the Order row exists"
+        actor: system
+        preconditions:
+          - "an Order with source==AUCTION_WIN exists for this listing"
+        side_effects:
+          - "increments Listing.version by 1"
+      - from: ACTIVE
+        to: ENDED_RESERVE_NOT_MET
+        trigger: "POST /_clock/advance (auction reaches effective_end_at) — system close with bids but reserve unmet"
+        actor: system
+        preconditions:
+          - "current clock >= effective_end_at"
+          - "bid_count >= 1"
+          - "reserve_price_cents is not null AND highest bid current_price_cents < reserve_price_cents"
+        side_effects:
+          - "no winner; no Order; mark all Bids OUTBID except none winning"
+          - "increments Listing.version by 1"
+      - from: ACTIVE
+        to: ENDED_NO_BIDS
+        trigger: "POST /_clock/advance (auction reaches effective_end_at) — system close with zero bids"
+        actor: system
+        preconditions:
+          - "current clock >= effective_end_at"
+          - "bid_count == 0"
+        side_effects:
+          - "increments Listing.version by 1"
+      - from: ACTIVE
+        to: SOLD
+        trigger: "POST /listings/{id}/buy-now"
+        actor: Buyer
+        preconditions:
+          - "format IN {BUY_NOW, HYBRID}"
+          - "for HYBRID: bid_count == 0 (buy-now option disappears after first bid)"
+          - "buyer holds BUYER role and buyer_account_id != seller_account_id"
+          - "buyer Account.status == ACTIVE"
+        side_effects:
+          - "set winner_account_id = buyer; sold_price_cents = buy_now_price_cents"
+          - "cascade: create Order(source=BUY_NOW) -> Order creation cascades a SellerFeeInvoice"
+          - "increments Listing.version by 1"
+      - from: ACTIVE
+        to: SOLD
+        trigger: "POST /offers/{id}/accept (seller accepts a buyer offer)"
+        actor: Seller
+        preconditions:
+          - "offer.listing_id == this listing; offer.status IN {PENDING, COUNTERED} with last_actor==BUYER"
+          - "accepts_offers == true"
+        side_effects:
+          - "set winner_account_id = offer.buyer; sold_price_cents = offer.amount_cents"
+          - "cascade: Offer -> ACCEPTED; create Order(source=OFFER_ACCEPT) -> Order cascades a SellerFeeInvoice"
+          - "cascade: all other PENDING/COUNTERED Offers on this listing -> DECLINED (conditional cascade)"
+          - "increments Listing.version by 1"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /listings/{id}/cancel"
+        actor: Seller
+        preconditions: ["acting Seller owns the listing"]
+        side_effects: ["increments Listing.version by 1"]
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /listings/{id}/cancel"
+        actor: Seller
+        preconditions:
+          - "acting Seller owns the listing"
+          - "bid_count == 0 (cannot cancel an auction that already has bids)"
+        side_effects:
+          - "cascade: all active Watches remain but listing is closed; all PENDING/COUNTERED Offers -> DECLINED"
+          - "increments Listing.version by 1"
+
+  - entity: Offer
+    initial_state: PENDING
+    terminal_states: [ACCEPTED, DECLINED, EXPIRED, WITHDRAWN]
+    transitions:
+      - from: PENDING
+        to: COUNTERED
+        trigger: "POST /offers/{id}/counter (seller counters a buyer offer)"
+        actor: Seller
+        preconditions:
+          - "acting Seller owns the listing"
+          - "last_actor == BUYER"
+          - "round_no < OFFER_MAX_ROUNDS"
+        side_effects:
+          - "set amount_cents = counter amount; last_actor = SELLER; round_no += 1"
+          - "increments Offer.version by 1"
+        note: "Cyclic negotiation: COUNTERED can return to COUNTERED via buyer re-counter; loop bounded by OFFER_MAX_ROUNDS."
+      - from: COUNTERED
+        to: COUNTERED
+        trigger: "POST /offers/{id}/counter (buyer re-counters a seller counter, or seller counters a buyer re-counter)"
+        actor: Buyer | Seller
+        preconditions:
+          - "buyer counter requires last_actor==SELLER; seller counter requires last_actor==BUYER"
+          - "round_no < OFFER_MAX_ROUNDS"
+        side_effects:
+          - "set amount_cents = counter amount; flip last_actor; round_no += 1"
+          - "increments Offer.version by 1"
+      - from: PENDING
+        to: ACCEPTED
+        trigger: "POST /offers/{id}/accept"
+        actor: Seller
+        preconditions: ["acting Seller owns the listing", "last_actor == BUYER"]
+        side_effects:
+          - "cascade into Listing ACTIVE->SOLD (see Listing machine)"
+          - "increments Offer.version by 1"
+      - from: COUNTERED
+        to: ACCEPTED
+        trigger: "POST /offers/{id}/accept"
+        actor: Buyer | Seller
+        preconditions:
+          - "buyer accepts requires last_actor==SELLER; seller accepts requires last_actor==BUYER"
+        side_effects:
+          - "cascade into Listing ACTIVE->SOLD"
+          - "increments Offer.version by 1"
+      - from: PENDING
+        to: DECLINED
+        trigger: "POST /offers/{id}/decline"
+        actor: Seller
+        preconditions: ["acting Seller owns the listing"]
+        side_effects: ["increments Offer.version by 1"]
+      - from: COUNTERED
+        to: DECLINED
+        trigger: "POST /offers/{id}/decline"
+        actor: Buyer | Seller
+        preconditions: ["actor is the party who did NOT make the standing amount"]
+        side_effects: ["increments Offer.version by 1"]
+      - from: PENDING
+        to: WITHDRAWN
+        trigger: "POST /offers/{id}/withdraw"
+        actor: Buyer
+        preconditions: ["acting Buyer is offer.buyer_account_id", "last_actor == BUYER"]
+        side_effects: ["increments Offer.version by 1"]
+      - from: PENDING
+        to: EXPIRED
+        trigger: "POST /_clock/advance (offer reaches OFFER_TTL_SECONDS past created_at)"
+        actor: system
+        preconditions: ["current clock >= created_at + OFFER_TTL_SECONDS"]
+        side_effects: ["increments Offer.version by 1"]
+      - from: COUNTERED
+        to: EXPIRED
+        trigger: "POST /_clock/advance (offer reaches OFFER_TTL_SECONDS past updated_at)"
+        actor: system
+        preconditions: ["current clock >= updated_at + OFFER_TTL_SECONDS"]
+        side_effects: ["increments Offer.version by 1"]
+
+  - entity: Order
+    initial_state: UNPAID
+    terminal_states: []
+    note: "Parallel dimensions: payment_status (UNPAID->PAID->REFUNDED/PARTIALLY_REFUNDED) and fulfillment_status (AWAITING_PAYMENT->READY_TO_SHIP->SHIPPED->DELIVERED->RETURNED/CANCELLED) evolve on the same Order row independently."
+    transitions:
+      - from: UNPAID
+        to: PAID
+        trigger: "POST /orders/{id}/pay (payment_status dimension)"
+        actor: Buyer
+        preconditions:
+          - "acting Buyer is order.buyer_account_id"
+          - "payment_status == UNPAID"
+        side_effects:
+          - "append Payment(kind=CHARGE, amount_cents=total_cents) for this order"
+          - "set paid_amount_cents = total_cents (running sum of CHARGE minus REFUND)"
+          - "fulfillment_status: AWAITING_PAYMENT -> READY_TO_SHIP (bubble across dimensions)"
+          - "increments Order.version by 1"
+      - from: PAID
+        to: REFUNDED
+        trigger: "system: dispute resolved full-refund OR return completed (payment_status dimension)"
+        actor: system
+        preconditions: ["resolved/returned amount == paid_amount_cents (full)"]
+        side_effects:
+          - "append Payment(kind=REFUND, amount_cents=paid_amount_cents_before)"
+          - "set paid_amount_cents = 0 (compensating invariant: paid_amount_cents conserved against refund)"
+          - "cascade: SellerFeeInvoice for this order -> CREDITED (fee reversed)"
+          - "increments Order.version by 1"
+      - from: PAID
+        to: PARTIALLY_REFUNDED
+        trigger: "system: dispute resolved partial-refund (payment_status dimension)"
+        actor: system
+        preconditions: ["0 < refund amount < paid_amount_cents"]
+        side_effects:
+          - "append Payment(kind=REFUND, amount_cents=refund amount)"
+          - "set paid_amount_cents -= refund amount"
+          - "cascade: SellerFeeInvoice.amount_cents recomputed on the reduced gross (fee adjusted, not credited)"
+          - "increments Order.version by 1"
+      - from: READY_TO_SHIP
+        to: SHIPPED
+        trigger: "POST /orders/{id}/ship (fulfillment_status dimension)"
+        actor: Seller
+        preconditions:
+          - "acting Seller is order.seller_account_id"
+          - "payment_status == PAID"
+          - "fulfillment_status == READY_TO_SHIP"
+        side_effects: ["increments Order.version by 1"]
+        note: "Cross-entity/cross-dimension dependency: ship (fulfillment) requires payment_status==PAID."
+      - from: SHIPPED
+        to: DELIVERED
+        trigger: "POST /orders/{id}/deliver (fulfillment_status dimension)"
+        actor: Buyer
+        preconditions: ["acting Buyer is order.buyer_account_id", "fulfillment_status == SHIPPED"]
+        side_effects: ["increments Order.version by 1"]
+      - from: DELIVERED
+        to: RETURNED
+        trigger: "POST /orders/{id}/complete-return (fulfillment_status dimension)"
+        actor: Seller
+        preconditions:
+          - "fulfillment_status == DELIVERED"
+          - "current clock <= DELIVERED transition time + RETURN_WINDOW_SECONDS"
+        side_effects:
+          - "cascade: payment_status PAID -> REFUNDED (full refund of paid_amount_cents)"
+          - "cascade: SellerFeeInvoice -> CREDITED"
+          - "increments Order.version by 1"
+      - from: AWAITING_PAYMENT
+        to: CANCELLED
+        trigger: "POST /orders/{id}/cancel (unpaid order cancellation, fulfillment_status dimension)"
+        actor: Seller
+        preconditions:
+          - "acting Seller is order.seller_account_id"
+          - "payment_status == UNPAID"
+        side_effects:
+          - "cascade: SellerFeeInvoice -> CREDITED (no sale, fee reversed)"
+          - "cascade: Listing -> CANCELLED if not already terminal"
+          - "increments Order.version by 1"
+
+  - entity: Dispute
+    initial_state: OPEN
+    terminal_states: [RESOLVED_REFUND, RESOLVED_NO_REFUND, CLOSED]
+    transitions:
+      - from: OPEN
+        to: SELLER_RESPONDED
+        trigger: "POST /disputes/{id}/respond"
+        actor: Seller
+        preconditions: ["acting Seller is order.seller_account_id", "Dispute.status == OPEN"]
+        side_effects: ["increments Dispute.version by 1"]
+      - from: OPEN
+        to: ESCALATED
+        trigger: "POST /disputes/{id}/escalate (buyer escalates if seller silent past DISPUTE_RESPONSE_SECONDS)"
+        actor: Buyer
+        preconditions:
+          - "acting Buyer is dispute.opener_account_id"
+          - "current clock >= Dispute.created_at + DISPUTE_RESPONSE_SECONDS"
+        side_effects: ["increments Dispute.version by 1"]
+      - from: SELLER_RESPONDED
+        to: ESCALATED
+        trigger: "POST /disputes/{id}/escalate"
+        actor: Buyer
+        preconditions: ["acting Buyer is dispute.opener_account_id"]
+        side_effects: ["increments Dispute.version by 1"]
+      - from: ESCALATED
+        to: RESOLVED_REFUND
+        trigger: "POST /disputes/{id}/resolve (admin approves refund — branch A)"
+        actor: PlatformAdmin
+        preconditions:
+          - "0 < approved_amount_cents <= order.paid_amount_cents"
+        side_effects:
+          - "set resolved_amount_cents = approved_amount_cents"
+          - "cascade (depth-3): Dispute resolve -> Order payment_status PAID->REFUNDED|PARTIALLY_REFUNDED -> SellerFeeInvoice CREDITED|recomputed"
+          - "increments Dispute.version by 1"
+      - from: ESCALATED
+        to: RESOLVED_NO_REFUND
+        trigger: "POST /disputes/{id}/resolve (admin denies refund — branch B)"
+        actor: PlatformAdmin
+        preconditions: ["approved_amount_cents == 0"]
+        side_effects:
+          - "set resolved_amount_cents = 0; Order payment unchanged; SellerFeeInvoice unchanged (divergent branch side-effects)"
+          - "increments Dispute.version by 1"
+      - from: SELLER_RESPONDED
+        to: CLOSED
+        trigger: "POST /disputes/{id}/close (buyer accepts seller response)"
+        actor: Buyer
+        preconditions: ["acting Buyer is dispute.opener_account_id"]
+        side_effects: ["increments Dispute.version by 1"]
+
+  - entity: SellerFeeInvoice
+    initial_state: INVOICED
+    terminal_states: [PAID, CREDITED]
+    transitions:
+      - from: INVOICED
+        to: PAID
+        trigger: "POST /seller-fee-invoices/{id}/settle"
+        actor: PlatformAdmin
+        preconditions: ["settlement_status == INVOICED"]
+        side_effects:
+          - "recompute seller Account.fee_balance_cents (this invoice now contributes 0) and Account.standing"
+          - "increments SellerFeeInvoice.version by 1"
+      - from: INVOICED
+        to: CREDITED
+        trigger: "system: order cancelled / full refund / return completed reverses the fee"
+        actor: system
+        preconditions: ["the order's payment was fully refunded or the order was cancelled before payment"]
+        side_effects:
+          - "recompute seller Account.fee_balance_cents (this invoice now contributes 0) and Account.standing"
+          - "increments SellerFeeInvoice.version by 1"
+
+# =====================================================================
+# §1.2.1 Concurrency Rules
+# =====================================================================
+concurrency_rules:
+  - rule_id: offer-counter-stale-listing
+    parent_entity: Offer
+    write_endpoint: "POST /offers/{id}/counter"
+    occ_field: "expected_offer_version"
+    description: |
+      Countering an Offer whose version has advanced since the client last
+      observed it is rejected with a stale-version error. This captures the
+      case where the counterparty has already advanced the negotiation
+      (their own counter legitimately moved the standing amount and bumped
+      Offer.version) and the current actor's view of the offer is therefore
+      stale; submitting a counter against the obsolete amount would silently
+      overwrite the counterparty's move.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: order-pay-stale-order
+    parent_entity: Order
+    write_endpoint: "POST /orders/{id}/pay"
+    occ_field: "expected_order_version"
+    description: |
+      Paying an Order whose version has advanced since the client last
+      observed it is rejected with a stale-version error. This captures the
+      case where a cascaded side effect (e.g., a seller cancellation of the
+      unpaid order, or a fee recompute) has already advanced Order.version,
+      so the buyer's checkout view is stale and the payment must be rejected
+      rather than applied against an obsolete total.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 Calculation Rules Table
+# =====================================================================
+calculations:
+  - name: proxy_bid_resolution
+    trigger: "on POST /listings/{id}/bids (each new bid) — recomputes current_price_cents and highest_bid_id"
+    algorithm: chronological
+    formula: |
+      # Inputs: incoming bid B with max_proxy_cents M_new placed at time t.
+      # Let prev = current Listing.highest_bid_id bid (winner) with max M_prev
+      #   and prev committed current_price_cents C_prev. increment = bid_increment(current_price_cents).
+      #
+      # Eligibility for new bid (validated, not part of this calc):
+      #   first bid: M_new >= start_price_cents
+      #   subsequent: M_new >= C_prev + increment (computed on C_prev)
+      #
+      # Resolution:
+      # CASE first bid on listing:
+      #     winner = B; B.current_price_cents = start_price_cents
+      # CASE M_new > M_prev  (new bid takes the lead):
+      #     winner = B
+      #     B.current_price_cents = min(M_new, M_prev + bid_increment(M_prev))
+      #     prev.current_price_cents stays at M_prev; prev.status = OUTBID; prev.is_winning=false
+      # CASE M_new <= M_prev  (proxy holds — incumbent stays winner):
+      #     winner = prev (unchanged)
+      #     prev.current_price_cents = min(M_prev, M_new + bid_increment(M_new))
+      #     B.current_price_cents = M_new; B.status = OUTBID; B.is_winning=false
+      # CASE M_new == M_prev exactly:
+      #     incumbent wins (earlier created_at wins the tie); prev.current_price_cents = M_prev
+      #     B.status = OUTBID at M_new
+      # Listing.current_price_cents = winner.current_price_cents
+    input_set: "all ACCEPTED Bids on the listing plus the incoming bid; OUTBID/RETRACTED bids excluded from winner selection"
+    constants:
+      TIE_BREAK: "earlier Bid.created_at wins when max_proxy_cents are equal"
+    precision: "integer cents; no rounding (increments are integer)"
+    variants:
+      - name: tie_break_equal_max
+        when: "M_new == M_prev"
+        difference: "incumbent retains lead by earlier created_at; price set to the shared max"
+  - name: bid_increment
+    trigger: "called inside proxy_bid_resolution and inside bid eligibility validation"
+    algorithm: tiered_pricing
+    formula: |
+      # Minimum bid increment as a step function of the price the increment is measured ON.
+      # increment(p) where p is in cents:
+      #   p <  100_00       -> 1_00     (1.00 below $100)
+      #   100_00 <= p < 500_00   -> 5_00     (5.00 from $100 up to $500)
+      #   500_00 <= p < 1000_00  -> 10_00    (10.00 from $500 up to $1000)
+      #   p >= 1000_00      -> 25_00    (25.00 at $1000 and above)
+      # Boundary: 500_00 takes the 10_00 tier (>= lower edge wins). 499_99 takes 5_00.
+    input_set: "a single price value p in integer cents"
+    constants:
+      T1_EDGE_CENTS: 10000
+      T2_EDGE_CENTS: 50000
+      T3_EDGE_CENTS: 100000
+      INC_T0_CENTS: 100
+      INC_T1_CENTS: 500
+      INC_T2_CENTS: 1000
+      INC_T3_CENTS: 2500
+    precision: "integer cents; tier selected by lower-edge-inclusive comparison (>=)"
+  - name: snipe_extension
+    trigger: "on POST /listings/{id}/bids when the bid is accepted and the auction is near close"
+    algorithm: interval_merge
+    formula: |
+      # Anti-sniping: a winning/accepted bid placed inside the soft-close window
+      # pushes the effective_end_at forward.
+      # remaining = effective_end_at - current_clock  (seconds)
+      # IF remaining <= SNIPE_TRIGGER_SECONDS AND remaining > 0:
+      #     effective_end_at = current_clock + SNIPE_EXTENSION_SECONDS
+      # ELSE: effective_end_at unchanged
+      # Boundary: remaining == SNIPE_TRIGGER_SECONDS triggers extension (<=).
+      # remaining == SNIPE_TRIGGER_SECONDS + 1 does NOT.
+      # Each qualifying bid resets the window from current_clock (windows do not stack;
+      # the new end is always current_clock + SNIPE_EXTENSION_SECONDS, never a sum).
+    input_set: "the single Listing's effective_end_at vs the current clock at bid time"
+    constants:
+      SNIPE_TRIGGER_SECONDS: 300
+      SNIPE_EXTENSION_SECONDS: 300
+      # Domain time/round constants used by §1.2 state machines and §1.4 validations:
+      BID_RETRACT_LOCKOUT_SECONDS: 43200      # 12h before effective_end_at; retraction forbidden inside this window
+      OFFER_TTL_SECONDS: 86400                # 24h; PENDING offer expires this long after created_at, COUNTERED after updated_at
+      OFFER_MAX_ROUNDS: 5                     # counter rejected once round_no >= 5
+      RETURN_WINDOW_SECONDS: 1209600         # 14d after DELIVERED; complete-return forbidden after
+      DISPUTE_RESPONSE_SECONDS: 259200       # 72h; buyer may escalate only after this elapses from Dispute.created_at
+    precision: "whole seconds; comparison on UTC timestamps"
+  - name: seller_fee
+    trigger: "on Order creation (cascade from auction close / buy-now / offer accept) — produces SellerFeeInvoice.amount_cents; recomputed on partial refund"
+    algorithm: tiered_pricing
+    formula: |
+      # Final value fee (FVF) on gross_item_cents G, plus a flat insertion fee, capped.
+      # Marginal tiered rate (basis points apply to the slice in each tier):
+      #   slice 0          .. 25_000   cents -> FVF_BP_T1 (1255 bp = 12.55%)
+      #   slice 25_000     .. 75_000   cents -> FVF_BP_T2 (925 bp  = 9.25%)
+      #   slice above 75_000 cents           -> FVF_BP_T3 (255 bp  = 2.55%)
+      # fvf = sum over tiers of (slice_cents * tier_bp / 10000), rounding ONCE at the end.
+      # ROUNDING ORDER IS PINNED: compute each tier slice's exact product, SUM the exact
+      #   products, THEN round_half_up to whole cents (sum-then-round, NOT round-per-tier).
+      #   These two orders DIVERGE: e.g. G=30000 -> slice products 3137.5 + 462.5 = 3600.0 exact
+      #   (sum-then-round = 3600), whereas round-per-tier = round(3137.5)+round(462.5) = 3138+463 = 3601.
+      #   The scaffold pins SUM-THEN-ROUND.
+      # total_fee = round_half_up(fvf_exact) + INSERTION_FEE_CENTS
+      # total_fee = min(total_fee, FVF_CAP_CENTS)
+      # fvf_rate_basis_points snapshot = effective blended rate*10000 rounded for audit (display only).
+    input_set: "the single Order's item_price_cents as gross_item_cents"
+    constants:
+      FVF_T1_EDGE_CENTS: 25000
+      FVF_T2_EDGE_CENTS: 75000
+      FVF_BP_T1: 1255
+      FVF_BP_T2: 925
+      FVF_BP_T3: 255
+      INSERTION_FEE_CENTS: 30
+      FVF_CAP_CENTS: 75000
+    precision: "2 decimal places of a dollar = integer cents; round_half_up applied ONCE after summing exact tier products"
+  - name: account_feedback_score
+    trigger: "on Feedback creation — recomputes ratee Account.feedback_score"
+    algorithm: aggregation
+    formula: |
+      # Net score over all Feedback rows where ratee_account_id == account.id:
+      # score = count(rating==POSITIVE) - count(rating==NEGATIVE)
+      # NEUTRAL contributes 0. No time window (lifetime). Recomputed full on each new feedback.
+    input_set: "all Feedback rows for the ratee account; no status filter (Feedback is append-only)"
+    constants: {}
+    precision: "integer count"
+  - name: seller_fee_balance
+    trigger: "on SellerFeeInvoice create / settle / credit / recompute — recomputes seller Account.fee_balance_cents and standing"
+    algorithm: aggregation
+    formula: |
+      # fee_balance_cents = sum(SellerFeeInvoice.amount_cents WHERE seller==acct AND settlement_status==INVOICED)
+      # (PAID and CREDITED invoices contribute 0 to the outstanding balance.)
+      # standing = SUSPENDED if fee_balance_cents > FEE_SUSPEND_THRESHOLD_CENTS else GOOD.
+      # Boundary: fee_balance_cents == FEE_SUSPEND_THRESHOLD_CENTS is GOOD (strictly greater suspends).
+    input_set: "all SellerFeeInvoice rows for the seller with settlement_status==INVOICED"
+    constants:
+      FEE_SUSPEND_THRESHOLD_CENTS: 3000
+    precision: "integer cents"
+
+# =====================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =====================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except anonymous read endpoints"
+  - priority: 2
+    category: auth
+    check: "acting role permitted for this operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all role-gated endpoints"
+  - priority: 3
+    category: auth
+    check: "ownership — acting account is the owner of the targeted resource (seller of listing/order, buyer of bid/offer/order, opener of dispute)"
+    error_id: ERR_NOT_OWNER
+    http_status: 403
+    applies_to: "all owner-scoped mutations"
+  - priority: 4
+    category: existence
+    check: "path/body-referenced resources exist (listing, bid, offer, order, dispute, account), validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+  - priority: 5
+    category: state
+    check: "OCC: expected_<parent>_version matches current parent.version for OCC-guarded writes"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /offers/{id}/counter, POST /orders/{id}/pay"
+  - priority: 6
+    category: state
+    check: "target resource is in a state from which the requested transition is defined"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-changing endpoints"
+  - priority: 7
+    category: business_temporal
+    check: "auction not yet closed — bids/offers rejected once current clock >= effective_end_at (auction) or listing terminal"
+    error_id: ERR_AUCTION_CLOSED
+    http_status: 409
+    applies_to: "POST /listings/{id}/bids, POST /listings/{id}/buy-now, POST /listings/{id}/offers"
+  - priority: 8
+    category: business_temporal
+    check: "return window / dispute window — return-complete after RETURN_WINDOW_SECONDS rejected; escalate before DISPUTE_RESPONSE_SECONDS rejected"
+    error_id: ERR_WINDOW_EXPIRED
+    http_status: 409
+    applies_to: "POST /orders/{id}/complete-return, POST /disputes/{id}/escalate"
+  - priority: 9
+    category: business_safety
+    check: "self-dealing — bidder/offerer/buyer must not be the listing's seller"
+    error_id: ERR_SELF_TRADING
+    http_status: 422
+    applies_to: "POST /listings/{id}/bids, POST /listings/{id}/buy-now, POST /listings/{id}/offers"
+  - priority: 10
+    category: business_safety
+    check: "seller standing gate — a seller whose Account.standing==SUSPENDED cannot publish listings"
+    error_id: ERR_SELLER_SUSPENDED
+    http_status: 422
+    applies_to: "POST /listings/{id}/publish"
+  - priority: 11
+    category: business_constraint
+    check: "bid eligibility — first bid max_proxy_cents >= start_price_cents; subsequent bid max_proxy_cents >= current_price_cents + bid_increment(current_price_cents)"
+    error_id: ERR_BID_TOO_LOW
+    http_status: 422
+    applies_to: "POST /listings/{id}/bids"
+  - priority: 12
+    category: business_constraint
+    check: "offer amount eligibility — 1 <= amount_cents < listing.buy_now_price_cents; listing.accepts_offers==true"
+    error_id: ERR_OFFER_INVALID
+    http_status: 422
+    applies_to: "POST /listings/{id}/offers, POST /offers/{id}/counter"
+  - priority: 13
+    category: business_constraint
+    check: "offer round cap — counter rejected when round_no >= OFFER_MAX_ROUNDS"
+    error_id: ERR_OFFER_ROUND_LIMIT
+    http_status: 422
+    applies_to: "POST /offers/{id}/counter"
+  - priority: 14
+    category: business_constraint
+    check: "bid retraction lockout — a Bid may be retracted only > BID_RETRACT_LOCKOUT_SECONDS before effective_end_at and only if not currently winning"
+    error_id: ERR_RETRACT_NOT_ALLOWED
+    http_status: 422
+    applies_to: "POST /bids/{id}/retract"
+  - priority: 15
+    category: business_referential
+    check: "feedback eligibility — order.fulfillment_status IN {DELIVERED, RETURNED}; rater is buyer or seller of the order; unique (order_id, role)"
+    error_id: ERR_FEEDBACK_NOT_ELIGIBLE
+    http_status: 422
+    applies_to: "POST /orders/{id}/feedback"
+  - priority: 16
+    category: business_referential
+    check: "dispute eligibility — order.payment_status==PAID; requested_amount_cents <= order.paid_amount_cents; one OPEN dispute per order"
+    error_id: ERR_DISPUTE_NOT_ELIGIBLE
+    http_status: 422
+    applies_to: "POST /orders/{id}/disputes"
+  - priority: 17
+    category: business_constraint
+    check: "field-shape validation — required fields present, enums in range, integers >= constraints (start_price_cents>=1, etc.)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all
+
+# =====================================================================
+# §1.5 API Endpoint Table
+# =====================================================================
+endpoints:
+  # ---- Accounts ----
+  - method: POST
+    path: "/accounts"
+    description: "register an account (buyer/seller/both)"
+    roles: [Anonymous]
+    code: 201
+    input: [email, display_name, roles]
+    output: Account
+    side_effects: ["account created ACTIVE with fee_balance_cents=0, feedback_score=0, standing=GOOD"]
+  - method: GET
+    path: "/accounts/{id}"
+    description: "fetch an account (public profile incl. feedback_score, standing)"
+    roles: [Anonymous, Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: []
+    output: Account
+    side_effects: []
+  - method: GET
+    path: "/accounts/{id}/feedback"
+    description: "list feedback received by this account (reverse-reachability for Feedback.ratee_account_id)"
+    roles: [Anonymous, Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Feedback[]
+    side_effects: []
+  - method: GET
+    path: "/accounts/{id}/invoices"
+    description: "list seller-fee invoices for this seller (reverse-reachability for SellerFeeInvoice.seller_account_id)"
+    roles: [Seller, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: SellerFeeInvoice[]
+    side_effects: []
+  - method: POST
+    path: "/accounts/{id}/close"
+    description: "admin closes an account"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["Account.status -> CLOSED"]
+  # ---- Listings ----
+  - method: POST
+    path: "/listings"
+    description: "create a DRAFT listing"
+    roles: [Seller]
+    code: 201
+    input: [seller_account_id, title, format, "start_price_cents?", "buy_now_price_cents?", "reserve_price_cents?", "accepts_offers?", "scheduled_end_at?"]
+    output: Listing
+    side_effects: ["listing created in DRAFT"]
+  - method: GET
+    path: "/listings/{id}"
+    description: "fetch a listing with computed price fields"
+    roles: [Anonymous, Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: []
+    output: Listing
+    side_effects: []
+  - method: GET
+    path: "/listings"
+    description: "list listings (filterable by seller_account_id, status)"
+    roles: [Anonymous, Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: ["seller_account_id?", "status?", "limit?", "offset?"]
+    output: Listing[]
+    side_effects: []
+  - method: POST
+    path: "/listings/{id}/publish"
+    description: "publish DRAFT->ACTIVE (gated by seller standing)"
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Listing
+    side_effects: ["set effective_end_at, current_price_cents; increments Listing.version by 1"]
+  - method: POST
+    path: "/listings/{id}/cancel"
+    description: "cancel a DRAFT or bid-free ACTIVE listing"
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Listing
+    side_effects: ["Listing -> CANCELLED; cascade open Offers -> DECLINED; increments Listing.version by 1"]
+  - method: POST
+    path: "/listings/{id}/buy-now"
+    description: "instant purchase for BUY_NOW/HYBRID"
+    roles: [Buyer]
+    code: 201
+    input: [buyer_account_id, "shipping_cents?"]
+    output: Order
+    side_effects: ["Listing -> SOLD; cascade create Order(BUY_NOW) -> cascade SellerFeeInvoice; increments Listing.version by 1"]
+  # ---- Bids ----
+  - method: POST
+    path: "/listings/{id}/bids"
+    description: "place a proxy bid"
+    roles: [Buyer]
+    code: 201
+    input: [bidder_account_id, max_proxy_cents]
+    output: Bid
+    side_effects: ["proxy_bid_resolution recomputes current_price_cents/highest_bid_id; snipe_extension may push effective_end_at; bid_count incremented; increments Listing.version by 1"]
+  - method: GET
+    path: "/bids/{id}"
+    description: "fetch a bid"
+    roles: [Anonymous, Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: []
+    output: Bid
+    side_effects: []
+  - method: GET
+    path: "/bids"
+    description: "list bids filtered by listing_id and/or bidder_account_id (reverse-reachability for Bid.listing_id and Bid.bidder_account_id)"
+    roles: [Anonymous, Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: ["listing_id?", "bidder_account_id?", "limit?", "offset?"]
+    output: Bid[]
+    side_effects: []
+  - method: POST
+    path: "/bids/{id}/retract"
+    description: "retract a non-winning bid outside the lockout window"
+    roles: [Buyer]
+    code: 200
+    input: []
+    output: Bid
+    side_effects: ["Bid -> RETRACTED; proxy_bid_resolution re-run on remaining ACCEPTED bids; increments Listing.version by 1"]
+  # ---- Watches ----
+  - method: POST
+    path: "/listings/{id}/watch"
+    description: "watch a listing"
+    roles: [Buyer, Seller]
+    code: 201
+    input: [watcher_account_id]
+    output: Watch
+    side_effects: ["create/reactivate Watch with active=true"]
+  - method: GET
+    path: "/watches/{id}"
+    description: "fetch a watch by id"
+    roles: [Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: []
+    output: Watch
+    side_effects: []
+  - method: DELETE
+    path: "/watches/{id}"
+    description: "unwatch (soft delete: active=false)"
+    roles: [Buyer, Seller]
+    code: 200
+    input: []
+    output: Watch
+    side_effects: ["Watch.active -> false"]
+  - method: GET
+    path: "/watches"
+    description: "list watches filtered by listing_id and/or watcher_account_id (reverse-reachability for Watch FKs); active-only by default"
+    roles: [Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: ["listing_id?", "watcher_account_id?", "include_inactive?", "limit?", "offset?"]
+    output: Watch[]
+    side_effects: []
+  # ---- Offers ----
+  - method: POST
+    path: "/listings/{id}/offers"
+    description: "submit a buyer offer"
+    roles: [Buyer]
+    code: 201
+    input: [buyer_account_id, amount_cents]
+    output: Offer
+    side_effects: ["create Offer PENDING round_no=1 last_actor=BUYER"]
+  - method: GET
+    path: "/offers/{id}"
+    description: "fetch an offer"
+    roles: [Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: []
+    output: Offer
+    side_effects: []
+  - method: GET
+    path: "/offers"
+    description: "list offers filtered by listing_id and/or buyer_account_id (reverse-reachability for Offer FKs)"
+    roles: [Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: ["listing_id?", "buyer_account_id?", "limit?", "offset?"]
+    output: Offer[]
+    side_effects: []
+  - method: POST
+    path: "/offers/{id}/counter"
+    description: "counter an offer (seller or buyer), OCC-guarded"
+    roles: [Buyer, Seller]
+    code: 200
+    input: [amount_cents, expected_offer_version]
+    output: Offer
+    side_effects: ["amount/last_actor/round_no updated; increments Offer.version by 1"]
+  - method: POST
+    path: "/offers/{id}/accept"
+    description: "accept the standing offer amount"
+    roles: [Buyer, Seller]
+    code: 200
+    input: ["shipping_cents?"]
+    output: Offer
+    side_effects: ["Offer -> ACCEPTED; cascade Listing -> SOLD; create Order(OFFER_ACCEPT) -> SellerFeeInvoice; other open Offers -> DECLINED; increments Offer.version by 1"]
+  - method: POST
+    path: "/offers/{id}/decline"
+    description: "decline the standing offer"
+    roles: [Buyer, Seller]
+    code: 200
+    input: []
+    output: Offer
+    side_effects: ["Offer -> DECLINED; increments Offer.version by 1"]
+  - method: POST
+    path: "/offers/{id}/withdraw"
+    description: "buyer withdraws their pending offer"
+    roles: [Buyer]
+    code: 200
+    input: []
+    output: Offer
+    side_effects: ["Offer -> WITHDRAWN; increments Offer.version by 1"]
+  # ---- Orders ----
+  - method: GET
+    path: "/orders/{id}"
+    description: "fetch an order with totals and dual statuses"
+    roles: [Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+  - method: GET
+    path: "/orders"
+    description: "list orders filtered by listing_id, buyer_account_id, seller_account_id (reverse-reachability for Order FKs)"
+    roles: [Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: ["listing_id?", "buyer_account_id?", "seller_account_id?", "limit?", "offset?"]
+    output: Order[]
+    side_effects: []
+  - method: POST
+    path: "/orders/{id}/pay"
+    description: "buyer pays the order total, OCC-guarded"
+    roles: [Buyer]
+    code: 200
+    input: [expected_order_version]
+    output: Order
+    side_effects: ["payment_status -> PAID; paid_amount_cents=total_cents; fulfillment_status -> READY_TO_SHIP; increments Order.version by 1"]
+  - method: POST
+    path: "/orders/{id}/ship"
+    description: "seller marks order shipped"
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["fulfillment_status -> SHIPPED; increments Order.version by 1"]
+  - method: POST
+    path: "/orders/{id}/deliver"
+    description: "buyer confirms delivery"
+    roles: [Buyer]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["fulfillment_status -> DELIVERED; records delivery time; increments Order.version by 1"]
+  - method: POST
+    path: "/orders/{id}/cancel"
+    description: "seller cancels an unpaid order"
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["fulfillment_status -> CANCELLED; cascade SellerFeeInvoice -> CREDITED; cascade Listing -> CANCELLED; increments Order.version by 1"]
+  - method: POST
+    path: "/orders/{id}/complete-return"
+    description: "seller completes a return after delivery (within window)"
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["fulfillment_status -> RETURNED; cascade payment_status -> REFUNDED; cascade SellerFeeInvoice -> CREDITED; increments Order.version by 1"]
+  - method: GET
+    path: "/orders/{id}/invoice"
+    description: "fetch the seller-fee invoice for an order (computed read)"
+    roles: [Seller, PlatformAdmin]
+    code: 200
+    input: []
+    output: SellerFeeInvoice
+    side_effects: []
+  - method: GET
+    path: "/orders/{id}/payments"
+    description: "list the payment events (CHARGE/REFUND) for an order (reverse-reachability for Payment.order_id)"
+    roles: [Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Payment[]
+    side_effects: []
+  - method: GET
+    path: "/seller-fee-invoices/{id}"
+    description: "fetch a seller-fee invoice by id"
+    roles: [Seller, PlatformAdmin]
+    code: 200
+    input: []
+    output: SellerFeeInvoice
+    side_effects: []
+  - method: GET
+    path: "/seller-fee-invoices"
+    description: "list seller-fee invoices filtered by order_id and/or seller_account_id (reverse-reachability for SellerFeeInvoice FKs)"
+    roles: [Seller, PlatformAdmin]
+    code: 200
+    input: ["order_id?", "seller_account_id?", "limit?", "offset?"]
+    output: SellerFeeInvoice[]
+    side_effects: []
+  - method: POST
+    path: "/seller-fee-invoices/{id}/settle"
+    description: "settle an outstanding seller-fee invoice (INVOICED -> PAID); admin/billing action"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: SellerFeeInvoice
+    side_effects: ["settlement_status INVOICED -> PAID; recompute seller Account.fee_balance_cents and standing; increments SellerFeeInvoice.version by 1"]
+  # ---- Feedback ----
+  - method: POST
+    path: "/orders/{id}/feedback"
+    description: "leave feedback on an order"
+    roles: [Buyer, Seller]
+    code: 201
+    input: [rater_account_id, rating, "comment?"]
+    output: Feedback
+    side_effects: ["create Feedback; recompute ratee Account.feedback_score"]
+  - method: GET
+    path: "/orders/{id}/feedback-entries"
+    description: "list feedback rows tied to an order (reverse-reachability for Feedback.order_id)"
+    roles: [Anonymous, Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Feedback[]
+    side_effects: []
+  - method: GET
+    path: "/feedback/{id}"
+    description: "fetch a feedback row by id"
+    roles: [Anonymous, Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: []
+    output: Feedback
+    side_effects: []
+  - method: GET
+    path: "/feedback"
+    description: "list feedback filtered by order_id, rater_account_id, and/or ratee_account_id (reverse-reachability for Feedback FKs)"
+    roles: [Anonymous, Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: ["order_id?", "rater_account_id?", "ratee_account_id?", "limit?", "offset?"]
+    output: Feedback[]
+    side_effects: []
+  # ---- Disputes ----
+  - method: POST
+    path: "/orders/{id}/disputes"
+    description: "buyer opens a dispute on a paid order"
+    roles: [Buyer]
+    code: 201
+    input: [opener_account_id, reason, requested_amount_cents]
+    output: Dispute
+    side_effects: ["create Dispute OPEN"]
+  - method: GET
+    path: "/disputes/{id}"
+    description: "fetch a dispute"
+    roles: [Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: []
+  - method: GET
+    path: "/disputes"
+    description: "list disputes filtered by order_id and/or opener_account_id (reverse-reachability for Dispute FKs)"
+    roles: [Buyer, Seller, PlatformAdmin]
+    code: 200
+    input: ["order_id?", "opener_account_id?", "limit?", "offset?"]
+    output: Dispute[]
+    side_effects: []
+  - method: POST
+    path: "/disputes/{id}/respond"
+    description: "seller responds to a dispute"
+    roles: [Seller]
+    code: 200
+    input: ["message?"]
+    output: Dispute
+    side_effects: ["Dispute -> SELLER_RESPONDED; increments Dispute.version by 1"]
+  - method: POST
+    path: "/disputes/{id}/escalate"
+    description: "buyer escalates a dispute to platform"
+    roles: [Buyer]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["Dispute -> ESCALATED; increments Dispute.version by 1"]
+  - method: POST
+    path: "/disputes/{id}/close"
+    description: "buyer closes a dispute accepting the seller response"
+    roles: [Buyer]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["Dispute -> CLOSED; increments Dispute.version by 1"]
+  - method: POST
+    path: "/disputes/{id}/resolve"
+    description: "admin resolves an escalated dispute (refund or no-refund)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [approved_amount_cents]
+    output: Dispute
+    side_effects: ["Dispute -> RESOLVED_REFUND|RESOLVED_NO_REFUND; cascade Order payment_status + SellerFeeInvoice; increments Dispute.version by 1"]
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set"
+    description: "test-driving: set the system UTC clock to an absolute timestamp"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["system clock set"]
+  - method: POST
+    path: "/_clock/advance"
+    description: "test-driving: advance the clock and fire all due timers (auction close, offer expiry, etc.)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["clock advanced; due auctions close (cascade Orders+Invoices); due offers EXPIRE; listings auto-transition"]
+
+# =====================================================================
+# §1.6 Error Code Catalog
+# =====================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/malformed X-User-Role or X-User-ID on a protected endpoint"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "acting role not permitted for this operation"
+  - id: ERR_NOT_OWNER
+    http: 403
+    condition: "acting account does not own the targeted resource"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced resource does not exist"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_<parent>_version does not match current parent.version (OCC)"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested transition not defined from the resource's current state"
+  - id: ERR_AUCTION_CLOSED
+    http: 409
+    condition: "bid/offer/buy-now attempted after the auction's effective_end_at or on a terminal listing"
+  - id: ERR_WINDOW_EXPIRED
+    http: 409
+    condition: "operation outside its temporal window (return after RETURN_WINDOW_SECONDS; escalate before DISPUTE_RESPONSE_SECONDS)"
+  - id: ERR_SELF_TRADING
+    http: 422
+    condition: "the bidder/offerer/buyer is the listing's seller"
+  - id: ERR_SELLER_SUSPENDED
+    http: 422
+    condition: "seller Account.standing==SUSPENDED attempts to publish a listing"
+  - id: ERR_BID_TOO_LOW
+    http: 422
+    condition: "max_proxy_cents below the minimum acceptable bid (start_price or current_price + increment)"
+  - id: ERR_OFFER_INVALID
+    http: 422
+    condition: "offer amount out of range, listing does not accept offers, or counter on a non-offer listing"
+  - id: ERR_OFFER_ROUND_LIMIT
+    http: 422
+    condition: "counter attempted when round_no >= OFFER_MAX_ROUNDS"
+  - id: ERR_RETRACT_NOT_ALLOWED
+    http: 422
+    condition: "bid retraction inside lockout window or on a currently-winning bid"
+  - id: ERR_FEEDBACK_NOT_ELIGIBLE
+    http: 422
+    condition: "order not in a feedback-eligible state, rater not a party, or duplicate (order_id, role)"
+  - id: ERR_DISPUTE_NOT_ELIGIBLE
+    http: 422
+    condition: "order not PAID, requested amount exceeds paid_amount_cents, or an OPEN dispute already exists"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "missing required field, bad enum, or numeric constraint violation"
+  - id: ERR_REFUND_EXCEEDS_PAID
+    http: 422
+    condition: "admin approved_amount_cents exceeds order.paid_amount_cents on resolve"
+  - id: ERR_ACCOUNT_CLOSED
+    http: 403
+    condition: "acting Account.status==CLOSED attempts any mutation"
+
+# =====================================================================
+# §1.7 RBAC Matrix
+# =====================================================================
+roles:
+  - name: Anonymous
+    description: "unauthenticated public reader"
+    identity: "opaque"
+    exclusive_operations: ["POST /accounts"]
+    shared_operations:
+      - "GET /listings"
+      - "GET /listings/{id}"
+      - "GET /bids/{id}"
+      - "GET /bids"
+      - "GET /accounts/{id}"
+      - "GET /accounts/{id}/feedback"
+      - "GET /orders/{id}/feedback-entries"
+  - name: Buyer
+    description: "account holding BUYER role; bids, offers, buys, pays, disputes"
+    identity: "entity_backed:Account"
+    exclusive_operations:
+      - "POST /listings/{id}/bids"
+      - "POST /bids/{id}/retract"
+      - "POST /listings/{id}/buy-now"
+      - "POST /listings/{id}/offers"
+      - "POST /offers/{id}/withdraw"
+      - "POST /orders/{id}/pay"
+      - "POST /orders/{id}/deliver"
+      - "POST /orders/{id}/disputes"
+      - "POST /disputes/{id}/escalate"
+      - "POST /disputes/{id}/close"
+    shared_operations:
+      - "POST /listings/{id}/watch"
+      - "DELETE /watches/{id}"
+      - "GET /watches"
+      - "POST /offers/{id}/counter"
+      - "POST /offers/{id}/accept"
+      - "POST /offers/{id}/decline"
+      - "GET /offers/{id}"
+      - "GET /offers"
+      - "GET /orders/{id}"
+      - "GET /orders"
+      - "POST /orders/{id}/feedback"
+      - "GET /disputes/{id}"
+      - "GET /disputes"
+  - name: Seller
+    description: "account holding SELLER role; creates/publishes listings, ships, handles offers/disputes, owns fee invoices"
+    identity: "entity_backed:Account"
+    exclusive_operations:
+      - "POST /listings"
+      - "POST /listings/{id}/publish"
+      - "POST /listings/{id}/cancel"
+      - "POST /orders/{id}/ship"
+      - "POST /orders/{id}/cancel"
+      - "POST /orders/{id}/complete-return"
+      - "GET /orders/{id}/invoice"
+      - "GET /accounts/{id}/invoices"
+      - "POST /disputes/{id}/respond"
+    shared_operations:
+      - "POST /listings/{id}/watch"
+      - "DELETE /watches/{id}"
+      - "GET /watches"
+      - "POST /offers/{id}/counter"
+      - "POST /offers/{id}/accept"
+      - "POST /offers/{id}/decline"
+      - "GET /offers/{id}"
+      - "GET /offers"
+      - "GET /orders/{id}"
+      - "GET /orders"
+      - "POST /orders/{id}/feedback"
+      - "GET /disputes/{id}"
+      - "GET /disputes"
+  - name: PlatformAdmin
+    description: "platform operator; resolves disputes, closes accounts, drives the clock"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /accounts/{id}/close"
+      - "POST /disputes/{id}/resolve"
+      - "POST /seller-fee-invoices/{id}/settle"
+      - "POST /_clock/set"
+      - "POST /_clock/advance"
+    shared_operations:
+      - "GET /listings"
+      - "GET /listings/{id}"
+      - "GET /orders/{id}"
+      - "GET /orders"
+      - "GET /orders/{id}/payments"
+      - "GET /offers/{id}"
+      - "GET /offers"
+      - "GET /disputes/{id}"
+      - "GET /disputes"
+      - "GET /accounts/{id}"
+      - "GET /accounts/{id}/invoices"
+      - "GET /seller-fee-invoices/{id}"
+      - "GET /seller-fee-invoices"
+      - "GET /orders/{id}/invoice"

@@ -1,0 +1,37 @@
+"""Domain thresholds — numeric constants from the PRD calculations (§3.4–§3.8)."""
+
+# Seat subtotal (PRD §3.4)
+SPLIT_SURCHARGE_CENTS = 1500
+GROUP_THRESHOLD = 4
+GROUP_DISCOUNT_PCT = 10
+
+# Deposit (PRD §3.4)
+DEPOSIT_PCT = 25
+MIN_DEPOSIT_CENTS = 2000
+
+# Add-on line (PRD §3.5)
+ADDON_RATE_CARD = {
+    "BAIT": 800,
+    "ROD_RENTAL": 2500,
+    "FISH_CLEANING": 1200,
+    "COOLER_ICE": 600,
+}
+BULK_QTY = 10
+BULK_PCT = 15
+
+# Cancellation refund (PRD §3.8)
+FULL_REFUND_HOURS = 72
+PARTIAL_REFUND_HOURS = 24
+PARTIAL_PCT = 50
+
+# Gratuity (PRD §3.8)
+AUTO_GRAT_PARTY = 6
+AUTO_GRAT_PCT = 20
+
+# Reschedule fee (PRD §3.7)
+FIRST_RESCHEDULE_FEE_CENTS = 1000
+SECOND_RESCHEDULE_FEE_CENTS = 2500
+REPEAT_RESCHEDULE_PCT = 15
+
+# Default marina turnaround buffer (PRD §3.1)
+DEFAULT_TURNAROUND_BUFFER_MINUTES = 30

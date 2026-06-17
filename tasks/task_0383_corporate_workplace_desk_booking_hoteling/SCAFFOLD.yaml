@@ -1,0 +1,1486 @@
+scenario: "383. Corporate Workplace & Desk Booking (Hoteling): floor-plan & seat/room inventory, reservation & check-in, neighborhood/team zoning, occupancy & utilization analytics, visitor desk, no-show release, capacity policy, amenity request"
+domain_name: workplace-desk-booking-hoteling
+api_prefix: /workplace
+
+complexity_profile:
+  primary_archetype: temporal_windowing
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - rate_threshold_triggers      # no-show strike score crosses suspend threshold
+    - cascading_side_effects       # release cascades: reservation -> seat free -> neighborhood occupancy -> amenity cancel
+    - scheduled_deferred_actions   # check-in window + no-show grace release driven by a settable clock
+    - derived_field_reconciliation # neighborhood/seat occupancy counters and employee strike_score kept consistent
+    - optimistic_concurrency       # OCC on Seat.version / Room.version for create-with-supersede races
+    - dual_variant_calculation     # provisional vs final amenity chargeback; planned vs realized utilization
+
+  entity_topology: hybrid
+  # Site -> Floor -> Neighborhood -> Seat is a strict tree; Room hangs off Floor;
+  # Reservation is a flat entity referencing Seat/Room + Employee across the tree;
+  # CheckIn / AmenityRequest / NoShowEvent are children of Reservation/Employee.
+
+  state_machine_shape: parallel
+  # Reservation carries two independent dimensions: occupancy_status (booking
+  # lifecycle) and billing_status (amenity chargeback lifecycle). VisitorPass is
+  # cyclic (REQUESTED -> revise loop). Employee privilege is compound (derived
+  # from strike_score). AmenityRequest is branching (approve/deny fork).
+
+  relationship_patterns:
+    - one_to_many          # Floor->Neighborhood, Neighborhood->Seat, Reservation->AmenityRequest
+    - cross_aggregate      # Reservation references Seat/Room and Employee across aggregates
+    - polymorphic          # Reservation.resource_type selects Seat | Room target
+
+  role_model: peer_roles
+  # Employee books own reservations; FacilityManager owns inventory + policy +
+  # forced release; Receptionist owns visitor desk; Analyst reads utilization.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: Site
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: building / campus name
+        constraints: non-empty, max 120 chars
+      - name: timezone
+        type: string
+        source: input
+        description: IANA tz used to interpret booking dates against the clock
+        default: "UTC"
+      - name: status
+        type: enum
+        source: system
+        description: lifecycle of the site
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, ARCHIVED}"
+
+  - name: Floor
+    parent: Site
+    common_fields: true
+    fields:
+      - name: site_id
+        type: string
+        source: input
+        description: "FK -> Site.id; the building this floor belongs to"
+      - name: level
+        type: integer
+        source: input
+        description: floor level number, unique within a site
+        constraints: integer, unique per site_id
+      - name: workday_start_minute
+        type: integer
+        source: input
+        description: minutes-from-midnight when the bookable workday opens (local)
+        default: 540
+        constraints: "0 <= workday_start_minute < workday_end_minute <= 1440"
+      - name: workday_end_minute
+        type: integer
+        source: input
+        description: minutes-from-midnight when the bookable workday closes (local)
+        default: 1080
+        constraints: "workday_start_minute < workday_end_minute <= 1440"
+      - name: capacity_minutes
+        type: integer
+        source: computed
+        description: "workday_end_minute - workday_start_minute; denominator for utilization"
+      - name: status
+        type: enum
+        source: system
+        description: lifecycle of the floor
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, ARCHIVED}"
+
+  - name: Neighborhood
+    parent: Floor
+    common_fields: true
+    fields:
+      - name: floor_id
+        type: string
+        source: input
+        description: "FK -> Floor.id; the floor this zone sits on"
+      - name: name
+        type: string
+        source: input
+        description: zone label, e.g. "Engineering East"
+        constraints: non-empty, unique per floor_id
+      - name: team_code
+        type: string
+        source: input
+        description: team that the zone is reserved for; null means open to all teams
+        default: null
+      - name: capacity_cap_pct
+        type: integer
+        source: input
+        description: max percent of this zone's seats that may be reserved on any one date
+        default: 100
+        constraints: "1 <= capacity_cap_pct <= 100"
+      - name: seat_count
+        type: integer
+        source: computed
+        description: "count of Seat where neighborhood_id == this.id and status != RETIRED"
+      - name: effective_cap_seats
+        type: integer
+        source: computed
+        description: "ceil(seat_count * capacity_cap_pct / 100); max distinct seats reservable per date"
+
+  - name: Seat
+    parent: Neighborhood
+    common_fields: true
+    fields:
+      - name: neighborhood_id
+        type: string
+        source: input
+        description: "FK -> Neighborhood.id; the zone this desk lives in"
+      - name: label
+        type: string
+        source: input
+        description: human seat label, unique per neighborhood_id
+        constraints: non-empty, unique per neighborhood_id
+      - name: is_standing
+        type: boolean
+        source: input
+        description: whether the desk is a standing desk
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: inventory lifecycle of the seat
+        default: "AVAILABLE"
+        constraints: "one of {AVAILABLE, OUT_OF_SERVICE, RETIRED}"
+
+  - name: Room
+    parent: Floor
+    common_fields: true
+    fields:
+      - name: floor_id
+        type: string
+        source: input
+        description: "FK -> Floor.id; the floor this meeting room is on"
+      - name: label
+        type: string
+        source: input
+        description: room label, unique per floor_id
+        constraints: non-empty, unique per floor_id
+      - name: seats_capacity
+        type: integer
+        source: input
+        description: how many people the room holds
+        constraints: integer >= 1
+      - name: turnover_buffer_minute
+        type: integer
+        source: input
+        description: cleaning/turnover buffer enforced AFTER each room booking
+        default: 15
+        constraints: integer >= 0
+      - name: status
+        type: enum
+        source: system
+        description: inventory lifecycle of the room
+        default: "AVAILABLE"
+        constraints: "one of {AVAILABLE, OUT_OF_SERVICE, RETIRED}"
+
+  - name: Employee
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: corporate email, globally unique
+        constraints: non-empty, unique, lowercased on store
+      - name: full_name
+        type: string
+        source: input
+        description: display name
+      - name: team_code
+        type: string
+        source: input
+        description: the employee's team; matched against Neighborhood.team_code for zoning
+      - name: strike_score
+        type: integer
+        source: computed
+        description: "max(0, sum over NoShowEvent.delta for this employee); see strike_score calc"
+        default: 0
+      - name: booking_privilege
+        type: enum
+        source: computed
+        description: "ACTIVE while strike_score < SUSPEND_THRESHOLD, else SUSPENDED; compound on strike_score"
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, SUSPENDED}"
+      - name: status
+        type: enum
+        source: system
+        description: employee record lifecycle
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, ARCHIVED}"
+
+  - name: Reservation
+    parent: null
+    common_fields: true
+    fields:
+      - name: employee_id
+        type: string
+        source: input
+        description: "FK -> Employee.id; who holds the booking"
+      - name: resource_type
+        type: enum
+        source: input
+        description: which kind of resource is booked
+        constraints: "one of {SEAT, ROOM}"
+      - name: seat_id
+        type: string
+        source: input
+        description: "FK -> Seat.id; the booked desk (required iff resource_type == SEAT, else null)"
+        default: null
+      - name: room_id
+        type: string
+        source: input
+        description: "FK -> Room.id; the booked room (required iff resource_type == ROOM, else null)"
+        default: null
+      - name: booking_date
+        type: string
+        source: input
+        description: local calendar date (YYYY-MM-DD) the booking occupies
+        constraints: ISO date
+      - name: start_minute
+        type: integer
+        source: input
+        description: minutes-from-midnight (local) the occupation starts
+        constraints: "must fall within the resource's floor workday window"
+      - name: end_minute
+        type: integer
+        source: input
+        description: minutes-from-midnight (local) the occupation ends (exclusive)
+        constraints: "start_minute < end_minute; within floor workday window"
+      - name: occupancy_status
+        type: enum
+        source: system
+        description: booking-lifecycle dimension
+        default: "BOOKED"
+        constraints: "one of {BOOKED, CHECKED_IN, COMPLETED, NO_SHOW_RELEASED, CANCELLED}"
+      - name: billing_status
+        type: enum
+        source: system
+        description: amenity-chargeback dimension, evolves independently of occupancy_status
+        default: "NONE"
+        constraints: "one of {NONE, PROVISIONAL, FINALIZED, VOID}"
+      - name: provisional_chargeback_cents
+        type: integer
+        source: computed
+        description: "running estimate over APPROVED+REQUESTED amenity lines; see amenity_chargeback calc (provisional variant)"
+        default: 0
+      - name: final_chargeback_cents
+        type: integer
+        source: computed
+        description: "frozen chargeback over APPROVED amenity lines at completion; see amenity_chargeback calc (final variant)"
+        default: 0
+      - name: checkin_deadline_minute
+        type: integer
+        source: computed
+        description: "start_minute + GRACE_MINUTES; no check-in by this clock time => eligible for no-show release"
+      - name: occupied_minutes
+        type: integer
+        source: computed
+        description: "end_minute - start_minute while occupancy_status in {CHECKED_IN, COMPLETED}, else 0; numerator for utilization"
+
+  - name: CheckIn
+    parent: Reservation
+    common_fields: false
+    fields:
+      - name: reservation_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id; the reservation being checked into"
+      - name: checked_in_at_minute
+        type: integer
+        source: system
+        description: minutes-from-midnight (local, from the clock) at which check-in occurred
+      - name: within_grace
+        type: boolean
+        source: computed
+        description: "true iff checked_in_at_minute <= reservation.checkin_deadline_minute"
+
+  - name: AmenityRequest
+    parent: Reservation
+    common_fields: true
+    fields:
+      - name: reservation_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id; the reservation this amenity attaches to"
+      - name: amenity_code
+        type: string
+        source: input
+        description: catalog code, e.g. MONITOR, PARKING, CATERING
+        constraints: non-empty
+      - name: unit_price_cents
+        type: integer
+        source: input
+        description: catalog unit price in cents
+        constraints: integer >= 0
+      - name: quantity
+        type: integer
+        source: input
+        description: number of units requested
+        constraints: integer >= 1
+      - name: line_status
+        type: enum
+        source: system
+        description: per-line amenity lifecycle (branching approve/deny)
+        default: "REQUESTED"
+        constraints: "one of {REQUESTED, APPROVED, DENIED, CANCELLED}"
+      - name: line_total_cents
+        type: integer
+        source: computed
+        description: "unit_price_cents * quantity (base amount before service fee)"
+
+  - name: NoShowEvent
+    parent: Employee
+    common_fields: false
+    fields:
+      - name: employee_id
+        type: string
+        source: input
+        description: "FK -> Employee.id; subject of the strike adjustment"
+      - name: reservation_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id; the reservation that produced this adjustment"
+      - name: kind
+        type: enum
+        source: system
+        description: whether this entry adds a strike or credits good behaviour
+        constraints: "one of {NO_SHOW, GOOD_CHECKIN}"
+      - name: delta
+        type: integer
+        source: system
+        description: "+STRIKE_WEIGHT for NO_SHOW, -GOOD_CREDIT for GOOD_CHECKIN; summed into strike_score"
+
+  - name: CapacityPolicy
+    parent: Floor
+    common_fields: true
+    fields:
+      - name: floor_id
+        type: string
+        source: input
+        description: "FK -> Floor.id; the floor this policy governs"
+      - name: max_active_reservations_per_employee
+        type: integer
+        source: input
+        description: cap on the number of concurrent non-terminal reservations one employee may hold on this floor per date
+        default: 1
+        constraints: integer >= 1
+      - name: grace_minutes
+        type: integer
+        source: input
+        description: minutes after start_minute before a no-checked-in reservation is releasable
+        default: 30
+        constraints: integer >= 0
+      - name: enforce_team_zoning
+        type: boolean
+        source: input
+        description: when true, seats in a team-coded neighborhood are bookable only by matching team
+        default: true
+
+  - name: VisitorPass
+    parent: null
+    common_fields: true
+    fields:
+      - name: host_employee_id
+        type: string
+        source: input
+        description: "FK -> Employee.id; the host who sponsors the visitor"
+      - name: seat_id
+        type: string
+        source: input
+        description: "FK -> Seat.id; visitor desk assigned (a SEAT resource)"
+      - name: visitor_name
+        type: string
+        source: input
+        description: visiting guest's name
+        constraints: non-empty
+      - name: booking_date
+        type: string
+        source: input
+        description: local calendar date (YYYY-MM-DD)
+        constraints: ISO date
+      - name: start_minute
+        type: integer
+        source: input
+        description: minutes-from-midnight (local) the visit starts
+      - name: end_minute
+        type: integer
+        source: input
+        description: minutes-from-midnight (local) the visit ends (exclusive)
+        constraints: "start_minute < end_minute"
+      - name: status
+        type: enum
+        source: system
+        description: visitor-pass lifecycle (cyclic revise loop on host review)
+        default: "REQUESTED"
+        constraints: "one of {REQUESTED, CHANGES_REQUESTED, APPROVED, CHECKED_IN, COMPLETED, CANCELLED}"
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  # ---- Reservation: occupancy dimension (parallel with billing dimension) ----
+  - entity: Reservation
+    dimension: occupancy_status
+    initial_state: BOOKED
+    terminal_states: [COMPLETED, NO_SHOW_RELEASED, CANCELLED]
+    transitions:
+      - from: BOOKED
+        to: CHECKED_IN
+        trigger: "POST /workplace/reservations/{id}/check-in"
+        actor: Employee
+        preconditions:
+          - "reservation.occupancy_status == BOOKED"
+          - "acting Employee.id == reservation.employee_id"
+          - "clock local minute-of-day <= reservation.checkin_deadline_minute (grace not expired)"
+          - "the booked Seat.status == AVAILABLE OR Room.status == AVAILABLE (resource not pulled OUT_OF_SERVICE)"
+        side_effects:
+          - "create CheckIn child with checked_in_at_minute = clock local minute-of-day, within_grace = true"
+          - "append NoShowEvent(kind=GOOD_CHECKIN, delta=-GOOD_CREDIT) for reservation.employee_id"
+          - "recompute Employee.strike_score and re-derive Employee.booking_privilege (compound)"
+          - "set reservation.occupied_minutes = end_minute - start_minute"
+        note: "GOOD_CHECKIN credit is what lets a suspended-then-good employee recover; strike_score floors at 0."
+      - from: CHECKED_IN
+        to: COMPLETED
+        trigger: "POST /workplace/reservations/{id}/complete"
+        actor: Employee
+        preconditions:
+          - "reservation.occupancy_status == CHECKED_IN"
+          - "acting Employee.id == reservation.employee_id"
+        side_effects:
+          - "if reservation.billing_status == PROVISIONAL: set billing_status = FINALIZED and freeze final_chargeback_cents = amenity_chargeback(final variant)"
+          - "release the booked Seat/Room occupation for the date window (decrement Neighborhood occupancy for the date)"
+          - "set reservation.occupied_minutes = end_minute - start_minute"
+      - from: BOOKED
+        to: NO_SHOW_RELEASED
+        trigger: "POST /workplace/_clock/advance (system no-show sweep) OR POST /workplace/reservations/{id}/release"
+        actor: system
+        preconditions:
+          - "reservation.occupancy_status == BOOKED"
+          - "clock local minute-of-day > reservation.checkin_deadline_minute (grace expired)"
+        side_effects:
+          - "free the booked Seat/Room window so the slot can be re-booked (decrement Neighborhood occupancy for the date)"
+          - "append NoShowEvent(kind=NO_SHOW, delta=+STRIKE_WEIGHT) for reservation.employee_id"
+          - "recompute Employee.strike_score; if it crosses SUSPEND_THRESHOLD, re-derive Employee.booking_privilege = SUSPENDED (compound)"
+          - "cascade: set every AmenityRequest of this reservation in {REQUESTED, APPROVED} to CANCELLED; then set reservation.billing_status = VOID and provisional_chargeback_cents = 0"
+        note: "Depth-3 cascade: release -> strike_score recompute -> privilege flip; AND release -> amenity cancel -> billing VOID."
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /workplace/reservations/{id}/cancel"
+        actor: Employee
+        preconditions:
+          - "reservation.occupancy_status == BOOKED"
+          - "acting Employee.id == reservation.employee_id"
+        side_effects:
+          - "free the booked Seat/Room window (decrement Neighborhood occupancy for the date)"
+          - "cascade: set every AmenityRequest in {REQUESTED, APPROVED} to CANCELLED; set reservation.billing_status = VOID and provisional_chargeback_cents = 0"
+        note: "Voluntary cancel before start carries NO strike (unlike no-show release)."
+      - from: CHECKED_IN
+        to: CANCELLED
+        trigger: "POST /workplace/reservations/{id}/cancel"
+        actor: Employee
+        preconditions:
+          - "reservation.occupancy_status == CHECKED_IN"
+          - "acting Employee.id == reservation.employee_id"
+        side_effects:
+          - "free the booked Seat/Room window (decrement Neighborhood occupancy for the date)"
+          - "cascade: set every AmenityRequest in {REQUESTED, APPROVED} to CANCELLED; set reservation.billing_status = VOID; set reservation.occupied_minutes = 0"
+
+  # ---- Reservation: billing dimension (parallel; evolves independently) ----
+  - entity: Reservation
+    dimension: billing_status
+    initial_state: NONE
+    terminal_states: [FINALIZED, VOID]
+    transitions:
+      - from: NONE
+        to: PROVISIONAL
+        trigger: "POST /workplace/reservations/{id}/amenities (first amenity line created)"
+        actor: Employee
+        preconditions:
+          - "reservation.occupancy_status in {BOOKED, CHECKED_IN}"
+          - "reservation.billing_status == NONE"
+        side_effects:
+          - "recompute reservation.provisional_chargeback_cents = amenity_chargeback(provisional variant)"
+      - from: PROVISIONAL
+        to: PROVISIONAL
+        trigger: "POST /workplace/amenity-requests/{id}/approve OR /deny OR POST /workplace/reservations/{id}/amenities (subsequent line)"
+        actor: FacilityManager
+        preconditions:
+          - "reservation.billing_status == PROVISIONAL"
+        side_effects:
+          - "recompute reservation.provisional_chargeback_cents = amenity_chargeback(provisional variant)"
+        note: "Self-loop: provisional total is re-derived on every amenity line change while reservation is open."
+      - from: PROVISIONAL
+        to: FINALIZED
+        trigger: "POST /workplace/reservations/{id}/complete (occupancy COMPLETED)"
+        actor: Employee
+        preconditions:
+          - "reservation.billing_status == PROVISIONAL"
+          - "reservation.occupancy_status transition to COMPLETED is firing"
+        side_effects:
+          - "freeze reservation.final_chargeback_cents = amenity_chargeback(final variant) over APPROVED lines only"
+      - from: PROVISIONAL
+        to: VOID
+        trigger: "no-show release / cancel of the parent reservation"
+        actor: system
+        preconditions:
+          - "reservation.occupancy_status transition to NO_SHOW_RELEASED or CANCELLED is firing"
+        side_effects:
+          - "set reservation.provisional_chargeback_cents = 0; APPROVED/REQUESTED amenity lines cascade to CANCELLED"
+
+  # ---- AmenityRequest: branching approve/deny fork ----
+  - entity: AmenityRequest
+    initial_state: REQUESTED
+    terminal_states: [DENIED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /workplace/amenity-requests/{id}/approve"
+        actor: FacilityManager
+        preconditions:
+          - "amenity_request.line_status == REQUESTED"
+          - "parent reservation.occupancy_status in {BOOKED, CHECKED_IN}"
+        side_effects:
+          - "recompute parent reservation.provisional_chargeback_cents (provisional variant now counts this APPROVED line at full weight)"
+      - from: REQUESTED
+        to: DENIED
+        trigger: "POST /workplace/amenity-requests/{id}/deny"
+        actor: FacilityManager
+        preconditions:
+          - "amenity_request.line_status == REQUESTED"
+        side_effects:
+          - "recompute parent reservation.provisional_chargeback_cents (denied line drops out of the provisional set)"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /workplace/amenity-requests/{id}/cancel OR cascade from reservation cancel/no-show"
+        actor: Employee
+        preconditions:
+          - "amenity_request.line_status == REQUESTED"
+          - "acting Employee.id == parent reservation.employee_id (when employee-triggered)"
+        side_effects:
+          - "recompute parent reservation.provisional_chargeback_cents"
+      - from: APPROVED
+        to: CANCELLED
+        trigger: "POST /workplace/amenity-requests/{id}/cancel OR cascade from reservation cancel/no-show"
+        actor: Employee
+        preconditions:
+          - "amenity_request.line_status == APPROVED"
+          - "parent reservation.occupancy_status != COMPLETED (cannot cancel once chargeback frozen)"
+        side_effects:
+          - "recompute parent reservation.provisional_chargeback_cents"
+
+  # ---- VisitorPass: cyclic host-review loop ----
+  - entity: VisitorPass
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: CHANGES_REQUESTED
+        trigger: "POST /workplace/visitor-passes/{id}/request-changes"
+        actor: Employee
+        preconditions:
+          - "visitor_pass.status == REQUESTED"
+          - "acting Employee.id == visitor_pass.host_employee_id"
+        side_effects:
+          - "free the held Seat window for the visit date so the host can amend it"
+      - from: CHANGES_REQUESTED
+        to: REQUESTED
+        trigger: "POST /workplace/visitor-passes/{id}/resubmit"
+        actor: Receptionist
+        preconditions:
+          - "visitor_pass.status == CHANGES_REQUESTED"
+        side_effects:
+          - "re-hold a Seat window for the amended visit (re-check seat overlap on the new window)"
+        note: "Cycle: REQUESTED -> CHANGES_REQUESTED -> REQUESTED, any number of rounds."
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /workplace/visitor-passes/{id}/approve"
+        actor: Employee
+        preconditions:
+          - "visitor_pass.status == REQUESTED"
+          - "acting Employee.id == visitor_pass.host_employee_id"
+          - "the Seat window is free of any Reservation or other VisitorPass overlap on booking_date"
+        side_effects:
+          - "lock the Seat window for the visit date"
+      - from: APPROVED
+        to: CHECKED_IN
+        trigger: "POST /workplace/visitor-passes/{id}/check-in"
+        actor: Receptionist
+        preconditions:
+          - "visitor_pass.status == APPROVED"
+        side_effects: []
+      - from: CHECKED_IN
+        to: COMPLETED
+        trigger: "POST /workplace/visitor-passes/{id}/complete"
+        actor: Receptionist
+        preconditions:
+          - "visitor_pass.status == CHECKED_IN"
+        side_effects:
+          - "free the Seat window for the visit date"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /workplace/visitor-passes/{id}/cancel"
+        actor: Receptionist
+        preconditions:
+          - "visitor_pass.status in {REQUESTED, CHANGES_REQUESTED, APPROVED}"
+        side_effects:
+          - "free the Seat window for the visit date"
+
+  # ---- Seat: inventory lifecycle (guarded by reservation state) ----
+  - entity: Seat
+    initial_state: AVAILABLE
+    terminal_states: [RETIRED]
+    transitions:
+      - from: AVAILABLE
+        to: OUT_OF_SERVICE
+        trigger: "POST /workplace/seats/{id}/out-of-service"
+        actor: FacilityManager
+        preconditions:
+          - "seat.status == AVAILABLE"
+        side_effects:
+          - "future BOOKED reservations on this seat remain but new bookings are rejected"
+      - from: OUT_OF_SERVICE
+        to: AVAILABLE
+        trigger: "POST /workplace/seats/{id}/restore"
+        actor: FacilityManager
+        preconditions:
+          - "seat.status == OUT_OF_SERVICE"
+        side_effects: []
+      - from: AVAILABLE
+        to: RETIRED
+        trigger: "POST /workplace/seats/{id}/retire"
+        actor: FacilityManager
+        preconditions:
+          - "seat.status == AVAILABLE"
+          - "no Reservation on this seat has occupancy_status in {BOOKED, CHECKED_IN}"
+        side_effects:
+          - "decrement Neighborhood.seat_count; recompute Neighborhood.effective_cap_seats"
+
+  # ---- Employee: compound privilege dimension (derived from strike_score) ----
+  - entity: Employee
+    dimension: booking_privilege
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "system: strike_score recompute crosses threshold"
+        actor: system
+        preconditions:
+          - "Employee.strike_score >= SUSPEND_THRESHOLD after a NoShowEvent append"
+        side_effects:
+          - "Employee.booking_privilege = SUSPENDED; new reservation creates are rejected with ERR_BOOKING_SUSPENDED"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "system: strike_score recompute falls below threshold (GOOD_CHECKIN credits) OR POST /workplace/employees/{id}/reinstate"
+        actor: system
+        preconditions:
+          - "Employee.strike_score < SUSPEND_THRESHOLD after recompute, OR FacilityManager reinstate clears strike history"
+        side_effects:
+          - "Employee.booking_privilege = ACTIVE"
+
+concurrency_rules:
+  - rule_id: seat-reservation-create-stale-seat
+    parent_entity: Seat
+    write_endpoint: "POST /workplace/reservations"
+    occ_field: "expected_seat_version"
+    description: |
+      Creating a SEAT Reservation against a Seat whose version has advanced since
+      the client last observed it is rejected. This captures the case where another
+      writer has just booked (or the FacilityManager pulled the seat OUT_OF_SERVICE),
+      legitimately changing the seat's occupation/inventory state, so the current
+      writer's view of the seat is stale and its overlap check would be based on
+      outdated occupancy.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: room-reservation-create-stale-room
+    parent_entity: Room
+    write_endpoint: "POST /workplace/reservations"
+    occ_field: "expected_room_version"
+    description: |
+      Creating a ROOM Reservation against a Room whose version has advanced since
+      the client last observed it is rejected. Another writer's just-committed room
+      booking advances Room.version; a create still carrying the older
+      expected_room_version is rejected because its turnover-buffer overlap check
+      was computed against a stale room view.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: amenity_chargeback
+    trigger: "on every AmenityRequest create/approve/deny/cancel (provisional); frozen on reservation complete (final)"
+    algorithm: aggregation
+    formula: |
+      # Evaluation order is PINNED (mode (c) circular-looking dependency):
+      #   1. line_amounts = [ unit_price_cents * quantity for each line in the selected set ]
+      #   2. subtotal_cents = sum(line_amounts)
+      #   3. per_line_fee = [ round_half_up(amount * SERVICE_FEE_RATE) for amount in line_amounts ]   # mode (b): round PER LINE
+      #   4. fee_cents = sum(per_line_fee)                                                            # ...THEN sum
+      #   5. pre_discount_total = subtotal_cents + fee_cents
+      #   6. discount_pct = tier(pre_discount_total):  <500 -> 0 ; 500..999 -> 5 ; >=1000 -> 10       # keyed on the total tier
+      #   7. discount_cents = round_half_up(pre_discount_total * discount_pct / 100)
+      #   8. chargeback_cents = pre_discount_total - discount_cents
+      # The discount depends on pre_discount_total and pre_discount_total depends on fee;
+      # the order above breaks the apparent circularity (fee is computed BEFORE the discount tier).
+    input_set: |
+      provisional variant: lines with line_status in {REQUESTED, APPROVED}.
+      final variant: lines with line_status == APPROVED only (REQUESTED-at-completion lines excluded).
+    constants:
+      SERVICE_FEE_RATE: 0.085
+      TIER_LOW_MAX_CENTS: 499
+      TIER_MID_MAX_CENTS: 999
+      TIER_LOW_PCT: 0
+      TIER_MID_PCT: 5
+      TIER_HIGH_PCT: 10
+    precision: "all monetary steps in integer cents; round_half_up at steps 3 and 7"
+    variants:
+      - name: provisional
+        when: "reservation.billing_status == PROVISIONAL (booking still open); recomputed on each line change"
+        difference: "input set includes REQUESTED and APPROVED lines, written to provisional_chargeback_cents"
+      - name: final
+        when: "reservation.occupancy_status transitions to COMPLETED"
+        difference: "input set restricted to APPROVED lines, frozen into final_chargeback_cents; never recomputed afterwards"
+
+  - name: strike_score
+    trigger: "on every NoShowEvent append (NO_SHOW from release, GOOD_CHECKIN from check-in) and on reinstate"
+    algorithm: weighted_scoring
+    formula: |
+      # Mode (a): >=3 inputs with non-linear interaction (sum, floor at 0, threshold branch).
+      raw = sum(ev.delta for ev in NoShowEvent where employee_id == E.id and ev created after last reinstate_at)
+      strike_score = max(0, raw)                          # floor at 0 (good behaviour cannot go negative)
+      booking_privilege = SUSPENDED if strike_score >= SUSPEND_THRESHOLD else ACTIVE   # compound derive
+    input_set: "all NoShowEvent rows for the employee created strictly after the employee's most recent reinstate_at (or all rows if never reinstated)"
+    constants:
+      STRIKE_WEIGHT: 10
+      GOOD_CREDIT: 3
+      SUSPEND_THRESHOLD: 30
+    precision: "integer arithmetic; no rounding"
+    variants:
+      - name: instantaneous
+        when: "recomputed synchronously after each NoShowEvent append"
+        difference: "uses the event set as of the triggering append"
+
+  - name: utilization_report
+    trigger: "GET /workplace/floors/{id}/utilization?date=YYYY-MM-DD"
+    algorithm: aggregation
+    formula: |
+      # Two divergent algorithms over the SAME data (dual-variant):
+      # capacity_minutes = floor.workday_end_minute - floor.workday_start_minute  (per seat)
+      # For each Seat s on the floor (status != RETIRED):
+      #    booked = sum(r.occupied_minutes for r in Reservations on s, booking_date == date)
+      #    seat_pct = round_half_up(booked / capacity_minutes * 100, 2)
+      # PLANNED variant:  occupied_minutes uses (end_minute - start_minute) for r.occupancy_status in {BOOKED, CHECKED_IN, COMPLETED}
+      # REALIZED variant: occupied_minutes counts ONLY r.occupancy_status in {CHECKED_IN, COMPLETED} (BOOKED-but-never-checked-in excluded)
+      # floor_utilization_pct = round_half_up( mean(seat_pct over all non-RETIRED seats) , 2 )
+      # Empty floor (zero non-RETIRED seats) -> floor_utilization_pct = 0.00 (boundary, no division)
+    input_set: "Reservations whose booking_date == requested date; seats filtered by status != RETIRED; tie-break/order irrelevant (mean is order-free)"
+    constants:
+      DECIMAL_PLACES: 2
+    precision: "2 decimal places, round_half_up; per-seat pct rounded to 2dp THEN averaged THEN rounded to 2dp"
+    variants:
+      - name: planned
+        when: "query param mode=PLANNED (default)"
+        difference: "counts BOOKED reservations toward occupancy (forward-looking demand)"
+      - name: realized
+        when: "query param mode=REALIZED"
+        difference: "counts only CHECKED_IN/COMPLETED (actual usage); BOOKED no-shows excluded -> lower number"
+
+  - name: neighborhood_capacity_check
+    trigger: "on POST /workplace/reservations for a SEAT (capacity gate before overlap commit)"
+    algorithm: threshold
+    formula: |
+      # effective_cap_seats = ceil(seat_count * capacity_cap_pct / 100)
+      # distinct_reserved = count(DISTINCT seat_id) over Reservations in the neighborhood with
+      #                     booking_date == new.booking_date and occupancy_status in {BOOKED, CHECKED_IN}
+      # If the new seat_id is already among distinct_reserved, capacity is NOT re-consumed (same seat).
+      # Otherwise the booking is allowed only if distinct_reserved + 1 <= effective_cap_seats.
+      # Boundary: distinct_reserved + 1 == effective_cap_seats is ALLOWED (<=, not <).
+    input_set: "Reservations in the neighborhood on the same booking_date with occupancy_status in {BOOKED, CHECKED_IN}; seat_count counts Seat where status != RETIRED"
+    constants: {}
+    precision: "integer; ceil on effective_cap_seats; comparison uses <= at the boundary"
+    variants:
+      - name: per_date
+        when: "evaluated per booking_date"
+        difference: "capacity is a per-date budget; a different date has an independent count"
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted to perform this operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "every path/body-referenced resource (Site, Floor, Neighborhood, Seat, Room, Employee, Reservation, AmenityRequest, VisitorPass, CapacityPolicy) exists; validated left-to-right in path then body FKs"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: existence
+    check: "request body is well-formed and required fields present with correct types (e.g. resource_type in {SEAT,ROOM}; booking_date is ISO date; start_minute/end_minute integers)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all write endpoints
+
+  - priority: 5
+    category: business_constraint
+    check: "resource_type==SEAT requires seat_id and null room_id; resource_type==ROOM requires room_id and null seat_id (exclusive selector)"
+    error_id: ERR_RESOURCE_TARGET_MISMATCH
+    http_status: 422
+    applies_to: "POST /workplace/reservations"
+
+  - priority: 6
+    category: business_temporal
+    check: "start_minute < end_minute AND both within the floor workday window [workday_start_minute, workday_end_minute]"
+    error_id: ERR_OUTSIDE_WORKDAY
+    http_status: 422
+    applies_to: "POST /workplace/reservations, POST /workplace/visitor-passes"
+
+  - priority: 7
+    category: state
+    check: "target resource is in the correct state for the transition (e.g. reservation.occupancy_status == BOOKED for check-in; amenity.line_status == REQUESTED for approve/deny)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 8
+    category: state
+    check: "the booked Seat/Room is AVAILABLE (not OUT_OF_SERVICE or RETIRED) at booking time"
+    error_id: ERR_RESOURCE_NOT_BOOKABLE
+    http_status: 409
+    applies_to: "POST /workplace/reservations, POST /workplace/visitor-passes"
+
+  - priority: 9
+    category: business_constraint
+    check: "acting Employee.booking_privilege == ACTIVE (not SUSPENDED) when creating a reservation"
+    error_id: ERR_BOOKING_SUSPENDED
+    http_status: 409
+    applies_to: "POST /workplace/reservations"
+
+  - priority: 10
+    category: business_safety
+    check: "team zoning: if CapacityPolicy.enforce_team_zoning and the seat's Neighborhood.team_code is non-null, acting Employee.team_code must equal it"
+    error_id: ERR_TEAM_ZONING_VIOLATION
+    http_status: 409
+    applies_to: "POST /workplace/reservations (SEAT)"
+
+  - priority: 11
+    category: business_referential
+    check: "max_active_reservations_per_employee: the employee must not already hold that many non-terminal (BOOKED/CHECKED_IN) reservations on the same floor and booking_date"
+    error_id: ERR_RESERVATION_LIMIT_REACHED
+    http_status: 409
+    applies_to: "POST /workplace/reservations"
+
+  - priority: 12
+    category: business_temporal
+    check: "SEAT overlap: the requested [start_minute, end_minute) must not intersect any existing non-terminal Reservation OR APPROVED/active VisitorPass window on the same seat and booking_date (half-open intervals; touching endpoints OK)"
+    error_id: ERR_SEAT_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /workplace/reservations (SEAT), POST /workplace/visitor-passes, visitor-pass approve"
+
+  - priority: 13
+    category: business_temporal
+    check: "ROOM overlap: the requested window plus the room's turnover_buffer_minute appended AFTER it must not intersect any existing non-terminal Reservation window on the same room and booking_date (buffered interval geometry)"
+    error_id: ERR_ROOM_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /workplace/reservations (ROOM)"
+
+  - priority: 14
+    category: business_fiscal
+    check: "neighborhood capacity: distinct reserved seats on the date must not exceed effective_cap_seats (see neighborhood_capacity_check); boundary distinct+1 <= cap is allowed"
+    error_id: ERR_NEIGHBORHOOD_CAPACITY_FULL
+    http_status: 409
+    applies_to: "POST /workplace/reservations (SEAT)"
+
+  - priority: 15
+    category: state
+    check: "optimistic concurrency: expected_seat_version / expected_room_version must equal the live parent version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /workplace/reservations"
+
+  - priority: 16
+    category: business_constraint
+    check: "uniqueness: Floor.level unique per site; Neighborhood.name unique per floor; Seat.label unique per neighborhood; Room.label unique per floor; Employee.email globally unique"
+    error_id: ERR_DUPLICATE
+    http_status: 409
+    applies_to: "create endpoints for Floor, Neighborhood, Seat, Room, Employee"
+
+  - priority: 17
+    category: business_constraint
+    check: "pagination params: limit in [1,100], offset >= 0"
+    error_id: ERR_INVALID_PAGINATION
+    http_status: 422
+    applies_to: "all list endpoints"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # ---- Sites / Floors ----
+  - method: POST
+    path: "/workplace/sites"
+    description: "create a site"
+    roles: [FacilityManager]
+    code: 201
+    input: ["name", "timezone?"]
+    output: Site
+    side_effects: []
+  - method: GET
+    path: "/workplace/sites/{id}"
+    description: "fetch a site"
+    roles: [FacilityManager, Analyst, Receptionist, Employee]
+    code: 200
+    input: []
+    output: Site
+    side_effects: []
+  - method: POST
+    path: "/workplace/sites/{id}/floors"
+    description: "create a floor under a site"
+    roles: [FacilityManager]
+    code: 201
+    input: ["level", "workday_start_minute?", "workday_end_minute?"]
+    output: Floor
+    side_effects: ["compute Floor.capacity_minutes"]
+  - method: GET
+    path: "/workplace/sites/{id}/floors"
+    description: "list floors of a site (reverse lookup for Floor.site_id)"
+    roles: [FacilityManager, Analyst, Receptionist, Employee]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Floor[]
+    side_effects: []
+  - method: GET
+    path: "/workplace/floors/{id}"
+    description: "fetch a floor"
+    roles: [FacilityManager, Analyst, Receptionist, Employee]
+    code: 200
+    input: []
+    output: Floor
+    side_effects: []
+  - method: GET
+    path: "/workplace/floors/{id}/utilization"
+    description: "computed read: planned vs realized utilization for a date"
+    roles: [FacilityManager, Analyst]
+    code: 200
+    input: ["date", "mode?"]
+    output: "{ floor_utilization_pct: number, capacity_minutes: integer, seat_breakdown: array, mode: string, date: string }"
+    side_effects: ["runs utilization_report calculation (PLANNED default, REALIZED on mode=REALIZED)"]
+
+  # ---- Capacity policy (per floor) ----
+  - method: POST
+    path: "/workplace/floors/{id}/capacity-policy"
+    description: "create/replace the floor's capacity policy"
+    roles: [FacilityManager]
+    code: 201
+    input: ["max_active_reservations_per_employee?", "grace_minutes?", "enforce_team_zoning?"]
+    output: CapacityPolicy
+    side_effects: []
+  - method: GET
+    path: "/workplace/floors/{id}/capacity-policy"
+    description: "list the floor's capacity policy (reverse lookup for CapacityPolicy.floor_id)"
+    roles: [FacilityManager, Analyst]
+    code: 200
+    input: []
+    output: CapacityPolicy[]
+    side_effects: []
+
+  # ---- Neighborhoods ----
+  - method: POST
+    path: "/workplace/floors/{id}/neighborhoods"
+    description: "create a neighborhood (zone) on a floor"
+    roles: [FacilityManager]
+    code: 201
+    input: ["name", "team_code?", "capacity_cap_pct?"]
+    output: Neighborhood
+    side_effects: ["initialize seat_count=0, effective_cap_seats=0"]
+  - method: GET
+    path: "/workplace/floors/{id}/neighborhoods"
+    description: "list neighborhoods of a floor (reverse lookup for Neighborhood.floor_id)"
+    roles: [FacilityManager, Analyst, Receptionist, Employee]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Neighborhood[]
+    side_effects: []
+  - method: GET
+    path: "/workplace/neighborhoods/{id}"
+    description: "fetch a neighborhood with computed seat_count and effective_cap_seats"
+    roles: [FacilityManager, Analyst, Receptionist, Employee]
+    code: 200
+    input: []
+    output: Neighborhood
+    side_effects: []
+
+  # ---- Seats ----
+  - method: POST
+    path: "/workplace/neighborhoods/{id}/seats"
+    description: "create a seat in a neighborhood"
+    roles: [FacilityManager]
+    code: 201
+    input: ["label", "is_standing?"]
+    output: Seat
+    side_effects: ["increment Neighborhood.seat_count; recompute Neighborhood.effective_cap_seats"]
+  - method: GET
+    path: "/workplace/neighborhoods/{id}/seats"
+    description: "list seats of a neighborhood (reverse lookup for Seat.neighborhood_id)"
+    roles: [FacilityManager, Analyst, Receptionist, Employee]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Seat[]
+    side_effects: []
+  - method: GET
+    path: "/workplace/seats/{id}"
+    description: "fetch a seat"
+    roles: [FacilityManager, Analyst, Receptionist, Employee]
+    code: 200
+    input: []
+    output: Seat
+    side_effects: []
+  - method: POST
+    path: "/workplace/seats/{id}/out-of-service"
+    description: "mark a seat OUT_OF_SERVICE"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: Seat
+    side_effects: ["Seat.status -> OUT_OF_SERVICE"]
+  - method: POST
+    path: "/workplace/seats/{id}/restore"
+    description: "restore a seat to AVAILABLE"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: Seat
+    side_effects: ["Seat.status -> AVAILABLE"]
+  - method: POST
+    path: "/workplace/seats/{id}/retire"
+    description: "retire a seat permanently"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: Seat
+    side_effects: ["Seat.status -> RETIRED; decrement Neighborhood.seat_count; recompute effective_cap_seats"]
+
+  # ---- Rooms ----
+  - method: POST
+    path: "/workplace/floors/{id}/rooms"
+    description: "create a meeting room on a floor"
+    roles: [FacilityManager]
+    code: 201
+    input: ["label", "seats_capacity", "turnover_buffer_minute?"]
+    output: Room
+    side_effects: []
+  - method: GET
+    path: "/workplace/floors/{id}/rooms"
+    description: "list rooms of a floor (reverse lookup for Room.floor_id)"
+    roles: [FacilityManager, Analyst, Receptionist, Employee]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Room[]
+    side_effects: []
+  - method: GET
+    path: "/workplace/rooms/{id}"
+    description: "fetch a room"
+    roles: [FacilityManager, Analyst, Receptionist, Employee]
+    code: 200
+    input: []
+    output: Room
+    side_effects: []
+
+  # ---- Employees ----
+  - method: POST
+    path: "/workplace/employees"
+    description: "create an employee"
+    roles: [FacilityManager]
+    code: 201
+    input: [email, full_name, team_code]
+    output: Employee
+    side_effects: ["initialize strike_score=0, booking_privilege=ACTIVE"]
+  - method: GET
+    path: "/workplace/employees/{id}"
+    description: "fetch an employee with computed strike_score and booking_privilege"
+    roles: [FacilityManager, Analyst, Receptionist, Employee]
+    code: 200
+    input: []
+    output: Employee
+    side_effects: []
+  - method: GET
+    path: "/workplace/employees/{id}/no-show-events"
+    description: "list an employee's strike ledger (reverse lookup for NoShowEvent.employee_id)"
+    roles: [FacilityManager, Analyst]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: NoShowEvent[]
+    side_effects: []
+  - method: POST
+    path: "/workplace/employees/{id}/reinstate"
+    description: "FacilityManager clears strike history and reinstates booking privilege"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: Employee
+    side_effects: ["set reinstate baseline; recompute strike_score=0; booking_privilege -> ACTIVE"]
+
+  # ---- Reservations ----
+  - method: POST
+    path: "/workplace/reservations"
+    description: "create a seat or room reservation (overlap, capacity, zoning, OCC checks)"
+    roles: [Employee]
+    code: 201
+    input: ["employee_id", "resource_type", "seat_id?", "room_id?", "booking_date", "start_minute", "end_minute", "expected_seat_version?", "expected_room_version?"]
+    output: Reservation
+    side_effects:
+      - "set occupancy_status=BOOKED, billing_status=NONE"
+      - "compute checkin_deadline_minute = start_minute + CapacityPolicy.grace_minutes"
+      - "increment Neighborhood occupancy for the date (SEAT); hold Seat/Room window"
+      - "increments Seat.version by 1 (SEAT) OR increments Room.version by 1 (ROOM)"
+  - method: GET
+    path: "/workplace/reservations/{id}"
+    description: "fetch a reservation with both status dimensions and chargeback fields"
+    roles: [FacilityManager, Analyst, Employee]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+  - method: GET
+    path: "/workplace/reservations"
+    description: "list/filter reservations (reverse lookup for Reservation.employee_id, .seat_id, .room_id)"
+    roles: [FacilityManager, Analyst, Employee]
+    code: 200
+    input: ["employee_id?", "seat_id?", "room_id?", "booking_date?", "occupancy_status?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+  - method: POST
+    path: "/workplace/reservations/{id}/check-in"
+    description: "employee checks in (within grace)"
+    roles: [Employee]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects:
+      - "occupancy_status BOOKED -> CHECKED_IN"
+      - "create CheckIn child; append GOOD_CHECKIN NoShowEvent; recompute strike_score and booking_privilege"
+  - method: POST
+    path: "/workplace/reservations/{id}/complete"
+    description: "employee completes the booking; freezes final chargeback"
+    roles: [Employee]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects:
+      - "occupancy_status CHECKED_IN -> COMPLETED"
+      - "if billing_status==PROVISIONAL: -> FINALIZED, freeze final_chargeback_cents (final variant); free resource window"
+  - method: POST
+    path: "/workplace/reservations/{id}/cancel"
+    description: "employee cancels (no strike)"
+    roles: [Employee]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects:
+      - "occupancy_status -> CANCELLED; free window; cascade amenity cancel; billing_status -> VOID"
+  - method: POST
+    path: "/workplace/reservations/{id}/release"
+    description: "FacilityManager force-releases a grace-expired no-show reservation"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects:
+      - "occupancy_status BOOKED -> NO_SHOW_RELEASED; free window; append NO_SHOW NoShowEvent; recompute strike_score/privilege; cascade amenity cancel; billing_status -> VOID"
+  - method: GET
+    path: "/workplace/reservations/{id}/check-ins"
+    description: "list check-ins of a reservation (reverse lookup for CheckIn.reservation_id)"
+    roles: [FacilityManager, Analyst, Employee]
+    code: 200
+    input: []
+    output: CheckIn[]
+    side_effects: []
+  - method: GET
+    path: "/workplace/reservations/{id}/no-show-events"
+    description: "list the NoShowEvent rows produced by this reservation (reverse lookup for NoShowEvent.reservation_id)"
+    roles: [FacilityManager, Analyst]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: NoShowEvent[]
+    side_effects: []
+
+  # ---- Amenity requests (child of reservation) ----
+  - method: POST
+    path: "/workplace/reservations/{id}/amenities"
+    description: "add an amenity request line to a reservation"
+    roles: [Employee]
+    code: 201
+    input: [amenity_code, unit_price_cents, quantity]
+    output: AmenityRequest
+    side_effects:
+      - "line_status=REQUESTED; compute line_total_cents"
+      - "if reservation.billing_status==NONE -> PROVISIONAL; recompute provisional_chargeback_cents (provisional variant)"
+  - method: GET
+    path: "/workplace/reservations/{id}/amenities"
+    description: "list amenity requests of a reservation (reverse lookup for AmenityRequest.reservation_id)"
+    roles: [FacilityManager, Analyst, Employee]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: AmenityRequest[]
+    side_effects: []
+  - method: GET
+    path: "/workplace/amenity-requests/{id}"
+    description: "fetch an amenity request"
+    roles: [FacilityManager, Analyst, Employee]
+    code: 200
+    input: []
+    output: AmenityRequest
+    side_effects: []
+  - method: POST
+    path: "/workplace/amenity-requests/{id}/approve"
+    description: "FacilityManager approves an amenity line"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: AmenityRequest
+    side_effects: ["line_status REQUESTED -> APPROVED; recompute parent provisional_chargeback_cents"]
+  - method: POST
+    path: "/workplace/amenity-requests/{id}/deny"
+    description: "FacilityManager denies an amenity line"
+    roles: [FacilityManager]
+    code: 200
+    input: []
+    output: AmenityRequest
+    side_effects: ["line_status REQUESTED -> DENIED; recompute parent provisional_chargeback_cents"]
+  - method: POST
+    path: "/workplace/amenity-requests/{id}/cancel"
+    description: "employee cancels an amenity line"
+    roles: [Employee]
+    code: 200
+    input: []
+    output: AmenityRequest
+    side_effects: ["line_status -> CANCELLED; recompute parent provisional_chargeback_cents"]
+
+  # ---- Visitor passes ----
+  - method: POST
+    path: "/workplace/visitor-passes"
+    description: "Receptionist files a visitor pass holding a seat window"
+    roles: [Receptionist]
+    code: 201
+    input: [host_employee_id, seat_id, visitor_name, booking_date, start_minute, end_minute]
+    output: VisitorPass
+    side_effects: ["status=REQUESTED; hold Seat window (overlap pre-check)"]
+  - method: GET
+    path: "/workplace/visitor-passes/{id}"
+    description: "fetch a visitor pass"
+    roles: [FacilityManager, Receptionist, Employee, Analyst]
+    code: 200
+    input: []
+    output: VisitorPass
+    side_effects: []
+  - method: GET
+    path: "/workplace/visitor-passes"
+    description: "list visitor passes (reverse lookup for VisitorPass.host_employee_id and .seat_id)"
+    roles: [FacilityManager, Receptionist, Analyst]
+    code: 200
+    input: ["host_employee_id?", "seat_id?", "booking_date?", "status?", "limit?", "offset?"]
+    output: VisitorPass[]
+    side_effects: []
+  - method: POST
+    path: "/workplace/visitor-passes/{id}/request-changes"
+    description: "host requests changes (cyclic loop back)"
+    roles: [Employee]
+    code: 200
+    input: []
+    output: VisitorPass
+    side_effects: ["status REQUESTED -> CHANGES_REQUESTED; free held seat window"]
+  - method: POST
+    path: "/workplace/visitor-passes/{id}/resubmit"
+    description: "Receptionist resubmits an amended pass"
+    roles: [Receptionist]
+    code: 200
+    input: ["start_minute?", "end_minute?", "booking_date?"]
+    output: VisitorPass
+    side_effects: ["status CHANGES_REQUESTED -> REQUESTED; re-hold seat window with overlap re-check"]
+  - method: POST
+    path: "/workplace/visitor-passes/{id}/approve"
+    description: "host approves the visitor pass (locks seat window)"
+    roles: [Employee]
+    code: 200
+    input: []
+    output: VisitorPass
+    side_effects: ["status REQUESTED -> APPROVED; lock seat window (overlap re-check)"]
+  - method: POST
+    path: "/workplace/visitor-passes/{id}/check-in"
+    description: "Receptionist checks in the visitor"
+    roles: [Receptionist]
+    code: 200
+    input: []
+    output: VisitorPass
+    side_effects: ["status APPROVED -> CHECKED_IN"]
+  - method: POST
+    path: "/workplace/visitor-passes/{id}/complete"
+    description: "Receptionist completes the visit (frees window)"
+    roles: [Receptionist]
+    code: 200
+    input: []
+    output: VisitorPass
+    side_effects: ["status CHECKED_IN -> COMPLETED; free seat window"]
+  - method: POST
+    path: "/workplace/visitor-passes/{id}/cancel"
+    description: "Receptionist cancels the visitor pass"
+    roles: [Receptionist]
+    code: 200
+    input: []
+    output: VisitorPass
+    side_effects: ["status -> CANCELLED; free seat window"]
+
+  # ---- Clock (test-driving) ----
+  - method: POST
+    path: "/workplace/_clock/set"
+    description: "set the simulated current local date + minute-of-day for grace/no-show evaluation"
+    roles: [FacilityManager]
+    code: 200
+    input: [current_date, current_minute]
+    output: "{ current_date: string, current_minute: integer }"
+    side_effects: ["sets the server clock used by check-in grace and the no-show sweep"]
+  - method: POST
+    path: "/workplace/_clock/advance-no-show-sweep"
+    description: "run the system no-show sweep: release every BOOKED reservation whose grace has expired at the current clock"
+    roles: [FacilityManager]
+    code: 200
+    input: ["booking_date?"]
+    output: "{ released_count: integer, released_reservation_ids: array }"
+    side_effects: ["for each grace-expired BOOKED reservation: occupancy_status -> NO_SHOW_RELEASED + full release cascade"]
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/blank X-User-Role or X-User-ID, or unknown role value"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "acting role not permitted for the operation, or entity_backed actor acting on a resource it does not own"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced resource (path id or body FK) does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "malformed body, missing required field, or wrong type"
+  - id: ERR_INVALID_PAGINATION
+    http: 422
+    condition: "limit outside [1,100] or offset < 0"
+  - id: ERR_RESOURCE_TARGET_MISMATCH
+    http: 422
+    condition: "resource_type/seat_id/room_id combination is inconsistent (SEAT without seat_id, ROOM without room_id, or both set)"
+  - id: ERR_OUTSIDE_WORKDAY
+    http: 422
+    condition: "start_minute >= end_minute, or window falls outside the floor workday [workday_start_minute, workday_end_minute]"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "target resource is not in a state from which this transition is allowed"
+  - id: ERR_RESOURCE_NOT_BOOKABLE
+    http: 409
+    condition: "the seat/room is OUT_OF_SERVICE or RETIRED at booking/transition time"
+  - id: ERR_BOOKING_SUSPENDED
+    http: 409
+    condition: "acting employee's booking_privilege is SUSPENDED"
+  - id: ERR_TEAM_ZONING_VIOLATION
+    http: 409
+    condition: "team zoning enforced and employee.team_code != neighborhood.team_code"
+  - id: ERR_RESERVATION_LIMIT_REACHED
+    http: 409
+    condition: "employee already holds max_active_reservations_per_employee non-terminal reservations on the floor/date"
+  - id: ERR_SEAT_DOUBLE_BOOKED
+    http: 409
+    condition: "requested seat window overlaps an existing non-terminal reservation or active visitor pass on the same seat/date"
+  - id: ERR_ROOM_DOUBLE_BOOKED
+    http: 409
+    condition: "requested room window (incl. turnover buffer) overlaps an existing non-terminal reservation on the same room/date"
+  - id: ERR_NEIGHBORHOOD_CAPACITY_FULL
+    http: 409
+    condition: "reserving this seat would exceed the neighborhood's effective_cap_seats for the date"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_seat_version/expected_room_version does not match the live parent version"
+  - id: ERR_DUPLICATE
+    http: 409
+    condition: "uniqueness violation (floor level, neighborhood name, seat label, room label, employee email)"
+  - id: ERR_AMENITY_LOCKED
+    http: 409
+    condition: "attempt to cancel an APPROVED amenity line whose parent reservation is already COMPLETED (chargeback frozen)"
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: FacilityManager
+    description: "owns floor-plan inventory, capacity policy, amenity approval, forced release, reinstate, clock control"
+    identity: "opaque"
+    exclusive_operations:
+      - "create/manage Site, Floor, Neighborhood, Seat, Room, Employee, CapacityPolicy"
+      - "seat out-of-service / restore / retire"
+      - "amenity approve / deny"
+      - "reservation force release (no-show)"
+      - "employee reinstate"
+      - "clock set / no-show sweep"
+    shared_operations:
+      - "read floors, neighborhoods, seats, rooms, employees, reservations, amenities, visitor passes, utilization"
+  - name: Employee
+    description: "books own seat/room reservations, checks in, completes, cancels, manages own amenity lines, hosts/approves visitor passes"
+    identity: "entity_backed:Employee"
+    exclusive_operations:
+      - "create reservation (must be employee_id == self)"
+      - "reservation check-in / complete / cancel (own reservation)"
+      - "add amenity line / cancel own amenity line"
+      - "visitor-pass request-changes / approve (as host_employee_id == self)"
+    shared_operations:
+      - "read own reservations, amenities, check-ins, seats, rooms, neighborhoods, visitor passes"
+  - name: Receptionist
+    description: "owns the visitor desk: files, resubmits, checks-in, completes, cancels visitor passes"
+    identity: "opaque"
+    exclusive_operations:
+      - "create visitor pass; resubmit; visitor check-in; visitor complete; visitor cancel"
+    shared_operations:
+      - "read seats, rooms, neighborhoods, visitor passes, sites, floors"
+  - name: Analyst
+    description: "read-only access to utilization analytics and the strike ledger"
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations:
+      - "read floors, neighborhoods, seats, rooms, employees, reservations, amenities, visitor passes, no-show events, utilization"

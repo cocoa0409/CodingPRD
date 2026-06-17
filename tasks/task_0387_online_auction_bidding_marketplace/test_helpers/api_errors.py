@@ -1,0 +1,55 @@
+"""Error IDs and HTTP status mapping (PRD §5 Error Code Catalogue).
+
+After defining the mapping, registers it with the framework so validate_error()
+auto-checks the HTTP status for a given error_id.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN_ROLE = "ERR_FORBIDDEN_ROLE"
+    ERR_NOT_OWNER = "ERR_NOT_OWNER"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_AUCTION_CLOSED = "ERR_AUCTION_CLOSED"
+    ERR_WINDOW_EXPIRED = "ERR_WINDOW_EXPIRED"
+    ERR_SELF_TRADING = "ERR_SELF_TRADING"
+    ERR_SELLER_SUSPENDED = "ERR_SELLER_SUSPENDED"
+    ERR_BID_TOO_LOW = "ERR_BID_TOO_LOW"
+    ERR_OFFER_INVALID = "ERR_OFFER_INVALID"
+    ERR_OFFER_ROUND_LIMIT = "ERR_OFFER_ROUND_LIMIT"
+    ERR_RETRACT_NOT_ALLOWED = "ERR_RETRACT_NOT_ALLOWED"
+    ERR_FEEDBACK_NOT_ELIGIBLE = "ERR_FEEDBACK_NOT_ELIGIBLE"
+    ERR_DISPUTE_NOT_ELIGIBLE = "ERR_DISPUTE_NOT_ELIGIBLE"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_REFUND_EXCEEDS_PAID = "ERR_REFUND_EXCEEDS_PAID"
+    ERR_ACCOUNT_CLOSED = "ERR_ACCOUNT_CLOSED"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN_ROLE: 403,
+    ApiErrorId.ERR_NOT_OWNER: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_AUCTION_CLOSED: 409,
+    ApiErrorId.ERR_WINDOW_EXPIRED: 409,
+    ApiErrorId.ERR_SELF_TRADING: 422,
+    ApiErrorId.ERR_SELLER_SUSPENDED: 422,
+    ApiErrorId.ERR_BID_TOO_LOW: 422,
+    ApiErrorId.ERR_OFFER_INVALID: 422,
+    ApiErrorId.ERR_OFFER_ROUND_LIMIT: 422,
+    ApiErrorId.ERR_RETRACT_NOT_ALLOWED: 422,
+    ApiErrorId.ERR_FEEDBACK_NOT_ELIGIBLE: 422,
+    ApiErrorId.ERR_DISPUTE_NOT_ELIGIBLE: 422,
+    ApiErrorId.ERR_INVALID_REQUEST: 422,
+    ApiErrorId.ERR_REFUND_EXCEEDS_PAID: 422,
+    ApiErrorId.ERR_ACCOUNT_CLOSED: 403,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

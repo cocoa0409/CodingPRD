@@ -1,0 +1,70 @@
+"""Error IDs and HTTP status mapping (PRD §5).
+
+Importing this module registers the error_id -> HTTP status map with the
+framework so ``validate_error()`` auto-checks the status code.
+"""
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    # auth (PRD §2.1, §3.12)
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN_ROLE = "ERR_FORBIDDEN_ROLE"
+    ERR_NOT_RESOURCE_OWNER = "ERR_NOT_RESOURCE_OWNER"
+
+    # existence (PRD §2.5)
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+
+    # state (PRD §3.12)
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+
+    # request shape (PRD §3.12)
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_INVALID_PAGINATION = "ERR_INVALID_PAGINATION"
+
+    # business rules (PRD §3)
+    ERR_DUPLICATE_EMAIL = "ERR_DUPLICATE_EMAIL"
+    ERR_NOT_PURCHASED = "ERR_NOT_PURCHASED"
+    ERR_WARRANTY_NOT_COVERED = "ERR_WARRANTY_NOT_COVERED"
+    ERR_FRAME_NOT_BIKE = "ERR_FRAME_NOT_BIKE"
+    ERR_BUILD_NOT_READY = "ERR_BUILD_NOT_READY"
+    ERR_RECALL_BLOCK = "ERR_RECALL_BLOCK"
+    ERR_INSUFFICIENT_STOCK = "ERR_INSUFFICIENT_STOCK"
+    ERR_NOT_FULLY_PAID = "ERR_NOT_FULLY_PAID"
+    ERR_DEPOSIT_SHORT = "ERR_DEPOSIT_SHORT"
+    ERR_LAYAWAY_NOT_PAID_OFF = "ERR_LAYAWAY_NOT_PAID_OFF"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    ERR_TARGET_NOT_PAYABLE = "ERR_TARGET_NOT_PAYABLE"
+    ERR_ALREADY_ACKNOWLEDGED = "ERR_ALREADY_ACKNOWLEDGED"
+    ERR_BAY_DOUBLE_BOOKED = "ERR_BAY_DOUBLE_BOOKED"
+
+
+HTTP_STATUS_CODES: dict[str, int] = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN_ROLE: 403,
+    ApiErrorId.ERR_NOT_RESOURCE_OWNER: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_INVALID_REQUEST: 400,
+    ApiErrorId.ERR_INVALID_PAGINATION: 400,
+    ApiErrorId.ERR_DUPLICATE_EMAIL: 409,
+    ApiErrorId.ERR_NOT_PURCHASED: 409,
+    ApiErrorId.ERR_WARRANTY_NOT_COVERED: 409,
+    ApiErrorId.ERR_FRAME_NOT_BIKE: 409,
+    ApiErrorId.ERR_BUILD_NOT_READY: 409,
+    ApiErrorId.ERR_RECALL_BLOCK: 409,
+    ApiErrorId.ERR_INSUFFICIENT_STOCK: 409,
+    ApiErrorId.ERR_NOT_FULLY_PAID: 409,
+    ApiErrorId.ERR_DEPOSIT_SHORT: 409,
+    ApiErrorId.ERR_LAYAWAY_NOT_PAID_OFF: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_TARGET_NOT_PAYABLE: 409,
+    ApiErrorId.ERR_ALREADY_ACKNOWLEDGED: 409,
+    ApiErrorId.ERR_BAY_DOUBLE_BOOKED: 409,
+}
+
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

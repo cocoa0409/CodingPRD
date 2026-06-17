@@ -1,0 +1,1582 @@
+scenario: "340. Self-Move Truck & Trailer Rental (U-Haul style): fleet (truck/trailer/tow) & location availability, one-way vs round-trip & mileage rate, reservation & equipment dispatch, moving-supplies & box add-on, damage/coverage waiver, fuel & late-return fee, dolly/pad rental, drop-off transfer"
+domain_name: "self-move-truck-trailer-rental"
+api_prefix: "/rental"
+
+complexity_profile:
+  primary_archetype: "Quota / allocation"
+  secondary_archetype: "Pricing engine"
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (Reservation -> Customer, Equipment, pickup/dropoff
+  # RentalLocation; RentalContract -> Reservation, Equipment). No deep nesting in URL paths;
+  # children carry parent FKs in their bodies and are discovered via filtered-list GETs.
+
+  state_machine_shape: parallel
+  # Reservation carries two independent state dimensions (booking_status × fulfillment_status);
+  # Equipment availability is cyclic (AVAILABLE -> RESERVED -> DISPATCHED -> IN_TRANSIT ->
+  # RETURNED -> AVAILABLE again at a possibly different location); RentalContract branches
+  # (return-clean vs return-with-damage) into divergent settlement side-effects.
+
+  relationship_patterns:
+    - one_to_many        # RentalLocation 1:* Equipment (home_location); Reservation 1:* SupplyLineItem / EquipmentAddOn
+    - cross_aggregate    # RentalContract.reservation_id crosses into Reservation; DropOffTransfer crosses two RentalLocations
+    - self_referential   # Equipment.current_location_id and home_location_id both point at RentalLocation; DropOffTransfer.from/to are two RentalLocation rows
+
+  role_model: peer_roles
+  # Customer owns reservations/contracts they hold; LocationAgent operates a single physical
+  # location's fleet (dispatch, accept returns, file damage); FleetManager configures classes,
+  # locations, equipment, supply catalog, coverage plans, and approves cross-location transfers.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: RentalLocation
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Human-readable location name (e.g., 'Oakland Broadway')."
+        constraints: "non-empty, length 1..120"
+      - name: state_code
+        type: string
+        source: input
+        description: "Two-letter US state code; participates in one-way drop-off-fee zoning."
+        constraints: "exactly 2 uppercase letters"
+      - name: lot_capacity
+        type: integer
+        source: input
+        description: "Maximum number of Equipment rows whose current_location_id may equal this location."
+        constraints: ">= 1"
+      - name: on_lot_count
+        type: integer
+        source: computed
+        description: "Count of Equipment with current_location_id == this.id AND status IN {AVAILABLE, RESERVED, MAINTENANCE}. Recomputed on every dispatch, return, and transfer completion."
+      - name: accepts_one_way_dropoff
+        type: boolean
+        source: input
+        description: "When false, this location may not be selected as a one-way Reservation.dropoff_location_id."
+        default: true
+      - name: status
+        type: enum
+        source: input
+        description: "Operational status of the location."
+        default: OPEN
+        constraints: "one of {OPEN, CLOSED}; CLOSED locations reject new dispatch and new inbound transfers"
+
+  - name: EquipmentClass
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: "Unique class code (e.g., 'TRUCK_15', 'TRAILER_5x8', 'TOW_DOLLY')."
+        constraints: "unique across EquipmentClass; uppercase alnum + underscore; length 1..32"
+      - name: category
+        type: enum
+        source: input
+        description: "Broad fleet category driving availability and mileage rules."
+        constraints: "one of {TRUCK, TRAILER, TOW}"
+      - name: daily_rate_cents
+        type: integer
+        source: input
+        description: "Base per-rental-day rate in cents."
+        constraints: ">= 0"
+      - name: mileage_rate_cents
+        type: integer
+        source: input
+        description: "Per-mile charge in cents; applied ONLY to round-trip rentals (category TRUCK). Ignored for one-way and for non-TRUCK categories."
+        constraints: ">= 0"
+      - name: one_way_flat_cents
+        type: integer
+        source: input
+        description: "Flat one-way base fee in cents replacing mileage charging; applies to one-way rentals of this class."
+        constraints: ">= 0"
+      - name: fuel_capacity_gallons
+        type: number
+        source: input
+        description: "Tank capacity in gallons; 0 for non-fueled classes (TRAILER, TOW). Used in the fuel shortfall charge."
+        constraints: ">= 0"
+      - name: requires_coverage
+        type: boolean
+        source: input
+        description: "When true, a Reservation of this class must carry a non-DECLINED coverage selection before dispatch."
+        default: false
+
+  - name: CoveragePlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: "Unique coverage plan code (e.g., 'SAFEMOVE', 'BASIC')."
+        constraints: "unique across CoveragePlan; uppercase; length 1..32"
+      - name: daily_fee_cents
+        type: integer
+        source: input
+        description: "Per-rental-day waiver fee in cents."
+        constraints: ">= 0"
+      - name: damage_deductible_cents
+        type: integer
+        source: input
+        description: "Customer's out-of-pocket cap on a damage claim under this plan; damage above is waived."
+        constraints: ">= 0"
+      - name: active
+        type: boolean
+        source: input
+        description: "When false, the plan may not be selected on new reservations but remains valid on existing ones."
+        default: true
+
+  - name: MovingSupply
+    parent: null
+    common_fields: true
+    fields:
+      - name: sku
+        type: string
+        source: input
+        description: "Unique supply SKU (e.g., 'BOX_MEDIUM', 'TAPE_ROLL')."
+        constraints: "unique across MovingSupply; length 1..32"
+      - name: unit_price_cents
+        type: integer
+        source: input
+        description: "Per-unit price in cents."
+        constraints: ">= 0"
+      - name: stock_qty
+        type: integer
+        source: input
+        description: "On-hand sellable quantity; decremented when a SupplyLineItem is added, restored when removed before pickup."
+        constraints: ">= 0"
+      - name: returnable
+        type: boolean
+        source: input
+        description: "When true, unopened units may be refunded at contract settlement (e.g., unused boxes) at 50% of unit_price_cents."
+        default: false
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Unique login/contact email."
+        constraints: "unique across Customer; valid email shape"
+      - name: full_name
+        type: string
+        source: input
+        description: "Customer full name."
+        constraints: "non-empty"
+      - name: license_verified
+        type: boolean
+        source: input
+        description: "Whether the driver license has been verified; a Reservation for a TRUCK class cannot be dispatched while false."
+        default: false
+      - name: loyalty_tier
+        type: enum
+        source: input
+        description: "Loyalty tier driving the round-trip mileage discount tier."
+        default: STANDARD
+        constraints: "one of {STANDARD, SILVER, GOLD}"
+
+  - name: Reservation
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the holder of this reservation."
+      - name: equipment_class_id
+        type: string
+        source: input
+        description: "FK -> EquipmentClass.id; the class of equipment requested."
+      - name: pickup_location_id
+        type: string
+        source: input
+        description: "FK -> RentalLocation.id; where equipment is dispatched from."
+      - name: dropoff_location_id
+        type: string
+        source: input
+        description: "FK -> RentalLocation.id; where equipment is to be returned. Equals pickup for round-trip; differs for one-way."
+      - name: coverage_plan_id
+        type: string
+        source: input
+        description: "FK -> CoveragePlan.id; selected damage-waiver plan. Null when coverage_choice is DECLINED."
+      - name: trip_type
+        type: enum
+        source: computed
+        description: "ONE_WAY when pickup_location_id != dropoff_location_id, else ROUND_TRIP. Derived at create; never accepted as input."
+        constraints: "one of {ONE_WAY, ROUND_TRIP}"
+      - name: coverage_choice
+        type: enum
+        source: input
+        description: "SELECTED when coverage_plan_id is provided, DECLINED otherwise. Input-validated against coverage_plan_id presence."
+        default: DECLINED
+        constraints: "one of {SELECTED, DECLINED}"
+      - name: scheduled_pickup_at
+        type: datetime
+        source: input
+        description: "Planned pickup timestamp (ISO 8601 UTC)."
+      - name: scheduled_return_at
+        type: datetime
+        source: input
+        description: "Planned return timestamp; must be strictly after scheduled_pickup_at."
+      - name: planned_days
+        type: integer
+        source: computed
+        description: "ceil((scheduled_return_at - scheduled_pickup_at) / 24h), minimum 1. Drives quoted daily charges."
+      - name: booking_status
+        type: enum
+        source: computed
+        description: "Booking-dimension state. Independent of fulfillment_status."
+        default: PENDING
+        constraints: "one of {PENDING, CONFIRMED, CANCELLED}"
+      - name: fulfillment_status
+        type: enum
+        source: computed
+        description: "Fulfillment-dimension state. Independent of booking_status; only advances while booking_status == CONFIRMED."
+        default: AWAITING_DISPATCH
+        constraints: "one of {AWAITING_DISPATCH, DISPATCHED, COMPLETED}"
+      - name: assigned_equipment_id
+        type: string
+        source: computed
+        description: "FK -> Equipment.id; set at round-trip confirm (earmark) and/or at dispatch via the selector policy. Null for an un-earmarked one-way reservation until DISPATCHED. Used by equipment_window_overlap to find the reservations sharing a unit."
+      - name: quoted_total_cents
+        type: integer
+        source: computed
+        description: "Estimate computed by the reservation_quote calculation at create/confirm time (forward-looking, before actual usage)."
+
+  - name: EquipmentAddOn
+    parent: null
+    common_fields: true
+    fields:
+      - name: reservation_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id; the reservation this add-on attaches to."
+      - name: addon_type
+        type: enum
+        source: input
+        description: "Rentable accessory type."
+        constraints: "one of {UTILITY_DOLLY, APPLIANCE_DOLLY, FURNITURE_PAD_DOZEN}"
+      - name: quantity
+        type: integer
+        source: input
+        description: "Count of this accessory rented."
+        constraints: ">= 1"
+      - name: daily_rate_cents
+        type: integer
+        source: computed
+        description: "Per-day rate snapshotted from the ADDON_RATES constant at create time."
+
+  - name: SupplyLineItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: reservation_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id; the reservation this supply purchase attaches to."
+      - name: supply_id
+        type: string
+        source: input
+        description: "FK -> MovingSupply.id; the catalog item purchased."
+      - name: quantity
+        type: integer
+        source: input
+        description: "Units purchased."
+        constraints: ">= 1; must not exceed MovingSupply.stock_qty at create time"
+      - name: unit_price_cents
+        type: integer
+        source: computed
+        description: "Snapshot of MovingSupply.unit_price_cents at create time; immune to later catalog price changes."
+      - name: refunded_units
+        type: integer
+        source: computed
+        description: "Units refunded at settlement (only when the MovingSupply was returnable); 0 until settlement."
+        default: 0
+
+  - name: Equipment
+    parent: null
+    common_fields: true
+    fields:
+      - name: equipment_class_id
+        type: string
+        source: input
+        description: "FK -> EquipmentClass.id; the class this unit belongs to."
+      - name: home_location_id
+        type: string
+        source: input
+        description: "FK -> RentalLocation.id; the unit's home base for round-trip availability accounting."
+      - name: current_location_id
+        type: string
+        source: computed
+        description: "FK -> RentalLocation.id; where the unit physically sits now. Mutated by dispatch (cleared), return (set to drop-off), and transfer completion."
+      - name: status
+        type: enum
+        source: computed
+        description: "Availability lifecycle state."
+        default: AVAILABLE
+        constraints: "one of {AVAILABLE, RESERVED, DISPATCHED, IN_TRANSIT, MAINTENANCE, RETIRED}"
+      - name: odometer_miles
+        type: integer
+        source: input
+        description: "Current odometer reading; only meaningful for TRUCK category. Updated at return to closing reading."
+        default: 0
+      - name: fuel_level_eighths
+        type: integer
+        source: input
+        description: "Fuel level in eighths of a tank (0..8); only meaningful for fueled classes. Updated at return."
+        default: 8
+        constraints: "0 <= fuel_level_eighths <= 8"
+
+  - name: RentalContract
+    parent: null
+    common_fields: true
+    fields:
+      - name: reservation_id
+        type: string
+        source: input
+        description: "FK -> Reservation.id; the reservation fulfilled by this contract (1:1)."
+      - name: equipment_id
+        type: string
+        source: input
+        description: "FK -> Equipment.id; the dispatched unit under contract."
+      - name: pickup_odometer_miles
+        type: integer
+        source: computed
+        description: "Equipment.odometer_miles snapshot at dispatch."
+      - name: pickup_fuel_eighths
+        type: integer
+        source: computed
+        description: "Equipment.fuel_level_eighths snapshot at dispatch."
+      - name: return_odometer_miles
+        type: integer
+        source: input
+        description: "Closing odometer reading captured at return; must be >= pickup_odometer_miles."
+      - name: return_fuel_eighths
+        type: integer
+        source: input
+        description: "Closing fuel level captured at return (0..8)."
+        constraints: "0 <= return_fuel_eighths <= 8"
+      - name: miles_driven
+        type: integer
+        source: computed
+        description: "return_odometer_miles - pickup_odometer_miles; computed at return."
+      - name: actual_return_at
+        type: datetime
+        source: input
+        description: "Wall-clock return timestamp captured at return; compared to Reservation.scheduled_return_at for the late fee."
+      - name: status
+        type: enum
+        source: computed
+        description: "Contract lifecycle state with a branch on damage at return."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, RETURNED_CLEAN, RETURNED_DAMAGED, SETTLED, VOID}"
+      - name: settlement_total_cents
+        type: integer
+        source: computed
+        description: "Final charge computed by the contract_settlement calculation (chronological/actual); set at settlement."
+      - name: damage_charge_cents
+        type: integer
+        source: computed
+        description: "Net customer-borne damage after applying coverage deductible; set when settling a RETURNED_DAMAGED contract, else 0."
+        default: 0
+
+  - name: DamageReport
+    parent: null
+    common_fields: false
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> RentalContract.id; the contract the damage was found on (append-only event)."
+      - name: assessed_cost_cents
+        type: integer
+        source: input
+        description: "Gross repair cost assessed by the agent."
+        constraints: ">= 1"
+      - name: description
+        type: string
+        source: input
+        description: "Free-text damage description."
+        constraints: "non-empty"
+
+  - name: DropOffTransfer
+    parent: null
+    common_fields: true
+    fields:
+      - name: equipment_id
+        type: string
+        source: input
+        description: "FK -> Equipment.id; the unit being relocated."
+      - name: from_location_id
+        type: string
+        source: input
+        description: "FK -> RentalLocation.id; origin (the unit's current_location_id when transfer is opened)."
+      - name: to_location_id
+        type: string
+        source: input
+        description: "FK -> RentalLocation.id; destination location to rebalance the unit to."
+      - name: reason
+        type: enum
+        source: input
+        description: "Why the transfer exists."
+        constraints: "one of {ONE_WAY_REBALANCE, FLEET_REBALANCE}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Transfer lifecycle state."
+        default: REQUESTED
+        constraints: "one of {REQUESTED, APPROVED, COMPLETED, REJECTED}"
+
+  - name: ChargeLedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> RentalContract.id; the contract this charge line belongs to (append-only)."
+      - name: kind
+        type: enum
+        source: system
+        description: "Charge category."
+        constraints: "one of {BASE_DAYS, MILEAGE, ONE_WAY_FLAT, ADDON, COVERAGE, FUEL_SHORTFALL, LATE_RETURN, DAMAGE, SUPPLY, SUPPLY_REFUND}"
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Signed amount in cents; positive = charge, negative = refund (SUPPLY_REFUND)."
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  # ---- Reservation: PARALLEL dimensions (booking_status × fulfillment_status) ----
+  - entity: Reservation
+    initial_state: "booking_status=PENDING; fulfillment_status=AWAITING_DISPATCH"
+    terminal_states: ["booking_status=CANCELLED", "fulfillment_status=COMPLETED"]
+    transitions:
+      - from: "booking_status=PENDING"
+        to: "booking_status=CONFIRMED"
+        trigger: "POST /rental/reservations/{id}/confirm"
+        actor: Customer
+        preconditions:
+          - "booking_status == PENDING"
+          - "coverage_choice == SELECTED when EquipmentClass.requires_coverage is true"
+          - "round-trip overlap gate: among the Equipment of the reservation's class stationed at pickup_location_id (current_location_id == pickup, status IN {AVAILABLE, RESERVED}), at least one must have NO CONFIRMED reservation whose buffer-extended window [pickup, return+TURNAROUND_HOURS) overlaps this reservation's window (equipment_window_overlap variant reservation_buffered_overlap). If every stationed unit is held by an overlapping CONFIRMED reservation, reject ERR_EQUIPMENT_DOUBLE_BOOKED. ERR_NO_EQUIPMENT_AVAILABLE is NOT evaluated at confirm (it is dispatch-only); a class with zero stationed units may still confirm (a unit may be returned/transferred in before dispatch) and is simply left un-earmarked. One-way reservations are never earmarked at confirm."
+        side_effects:
+          - "recompute quoted_total_cents via reservation_quote (forward_looking)"
+          - "round-trip only: earmark an eligible Equipment AVAILABLE -> RESERVED and set Reservation.assigned_equipment_id to it (cascade)"
+          - "increments Reservation.version by 1"
+        note: "Confirm freezes the quote inputs (planned_days, rates) for the booking dimension and earmarks a round-trip unit."
+      - from: "booking_status=PENDING"
+        to: "booking_status=CANCELLED"
+        trigger: "POST /rental/reservations/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "booking_status IN {PENDING, CONFIRMED}"
+          - "fulfillment_status == AWAITING_DISPATCH (cannot cancel after dispatch)"
+        side_effects:
+          - "restore stock_qty for every SupplyLineItem on this reservation (cascade)"
+          - "if an Equipment was RESERVED for this reservation, set it back to AVAILABLE, clear Reservation.assigned_equipment_id, and recompute its current_location's on_lot_count (cascade)"
+          - "increments Reservation.version by 1"
+      - from: "booking_status=CONFIRMED"
+        to: "booking_status=CANCELLED"
+        trigger: "POST /rental/reservations/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "booking_status == CONFIRMED"
+          - "fulfillment_status == AWAITING_DISPATCH"
+        side_effects:
+          - "restore stock_qty for every SupplyLineItem on this reservation (cascade)"
+          - "if an Equipment was RESERVED for this reservation, set it back to AVAILABLE, clear Reservation.assigned_equipment_id, and recompute its current_location's on_lot_count (cascade)"
+          - "increments Reservation.version by 1"
+      - from: "fulfillment_status=AWAITING_DISPATCH"
+        to: "fulfillment_status=DISPATCHED"
+        trigger: "POST /rental/reservations/{id}/dispatch"
+        actor: LocationAgent
+        preconditions:
+          - "booking_status == CONFIRMED"
+          - "Customer.license_verified == true when EquipmentClass.category == TRUCK"
+          - "pickup RentalLocation.status == OPEN"
+          - "the equipment selector policy yields a non-empty candidate set (else ERR_NO_EQUIPMENT_AVAILABLE)"
+        side_effects:
+          - "select Equipment via selector policy; set assigned_equipment_id"
+          - "Equipment.status AVAILABLE -> DISPATCHED; clear Equipment.current_location_id"
+          - "decrement pickup RentalLocation.on_lot_count (cascade: recompute on_lot_count)"
+          - "create RentalContract (status=ACTIVE) snapshotting pickup_odometer_miles and pickup_fuel_eighths"
+          - "increments Reservation.version by 1"
+        note: "Dispatch advances the fulfillment dimension only; booking_status stays CONFIRMED."
+      - from: "fulfillment_status=DISPATCHED"
+        to: "fulfillment_status=COMPLETED"
+        trigger: "system: RentalContract reaches SETTLED"
+        actor: system
+        preconditions:
+          - "the linked RentalContract.status == SETTLED"
+        side_effects:
+          - "increments Reservation.version by 1"
+        note: "Bubble-up: contract settlement closes the reservation's fulfillment dimension."
+
+  # ---- Equipment: CYCLIC availability lifecycle ----
+  - entity: Equipment
+    initial_state: AVAILABLE
+    terminal_states: [RETIRED]
+    transitions:
+      - from: AVAILABLE
+        to: RESERVED
+        trigger: "system: Reservation confirm earmarks a round-trip unit"
+        actor: system
+        preconditions:
+          - "Reservation.trip_type == ROUND_TRIP"
+          - "Equipment.current_location_id == Reservation.pickup_location_id"
+          - "Equipment.status == AVAILABLE"
+          - "Equipment's buffer-extended reservation window does NOT overlap the new reservation's window (equipment_window_overlap reservation_buffered_overlap)"
+        side_effects:
+          - "Equipment.status AVAILABLE -> RESERVED (earmark; current_location unchanged)"
+        note: "Round-trip confirm earmarks a specific unit so availability accounting reflects the hold."
+      - from: RESERVED
+        to: AVAILABLE
+        trigger: "system: Reservation cancel releases the earmark"
+        actor: system
+        preconditions:
+          - "the earmarking Reservation transitions to CANCELLED"
+        side_effects:
+          - "Equipment.status RESERVED -> AVAILABLE"
+          - "recompute current_location.on_lot_count"
+      - from: AVAILABLE
+        to: DISPATCHED
+        trigger: "POST /rental/reservations/{id}/dispatch (one-way path, unit not pre-earmarked)"
+        actor: LocationAgent
+        preconditions:
+          - "Equipment.status == AVAILABLE"
+          - "selected by the dispatch selector policy"
+        side_effects:
+          - "Equipment.status -> DISPATCHED; clear current_location_id"
+          - "recompute prior current_location.on_lot_count"
+      - from: RESERVED
+        to: DISPATCHED
+        trigger: "POST /rental/reservations/{id}/dispatch (round-trip path, earmarked unit)"
+        actor: LocationAgent
+        preconditions:
+          - "Equipment.status == RESERVED for this reservation"
+        side_effects:
+          - "Equipment.status RESERVED -> DISPATCHED; clear current_location_id"
+          - "recompute prior current_location.on_lot_count"
+      - from: DISPATCHED
+        to: IN_TRANSIT
+        trigger: "system: dispatch completes (truck leaves the lot)"
+        actor: system
+        preconditions:
+          - "RentalContract created with status ACTIVE"
+        side_effects:
+          - "Equipment.status DISPATCHED -> IN_TRANSIT"
+        note: "Modeled as an immediate follow-on of dispatch so the unit is unambiguously off-lot."
+      - from: IN_TRANSIT
+        to: AVAILABLE
+        trigger: "POST /rental/contracts/{id}/return"
+        actor: LocationAgent
+        preconditions:
+          - "RentalContract.status == ACTIVE"
+          - "return RentalLocation (Reservation.dropoff_location_id) is OPEN"
+          - "return location on_lot_count < lot_capacity (else ERR_RETURN_LOT_FULL)"
+        side_effects:
+          - "Equipment.status IN_TRANSIT -> AVAILABLE"
+          - "set Equipment.current_location_id = Reservation.dropoff_location_id"
+          - "update Equipment.odometer_miles and fuel_level_eighths to closing readings"
+          - "recompute dropoff_location.on_lot_count"
+        note: "For one-way returns the unit lands at a different location than its home — drives a possible DropOffTransfer."
+      - from: AVAILABLE
+        to: MAINTENANCE
+        trigger: "POST /rental/equipment/{id}/maintenance"
+        actor: FleetManager
+        preconditions:
+          - "Equipment.status == AVAILABLE"
+        side_effects:
+          - "Equipment.status AVAILABLE -> MAINTENANCE (still counts toward on_lot_count)"
+      - from: MAINTENANCE
+        to: AVAILABLE
+        trigger: "POST /rental/equipment/{id}/clear-maintenance"
+        actor: FleetManager
+        preconditions:
+          - "Equipment.status == MAINTENANCE"
+        side_effects:
+          - "Equipment.status MAINTENANCE -> AVAILABLE"
+      - from: AVAILABLE
+        to: RETIRED
+        trigger: "POST /rental/equipment/{id}/retire"
+        actor: FleetManager
+        preconditions:
+          - "Equipment.status == AVAILABLE"
+        side_effects:
+          - "Equipment.status -> RETIRED; recompute current_location.on_lot_count (drops out of count)"
+
+  # ---- RentalContract: BRANCHING (clean vs damaged) into divergent settlement ----
+  - entity: RentalContract
+    initial_state: ACTIVE
+    terminal_states: [SETTLED, VOID]
+    transitions:
+      - from: ACTIVE
+        to: RETURNED_CLEAN
+        trigger: "POST /rental/contracts/{id}/return"
+        actor: LocationAgent
+        preconditions:
+          - "RentalContract.status == ACTIVE"
+          - "return_odometer_miles >= pickup_odometer_miles (else ERR_ODOMETER_REGRESSION)"
+          - "no DamageReport exists for this contract at return time"
+        side_effects:
+          - "compute miles_driven; update linked Equipment per its IN_TRANSIT->AVAILABLE transition (cascade)"
+        note: "Clean branch: settlement will exclude any DAMAGE ledger line."
+      - from: ACTIVE
+        to: RETURNED_DAMAGED
+        trigger: "POST /rental/contracts/{id}/return"
+        actor: LocationAgent
+        preconditions:
+          - "RentalContract.status == ACTIVE"
+          - "return_odometer_miles >= pickup_odometer_miles"
+          - "at least one DamageReport exists for this contract at return time"
+        side_effects:
+          - "compute miles_driven; update linked Equipment per its IN_TRANSIT->AVAILABLE transition (cascade)"
+        note: "Damaged branch: settlement adds a DAMAGE ledger line net of coverage deductible."
+      - from: RETURNED_CLEAN
+        to: SETTLED
+        trigger: "POST /rental/contracts/{id}/settle"
+        actor: LocationAgent
+        preconditions:
+          - "RentalContract.status == RETURNED_CLEAN"
+        side_effects:
+          - "run contract_settlement (chronological/actual); set settlement_total_cents"
+          - "emit BASE_DAYS, MILEAGE|ONE_WAY_FLAT, ADDON, COVERAGE, FUEL_SHORTFALL, LATE_RETURN, SUPPLY, SUPPLY_REFUND ChargeLedgerEntry rows (cascade)"
+          - "for each returnable SupplyLineItem, set refunded_units and emit a negative SUPPLY_REFUND line (cascade)"
+          - "set linked Reservation.fulfillment_status DISPATCHED -> COMPLETED (bubble-up cascade)"
+          - "increments RentalContract.version by 1"
+      - from: RETURNED_DAMAGED
+        to: SETTLED
+        trigger: "POST /rental/contracts/{id}/settle"
+        actor: LocationAgent
+        preconditions:
+          - "RentalContract.status == RETURNED_DAMAGED"
+        side_effects:
+          - "run contract_settlement; compute damage_charge_cents = max(0, sum(DamageReport.assessed_cost_cents) - CoveragePlan.damage_deductible_cents) when coverage SELECTED, else full sum"
+          - "emit all clean-branch ledger lines plus a DAMAGE ChargeLedgerEntry"
+          - "set settlement_total_cents inclusive of damage_charge_cents"
+          - "set linked Reservation.fulfillment_status DISPATCHED -> COMPLETED (bubble-up cascade)"
+          - "increments RentalContract.version by 1"
+      - from: ACTIVE
+        to: VOID
+        trigger: "POST /rental/contracts/{id}/void"
+        actor: FleetManager
+        preconditions:
+          - "RentalContract.status == ACTIVE"
+        side_effects:
+          - "Equipment.status -> AVAILABLE at its pickup_location (rollback dispatch); recompute on_lot_count (cascade)"
+          - "Reservation.fulfillment_status DISPATCHED -> AWAITING_DISPATCH; clear assigned_equipment_id (compensation cascade)"
+          - "increments RentalContract.version by 1"
+        note: "Compensation: voids a mis-dispatch, conserving on-lot inventory."
+
+  # ---- DropOffTransfer: branching approval (approve vs reject) ----
+  - entity: DropOffTransfer
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, REJECTED]
+    transitions:
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /rental/transfers/{id}/approve"
+        actor: FleetManager
+        preconditions:
+          - "DropOffTransfer.status == REQUESTED"
+          - "to_location RentalLocation.status == OPEN"
+          - "to_location on_lot_count < lot_capacity (capacity must exist at destination)"
+        side_effects:
+          - "Equipment.status AVAILABLE -> IN_TRANSIT; recompute from_location.on_lot_count (cascade)"
+          - "increments DropOffTransfer.version by 1"
+      - from: REQUESTED
+        to: REJECTED
+        trigger: "POST /rental/transfers/{id}/reject"
+        actor: FleetManager
+        preconditions:
+          - "DropOffTransfer.status == REQUESTED"
+        side_effects:
+          - "increments DropOffTransfer.version by 1"
+      - from: APPROVED
+        to: COMPLETED
+        trigger: "POST /rental/transfers/{id}/complete"
+        actor: LocationAgent
+        preconditions:
+          - "DropOffTransfer.status == APPROVED"
+          - "to_location on_lot_count < lot_capacity at completion time (else ERR_RETURN_LOT_FULL)"
+        side_effects:
+          - "Equipment.status IN_TRANSIT -> AVAILABLE; set Equipment.current_location_id = to_location_id"
+          - "recompute to_location.on_lot_count and from_location.on_lot_count (cascade)"
+          - "increments DropOffTransfer.version by 1"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules (OCC on parent version)
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: dispatch-stale-reservation
+    parent_entity: Reservation
+    write_endpoint: "POST /rental/reservations/{id}/dispatch"
+    occ_field: "expected_reservation_version"
+    description: |
+      Dispatching a Reservation whose version has advanced since the agent last
+      observed it is rejected. This captures the case where another writer has
+      already dispatched the reservation (which legitimately consumes an
+      Equipment unit and advances fulfillment_status), so the current agent's
+      view of the reservation is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: settle-stale-contract
+    parent_entity: RentalContract
+    write_endpoint: "POST /rental/contracts/{id}/settle"
+    occ_field: "expected_contract_version"
+    description: |
+      Settling a RentalContract whose version has advanced since the agent last
+      observed it is rejected. This captures the case where another writer has
+      already returned/settled the contract (which legitimately emits ledger
+      lines and bubbles the reservation to COMPLETED), so the current agent's
+      view of the contract is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: reservation_quote
+    trigger: "Reservation create and POST /rental/reservations/{id}/confirm"
+    algorithm: forward_looking
+    formula: |
+      # FORWARD-LOOKING ESTIMATE — uses planned inputs, not actual usage.
+      # Evaluation order is fixed; do not reorder.
+      planned_days = ceil((scheduled_return_at - scheduled_pickup_at) / 24h)   # min 1
+      base = EquipmentClass.daily_rate_cents * planned_days
+      if trip_type == ONE_WAY:
+          trip_component = EquipmentClass.one_way_flat_cents
+          # one-way does NOT quote mileage (actual miles unknown, flat fee instead)
+      else:  # ROUND_TRIP
+          est_miles = ESTIMATED_ROUND_TRIP_MILES   # constant; actual unknown at quote time
+          raw_mileage = EquipmentClass.mileage_rate_cents * est_miles   (TRUCK only; 0 otherwise)
+          # loyalty discount on the MILEAGE component only:
+          mileage_discount_pct = MILEAGE_DISCOUNT_BY_TIER[Customer.loyalty_tier]
+          trip_component = round_half_up(raw_mileage * (1 - mileage_discount_pct))
+      addons = sum over EquipmentAddOn of (addon.daily_rate_cents * addon.quantity * planned_days)
+      coverage = (coverage_choice == SELECTED) ? (CoveragePlan.daily_fee_cents * planned_days) : 0
+      supplies = sum over SupplyLineItem of (line.unit_price_cents * line.quantity)
+      quoted_total_cents = base + trip_component + addons + coverage + supplies
+    input_set: "EquipmentAddOn and SupplyLineItem rows on the reservation at quote time; coverage only when SELECTED."
+    constants:
+      ESTIMATED_ROUND_TRIP_MILES: 60
+      MILEAGE_DISCOUNT_BY_TIER: { STANDARD: 0.00, SILVER: 0.10, GOLD: 0.20 }
+      ADDON_RATES: { UTILITY_DOLLY: 700, APPLIANCE_DOLLY: 1000, FURNITURE_PAD_DOZEN: 500 }
+    precision: "integer cents; round_half_up only at the single mileage_discount step, then sum exact integers"
+    variants:
+      - name: estimate_at_create
+        when: "Reservation create"
+        difference: "uses the supply/add-on rows present at create; coverage may still be DECLINED"
+      - name: estimate_at_confirm
+        when: "POST .../confirm"
+        difference: "re-runs with the now-final add-on/supply set and the confirmed coverage; this is the figure frozen for the booking dimension"
+
+  - name: contract_settlement
+    trigger: "POST /rental/contracts/{id}/settle"
+    algorithm: chronological
+    formula: |
+      # ACTUAL/CHRONOLOGICAL — uses observed usage at return, NOT the quote.
+      # Evaluation order is fixed; do not reorder.
+      rental_days = ceil((actual_return_at - scheduled_pickup_at) / 24h)   # min 1; uses ACTUAL return
+      base = EquipmentClass.daily_rate_cents * rental_days
+      if trip_type == ONE_WAY:
+          trip_component = EquipmentClass.one_way_flat_cents
+      else:  # ROUND_TRIP, TRUCK only
+          raw_mileage = EquipmentClass.mileage_rate_cents * miles_driven   # ACTUAL miles
+          mileage_discount_pct = MILEAGE_DISCOUNT_BY_TIER[Customer.loyalty_tier]
+          trip_component = round_half_up(raw_mileage * (1 - mileage_discount_pct))
+      addons = sum over EquipmentAddOn of (addon.daily_rate_cents * addon.quantity * rental_days)
+      coverage = (coverage_choice == SELECTED) ? (CoveragePlan.daily_fee_cents * rental_days) : 0
+      # FUEL SHORTFALL: charge for missing eighths below pickup level
+      missing_eighths = max(0, pickup_fuel_eighths - return_fuel_eighths)
+      gallons_short = (EquipmentClass.fuel_capacity_gallons / 8) * missing_eighths
+      fuel_shortfall = round_half_up(gallons_short * FUEL_PRICE_PER_GALLON_CENTS) + (missing_eighths > 0 ? REFUEL_SERVICE_FEE_CENTS : 0)
+      # LATE RETURN: threshold on grace minutes, then per-day late fee
+      late_minutes = max(0, (actual_return_at - scheduled_return_at) in minutes)
+      late_days = (late_minutes <= LATE_GRACE_MINUTES) ? 0 : ceil((late_minutes - LATE_GRACE_MINUTES) / (24*60))
+      late_fee = late_days * LATE_FEE_PER_DAY_CENTS
+      # DAMAGE (only on RETURNED_DAMAGED branch):
+      gross_damage = sum over DamageReport.assessed_cost_cents for this contract
+      damage_charge = (status == RETURNED_DAMAGED)
+                      ? ( coverage_choice == SELECTED
+                          ? max(0, gross_damage - CoveragePlan.damage_deductible_cents)
+                          : gross_damage )
+                      : 0
+      # SUPPLIES net of returnable refunds:
+      supplies = sum over SupplyLineItem of (line.unit_price_cents * line.quantity)
+      supply_refund = sum over returnable SupplyLineItem of round_half_up(line.unit_price_cents * line.refunded_units * SUPPLY_REFUND_PCT)
+      settlement_total_cents = base + trip_component + addons + coverage
+                               + fuel_shortfall + late_fee + damage_charge
+                               + supplies - supply_refund
+    input_set: "DamageReport rows (RETURNED_DAMAGED only), all EquipmentAddOn / SupplyLineItem on the reservation; actual return readings on the contract."
+    constants:
+      FUEL_PRICE_PER_GALLON_CENTS: 600
+      REFUEL_SERVICE_FEE_CENTS: 3000
+      LATE_GRACE_MINUTES: 119
+      LATE_FEE_PER_DAY_CENTS: 4000
+      SUPPLY_REFUND_PCT: 0.50
+      MILEAGE_DISCOUNT_BY_TIER: { STANDARD: 0.00, SILVER: 0.10, GOLD: 0.20 }
+    precision: "integer cents; round_half_up applied PER COMPONENT (mileage, fuel, each supply refund) BEFORE summation — components are rounded, then the final total is an exact integer sum. Do NOT sum raw then round."
+    variants:
+      - name: clean_settlement
+        when: "RentalContract.status == RETURNED_CLEAN"
+        difference: "damage_charge is 0; no DAMAGE ledger line"
+      - name: damaged_settlement
+        when: "RentalContract.status == RETURNED_DAMAGED"
+        difference: "adds damage_charge net of coverage deductible (full gross when coverage DECLINED)"
+
+  - name: location_availability
+    trigger: "GET /rental/locations/{id}/availability and dispatch/confirm preconditions"
+    algorithm: aggregation
+    formula: |
+      # Count of dispatch-ready units of a class at a location.
+      available_count(location, class) =
+        count of Equipment where
+          equipment_class_id == class.id
+          AND current_location_id == location.id
+          AND status == AVAILABLE                # RESERVED/MAINTENANCE/DISPATCHED excluded
+      reserved_count(location, class) =
+        count of Equipment where ... AND status == RESERVED AND current_location_id == location.id
+      # availability for a NEW round-trip confirm requires available_count >= 1.
+    input_set: "Equipment rows with current_location_id == location.id; status strictly AVAILABLE for the available pool."
+    constants: {}
+    precision: "integer counts"
+    variants:
+      - name: dispatch_pool
+        when: "dispatch / round-trip confirm precondition"
+        difference: "counts only status == AVAILABLE (RESERVED earmarks excluded from the free pool)"
+      - name: lot_occupancy
+        when: "return / transfer capacity check (on_lot_count)"
+        difference: "counts status IN {AVAILABLE, RESERVED, MAINTENANCE} — earmarked and in-maintenance units still occupy a lot slot; DISPATCHED/IN_TRANSIT/RETIRED do not"
+
+  - name: equipment_dispatch_selector
+    trigger: "POST /rental/reservations/{id}/dispatch"
+    algorithm: weighted_scoring
+    formula: |
+      # SELECTOR POLICY — pick exactly one Equipment from the candidate pool.
+      # (a) eligibility filter (candidate set):
+      candidates = Equipment where
+        equipment_class_id == Reservation.equipment_class_id
+        AND status == AVAILABLE
+        AND current_location_id == Reservation.pickup_location_id
+        AND (Reservation.trip_type == ONE_WAY OR not earmarked-to-another-reservation)
+      # round-trip path may instead use the unit earmarked (status RESERVED) for THIS reservation.
+      # (b) ranking expression (choose the unit that minimizes future imbalance):
+      #     prefer the unit whose home_location_id == Reservation.dropoff_location_id
+      #     (returns home, no rebalance needed) — boolean key, true sorts first;
+      #     then prefer lower odometer_miles (spread wear).
+      sort_key = ( home_matches_dropoff DESC, odometer_miles ASC )
+      # (c) tie-break: created_at ASC (oldest unit first). NEVER id.
+      # (d) empty candidate set -> ERR_NO_EQUIPMENT_AVAILABLE.
+    input_set: "AVAILABLE Equipment of the class at the pickup location; or the RESERVED earmark for this reservation."
+    constants: {}
+    precision: "deterministic single selection"
+    variants:
+      - name: round_trip_earmarked
+        when: "trip_type == ROUND_TRIP and a unit was earmarked at confirm"
+        difference: "uses the earmarked RESERVED unit directly, bypassing the ranking"
+      - name: one_way_open_pool
+        when: "trip_type == ONE_WAY (no earmark held)"
+        difference: "ranks the AVAILABLE pool by (home_matches_dropoff DESC, odometer_miles ASC, created_at ASC)"
+
+  - name: equipment_window_overlap
+    trigger: "POST /rental/reservations/{id}/confirm (round-trip earmark) and POST /rental/reservations/{id}/dispatch (candidate filter)"
+    algorithm: interval_merge
+    formula: |
+      # A physical Equipment unit may not serve two rentals whose effective
+      # occupation windows collide. Two distinct interval semantics apply on
+      # two distinct resources; both reject with ERR_EQUIPMENT_DOUBLE_BOOKED
+      # / ERR_TRANSFER_IN_PROGRESS respectively.
+      #
+      # (1) RESERVATION-window overlap on Equipment (buffer-extended, half-open):
+      #     For a candidate unit U and the new Reservation R, U is INELIGIBLE if
+      #     ANY other Reservation R2 with assigned_equipment_id == U.id (or earmark
+      #     to U) and booking_status == CONFIRMED satisfies:
+      #         R.scheduled_pickup_at  <  R2.scheduled_return_at + TURNAROUND_HOURS
+      #       AND
+      #         R2.scheduled_pickup_at <  R.scheduled_return_at + TURNAROUND_HOURS
+      #     i.e. each window is right-extended by TURNAROUND_HOURS for cleaning/
+      #     inspection; intervals are treated as half-open [start, end+buffer).
+      #     Touching at the buffered boundary (R.pickup == R2.return + buffer
+      #     exactly) does NOT overlap.
+      #
+      # (2) TRANSFER lifecycle overlap on Equipment (point-occupancy, NO buffer):
+      #     An Equipment may have AT MOST ONE open DropOffTransfer, where "open"
+      #     means status IN {REQUESTED, APPROVED}. Opening a second transfer while
+      #     one is open is rejected. This is pure lifecycle occupancy — there is
+      #     no time window or buffer; the unit is either encumbered by an open
+      #     transfer or it is not.
+    input_set: "(1) CONFIRMED Reservations sharing the candidate Equipment, by [pickup, return+buffer). (2) DropOffTransfers on the equipment with status IN {REQUESTED, APPROVED}."
+    constants:
+      TURNAROUND_HOURS: 3
+    precision: "datetime comparison at second resolution; half-open buffered intervals for (1), set-membership for (2)"
+    variants:
+      - name: reservation_buffered_overlap
+        when: "round-trip confirm earmark / dispatch candidate filter"
+        difference: "half-open intervals right-extended by TURNAROUND_HOURS; boundary-touch after buffer is NOT a collision"
+      - name: transfer_lifecycle_overlap
+        when: "POST /rental/transfers"
+        difference: "no time window — existence of any REQUESTED/APPROVED transfer on the unit blocks a second"
+
+# ===========================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "the role is permitted to call this endpoint per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: auth
+    check: "for Customer-owned resources, X-User-ID equals the resource's customer_id"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Customer-scoped reservation/contract reads and customer actions"
+  - priority: 4
+    category: existence
+    check: "all path and FK-referenced resources exist (validated left-to-right in path, then body FKs)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+  - priority: 5
+    category: business_constraint
+    check: "request body required fields present and well-typed; enums in allowed set; list-endpoint pagination params within bounds (limit in 1..100 -> ERR_VALIDATION_PAGINATION, offset >= 0 -> ERR_VALIDATION_PAGINATION)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all
+  - priority: 6
+    category: business_constraint
+    check: "scheduled_return_at strictly after scheduled_pickup_at on reservation create"
+    error_id: ERR_INVALID_TIME_RANGE
+    http_status: 422
+    applies_to: "POST /rental/reservations"
+  - priority: 7
+    category: business_referential
+    check: "coverage_choice SELECTED requires a non-null coverage_plan_id referencing an active CoveragePlan; DECLINED requires coverage_plan_id null"
+    error_id: ERR_COVERAGE_MISMATCH
+    http_status: 422
+    applies_to: "POST /rental/reservations, POST .../confirm"
+  - priority: 8
+    category: business_referential
+    check: "one-way reservation: dropoff_location_id != pickup_location_id AND dropoff RentalLocation.accepts_one_way_dropoff == true"
+    error_id: ERR_ONE_WAY_DROPOFF_NOT_ALLOWED
+    http_status: 422
+    applies_to: "POST /rental/reservations"
+  - priority: 9
+    category: state
+    check: "target resource in the correct state for the requested transition (booking_status / fulfillment_status / Equipment.status / RentalContract.status / DropOffTransfer.status)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 10
+    category: business_safety
+    check: "dispatch of a TRUCK class requires Customer.license_verified == true"
+    error_id: ERR_LICENSE_NOT_VERIFIED
+    http_status: 409
+    applies_to: "POST /rental/reservations/{id}/dispatch"
+  - priority: 11
+    category: business_safety
+    check: "confirm/dispatch of a class with requires_coverage == true demands coverage_choice == SELECTED"
+    error_id: ERR_COVERAGE_REQUIRED
+    http_status: 409
+    applies_to: "POST .../confirm, POST .../dispatch"
+  - priority: 12
+    category: business_temporal
+    check: "return: return_odometer_miles >= contract.pickup_odometer_miles (no odometer regression)"
+    error_id: ERR_ODOMETER_REGRESSION
+    http_status: 422
+    applies_to: "POST /rental/contracts/{id}/return"
+  - priority: 13
+    category: business_constraint
+    check: "SupplyLineItem create: quantity <= MovingSupply.stock_qty"
+    error_id: ERR_INSUFFICIENT_STOCK
+    http_status: 409
+    applies_to: "POST /rental/reservations/{id}/supplies"
+  - priority: 14
+    category: business_constraint
+    check: "add-ons / supplies may only be added or removed while booking_status == PENDING (before confirm freezes the order)"
+    error_id: ERR_RESERVATION_LOCKED
+    http_status: 409
+    applies_to: "POST/DELETE supplies and add-ons"
+  - priority: 15
+    category: business_constraint
+    check: "dispatch selector yields >= 1 candidate Equipment"
+    error_id: ERR_NO_EQUIPMENT_AVAILABLE
+    http_status: 409
+    applies_to: "POST /rental/reservations/{id}/dispatch"
+  - priority: 16
+    category: business_constraint
+    check: "return / transfer destination location on_lot_count < lot_capacity"
+    error_id: ERR_RETURN_LOT_FULL
+    http_status: 409
+    applies_to: "POST /rental/contracts/{id}/return, POST /rental/transfers/{id}/approve, POST /rental/transfers/{id}/complete"
+  - priority: 17
+    category: business_constraint
+    check: "DropOffTransfer create: from_location_id == Equipment.current_location_id AND to_location_id != from_location_id AND to RentalLocation.status == OPEN"
+    error_id: ERR_INVALID_TRANSFER
+    http_status: 422
+    applies_to: "POST /rental/transfers"
+  - priority: 18
+    category: business_temporal
+    check: "round-trip confirm earmark / dispatch: the candidate Equipment has no other CONFIRMED reservation whose buffer-extended window [pickup, return+TURNAROUND_HOURS) overlaps this reservation's window (equipment_window_overlap variant reservation_buffered_overlap)"
+    error_id: ERR_EQUIPMENT_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /rental/reservations/{id}/confirm, POST /rental/reservations/{id}/dispatch"
+  - priority: 19
+    category: business_temporal
+    check: "DropOffTransfer create: the equipment has no existing transfer with status IN {REQUESTED, APPROVED} (equipment_window_overlap variant transfer_lifecycle_overlap)"
+    error_id: ERR_TRANSFER_IN_PROGRESS
+    http_status: 409
+    applies_to: "POST /rental/transfers"
+  - priority: 20
+    category: business_fiscal
+    check: "OCC: expected_<parent>_version matches the live parent.version on guarded writes"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /rental/reservations/{id}/dispatch, POST /rental/contracts/{id}/settle"
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # ---- Configuration (FleetManager) ----
+  - method: POST
+    path: "/rental/locations"
+    description: "Create a rental location."
+    roles: [FleetManager]
+    code: 201
+    input: ["name", "state_code", "lot_capacity", "accepts_one_way_dropoff?", "status?"]
+    output: RentalLocation
+    side_effects: ["on_lot_count initialized to 0"]
+  - method: GET
+    path: "/rental/locations/{id}"
+    description: "Fetch a location."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: []
+    output: RentalLocation
+    side_effects: []
+  - method: GET
+    path: "/rental/locations"
+    description: "List locations (paginated)."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: ["state_code?", "status?", "limit?", "offset?"]
+    output: RentalLocation[]
+    side_effects: []
+  - method: GET
+    path: "/rental/locations/{id}/availability"
+    description: "Computed read: available_count and lot_occupancy per equipment class at this location."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: ["equipment_class_id?"]
+    output: "{ location_id: string, on_lot_count: integer, lot_capacity: integer, classes: object }"
+    side_effects: ["runs location_availability"]
+  - method: POST
+    path: "/rental/equipment-classes"
+    description: "Create an equipment class."
+    roles: [FleetManager]
+    code: 201
+    input: ["code", "category", "daily_rate_cents", "mileage_rate_cents", "one_way_flat_cents", "fuel_capacity_gallons", "requires_coverage?"]
+    output: EquipmentClass
+    side_effects: []
+  - method: GET
+    path: "/rental/equipment-classes/{id}"
+    description: "Fetch an equipment class."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: []
+    output: EquipmentClass
+    side_effects: []
+  - method: GET
+    path: "/rental/equipment-classes"
+    description: "List equipment classes (paginated)."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: ["category?", "limit?", "offset?"]
+    output: EquipmentClass[]
+    side_effects: []
+  - method: POST
+    path: "/rental/coverage-plans"
+    description: "Create a coverage/damage-waiver plan."
+    roles: [FleetManager]
+    code: 201
+    input: ["code", "daily_fee_cents", "damage_deductible_cents", "active?"]
+    output: CoveragePlan
+    side_effects: []
+  - method: GET
+    path: "/rental/coverage-plans"
+    description: "List coverage plans (paginated)."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: ["active?", "limit?", "offset?"]
+    output: CoveragePlan[]
+    side_effects: []
+  - method: POST
+    path: "/rental/supplies"
+    description: "Create a moving-supply catalog item."
+    roles: [FleetManager]
+    code: 201
+    input: ["sku", "unit_price_cents", "stock_qty", "returnable?"]
+    output: MovingSupply
+    side_effects: []
+  - method: GET
+    path: "/rental/supplies/{id}"
+    description: "Fetch a supply item."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: []
+    output: MovingSupply
+    side_effects: []
+  - method: GET
+    path: "/rental/supplies"
+    description: "List supply catalog (paginated)."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: ["returnable?", "limit?", "offset?"]
+    output: MovingSupply[]
+    side_effects: []
+  # ---- Equipment (FleetManager / LocationAgent) ----
+  - method: POST
+    path: "/rental/equipment"
+    description: "Add a physical equipment unit to a location's fleet."
+    roles: [FleetManager]
+    code: 201
+    input: ["equipment_class_id", "home_location_id", "odometer_miles?", "fuel_level_eighths?"]
+    output: Equipment
+    side_effects: ["set current_location_id = home_location_id; status AVAILABLE; recompute home_location.on_lot_count"]
+  - method: GET
+    path: "/rental/equipment/{id}"
+    description: "Fetch an equipment unit."
+    roles: [FleetManager, LocationAgent]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: []
+  - method: GET
+    path: "/rental/equipment"
+    description: "List equipment, filterable by class / current location / home location / status (paginated)."
+    roles: [FleetManager, LocationAgent]
+    code: 200
+    input: ["equipment_class_id?", "current_location_id?", "home_location_id?", "status?", "limit?", "offset?"]
+    output: Equipment[]
+    side_effects: []
+  - method: POST
+    path: "/rental/equipment/{id}/maintenance"
+    description: "Move an AVAILABLE unit into MAINTENANCE."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: ["Equipment.status AVAILABLE -> MAINTENANCE"]
+  - method: POST
+    path: "/rental/equipment/{id}/clear-maintenance"
+    description: "Return a unit from MAINTENANCE to AVAILABLE."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: ["Equipment.status MAINTENANCE -> AVAILABLE"]
+  - method: POST
+    path: "/rental/equipment/{id}/retire"
+    description: "Retire an AVAILABLE unit out of the fleet."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: ["Equipment.status -> RETIRED; recompute current_location.on_lot_count"]
+  # ---- Customers ----
+  - method: POST
+    path: "/rental/customers"
+    description: "Register a customer."
+    roles: [FleetManager, Customer]
+    code: 201
+    input: ["email", "full_name", "license_verified?", "loyalty_tier?"]
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/rental/customers/{id}"
+    description: "Fetch a customer."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+  - method: POST
+    path: "/rental/customers/{id}/verify-license"
+    description: "Mark a customer's driver license as verified."
+    roles: [FleetManager, LocationAgent]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["license_verified -> true"]
+  # ---- Reservations ----
+  - method: POST
+    path: "/rental/reservations"
+    description: "Create a reservation (trip_type, planned_days, quoted_total_cents derived)."
+    roles: [Customer, LocationAgent]
+    code: 201
+    input: ["customer_id", "equipment_class_id", "pickup_location_id", "dropoff_location_id", "coverage_plan_id?", "coverage_choice?", "scheduled_pickup_at", "scheduled_return_at"]
+    output: Reservation
+    side_effects: ["derive trip_type, planned_days; run reservation_quote (estimate_at_create)"]
+  - method: GET
+    path: "/rental/reservations/{id}"
+    description: "Fetch a reservation."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+  - method: GET
+    path: "/rental/reservations"
+    description: "List reservations, filterable by customer / pickup+dropoff location / class / coverage plan / assigned equipment / statuses (paginated). Provides reverse-reachability for Reservation FKs customer_id, equipment_class_id, pickup_location_id, dropoff_location_id, coverage_plan_id, assigned_equipment_id."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: ["customer_id?", "pickup_location_id?", "dropoff_location_id?", "equipment_class_id?", "coverage_plan_id?", "assigned_equipment_id?", "booking_status?", "fulfillment_status?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+  - method: POST
+    path: "/rental/reservations/{id}/supplies"
+    description: "Add a moving-supply line item to a PENDING reservation."
+    roles: [Customer, LocationAgent]
+    code: 201
+    input: [supply_id, quantity]
+    output: SupplyLineItem
+    side_effects: ["snapshot unit_price_cents; decrement MovingSupply.stock_qty; re-run reservation_quote"]
+  - method: DELETE
+    path: "/rental/reservations/{id}/supplies/{lineId}"
+    description: "Remove a supply line item from a PENDING reservation."
+    roles: [Customer, LocationAgent]
+    code: 200
+    input: []
+    output: SupplyLineItem
+    side_effects: ["restore MovingSupply.stock_qty; re-run reservation_quote"]
+  - method: GET
+    path: "/rental/reservations/{id}/supplies"
+    description: "List supply line items on a reservation (reverse-reachability for SupplyLineItem.reservation_id)."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: []
+    output: SupplyLineItem[]
+    side_effects: []
+  - method: GET
+    path: "/rental/supplies/{id}/line-items"
+    description: "List SupplyLineItem rows that reference this catalog item (reverse-reachability for SupplyLineItem.supply_id)."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: []
+    output: SupplyLineItem[]
+    side_effects: []
+  - method: POST
+    path: "/rental/reservations/{id}/addons"
+    description: "Add a dolly/pad add-on to a PENDING reservation."
+    roles: [Customer, LocationAgent]
+    code: 201
+    input: [addon_type, quantity]
+    output: EquipmentAddOn
+    side_effects: ["snapshot daily_rate_cents from ADDON_RATES; re-run reservation_quote"]
+  - method: GET
+    path: "/rental/reservations/{id}/addons"
+    description: "List add-ons on a reservation (reverse-reachability for EquipmentAddOn.reservation_id)."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: []
+    output: EquipmentAddOn[]
+    side_effects: []
+  - method: POST
+    path: "/rental/reservations/{id}/confirm"
+    description: "Confirm a PENDING reservation; freezes the quote and earmarks a round-trip unit."
+    roles: [Customer]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["booking_status PENDING -> CONFIRMED; re-run reservation_quote (estimate_at_confirm); earmark round-trip Equipment AVAILABLE -> RESERVED; increments Reservation.version"]
+  - method: POST
+    path: "/rental/reservations/{id}/cancel"
+    description: "Cancel a PENDING/CONFIRMED reservation before dispatch."
+    roles: [Customer]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["booking_status -> CANCELLED; restore supply stock; release Equipment earmark RESERVED -> AVAILABLE; recompute on_lot_count; increments Reservation.version"]
+  - method: POST
+    path: "/rental/reservations/{id}/dispatch"
+    description: "Dispatch a CONFIRMED reservation: select Equipment, create RentalContract."
+    roles: [LocationAgent]
+    code: 201
+    input: [expected_reservation_version]
+    output: RentalContract
+    side_effects: ["run equipment_dispatch_selector; set assigned_equipment_id; Equipment -> DISPATCHED->IN_TRANSIT; clear current_location_id; decrement pickup on_lot_count; create RentalContract ACTIVE; fulfillment_status -> DISPATCHED; increments Reservation.version"]
+  # ---- Contracts ----
+  - method: GET
+    path: "/rental/contracts/{id}"
+    description: "Fetch a rental contract."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: []
+    output: RentalContract
+    side_effects: []
+  - method: GET
+    path: "/rental/contracts"
+    description: "List contracts, filterable by reservation / equipment / status (reverse-reachability for RentalContract.reservation_id and .equipment_id)."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: ["reservation_id?", "equipment_id?", "status?", "limit?", "offset?"]
+    output: RentalContract[]
+    side_effects: []
+  - method: POST
+    path: "/rental/contracts/{id}/return"
+    description: "Check in a unit: capture closing odometer/fuel/time; branch clean vs damaged."
+    roles: [LocationAgent]
+    code: 200
+    input: [return_odometer_miles, return_fuel_eighths, actual_return_at]
+    output: RentalContract
+    side_effects: ["compute miles_driven; Equipment IN_TRANSIT -> AVAILABLE at dropoff; update odometer/fuel; recompute dropoff on_lot_count; status -> RETURNED_CLEAN | RETURNED_DAMAGED"]
+  - method: POST
+    path: "/rental/contracts/{id}/damage-reports"
+    description: "File a damage report against an ACTIVE contract (before return is checked in)."
+    roles: [LocationAgent]
+    code: 201
+    input: [assessed_cost_cents, description]
+    output: DamageReport
+    side_effects: ["append DamageReport; subsequent return takes the RETURNED_DAMAGED branch"]
+  - method: GET
+    path: "/rental/contracts/{id}/damage-reports"
+    description: "List damage reports for a contract (reverse-reachability for DamageReport.contract_id)."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: []
+    output: DamageReport[]
+    side_effects: []
+  - method: POST
+    path: "/rental/contracts/{id}/settle"
+    description: "Finalize a returned contract: run settlement, emit ledger lines, refund returnable supplies, complete reservation."
+    roles: [LocationAgent]
+    code: 200
+    input: [expected_contract_version]
+    output: RentalContract
+    side_effects: ["run contract_settlement; set settlement_total_cents and damage_charge_cents; emit ChargeLedgerEntry rows; set refunded_units; status -> SETTLED; Reservation.fulfillment_status -> COMPLETED; increments RentalContract.version"]
+  - method: POST
+    path: "/rental/contracts/{id}/void"
+    description: "Void a mis-dispatched ACTIVE contract; rollback dispatch."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: RentalContract
+    side_effects: ["status -> VOID; Equipment -> AVAILABLE at pickup; recompute on_lot_count; Reservation.fulfillment_status -> AWAITING_DISPATCH; clear assigned_equipment_id"]
+  - method: GET
+    path: "/rental/contracts/{id}/ledger"
+    description: "List ChargeLedgerEntry rows for a contract (reverse-reachability for ChargeLedgerEntry.contract_id)."
+    roles: [FleetManager, LocationAgent, Customer]
+    code: 200
+    input: []
+    output: ChargeLedgerEntry[]
+    side_effects: []
+  # ---- Drop-off transfers ----
+  - method: POST
+    path: "/rental/transfers"
+    description: "Open a drop-off / rebalance transfer for an AVAILABLE unit."
+    roles: [FleetManager, LocationAgent]
+    code: 201
+    input: [equipment_id, to_location_id, reason]
+    output: DropOffTransfer
+    side_effects: ["set from_location_id = Equipment.current_location_id; status REQUESTED"]
+  - method: GET
+    path: "/rental/transfers/{id}"
+    description: "Fetch a transfer."
+    roles: [FleetManager, LocationAgent]
+    code: 200
+    input: []
+    output: DropOffTransfer
+    side_effects: []
+  - method: GET
+    path: "/rental/transfers"
+    description: "List transfers, filterable by equipment / from / to / status (reverse-reachability for DropOffTransfer.equipment_id, from_location_id, to_location_id)."
+    roles: [FleetManager, LocationAgent]
+    code: 200
+    input: ["equipment_id?", "from_location_id?", "to_location_id?", "status?", "limit?", "offset?"]
+    output: DropOffTransfer[]
+    side_effects: []
+  - method: POST
+    path: "/rental/transfers/{id}/approve"
+    description: "Approve a REQUESTED transfer; place unit IN_TRANSIT."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: DropOffTransfer
+    side_effects: ["status -> APPROVED; Equipment AVAILABLE -> IN_TRANSIT; recompute from_location on_lot_count"]
+  - method: POST
+    path: "/rental/transfers/{id}/reject"
+    description: "Reject a REQUESTED transfer."
+    roles: [FleetManager]
+    code: 200
+    input: []
+    output: DropOffTransfer
+    side_effects: ["status -> REJECTED"]
+  - method: POST
+    path: "/rental/transfers/{id}/complete"
+    description: "Complete an APPROVED transfer; land the unit at the destination."
+    roles: [LocationAgent]
+    code: 200
+    input: []
+    output: DropOffTransfer
+    side_effects: ["status -> COMPLETED; Equipment IN_TRANSIT -> AVAILABLE at to_location; recompute both on_lot_counts"]
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID headers, or unknown role."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Role is authenticated but not permitted to call this endpoint."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Customer acts on a reservation/contract whose customer_id != X-User-ID."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A path or FK-referenced resource does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Missing required body field, wrong type, or enum value out of range."
+  - id: ERR_INVALID_TIME_RANGE
+    http: 422
+    condition: "scheduled_return_at not strictly after scheduled_pickup_at."
+  - id: ERR_COVERAGE_MISMATCH
+    http: 422
+    condition: "coverage_choice SELECTED without an active coverage_plan_id, or DECLINED with a coverage_plan_id provided."
+  - id: ERR_ONE_WAY_DROPOFF_NOT_ALLOWED
+    http: 422
+    condition: "One-way reservation drop-off location equals pickup, or its accepts_one_way_dropoff is false."
+  - id: ERR_INVALID_TRANSFER
+    http: 422
+    condition: "Transfer from_location != equipment.current_location, or to == from, or destination CLOSED."
+  - id: ERR_ODOMETER_REGRESSION
+    http: 422
+    condition: "return_odometer_miles < contract.pickup_odometer_miles."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource is not in a state from which the requested transition is allowed."
+  - id: ERR_LICENSE_NOT_VERIFIED
+    http: 409
+    condition: "Dispatch of a TRUCK class while Customer.license_verified is false."
+  - id: ERR_COVERAGE_REQUIRED
+    http: 409
+    condition: "Confirm/dispatch of a class with requires_coverage while coverage_choice != SELECTED."
+  - id: ERR_INSUFFICIENT_STOCK
+    http: 409
+    condition: "SupplyLineItem quantity exceeds MovingSupply.stock_qty."
+  - id: ERR_RESERVATION_LOCKED
+    http: 409
+    condition: "Add/remove of supplies or add-ons after the reservation left PENDING."
+  - id: ERR_NO_EQUIPMENT_AVAILABLE
+    http: 409
+    condition: "Dispatch selector candidate set is empty for the class at the pickup location."
+  - id: ERR_RETURN_LOT_FULL
+    http: 409
+    condition: "Return/transfer destination on_lot_count would meet or exceed lot_capacity."
+  - id: ERR_EQUIPMENT_DOUBLE_BOOKED
+    http: 409
+    condition: "Confirm/dispatch would assign an Equipment whose buffer-extended rental window overlaps another CONFIRMED reservation's window."
+  - id: ERR_TRANSFER_IN_PROGRESS
+    http: 409
+    condition: "Opening a DropOffTransfer for an equipment that already has a REQUESTED/APPROVED transfer."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "OCC: expected_<parent>_version does not match the live parent.version."
+  - id: ERR_VALIDATION_PAGINATION
+    http: 422
+    condition: "limit/offset outside allowed bounds (limit 1..100, offset >= 0)."
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: FleetManager
+    description: "Configures the fleet (classes, locations, coverage plans, supply catalog, equipment), runs maintenance/retire, approves/rejects transfers, voids contracts. Operational, not tied to a customer entity."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /rental/equipment-classes"
+      - "POST /rental/locations"
+      - "POST /rental/coverage-plans"
+      - "POST /rental/supplies"
+      - "POST /rental/equipment"
+      - "POST /rental/equipment/{id}/maintenance"
+      - "POST /rental/equipment/{id}/clear-maintenance"
+      - "POST /rental/equipment/{id}/retire"
+      - "POST /rental/transfers/{id}/approve"
+      - "POST /rental/transfers/{id}/reject"
+      - "POST /rental/contracts/{id}/void"
+    shared_operations:
+      - "POST /rental/customers"
+      - "POST /rental/transfers"
+      - "GET (all read endpoints)"
+  - name: LocationAgent
+    description: "Operates a physical location's counter: dispatches confirmed reservations, accepts returns, files damage, settles contracts, completes inbound transfers, verifies licenses. Operational, not tied to a customer entity."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /rental/reservations/{id}/dispatch"
+      - "POST /rental/contracts/{id}/return"
+      - "POST /rental/contracts/{id}/damage-reports"
+      - "POST /rental/contracts/{id}/settle"
+      - "POST /rental/transfers/{id}/complete"
+      - "POST /rental/customers/{id}/verify-license"
+    shared_operations:
+      - "POST /rental/reservations"
+      - "POST /rental/reservations/{id}/supplies"
+      - "DELETE /rental/reservations/{id}/supplies/{lineId}"
+      - "POST /rental/reservations/{id}/addons"
+      - "POST /rental/customers"
+      - "POST /rental/transfers"
+      - "GET (all read endpoints)"
+  - name: Customer
+    description: "End renter. Creates reservations they own, manages add-ons/supplies while PENDING, confirms and cancels their own reservations, reads their own reservations/contracts."
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /rental/reservations/{id}/confirm"
+      - "POST /rental/reservations/{id}/cancel"
+    shared_operations:
+      - "POST /rental/customers"
+      - "POST /rental/reservations"
+      - "POST /rental/reservations/{id}/supplies"
+      - "DELETE /rental/reservations/{id}/supplies/{lineId}"
+      - "POST /rental/reservations/{id}/addons"
+      - "GET (own reservations, own contracts, public catalog reads)"

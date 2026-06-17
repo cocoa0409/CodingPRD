@@ -1,0 +1,1606 @@
+scenario: "334. Tire Shop & Service: tire catalog & fitment, road-hazard warranty, mount/balance/rotation/TPMS, install scheduling & bay, alignment add-on, disposal fee, mileage-warranty proration, special order"
+domain_name: tire-shop-service
+api_prefix: /
+
+# ---------------------------------------------------------------------------
+# Complexity Profile (§0.1–§0.3)
+# ---------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: temporal_windowing
+  complexity_layers:
+    - dual_variant_calculation       # mileage-warranty proration: tread-based vs mileage-based
+    - cascading_side_effects         # WorkOrder approval -> line locks -> inventory debit -> bay block
+    - rate_threshold_triggers        # disposal-fee bracket + mileage proration eligibility cutoff
+    - optimistic_concurrency         # OCC on WorkOrder.version for line mutation and on ServiceBay.version for appointment booking
+
+  entity_topology: hybrid
+  # WorkOrder -> WorkOrderLine is a strict hierarchy (lines owned by the order);
+  # FitmentRule is a many-to-many junction between Vehicle and TireModel;
+  # InstallAppointment references ServiceBay + WorkOrder across aggregate boundaries (flat FKs).
+
+  state_machine_shape: parallel
+  # WorkOrder carries TWO independent dimensions: fulfillment_status and payment_status.
+  # SpecialOrder is branching (fork-join: ORDERED -> {RECEIVED, BACKORDER_CANCELLED}).
+  # InstallAppointment has a revert cycle (SCHEDULED <-> RESCHEDULE_PENDING).
+
+  relationship_patterns:
+    - one_to_many          # WorkOrder -> WorkOrderLine; ServiceBay -> InstallAppointment
+    - many_to_many         # Vehicle <-> TireModel via FitmentRule
+    - cross_aggregate      # InstallAppointment -> WorkOrder + ServiceBay; MileageWarrantyClaim -> WorkOrderLine
+
+  role_model: peer_roles
+  # Customer owns their own WorkOrders/Vehicles; ServiceAdvisor runs the shop counter; Technician executes bay work; InventoryManager owns catalog & stock & special orders.
+
+  consistency_model: immediate
+
+# ---------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — verbatim)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Unique login identity for the customer"
+        constraints: "unique across Customer; non-empty"
+      - name: full_name
+        type: string
+        source: input
+        description: "Customer display name"
+      - name: phone
+        type: string
+        source: input
+        description: "Contact phone"
+      - name: store_credit_cents
+        type: integer
+        source: computed
+        description: "Running store-credit balance in cents; credited by approved MileageWarrantyClaim payout when payout_method=STORE_CREDIT, debited when applied to a WorkOrder"
+        default: 0
+        constraints: ">= 0"
+
+  - name: Vehicle
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the owner of this vehicle"
+      - name: make
+        type: string
+        source: input
+        description: "Vehicle make, e.g. TOYOTA"
+      - name: model
+        type: string
+        source: input
+        description: "Vehicle model, e.g. CAMRY"
+      - name: model_year
+        type: integer
+        source: input
+        description: "Model year"
+        constraints: "1980 <= model_year <= 2030"
+      - name: oe_tire_size
+        type: string
+        source: input
+        description: "Original-equipment tire size token, e.g. 235/45R18"
+      - name: rim_diameter_in
+        type: integer
+        source: input
+        description: "Wheel rim diameter in inches"
+        constraints: "13 <= rim_diameter_in <= 24"
+      - name: tpms_type
+        type: enum
+        source: input
+        description: "TPMS sensor technology on this vehicle"
+        constraints: "one of {DIRECT, INDIRECT, NONE}"
+
+  - name: TireModel
+    parent: null
+    common_fields: true
+    fields:
+      - name: brand
+        type: string
+        source: input
+        description: "Tire brand"
+      - name: model_name
+        type: string
+        source: input
+        description: "Tire model name"
+      - name: size_token
+        type: string
+        source: input
+        description: "Tire size token, e.g. 235/45R18"
+      - name: load_index
+        type: integer
+        source: input
+        description: "Load index rating"
+        constraints: "70 <= load_index <= 130"
+      - name: speed_rating
+        type: enum
+        source: input
+        description: "Speed rating letter"
+        constraints: "one of {S, T, H, V, W, Y}"
+      - name: unit_price_cents
+        type: integer
+        source: input
+        description: "Per-tire retail price in cents"
+        constraints: ">= 0"
+      - name: mileage_warranty_miles
+        type: integer
+        source: input
+        description: "Treadwear mileage warranty in miles; 0 means no mileage warranty offered"
+        default: 0
+        constraints: ">= 0"
+      - name: original_tread_32nds
+        type: integer
+        source: input
+        description: "New-tire tread depth in 32nds of an inch; baseline for proration"
+        constraints: "6 <= original_tread_32nds <= 14"
+      - name: stock_qty
+        type: integer
+        source: computed
+        description: "On-hand units; debited when a tire line is committed, restocked when an unfulfilled order is cancelled, incremented by SpecialOrder receipt"
+        default: 0
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: computed
+        description: "Catalog lifecycle status"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, DISCONTINUED}"
+
+  - name: FitmentRule
+    parent: null
+    common_fields: false
+    fields:
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the vehicle this fitment record covers"
+      - name: tire_model_id
+        type: string
+        source: input
+        description: "FK -> TireModel.id; a tire model approved to fit the vehicle"
+      - name: fitment_grade
+        type: enum
+        source: input
+        description: "Fitment quality grade for this pairing"
+        constraints: "one of {OE_EXACT, APPROVED_PLUS, NOT_RECOMMENDED}"
+
+  - name: ServiceBay
+    parent: null
+    common_fields: true
+    fields:
+      - name: bay_name
+        type: string
+        source: input
+        description: "Human-readable bay label"
+        constraints: "unique across ServiceBay"
+      - name: alignment_capable
+        type: boolean
+        source: input
+        description: "Whether this bay has an alignment rack"
+        default: false
+      - name: turnover_buffer_min
+        type: integer
+        source: input
+        description: "Cleanup buffer minutes that must remain free after each appointment end before the next may start in this bay"
+        default: 15
+        constraints: "0 <= turnover_buffer_min <= 60"
+      - name: status
+        type: enum
+        source: computed
+        description: "Bay operational status; OUT_OF_SERVICE bays reject new appointments"
+        default: OPEN
+        constraints: "one of {OPEN, OUT_OF_SERVICE}"
+
+  - name: WorkOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; owner of this work order"
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; vehicle being serviced; must belong to customer_id"
+      - name: fulfillment_status
+        type: enum
+        source: computed
+        description: "Fulfillment dimension of the parallel state machine"
+        default: DRAFT
+        constraints: "one of {DRAFT, APPROVED, IN_SERVICE, COMPLETED, CANCELLED}"
+      - name: payment_status
+        type: enum
+        source: computed
+        description: "Payment dimension of the parallel state machine; evolves independently of fulfillment_status"
+        default: UNPAID
+        constraints: "one of {UNPAID, AUTHORIZED, PAID, REFUNDED}"
+      - name: store_credit_applied_cents
+        type: integer
+        source: input
+        description: "Store credit the customer elects to apply at approval; capped at min(customer.store_credit_cents, total_due_cents)"
+        default: 0
+        constraints: ">= 0"
+      - name: parts_subtotal_cents
+        type: integer
+        source: computed
+        description: "Sum of per-line extended tire/part amounts; see calc work_order_pricing"
+        default: 0
+      - name: service_subtotal_cents
+        type: integer
+        source: computed
+        description: "Sum of per-line extended service amounts (mount/balance/rotation/tpms/alignment)"
+        default: 0
+      - name: disposal_fee_cents
+        type: integer
+        source: computed
+        description: "Total tire-disposal fee; see calc disposal_fee_total"
+        default: 0
+      - name: road_hazard_premium_cents
+        type: integer
+        source: computed
+        description: "Total road-hazard warranty premium across covered tire lines"
+        default: 0
+      - name: tax_cents
+        type: integer
+        source: computed
+        description: "Sales tax; applied to taxable base only; see calc work_order_pricing"
+        default: 0
+      - name: total_due_cents
+        type: integer
+        source: computed
+        description: "Grand total net of store credit applied; see calc work_order_pricing"
+        default: 0
+
+  - name: WorkOrderLine
+    parent: WorkOrder
+    common_fields: true
+    fields:
+      - name: work_order_id
+        type: string
+        source: input
+        description: "FK -> WorkOrder.id; the parent order"
+      - name: line_type
+        type: enum
+        source: input
+        description: "Kind of line item"
+        constraints: "one of {TIRE, MOUNT_BALANCE, ROTATION, TPMS_SERVICE, ALIGNMENT}"
+      - name: tire_model_id
+        type: string
+        source: input
+        description: "FK -> TireModel.id; required when line_type=TIRE, must be null otherwise"
+      - name: quantity
+        type: integer
+        source: input
+        description: "Units for this line (tire count, or 1 for ALIGNMENT/whole-vehicle services)"
+        constraints: ">= 1"
+      - name: unit_price_cents_snapshot
+        type: integer
+        source: computed
+        description: "Price-per-unit captured when the line is created; TIRE lines snapshot TireModel.unit_price_cents, service lines snapshot the service constant"
+        default: 0
+      - name: road_hazard_opted
+        type: boolean
+        source: input
+        description: "Whether road-hazard warranty is purchased for this TIRE line; ignored (forced false) for non-TIRE lines"
+        default: false
+      - name: extended_cents
+        type: integer
+        source: computed
+        description: "unit_price_cents_snapshot * quantity, rounded per the pinned order in calc work_order_pricing"
+        default: 0
+      - name: line_status
+        type: enum
+        source: computed
+        description: "Line lifecycle; PENDING until order approval, then COMMITTED; VOID if order cancelled before service"
+        default: PENDING
+        constraints: "one of {PENDING, COMMITTED, VOID}"
+
+  - name: RoadHazardWarranty
+    parent: null
+    common_fields: true
+    fields:
+      - name: work_order_line_id
+        type: string
+        source: input
+        description: "FK -> WorkOrderLine.id; the covered TIRE line"
+      - name: tire_model_id
+        type: string
+        source: input
+        description: "FK -> TireModel.id; tire model covered (snapshot for proration baseline)"
+      - name: covered_quantity
+        type: integer
+        source: computed
+        description: "Number of tires covered; equals the covered line's quantity at activation"
+        default: 0
+      - name: premium_cents
+        type: integer
+        source: computed
+        description: "Premium charged for this warranty; see calc road_hazard_premium"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Warranty lifecycle"
+        default: PENDING
+        constraints: "one of {PENDING, ACTIVE, CLAIMED, VOID}"
+
+  - name: InstallAppointment
+    parent: null
+    common_fields: true
+    fields:
+      - name: work_order_id
+        type: string
+        source: input
+        description: "FK -> WorkOrder.id; the order to be serviced in the bay"
+      - name: service_bay_id
+        type: string
+        source: input
+        description: "FK -> ServiceBay.id; the bay reserved"
+      - name: scheduled_start
+        type: datetime
+        source: input
+        description: "Half-open interval start (inclusive), ISO 8601 UTC"
+      - name: scheduled_end
+        type: datetime
+        source: input
+        description: "Half-open interval end (exclusive), ISO 8601 UTC; must be strictly after scheduled_start"
+      - name: requires_alignment
+        type: boolean
+        source: computed
+        description: "True when the order has an ALIGNMENT line; forces selection of an alignment_capable bay"
+        default: false
+      - name: status
+        type: enum
+        source: computed
+        description: "Appointment lifecycle"
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, RESCHEDULE_PENDING, CHECKED_IN, COMPLETED, CANCELLED}"
+
+  - name: SpecialOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: work_order_line_id
+        type: string
+        source: input
+        description: "FK -> WorkOrderLine.id; the TIRE line that triggered the special order (insufficient stock)"
+      - name: tire_model_id
+        type: string
+        source: input
+        description: "FK -> TireModel.id; the back-ordered tire model"
+      - name: requested_quantity
+        type: integer
+        source: input
+        description: "Units to procure"
+        constraints: ">= 1"
+      - name: deposit_cents
+        type: integer
+        source: computed
+        description: "Non-refundable deposit collected; see calc special_order_deposit"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Special-order lifecycle"
+        default: ORDERED
+        constraints: "one of {ORDERED, RECEIVED, BACKORDER_CANCELLED}"
+
+  - name: MileageWarrantyClaim
+    parent: null
+    common_fields: true
+    fields:
+      - name: work_order_line_id
+        type: string
+        source: input
+        description: "FK -> WorkOrderLine.id; the original TIRE line whose tires wore out prematurely"
+      - name: tire_model_id
+        type: string
+        source: input
+        description: "FK -> TireModel.id; snapshot of the worn tire model"
+      - name: measured_tread_32nds
+        type: integer
+        source: input
+        description: "Remaining tread depth measured at claim, in 32nds of an inch"
+        constraints: "2 <= measured_tread_32nds <= original_tread_32nds"
+      - name: miles_driven
+        type: integer
+        source: input
+        description: "Odometer miles accrued on the worn tires"
+        constraints: ">= 0"
+      - name: payout_method
+        type: enum
+        source: input
+        description: "How an approved payout is delivered"
+        constraints: "one of {STORE_CREDIT, REFUND}"
+      - name: claim_quantity
+        type: integer
+        source: input
+        description: "Number of tires claimed"
+        constraints: ">= 1"
+      - name: prorated_credit_cents
+        type: integer
+        source: computed
+        description: "Approved payout amount; see calc mileage_proration (dual-variant)"
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Claim lifecycle"
+        default: SUBMITTED
+        constraints: "one of {SUBMITTED, APPROVED, REJECTED, PAID}"
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  # ---- WorkOrder: PARALLEL dimensions (fulfillment_status x payment_status) ----
+  - entity: WorkOrder
+    initial_state: DRAFT
+    terminal_states: [CANCELLED]
+    note: "Two independent state dimensions on one row. fulfillment_status governs service progress; payment_status governs money and evolves independently. CANCELLED (fulfillment) and REFUNDED (payment) are the terminal sinks."
+    transitions:
+      # --- fulfillment dimension ---
+      - from: DRAFT
+        to: APPROVED
+        trigger: "POST /work-orders/{id}/approve"
+        actor: ServiceAdvisor
+        preconditions:
+          - "fulfillment_status == DRAFT"
+          - "order has >= 1 WorkOrderLine"
+          - "every TIRE line's tire_model has fitment_grade IN {OE_EXACT, APPROVED_PLUS} for the order's vehicle (a NOT_RECOMMENDED or missing FitmentRule blocks approval)"
+          - "expected_work_order_version matches WorkOrder.version (OCC)"
+        side_effects:
+          - "run calc work_order_pricing -> sets parts_subtotal_cents, service_subtotal_cents, disposal_fee_cents, road_hazard_premium_cents, tax_cents, total_due_cents"
+          - "store_credit_applied_cents clamped to min(customer.store_credit_cents, pre-credit grand total); customer.store_credit_cents debited by the clamped amount"
+          - "every WorkOrderLine.line_status PENDING->COMMITTED"
+          - "for each TIRE line with sufficient TireModel.stock_qty: debit TireModel.stock_qty by line.quantity"
+          - "for each TIRE line with road_hazard_opted: create RoadHazardWarranty PENDING->ACTIVE with premium_cents from calc road_hazard_premium"
+          - "increments WorkOrder.version by 1"
+      - from: APPROVED
+        to: IN_SERVICE
+        trigger: "POST /work-orders/{id}/start-service"
+        actor: Technician
+        preconditions:
+          - "fulfillment_status == APPROVED"
+          - "an InstallAppointment for this work_order_id is in CHECKED_IN"
+        side_effects:
+          - "refresh updated_at"
+      - from: IN_SERVICE
+        to: COMPLETED
+        trigger: "POST /work-orders/{id}/complete"
+        actor: Technician
+        preconditions:
+          - "fulfillment_status == IN_SERVICE"
+          - "payment_status IN {AUTHORIZED, PAID} (cannot complete service on an unpaid order)"
+        side_effects:
+          - "the linked CHECKED_IN InstallAppointment transitions to COMPLETED"
+          - "if payment_status == AUTHORIZED, payment_status AUTHORIZED->PAID (capture on completion)"
+          - "refresh updated_at"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /work-orders/{id}/cancel"
+        actor: ServiceAdvisor
+        preconditions:
+          - "fulfillment_status IN {DRAFT, APPROVED}"
+        side_effects:
+          - "every non-VOID WorkOrderLine.line_status -> VOID"
+          - "for each COMMITTED TIRE line that had debited stock: restock TireModel.stock_qty by line.quantity (compensation; conserves catalog inventory)"
+          - "any ACTIVE RoadHazardWarranty on the order -> VOID"
+          - "if store_credit_applied_cents > 0: refund it to customer.store_credit_cents (compensation; conserves customer credit)"
+          - "any SCHEDULED or RESCHEDULE_PENDING InstallAppointment for this order -> CANCELLED (frees the bay interval)"
+          - "if payment_status == AUTHORIZED: payment_status -> REFUNDED"
+          - "increments WorkOrder.version by 1"
+      - from: APPROVED
+        to: CANCELLED
+        trigger: "POST /work-orders/{id}/cancel"
+        actor: ServiceAdvisor
+        preconditions:
+          - "fulfillment_status == APPROVED"
+          - "no InstallAppointment for this order is CHECKED_IN (cannot cancel once the vehicle is on the rack)"
+        side_effects:
+          - "every non-VOID WorkOrderLine.line_status -> VOID"
+          - "for each COMMITTED TIRE line that had debited stock: restock TireModel.stock_qty by line.quantity (compensation; conserves catalog inventory)"
+          - "any ACTIVE RoadHazardWarranty on the order -> VOID"
+          - "if store_credit_applied_cents > 0: refund it to customer.store_credit_cents (compensation; conserves customer credit)"
+          - "any SCHEDULED or RESCHEDULE_PENDING InstallAppointment for this order -> CANCELLED"
+          - "if payment_status == AUTHORIZED: payment_status -> REFUNDED"
+          - "increments WorkOrder.version by 1"
+      # --- payment dimension (independent axis) ---
+      - from: UNPAID
+        to: AUTHORIZED
+        trigger: "POST /work-orders/{id}/authorize-payment"
+        actor: ServiceAdvisor
+        preconditions:
+          - "fulfillment_status == APPROVED (pricing must be finalized before money is authorized)"
+          - "payment_status == UNPAID"
+        side_effects:
+          - "refresh updated_at"
+        note: "payment_status axis; does not change fulfillment_status."
+      - from: AUTHORIZED
+        to: PAID
+        trigger: "POST /work-orders/{id}/capture-payment"
+        actor: ServiceAdvisor
+        preconditions:
+          - "payment_status == AUTHORIZED"
+        side_effects:
+          - "refresh updated_at"
+        note: "May also fire automatically as a side effect of fulfillment COMPLETED."
+
+  # ---- WorkOrderLine ----
+  - entity: WorkOrderLine
+    initial_state: PENDING
+    terminal_states: [VOID]
+    transitions:
+      - from: PENDING
+        to: COMMITTED
+        trigger: "system: parent WorkOrder DRAFT->APPROVED"
+        actor: system
+        preconditions:
+          - "parent WorkOrder transitioning to APPROVED"
+        side_effects:
+          - "snapshot extended_cents per calc work_order_pricing"
+      - from: PENDING
+        to: VOID
+        trigger: "system: parent WorkOrder cancelled while DRAFT"
+        actor: system
+        preconditions:
+          - "parent WorkOrder DRAFT->CANCELLED"
+        side_effects:
+          - "refresh updated_at"
+      - from: COMMITTED
+        to: VOID
+        trigger: "system: parent WorkOrder cancelled while APPROVED"
+        actor: system
+        preconditions:
+          - "parent WorkOrder APPROVED->CANCELLED"
+        side_effects:
+          - "associated stock restock and RoadHazardWarranty void handled by the WorkOrder cancel transition"
+
+  # ---- RoadHazardWarranty ----
+  - entity: RoadHazardWarranty
+    initial_state: PENDING
+    terminal_states: [CLAIMED, VOID]
+    transitions:
+      - from: PENDING
+        to: ACTIVE
+        trigger: "system: parent WorkOrder DRAFT->APPROVED for an opted TIRE line"
+        actor: system
+        preconditions:
+          - "covered WorkOrderLine.line_status -> COMMITTED"
+        side_effects:
+          - "premium_cents set from calc road_hazard_premium; covered_quantity set to line.quantity"
+      - from: ACTIVE
+        to: CLAIMED
+        trigger: "system: a MileageWarrantyClaim on the same line is APPROVED under the road-hazard path"
+        actor: system
+        preconditions:
+          - "status == ACTIVE"
+        note: "Road-hazard coverage is consumed once a claim is paid against its line."
+      - from: ACTIVE
+        to: VOID
+        trigger: "system: parent WorkOrder cancelled"
+        actor: system
+        preconditions:
+          - "status == ACTIVE"
+        side_effects:
+          - "refresh updated_at"
+
+  # ---- ServiceBay ----
+  - entity: ServiceBay
+    initial_state: OPEN
+    terminal_states: []
+    transitions:
+      - from: OPEN
+        to: OUT_OF_SERVICE
+        trigger: "POST /service-bays/{id}/close"
+        actor: InventoryManager
+        preconditions:
+          - "status == OPEN"
+          - "no InstallAppointment on this bay is in {SCHEDULED, RESCHEDULE_PENDING, CHECKED_IN}"
+          - "expected_service_bay_version matches ServiceBay.version (OCC)"
+        side_effects:
+          - "increments ServiceBay.version by 1"
+      - from: OUT_OF_SERVICE
+        to: OPEN
+        trigger: "POST /service-bays/{id}/reopen"
+        actor: InventoryManager
+        preconditions:
+          - "status == OUT_OF_SERVICE"
+          - "expected_service_bay_version matches ServiceBay.version (OCC)"
+        side_effects:
+          - "increments ServiceBay.version by 1"
+
+  # ---- InstallAppointment: revert cycle (SCHEDULED <-> RESCHEDULE_PENDING) ----
+  - entity: InstallAppointment
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: RESCHEDULE_PENDING
+        trigger: "POST /appointments/{id}/request-reschedule"
+        actor: Customer
+        preconditions:
+          - "status == SCHEDULED"
+        side_effects:
+          - "the appointment's interval no longer blocks the bay while RESCHEDULE_PENDING (its slot is released for overlap checks)"
+      - from: RESCHEDULE_PENDING
+        to: SCHEDULED
+        trigger: "POST /appointments/{id}/confirm-reschedule"
+        actor: ServiceAdvisor
+        preconditions:
+          - "status == RESCHEDULE_PENDING"
+          - "new scheduled_start/scheduled_end interval does not overlap (per bay turnover_buffer_min) any SCHEDULED/CHECKED_IN appointment on the same bay"
+          - "if requires_alignment, the bay is alignment_capable"
+        side_effects:
+          - "scheduled_start/scheduled_end updated to the new interval; interval re-blocks the bay"
+      - from: SCHEDULED
+        to: CHECKED_IN
+        trigger: "POST /appointments/{id}/check-in"
+        actor: Technician
+        preconditions:
+          - "status == SCHEDULED"
+          - "parent WorkOrder.fulfillment_status == APPROVED (cross-entity: appointment cannot check in unless its order is approved)"
+          - "the appointment's ServiceBay.status == OPEN (cross-entity: cannot check into a bay that has been taken out of service)"
+        side_effects:
+          - "refresh updated_at"
+        note: "Payment is NOT gated here; the payment gate is enforced at WorkOrder complete (ERR_PAYMENT_REQUIRED), allowing an UNPAID order to be checked in and serviced but not completed until paid."
+      - from: CHECKED_IN
+        to: COMPLETED
+        trigger: "system: parent WorkOrder IN_SERVICE->COMPLETED"
+        actor: system
+        preconditions:
+          - "status == CHECKED_IN"
+        side_effects:
+          - "refresh updated_at"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /appointments/{id}/cancel"
+        actor: ServiceAdvisor
+        preconditions:
+          - "status IN {SCHEDULED, RESCHEDULE_PENDING}"
+        side_effects:
+          - "frees the bay interval"
+
+  # ---- SpecialOrder: branching fork-join (ORDERED -> {RECEIVED, BACKORDER_CANCELLED}) ----
+  - entity: SpecialOrder
+    initial_state: ORDERED
+    terminal_states: [RECEIVED, BACKORDER_CANCELLED]
+    transitions:
+      - from: ORDERED
+        to: RECEIVED
+        trigger: "POST /special-orders/{id}/receive"
+        actor: InventoryManager
+        preconditions:
+          - "status == ORDERED"
+        side_effects:
+          - "TireModel.stock_qty incremented by requested_quantity (goods arrive in inventory)"
+          - "the linked WorkOrderLine becomes eligible for stock debit at order approval"
+      - from: ORDERED
+        to: BACKORDER_CANCELLED
+        trigger: "POST /special-orders/{id}/cancel-backorder"
+        actor: InventoryManager
+        preconditions:
+          - "status == ORDERED"
+        side_effects:
+          - "deposit_cents is forfeited (non-refundable; remains booked, conserving collected deposits)"
+          - "the linked WorkOrderLine -> VOID if its parent WorkOrder is still DRAFT"
+
+  # ---- MileageWarrantyClaim ----
+  - entity: MileageWarrantyClaim
+    initial_state: SUBMITTED
+    terminal_states: [REJECTED, PAID]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /mileage-claims/{id}/approve"
+        actor: ServiceAdvisor
+        preconditions:
+          - "status == SUBMITTED"
+          - "the covered WorkOrderLine.line_status == COMMITTED (cross-entity: a claim can only be approved on a tire line that was actually sold/installed, i.e. its order was approved)"
+          - "the original TireModel.mileage_warranty_miles > 0"
+          - "miles_driven < TireModel.mileage_warranty_miles (a tire that exceeded its mileage rating is not eligible)"
+          - "measured_tread_32nds <= WEAR_BAR_THRESHOLD_32NDS (tire must be at/below the wear bar to qualify)"
+        side_effects:
+          - "run calc mileage_proration -> sets prorated_credit_cents"
+          - "if a RoadHazardWarranty on the same line is ACTIVE, it transitions ACTIVE->CLAIMED"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /mileage-claims/{id}/reject"
+        actor: ServiceAdvisor
+        preconditions:
+          - "status == SUBMITTED"
+        side_effects:
+          - "refresh updated_at"
+      - from: APPROVED
+        to: PAID
+        trigger: "POST /mileage-claims/{id}/pay"
+        actor: ServiceAdvisor
+        preconditions:
+          - "status == APPROVED"
+        side_effects:
+          - "if payout_method == STORE_CREDIT: credit customer.store_credit_cents by prorated_credit_cents (the vehicle owner of the claimed line's work order)"
+          - "if payout_method == REFUND: external refund booked; customer.store_credit_cents unchanged"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules (OCC only — see §1.2.1 filter)
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: appointment-create-stale-bay
+    parent_entity: ServiceBay
+    write_endpoint: "POST /appointments"
+    occ_field: "expected_service_bay_version"
+    description: |
+      Booking an InstallAppointment against a ServiceBay whose version has
+      advanced since the client last observed it is rejected. The bay's
+      version bumps when another appointment is booked on it (or when it is
+      closed/reopened), so a stale expected_service_bay_version means the
+      client booked against an out-of-date view of the bay's occupancy and
+      its overlap check may be invalid.
+    error_id: ERR_STALE_BAY_VERSION
+    http_status: 412
+  - rule_id: line-add-stale-work-order
+    parent_entity: WorkOrder
+    write_endpoint: "POST /work-orders/{id}/lines"
+    occ_field: "expected_work_order_version"
+    description: |
+      Adding a WorkOrderLine to a WorkOrder whose version has advanced since
+      the client last observed it is rejected. The order's version bumps on
+      approval and on cancel; a stale expected_work_order_version means the
+      client is appending a line to an order whose lifecycle has already
+      moved past DRAFT under another writer's view.
+    error_id: ERR_STALE_WORK_ORDER_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: work_order_pricing
+    trigger: "WorkOrder DRAFT->APPROVED (POST /work-orders/{id}/approve)"
+    algorithm: aggregation
+    formula: |
+      # Evaluation order is PINNED. Per-line rounding then sum (mode b).
+      # Each line already stores an integer cents unit_price snapshot, so
+      # extended_cents = unit_price_cents_snapshot * quantity is exact (no per-line rounding remainder),
+      # but the ORDER below is normative for the dependent fee/tax steps.
+      #
+      # Step 1 — per-line extension (integer cents, exact):
+      for each non-VOID line:
+        line.extended_cents = line.unit_price_cents_snapshot * line.quantity
+      #
+      # Step 2 — subtotals by line_type bucket:
+      parts_subtotal_cents   = sum(line.extended_cents where line_type == TIRE)
+      service_subtotal_cents = sum(line.extended_cents where line_type IN {MOUNT_BALANCE, ROTATION, TPMS_SERVICE, ALIGNMENT})
+      #
+      # Step 3 — disposal fee (see calc disposal_fee_total; depends on total TIRE quantity bracket):
+      disposal_fee_cents = disposal_fee_total(total tire quantity)
+      #
+      # Step 4 — road-hazard premium (see calc road_hazard_premium; sum over opted TIRE lines):
+      road_hazard_premium_cents = sum over opted TIRE lines of road_hazard_premium(line)
+      #
+      # Step 5 — taxable base. Tax applies to parts + service ONLY (disposal fee and road-hazard premium are NON-taxable):
+      taxable_base = parts_subtotal_cents + service_subtotal_cents
+      tax_cents = round_half_up(taxable_base * TAX_RATE)        # single rounding at the tax step
+      #
+      # Step 6 — pre-credit grand total then store-credit clamp:
+      pre_credit_total = parts_subtotal_cents + service_subtotal_cents + disposal_fee_cents + road_hazard_premium_cents + tax_cents
+      applied_credit   = min(WorkOrder.store_credit_applied_cents, customer.store_credit_cents, pre_credit_total)
+      total_due_cents  = pre_credit_total - applied_credit
+    input_set: "All WorkOrderLine rows of the order that are NOT line_status==VOID at the moment of approval. VOID lines are excluded."
+    constants:
+      TAX_RATE: 0.0825
+    precision: "All money in integer cents. round_half_up applied exactly once, at the tax step (Step 5). No intermediate rounding elsewhere."
+    variants:
+      - name: pre_credit_vs_net
+        when: "pre_credit_total is the gross; total_due_cents is net of applied store credit"
+        difference: "applied_credit is clamped to min(requested, customer balance, pre_credit_total) so total_due_cents never goes negative"
+
+  - name: disposal_fee_total
+    trigger: "Step 3 of work_order_pricing"
+    algorithm: tiered_pricing
+    formula: |
+      # Bracketed per-tire disposal fee — marginal-by-bracket (NOT flat by top bracket).
+      # n = total quantity across all non-VOID TIRE lines.
+      # Tiers (per-tire fee depends on which bracket each successive tire falls in):
+      #   tires 1..4   : DISPOSAL_FEE_T1_CENTS each
+      #   tires 5..8   : DISPOSAL_FEE_T2_CENTS each
+      #   tires 9+     : DISPOSAL_FEE_T3_CENTS each
+      # disposal_fee_cents =
+      #     min(n,4)               * DISPOSAL_FEE_T1_CENTS
+      #   + clamp(n-4, 0, 4)       * DISPOSAL_FEE_T2_CENTS
+      #   + max(n-8, 0)            * DISPOSAL_FEE_T3_CENTS
+    input_set: "Total quantity n summed across non-VOID TIRE lines of the order."
+    constants:
+      DISPOSAL_FEE_T1_CENTS: 350
+      DISPOSAL_FEE_T2_CENTS: 250
+      DISPOSAL_FEE_T3_CENTS: 150
+    precision: "Integer cents; marginal bracket allocation, no rounding."
+
+  - name: road_hazard_premium
+    trigger: "Per opted TIRE line at WorkOrder approval; Step 4 of work_order_pricing"
+    algorithm: threshold
+    formula: |
+      # Premium is a percentage of the tire line's extended price, with a
+      # per-tire floor. >3 inputs interacting non-linearly (extended price,
+      # quantity, percentage, floor) with a max() guard.
+      pct_premium  = round_half_up(line.extended_cents * ROAD_HAZARD_PCT)
+      floor_premium = line.quantity * ROAD_HAZARD_FLOOR_PER_TIRE_CENTS
+      premium_cents = max(pct_premium, floor_premium)
+    input_set: "A single opted TIRE line (road_hazard_opted == true)."
+    constants:
+      ROAD_HAZARD_PCT: 0.12
+      ROAD_HAZARD_FLOOR_PER_TIRE_CENTS: 1200
+    precision: "Integer cents; round_half_up on the percentage term before the max()."
+
+  - name: mileage_proration
+    trigger: "MileageWarrantyClaim SUBMITTED->APPROVED (POST /mileage-claims/{id}/approve)"
+    algorithm: weighted_scoring
+    formula: |
+      # DUAL-VARIANT on the MileageWarrantyClaim domain. Two valid proration
+      # bases produce DIFFERENT credits for identical inputs; the scaffold
+      # PINS the mileage-based variant as the one the system uses, and pins
+      # the tread-based variant as the documented alternative.
+      #
+      # Shared inputs:
+      #   orig_price   = TireModel.unit_price_cents (current catalog price, snapshot)
+      #   warranty_mi  = TireModel.mileage_warranty_miles
+      #   orig_tread   = TireModel.original_tread_32nds
+      #   meas_tread   = claim.measured_tread_32nds
+      #   miles        = claim.miles_driven
+      #   qty          = claim.claim_quantity
+      #
+      # === VARIANT A — mileage_based (SYSTEM-SELECTED) ===
+      #   used_fraction_A   = miles / warranty_mi          # in [0,1)
+      #   remaining_frac_A  = 1 - used_fraction_A
+      #   per_tire_A        = round_half_up(orig_price * remaining_frac_A)
+      #   prorated_credit_cents = per_tire_A * qty
+      #
+      # === VARIANT B — tread_based (DOCUMENTED ALTERNATIVE, not applied) ===
+      #   usable_tread      = orig_tread - WEAR_BAR_THRESHOLD_32NDS   # 2/32 wear bar
+      #   used_tread        = orig_tread - meas_tread
+      #   used_fraction_B   = used_tread / usable_tread
+      #   remaining_frac_B  = 1 - used_fraction_B
+      #   per_tire_B        = round_half_up(orig_price * remaining_frac_B)
+      #   (Variant B credit = per_tire_B * qty)
+      #
+      # The system applies VARIANT A. The two variants diverge whenever
+      # tread wear is not proportional to mileage (the common real case).
+    input_set: "A single APPROVED-transition MileageWarrantyClaim and the snapshot TireModel it references."
+    constants:
+      WEAR_BAR_THRESHOLD_32NDS: 2
+    precision: "Integer cents; round_half_up at per-tire computation, then multiply by qty (round per-tire THEN multiply — pinned order)."
+    variants:
+      - name: mileage_based
+        when: "always — this is the variant the system computes into prorated_credit_cents"
+        difference: "remaining fraction = 1 - miles/warranty_mi"
+      - name: tread_based
+        when: "documented alternative basis; NOT applied by the system"
+        difference: "remaining fraction = 1 - (orig_tread-meas_tread)/(orig_tread-2); diverges from mileage_based when wear is non-linear in mileage"
+
+  - name: special_order_deposit
+    trigger: "SpecialOrder creation (POST /special-orders)"
+    algorithm: threshold
+    formula: |
+      # Deposit = a percentage of the back-ordered goods value, floored.
+      goods_value  = TireModel.unit_price_cents * requested_quantity
+      pct_deposit  = round_half_up(goods_value * SPECIAL_ORDER_DEPOSIT_PCT)
+      deposit_cents = max(pct_deposit, SPECIAL_ORDER_MIN_DEPOSIT_CENTS)
+    input_set: "A single SpecialOrder at creation and the TireModel it references."
+    constants:
+      SPECIAL_ORDER_DEPOSIT_PCT: 0.25
+      SPECIAL_ORDER_MIN_DEPOSIT_CENTS: 2000
+    precision: "Integer cents; round_half_up on the percentage term before the max()."
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a recognized role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for the operation per §1.7 RBAC"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: existence
+    check: "All path-referenced resources exist, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids"
+  - priority: 4
+    category: existence
+    check: "All body-referenced FK resources exist (customer_id, vehicle_id, tire_model_id, work_order_id, service_bay_id, work_order_line_id)"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "create endpoints with FK body fields"
+  - priority: 5
+    category: business_referential
+    check: "On WorkOrder create, vehicle_id must belong to customer_id (vehicle.customer_id == work_order.customer_id)"
+    error_id: ERR_VEHICLE_NOT_OWNED
+    http_status: 422
+    applies_to: "POST /work-orders"
+  - priority: 6
+    category: business_constraint
+    check: "On WorkOrderLine create: line_type==TIRE requires tire_model_id; line_type!=TIRE requires tire_model_id absent"
+    error_id: ERR_LINE_TYPE_FIELD_MISMATCH
+    http_status: 422
+    applies_to: "POST /work-orders/{id}/lines"
+  - priority: 7
+    category: state
+    check: "Target resource is in a state from which this transition is defined, INCLUDING cross-entity state preconditions (e.g. approve requires DRAFT; lines can only be added while DRAFT; check-in requires SCHEDULED; start-service requires a CHECKED_IN appointment; mileage-claim approve requires the covered WorkOrderLine.line_status == COMMITTED)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints and POST /work-orders/{id}/lines"
+  - priority: 8
+    category: business_referential
+    check: "On approve: every TIRE line's tire_model has a FitmentRule for the order's vehicle with fitment_grade IN {OE_EXACT, APPROVED_PLUS}"
+    error_id: ERR_FITMENT_NOT_APPROVED
+    http_status: 422
+    applies_to: "POST /work-orders/{id}/approve"
+  - priority: 9
+    category: business_safety
+    check: "On appointment confirm-reschedule and create: if the order requires_alignment (has an ALIGNMENT line), the chosen ServiceBay must be alignment_capable"
+    error_id: ERR_BAY_NOT_ALIGNMENT_CAPABLE
+    http_status: 422
+    applies_to: "POST /appointments, POST /appointments/{id}/confirm-reschedule"
+  - priority: 10
+    category: state
+    check: "On appointment create / confirm-reschedule / check-in: the target ServiceBay.status must be OPEN (cross-entity dependency: appointment operations depend on the bay's state)"
+    error_id: ERR_BAY_OUT_OF_SERVICE
+    http_status: 409
+    applies_to: "POST /appointments, POST /appointments/{id}/confirm-reschedule, POST /appointments/{id}/check-in"
+  - priority: 11
+    category: business_temporal
+    check: "scheduled_end must be strictly after scheduled_start"
+    error_id: ERR_INVALID_INTERVAL
+    http_status: 422
+    applies_to: "POST /appointments, POST /appointments/{id}/confirm-reschedule"
+  - priority: 12
+    category: business_temporal
+    check: "On appointment create / confirm-reschedule: the [start,end) interval, expanded by the bay's turnover_buffer_min after end, must not overlap any SCHEDULED or CHECKED_IN appointment on the same bay"
+    error_id: ERR_BAY_TIME_CONFLICT
+    http_status: 409
+    applies_to: "POST /appointments, POST /appointments/{id}/confirm-reschedule"
+  - priority: 13
+    category: business_constraint
+    check: "On approve: every TIRE line must have sufficient stock OR an open/received SpecialOrder covering the shortfall; otherwise approval is blocked"
+    error_id: ERR_INSUFFICIENT_STOCK
+    http_status: 422
+    applies_to: "POST /work-orders/{id}/approve"
+  - priority: 14
+    category: business_constraint
+    check: "On mileage-claim approve: miles_driven < TireModel.mileage_warranty_miles (tire still within mileage warranty)"
+    error_id: ERR_MILEAGE_EXCEEDED
+    http_status: 422
+    applies_to: "POST /mileage-claims/{id}/approve"
+  - priority: 15
+    category: business_constraint
+    check: "On mileage-claim approve: measured_tread_32nds <= WEAR_BAR_THRESHOLD_32NDS (tire worn to the wear bar) AND TireModel.mileage_warranty_miles > 0"
+    error_id: ERR_NOT_WORN_TO_BAR
+    http_status: 422
+    applies_to: "POST /mileage-claims/{id}/approve"
+  - priority: 16
+    category: business_fiscal
+    check: "On complete: payment_status must be IN {AUTHORIZED, PAID}"
+    error_id: ERR_PAYMENT_REQUIRED
+    http_status: 402
+    applies_to: "POST /work-orders/{id}/complete"
+  - priority: 17
+    category: business_fiscal
+    check: "OCC: expected_<parent>_version must equal the parent's current version on guarded writes (line add, appointment create, bay close/reopen, approve)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /work-orders/{id}/lines, POST /appointments, POST /service-bays/{id}/close, POST /service-bays/{id}/reopen, POST /work-orders/{id}/approve"
+  - priority: 18
+    category: business_constraint
+    check: "Field-level input validity: enum domain, numeric ranges, quantity >= 1, required fields present"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # ---- Customers ----
+  - method: POST
+    path: "/customers"
+    description: "Register a customer"
+    roles: [ServiceAdvisor]
+    code: 201
+    input: [email, full_name, phone]
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/customers/{id}"
+    description: "Fetch a customer (includes store_credit_cents)"
+    roles: [ServiceAdvisor, Customer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  # ---- Vehicles (child of Customer via FK) ----
+  - method: POST
+    path: "/vehicles"
+    description: "Register a vehicle for a customer"
+    roles: [ServiceAdvisor, Customer]
+    code: 201
+    input: [customer_id, make, model, model_year, oe_tire_size, rim_diameter_in, tpms_type]
+    output: Vehicle
+    side_effects: []
+  - method: GET
+    path: "/vehicles/{id}"
+    description: "Fetch a vehicle"
+    roles: [ServiceAdvisor, Customer]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: []
+  - method: GET
+    path: "/vehicles"
+    description: "List vehicles, optionally filtered by owning customer"
+    roles: [ServiceAdvisor, Customer]
+    code: 200
+    input: ["customer_id?", "limit?", "offset?"]
+    output: Vehicle[]
+    side_effects: []
+
+  # ---- Tire catalog ----
+  - method: POST
+    path: "/tire-models"
+    description: "Create a catalog tire model"
+    roles: [InventoryManager]
+    code: 201
+    input: ["brand", "model_name", "size_token", "load_index", "speed_rating", "unit_price_cents", "mileage_warranty_miles?", "original_tread_32nds", "stock_qty?"]
+    output: TireModel
+    side_effects: ["sets stock_qty from input (default 0)"]
+  - method: GET
+    path: "/tire-models/{id}"
+    description: "Fetch a tire model"
+    roles: [InventoryManager, ServiceAdvisor, Customer]
+    code: 200
+    input: []
+    output: TireModel
+    side_effects: []
+  - method: GET
+    path: "/tire-models"
+    description: "List/search catalog tire models"
+    roles: [InventoryManager, ServiceAdvisor, Customer]
+    code: 200
+    input: ["size_token?", "status?", "limit?", "offset?"]
+    output: TireModel[]
+    side_effects: []
+  - method: POST
+    path: "/tire-models/{id}/restock"
+    description: "Adjust on-hand stock for a tire model"
+    roles: [InventoryManager]
+    code: 200
+    input: [delta_qty]
+    output: TireModel
+    side_effects: ["stock_qty += delta_qty (must not go below 0)"]
+  - method: POST
+    path: "/tire-models/{id}/discontinue"
+    description: "Mark a tire model DISCONTINUED"
+    roles: [InventoryManager]
+    code: 200
+    input: []
+    output: TireModel
+    side_effects: ["status -> DISCONTINUED"]
+
+  # ---- Fitment (Vehicle <-> TireModel junction) ----
+  - method: POST
+    path: "/fitment-rules"
+    description: "Declare that a tire model fits a vehicle with a grade"
+    roles: [InventoryManager]
+    code: 201
+    input: [vehicle_id, tire_model_id, fitment_grade]
+    output: FitmentRule
+    side_effects: []
+  - method: GET
+    path: "/fitment-rules/{id}"
+    description: "Fetch a single fitment rule"
+    roles: [InventoryManager, ServiceAdvisor, Customer]
+    code: 200
+    input: []
+    output: FitmentRule
+    side_effects: []
+  - method: GET
+    path: "/fitment-rules"
+    description: "List fitment rules, filterable by vehicle or tire model"
+    roles: [InventoryManager, ServiceAdvisor, Customer]
+    code: 200
+    input: ["vehicle_id?", "tire_model_id?", "limit?", "offset?"]
+    output: FitmentRule[]
+    side_effects: []
+
+  # ---- Service bays ----
+  - method: POST
+    path: "/service-bays"
+    description: "Create a service bay"
+    roles: [InventoryManager]
+    code: 201
+    input: ["bay_name", "alignment_capable?", "turnover_buffer_min?"]
+    output: ServiceBay
+    side_effects: []
+  - method: GET
+    path: "/service-bays/{id}"
+    description: "Fetch a service bay"
+    roles: [InventoryManager, ServiceAdvisor, Technician]
+    code: 200
+    input: []
+    output: ServiceBay
+    side_effects: []
+  - method: GET
+    path: "/service-bays"
+    description: "List service bays"
+    roles: [InventoryManager, ServiceAdvisor, Technician]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ServiceBay[]
+    side_effects: []
+  - method: POST
+    path: "/service-bays/{id}/close"
+    description: "Take a bay out of service"
+    roles: [InventoryManager]
+    code: 200
+    input: [expected_service_bay_version]
+    output: ServiceBay
+    side_effects: ["status -> OUT_OF_SERVICE", "increments ServiceBay.version by 1"]
+  - method: POST
+    path: "/service-bays/{id}/reopen"
+    description: "Return a bay to service"
+    roles: [InventoryManager]
+    code: 200
+    input: [expected_service_bay_version]
+    output: ServiceBay
+    side_effects: ["status -> OPEN", "increments ServiceBay.version by 1"]
+
+  # ---- Work orders ----
+  - method: POST
+    path: "/work-orders"
+    description: "Open a DRAFT work order for a customer's vehicle"
+    roles: [ServiceAdvisor, Customer]
+    code: 201
+    input: ["customer_id", "vehicle_id", "store_credit_applied_cents?"]
+    output: WorkOrder
+    side_effects: []
+  - method: GET
+    path: "/work-orders/{id}"
+    description: "Fetch a work order with computed pricing fields"
+    roles: [ServiceAdvisor, Customer, Technician]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: []
+  - method: GET
+    path: "/work-orders"
+    description: "List work orders, filterable by customer or vehicle"
+    roles: [ServiceAdvisor, Customer]
+    code: 200
+    input: ["customer_id?", "vehicle_id?", "fulfillment_status?", "payment_status?", "limit?", "offset?"]
+    output: WorkOrder[]
+    side_effects: []
+  - method: POST
+    path: "/work-orders/{id}/lines"
+    description: "Add a line item to a DRAFT work order"
+    roles: [ServiceAdvisor, Customer]
+    code: 201
+    input: ["line_type", "tire_model_id?", "quantity", "road_hazard_opted?", "expected_work_order_version"]
+    output: WorkOrderLine
+    side_effects: ["snapshots unit_price_cents_snapshot", "increments WorkOrder.version by 1"]
+  - method: GET
+    path: "/work-orders/{id}/lines"
+    description: "List line items of a work order"
+    roles: [ServiceAdvisor, Customer, Technician]
+    code: 200
+    input: []
+    output: WorkOrderLine[]
+    side_effects: []
+  - method: GET
+    path: "/work-order-lines/{id}"
+    description: "Fetch a single work order line"
+    roles: [ServiceAdvisor, Customer, Technician]
+    code: 200
+    input: []
+    output: WorkOrderLine
+    side_effects: []
+  - method: GET
+    path: "/work-order-lines"
+    description: "List work order lines, filterable by parent order or tire model"
+    roles: [ServiceAdvisor, Customer, Technician]
+    code: 200
+    input: ["work_order_id?", "tire_model_id?", "limit?", "offset?"]
+    output: WorkOrderLine[]
+    side_effects: []
+  - method: POST
+    path: "/work-orders/{id}/approve"
+    description: "Approve a DRAFT order: finalize pricing, commit lines, debit stock, activate road-hazard warranties, apply store credit"
+    roles: [ServiceAdvisor]
+    code: 200
+    input: [expected_work_order_version]
+    output: WorkOrder
+    side_effects:
+      - "runs calc work_order_pricing (sets all computed money fields)"
+      - "WorkOrderLine PENDING->COMMITTED for all non-VOID lines"
+      - "debits TireModel.stock_qty for committed TIRE lines"
+      - "creates+activates RoadHazardWarranty for opted TIRE lines (calc road_hazard_premium)"
+      - "debits customer.store_credit_cents by clamped store_credit_applied_cents"
+      - "increments WorkOrder.version by 1"
+  - method: POST
+    path: "/work-orders/{id}/authorize-payment"
+    description: "Authorize payment on an APPROVED order (payment axis)"
+    roles: [ServiceAdvisor]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["payment_status UNPAID->AUTHORIZED"]
+  - method: POST
+    path: "/work-orders/{id}/capture-payment"
+    description: "Capture an authorized payment (payment axis)"
+    roles: [ServiceAdvisor]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["payment_status AUTHORIZED->PAID"]
+  - method: POST
+    path: "/work-orders/{id}/start-service"
+    description: "Begin bay service (fulfillment axis)"
+    roles: [Technician]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["fulfillment_status APPROVED->IN_SERVICE"]
+  - method: POST
+    path: "/work-orders/{id}/complete"
+    description: "Complete service; auto-capture authorized payment; complete the appointment"
+    roles: [Technician]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects:
+      - "fulfillment_status IN_SERVICE->COMPLETED"
+      - "linked CHECKED_IN InstallAppointment -> COMPLETED"
+      - "if payment_status==AUTHORIZED, payment_status->PAID"
+  - method: POST
+    path: "/work-orders/{id}/cancel"
+    description: "Cancel a DRAFT or APPROVED order with full compensation"
+    roles: [ServiceAdvisor]
+    code: 200
+    input: [expected_work_order_version]
+    output: WorkOrder
+    side_effects:
+      - "fulfillment_status -> CANCELLED"
+      - "non-VOID lines -> VOID; restock committed TIRE lines"
+      - "ACTIVE RoadHazardWarranty -> VOID"
+      - "refund store_credit_applied_cents to customer.store_credit_cents"
+      - "SCHEDULED/RESCHEDULE_PENDING InstallAppointment -> CANCELLED"
+      - "if payment_status==AUTHORIZED, payment_status->REFUNDED"
+      - "increments WorkOrder.version by 1"
+
+  # ---- Road-hazard warranties (reverse-reachable from lines) ----
+  - method: GET
+    path: "/road-hazard-warranties/{id}"
+    description: "Fetch a road-hazard warranty"
+    roles: [ServiceAdvisor, Customer]
+    code: 200
+    input: []
+    output: RoadHazardWarranty
+    side_effects: []
+  - method: GET
+    path: "/road-hazard-warranties"
+    description: "List road-hazard warranties, filterable by covered line or tire model"
+    roles: [ServiceAdvisor, Customer]
+    code: 200
+    input: ["work_order_line_id?", "tire_model_id?", "limit?", "offset?"]
+    output: RoadHazardWarranty[]
+    side_effects: []
+
+  # ---- Install appointments ----
+  - method: POST
+    path: "/appointments"
+    description: "Book an install appointment in a bay for an approved work order"
+    roles: [ServiceAdvisor, Customer]
+    code: 201
+    input: [work_order_id, service_bay_id, scheduled_start, scheduled_end, expected_service_bay_version]
+    output: InstallAppointment
+    side_effects: ["increments ServiceBay.version by 1", "requires_alignment computed from the order's lines"]
+  - method: GET
+    path: "/appointments/{id}"
+    description: "Fetch an appointment"
+    roles: [ServiceAdvisor, Customer, Technician]
+    code: 200
+    input: []
+    output: InstallAppointment
+    side_effects: []
+  - method: GET
+    path: "/appointments"
+    description: "List appointments, filterable by bay or work order"
+    roles: [ServiceAdvisor, Customer, Technician]
+    code: 200
+    input: ["service_bay_id?", "work_order_id?", "status?", "limit?", "offset?"]
+    output: InstallAppointment[]
+    side_effects: []
+  - method: POST
+    path: "/appointments/{id}/request-reschedule"
+    description: "Customer requests a reschedule; releases the slot"
+    roles: [Customer, ServiceAdvisor]
+    code: 200
+    input: []
+    output: InstallAppointment
+    side_effects: ["status SCHEDULED->RESCHEDULE_PENDING; interval released"]
+  - method: POST
+    path: "/appointments/{id}/confirm-reschedule"
+    description: "Advisor confirms a new interval (re-runs overlap + alignment checks)"
+    roles: [ServiceAdvisor]
+    code: 200
+    input: [scheduled_start, scheduled_end]
+    output: InstallAppointment
+    side_effects: ["status RESCHEDULE_PENDING->SCHEDULED; interval re-blocks bay"]
+  - method: POST
+    path: "/appointments/{id}/check-in"
+    description: "Technician checks in the vehicle"
+    roles: [Technician]
+    code: 200
+    input: []
+    output: InstallAppointment
+    side_effects: ["status SCHEDULED->CHECKED_IN"]
+  - method: POST
+    path: "/appointments/{id}/cancel"
+    description: "Cancel an appointment and free the slot"
+    roles: [ServiceAdvisor]
+    code: 200
+    input: []
+    output: InstallAppointment
+    side_effects: ["status -> CANCELLED; interval freed"]
+
+  # ---- Special orders ----
+  - method: POST
+    path: "/special-orders"
+    description: "Place a special order for a back-ordered tire line"
+    roles: [InventoryManager, ServiceAdvisor]
+    code: 201
+    input: [work_order_line_id, tire_model_id, requested_quantity]
+    output: SpecialOrder
+    side_effects: ["deposit_cents from calc special_order_deposit"]
+  - method: GET
+    path: "/special-orders/{id}"
+    description: "Fetch a special order"
+    roles: [InventoryManager, ServiceAdvisor]
+    code: 200
+    input: []
+    output: SpecialOrder
+    side_effects: []
+  - method: GET
+    path: "/special-orders"
+    description: "List special orders, filterable by covered line or tire model"
+    roles: [InventoryManager, ServiceAdvisor]
+    code: 200
+    input: ["work_order_line_id?", "tire_model_id?", "status?", "limit?", "offset?"]
+    output: SpecialOrder[]
+    side_effects: []
+  - method: POST
+    path: "/special-orders/{id}/receive"
+    description: "Mark special-order goods received; restock"
+    roles: [InventoryManager]
+    code: 200
+    input: []
+    output: SpecialOrder
+    side_effects: ["status ORDERED->RECEIVED", "TireModel.stock_qty += requested_quantity"]
+  - method: POST
+    path: "/special-orders/{id}/cancel-backorder"
+    description: "Cancel an unreceived special order; forfeit deposit"
+    roles: [InventoryManager]
+    code: 200
+    input: []
+    output: SpecialOrder
+    side_effects: ["status ORDERED->BACKORDER_CANCELLED", "deposit forfeited", "linked line VOID if parent order still DRAFT"]
+
+  # ---- Mileage warranty claims ----
+  - method: POST
+    path: "/mileage-claims"
+    description: "Submit a mileage-warranty claim on a worn tire line"
+    roles: [ServiceAdvisor, Customer]
+    code: 201
+    input: [work_order_line_id, tire_model_id, measured_tread_32nds, miles_driven, payout_method, claim_quantity]
+    output: MileageWarrantyClaim
+    side_effects: []
+  - method: GET
+    path: "/mileage-claims/{id}"
+    description: "Fetch a mileage-warranty claim"
+    roles: [ServiceAdvisor, Customer]
+    code: 200
+    input: []
+    output: MileageWarrantyClaim
+    side_effects: []
+  - method: GET
+    path: "/mileage-claims"
+    description: "List mileage-warranty claims, filterable by covered line or tire model"
+    roles: [ServiceAdvisor, Customer]
+    code: 200
+    input: ["work_order_line_id?", "tire_model_id?", "status?", "limit?", "offset?"]
+    output: MileageWarrantyClaim[]
+    side_effects: []
+  - method: POST
+    path: "/mileage-claims/{id}/approve"
+    description: "Approve a claim: run dual-variant proration, consume road-hazard coverage"
+    roles: [ServiceAdvisor]
+    code: 200
+    input: []
+    output: MileageWarrantyClaim
+    side_effects: ["runs calc mileage_proration (sets prorated_credit_cents)", "ACTIVE RoadHazardWarranty on the line -> CLAIMED"]
+  - method: POST
+    path: "/mileage-claims/{id}/reject"
+    description: "Reject a claim"
+    roles: [ServiceAdvisor]
+    code: 200
+    input: []
+    output: MileageWarrantyClaim
+    side_effects: ["status SUBMITTED->REJECTED"]
+  - method: POST
+    path: "/mileage-claims/{id}/pay"
+    description: "Pay an approved claim via store credit or refund"
+    roles: [ServiceAdvisor]
+    code: 200
+    input: []
+    output: MileageWarrantyClaim
+    side_effects: ["status APPROVED->PAID", "if STORE_CREDIT: credit customer.store_credit_cents by prorated_credit_cents"]
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID header"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Acting role not permitted for the operation"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Path-referenced resource does not exist"
+  - id: ERR_REFERENCE_NOT_FOUND
+    http: 404
+    condition: "Body FK references a non-existent resource"
+  - id: ERR_VEHICLE_NOT_OWNED
+    http: 422
+    condition: "vehicle_id does not belong to the work order's customer_id"
+  - id: ERR_LINE_TYPE_FIELD_MISMATCH
+    http: 422
+    condition: "TIRE line missing tire_model_id, or non-TIRE line supplying tire_model_id"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Transition not defined from the resource's current state (includes adding a line to a non-DRAFT order)"
+  - id: ERR_FITMENT_NOT_APPROVED
+    http: 422
+    condition: "A TIRE line's tire model has no approved FitmentRule for the order's vehicle"
+  - id: ERR_BAY_NOT_ALIGNMENT_CAPABLE
+    http: 422
+    condition: "Order requires alignment but the chosen bay is not alignment_capable"
+  - id: ERR_BAY_OUT_OF_SERVICE
+    http: 409
+    condition: "Chosen ServiceBay.status is OUT_OF_SERVICE"
+  - id: ERR_INVALID_INTERVAL
+    http: 422
+    condition: "scheduled_end not strictly after scheduled_start"
+  - id: ERR_BAY_TIME_CONFLICT
+    http: 409
+    condition: "Appointment interval (plus turnover buffer) overlaps an existing SCHEDULED/CHECKED_IN appointment on the same bay"
+  - id: ERR_INSUFFICIENT_STOCK
+    http: 422
+    condition: "A TIRE line at approval lacks stock and lacks a received/open special order to cover it"
+  - id: ERR_MILEAGE_EXCEEDED
+    http: 422
+    condition: "miles_driven >= TireModel.mileage_warranty_miles at claim approval"
+  - id: ERR_NOT_WORN_TO_BAR
+    http: 422
+    condition: "measured_tread_32nds above the wear bar, or tire model has no mileage warranty, at claim approval"
+  - id: ERR_PAYMENT_REQUIRED
+    http: 402
+    condition: "Completing service while payment_status is UNPAID"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "Generic OCC mismatch (work order approve / line add fallback)"
+  - id: ERR_STALE_BAY_VERSION
+    http: 412
+    condition: "expected_service_bay_version does not match ServiceBay.version on appointment create or bay close/reopen"
+  - id: ERR_STALE_WORK_ORDER_VERSION
+    http: 412
+    condition: "expected_work_order_version does not match WorkOrder.version on line add"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Field-level validation failure: bad enum, out-of-range number, quantity < 1, missing required field"
+  - id: ERR_NEGATIVE_STOCK
+    http: 422
+    condition: "A restock delta_qty would drive stock_qty below 0"
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: Customer
+    description: "Vehicle owner; can manage own vehicles, open work orders, view pricing, book/reschedule appointments, submit mileage claims"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /appointments/{id}/request-reschedule (own appointment)"
+    shared_operations:
+      - "POST /vehicles"
+      - "POST /work-orders"
+      - "POST /work-orders/{id}/lines"
+      - "POST /appointments"
+      - "POST /mileage-claims"
+      - "GET own customer/vehicle/work-order/appointment/claim resources"
+  - name: ServiceAdvisor
+    description: "Shop counter staff; runs the work-order lifecycle, pricing approval, payment, appointment management, claim adjudication"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /work-orders/{id}/approve"
+      - "POST /work-orders/{id}/authorize-payment"
+      - "POST /work-orders/{id}/capture-payment"
+      - "POST /work-orders/{id}/cancel"
+      - "POST /appointments/{id}/confirm-reschedule"
+      - "POST /appointments/{id}/cancel"
+      - "POST /mileage-claims/{id}/approve"
+      - "POST /mileage-claims/{id}/reject"
+      - "POST /mileage-claims/{id}/pay"
+      - "POST /customers"
+    shared_operations:
+      - "POST /vehicles"
+      - "POST /work-orders"
+      - "POST /work-orders/{id}/lines"
+      - "POST /appointments"
+      - "POST /appointments/{id}/request-reschedule"
+      - "POST /mileage-claims"
+      - "POST /special-orders"
+  - name: Technician
+    description: "Bay technician; executes service work and appointment check-in/service progression"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /work-orders/{id}/start-service"
+      - "POST /work-orders/{id}/complete"
+      - "POST /appointments/{id}/check-in"
+    shared_operations:
+      - "GET work-order, line, appointment, bay resources"
+  - name: InventoryManager
+    description: "Owns catalog, stock, fitment, service bays, and special orders"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /tire-models"
+      - "POST /tire-models/{id}/restock"
+      - "POST /tire-models/{id}/discontinue"
+      - "POST /fitment-rules"
+      - "POST /service-bays"
+      - "POST /service-bays/{id}/close"
+      - "POST /service-bays/{id}/reopen"
+      - "POST /special-orders/{id}/receive"
+      - "POST /special-orders/{id}/cancel-backorder"
+    shared_operations:
+      - "POST /special-orders"
+      - "GET catalog/stock/bay/special-order resources"

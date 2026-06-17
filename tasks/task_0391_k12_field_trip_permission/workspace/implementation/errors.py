@@ -1,0 +1,72 @@
+"""Error classes and the full error catalogue (PRD §5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# HTTP status for every error_id (PRD §5 Error Code Catalogue).
+ERROR_HTTP = {
+    "ERR_MISSING_OR_INVALID_USER_CONTEXT": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_TRIP_NOT_FOUND": 404,
+    "ERR_SLIP_NOT_FOUND": 404,
+    "ERR_CHAPERONE_NOT_FOUND": 404,
+    "ERR_BOOKING_NOT_FOUND": 404,
+    "ERR_GRANT_NOT_FOUND": 404,
+    "ERR_STUDENT_NOT_FOUND": 404,
+    "ERR_GUARDIAN_NOT_FOUND": 404,
+    "ERR_VEHICLE_NOT_FOUND": 404,
+    "ERR_POOL_NOT_FOUND": 404,
+    "ERR_NOT_SLIP_GUARDIAN": 403,
+    "ERR_NOT_CHAPERONE_GUARDIAN": 403,
+    "ERR_GUARDIAN_EMAIL_TAKEN": 409,
+    "ERR_TRIP_NOT_DRAFT": 409,
+    "ERR_TRIP_NOT_AWAITING_PRINCIPAL": 409,
+    "ERR_TRIP_NOT_AWAITING_DISTRICT": 409,
+    "ERR_TRIP_NOT_APPROVED": 409,
+    "ERR_TRIP_NOT_LOCKED": 409,
+    "ERR_TRIP_NOT_IN_PROGRESS": 409,
+    "ERR_TRIP_NOT_CANCELLABLE": 409,
+    "ERR_ROSTER_LOCKED": 409,
+    "ERR_INVALID_TIME_WINDOW": 422,
+    "ERR_INVALID_CAPACITY": 422,
+    "ERR_INVALID_APPROVAL_STEP": 422,
+    "ERR_TRIP_NOT_OPEN_FOR_SIGNING": 409,
+    "ERR_TRIP_NOT_OPEN_FOR_WITHDRAWAL": 409,
+    "ERR_SLIP_ALREADY_SIGNED": 409,
+    "ERR_SLIP_NOT_SIGNED": 409,
+    "ERR_SLIP_ALREADY_PAID": 409,
+    "ERR_SLIP_NOT_PAID": 409,
+    "ERR_EMERGENCY_CONTACT_REQUIRED": 409,
+    "ERR_PAYMENT_AMOUNT_MISMATCH": 409,
+    "ERR_CHAPERONE_NOT_INVITED": 409,
+    "ERR_CHAPERONE_NOT_CONFIRMED": 409,
+    "ERR_CHAPERONE_NOT_WITHDRAWABLE": 409,
+    "ERR_BACKGROUND_CHECK_MISSING": 409,
+    "ERR_BOOKING_NOT_REQUESTED": 409,
+    "ERR_BOOKING_NOT_CANCELLABLE": 409,
+    "ERR_VEHICLE_RETIRED": 409,
+    "ERR_TRIP_AT_CAPACITY": 409,
+    "ERR_VEHICLE_OVERBOOKED": 409,
+    "ERR_VEHICLE_TIME_CONFLICT": 409,
+    "ERR_CHAPERONE_TIME_CONFLICT": 409,
+    "ERR_TRANSPORT_NOT_BOOKED": 409,
+    "ERR_CHAPERONE_RATIO_UNMET": 409,
+    "ERR_EMPTY_ROSTER": 409,
+    "ERR_RETURN_HEADCOUNT_INCOMPLETE": 409,
+    "ERR_SCHOLARSHIP_POOL_EXHAUSTED": 409,
+    "ERR_AWARD_EXCEEDS_WAIVABLE": 409,
+    "ERR_GRANT_NOT_ACTIVE": 409,
+    "ERR_STALE_TRIP_VERSION": 412,
+    "ERR_VALIDATION": 422,
+}
+
+
+def err(error_id, message=None):
+    """Build an ApiError from the catalogue (status looked up by id)."""
+    return ApiError(error_id, ERROR_HTTP[error_id], message)

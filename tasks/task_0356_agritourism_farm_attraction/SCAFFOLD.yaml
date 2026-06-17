@@ -1,0 +1,1301 @@
+# =============================================================================
+# PRD Benchmark Scaffold — Agritourism & Farm Attraction (pumpkin patch / corn maze)
+# §1.0–§1.7. Difficulty target: Expert.
+# =============================================================================
+
+scenario: |
+  356. Agritourism & Farm Attraction (pumpkin patch/corn maze): timed admission &
+  capacity, activity pass (hayride/maze/u-pick), weight/quantity pricing (pumpkins),
+  group/field-trip & school rate, season pass, weather closure, parking & concessions,
+  waiver
+
+domain_name: agritourism-farm-attraction
+api_prefix: ""
+# Flat/hybrid topology: peer collections live at the API root (/farms, /reservations,
+# /admission-windows, /visitors, /season-passes, /group-bookings, /pricing-policies)
+# with sub-resource and filtered-list GETs for every FK. api_prefix is the root so
+# each peer collection segment is reverse-reachable.
+
+# -----------------------------------------------------------------------------
+# Complexity Profile
+# -----------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: quota_allocation        # timed-admission capacity competed for, reserved, committed, released
+  secondary_archetype: pricing_engine        # weight/quantity pricing, group rate, season-pass crediting
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on AdmissionWindow.version for reservation-create races
+    - cascading_side_effects                 # weather closure → reservation refunds → window capacity release → group rollups
+    - dual_variant_calculation               # provisional vs settled admission charge; estimate vs scale-weighed pumpkin charge
+    - rate_threshold_triggers                # group head-count tier breakpoints; pumpkin per-lb vs flat-each breakpoint
+    - derived_field_reconciliation           # AdmissionWindow.seats_committed / seats_held kept consistent with child reservations
+
+  entity_topology: hybrid
+  # Farm is the aggregate root (posture-driven gate). AdmissionWindow, PricingPolicy,
+  # SeasonPass, GroupBooking, WeatherEvent hang off Farm. Reservation references a
+  # Window + a Visitor (cross-aggregate FK). ActivityPass / Waiver / PumpkinPurchase
+  # / ConcessionOrder hang off a Reservation. So: tree + cross-cutting FK refs.
+
+  state_machine_shape: posture_driven
+  # Farm.operational_status (OPEN / WEATHER_HOLD / CLOSED) gates child operations,
+  # PLUS Reservation has a branching fork-join lifecycle (CHECKED_IN forks into the
+  # parallel-finalized checkout that joins at SETTLED), and GroupBooking has a
+  # cyclic revise loop (QUOTED -> REVISING -> QUOTED).
+
+  relationship_patterns:
+    - one_to_many        # Farm -> AdmissionWindow; AdmissionWindow -> Reservation; Reservation -> ActivityPass
+    - cross_aggregate    # Reservation -> Visitor; Reservation -> SeasonPass; GroupBooking -> AdmissionWindow
+    - self_referential   # GroupBooking.parent_group_id (a split chaperone sub-group references its parent group)
+
+  role_model: peer_roles
+  # Visitor (buys, checks in own reservations), GroupLeader (manages own GroupBooking),
+  # GateAgent (operational: check-in, weigh-out, scan), FarmManager (configures farm,
+  # declares weather, sets pricing). Peer ownership: Visitor owns Reservations they
+  # created; GroupLeader owns their GroupBooking.
+
+  consistency_model: immediate
+  # All cascades (weather closure refunds, capacity release, group rollups) resolve
+  # atomically within the triggering request.
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  # ---------------------------------------------------------------------------
+  - name: Farm
+    parent: null
+    common_fields: true            # id, created_at, updated_at, version
+    fields:
+      - { name: name, type: string, source: input, description: "Farm display name" }
+      - { name: timezone, type: string, source: input, description: "IANA tz used to interpret window local times", default: "America/Chicago" }
+      - { name: parking_fee_cents, type: integer, source: input, description: "Flat per-vehicle parking fee charged at concession", default: 1000, constraints: ">= 0" }
+      - { name: window_buffer_minutes, type: integer, source: input, description: "Minimum cleanup gap required between two AdmissionWindows on this farm; two windows whose [starts_at, ends_at) intervals are closer than this buffer collide", default: 30, constraints: ">= 0" }
+      - { name: operational_status, type: enum, source: computed, description: "OPEN | WEATHER_HOLD | CLOSED — posture derived from latest WeatherEvent; gates child operations", default: "OPEN", constraints: "one of OPEN, WEATHER_HOLD, CLOSED" }
+      - { name: active_weather_event_id, type: string, source: computed, description: "Computed back-pointer to the most recent non-CLEARED WeatherEvent driving the current posture (WeatherEvent.id), else null. Not a structural FK — WeatherEvent.farm_id is the owning FK.", default: null }
+      - { name: refunds_issued_cents, type: integer, source: computed, description: "Running total of admission cents auto-refunded by weather closures; reconciled on every closure cascade", default: 0 }
+
+  # ---------------------------------------------------------------------------
+  - name: WeatherEvent
+    parent: Farm
+    common_fields: false            # append-only event log: id + created_at only, never mutated
+    fields:
+      - { name: farm_id, type: string, source: input, description: "FK -> Farm.id; farm this weather event applies to" }
+      - { name: kind, type: enum, source: input, description: "HOLD | CLEARED | CLOSURE", constraints: "one of HOLD, CLEARED, CLOSURE" }
+      - { name: affected_span_start, type: datetime, source: input, description: "Start (ISO 8601 UTC, inclusive) of the affected span; windows with starts_at in [start, end) are cancelled on CLOSURE", default: null }
+      - { name: affected_span_end, type: datetime, source: input, description: "End (ISO 8601 UTC, exclusive) of the affected span on CLOSURE", default: null }
+      - { name: note, type: string, source: input, description: "Free-text operator note", default: null }
+      - { name: resulting_status, type: enum, source: computed, description: "Farm.operational_status snapshotted immediately after this event was applied (OPEN | WEATHER_HOLD | CLOSED)" }
+
+  # ---------------------------------------------------------------------------
+  - name: PricingPolicy
+    parent: Farm
+    common_fields: true
+    fields:
+      - { name: farm_id, type: string, source: input, description: "FK -> Farm.id; farm this policy prices" }
+      - { name: adult_admission_cents, type: integer, source: input, description: "Per-adult timed-admission price", constraints: ">= 0" }
+      - { name: child_admission_cents, type: integer, source: input, description: "Per-child timed-admission price", constraints: ">= 0" }
+      - { name: hayride_pass_cents, type: integer, source: input, description: "Activity-pass price for HAYRIDE", constraints: ">= 0" }
+      - { name: maze_pass_cents, type: integer, source: input, description: "Activity-pass price for MAZE", constraints: ">= 0" }
+      - { name: upick_pass_cents, type: integer, source: input, description: "Activity-pass price for UPICK", constraints: ">= 0" }
+      - { name: pumpkin_per_lb_cents, type: integer, source: input, description: "Per-pound rate applied to pumpkins at/under the flat-each breakpoint weight", constraints: ">= 0" }
+      - { name: pumpkin_flat_each_cents, type: integer, source: input, description: "Flat per-pumpkin price charged once a pumpkin's weight is >= heavy_pumpkin_lb breakpoint", constraints: ">= 0" }
+      - { name: heavy_pumpkin_lb, type: number, source: input, description: "Weight breakpoint (pounds) at which a pumpkin flips from per-lb to flat-each pricing", default: 20, constraints: "> 0" }
+      - { name: group_rate_min_headcount, type: integer, source: input, description: "Minimum participants for a GroupBooking to qualify for the group discount tier", default: 15, constraints: ">= 1" }
+      - { name: group_discount_pct, type: number, source: input, description: "Fractional discount on per-head admission for qualifying groups, e.g. 0.20 = 20% off", default: 0.20, constraints: "0 <= x < 1" }
+      - { name: school_discount_pct, type: number, source: input, description: "Deeper fractional discount applied instead of group_discount_pct when GroupBooking.kind == SCHOOL", default: 0.35, constraints: "0 <= x < 1" }
+      - { name: season_pass_price_cents, type: integer, source: input, description: "Price of one SeasonPass", constraints: ">= 0" }
+      - { name: status, type: enum, source: system, description: "DRAFT | ACTIVE | SUPERSEDED — only one ACTIVE policy per farm at a time", default: "DRAFT", constraints: "one of DRAFT, ACTIVE, SUPERSEDED" }
+
+  # ---------------------------------------------------------------------------
+  - name: AdmissionWindow
+    parent: Farm
+    common_fields: true
+    fields:
+      - { name: farm_id, type: string, source: input, description: "FK -> Farm.id; farm offering this window" }
+      - { name: starts_at, type: datetime, source: input, description: "Window start (ISO 8601 UTC, inclusive)" }
+      - { name: ends_at, type: datetime, source: input, description: "Window end (ISO 8601 UTC, exclusive)" }
+      - { name: capacity, type: integer, source: input, description: "Maximum total participants (committed + held) admitted in this window", constraints: ">= 1" }
+      - { name: seats_held, type: integer, source: computed, description: "Participants in PENDING reservations holding inventory in this window; reconciled on every reservation create/cancel/confirm", default: 0 }
+      - { name: seats_committed, type: integer, source: computed, description: "Participants in CONFIRMED+ reservations occupying this window; reconciled on confirm/check-in/cancel/closure", default: 0 }
+      - { name: seats_available, type: integer, source: computed, description: "capacity - seats_held - seats_committed; never negative", default: 0 }
+      - { name: status, type: enum, source: computed, description: "SCHEDULED | SOLD_OUT | CANCELLED — SOLD_OUT when seats_available == 0; CANCELLED set by weather closure cascade", default: "SCHEDULED", constraints: "one of SCHEDULED, SOLD_OUT, CANCELLED" }
+
+  # ---------------------------------------------------------------------------
+  - name: Visitor
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Visitor contact email; unique per visitor" }
+      - { name: full_name, type: string, source: input, description: "Visitor full name" }
+      - { name: wallet_credit_cents, type: integer, source: computed, description: "Refund/credit balance granted by weather closures and overpayment, redeemable at checkout", default: 0 }
+
+  # ---------------------------------------------------------------------------
+  - name: SeasonPass
+    parent: Farm
+    common_fields: true
+    fields:
+      - { name: farm_id, type: string, source: input, description: "FK -> Farm.id; farm this pass admits to" }
+      - { name: visitor_id, type: string, source: input, description: "FK -> Visitor.id; pass holder" }
+      - { name: purchase_price_cents, type: integer, source: system, description: "Price paid, snapshotted from the ACTIVE PricingPolicy.season_pass_price_cents at issue", constraints: ">= 0" }
+      - { name: valid_from, type: datetime, source: input, description: "First instant the pass admits (ISO 8601 UTC, inclusive)" }
+      - { name: valid_until, type: datetime, source: input, description: "Last instant the pass admits (ISO 8601 UTC, exclusive)" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | EXPIRED | REVOKED", default: "ACTIVE", constraints: "one of ACTIVE, EXPIRED, REVOKED" }
+      - { name: visits_used, type: integer, source: computed, description: "Count of reservations that redeemed this pass; incremented on confirm, decremented on cancel/closure", default: 0 }
+
+  # ---------------------------------------------------------------------------
+  - name: Reservation
+    parent: null
+    common_fields: true
+    fields:
+      - { name: window_id, type: string, source: input, description: "FK -> AdmissionWindow.id; timed window this reservation occupies" }
+      - { name: visitor_id, type: string, source: input, description: "FK -> Visitor.id; owner who created and may check in this reservation" }
+      - { name: season_pass_id, type: string, source: input, description: "FK -> SeasonPass.id; optional pass redeemed for admission (null = pay per head)" }
+      - { name: group_booking_id, type: string, source: input, description: "FK -> GroupBooking.id; set when this reservation belongs to a confirmed group (null = individual)" }
+      - { name: adult_count, type: integer, source: input, description: "Number of adult participants", constraints: ">= 0" }
+      - { name: child_count, type: integer, source: input, description: "Number of child participants", constraints: ">= 0" }
+      - { name: participant_count, type: integer, source: computed, description: "adult_count + child_count; must be >= 1 and is the seat draw against the window" }
+      - { name: admission_charge_cents, type: integer, source: computed, description: "Provisional admission charge computed at create; the SETTLED charge recomputed at check-in may differ (dual-variant)", default: 0 }
+      - { name: settled_charge_cents, type: integer, source: computed, description: "Final admission charge locked at check-in; null until CHECKED_IN", default: 0 }
+      - { name: expected_window_version, type: integer, source: input, description: "OCC token: the AdmissionWindow.version the client last observed; checked on create against live window version" }
+      - { name: status, type: enum, source: system, description: "PENDING | CONFIRMED | CHECKED_IN | SETTLED | CANCELLED | NO_SHOW", default: "PENDING", constraints: "one of PENDING, CONFIRMED, CHECKED_IN, SETTLED, CANCELLED, NO_SHOW" }
+      - { name: checkout_finalized, type: boolean, source: computed, description: "True once pumpkin weigh-out is finalized for this reservation (join condition for SETTLED)", default: false }
+      - { name: waiver_satisfied, type: boolean, source: computed, description: "True once a SIGNED Waiver covers every participant (join condition for SETTLED)", default: false }
+      - { name: gross_cents, type: integer, source: computed, description: "Computed-read total before wallet credit: admission (settled if CHECKED_IN+ else provisional) + activities + pumpkins + concessions; populated on GET /reservations/{id}/total", default: 0 }
+      - { name: net_due_cents, type: integer, source: computed, description: "Computed-read amount due: gross_cents - min(Visitor.wallet_credit_cents, gross_cents); populated on GET /reservations/{id}/total", default: 0 }
+
+  # ---------------------------------------------------------------------------
+  - name: ActivityPass
+    parent: Reservation
+    common_fields: true
+    fields:
+      - { name: reservation_id, type: string, source: input, description: "FK -> Reservation.id; reservation this pass attaches to" }
+      - { name: activity, type: enum, source: input, description: "HAYRIDE | MAZE | UPICK", constraints: "one of HAYRIDE, MAZE, UPICK" }
+      - { name: quantity, type: integer, source: input, description: "Number of this pass purchased", constraints: ">= 1" }
+      - { name: unit_price_cents, type: integer, source: system, description: "Per-pass price snapshotted from the ACTIVE PricingPolicy at attach time", constraints: ">= 0" }
+      - { name: line_total_cents, type: integer, source: computed, description: "quantity * unit_price_cents" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | REVOKED — REVOKED on reservation cancel/closure", default: "ACTIVE", constraints: "one of ACTIVE, REVOKED" }
+
+  # ---------------------------------------------------------------------------
+  - name: Waiver
+    parent: Reservation
+    common_fields: true
+    fields:
+      - { name: reservation_id, type: string, source: input, description: "FK -> Reservation.id; reservation this waiver covers" }
+      - { name: participant_name, type: string, source: input, description: "Name of the participant signing or being covered" }
+      - { name: is_minor, type: boolean, source: input, description: "True if the participant is a minor (requires guardian_name)", default: false }
+      - { name: guardian_name, type: string, source: input, description: "Guardian name; required when is_minor is true", default: null }
+      - { name: status, type: enum, source: system, description: "SIGNED | VOID — VOID on reservation cancel/closure", default: "SIGNED", constraints: "one of SIGNED, VOID" }
+
+  # ---------------------------------------------------------------------------
+  - name: PumpkinPurchase
+    parent: Reservation
+    common_fields: true
+    fields:
+      - { name: reservation_id, type: string, source: input, description: "FK -> Reservation.id; reservation whose checkout this purchase belongs to" }
+      - { name: estimated_weight_lb, type: number, source: input, description: "Visitor-declared estimated weight at add time (used for the provisional estimate variant)", constraints: "> 0" }
+      - { name: scale_weight_lb, type: number, source: system, description: "Authoritative scale weight recorded at weigh-out by the GateAgent; null until weighed", default: null }
+      - { name: charge_cents, type: integer, source: computed, description: "Provisional charge from estimated_weight_lb at add; recomputed from scale_weight_lb at weigh-out (dual-variant)", default: 0 }
+      - { name: status, type: enum, source: system, description: "ESTIMATED | WEIGHED | VOID — ESTIMATED at add, WEIGHED at weigh-out, VOID on reservation cancel/closure", default: "ESTIMATED", constraints: "one of ESTIMATED, WEIGHED, VOID" }
+
+  # ---------------------------------------------------------------------------
+  - name: ConcessionOrder
+    parent: Reservation
+    common_fields: true
+    fields:
+      - { name: reservation_id, type: string, source: input, description: "FK -> Reservation.id; reservation this order is billed to" }
+      - { name: food_cents, type: integer, source: input, description: "Food/beverage subtotal in cents", default: 0, constraints: ">= 0" }
+      - { name: vehicle_count, type: integer, source: input, description: "Number of vehicles parked (each billed at Farm.parking_fee_cents)", default: 0, constraints: ">= 0" }
+      - { name: parking_cents, type: integer, source: computed, description: "vehicle_count * Farm.parking_fee_cents, snapshotted at create" }
+      - { name: total_cents, type: integer, source: computed, description: "food_cents + parking_cents" }
+      - { name: status, type: enum, source: system, description: "PAID | REFUNDED — REFUNDED on reservation closure cascade", default: "PAID", constraints: "one of PAID, REFUNDED" }
+
+  # ---------------------------------------------------------------------------
+  - name: GroupBooking
+    parent: Farm
+    common_fields: true
+    fields:
+      - { name: farm_id, type: string, source: input, description: "FK -> Farm.id; farm hosting the group" }
+      - { name: window_id, type: string, source: input, description: "FK -> AdmissionWindow.id; window the group will occupy on confirm" }
+      - { name: group_leader_id, type: string, source: input, description: "FK -> Visitor.id; the GroupLeader who owns this booking" }
+      - { name: parent_group_id, type: string, source: input, description: "FK -> GroupBooking.id; set when this is a split chaperone sub-group of a larger booking (self-referential; null for a top-level group)", default: null }
+      - { name: kind, type: enum, source: input, description: "FIELD_TRIP | SCHOOL | CORPORATE — SCHOOL gets school_discount_pct, others get group_discount_pct", constraints: "one of FIELD_TRIP, SCHOOL, CORPORATE" }
+      - { name: adult_count, type: integer, source: input, description: "Chaperones/adults in the group", constraints: ">= 0" }
+      - { name: child_count, type: integer, source: input, description: "Students/children in the group", constraints: ">= 0" }
+      - { name: headcount, type: integer, source: computed, description: "adult_count + child_count" }
+      - { name: quoted_total_cents, type: integer, source: computed, description: "Discounted admission quote for the whole group; recomputed on each (re)quote" }
+      - { name: deposit_cents, type: integer, source: computed, description: "Non-refundable deposit = ceil(quoted_total_cents * DEPOSIT_PCT); locked at confirm", default: 0 }
+      - { name: expected_window_version, type: integer, source: input, description: "OCC token: the AdmissionWindow.version observed when confirming; checked at confirm against live window version" }
+      - { name: status, type: enum, source: system, description: "QUOTED | REVISING | CONFIRMED | CANCELLED — cyclic QUOTED<->REVISING revision loop before CONFIRMED", default: "QUOTED", constraints: "one of QUOTED, REVISING, CONFIRMED, CANCELLED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---------------------------------------------------------------------------
+  # Farm posture (posture_driven) — gates all child operations.
+  - entity: Farm
+    field: operational_status
+    initial_state: OPEN
+    terminal_states: []
+    note: "Posture is derived from the latest WeatherEvent; never set directly."
+    transitions:
+      - from: OPEN
+        to: WEATHER_HOLD
+        trigger: "POST /farms/{id}/weather-events  (kind=HOLD)"
+        actor: FarmManager
+        preconditions:
+          - "Farm.operational_status == OPEN"
+        side_effects:
+          - "Farm.active_weather_event_id = new WeatherEvent.id"
+          - "New reservation creation blocked (ERR_FARM_NOT_OPEN); check-in/weigh-out/refund cleanup still allowed"
+
+      - from: WEATHER_HOLD
+        to: OPEN
+        trigger: "POST /farms/{id}/weather-events  (kind=CLEARED)"
+        actor: FarmManager
+        preconditions:
+          - "Farm.operational_status == WEATHER_HOLD"
+        side_effects:
+          - "Farm.active_weather_event_id = null"
+          - "Reservation creation resumes"
+
+      - from: [OPEN, WEATHER_HOLD]
+        to: CLOSED
+        trigger: "POST /farms/{id}/weather-events  (kind=CLOSURE)"
+        actor: FarmManager
+        preconditions:
+          - "Farm.operational_status != CLOSED"
+        side_effects:
+          - "CASCADE L1: every AdmissionWindow whose starts_at is within the WeatherEvent's affected span and status != CANCELLED -> CANCELLED (this is the link that fires the L2 reservation cascade below)"
+          - "Farm.active_weather_event_id = new WeatherEvent.id"
+        note: "Depth-3 cascade root: Farm CLOSED -> Window CANCELLED -> Reservation CANCELLED -> SeasonPass.visits_used decrement / Visitor.wallet_credit_cents credit. See AdmissionWindow and Reservation machines for the downstream links."
+
+      - from: CLOSED
+        to: OPEN
+        trigger: "POST /farms/{id}/weather-events  (kind=CLEARED)"
+        actor: FarmManager
+        preconditions:
+          - "Farm.operational_status == CLOSED"
+        side_effects:
+          - "Farm.active_weather_event_id = null"
+        note: "Cancelled windows are NOT revived; only posture reopens."
+
+  # ---------------------------------------------------------------------------
+  # AdmissionWindow — capacity lifecycle; CANCELLED only via closure cascade.
+  - entity: AdmissionWindow
+    field: status
+    initial_state: SCHEDULED
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: SOLD_OUT
+        trigger: "system (reservation confirm/create drives seats_available to 0)"
+        actor: system
+        preconditions:
+          - "seats_available == 0 after a reservation create or confirm"
+        side_effects:
+          - "Further reservation creation against this window rejected with ERR_WINDOW_SOLD_OUT"
+
+      - from: SOLD_OUT
+        to: SCHEDULED
+        trigger: "system (a reservation cancel frees a seat: seats_available > 0)"
+        actor: system
+        preconditions:
+          - "seats_available > 0 after a reservation cancel/closure"
+        side_effects: []
+
+      - from: [SCHEDULED, SOLD_OUT]
+        to: CANCELLED
+        trigger: "system (Farm CLOSURE cascade — L1 link)"
+        actor: system
+        preconditions:
+          - "Owning Farm transitioned to CLOSED and this window is within the affected span"
+        side_effects:
+          - "CASCADE L2: every Reservation on this window with status IN {PENDING, CONFIRMED} -> CANCELLED (closure cause). This L2 link is itself caused by the L1 Window->CANCELLED, not by the original POST."
+          - "seats_held and seats_committed reset to 0; seats_available recomputed"
+
+  # ---------------------------------------------------------------------------
+  # Reservation — branching fork-join: CHECKED_IN forks into two parallel finalize
+  # legs (pumpkin weigh-out, waiver satisfaction) that JOIN at SETTLED.
+  - entity: Reservation
+    field: status
+    initial_state: PENDING
+    terminal_states: [SETTLED, CANCELLED, NO_SHOW]
+    transitions:
+      - from: PENDING
+        to: CONFIRMED
+        trigger: "POST /reservations/{id}/confirm"
+        actor: Visitor
+        preconditions:
+          - "Owning Farm.operational_status == OPEN"
+          - "AdmissionWindow.status != CANCELLED"
+          - "If season_pass_id set: SeasonPass.status == ACTIVE AND window starts_at in [valid_from, valid_until)"
+        side_effects:
+          - "AdmissionWindow.seats_held -= participant_count; AdmissionWindow.seats_committed += participant_count (move hold to commit); seats_available recomputed; window -> SOLD_OUT if seats_available == 0"
+          - "If season_pass_id set: SeasonPass.visits_used += 1"
+          - "admission_charge_cents recomputed (provisional variant) and re-pinned"
+
+      - from: [PENDING, CONFIRMED]
+        to: CANCELLED
+        trigger: "POST /reservations/{id}/cancel  OR  system (closure cascade — L2/L3 link)"
+        actor: Visitor | system
+        preconditions:
+          - "Reservation.status IN {PENDING, CONFIRMED}"
+        side_effects:
+          - "Release inventory: if was PENDING, seats_held -= participant_count; if was CONFIRMED, seats_committed -= participant_count; seats_available recomputed; window SOLD_OUT -> SCHEDULED if seats_available > 0"
+          - "CASCADE L3 (closure path only): if cause is closure AND season_pass_id set -> SeasonPass.visits_used -= 1; AND credit Visitor.wallet_credit_cents += admission_charge_cents; AND Farm.refunds_issued_cents += admission_charge_cents"
+          - "All child ActivityPass -> REVOKED; all child Waiver -> VOID; all child PumpkinPurchase -> VOID; all child ConcessionOrder -> REFUNDED"
+        note: "Self-cancel by Visitor does NOT credit wallet (deposit/policy); only the closure cascade credits. This conditional cascade is the L3 link."
+
+      - from: CONFIRMED
+        to: NO_SHOW
+        trigger: "POST /admission-windows/{id}/mark-no-shows  (system sweep after window ends_at)"
+        actor: GateAgent
+        preconditions:
+          - "AdmissionWindow.ends_at <= current clock"
+          - "Reservation.status == CONFIRMED (never checked in)"
+        side_effects:
+          - "seats_committed -= participant_count; seats_available recomputed"
+          - "If season_pass_id set: SeasonPass.visits_used unchanged (a no-show still consumes the visit)"
+
+      - from: CONFIRMED
+        to: CHECKED_IN
+        trigger: "POST /reservations/{id}/check-in"
+        actor: GateAgent
+        preconditions:
+          - "Owning Farm.operational_status IN {OPEN, WEATHER_HOLD}  (check-in allowed during a hold, not when CLOSED)"
+          - "AdmissionWindow.status != CANCELLED"
+          - "A SIGNED Waiver exists covering every participant (waiver_satisfied becomes true) — else ERR_WAIVER_INCOMPLETE"
+        side_effects:
+          - "settled_charge_cents recomputed (settled variant — see calculations) and locked"
+          - "waiver_satisfied recomputed; fork begins: pumpkin weigh-out leg and checkout-finalize leg run independently"
+
+      - from: CHECKED_IN
+        to: SETTLED
+        trigger: "POST /reservations/{id}/settle"
+        actor: GateAgent
+        preconditions:
+          - "checkout_finalized == true (every PumpkinPurchase is WEIGHED or there are none) AND waiver_satisfied == true (JOIN of both finalize legs)"
+        side_effects:
+          - "Reservation locked; no further child mutations permitted"
+
+  # ---------------------------------------------------------------------------
+  # GroupBooking — cyclic revision loop QUOTED <-> REVISING before CONFIRMED.
+  - entity: GroupBooking
+    field: status
+    initial_state: QUOTED
+    terminal_states: [CONFIRMED, CANCELLED]
+    transitions:
+      - from: QUOTED
+        to: REVISING
+        trigger: "POST /group-bookings/{id}/revise"
+        actor: GroupLeader
+        preconditions:
+          - "GroupBooking.status == QUOTED"
+        side_effects:
+          - "Booking re-opened for headcount/kind edits"
+
+      - from: REVISING
+        to: QUOTED
+        trigger: "POST /group-bookings/{id}/requote"
+        actor: GroupLeader
+        preconditions:
+          - "GroupBooking.status == REVISING"
+        side_effects:
+          - "quoted_total_cents recomputed from updated headcount/kind (group quote calc)"
+        note: "Cycle: a leader may revise and requote any number of rounds before confirming."
+
+      - from: QUOTED
+        to: CONFIRMED
+        trigger: "POST /group-bookings/{id}/confirm"
+        actor: GroupLeader
+        preconditions:
+          - "Owning Farm.operational_status == OPEN"
+          - "AdmissionWindow.status != CANCELLED"
+          - "headcount >= 1"
+          - "AdmissionWindow.seats_available >= headcount"
+          - "expected_window_version matches AdmissionWindow.version (OCC)"
+        side_effects:
+          - "deposit_cents = ceil(quoted_total_cents * DEPOSIT_PCT) and locked"
+          - "AdmissionWindow.seats_committed += headcount; seats_available recomputed; window -> SOLD_OUT if seats_available == 0"
+          - "Increments AdmissionWindow.version by 1"
+
+      - from: [QUOTED, REVISING]
+        to: CANCELLED
+        trigger: "POST /group-bookings/{id}/cancel"
+        actor: GroupLeader
+        preconditions:
+          - "GroupBooking.status IN {QUOTED, REVISING}"
+        side_effects:
+          - "If was CONFIRMED inventory had been committed it would be released — but cancel is only permitted pre-confirm, so no seat release needed"
+        note: "A CONFIRMED group cannot be cancelled (deposit non-refundable); only QUOTED/REVISING groups cancel."
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version — true races only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: reservation-create-stale-window
+    parent_entity: AdmissionWindow
+    write_endpoint: "POST /reservations"
+    occ_field: "expected_window_version"
+    description: |
+      Creating a Reservation against an AdmissionWindow whose version has advanced
+      since the client last observed it is rejected. This captures the case where
+      another writer has just placed a reservation hold (legitimately consuming
+      inventory and bumping the window version) and the current writer's view of
+      the window's available seats is therefore stale.
+    error_id: ERR_WINDOW_VERSION_STALE
+    http_status: 412
+
+  - rule_id: group-confirm-stale-window
+    parent_entity: AdmissionWindow
+    write_endpoint: "POST /group-bookings/{id}/confirm"
+    occ_field: "expected_window_version"
+    description: |
+      Confirming a GroupBooking against an AdmissionWindow whose version has advanced
+      since the leader last requoted is rejected. Another reservation or group may have
+      committed seats in the interim, so the leader's seats_available view is stale and
+      a deterministic OCC check guards the large block commit.
+    error_id: ERR_WINDOW_VERSION_STALE
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  # --- Dual-variant #1: admission charge (Reservation domain) ---
+  - name: admission_charge
+    trigger: "Reservation create (provisional) and Reservation check-in (settled)"
+    algorithm: tiered_pricing
+    formula: |
+      base = adult_count * policy.adult_admission_cents
+           + child_count * policy.child_admission_cents
+
+      # group discount only when this reservation belongs to a CONFIRMED GroupBooking
+      if group_booking_id is set AND GroupBooking.status == CONFIRMED:
+        pct = policy.school_discount_pct if GroupBooking.kind == SCHOOL
+              else policy.group_discount_pct
+        # discount applies to the per-head admission base only
+        base = round_half_up(base * (1 - pct))     # round once, after applying pct
+
+      # season pass waives admission entirely (passholder admitted free)
+      if season_pass_id is set AND SeasonPass.status == ACTIVE:
+        admission = 0
+      else:
+        admission = base
+
+      charge = admission
+    input_set: "adult_count, child_count from this Reservation; rates from the farm's single ACTIVE PricingPolicy; group kind/status from the linked GroupBooking; pass status from the linked SeasonPass"
+    constants: {}
+    precision: "integer cents; round_half_up applied exactly once after the discount multiply"
+    variants:
+      - name: provisional
+        when: "computed at Reservation create and re-pinned at confirm into admission_charge_cents"
+        difference: "uses the GroupBooking status as of create time; if the reservation is created before its group is CONFIRMED, no discount is applied"
+      - name: settled
+        when: "recomputed at check-in into settled_charge_cents"
+        difference: "re-evaluates group status as of check-in; a reservation whose group became CONFIRMED between create and check-in is discounted at settle but was not at create, so settled_charge_cents < admission_charge_cents — the two variants diverge for identical participant counts"
+
+  # --- Dual-variant #2: pumpkin charge (PumpkinPurchase domain) ---
+  - name: pumpkin_charge
+    trigger: "PumpkinPurchase add (estimate variant) and weigh-out (scale variant)"
+    algorithm: threshold
+    formula: |
+      w = estimated_weight_lb   # estimate variant
+      # OR w = scale_weight_lb  # scale variant at weigh-out
+      if w >= policy.heavy_pumpkin_lb:
+        charge = policy.pumpkin_flat_each_cents          # heavy pumpkin: single flat price
+      else:
+        charge = round_half_up(w * policy.pumpkin_per_lb_cents)   # light pumpkin: per-lb
+    input_set: "estimated_weight_lb (add) or scale_weight_lb (weigh-out); rates and breakpoint from the ACTIVE PricingPolicy"
+    constants: {}
+    precision: "integer cents; round_half_up on the per-lb branch; breakpoint comparison is >= (a pumpkin weighing exactly heavy_pumpkin_lb is flat-each, NOT per-lb)"
+    variants:
+      - name: estimate
+        when: "at add; uses visitor-declared estimated_weight_lb; stored in charge_cents while status=ESTIMATED"
+        difference: "an under-estimate that sits below the breakpoint is billed per-lb"
+      - name: scale
+        when: "at weigh-out; uses authoritative scale_weight_lb; overwrites charge_cents, status=WEIGHED"
+        difference: "if scale_weight_lb crosses the breakpoint the estimate missed, the same pumpkin flips from per-lb to flat-each — estimate and scale charges diverge for the same physical pumpkin"
+
+  # --- Combinatorial (mode a): group quote — >=3 inputs, nested branch + tier select ---
+  - name: group_quote
+    trigger: "GroupBooking requote (REVISING -> QUOTED) and at quote creation"
+    algorithm: tiered_pricing
+    formula: |
+      headcount = adult_count + child_count
+      per_head_base = adult_count * policy.adult_admission_cents
+                    + child_count * policy.child_admission_cents
+      # tier select: discount only if the group meets the minimum head count
+      if headcount >= policy.group_rate_min_headcount:
+        pct = policy.school_discount_pct if kind == SCHOOL else policy.group_discount_pct
+      else:
+        pct = 0
+      quoted_total_cents = round_half_up(per_head_base * (1 - pct))
+    input_set: "adult_count, child_count, kind from the GroupBooking; rates, group_rate_min_headcount, group_discount_pct, school_discount_pct from the ACTIVE PricingPolicy"
+    constants: {}
+    precision: "integer cents; round_half_up applied once after the discount multiply (sum-then-round, NOT per-head-round)"
+    note: "Mode (a): >=3 inputs (adult_count, child_count, kind, headcount threshold) with nested conditional branch (qualifies?) feeding a tier-selected rate (SCHOOL vs group)."
+
+  # --- Combinatorial (mode c): reservation grand total — pinned evaluation order ---
+  - name: reservation_grand_total
+    trigger: "GET /reservations/{id}/total (computed read) and at settle"
+    algorithm: aggregation
+    formula: |
+      # Evaluation order is PINNED to avoid the circular look:
+      #   wallet credit can only be applied AFTER all line items are summed,
+      #   and admission must be the SETTLED charge (not provisional) once CHECKED_IN.
+      step1_admission = settled_charge_cents if status IN {CHECKED_IN, SETTLED} else admission_charge_cents
+      step2_activities = sum(ActivityPass.line_total_cents for ActivityPass where status == ACTIVE)
+      step3_pumpkins   = sum(PumpkinPurchase.charge_cents for PumpkinPurchase where status IN {ESTIMATED, WEIGHED})
+      step4_concessions = sum(ConcessionOrder.total_cents for ConcessionOrder where status == PAID)
+      gross = step1_admission + step2_activities + step3_pumpkins + step4_concessions
+      # wallet applied LAST, capped at gross (never negative)
+      applied_credit = min(Visitor.wallet_credit_cents, gross)
+      net_due_cents = gross - applied_credit
+    input_set: "this Reservation's settled/provisional admission, its ACTIVE ActivityPass lines, its ESTIMATED/WEIGHED PumpkinPurchase lines, its PAID ConcessionOrder lines, and the owning Visitor's wallet_credit_cents"
+    constants: {}
+    precision: "integer cents; no rounding (all inputs already integer cents); wallet applied strictly last and capped at gross"
+    note: "Mode (c): looks circular (net depends on gross, gross depends on which admission variant which depends on status) — evaluation order is explicitly pinned step1..step4 then credit, so the value is well-defined."
+
+  # --- Aggregation: window seat reconciliation (derived-field reconciliation) ---
+  - name: window_seats
+    trigger: "any Reservation create/confirm/cancel/check-in/no-show, GroupBooking confirm, closure cascade"
+    algorithm: aggregation
+    formula: |
+      seats_held = sum(Reservation.participant_count
+                       for Reservation on this window where status == PENDING)
+      seats_committed = sum(Reservation.participant_count
+                            for Reservation on this window where status IN {CONFIRMED, CHECKED_IN, SETTLED})
+                        + sum(GroupBooking.headcount
+                              for GroupBooking on this window where status == CONFIRMED)
+      seats_available = max(0, capacity - seats_held - seats_committed)
+    input_set: "all Reservations and GroupBookings on this AdmissionWindow, filtered by the exact statuses above"
+    constants: {}
+    precision: "integer participants; seats_available floored at 0"
+    note: "NO_SHOW, CANCELLED reservations and QUOTED/REVISING/CANCELLED groups are EXCLUDED from both sums."
+
+  - name: group_deposit
+    trigger: "GroupBooking confirm"
+    algorithm: threshold
+    formula: |
+      deposit_cents = ceil(quoted_total_cents * DEPOSIT_PCT)
+    input_set: "quoted_total_cents on the GroupBooking at confirm time"
+    constants:
+      DEPOSIT_PCT: 0.25
+    precision: "integer cents; ceil (round UP) so the deposit is never under a quarter of the quote"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Role is permitted for this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "All path/body-referenced resources exist (validated left-to-right in path, then body FKs)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: auth
+    check: "Acting entity_backed user owns the targeted resource (Visitor owns the Reservation; GroupLeader owns the GroupBooking)"
+    error_id: ERR_NOT_OWNER
+    http_status: 403
+    applies_to: "reservation owner actions, group-booking leader actions"
+
+  - priority: 5
+    category: state
+    check: "Owning Farm.operational_status == OPEN for reservation/group creation & confirm (closure/hold blocks new admission)"
+    error_id: ERR_FARM_NOT_OPEN
+    http_status: 409
+    applies_to: "POST /reservations, POST /reservations/{id}/confirm, POST /group-bookings, POST /group-bookings/{id}/confirm"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a valid state for the requested transition (per §1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6.5
+    category: state
+    check: "Target AdmissionWindow.status != CANCELLED for reservation create/confirm and group confirm (a closure-cancelled window admits nothing, even after the farm reopens)"
+    error_id: ERR_WINDOW_CANCELLED
+    http_status: 409
+    applies_to: "POST /reservations, POST /reservations/{id}/confirm, POST /group-bookings/{id}/confirm"
+
+  - priority: 7
+    category: business_safety
+    check: "A SIGNED Waiver covers every participant before check-in; minors must carry guardian_name"
+    error_id: ERR_WAIVER_INCOMPLETE
+    http_status: 422
+    applies_to: "POST /reservations/{id}/check-in"
+
+  - priority: 8
+    category: business_safety
+    check: "A Waiver for a minor participant must include guardian_name (rejected at waiver create)"
+    error_id: ERR_GUARDIAN_REQUIRED
+    http_status: 422
+    applies_to: "POST /reservations/{id}/waivers"
+
+  - priority: 9
+    category: business_referential
+    check: "If season_pass_id is supplied on a reservation, the pass belongs to the same visitor and same farm and is ACTIVE and its validity window covers the AdmissionWindow.starts_at"
+    error_id: ERR_PASS_NOT_VALID
+    http_status: 422
+    applies_to: "POST /reservations, POST /reservations/{id}/confirm"
+
+  - priority: 10
+    category: business_referential
+    check: "A reservation's group_booking_id (if set) must reference a GroupBooking on the same AdmissionWindow"
+    error_id: ERR_GROUP_WINDOW_MISMATCH
+    http_status: 422
+    applies_to: "POST /reservations"
+
+  - priority: 11
+    category: business_temporal
+    check: "AdmissionWindow.starts_at < ends_at (start strictly before end; zero-length window rejected)"
+    error_id: ERR_WINDOW_TIME_INVALID
+    http_status: 422
+    applies_to: "POST /farms/{id}/admission-windows"
+
+  - priority: 11.5
+    category: business_temporal
+    check: |
+      Buffered-interval overlap: a new AdmissionWindow on the farm must not collide with any
+      existing window whose status != CANCELLED. Two windows A,B collide when their
+      buffer-expanded half-open intervals intersect: NOT (A.ends_at + buffer <= B.starts_at
+      OR B.ends_at + buffer <= A.starts_at), where buffer = Farm.window_buffer_minutes.
+      Adjacency closer than the buffer is a collision; a gap of exactly buffer minutes is allowed.
+    error_id: ERR_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /farms/{id}/admission-windows"
+
+  - priority: 11.6
+    category: business_referential
+    check: |
+      Plain half-open overlap (no buffer): a Visitor may not hold two ACTIVE SeasonPasses on the
+      same Farm whose validity intervals overlap. Passes P,Q on the same (visitor, farm) collide when
+      NOT (P.valid_until <= Q.valid_from OR Q.valid_until <= P.valid_from). Back-to-back passes where
+      one's valid_until == the other's valid_from (zero gap) do NOT collide (half-open, adjacency OK).
+    error_id: ERR_PASS_OVERLAP
+    http_status: 409
+    applies_to: "POST /farms/{id}/season-passes"
+
+  - priority: 12
+    category: business_constraint
+    check: "participant_count (adult_count + child_count) >= 1 on a reservation; headcount >= 1 on a group confirm"
+    error_id: ERR_EMPTY_PARTY
+    http_status: 422
+    applies_to: "POST /reservations, POST /group-bookings/{id}/confirm"
+
+  - priority: 13
+    category: business_fiscal
+    check: "AdmissionWindow.seats_available >= the requested participant_count (reservation) or headcount (group confirm) BEFORE committing"
+    error_id: ERR_WINDOW_SOLD_OUT
+    http_status: 409
+    applies_to: "POST /reservations, POST /reservations/{id}/confirm, POST /group-bookings/{id}/confirm"
+
+  - priority: 14
+    category: state
+    check: "OCC: expected_window_version equals AdmissionWindow.version at create/confirm time"
+    error_id: ERR_WINDOW_VERSION_STALE
+    http_status: 412
+    applies_to: "POST /reservations, POST /group-bookings/{id}/confirm"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Farm ---
+  - method: POST
+    path: "/farms"
+    description: "Create a farm (posture starts OPEN)"
+    roles: [FarmManager]
+    code: 201
+    input: [name, "timezone?", "parking_fee_cents?", "window_buffer_minutes?"]
+    output: Farm
+    side_effects: ["operational_status=OPEN"]
+
+  - method: GET
+    path: "/farms/{id}"
+    description: "Read a farm (includes operational_status, refunds_issued_cents)"
+    roles: [FarmManager, Visitor, GroupLeader, GateAgent]
+    code: 200
+    input: []
+    output: Farm
+    side_effects: []
+
+  - method: POST
+    path: "/farms/{id}/weather-events"
+    description: "Record a weather event (kind=HOLD|CLEARED|CLOSURE) — drives Farm posture and closure cascade"
+    roles: [FarmManager]
+    code: 201
+    input: [kind, "affected_span_start?", "affected_span_end?", "note?"]
+    output: WeatherEvent
+    side_effects:
+      - "Recomputes Farm.operational_status per §1.2"
+      - "On CLOSURE: cascades window cancellation -> reservation cancellation -> wallet credit / pass decrement / refund rollup"
+
+  - method: GET
+    path: "/farms/{id}/weather-events"
+    description: "List weather events for a farm (newest first)"
+    roles: [FarmManager, Visitor, GroupLeader, GateAgent]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WeatherEvent[]
+    side_effects: []
+
+  # --- PricingPolicy ---
+  - method: POST
+    path: "/farms/{id}/pricing-policies"
+    description: "Create a pricing policy (DRAFT)"
+    roles: [FarmManager]
+    code: 201
+    input: [adult_admission_cents, child_admission_cents, hayride_pass_cents, maze_pass_cents, upick_pass_cents, pumpkin_per_lb_cents, pumpkin_flat_each_cents, season_pass_price_cents, "heavy_pumpkin_lb?", "group_rate_min_headcount?", "group_discount_pct?", "school_discount_pct?"]
+    output: PricingPolicy
+    side_effects: ["status=DRAFT"]
+
+  - method: POST
+    path: "/pricing-policies/{id}/activate"
+    description: "Activate a pricing policy; supersedes any currently ACTIVE policy on the same farm"
+    roles: [FarmManager]
+    code: 200
+    input: []
+    output: PricingPolicy
+    side_effects: ["status -> ACTIVE", "any prior ACTIVE policy on the farm -> SUPERSEDED"]
+
+  - method: GET
+    path: "/pricing-policies/{id}"
+    description: "Read a pricing policy"
+    roles: [FarmManager, Visitor, GroupLeader, GateAgent]
+    code: 200
+    input: []
+    output: PricingPolicy
+    side_effects: []
+
+  - method: GET
+    path: "/farms/{id}/pricing-policies"
+    description: "List pricing policies for a farm (filter by status)"
+    roles: [FarmManager, Visitor, GroupLeader, GateAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: PricingPolicy[]
+    side_effects: []
+
+  # --- AdmissionWindow ---
+  - method: POST
+    path: "/farms/{id}/admission-windows"
+    description: "Create a timed admission window"
+    roles: [FarmManager]
+    code: 201
+    input: [starts_at, ends_at, capacity]
+    output: AdmissionWindow
+    side_effects: ["status=SCHEDULED", "seats_available=capacity"]
+
+  - method: GET
+    path: "/admission-windows/{id}"
+    description: "Read a window (includes seats_held/committed/available, status)"
+    roles: [FarmManager, Visitor, GroupLeader, GateAgent]
+    code: 200
+    input: []
+    output: AdmissionWindow
+    side_effects: []
+
+  - method: GET
+    path: "/farms/{id}/admission-windows"
+    description: "List windows for a farm (reverse-reachability for AdmissionWindow.farm_id)"
+    roles: [FarmManager, Visitor, GroupLeader, GateAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: AdmissionWindow[]
+    side_effects: []
+
+  - method: POST
+    path: "/admission-windows/{id}/mark-no-shows"
+    description: "Sweep CONFIRMED reservations on an ended window to NO_SHOW (releases committed seats)"
+    roles: [GateAgent]
+    code: 200
+    input: []
+    output: AdmissionWindow
+    side_effects: ["each CONFIRMED reservation past ends_at -> NO_SHOW; seats_committed released"]
+
+  - method: GET
+    path: "/admission-windows/{id}/reservations"
+    description: "List reservations on a window (reverse-reachability for Reservation.window_id)"
+    roles: [FarmManager, Visitor, GroupLeader, GateAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+
+  - method: GET
+    path: "/admission-windows/{id}/group-bookings"
+    description: "List group bookings on a window (reverse-reachability for GroupBooking.window_id)"
+    roles: [FarmManager, Visitor, GroupLeader, GateAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: GroupBooking[]
+    side_effects: []
+
+  # --- Visitor ---
+  - method: POST
+    path: "/visitors"
+    description: "Register a visitor"
+    roles: [FarmManager, Visitor]
+    code: 201
+    input: [email, full_name]
+    output: Visitor
+    side_effects: ["wallet_credit_cents=0"]
+
+  - method: GET
+    path: "/visitors/{id}"
+    description: "Read a visitor (includes wallet_credit_cents)"
+    roles: [FarmManager, Visitor]
+    code: 200
+    input: []
+    output: Visitor
+    side_effects: []
+
+  - method: GET
+    path: "/visitors/{id}/season-passes"
+    description: "List a visitor's season passes (reverse-reachability for SeasonPass.visitor_id)"
+    roles: [FarmManager, Visitor]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: SeasonPass[]
+    side_effects: []
+
+  - method: GET
+    path: "/visitors/{id}/group-bookings"
+    description: "List group bookings led by a visitor (reverse-reachability for GroupBooking.group_leader_id)"
+    roles: [FarmManager, GroupLeader, Visitor]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: GroupBooking[]
+    side_effects: []
+
+  # --- SeasonPass ---
+  - method: POST
+    path: "/farms/{id}/season-passes"
+    description: "Issue a season pass to a visitor (price snapshot from ACTIVE policy)"
+    roles: [FarmManager, Visitor]
+    code: 201
+    input: [visitor_id, valid_from, valid_until]
+    output: SeasonPass
+    side_effects: ["purchase_price_cents snapshotted from ACTIVE PricingPolicy", "status=ACTIVE"]
+
+  - method: GET
+    path: "/season-passes/{id}"
+    description: "Read a season pass (includes visits_used, status)"
+    roles: [FarmManager, Visitor]
+    code: 200
+    input: []
+    output: SeasonPass
+    side_effects: []
+
+  - method: GET
+    path: "/farms/{id}/season-passes"
+    description: "List season passes for a farm (reverse-reachability for SeasonPass.farm_id; filter by visitor_id)"
+    roles: [FarmManager, Visitor]
+    code: 200
+    input: ["visitor_id?", "status?", "limit?", "offset?"]
+    output: SeasonPass[]
+    side_effects: []
+
+  - method: POST
+    path: "/season-passes/{id}/revoke"
+    description: "Revoke a season pass"
+    roles: [FarmManager]
+    code: 200
+    input: []
+    output: SeasonPass
+    side_effects: ["status -> REVOKED"]
+
+  # --- Reservation ---
+  - method: POST
+    path: "/reservations"
+    description: "Create a timed-admission reservation (places hold; OCC on window version)"
+    roles: [Visitor]
+    code: 201
+    input: [window_id, visitor_id, adult_count, child_count, expected_window_version, "season_pass_id?", "group_booking_id?"]
+    output: Reservation
+    side_effects:
+      - "status=PENDING"
+      - "AdmissionWindow.seats_held += participant_count; seats_available recomputed; window -> SOLD_OUT if 0"
+      - "admission_charge_cents computed (provisional variant)"
+      - "Increments AdmissionWindow.version by 1"
+
+  - method: GET
+    path: "/reservations/{id}"
+    description: "Read a reservation"
+    roles: [FarmManager, Visitor, GroupLeader, GateAgent]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+
+  - method: GET
+    path: "/visitors/{id}/reservations"
+    description: "List a visitor's reservations (reverse-reachability for Reservation.visitor_id)"
+    roles: [FarmManager, Visitor]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+
+  - method: GET
+    path: "/season-passes/{id}/reservations"
+    description: "List reservations that redeemed a pass (reverse-reachability for Reservation.season_pass_id)"
+    roles: [FarmManager, Visitor]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+
+  - method: GET
+    path: "/group-bookings/{id}/reservations"
+    description: "List reservations under a group (reverse-reachability for Reservation.group_booking_id)"
+    roles: [FarmManager, GroupLeader]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+
+  - method: GET
+    path: "/reservations/{id}/total"
+    description: "Computed read: reservation grand total (admission + activities + pumpkins + concessions - wallet)"
+    roles: [FarmManager, Visitor, GateAgent]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["reservation_grand_total calculation (read-only, no persistence)"]
+
+  - method: POST
+    path: "/reservations/{id}/confirm"
+    description: "Confirm a PENDING reservation (move hold to commit)"
+    roles: [Visitor]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["status -> CONFIRMED", "seats_held -> seats_committed", "SeasonPass.visits_used += 1 if pass used", "admission_charge_cents re-pinned"]
+
+  - method: POST
+    path: "/reservations/{id}/cancel"
+    description: "Cancel a PENDING/CONFIRMED reservation (release inventory; no wallet credit on self-cancel)"
+    roles: [Visitor]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["status -> CANCELLED", "inventory released", "child ActivityPass/Waiver/PumpkinPurchase/ConcessionOrder revoked/voided/refunded"]
+
+  - method: POST
+    path: "/reservations/{id}/check-in"
+    description: "Check in a CONFIRMED reservation at the gate (locks settled charge; forks finalize legs)"
+    roles: [GateAgent]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["status -> CHECKED_IN", "settled_charge_cents computed (settled variant) and locked", "waiver_satisfied recomputed"]
+
+  - method: POST
+    path: "/reservations/{id}/settle"
+    description: "Settle a CHECKED_IN reservation (join: weigh-out finalized AND waiver satisfied)"
+    roles: [GateAgent]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["status -> SETTLED", "reservation locked"]
+
+  # --- ActivityPass ---
+  - method: POST
+    path: "/reservations/{id}/activity-passes"
+    description: "Attach an activity pass (hayride/maze/u-pick) to a reservation"
+    roles: [Visitor]
+    code: 201
+    input: [activity, quantity]
+    output: ActivityPass
+    side_effects: ["unit_price_cents snapshotted from ACTIVE policy", "line_total_cents computed", "status=ACTIVE"]
+
+  - method: GET
+    path: "/reservations/{id}/activity-passes"
+    description: "List activity passes on a reservation (reverse-reachability for ActivityPass.reservation_id)"
+    roles: [FarmManager, Visitor, GateAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ActivityPass[]
+    side_effects: []
+
+  # --- Waiver ---
+  - method: POST
+    path: "/reservations/{id}/waivers"
+    description: "Sign a participant waiver (minor requires guardian_name)"
+    roles: [Visitor]
+    code: 201
+    input: [participant_name, "is_minor?", "guardian_name?"]
+    output: Waiver
+    side_effects: ["status=SIGNED", "Reservation.waiver_satisfied recomputed"]
+
+  - method: GET
+    path: "/reservations/{id}/waivers"
+    description: "List waivers on a reservation (reverse-reachability for Waiver.reservation_id)"
+    roles: [FarmManager, Visitor, GateAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Waiver[]
+    side_effects: []
+
+  # --- PumpkinPurchase ---
+  - method: POST
+    path: "/reservations/{id}/pumpkin-purchases"
+    description: "Add a pumpkin to checkout with an estimated weight (provisional charge)"
+    roles: [Visitor]
+    code: 201
+    input: [estimated_weight_lb]
+    output: PumpkinPurchase
+    side_effects: ["charge_cents computed (estimate variant)", "status=ESTIMATED", "Reservation.checkout_finalized=false"]
+
+  - method: POST
+    path: "/pumpkin-purchases/{id}/weigh-out"
+    description: "Record authoritative scale weight (scale variant); finalizes this pumpkin"
+    roles: [GateAgent]
+    code: 200
+    input: [scale_weight_lb]
+    output: PumpkinPurchase
+    side_effects: ["scale_weight_lb recorded", "charge_cents recomputed (scale variant)", "status -> WEIGHED", "Reservation.checkout_finalized recomputed (true when no ESTIMATED pumpkins remain)"]
+
+  - method: GET
+    path: "/reservations/{id}/pumpkin-purchases"
+    description: "List pumpkin purchases on a reservation (reverse-reachability for PumpkinPurchase.reservation_id)"
+    roles: [FarmManager, Visitor, GateAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: PumpkinPurchase[]
+    side_effects: []
+
+  # --- ConcessionOrder ---
+  - method: POST
+    path: "/reservations/{id}/concession-orders"
+    description: "Add a concession/parking order to a reservation"
+    roles: [Visitor, GateAgent]
+    code: 201
+    input: ["food_cents?", "vehicle_count?"]
+    output: ConcessionOrder
+    side_effects: ["parking_cents = vehicle_count * Farm.parking_fee_cents", "total_cents computed", "status=PAID"]
+
+  - method: GET
+    path: "/reservations/{id}/concession-orders"
+    description: "List concession orders on a reservation (reverse-reachability for ConcessionOrder.reservation_id)"
+    roles: [FarmManager, Visitor, GateAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ConcessionOrder[]
+    side_effects: []
+
+  # --- GroupBooking ---
+  - method: POST
+    path: "/farms/{id}/group-bookings"
+    description: "Create a group booking quote (field-trip/school/corporate)"
+    roles: [GroupLeader]
+    code: 201
+    input: [window_id, group_leader_id, kind, adult_count, child_count, "parent_group_id?"]
+    output: GroupBooking
+    side_effects: ["status=QUOTED", "quoted_total_cents computed (group_quote calc)"]
+
+  - method: GET
+    path: "/group-bookings/{id}"
+    description: "Read a group booking (includes quoted_total_cents, deposit_cents, status)"
+    roles: [FarmManager, GroupLeader, Visitor]
+    code: 200
+    input: []
+    output: GroupBooking
+    side_effects: []
+
+  - method: GET
+    path: "/farms/{id}/group-bookings"
+    description: "List group bookings for a farm (reverse-reachability for GroupBooking.farm_id)"
+    roles: [FarmManager, GroupLeader]
+    code: 200
+    input: ["status?", "kind?", "limit?", "offset?"]
+    output: GroupBooking[]
+    side_effects: []
+
+  - method: GET
+    path: "/group-bookings/{id}/sub-groups"
+    description: "List split sub-groups (reverse-reachability for GroupBooking.parent_group_id self-reference)"
+    roles: [FarmManager, GroupLeader]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: GroupBooking[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/group-bookings/{id}"
+    description: "Edit headcount/kind on a REVISING group booking"
+    roles: [GroupLeader]
+    code: 200
+    input: ["adult_count?", "child_count?", "kind?"]
+    output: GroupBooking
+    side_effects: ["fields updated (does not requote until /requote)"]
+
+  - method: POST
+    path: "/group-bookings/{id}/revise"
+    description: "Open a QUOTED group for editing (QUOTED -> REVISING)"
+    roles: [GroupLeader]
+    code: 200
+    input: []
+    output: GroupBooking
+    side_effects: ["status -> REVISING"]
+
+  - method: POST
+    path: "/group-bookings/{id}/requote"
+    description: "Recompute the quote and return to QUOTED (REVISING -> QUOTED)"
+    roles: [GroupLeader]
+    code: 200
+    input: []
+    output: GroupBooking
+    side_effects: ["status -> QUOTED", "quoted_total_cents recomputed (group_quote calc)"]
+
+  - method: POST
+    path: "/group-bookings/{id}/confirm"
+    description: "Confirm a QUOTED group (commits seats, locks deposit; OCC on window version)"
+    roles: [GroupLeader]
+    code: 200
+    input: [expected_window_version]
+    output: GroupBooking
+    side_effects: ["status -> CONFIRMED", "deposit_cents = ceil(quoted_total_cents * 0.25)", "seats_committed += headcount", "Increments AdmissionWindow.version by 1"]
+
+  - method: POST
+    path: "/group-bookings/{id}/cancel"
+    description: "Cancel a QUOTED/REVISING group booking"
+    roles: [GroupLeader]
+    code: 200
+    input: []
+    output: GroupBooking
+    side_effects: ["status -> CANCELLED"]
+
+  # --- Test-driving clock (time-gated no-show sweeps & pass validity) ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving endpoint: set the server's current UTC clock (drives ends_at no-show sweeps and pass-validity windows deterministically)"
+    roles: [FarmManager]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock set to to_iso8601"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing X-User-Role or X-User-ID header" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Role not permitted for this operation" }
+  - { id: ERR_NOT_OWNER, http: 403, condition: "Acting entity_backed user does not own the targeted reservation/group" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Referenced resource does not exist" }
+  - { id: ERR_VALIDATION, http: 422, condition: "Malformed body, missing required field, bad enum, or out-of-range numeric" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a valid state for the requested transition" }
+  - { id: ERR_FARM_NOT_OPEN, http: 409, condition: "Farm.operational_status != OPEN blocks new reservation/group creation or confirm" }
+  - { id: ERR_WINDOW_TIME_INVALID, http: 422, condition: "AdmissionWindow starts_at not strictly before ends_at" }
+  - { id: ERR_EMPTY_PARTY, http: 422, condition: "Reservation participant_count < 1 or group headcount < 1 at confirm" }
+  - { id: ERR_WINDOW_SOLD_OUT, http: 409, condition: "AdmissionWindow.seats_available < requested participant_count/headcount" }
+  - { id: ERR_WINDOW_VERSION_STALE, http: 412, condition: "expected_window_version != AdmissionWindow.version (OCC) on create/confirm" }
+  - { id: ERR_WAIVER_INCOMPLETE, http: 422, condition: "Check-in attempted before a SIGNED waiver covers every participant" }
+  - { id: ERR_GUARDIAN_REQUIRED, http: 422, condition: "Waiver for a minor is missing guardian_name" }
+  - { id: ERR_PASS_NOT_VALID, http: 422, condition: "season_pass_id references a pass that is not ACTIVE, not owned by the visitor, wrong farm, or whose validity does not cover the window start" }
+  - { id: ERR_GROUP_WINDOW_MISMATCH, http: 422, condition: "Reservation group_booking_id references a group on a different AdmissionWindow" }
+  - { id: ERR_PASS_ALREADY_REVOKED, http: 409, condition: "Revoke attempted on a pass already REVOKED" }
+  - { id: ERR_PUMPKIN_ALREADY_WEIGHED, http: 409, condition: "weigh-out attempted on a PumpkinPurchase already WEIGHED or VOID" }
+  - { id: ERR_CHECKOUT_NOT_FINALIZED, http: 409, condition: "Settle attempted while a PumpkinPurchase is still ESTIMATED or waiver not satisfied (join not met)" }
+  - { id: ERR_GROUP_NOT_REVISABLE, http: 409, condition: "Revise/requote/edit attempted on a group not in the required QUOTED/REVISING state" }
+  - { id: ERR_NO_ACTIVE_POLICY, http: 409, condition: "Pricing operation attempted when the farm has no ACTIVE PricingPolicy" }
+  - { id: ERR_POLICY_ALREADY_ACTIVE, http: 409, condition: "Activate attempted on a policy already ACTIVE or SUPERSEDED" }
+  - { id: ERR_WINDOW_CANCELLED, http: 409, condition: "Operation attempted against an AdmissionWindow in CANCELLED status" }
+  - { id: ERR_WINDOW_OVERLAP, http: 409, condition: "New AdmissionWindow collides with an existing non-CANCELLED window after applying Farm.window_buffer_minutes" }
+  - { id: ERR_PASS_OVERLAP, http: 409, condition: "New SeasonPass validity interval overlaps an existing ACTIVE pass for the same visitor+farm (half-open, adjacency allowed)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: FarmManager
+    description: "Operator who configures farms, pricing, windows, declares weather, issues/revokes passes"
+    identity: opaque
+    exclusive_operations:
+      - "POST /farms — create farm"
+      - "POST /farms/{id}/weather-events — declare weather (HOLD/CLEARED/CLOSURE)"
+      - "POST /farms/{id}/pricing-policies — create pricing policy"
+      - "POST /pricing-policies/{id}/activate — activate policy"
+      - "POST /farms/{id}/admission-windows — create window"
+      - "POST /season-passes/{id}/revoke — revoke a pass"
+      - "POST /_clock/set_current_utc — set clock (test-driving)"
+    shared_operations:
+      - "POST /visitors — register visitor (shared with Visitor)"
+      - "POST /farms/{id}/season-passes — issue pass (shared with Visitor)"
+      - "GET reads across farms, windows, policies, reservations, passes, groups"
+
+  - name: Visitor
+    description: "Buyer who registers, buys season passes, creates/confirms/cancels their own reservations, and adds activity/pumpkin/concession/waiver lines"
+    identity: "entity_backed:Visitor"
+    exclusive_operations:
+      - "POST /reservations — create own reservation"
+      - "POST /reservations/{id}/confirm — confirm own reservation"
+      - "POST /reservations/{id}/cancel — cancel own reservation"
+      - "POST /reservations/{id}/activity-passes — attach activity pass"
+      - "POST /reservations/{id}/waivers — sign waiver"
+      - "POST /reservations/{id}/pumpkin-purchases — add pumpkin (estimate)"
+    shared_operations:
+      - "POST /visitors — register visitor (shared with FarmManager)"
+      - "POST /farms/{id}/season-passes — buy own pass (shared with FarmManager)"
+      - "POST /reservations/{id}/concession-orders — add concession/parking (shared with GateAgent)"
+      - "GET reads on own reservations, passes, windows, farms, groups, totals"
+
+  - name: GroupLeader
+    description: "Organizer of a field-trip/school/corporate group; owns and drives their GroupBooking through the quote/revise/confirm cycle"
+    identity: "entity_backed:Visitor"
+    exclusive_operations:
+      - "POST /farms/{id}/group-bookings — create own group quote"
+      - "PATCH /group-bookings/{id} — edit revising group"
+      - "POST /group-bookings/{id}/revise — open for editing"
+      - "POST /group-bookings/{id}/requote — recompute quote"
+      - "POST /group-bookings/{id}/confirm — confirm group (commit seats)"
+      - "POST /group-bookings/{id}/cancel — cancel group"
+    shared_operations:
+      - "GET reads on own group bookings, sub-groups, reservations, windows, farms"
+
+  - name: GateAgent
+    description: "On-site operator who checks in reservations, weighs pumpkins, settles, and sweeps no-shows"
+    identity: opaque
+    exclusive_operations:
+      - "POST /reservations/{id}/check-in — check in reservation"
+      - "POST /reservations/{id}/settle — settle reservation"
+      - "POST /pumpkin-purchases/{id}/weigh-out — record scale weight"
+      - "POST /admission-windows/{id}/mark-no-shows — sweep no-shows"
+    shared_operations:
+      - "POST /reservations/{id}/concession-orders — add concession/parking (shared with Visitor)"
+      - "GET reads on reservations, windows, lines, totals, farms"

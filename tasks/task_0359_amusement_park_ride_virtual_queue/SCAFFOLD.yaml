@@ -1,0 +1,1360 @@
+scenario: "359. Amusement Park Ride Reservation & Virtual Queue: park admission & capacity, ride inventory & wait time, virtual queue/return window, paid line-skip (Lightning Lane) tiers, single-rider, height/accessibility, ride-down redistribution, party linking"
+domain_name: amusement-park-ride-virtual-queue
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: "Quota / allocation"
+  secondary_archetype: "Temporal windowing"
+  complexity_layers:
+    - "Optimistic concurrency"
+    - "Cascading side effects"
+    - "Dual-variant calculation"
+    - "Rate / threshold triggers"
+
+  entity_topology: hybrid
+  # Park is the aggregate root; Ride, Guest, Party, EntitlementPlan hang off it via
+  # FK references (flat peer entities), while Reservation / LightningLanePurchase /
+  # GuestDayTicket are children with cross-aggregate references (Reservation -> Ride,
+  # Guest, ReturnWindow). This is a tree-with-cross-cutting-associations = hybrid.
+
+  state_machine_shape: compound
+  # Ride.operational_status (OPEN/DOWN/CLOSED) is a posture-like gate over its child
+  # Reservations. Reservation itself is branching-with-revert (HELD->BOOKED->REDEEMED,
+  # BOOKED->REDISTRIBUTED->BOOKED, BOOKED->FORFEITED). Park.day_phase auto-derives
+  # from admission counts (compound). Mixed shapes => compound dominant.
+
+  relationship_patterns:
+    - one_to_many        # Park -> Rides, Park -> Guests, Ride -> Reservations
+    - many_to_many       # Guests <-> Party via PartyMembership junction
+    - cross_aggregate    # Reservation references Ride + Guest + ReturnWindow
+
+  role_model: peer_roles
+  # GuestApp acts on its own Guest/Party/Reservations (entity_backed:Guest).
+  # RideOperator owns ride operational status + redemption + redistribution.
+  # ParkAdmin owns park config, capacity, plans, admissions, clock.
+
+  consistency_model: immediate
+  # All capacity debits/credits, cascades, and derived counters reconcile
+  # synchronously within the triggering request.
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 Entity-Relationship Table
+# =====================================================================
+entities:
+  - name: Park
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Park display name"
+      - name: gate_capacity
+        type: integer
+        source: input
+        description: "Maximum simultaneous admitted guests (turnstile cap)"
+        constraints: ">= 1"
+      - name: admitted_count
+        type: integer
+        source: computed
+        description: "Count of GuestDayTicket with admission_status=ADMITTED for current operating_date; recomputed on every admit/exit"
+        default: 0
+      - name: peak_threshold_pct
+        type: number
+        source: input
+        description: "Occupancy fraction (0..1) at/above which day_phase becomes PEAK and only Multi-Pass holders may book new virtual-queue reservations"
+        default: 0.85
+        constraints: "0 < peak_threshold_pct <= 1"
+      - name: day_phase
+        type: enum
+        source: computed
+        description: "OPEN when admitted_count/gate_capacity < peak_threshold_pct; PEAK when >= peak_threshold_pct and < 1.0; FULL when admitted_count >= gate_capacity. Recomputed on every admission change."
+        default: OPEN
+        constraints: "one of {OPEN, PEAK, FULL}"
+      - name: operating_date
+        type: string
+        source: input
+        description: "Current operating date (YYYY-MM-DD) the park is selling/serving"
+      - name: current_utc
+        type: datetime
+        source: system
+        description: "Park-local logical clock; set via /_clock/set_current_utc; all return-window comparisons use this, never wall-clock"
+
+  - name: Ride
+    parent: Park
+    common_fields: true
+    fields:
+      - name: park_id
+        type: string
+        source: input
+        description: "FK -> Park.id; the park this ride belongs to"
+      - name: name
+        type: string
+        source: input
+        description: "Ride display name"
+      - name: hourly_throughput
+        type: integer
+        source: input
+        description: "Guests the ride can cycle per operating hour at full operation; basis for virtual-queue slot supply and posted wait time"
+        constraints: ">= 1"
+      - name: min_height_cm
+        type: integer
+        source: input
+        description: "Minimum guest height in centimeters required to ride; 0 means no height requirement"
+        default: 0
+        constraints: ">= 0"
+      - name: wheelchair_transfer_required
+        type: boolean
+        source: input
+        description: "True when guest must transfer out of a wheelchair to board; drives accessibility eligibility checks"
+        default: false
+      - name: single_rider_enabled
+        type: boolean
+        source: input
+        description: "True when this ride offers a single-rider line"
+        default: false
+      - name: operational_status
+        type: enum
+        source: computed
+        description: "OPEN normally; DOWN when operator declares a breakdown (gates new bookings, triggers redistribution); CLOSED at end of day. Initial OPEN."
+        default: OPEN
+        constraints: "one of {OPEN, DOWN, CLOSED}"
+      - name: booked_slot_count
+        type: integer
+        source: computed
+        description: "Count of this ride's Reservations in status HELD or BOOKED for the active ReturnWindow set; debited/credited as reservations book, redeem, forfeit, redistribute"
+        default: 0
+      - name: posted_wait_minutes
+        type: integer
+        source: computed
+        description: "Standby wait estimate in minutes; see calc posted_wait_estimate. Recomputed on booking, redemption, status change."
+        default: 0
+
+  - name: ReturnWindow
+    parent: Ride
+    common_fields: true
+    fields:
+      - name: ride_id
+        type: string
+        source: input
+        description: "FK -> Ride.id; the ride this window allocates capacity for"
+      - name: window_start_utc
+        type: datetime
+        source: input
+        description: "Inclusive start of the return window (half-open interval [start, end))"
+      - name: window_end_utc
+        type: datetime
+        source: input
+        description: "Exclusive end of the return window; window is half-open [start, end)"
+      - name: slot_capacity
+        type: integer
+        source: input
+        description: "Total virtual-queue reservations this window may hold; equals floor(hourly_throughput * window_minutes/60 * vq_supply_fraction)"
+        constraints: ">= 0"
+      - name: reserved_count
+        type: integer
+        source: computed
+        description: "Count of Reservations referencing this window in status HELD or BOOKED; the window is exhausted when reserved_count >= slot_capacity"
+        default: 0
+      - name: window_status
+        type: enum
+        source: computed
+        description: "OPEN while window accepts bookings; EXHAUSTED when reserved_count >= slot_capacity; EXPIRED when current_utc >= window_end_utc; SUSPENDED when parent Ride is DOWN. Initial OPEN."
+        default: OPEN
+        constraints: "one of {OPEN, EXHAUSTED, EXPIRED, SUSPENDED}"
+
+  - name: Guest
+    parent: Park
+    common_fields: true
+    fields:
+      - name: park_id
+        type: string
+        source: input
+        description: "FK -> Park.id; the park profile this guest belongs to"
+      - name: full_name
+        type: string
+        source: input
+        description: "Guest full name"
+      - name: height_cm
+        type: integer
+        source: input
+        description: "Guest height in centimeters; compared to Ride.min_height_cm"
+        constraints: ">= 30"
+      - name: uses_wheelchair
+        type: boolean
+        source: input
+        description: "True when guest uses a wheelchair and cannot transfer; blocks rides with wheelchair_transfer_required=true"
+        default: false
+      - name: party_id
+        type: string
+        source: computed
+        description: "FK -> Party.id; the party this guest currently belongs to, or null when unlinked; set by party-link, cleared by party-unlink"
+        default: null
+
+  - name: Party
+    parent: Park
+    common_fields: true
+    fields:
+      - name: park_id
+        type: string
+        source: input
+        description: "FK -> Park.id; the park this party operates within"
+      - name: leader_guest_id
+        type: string
+        source: input
+        description: "FK -> Guest.id; the guest who created the party and may book on behalf of members"
+      - name: member_count
+        type: integer
+        source: computed
+        description: "Count of PartyMembership rows with membership_status=LINKED for this party (includes the leader)"
+        default: 1
+      - name: party_status
+        type: enum
+        source: computed
+        description: "FORMING while accepting members; LOCKED while a party-booking is in flight (prevents membership churn); DISBANDED when leader disbands. Initial FORMING."
+        default: FORMING
+        constraints: "one of {FORMING, LOCKED, DISBANDED}"
+
+  - name: PartyMembership
+    parent: Party
+    common_fields: true
+    fields:
+      - name: party_id
+        type: string
+        source: input
+        description: "FK -> Party.id; the party this membership links into"
+      - name: guest_id
+        type: string
+        source: input
+        description: "FK -> Guest.id; the guest linked by this membership"
+      - name: membership_status
+        type: enum
+        source: computed
+        description: "LINKED while active; REMOVED when guest leaves or is removed. Initial LINKED."
+        default: LINKED
+        constraints: "one of {LINKED, REMOVED}"
+
+  - name: EntitlementPlan
+    parent: Park
+    common_fields: true
+    fields:
+      - name: park_id
+        type: string
+        source: input
+        description: "FK -> Park.id; the park whose Lightning Lane this plan is sold for"
+      - name: tier
+        type: enum
+        source: input
+        description: "MULTI_PASS allows multiple concurrent line-skip holds across rides; SINGLE_PASS allows one premium per day on a single high-demand ride"
+        constraints: "one of {MULTI_PASS, SINGLE_PASS}"
+      - name: price_cents
+        type: integer
+        source: input
+        description: "Base price in cents before surge multiplier"
+        constraints: ">= 0"
+      - name: max_concurrent_holds
+        type: integer
+        source: input
+        description: "Maximum simultaneously-active LightningLanePurchase holds a guest may carry under this plan (MULTI_PASS typically 3; SINGLE_PASS 1)"
+        constraints: ">= 1"
+      - name: surge_multiplier
+        type: number
+        source: input
+        description: "Demand multiplier applied to price_cents when the target ride day_phase contribution is PEAK; see calc lightning_lane_price"
+        default: 1.0
+        constraints: ">= 1.0"
+
+  - name: GuestDayTicket
+    parent: Park
+    common_fields: true
+    fields:
+      - name: park_id
+        type: string
+        source: input
+        description: "FK -> Park.id; the park admitting this ticket"
+      - name: guest_id
+        type: string
+        source: input
+        description: "FK -> Guest.id; the guest holding the ticket"
+      - name: ticket_date
+        type: string
+        source: input
+        description: "Operating date (YYYY-MM-DD) the ticket admits for; must equal Park.operating_date at admission"
+      - name: admission_status
+        type: enum
+        source: computed
+        description: "ISSUED on sale; ADMITTED after gate scan (counts toward gate_capacity); EXITED after gate-out (frees capacity). Initial ISSUED."
+        default: ISSUED
+        constraints: "one of {ISSUED, ADMITTED, EXITED}"
+
+  - name: Reservation
+    parent: Ride
+    common_fields: true
+    fields:
+      - name: ride_id
+        type: string
+        source: input
+        description: "FK -> Ride.id; the ride the virtual-queue reservation is for"
+      - name: guest_id
+        type: string
+        source: input
+        description: "FK -> Guest.id; the guest holding the reservation"
+      - name: return_window_id
+        type: string
+        source: input
+        description: "FK -> ReturnWindow.id; the window whose slot this reservation occupies"
+      - name: party_id
+        type: string
+        source: input
+        description: "FK -> Party.id; set when booked as part of a linked party-booking, else null"
+        default: null
+      - name: queue_type
+        type: enum
+        source: input
+        description: "VIRTUAL_QUEUE (free return-window slot) or SINGLE_RIDER (loose-fill standby for single seats); SINGLE_RIDER does not consume window slot_capacity"
+        constraints: "one of {VIRTUAL_QUEUE, SINGLE_RIDER}"
+      - name: reservation_status
+        type: enum
+        source: computed
+        description: "HELD on creation (capacity provisionally debited); BOOKED once confirmed; REDEEMED after operator scans guest in; FORFEITED when window expires unredeemed; REDISTRIBUTED when moved to a replacement window after ride-down. Initial HELD."
+        default: HELD
+        constraints: "one of {HELD, BOOKED, REDEEMED, FORFEITED, REDISTRIBUTED}"
+      - name: redistributed_from_window_id
+        type: string
+        source: computed
+        description: "FK -> ReturnWindow.id; original window before a ride-down redistribution moved this reservation, else null"
+        default: null
+
+  - name: LightningLanePurchase
+    parent: Park
+    common_fields: true
+    fields:
+      - name: park_id
+        type: string
+        source: input
+        description: "FK -> Park.id; the park this purchase is valid in"
+      - name: guest_id
+        type: string
+        source: input
+        description: "FK -> Guest.id; the guest who bought the line-skip"
+      - name: ride_id
+        type: string
+        source: input
+        description: "FK -> Ride.id; the ride this premium line-skip applies to"
+      - name: plan_id
+        type: string
+        source: input
+        description: "FK -> EntitlementPlan.id; the plan tier purchased under"
+      - name: charged_cents
+        type: integer
+        source: computed
+        description: "Final amount charged; see calc lightning_lane_price (base price x surge, tier-capped)"
+        default: 0
+      - name: hold_status
+        type: enum
+        source: computed
+        description: "ACTIVE while redeemable; CONSUMED after the guest scans into the premium line; REFUNDED when ride goes DOWN before redemption. Initial ACTIVE."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, CONSUMED, REFUNDED}"
+
+# =====================================================================
+# §1.2 State Machine Table
+# =====================================================================
+state_machines:
+  - entity: GuestDayTicket
+    initial_state: ISSUED
+    terminal_states: [EXITED]
+    transitions:
+      - from: ISSUED
+        to: ADMITTED
+        trigger: "POST /parks/{id}/admissions"
+        actor: ParkAdmin
+        preconditions:
+          - "GuestDayTicket.admission_status == ISSUED"
+          - "GuestDayTicket.ticket_date == Park.operating_date"
+          - "Park.admitted_count < Park.gate_capacity (park not FULL)"
+        side_effects:
+          - "set GuestDayTicket.admission_status = ADMITTED"
+          - "increment Park.admitted_count by 1"
+          - "recompute Park.day_phase from admitted_count/gate_capacity (cross-entity to Park)"
+          - "increments Park.version by 1"
+      - from: ADMITTED
+        to: EXITED
+        trigger: "POST /parks/{id}/exits"
+        actor: ParkAdmin
+        preconditions:
+          - "GuestDayTicket.admission_status == ADMITTED"
+        side_effects:
+          - "set GuestDayTicket.admission_status = EXITED"
+          - "decrement Park.admitted_count by 1"
+          - "recompute Park.day_phase (may relax FULL->PEAK->OPEN)"
+          - "increments Park.version by 1"
+
+  - entity: Ride
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: DOWN
+        trigger: "POST /rides/{id}/declare-down"
+        actor: RideOperator
+        preconditions:
+          - "Ride.operational_status == OPEN"
+        side_effects:
+          - "set Ride.operational_status = DOWN"
+          - "set window_status = SUSPENDED for every child ReturnWindow currently OPEN or EXHAUSTED (cascade down)"
+          - "for each Reservation on this ride in status BOOKED: set reservation_status = REDISTRIBUTED and set redistributed_from_window_id = its current return_window_id (cascade; see redistribution)"
+          - "for each LightningLanePurchase on this ride in status ACTIVE: set hold_status = REFUNDED and credit charged_cents back (cross-entity compensation)"
+          - "recompute Ride.booked_slot_count (drops to count of remaining HELD/BOOKED, i.e. 0 after redistribution)"
+          - "recompute Ride.posted_wait_minutes"
+      - from: DOWN
+        to: OPEN
+        trigger: "POST /rides/{id}/restore"
+        actor: RideOperator
+        preconditions:
+          - "Ride.operational_status == DOWN"
+        side_effects:
+          - "set Ride.operational_status = OPEN"
+          - "set window_status = OPEN for every child ReturnWindow that is SUSPENDED and whose window_end_utc > Park.current_utc; SUSPENDED windows already past end go EXPIRED"
+          - "recompute Ride.posted_wait_minutes"
+        note: "Reservations REDISTRIBUTED during the DOWN episode are not auto-restored here; they are re-homed by POST /rides/{id}/redistribute."
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /rides/{id}/close"
+        actor: RideOperator
+        preconditions:
+          - "Ride.operational_status == OPEN"
+        side_effects:
+          - "set Ride.operational_status = CLOSED"
+          - "set window_status = EXPIRED for all child ReturnWindows not already EXPIRED"
+          - "for each Reservation in HELD or BOOKED: set reservation_status = FORFEITED"
+
+  - entity: ReturnWindow
+    initial_state: OPEN
+    terminal_states: [EXPIRED]
+    transitions:
+      - from: OPEN
+        to: EXHAUSTED
+        trigger: "system: on Reservation HELD when reserved_count reaches slot_capacity"
+        actor: system
+        preconditions:
+          - "ReturnWindow.window_status == OPEN"
+          - "ReturnWindow.reserved_count >= ReturnWindow.slot_capacity after the debit"
+        side_effects:
+          - "set ReturnWindow.window_status = EXHAUSTED"
+      - from: EXHAUSTED
+        to: OPEN
+        trigger: "system: on Reservation FORFEITED/REDISTRIBUTED freeing a slot while window not expired"
+        actor: system
+        preconditions:
+          - "ReturnWindow.window_status == EXHAUSTED"
+          - "ReturnWindow.reserved_count < ReturnWindow.slot_capacity after the credit"
+          - "Park.current_utc < ReturnWindow.window_end_utc"
+        side_effects:
+          - "set ReturnWindow.window_status = OPEN"
+      - from: OPEN
+        to: EXPIRED
+        trigger: "POST /parks/{id}/advance-windows"
+        actor: ParkAdmin
+        preconditions:
+          - "ReturnWindow.window_status in {OPEN, EXHAUSTED}"
+          - "Park.current_utc >= ReturnWindow.window_end_utc"
+        side_effects:
+          - "set ReturnWindow.window_status = EXPIRED"
+          - "for each Reservation on this window in HELD or BOOKED: set reservation_status = FORFEITED and credit the window/ride counters (cascade; see Reservation BOOKED->FORFEITED)"
+      - from: SUSPENDED
+        to: OPEN
+        trigger: "POST /rides/{id}/restore"
+        actor: RideOperator
+        preconditions:
+          - "ReturnWindow.window_status == SUSPENDED"
+          - "Park.current_utc < ReturnWindow.window_end_utc"
+        side_effects:
+          - "set ReturnWindow.window_status = OPEN"
+      - from: SUSPENDED
+        to: EXPIRED
+        trigger: "POST /rides/{id}/restore or POST /parks/{id}/advance-windows"
+        actor: RideOperator
+        preconditions:
+          - "ReturnWindow.window_status == SUSPENDED"
+          - "Park.current_utc >= ReturnWindow.window_end_utc"
+        side_effects:
+          - "set ReturnWindow.window_status = EXPIRED"
+
+  - entity: Reservation
+    initial_state: HELD
+    terminal_states: [REDEEMED, FORFEITED]
+    transitions:
+      - from: HELD
+        to: BOOKED
+        trigger: "POST /reservations/{id}/confirm"
+        actor: GuestApp
+        preconditions:
+          - "Reservation.reservation_status == HELD"
+          - "parent Ride.operational_status == OPEN"
+          - "for VIRTUAL_QUEUE: ReturnWindow.window_status == OPEN"
+        side_effects:
+          - "set Reservation.reservation_status = BOOKED"
+          - "recompute Ride.posted_wait_minutes"
+      - from: BOOKED
+        to: REDEEMED
+        trigger: "POST /reservations/{id}/redeem"
+        actor: RideOperator
+        preconditions:
+          - "Reservation.reservation_status == BOOKED"
+          - "parent Ride.operational_status == OPEN"
+          - "for VIRTUAL_QUEUE: Park.current_utc >= ReturnWindow.window_start_utc AND Park.current_utc < ReturnWindow.window_end_utc"
+        side_effects:
+          - "set Reservation.reservation_status = REDEEMED"
+          - "decrement ReturnWindow.reserved_count by 1 (VIRTUAL_QUEUE only) and decrement Ride.booked_slot_count by 1"
+          - "if ReturnWindow was EXHAUSTED and now reserved_count < slot_capacity and not expired: window_status -> OPEN (bubble up)"
+          - "recompute Ride.posted_wait_minutes"
+      - from: BOOKED
+        to: REDISTRIBUTED
+        trigger: "POST /rides/{id}/declare-down (cascade) ; re-homed by POST /rides/{id}/redistribute"
+        actor: system
+        preconditions:
+          - "Reservation.reservation_status == BOOKED"
+          - "parent Ride transitions OPEN->DOWN"
+        side_effects:
+          - "set Reservation.reservation_status = REDISTRIBUTED"
+          - "set redistributed_from_window_id = current return_window_id"
+          - "decrement old ReturnWindow.reserved_count by 1 and decrement Ride.booked_slot_count by 1"
+      - from: REDISTRIBUTED
+        to: BOOKED
+        trigger: "POST /rides/{id}/redistribute"
+        actor: RideOperator
+        preconditions:
+          - "Reservation.reservation_status == REDISTRIBUTED"
+          - "a replacement ReturnWindow on the same ride exists in window_status OPEN with reserved_count < slot_capacity and window_end_utc > Park.current_utc"
+        side_effects:
+          - "set Reservation.return_window_id = the selected replacement window id"
+          - "set Reservation.reservation_status = BOOKED"
+          - "increment replacement ReturnWindow.reserved_count by 1 and increment Ride.booked_slot_count by 1"
+          - "if replacement window now reserved_count >= slot_capacity: window_status -> EXHAUSTED (bubble up)"
+        note: "Replacement window selection: among same-ride OPEN windows with free capacity and window_end_utc > current_utc, pick the one with the earliest window_start_utc; tie-break earliest created_at. If none, the reservation stays REDISTRIBUTED and the redistribute call returns ERR_NO_REPLACEMENT_WINDOW."
+      - from: BOOKED
+        to: FORFEITED
+        trigger: "POST /parks/{id}/advance-windows (window expiry cascade) or POST /rides/{id}/close"
+        actor: system
+        preconditions:
+          - "Reservation.reservation_status == BOOKED"
+          - "owning ReturnWindow transitions to EXPIRED (current_utc >= window_end_utc) OR Ride closed"
+        side_effects:
+          - "set Reservation.reservation_status = FORFEITED"
+          - "decrement ReturnWindow.reserved_count by 1 (VIRTUAL_QUEUE) and decrement Ride.booked_slot_count by 1"
+      - from: HELD
+        to: FORFEITED
+        trigger: "POST /reservations/{id}/cancel"
+        actor: GuestApp
+        preconditions:
+          - "Reservation.reservation_status == HELD"
+        side_effects:
+          - "set Reservation.reservation_status = FORFEITED"
+          - "decrement ReturnWindow.reserved_count by 1 (VIRTUAL_QUEUE) and decrement Ride.booked_slot_count by 1"
+          - "if window was EXHAUSTED and now below capacity and not expired: window_status -> OPEN (bubble up)"
+
+  - entity: Party
+    initial_state: FORMING
+    terminal_states: [DISBANDED]
+    transitions:
+      - from: FORMING
+        to: LOCKED
+        trigger: "POST /parties/{id}/party-book"
+        actor: GuestApp
+        preconditions:
+          - "Party.party_status == FORMING"
+          - "Party.member_count >= 1"
+        side_effects:
+          - "set Party.party_status = LOCKED"
+          - "create one HELD Reservation per LINKED member that passes height/accessibility (cascade; partial members may be skipped per partial-booking policy)"
+          - "increments Party.version by 1"
+      - from: LOCKED
+        to: FORMING
+        trigger: "POST /parties/{id}/release-lock"
+        actor: GuestApp
+        preconditions:
+          - "Party.party_status == LOCKED"
+        side_effects:
+          - "set Party.party_status = FORMING"
+          - "increments Party.version by 1"
+      - from: FORMING
+        to: DISBANDED
+        trigger: "POST /parties/{id}/disband"
+        actor: GuestApp
+        preconditions:
+          - "Party.party_status == FORMING"
+        side_effects:
+          - "set Party.party_status = DISBANDED"
+          - "set membership_status = REMOVED for all LINKED PartyMembership rows"
+          - "set party_id = null on each affected Guest (cascade down)"
+
+  - entity: LightningLanePurchase
+    initial_state: ACTIVE
+    terminal_states: [CONSUMED, REFUNDED]
+    transitions:
+      - from: ACTIVE
+        to: CONSUMED
+        trigger: "POST /lightning-lane-purchases/{id}/redeem"
+        actor: RideOperator
+        preconditions:
+          - "LightningLanePurchase.hold_status == ACTIVE"
+          - "parent Ride.operational_status == OPEN"
+        side_effects:
+          - "set LightningLanePurchase.hold_status = CONSUMED"
+      - from: ACTIVE
+        to: REFUNDED
+        trigger: "POST /rides/{id}/declare-down (cascade)"
+        actor: system
+        preconditions:
+          - "LightningLanePurchase.hold_status == ACTIVE"
+          - "parent Ride transitions OPEN->DOWN"
+        side_effects:
+          - "set LightningLanePurchase.hold_status = REFUNDED"
+
+# ---------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: vq-book-stale-window
+    parent_entity: ReturnWindow
+    write_endpoint: "POST /reservations"
+    occ_field: "expected_return_window_id_version"
+    description: |
+      Creating a VIRTUAL_QUEUE Reservation against a ReturnWindow whose version
+      has advanced since the client last observed it is rejected. The new
+      reservation legitimately competes for the same remaining slot as a
+      reservation just created by another writer; a stale window version means
+      the client's view of reserved_count/slot_capacity is no longer current,
+      so the booking is refused before it can oversell the window.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: party-book-stale-party
+    parent_entity: Party
+    write_endpoint: "POST /parties/{id}/party-book"
+    occ_field: "expected_party_version"
+    description: |
+      Submitting a party-booking against a Party whose version has advanced
+      since the client last observed it is rejected. Membership changes
+      (link/unlink) and a prior party-book both bump Party.version; a stale
+      version means the booking would fan out HELD reservations over a member
+      set the client no longer accurately knows, so it is refused.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 Calculation Rules Table
+# =====================================================================
+calculations:
+  - name: return_window_slot_capacity
+    trigger: "on POST /rides/{id}/return-windows (ReturnWindow creation)"
+    algorithm: threshold
+    formula: |
+      window_minutes = (window_end_utc - window_start_utc) in whole minutes
+      raw = hourly_throughput * (window_minutes / 60.0) * VQ_SUPPLY_FRACTION
+      slot_capacity = floor(raw)
+      # VQ_SUPPLY_FRACTION carves the virtual-queue share out of total throughput;
+      # the remainder is implicitly standby + single-rider.
+    input_set: "Single parent Ride's hourly_throughput and the supplied window bounds"
+    constants:
+      VQ_SUPPLY_FRACTION: 0.40
+    precision: "integer slots via floor (truncate toward zero); window_minutes is whole minutes truncated"
+    variants:
+      - name: zero_capacity_window
+        when: "window shorter than 60/(hourly_throughput*VQ_SUPPLY_FRACTION) minutes"
+        difference: "raw < 1 floors to slot_capacity = 0; window is created but immediately behaves as EXHAUSTED-equivalent (no VQ bookings accepted), distinct from EXPIRED"
+
+  - name: lightning_lane_price
+    trigger: "on POST /lightning-lane-purchases (LightningLanePurchase creation)"
+    algorithm: tiered_pricing
+    formula: |
+      phase = phase_contribution(target Ride)  # OPEN or PEAK, derived from the
+              ride's booked_slot_count vs its active windows' total slot_capacity:
+              ride_load = booked_slot_count / max(1, sum slot_capacity of OPEN/EXHAUSTED windows)
+              phase = PEAK if ride_load >= RIDE_PEAK_LOAD else OPEN
+      base = EntitlementPlan.price_cents
+      if phase == PEAK:
+        surged = base * EntitlementPlan.surge_multiplier
+      else:
+        surged = base
+      # SINGLE_PASS premium cap: a SINGLE_PASS purchase never exceeds SINGLE_PASS_CAP_CENTS
+      if EntitlementPlan.tier == SINGLE_PASS:
+        charged_cents = round_half_up(min(surged, SINGLE_PASS_CAP_CENTS))
+      else:
+        charged_cents = round_half_up(surged)
+    input_set: "Target Ride load over its OPEN/EXHAUSTED windows; the chosen EntitlementPlan"
+    constants:
+      RIDE_PEAK_LOAD: 0.75
+      SINGLE_PASS_CAP_CENTS: 9900
+    precision: "2-step: compute surged as float, then round_half_up to whole cents AFTER the min() cap is applied (cap-then-round order is pinned)"
+    variants:
+      - name: peak_surge_applied
+        when: "target ride ride_load >= RIDE_PEAK_LOAD"
+        difference: "surge_multiplier multiplies base before the cap/round"
+      - name: open_flat_price
+        when: "ride_load < RIDE_PEAK_LOAD"
+        difference: "charged_cents = base (no surge); cap still applies for SINGLE_PASS but rarely binds"
+
+  - name: posted_wait_estimate
+    trigger: "on Reservation confirm/redeem/forfeit and on Ride status change"
+    algorithm: aggregation
+    formula: |
+      if Ride.operational_status != OPEN:
+        posted_wait_minutes = 0   # DOWN/CLOSED rides post 0 (not-operating sentinel)
+      else:
+        standby_demand = booked_slot_count + STANDBY_BASELINE
+        # minutes = how long to clear standby_demand guests at hourly_throughput
+        posted_wait_minutes = ceil( standby_demand / hourly_throughput * 60 )
+    input_set: "This Ride's booked_slot_count (HELD+BOOKED VIRTUAL_QUEUE reservations) and hourly_throughput"
+    constants:
+      STANDBY_BASELINE: 20
+    precision: "ceil to whole minutes; never negative"
+    variants:
+      - name: ride_not_operating
+        when: "operational_status in {DOWN, CLOSED}"
+        difference: "short-circuits to 0 regardless of booked_slot_count"
+
+  - name: max_concurrent_hold_check
+    trigger: "on POST /lightning-lane-purchases (count guest's ACTIVE holds) and on POST /reservations (count guest's HELD+BOOKED VQ reservations)"
+    algorithm: aggregation
+    formula: |
+      active_ll_holds = count(LightningLanePurchase where guest_id == G and hold_status == ACTIVE)
+      active_vq_res   = count(Reservation where guest_id == G and queue_type == VIRTUAL_QUEUE and reservation_status in {HELD, BOOKED})
+      # plan-tier ceiling on Lightning Lane holds:
+      ll_limit = EntitlementPlan.max_concurrent_holds
+      # park-wide ceiling on free virtual-queue reservations:
+      vq_limit = VQ_MAX_PER_GUEST
+    input_set: "All of guest G's LightningLanePurchase rows in ACTIVE; all of G's VIRTUAL_QUEUE Reservations in HELD or BOOKED"
+    constants:
+      VQ_MAX_PER_GUEST: 2
+    precision: "exact integer counts; the boundary is '>=' the limit blocks (limit+0 is allowed up to the limit; the (limit+1)-th is rejected)"
+    variants:
+      - name: ll_hold_ceiling
+        when: "creating a LightningLanePurchase"
+        difference: "blocks when active_ll_holds >= ll_limit (ERR_HOLD_LIMIT_REACHED)"
+      - name: vq_reservation_ceiling
+        when: "creating a VIRTUAL_QUEUE Reservation"
+        difference: "blocks when active_vq_res >= VQ_MAX_PER_GUEST (ERR_VQ_LIMIT_REACHED)"
+
+# =====================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =====================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to perform this operation per §1.7 RBAC"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "All path/body referenced resources exist (Park, Ride, Guest, Party, ReturnWindow, EntitlementPlan, Reservation, LightningLanePurchase), validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: business_referential
+    check: "GuestApp acting as a Guest may only act on its own Guest/Reservations or a Party it leads; X-User-ID must match the owning guest_id or Party.leader_guest_id"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /reservations, /reservations/{id}/*, /parties/{id}/*, /lightning-lane-purchases"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a valid state for the requested transition (e.g., Reservation HELD for confirm; Ride OPEN for redeem; Party FORMING for party-book; window not SUSPENDED/EXPIRED for booking)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_<parent>_version matches the parent's current version on a guarded write (POST /reservations vs ReturnWindow.version, POST /parties/{id}/party-book vs Party.version)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /reservations, POST /parties/{id}/party-book"
+
+  - priority: 7
+    category: business_safety
+    check: "Guest.height_cm >= Ride.min_height_cm for the booked/redeemed ride"
+    error_id: ERR_HEIGHT_REQUIREMENT_NOT_MET
+    http_status: 422
+    applies_to: "POST /reservations, POST /reservations/{id}/redeem, POST /lightning-lane-purchases, POST /parties/{id}/party-book"
+
+  - priority: 8
+    category: business_safety
+    check: "Not (Guest.uses_wheelchair == true AND Ride.wheelchair_transfer_required == true); guest must be able to board"
+    error_id: ERR_ACCESSIBILITY_BLOCKED
+    http_status: 422
+    applies_to: "POST /reservations, POST /lightning-lane-purchases, POST /parties/{id}/party-book"
+
+  - priority: 9
+    category: business_temporal
+    check: "For VIRTUAL_QUEUE booking, the chosen ReturnWindow.window_end_utc > Park.current_utc (cannot book an already-elapsed window); for redeem, current_utc within [window_start_utc, window_end_utc)"
+    error_id: ERR_WINDOW_NOT_REDEEMABLE
+    http_status: 422
+    applies_to: "POST /reservations, POST /reservations/{id}/redeem"
+
+  - priority: 10
+    category: business_constraint
+    check: "PEAK day_phase gate: when Park.day_phase == PEAK, a new VIRTUAL_QUEUE Reservation is allowed only if the acting guest holds an ACTIVE MULTI_PASS LightningLanePurchase in this park; otherwise blocked"
+    error_id: ERR_PEAK_GATE_BLOCKED
+    http_status: 422
+    applies_to: "POST /reservations, POST /parties/{id}/party-book"
+
+  - priority: 11
+    category: business_constraint
+    check: "Per-guest virtual-queue ceiling: active VIRTUAL_QUEUE reservations (HELD+BOOKED) for the guest must be < VQ_MAX_PER_GUEST before adding another (see calc max_concurrent_hold_check)"
+    error_id: ERR_VQ_LIMIT_REACHED
+    http_status: 422
+    applies_to: "POST /reservations, POST /parties/{id}/party-book"
+
+  - priority: 12
+    category: business_constraint
+    check: "Per-guest Lightning Lane hold ceiling: active LightningLanePurchase holds for the guest must be < EntitlementPlan.max_concurrent_holds before adding another"
+    error_id: ERR_HOLD_LIMIT_REACHED
+    http_status: 422
+    applies_to: "POST /lightning-lane-purchases"
+
+  - priority: 13
+    category: business_fiscal
+    check: "VIRTUAL_QUEUE window capacity: ReturnWindow.reserved_count < ReturnWindow.slot_capacity (window not EXHAUSTED) before debiting a new slot"
+    error_id: ERR_WINDOW_EXHAUSTED
+    http_status: 409
+    applies_to: "POST /reservations (VIRTUAL_QUEUE), POST /parties/{id}/party-book"
+
+  - priority: 14
+    category: business_fiscal
+    check: "Park admission capacity: Park.admitted_count < Park.gate_capacity before admitting (day_phase != FULL)"
+    error_id: ERR_PARK_AT_CAPACITY
+    http_status: 409
+    applies_to: "POST /parks/{id}/admissions"
+
+# =====================================================================
+# §1.5 API Endpoint Table
+# =====================================================================
+endpoints:
+  # ---- Park ----
+  - method: POST
+    path: "/parks"
+    description: "Create a park"
+    roles: [ParkAdmin]
+    code: 201
+    input: [name, gate_capacity, "peak_threshold_pct?", operating_date]
+    output: Park
+    side_effects: ["Park created with day_phase=OPEN, admitted_count=0, current_utc defaulted to epoch-unset until clock-set"]
+  - method: GET
+    path: "/parks/{id}"
+    description: "Read a park including computed admitted_count and day_phase"
+    roles: [ParkAdmin, RideOperator, GuestApp]
+    code: 200
+    input: []
+    output: Park
+    side_effects: []
+  - method: POST
+    path: "/parks/{id}/admissions"
+    description: "Admit a guest's day ticket through the gate"
+    roles: [ParkAdmin]
+    code: 201
+    input: [ticket_id]
+    output: GuestDayTicket
+    side_effects: ["GuestDayTicket ISSUED->ADMITTED", "Park.admitted_count += 1", "recompute Park.day_phase", "increments Park.version by 1"]
+  - method: POST
+    path: "/parks/{id}/exits"
+    description: "Exit an admitted guest through the gate, freeing capacity"
+    roles: [ParkAdmin]
+    code: 201
+    input: [ticket_id]
+    output: GuestDayTicket
+    side_effects: ["GuestDayTicket ADMITTED->EXITED", "Park.admitted_count -= 1", "recompute Park.day_phase", "increments Park.version by 1"]
+  - method: POST
+    path: "/parks/{id}/advance-windows"
+    description: "Advance/expire all return windows whose end is <= current_utc; cascades reservation forfeits"
+    roles: [ParkAdmin]
+    code: 200
+    input: []
+    output: "{ expired_window_count: integer, forfeited_reservation_ids: string[] }"
+    side_effects: ["ReturnWindow OPEN/EXHAUSTED->EXPIRED for elapsed windows", "Reservation BOOKED/HELD->FORFEITED cascade", "credit ride/window counters"]
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving: set the park logical clock used for all window comparisons"
+    roles: [ParkAdmin]
+    code: 200
+    input: [park_id, to_iso8601]
+    output: Park
+    side_effects: ["set Park.current_utc = to_iso8601"]
+
+  # ---- Ride + ReturnWindow ----
+  - method: POST
+    path: "/parks/{id}/rides"
+    description: "Create a ride under a park"
+    roles: [ParkAdmin]
+    code: 201
+    input: [name, hourly_throughput, "min_height_cm?", "wheelchair_transfer_required?", "single_rider_enabled?"]
+    output: Ride
+    side_effects: ["Ride created OPEN, booked_slot_count=0, posted_wait_minutes computed"]
+  - method: GET
+    path: "/parks/{id}/rides"
+    description: "List rides for a park (reverse-reachability for Ride.park_id)"
+    roles: [ParkAdmin, RideOperator, GuestApp]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Ride[]
+    side_effects: []
+  - method: GET
+    path: "/rides/{id}"
+    description: "Read a ride including posted_wait_minutes and operational_status"
+    roles: [ParkAdmin, RideOperator, GuestApp]
+    code: 200
+    input: []
+    output: Ride
+    side_effects: []
+  - method: POST
+    path: "/rides/{id}/return-windows"
+    description: "Create a return window for a ride; slot_capacity auto-computed"
+    roles: [ParkAdmin]
+    code: 201
+    input: [window_start_utc, window_end_utc]
+    output: ReturnWindow
+    side_effects: ["compute slot_capacity via return_window_slot_capacity", "ReturnWindow created OPEN, reserved_count=0"]
+  - method: GET
+    path: "/rides/{id}/return-windows"
+    description: "List return windows of a ride (reverse-reachability for ReturnWindow.ride_id)"
+    roles: [ParkAdmin, RideOperator, GuestApp]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ReturnWindow[]
+    side_effects: []
+  - method: GET
+    path: "/return-windows/{id}"
+    description: "Read a return window including reserved_count and window_status"
+    roles: [ParkAdmin, RideOperator, GuestApp]
+    code: 200
+    input: []
+    output: ReturnWindow
+    side_effects: []
+  - method: POST
+    path: "/rides/{id}/declare-down"
+    description: "Operator declares the ride down; suspends windows, redistributes booked reservations, refunds active LL holds"
+    roles: [RideOperator]
+    code: 200
+    input: []
+    output: Ride
+    side_effects: ["Ride OPEN->DOWN", "child windows OPEN/EXHAUSTED->SUSPENDED", "BOOKED Reservations->REDISTRIBUTED", "ACTIVE LightningLanePurchases->REFUNDED", "recompute counters"]
+  - method: POST
+    path: "/rides/{id}/restore"
+    description: "Operator restores a down ride; un-suspends still-valid windows"
+    roles: [RideOperator]
+    code: 200
+    input: []
+    output: Ride
+    side_effects: ["Ride DOWN->OPEN", "SUSPENDED windows->OPEN if not elapsed else EXPIRED", "recompute posted_wait_minutes"]
+  - method: POST
+    path: "/rides/{id}/close"
+    description: "Operator closes the ride for the day; expires windows, forfeits open reservations"
+    roles: [RideOperator]
+    code: 200
+    input: []
+    output: Ride
+    side_effects: ["Ride OPEN->CLOSED", "windows->EXPIRED", "HELD/BOOKED Reservations->FORFEITED"]
+  - method: POST
+    path: "/rides/{id}/redistribute"
+    description: "Operator re-homes the ride's REDISTRIBUTED reservations into replacement windows (earliest-start, tie-break earliest created_at)"
+    roles: [RideOperator]
+    code: 200
+    input: []
+    output: "{ rehomed_count: integer, rehomed_reservation_ids: string[], unplaced_reservation_ids: string[] }"
+    side_effects: ["Reservation REDISTRIBUTED->BOOKED into replacement window", "replacement window reserved_count += 1, ride booked_slot_count += 1", "window EXHAUSTED bubble-up"]
+
+  # ---- Guest ----
+  - method: POST
+    path: "/parks/{id}/guests"
+    description: "Create a guest profile under a park"
+    roles: [ParkAdmin, GuestApp]
+    code: 201
+    input: [full_name, height_cm, "uses_wheelchair?"]
+    output: Guest
+    side_effects: ["Guest created with party_id=null"]
+  - method: GET
+    path: "/parks/{id}/guests"
+    description: "List guests of a park (reverse-reachability for Guest.park_id)"
+    roles: [ParkAdmin, GuestApp]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Guest[]
+    side_effects: []
+  - method: GET
+    path: "/guests/{id}"
+    description: "Read a guest including current party_id"
+    roles: [ParkAdmin, RideOperator, GuestApp]
+    code: 200
+    input: []
+    output: Guest
+    side_effects: []
+  - method: GET
+    path: "/guests"
+    description: "List/filter guests across the system (reverse-reachability for Guest.park_id and Guest.party_id)"
+    roles: [ParkAdmin, GuestApp]
+    code: 200
+    input: ["park_id?", "party_id?", "limit?", "offset?"]
+    output: Guest[]
+    side_effects: []
+  - method: POST
+    path: "/parks/{id}/day-tickets"
+    description: "Issue a day ticket for a guest"
+    roles: [ParkAdmin]
+    code: 201
+    input: [guest_id, ticket_date]
+    output: GuestDayTicket
+    side_effects: ["GuestDayTicket created ISSUED"]
+  - method: GET
+    path: "/parks/{id}/day-tickets"
+    description: "List day tickets of a park; supports guest filter (reverse-reachability for GuestDayTicket.park_id and .guest_id)"
+    roles: [ParkAdmin]
+    code: 200
+    input: ["guest_id?", "limit?", "offset?"]
+    output: GuestDayTicket[]
+    side_effects: []
+  - method: GET
+    path: "/day-tickets/{id}"
+    description: "Read a single day ticket including admission_status"
+    roles: [ParkAdmin]
+    code: 200
+    input: []
+    output: GuestDayTicket
+    side_effects: []
+  - method: GET
+    path: "/day-tickets"
+    description: "List/filter day tickets across the system (reverse-reachability for GuestDayTicket.park_id and .guest_id)"
+    roles: [ParkAdmin]
+    code: 200
+    input: ["park_id?", "guest_id?", "limit?", "offset?"]
+    output: GuestDayTicket[]
+    side_effects: []
+
+  # ---- Party + PartyMembership ----
+  - method: POST
+    path: "/parks/{id}/parties"
+    description: "Create a party led by a guest"
+    roles: [GuestApp]
+    code: 201
+    input: [leader_guest_id]
+    output: Party
+    side_effects: ["Party created FORMING; leader auto-linked as PartyMembership LINKED; member_count=1; Guest.party_id set to party (cascade)"]
+  - method: GET
+    path: "/parks/{id}/parties"
+    description: "List parties of a park (reverse-reachability for Party.park_id)"
+    roles: [ParkAdmin, GuestApp]
+    code: 200
+    input: ["leader_guest_id?", "limit?", "offset?"]
+    output: Party[]
+    side_effects: []
+  - method: GET
+    path: "/parties/{id}"
+    description: "Read a party including member_count and party_status"
+    roles: [ParkAdmin, GuestApp]
+    code: 200
+    input: []
+    output: Party
+    side_effects: []
+  - method: GET
+    path: "/parties"
+    description: "List/filter parties across the system (reverse-reachability for Party.park_id and Party.leader_guest_id)"
+    roles: [ParkAdmin, GuestApp]
+    code: 200
+    input: ["park_id?", "leader_guest_id?", "limit?", "offset?"]
+    output: Party[]
+    side_effects: []
+  - method: POST
+    path: "/parties/{id}/members"
+    description: "Link a guest into a party (leader only)"
+    roles: [GuestApp]
+    code: 201
+    input: [guest_id]
+    output: PartyMembership
+    side_effects: ["PartyMembership LINKED created", "Party.member_count += 1", "Guest.party_id set (cross-entity)", "increments Party.version by 1"]
+  - method: GET
+    path: "/parties/{id}/members"
+    description: "List memberships of a party (reverse-reachability for PartyMembership.party_id)"
+    roles: [ParkAdmin, GuestApp]
+    code: 200
+    input: ["guest_id?", "limit?", "offset?"]
+    output: PartyMembership[]
+    side_effects: []
+  - method: GET
+    path: "/party-memberships/{id}"
+    description: "Read a single party membership including membership_status"
+    roles: [ParkAdmin, GuestApp]
+    code: 200
+    input: []
+    output: PartyMembership
+    side_effects: []
+  - method: GET
+    path: "/party-memberships"
+    description: "List/filter party memberships across the system (reverse-reachability for PartyMembership.party_id and .guest_id)"
+    roles: [ParkAdmin, GuestApp]
+    code: 200
+    input: ["party_id?", "guest_id?", "limit?", "offset?"]
+    output: PartyMembership[]
+    side_effects: []
+  - method: DELETE
+    path: "/parties/{id}/members/{guest_id}"
+    description: "Unlink a guest from a party (leader only); cannot remove the leader"
+    roles: [GuestApp]
+    code: 200
+    input: []
+    output: PartyMembership
+    side_effects: ["PartyMembership LINKED->REMOVED", "Party.member_count -= 1", "Guest.party_id cleared to null", "increments Party.version by 1"]
+  - method: POST
+    path: "/parties/{id}/party-book"
+    description: "Book virtual-queue reservations for all eligible linked members of a ride return window in one shot"
+    roles: [GuestApp]
+    code: 201
+    input: [ride_id, return_window_id, expected_party_version]
+    output: "{ party_id: string, created_reservation_ids: string[], skipped_guest_ids: string[] }"
+    side_effects: ["Party FORMING->LOCKED", "one HELD Reservation per eligible LINKED member", "window/ride counters debited per created reservation", "increments Party.version by 1"]
+  - method: POST
+    path: "/parties/{id}/release-lock"
+    description: "Release a LOCKED party back to FORMING"
+    roles: [GuestApp]
+    code: 200
+    input: []
+    output: Party
+    side_effects: ["Party LOCKED->FORMING", "increments Party.version by 1"]
+  - method: POST
+    path: "/parties/{id}/disband"
+    description: "Disband a FORMING party"
+    roles: [GuestApp]
+    code: 200
+    input: []
+    output: Party
+    side_effects: ["Party FORMING->DISBANDED", "all memberships REMOVED", "each Guest.party_id cleared (cascade)"]
+
+  # ---- EntitlementPlan + LightningLanePurchase ----
+  - method: POST
+    path: "/parks/{id}/entitlement-plans"
+    description: "Create a Lightning Lane entitlement plan"
+    roles: [ParkAdmin]
+    code: 201
+    input: [tier, price_cents, max_concurrent_holds, "surge_multiplier?"]
+    output: EntitlementPlan
+    side_effects: ["EntitlementPlan created"]
+  - method: GET
+    path: "/parks/{id}/entitlement-plans"
+    description: "List entitlement plans of a park (reverse-reachability for EntitlementPlan.park_id)"
+    roles: [ParkAdmin, GuestApp]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: EntitlementPlan[]
+    side_effects: []
+  - method: POST
+    path: "/lightning-lane-purchases"
+    description: "Buy a Lightning Lane line-skip hold for a guest on a ride; price computed with surge and tier cap"
+    roles: [GuestApp]
+    code: 201
+    input: [park_id, guest_id, ride_id, plan_id]
+    output: LightningLanePurchase
+    side_effects: ["compute charged_cents via lightning_lane_price", "LightningLanePurchase created ACTIVE"]
+  - method: GET
+    path: "/lightning-lane-purchases"
+    description: "List Lightning Lane purchases; filterable (reverse-reachability for park_id, guest_id, ride_id, plan_id)"
+    roles: [ParkAdmin, RideOperator, GuestApp]
+    code: 200
+    input: ["park_id?", "guest_id?", "ride_id?", "plan_id?", "limit?", "offset?"]
+    output: LightningLanePurchase[]
+    side_effects: []
+  - method: GET
+    path: "/lightning-lane-purchases/{id}"
+    description: "Read a Lightning Lane purchase including charged_cents and hold_status"
+    roles: [ParkAdmin, RideOperator, GuestApp]
+    code: 200
+    input: []
+    output: LightningLanePurchase
+    side_effects: []
+  - method: POST
+    path: "/lightning-lane-purchases/{id}/redeem"
+    description: "Operator scans the guest into the premium line"
+    roles: [RideOperator]
+    code: 200
+    input: []
+    output: LightningLanePurchase
+    side_effects: ["LightningLanePurchase ACTIVE->CONSUMED"]
+
+  # ---- Reservation ----
+  - method: POST
+    path: "/reservations"
+    description: "Create a virtual-queue or single-rider reservation (HELD); slot debited for VIRTUAL_QUEUE"
+    roles: [GuestApp]
+    code: 201
+    input: [ride_id, guest_id, return_window_id, queue_type, expected_return_window_id_version]
+    output: Reservation
+    side_effects: ["Reservation created HELD", "VIRTUAL_QUEUE: ReturnWindow.reserved_count += 1, Ride.booked_slot_count += 1", "window EXHAUSTED bubble-up", "increments ReturnWindow.version by 1", "recompute posted_wait_minutes"]
+  - method: GET
+    path: "/reservations"
+    description: "List reservations; filterable (reverse-reachability for ride_id, guest_id, return_window_id, party_id, redistributed_from_window_id)"
+    roles: [ParkAdmin, RideOperator, GuestApp]
+    code: 200
+    input: ["ride_id?", "guest_id?", "return_window_id?", "party_id?", "redistributed_from_window_id?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+  - method: GET
+    path: "/reservations/{id}"
+    description: "Read a reservation including reservation_status and redistributed_from_window_id"
+    roles: [ParkAdmin, RideOperator, GuestApp]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+  - method: POST
+    path: "/reservations/{id}/confirm"
+    description: "Guest confirms a HELD reservation into BOOKED"
+    roles: [GuestApp]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["Reservation HELD->BOOKED", "recompute posted_wait_minutes"]
+  - method: POST
+    path: "/reservations/{id}/redeem"
+    description: "Operator scans a BOOKED reservation in during its window"
+    roles: [RideOperator]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["Reservation BOOKED->REDEEMED", "window reserved_count -= 1, ride booked_slot_count -= 1 (VIRTUAL_QUEUE)", "window EXHAUSTED->OPEN bubble-up", "recompute posted_wait_minutes"]
+  - method: POST
+    path: "/reservations/{id}/cancel"
+    description: "Guest cancels a HELD reservation, freeing the slot"
+    roles: [GuestApp]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["Reservation HELD->FORFEITED", "window reserved_count -= 1, ride booked_slot_count -= 1 (VIRTUAL_QUEUE)", "window EXHAUSTED->OPEN bubble-up", "recompute posted_wait_minutes"]
+
+# =====================================================================
+# §1.6 Error Code Catalog
+# =====================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID header, or unknown role"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Acting role not permitted for this operation per RBAC"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "GuestApp X-User-ID is neither the owning guest nor the leader of the target party/resource"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced Park/Ride/Guest/Party/ReturnWindow/EntitlementPlan/Reservation/LightningLanePurchase/ticket does not exist"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource not in a valid state for the requested transition"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_<parent>_version does not match the parent entity's current version (OCC)"
+  - id: ERR_HEIGHT_REQUIREMENT_NOT_MET
+    http: 422
+    condition: "Guest.height_cm < Ride.min_height_cm"
+  - id: ERR_ACCESSIBILITY_BLOCKED
+    http: 422
+    condition: "Guest.uses_wheelchair AND Ride.wheelchair_transfer_required"
+  - id: ERR_WINDOW_NOT_REDEEMABLE
+    http: 422
+    condition: "Booking an already-elapsed window, or redeeming outside [window_start_utc, window_end_utc)"
+  - id: ERR_PEAK_GATE_BLOCKED
+    http: 422
+    condition: "Park.day_phase == PEAK and guest lacks an ACTIVE MULTI_PASS hold for a new virtual-queue booking"
+  - id: ERR_VQ_LIMIT_REACHED
+    http: 422
+    condition: "Guest already holds VQ_MAX_PER_GUEST active VIRTUAL_QUEUE reservations (HELD+BOOKED)"
+  - id: ERR_HOLD_LIMIT_REACHED
+    http: 422
+    condition: "Guest already holds plan.max_concurrent_holds ACTIVE LightningLanePurchases"
+  - id: ERR_WINDOW_EXHAUSTED
+    http: 409
+    condition: "ReturnWindow.reserved_count >= slot_capacity (window full) for a new VIRTUAL_QUEUE booking"
+  - id: ERR_PARK_AT_CAPACITY
+    http: 409
+    condition: "Park.admitted_count >= gate_capacity (day_phase FULL) on admission"
+  - id: ERR_NO_REPLACEMENT_WINDOW
+    http: 409
+    condition: "redistribute found no OPEN same-ride window with free capacity and future end for one or more REDISTRIBUTED reservations"
+  - id: ERR_VALIDATION
+    http: 400
+    condition: "Missing required field, malformed value, or invalid enum"
+  - id: ERR_LEADER_REMOVAL_FORBIDDEN
+    http: 409
+    condition: "Attempt to unlink the party leader from its own party"
+  - id: ERR_GUEST_PARK_MISMATCH
+    http: 422
+    condition: "A referenced Guest/Ride/Window belongs to a different Park than the operation's park scope"
+
+# =====================================================================
+# §1.7 RBAC Matrix
+# =====================================================================
+roles:
+  - name: ParkAdmin
+    description: "Park operations staff; configures parks, rides, windows, plans, tickets; runs admissions, exits, clock, window advancement"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /parks"
+      - "POST /parks/{id}/rides"
+      - "POST /rides/{id}/return-windows"
+      - "POST /parks/{id}/day-tickets"
+      - "POST /parks/{id}/admissions"
+      - "POST /parks/{id}/exits"
+      - "POST /parks/{id}/advance-windows"
+      - "POST /parks/{id}/entitlement-plans"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "GET (most read endpoints)"
+      - "POST /parks/{id}/guests (with GuestApp)"
+
+  - name: RideOperator
+    description: "Ride attendant; controls ride operational status and scans guests into queues"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /rides/{id}/declare-down"
+      - "POST /rides/{id}/restore"
+      - "POST /rides/{id}/close"
+      - "POST /rides/{id}/redistribute"
+      - "POST /reservations/{id}/redeem"
+      - "POST /lightning-lane-purchases/{id}/redeem"
+    shared_operations:
+      - "GET /rides/{id}, GET /reservations, GET /lightning-lane-purchases (read)"
+
+  - name: GuestApp
+    description: "Guest-facing app acting as a specific Guest (entity_backed); books and manages own reservations, parties, and purchases"
+    identity: "entity_backed:Guest"
+    exclusive_operations:
+      - "POST /reservations"
+      - "POST /reservations/{id}/confirm"
+      - "POST /reservations/{id}/cancel"
+      - "POST /parks/{id}/parties"
+      - "POST /parties/{id}/members"
+      - "DELETE /parties/{id}/members/{guest_id}"
+      - "POST /parties/{id}/party-book"
+      - "POST /parties/{id}/release-lock"
+      - "POST /parties/{id}/disband"
+      - "POST /lightning-lane-purchases"
+    shared_operations:
+      - "POST /parks/{id}/guests (with ParkAdmin)"
+      - "GET reads on own/park resources"

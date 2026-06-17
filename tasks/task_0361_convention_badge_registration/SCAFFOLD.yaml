@@ -1,0 +1,1533 @@
+scenario: |
+  361. Convention & Badge Registration (Comic-Con style): ticket type/tier & day pass,
+  capacity & waitlist/lottery, badge issuance & RFID, session/panel reservation,
+  exhibitor/vendor booth, group & VIP, transfer/refund, on-site pickup/print
+
+domain_name: convention-badge-registration
+api_prefix: /
+
+# =============================================================================
+# Complexity Profile (§0.1–§0.4)
+# =============================================================================
+complexity_profile:
+  primary_archetype: quota_allocation        # finite capacity competed for, reserved, committed, released
+  secondary_archetype: workflow_orchestration # register -> pay -> issue badge -> reserve sessions -> pickup/print
+  complexity_layers:
+    - optimistic_concurrency        # OCC on Convention.version for capacity-consuming creates; on Session.version for seat reservation
+    - cascading_side_effects        # order cancel -> badges void -> session reservations release -> waitlist promote
+    - dual_variant_calculation      # refund: provisional vs final on Order; booth charge: estimated vs actual on Exhibitor
+    - rate_threshold_triggers       # group-discount tier breakpoints; lottery capacity boundary
+    - derived_field_reconciliation  # Convention.badges_issued_count, Session.seats_taken kept consistent
+
+  entity_topology: flat             # peer entities linked by FK (Order, Badge, Session, Exhibitor, Booth) — no deep URL nesting
+  state_machine_shape: branching    # Order/Badge fork (issued vs refunded), WaitlistEntry fork (won/lost), parallel dims on Badge
+  relationship_patterns:
+    - one_to_many                   # Convention->TicketType, Order->TicketLineItem, Exhibitor->BoothBooking
+    - many_to_many                  # Attendee<->Session via SessionReservation; Exhibitor<->Booth via BoothBooking
+    - cross_aggregate               # Badge references Order and Attendee across aggregates; reservation references Badge+Session
+  role_model: peer_roles            # Attendee owns own badges/reservations; Exhibitor owns booth bookings; staff roles operate
+  consistency_model: immediate      # all changes atomic within a single request, including cascades
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  # ---------------------------------------------------------------------------
+  - name: Convention
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: display name of the convention
+      - name: event_start_utc
+        type: datetime
+        source: input
+        description: first day of the convention, ISO 8601 UTC; used as the reference instant for refund-penalty tier and badge issuance window
+      - name: event_end_utc
+        type: datetime
+        source: input
+        description: last instant of the convention, ISO 8601 UTC
+        constraints: must be strictly after event_start_utc
+      - name: total_badge_capacity
+        type: integer
+        source: input
+        description: hard cap on the number of non-voided badges that may exist across all orders for this convention
+        constraints: integer >= 1
+      - name: badges_issued_count
+        type: integer
+        source: computed
+        description: count of Badge rows for this convention whose status IN {ISSUED, PICKED_UP, PRINTED}; recomputed on every badge issuance, void, and order cancellation
+        default: 0
+      - name: lottery_open_utc
+        type: datetime
+        source: input
+        description: instant at which the convention lottery opens; WaitlistEntry early_bird_bonus is granted when the entry is created within EARLY_WINDOW_HOURS after this instant
+      - name: posture
+        type: enum
+        source: computed
+        description: gate over capacity-consuming operations; OPEN allows paid registration, SOLD_OUT blocks new badge issuance but allows waitlist entries, CLOSED blocks all registration and waitlist
+        default: OPEN
+        constraints: one of {OPEN, SOLD_OUT, CLOSED}
+  # ---------------------------------------------------------------------------
+  - name: TicketType
+    parent: Convention
+    common_fields: true
+    fields:
+      - name: convention_id
+        type: string
+        source: input
+        description: FK -> Convention.id; the convention this ticket type belongs to
+      - name: tier
+        type: enum
+        source: input
+        description: ticket tier
+        constraints: one of {GENERAL, THREE_DAY, VIP, EXHIBITOR}
+      - name: base_price_cents
+        type: integer
+        source: input
+        description: per-badge price in cents before any group discount
+        constraints: integer >= 0
+      - name: tier_capacity
+        type: integer
+        source: input
+        description: maximum number of non-voided badges that may be issued against this ticket type
+        constraints: integer >= 1
+      - name: tier_issued_count
+        type: integer
+        source: computed
+        description: count of non-voided badges issued against this ticket type (status IN {ISSUED, PICKED_UP, PRINTED}); recomputed on issuance/void
+        default: 0
+      - name: is_day_pass
+        type: boolean
+        source: input
+        description: true for single-day passes (GENERAL); affects nothing in pricing but flags badge access scope
+        default: false
+  # ---------------------------------------------------------------------------
+  - name: Attendee
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: unique attendee email (case-insensitive), used as login identity
+        constraints: unique across all Attendee rows, case-insensitive
+      - name: full_name
+        type: string
+        source: input
+        description: attendee legal name printed on the badge
+      - name: loyalty_tier
+        type: enum
+        source: input
+        description: loyalty standing that feeds lottery priority scoring
+        default: NONE
+        constraints: one of {NONE, SILVER, GOLD, PLATINUM}
+      - name: status
+        type: enum
+        source: computed
+        description: ACTIVE attendees may register and reserve; BANNED attendees are blocked from all create operations
+        default: ACTIVE
+        constraints: one of {ACTIVE, BANNED}
+  # ---------------------------------------------------------------------------
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - name: convention_id
+        type: string
+        source: input
+        description: FK -> Convention.id; the convention this order purchases badges for
+      - name: purchaser_attendee_id
+        type: string
+        source: input
+        description: FK -> Attendee.id; the attendee who owns and pays for this order
+      - name: is_group
+        type: boolean
+        source: computed
+        description: true when total badge quantity across line items is >= GROUP_MIN_QTY (5); drives group-discount eligibility
+        default: false
+      - name: status
+        type: enum
+        source: computed
+        description: order lifecycle state
+        default: DRAFT
+        constraints: one of {DRAFT, PENDING_PAYMENT, PAID, CANCELLED, REFUNDED}
+      - name: ticket_subtotal_cents
+        type: integer
+        source: computed
+        description: sum over line items of round_half_up(line_base * (1 - group_discount_pct)); pinned rounding order is per-line-then-sum
+        default: 0
+      - name: processing_fee_cents
+        type: integer
+        source: computed
+        description: min(round_half_up(ticket_subtotal_cents * FEE_RATE), FEE_CAP_CENTS); non-refundable
+        default: 0
+      - name: total_cents
+        type: integer
+        source: computed
+        description: ticket_subtotal_cents + processing_fee_cents
+        default: 0
+      - name: amount_paid_cents
+        type: integer
+        source: computed
+        description: amount captured at payment; equals total_cents on PAID
+        default: 0
+      - name: refund_amount_cents
+        type: integer
+        source: computed
+        description: final settled refund in cents written when the order moves to REFUNDED; computed from ticket_subtotal_cents and the cancellation penalty tier at execution time
+        default: 0
+      - name: provisional_refund_cents
+        type: integer
+        source: computed
+        description: forward-looking refund estimate computed at cancellation-request time from the penalty tier implied by the current clock; recomputed on every quote read, distinct from refund_amount_cents
+        default: 0
+  # ---------------------------------------------------------------------------
+  - name: TicketLineItem
+    parent: Order
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; the order this line belongs to
+      - name: ticket_type_id
+        type: string
+        source: input
+        description: FK -> TicketType.id; the ticket tier purchased on this line
+      - name: quantity
+        type: integer
+        source: input
+        description: number of badges of this tier on this line
+        constraints: integer >= 1
+      - name: line_base_cents
+        type: integer
+        source: computed
+        description: ticket_type.base_price_cents * quantity, before discount
+        default: 0
+      - name: line_discounted_cents
+        type: integer
+        source: computed
+        description: round_half_up(line_base_cents * (1 - group_discount_pct)) using the order-level group discount tier
+        default: 0
+  # ---------------------------------------------------------------------------
+  - name: Badge
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: FK -> Order.id; the order that paid for this badge
+      - name: ticket_type_id
+        type: string
+        source: input
+        description: FK -> TicketType.id; the tier this badge grants
+      - name: holder_attendee_id
+        type: string
+        source: input
+        description: FK -> Attendee.id; the current holder of the badge (may change via transfer)
+      - name: status
+        type: enum
+        source: computed
+        description: badge lifecycle dimension
+        default: ISSUED
+        constraints: one of {ISSUED, PICKED_UP, PRINTED, VOID}
+      - name: rfid_status
+        type: enum
+        source: computed
+        description: independent RFID-activation dimension that advances on its own axis alongside status (a second state dimension on the same row)
+        default: UNASSIGNED
+        constraints: one of {UNASSIGNED, ENCODED, DEACTIVATED}
+      - name: rfid_uid
+        type: string
+        source: computed
+        description: hardware UID written when RFID is encoded at pickup; null until ENCODED
+        default: null
+      - name: transfer_count
+        type: integer
+        source: computed
+        description: number of completed holder transfers; bounded by MAX_TRANSFERS (2)
+        default: 0
+  # ---------------------------------------------------------------------------
+  - name: Session
+    parent: Convention
+    common_fields: true
+    fields:
+      - name: convention_id
+        type: string
+        source: input
+        description: FK -> Convention.id; the convention this session belongs to
+      - name: title
+        type: string
+        source: input
+        description: panel/session title
+      - name: start_utc
+        type: datetime
+        source: input
+        description: session start, ISO 8601 UTC; intervals are half-open [start_utc, end_utc)
+      - name: end_utc
+        type: datetime
+        source: input
+        description: session end, ISO 8601 UTC, exclusive
+        constraints: must be strictly after start_utc
+      - name: seat_capacity
+        type: integer
+        source: input
+        description: maximum number of confirmed reservations
+        constraints: integer >= 1
+      - name: seats_taken
+        type: integer
+        source: computed
+        description: count of SessionReservation rows for this session in status CONFIRMED; recomputed on reserve/cancel/promote
+        default: 0
+      - name: requires_vip
+        type: boolean
+        source: input
+        description: when true, only badges whose ticket tier is VIP may hold a CONFIRMED reservation
+        default: false
+  # ---------------------------------------------------------------------------
+  - name: SessionReservation
+    parent: null
+    common_fields: true
+    fields:
+      - name: session_id
+        type: string
+        source: input
+        description: FK -> Session.id; the reserved session
+      - name: badge_id
+        type: string
+        source: input
+        description: FK -> Badge.id; the badge holding this reservation
+      - name: status
+        type: enum
+        source: computed
+        description: reservation lifecycle
+        default: CONFIRMED
+        constraints: one of {CONFIRMED, WAITLISTED, CANCELLED}
+      - name: waitlist_score
+        type: integer
+        source: computed
+        description: priority score used to order WAITLISTED reservations for promotion when a seat frees; 0 for CONFIRMED rows
+        default: 0
+  # ---------------------------------------------------------------------------
+  - name: WaitlistEntry
+    parent: Convention
+    common_fields: true
+    fields:
+      - name: convention_id
+        type: string
+        source: input
+        description: FK -> Convention.id; the convention this lottery entry competes in
+      - name: attendee_id
+        type: string
+        source: input
+        description: FK -> Attendee.id; the attendee entering the lottery
+      - name: requested_quantity
+        type: integer
+        source: input
+        description: number of badges requested in the lottery
+        constraints: integer >= 1
+      - name: group_size
+        type: integer
+        source: input
+        description: declared group size feeding the group_size_factor in the priority score
+        constraints: integer >= 1
+      - name: priority_score
+        type: integer
+        source: computed
+        description: loyalty_points + early_bird_bonus + group_size_factor; pinned at creation
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: lottery entry state
+        default: ENTERED
+        constraints: one of {ENTERED, WON, LOST}
+  # ---------------------------------------------------------------------------
+  - name: Exhibitor
+    parent: null
+    common_fields: true
+    fields:
+      - name: convention_id
+        type: string
+        source: input
+        description: FK -> Convention.id; the convention this exhibitor exhibits at
+      - name: company_name
+        type: string
+        source: input
+        description: exhibitor/vendor company name
+      - name: contact_email
+        type: string
+        source: input
+        description: unique exhibitor contact email (case-insensitive), used as login identity
+        constraints: unique across all Exhibitor rows, case-insensitive
+      - name: estimated_booth_cents
+        type: integer
+        source: computed
+        description: forward-looking total booth charge assuming every BoothBooking is occupied for its full requested_days; recomputed on each booth booking create/cancel
+        default: 0
+      - name: actual_booth_cents
+        type: integer
+        source: computed
+        description: chronological total booth charge over BoothBookings that were checked in, billing only occupied_days; recomputed on each booth check-in
+        default: 0
+  # ---------------------------------------------------------------------------
+  - name: Booth
+    parent: Convention
+    common_fields: true
+    fields:
+      - name: convention_id
+        type: string
+        source: input
+        description: FK -> Convention.id; the convention this booth is on the floor of
+      - name: booth_code
+        type: string
+        source: input
+        description: floor identifier unique within the convention
+        constraints: unique per convention_id
+      - name: zone
+        type: enum
+        source: input
+        description: booth zone determining the daily rate
+        constraints: one of {STANDARD, PREMIUM, ENDCAP}
+      - name: setup_buffer_hours
+        type: integer
+        source: input
+        description: physical setup/teardown buffer applied symmetrically around each booking interval for overlap detection
+        default: 12
+        constraints: integer >= 0
+  # ---------------------------------------------------------------------------
+  - name: BoothBooking
+    parent: null
+    common_fields: true
+    fields:
+      - name: booth_id
+        type: string
+        source: input
+        description: FK -> Booth.id; the booth being occupied
+      - name: exhibitor_id
+        type: string
+        source: input
+        description: FK -> Exhibitor.id; the exhibitor occupying the booth
+      - name: occupy_start_utc
+        type: datetime
+        source: input
+        description: requested booth occupancy start, ISO 8601 UTC; closed interval [occupy_start_utc, occupy_end_utc], buffer-expanded for overlap detection
+      - name: occupy_end_utc
+        type: datetime
+        source: input
+        description: requested booth occupancy end, ISO 8601 UTC, inclusive
+        constraints: must be strictly after occupy_start_utc
+      - name: requested_days
+        type: integer
+        source: input
+        description: number of days requested; multiplies the zone daily rate for the estimated charge
+        constraints: integer >= 1
+      - name: occupied_days
+        type: integer
+        source: computed
+        description: days actually billed; set to requested_days on check-in, 0 until then
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: booth booking lifecycle
+        default: RESERVED
+        constraints: one of {RESERVED, CHECKED_IN, RELEASED}
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---------------------------------------------------------------------------
+  - entity: Order
+    initial_state: DRAFT
+    terminal_states: [REFUNDED]
+    transitions:
+      - from: DRAFT
+        to: PENDING_PAYMENT
+        trigger: "POST /orders/{id}/submit"
+        actor: Attendee
+        preconditions:
+          - "order has at least one TicketLineItem"
+          - "Convention.posture == OPEN"
+          - "for every line: ticket_type.tier_issued_count + (badges already pending across DRAFT/PENDING_PAYMENT orders is NOT counted) — capacity checked at payment, not submit"
+        side_effects:
+          - "recompute group_discount tier, line_discounted_cents per line, ticket_subtotal_cents, processing_fee_cents, total_cents (calc: order_pricing)"
+          - "set is_group = (total badge qty >= GROUP_MIN_QTY)"
+          - "increments Order.version by 1"
+      - from: PENDING_PAYMENT
+        to: PAID
+        trigger: "POST /orders/{id}/pay"
+        actor: Attendee
+        preconditions:
+          - "Convention.posture == OPEN"
+          - "for every line: ticket_type.tier_issued_count + line.quantity <= ticket_type.tier_capacity"
+          - "Convention.badges_issued_count + (sum of line quantities) <= Convention.total_badge_capacity"
+          - "request carries expected_convention_version equal to current Convention.version"
+        side_effects:
+          - "set amount_paid_cents = total_cents"
+          - "issue one Badge per badge unit (status=ISSUED, rfid_status=UNASSIGNED, holder=purchaser) — cascade A hop 1"
+          - "increment TicketType.tier_issued_count and Convention.badges_issued_count by the issued count (calc: capacity_counters) — cascade A hop 2"
+          - "if Convention.badges_issued_count == Convention.total_badge_capacity then set Convention.posture = SOLD_OUT — cascade A hop 3"
+          - "increments Convention.version by 1"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /orders/{id}/cancel"
+        actor: Attendee
+        preconditions:
+          - "order.status == DRAFT"
+        side_effects:
+          - "set refund_amount_cents = 0 (nothing was paid)"
+          - "increments Order.version by 1"
+      - from: PENDING_PAYMENT
+        to: CANCELLED
+        trigger: "POST /orders/{id}/cancel"
+        actor: Attendee
+        preconditions:
+          - "order.status == PENDING_PAYMENT"
+        side_effects:
+          - "set refund_amount_cents = 0 (nothing was captured)"
+          - "increments Order.version by 1"
+      - from: PAID
+        to: REFUNDED
+        trigger: "POST /orders/{id}/refund"
+        actor: RegistrationAgent
+        preconditions:
+          - "order.status == PAID"
+          - "current clock is strictly before Convention.event_end_utc"
+        side_effects:
+          - "compute refund_amount_cents = final refund (calc: order_refund, FINAL variant) using penalty tier at the current clock"
+          - "void every non-VOID Badge of this order (status=VOID, rfid_status=DEACTIVATED) — cascade B hop 1"
+          - "for each voided badge, cancel its CONFIRMED/WAITLISTED SessionReservations (status=CANCELLED) — cascade B hop 2"
+          - "for each freed CONFIRMED seat, promote the highest waitlist_score WAITLISTED reservation on that session to CONFIRMED and recompute Session.seats_taken — cascade B hop 3"
+          - "decrement TicketType.tier_issued_count and Convention.badges_issued_count by voided count (calc: capacity_counters)"
+          - "if Convention.posture == SOLD_OUT and badges_issued_count < total_badge_capacity then set posture = OPEN"
+          - "increments Convention.version by 1"
+  # ---------------------------------------------------------------------------
+  - entity: Badge
+    initial_state: ISSUED
+    terminal_states: [VOID]
+    transitions:
+      - from: ISSUED
+        to: PICKED_UP
+        trigger: "POST /badges/{id}/pickup"
+        actor: RegistrationAgent
+        preconditions:
+          - "badge.status == ISSUED"
+          - "current clock is >= (Convention.event_start_utc - PICKUP_WINDOW_HOURS) — on-site pickup window open"
+        side_effects:
+          - "set rfid_status = ENCODED and assign rfid_uid (parallel RFID dimension advances independently)"
+          - "increments Badge.version by 1"
+      - from: PICKED_UP
+        to: PRINTED
+        trigger: "POST /badges/{id}/print"
+        actor: RegistrationAgent
+        preconditions:
+          - "badge.status == PICKED_UP"
+          - "badge.rfid_status == ENCODED"
+        side_effects:
+          - "increments Badge.version by 1"
+        note: "status (ISSUED->PICKED_UP->PRINTED) and rfid_status (UNASSIGNED->ENCODED->DEACTIVATED) are parallel dimensions on the same Badge row"
+      - from: ISSUED
+        to: VOID
+        trigger: "system: order refund/cancel cascade, or POST /badges/{id}/void"
+        actor: RegistrationAgent | system
+        preconditions:
+          - "badge.status IN {ISSUED, PICKED_UP, PRINTED}"
+        side_effects:
+          - "set rfid_status = DEACTIVATED"
+          - "cancel this badge's CONFIRMED/WAITLISTED SessionReservations (cross-entity) — promotes waitlist on freed sessions"
+          - "decrement TicketType.tier_issued_count and Convention.badges_issued_count"
+          - "increments Badge.version by 1"
+      - from: PICKED_UP
+        to: VOID
+        trigger: "POST /badges/{id}/void"
+        actor: RegistrationAgent | system
+        preconditions:
+          - "badge.status IN {ISSUED, PICKED_UP, PRINTED}"
+        side_effects:
+          - "set rfid_status = DEACTIVATED"
+          - "cancel this badge's reservations and promote waitlist"
+          - "decrement capacity counters"
+          - "increments Badge.version by 1"
+      - from: PRINTED
+        to: VOID
+        trigger: "POST /badges/{id}/void"
+        actor: RegistrationAgent | system
+        preconditions:
+          - "badge.status IN {ISSUED, PICKED_UP, PRINTED}"
+        side_effects:
+          - "set rfid_status = DEACTIVATED"
+          - "cancel this badge's reservations and promote waitlist"
+          - "decrement capacity counters"
+          - "increments Badge.version by 1"
+    note: "transfer (POST /badges/{id}/transfer) changes holder_attendee_id and increments transfer_count without changing status; allowed only while status IN {ISSUED} and transfer_count < MAX_TRANSFERS"
+  # ---------------------------------------------------------------------------
+  - entity: SessionReservation
+    initial_state: CONFIRMED
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /session-reservations/{id}/cancel"
+        actor: Attendee | system
+        preconditions:
+          - "reservation.status == CONFIRMED"
+        side_effects:
+          - "decrement Session.seats_taken by 1"
+          - "promote the highest-waitlist_score WAITLISTED reservation on the same session to CONFIRMED (tie-break created_at ASC), recompute Session.seats_taken — cascade C hop 2"
+          - "increments SessionReservation.version by 1"
+      - from: WAITLISTED
+        to: CONFIRMED
+        trigger: "system: promotion when a CONFIRMED seat frees on the session"
+        actor: system
+        preconditions:
+          - "reservation.status == WAITLISTED"
+          - "Session.seats_taken < Session.seat_capacity"
+        side_effects:
+          - "increment Session.seats_taken by 1"
+          - "set waitlist_score = 0"
+          - "increments SessionReservation.version by 1"
+      - from: WAITLISTED
+        to: CANCELLED
+        trigger: "POST /session-reservations/{id}/cancel"
+        actor: Attendee | system
+        preconditions:
+          - "reservation.status == WAITLISTED"
+        side_effects:
+          - "increments SessionReservation.version by 1"
+    note: "a reservation is created CONFIRMED when Session.seats_taken < seat_capacity at create time, else WAITLISTED (calc: waitlist_priority sets waitlist_score)"
+  # ---------------------------------------------------------------------------
+  - entity: WaitlistEntry
+    initial_state: ENTERED
+    terminal_states: [WON, LOST]
+    transitions:
+      - from: ENTERED
+        to: WON
+        trigger: "POST /conventions/{id}/run-lottery (system batch)"
+        actor: ConventionAdmin
+        preconditions:
+          - "entry.status == ENTERED"
+          - "entry was selected in the deterministic allocation (priority_score DESC, created_at ASC) within remaining convention capacity"
+        side_effects:
+          - "increments WaitlistEntry.version by 1"
+        note: "winning grants the attendee eligibility to create a paid order; it does NOT itself issue badges"
+      - from: ENTERED
+        to: LOST
+        trigger: "POST /conventions/{id}/run-lottery (system batch)"
+        actor: ConventionAdmin
+        preconditions:
+          - "entry.status == ENTERED"
+          - "entry was NOT selected (rank beyond remaining capacity)"
+        side_effects:
+          - "increments WaitlistEntry.version by 1"
+  # ---------------------------------------------------------------------------
+  - entity: BoothBooking
+    initial_state: RESERVED
+    terminal_states: [RELEASED]
+    transitions:
+      - from: RESERVED
+        to: CHECKED_IN
+        trigger: "POST /booth-bookings/{id}/check-in"
+        actor: Exhibitor | RegistrationAgent
+        preconditions:
+          - "booking.status == RESERVED"
+          - "current clock is >= (Convention.event_start_utc - PICKUP_WINDOW_HOURS)"
+        side_effects:
+          - "set occupied_days = requested_days"
+          - "recompute Exhibitor.actual_booth_cents (calc: booth_charge, ACTUAL variant) — cross-entity"
+          - "increments BoothBooking.version by 1"
+      - from: RESERVED
+        to: RELEASED
+        trigger: "POST /booth-bookings/{id}/release"
+        actor: Exhibitor | RegistrationAgent
+        preconditions:
+          - "booking.status == RESERVED"
+        side_effects:
+          - "recompute Exhibitor.estimated_booth_cents excluding this booking (calc: booth_charge, ESTIMATED variant) — cross-entity"
+          - "free the booth interval so a later booking no longer overlaps"
+          - "increments BoothBooking.version by 1"
+      - from: CHECKED_IN
+        to: RELEASED
+        trigger: "POST /booth-bookings/{id}/release"
+        actor: Exhibitor | RegistrationAgent
+        preconditions:
+          - "booking.status == CHECKED_IN"
+        side_effects:
+          - "recompute Exhibitor.estimated_booth_cents excluding this booking; actual_booth_cents retains billed occupied_days"
+          - "increments BoothBooking.version by 1"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version)
+# =============================================================================
+concurrency_rules:
+  - rule_id: order-pay-stale-convention
+    parent_entity: Convention
+    write_endpoint: "POST /orders/{id}/pay"
+    occ_field: "expected_convention_version"
+    description: |
+      Paying an order issues badges that consume Convention badge capacity and may flip
+      the convention posture to SOLD_OUT (which advances Convention.version). Paying against
+      a Convention whose version has advanced since the client last observed it is rejected:
+      the client's view of remaining capacity / posture is stale. A second pay carrying a
+      version that another successful pay already superseded is rejected with 412.
+    error_id: ERR_STALE_CONVENTION_VERSION
+    http_status: 412
+  - rule_id: reservation-create-stale-session
+    parent_entity: Session
+    write_endpoint: "POST /session-reservations"
+    occ_field: "expected_session_version"
+    description: |
+      Creating a SessionReservation consumes a seat and advances Session.version (seats_taken
+      change). Creating a reservation against a Session whose version has advanced since the
+      client last read it is rejected: the client's view of available seats is stale, and the
+      seat it expected to claim CONFIRMED may already be gone. The stale request is rejected
+      with 412 rather than silently landing on the waitlist.
+    error_id: ERR_STALE_SESSION_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  # --- order pricing: combinatorial mode (a) AND mode (b) host ---
+  - name: order_pricing
+    trigger: "on POST /orders/{id}/submit (DRAFT->PENDING_PAYMENT)"
+    algorithm: tiered_pricing
+    formula: |
+      total_badge_qty = sum(line.quantity for line in order.line_items)
+      group_discount_pct =
+        0.150 if total_badge_qty >= 50
+        else 0.125 if total_badge_qty >= 25
+        else 0.100 if total_badge_qty >= 10
+        else 0.050 if total_badge_qty >= 5
+        else 0.000
+      # PINNED ROUNDING ORDER: round per-line, THEN sum (NOT sum-then-round)
+      for line in order.line_items:
+        line.line_base_cents = ticket_type(line).base_price_cents * line.quantity
+        line.line_discounted_cents = round_half_up(line.line_base_cents * (1 - group_discount_pct))
+      ticket_subtotal_cents = sum(line.line_discounted_cents for line in order.line_items)
+      processing_fee_cents  = min(round_half_up(ticket_subtotal_cents * FEE_RATE), FEE_CAP_CENTS)
+      total_cents = ticket_subtotal_cents + processing_fee_cents
+      is_group = (total_badge_qty >= GROUP_MIN_QTY)
+    input_set: "all TicketLineItem rows whose order_id == this order; line quantities and the line's ticket_type.base_price_cents"
+    constants:
+      GROUP_MIN_QTY: 5
+      FEE_RATE: 0.03
+      FEE_CAP_CENTS: 5000
+    precision: "integer cents, round_half_up; rounding applied per-line BEFORE summation, then again once on the processing fee"
+    variants:
+      - name: per_line_then_sum
+        when: "always (this is the pinned canonical order)"
+        difference: "rounds each line_discounted_cents individually then sums; differs from a sum-then-round implementation by up to a few cents when the discount produces half-cent fractions on multiple lines"
+  # --- order refund: DUAL-VARIANT on Order domain ---
+  - name: order_refund
+    trigger: "PROVISIONAL on GET /orders/{id}/refund-quote; FINAL on POST /orders/{id}/refund (PAID->REFUNDED)"
+    algorithm: forward_looking
+    formula: |
+      days_before = floor((Convention.event_start_utc - current_clock) / 86400 seconds)
+      penalty_pct =
+        0.00 if days_before > 30
+        else 0.25 if days_before >= 8
+        else 0.50 if days_before >= 1
+        else 1.00            # day-of (days_before <= 0) or after start
+      refund = round_half_up(order.ticket_subtotal_cents * (1 - penalty_pct))
+      # processing_fee_cents is NEVER refunded
+    input_set: "the order's ticket_subtotal_cents; the convention's event_start_utc; the current clock"
+    constants:
+      PENALTY_FREE_DAYS: 30
+      PENALTY_QUARTER_MIN_DAYS: 8
+      PENALTY_HALF_MIN_DAYS: 1
+    precision: "integer cents, round_half_up"
+    variants:
+      - name: provisional
+        when: "computed at GET /orders/{id}/refund-quote request time; written to Order.provisional_refund_cents"
+        difference: "uses the current clock at quote time; a forward-looking estimate that becomes stale as the clock advances toward the event and crosses a penalty-tier boundary"
+      - name: final
+        when: "computed at POST /orders/{id}/refund execution; written to Order.refund_amount_cents"
+        difference: "uses the current clock at execution time; if approval is delayed across a penalty-tier boundary the FINAL refund is strictly less than the earlier PROVISIONAL quote for the same order"
+  # --- booth charge: DUAL-VARIANT on Exhibitor domain ---
+  - name: booth_charge
+    trigger: "ESTIMATED on POST /booth-bookings and on release; ACTUAL on POST /booth-bookings/{id}/check-in"
+    algorithm: aggregation
+    formula: |
+      ZONE_DAILY_RATE = { STANDARD: 50000, PREMIUM: 120000, ENDCAP: 200000 }
+      estimated_booth_cents = sum over BoothBooking b of exhibitor where b.status IN {RESERVED, CHECKED_IN}:
+                                ZONE_DAILY_RATE[booth(b).zone] * b.requested_days
+      actual_booth_cents   = sum over BoothBooking b of exhibitor where b.status == CHECKED_IN:
+                                ZONE_DAILY_RATE[booth(b).zone] * b.occupied_days
+    input_set: "ESTIMATED: bookings in {RESERVED, CHECKED_IN}, billing requested_days. ACTUAL: bookings in {CHECKED_IN} only, billing occupied_days (== requested_days at check-in)."
+    constants:
+      ZONE_RATE_STANDARD: 50000
+      ZONE_RATE_PREMIUM: 120000
+      ZONE_RATE_ENDCAP: 200000
+    precision: "integer cents (rates are whole-cent daily rates; no rounding required)"
+    variants:
+      - name: estimated
+        when: "forward-looking, computed on booking create and on release; assumes every active booking occupies its full requested_days"
+        difference: "includes RESERVED bookings not yet checked in; bills requested_days"
+      - name: actual
+        when: "chronological, computed on check-in; counts only bookings actually checked in"
+        difference: "excludes RESERVED bookings; bills occupied_days; for an exhibitor with RESERVED-but-not-checked-in bookings, actual < estimated"
+  # --- lottery priority: combinatorial weighted scoring (mode a, different metric/entity) ---
+  - name: waitlist_priority
+    trigger: "on POST /conventions/{id}/waitlist (sets WaitlistEntry.priority_score) and on POST /session-reservations (sets SessionReservation.waitlist_score)"
+    algorithm: weighted_scoring
+    formula: |
+      loyalty_points = { NONE: 0, SILVER: 100, GOLD: 200, PLATINUM: 300 }[attendee.loyalty_tier]
+      early_bird_bonus = 50 if (created_at <= Convention.lottery_open_utc + EARLY_WINDOW_HOURS hours)
+                            and (created_at >= Convention.lottery_open_utc)
+                         else 0
+      group_size_factor = min(group_size * GROUP_FACTOR_PER_HEAD, GROUP_FACTOR_CAP)
+      priority_score = loyalty_points + early_bird_bonus + group_size_factor
+    input_set: "the attendee's loyalty_tier; the entry's created_at vs Convention.lottery_open_utc; the entry's group_size (for session reservations, group_size defaults to 1)"
+    constants:
+      EARLY_WINDOW_HOURS: 24
+      GROUP_FACTOR_PER_HEAD: 5
+      GROUP_FACTOR_CAP: 60
+    precision: "integer points"
+  # --- capacity counters reconciliation (derived-field consistency) ---
+  - name: capacity_counters
+    trigger: "on badge issuance (POST /orders/{id}/pay) and on badge void (POST /badges/{id}/void, order refund cascade)"
+    algorithm: aggregation
+    formula: |
+      # recomputed (not incrementally drifted) from the authoritative badge set:
+      Convention.badges_issued_count = count(Badge where order.convention_id == convention.id
+                                             and status IN {ISSUED, PICKED_UP, PRINTED})
+      TicketType.tier_issued_count   = count(Badge where ticket_type_id == ticket_type.id
+                                             and status IN {ISSUED, PICKED_UP, PRINTED})
+    input_set: "all Badge rows for the convention / ticket type whose status IN {ISSUED, PICKED_UP, PRINTED} (VOID excluded)"
+    constants: {}
+    precision: "integer badge counts; recomputed from source on every issuance and void to avoid drift"
+  # --- on-site window constant carrier (named here for §1.2/§1.4 reference) ---
+  - name: onsite_window
+    trigger: "evaluated on POST /badges/{id}/pickup, POST /badges/{id}/print, POST /booth-bookings/{id}/check-in"
+    algorithm: threshold
+    formula: |
+      window_open_utc = Convention.event_start_utc - PICKUP_WINDOW_HOURS hours
+      is_open = (current_clock >= window_open_utc)
+    input_set: "the convention's event_start_utc; the current clock"
+    constants:
+      PICKUP_WINDOW_HOURS: 48
+    precision: "instant comparison; window opens exactly at event_start_utc - 48h (>= is inclusive of the boundary instant)"
+  # --- lottery allocation: waterfall over remaining capacity ---
+  - name: lottery_allocation
+    trigger: "on POST /conventions/{id}/run-lottery"
+    algorithm: waterfall_allocation
+    formula: |
+      remaining = Convention.total_badge_capacity - Convention.badges_issued_count
+      candidates = WaitlistEntry rows where convention_id == this and status == ENTERED
+      sort candidates by priority_score DESC, then created_at ASC   # never id
+      for entry in sorted candidates:
+        if entry.requested_quantity <= remaining:
+          entry.status = WON
+          remaining -= entry.requested_quantity     # all-or-nothing per entry
+        else:
+          entry.status = LOST                       # cannot partially grant
+    input_set: "all ENTERED WaitlistEntry rows for the convention; the convention's remaining capacity"
+    constants: {}
+    precision: "integer badges; all-or-nothing per entry (an entry whose requested_quantity exceeds remaining is LOST, and the waterfall continues to later, smaller entries)"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /attendees and POST /exhibitors (self-registration)"
+  - priority: 2
+    category: auth
+    check: "the role is permitted for this operation per §1.7; entity_backed roles may act only on resources they own"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "every path/body resource id resolves to an existing row, validated left-to-right in the path then body FKs"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all id-bearing endpoints"
+  - priority: 4
+    category: state
+    check: "acting attendee/exhibitor is not BANNED"
+    error_id: ERR_ATTENDEE_BANNED
+    http_status: 403
+    applies_to: "all create/transition endpoints by Attendee or Exhibitor"
+  - priority: 5
+    category: state
+    check: "target resource is in a state from which this transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 6
+    category: business_temporal
+    check: "on badge pickup/print and booth check-in: current clock is within the on-site window (>= event_start_utc - PICKUP_WINDOW_HOURS)"
+    error_id: ERR_PICKUP_WINDOW_CLOSED
+    http_status: 409
+    applies_to: "POST /badges/{id}/pickup, POST /badges/{id}/print, POST /booth-bookings/{id}/check-in"
+  - priority: 7
+    category: business_temporal
+    check: "on order refund: current clock is strictly before Convention.event_end_utc (no refunds after the event closes)"
+    error_id: ERR_REFUND_WINDOW_CLOSED
+    http_status: 409
+    applies_to: "POST /orders/{id}/refund"
+  - priority: 8
+    category: business_constraint
+    check: "session reservation: the badge has no other CONFIRMED reservation whose half-open [start_utc,end_utc) overlaps this session; adjacency (end==start) is allowed"
+    error_id: ERR_SESSION_TIME_CONFLICT
+    http_status: 409
+    applies_to: "POST /session-reservations"
+  - priority: 9
+    category: business_constraint
+    check: "session reservation: if Session.requires_vip is true, the badge's ticket tier must be VIP"
+    error_id: ERR_VIP_REQUIRED
+    http_status: 409
+    applies_to: "POST /session-reservations"
+  - priority: 10
+    category: business_constraint
+    check: "booth booking: the buffer-expanded interval [start - setup_buffer_hours, end + setup_buffer_hours] must not overlap another RESERVED/CHECKED_IN booking's buffer-expanded interval on the same booth (closed-interval overlap)"
+    error_id: ERR_BOOTH_TIME_CONFLICT
+    http_status: 409
+    applies_to: "POST /booth-bookings"
+  - priority: 11
+    category: business_constraint
+    check: "badge transfer: badge.status == ISSUED and transfer_count < MAX_TRANSFERS"
+    error_id: ERR_TRANSFER_LIMIT
+    http_status: 409
+    applies_to: "POST /badges/{id}/transfer"
+  - priority: 12
+    category: business_referential
+    check: "lottery: at most one ENTERED WaitlistEntry per (convention_id, attendee_id)"
+    error_id: ERR_DUPLICATE_WAITLIST
+    http_status: 409
+    applies_to: "POST /conventions/{id}/waitlist"
+  - priority: 13
+    category: business_constraint
+    check: "convention posture allows the operation: paid registration requires posture OPEN; waitlist entry requires posture IN {OPEN, SOLD_OUT}; both blocked when CLOSED"
+    error_id: ERR_POSTURE_BLOCKED
+    http_status: 409
+    applies_to: "POST /orders/{id}/pay, POST /conventions/{id}/waitlist"
+  - priority: 14
+    category: business_fiscal
+    check: "per-tier capacity: ticket_type.tier_issued_count + sum(line.quantity for lines of that tier) <= ticket_type.tier_capacity"
+    error_id: ERR_TIER_SOLD_OUT
+    http_status: 409
+    applies_to: "POST /orders/{id}/pay"
+  - priority: 15
+    category: business_fiscal
+    check: "convention capacity: Convention.badges_issued_count + sum(all line quantities) <= Convention.total_badge_capacity"
+    error_id: ERR_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /orders/{id}/pay"
+  - priority: 16
+    category: business_constraint
+    check: "session seat capacity is informational, not a hard reject: when seats_taken == seat_capacity the reservation is created WAITLISTED rather than rejected (no error)"
+    error_id: ERR_SESSION_FULL
+    http_status: 409
+    applies_to: "POST /session-reservations (only when explicitly requesting CONFIRMED-only via confirmed_only=true)"
+  - priority: 17
+    category: business_constraint
+    check: "OCC: write carries the correct expected_<parent>_version; stale version rejected"
+    error_id: ERR_STALE_CONVENTION_VERSION
+    http_status: 412
+    applies_to: "POST /orders/{id}/pay, POST /session-reservations"
+  - priority: 18
+    category: business_constraint
+    check: "request body well-formed: required fields present, enum values legal, numeric fields in range, end > start"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all create/update endpoints"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Convention ----
+  - method: POST
+    path: "/conventions"
+    description: "create a convention"
+    roles: [ConventionAdmin]
+    code: 201
+    input: [name, event_start_utc, event_end_utc, total_badge_capacity, lottery_open_utc]
+    output: Convention
+    side_effects: ["posture initialized OPEN; badges_issued_count = 0"]
+  - method: GET
+    path: "/conventions/{id}"
+    description: "read a convention (includes computed posture, badges_issued_count)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee, Exhibitor]
+    code: 200
+    input: []
+    output: Convention
+    side_effects: []
+  - method: GET
+    path: "/conventions"
+    description: "list conventions (paginated)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee, Exhibitor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Convention[]
+    side_effects: []
+  - method: POST
+    path: "/conventions/{id}/close"
+    description: "set convention posture to CLOSED (blocks registration and waitlist)"
+    roles: [ConventionAdmin]
+    code: 200
+    input: [expected_convention_version]
+    output: Convention
+    side_effects: ["posture = CLOSED; increments Convention.version by 1"]
+  - method: POST
+    path: "/conventions/{id}/run-lottery"
+    description: "run the deterministic lottery allocation over ENTERED waitlist entries"
+    roles: [ConventionAdmin]
+    code: 200
+    input: [expected_convention_version]
+    output: Convention
+    side_effects: ["calc: lottery_allocation; each entry -> WON or LOST; increments Convention.version by 1"]
+  # ---- TicketType ----
+  - method: POST
+    path: "/conventions/{id}/ticket-types"
+    description: "create a ticket type/tier under a convention"
+    roles: [ConventionAdmin]
+    code: 201
+    input: [tier, base_price_cents, tier_capacity, "is_day_pass?"]
+    output: TicketType
+    side_effects: ["tier_issued_count = 0"]
+  - method: GET
+    path: "/conventions/{id}/ticket-types"
+    description: "list ticket types of a convention (reverse-reachability for TicketType.convention_id)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee, Exhibitor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TicketType[]
+    side_effects: []
+  - method: GET
+    path: "/ticket-types/{id}"
+    description: "read a ticket type"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee, Exhibitor]
+    code: 200
+    input: []
+    output: TicketType
+    side_effects: []
+  # ---- Attendee ----
+  - method: POST
+    path: "/attendees"
+    description: "self-register an attendee"
+    roles: [Anonymous, ConventionAdmin, RegistrationAgent]
+    code: 201
+    input: [email, full_name, "loyalty_tier?"]
+    output: Attendee
+    side_effects: ["status initialized ACTIVE"]
+  - method: GET
+    path: "/attendees/{id}"
+    description: "read an attendee"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: []
+    output: Attendee
+    side_effects: []
+  - method: POST
+    path: "/attendees/{id}/ban"
+    description: "ban an attendee (blocks future create operations)"
+    roles: [ConventionAdmin]
+    code: 200
+    input: [expected_attendee_version]
+    output: Attendee
+    side_effects: ["status = BANNED; increments Attendee.version by 1"]
+  # ---- Order ----
+  - method: POST
+    path: "/orders"
+    description: "create a DRAFT order with one or more ticket line items"
+    roles: [Attendee, RegistrationAgent]
+    code: 201
+    input: [convention_id, purchaser_attendee_id, line_items]
+    output: Order
+    side_effects: ["create TicketLineItem rows; status = DRAFT; pricing fields 0 until submit"]
+  - method: GET
+    path: "/orders/{id}"
+    description: "read an order (computed pricing, refund fields)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+  - method: GET
+    path: "/orders"
+    description: "list orders, filterable by purchaser_attendee_id or convention_id (reverse-reachability for Order FKs)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: ["purchaser_attendee_id?", "convention_id?", "limit?", "offset?"]
+    output: Order[]
+    side_effects: []
+  - method: GET
+    path: "/orders/{id}/line-items"
+    description: "list an order's line items (reverse-reachability for TicketLineItem.order_id)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TicketLineItem[]
+    side_effects: []
+  - method: GET
+    path: "/ticket-line-items"
+    description: "list line items, filterable by order_id or ticket_type_id (reverse-reachability for TicketLineItem.ticket_type_id)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: ["order_id?", "ticket_type_id?", "limit?", "offset?"]
+    output: TicketLineItem[]
+    side_effects: []
+  - method: GET
+    path: "/ticket-line-items/{id}"
+    description: "read a single ticket line item"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: []
+    output: TicketLineItem
+    side_effects: []
+  - method: POST
+    path: "/orders/{id}/submit"
+    description: "submit a DRAFT order for payment (prices it)"
+    roles: [Attendee, RegistrationAgent]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["calc: order_pricing; DRAFT -> PENDING_PAYMENT; increments Order.version by 1"]
+  - method: POST
+    path: "/orders/{id}/pay"
+    description: "pay a PENDING_PAYMENT order, issuing badges and consuming capacity"
+    roles: [Attendee, RegistrationAgent]
+    code: 200
+    input: [expected_convention_version]
+    output: Order
+    side_effects: ["PENDING_PAYMENT -> PAID; issue badges (cascade A); increment counters; maybe posture SOLD_OUT; increments Convention.version by 1"]
+  - method: GET
+    path: "/orders/{id}/refund-quote"
+    description: "compute and return the PROVISIONAL refund estimate at the current clock"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["calc: order_refund PROVISIONAL variant -> Order.provisional_refund_cents"]
+  - method: POST
+    path: "/orders/{id}/cancel"
+    description: "cancel a DRAFT or PENDING_PAYMENT order (no refund)"
+    roles: [Attendee, RegistrationAgent]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["-> CANCELLED; refund_amount_cents = 0; increments Order.version by 1"]
+  - method: POST
+    path: "/orders/{id}/refund"
+    description: "refund a PAID order, voiding badges and computing the final refund"
+    roles: [RegistrationAgent, ConventionAdmin]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["calc: order_refund FINAL; PAID -> REFUNDED; cascade B (void badges -> cancel reservations -> promote waitlist); decrement counters; maybe posture OPEN; increments Convention.version by 1"]
+  # ---- Badge ----
+  - method: GET
+    path: "/badges/{id}"
+    description: "read a badge (status + rfid_status parallel dimensions)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: []
+    output: Badge
+    side_effects: []
+  - method: GET
+    path: "/badges"
+    description: "list badges, filterable by order_id, ticket_type_id, or holder_attendee_id (reverse-reachability for Badge FKs)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: ["order_id?", "ticket_type_id?", "holder_attendee_id?", "limit?", "offset?"]
+    output: Badge[]
+    side_effects: []
+  - method: POST
+    path: "/badges/{id}/pickup"
+    description: "on-site pickup: encode RFID and advance status to PICKED_UP"
+    roles: [RegistrationAgent]
+    code: 200
+    input: []
+    output: Badge
+    side_effects: ["ISSUED -> PICKED_UP; rfid_status -> ENCODED; assign rfid_uid; increments Badge.version by 1"]
+  - method: POST
+    path: "/badges/{id}/print"
+    description: "print a picked-up badge"
+    roles: [RegistrationAgent]
+    code: 200
+    input: []
+    output: Badge
+    side_effects: ["PICKED_UP -> PRINTED; increments Badge.version by 1"]
+  - method: POST
+    path: "/badges/{id}/transfer"
+    description: "transfer a badge to a new holder"
+    roles: [Attendee, RegistrationAgent]
+    code: 200
+    input: [new_holder_attendee_id]
+    output: Badge
+    side_effects: ["holder_attendee_id updated; transfer_count += 1; increments Badge.version by 1"]
+  - method: POST
+    path: "/badges/{id}/void"
+    description: "void a badge (deactivate RFID, cancel reservations, promote waitlist, decrement counters)"
+    roles: [RegistrationAgent, ConventionAdmin]
+    code: 200
+    input: []
+    output: Badge
+    side_effects: ["status -> VOID; rfid_status -> DEACTIVATED; cancel reservations; promote waitlist; decrement counters; increments Badge.version by 1"]
+  # ---- Session ----
+  - method: POST
+    path: "/conventions/{id}/sessions"
+    description: "create a session/panel under a convention"
+    roles: [ConventionAdmin]
+    code: 201
+    input: [title, start_utc, end_utc, seat_capacity, "requires_vip?"]
+    output: Session
+    side_effects: ["seats_taken = 0"]
+  - method: GET
+    path: "/conventions/{id}/sessions"
+    description: "list a convention's sessions (reverse-reachability for Session.convention_id)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Session[]
+    side_effects: []
+  - method: GET
+    path: "/sessions/{id}"
+    description: "read a session (computed seats_taken)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: []
+    output: Session
+    side_effects: []
+  # ---- SessionReservation ----
+  - method: POST
+    path: "/session-reservations"
+    description: "reserve a session seat for a badge (CONFIRMED if seats free, else WAITLISTED unless confirmed_only)"
+    roles: [Attendee, RegistrationAgent]
+    code: 201
+    input: [session_id, badge_id, expected_session_version, "confirmed_only?"]
+    output: SessionReservation
+    side_effects: ["calc: waitlist_priority; CONFIRMED or WAITLISTED; if CONFIRMED increment Session.seats_taken; increments Session.version by 1"]
+  - method: GET
+    path: "/session-reservations/{id}"
+    description: "read a reservation"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: []
+    output: SessionReservation
+    side_effects: []
+  - method: GET
+    path: "/session-reservations"
+    description: "list reservations, filterable by session_id or badge_id (reverse-reachability for SessionReservation FKs)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: ["session_id?", "badge_id?", "limit?", "offset?"]
+    output: SessionReservation[]
+    side_effects: []
+  - method: POST
+    path: "/session-reservations/{id}/cancel"
+    description: "cancel a reservation; frees a seat and promotes the top waitlisted reservation"
+    roles: [Attendee, RegistrationAgent]
+    code: 200
+    input: []
+    output: SessionReservation
+    side_effects: ["-> CANCELLED; decrement seats_taken; promote waitlist (cascade C); increments SessionReservation.version by 1"]
+  # ---- WaitlistEntry ----
+  - method: POST
+    path: "/conventions/{id}/waitlist"
+    description: "enter the convention lottery"
+    roles: [Attendee, RegistrationAgent]
+    code: 201
+    input: [attendee_id, requested_quantity, group_size]
+    output: WaitlistEntry
+    side_effects: ["calc: waitlist_priority -> priority_score; status = ENTERED"]
+  - method: GET
+    path: "/conventions/{id}/waitlist"
+    description: "list a convention's waitlist entries (reverse-reachability for WaitlistEntry.convention_id)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: ["attendee_id?", "limit?", "offset?"]
+    output: WaitlistEntry[]
+    side_effects: []
+  - method: GET
+    path: "/waitlist-entries"
+    description: "list waitlist entries, filterable by attendee_id or convention_id (reverse-reachability for WaitlistEntry.attendee_id)"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: ["attendee_id?", "convention_id?", "limit?", "offset?"]
+    output: WaitlistEntry[]
+    side_effects: []
+  - method: GET
+    path: "/waitlist-entries/{id}"
+    description: "read a waitlist entry"
+    roles: [ConventionAdmin, RegistrationAgent, Attendee]
+    code: 200
+    input: []
+    output: WaitlistEntry
+    side_effects: []
+  # ---- Exhibitor ----
+  - method: POST
+    path: "/exhibitors"
+    description: "self-register an exhibitor"
+    roles: [Anonymous, ConventionAdmin]
+    code: 201
+    input: [convention_id, company_name, contact_email]
+    output: Exhibitor
+    side_effects: ["estimated_booth_cents = 0; actual_booth_cents = 0"]
+  - method: GET
+    path: "/exhibitors/{id}"
+    description: "read an exhibitor (computed booth charges)"
+    roles: [ConventionAdmin, RegistrationAgent, Exhibitor]
+    code: 200
+    input: []
+    output: Exhibitor
+    side_effects: []
+  - method: GET
+    path: "/exhibitors"
+    description: "list exhibitors, filterable by convention_id (reverse-reachability for Exhibitor.convention_id)"
+    roles: [ConventionAdmin, RegistrationAgent, Exhibitor]
+    code: 200
+    input: ["convention_id?", "limit?", "offset?"]
+    output: Exhibitor[]
+    side_effects: []
+  # ---- Booth ----
+  - method: POST
+    path: "/conventions/{id}/booths"
+    description: "create a booth on the convention floor"
+    roles: [ConventionAdmin]
+    code: 201
+    input: [booth_code, zone, "setup_buffer_hours?"]
+    output: Booth
+    side_effects: []
+  - method: GET
+    path: "/conventions/{id}/booths"
+    description: "list a convention's booths (reverse-reachability for Booth.convention_id)"
+    roles: [ConventionAdmin, RegistrationAgent, Exhibitor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Booth[]
+    side_effects: []
+  - method: GET
+    path: "/booths/{id}"
+    description: "read a booth"
+    roles: [ConventionAdmin, RegistrationAgent, Exhibitor]
+    code: 200
+    input: []
+    output: Booth
+    side_effects: []
+  # ---- BoothBooking ----
+  - method: POST
+    path: "/booth-bookings"
+    description: "book a booth for an exhibitor over an occupancy interval"
+    roles: [Exhibitor, ConventionAdmin]
+    code: 201
+    input: [booth_id, exhibitor_id, occupy_start_utc, occupy_end_utc, requested_days]
+    output: BoothBooking
+    side_effects: ["calc: booth_charge ESTIMATED -> Exhibitor.estimated_booth_cents; status = RESERVED"]
+  - method: GET
+    path: "/booth-bookings/{id}"
+    description: "read a booth booking"
+    roles: [ConventionAdmin, RegistrationAgent, Exhibitor]
+    code: 200
+    input: []
+    output: BoothBooking
+    side_effects: []
+  - method: GET
+    path: "/booth-bookings"
+    description: "list booth bookings, filterable by booth_id or exhibitor_id (reverse-reachability for BoothBooking FKs)"
+    roles: [ConventionAdmin, RegistrationAgent, Exhibitor]
+    code: 200
+    input: ["booth_id?", "exhibitor_id?", "limit?", "offset?"]
+    output: BoothBooking[]
+    side_effects: []
+  - method: POST
+    path: "/booth-bookings/{id}/check-in"
+    description: "check in a reserved booth booking (bills actual occupancy)"
+    roles: [Exhibitor, RegistrationAgent]
+    code: 200
+    input: []
+    output: BoothBooking
+    side_effects: ["RESERVED -> CHECKED_IN; set occupied_days; calc: booth_charge ACTUAL; increments BoothBooking.version by 1"]
+  - method: POST
+    path: "/booth-bookings/{id}/release"
+    description: "release a booth booking, freeing the interval"
+    roles: [Exhibitor, RegistrationAgent]
+    code: 200
+    input: []
+    output: BoothBooking
+    side_effects: ["-> RELEASED; recompute Exhibitor.estimated_booth_cents; free interval; increments BoothBooking.version by 1"]
+  # ---- test-driving clock endpoint (/_ namespace) ----
+  - method: POST
+    path: "/_clock/set"
+    description: "test-driving endpoint: set the server's current UTC clock to a fixed instant"
+    roles: [ConventionAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server clock pinned to to_iso8601 for all subsequent time-dependent reads"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/invalid X-User-Role or X-User-ID on an endpoint that requires auth"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "role not permitted for the operation, or entity_backed actor acting on a resource it does not own"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced resource id (path or body FK) does not resolve"
+  - id: ERR_ATTENDEE_BANNED
+    http: 403
+    condition: "acting attendee/exhibitor has status BANNED"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "transition not defined from the resource's current state"
+  - id: ERR_PICKUP_WINDOW_CLOSED
+    http: 409
+    condition: "badge pickup/print or booth check-in attempted before the on-site window opens"
+  - id: ERR_REFUND_WINDOW_CLOSED
+    http: 409
+    condition: "order refund attempted at or after Convention.event_end_utc"
+  - id: ERR_SESSION_TIME_CONFLICT
+    http: 409
+    condition: "the badge already holds a CONFIRMED reservation whose [start,end) overlaps the requested session"
+  - id: ERR_VIP_REQUIRED
+    http: 409
+    condition: "session requires_vip but the badge tier is not VIP"
+  - id: ERR_BOOTH_TIME_CONFLICT
+    http: 409
+    condition: "buffer-expanded booking interval overlaps an existing RESERVED/CHECKED_IN booking on the same booth"
+  - id: ERR_TRANSFER_LIMIT
+    http: 409
+    condition: "badge not ISSUED, or transfer_count already at MAX_TRANSFERS"
+  - id: ERR_DUPLICATE_WAITLIST
+    http: 409
+    condition: "an ENTERED WaitlistEntry already exists for this (convention, attendee)"
+  - id: ERR_POSTURE_BLOCKED
+    http: 409
+    condition: "operation blocked by convention posture (pay requires OPEN; waitlist requires OPEN or SOLD_OUT)"
+  - id: ERR_TIER_SOLD_OUT
+    http: 409
+    condition: "paying would exceed the ticket type's tier_capacity"
+  - id: ERR_CAPACITY_EXCEEDED
+    http: 409
+    condition: "paying would exceed Convention.total_badge_capacity"
+  - id: ERR_SESSION_FULL
+    http: 409
+    condition: "confirmed_only=true requested but the session has no free seat"
+  - id: ERR_STALE_CONVENTION_VERSION
+    http: 412
+    condition: "expected_convention_version does not match the current Convention.version"
+  - id: ERR_STALE_SESSION_VERSION
+    http: 412
+    condition: "expected_session_version does not match the current Session.version"
+  - id: ERR_STALE_ATTENDEE_VERSION
+    http: 412
+    condition: "expected_attendee_version does not match the current Attendee.version"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "malformed body: missing required field, illegal enum, out-of-range number, or end <= start"
+  - id: ERR_DUPLICATE_EMAIL
+    http: 409
+    condition: "attendee email or exhibitor contact_email already exists (case-insensitive)"
+  - id: ERR_DUPLICATE_BOOTH_CODE
+    http: 409
+    condition: "booth_code already exists within the convention"
+  - id: ERR_EMPTY_ORDER
+    http: 422
+    condition: "order create with zero line items, or submit on an order with zero line items"
+  - id: ERR_LOTTERY_NOT_WON
+    http: 409
+    condition: "attendee tries to create a paid order under SOLD_OUT posture without a WON WaitlistEntry"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: ConventionAdmin
+    description: "operator who configures conventions, ticket types, sessions, booths, runs the lottery, and closes registration"
+    identity: opaque
+    exclusive_operations:
+      - "POST /conventions"
+      - "POST /conventions/{id}/close"
+      - "POST /conventions/{id}/run-lottery"
+      - "POST /conventions/{id}/ticket-types"
+      - "POST /conventions/{id}/sessions"
+      - "POST /conventions/{id}/booths"
+      - "POST /attendees/{id}/ban"
+      - "POST /_clock/set"
+    shared_operations:
+      - "POST /orders/{id}/refund"
+      - "POST /badges/{id}/void"
+      - "all GET reads"
+  - name: RegistrationAgent
+    description: "on-site staff who pick up/print/void badges, process refunds, and may act on behalf of attendees/exhibitors at the desk"
+    identity: opaque
+    exclusive_operations:
+      - "POST /badges/{id}/pickup"
+      - "POST /badges/{id}/print"
+    shared_operations:
+      - "POST /orders (on behalf of attendee)"
+      - "POST /orders/{id}/submit"
+      - "POST /orders/{id}/pay"
+      - "POST /orders/{id}/cancel"
+      - "POST /orders/{id}/refund"
+      - "POST /badges/{id}/transfer"
+      - "POST /badges/{id}/void"
+      - "POST /session-reservations"
+      - "POST /session-reservations/{id}/cancel"
+      - "POST /conventions/{id}/waitlist"
+      - "POST /booth-bookings"
+      - "POST /booth-bookings/{id}/check-in"
+      - "POST /booth-bookings/{id}/release"
+      - "all GET reads"
+  - name: Attendee
+    description: "registered person who buys orders, holds/transfers badges, reserves sessions, and enters the lottery; acts only on resources they own"
+    identity: "entity_backed:Attendee"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /orders (own)"
+      - "POST /orders/{id}/submit (own)"
+      - "POST /orders/{id}/pay (own)"
+      - "POST /orders/{id}/cancel (own)"
+      - "POST /badges/{id}/transfer (own)"
+      - "POST /session-reservations (own badge)"
+      - "POST /session-reservations/{id}/cancel (own)"
+      - "POST /conventions/{id}/waitlist (own)"
+      - "GET reads of own orders/badges/reservations and public convention/session data"
+  - name: Exhibitor
+    description: "vendor who books and manages booths; acts only on its own bookings"
+    identity: "entity_backed:Exhibitor"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /booth-bookings (own)"
+      - "POST /booth-bookings/{id}/check-in (own)"
+      - "POST /booth-bookings/{id}/release (own)"
+      - "GET reads of own exhibitor/bookings and public convention/booth data"
+  - name: Anonymous
+    description: "unauthenticated caller; may only self-register as an attendee or exhibitor"
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "POST /attendees"
+      - "POST /exhibitors"
