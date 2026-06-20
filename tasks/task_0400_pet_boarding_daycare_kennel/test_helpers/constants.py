@@ -1,0 +1,43 @@
+"""Domain thresholds and pricing tables from the PRD calculation rules (§2.7, §3)."""
+
+# Deposit calculation (§3.5)
+BASE_BY_SERVICE = {"DAYCARE": 1500, "OVERNIGHT": 4000}
+SIZE_MULT = {"TOY": 0.8, "SMALL": 1.0, "MEDIUM": 1.2, "LARGE": 1.5}
+POLICY_FACTOR = {"STANDARD": 0.30, "STRICT": 0.50, "NONE": 0.0}
+
+# Cancellation refund lead-time tiers (§3.8)
+FULL_REFUND_LEAD_DAYS = 7
+PARTIAL_REFUND_LEAD_DAYS = 2
+PARTIAL_RATE = 0.50
+
+# Final bill / reservation_total (§3.8)
+OVERNIGHT_NIGHTLY = {"TOY": 3500, "SMALL": 4000, "MEDIUM": 5000, "LARGE": 6500}
+DAYCARE_DAY = {"TOY": 2500, "SMALL": 3000, "MEDIUM": 3500, "LARGE": 4500}
+ADDON_PRICE_BATH = {"TOY": 1500, "SMALL": 2000, "MEDIUM": 2500, "LARGE": 3500}
+ADDON_PRICE_PLAYTIME = {"TOY": 1000, "SMALL": 1000, "MEDIUM": 1500, "LARGE": 2000}
+TIER1_THRESHOLD = 15000
+TIER1_RATE = 0.05
+TIER2_THRESHOLD = 30000
+TIER2_RATE = 0.10
+
+# Group compatibility scoring (§3.6)
+W_SIZE = 2
+W_TEMP = 3
+SIZE_RANK = {"TOY": 0, "SMALL": 1, "MEDIUM": 2, "LARGE": 3}
+STRICT_MAX = 4
+LENIENT_MAX = 9
+
+# Package tiers (§3.7)
+CREDITS_BY_TIER = {"DAYCARE_10": 10, "DAYCARE_20": 20}
+PACKAGE_CYCLE_DAYS = 30
+
+# Size-class weight boundaries (§3.2)
+SIZE_TOY_MAX = 5      # < 5 kg -> TOY
+SIZE_SMALL_MAX = 15   # 5 .. <15 -> SMALL
+SIZE_MEDIUM_MAX = 30  # 15 .. <30 -> MEDIUM; >=30 -> LARGE
+
+# Facility defaults (§3.1)
+DEFAULT_CURRENT_DATE = "2026-01-01"
+DEFAULT_DAYCARE_CUTOFF_TIME = "19:00"
+DEFAULT_DEPOSIT_POLICY = "STANDARD"
+DEFAULT_OVERBOOK_GRACE = 0

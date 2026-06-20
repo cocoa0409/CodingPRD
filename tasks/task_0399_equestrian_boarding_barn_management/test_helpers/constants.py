@@ -1,0 +1,47 @@
+"""Domain thresholds — numeric constants from the PRD's calculation rules.
+
+Generic NON_EXISTENT_UUID comes from the framework.
+"""
+
+# Waiver validity / expiry (PRD §3.4)
+VALIDITY_DAYS = 365
+
+# Boarding charge (PRD §3.6)
+BILLING_MONTH_DAYS = 30
+
+# Owner standing score (PRD §3.9)
+OVERDUE_UNIT_CENTS = 10000
+POINTS_PER_UNIT = 10
+UNPAID_INVOICE_POINTS = 20
+SUSPEND_SCORE = 80
+BALANCE_COMPONENT_CAP = 60
+PENALTY_COMPONENT_CAP = 40
+STANDING_SCORE_CAP = 100
+
+# Invoice multi-horse discount tiers (PRD §3.9)
+DISCOUNT_TIER_2_PCT = 0.05
+DISCOUNT_TIER_3_PCT = 0.10
+
+# Lesson fee (PRD §3.7)
+NO_SHOW_PCT = 0.50
+CANCEL_CUTOFF_HOURS = 24
+
+# Aggregated for convenience.
+THRESHOLDS = {
+    "VALIDITY_DAYS": VALIDITY_DAYS,
+    "BILLING_MONTH_DAYS": BILLING_MONTH_DAYS,
+    "OVERDUE_UNIT_CENTS": OVERDUE_UNIT_CENTS,
+    "POINTS_PER_UNIT": POINTS_PER_UNIT,
+    "UNPAID_INVOICE_POINTS": UNPAID_INVOICE_POINTS,
+    "SUSPEND_SCORE": SUSPEND_SCORE,
+    "DISCOUNT_TIER_2_PCT": DISCOUNT_TIER_2_PCT,
+    "DISCOUNT_TIER_3_PCT": DISCOUNT_TIER_3_PCT,
+    "NO_SHOW_PCT": NO_SHOW_PCT,
+    "CANCEL_CUTOFF_HOURS": CANCEL_CUTOFF_HOURS,
+}
+
+# Common test default daily rate (a clean 4500 cents used across recipes).
+TEST_DEFAULTS = {
+    "DAILY_RATE_CENTS": 4500,
+    "PASTURE_DAILY_RATE_CENTS": 1000,
+}

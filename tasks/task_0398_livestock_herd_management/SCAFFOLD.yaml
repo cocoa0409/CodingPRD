@@ -1,0 +1,1635 @@
+scenario: "Livestock & Herd Management: animal/lot identification (ear tag/RFID), breeding & calving record, weight/feed & ration, health/vaccination & withdrawal period, movement (pasture/pen), sale/auction & weight ticket, mortality, traceability"
+domain_name: livestock-herd-management
+api_prefix: /
+
+# =============================================================================
+# Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: temporal_windowing
+  complexity_layers:
+    - derived_field_reconciliation
+    - cascading_side_effects
+    - dual_variant_calculation
+    - optimistic_concurrency
+
+  entity_topology: flat
+  # Flat with FK references: Herd / Pasture / DrugProduct / FeedRation are peers;
+  # Animal references Herd + Pasture; events (Weight/Feeding/Health/Movement/
+  # Mortality) and sale objects (SaleLot/WeightTicket) reference Animal/Herd by FK.
+
+  state_machine_shape: parallel
+  # Animal carries two orthogonal dimensions that evolve independently:
+  #   life_status (ACTIVE→...→SOLD/DEAD/CULLED, with a SUSPENDED revert cycle)
+  #   meat_clearance_status (CLEAR↔WITHHELD, a cycle driven by HealthTreatment
+  #   withdrawal periods that can loop back to WITHHELD on each new treatment).
+  # BreedingRecord is cyclic (OPEN→BRED→{CONFIRMED_PREGNANT→CALVED | OPEN}),
+  # SaleLot is branching (OPEN→{SOLD | WITHDRAWN}), HealthTreatment has a
+  # WITHDRAWAL_ACTIVE→CLEARED auto-transition keyed on the clock.
+
+  relationship_patterns:
+    - one_to_many        # Herd has many Animals; Animal has many Weight/Health/Movement records
+    - self_referential   # Animal.dam_animal_id / sire_animal_id reference Animal (pedigree)
+    - cross_aggregate    # WeightTicket references SaleLot AND Animal across aggregates
+
+  role_model: peer_roles
+  # HerdManager owns animals/breeding/movement; Veterinarian owns health/withdrawal;
+  # SaleClerk owns sale lots / weight tickets; FeedlotOperator owns rations/feeding;
+  # Auditor is read-only across the trace surface.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Herd
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: Display name of the herd / operation unit
+        constraints: 1..120 chars, required
+      - name: species
+        type: enum
+        source: input
+        description: Species governs gestation length and weight-unit defaults
+        constraints: "one of {CATTLE, SHEEP, GOAT}"
+      - name: premises_id
+        type: string
+        source: input
+        description: Regulatory premises identifier used in traceability exports
+        constraints: 1..40 chars, required, unique across Herd
+      - name: active_animal_count
+        type: integer
+        source: computed
+        description: Count of Animals in this herd whose life_status IN {ACTIVE, SUSPENDED}. Recomputed on every Animal life_status transition.
+        default: 0
+      - name: total_au_load
+        type: number
+        source: computed
+        description: Sum over Animals with life_status IN {ACTIVE, SUSPENDED} of (latest_weight_kg / AU_KG). Recomputed when an Animal's weight or life_status changes. Three decimals.
+        default: 0
+      - name: mortality_rate_pct
+        type: number
+        source: computed
+        description: Rolling mortality percentage = (count of MortalityRecord in trailing window) / active_animal_count_at_window_start * 100. See calculations.herd_mortality_rate. Two decimals.
+        default: 0
+
+  - name: Pasture
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: Pasture or pen name
+        constraints: 1..80 chars, required
+      - name: kind
+        type: enum
+        source: input
+        description: Whether this is open pasture or a confined pen (affects overlap buffer semantics)
+        constraints: "one of {PASTURE, PEN}"
+      - name: capacity_au
+        type: number
+        source: input
+        description: Maximum aggregate animal-unit (AU) load that may occupy this place at any instant
+        constraints: "> 0"
+      - name: rest_days
+        type: integer
+        source: input
+        description: For PASTURE kind, mandatory grazing rest gap (days) that must separate the end of one occupancy and the start of the next; ignored for PEN
+        default: 0
+        constraints: ">= 0"
+      - name: current_au_load
+        type: number
+        source: computed
+        description: Sum of AU of Animals whose current_pasture_id == this Pasture.id and life_status IN {ACTIVE, SUSPENDED}. Recomputed on movement apply/revert. Three decimals.
+        default: 0
+
+  - name: DrugProduct
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: Trade name of the drug / vaccine
+        constraints: 1..120 chars, required
+      - name: category
+        type: enum
+        source: input
+        description: Drug category; VACCINE products carry no meat withdrawal, ANTIBIOTIC/ANTIPARASITIC do
+        constraints: "one of {VACCINE, ANTIBIOTIC, ANTIPARASITIC, HORMONE}"
+      - name: route_withdrawals
+        type: object
+        source: input
+        description: "Map of administration route -> meat withdrawal days, e.g. {INJECTION_IM: 28, ORAL: 14, TOPICAL_POUR_ON: 48}. Routes absent from the map are not permitted for this product."
+        constraints: "keys subset of {INJECTION_IM, INJECTION_SC, ORAL, TOPICAL_POUR_ON, INTRAMAMMARY}; values >= 0 integers"
+      - name: milk_withdrawal_hours
+        type: integer
+        source: input
+        description: Milk withdrawal in hours (used only for lactating dams); 0 for products with no milk restriction
+        default: 0
+        constraints: ">= 0"
+
+  - name: FeedRation
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: Ration name (e.g. GROWER, FINISHER)
+        constraints: 1..80 chars, required
+      - name: target_dmi_kg
+        type: number
+        source: input
+        description: Target dry-matter intake per head per day, in kg
+        constraints: "> 0"
+      - name: ingredients
+        type: array
+        source: input
+        description: "Ordered list of ingredient objects [{feedstuff, dry_matter_pct, max_inclusion_pct, cost_per_kg_as_fed}]. ORDER IS SIGNIFICANT — the waterfall fills ingredients in declared order; the LAST ingredient is the filler that absorbs the remainder. See calculations.ration_waterfall_allocation."
+        constraints: "length >= 1; each dry_matter_pct in (0,1]; each max_inclusion_pct in (0,1]; cost_per_kg_as_fed >= 0"
+      - name: status
+        type: enum
+        source: computed
+        description: ACTIVE while usable; ARCHIVED once retired. Initialized ACTIVE.
+        default: ACTIVE
+        constraints: "one of {ACTIVE, ARCHIVED}"
+
+  - name: Animal
+    parent: null
+    common_fields: true
+    fields:
+      - name: herd_id
+        type: string
+        source: input
+        description: "FK -> Herd.id"
+      - name: ear_tag
+        type: string
+        source: input
+        description: Visual ear-tag identifier
+        constraints: 1..32 chars, required, unique within (herd_id, ear_tag)
+      - name: rfid
+        type: string
+        source: input
+        description: Electronic RFID/EID number
+        constraints: "optional; when present must be globally unique across all Animals"
+      - name: sex
+        type: enum
+        source: input
+        description: Animal sex; only FEMALE animals may be a breeding dam
+        constraints: "one of {MALE, FEMALE, STEER}"
+      - name: birth_date
+        type: datetime
+        source: input
+        description: Date of birth (ISO 8601 date). Used as the baseline for lifetime ADG and age checks.
+        constraints: "must be <= current clock date"
+      - name: birth_weight_kg
+        type: number
+        source: input
+        description: Recorded weight at birth, baseline for lifetime ADG
+        constraints: "> 0"
+      - name: dam_animal_id
+        type: string
+        source: input
+        description: "FK -> Animal.id; the dam (mother). Self-referential pedigree link. Optional. When set, referenced Animal must have sex == FEMALE."
+      - name: sire_animal_id
+        type: string
+        source: input
+        description: "FK -> Animal.id; the sire (father). Self-referential pedigree link. Optional. When set, referenced Animal must have sex == MALE."
+      - name: current_pasture_id
+        type: string
+        source: computed
+        description: "FK -> Pasture.id; current location, set by the most recently APPLIED MovementRecord. Null until first movement applied."
+      - name: latest_weight_kg
+        type: number
+        source: computed
+        description: Weight from the most recent WeightRecord (by weighed_at, tie-break created_at ASC). Equals birth_weight_kg until a WeightRecord exists. Drives AU load.
+        default: 0
+      - name: lifetime_adg_kg
+        type: number
+        source: computed
+        description: Lifetime average daily gain. See calculations.average_daily_gain variant lifetime. Three decimals.
+        default: 0
+      - name: life_status
+        type: enum
+        source: computed
+        description: "Primary lifecycle dimension. Initialized ACTIVE. one of {ACTIVE, SUSPENDED, SOLD, DEAD, CULLED}."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED, SOLD, DEAD, CULLED}"
+      - name: meat_clearance_status
+        type: enum
+        source: computed
+        description: "Orthogonal residue dimension, evolves independently of life_status. Initialized CLEAR. WITHHELD while any HealthTreatment imposes an unexpired meat withdrawal; returns to CLEAR when the latest clearance date has passed. one of {CLEAR, WITHHELD}."
+        default: CLEAR
+        constraints: "one of {CLEAR, WITHHELD}"
+      - name: meat_clear_on
+        type: datetime
+        source: computed
+        description: "The latest meat withdrawal clearance date across this Animal's HealthTreatments (max over treatments of clearance_date). Null when meat_clearance_status == CLEAR. ISO 8601 date."
+
+  - name: WeightRecord
+    parent: null
+    common_fields: false
+    fields:
+      - name: animal_id
+        type: string
+        source: input
+        description: "FK -> Animal.id"
+      - name: weighed_at
+        type: datetime
+        source: input
+        description: When the animal was weighed (ISO 8601 date). Used to order records chronologically.
+        constraints: "must be > Animal.birth_date and <= current clock date"
+      - name: weight_kg
+        type: number
+        source: input
+        description: Observed live weight
+        constraints: "> 0"
+      - name: source
+        type: enum
+        source: input
+        description: How the weight was obtained
+        default: SCALE
+        constraints: "one of {SCALE, TAPE, ESTIMATE}"
+      - name: interval_adg_kg
+        type: number
+        source: computed
+        description: Average daily gain since the immediately prior WeightRecord for this animal. See calculations.average_daily_gain variant interval. Null for the first record. Three decimals.
+
+  - name: BreedingRecord
+    parent: null
+    common_fields: true
+    fields:
+      - name: dam_animal_id
+        type: string
+        source: input
+        description: "FK -> Animal.id; the female being bred. Must have sex == FEMALE and life_status == ACTIVE."
+      - name: sire_animal_id
+        type: string
+        source: input
+        description: "FK -> Animal.id; the sire used. Optional (AI may have no on-farm sire). When set must have sex == MALE."
+      - name: bred_on
+        type: datetime
+        source: input
+        description: Service/insemination date (ISO 8601 date)
+        constraints: "<= current clock date"
+      - name: expected_calving_on
+        type: datetime
+        source: computed
+        description: bred_on + gestation_days(species). See calculations.expected_calving_date. ISO 8601 date.
+      - name: calved_on
+        type: datetime
+        source: computed
+        description: Actual calving date, set on CALVED transition. Null until calved.
+      - name: calf_animal_id
+        type: string
+        source: computed
+        description: "FK -> Animal.id; the calf Animal created at calving. Null until calved."
+      - name: status
+        type: enum
+        source: computed
+        description: "Cyclic breeding lifecycle. Initialized OPEN. one of {OPEN, BRED, CONFIRMED_PREGNANT, CALVED, FAILED}."
+        default: OPEN
+        constraints: "one of {OPEN, BRED, CONFIRMED_PREGNANT, CALVED, FAILED}"
+
+  - name: HealthTreatment
+    parent: null
+    common_fields: true
+    fields:
+      - name: animal_id
+        type: string
+        source: input
+        description: "FK -> Animal.id; treated animal. Must have life_status IN {ACTIVE, SUSPENDED}."
+      - name: drug_product_id
+        type: string
+        source: input
+        description: "FK -> DrugProduct.id; product administered."
+      - name: route
+        type: enum
+        source: input
+        description: Administration route; must be a key present in the DrugProduct.route_withdrawals map
+        constraints: "one of {INJECTION_IM, INJECTION_SC, ORAL, TOPICAL_POUR_ON, INTRAMAMMARY}"
+      - name: dose_count
+        type: integer
+        source: input
+        description: Number of doses in this treatment course
+        default: 1
+        constraints: ">= 1"
+      - name: first_dose_on
+        type: datetime
+        source: input
+        description: Date of the first dose (ISO 8601 date)
+        constraints: "<= current clock date"
+      - name: last_dose_on
+        type: datetime
+        source: input
+        description: Date of the final dose; clearance counts from this date. Must be >= first_dose_on. For single-dose treatments equals first_dose_on.
+        constraints: ">= first_dose_on and <= current clock date"
+      - name: clearance_date
+        type: datetime
+        source: computed
+        description: last_dose_on + DrugProduct.route_withdrawals[route] days. See calculations.withdrawal_clearance_date. ISO 8601 date.
+      - name: status
+        type: enum
+        source: computed
+        description: "Initialized WITHDRAWAL_ACTIVE when the product has a meat withdrawal > 0; CLEARED immediately when withdrawal == 0. Auto-transitions WITHDRAWAL_ACTIVE->CLEARED once clock date >= clearance_date. one of {WITHDRAWAL_ACTIVE, CLEARED, VOIDED}."
+        default: WITHDRAWAL_ACTIVE
+        constraints: "one of {WITHDRAWAL_ACTIVE, CLEARED, VOIDED}"
+
+  - name: MovementRecord
+    parent: null
+    common_fields: true
+    fields:
+      - name: animal_id
+        type: string
+        source: input
+        description: "FK -> Animal.id; the animal being moved. Must have life_status IN {ACTIVE, SUSPENDED}."
+      - name: to_pasture_id
+        type: string
+        source: input
+        description: "FK -> Pasture.id; destination."
+      - name: from_pasture_id
+        type: string
+        source: computed
+        description: "FK -> Pasture.id; the Animal.current_pasture_id captured at apply time. Null if the animal had no prior location."
+      - name: effective_from
+        type: datetime
+        source: input
+        description: Start of occupancy at destination (ISO 8601 datetime, UTC)
+        constraints: "<= current clock; required"
+      - name: effective_to
+        type: datetime
+        source: input
+        description: "Planned end of occupancy (ISO 8601 datetime, UTC). Half-open interval [effective_from, effective_to). Optional; null means open-ended (occupies indefinitely)."
+        constraints: "when present, must be > effective_from"
+      - name: status
+        type: enum
+        source: computed
+        description: "Initialized PLANNED. one of {PLANNED, APPLIED, REVERTED}."
+        default: PLANNED
+        constraints: "one of {PLANNED, APPLIED, REVERTED}"
+
+  - name: SaleLot
+    parent: null
+    common_fields: true
+    fields:
+      - name: herd_id
+        type: string
+        source: input
+        description: "FK -> Herd.id; the consigning herd."
+      - name: channel
+        type: enum
+        source: input
+        description: Sale channel; AUCTION applies a commission, PRIVATE_TREATY does not
+        constraints: "one of {AUCTION, PRIVATE_TREATY}"
+      - name: pencil_shrink_pct
+        type: number
+        source: input
+        description: Pencil shrink applied to gross weight before pricing (a fraction)
+        default: 0
+        constraints: "0 <= x <= 0.10"
+      - name: commission_pct
+        type: number
+        source: input
+        description: Sale-yard commission as a fraction of gross sale amount; must be 0 when channel == PRIVATE_TREATY
+        default: 0
+        constraints: "0 <= x <= 0.20"
+      - name: head_count
+        type: integer
+        source: computed
+        description: Number of WeightTickets attached to this lot. Recomputed on ticket add.
+        default: 0
+      - name: gross_sale_amount
+        type: number
+        source: computed
+        description: Sum of WeightTicket gross_line_amount across the lot, computed at SOLD. See calculations.weight_ticket_pricing. Two decimals.
+        default: 0
+      - name: commission_amount
+        type: number
+        source: computed
+        description: gross_sale_amount * commission_pct, computed at SOLD (lot-level, sum-then-round). Two decimals.
+        default: 0
+      - name: net_proceeds
+        type: number
+        source: computed
+        description: gross_sale_amount - commission_amount, computed at SOLD. Two decimals.
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Branching sale lifecycle. Initialized OPEN. one of {OPEN, SOLD, WITHDRAWN}."
+        default: OPEN
+        constraints: "one of {OPEN, SOLD, WITHDRAWN}"
+
+  - name: WeightTicket
+    parent: null
+    common_fields: true
+    fields:
+      - name: sale_lot_id
+        type: string
+        source: input
+        description: "FK -> SaleLot.id; the lot this ticket belongs to. Lot must be in status OPEN."
+      - name: animal_id
+        type: string
+        source: input
+        description: "FK -> Animal.id; the animal sold. Must have life_status == ACTIVE and meat_clearance_status == CLEAR at ticket time."
+      - name: gross_weight_kg
+        type: number
+        source: input
+        description: Scale gross weight on the ticket
+        constraints: "> 0"
+      - name: price_per_100kg
+        type: number
+        source: computed
+        description: Tier price selected from the per-head net weight class. See calculations.weight_ticket_pricing. Two decimals.
+        default: 0
+      - name: net_weight_kg
+        type: number
+        source: computed
+        description: gross_weight_kg * (1 - SaleLot.pencil_shrink_pct). Three decimals.
+        default: 0
+      - name: gross_line_amount
+        type: number
+        source: computed
+        description: net_weight_kg / 100 * price_per_100kg, computed at ticket creation. Two decimals.
+        default: 0
+
+  - name: MortalityRecord
+    parent: null
+    common_fields: true
+    fields:
+      - name: animal_id
+        type: string
+        source: input
+        description: "FK -> Animal.id; the deceased animal. Must have life_status IN {ACTIVE, SUSPENDED}."
+      - name: died_on
+        type: datetime
+        source: input
+        description: Date of death (ISO 8601 date)
+        constraints: "<= current clock date and >= Animal.birth_date"
+      - name: cause
+        type: enum
+        source: input
+        description: Recorded cause of death
+        constraints: "one of {DISEASE, PREDATION, ACCIDENT, CALVING, UNKNOWN}"
+      - name: disposal_method
+        type: enum
+        source: input
+        description: Carcass disposal route
+        default: RENDERING
+        constraints: "one of {RENDERING, BURIAL, INCINERATION, COMPOST}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Initialized RECORDED; may be VOIDED if entered in error (compensating reversal). one of {RECORDED, VOIDED}."
+        default: RECORDED
+        constraints: "one of {RECORDED, VOIDED}"
+
+  - name: TraceEvent
+    parent: null
+    common_fields: false
+    fields:
+      - name: animal_id
+        type: string
+        source: input
+        description: "FK -> Animal.id; subject of the trace event."
+      - name: event_type
+        type: enum
+        source: system
+        description: "Kind of traceability event appended to the chain."
+        constraints: "one of {BIRTH, MOVEMENT, TREATMENT, SALE, MORTALITY, CULL, SUSPEND, REINSTATE}"
+      - name: ref_entity
+        type: string
+        source: system
+        description: Name of the originating entity type (e.g. MovementRecord, WeightTicket)
+      - name: ref_id
+        type: string
+        source: system
+        description: "FK -> (polymorphic) originating record id; resolves within ref_entity's collection."
+      - name: occurred_on
+        type: datetime
+        source: system
+        description: Business date of the event (ISO 8601). Trace chain is ordered by occurred_on then created_at ASC.
+      - name: detail
+        type: object
+        source: system
+        description: Snapshot payload (e.g. from/to pasture, drug, clearance_date, sale amount) captured at append time.
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ----- Animal: PRIMARY dimension life_status -----
+  - entity: Animal
+    initial_state: ACTIVE          # life_status
+    terminal_states: [SOLD, DEAD, CULLED]
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /animals/{id}/life-status {to_status: SUSPENDED}"
+        actor: HerdManager
+        preconditions:
+          - "life_status == ACTIVE"
+        side_effects:
+          - "decrement Herd.active_animal_count by 1 is NOT applied (SUSPENDED still counts as active inventory); leave Herd.active_animal_count unchanged"
+          - "append TraceEvent{event_type: SUSPEND, ref_entity: Animal, ref_id: this.id}"
+        note: "SUSPENDED animals remain in inventory and AU load; used for quarantine/hold."
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /animals/{id}/life-status {to_status: ACTIVE}"
+        actor: HerdManager
+        preconditions:
+          - "life_status == SUSPENDED"
+        side_effects:
+          - "append TraceEvent{event_type: REINSTATE, ref_entity: Animal, ref_id: this.id}"
+        note: "Revert cycle ACTIVE<->SUSPENDED."
+      - from: ACTIVE
+        to: SOLD
+        trigger: "POST /sale-lots/{id}/sell (cascade per attached WeightTicket)"
+        actor: SaleClerk
+        preconditions:
+          - "WeightTicket exists linking this Animal to the SOLD lot"
+          - "life_status == ACTIVE"
+          - "meat_clearance_status == CLEAR"
+        side_effects:
+          - "set life_status = SOLD"
+          - "if current_pasture_id set: subtract this Animal's AU from Pasture.current_au_load"
+          - "decrement Herd.active_animal_count by 1 and subtract AU from Herd.total_au_load"
+          - "append TraceEvent{event_type: SALE, ref_entity: WeightTicket, ref_id: <ticket.id>}"
+      - from: ACTIVE
+        to: DEAD
+        trigger: "POST /mortality-records (cascade)"
+        actor: HerdManager
+        preconditions:
+          - "life_status IN {ACTIVE, SUSPENDED}"
+        side_effects:
+          - "set life_status = DEAD"
+          - "if current_pasture_id set: subtract this Animal's AU from Pasture.current_au_load"
+          - "decrement Herd.active_animal_count by 1; subtract AU from Herd.total_au_load; recompute Herd.mortality_rate_pct"
+          - "append TraceEvent{event_type: MORTALITY, ref_entity: MortalityRecord, ref_id: <record.id>}"
+      - from: SUSPENDED
+        to: DEAD
+        trigger: "POST /mortality-records (cascade)"
+        actor: HerdManager
+        preconditions:
+          - "life_status IN {ACTIVE, SUSPENDED}"
+        side_effects:
+          - "set life_status = DEAD"
+          - "if current_pasture_id set: subtract this Animal's AU from Pasture.current_au_load"
+          - "decrement Herd.active_animal_count by 1; subtract AU from Herd.total_au_load; recompute Herd.mortality_rate_pct"
+          - "append TraceEvent{event_type: MORTALITY, ref_entity: MortalityRecord, ref_id: <record.id>}"
+      - from: ACTIVE
+        to: CULLED
+        trigger: "POST /animals/{id}/life-status {to_status: CULLED}"
+        actor: HerdManager
+        preconditions:
+          - "life_status == ACTIVE"
+          - "meat_clearance_status == CLEAR"
+        side_effects:
+          - "set life_status = CULLED"
+          - "if current_pasture_id set: subtract this Animal's AU from Pasture.current_au_load"
+          - "decrement Herd.active_animal_count by 1; subtract AU from Herd.total_au_load"
+          - "append TraceEvent{event_type: CULL, ref_entity: Animal, ref_id: this.id}"
+      - from: DEAD
+        to: ACTIVE
+        trigger: "POST /mortality-records/{id}/void (compensating reversal)"
+        actor: HerdManager
+        preconditions:
+          - "the MortalityRecord that drove this Animal DEAD is in status RECORDED"
+          - "life_status == DEAD"
+        side_effects:
+          - "restore life_status to its pre-death value (ACTIVE; the void path only re-activates animals whose pre-death status was ACTIVE — SUSPENDED-at-death animals also restore to ACTIVE)"
+          - "increment Herd.active_animal_count by 1; add AU back to Herd.total_au_load; recompute Herd.mortality_rate_pct"
+          - "append TraceEvent{event_type: REINSTATE, ref_entity: MortalityRecord, ref_id: <record.id>}"
+        note: "Compensating action — see calculations invariant herd_inventory_conservation."
+
+  # ----- Animal: ORTHOGONAL dimension meat_clearance_status (parallel, cyclic) -----
+  - entity: Animal
+    initial_state: CLEAR           # meat_clearance_status
+    terminal_states: []
+    transitions:
+      - from: CLEAR
+        to: WITHHELD
+        trigger: "POST /health-treatments (cascade when DrugProduct meat withdrawal > 0)"
+        actor: Veterinarian
+        preconditions:
+          - "the new HealthTreatment.clearance_date > current clock date"
+        side_effects:
+          - "set meat_clearance_status = WITHHELD"
+          - "set meat_clear_on = max(existing meat_clear_on, new clearance_date)"
+          - "append TraceEvent{event_type: TREATMENT, ref_entity: HealthTreatment, ref_id: <treatment.id>}"
+      - from: WITHHELD
+        to: WITHHELD
+        trigger: "POST /health-treatments (additional treatment extends withhold)"
+        actor: Veterinarian
+        preconditions:
+          - "the new HealthTreatment.clearance_date > current clock date"
+        side_effects:
+          - "set meat_clear_on = max(existing meat_clear_on, new clearance_date)"
+          - "append TraceEvent{event_type: TREATMENT, ref_entity: HealthTreatment, ref_id: <treatment.id>}"
+        note: "Self-loop: stacking treatments pushes meat_clear_on later; cyclic dimension."
+      - from: WITHHELD
+        to: CLEAR
+        trigger: "system clock advance via POST /_clock/set_current_utc (auto-transition)"
+        actor: system
+        preconditions:
+          - "current clock date >= meat_clear_on"
+          - "no HealthTreatment for this Animal has clearance_date > current clock date"
+        side_effects:
+          - "set meat_clearance_status = CLEAR; set meat_clear_on = null"
+          - "set every HealthTreatment of this Animal with status WITHDRAWAL_ACTIVE and clearance_date <= current clock to status CLEARED"
+        note: "Re-derived on clock set; the withhold can re-open via a later treatment (cycle)."
+
+  # ----- BreedingRecord: CYCLIC -----
+  - entity: BreedingRecord
+    initial_state: OPEN
+    terminal_states: [CALVED, FAILED]
+    transitions:
+      - from: OPEN
+        to: BRED
+        trigger: "POST /breeding-records/{id}/transition {to_status: BRED}"
+        actor: HerdManager
+        preconditions:
+          - "dam Animal.life_status == ACTIVE and sex == FEMALE"
+          - "bred_on <= current clock date"
+        side_effects:
+          - "set expected_calving_on = bred_on + gestation_days(Herd.species)"
+      - from: BRED
+        to: CONFIRMED_PREGNANT
+        trigger: "POST /breeding-records/{id}/transition {to_status: CONFIRMED_PREGNANT}"
+        actor: Veterinarian
+        preconditions:
+          - "status == BRED"
+        side_effects: []
+      - from: BRED
+        to: OPEN
+        trigger: "POST /breeding-records/{id}/transition {to_status: OPEN}"
+        actor: HerdManager
+        preconditions:
+          - "status == BRED"
+        side_effects:
+          - "clear expected_calving_on"
+        note: "Cycle: failed conception returns dam to OPEN for re-breeding."
+      - from: CONFIRMED_PREGNANT
+        to: OPEN
+        trigger: "POST /breeding-records/{id}/transition {to_status: OPEN}"
+        actor: HerdManager
+        preconditions:
+          - "status == CONFIRMED_PREGNANT"
+        side_effects:
+          - "clear expected_calving_on"
+        note: "Cycle: abortion/loss returns dam to OPEN."
+      - from: CONFIRMED_PREGNANT
+        to: CALVED
+        trigger: "POST /breeding-records/{id}/transition {to_status: CALVED}"
+        actor: HerdManager
+        preconditions:
+          - "status == CONFIRMED_PREGNANT"
+          - "calved_on >= bred_on and calved_on <= current clock date"
+        side_effects:
+          - "set calved_on"
+          - "create new Animal (the calf) in same Herd with dam_animal_id = this dam, life_status ACTIVE, birth_date = calved_on; set calf_animal_id"
+          - "increment Herd.active_animal_count by 1; add calf AU to Herd.total_au_load"
+          - "append TraceEvent{event_type: BIRTH, ref_entity: Animal, ref_id: <calf.id>}"
+      - from: OPEN
+        to: FAILED
+        trigger: "POST /breeding-records/{id}/transition {to_status: FAILED}"
+        actor: HerdManager
+        preconditions:
+          - "status == OPEN"
+        side_effects: []
+      - from: BRED
+        to: FAILED
+        trigger: "POST /breeding-records/{id}/transition {to_status: FAILED}"
+        actor: HerdManager
+        preconditions:
+          - "status == BRED"
+        side_effects: []
+
+  # ----- HealthTreatment: linear with clock auto-transition -----
+  - entity: HealthTreatment
+    initial_state: WITHDRAWAL_ACTIVE
+    terminal_states: [CLEARED, VOIDED]
+    transitions:
+      - from: WITHDRAWAL_ACTIVE
+        to: CLEARED
+        trigger: "system clock advance via POST /_clock/set_current_utc (auto-transition)"
+        actor: system
+        preconditions:
+          - "current clock date >= clearance_date"
+        side_effects:
+          - "if no other WITHDRAWAL_ACTIVE treatment with clearance_date > clock remains for the animal: drive Animal CLEARANCE dimension WITHHELD->CLEAR"
+      - from: WITHDRAWAL_ACTIVE
+        to: VOIDED
+        trigger: "POST /health-treatments/{id}/void"
+        actor: Veterinarian
+        preconditions:
+          - "status == WITHDRAWAL_ACTIVE"
+        side_effects:
+          - "recompute Animal.meat_clear_on = max clearance_date over remaining non-VOIDED treatments with clearance_date > clock; if none remain in the future, drive Animal WITHHELD->CLEAR"
+        note: "Compensating action for a mis-entered treatment; see invariant withdrawal_clearance_consistency."
+
+  # ----- MovementRecord: PLANNED -> APPLIED, REVERTED -----
+  - entity: MovementRecord
+    initial_state: PLANNED
+    terminal_states: [REVERTED]
+    transitions:
+      - from: PLANNED
+        to: APPLIED
+        trigger: "POST /movement-records/{id}/apply"
+        actor: HerdManager
+        preconditions:
+          - "animal life_status IN {ACTIVE, SUSPENDED}"
+          - "destination Pasture aggregate AU during [effective_from, effective_to) plus this animal's AU does not exceed Pasture.capacity_au (see validations resource_overlap)"
+          - "for PASTURE kind: effective_from is at least Pasture.rest_days after the prior occupancy's effective_to on that pasture"
+        side_effects:
+          - "capture from_pasture_id = animal.current_pasture_id"
+          - "set animal.current_pasture_id = to_pasture_id"
+          - "subtract animal AU from old Pasture.current_au_load (if any); add animal AU to destination Pasture.current_au_load"
+          - "append TraceEvent{event_type: MOVEMENT, ref_entity: MovementRecord, ref_id: this.id}"
+      - from: APPLIED
+        to: REVERTED
+        trigger: "POST /movement-records/{id}/revert (compensating)"
+        actor: HerdManager
+        preconditions:
+          - "status == APPLIED"
+          - "this is the animal's most recently APPLIED movement (no later APPLIED movement exists)"
+        side_effects:
+          - "restore animal.current_pasture_id = from_pasture_id"
+          - "subtract animal AU from to Pasture.current_au_load; add animal AU back to from Pasture.current_au_load (if from set)"
+        note: "Compensating action; see invariant pasture_au_conservation."
+
+  # ----- SaleLot: BRANCHING (SOLD | WITHDRAWN) -----
+  - entity: SaleLot
+    initial_state: OPEN
+    terminal_states: [SOLD, WITHDRAWN]
+    transitions:
+      - from: OPEN
+        to: SOLD
+        trigger: "POST /sale-lots/{id}/sell"
+        actor: SaleClerk
+        preconditions:
+          - "head_count >= 1 (at least one WeightTicket)"
+          - "every linked Animal has life_status == ACTIVE and meat_clearance_status == CLEAR"
+        side_effects:
+          - "compute gross_sale_amount = sum over tickets of gross_line_amount; commission_amount = round(gross_sale_amount * commission_pct, 2); net_proceeds = gross_sale_amount - commission_amount"
+          - "cascade: each linked Animal ACTIVE->SOLD (which itself subtracts AU from Pasture and decrements Herd counters)"
+      - from: OPEN
+        to: WITHDRAWN
+        trigger: "POST /sale-lots/{id}/withdraw"
+        actor: SaleClerk
+        preconditions:
+          - "status == OPEN"
+        side_effects:
+          - "no animal state changes; tickets remain attached for audit"
+        note: "Branch alternative to SOLD; animals stay ACTIVE."
+
+  # ----- MortalityRecord: RECORDED -> VOIDED -----
+  - entity: MortalityRecord
+    initial_state: RECORDED
+    terminal_states: [VOIDED]
+    transitions:
+      - from: RECORDED
+        to: VOIDED
+        trigger: "POST /mortality-records/{id}/void"
+        actor: HerdManager
+        preconditions:
+          - "status == RECORDED"
+        side_effects:
+          - "cascade: drive the dead Animal DEAD->ACTIVE (restores Herd counters and recomputes mortality_rate_pct)"
+          - "append TraceEvent{event_type: REINSTATE, ref_entity: MortalityRecord, ref_id: this.id}"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: ticket-add-stale-lot
+    parent_entity: SaleLot
+    write_endpoint: "POST /sale-lots/{id}/tickets"
+    occ_field: "expected_sale_lot_version"
+    description: |
+      Adding a WeightTicket to a SaleLot whose version has advanced since the
+      client last observed it is rejected. A prior writer may have already
+      added a ticket (legitimately changing head_count and the lot's pricing
+      basis) or withdrawn the lot; the current writer's view of the lot is
+      therefore stale and the create must not proceed against the old version.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: movement-apply-stale-animal
+    parent_entity: Animal
+    write_endpoint: "POST /movement-records/{id}/apply"
+    occ_field: "expected_animal_version"
+    description: |
+      Applying a MovementRecord against an Animal whose version has advanced
+      since the client read it is rejected. Another writer may have already
+      applied a different movement (changing current_pasture_id and the AU
+      attribution), so this client's intended from->to transition is computed
+      from a stale location and must not be committed.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: average_daily_gain
+    trigger: "On WeightRecord creation (POST /animals/{id}/weights): recompute Animal.lifetime_adg_kg and the new record's interval_adg_kg"
+    algorithm: aggregation
+    formula: |
+      # lifetime variant (on Animal):
+      age_days = date(latest.weighed_at) - date(Animal.birth_date)   # in whole days
+      lifetime_adg_kg = round((latest.weight_kg - Animal.birth_weight_kg) / age_days, 3)
+      # interval variant (on the new WeightRecord):
+      prev = WeightRecord for this animal with the greatest weighed_at strictly before
+             this record (tie-break: created_at ASC); null for the first record
+      if prev is null: interval_adg_kg = null
+      else:
+        gap_days = date(this.weighed_at) - date(prev.weighed_at)
+        interval_adg_kg = round((this.weight_kg - prev.weight_kg) / gap_days, 3)
+    input_set: "lifetime uses Animal.birth_weight_kg + birth_date as baseline; interval uses the immediately prior WeightRecord by weighed_at"
+    constants: {}
+    precision: "3 decimal places, round_half_up; gap measured in whole calendar days"
+    variants:
+      - name: lifetime
+        when: "stored on Animal.lifetime_adg_kg, baseline is birth weight"
+        difference: "denominator is age since birth; numerator is gain since birth weight"
+      - name: interval
+        when: "stored on the WeightRecord.interval_adg_kg"
+        difference: "denominator is days since previous weighing; numerator is gain since previous weight; first record yields null"
+
+  - name: withdrawal_clearance_date
+    trigger: "On HealthTreatment creation (POST /health-treatments)"
+    algorithm: threshold
+    formula: |
+      wd_days = DrugProduct.route_withdrawals[treatment.route]   # KeyError -> ERR_ROUTE_NOT_PERMITTED
+      clearance_date = date(treatment.last_dose_on) + wd_days days
+      # status:
+      if wd_days == 0: status = CLEARED (no withhold; meat_clearance_status unaffected)
+      elif clearance_date <= current clock date: status = CLEARED (already past)
+      else: status = WITHDRAWAL_ACTIVE and drive Animal CLEAR/WITHHELD -> WITHHELD
+    input_set: "single treatment; the route key selects the withdrawal-day case"
+    constants: {}
+    precision: "whole days; dates compared at date granularity (UTC)"
+    variants:
+      - name: by_route_im
+        when: "route == INJECTION_IM"
+        difference: "uses route_withdrawals[INJECTION_IM] (e.g. 28 days)"
+      - name: by_route_oral
+        when: "route == ORAL"
+        difference: "uses route_withdrawals[ORAL] (e.g. 14 days) — shorter clearance for same drug"
+      - name: by_route_pour_on
+        when: "route == TOPICAL_POUR_ON"
+        difference: "uses route_withdrawals[TOPICAL_POUR_ON] (e.g. 48 days) — longest clearance"
+      - name: multi_dose_from_last
+        when: "dose_count > 1"
+        difference: "clearance counts from last_dose_on, not first_dose_on"
+
+  - name: weight_ticket_pricing
+    trigger: "gross_line_amount computed on WeightTicket creation (POST /sale-lots/{id}/tickets); gross_sale_amount/commission_amount/net_proceeds computed on SaleLot SOLD"
+    algorithm: tiered_pricing
+    formula: |
+      # per ticket (at ticket creation), using the lot's pencil_shrink_pct:
+      net_weight_kg = round(gross_weight_kg * (1 - SaleLot.pencil_shrink_pct), 3)
+      # weight-class tier selected on per-head net weight (head=1 per ticket):
+      if   net_weight_kg <  250: price_per_100kg = 520.00   # LIGHT
+      elif net_weight_kg <  400: price_per_100kg = 480.00   # MEDIUM
+      else:                      price_per_100kg = 440.00   # HEAVY (>= 400)
+      gross_line_amount = round(net_weight_kg / 100 * price_per_100kg, 2)
+      # at SOLD (lot level) — ROUNDING ORDER PINNED: sum the already-rounded
+      # per-ticket gross_line_amounts, THEN apply commission once at lot level:
+      gross_sale_amount = round(sum(ticket.gross_line_amount), 2)
+      commission_amount = round(gross_sale_amount * SaleLot.commission_pct, 2)
+      net_proceeds      = round(gross_sale_amount - commission_amount, 2)
+    input_set: "WeightTickets attached to the lot; PRIVATE_TREATY forces commission_pct == 0"
+    constants:
+      TIER_LIGHT_MAX: 250
+      TIER_MEDIUM_MAX: 400
+      PRICE_LIGHT_PER_100KG: 520.00
+      PRICE_MEDIUM_PER_100KG: 480.00
+      PRICE_HEAVY_PER_100KG: 440.00
+    precision: "net_weight 3 decimals; amounts 2 decimals, round_half_up. Rounding order: per-ticket round FIRST, then lot sum, then commission (sum-then-commission)."
+    variants:
+      - name: auction_with_commission
+        when: "channel == AUCTION"
+        difference: "commission_amount > 0; net_proceeds = gross - commission"
+      - name: private_treaty_no_commission
+        when: "channel == PRIVATE_TREATY"
+        difference: "commission_pct forced 0; net_proceeds == gross_sale_amount"
+
+  - name: ration_waterfall_allocation
+    trigger: "GET /feed-rations/{id}/computed-ration (computed read; also referenced by feeding cost)"
+    algorithm: waterfall_allocation
+    formula: |
+      remaining = FeedRation.target_dmi_kg
+      for idx, ing in enumerate(ingredients):     # DECLARED ORDER
+        if idx == last_index:
+          dm_alloc = remaining                    # filler absorbs remainder
+        else:
+          dm_alloc = min(ing.max_inclusion_pct * target_dmi_kg, remaining)
+        remaining -= dm_alloc
+        as_fed_kg = round(dm_alloc / ing.dry_matter_pct, 3)
+      total_as_fed_kg = round(sum(as_fed_kg), 3)
+      # If filler remainder would be negative (caps already exceed target),
+      # that is impossible because caps are applied against remaining (clamped >= 0).
+    input_set: "ingredients in declared order; last ingredient is the filler"
+    constants: {}
+    precision: "as_fed 3 decimals, round_half_up; dm_alloc kept full precision before division"
+    variants:
+      - name: target_meets_caps
+        when: "sum of non-filler caps < target_dmi_kg"
+        difference: "filler receives a positive remainder"
+      - name: caps_cover_target
+        when: "sum of non-filler caps >= target_dmi_kg"
+        difference: "filler receives 0 dm; earlier ingredients clamp to remaining"
+
+  - name: expected_calving_date
+    trigger: "On BreedingRecord OPEN->BRED (record-service)"
+    algorithm: aggregation
+    formula: |
+      gestation = GESTATION_DAYS[Herd.species]
+      expected_calving_on = date(bred_on) + gestation days
+    input_set: "single breeding record; species from the dam's Herd"
+    constants:
+      GESTATION_DAYS: { CATTLE: 283, SHEEP: 147, GOAT: 150 }
+    precision: "whole days (date arithmetic, UTC)"
+    variants:
+      - name: cattle
+        when: "Herd.species == CATTLE"
+        difference: "283-day gestation"
+      - name: small_ruminant
+        when: "Herd.species IN {SHEEP, GOAT}"
+        difference: "147 (SHEEP) / 150 (GOAT) day gestation"
+
+  - name: herd_mortality_rate
+    trigger: "Recomputed on Animal ACTIVE/SUSPENDED->DEAD and on mortality void; readable via GET /herds/{id}/summary"
+    algorithm: aggregation
+    formula: |
+      window_start = current clock date - MORTALITY_WINDOW_DAYS
+      deaths = count of MortalityRecord m where m.status == RECORDED
+               and date(m.died_on) >= window_start
+               and m.animal_id in animals of this herd
+      denom  = active_animal_count + deaths   # inventory at window start approximation
+      mortality_rate_pct = round(deaths / denom * 100, 2) if denom > 0 else 0.00
+    input_set: "RECORDED MortalityRecords within the trailing window; VOIDED excluded"
+    constants:
+      MORTALITY_WINDOW_DAYS: 365
+    precision: "2 decimals, round_half_up"
+    variants:
+      - name: nonzero_inventory
+        when: "denom > 0"
+        difference: "standard ratio"
+      - name: empty_inventory
+        when: "denom == 0"
+        difference: "returns 0.00 (avoids divide-by-zero)"
+
+  - name: animal_unit_load
+    trigger: "Recomputed on Animal create, weight record, movement apply/revert, and life_status changes; surfaced on Herd.total_au_load, Pasture.current_au_load, and the movement capacity check"
+    algorithm: aggregation
+    formula: |
+      animal_au(a)        = a.latest_weight_kg / AU_KG           # full precision, NOT rounded per-animal
+      Pasture.current_au_load = round(sum(animal_au(a) for a in Animals
+                                 where a.current_pasture_id == p.id
+                                 and a.life_status IN {ACTIVE, SUSPENDED}), 3)
+      Herd.total_au_load      = round(sum(animal_au(a) for a in Animals of herd
+                                 where a.life_status IN {ACTIVE, SUSPENDED}), 3)
+      # Capacity check (movement apply) compares the UNROUNDED aggregate to capacity:
+      projected = sum(animal_au(a) for a already occupying dest during overlap window) + animal_au(mover)
+      reject if projected > Pasture.capacity_au          # strict '>' — equality is allowed
+    input_set: "Animals with life_status IN {ACTIVE, SUSPENDED}; the capacity check additionally restricts to occupancies overlapping [effective_from, effective_to)"
+    constants:
+      AU_KG: 454
+    precision: "stored loads rounded to 3 decimals (sum-then-round); capacity comparison uses unrounded aggregate; boundary is strict '>' (projected == capacity passes)"
+    variants:
+      - name: stored_load
+        when: "writing Herd.total_au_load / Pasture.current_au_load"
+        difference: "sum of weight/454 over qualifying animals, rounded to 3 decimals"
+      - name: capacity_gate
+        when: "evaluating a movement apply against Pasture.capacity_au"
+        difference: "uses unrounded projected aggregate over the overlap window; rejects only when strictly greater than capacity"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this endpoint per §1.7"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "Every referenced resource in the path and FK body fields exists (validated left-to-right)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: business_constraint
+    check: "Required body fields present and well-typed; enum values in domain; numeric ranges respected"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all writes
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which the requested transition is allowed"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6
+    category: business_referential
+    check: "dam_animal_id references a FEMALE animal; sire_animal_id references a MALE animal; calf creation links to the dam's herd"
+    error_id: ERR_INVALID_PEDIGREE
+    http_status: 422
+    applies_to: "POST /animals, POST /breeding-records"
+
+  - priority: 7
+    category: business_constraint
+    check: "ear_tag unique within (herd_id, ear_tag); rfid (if present) globally unique"
+    error_id: ERR_DUPLICATE_IDENTIFIER
+    http_status: 409
+    applies_to: "POST /animals"
+
+  - priority: 8
+    category: business_safety
+    check: "Selling or culling an Animal whose meat_clearance_status == WITHHELD is forbidden (residue safety)"
+    error_id: ERR_WITHDRAWAL_NOT_CLEARED
+    http_status: 409
+    applies_to: "POST /sale-lots/{id}/tickets, POST /sale-lots/{id}/sell, POST /animals/{id}/life-status (to_status CULLED)"
+
+  - priority: 9
+    category: business_safety
+    check: "The treatment route must be a key present in the DrugProduct.route_withdrawals map"
+    error_id: ERR_ROUTE_NOT_PERMITTED
+    http_status: 422
+    applies_to: "POST /health-treatments"
+
+  - priority: 10
+    category: business_referential
+    check: "An Animal may belong to at most one OPEN SaleLot via WeightTicket; ticket animal must not already be on another OPEN lot"
+    error_id: ERR_ANIMAL_ALREADY_LISTED
+    http_status: 409
+    applies_to: "POST /sale-lots/{id}/tickets"
+
+  - priority: 11
+    category: business_temporal
+    check: "For PASTURE kind, effective_from must be at least Pasture.rest_days after the prior occupancy's effective_to on that pasture (grazing rest gap)"
+    error_id: ERR_REST_PERIOD_VIOLATION
+    http_status: 409
+    applies_to: "POST /movement-records/{id}/apply"
+
+  - priority: 12
+    category: business_temporal
+    check: "Applying a movement whose [effective_from, effective_to) window, together with concurrent occupancies, drives the destination Pasture aggregate AU above capacity_au, is rejected"
+    error_id: ERR_PASTURE_OVER_CAPACITY
+    http_status: 409
+    applies_to: "POST /movement-records/{id}/apply"
+
+  - priority: 13
+    category: business_constraint
+    check: "PRIVATE_TREATY SaleLot must have commission_pct == 0"
+    error_id: ERR_COMMISSION_NOT_ALLOWED
+    http_status: 422
+    applies_to: "POST /sale-lots"
+
+  - priority: 14
+    category: business_temporal
+    check: "WeightRecord.weighed_at must be strictly after Animal.birth_date and not in the future"
+    error_id: ERR_WEIGH_DATE_INVALID
+    http_status: 422
+    applies_to: "POST /animals/{id}/weights"
+
+  - priority: 15
+    category: business_referential
+    check: "last_dose_on >= first_dose_on and dose_count >= 1 consistent with the dates"
+    error_id: ERR_DOSE_DATES_INVALID
+    http_status: 422
+    applies_to: "POST /health-treatments"
+
+  - priority: 16
+    category: business_fiscal
+    check: "OCC: expected_<parent>_version must equal the current parent version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /sale-lots/{id}/tickets, POST /movement-records/{id}/apply"
+
+  - priority: 17
+    category: business_referential
+    check: "A WeightTicket animal must belong to the same Herd as the SaleLot.herd_id"
+    error_id: ERR_HERD_MISMATCH
+    http_status: 409
+    applies_to: "POST /sale-lots/{id}/tickets"
+
+  - priority: 18
+    category: business_constraint
+    check: "Reverting a movement that is not the animal's most recent APPLIED movement is rejected"
+    error_id: ERR_NOT_LATEST_MOVEMENT
+    http_status: 409
+    applies_to: "POST /movement-records/{id}/revert"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Herd ----
+  - method: POST
+    path: "/herds"
+    description: Create a herd
+    roles: [HerdManager]
+    code: 201
+    input: [name, species, premises_id]
+    output: Herd
+    side_effects: ["initialize active_animal_count=0, total_au_load=0, mortality_rate_pct=0"]
+  - method: GET
+    path: "/herds/{id}"
+    description: Get a herd (computed active_animal_count, total_au_load, mortality_rate_pct recomputed on read)
+    roles: [HerdManager, Veterinarian, SaleClerk, FeedlotOperator, Auditor]
+    code: 200
+    input: []
+    output: Herd
+    side_effects: ["recompute herd_mortality_rate over trailing window"]
+
+  # ---- Pasture ----
+  - method: POST
+    path: "/pastures"
+    description: Create a pasture or pen
+    roles: [HerdManager]
+    code: 201
+    input: [name, kind, capacity_au, "rest_days?"]
+    output: Pasture
+    side_effects: ["initialize current_au_load=0"]
+  - method: GET
+    path: "/pastures/{id}"
+    description: Get a pasture (computed current_au_load)
+    roles: [HerdManager, Veterinarian, SaleClerk, FeedlotOperator, Auditor]
+    code: 200
+    input: []
+    output: Pasture
+    side_effects: []
+
+  # ---- DrugProduct ----
+  - method: POST
+    path: "/drug-products"
+    description: Create a drug/vaccine product with per-route withdrawal map
+    roles: [Veterinarian]
+    code: 201
+    input: [name, category, route_withdrawals, "milk_withdrawal_hours?"]
+    output: DrugProduct
+    side_effects: []
+
+  # ---- FeedRation ----
+  - method: POST
+    path: "/feed-rations"
+    description: Create a ration
+    roles: [FeedlotOperator]
+    code: 201
+    input: [name, target_dmi_kg, ingredients]
+    output: FeedRation
+    side_effects: ["status=ACTIVE"]
+  - method: GET
+    path: "/feed-rations/{id}/computed-ration"
+    description: Computed read — waterfall allocation, per-ingredient as_fed_kg and total_as_fed_kg
+    roles: [FeedlotOperator, HerdManager, Auditor]
+    code: 200
+    input: []
+    output: "{ total_as_fed_kg: number, allocations: array }"
+    side_effects: ["run ration_waterfall_allocation"]
+
+  # ---- Animal ----
+  - method: POST
+    path: "/animals"
+    description: Register an animal (ear tag / RFID identification)
+    roles: [HerdManager]
+    code: 201
+    input: [herd_id, ear_tag, "rfid?", sex, birth_date, birth_weight_kg, "dam_animal_id?", "sire_animal_id?"]
+    output: Animal
+    side_effects: ["life_status=ACTIVE; meat_clearance_status=CLEAR; latest_weight_kg=birth_weight_kg; increment Herd.active_animal_count and total_au_load; append TraceEvent BIRTH"]
+  - method: GET
+    path: "/animals/{id}"
+    description: Get an animal (both state dimensions; computed latest_weight_kg / lifetime_adg_kg / current_pasture_id / meat_clear_on)
+    roles: [HerdManager, Veterinarian, SaleClerk, FeedlotOperator, Auditor]
+    code: 200
+    input: []
+    output: Animal
+    side_effects: []
+  - method: GET
+    path: "/animals"
+    description: "List animals; filtered-list FK reverse-reachability for Animal.herd_id, Animal.dam_animal_id, Animal.sire_animal_id, Animal.current_pasture_id"
+    roles: [HerdManager, Veterinarian, SaleClerk, FeedlotOperator, Auditor]
+    code: 200
+    input: ["herd_id?", "dam_animal_id?", "sire_animal_id?", "current_pasture_id?", "limit?", "offset?"]
+    output: Animal[]
+    side_effects: []
+  - method: POST
+    path: "/animals/{id}/life-status"
+    description: "Drive the Animal life_status dimension. to_status in {SUSPENDED (ACTIVE->SUSPENDED), ACTIVE (SUSPENDED->ACTIVE), CULLED (ACTIVE->CULLED; requires meat_clearance_status==CLEAR)}."
+    roles: [HerdManager]
+    code: 200
+    input: [to_status]
+    output: Animal
+    side_effects: ["life_status transition; append SUSPEND/REINSTATE/CULL TraceEvent; CULLED subtracts AU from Pasture and Herd and decrements counts"]
+  - method: POST
+    path: "/animals/{id}/weights"
+    description: Record a weight (creates WeightRecord; recomputes ADG)
+    roles: [HerdManager, FeedlotOperator]
+    code: 201
+    input: [weighed_at, weight_kg, "source?"]
+    output: WeightRecord
+    side_effects: ["compute interval_adg_kg and Animal.lifetime_adg_kg; update Animal.latest_weight_kg; recompute Pasture.current_au_load and Herd.total_au_load"]
+  - method: GET
+    path: "/animals/{id}/weights"
+    description: List an animal's weight records (sub-resource FK reverse-reachability for WeightRecord.animal_id)
+    roles: [HerdManager, FeedlotOperator, Veterinarian, Auditor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WeightRecord[]
+    side_effects: []
+  - method: GET
+    path: "/animals/{id}/trace"
+    description: "Traceability chain — ordered TraceEvents (birth, movement, treatment, sale, mortality), ascending by occurred_on then created_at (sub-resource FK reverse-reachability for TraceEvent.animal_id)"
+    roles: [HerdManager, Veterinarian, SaleClerk, FeedlotOperator, Auditor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TraceEvent[]
+    side_effects: []
+
+  # ---- BreedingRecord ----
+  - method: POST
+    path: "/breeding-records"
+    description: Open a breeding record for a dam
+    roles: [HerdManager]
+    code: 201
+    input: [dam_animal_id, "sire_animal_id?", bred_on]
+    output: BreedingRecord
+    side_effects: ["status=OPEN"]
+  - method: GET
+    path: "/breeding-records/{id}"
+    description: Get a breeding record
+    roles: [HerdManager, Veterinarian, Auditor]
+    code: 200
+    input: []
+    output: BreedingRecord
+    side_effects: []
+  - method: GET
+    path: "/breeding-records"
+    description: "List breeding records; filtered-list FK reverse-reachability for BreedingRecord.dam_animal_id, BreedingRecord.sire_animal_id, BreedingRecord.calf_animal_id"
+    roles: [HerdManager, Veterinarian, Auditor]
+    code: 200
+    input: ["dam_animal_id?", "sire_animal_id?", "calf_animal_id?", "limit?", "offset?"]
+    output: BreedingRecord[]
+    side_effects: []
+  - method: POST
+    path: "/breeding-records/{id}/transition"
+    description: "Drive the cyclic breeding lifecycle. to_status in {BRED (OPEN->BRED, computes expected_calving_on), CONFIRMED_PREGNANT (BRED->CONFIRMED_PREGNANT, Veterinarian only), OPEN (BRED|CONFIRMED_PREGNANT->OPEN, clears expected_calving_on), CALVED (CONFIRMED_PREGNANT->CALVED, requires calf_* fields, creates calf), FAILED (OPEN|BRED->FAILED)}."
+    roles: [HerdManager, Veterinarian]
+    code: 200
+    input: [to_status, "calved_on?", "calf_ear_tag?", "calf_birth_weight_kg?", "calf_sex?"]
+    output: BreedingRecord
+    side_effects: ["per to_status: compute expected_calving_date; clear expected_calving_on; create calf Animal, set calf_animal_id, increment Herd counters, append TraceEvent BIRTH on CALVED"]
+
+  # ---- HealthTreatment ----
+  - method: POST
+    path: "/health-treatments"
+    description: Record a treatment/vaccination; compute clearance date and drive withhold
+    roles: [Veterinarian]
+    code: 201
+    input: [animal_id, drug_product_id, route, "dose_count?", first_dose_on, last_dose_on]
+    output: HealthTreatment
+    side_effects: ["compute withdrawal_clearance_date; if withhold, drive Animal CLEAR/WITHHELD->WITHHELD and set meat_clear_on; append TraceEvent TREATMENT"]
+  - method: GET
+    path: "/health-treatments/{id}"
+    description: Get a treatment
+    roles: [Veterinarian, HerdManager, Auditor]
+    code: 200
+    input: []
+    output: HealthTreatment
+    side_effects: []
+  - method: GET
+    path: "/health-treatments"
+    description: "List health treatments; filtered-list FK reverse-reachability for HealthTreatment.animal_id and HealthTreatment.drug_product_id"
+    roles: [Veterinarian, HerdManager, Auditor]
+    code: 200
+    input: ["animal_id?", "drug_product_id?", "limit?", "offset?"]
+    output: HealthTreatment[]
+    side_effects: []
+  - method: POST
+    path: "/health-treatments/{id}/void"
+    description: Void a mis-entered treatment (WITHDRAWAL_ACTIVE->VOIDED); recompute animal clearance
+    roles: [Veterinarian]
+    code: 200
+    input: []
+    output: HealthTreatment
+    side_effects: ["recompute Animal.meat_clear_on; possibly drive WITHHELD->CLEAR"]
+
+  # ---- MovementRecord ----
+  - method: POST
+    path: "/movement-records"
+    description: Plan a movement to a pasture/pen (PLANNED)
+    roles: [HerdManager]
+    code: 201
+    input: [animal_id, to_pasture_id, effective_from, "effective_to?"]
+    output: MovementRecord
+    side_effects: ["status=PLANNED"]
+  - method: GET
+    path: "/movement-records/{id}"
+    description: Get a movement record
+    roles: [HerdManager, Auditor]
+    code: 200
+    input: []
+    output: MovementRecord
+    side_effects: []
+  - method: GET
+    path: "/movement-records"
+    description: "List movement records; filtered-list FK reverse-reachability for MovementRecord.animal_id, MovementRecord.to_pasture_id, MovementRecord.from_pasture_id"
+    roles: [HerdManager, Auditor]
+    code: 200
+    input: ["animal_id?", "to_pasture_id?", "from_pasture_id?", "limit?", "offset?"]
+    output: MovementRecord[]
+    side_effects: []
+  - method: POST
+    path: "/movement-records/{id}/apply"
+    description: Apply a planned movement (PLANNED->APPLIED); OCC on Animal.version; capacity + rest checks
+    roles: [HerdManager]
+    code: 200
+    input: [expected_animal_version]
+    output: MovementRecord
+    side_effects: ["set from_pasture_id; update Animal.current_pasture_id; adjust both Pasture.current_au_load; increment Animal.version by 1; append TraceEvent MOVEMENT"]
+  - method: POST
+    path: "/movement-records/{id}/revert"
+    description: Revert the most recent applied movement (APPLIED->REVERTED); compensating
+    roles: [HerdManager]
+    code: 200
+    input: []
+    output: MovementRecord
+    side_effects: ["restore Animal.current_pasture_id; reverse Pasture.current_au_load adjustments"]
+
+  # ---- SaleLot ----
+  - method: POST
+    path: "/sale-lots"
+    description: Open a sale lot
+    roles: [SaleClerk]
+    code: 201
+    input: [herd_id, channel, "pencil_shrink_pct?", "commission_pct?"]
+    output: SaleLot
+    side_effects: ["status=OPEN; head_count=0"]
+  - method: GET
+    path: "/sale-lots/{id}"
+    description: Get a sale lot (computed head_count, gross_sale_amount, commission_amount, net_proceeds)
+    roles: [SaleClerk, HerdManager, Auditor]
+    code: 200
+    input: []
+    output: SaleLot
+    side_effects: []
+  - method: GET
+    path: "/sale-lots"
+    description: "List sale lots; filtered-list FK reverse-reachability for SaleLot.herd_id"
+    roles: [SaleClerk, HerdManager, Auditor]
+    code: 200
+    input: ["herd_id?", "limit?", "offset?"]
+    output: SaleLot[]
+    side_effects: []
+  - method: POST
+    path: "/sale-lots/{id}/tickets"
+    description: Attach a WeightTicket to an OPEN lot; OCC on SaleLot.version; compute pricing
+    roles: [SaleClerk]
+    code: 201
+    input: [animal_id, gross_weight_kg, expected_sale_lot_version]
+    output: WeightTicket
+    side_effects: ["compute net_weight_kg, price_per_100kg, gross_line_amount; increment SaleLot.head_count and SaleLot.version by 1"]
+  - method: GET
+    path: "/sale-lots/{id}/tickets"
+    description: List weight tickets on a lot (sub-resource FK reverse-reachability for WeightTicket.sale_lot_id)
+    roles: [SaleClerk, HerdManager, Auditor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WeightTicket[]
+    side_effects: []
+  - method: POST
+    path: "/sale-lots/{id}/sell"
+    description: Finalize sale (OPEN->SOLD); compute lot totals; cascade animals to SOLD
+    roles: [SaleClerk]
+    code: 200
+    input: []
+    output: SaleLot
+    side_effects: ["compute weight_ticket_pricing lot totals; cascade each linked Animal ACTIVE->SOLD; adjust Pasture/Herd AU and counts; append TraceEvent SALE per ticket"]
+  - method: POST
+    path: "/sale-lots/{id}/withdraw"
+    description: Withdraw an open lot (OPEN->WITHDRAWN)
+    roles: [SaleClerk]
+    code: 200
+    input: []
+    output: SaleLot
+    side_effects: ["no animal changes"]
+
+  # ---- WeightTicket ----
+  - method: GET
+    path: "/weight-tickets/{id}"
+    description: Get a weight ticket
+    roles: [SaleClerk, HerdManager, Auditor]
+    code: 200
+    input: []
+    output: WeightTicket
+    side_effects: []
+  - method: GET
+    path: "/weight-tickets"
+    description: "List weight tickets; filtered-list FK reverse-reachability for WeightTicket.animal_id (and sale_lot_id)"
+    roles: [SaleClerk, HerdManager, Auditor]
+    code: 200
+    input: ["animal_id?", "sale_lot_id?", "limit?", "offset?"]
+    output: WeightTicket[]
+    side_effects: []
+
+  # ---- MortalityRecord ----
+  - method: POST
+    path: "/mortality-records"
+    description: Record a death; cascade animal ACTIVE/SUSPENDED->DEAD
+    roles: [HerdManager]
+    code: 201
+    input: [animal_id, died_on, cause, "disposal_method?"]
+    output: MortalityRecord
+    side_effects: ["status=RECORDED; cascade Animal->DEAD; subtract AU; recompute Herd.mortality_rate_pct; append TraceEvent MORTALITY"]
+  - method: GET
+    path: "/mortality-records/{id}"
+    description: Get a mortality record
+    roles: [HerdManager, Veterinarian, Auditor]
+    code: 200
+    input: []
+    output: MortalityRecord
+    side_effects: []
+  - method: GET
+    path: "/mortality-records"
+    description: "List mortality records; filtered-list FK reverse-reachability for MortalityRecord.animal_id"
+    roles: [HerdManager, Veterinarian, Auditor]
+    code: 200
+    input: ["animal_id?", "limit?", "offset?"]
+    output: MortalityRecord[]
+    side_effects: []
+  - method: POST
+    path: "/mortality-records/{id}/void"
+    description: Void a mis-entered death (RECORDED->VOIDED); compensating reactivation
+    roles: [HerdManager]
+    code: 200
+    input: []
+    output: MortalityRecord
+    side_effects: ["cascade Animal DEAD->ACTIVE; restore Herd counters; recompute mortality_rate_pct; append TraceEvent REINSTATE"]
+
+  # ---- Test-driving: clock ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: Test-driving endpoint — set the system clock; triggers withdrawal auto-clearances and re-derives meat_clearance_status
+    roles: [HerdManager, Veterinarian, SaleClerk, FeedlotOperator]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: string }"
+    side_effects: ["auto-transition HealthTreatment WITHDRAWAL_ACTIVE->CLEARED where clock>=clearance_date; drive Animal WITHHELD->CLEAR where eligible"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing or malformed X-User-Role / X-User-ID headers"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Acting role not permitted for the endpoint"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced resource (path id or FK body field) does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Missing required field, bad type, out-of-domain enum, or numeric range violation"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not allowed from the resource's current state"
+  - id: ERR_INVALID_PEDIGREE
+    http: 422
+    condition: "dam_animal_id is not FEMALE or sire_animal_id is not MALE"
+  - id: ERR_DUPLICATE_IDENTIFIER
+    http: 409
+    condition: "ear_tag duplicate within herd, or rfid duplicate globally"
+  - id: ERR_WITHDRAWAL_NOT_CLEARED
+    http: 409
+    condition: "Attempt to ticket/sell/cull an Animal whose meat_clearance_status == WITHHELD"
+  - id: ERR_ROUTE_NOT_PERMITTED
+    http: 422
+    condition: "Treatment route is not a key in DrugProduct.route_withdrawals"
+  - id: ERR_ANIMAL_ALREADY_LISTED
+    http: 409
+    condition: "Animal is already attached to another OPEN SaleLot"
+  - id: ERR_REST_PERIOD_VIOLATION
+    http: 409
+    condition: "PASTURE movement effective_from violates the required rest gap after prior occupancy"
+  - id: ERR_PASTURE_OVER_CAPACITY
+    http: 409
+    condition: "Applying the movement would push destination pasture aggregate AU above capacity during the overlap window"
+  - id: ERR_COMMISSION_NOT_ALLOWED
+    http: 422
+    condition: "PRIVATE_TREATY lot supplied a non-zero commission_pct"
+  - id: ERR_WEIGH_DATE_INVALID
+    http: 422
+    condition: "WeightRecord weighed_at not after birth_date or in the future"
+  - id: ERR_DOSE_DATES_INVALID
+    http: 422
+    condition: "last_dose_on earlier than first_dose_on or dose dates in the future"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_<parent>_version does not match the parent's current version"
+  - id: ERR_HERD_MISMATCH
+    http: 409
+    condition: "WeightTicket animal's herd_id differs from the SaleLot.herd_id"
+  - id: ERR_NOT_LATEST_MOVEMENT
+    http: 409
+    condition: "Revert requested on a movement that is not the animal's most recent APPLIED movement"
+  - id: ERR_VALIDATION_LIMIT
+    http: 422
+    condition: "Pagination limit out of [1,100] or offset negative"
+  - id: ERR_ANIMAL_NOT_ACTIVE
+    http: 409
+    condition: "Operation requires the Animal life_status == ACTIVE (e.g. add ticket) but it is SUSPENDED/SOLD/DEAD/CULLED"
+  - id: ERR_EMPTY_LOT
+    http: 409
+    condition: "Selling a lot with head_count == 0 (no tickets)"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: HerdManager
+    description: "Owns animals, breeding, movement planning/apply, mortality, herd/pasture setup"
+    identity: opaque
+    exclusive_operations:
+      - "POST /herds"
+      - "POST /pastures"
+      - "POST /animals"
+      - "POST /animals/{id}/life-status"
+      - "POST /breeding-records and POST /breeding-records/{id}/transition (record-service, mark-open, record-calving, abandon)"
+      - "POST /movement-records and apply/revert"
+      - "POST /mortality-records and void"
+    shared_operations:
+      - "POST /animals/{id}/weights (shared with FeedlotOperator)"
+      - "GET reads across animals/herds/pastures/trace"
+  - name: Veterinarian
+    description: "Owns drug products, health treatments, pregnancy confirmation"
+    identity: opaque
+    exclusive_operations:
+      - "POST /drug-products"
+      - "POST /health-treatments and void"
+      - "POST /breeding-records/{id}/transition (to_status CONFIRMED_PREGNANT)"
+    shared_operations:
+      - "GET reads across animals, treatments, herds, trace"
+  - name: SaleClerk
+    description: "Owns sale lots, weight tickets, sale finalization"
+    identity: opaque
+    exclusive_operations:
+      - "POST /sale-lots"
+      - "POST /sale-lots/{id}/tickets"
+      - "POST /sale-lots/{id}/sell"
+      - "POST /sale-lots/{id}/withdraw"
+    shared_operations:
+      - "GET reads across sale-lots, tickets, animals, trace"
+  - name: FeedlotOperator
+    description: "Owns rations and feeding; can record weights"
+    identity: opaque
+    exclusive_operations:
+      - "POST /feed-rations"
+    shared_operations:
+      - "POST /animals/{id}/weights (shared with HerdManager)"
+      - "GET reads across rations, animals, pastures, trace"
+  - name: Auditor
+    description: "Read-only across the traceability surface"
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "GET reads across all collections, summaries, and trace chains"

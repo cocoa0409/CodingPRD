@@ -1,0 +1,1160 @@
+# =============================================================================
+# Non-Medical In-Home Senior Care — Scaffold (SCAFFOLD.yaml, §1.0–§1.7)
+# Expert tier
+# =============================================================================
+
+scenario: |
+  Non-Medical In-Home Senior Care (Home Instead style): caregiver registry &
+  background tier, client care plan & ADL/IADL task list, visit scheduling &
+  electronic visit verification (EVV), caregiver-client matching & continuity,
+  hourly/live-in billing & overtime, mileage & companion errands, telephony
+  clock-in/out, long-term-care insurance claim assignment
+
+domain_name: in-home-senior-care
+api_prefix: ""   # flat topology: peer resource collections sit at the API root
+
+# =============================================================================
+# Complexity Profile (§0.1–§0.3)
+# =============================================================================
+complexity_profile:
+  primary_archetype: "Ledger reconciliation"
+  secondary_archetype: "Temporal windowing"
+  complexity_layers:
+    - "Dual-variant calculation"      # provisional (forward) vs final (chronological/OT) billing
+    - "Cascading side effects"        # clock-out -> visit charge -> continuity; finalize -> claim recompute
+    - "Optimistic concurrency"        # OCC on Invoice.version for claim assignment / supersede
+    - "Rate / threshold triggers"     # weekly OT threshold, EVV 15-min rounding, daily benefit cap
+
+  entity_topology: hybrid
+  # Caregiver/Client/Visit/Invoice/LtcClaim are flat cross-cutting peers with FK
+  # references; CarePlan/CareTask/MileageEntry are nested sub-resources.
+
+  state_machine_shape: cyclic
+  # Visit (cancel/revert loops), Invoice (dispute->draft loop), LtcClaim
+  # (deny->appeal->resubmit loop), Caregiver & CaregiverMatch (parallel dimensions).
+
+  relationship_patterns:
+    - one_to_many       # Client -> Visit, CarePlan -> CareTask
+    - many_to_many      # Caregiver <-> Client via CaregiverMatch (junction)
+    - cross_aggregate   # Visit references Caregiver, Client, CarePlan across aggregates
+
+  role_model: peer_roles
+  # Scheduler, Caregiver, BillingClerk, AgencyAdmin own distinct resource types.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table  (10 entities)
+# =============================================================================
+entities:
+  - name: Agency
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: name, type: string, source: input, description: "Agency legal name" }
+      - { name: base_hourly_rate, type: number, source: input, description: "Default caregiver hourly bill rate in USD, e.g. 30.00", constraints: "> 0" }
+      - { name: live_in_day_rate, type: number, source: input, description: "Flat per-day live-in bill rate in USD, e.g. 250.00", constraints: "> 0" }
+      - { name: overtime_threshold_hours, type: number, source: input, default: 40, description: "Weekly billable-hours threshold above which overtime applies", constraints: ">= 0" }
+      - { name: overtime_multiplier, type: number, source: input, default: 1.5, description: "Multiplier applied to base_hourly_rate for overtime hours", constraints: ">= 1" }
+      - { name: mileage_rate, type: number, source: input, default: 0.70, description: "Reimbursement rate per mile in USD", constraints: ">= 0" }
+      - { name: evv_rounding_minutes, type: integer, source: input, default: 15, description: "EVV duration rounding increment in minutes (round-half-up to nearest multiple)", constraints: "> 0" }
+      - { name: travel_buffer_minutes, type: integer, source: input, default: 30, description: "Travel buffer added on each side of a client's visit interval for client-overlap detection", constraints: ">= 0" }
+
+  - name: Caregiver
+    parent: null
+    common_fields: true
+    fields:
+      - { name: agency_id, type: string, source: input, description: "FK -> Agency.id" }
+      - { name: full_name, type: string, source: input, description: "Caregiver full name" }
+      - { name: hire_state_code, type: string, source: input, description: "Two-letter US state where caregiver is registered, e.g. CA" }
+      - { name: background_tier, type: enum, source: computed, default: "PENDING", description: "Background screening tier: PENDING | TIER_1 | TIER_2 | TIER_3 | REVOKED. Set by clear/revoke actions; gates match eligibility." }
+      - { name: employment_status, type: enum, source: computed, default: "APPLICANT", description: "APPLICANT | ACTIVE | SUSPENDED | TERMINATED. Independent dimension from background_tier." }
+      - { name: max_weekly_hours, type: number, source: input, default: 50, description: "Cap on scheduled billable hours per ISO week", constraints: "> 0" }
+
+  - name: Client
+    parent: null
+    common_fields: true
+    fields:
+      - { name: agency_id, type: string, source: input, description: "FK -> Agency.id" }
+      - { name: full_name, type: string, source: input, description: "Client full name" }
+      - { name: residence_state_code, type: string, source: input, description: "Two-letter US state of client residence, e.g. CA" }
+      - { name: requires_live_in, type: boolean, source: input, default: false, description: "Whether this client is typically billed live-in (flat daily) rather than hourly" }
+      - { name: continuity_score, type: number, source: computed, default: 0, description: "Weighted 0..1: 0.6*continuity_ratio + 0.4*reliability over terminal visits. Recomputed on visit completion/cancel/missed and match break." }
+      - { name: status, type: enum, source: computed, default: "INTAKE", description: "INTAKE | ACTIVE | ON_HOLD | DISCHARGED. Gates match activation and visit clock-in." }
+
+  - name: CarePlan
+    parent: Client
+    common_fields: true
+    fields:
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id" }
+      - { name: title, type: string, source: input, description: "Care plan title" }
+      - { name: status, type: enum, source: computed, default: "DRAFT", description: "DRAFT | PUBLISHED | RETIRED. A visit may only clock-in against a PUBLISHED plan." }
+      - { name: task_count, type: integer, source: computed, default: 0, description: "Count of ACTIVE (non-REMOVED) CareTask rows on this plan" }
+
+  - name: CareTask
+    parent: CarePlan
+    common_fields: true
+    fields:
+      - { name: care_plan_id, type: string, source: input, description: "FK -> CarePlan.id" }
+      - { name: category, type: enum, source: input, description: "ADL | IADL — Activity of Daily Living vs Instrumental ADL" }
+      - { name: name, type: string, source: input, description: "Task name, e.g. 'Bathing assistance', 'Grocery errand'" }
+      - { name: requires_companion_errand, type: boolean, source: input, default: false, description: "Whether the task involves a companion/errand trip that may accrue mileage" }
+      - { name: status, type: enum, source: computed, default: "ACTIVE", description: "ACTIVE | REMOVED. REMOVED tasks are excluded from task_count." }
+
+  - name: CaregiverMatch
+    parent: null
+    common_fields: true
+    fields:
+      - { name: caregiver_id, type: string, source: input, description: "FK -> Caregiver.id" }
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id" }
+      - { name: is_primary, type: boolean, source: input, default: false, description: "Whether this is the client's primary (continuity) caregiver" }
+      - { name: match_status, type: enum, source: computed, default: "PROPOSED", description: "PROPOSED | ACTIVE | ENDED. PROPOSED->ACTIVE on activation; a visit requires an ACTIVE match for its (caregiver_id, client_id)." }
+      - { name: continuity_status, type: enum, source: computed, default: "STANDARD", description: "Parallel dimension: STANDARD | PREFERRED | BROKEN. Independent of match_status; PREFERRED set for an active primary match; BROKEN when primary continuity lapses." }
+
+  - name: Visit
+    parent: null
+    common_fields: true
+    fields:
+      - { name: caregiver_id, type: string, source: input, description: "FK -> Caregiver.id" }
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id" }
+      - { name: care_plan_id, type: string, source: input, description: "FK -> CarePlan.id" }
+      - { name: billing_mode, type: enum, source: input, description: "HOURLY | LIVE_IN — determines the visit charge formula" }
+      - { name: scheduled_start, type: datetime, source: input, description: "ISO 8601 UTC planned start" }
+      - { name: scheduled_end, type: datetime, source: input, description: "ISO 8601 UTC planned end; must be > scheduled_start" }
+      - { name: clock_in_at, type: datetime, source: computed, default: null, description: "EVV telephony clock-in timestamp; set by clock-in action" }
+      - { name: clock_out_at, type: datetime, source: computed, default: null, description: "EVV telephony clock-out timestamp; set by clock-out action" }
+      - { name: evv_source, type: enum, source: computed, default: null, description: "Channel of the most recent EVV event: TELEPHONY | MOBILE | MANUAL" }
+      - { name: evv_log, type: array, source: computed, default: [], description: "Append-only EVV event log: array of {event_type: CLOCK_IN|CLOCK_OUT, event_at, evv_source, caller_id}" }
+      - { name: billable_minutes, type: integer, source: computed, default: 0, description: "EVV duration rounded to Agency.evv_rounding_minutes (round-half-up). 0 until clocked out." }
+      - { name: visit_charge, type: number, source: computed, default: 0, description: "Provisional charge (forward variant) set at clock-out. HOURLY: billable_minutes/60*base_hourly_rate. LIVE_IN: live_in_day_rate per started 24h block." }
+      - { name: status, type: enum, source: computed, default: "SCHEDULED", description: "SCHEDULED | EN_ROUTE | IN_PROGRESS | COMPLETED | CANCELLED | MISSED. Cyclic: EN_ROUTE/IN_PROGRESS can revert to SCHEDULED." }
+
+  - name: MileageEntry
+    parent: Visit
+    common_fields: true
+    fields:
+      - { name: visit_id, type: string, source: input, description: "FK -> Visit.id" }
+      - { name: miles, type: number, source: input, description: "Miles driven for a companion errand on this visit", constraints: "> 0" }
+      - { name: purpose, type: string, source: input, description: "Errand purpose, e.g. 'Grocery run'" }
+      - { name: line_charge, type: number, source: computed, default: 0, description: "round_half_up(miles * Agency.mileage_rate) — rounded PER ENTRY at creation" }
+      - { name: status, type: enum, source: computed, default: "RECORDED", description: "RECORDED | VOIDED. VOIDED entries are excluded from invoice mileage totals." }
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - { name: agency_id, type: string, source: input, description: "FK -> Agency.id" }
+      - { name: caregiver_id, type: string, source: input, description: "FK -> Caregiver.id" }
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id" }
+      - { name: period_start, type: datetime, source: input, description: "ISO 8601 UTC inclusive start of billing period" }
+      - { name: period_end, type: datetime, source: input, description: "ISO 8601 UTC exclusive end of billing period; must be > period_start" }
+      - { name: labor_total, type: number, source: computed, default: 0, description: "Final labor charge with overtime applied (chronological variant). 0 in DRAFT until finalized." }
+      - { name: mileage_total, type: number, source: computed, default: 0, description: "Sum of RECORDED MileageEntry.line_charge for COMPLETED visits in window" }
+      - { name: invoice_total, type: number, source: computed, default: 0, description: "labor_total + mileage_total, set at finalize" }
+      - { name: client_responsible_amount, type: number, source: computed, default: 0, description: "invoice_total minus assigned LtcClaim covered_amount; equals invoice_total when no claim is in effect" }
+      - { name: lines, type: array, source: computed, default: [], description: "Embedded billing lines: array of {line_type: REGULAR|OVERTIME|LIVE_IN|MILEAGE, source_visit_id, hours, rate, amount}. Rebuilt at finalize, cleared on reopen." }
+      - { name: status, type: enum, source: computed, default: "DRAFT", description: "DRAFT | ISSUED | DISPUTED | PAID | VOID. Cyclic: DISPUTED->DRAFT." }
+
+  - name: LtcClaim
+    parent: null
+    common_fields: true
+    fields:
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id" }
+      - { name: invoice_id, type: string, source: input, description: "FK -> Invoice.id" }
+      - { name: insurer_name, type: string, source: input, description: "Long-term-care insurer name" }
+      - { name: policy_number, type: string, source: input, description: "LTC policy number" }
+      - { name: covered_pct, type: number, source: input, description: "Fraction of invoice_total the policy covers, e.g. 0.80", constraints: ">= 0 and <= 1" }
+      - { name: daily_benefit_max, type: number, source: input, description: "Maximum covered USD per benefit day", constraints: "> 0" }
+      - { name: covered_days, type: integer, source: input, description: "Number of benefit days the claim spans", constraints: "> 0" }
+      - { name: expected_invoice_version, type: integer, source: input, description: "OCC: the Invoice.version the client observed when assigning this claim" }
+      - { name: covered_amount, type: number, source: computed, default: 0, description: "min(round_half_up(invoice_total*covered_pct), daily_benefit_max*covered_days); set on submit" }
+      - { name: status, type: enum, source: computed, default: "DRAFT", description: "DRAFT | SUBMITTED | APPROVED | DENIED | APPEALED | PAID. Branching+cyclic: SUBMITTED->{APPROVED,DENIED}; DENIED->APPEALED->SUBMITTED." }
+
+# =============================================================================
+# §1.2 State Machine Table  (6 machines)
+# =============================================================================
+state_machines:
+  - entity: Caregiver
+    field: "background_tier × employment_status (parallel dimensions)"
+    initial_state: "background_tier=PENDING, employment_status=APPLICANT"
+    terminal_states: [TERMINATED, REVOKED]
+    transitions:
+      - from: "background_tier=PENDING"
+        to: "background_tier=TIER_1|TIER_2|TIER_3"
+        trigger: "POST /caregivers/{id}/transition (action=CLEAR_BACKGROUND)"
+        actor: AgencyAdmin
+        preconditions:
+          - "caregiver.background_tier == PENDING (ERR_BACKGROUND_NOT_PENDING)"
+          - "target_tier in {TIER_1, TIER_2, TIER_3} (ERR_INVALID_REQUEST)"
+        side_effects:
+          - "Set background_tier to target_tier"
+        note: "Independent of the employment_status dimension."
+      - from: "employment_status=APPLICANT"
+        to: "employment_status=ACTIVE"
+        trigger: "POST /caregivers/{id}/transition (action=ACTIVATE)"
+        actor: AgencyAdmin
+        preconditions:
+          - "caregiver.background_tier in {TIER_1, TIER_2, TIER_3} (ERR_BACKGROUND_NOT_CLEARED)"
+          - "caregiver.employment_status == APPLICANT (ERR_INVALID_STATE)"
+        side_effects:
+          - "Set employment_status to ACTIVE"
+        note: "Cross-dimension guard: activation depends on the parallel background_tier dimension."
+      - from: "employment_status=ACTIVE"
+        to: "employment_status=SUSPENDED"
+        trigger: "POST /caregivers/{id}/transition (action=SUSPEND)"
+        actor: AgencyAdmin
+        preconditions:
+          - "caregiver.employment_status == ACTIVE (ERR_INVALID_STATE)"
+        side_effects:
+          - "Set employment_status to SUSPENDED"
+          - "Cascade: every ACTIVE CaregiverMatch for this caregiver -> match_status=ENDED; if that match was is_primary with continuity_status==PREFERRED, set its continuity_status=BROKEN and recompute that client's continuity_score"
+      - from: "employment_status=SUSPENDED"
+        to: "employment_status=ACTIVE"
+        trigger: "POST /caregivers/{id}/transition (action=ACTIVATE)"
+        actor: AgencyAdmin
+        preconditions:
+          - "caregiver.background_tier in {TIER_1, TIER_2, TIER_3} (ERR_BACKGROUND_NOT_CLEARED)"
+          - "caregiver.employment_status == SUSPENDED (ERR_INVALID_STATE)"
+        side_effects:
+          - "Set employment_status to ACTIVE"
+        note: "Cyclic: SUSPENDED returns to ACTIVE."
+      - from: "background_tier in {PENDING, TIER_1, TIER_2, TIER_3}"
+        to: "background_tier=REVOKED"
+        trigger: "POST /caregivers/{id}/transition (action=REVOKE)"
+        actor: AgencyAdmin
+        preconditions:
+          - "caregiver.background_tier != REVOKED (ERR_INVALID_STATE)"
+        side_effects:
+          - "Set background_tier to REVOKED and employment_status to TERMINATED"
+          - "Cascade: every PROPOSED/ACTIVE CaregiverMatch for this caregiver -> match_status=ENDED; primary PREFERRED matches set continuity_status=BROKEN and recompute that client's continuity_score"
+        note: "Terminal on both dimensions."
+
+  - entity: CaregiverMatch
+    field: "match_status × continuity_status (parallel dimensions)"
+    initial_state: "match_status=PROPOSED, continuity_status=STANDARD"
+    terminal_states: [ENDED]
+    transitions:
+      - from: "match_status=PROPOSED"
+        to: "match_status=ACTIVE"
+        trigger: "POST /matches/{id}/transition (action=ACTIVATE)"
+        actor: Scheduler
+        preconditions:
+          - "caregiver.employment_status == ACTIVE (ERR_CAREGIVER_NOT_ACTIVE)"
+          - "caregiver.background_tier in {TIER_1, TIER_2, TIER_3} (ERR_BACKGROUND_NOT_CLEARED)"
+          - "client.status in {INTAKE, ACTIVE} (ERR_CLIENT_NOT_SCHEDULABLE)"
+          - "no other ACTIVE match exists for this (caregiver_id, client_id) pair (ERR_DUPLICATE_ACTIVE_MATCH)"
+        side_effects:
+          - "Set match_status to ACTIVE"
+          - "If is_primary: set this match continuity_status=PREFERRED and set any other PREFERRED match for the same client_id to STANDARD"
+      - from: "continuity_status=PREFERRED"
+        to: "continuity_status=BROKEN"
+        trigger: "system (primary caregiver suspended/revoked, or primary match ended)"
+        actor: system
+        preconditions:
+          - "match.is_primary == true"
+        side_effects:
+          - "Set continuity_status to BROKEN"
+          - "Recompute client.continuity_score"
+        note: "Parallel dimension evolves independently of match_status."
+      - from: "match_status in {PROPOSED, ACTIVE}"
+        to: "match_status=ENDED"
+        trigger: "POST /matches/{id}/transition (action=END)"
+        actor: Scheduler
+        preconditions:
+          - "match.match_status != ENDED (ERR_INVALID_STATE)"
+        side_effects:
+          - "Set match_status to ENDED"
+          - "If match.is_primary and continuity_status==PREFERRED: set continuity_status=BROKEN and recompute client.continuity_score"
+
+  - entity: Visit
+    field: status
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED, MISSED]
+    transitions:
+      - from: SCHEDULED
+        to: EN_ROUTE
+        trigger: "POST /visits/{id}/transition (action=DEPART)"
+        actor: Caregiver
+        preconditions:
+          - "visit.status == SCHEDULED (ERR_INVALID_STATE)"
+          - "an ACTIVE CaregiverMatch exists for (visit.caregiver_id, visit.client_id) (ERR_NO_ACTIVE_MATCH)"
+        side_effects: []
+      - from: "{SCHEDULED, EN_ROUTE}"
+        to: IN_PROGRESS
+        trigger: "POST /visits/{id}/clock-in"
+        actor: Caregiver
+        preconditions:
+          - "visit.status in {SCHEDULED, EN_ROUTE} (ERR_INVALID_STATE)"
+          - "client.status == ACTIVE (ERR_CLIENT_NOT_SCHEDULABLE)"
+          - "care_plan.status == PUBLISHED (ERR_CARE_PLAN_NOT_PUBLISHED)"
+          - "an ACTIVE CaregiverMatch exists for (visit.caregiver_id, visit.client_id) (ERR_NO_ACTIVE_MATCH)"
+        side_effects:
+          - "Set clock_in_at to event_at; set evv_source; append a CLOCK_IN entry to evv_log"
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /visits/{id}/clock-out"
+        actor: Caregiver
+        preconditions:
+          - "visit.status == IN_PROGRESS (ERR_VISIT_NOT_IN_PROGRESS)"
+          - "event_at > clock_in_at (ERR_INVALID_CLOCK_WINDOW)"
+        side_effects:
+          - "Set clock_out_at to event_at; append a CLOCK_OUT entry to evv_log"
+          - "Compute billable_minutes via evv_rounding (round_half_up to nearest evv_rounding_minutes)"
+          - "Compute visit_charge (provisional/forward variant)"
+          - "Recompute client.continuity_score"
+      - from: "{SCHEDULED, EN_ROUTE}"
+        to: CANCELLED
+        trigger: "POST /visits/{id}/transition (action=CANCEL)"
+        actor: Scheduler
+        preconditions:
+          - "visit.status in {SCHEDULED, EN_ROUTE} (ERR_INVALID_STATE)"
+        side_effects:
+          - "Set billable_minutes=0, visit_charge=0"
+          - "Recompute client.continuity_score"
+      - from: "{EN_ROUTE, IN_PROGRESS}"
+        to: SCHEDULED
+        trigger: "POST /visits/{id}/transition (action=RESET)"
+        actor: Scheduler
+        preconditions:
+          - "visit.status in {EN_ROUTE, IN_PROGRESS} (ERR_INVALID_STATE)"
+        side_effects:
+          - "Clear clock_in_at, clock_out_at, evv_source; set billable_minutes=0, visit_charge=0"
+        note: "Cyclic revert loop for mis-clocked visits."
+      - from: SCHEDULED
+        to: MISSED
+        trigger: "POST /visits/{id}/transition (action=MARK_MISSED)"
+        actor: Scheduler
+        preconditions:
+          - "visit.status == SCHEDULED (ERR_INVALID_STATE)"
+        side_effects:
+          - "Recompute client.continuity_score (reliability term penalised)"
+
+  - entity: Invoice
+    field: status
+    initial_state: DRAFT
+    terminal_states: [PAID, VOID]
+    transitions:
+      - from: DRAFT
+        to: ISSUED
+        trigger: "POST /invoices/{id}/finalize"
+        actor: BillingClerk
+        preconditions:
+          - "invoice.status == DRAFT (ERR_INVOICE_NOT_DRAFT)"
+          - "at least one COMPLETED Visit exists in [period_start, period_end) for (caregiver_id, client_id) (ERR_NO_BILLABLE_VISITS)"
+        side_effects:
+          - "Rebuild Invoice.lines from COMPLETED visits in window (REGULAR/OVERTIME/LIVE_IN) and RECORDED mileage (MILEAGE)"
+          - "Compute labor_total via final/chronological overtime variant; compute mileage_total"
+          - "Set invoice_total = labor_total + mileage_total; set client_responsible_amount = invoice_total"
+          - "Increments Invoice.version by 1"
+      - from: ISSUED
+        to: DISPUTED
+        trigger: "POST /invoices/{id}/transition (action=DISPUTE)"
+        actor: AgencyAdmin
+        preconditions:
+          - "invoice.status == ISSUED (ERR_INVOICE_NOT_ISSUED)"
+        side_effects:
+          - "Cascade: any LtcClaim in {SUBMITTED, APPROVED} for this invoice -> DENIED; that DENY resets the claim's covered_amount to 0; restore invoice.client_responsible_amount to invoice_total"
+          - "Increments Invoice.version by 1"
+      - from: DISPUTED
+        to: DRAFT
+        trigger: "POST /invoices/{id}/transition (action=REOPEN)"
+        actor: AgencyAdmin
+        preconditions:
+          - "invoice.status == DISPUTED (ERR_INVOICE_NOT_DISPUTED)"
+        side_effects:
+          - "Clear Invoice.lines; reset labor_total, mileage_total, invoice_total, client_responsible_amount to 0"
+          - "Increments Invoice.version by 1"
+        note: "Cyclic: DISPUTED returns to DRAFT for re-finalization."
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /invoices/{id}/transition (action=MARK_PAID)"
+        actor: BillingClerk
+        preconditions:
+          - "invoice.status == ISSUED (ERR_INVOICE_NOT_ISSUED)"
+          - "if any LtcClaim is assigned to this invoice, it must be APPROVED or PAID (ERR_CLAIM_NOT_RESOLVED)"
+        side_effects:
+          - "Cascade: any APPROVED LtcClaim for this invoice -> PAID"
+          - "Increments Invoice.version by 1"
+      - from: DRAFT
+        to: VOID
+        trigger: "POST /invoices/{id}/transition (action=VOID)"
+        actor: AgencyAdmin
+        preconditions:
+          - "invoice.status == DRAFT (ERR_INVOICE_NOT_DRAFT)"
+        side_effects: []
+
+  - entity: LtcClaim
+    field: status
+    initial_state: DRAFT
+    terminal_states: [PAID]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /ltc-claims/{id}/submit"
+        actor: BillingClerk
+        preconditions:
+          - "claim.status == DRAFT (ERR_INVALID_STATE)"
+          - "invoice.status == ISSUED (ERR_INVOICE_NOT_ISSUED)"
+        side_effects:
+          - "Compute covered_amount = min(round_half_up(invoice.invoice_total*covered_pct), daily_benefit_max*covered_days)"
+          - "Set invoice.client_responsible_amount = round_half_up(invoice.invoice_total - covered_amount)"
+          - "Increments Invoice.version by 1"
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /ltc-claims/{id}/transition (action=APPROVE)"
+        actor: AgencyAdmin
+        preconditions:
+          - "claim.status == SUBMITTED (ERR_INVALID_STATE)"
+        side_effects: []
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /ltc-claims/{id}/transition (action=DENY)"
+        actor: AgencyAdmin
+        preconditions:
+          - "claim.status == SUBMITTED (ERR_INVALID_STATE)"
+        side_effects:
+          - "Compensation: set covered_amount=0; restore invoice.client_responsible_amount = invoice.invoice_total"
+          - "Increments Invoice.version by 1"
+      - from: DENIED
+        to: APPEALED
+        trigger: "POST /ltc-claims/{id}/transition (action=APPEAL)"
+        actor: BillingClerk
+        preconditions:
+          - "claim.status == DENIED (ERR_INVALID_STATE)"
+        side_effects: []
+      - from: APPEALED
+        to: SUBMITTED
+        trigger: "POST /ltc-claims/{id}/submit"
+        actor: BillingClerk
+        preconditions:
+          - "claim.status == APPEALED (ERR_INVALID_STATE)"
+          - "invoice.status == ISSUED (ERR_INVOICE_NOT_ISSUED)"
+        side_effects:
+          - "Recompute covered_amount; set invoice.client_responsible_amount = round_half_up(invoice.invoice_total - covered_amount)"
+          - "Increments Invoice.version by 1"
+        note: "Cyclic: DENIED -> APPEALED -> SUBMITTED resubmission loop."
+      - from: APPROVED
+        to: PAID
+        trigger: "system (parent invoice marked PAID)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: claim-assign-stale-invoice
+    parent_entity: Invoice
+    write_endpoint: "POST /ltc-claims"
+    occ_field: "expected_invoice_version"
+    description: |
+      Creating an LtcClaim against an Invoice whose version has advanced since
+      the client last observed it is rejected. A claim assignment legitimately
+      supersedes any prior claim attached to that invoice, so a stale-version
+      create indicates the client's view of the invoice (its total, status, or
+      a previously-assigned claim) is out of date and the new claim would
+      attach to a superseded financial snapshot.
+    error_id: ERR_STALE_INVOICE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table  (5 calculations)
+# =============================================================================
+calculations:
+  - name: visit_charge_provisional
+    trigger: "Visit clock-out (IN_PROGRESS -> COMPLETED)"
+    algorithm: forward_looking
+    formula: |
+      raw_minutes = floor((clock_out_at - clock_in_at) in whole minutes)
+      billable_minutes = round_half_up(raw_minutes / evv_rounding_minutes) * evv_rounding_minutes
+      if billing_mode == HOURLY:
+        visit_charge = round_half_up( (billable_minutes / 60) * agency.base_hourly_rate )
+      elif billing_mode == LIVE_IN:
+        started_days = ceil(billable_minutes / 1440)        # each started 24h block
+        visit_charge = round_half_up( started_days * agency.live_in_day_rate )
+    input_set: "Only this single Visit's EVV window. No overtime awareness — every hour is billed at base_hourly_rate."
+    constants: {}
+    precision: "2 decimal places, round_half_up"
+    note: "Forward variant: each visit priced in isolation at base rate the moment it completes."
+    variants:
+      - name: hourly
+        when: "visit.billing_mode == HOURLY"
+        difference: "Charges billable_minutes/60 at base_hourly_rate."
+      - name: live_in
+        when: "visit.billing_mode == LIVE_IN"
+        difference: "Charges live_in_day_rate per started 24h block, ignoring per-hour rate."
+
+  - name: invoice_labor_final
+    trigger: "Invoice finalize (DRAFT -> ISSUED)"
+    algorithm: chronological
+    formula: |
+      # COMPLETED visits in [period_start, period_end) for (caregiver_id, client_id),
+      # ordered by clock_in_at ASC, then created_at ASC as tie-break.
+      running_hours = 0
+      for visit in ordered_completed_visits:
+        if visit.billing_mode == LIVE_IN:
+          started_days = ceil(visit.billable_minutes / 1440)
+          line(LIVE_IN, hours=0, rate=live_in_day_rate, amount=round_half_up(started_days*live_in_day_rate))
+          continue
+        h = visit.billable_minutes / 60
+        reg_remaining = max(0, overtime_threshold_hours - running_hours)
+        reg_h = min(h, reg_remaining)
+        ot_h  = h - reg_h
+        if reg_h > 0: line(REGULAR,  hours=reg_h, rate=base_hourly_rate,                     amount=round_half_up(reg_h*base_hourly_rate))
+        if ot_h  > 0: line(OVERTIME, hours=ot_h,  rate=base_hourly_rate*overtime_multiplier, amount=round_half_up(ot_h*base_hourly_rate*overtime_multiplier))
+        running_hours += h
+      labor_total = sum of all REGULAR/OVERTIME/LIVE_IN line amounts   # sum of already-rounded lines
+    input_set: "COMPLETED visits only, in [period_start, period_end), same caregiver_id AND client_id. CANCELLED/MISSED excluded."
+    constants: {}
+    precision: "2 decimal places; round PER LINE then sum (order pinned)."
+    note: |
+      Final/chronological variant: overtime is allocated across the whole period by
+      accumulating running_hours in clock_in_at order. Hours past
+      overtime_threshold_hours bill at base_hourly_rate*overtime_multiplier. This
+      diverges from the plain sum of visit_charge_provisional (which never applies
+      overtime). The two variants operate on different entity domains (Invoice labor
+      vs. per-Visit charge).
+    variants:
+      - name: provisional_sum
+        when: "viewed at DRAFT (before finalize)"
+        difference: "Equals sum(visit.visit_charge) — no overtime, every hour at base rate."
+      - name: final_overtime
+        when: "computed at finalize"
+        difference: "Allocates hours over overtime_threshold_hours at the overtime rate; total >= provisional_sum."
+
+  - name: mileage_total
+    trigger: "MileageEntry create (per-entry line_charge); Invoice finalize (aggregate)"
+    algorithm: aggregation
+    formula: |
+      # Per MileageEntry at creation (round PER ENTRY):
+      line_charge = round_half_up(miles * agency.mileage_rate)
+      # At invoice finalize:
+      mileage_total = SUM over MileageEntry where status==RECORDED
+                      and entry.visit_id in {COMPLETED visits in [period_start, period_end)}
+                      of line_charge        # plain sum of already-rounded line_charges
+    input_set: "RECORDED MileageEntry rows whose visit is a COMPLETED visit inside [period_start, period_end). VOIDED excluded."
+    constants: {}
+    precision: "2 decimal places; round_half_up PER ENTRY at creation, then SUM the already-rounded line_charges."
+    note: |
+      Rounding order is pinned: each MileageEntry.line_charge is rounded at creation,
+      and mileage_total is the plain sum of those rounded values (NOT
+      round_half_up(sum(miles)*rate)). For miles whose raw charge ends on a half-cent,
+      per-entry rounding and sum-then-round diverge — per-entry order is authoritative.
+
+  - name: claim_covered_amount
+    trigger: "LtcClaim submit (DRAFT/APPEALED -> SUBMITTED)"
+    algorithm: threshold
+    formula: |
+      pct_covered  = round_half_up(invoice.invoice_total * covered_pct)
+      benefit_cap  = daily_benefit_max * covered_days
+      covered_amount = min(pct_covered, benefit_cap)
+      invoice.client_responsible_amount = round_half_up(invoice.invoice_total - covered_amount)
+    input_set: "A single ISSUED Invoice and the claim's policy parameters."
+    constants: {}
+    precision: "2 decimal places, round_half_up"
+    note: "Threshold: the daily-benefit cap binds when daily_benefit_max*covered_days < round_half_up(invoice_total*covered_pct)."
+    variants:
+      - name: percentage_bound
+        when: "round_half_up(invoice_total*covered_pct) <= daily_benefit_max*covered_days"
+        difference: "covered_amount = the percentage of invoice_total."
+      - name: cap_bound
+        when: "round_half_up(invoice_total*covered_pct) > daily_benefit_max*covered_days"
+        difference: "covered_amount = daily_benefit_max*covered_days (the cap)."
+
+  - name: continuity_score
+    trigger: "Visit completion/cancellation/missed; CaregiverMatch end/break"
+    algorithm: weighted_scoring
+    formula: |
+      # Over all terminal-state visits for the client (COMPLETED + CANCELLED + MISSED):
+      completed = count(visits where status==COMPLETED)
+      terminal  = count(visits where status in {COMPLETED, CANCELLED, MISSED})
+      if terminal == 0:
+        continuity_score = 0
+      else:
+        # primary caregiver: caregiver_id of the client's ACTIVE is_primary match;
+        # if none, the caregiver_id of the earliest-created ACTIVE match by created_at ASC;
+        # if no ACTIVE match, null.
+        if completed == 0:
+          continuity_ratio = 0
+        else:
+          continuity_ratio = (completed visits whose caregiver_id == primary_caregiver_id) / completed
+        reliability = completed / terminal
+        continuity_score = round_half_up( 0.6*continuity_ratio + 0.4*reliability , 2 )
+    input_set: "Terminal-state visits for one client; primary caregiver from the ACTIVE primary match."
+    constants:
+      CONTINUITY_WEIGHT: 0.6
+      RELIABILITY_WEIGHT: 0.4
+    precision: "2 decimal places, round_half_up"
+    note: "Tie-break for primary-caregiver selection uses created_at ASC, never id."
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and well-formed"
+    error_id: ERR_MISSING_AUTH
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Role permitted for this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "Path/body resource ids exist, validated left-to-right (agency, then caregiver/client/plan, then visit/invoice/claim/mileage)"
+    error_id: "ERR_AGENCY_NOT_FOUND / ERR_CAREGIVER_NOT_FOUND / ERR_CLIENT_NOT_FOUND / ERR_CARE_PLAN_NOT_FOUND / ERR_MATCH_NOT_FOUND / ERR_VISIT_NOT_FOUND / ERR_INVOICE_NOT_FOUND / ERR_CLAIM_NOT_FOUND (a missing CareTask folds into ERR_CARE_PLAN_NOT_FOUND; a missing MileageEntry into ERR_VISIT_NOT_FOUND)"
+    http_status: 404
+    applies_to: "all endpoints with path or FK ids"
+
+  - priority: 4
+    category: business_constraint
+    check: "Body well-formed: required fields present, enums valid, scheduled_end > scheduled_start, period_end > period_start, covered_pct in [0,1], miles > 0"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST/PUT/PATCH"
+
+  - priority: 5
+    category: state
+    check: "Target resource in a valid state for the requested transition (state-machine from: clause)"
+    error_id: "ERR_INVALID_STATE / ERR_VISIT_NOT_IN_PROGRESS / ERR_INVOICE_NOT_DRAFT / ERR_INVOICE_NOT_ISSUED / ERR_INVOICE_NOT_DISPUTED / ERR_BACKGROUND_NOT_PENDING"
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6
+    category: business_referential
+    check: "Caregiver background cleared (tier in {TIER_1,TIER_2,TIER_3}) before activation and before match activation"
+    error_id: ERR_BACKGROUND_NOT_CLEARED
+    http_status: 409
+    applies_to: "POST /caregivers/{id}/transition (ACTIVATE), POST /matches/{id}/transition (ACTIVATE)"
+
+  - priority: 7
+    category: business_referential
+    check: "Caregiver employment_status==ACTIVE before a match referencing them can be activated"
+    error_id: ERR_CAREGIVER_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /matches/{id}/transition (ACTIVATE)"
+
+  - priority: 8
+    category: business_referential
+    check: "Client.status schedulable: INTAKE/ACTIVE for match activation; ACTIVE for visit clock-in"
+    error_id: ERR_CLIENT_NOT_SCHEDULABLE
+    http_status: 409
+    applies_to: "POST /matches/{id}/transition (ACTIVATE), POST /visits/{id}/clock-in"
+
+  - priority: 9
+    category: business_referential
+    check: "CarePlan referenced by a visit clock-in must be PUBLISHED"
+    error_id: ERR_CARE_PLAN_NOT_PUBLISHED
+    http_status: 409
+    applies_to: "POST /visits/{id}/clock-in"
+
+  - priority: 10
+    category: business_referential
+    check: "An ACTIVE CaregiverMatch must exist for (visit.caregiver_id, visit.client_id) to depart or clock-in"
+    error_id: ERR_NO_ACTIVE_MATCH
+    http_status: 409
+    applies_to: "POST /visits/{id}/transition (DEPART), POST /visits/{id}/clock-in"
+
+  - priority: 11
+    category: business_constraint
+    check: "No duplicate ACTIVE CaregiverMatch for the same (caregiver_id, client_id) pair"
+    error_id: ERR_DUPLICATE_ACTIVE_MATCH
+    http_status: 409
+    applies_to: "POST /matches/{id}/transition (ACTIVATE)"
+
+  - priority: 12
+    category: business_temporal
+    check: "A visit's [scheduled_start, scheduled_end) must not overlap any non-terminal (SCHEDULED/EN_ROUTE/IN_PROGRESS) visit for the SAME caregiver. Half-open interval: exact endpoint touch (a.end == b.start) is allowed."
+    error_id: ERR_CAREGIVER_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /visits"
+
+  - priority: 13
+    category: business_temporal
+    check: "A visit's interval, expanded by Agency.travel_buffer_minutes on EACH side, must not overlap any non-terminal visit for the SAME client. Buffered-closed interval: a touching endpoint within the buffer conflicts."
+    error_id: ERR_CLIENT_VISIT_CONFLICT
+    http_status: 409
+    applies_to: "POST /visits"
+
+  - priority: 14
+    category: business_constraint
+    check: "Scheduling a visit must not push the caregiver's total scheduled billable hours in the visit's ISO week above caregiver.max_weekly_hours"
+    error_id: ERR_WEEKLY_HOURS_EXCEEDED
+    http_status: 409
+    applies_to: "POST /visits"
+
+  - priority: 15
+    category: business_temporal
+    check: "clock_out event_at must be strictly greater than clock_in_at"
+    error_id: ERR_INVALID_CLOCK_WINDOW
+    http_status: 409
+    applies_to: "POST /visits/{id}/clock-out"
+
+  - priority: 16
+    category: business_constraint
+    check: "Invoice finalize requires at least one COMPLETED visit in window for (caregiver_id, client_id)"
+    error_id: ERR_NO_BILLABLE_VISITS
+    http_status: 409
+    applies_to: "POST /invoices/{id}/finalize"
+
+  - priority: 17
+    category: business_fiscal
+    check: "mark-paid blocked while an assigned LtcClaim is not APPROVED/PAID"
+    error_id: ERR_CLAIM_NOT_RESOLVED
+    http_status: 409
+    applies_to: "POST /invoices/{id}/transition (MARK_PAID)"
+
+  - priority: 18
+    category: concurrency
+    check: "expected_invoice_version on claim assignment must equal current Invoice.version"
+    error_id: ERR_STALE_INVOICE_VERSION
+    http_status: 412
+    applies_to: "POST /ltc-claims"
+
+# =============================================================================
+# §1.5 API Endpoint Table  (32 endpoints)
+# =============================================================================
+endpoints:
+  # ---- Agency ----
+  - method: POST
+    path: "/agencies"
+    description: "Create an Agency (config root holding rates/thresholds)"
+    roles: [AgencyAdmin]
+    code: 201
+    input: [name, base_hourly_rate, live_in_day_rate, "overtime_threshold_hours?", "overtime_multiplier?", "mileage_rate?", "evv_rounding_minutes?", "travel_buffer_minutes?"]
+    output: Agency
+    side_effects: []
+
+  # ---- Caregiver ----
+  - method: POST
+    path: "/caregivers"
+    description: "Register a Caregiver (background_tier=PENDING, employment_status=APPLICANT)"
+    roles: [AgencyAdmin]
+    code: 201
+    input: [agency_id, full_name, hire_state_code, "max_weekly_hours?"]
+    output: Caregiver
+    side_effects: ["background_tier=PENDING, employment_status=APPLICANT"]
+  - method: GET
+    path: "/caregivers"
+    description: "List/filter Caregivers by agency"
+    roles: [AgencyAdmin, Scheduler, BillingClerk]
+    code: 200
+    input: ["agency_id?", "limit?", "offset?"]
+    output: "Caregiver[]"
+    side_effects: []
+  - method: GET
+    path: "/caregivers/{id}"
+    description: "Get a Caregiver"
+    roles: [AgencyAdmin, Scheduler, BillingClerk, Caregiver]
+    code: 200
+    input: []
+    output: Caregiver
+    side_effects: []
+  - method: POST
+    path: "/caregivers/{id}/transition"
+    description: "Employment/background lifecycle action. action=CLEAR_BACKGROUND (PENDING->target_tier; target_tier required), ACTIVATE (->ACTIVE), SUSPEND (->SUSPENDED), REVOKE (->REVOKED + employment TERMINATED)"
+    roles: [AgencyAdmin]
+    code: 200
+    input: [action, "target_tier?"]
+    output: Caregiver
+    side_effects: ["dimension transition; cascade end of matches on SUSPEND/REVOKE"]
+
+  # ---- Client ----
+  - method: POST
+    path: "/clients"
+    description: "Create a Client (status=INTAKE)"
+    roles: [AgencyAdmin, Scheduler]
+    code: 201
+    input: [agency_id, full_name, residence_state_code, "requires_live_in?"]
+    output: Client
+    side_effects: ["status=INTAKE, continuity_score=0"]
+  - method: GET
+    path: "/clients"
+    description: "List/filter Clients by agency"
+    roles: [AgencyAdmin, Scheduler, BillingClerk]
+    code: 200
+    input: ["agency_id?", "limit?", "offset?"]
+    output: "Client[]"
+    side_effects: []
+  - method: GET
+    path: "/clients/{id}"
+    description: "Get a Client (computed continuity_score)"
+    roles: [AgencyAdmin, Scheduler, BillingClerk, Caregiver]
+    code: 200
+    input: []
+    output: Client
+    side_effects: []
+  - method: POST
+    path: "/clients/{id}/transition"
+    description: "Change Client.status. action=ACTIVATE (INTAKE->ACTIVE), HOLD (ACTIVE->ON_HOLD), RESUME (ON_HOLD->ACTIVE), DISCHARGE (->DISCHARGED)"
+    roles: [AgencyAdmin, Scheduler]
+    code: 200
+    input: [action]
+    output: Client
+    side_effects: ["status set"]
+
+  # ---- CarePlan / CareTask ----
+  - method: POST
+    path: "/clients/{id}/care-plans"
+    description: "Create a CarePlan for a client (status=DRAFT)"
+    roles: [AgencyAdmin, Scheduler]
+    code: 201
+    input: [title]
+    output: CarePlan
+    side_effects: ["status=DRAFT, task_count=0"]
+  - method: GET
+    path: "/clients/{id}/care-plans"
+    description: "List CarePlans for a client"
+    roles: [AgencyAdmin, Scheduler, BillingClerk, Caregiver]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "CarePlan[]"
+    side_effects: []
+  - method: GET
+    path: "/care-plans/{id}"
+    description: "Get a CarePlan"
+    roles: [AgencyAdmin, Scheduler, BillingClerk, Caregiver]
+    code: 200
+    input: []
+    output: CarePlan
+    side_effects: []
+  - method: POST
+    path: "/care-plans/{id}/transition"
+    description: "CarePlan lifecycle action. action=PUBLISH (DRAFT->PUBLISHED), RETIRE (PUBLISHED->RETIRED)"
+    roles: [AgencyAdmin, Scheduler]
+    code: 200
+    input: [action]
+    output: CarePlan
+    side_effects: ["status transition"]
+  - method: POST
+    path: "/care-plans/{id}/tasks"
+    description: "Add an ADL/IADL CareTask to a plan"
+    roles: [AgencyAdmin, Scheduler]
+    code: 201
+    input: [category, name, "requires_companion_errand?"]
+    output: CareTask
+    side_effects: ["status=ACTIVE; parent task_count incremented"]
+  - method: GET
+    path: "/care-plans/{id}/tasks"
+    description: "List CareTasks for a plan"
+    roles: [AgencyAdmin, Scheduler, BillingClerk, Caregiver]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "CareTask[]"
+    side_effects: []
+  - method: DELETE
+    path: "/care-plans/{id}/tasks/{id}"
+    description: "Remove a CareTask (status=REMOVED; task_count decremented)"
+    roles: [AgencyAdmin, Scheduler]
+    code: 200
+    input: []
+    output: CareTask
+    side_effects: ["status=REMOVED; parent task_count decremented"]
+
+  # ---- CaregiverMatch ----
+  - method: POST
+    path: "/matches"
+    description: "Propose a caregiver-client match (status=PROPOSED)"
+    roles: [Scheduler, AgencyAdmin]
+    code: 201
+    input: [caregiver_id, client_id, "is_primary?"]
+    output: CaregiverMatch
+    side_effects: ["match_status=PROPOSED, continuity_status=STANDARD"]
+  - method: GET
+    path: "/matches"
+    description: "List/filter matches by caregiver or client"
+    roles: [AgencyAdmin, Scheduler, BillingClerk]
+    code: 200
+    input: ["caregiver_id?", "client_id?", "limit?", "offset?"]
+    output: "CaregiverMatch[]"
+    side_effects: []
+  - method: GET
+    path: "/matches/{id}"
+    description: "Get a match"
+    roles: [AgencyAdmin, Scheduler, BillingClerk, Caregiver]
+    code: 200
+    input: []
+    output: CaregiverMatch
+    side_effects: []
+  - method: POST
+    path: "/matches/{id}/transition"
+    description: "Match lifecycle action. action=ACTIVATE (PROPOSED->ACTIVE), END (->ENDED)"
+    roles: [Scheduler, AgencyAdmin]
+    code: 200
+    input: [action]
+    output: CaregiverMatch
+    side_effects: ["match_status/continuity_status transition; continuity cascades"]
+
+  # ---- Visit ----
+  - method: POST
+    path: "/visits"
+    description: "Schedule a Visit (status=SCHEDULED)"
+    roles: [Scheduler, AgencyAdmin]
+    code: 201
+    input: [caregiver_id, client_id, care_plan_id, billing_mode, scheduled_start, scheduled_end]
+    output: Visit
+    side_effects: ["caregiver/client overlap + weekly-hours validation; status=SCHEDULED"]
+  - method: GET
+    path: "/visits"
+    description: "List/filter Visits by caregiver, client, care_plan, or status"
+    roles: [AgencyAdmin, Scheduler, BillingClerk, Caregiver]
+    code: 200
+    input: ["caregiver_id?", "client_id?", "care_plan_id?", "status?", "limit?", "offset?"]
+    output: "Visit[]"
+    side_effects: []
+  - method: GET
+    path: "/visits/{id}"
+    description: "Get a Visit (computed billable_minutes, visit_charge; EVV log/timestamps)"
+    roles: [AgencyAdmin, Scheduler, BillingClerk, Caregiver]
+    code: 200
+    input: []
+    output: Visit
+    side_effects: []
+  - method: POST
+    path: "/visits/{id}/clock-in"
+    description: "EVV telephony clock-in (SCHEDULED/EN_ROUTE -> IN_PROGRESS)"
+    roles: [Caregiver]
+    code: 200
+    input: [event_at, "evv_source?", "caller_id?"]
+    output: Visit
+    side_effects: ["clock_in_at=event_at; evv_source set; CLOCK_IN appended to evv_log; status=IN_PROGRESS"]
+  - method: POST
+    path: "/visits/{id}/clock-out"
+    description: "EVV telephony clock-out (IN_PROGRESS -> COMPLETED): compute billable_minutes, visit_charge"
+    roles: [Caregiver]
+    code: 200
+    input: [event_at, "evv_source?", "caller_id?"]
+    output: Visit
+    side_effects: ["clock_out_at=event_at; CLOCK_OUT appended to evv_log; compute billable_minutes+visit_charge; recompute continuity_score; status=COMPLETED"]
+  - method: POST
+    path: "/visits/{id}/transition"
+    description: "Scheduler/caregiver visit action. action=DEPART (SCHEDULED->EN_ROUTE), CANCEL (->CANCELLED), RESET (EN_ROUTE/IN_PROGRESS->SCHEDULED), MARK_MISSED (SCHEDULED->MISSED)"
+    roles: [Scheduler, AgencyAdmin, Caregiver]
+    code: 200
+    input: [action]
+    output: Visit
+    side_effects: ["status transition; clock reset on RESET; recompute continuity_score on CANCEL/MARK_MISSED"]
+
+  # ---- MileageEntry ----
+  - method: POST
+    path: "/visits/{id}/mileage"
+    description: "Record a mileage/companion-errand entry on a visit (line_charge rounded per entry)"
+    roles: [Caregiver, Scheduler]
+    code: 201
+    input: [miles, purpose]
+    output: MileageEntry
+    side_effects: ["line_charge=round_half_up(miles*mileage_rate); status=RECORDED"]
+  - method: GET
+    path: "/visits/{id}/mileage"
+    description: "List mileage entries for a visit"
+    roles: [AgencyAdmin, Scheduler, BillingClerk, Caregiver]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "MileageEntry[]"
+    side_effects: []
+  - method: POST
+    path: "/mileage/{id}/void"
+    description: "Void a mileage entry (RECORDED -> VOIDED)"
+    roles: [Scheduler, AgencyAdmin]
+    code: 200
+    input: []
+    output: MileageEntry
+    side_effects: ["status=VOIDED"]
+
+  # ---- Invoice ----
+  - method: POST
+    path: "/invoices"
+    description: "Open a DRAFT Invoice for a caregiver/client billing period"
+    roles: [BillingClerk, AgencyAdmin]
+    code: 201
+    input: [agency_id, caregiver_id, client_id, period_start, period_end]
+    output: Invoice
+    side_effects: ["status=DRAFT; totals=0; lines=[]"]
+  - method: GET
+    path: "/invoices"
+    description: "List/filter Invoices by caregiver, client, or agency"
+    roles: [AgencyAdmin, Scheduler, BillingClerk]
+    code: 200
+    input: ["caregiver_id?", "client_id?", "agency_id?", "limit?", "offset?"]
+    output: "Invoice[]"
+    side_effects: []
+  - method: GET
+    path: "/invoices/{id}"
+    description: "Get an Invoice (computed totals, embedded lines, version)"
+    roles: [AgencyAdmin, Scheduler, BillingClerk, Caregiver]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+  - method: POST
+    path: "/invoices/{id}/finalize"
+    description: "Finalize Invoice (DRAFT -> ISSUED): build lines, apply chronological overtime, set totals"
+    roles: [BillingClerk, AgencyAdmin]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["rebuild lines; labor_total final; mileage_total; invoice_total; client_responsible_amount=invoice_total; version+1"]
+  - method: POST
+    path: "/invoices/{id}/transition"
+    description: "Invoice lifecycle action. action=DISPUTE (ISSUED->DISPUTED), REOPEN (DISPUTED->DRAFT), MARK_PAID (ISSUED->PAID), VOID (DRAFT->VOID)"
+    roles: [BillingClerk, AgencyAdmin]
+    code: 200
+    input: [action]
+    output: Invoice
+    side_effects: ["status transition; claim compensation on DISPUTE; APPROVED claim->PAID on MARK_PAID; version+1"]
+
+  # ---- LtcClaim ----
+  - method: POST
+    path: "/ltc-claims"
+    description: "Assign an LTC insurance claim to an ISSUED invoice (OCC on Invoice.version)"
+    roles: [BillingClerk, AgencyAdmin]
+    code: 201
+    input: [client_id, invoice_id, insurer_name, policy_number, covered_pct, daily_benefit_max, covered_days, expected_invoice_version]
+    output: LtcClaim
+    side_effects: ["status=DRAFT; OCC check: expected_invoice_version must equal Invoice.version; increments Invoice.version by 1 on success (so a subsequent stale-version assignment fails)"]
+  - method: GET
+    path: "/ltc-claims"
+    description: "List/filter LTC claims by client or invoice"
+    roles: [AgencyAdmin, BillingClerk]
+    code: 200
+    input: ["client_id?", "invoice_id?", "limit?", "offset?"]
+    output: "LtcClaim[]"
+    side_effects: []
+  - method: GET
+    path: "/ltc-claims/{id}"
+    description: "Get an LTC claim (computed covered_amount)"
+    roles: [AgencyAdmin, BillingClerk]
+    code: 200
+    input: []
+    output: LtcClaim
+    side_effects: []
+  - method: POST
+    path: "/ltc-claims/{id}/submit"
+    description: "Submit/resubmit a claim (DRAFT/APPEALED -> SUBMITTED): compute covered_amount, adjust client_responsible_amount"
+    roles: [BillingClerk]
+    code: 200
+    input: []
+    output: LtcClaim
+    side_effects: ["covered_amount computed; invoice.client_responsible_amount adjusted; invoice version+1"]
+  - method: POST
+    path: "/ltc-claims/{id}/transition"
+    description: "Claim adjudication/appeal action. action=APPROVE (SUBMITTED->APPROVED), DENY (SUBMITTED->DENIED), APPEAL (DENIED->APPEALED)"
+    roles: [AgencyAdmin, BillingClerk]
+    code: 200
+    input: [action]
+    output: LtcClaim
+    side_effects: ["status transition; compensation restores client_responsible_amount + invoice version+1 on DENY"]
+
+  # ---- Test-driving endpoint ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-only: pin the server clock for deterministic ISO-week / billing-period computations"
+    roles: [AgencyAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["server current UTC clock set to the given timestamp"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- auth ---
+  - { id: ERR_MISSING_AUTH, http: 401, condition: "X-User-ID or X-User-Role header missing or malformed" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Authenticated role not permitted for this operation" }
+  # --- request ---
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Malformed body: missing required field, bad enum, scheduled_end<=scheduled_start, period_end<=period_start, covered_pct out of [0,1], miles<=0, unknown action/target_tier" }
+  # --- not found ---
+  - { id: ERR_AGENCY_NOT_FOUND, http: 404, condition: "Agency id does not exist" }
+  - { id: ERR_CAREGIVER_NOT_FOUND, http: 404, condition: "Caregiver id does not exist" }
+  - { id: ERR_CLIENT_NOT_FOUND, http: 404, condition: "Client id does not exist" }
+  - { id: ERR_CARE_PLAN_NOT_FOUND, http: 404, condition: "CarePlan id does not exist (also covers a missing CareTask under a valid plan)" }
+  - { id: ERR_MATCH_NOT_FOUND, http: 404, condition: "CaregiverMatch id does not exist" }
+  - { id: ERR_VISIT_NOT_FOUND, http: 404, condition: "Visit id does not exist (also covers a missing MileageEntry on /mileage/{id}/void)" }
+  - { id: ERR_INVOICE_NOT_FOUND, http: 404, condition: "Invoice id does not exist" }
+  - { id: ERR_CLAIM_NOT_FOUND, http: 404, condition: "LtcClaim id does not exist" }
+  # --- generic state ---
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a state permitting the requested transition" }
+  # --- caregiver lifecycle ---
+  - { id: ERR_BACKGROUND_NOT_PENDING, http: 409, condition: "CLEAR_BACKGROUND transition requires background_tier==PENDING" }
+  - { id: ERR_BACKGROUND_NOT_CLEARED, http: 409, condition: "Operation requires background_tier in {TIER_1,TIER_2,TIER_3}" }
+  - { id: ERR_CAREGIVER_NOT_ACTIVE, http: 409, condition: "Operation requires caregiver employment_status==ACTIVE" }
+  # --- client/match/visit ---
+  - { id: ERR_CLIENT_NOT_SCHEDULABLE, http: 409, condition: "Client.status not schedulable for the requested operation" }
+  - { id: ERR_CARE_PLAN_NOT_PUBLISHED, http: 409, condition: "Referenced CarePlan is not PUBLISHED" }
+  - { id: ERR_NO_ACTIVE_MATCH, http: 409, condition: "No ACTIVE CaregiverMatch for (caregiver_id, client_id)" }
+  - { id: ERR_DUPLICATE_ACTIVE_MATCH, http: 409, condition: "An ACTIVE match already exists for this (caregiver_id, client_id) pair" }
+  - { id: ERR_VISIT_NOT_IN_PROGRESS, http: 409, condition: "clock-out requires visit.status==IN_PROGRESS" }
+  - { id: ERR_INVALID_CLOCK_WINDOW, http: 409, condition: "clock_out event_at not strictly greater than clock_in_at" }
+  - { id: ERR_CAREGIVER_DOUBLE_BOOKED, http: 409, condition: "Visit interval overlaps another non-terminal visit for the same caregiver (half-open)" }
+  - { id: ERR_CLIENT_VISIT_CONFLICT, http: 409, condition: "Visit interval (plus travel buffer) overlaps another non-terminal visit for the same client" }
+  - { id: ERR_WEEKLY_HOURS_EXCEEDED, http: 409, condition: "Scheduling would push caregiver weekly scheduled hours above max_weekly_hours" }
+  # --- invoice/claim ---
+  - { id: ERR_INVOICE_NOT_DRAFT, http: 409, condition: "Operation requires invoice.status==DRAFT" }
+  - { id: ERR_INVOICE_NOT_ISSUED, http: 409, condition: "Operation requires invoice.status==ISSUED" }
+  - { id: ERR_INVOICE_NOT_DISPUTED, http: 409, condition: "Operation requires invoice.status==DISPUTED" }
+  - { id: ERR_NO_BILLABLE_VISITS, http: 409, condition: "Finalize found no COMPLETED visits in the billing window" }
+  - { id: ERR_CLAIM_NOT_RESOLVED, http: 409, condition: "mark-paid blocked: an assigned claim is not APPROVED/PAID" }
+  - { id: ERR_STALE_INVOICE_VERSION, http: 412, condition: "expected_invoice_version != current Invoice.version on claim assignment" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: AgencyAdmin
+    description: "Agency operator: manages caregivers, background tiers, client lifecycle, disputes, claim adjudication"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /agencies"
+      - "POST /caregivers, /caregivers/{id}/transition (CLEAR_BACKGROUND/ACTIVATE/SUSPEND/REVOKE)"
+      - "POST /invoices/{id}/transition (DISPUTE/REOPEN/VOID)"
+      - "POST /ltc-claims/{id}/transition (APPROVE/DENY)"
+    shared_operations:
+      - "Client, CarePlan, CareTask, Match, Visit, Mileage, Invoice, LtcClaim creation/reads shared with peers"
+
+  - name: Scheduler
+    description: "Builds care plans, proposes/activates matches, schedules visits, records cancellations and mileage"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /visits (schedule), /visits/{id}/transition (CANCEL/RESET/MARK_MISSED)"
+      - "POST /clients/{id}/transition, /care-plans/{id}/transition, /care-plans/{id}/tasks, DELETE care-tasks"
+      - "POST /mileage/{id}/void"
+    shared_operations:
+      - "POST /clients, /clients/{id}/care-plans, /matches, /matches/{id}/transition, /visits/{id}/mileage; reads"
+
+  - name: Caregiver
+    description: "Field worker: performs EVV telephony clock-in/out, departs, records mileage"
+    identity: "entity_backed:Caregiver"
+    exclusive_operations:
+      - "POST /visits/{id}/clock-in, /visits/{id}/clock-out"
+    shared_operations:
+      - "POST /visits/{id}/transition (DEPART), /visits/{id}/mileage; GET reads of agencies, own visits, clients, plans"
+
+  - name: BillingClerk
+    description: "Finance: opens/finalizes invoices, marks paid, assigns and submits/appeals LTC claims"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /invoices/{id}/finalize, /invoices/{id}/transition (MARK_PAID)"
+      - "POST /ltc-claims/{id}/submit"
+    shared_operations:
+      - "POST /invoices, /ltc-claims, /ltc-claims/{id}/transition (APPEAL/DENY shared w/ AgencyAdmin); reads"

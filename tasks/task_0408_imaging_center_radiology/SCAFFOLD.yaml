@@ -1,0 +1,1367 @@
+# =============================================================================
+# Scaffold: Imaging Center & Radiology Workflow (RIS/PACS) — Expert tier
+# =============================================================================
+
+scenario: |
+  Imaging Center & Radiology Workflow (RIS/PACS): order & modality scheduling
+  (MRI/CT/X-ray/US), prior-auth & benefit check, patient prep & contrast/safety
+  screening, technologist & room assignment, acquisition→read→sign-off,
+  critical-result notification & acknowledgement, radiologist RVU & report
+  turnaround, repeat/reject rate
+
+domain_name: imaging-center-radiology
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: workflow_orchestration
+  secondary_archetype: temporal_windowing
+  complexity_layers:
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+    - optimistic_concurrency
+  entity_topology: hybrid
+  # ImagingCenter is the root; Modality/Room/Staff/Order hang off it; ImagingExam
+  # bridges Order×Slot×Room×Technologist; ImageSeries/Report/CriticalResult are
+  # cross-cutting children of ImagingExam — a tree with cross-aggregate FKs.
+  state_machine_shape: branching
+  # ImagingOrder branches at read time (PASS sign-off vs ADDENDUM revision loop);
+  # ImagingExam has the acquisition→read pipeline with REPEAT cycle back to
+  # ACQUIRING; CriticalResult is an independent ack dimension; ImagingCenter
+  # posture is compound-derived. Mixed branching + cyclic + parallel + compound.
+  relationship_patterns:
+    - one_to_many        # ImagingCenter → Modality/Room/Staff/Order
+    - cross_aggregate    # ImagingExam.room_id, .technologist_id, .radiologist_id
+    - polymorphic        # CriticalResult.notified_party_role ∈ {OrderingProvider, ...}
+  role_model: segregation_of_duties
+  # Same person cannot both acquire (Technologist) and read+sign-off (Radiologist)
+  # an exam; the protocol-screening Nurse is distinct from both; SchedulingClerk
+  # owns scheduling. CenterAdmin is opaque operator with override surface.
+  consistency_model: immediate
+
+# =============================================================================
+# Table 1.0: Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# Table 1.1: Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: ImagingCenter
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: name, type: string, source: input, description: "Center name" }
+      - { name: time_zone, type: string, source: input, default: "UTC", description: "IANA TZ label (informational; all timestamps stored UTC)" }
+      - { name: now_utc, type: datetime, source: system, description: "Deterministic center clock; advances only via POST /_clock/set_current_utc; defaults to 1970-01-01T00:00:00.000Z until first set" }
+      - { name: critical_ack_sla_minutes, type: integer, source: input, default: 60, description: "Minutes a CriticalResult may stay UNACKNOWLEDGED before it breaches SLA" }
+      - { name: repeat_rate_threshold_pct, type: number, source: input, default: 8.0, description: "Repeat/reject rate (%) at or above which the center posture escalates to QUALITY_HOLD" }
+      - { name: admin_locked, type: boolean, source: system, default: false, description: "Set true by POST .../lock, false by POST .../unlock; when true posture is LOCKED regardless of metrics" }
+      - { name: posture, type: enum, source: computed, default: "OPEN", description: "OPEN | QUALITY_HOLD | LOCKED — derived; LOCKED when admin_locked; else QUALITY_HOLD when repeat_reject_rate_pct >= repeat_rate_threshold_pct OR any CriticalResult is SLA-breached; else OPEN" }
+      - { name: total_acquired_series, type: integer, source: computed, default: 0, description: "Count of ImageSeries ever transitioned out of CAPTURING (denominator base for repeat/reject rate)" }
+      - { name: total_repeat_reject_series, type: integer, source: computed, default: 0, description: "Count of ImageSeries with outcome REPEATED or REJECTED" }
+      - { name: repeat_reject_rate_pct, type: number, source: computed, default: 0.0, description: "= round(100 * total_repeat_reject_series / total_acquired_series, 2); 0.0 when total_acquired_series == 0" }
+
+  - name: Modality
+    parent: ImagingCenter
+    common_fields: true
+    fields:
+      - { name: imaging_center_id, type: string, source: system, description: "FK -> ImagingCenter.id" }
+      - { name: modality_type, type: enum, source: input, description: "MRI | CT | XRAY | US" }
+      - { name: name, type: string, source: input, description: "Human label, e.g. 'MRI 3T #1'" }
+      - { name: base_rvu, type: number, source: input, description: "Base work-RVU credited per signed-off exam on this modality (>= 0)" }
+      - { name: requires_contrast_screening, type: boolean, source: computed, description: "True when modality_type IN {MRI, CT}; XRAY and US never require contrast screening" }
+      - { name: requires_prior_auth, type: boolean, source: input, default: true, description: "When true, an order on this modality cannot be scheduled until prior-auth is AUTHORIZED" }
+
+  - name: Room
+    parent: ImagingCenter
+    common_fields: true
+    fields:
+      - { name: imaging_center_id, type: string, source: system, description: "FK -> ImagingCenter.id" }
+      - { name: modality_id, type: string, source: input, description: "FK -> Modality.id; the room hosts exactly this modality" }
+      - { name: name, type: string, source: input, description: "Room label" }
+      - { name: cleanup_buffer_minutes, type: integer, source: input, default: 0, description: "Minutes of post-exam cleanup appended to each booking; the room is unavailable during [exam_end, exam_end + cleanup_buffer_minutes)" }
+      - { name: status, type: enum, source: system, default: "AVAILABLE", description: "AVAILABLE | OUT_OF_SERVICE — OUT_OF_SERVICE rooms reject new bookings" }
+
+  - name: Staff
+    parent: ImagingCenter
+    common_fields: true
+    fields:
+      - { name: imaging_center_id, type: string, source: system, description: "FK -> ImagingCenter.id" }
+      - { name: staff_role, type: enum, source: input, description: "TECHNOLOGIST | RADIOLOGIST | NURSE" }
+      - { name: full_name, type: string, source: input, description: "Staff member name" }
+      - { name: credentialed_modalities, type: array, source: input, description: "Subset of {MRI,CT,XRAY,US} this staff member may operate/read; empty array forbidden" }
+      - { name: signed_rvu_total, type: number, source: computed, default: 0.0, description: "Cumulative work-RVU credited to this staff member from signed-off exams (RADIOLOGIST only)" }
+
+  - name: ImagingOrder
+    parent: ImagingCenter
+    common_fields: true
+    fields:
+      - { name: imaging_center_id, type: string, source: system, description: "FK -> ImagingCenter.id" }
+      - { name: modality_id, type: string, source: input, description: "FK -> Modality.id; modality requested for this order" }
+      - { name: patient_mrn, type: string, source: input, description: "Patient medical record number (free-form identifier)" }
+      - { name: ordering_provider_npi, type: string, source: input, description: "National Provider Identifier of the ordering clinician" }
+      - { name: priority, type: enum, source: input, default: "ROUTINE", description: "STAT | ROUTINE — STAT orders are read-prioritized and carry a tighter turnaround target" }
+      - { name: requires_contrast, type: boolean, source: input, default: false, description: "Whether the ordered protocol uses IV contrast (only meaningful for MRI/CT)" }
+      - { name: status, type: enum, source: system, default: "REQUESTED", description: "REQUESTED -> BENEFIT_CHECKED -> SCREEN_CLEARED -> SCHEDULED -> READ_PENDING -> SIGNED_OFF | CANCELLED; ADDENDUM_REQUESTED is a side-loop off SIGNED_OFF" }
+      - { name: report_turnaround_minutes, type: number, source: computed, description: "Set on sign-off = minutes from exam ACQUIRED timestamp to sign-off timestamp; null until signed off" }
+      - { name: turnaround_met, type: boolean, source: computed, description: "Set on sign-off; true when report_turnaround_minutes <= modality+priority target; null until signed off" }
+
+  - name: PriorAuthorization
+    parent: ImagingOrder
+    common_fields: true
+    fields:
+      - { name: imaging_order_id, type: string, source: system, description: "FK -> ImagingOrder.id" }
+      - { name: payer_name, type: string, source: input, description: "Insurance payer name" }
+      - { name: requested_units, type: integer, source: input, description: "Authorization units requested (>= 1)" }
+      - { name: authorized_units, type: integer, source: computed, default: 0, description: "Units the payer authorized; 0 until a decision is recorded" }
+      - { name: benefit_copay_cents, type: integer, source: computed, default: 0, description: "Patient copay assigned at benefit check; 0 until decided" }
+      - { name: status, type: enum, source: system, default: "PENDING", description: "PENDING -> AUTHORIZED | DENIED" }
+
+  - name: ContrastScreening
+    parent: ImagingOrder
+    common_fields: true
+    fields:
+      - { name: imaging_order_id, type: string, source: system, description: "FK -> ImagingOrder.id" }
+      - { name: egfr_value, type: number, source: input, description: "Patient estimated GFR (mL/min/1.73m^2); renal safety gate for contrast" }
+      - { name: has_contrast_allergy, type: boolean, source: input, default: false, description: "Documented prior contrast reaction" }
+      - { name: is_pregnant, type: boolean, source: input, default: false, description: "Pregnancy flag — hard safety stop for contrast and for CT regardless of contrast" }
+      - { name: metal_implant_unsafe, type: boolean, source: input, default: false, description: "MRI-specific: ferromagnetic implant deemed unsafe (hard stop for MRI)" }
+      - { name: outcome, type: enum, source: system, default: "PENDING", description: "PENDING -> CLEARED | BLOCKED — BLOCKED carries blocking_reason" }
+      - { name: blocking_reason, type: string, source: computed, description: "Populated when outcome == BLOCKED; null otherwise" }
+
+  - name: ImagingExam
+    parent: ImagingOrder
+    common_fields: true
+    fields:
+      - { name: imaging_order_id, type: string, source: system, description: "FK -> ImagingOrder.id" }
+      - { name: room_id, type: string, source: input, description: "FK -> Room.id; room reserved for this exam" }
+      - { name: technologist_id, type: string, source: input, description: "FK -> Staff.id; assigned technologist (must be credentialed on the order's modality)" }
+      - { name: radiologist_id, type: string, source: computed, description: "FK -> Staff.id; assigned at claim-for-read; null until claimed" }
+      - { name: scheduled_start_utc, type: datetime, source: input, description: "Booking interval start (inclusive)" }
+      - { name: scheduled_end_utc, type: datetime, source: input, description: "Booking interval end (exclusive); must be strictly after start" }
+      - { name: acquired_at_utc, type: datetime, source: computed, description: "Stamped when exam transitions ACQUIRING -> ACQUIRED (= center now_utc at acquisition); null until acquired" }
+      - { name: signed_off_at_utc, type: datetime, source: computed, description: "Stamped on sign-off (= center now_utc at sign-off); null until signed off" }
+      - { name: status, type: enum, source: system, default: "BOOKED", description: "BOOKED -> CHECKED_IN -> ACQUIRING -> ACQUIRED -> READING -> READ_COMPLETE -> SIGNED_OFF; CANCELLED from any pre-ACQUIRED state" }
+
+  - name: ImageSeries
+    parent: ImagingExam
+    common_fields: true
+    fields:
+      - { name: imaging_exam_id, type: string, source: system, description: "FK -> ImagingExam.id" }
+      - { name: imaging_center_id, type: string, source: system, description: "FK -> ImagingCenter.id; denormalized for center-level rate rollup" }
+      - { name: series_label, type: string, source: input, description: "Series description, e.g. 'AX T2 FLAIR'" }
+      - { name: outcome, type: enum, source: system, default: "CAPTURING", description: "CAPTURING -> ACCEPTED | REPEATED | REJECTED; ACCEPTED counts as usable, REPEATED/REJECTED count toward repeat/reject rate" }
+      - { name: reject_reason, type: enum, source: input, description: "Required when finalizing to REPEATED or REJECTED: MOTION | POSITIONING | EXPOSURE | ARTIFACT | EQUIPMENT; null for ACCEPTED" }
+
+  - name: RadiologyReport
+    parent: ImagingExam
+    common_fields: true
+    fields:
+      - { name: imaging_exam_id, type: string, source: system, description: "FK -> ImagingExam.id" }
+      - { name: radiologist_id, type: string, source: system, description: "FK -> Staff.id; author of the report (the reading radiologist)" }
+      - { name: findings_text, type: string, source: input, description: "Report body" }
+      - { name: has_critical_finding, type: boolean, source: input, default: false, description: "When true, sign-off requires a CriticalResult to be raised first" }
+      - { name: rvu_credited, type: number, source: computed, default: 0.0, description: "work-RVU credited on sign-off (see calc rvu_credit)" }
+      - { name: addendum_count, type: integer, source: computed, default: 0, description: "Number of times an addendum has been opened on this report" }
+      - { name: status, type: enum, source: system, default: "DRAFT", description: "DRAFT -> FINAL -> AMENDED; AMENDED reached via addendum loop" }
+
+  - name: CriticalResult
+    parent: RadiologyReport
+    common_fields: true
+    fields:
+      - { name: radiology_report_id, type: string, source: system, description: "FK -> RadiologyReport.id" }
+      - { name: imaging_center_id, type: string, source: system, description: "FK -> ImagingCenter.id; denormalized for posture/SLA rollup" }
+      - { name: notified_party_role, type: enum, source: input, description: "ORDERING_PROVIDER | COVERING_PROVIDER | RAPID_RESPONSE — who was notified" }
+      - { name: raised_at_utc, type: datetime, source: computed, description: "= center now_utc when raised" }
+      - { name: acknowledged_at_utc, type: datetime, source: computed, description: "= center now_utc when acknowledged; null until acknowledged" }
+      - { name: minutes_to_ack, type: number, source: computed, description: "= minutes from raised_at_utc to acknowledged_at_utc; null until acknowledged" }
+      - { name: sla_breached, type: boolean, source: computed, default: false, description: "True when (acknowledged && minutes_to_ack > center.critical_ack_sla_minutes) OR (still UNACKNOWLEDGED && now_utc - raised_at_utc > sla minutes)" }
+      - { name: status, type: enum, source: system, default: "UNACKNOWLEDGED", description: "UNACKNOWLEDGED -> ACKNOWLEDGED" }
+
+# =============================================================================
+# Table 1.2: State Machine Table
+# =============================================================================
+state_machines:
+  - entity: ImagingOrder
+    initial_state: REQUESTED
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: BENEFIT_CHECKED
+        trigger: "POST /imaging-orders/{id}/benefit-check"
+        actor: SchedulingClerk
+        preconditions:
+          - "Order in REQUESTED (ERR_INVALID_STATE)"
+          - "A PriorAuthorization child exists and is AUTHORIZED when the order's modality.requires_prior_auth (ERR_PRIOR_AUTH_REQUIRED); if modality.requires_prior_auth is false this check is skipped"
+        side_effects:
+          - "Set PriorAuthorization.benefit_copay_cents from the decision payload (default 0 when modality.requires_prior_auth is false and no PriorAuthorization exists)"
+        note: "Benefit check is the fiscal gate before screening."
+      - from: BENEFIT_CHECKED
+        to: SCREEN_CLEARED
+        trigger: "POST /imaging-orders/{id}/clear-screening"
+        actor: Nurse
+        preconditions:
+          - "Order in BENEFIT_CHECKED (ERR_INVALID_STATE)"
+          - "When modality.requires_contrast_screening: a ContrastScreening child exists with outcome CLEARED (ERR_SCREENING_NOT_CLEARED); when modality does not require screening this check is skipped and no ContrastScreening need exist"
+        side_effects: []
+        note: "Cross-entity gate: order advance depends on ContrastScreening.outcome."
+      - from: SCREEN_CLEARED
+        to: SCHEDULED
+        trigger: "POST /imaging-orders/{id}/exams (creates ImagingExam)"
+        actor: SchedulingClerk
+        preconditions:
+          - "Order in SCREEN_CLEARED (ERR_INVALID_STATE)"
+          - "ImagingExam booking passes room overlap, technologist overlap, credential, and OUT_OF_SERVICE checks (see ImagingExam.BOOKED creation)"
+        side_effects:
+          - "Create ImagingExam in BOOKED; order moves to SCHEDULED"
+      - from: SCHEDULED
+        to: READ_PENDING
+        trigger: "system: ImagingExam transitions ACQUIRING -> ACQUIRED"
+        actor: system
+        preconditions:
+          - "Exam reached ACQUIRED with at least one ImageSeries outcome ACCEPTED (ERR_NO_ACCEPTED_SERIES)"
+        side_effects:
+          - "Order.status <- READ_PENDING; exam.acquired_at_utc stamped"
+        note: "Bubble-up: exam acquisition advances the order."
+      - from: READ_PENDING
+        to: SIGNED_OFF
+        trigger: "system: ImagingExam transitions READ_COMPLETE -> SIGNED_OFF"
+        actor: system
+        preconditions:
+          - "Exam reached SIGNED_OFF"
+        side_effects:
+          - "Compute ImagingOrder.report_turnaround_minutes via calc report_turnaround"
+          - "Compute ImagingOrder.turnaround_met via calc turnaround_target"
+      - from: SIGNED_OFF
+        to: ADDENDUM_REQUESTED
+        trigger: "POST /imaging-orders/{id}/request-addendum"
+        actor: Radiologist
+        preconditions:
+          - "Order in SIGNED_OFF (ERR_INVALID_STATE)"
+          - "The RadiologyReport for the order's exam is FINAL or AMENDED (ERR_REPORT_NOT_FINAL)"
+        side_effects:
+          - "RadiologyReport.status DRAFT-loop reopened: report status set DRAFT, addendum_count += 1 (see RadiologyReport cycle)"
+        note: "Revision loop entry; order returns to SIGNED_OFF when the addendum is re-signed."
+      - from: ADDENDUM_REQUESTED
+        to: SIGNED_OFF
+        trigger: "system: RadiologyReport re-finalized to AMENDED via sign-off"
+        actor: system
+        preconditions:
+          - "RadiologyReport reached AMENDED"
+        side_effects:
+          - "Recompute ImagingOrder.report_turnaround_minutes and turnaround_met against the new sign-off timestamp"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /imaging-orders/{id}/cancel"
+        actor: SchedulingClerk
+        preconditions:
+          - "Order NOT in {SIGNED_OFF, ADDENDUM_REQUESTED, CANCELLED} (ERR_INVALID_STATE)"
+        side_effects:
+          - "If an ImagingExam exists in a non-terminal pre-ACQUIRED state {BOOKED, CHECKED_IN}, cascade-cancel it (releases room/technologist interval)"
+        note: "Cancel is reachable from REQUESTED/BENEFIT_CHECKED/SCREEN_CLEARED/SCHEDULED/READ_PENDING; the from: row is illustrative — the precondition lists the exclusion set authoritatively."
+
+  - entity: PriorAuthorization
+    initial_state: PENDING
+    terminal_states: [AUTHORIZED, DENIED]
+    transitions:
+      - from: PENDING
+        to: AUTHORIZED
+        trigger: "POST /prior-authorizations/{id}/decision (decision=AUTHORIZE)"
+        actor: SchedulingClerk
+        preconditions:
+          - "PriorAuthorization in PENDING (ERR_INVALID_STATE)"
+          - "authorized_units in payload >= requested_units (ERR_INSUFFICIENT_AUTH_UNITS)"
+        side_effects:
+          - "Set authorized_units from payload"
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /prior-authorizations/{id}/decision (decision=DENY)"
+        actor: SchedulingClerk
+        preconditions:
+          - "PriorAuthorization in PENDING (ERR_INVALID_STATE)"
+        side_effects:
+          - "authorized_units stays 0"
+
+  - entity: ContrastScreening
+    initial_state: PENDING
+    terminal_states: [CLEARED, BLOCKED]
+    transitions:
+      - from: PENDING
+        to: CLEARED
+        trigger: "POST /contrast-screenings/{id}/evaluate"
+        actor: Nurse
+        preconditions:
+          - "Screening in PENDING (ERR_INVALID_STATE)"
+          - "No hard safety stop fires (see calc screening_decision) — when a hard stop fires the system routes to BLOCKED instead, not an error"
+        side_effects:
+          - "outcome <- CLEARED; blocking_reason stays null"
+      - from: PENDING
+        to: BLOCKED
+        trigger: "POST /contrast-screenings/{id}/evaluate (when a hard stop fires)"
+        actor: Nurse
+        preconditions:
+          - "Screening in PENDING (ERR_INVALID_STATE)"
+        side_effects:
+          - "outcome <- BLOCKED; blocking_reason set per calc screening_decision precedence"
+        note: "evaluate is deterministic: the same screening inputs always route to the same outcome; CLEARED vs BLOCKED is decided by calc screening_decision, not the caller."
+
+  - entity: ImagingExam
+    initial_state: BOOKED
+    terminal_states: [SIGNED_OFF, CANCELLED]
+    transitions:
+      - from: BOOKED
+        to: CHECKED_IN
+        trigger: "POST /imaging-exams/{id}/check-in"
+        actor: Technologist
+        preconditions:
+          - "Exam in BOOKED (ERR_INVALID_STATE)"
+          - "Acting technologist X-User-ID == exam.technologist_id (ERR_NOT_ASSIGNED_TECH)"
+          - "center now_utc >= scheduled_start_utc (ERR_TOO_EARLY_TO_CHECK_IN)"
+        side_effects: []
+      - from: CHECKED_IN
+        to: ACQUIRING
+        trigger: "POST /imaging-exams/{id}/start-acquisition"
+        actor: Technologist
+        preconditions:
+          - "Exam in CHECKED_IN (ERR_INVALID_STATE)"
+          - "Acting technologist X-User-ID == exam.technologist_id (ERR_NOT_ASSIGNED_TECH)"
+          - "center posture != QUALITY_HOLD (ERR_CENTER_QUALITY_HOLD)"
+        side_effects: []
+      - from: ACQUIRING
+        to: ACQUIRED
+        trigger: "POST /imaging-exams/{id}/finish-acquisition"
+        actor: Technologist
+        preconditions:
+          - "Exam in ACQUIRING (ERR_INVALID_STATE)"
+          - "At least one ImageSeries on this exam has outcome ACCEPTED (ERR_NO_ACCEPTED_SERIES)"
+          - "No ImageSeries on this exam is still CAPTURING (ERR_SERIES_STILL_CAPTURING)"
+        side_effects:
+          - "Stamp exam.acquired_at_utc = center now_utc"
+          - "Bubble up: parent ImagingOrder SCHEDULED -> READ_PENDING"
+      - from: ACQUIRED
+        to: READING
+        trigger: "POST /imaging-exams/{id}/claim-read"
+        actor: Radiologist
+        preconditions:
+          - "Exam in ACQUIRED (ERR_INVALID_STATE)"
+          - "Acting radiologist credentialed on the order's modality_type (ERR_RADIOLOGIST_NOT_CREDENTIALED)"
+          - "Acting radiologist X-User-ID != exam.technologist_id (ERR_SEGREGATION_OF_DUTIES)"
+          - "exam.radiologist_id is null, i.e. not already claimed (ERR_ALREADY_CLAIMED)"
+        side_effects:
+          - "Set exam.radiologist_id = acting radiologist X-User-ID"
+      - from: READING
+        to: READ_COMPLETE
+        trigger: "POST /imaging-exams/{id}/reports (creates RadiologyReport in DRAFT then finalizes) — modeled as POST report then POST /radiology-reports/{id}/finalize"
+        actor: Radiologist
+        preconditions:
+          - "Exam in READING (ERR_INVALID_STATE)"
+          - "Acting radiologist X-User-ID == exam.radiologist_id (ERR_NOT_ASSIGNED_RADIOLOGIST)"
+          - "A RadiologyReport exists and reached FINAL (ERR_REPORT_NOT_FINAL)"
+        side_effects: []
+      - from: READ_COMPLETE
+        to: SIGNED_OFF
+        trigger: "POST /imaging-exams/{id}/sign-off"
+        actor: Radiologist
+        preconditions:
+          - "Exam in READ_COMPLETE (ERR_INVALID_STATE)"
+          - "Acting radiologist X-User-ID == exam.radiologist_id (ERR_NOT_ASSIGNED_RADIOLOGIST)"
+          - "If RadiologyReport.has_critical_finding: a CriticalResult exists for the report (ERR_CRITICAL_RESULT_REQUIRED)"
+        side_effects:
+          - "Stamp exam.signed_off_at_utc = center now_utc"
+          - "Compute RadiologyReport.rvu_credited via calc rvu_credit; add to Staff(radiologist).signed_rvu_total"
+          - "Bubble up: parent ImagingOrder READ_PENDING -> SIGNED_OFF (computes report_turnaround_minutes, turnaround_met)"
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /imaging-exams/{id}/cancel or cascade from order cancel"
+        actor: SchedulingClerk
+        preconditions:
+          - "Exam in {BOOKED, CHECKED_IN} (ERR_INVALID_STATE) — cannot cancel once ACQUIRING or later"
+        side_effects:
+          - "Release the room booking interval and technologist interval (they no longer count toward overlap)"
+
+  - entity: ImageSeries
+    initial_state: CAPTURING
+    terminal_states: [ACCEPTED, REPEATED, REJECTED]
+    transitions:
+      - from: CAPTURING
+        to: ACCEPTED
+        trigger: "POST /image-series/{id}/finalize (outcome=ACCEPTED)"
+        actor: Technologist
+        preconditions:
+          - "Series in CAPTURING (ERR_INVALID_STATE)"
+          - "Parent exam in ACQUIRING (ERR_INVALID_STATE)"
+        side_effects:
+          - "Increment ImagingCenter.total_acquired_series by 1; recompute repeat_reject_rate_pct and posture (calc repeat_reject_rate)"
+      - from: CAPTURING
+        to: REPEATED
+        trigger: "POST /image-series/{id}/finalize (outcome=REPEATED)"
+        actor: Technologist
+        preconditions:
+          - "Series in CAPTURING (ERR_INVALID_STATE)"
+          - "Parent exam in ACQUIRING (ERR_INVALID_STATE)"
+          - "reject_reason provided (ERR_REJECT_REASON_REQUIRED)"
+        side_effects:
+          - "Increment ImagingCenter.total_acquired_series by 1 AND total_repeat_reject_series by 1; recompute repeat_reject_rate_pct and posture (calc repeat_reject_rate)"
+          - "Cascade: if recomputed posture becomes QUALITY_HOLD, posture freezes new start-acquisition transitions center-wide"
+      - from: CAPTURING
+        to: REJECTED
+        trigger: "POST /image-series/{id}/finalize (outcome=REJECTED)"
+        actor: Technologist
+        preconditions:
+          - "Series in CAPTURING (ERR_INVALID_STATE)"
+          - "Parent exam in ACQUIRING (ERR_INVALID_STATE)"
+          - "reject_reason provided (ERR_REJECT_REASON_REQUIRED)"
+        side_effects:
+          - "Increment ImagingCenter.total_acquired_series by 1 AND total_repeat_reject_series by 1; recompute repeat_reject_rate_pct and posture (calc repeat_reject_rate)"
+
+  - entity: RadiologyReport
+    initial_state: DRAFT
+    terminal_states: []
+    transitions:
+      - from: DRAFT
+        to: FINAL
+        trigger: "POST /radiology-reports/{id}/finalize"
+        actor: Radiologist
+        preconditions:
+          - "Report in DRAFT (ERR_INVALID_STATE)"
+          - "Acting radiologist X-User-ID == report.radiologist_id (ERR_NOT_ASSIGNED_RADIOLOGIST)"
+          - "Parent exam in READING (ERR_INVALID_STATE)"
+        side_effects:
+          - "Parent exam READING -> READ_COMPLETE"
+      - from: FINAL
+        to: AMENDED
+        trigger: "POST /radiology-reports/{id}/finalize (after addendum reopen)"
+        actor: Radiologist
+        preconditions:
+          - "Report in DRAFT having been reopened from a prior FINAL/AMENDED via addendum (addendum_count >= 1) (ERR_INVALID_STATE)"
+          - "Acting radiologist X-User-ID == report.radiologist_id (ERR_NOT_ASSIGNED_RADIOLOGIST)"
+        side_effects:
+          - "Report -> AMENDED; bubble up parent ImagingOrder ADDENDUM_REQUESTED -> SIGNED_OFF (recompute turnaround)"
+        note: "Cyclic: FINAL -> (addendum reopen sets DRAFT, addendum_count+1) -> finalize -> AMENDED; re-amend loops the same way."
+
+  - entity: CriticalResult
+    initial_state: UNACKNOWLEDGED
+    terminal_states: [ACKNOWLEDGED]
+    transitions:
+      - from: UNACKNOWLEDGED
+        to: ACKNOWLEDGED
+        trigger: "POST /critical-results/{id}/acknowledge"
+        actor: Radiologist
+        preconditions:
+          - "CriticalResult in UNACKNOWLEDGED (ERR_INVALID_STATE)"
+        side_effects:
+          - "Stamp acknowledged_at_utc = center now_utc; compute minutes_to_ack and sla_breached (calc critical_ack_sla)"
+          - "Recompute parent ImagingCenter.posture (an ACK that resolves the only breach may clear QUALITY_HOLD if rate is also below threshold)"
+        note: "Parallel dimension: a CriticalResult's ack lifecycle evolves independently of its parent report's DRAFT/FINAL/AMENDED lifecycle on the same exam."
+
+# =============================================================================
+# Table 1.2.1: Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: claim-read-stale-exam
+    parent_entity: ImagingExam
+    write_endpoint: "POST /imaging-exams/{id}/claim-read"
+    occ_field: "expected_imaging_exam_version"
+    description: |
+      Claiming an ImagingExam for reading against an exam whose version has
+      advanced since the client last observed it is rejected. This captures the
+      case where another radiologist has already claimed the exam (legitimately
+      setting radiologist_id and bumping the exam version) and the current
+      reader's view of the exam is therefore stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: schedule-exam-stale-order
+    parent_entity: ImagingOrder
+    write_endpoint: "POST /imaging-orders/{id}/exams"
+    occ_field: "expected_imaging_order_version"
+    description: |
+      Creating an ImagingExam against an ImagingOrder whose version has advanced
+      since the client last observed it is rejected. This captures the case where
+      another scheduling action has already created an exam for the order (which
+      legitimately moves the order SCREEN_CLEARED -> SCHEDULED and bumps the order
+      version) and the current scheduler's view of the order is therefore stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# Table 1.3: Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: screening_decision
+    trigger: "POST /contrast-screenings/{id}/evaluate"
+    algorithm: constraint_propagation
+    formula: |
+      # Inputs: order.requires_contrast, modality.modality_type, screening fields.
+      # Evaluate hard stops in THIS fixed precedence; first match wins and sets
+      # both outcome=BLOCKED and blocking_reason. If none match -> CLEARED.
+      #
+      # 1. PREGNANCY:
+      #      if screening.is_pregnant AND (order.requires_contrast OR modality_type == "CT"):
+      #          BLOCKED, reason = "PREGNANCY"
+      # 2. METAL_IMPLANT (MRI only):
+      #      if modality_type == "MRI" AND screening.metal_implant_unsafe:
+      #          BLOCKED, reason = "METAL_IMPLANT"
+      # 3. CONTRAST_ALLERGY:
+      #      if order.requires_contrast AND screening.has_contrast_allergy:
+      #          BLOCKED, reason = "CONTRAST_ALLERGY"
+      # 4. RENAL (low eGFR with contrast):
+      #      if order.requires_contrast AND screening.egfr_value < EGFR_MIN:
+      #          BLOCKED, reason = "RENAL_FUNCTION"
+      # else CLEARED
+    input_set: "Single ContrastScreening + its parent ImagingOrder + the order's Modality"
+    constants:
+      EGFR_MIN: 30
+    precision: "exact comparison; egfr_value compared as a real number with strict < EGFR_MIN"
+    variants:
+      - name: contrast_protocol
+        when: "order.requires_contrast == true"
+        difference: "All four hard stops are live (renal + allergy gate on contrast; pregnancy gates on contrast)"
+      - name: non_contrast_protocol
+        when: "order.requires_contrast == false"
+        difference: "Renal and allergy gates are inert; pregnancy still BLOCKS when modality_type == CT; metal-implant still BLOCKS for MRI"
+
+  - name: repeat_reject_rate
+    trigger: "side effect of ImageSeries CAPTURING -> {ACCEPTED, REPEATED, REJECTED}"
+    algorithm: aggregation
+    formula: |
+      # Center-level running aggregate. On EACH series finalization:
+      #   total_acquired_series += 1                 # every finalized series
+      #   if outcome in {REPEATED, REJECTED}:
+      #       total_repeat_reject_series += 1
+      #   repeat_reject_rate_pct =
+      #       0.0 if total_acquired_series == 0
+      #       else round(100.0 * total_repeat_reject_series / total_acquired_series, 2)
+      # Posture re-derivation (calc posture_derivation) runs immediately after.
+    input_set: "All ImageSeries under the center that have left CAPTURING (status in {ACCEPTED,REPEATED,REJECTED})"
+    constants: {}
+    precision: "2 decimal places, round_half_up on the percentage; counts are integers"
+    variants:
+      - name: incremental_update
+        when: "on each series finalization"
+        difference: "Counters advance by 1 per event (the authoritative path); equals a full recount over all finalized series"
+
+  - name: rvu_credit
+    trigger: "side effect of ImagingExam READ_COMPLETE -> SIGNED_OFF"
+    algorithm: weighted_scoring
+    formula: |
+      # Per signed-off exam, credit work-RVU to the reading radiologist.
+      #   base = modality.base_rvu
+      #   stat_factor   = STAT_MULTIPLIER if order.priority == "STAT" else 1.0
+      #   contrast_add  = CONTRAST_ADDON if order.requires_contrast else 0.0
+      #   amend_factor  = 1.0 for the first sign-off;
+      #                   AMEND_FACTOR for every sign-off that finalizes an AMENDED
+      #                   report (addendum re-sign credits a reduced RVU)
+      #   rvu_credited = round((base * stat_factor + contrast_add) * amend_factor, 2)
+      # On first sign-off amend_factor = 1.0. On addendum re-sign-off the report is
+      # AMENDED: amend_factor = AMEND_FACTOR and the DELTA (new_rvu - prior_rvu) is
+      # added to Staff.signed_rvu_total (compensating adjustment, see invariant).
+    input_set: "Single ImagingExam + its Modality + parent ImagingOrder + RadiologyReport"
+    constants:
+      STAT_MULTIPLIER: 1.5
+      CONTRAST_ADDON: 0.75
+      AMEND_FACTOR: 0.5
+    precision: "2 decimal places, round_half_up; rounding applied ONCE to the final product, not per term"
+    variants:
+      - name: first_signoff
+        when: "report.status transitions DRAFT -> FINAL then exam signs off (report becomes FINAL)"
+        difference: "amend_factor = 1.0; Staff.signed_rvu_total += rvu_credited"
+      - name: addendum_signoff
+        when: "report re-finalized to AMENDED then re-signed"
+        difference: "amend_factor = AMEND_FACTOR; Staff.signed_rvu_total += (new rvu_credited - prior rvu_credited)"
+
+  - name: report_turnaround
+    trigger: "side effect of ImagingOrder READ_PENDING -> SIGNED_OFF (and recomputed on ADDENDUM_REQUESTED -> SIGNED_OFF)"
+    algorithm: aggregation
+    formula: |
+      # report_turnaround_minutes =
+      #   (exam.signed_off_at_utc - exam.acquired_at_utc) in whole+fractional minutes
+      #   = (signed_off_epoch_ms - acquired_epoch_ms) / 60000.0
+      # acquired_at_utc is fixed at acquisition; signed_off_at_utc is the latest
+      # sign-off (re-stamped on addendum re-sign), so turnaround GROWS after an
+      # addendum.
+    input_set: "Single ImagingExam (acquired_at_utc, signed_off_at_utc)"
+    constants: {}
+    precision: "2 decimal places, round_half_up on minutes"
+
+  - name: turnaround_target
+    trigger: "side effect of ImagingOrder READ_PENDING -> SIGNED_OFF (and on addendum re-sign)"
+    algorithm: threshold
+    formula: |
+      # target_minutes selected by (modality_type, priority):
+      #   if priority == "STAT": target = STAT_TARGET_MIN[modality_type]
+      #   else:                  target = ROUTINE_TARGET_MIN[modality_type]
+      # turnaround_met = report_turnaround_minutes <= target   # boundary: <= is MET
+    input_set: "Single ImagingOrder (priority) + its Modality (modality_type) + report_turnaround_minutes"
+    constants:
+      STAT_TARGET_MIN: { MRI: 60, CT: 45, XRAY: 30, US: 45 }
+      ROUTINE_TARGET_MIN: { MRI: 1440, CT: 720, XRAY: 240, US: 480 }
+    precision: "exact comparison; turnaround exactly equal to target counts as MET (<=)"
+
+  - name: critical_ack_sla
+    trigger: "POST /critical-results/{id}/acknowledge, and re-evaluated whenever center now_utc advances"
+    algorithm: threshold
+    formula: |
+      # On acknowledge:
+      #   minutes_to_ack = (acknowledged_at_utc - raised_at_utc) / 60000.0  (ms->min)
+      #   sla_breached   = minutes_to_ack > center.critical_ack_sla_minutes  # strict >
+      # While UNACKNOWLEDGED (re-evaluated on clock advance):
+      #   elapsed = (center.now_utc - raised_at_utc) / 60000.0
+      #   sla_breached = elapsed > center.critical_ack_sla_minutes           # strict >
+      # Boundary: elapsed exactly == sla_minutes is NOT breached.
+    input_set: "Single CriticalResult + parent ImagingCenter.critical_ack_sla_minutes + center.now_utc"
+    constants: {}
+    precision: "2 decimal places, round_half_up on minutes_to_ack; comparison strict >"
+
+  - name: posture_derivation
+    trigger: "recomputed after repeat_reject_rate update, after CriticalResult raise/acknowledge, and on clock advance"
+    algorithm: threshold
+    formula: |
+      # posture precedence (first match wins):
+      #   if center.admin_locked: LOCKED            # set only by admin lock endpoint
+      #   elif (repeat_reject_rate_pct >= repeat_rate_threshold_pct)
+      #        OR (exists CriticalResult under center with sla_breached == true):
+      #            QUALITY_HOLD
+      #   else: OPEN
+      # NOTE: >= at the rate threshold (boundary: exactly threshold => QUALITY_HOLD).
+    input_set: "ImagingCenter.repeat_reject_rate_pct, repeat_rate_threshold_pct, and all CriticalResult.sla_breached under the center"
+    constants: {}
+    precision: "exact; rate compared with >= threshold"
+    variants:
+      - name: rate_trigger
+        when: "repeat_reject_rate_pct >= repeat_rate_threshold_pct"
+        difference: "QUALITY_HOLD driven by quality metric; clears when rate drops below threshold"
+      - name: sla_trigger
+        when: "any CriticalResult under center is sla_breached"
+        difference: "QUALITY_HOLD driven by safety; clears only when no breached unacked result remains"
+
+# =============================================================================
+# Table 1.4: Validation Rules Table (Ordered by Priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to call this endpoint per §1.7"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: existence
+    check: "All path-referenced resources exist, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids"
+  - priority: 4
+    category: existence
+    check: "FK body fields reference existing resources (modality_id, room_id, technologist_id, etc.)"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "endpoints accepting FK body fields"
+  - priority: 5
+    category: business_constraint
+    check: "Required body fields present and enums valid"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all writes"
+  - priority: 6
+    category: business_constraint
+    check: "Staff.credentialed_modalities non-empty on Staff create"
+    error_id: ERR_EMPTY_CREDENTIALS
+    http_status: 422
+    applies_to: "POST /imaging-centers/{id}/staff"
+  - priority: 7
+    category: state
+    check: "Target resource in the correct state for the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 8
+    category: state
+    check: "OCC: expected_<parent>_version matches current parent.version on guarded writes"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /imaging-exams/{id}/claim-read, POST /imaging-orders/{id}/exams"
+  - priority: 9
+    category: business_safety
+    check: "Pregnancy / metal-implant / contrast-allergy / low-eGFR hard stops route screening to BLOCKED (screening evaluate is deterministic, never errors); clearing an order whose required screening is not CLEARED is blocked"
+    error_id: ERR_SCREENING_NOT_CLEARED
+    http_status: 409
+    applies_to: "POST /imaging-orders/{id}/clear-screening"
+  - priority: 10
+    category: business_safety
+    check: "Center posture must not be QUALITY_HOLD to start a new acquisition"
+    error_id: ERR_CENTER_QUALITY_HOLD
+    http_status: 409
+    applies_to: "POST /imaging-exams/{id}/start-acquisition"
+  - priority: 11
+    category: business_safety
+    check: "Segregation of duties: the reading radiologist must not be the acquiring technologist of the same exam"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 409
+    applies_to: "POST /imaging-exams/{id}/claim-read"
+  - priority: 12
+    category: business_safety
+    check: "Sign-off with a critical finding requires a CriticalResult to be raised first"
+    error_id: ERR_CRITICAL_RESULT_REQUIRED
+    http_status: 409
+    applies_to: "POST /imaging-exams/{id}/sign-off"
+  - priority: 13
+    category: business_referential
+    check: "Radiologist credentialed on the order's modality_type before claiming read; technologist credentialed before booking"
+    error_id: ERR_RADIOLOGIST_NOT_CREDENTIALED
+    http_status: 422
+    applies_to: "POST /imaging-exams/{id}/claim-read"
+  - priority: 14
+    category: business_referential
+    check: "Booking technologist credentialed on the order's modality_type"
+    error_id: ERR_TECH_NOT_CREDENTIALED
+    http_status: 422
+    applies_to: "POST /imaging-orders/{id}/exams"
+  - priority: 15
+    category: business_referential
+    check: "Booked room's modality matches the order's modality; room not OUT_OF_SERVICE"
+    error_id: ERR_ROOM_MODALITY_MISMATCH
+    http_status: 422
+    applies_to: "POST /imaging-orders/{id}/exams"
+  - priority: 16
+    category: business_temporal
+    check: "scheduled_end_utc strictly after scheduled_start_utc"
+    error_id: ERR_INVALID_INTERVAL
+    http_status: 422
+    applies_to: "POST /imaging-orders/{id}/exams"
+  - priority: 17
+    category: business_temporal
+    check: "Room booking interval (including cleanup buffer) does not overlap another non-cancelled exam in the same room"
+    error_id: ERR_ROOM_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /imaging-orders/{id}/exams"
+  - priority: 18
+    category: business_temporal
+    check: "Technologist interval (no buffer) does not overlap another non-cancelled exam assigned to the same technologist"
+    error_id: ERR_TECH_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /imaging-orders/{id}/exams"
+  - priority: 19
+    category: business_fiscal
+    check: "Modality requiring prior-auth has an AUTHORIZED PriorAuthorization before benefit-check completes"
+    error_id: ERR_PRIOR_AUTH_REQUIRED
+    http_status: 402
+    applies_to: "POST /imaging-orders/{id}/benefit-check"
+  - priority: 20
+    category: business_fiscal
+    check: "authorized_units in an AUTHORIZE decision >= requested_units"
+    error_id: ERR_INSUFFICIENT_AUTH_UNITS
+    http_status: 422
+    applies_to: "POST /prior-authorizations/{id}/decision"
+
+# =============================================================================
+# Table 1.5: API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- ImagingCenter ----
+  - method: POST
+    path: "/imaging-centers"
+    description: "Create an imaging center"
+    roles: [CenterAdmin]
+    code: 201
+    input: [name, "time_zone?", "critical_ack_sla_minutes?", "repeat_rate_threshold_pct?"]
+    output: ImagingCenter
+    side_effects: ["posture initialized OPEN; counters 0; now_utc = 1970-01-01T00:00:00.000Z"]
+  - method: GET
+    path: "/imaging-centers/{id}"
+    description: "Fetch a center (includes posture, rate, counters)"
+    roles: [CenterAdmin, SchedulingClerk, Nurse, Technologist, Radiologist]
+    code: 200
+    input: []
+    output: ImagingCenter
+    side_effects: []
+  - method: GET
+    path: "/imaging-centers"
+    description: "List centers (paginated)"
+    roles: [CenterAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ImagingCenter[]
+    side_effects: []
+  - method: POST
+    path: "/imaging-centers/{id}/lock"
+    description: "Admin override: set posture LOCKED (admin_locked=true)"
+    roles: [CenterAdmin]
+    code: 200
+    input: []
+    output: ImagingCenter
+    side_effects: ["posture -> LOCKED"]
+  - method: POST
+    path: "/imaging-centers/{id}/unlock"
+    description: "Admin override: clear admin lock; posture re-derived"
+    roles: [CenterAdmin]
+    code: 200
+    input: []
+    output: ImagingCenter
+    side_effects: ["admin_locked=false; posture re-derived via calc posture_derivation"]
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving: set a center's deterministic now_utc; re-evaluates critical SLA + posture"
+    roles: [CenterAdmin]
+    code: 200
+    input: [imaging_center_id, to_iso8601]
+    output: ImagingCenter
+    side_effects: ["center.now_utc = to_iso8601; recompute every CriticalResult.sla_breached and posture"]
+
+  # ---- Modality ----
+  - method: POST
+    path: "/imaging-centers/{id}/modalities"
+    description: "Create a modality under a center"
+    roles: [CenterAdmin]
+    code: 201
+    input: [modality_type, name, base_rvu, "requires_prior_auth?"]
+    output: Modality
+    side_effects: ["requires_contrast_screening computed from modality_type"]
+  - method: GET
+    path: "/modalities/{id}"
+    description: "Fetch a modality"
+    roles: [CenterAdmin, SchedulingClerk, Nurse, Technologist, Radiologist]
+    code: 200
+    input: []
+    output: Modality
+    side_effects: []
+  - method: GET
+    path: "/imaging-centers/{id}/modalities"
+    description: "List a center's modalities (reverse-reachability for Modality.imaging_center_id)"
+    roles: [CenterAdmin, SchedulingClerk, Nurse, Technologist, Radiologist]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Modality[]
+    side_effects: []
+  - method: GET
+    path: "/modalities/{id}/rooms"
+    description: "List rooms hosting a modality (reverse-reachability for Room.modality_id)"
+    roles: [CenterAdmin, SchedulingClerk, Technologist]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Room[]
+    side_effects: []
+  - method: GET
+    path: "/modalities/{id}/imaging-orders"
+    description: "List orders for a modality (reverse-reachability for ImagingOrder.modality_id)"
+    roles: [CenterAdmin, SchedulingClerk, Nurse, Technologist, Radiologist]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ImagingOrder[]
+    side_effects: []
+
+  # ---- Room ----
+  - method: POST
+    path: "/imaging-centers/{id}/rooms"
+    description: "Create a room hosting one modality"
+    roles: [CenterAdmin]
+    code: 201
+    input: [modality_id, name, "cleanup_buffer_minutes?"]
+    output: Room
+    side_effects: ["status AVAILABLE"]
+  - method: GET
+    path: "/rooms/{id}"
+    description: "Fetch a room"
+    roles: [CenterAdmin, SchedulingClerk, Technologist]
+    code: 200
+    input: []
+    output: Room
+    side_effects: []
+  - method: GET
+    path: "/imaging-centers/{id}/rooms"
+    description: "List a center's rooms (reverse-reachability for Room.imaging_center_id)"
+    roles: [CenterAdmin, SchedulingClerk, Technologist]
+    code: 200
+    input: ["modality_id?", "limit?", "offset?"]
+    output: Room[]
+    side_effects: []
+  - method: POST
+    path: "/rooms/{id}/out-of-service"
+    description: "Mark a room OUT_OF_SERVICE"
+    roles: [CenterAdmin]
+    code: 200
+    input: []
+    output: Room
+    side_effects: ["status -> OUT_OF_SERVICE"]
+
+  # ---- Staff ----
+  - method: POST
+    path: "/imaging-centers/{id}/staff"
+    description: "Create a staff member (technologist/radiologist/nurse)"
+    roles: [CenterAdmin]
+    code: 201
+    input: [staff_role, full_name, credentialed_modalities]
+    output: Staff
+    side_effects: ["signed_rvu_total = 0.0"]
+  - method: GET
+    path: "/staff/{id}"
+    description: "Fetch a staff member (includes signed_rvu_total)"
+    roles: [CenterAdmin, SchedulingClerk, Technologist, Radiologist]
+    code: 200
+    input: []
+    output: Staff
+    side_effects: []
+  - method: GET
+    path: "/imaging-centers/{id}/staff"
+    description: "List a center's staff (reverse-reachability for Staff.imaging_center_id)"
+    roles: [CenterAdmin, SchedulingClerk, Technologist, Radiologist]
+    code: 200
+    input: ["staff_role?", "limit?", "offset?"]
+    output: Staff[]
+    side_effects: []
+
+  # ---- ImagingOrder ----
+  - method: POST
+    path: "/imaging-centers/{id}/imaging-orders"
+    description: "Create an imaging order"
+    roles: [SchedulingClerk]
+    code: 201
+    input: [modality_id, patient_mrn, ordering_provider_npi, "priority?", "requires_contrast?"]
+    output: ImagingOrder
+    side_effects: ["status REQUESTED"]
+  - method: GET
+    path: "/imaging-orders/{id}"
+    description: "Fetch an order (includes turnaround fields after sign-off)"
+    roles: [CenterAdmin, SchedulingClerk, Nurse, Technologist, Radiologist]
+    code: 200
+    input: []
+    output: ImagingOrder
+    side_effects: []
+  - method: GET
+    path: "/imaging-centers/{id}/imaging-orders"
+    description: "List a center's orders (reverse-reachability for ImagingOrder.imaging_center_id)"
+    roles: [CenterAdmin, SchedulingClerk, Nurse, Technologist, Radiologist]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ImagingOrder[]
+    side_effects: []
+  - method: POST
+    path: "/imaging-orders/{id}/benefit-check"
+    description: "Run prior-auth + benefit check; advance REQUESTED -> BENEFIT_CHECKED"
+    roles: [SchedulingClerk]
+    code: 200
+    input: ["benefit_copay_cents?"]
+    output: ImagingOrder
+    side_effects: ["set PriorAuthorization.benefit_copay_cents; status -> BENEFIT_CHECKED"]
+  - method: POST
+    path: "/imaging-orders/{id}/clear-screening"
+    description: "Advance BENEFIT_CHECKED -> SCREEN_CLEARED (gated by ContrastScreening when required)"
+    roles: [Nurse]
+    code: 200
+    input: []
+    output: ImagingOrder
+    side_effects: ["status -> SCREEN_CLEARED"]
+  - method: POST
+    path: "/imaging-orders/{id}/exams"
+    description: "Schedule an exam (creates ImagingExam, books room + technologist); SCREEN_CLEARED -> SCHEDULED"
+    roles: [SchedulingClerk]
+    code: 201
+    input: [room_id, technologist_id, scheduled_start_utc, scheduled_end_utc, expected_imaging_order_version]
+    output: ImagingExam
+    side_effects: ["create ImagingExam BOOKED; order -> SCHEDULED; increments ImagingOrder.version by 1"]
+  - method: POST
+    path: "/imaging-orders/{id}/cancel"
+    description: "Cancel an order (cascade-cancels a pre-ACQUIRED exam)"
+    roles: [SchedulingClerk]
+    code: 200
+    input: []
+    output: ImagingOrder
+    side_effects: ["status -> CANCELLED; cascade-cancel BOOKED/CHECKED_IN exam, releasing room+tech intervals"]
+  - method: POST
+    path: "/imaging-orders/{id}/request-addendum"
+    description: "Open an addendum on a signed-off order; SIGNED_OFF -> ADDENDUM_REQUESTED"
+    roles: [Radiologist]
+    code: 200
+    input: []
+    output: ImagingOrder
+    side_effects: ["report status set DRAFT; addendum_count += 1; status -> ADDENDUM_REQUESTED"]
+
+  # ---- PriorAuthorization ----
+  - method: POST
+    path: "/imaging-orders/{id}/prior-authorizations"
+    description: "Create a prior-authorization request for an order"
+    roles: [SchedulingClerk]
+    code: 201
+    input: [payer_name, requested_units]
+    output: PriorAuthorization
+    side_effects: ["status PENDING"]
+  - method: GET
+    path: "/prior-authorizations/{id}"
+    description: "Fetch a prior-authorization"
+    roles: [CenterAdmin, SchedulingClerk]
+    code: 200
+    input: []
+    output: PriorAuthorization
+    side_effects: []
+  - method: GET
+    path: "/imaging-orders/{id}/prior-authorizations"
+    description: "List an order's prior-authorizations (reverse-reachability for PriorAuthorization.imaging_order_id)"
+    roles: [CenterAdmin, SchedulingClerk]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PriorAuthorization[]
+    side_effects: []
+  - method: POST
+    path: "/prior-authorizations/{id}/decision"
+    description: "Record AUTHORIZE/DENY decision"
+    roles: [SchedulingClerk]
+    code: 200
+    input: [decision, "authorized_units?"]
+    output: PriorAuthorization
+    side_effects: ["status -> AUTHORIZED|DENIED; set authorized_units on AUTHORIZE"]
+
+  # ---- ContrastScreening ----
+  - method: POST
+    path: "/imaging-orders/{id}/contrast-screenings"
+    description: "Create a contrast/safety screening for an order"
+    roles: [Nurse]
+    code: 201
+    input: [egfr_value, "has_contrast_allergy?", "is_pregnant?", "metal_implant_unsafe?"]
+    output: ContrastScreening
+    side_effects: ["outcome PENDING"]
+  - method: GET
+    path: "/contrast-screenings/{id}"
+    description: "Fetch a screening (includes outcome + blocking_reason)"
+    roles: [CenterAdmin, SchedulingClerk, Nurse]
+    code: 200
+    input: []
+    output: ContrastScreening
+    side_effects: []
+  - method: GET
+    path: "/imaging-orders/{id}/contrast-screenings"
+    description: "List an order's screenings (reverse-reachability for ContrastScreening.imaging_order_id)"
+    roles: [CenterAdmin, SchedulingClerk, Nurse]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ContrastScreening[]
+    side_effects: []
+  - method: POST
+    path: "/contrast-screenings/{id}/evaluate"
+    description: "Evaluate screening; deterministically routes PENDING -> CLEARED|BLOCKED via calc screening_decision"
+    roles: [Nurse]
+    code: 200
+    input: []
+    output: ContrastScreening
+    side_effects: ["outcome -> CLEARED|BLOCKED; blocking_reason set when BLOCKED"]
+
+  # ---- ImagingExam ----
+  - method: GET
+    path: "/imaging-exams/{id}"
+    description: "Fetch an exam (includes radiologist_id, timestamps)"
+    roles: [CenterAdmin, SchedulingClerk, Technologist, Radiologist]
+    code: 200
+    input: []
+    output: ImagingExam
+    side_effects: []
+  - method: GET
+    path: "/imaging-orders/{id}/exams"
+    description: "List an order's exams (reverse-reachability for ImagingExam.imaging_order_id)"
+    roles: [CenterAdmin, SchedulingClerk, Technologist, Radiologist]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ImagingExam[]
+    side_effects: []
+  - method: GET
+    path: "/rooms/{id}/exams"
+    description: "List exams booked in a room (reverse-reachability for ImagingExam.room_id)"
+    roles: [CenterAdmin, SchedulingClerk, Technologist]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ImagingExam[]
+    side_effects: []
+  - method: GET
+    path: "/staff/{id}/exams"
+    description: "List exams assigned to a staff member as technologist or radiologist (reverse-reachability for ImagingExam.technologist_id and ImagingExam.radiologist_id)"
+    roles: [CenterAdmin, SchedulingClerk, Technologist, Radiologist]
+    code: 200
+    input: ["assignment_role?", "limit?", "offset?"]
+    output: ImagingExam[]
+    side_effects: []
+  - method: POST
+    path: "/imaging-exams/{id}/check-in"
+    description: "Technologist checks the patient in; BOOKED -> CHECKED_IN"
+    roles: [Technologist]
+    code: 200
+    input: []
+    output: ImagingExam
+    side_effects: []
+  - method: POST
+    path: "/imaging-exams/{id}/start-acquisition"
+    description: "Start image acquisition; CHECKED_IN -> ACQUIRING (blocked under QUALITY_HOLD)"
+    roles: [Technologist]
+    code: 200
+    input: []
+    output: ImagingExam
+    side_effects: []
+  - method: POST
+    path: "/imaging-exams/{id}/finish-acquisition"
+    description: "Finish acquisition; ACQUIRING -> ACQUIRED; bubbles order to READ_PENDING"
+    roles: [Technologist]
+    code: 200
+    input: []
+    output: ImagingExam
+    side_effects: ["stamp acquired_at_utc; order SCHEDULED -> READ_PENDING"]
+  - method: POST
+    path: "/imaging-exams/{id}/claim-read"
+    description: "Radiologist claims the exam to read; ACQUIRED -> READING (OCC + segregation gated)"
+    roles: [Radiologist]
+    code: 200
+    input: [expected_imaging_exam_version]
+    output: ImagingExam
+    side_effects: ["set radiologist_id; increments ImagingExam.version by 1"]
+  - method: POST
+    path: "/imaging-exams/{id}/sign-off"
+    description: "Sign off the read; READ_COMPLETE -> SIGNED_OFF; credits RVU; bubbles order to SIGNED_OFF"
+    roles: [Radiologist]
+    code: 200
+    input: []
+    output: ImagingExam
+    side_effects: ["stamp signed_off_at_utc; compute rvu_credit; Staff.signed_rvu_total += rvu; order READ_PENDING -> SIGNED_OFF (turnaround computed)"]
+  - method: POST
+    path: "/imaging-exams/{id}/cancel"
+    description: "Cancel a pre-ACQUIRED exam directly; releases room+tech intervals"
+    roles: [SchedulingClerk]
+    code: 200
+    input: []
+    output: ImagingExam
+    side_effects: ["status -> CANCELLED; release intervals"]
+
+  # ---- ImageSeries ----
+  - method: POST
+    path: "/imaging-exams/{id}/image-series"
+    description: "Capture a new image series under an ACQUIRING exam"
+    roles: [Technologist]
+    code: 201
+    input: [series_label]
+    output: ImageSeries
+    side_effects: ["outcome CAPTURING; imaging_center_id denormalized from exam"]
+  - method: GET
+    path: "/image-series/{id}"
+    description: "Fetch a series"
+    roles: [CenterAdmin, Technologist, Radiologist]
+    code: 200
+    input: []
+    output: ImageSeries
+    side_effects: []
+  - method: GET
+    path: "/imaging-exams/{id}/image-series"
+    description: "List an exam's series (reverse-reachability for ImageSeries.imaging_exam_id)"
+    roles: [CenterAdmin, Technologist, Radiologist]
+    code: 200
+    input: ["outcome?", "limit?", "offset?"]
+    output: ImageSeries[]
+    side_effects: []
+  - method: GET
+    path: "/imaging-centers/{id}/image-series"
+    description: "List a center's series (reverse-reachability for ImageSeries.imaging_center_id)"
+    roles: [CenterAdmin]
+    code: 200
+    input: ["outcome?", "limit?", "offset?"]
+    output: ImageSeries[]
+    side_effects: []
+  - method: POST
+    path: "/image-series/{id}/finalize"
+    description: "Finalize a series outcome; CAPTURING -> ACCEPTED|REPEATED|REJECTED; updates center rate + posture"
+    roles: [Technologist]
+    code: 200
+    input: [outcome, "reject_reason?"]
+    output: ImageSeries
+    side_effects: ["update center counters + repeat_reject_rate_pct + posture"]
+
+  # ---- RadiologyReport ----
+  - method: POST
+    path: "/imaging-exams/{id}/reports"
+    description: "Create a draft radiology report (READING exam only)"
+    roles: [Radiologist]
+    code: 201
+    input: [findings_text, "has_critical_finding?"]
+    output: RadiologyReport
+    side_effects: ["status DRAFT; radiologist_id set from exam.radiologist_id"]
+  - method: GET
+    path: "/radiology-reports/{id}"
+    description: "Fetch a report (includes rvu_credited, addendum_count)"
+    roles: [CenterAdmin, Radiologist, SchedulingClerk]
+    code: 200
+    input: []
+    output: RadiologyReport
+    side_effects: []
+  - method: GET
+    path: "/imaging-exams/{id}/reports"
+    description: "List an exam's reports (reverse-reachability for RadiologyReport.imaging_exam_id)"
+    roles: [CenterAdmin, Radiologist, SchedulingClerk]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RadiologyReport[]
+    side_effects: []
+  - method: GET
+    path: "/staff/{id}/reports"
+    description: "List reports authored by a radiologist (reverse-reachability for RadiologyReport.radiologist_id)"
+    roles: [CenterAdmin, Radiologist]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RadiologyReport[]
+    side_effects: []
+  - method: POST
+    path: "/radiology-reports/{id}/finalize"
+    description: "Finalize a draft report; DRAFT -> FINAL (or DRAFT-after-reopen -> AMENDED); advances exam READING -> READ_COMPLETE on first finalize"
+    roles: [Radiologist]
+    code: 200
+    input: []
+    output: RadiologyReport
+    side_effects: ["report -> FINAL|AMENDED; exam READING -> READ_COMPLETE (first); AMENDED bubbles order ADDENDUM_REQUESTED -> SIGNED_OFF + recompute turnaround + RVU delta"]
+
+  # ---- CriticalResult ----
+  - method: POST
+    path: "/radiology-reports/{id}/critical-results"
+    description: "Raise a critical result on a report (before sign-off)"
+    roles: [Radiologist]
+    code: 201
+    input: [notified_party_role]
+    output: CriticalResult
+    side_effects: ["status UNACKNOWLEDGED; raised_at_utc = center now_utc; imaging_center_id denormalized"]
+  - method: GET
+    path: "/critical-results/{id}"
+    description: "Fetch a critical result (includes minutes_to_ack, sla_breached)"
+    roles: [CenterAdmin, Radiologist, SchedulingClerk]
+    code: 200
+    input: []
+    output: CriticalResult
+    side_effects: []
+  - method: GET
+    path: "/radiology-reports/{id}/critical-results"
+    description: "List a report's critical results (reverse-reachability for CriticalResult.radiology_report_id)"
+    roles: [CenterAdmin, Radiologist, SchedulingClerk]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CriticalResult[]
+    side_effects: []
+  - method: GET
+    path: "/imaging-centers/{id}/critical-results"
+    description: "List a center's critical results (reverse-reachability for CriticalResult.imaging_center_id)"
+    roles: [CenterAdmin, SchedulingClerk]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: CriticalResult[]
+    side_effects: []
+  - method: POST
+    path: "/critical-results/{id}/acknowledge"
+    description: "Acknowledge a critical result; UNACKNOWLEDGED -> ACKNOWLEDGED; computes SLA; re-derives posture"
+    roles: [Radiologist]
+    code: 200
+    input: []
+    output: CriticalResult
+    side_effects: ["stamp acknowledged_at_utc; compute minutes_to_ack + sla_breached; re-derive center posture"]
+
+# =============================================================================
+# Table 1.6: Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/malformed X-User-Role or X-User-ID header" }
+  - { id: ERR_UNAUTHORIZED, http: 403, condition: "Acting role not permitted for this endpoint" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path-referenced resource does not exist" }
+  - { id: ERR_REFERENCE_NOT_FOUND, http: 404, condition: "FK body field references a non-existent resource" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required body field or invalid enum/type" }
+  - { id: ERR_EMPTY_CREDENTIALS, http: 422, condition: "Staff created with empty credentialed_modalities" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a valid state for the requested transition" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_<parent>_version does not match current parent.version (OCC)" }
+  - { id: ERR_PRIOR_AUTH_REQUIRED, http: 402, condition: "Benefit-check on a prior-auth-required modality without an AUTHORIZED PriorAuthorization" }
+  - { id: ERR_INSUFFICIENT_AUTH_UNITS, http: 422, condition: "AUTHORIZE decision with authorized_units < requested_units" }
+  - { id: ERR_SCREENING_NOT_CLEARED, http: 409, condition: "clear-screening on an order whose required ContrastScreening is not CLEARED" }
+  - { id: ERR_CENTER_QUALITY_HOLD, http: 409, condition: "start-acquisition while center posture is QUALITY_HOLD" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 409, condition: "Reading radiologist X-User-ID equals the exam's technologist_id" }
+  - { id: ERR_CRITICAL_RESULT_REQUIRED, http: 409, condition: "Sign-off of a report with has_critical_finding but no CriticalResult raised" }
+  - { id: ERR_RADIOLOGIST_NOT_CREDENTIALED, http: 422, condition: "Claiming read without credential on the order's modality_type" }
+  - { id: ERR_TECH_NOT_CREDENTIALED, http: 422, condition: "Booking a technologist not credentialed on the order's modality_type" }
+  - { id: ERR_ROOM_MODALITY_MISMATCH, http: 422, condition: "Booked room's modality differs from order's modality, or room OUT_OF_SERVICE" }
+  - { id: ERR_INVALID_INTERVAL, http: 422, condition: "scheduled_end_utc not strictly after scheduled_start_utc" }
+  - { id: ERR_ROOM_DOUBLE_BOOKED, http: 409, condition: "Room booking interval (incl. cleanup buffer) overlaps another non-cancelled exam in the room" }
+  - { id: ERR_TECH_DOUBLE_BOOKED, http: 409, condition: "Technologist interval overlaps another non-cancelled exam for the same technologist" }
+  - { id: ERR_NO_ACCEPTED_SERIES, http: 409, condition: "finish-acquisition with zero ImageSeries in ACCEPTED outcome" }
+  - { id: ERR_SERIES_STILL_CAPTURING, http: 409, condition: "finish-acquisition while at least one ImageSeries is still CAPTURING" }
+  - { id: ERR_REJECT_REASON_REQUIRED, http: 422, condition: "Finalizing a series to REPEATED/REJECTED without reject_reason" }
+  - { id: ERR_ALREADY_CLAIMED, http: 409, condition: "claim-read on an exam whose radiologist_id is already set" }
+  - { id: ERR_NOT_ASSIGNED_TECH, http: 403, condition: "Technologist action by someone other than the assigned exam.technologist_id" }
+  - { id: ERR_NOT_ASSIGNED_RADIOLOGIST, http: 403, condition: "Radiologist action by someone other than the assigned exam.radiologist_id / report.radiologist_id" }
+  - { id: ERR_TOO_EARLY_TO_CHECK_IN, http: 409, condition: "check-in before center now_utc reaches scheduled_start_utc" }
+  - { id: ERR_REPORT_NOT_FINAL, http: 409, condition: "request-addendum on an order whose report is not FINAL/AMENDED, or sign-off path missing a FINAL report" }
+  - { id: ERR_VALIDATION, http: 422, condition: "Generic semantic validation failure not covered by a more specific error" }
+
+# =============================================================================
+# Table 1.7: RBAC Matrix
+# =============================================================================
+roles:
+  - name: CenterAdmin
+    description: "Operator who provisions centers, modalities, rooms, staff; holds override surface (lock/unlock, out-of-service, clock)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /imaging-centers"
+      - "POST /imaging-centers/{id}/modalities"
+      - "POST /imaging-centers/{id}/rooms"
+      - "POST /imaging-centers/{id}/staff"
+      - "POST /imaging-centers/{id}/lock"
+      - "POST /imaging-centers/{id}/unlock"
+      - "POST /rooms/{id}/out-of-service"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "GET (all read endpoints)"
+  - name: SchedulingClerk
+    description: "Owns order intake, prior-auth/benefit, scheduling, and cancellation."
+    identity: opaque
+    exclusive_operations:
+      - "POST /imaging-centers/{id}/imaging-orders"
+      - "POST /imaging-orders/{id}/benefit-check"
+      - "POST /imaging-orders/{id}/exams"
+      - "POST /imaging-orders/{id}/cancel"
+      - "POST /imaging-orders/{id}/prior-authorizations"
+      - "POST /prior-authorizations/{id}/decision"
+      - "POST /imaging-exams/{id}/cancel"
+    shared_operations:
+      - "GET (order/exam/report read endpoints)"
+  - name: Nurse
+    description: "Owns contrast/safety screening and the screening clearance gate."
+    identity: entity_backed:Staff
+    exclusive_operations:
+      - "POST /imaging-orders/{id}/contrast-screenings"
+      - "POST /contrast-screenings/{id}/evaluate"
+      - "POST /imaging-orders/{id}/clear-screening"
+    shared_operations:
+      - "GET (order/screening read endpoints)"
+  - name: Technologist
+    description: "Acquires images: check-in, acquisition, series capture/finalize. Cannot read/sign exams (segregation of duties)."
+    identity: entity_backed:Staff
+    exclusive_operations:
+      - "POST /imaging-exams/{id}/check-in"
+      - "POST /imaging-exams/{id}/start-acquisition"
+      - "POST /imaging-exams/{id}/finish-acquisition"
+      - "POST /imaging-exams/{id}/image-series"
+      - "POST /image-series/{id}/finalize"
+    shared_operations:
+      - "GET (exam/series read endpoints)"
+  - name: Radiologist
+    description: "Reads and signs off exams; authors reports; raises and acknowledges critical results; opens addenda. Cannot acquire the same exam (segregation of duties)."
+    identity: entity_backed:Staff
+    exclusive_operations:
+      - "POST /imaging-exams/{id}/claim-read"
+      - "POST /imaging-exams/{id}/sign-off"
+      - "POST /imaging-exams/{id}/reports"
+      - "POST /radiology-reports/{id}/finalize"
+      - "POST /radiology-reports/{id}/critical-results"
+      - "POST /critical-results/{id}/acknowledge"
+      - "POST /imaging-orders/{id}/request-addendum"
+    shared_operations:
+      - "GET (exam/report/critical-result read endpoints)"

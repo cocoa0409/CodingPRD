@@ -1,0 +1,1283 @@
+# =============================================================================
+# Scaffold: Hospital Bed Management & Patient Flow (v1) — Expert tier
+# =============================================================================
+
+scenario: |
+  413. Hospital Bed Management & Patient Flow: bed inventory & status
+  (clean/dirty/occupied/blocked), admission/transfer/discharge (ADT) events,
+  ED boarding & throughput, isolation/telemetry constraints, EVS turnover
+  request, capacity huddle & surge, transfer-center placement, length-of-stay
+  & discharge-barrier tracking.
+
+domain_name: hospital-bed-flow
+api_prefix: ""    # flat/hybrid topology: multiple top-level collections (/units, /encounters, /bed-requests, /evs-tasks, /discharge-barriers, /surge-events, /capacity-huddles); Bed is nested under /units
+
+complexity_profile:
+  primary_archetype: quota_allocation        # finite bed pool reserved/committed/released
+  secondary_archetype: posture_driven_gating  # unit surge posture gates placement
+  complexity_layers:
+    - optimistic_concurrency        # OCC on Bed.version for transfer-center placement races
+    - cascading_side_effects        # place/discharge cascades across Bed↔Encounter↔Unit↔EvsTask
+    - derived_field_reconciliation  # Unit occupancy/posture, LOS, boarding hours
+    - selector_policy               # auto-place picks one bed from a candidate pool
+
+  entity_topology: hybrid
+  # Unit → Bed (strict ownership tree) plus flat cross-cutting peers
+  # (Encounter, BedRequest, EvsTask, DischargeBarrier, SurgeEvent, CapacityHuddle)
+  # that reference Unit/Bed/Encounter by FK without URL nesting.
+
+  state_machine_shape: cyclic
+  # Bed status cycles CLEAN→OCCUPIED→DIRTY→CLEAN (turnover loop); BedRequest has
+  # branching auto-place fork; SurgeEvent parallel to derived posture; Encounter ADT
+  # has transfer revert loops. Multiple non-linear machines on different entities.
+
+  relationship_patterns:
+    - one_to_many        # Unit→Bed, Encounter→DischargeBarrier, Encounter→AdtEvent
+    - cross_aggregate    # Bed.current_encounter_id ↔ Encounter.current_bed_id
+    - self_referential   # Encounter.transferred_from_bed_id references a prior Bed
+
+  role_model: peer_roles
+  # BedControlCoordinator (placement authority), ChargeNurse (unit/bed status),
+  # EvsTech (turnover), TransferCenterAgent (bed requests), CaseManager (discharge
+  # barriers), plus opaque FlowAdmin (override/clock).
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Unit
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: name, type: string, source: input, description: "Nursing unit name (e.g. '5 West')" }
+      - { name: unit_type, type: enum, source: input, description: "MEDSURG | TELEMETRY | ICU | ED", constraints: "one of MEDSURG, TELEMETRY, ICU, ED" }
+      - { name: gmlos_days, type: integer, source: input, default: 3, description: "Geometric mean length of stay benchmark in days for this unit (used by long-stay flag)" }
+      - { name: total_bed_count, type: integer, source: computed, default: 0, description: "Count of all non-RETIRED Bed rows whose unit_id == this Unit.id" }
+      - { name: staffed_bed_count, type: integer, source: computed, default: 0, description: "Count of Bed rows in this unit with status IN {CLEAN, DIRTY, OCCUPIED} (BLOCKED and RETIRED excluded)" }
+      - { name: occupied_bed_count, type: integer, source: computed, default: 0, description: "Count of Bed rows in this unit with status == OCCUPIED" }
+      - { name: clean_available_count, type: integer, source: computed, default: 0, description: "Count of Bed rows in this unit with status == CLEAN" }
+      - { name: occupancy_pct, type: number, source: computed, default: 0, description: "occupied_bed_count / staffed_bed_count * 100, round_half_up 2dp; 0.00 when staffed_bed_count == 0" }
+      - { name: derived_posture, type: enum, source: computed, description: "GREEN | YELLOW | RED | CLOSED — computed from occupancy_pct and staffed_bed_count (see calc unit_posture)" }
+      - { name: declared_surge_level, type: enum, source: computed, default: "GREEN", description: "GREEN | YELLOW | RED — highest currently-OPEN SurgeEvent.level for this unit, else GREEN" }
+      - { name: effective_posture, type: enum, source: computed, description: "GREEN | YELLOW | RED | CLOSED — max severity of derived_posture and declared_surge_level (rank GREEN<YELLOW<RED<CLOSED)" }
+
+  - name: Bed
+    parent: Unit
+    common_fields: true
+    fields:
+      - { name: unit_id, type: string, source: input, description: "FK -> Unit.id; owning nursing unit" }
+      - { name: label, type: string, source: input, description: "Bed label within unit (e.g. '512-A')" }
+      - { name: room_type, type: enum, source: input, default: "SEMIPRIVATE", description: "PRIVATE | SEMIPRIVATE — PRIVATE rooms accept any sex_cohort; SEMIPRIVATE enforce cohort match" }
+      - { name: isolation_capable, type: boolean, source: input, default: false, description: "True if bed is in a negative-pressure / contact-isolation-capable room" }
+      - { name: telemetry_capable, type: boolean, source: input, default: false, description: "True if bed has cardiac telemetry monitoring" }
+      - { name: status, type: enum, source: system, description: "CLEAN | DIRTY | OCCUPIED | BLOCKED | RETIRED — see Bed state machine", constraints: "one of CLEAN, DIRTY, OCCUPIED, BLOCKED, RETIRED" }
+      - { name: sex_cohort, type: enum, source: computed, default: "NONE", description: "NONE | MALE | FEMALE — cohort designation of this bed/room. Set to an occupant's sex on placement; PRESERVED across routine turnover (DIRTY→CLEAN) so a CLEAN bed keeps its last occupant's cohort; reset to NONE only on unblock (deep room turnover). Drives SEMIPRIVATE cohort matching." }
+      - { name: current_encounter_id, type: string, source: computed, description: "Denormalized back-pointer to the Encounter currently occupying this bed (Encounter.id), or null when not OCCUPIED; reverse view is Encounter.current_bed_id" }
+      - { name: blocked_reason, type: enum, source: computed, description: "MAINTENANCE | STAFFING | INFECTION_CONTROL | null — reason set when status==BLOCKED" }
+
+  - name: Encounter
+    parent: null
+    common_fields: true
+    fields:
+      - { name: mrn, type: string, source: input, description: "Medical record number (patient identifier string)" }
+      - { name: sex, type: enum, source: input, description: "MALE | FEMALE", constraints: "one of MALE, FEMALE" }
+      - { name: requires_isolation, type: boolean, source: input, default: false, description: "Patient needs an isolation_capable bed" }
+      - { name: requires_telemetry, type: boolean, source: input, default: false, description: "Patient needs a telemetry_capable bed" }
+      - { name: origin, type: enum, source: input, default: "ED", description: "ED | DIRECT | TRANSFER_IN — entry channel; ED encounters board until placed", constraints: "one of ED, DIRECT, TRANSFER_IN" }
+      - { name: status, type: enum, source: system, description: "REGISTERED | ADMIT_PENDING | BOARDING | PLACED | DISCHARGE_ORDERED | DISCHARGED | CANCELLED — see Encounter ADT machine", constraints: "one of REGISTERED, ADMIT_PENDING, BOARDING, PLACED, DISCHARGE_ORDERED, DISCHARGED, CANCELLED" }
+      - { name: current_bed_id, type: string, source: computed, description: "Denormalized pointer to the Bed the patient currently occupies (Bed.id), or null when not PLACED/DISCHARGE_ORDERED; set/cleared by ADT side-effects" }
+      - { name: transferred_from_bed_id, type: string, source: computed, description: "Self-referential pointer to the Bed this Encounter occupied before its most recent transfer (Bed.id), else null" }
+      - { name: admit_decision_at, type: datetime, source: computed, description: "Clock timestamp when the admit order was placed (REGISTERED→ADMIT_PENDING); anchors boarding_hours" }
+      - { name: admitted_at, type: datetime, source: computed, description: "Clock timestamp of first PLACED transition; anchors length_of_stay" }
+      - { name: discharge_order_at, type: datetime, source: computed, description: "Clock timestamp when discharge was ordered (PLACED→DISCHARGE_ORDERED); anchors discharge_delay" }
+      - { name: discharged_at, type: datetime, source: computed, description: "Clock timestamp of DISCHARGED transition" }
+      - { name: boarding_hours, type: number, source: computed, default: 0, description: "ED boarding duration in hours (see calc ed_boarding_hours); frozen at placement" }
+      - { name: boarding_breached, type: boolean, source: computed, default: false, description: "True when boarding_hours >= ED_BOARDING_SLA_HOURS (4.0)" }
+      - { name: length_of_stay_hours, type: number, source: computed, default: 0, description: "Hours since admitted_at to clock-now (or discharged_at if discharged); see calc length_of_stay" }
+      - { name: long_stay_flag, type: boolean, source: computed, default: false, description: "True when length_of_stay_hours >= placement Unit.gmlos_days * 24 * LONG_STAY_MULT (1.5)" }
+      - { name: open_barrier_count, type: integer, source: computed, default: 0, description: "Count of DischargeBarrier rows for this Encounter with status == OPEN" }
+
+  - name: BedRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: encounter_id, type: string, source: input, description: "FK -> Encounter.id; patient awaiting placement" }
+      - { name: preferred_unit_id, type: string, source: input, description: "FK -> Unit.id; transfer-center preferred destination unit, or null" }
+      - { name: acceptable_unit_types, type: array, source: input, default: [], description: "Allowed Unit.unit_type values; empty array means any unit type is acceptable" }
+      - { name: priority, type: enum, source: input, default: "ROUTINE", description: "STAT | URGENT | ROUTINE — placement urgency", constraints: "one of STAT, URGENT, ROUTINE" }
+      - { name: status, type: enum, source: system, description: "QUEUED | ASSIGNED | CONFIRMED | CANCELLED | EXPIRED — see BedRequest machine", constraints: "one of QUEUED, ASSIGNED, CONFIRMED, CANCELLED, EXPIRED" }
+      - { name: assigned_bed_id, type: string, source: computed, description: "Denormalized pointer to the Bed selected by auto-place / manual assign (Bed.id), or null; the bed itself is read via GET /units/{id}/beds/{bedId}" }
+      - { name: match_score, type: integer, source: computed, description: "Score of the assigned bed at assignment time (see calc placement_match_score), or null when QUEUED" }
+      - { name: queued_ops_index, type: integer, source: computed, default: 0, description: "Value of the global ops_run_index when this request entered QUEUED; anchors EXPIRED sweep" }
+
+  - name: EvsTask
+    parent: null
+    common_fields: true
+    fields:
+      - { name: bed_id, type: string, source: input, description: "FK -> Bed.id; the DIRTY bed to turn over" }
+      - { name: task_type, type: enum, source: input, default: "ROUTINE", description: "STAT | ISOLATION | ROUTINE — turnover class", constraints: "one of STAT, ISOLATION, ROUTINE" }
+      - { name: status, type: enum, source: system, description: "REQUESTED | ASSIGNED | IN_PROGRESS | COMPLETED | CANCELLED — see EvsTask machine", constraints: "one of REQUESTED, ASSIGNED, IN_PROGRESS, COMPLETED, CANCELLED" }
+      - { name: assigned_tech_id, type: string, source: computed, description: "Opaque EvsTech user id assigned to this task, or null" }
+      - { name: requested_at, type: datetime, source: computed, description: "Clock timestamp the task entered REQUESTED; anchors wait minutes for priority_score" }
+      - { name: priority_score, type: integer, source: computed, default: 0, description: "Urgency score (see calc evs_priority_score); recomputed on read against current clock and unit posture" }
+
+  - name: DischargeBarrier
+    parent: null
+    common_fields: true
+    fields:
+      - { name: encounter_id, type: string, source: input, description: "FK -> Encounter.id; the patient this barrier blocks" }
+      - { name: barrier_type, type: enum, source: input, description: "PLACEMENT_SNF | TRANSPORT | PHARMACY | FAMILY | EQUIPMENT — discharge blocker class", constraints: "one of PLACEMENT_SNF, TRANSPORT, PHARMACY, FAMILY, EQUIPMENT" }
+      - { name: note, type: string, source: input, default: "", description: "Free-text barrier detail" }
+      - { name: status, type: enum, source: system, description: "OPEN | RESOLVED — see DischargeBarrier machine", constraints: "one of OPEN, RESOLVED" }
+      - { name: opened_at, type: datetime, source: computed, description: "Clock timestamp barrier opened" }
+      - { name: resolved_at, type: datetime, source: computed, description: "Clock timestamp barrier resolved, else null" }
+
+  - name: SurgeEvent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: unit_id, type: string, source: input, description: "FK -> Unit.id; unit placed on surge" }
+      - { name: level, type: enum, source: input, description: "YELLOW | RED — declared surge severity", constraints: "one of YELLOW, RED" }
+      - { name: reason, type: string, source: input, default: "", description: "Free-text surge reason" }
+      - { name: status, type: enum, source: system, description: "OPEN | STOOD_DOWN — see SurgeEvent machine", constraints: "one of OPEN, STOOD_DOWN" }
+      - { name: opened_at, type: datetime, source: computed, description: "Clock timestamp surge declared" }
+      - { name: stood_down_at, type: datetime, source: computed, description: "Clock timestamp surge stood down, else null" }
+
+  - name: CapacityHuddle
+    parent: null
+    common_fields: true
+    fields:
+      - { name: huddle_at, type: datetime, source: computed, description: "Clock timestamp of the huddle snapshot" }
+      - { name: total_staffed_beds, type: integer, source: computed, description: "Sum of Unit.staffed_bed_count over all units at huddle time" }
+      - { name: total_occupied_beds, type: integer, source: computed, description: "Sum of Unit.occupied_bed_count over all units at huddle time" }
+      - { name: house_occupancy_pct, type: number, source: computed, description: "total_occupied_beds / total_staffed_beds * 100, round_half_up 2dp; 0.00 when no staffed beds" }
+      - { name: boarding_encounter_count, type: integer, source: computed, description: "Count of Encounter rows with status == BOARDING at huddle time" }
+      - { name: queued_request_count, type: integer, source: computed, description: "Count of BedRequest rows with status == QUEUED at huddle time" }
+      - { name: red_unit_count, type: integer, source: computed, description: "Count of Unit rows whose effective_posture == RED at huddle time" }
+
+  - name: AdtEvent
+    parent: Encounter
+    common_fields: false   # append-only: only id + created_at
+    fields:
+      - { name: encounter_id, type: string, source: system, description: "FK -> Encounter.id; the patient this event belongs to" }
+      - { name: event_type, type: enum, source: system, description: "ADMIT | PLACE | TRANSFER | DISCHARGE_ORDER | DISCHARGE | CANCEL — ADT event kind", constraints: "one of ADMIT, PLACE, TRANSFER, DISCHARGE_ORDER, DISCHARGE, CANCEL" }
+      - { name: from_bed_id, type: string, source: system, description: "Snapshot pointer to the Bed before the event (Bed.id), or null" }
+      - { name: to_bed_id, type: string, source: system, description: "Snapshot pointer to the Bed after the event (Bed.id), or null" }
+      - { name: event_at, type: datetime, source: system, description: "Clock timestamp of the event" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ----- Bed turnover cycle (CLEAN→OCCUPIED→DIRTY→CLEAN) + block/retire branches -----
+  - entity: Bed
+    initial_state: DIRTY
+    terminal_states: [RETIRED]
+    transitions:
+      - from: DIRTY
+        to: CLEAN
+        trigger: "POST /units/{id}/beds/{bedId}/mark-clean OR EvsTask completion"
+        actor: ChargeNurse | EvsTech | system
+        preconditions:
+          - "Bed.status == DIRTY"
+        side_effects:
+          - "sex_cohort PRESERVED across routine turnover (a CLEAN bed retains the cohort of its last occupant; cohort is only reset to NONE on unblock — deep room turnover)"
+          - "Direct mark-clean cancels any open EvsTask for this bed (REQUESTED/ASSIGNED/IN_PROGRESS → CANCELLED); the EvsTask-completion path itself drives this transition without self-cancelling"
+          - "Unit.clean_available_count recomputed; effective_posture recomputed"
+      - from: CLEAN
+        to: OCCUPIED
+        trigger: "system (Encounter PLACE/TRANSFER assigns this bed)"
+        actor: system
+        preconditions:
+          - "Bed.status == CLEAN"
+          - "isolation eligibility, telemetry eligibility, and sex-cohort checks pass (see validations 30/31/32)"
+        side_effects:
+          - "current_encounter_id := placing Encounter.id"
+          - "sex_cohort := Encounter.sex"
+          - "Unit.occupied_bed_count and occupancy_pct recomputed; effective_posture recomputed"
+      - from: OCCUPIED
+        to: DIRTY
+        trigger: "system (Encounter transfers out, discharges, or cancels from this bed)"
+        actor: system
+        preconditions:
+          - "Bed.status == OCCUPIED"
+        side_effects:
+          - "current_encounter_id := null"
+          - "Unit.occupied_bed_count recomputed; effective_posture recomputed"
+          - "Auto-create EvsTask (status REQUESTED, task_type ISOLATION if the departing Encounter.requires_isolation else ROUTINE) for this bed"
+      - from: CLEAN
+        to: BLOCKED
+        trigger: "POST /units/{id}/beds/{bedId}/block"
+        actor: ChargeNurse | FlowAdmin
+        preconditions:
+          - "Bed.status == CLEAN"
+          - "blocked_reason provided"
+        side_effects:
+          - "blocked_reason := request reason"
+          - "Unit.staffed_bed_count decremented (BLOCKED leaves staffed inventory); occupancy_pct and effective_posture recomputed"
+      - from: DIRTY
+        to: BLOCKED
+        trigger: "POST /units/{id}/beds/{bedId}/block"
+        actor: ChargeNurse | FlowAdmin
+        preconditions:
+          - "Bed.status == DIRTY"
+          - "blocked_reason provided"
+        side_effects:
+          - "blocked_reason := request reason"
+          - "Open EvsTask for this bed (REQUESTED/ASSIGNED/IN_PROGRESS) → CANCELLED"
+          - "Unit.staffed_bed_count decremented; occupancy_pct and effective_posture recomputed"
+      - from: BLOCKED
+        to: DIRTY
+        trigger: "POST /units/{id}/beds/{bedId}/unblock"
+        actor: ChargeNurse | FlowAdmin
+        preconditions:
+          - "Bed.status == BLOCKED"
+        side_effects:
+          - "blocked_reason := null"
+          - "sex_cohort reset to NONE (deep room turnover clears the cohort designation)"
+          - "Unit.staffed_bed_count restored; occupancy_pct and effective_posture recomputed"
+      - from: BLOCKED
+        to: RETIRED
+        trigger: "POST /units/{id}/beds/{bedId}/retire"
+        actor: FlowAdmin
+        preconditions:
+          - "Bed.status == BLOCKED"
+        side_effects:
+          - "Unit.total_bed_count decremented"
+        note: "Terminal — retired beds leave inventory permanently."
+
+  # ----- Encounter ADT lifecycle (branching + transfer revert loop) -----
+  - entity: Encounter
+    initial_state: REGISTERED
+    terminal_states: [DISCHARGED, CANCELLED]
+    transitions:
+      - from: REGISTERED
+        to: ADMIT_PENDING
+        trigger: "POST /encounters/{encounterId}/admit-order"
+        actor: BedControlCoordinator | FlowAdmin
+        preconditions:
+          - "Encounter.status == REGISTERED"
+        side_effects:
+          - "admit_decision_at := clock-now"
+          - "Append AdtEvent(event_type=ADMIT)"
+      - from: ADMIT_PENDING
+        to: BOARDING
+        trigger: "system (automatic when origin == ED on admit-order) OR POST /encounters/{encounterId}/start-boarding"
+        actor: system | BedControlCoordinator
+        preconditions:
+          - "Encounter.status == ADMIT_PENDING"
+          - "Encounter.origin == ED"
+        side_effects:
+          - "boarding_hours begins accruing from admit_decision_at"
+      - from: ADMIT_PENDING
+        to: PLACED
+        trigger: "POST /bed-requests/{bedRequestId}/confirm (DIRECT/TRANSFER_IN encounters place straight from ADMIT_PENDING)"
+        actor: BedControlCoordinator | TransferCenterAgent
+        preconditions:
+          - "Encounter.status == ADMIT_PENDING"
+          - "Encounter.origin != ED"
+          - "assigned Bed.status == CLEAN and passes isolation/telemetry/cohort checks"
+        side_effects:
+          - "current_bed_id := assigned bed; assigned Bed → OCCUPIED"
+          - "admitted_at := clock-now (first placement)"
+          - "Append AdtEvent(event_type=PLACE)"
+      - from: BOARDING
+        to: PLACED
+        trigger: "POST /bed-requests/{bedRequestId}/confirm"
+        actor: BedControlCoordinator | TransferCenterAgent
+        preconditions:
+          - "Encounter.status == BOARDING"
+          - "assigned Bed.status == CLEAN and passes isolation/telemetry/cohort checks"
+        side_effects:
+          - "boarding_hours frozen := clock-now - admit_decision_at; boarding_breached recomputed"
+          - "current_bed_id := assigned bed; assigned Bed → OCCUPIED; admitted_at := clock-now"
+          - "Append AdtEvent(event_type=PLACE)"
+      - from: PLACED
+        to: PLACED
+        trigger: "POST /encounters/{encounterId}/transfer"
+        actor: BedControlCoordinator
+        preconditions:
+          - "Encounter.status == PLACED"
+          - "target Bed.status == CLEAN and passes isolation/telemetry/cohort checks"
+          - "target bed != current bed"
+        side_effects:
+          - "transferred_from_bed_id := current_bed_id; old Bed → DIRTY (auto EvsTask created)"
+          - "current_bed_id := target bed; target Bed → OCCUPIED"
+          - "admitted_at unchanged (LOS clock continuous); Append AdtEvent(event_type=TRANSFER)"
+        note: "Self-loop on PLACED — transfer keeps the patient PLACED but swaps beds."
+      - from: PLACED
+        to: DISCHARGE_ORDERED
+        trigger: "POST /encounters/{encounterId}/discharge-order"
+        actor: CaseManager | BedControlCoordinator
+        preconditions:
+          - "Encounter.status == PLACED"
+        side_effects:
+          - "discharge_order_at := clock-now; Append AdtEvent(event_type=DISCHARGE_ORDER)"
+      - from: DISCHARGE_ORDERED
+        to: PLACED
+        trigger: "POST /encounters/{encounterId}/rescind-discharge"
+        actor: CaseManager | BedControlCoordinator
+        preconditions:
+          - "Encounter.status == DISCHARGE_ORDERED"
+        side_effects:
+          - "discharge_order_at := null"
+        note: "Revert loop — discharge order can be rescinded while patient still in bed."
+      - from: DISCHARGE_ORDERED
+        to: DISCHARGED
+        trigger: "POST /encounters/{encounterId}/discharge"
+        actor: CaseManager | BedControlCoordinator
+        preconditions:
+          - "Encounter.status == DISCHARGE_ORDERED"
+          - "open_barrier_count == 0"
+        side_effects:
+          - "discharged_at := clock-now; length_of_stay_hours frozen"
+          - "current_bed_id Bed → DIRTY (auto EvsTask created); current_bed_id := null"
+          - "Append AdtEvent(event_type=DISCHARGE)"
+      - from: REGISTERED
+        to: CANCELLED
+        trigger: "POST /encounters/{encounterId}/cancel"
+        actor: BedControlCoordinator | FlowAdmin
+        preconditions:
+          - "Encounter.status == REGISTERED"
+        side_effects:
+          - "Append AdtEvent(event_type=CANCEL)"
+      - from: ADMIT_PENDING
+        to: CANCELLED
+        trigger: "POST /encounters/{encounterId}/cancel"
+        actor: BedControlCoordinator | FlowAdmin
+        preconditions:
+          - "Encounter.status == ADMIT_PENDING"
+        side_effects:
+          - "Open BedRequest for this Encounter (QUEUED/ASSIGNED) → CANCELLED"
+          - "Append AdtEvent(event_type=CANCEL)"
+      - from: BOARDING
+        to: CANCELLED
+        trigger: "POST /encounters/{encounterId}/cancel"
+        actor: BedControlCoordinator | FlowAdmin
+        preconditions:
+          - "Encounter.status == BOARDING"
+        side_effects:
+          - "Open BedRequest for this Encounter (QUEUED/ASSIGNED) → CANCELLED"
+          - "Append AdtEvent(event_type=CANCEL)"
+
+  # ----- BedRequest placement (branching auto-place fork + queue) -----
+  - entity: BedRequest
+    initial_state: QUEUED
+    terminal_states: [CONFIRMED, CANCELLED, EXPIRED]
+    transitions:
+      - from: QUEUED
+        to: ASSIGNED
+        trigger: "POST /bed-requests/{bedRequestId}/auto-place"
+        actor: BedControlCoordinator | TransferCenterAgent
+        preconditions:
+          - "BedRequest.status == QUEUED"
+          - "Candidate pool (eligible beds, see calc placement_match_score) is non-empty, else ERR_NO_ELIGIBLE_BED"
+        side_effects:
+          - "assigned_bed_id := selected bed; match_score := selected bed score"
+          - "selected Bed reserved (still CLEAN, not yet OCCUPIED until confirm)"
+        note: "Branching: auto-place picks a bed; if pool empty the request stays QUEUED and ERR_NO_ELIGIBLE_BED is returned."
+      - from: QUEUED
+        to: ASSIGNED
+        trigger: "POST /bed-requests/{bedRequestId}/assign"
+        actor: BedControlCoordinator
+        preconditions:
+          - "BedRequest.status == QUEUED"
+          - "bed_id provided; that Bed.status == CLEAN and passes isolation/telemetry/cohort checks"
+        side_effects:
+          - "assigned_bed_id := provided bed; match_score := computed score of that bed"
+      - from: ASSIGNED
+        to: CONFIRMED
+        trigger: "POST /bed-requests/{bedRequestId}/confirm"
+        actor: BedControlCoordinator | TransferCenterAgent
+        preconditions:
+          - "BedRequest.status == ASSIGNED"
+          - "assigned Bed.status == CLEAN (still); expected_bed_version matches assigned Bed.version (OCC)"
+          - "Encounter for this request is in BOARDING or ADMIT_PENDING(non-ED)"
+        side_effects:
+          - "assigned Bed → OCCUPIED; Encounter → PLACED (see Encounter machine)"
+          - "increments Bed.version by 1"
+          - "Append AdtEvent(event_type=PLACE)"
+      - from: ASSIGNED
+        to: QUEUED
+        trigger: "POST /bed-requests/{bedRequestId}/release"
+        actor: BedControlCoordinator | TransferCenterAgent
+        preconditions:
+          - "BedRequest.status == ASSIGNED"
+        side_effects:
+          - "assigned_bed_id := null; match_score := null; bed reservation released"
+          - "queued_ops_index := current ops_run_index"
+        note: "Revert loop — releasing an assignment returns the request to the queue."
+      - from: QUEUED
+        to: CANCELLED
+        trigger: "POST /bed-requests/{bedRequestId}/cancel"
+        actor: BedControlCoordinator | TransferCenterAgent
+        preconditions:
+          - "BedRequest.status == QUEUED"
+        side_effects: []
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "POST /bed-requests/{bedRequestId}/cancel"
+        actor: BedControlCoordinator | TransferCenterAgent
+        preconditions:
+          - "BedRequest.status == ASSIGNED"
+        side_effects:
+          - "bed reservation released"
+      - from: QUEUED
+        to: EXPIRED
+        trigger: "system (POST /ops/run advances ops_run_index; QUEUED requests aged >= REQUEST_EXPIRY_RUNS ops runs expire)"
+        actor: system
+        preconditions:
+          - "BedRequest.status == QUEUED"
+          - "current ops_run_index - queued_ops_index >= REQUEST_EXPIRY_RUNS (2)"
+        side_effects: []
+
+  # ----- EvsTask turnover (linear with cancel branch; auto-completion cleans bed) -----
+  - entity: EvsTask
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: ASSIGNED
+        trigger: "POST /evs-tasks/{evsTaskId}/assign"
+        actor: EvsTech | FlowAdmin
+        preconditions:
+          - "EvsTask.status == REQUESTED"
+        side_effects:
+          - "assigned_tech_id := acting EvsTech X-User-ID (or provided tech_id for FlowAdmin)"
+      - from: ASSIGNED
+        to: IN_PROGRESS
+        trigger: "POST /evs-tasks/{evsTaskId}/start"
+        actor: EvsTech
+        preconditions:
+          - "EvsTask.status == ASSIGNED"
+        side_effects: []
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /evs-tasks/{evsTaskId}/complete"
+        actor: EvsTech
+        preconditions:
+          - "EvsTask.status == IN_PROGRESS"
+          - "target Bed.status == DIRTY"
+        side_effects:
+          - "Bed status DIRTY → CLEAN (sex_cohort PRESERVED — routine turnover keeps the room's cohort designation)"
+          - "Unit.clean_available_count and effective_posture recomputed"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /evs-tasks/{evsTaskId}/cancel OR system (bed blocked/retired)"
+        actor: EvsTech | ChargeNurse | FlowAdmin | system
+        preconditions:
+          - "EvsTask.status == REQUESTED"
+        side_effects: []
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "POST /evs-tasks/{evsTaskId}/cancel OR system (bed blocked/retired)"
+        actor: EvsTech | ChargeNurse | FlowAdmin | system
+        preconditions:
+          - "EvsTask.status == ASSIGNED"
+        side_effects: []
+      - from: IN_PROGRESS
+        to: CANCELLED
+        trigger: "POST /evs-tasks/{evsTaskId}/cancel"
+        actor: ChargeNurse | FlowAdmin
+        preconditions:
+          - "EvsTask.status == IN_PROGRESS"
+        side_effects: []
+
+  # ----- DischargeBarrier -----
+  - entity: DischargeBarrier
+    initial_state: OPEN
+    terminal_states: [RESOLVED]
+    transitions:
+      - from: OPEN
+        to: RESOLVED
+        trigger: "POST /discharge-barriers/{barrierId}/resolve"
+        actor: CaseManager | FlowAdmin
+        preconditions:
+          - "DischargeBarrier.status == OPEN"
+        side_effects:
+          - "resolved_at := clock-now; Encounter.open_barrier_count decremented"
+
+  # ----- SurgeEvent (parallel to Unit derived posture) -----
+  - entity: SurgeEvent
+    initial_state: OPEN
+    terminal_states: [STOOD_DOWN]
+    transitions:
+      - from: OPEN
+        to: STOOD_DOWN
+        trigger: "POST /surge-events/{surgeEventId}/stand-down"
+        actor: BedControlCoordinator | FlowAdmin
+        preconditions:
+          - "SurgeEvent.status == OPEN"
+        side_effects:
+          - "stood_down_at := clock-now"
+          - "Unit.declared_surge_level and effective_posture recomputed (drops if no other OPEN surge)"
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: confirm-stale-bed
+    parent_entity: Bed
+    write_endpoint: "POST /bed-requests/{bedRequestId}/confirm"
+    occ_field: "expected_bed_version"
+    description: |
+      Confirming a BedRequest against an assigned Bed whose version has advanced
+      since the client last observed it is rejected. This captures the case where
+      another BedRequest was already confirmed into the same Bed (legitimately
+      taking it OCCUPIED and bumping its version under the confirm side-effects),
+      so this client's view of the bed is stale and the seat is gone.
+    error_id: ERR_STALE_BED_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: unit_posture
+    trigger: "any Bed status change in the unit, SurgeEvent open/stand-down, or GET on the Unit"
+    algorithm: threshold
+    formula: |
+      staffed = count(Bed in unit where status IN {CLEAN, DIRTY, OCCUPIED})
+      occupied = count(Bed in unit where status == OCCUPIED)
+      if staffed == 0:
+        occupancy_pct = 0.00
+        derived_posture = CLOSED
+      else:
+        occupancy_pct = round_half_up(occupied / staffed * 100, 2)
+        if occupancy_pct >= SURGE_CRITICAL_PCT:   derived_posture = RED
+        elif occupancy_pct >= SURGE_HIGH_PCT:      derived_posture = YELLOW
+        else:                                      derived_posture = GREEN
+      declared_surge_level = highest level among OPEN SurgeEvents for unit (rank GREEN<YELLOW<RED), else GREEN
+      RANK = {GREEN:0, YELLOW:1, RED:2, CLOSED:3}
+      effective_posture = argmax-by-RANK(derived_posture, declared_surge_level)
+    input_set: "All non-RETIRED Bed rows of the unit; all OPEN SurgeEvent rows for the unit."
+    constants:
+      SURGE_HIGH_PCT: 85.0
+      SURGE_CRITICAL_PCT: 95.0
+    precision: "occupancy_pct: 2 decimal places, round_half_up. Thresholds are inclusive (>=)."
+
+  - name: length_of_stay
+    trigger: "GET on Encounter; frozen on DISCHARGED transition"
+    algorithm: aggregation
+    formula: |
+      end_ts = discharged_at if status == DISCHARGED else clock_now
+      length_of_stay_hours = round_half_up((end_ts - admitted_at) total_seconds / 3600, 2)   # 0.00 if admitted_at is null
+      long_stay_threshold_hours = placement_unit.gmlos_days * 24 * LONG_STAY_MULT
+      long_stay_flag = (admitted_at is not null) and (length_of_stay_hours >= long_stay_threshold_hours)
+    input_set: "Single Encounter; gmlos_days read from the Unit of current_bed_id (or last bed if discharged)."
+    constants:
+      LONG_STAY_MULT: 1.5
+    precision: "length_of_stay_hours: 2 decimal places, round_half_up. long_stay threshold inclusive (>=)."
+
+  - name: ed_boarding_hours
+    trigger: "GET on Encounter while BOARDING (live); frozen on BOARDING→PLACED"
+    algorithm: aggregation
+    formula: |
+      if status == BOARDING:
+        boarding_hours = round_half_up((clock_now - admit_decision_at) total_seconds / 3600, 2)
+      elif a BOARDING→PLACED transition has occurred:
+        boarding_hours = round_half_up((place_event_at - admit_decision_at) total_seconds / 3600, 2)  # frozen
+      else:
+        boarding_hours = 0.00
+      boarding_breached = boarding_hours >= ED_BOARDING_SLA_HOURS
+    input_set: "Single Encounter; admit_decision_at and the PLACE AdtEvent.event_at."
+    constants:
+      ED_BOARDING_SLA_HOURS: 4.0
+    precision: "boarding_hours: 2 decimal places, round_half_up. SLA breach inclusive (>=)."
+
+  - name: placement_match_score
+    trigger: "POST /bed-requests/{bedRequestId}/auto-place (selector); also computed on /assign for the chosen bed"
+    algorithm: weighted_scoring
+    formula: |
+      # ELIGIBILITY FILTER (hard predicate; bed excluded from pool if any fails):
+      #   bed.status == CLEAN
+      #   AND (request.acceptable_unit_types is empty OR bed.unit.unit_type IN request.acceptable_unit_types)
+      #   AND (request.encounter.requires_isolation == false OR bed.isolation_capable == true)
+      #   AND (request.encounter.requires_telemetry == false OR bed.telemetry_capable == true)
+      #   AND (bed.room_type == PRIVATE OR bed.sex_cohort IN {NONE, request.encounter.sex})
+      # RANKING (pick MAX match_score over the eligible pool):
+      match_score = 0
+      if bed.isolation_capable and not request.encounter.requires_isolation: match_score += ISO_WASTE_PENALTY   # -10
+      if bed.telemetry_capable  and not request.encounter.requires_telemetry: match_score += TELE_WASTE_PENALTY  # -5
+      match_score += POSTURE_BONUS[bed.unit.effective_posture]   # GREEN +20, YELLOW +10, RED 0, CLOSED 0
+      if request.preferred_unit_id is not null and bed.unit_id == request.preferred_unit_id: match_score += PREFERRED_UNIT_BONUS  # +50
+      # TIE-BREAK (when two eligible beds share the max match_score):
+      #   1. lower bed.unit.occupancy_pct first
+      #   2. then earlier bed.created_at (ASC)
+      # FALLBACK: eligible pool empty -> no selection; ERR_NO_ELIGIBLE_BED; request stays QUEUED.
+    input_set: "All Bed rows whose status == CLEAN that satisfy the eligibility predicate above."
+    constants:
+      ISO_WASTE_PENALTY: -10
+      TELE_WASTE_PENALTY: -5
+      PREFERRED_UNIT_BONUS: 50
+      POSTURE_BONUS: { GREEN: 20, YELLOW: 10, RED: 0, CLOSED: 0 }
+    precision: "Integer score. Tie-break by occupancy_pct ASC then created_at ASC (never by id)."
+
+  - name: evs_priority_score
+    trigger: "GET on EvsTask or GET /evs-tasks list (recomputed against current clock and bed's unit posture)"
+    algorithm: weighted_scoring
+    formula: |
+      base = TYPE_BASE[task_type]                       # STAT 100, ISOLATION 70, ROUTINE 40
+      surge = POSTURE_BONUS[bed.unit.effective_posture]  # RED +30, YELLOW +15, GREEN 0, CLOSED 0
+      wait_minutes = floor((clock_now - requested_at) total_seconds / 60)
+      aging = floor(wait_minutes / AGING_WINDOW_MIN) * AGING_STEP   # every 30 min adds 5
+      priority_score = base + surge + aging
+      # ordering for the list endpoint: priority_score DESC, then requested_at ASC (never by id)
+    input_set: "Single EvsTask; effective_posture of the Unit owning the task's bed."
+    constants:
+      TYPE_BASE: { STAT: 100, ISOLATION: 70, ROUTINE: 40 }
+      POSTURE_BONUS: { RED: 30, YELLOW: 15, GREEN: 0, CLOSED: 0 }
+      AGING_WINDOW_MIN: 30
+      AGING_STEP: 5
+    precision: "Integer score. List ordering: priority_score DESC, requested_at ASC tie-break."
+
+  - name: discharge_delay
+    trigger: "GET on Encounter in DISCHARGE_ORDERED or DISCHARGED with discharge_order_at set"
+    algorithm: aggregation
+    formula: |
+      end_ts = discharged_at if status == DISCHARGED else clock_now
+      discharge_delay_hours = round_half_up((end_ts - discharge_order_at) total_seconds / 3600, 2)  # 0.00 if no discharge_order_at
+      avoidable_bed_days = floor(discharge_delay_hours / 24)
+    input_set: "Single Encounter; discharge_order_at anchor."
+    precision: "discharge_delay_hours: 2 decimal places, round_half_up; avoidable_bed_days: integer floor."
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "Role permitted for this operation per §1.7 RBAC matrix"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: existence
+    check: "All path-referenced resources exist (validated left-to-right in path)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+  - priority: 4
+    category: existence
+    check: "All body-referenced FK resources exist (encounter_id, bed_id, unit_id, preferred_unit_id)"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /units/{id}/beds, POST /bed-requests, POST /evs-tasks, POST /discharge-barriers, POST /surge-events, /bed-requests/{id}/assign"
+  - priority: 5
+    category: business_constraint
+    check: "Request body required fields present and enum values legal"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all
+  - priority: 6
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined (§1.2 from-state)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 10
+    category: business_safety
+    check: "Patient requires isolation but target bed is not isolation_capable"
+    error_id: ERR_ISOLATION_REQUIRED
+    http_status: 409
+    applies_to: "/bed-requests/{id}/assign, /bed-requests/{id}/confirm, /encounters/{id}/transfer"
+  - priority: 11
+    category: business_safety
+    check: "Patient requires telemetry but target bed is not telemetry_capable"
+    error_id: ERR_TELEMETRY_REQUIRED
+    http_status: 409
+    applies_to: "/bed-requests/{id}/assign, /bed-requests/{id}/confirm, /encounters/{id}/transfer"
+  - priority: 12
+    category: business_safety
+    check: "SEMIPRIVATE target bed has a sex_cohort that conflicts with the patient's sex (cohort IN {NONE, patient.sex} required)"
+    error_id: ERR_COHORT_CONFLICT
+    http_status: 409
+    applies_to: "/bed-requests/{id}/assign, /bed-requests/{id}/confirm, /encounters/{id}/transfer"
+  - priority: 13
+    category: business_referential
+    check: "Target bed for placement/transfer/assign must be CLEAN"
+    error_id: ERR_BED_NOT_AVAILABLE
+    http_status: 409
+    applies_to: "/bed-requests/{id}/assign, /bed-requests/{id}/confirm, /encounters/{id}/transfer"
+  - priority: 14
+    category: business_referential
+    check: "Transfer target bed must differ from the patient's current bed"
+    error_id: ERR_SAME_BED
+    http_status: 409
+    applies_to: "/encounters/{id}/transfer"
+  - priority: 15
+    category: business_safety
+    check: "Discharge requires zero OPEN DischargeBarriers on the Encounter"
+    error_id: ERR_OPEN_BARRIERS
+    http_status: 409
+    applies_to: "/encounters/{id}/discharge"
+  - priority: 16
+    category: business_constraint
+    check: "auto-place candidate pool (CLEAN beds passing isolation/telemetry/cohort/unit-type predicate) is non-empty"
+    error_id: ERR_NO_ELIGIBLE_BED
+    http_status: 409
+    applies_to: "/bed-requests/{id}/auto-place"
+  - priority: 17
+    category: business_constraint
+    check: "EvsTask target bed must be DIRTY when the task is created"
+    error_id: ERR_BED_NOT_DIRTY
+    http_status: 409
+    applies_to: "POST /evs-tasks"
+  - priority: 18
+    category: business_constraint
+    check: "A bed may have at most one non-terminal EvsTask (REQUESTED/ASSIGNED/IN_PROGRESS) at a time"
+    error_id: ERR_EVS_TASK_EXISTS
+    http_status: 409
+    applies_to: "POST /evs-tasks"
+  - priority: 19
+    category: business_constraint
+    check: "block requires a blocked_reason; a bed cannot be blocked while OCCUPIED"
+    error_id: ERR_BED_OCCUPIED
+    http_status: 409
+    applies_to: "/units/{id}/beds/{bedId}/block"
+  - priority: 20
+    category: concurrency
+    check: "expected_bed_version must equal the assigned Bed's current version (OCC)"
+    error_id: ERR_STALE_BED_VERSION
+    http_status: 412
+    applies_to: "/bed-requests/{id}/confirm"
+  - priority: 21
+    category: business_constraint
+    check: "Pagination params within bounds (limit 1..100, offset >= 0)"
+    error_id: ERR_INVALID_PAGINATION
+    http_status: 422
+    applies_to: "all list endpoints"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---------- Units ----------
+  - method: POST
+    path: "/units"
+    description: "Create a nursing unit"
+    roles: [FlowAdmin]
+    code: 201
+    input: ["name", "unit_type", "gmlos_days?"]
+    output: Unit
+    side_effects: ["counts initialized to 0; derived_posture=CLOSED; effective_posture=CLOSED; declared_surge_level=GREEN"]
+  - method: GET
+    path: "/units/{id}"
+    description: "Get a unit with recomputed occupancy and posture"
+    roles: [FlowAdmin, BedControlCoordinator, ChargeNurse, TransferCenterAgent, CaseManager, EvsTech]
+    code: 200
+    input: []
+    output: Unit
+    side_effects: ["occupancy_pct, derived_posture, declared_surge_level, effective_posture recomputed on read"]
+  - method: GET
+    path: "/units"
+    description: "List units (paginated)"
+    roles: [FlowAdmin, BedControlCoordinator, ChargeNurse, TransferCenterAgent, CaseManager, EvsTech]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Unit[]
+    side_effects: []
+
+  # ---------- Beds (sub-resource of Unit) ----------
+  - method: POST
+    path: "/units/{id}/beds"
+    description: "Add a bed to a unit (starts DIRTY)"
+    roles: [FlowAdmin, ChargeNurse]
+    code: 201
+    input: ["unit_id", "label", "room_type?", "isolation_capable?", "telemetry_capable?"]
+    output: Bed
+    side_effects: ["status=DIRTY; sex_cohort=NONE; Unit.total_bed_count and staffed_bed_count recomputed"]
+  - method: GET
+    path: "/units/{id}/beds/{bedId}"
+    description: "Get a bed"
+    roles: [FlowAdmin, BedControlCoordinator, ChargeNurse, TransferCenterAgent, EvsTech]
+    code: 200
+    input: []
+    output: Bed
+    side_effects: []
+  - method: GET
+    path: "/units/{id}/beds"
+    description: "List beds in a unit (reverse-reachability for Bed.unit_id; paginated, optional status filter)"
+    roles: [FlowAdmin, BedControlCoordinator, ChargeNurse, TransferCenterAgent, EvsTech]
+    code: 200
+    input: ["unit_id?", "status?", "limit?", "offset?"]
+    output: Bed[]
+    side_effects: []
+  - method: POST
+    path: "/units/{id}/beds/{bedId}/mark-clean"
+    description: "Mark a DIRTY bed CLEAN directly (without EVS task)"
+    roles: [ChargeNurse, EvsTech]
+    code: 200
+    input: []
+    output: Bed
+    side_effects: ["DIRTY→CLEAN; sex_cohort PRESERVED (routine turnover keeps cohort); any open EvsTask for this bed → CANCELLED; Unit counts/posture recomputed"]
+  - method: POST
+    path: "/units/{id}/beds/{bedId}/block"
+    description: "Block a CLEAN or DIRTY bed (removes from staffed inventory)"
+    roles: [ChargeNurse, FlowAdmin]
+    code: 200
+    input: [blocked_reason]
+    output: Bed
+    side_effects: ["status→BLOCKED; open EvsTask cancelled if bed was DIRTY; Unit.staffed_bed_count/posture recomputed"]
+  - method: POST
+    path: "/units/{id}/beds/{bedId}/unblock"
+    description: "Unblock a BLOCKED bed (returns to DIRTY)"
+    roles: [ChargeNurse, FlowAdmin]
+    code: 200
+    input: []
+    output: Bed
+    side_effects: ["status BLOCKED→DIRTY; blocked_reason=null; sex_cohort reset to NONE (deep room turnover); Unit.staffed_bed_count/posture recomputed"]
+  - method: POST
+    path: "/units/{id}/beds/{bedId}/retire"
+    description: "Retire a BLOCKED bed permanently"
+    roles: [FlowAdmin]
+    code: 200
+    input: []
+    output: Bed
+    side_effects: ["status→RETIRED; Unit.total_bed_count recomputed"]
+
+  # ---------- Encounters & ADT ----------
+  - method: POST
+    path: "/encounters"
+    description: "Register a new patient encounter"
+    roles: [BedControlCoordinator, TransferCenterAgent, FlowAdmin]
+    code: 201
+    input: ["mrn", "sex", "requires_isolation?", "requires_telemetry?", "origin?"]
+    output: Encounter
+    side_effects: ["status=REGISTERED; computed time fields null; counters 0"]
+  - method: GET
+    path: "/encounters/{encounterId}"
+    description: "Get an encounter with recomputed LOS, boarding, barrier count"
+    roles: [FlowAdmin, BedControlCoordinator, ChargeNurse, TransferCenterAgent, CaseManager]
+    code: 200
+    input: []
+    output: Encounter
+    side_effects: ["length_of_stay_hours, long_stay_flag, boarding_hours, boarding_breached, open_barrier_count recomputed on read"]
+  - method: GET
+    path: "/encounters"
+    description: "List encounters (paginated; optional status filter)"
+    roles: [FlowAdmin, BedControlCoordinator, ChargeNurse, TransferCenterAgent, CaseManager]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Encounter[]
+    side_effects: []
+  - method: POST
+    path: "/encounters/{encounterId}/admit-order"
+    description: "Place admit order (REGISTERED→ADMIT_PENDING; ED auto-advances to BOARDING)"
+    roles: [BedControlCoordinator, FlowAdmin]
+    code: 200
+    input: []
+    output: Encounter
+    side_effects: ["admit_decision_at set; ED origin auto-advances to BOARDING; AdtEvent(ADMIT)"]
+  - method: POST
+    path: "/encounters/{encounterId}/start-boarding"
+    description: "Manually move ADMIT_PENDING ED encounter to BOARDING"
+    roles: [BedControlCoordinator]
+    code: 200
+    input: []
+    output: Encounter
+    side_effects: ["status→BOARDING"]
+  - method: POST
+    path: "/encounters/{encounterId}/transfer"
+    description: "Transfer a PLACED patient to a different CLEAN bed (self-loop on PLACED)"
+    roles: [BedControlCoordinator]
+    code: 200
+    input: [target_bed_id]
+    output: Encounter
+    side_effects: ["old bed→DIRTY (auto EvsTask); target bed→OCCUPIED; transferred_from_bed_id set; AdtEvent(TRANSFER)"]
+  - method: POST
+    path: "/encounters/{encounterId}/discharge-order"
+    description: "Order discharge (PLACED→DISCHARGE_ORDERED)"
+    roles: [CaseManager, BedControlCoordinator]
+    code: 200
+    input: []
+    output: Encounter
+    side_effects: ["discharge_order_at set; AdtEvent(DISCHARGE_ORDER)"]
+  - method: POST
+    path: "/encounters/{encounterId}/rescind-discharge"
+    description: "Rescind a discharge order (DISCHARGE_ORDERED→PLACED)"
+    roles: [CaseManager, BedControlCoordinator]
+    code: 200
+    input: []
+    output: Encounter
+    side_effects: ["discharge_order_at=null"]
+  - method: POST
+    path: "/encounters/{encounterId}/discharge"
+    description: "Discharge a patient (DISCHARGE_ORDERED→DISCHARGED) if no open barriers"
+    roles: [CaseManager, BedControlCoordinator]
+    code: 200
+    input: []
+    output: Encounter
+    side_effects: ["bed→DIRTY (auto EvsTask); current_bed_id=null; discharged_at set; LOS frozen; AdtEvent(DISCHARGE)"]
+  - method: POST
+    path: "/encounters/{encounterId}/cancel"
+    description: "Cancel a not-yet-placed encounter"
+    roles: [BedControlCoordinator, FlowAdmin]
+    code: 200
+    input: []
+    output: Encounter
+    side_effects: ["status→CANCELLED; open BedRequest cancelled; AdtEvent(CANCEL)"]
+  - method: GET
+    path: "/encounters/{id}/adt-events"
+    description: "List ADT events for an encounter (reverse-reachability for AdtEvent.encounter_id)"
+    roles: [FlowAdmin, BedControlCoordinator, CaseManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: AdtEvent[]
+    side_effects: []
+
+  # ---------- BedRequests (transfer-center placement) ----------
+  - method: POST
+    path: "/bed-requests"
+    description: "Create a placement request for an encounter (enters QUEUED)"
+    roles: [TransferCenterAgent, BedControlCoordinator]
+    code: 201
+    input: ["encounter_id", "preferred_unit_id?", "acceptable_unit_types?", "priority?"]
+    output: BedRequest
+    side_effects: ["status=QUEUED; queued_ops_index=current ops_run_index"]
+  - method: GET
+    path: "/bed-requests/{bedRequestId}"
+    description: "Get a bed request"
+    roles: [FlowAdmin, BedControlCoordinator, TransferCenterAgent]
+    code: 200
+    input: []
+    output: BedRequest
+    side_effects: []
+  - method: GET
+    path: "/bed-requests"
+    description: "List bed requests (reverse-reachability for BedRequest.encounter_id and preferred_unit_id; paginated)"
+    roles: [FlowAdmin, BedControlCoordinator, TransferCenterAgent]
+    code: 200
+    input: ["encounter_id?", "preferred_unit_id?", "status?", "limit?", "offset?"]
+    output: BedRequest[]
+    side_effects: []
+  - method: POST
+    path: "/bed-requests/{bedRequestId}/auto-place"
+    description: "Server selects the best eligible CLEAN bed and assigns it (QUEUED→ASSIGNED)"
+    roles: [BedControlCoordinator, TransferCenterAgent]
+    code: 200
+    input: []
+    output: BedRequest
+    side_effects: ["assigned_bed_id and match_score set; bed reserved; ERR_NO_ELIGIBLE_BED if pool empty"]
+  - method: POST
+    path: "/bed-requests/{bedRequestId}/assign"
+    description: "Manually assign a specific bed to a queued request (QUEUED→ASSIGNED)"
+    roles: [BedControlCoordinator]
+    code: 200
+    input: [bed_id]
+    output: BedRequest
+    side_effects: ["assigned_bed_id=bed_id; match_score computed; isolation/telemetry/cohort/availability validated"]
+  - method: POST
+    path: "/bed-requests/{bedRequestId}/confirm"
+    description: "Confirm an assigned bed, placing the patient (ASSIGNED→CONFIRMED; bed→OCCUPIED; encounter→PLACED). OCC-guarded."
+    roles: [BedControlCoordinator, TransferCenterAgent]
+    code: 200
+    input: [expected_bed_version]
+    output: BedRequest
+    side_effects: ["bed→OCCUPIED; encounter→PLACED; boarding frozen; admitted_at set; increments Bed.version by 1; AdtEvent(PLACE)"]
+  - method: POST
+    path: "/bed-requests/{bedRequestId}/release"
+    description: "Release an assignment back to the queue (ASSIGNED→QUEUED)"
+    roles: [BedControlCoordinator, TransferCenterAgent]
+    code: 200
+    input: []
+    output: BedRequest
+    side_effects: ["assigned_bed_id=null; match_score=null; bed reservation released; queued_ops_index reset"]
+  - method: POST
+    path: "/bed-requests/{bedRequestId}/cancel"
+    description: "Cancel a bed request"
+    roles: [BedControlCoordinator, TransferCenterAgent]
+    code: 200
+    input: []
+    output: BedRequest
+    side_effects: ["status→CANCELLED; bed reservation released if ASSIGNED"]
+
+  # ---------- EVS turnover ----------
+  - method: POST
+    path: "/evs-tasks"
+    description: "Create an EVS turnover task for a DIRTY bed"
+    roles: [ChargeNurse, BedControlCoordinator, EvsTech]
+    code: 201
+    input: ["bed_id", "task_type?"]
+    output: EvsTask
+    side_effects: ["status=REQUESTED; requested_at set; priority_score computed"]
+  - method: GET
+    path: "/evs-tasks/{evsTaskId}"
+    description: "Get an EVS task with recomputed priority_score"
+    roles: [FlowAdmin, EvsTech, ChargeNurse, BedControlCoordinator]
+    code: 200
+    input: []
+    output: EvsTask
+    side_effects: ["priority_score recomputed on read"]
+  - method: GET
+    path: "/evs-tasks"
+    description: "List EVS tasks ordered by priority_score DESC then requested_at ASC (reverse-reachability for EvsTask.bed_id; paginated)"
+    roles: [FlowAdmin, EvsTech, ChargeNurse, BedControlCoordinator]
+    code: 200
+    input: ["bed_id?", "status?", "limit?", "offset?"]
+    output: EvsTask[]
+    side_effects: ["priority_score recomputed for each task on read"]
+  - method: POST
+    path: "/evs-tasks/{evsTaskId}/assign"
+    description: "Assign a tech to a requested task (REQUESTED→ASSIGNED)"
+    roles: [EvsTech, FlowAdmin]
+    code: 200
+    input: ["tech_id?"]
+    output: EvsTask
+    side_effects: ["assigned_tech_id set"]
+  - method: POST
+    path: "/evs-tasks/{evsTaskId}/start"
+    description: "Start cleaning (ASSIGNED→IN_PROGRESS)"
+    roles: [EvsTech]
+    code: 200
+    input: []
+    output: EvsTask
+    side_effects: ["status→IN_PROGRESS"]
+  - method: POST
+    path: "/evs-tasks/{evsTaskId}/complete"
+    description: "Complete cleaning (IN_PROGRESS→COMPLETED; bed DIRTY→CLEAN)"
+    roles: [EvsTech]
+    code: 200
+    input: []
+    output: EvsTask
+    side_effects: ["status→COMPLETED; bed→CLEAN; sex_cohort PRESERVED (routine turnover keeps cohort); Unit posture recomputed"]
+  - method: POST
+    path: "/evs-tasks/{evsTaskId}/cancel"
+    description: "Cancel an EVS task"
+    roles: [EvsTech, ChargeNurse, FlowAdmin]
+    code: 200
+    input: []
+    output: EvsTask
+    side_effects: ["status→CANCELLED"]
+
+  # ---------- Discharge barriers ----------
+  - method: POST
+    path: "/discharge-barriers"
+    description: "Open a discharge barrier on an encounter"
+    roles: [CaseManager, BedControlCoordinator]
+    code: 201
+    input: ["encounter_id", "barrier_type", "note?"]
+    output: DischargeBarrier
+    side_effects: ["status=OPEN; opened_at set; Encounter.open_barrier_count incremented"]
+  - method: GET
+    path: "/discharge-barriers/{barrierId}"
+    description: "Get a discharge barrier"
+    roles: [FlowAdmin, CaseManager, BedControlCoordinator]
+    code: 200
+    input: []
+    output: DischargeBarrier
+    side_effects: []
+  - method: GET
+    path: "/discharge-barriers"
+    description: "List discharge barriers (reverse-reachability for DischargeBarrier.encounter_id; paginated)"
+    roles: [FlowAdmin, CaseManager, BedControlCoordinator]
+    code: 200
+    input: ["encounter_id?", "status?", "limit?", "offset?"]
+    output: DischargeBarrier[]
+    side_effects: []
+  - method: POST
+    path: "/discharge-barriers/{barrierId}/resolve"
+    description: "Resolve an open barrier (OPEN→RESOLVED)"
+    roles: [CaseManager, FlowAdmin]
+    code: 200
+    input: []
+    output: DischargeBarrier
+    side_effects: ["resolved_at set; Encounter.open_barrier_count decremented"]
+
+  # ---------- Surge ----------
+  - method: POST
+    path: "/surge-events"
+    description: "Declare a surge on a unit (raises declared_surge_level)"
+    roles: [BedControlCoordinator, FlowAdmin]
+    code: 201
+    input: ["unit_id", "level", "reason?"]
+    output: SurgeEvent
+    side_effects: ["status=OPEN; opened_at set; Unit.declared_surge_level/effective_posture recomputed"]
+  - method: GET
+    path: "/surge-events/{surgeEventId}"
+    description: "Get a surge event"
+    roles: [FlowAdmin, BedControlCoordinator]
+    code: 200
+    input: []
+    output: SurgeEvent
+    side_effects: []
+  - method: GET
+    path: "/surge-events"
+    description: "List surge events (reverse-reachability for SurgeEvent.unit_id; paginated)"
+    roles: [FlowAdmin, BedControlCoordinator]
+    code: 200
+    input: ["unit_id?", "status?", "limit?", "offset?"]
+    output: SurgeEvent[]
+    side_effects: []
+  - method: POST
+    path: "/surge-events/{surgeEventId}/stand-down"
+    description: "Stand down a surge (OPEN→STOOD_DOWN)"
+    roles: [BedControlCoordinator, FlowAdmin]
+    code: 200
+    input: []
+    output: SurgeEvent
+    side_effects: ["stood_down_at set; Unit.declared_surge_level/effective_posture recomputed"]
+
+  # ---------- Capacity huddle (computed snapshot) ----------
+  - method: POST
+    path: "/capacity-huddles"
+    description: "Snapshot house-wide capacity at the current clock"
+    roles: [BedControlCoordinator, FlowAdmin]
+    code: 201
+    input: []
+    output: CapacityHuddle
+    side_effects: ["all aggregate fields computed from current Units/Encounters/BedRequests at huddle_at"]
+  - method: GET
+    path: "/capacity-huddles/{huddleId}"
+    description: "Get a capacity huddle snapshot"
+    roles: [FlowAdmin, BedControlCoordinator]
+    code: 200
+    input: []
+    output: CapacityHuddle
+    side_effects: []
+  - method: GET
+    path: "/capacity-huddles"
+    description: "List capacity huddles (paginated)"
+    roles: [FlowAdmin, BedControlCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CapacityHuddle[]
+    side_effects: []
+
+  # ---------- Operations / clock (test-driving) ----------
+  - method: POST
+    path: "/ops/run"
+    description: "Advance the global ops_run_index by 1 and run the QUEUED-request expiry sweep"
+    roles: [FlowAdmin, BedControlCoordinator]
+    code: 200
+    input: []
+    output: "{ ops_run_index: integer, expired_request_ids: string[] }"
+    side_effects: ["ops_run_index += 1; QUEUED BedRequests aged >= REQUEST_EXPIRY_RUNS → EXPIRED"]
+  - method: POST
+    path: "/_clock/set"
+    description: "Test-driving: set the server's simulated current UTC clock"
+    roles: [FlowAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: string }"
+    side_effects: ["server clock_now := to_iso8601 (drives LOS, boarding, EVS aging, discharge delay)"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/invalid X-User-Role or X-User-ID header" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Role not permitted for this operation per §1.7" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path-referenced resource does not exist" }
+  - { id: ERR_REFERENCE_NOT_FOUND, http: 404, condition: "Body FK (encounter_id/bed_id/unit_id/preferred_unit_id) does not resolve" }
+  - { id: ERR_INVALID_REQUEST, http: 422, condition: "Missing required field, illegal enum value, or malformed body" }
+  - { id: ERR_INVALID_PAGINATION, http: 422, condition: "limit outside 1..100 or offset < 0" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a from-state for the requested transition" }
+  - { id: ERR_ISOLATION_REQUIRED, http: 409, condition: "Patient requires isolation but target bed is not isolation_capable" }
+  - { id: ERR_TELEMETRY_REQUIRED, http: 409, condition: "Patient requires telemetry but target bed is not telemetry_capable" }
+  - { id: ERR_COHORT_CONFLICT, http: 409, condition: "SEMIPRIVATE bed's sex_cohort conflicts with patient sex" }
+  - { id: ERR_BED_NOT_AVAILABLE, http: 409, condition: "Target bed for placement/transfer/assign is not CLEAN" }
+  - { id: ERR_SAME_BED, http: 409, condition: "Transfer target bed equals the patient's current bed" }
+  - { id: ERR_OPEN_BARRIERS, http: 409, condition: "Discharge attempted while OPEN DischargeBarriers remain" }
+  - { id: ERR_NO_ELIGIBLE_BED, http: 409, condition: "auto-place found no eligible CLEAN bed" }
+  - { id: ERR_BED_NOT_DIRTY, http: 409, condition: "EvsTask creation on a bed that is not DIRTY" }
+  - { id: ERR_EVS_TASK_EXISTS, http: 409, condition: "Bed already has a non-terminal EvsTask" }
+  - { id: ERR_BED_OCCUPIED, http: 409, condition: "Block/retire attempted on an OCCUPIED bed, or missing blocked_reason" }
+  - { id: ERR_STALE_BED_VERSION, http: 412, condition: "expected_bed_version does not match the assigned Bed's current version" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: FlowAdmin
+    description: "House-wide operations administrator: unit/bed lifecycle, surge, clock, ops runs, overrides."
+    identity: opaque
+    exclusive_operations:
+      - "POST /units — create unit"
+      - "POST /units/{id}/beds/{bedId}/retire — retire bed"
+      - "POST /_clock/set — set simulated clock"
+    shared_operations:
+      - "POST /units/{id}/beds — add bed (with ChargeNurse)"
+      - "POST /units/{id}/beds/{bedId}/block, /unblock — block/unblock (with ChargeNurse)"
+      - "POST /surge-events, /surge-events/{id}/stand-down — surge (with BedControlCoordinator)"
+      - "POST /capacity-huddles, /ops/run — capacity & ops (with BedControlCoordinator)"
+      - "POST /encounters, /encounters/{id}/admit-order, /cancel — registration/ADT (with BedControlCoordinator)"
+      - "POST /evs-tasks/{id}/assign, /cancel — EVS admin (with EvsTech/ChargeNurse)"
+      - "POST /discharge-barriers/{id}/resolve — resolve barrier (with CaseManager)"
+
+  - name: BedControlCoordinator
+    description: "Central placement authority: drives ADT, placement, transfers, surge, huddles."
+    identity: opaque
+    exclusive_operations:
+      - "POST /encounters/{id}/admit-order — place admit order"
+      - "POST /encounters/{id}/start-boarding — start boarding"
+      - "POST /encounters/{id}/transfer — transfer patient"
+      - "POST /bed-requests/{id}/assign — manual bed assignment"
+    shared_operations:
+      - "POST /encounters, /encounters/{id}/cancel — registration/cancel (with TransferCenterAgent/FlowAdmin)"
+      - "POST /bed-requests, /auto-place, /confirm, /release, /cancel — placement (with TransferCenterAgent)"
+      - "POST /encounters/{id}/discharge-order, /rescind-discharge, /discharge — discharge ops (with CaseManager)"
+      - "POST /surge-events, /stand-down — surge (with FlowAdmin)"
+      - "POST /capacity-huddles, /ops/run — capacity & ops (with FlowAdmin)"
+      - "POST /discharge-barriers — open barrier (with CaseManager)"
+
+  - name: ChargeNurse
+    description: "Unit-level bed status owner: bed creation, cleaning, blocking, EVS requests."
+    identity: opaque
+    exclusive_operations:
+      - "POST /units/{id}/beds/{bedId}/mark-clean — directly mark a bed clean"
+    shared_operations:
+      - "POST /units/{id}/beds — add bed (with FlowAdmin)"
+      - "POST /units/{id}/beds/{bedId}/block, /unblock — block/unblock (with FlowAdmin)"
+      - "POST /evs-tasks — create turnover task (with EvsTech/BedControlCoordinator)"
+      - "POST /evs-tasks/{id}/cancel — cancel turnover (with EvsTech/FlowAdmin)"
+
+  - name: TransferCenterAgent
+    description: "Transfer center: registers incoming patients and drives placement requests."
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "POST /encounters — register encounter (with BedControlCoordinator/FlowAdmin)"
+      - "POST /bed-requests, /auto-place, /confirm, /release, /cancel — placement (with BedControlCoordinator)"
+
+  - name: CaseManager
+    description: "Discharge planning: discharge orders, discharge, barrier management."
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "POST /encounters/{id}/discharge-order, /rescind-discharge, /discharge — discharge ops (with BedControlCoordinator)"
+      - "POST /discharge-barriers — open barrier (with BedControlCoordinator)"
+      - "POST /discharge-barriers/{id}/resolve — resolve barrier (with FlowAdmin)"
+
+  - name: EvsTech
+    description: "Environmental services technician: claims and completes turnover tasks."
+    identity: opaque
+    exclusive_operations:
+      - "POST /evs-tasks/{id}/start — start cleaning"
+      - "POST /evs-tasks/{id}/complete — complete cleaning"
+    shared_operations:
+      - "POST /units/{id}/beds/{bedId}/mark-clean — mark clean (with ChargeNurse)"
+      - "POST /evs-tasks — create turnover task (with ChargeNurse/BedControlCoordinator)"
+      - "POST /evs-tasks/{id}/assign — assign tech (with FlowAdmin)"
+      - "POST /evs-tasks/{id}/cancel — cancel turnover (with ChargeNurse/FlowAdmin)"

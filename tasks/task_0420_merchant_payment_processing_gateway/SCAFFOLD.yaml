@@ -1,0 +1,1618 @@
+scenario: "420. Merchant Payment Processing & Gateway (Stripe/Square style): merchant onboarding & underwriting (MCC/risk), authorization/capture/void, settlement & funding (T+1/T+2), interchange-plus vs flat fee, refund/partial-refund, chargeback dispute & representment, payout reserve & rolling hold, 1099-K & reconciliation"
+domain_name: merchant-payment-processing-gateway
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  secondary_archetype: event_sourcing
+  complexity_layers:
+    - dual_variant_calculation       # interchange-plus vs flat fee on the same capture
+    - cascading_side_effects         # capture -> settlement batch -> funding -> reserve ledger
+    - optimistic_concurrency         # OCC on Merchant.version for batch settlement / fee-plan switch
+    - rate_threshold_triggers        # 1099-K reporting threshold, monthly-volume markup tier, reserve release date
+    - derived_field_reconciliation   # Merchant.available_balance_cents / reserved_balance_cents kept consistent with ledger
+
+  entity_topology: flat
+  # Peer entities (Merchant, FeePlan, Charge, Refund, SettlementBatch, Payout,
+  # ReserveEntry, Dispute, LedgerEntry, Tax1099K, RiskReview, WebhookEvent)
+  # linked by foreign keys; no deep URL nesting beyond one level.
+
+  state_machine_shape: parallel
+  # Charge carries two independent axes (auth_status x settlement_status);
+  # Dispute is cyclic (representment rounds); Merchant onboarding is branching
+  # (approve/reject from underwriting); SettlementBatch + Payout are linear pipelines.
+
+  relationship_patterns:
+    - one_to_many        # Merchant -> Charge, Charge -> Refund, SettlementBatch -> Charge
+    - cross_aggregate    # LedgerEntry references any of Charge/Refund/Dispute/ReserveEntry/Payout
+    - polymorphic        # LedgerEntry.source_type + source_id reference different entity types
+
+  role_model: peer_roles
+  # MerchantUser owns its own Merchant's resources; UnderwritingOfficer owns risk
+  # review; PlatformOperator runs settlement/payout/reserve sweeps and clock; the
+  # acquiring side (network) is simulated via a test-driving endpoint.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: Merchant
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: Registered legal business name.
+      - name: mcc
+        type: string
+        source: input
+        description: "4-digit Merchant Category Code; drives risk band and reserve policy."
+        constraints: "exactly 4 ASCII digits"
+      - name: fee_plan_id
+        type: string
+        source: input
+        description: "FK -> FeePlan.id; the active fee plan used to price captures and refunds."
+      - name: onboarding_status
+        type: enum
+        source: system
+        description: Underwriting lifecycle state.
+        default: PENDING_REVIEW
+        constraints: "one of {PENDING_REVIEW, APPROVED, REJECTED, SUSPENDED}"
+      - name: risk_band
+        type: enum
+        source: computed
+        description: "Derived from MCC + requested_monthly_volume_cents at approval; pins reserve_rate_bps and funding delay."
+        constraints: "one of {LOW, MEDIUM, HIGH}"
+      - name: requested_monthly_volume_cents
+        type: integer
+        source: input
+        description: Self-declared expected monthly processing volume in cents.
+        constraints: ">= 0"
+      - name: reserve_rate_bps
+        type: integer
+        source: computed
+        description: "Rolling-reserve rate in basis points, fixed at approval from risk_band."
+        default: 0
+      - name: funding_delay_days
+        type: integer
+        source: computed
+        description: "T+N funding delay in days, fixed at approval from risk_band (T+1 or T+2)."
+        default: 2
+      - name: available_balance_cents
+        type: integer
+        source: computed
+        description: "Derived denormalized field = sum of LedgerEntry.amount_cents where account=AVAILABLE for this merchant; may be negative."
+        default: 0
+      - name: reserved_balance_cents
+        type: integer
+        source: computed
+        description: "Derived denormalized field = sum of LedgerEntry.amount_cents where account=RESERVE for this merchant; always >= 0."
+        default: 0
+      - name: payout_method
+        type: enum
+        source: input
+        description: Destination type for payouts.
+        default: BANK_ACCOUNT
+        constraints: "one of {BANK_ACCOUNT, DEBIT_CARD}"
+
+  - name: FeePlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: Human-readable plan label.
+      - name: pricing_model
+        type: enum
+        source: input
+        description: Determines which fee formula applies to captures.
+        constraints: "one of {FLAT, INTERCHANGE_PLUS}"
+      - name: flat_pct_bps
+        type: integer
+        source: input
+        description: "FLAT model: percentage component in basis points (e.g. 290 = 2.90%). Required when pricing_model=FLAT."
+        default: 0
+      - name: flat_fixed_cents
+        type: integer
+        source: input
+        description: "FLAT model: per-transaction fixed component in cents. Required when pricing_model=FLAT."
+        default: 0
+      - name: markup_pct_bps
+        type: integer
+        source: input
+        description: "INTERCHANGE_PLUS model: platform markup in basis points applied on captured amount. Required when pricing_model=INTERCHANGE_PLUS."
+        default: 0
+      - name: markup_fixed_cents
+        type: integer
+        source: input
+        description: "INTERCHANGE_PLUS model: platform per-transaction fixed markup in cents. Required when pricing_model=INTERCHANGE_PLUS."
+        default: 0
+      - name: volume_tier_threshold_cents
+        type: integer
+        source: input
+        description: "INTERCHANGE_PLUS model: merchant calendar-month settled-volume strictly above this value drops markup_pct_bps to discounted_markup_pct_bps for subsequent captures that month."
+        default: 0
+      - name: discounted_markup_pct_bps
+        type: integer
+        source: input
+        description: "INTERCHANGE_PLUS model: markup in bps once the monthly volume tier is crossed."
+        default: 0
+      - name: chargeback_fee_cents
+        type: integer
+        source: input
+        description: Non-refundable fee debited from the merchant when a Dispute opens.
+        default: 1500
+
+  - name: Charge
+    parent: null
+    common_fields: true
+    fields:
+      - name: merchant_id
+        type: string
+        source: input
+        description: "FK -> Merchant.id; the merchant that owns this charge."
+      - name: auth_amount_cents
+        type: integer
+        source: input
+        description: Amount authorized against the card at authorization time.
+        constraints: ">= 1"
+      - name: captured_amount_cents
+        type: integer
+        source: computed
+        description: "Cumulative amount captured; starts 0, set at capture, never exceeds auth_amount_cents."
+        default: 0
+      - name: refunded_amount_cents
+        type: integer
+        source: computed
+        description: "Cumulative amount refunded across all Refunds on this charge; never exceeds captured_amount_cents."
+        default: 0
+      - name: processing_fee_cents
+        type: integer
+        source: computed
+        description: "Fee charged on capture per the merchant fee plan; computed once at capture, non-refundable."
+        default: 0
+      - name: auth_status
+        type: enum
+        source: system
+        description: "Authorization axis of the parallel state machine."
+        default: AUTHORIZED
+        constraints: "one of {AUTHORIZED, CAPTURED, VOIDED, EXPIRED}"
+      - name: settlement_status
+        type: enum
+        source: system
+        description: "Settlement axis of the parallel state machine; advances independently once captured."
+        default: PENDING
+        constraints: "one of {PENDING, BATCHED, SETTLED, REVERSED}"
+      - name: settlement_batch_id
+        type: string
+        source: computed
+        description: "FK -> SettlementBatch.id; null until the charge is swept into a batch."
+        default: null
+      - name: card_last4
+        type: string
+        source: input
+        description: Last four digits of the card used (display only).
+        constraints: "exactly 4 ASCII digits"
+
+  - name: Refund
+    parent: null
+    common_fields: true
+    fields:
+      - name: charge_id
+        type: string
+        source: input
+        description: "FK -> Charge.id; the charge being refunded."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: Refund amount in cents.
+        constraints: ">= 1"
+      - name: refund_status
+        type: enum
+        source: system
+        description: Refund lifecycle.
+        default: PENDING
+        constraints: "one of {PENDING, SETTLED, FAILED}"
+      - name: reason
+        type: enum
+        source: input
+        description: Reason for the refund.
+        default: REQUESTED_BY_CUSTOMER
+        constraints: "one of {REQUESTED_BY_CUSTOMER, DUPLICATE, FRAUDULENT}"
+
+  - name: Dispute
+    parent: null
+    common_fields: true
+    fields:
+      - name: charge_id
+        type: string
+        source: input
+        description: "FK -> Charge.id; the charge being disputed by the cardholder."
+      - name: disputed_amount_cents
+        type: integer
+        source: input
+        description: Amount the cardholder is disputing; must equal net captured (captured minus refunded) at open time.
+        constraints: ">= 1"
+      - name: dispute_status
+        type: enum
+        source: system
+        description: Cyclic representment lifecycle.
+        default: OPEN
+        constraints: "one of {OPEN, UNDER_REVIEW, REPRESENTED, WON, LOST, ACCEPTED}"
+      - name: representment_round
+        type: integer
+        source: computed
+        description: "Number of representment submissions; increments each REPRESENTED transition; capped by MAX_REPRESENTMENT_ROUNDS."
+        default: 0
+      - name: evidence_due_at
+        type: datetime
+        source: computed
+        description: "Deadline to submit representment evidence; set on open to clock + EVIDENCE_WINDOW_DAYS."
+      - name: chargeback_fee_cents
+        type: integer
+        source: computed
+        description: Non-refundable fee debited at open, copied from the merchant fee plan; retained even if merchant wins.
+        default: 0
+
+  - name: SettlementBatch
+    parent: null
+    common_fields: true
+    fields:
+      - name: merchant_id
+        type: string
+        source: input
+        description: "FK -> Merchant.id; the merchant this batch settles for."
+      - name: business_date
+        type: string
+        source: input
+        description: "Calendar date (YYYY-MM-DD) the batch sweeps captures for."
+      - name: batch_status
+        type: enum
+        source: system
+        description: Batch lifecycle.
+        default: OPEN
+        constraints: "one of {OPEN, SETTLED, FUNDED}"
+      - name: gross_captured_cents
+        type: integer
+        source: computed
+        description: "Sum of captured_amount_cents over Charges swept into this batch; pinned at settle."
+        default: 0
+      - name: total_fees_cents
+        type: integer
+        source: computed
+        description: "Sum of processing_fee_cents over Charges in this batch; pinned at settle."
+        default: 0
+      - name: total_refunds_cents
+        type: integer
+        source: computed
+        description: "Sum of Refund.amount_cents settled against charges in this batch within the window; pinned at settle."
+        default: 0
+      - name: reserve_held_cents
+        type: integer
+        source: computed
+        description: "Rolling reserve withheld from this batch = round(gross_captured_cents * reserve_rate_bps / 10000)."
+        default: 0
+      - name: net_funding_cents
+        type: integer
+        source: computed
+        description: "Amount moved to AVAILABLE on funding = gross_captured - total_fees - total_refunds - reserve_held; pinned at settle."
+        default: 0
+
+  - name: Payout
+    parent: null
+    common_fields: true
+    fields:
+      - name: merchant_id
+        type: string
+        source: input
+        description: "FK -> Merchant.id; the merchant being paid out."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: Requested payout amount in cents; must not exceed available_balance_cents.
+        constraints: ">= 1"
+      - name: payout_status
+        type: enum
+        source: system
+        description: Payout lifecycle.
+        default: REQUESTED
+        constraints: "one of {REQUESTED, PAID, RETURNED}"
+      - name: scheduled_for
+        type: string
+        source: input
+        description: "Calendar date (YYYY-MM-DD) the payout is scheduled to execute."
+
+  - name: ReserveEntry
+    parent: null
+    common_fields: true
+    fields:
+      - name: merchant_id
+        type: string
+        source: input
+        description: "FK -> Merchant.id; the merchant the reserve is held against."
+      - name: settlement_batch_id
+        type: string
+        source: input
+        description: "FK -> SettlementBatch.id; the batch that contributed this reserve hold."
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: Amount held in reserve from the contributing batch.
+        default: 0
+      - name: release_date
+        type: string
+        source: computed
+        description: "Calendar date (YYYY-MM-DD) = batch business_date + RESERVE_HOLD_DAYS; reserve releases on a sweep when clock date >= this."
+      - name: reserve_status
+        type: enum
+        source: system
+        description: Reserve hold lifecycle.
+        default: HELD
+        constraints: "one of {HELD, RELEASED}"
+
+  - name: LedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: merchant_id
+        type: string
+        source: input
+        description: "FK -> Merchant.id; the merchant whose balance this entry affects."
+      - name: account
+        type: enum
+        source: input
+        description: Which sub-balance this entry posts to.
+        constraints: "one of {AVAILABLE, RESERVE}"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Signed posting; positive credits the merchant, negative debits."
+      - name: entry_type
+        type: enum
+        source: input
+        description: Accounting category of this posting.
+        constraints: "one of {FUNDING, FEE, REFUND, CHARGEBACK, CHARGEBACK_REVERSAL, RESERVE_HOLD, RESERVE_RELEASE, PAYOUT, PAYOUT_RETURN, ADJUSTMENT}; FEE is posted only for the non-refundable chargeback fee at Dispute open (processing fees are netted in FUNDING, not posted as FEE)"
+      - name: source_type
+        type: enum
+        source: input
+        description: "Polymorphic source kind this posting was generated by."
+        constraints: "one of {CHARGE, REFUND, DISPUTE, SETTLEMENT_BATCH, RESERVE_ENTRY, PAYOUT, MANUAL}"
+      - name: source_id
+        type: string
+        source: input
+        description: "Polymorphic id of the source entity (resolves against source_type); null when source_type=MANUAL."
+        default: null
+
+  - name: Tax1099K
+    parent: null
+    common_fields: true
+    fields:
+      - name: merchant_id
+        type: string
+        source: input
+        description: "FK -> Merchant.id; the merchant the form is generated for."
+      - name: tax_year
+        type: integer
+        source: input
+        description: Calendar year covered by the form.
+      - name: gross_amount_cents
+        type: integer
+        source: computed
+        description: "Box 1a gross = sum of captured_amount_cents over Charges with settlement_status=SETTLED whose settle posting fell in tax_year; no netting of refunds, fees, or chargebacks."
+        default: 0
+      - name: transaction_count
+        type: integer
+        source: computed
+        description: Count of SETTLED captures included in gross_amount_cents.
+        default: 0
+      - name: reportable
+        type: boolean
+        source: computed
+        description: "True when gross_amount_cents strictly exceeds REPORTING_THRESHOLD_CENTS."
+        default: false
+
+  - name: RiskReview
+    parent: null
+    common_fields: true
+    fields:
+      - name: merchant_id
+        type: string
+        source: input
+        description: "FK -> Merchant.id; the merchant under underwriting review."
+      - name: decision
+        type: enum
+        source: system
+        description: Underwriting outcome.
+        default: OPEN
+        constraints: "one of {OPEN, APPROVED, REJECTED}"
+      - name: assigned_risk_band
+        type: enum
+        source: input
+        description: "Risk band the officer assigns on approval; must be consistent with MCC high-risk policy."
+        default: null
+        constraints: "one of {LOW, MEDIUM, HIGH} or null while OPEN"
+      - name: notes
+        type: string
+        source: input
+        description: Free-text underwriting notes.
+        default: ""
+
+  - name: WebhookEvent
+    parent: null
+    common_fields: false
+    fields:
+      - name: merchant_id
+        type: string
+        source: input
+        description: "FK -> Merchant.id; the merchant the event concerns."
+      - name: event_type
+        type: enum
+        source: input
+        description: Domain event category.
+        constraints: "one of {CHARGE_CAPTURED, REFUND_SETTLED, DISPUTE_OPENED, DISPUTE_RESOLVED, BATCH_FUNDED, PAYOUT_PAID, RESERVE_RELEASED}"
+      - name: source_id
+        type: string
+        source: input
+        description: Id of the entity the event concerns (display only; not an FK constraint for reverse-reachability).
+      - name: idempotency_key
+        type: string
+        source: input
+        description: "Client-supplied key; a repeated emit with the same key returns the existing event instead of creating a new one."
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: Merchant
+    initial_state: PENDING_REVIEW
+    terminal_states: [REJECTED]
+    note: "Branching underwriting: PENDING_REVIEW forks to APPROVED or REJECTED; APPROVED can be SUSPENDED and reinstated. onboarding_status is the tracked field."
+    transitions:
+      - from: PENDING_REVIEW
+        to: APPROVED
+        trigger: "POST /merchants/{id}/risk-reviews/{rid}/approve"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Merchant.onboarding_status == PENDING_REVIEW"
+          - "an OPEN RiskReview exists for this merchant"
+          - "if Merchant.mcc is in HIGH_RISK_MCC_SET then assigned_risk_band must be HIGH"
+        side_effects:
+          - "RiskReview.decision = APPROVED"
+          - "set Merchant.risk_band = assigned_risk_band"
+          - "set Merchant.reserve_rate_bps from RISK_BAND_RESERVE_BPS[risk_band]"
+          - "set Merchant.funding_delay_days from RISK_BAND_FUNDING_DELAY[risk_band]"
+          - "increments Merchant.version by 1"
+      - from: PENDING_REVIEW
+        to: REJECTED
+        trigger: "POST /merchants/{id}/risk-reviews/{rid}/reject"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Merchant.onboarding_status == PENDING_REVIEW"
+          - "an OPEN RiskReview exists for this merchant"
+        side_effects:
+          - "RiskReview.decision = REJECTED"
+          - "increments Merchant.version by 1"
+      - from: APPROVED
+        to: SUSPENDED
+        trigger: "POST /merchants/{id}/suspend"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Merchant.onboarding_status == APPROVED"
+        side_effects:
+          - "increments Merchant.version by 1"
+        note: "Suspension blocks new authorizations and captures but not refunds/dispute handling."
+      - from: SUSPENDED
+        to: APPROVED
+        trigger: "POST /merchants/{id}/reinstate"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Merchant.onboarding_status == SUSPENDED"
+        side_effects:
+          - "increments Merchant.version by 1"
+
+  - entity: Charge
+    initial_state: "AUTHORIZED / PENDING"
+    terminal_states: ["VOIDED / PENDING", "EXPIRED / PENDING", "CAPTURED / SETTLED", "CAPTURED / REVERSED"]
+    note: "PARALLEL machine: auth_status (AUTHORIZED->CAPTURED|VOIDED|EXPIRED) and settlement_status (PENDING->BATCHED->SETTLED->REVERSED) evolve on independent axes. Settlement axis only advances after auth_status=CAPTURED."
+    transitions:
+      - from: "AUTHORIZED / PENDING"
+        to: "CAPTURED / PENDING"
+        trigger: "POST /charges/{id}/capture"
+        actor: MerchantUser
+        preconditions:
+          - "Charge.auth_status == AUTHORIZED"
+          - "Merchant.onboarding_status == APPROVED"
+          - "capture amount_cents >= 1 and amount_cents <= Charge.auth_amount_cents"
+        side_effects:
+          - "set Charge.captured_amount_cents = capture amount_cents"
+          - "compute Charge.processing_fee_cents via processing_fee calc (dual-variant by fee plan)"
+          - "auth_status -> CAPTURED; settlement_status stays PENDING"
+          - "note: NO ledger posting at capture; the fee is deducted only at funding via net_funding_cents (gross minus fees) so the fee is never double-counted"
+      - from: "AUTHORIZED / PENDING"
+        to: "VOIDED / PENDING"
+        trigger: "POST /charges/{id}/void"
+        actor: MerchantUser
+        preconditions:
+          - "Charge.auth_status == AUTHORIZED"
+        side_effects:
+          - "auth_status -> VOIDED (terminal); no ledger postings"
+      - from: "AUTHORIZED / PENDING"
+        to: "EXPIRED / PENDING"
+        trigger: "POST /_clock/advance (auth older than AUTH_HOLD_DAYS) — system sweep"
+        actor: system
+        preconditions:
+          - "Charge.auth_status == AUTHORIZED"
+          - "clock date >= Charge.created_at date + AUTH_HOLD_DAYS"
+        side_effects:
+          - "auth_status -> EXPIRED (terminal); no ledger postings"
+      - from: "CAPTURED / PENDING"
+        to: "CAPTURED / BATCHED"
+        trigger: "POST /merchants/{id}/settlement-batches (sweep) — system/PlatformOperator"
+        actor: PlatformOperator
+        preconditions:
+          - "Charge.auth_status == CAPTURED"
+          - "Charge.settlement_status == PENDING"
+          - "Charge.settlement_batch_id is null"
+        side_effects:
+          - "set Charge.settlement_batch_id = new batch id"
+          - "settlement_status -> BATCHED"
+      - from: "CAPTURED / BATCHED"
+        to: "CAPTURED / SETTLED"
+        trigger: "POST /settlement-batches/{id}/settle"
+        actor: PlatformOperator
+        preconditions:
+          - "SettlementBatch.batch_status == OPEN"
+          - "Charge.settlement_status == BATCHED"
+        side_effects:
+          - "settlement_status -> SETTLED"
+          - "this transition contributes to batch funding cascade (see SettlementBatch.OPEN_to_SETTLED)"
+      - from: "CAPTURED / SETTLED"
+        to: "CAPTURED / REVERSED"
+        trigger: "POST /charges/{id}/disputes (open) — when full net amount disputed"
+        actor: MerchantUser
+        preconditions:
+          - "Charge.auth_status == CAPTURED"
+          - "Charge.settlement_status == SETTLED"
+          - "disputed_amount_cents == captured_amount_cents - refunded_amount_cents"
+        side_effects:
+          - "settlement_status -> REVERSED"
+          - "(see Dispute.null_to_OPEN cascade for ledger postings)"
+
+  - entity: Refund
+    initial_state: PENDING
+    terminal_states: [SETTLED, FAILED]
+    note: "Linear with a failure branch; settling a refund posts the merchant debit."
+    transitions:
+      - from: null
+        to: PENDING
+        trigger: "POST /charges/{id}/refunds"
+        actor: MerchantUser
+        preconditions:
+          - "Charge.auth_status == CAPTURED"
+          - "Charge.refunded_amount_cents + amount_cents <= Charge.captured_amount_cents"
+          - "no OPEN/UNDER_REVIEW/REPRESENTED Dispute exists on the charge"
+        side_effects:
+          - "create Refund in PENDING"
+          - "increment Charge.refunded_amount_cents by amount_cents"
+      - from: PENDING
+        to: SETTLED
+        trigger: "POST /refunds/{id}/settle"
+        actor: PlatformOperator
+        preconditions:
+          - "Refund.refund_status == PENDING"
+        side_effects:
+          - "post LedgerEntry REFUND (account=AVAILABLE, amount = -Refund.amount_cents, source_type=REFUND)"
+          - "recompute Merchant.available_balance_cents"
+      - from: PENDING
+        to: FAILED
+        trigger: "POST /refunds/{id}/fail"
+        actor: PlatformOperator
+        preconditions:
+          - "Refund.refund_status == PENDING"
+        side_effects:
+          - "decrement Charge.refunded_amount_cents by Refund.amount_cents (compensation; restores refundable headroom)"
+
+  - entity: Dispute
+    initial_state: OPEN
+    terminal_states: [WON, LOST, ACCEPTED]
+    note: "CYCLIC representment: UNDER_REVIEW->REPRESENTED->UNDER_REVIEW loops up to MAX_REPRESENTMENT_ROUNDS. WON reverses the chargeback debit; LOST/ACCEPTED retain it."
+    transitions:
+      - from: null
+        to: OPEN
+        trigger: "POST /charges/{id}/disputes"
+        actor: MerchantUser
+        preconditions:
+          - "Charge.auth_status == CAPTURED"
+          - "Charge.settlement_status == SETTLED"
+          - "no non-terminal Dispute exists on the charge"
+          - "disputed_amount_cents == Charge.captured_amount_cents - Charge.refunded_amount_cents"
+        side_effects:
+          - "copy chargeback_fee_cents from merchant FeePlan.chargeback_fee_cents"
+          - "set evidence_due_at = clock + EVIDENCE_WINDOW_DAYS"
+          - "post LedgerEntry CHARGEBACK (account=AVAILABLE, amount = -disputed_amount_cents, source_type=DISPUTE)"
+          - "post LedgerEntry FEE (account=AVAILABLE, amount = -chargeback_fee_cents, source_type=DISPUTE)"
+          - "if disputed_amount_cents == net captured then Charge.settlement_status -> REVERSED"
+          - "recompute Merchant.available_balance_cents"
+      - from: OPEN
+        to: UNDER_REVIEW
+        trigger: "POST /disputes/{id}/acknowledge"
+        actor: MerchantUser
+        preconditions:
+          - "Dispute.dispute_status == OPEN"
+        side_effects:
+          - "no ledger postings"
+      - from: UNDER_REVIEW
+        to: REPRESENTED
+        trigger: "POST /disputes/{id}/represent"
+        actor: MerchantUser
+        preconditions:
+          - "Dispute.dispute_status == UNDER_REVIEW"
+          - "clock <= Dispute.evidence_due_at"
+          - "Dispute.representment_round < MAX_REPRESENTMENT_ROUNDS"
+        side_effects:
+          - "increment Dispute.representment_round by 1"
+      - from: REPRESENTED
+        to: UNDER_REVIEW
+        trigger: "POST /disputes/{id}/reopen — network requests more evidence (cycle)"
+        actor: PlatformOperator
+        preconditions:
+          - "Dispute.dispute_status == REPRESENTED"
+          - "Dispute.representment_round < MAX_REPRESENTMENT_ROUNDS"
+        side_effects:
+          - "extend evidence_due_at by EVIDENCE_WINDOW_DAYS"
+      - from: REPRESENTED
+        to: WON
+        trigger: "POST /disputes/{id}/resolve (outcome=WON)"
+        actor: PlatformOperator
+        preconditions:
+          - "Dispute.dispute_status == REPRESENTED"
+        side_effects:
+          - "post LedgerEntry CHARGEBACK_REVERSAL (account=AVAILABLE, amount = +disputed_amount_cents, source_type=DISPUTE)"
+          - "chargeback_fee_cents is NOT reversed (retained)"
+          - "if Charge.settlement_status == REVERSED then restore Charge.settlement_status -> SETTLED"
+          - "recompute Merchant.available_balance_cents"
+      - from: REPRESENTED
+        to: LOST
+        trigger: "POST /disputes/{id}/resolve (outcome=LOST)"
+        actor: PlatformOperator
+        preconditions:
+          - "Dispute.dispute_status == REPRESENTED"
+        side_effects:
+          - "no further ledger postings (chargeback debit retained)"
+      - from: OPEN
+        to: ACCEPTED
+        trigger: "POST /disputes/{id}/accept"
+        actor: MerchantUser
+        preconditions:
+          - "Dispute.dispute_status == OPEN"
+        side_effects:
+          - "no further ledger postings (chargeback debit retained)"
+      - from: UNDER_REVIEW
+        to: ACCEPTED
+        trigger: "POST /disputes/{id}/accept"
+        actor: MerchantUser
+        preconditions:
+          - "Dispute.dispute_status == UNDER_REVIEW"
+        side_effects:
+          - "no further ledger postings (chargeback debit retained)"
+
+  - entity: SettlementBatch
+    initial_state: OPEN
+    terminal_states: [FUNDED]
+    note: "Linear pipeline with the funding cascade fanning into the ledger and reserve ledger on settle, then funding on fund."
+    transitions:
+      - from: null
+        to: OPEN
+        trigger: "POST /merchants/{id}/settlement-batches"
+        actor: PlatformOperator
+        preconditions:
+          - "Merchant.onboarding_status in {APPROVED, SUSPENDED}"
+          - "at least one Charge with auth_status=CAPTURED, settlement_status=PENDING exists for the merchant on business_date"
+        side_effects:
+          - "sweep all eligible Charges: settlement_status PENDING->BATCHED, set settlement_batch_id"
+      - from: OPEN
+        to: SETTLED
+        trigger: "POST /settlement-batches/{id}/settle"
+        actor: PlatformOperator
+        preconditions:
+          - "SettlementBatch.batch_status == OPEN"
+          - "expected_merchant_version matches Merchant.version"
+        side_effects:
+          - "for each batched Charge: settlement_status BATCHED->SETTLED (cascade hop 1)"
+          - "pin gross_captured_cents, total_fees_cents, total_refunds_cents via settlement_summary calc"
+          - "reserve_held_cents = round(gross_captured_cents * Merchant.reserve_rate_bps / 10000)"
+          - "create ReserveEntry HELD (amount=reserve_held_cents, release_date=business_date+RESERVE_HOLD_DAYS) (cascade hop 2)"
+          - "post LedgerEntry RESERVE_HOLD (account=RESERVE, amount = +reserve_held_cents, source_type=RESERVE_ENTRY) (cascade hop 3)"
+          - "net_funding_cents = gross_captured - total_fees - total_refunds - reserve_held"
+          - "increments Merchant.version by 1"
+          - "recompute Merchant.reserved_balance_cents"
+      - from: SETTLED
+        to: FUNDED
+        trigger: "POST /settlement-batches/{id}/fund"
+        actor: PlatformOperator
+        preconditions:
+          - "SettlementBatch.batch_status == SETTLED"
+          - "clock date >= business_date + Merchant.funding_delay_days"
+        side_effects:
+          - "post LedgerEntry FUNDING (account=AVAILABLE, amount = +net_funding_cents, source_type=SETTLEMENT_BATCH)"
+          - "recompute Merchant.available_balance_cents"
+
+  - entity: Payout
+    initial_state: REQUESTED
+    terminal_states: [PAID, RETURNED]
+    note: "Linear with compensation on return; debits AVAILABLE at request, restores it on return."
+    transitions:
+      - from: null
+        to: REQUESTED
+        trigger: "POST /merchants/{id}/payouts"
+        actor: MerchantUser
+        preconditions:
+          - "Merchant.onboarding_status == APPROVED"
+          - "amount_cents <= Merchant.available_balance_cents"
+          - "amount_cents >= 1"
+        side_effects:
+          - "post LedgerEntry PAYOUT (account=AVAILABLE, amount = -amount_cents, source_type=PAYOUT)"
+          - "recompute Merchant.available_balance_cents"
+      - from: REQUESTED
+        to: PAID
+        trigger: "POST /payouts/{id}/mark-paid"
+        actor: PlatformOperator
+        preconditions:
+          - "Payout.payout_status == REQUESTED"
+          - "clock date >= Payout.scheduled_for"
+        side_effects:
+          - "no ledger posting (funds already debited at request)"
+      - from: REQUESTED
+        to: RETURNED
+        trigger: "POST /payouts/{id}/return"
+        actor: PlatformOperator
+        preconditions:
+          - "Payout.payout_status == REQUESTED"
+        side_effects:
+          - "post LedgerEntry PAYOUT_RETURN (account=AVAILABLE, amount = +amount_cents, source_type=PAYOUT)"
+          - "recompute Merchant.available_balance_cents"
+
+  - entity: ReserveEntry
+    initial_state: HELD
+    terminal_states: [RELEASED]
+    note: "Released by the reserve sweep when clock catches up to release_date; release moves funds RESERVE->AVAILABLE."
+    transitions:
+      - from: HELD
+        to: RELEASED
+        trigger: "POST /merchants/{id}/reserve-releases (sweep)"
+        actor: PlatformOperator
+        preconditions:
+          - "ReserveEntry.reserve_status == HELD"
+          - "clock date >= ReserveEntry.release_date"
+        side_effects:
+          - "post LedgerEntry RESERVE_RELEASE (account=RESERVE, amount = -amount_cents, source_type=RESERVE_ENTRY)"
+          - "post LedgerEntry ADJUSTMENT (account=AVAILABLE, amount = +amount_cents, source_type=RESERVE_ENTRY)"
+          - "recompute Merchant.reserved_balance_cents and available_balance_cents"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: batch-settle-stale-merchant
+    parent_entity: Merchant
+    write_endpoint: "POST /settlement-batches/{id}/settle"
+    occ_field: "expected_merchant_version"
+    description: |
+      Settling a SettlementBatch against a Merchant whose version has advanced
+      since the operator last observed it is rejected. The settle action pins
+      the merchant's reserve_rate_bps and funding_delay_days into the batch and
+      bumps Merchant.version; if the merchant was re-underwritten (risk band /
+      reserve rate changed) after the operator read the merchant, the operator's
+      view is stale and the settle is refused so the batch never settles against
+      out-of-date reserve terms.
+    error_id: ERR_STALE_MERCHANT_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: processing_fee
+    trigger: "Charge AUTHORIZED/PENDING -> CAPTURED/PENDING (POST /charges/{id}/capture)"
+    algorithm: tiered_pricing
+    formula: |
+      base = capture_amount_cents
+      if FeePlan.pricing_model == FLAT:
+          # round the percentage component to whole cents, THEN add fixed
+          pct = round_half_up(base * FeePlan.flat_pct_bps / 10000)
+          fee = pct + FeePlan.flat_fixed_cents
+      elif FeePlan.pricing_model == INTERCHANGE_PLUS:
+          # interchange is the network cost supplied per-capture at capture time
+          ic = round_half_up(base * INTERCHANGE_BPS / 10000) + INTERCHANGE_FIXED_CENTS
+          # monthly-volume tier: prior_month_settled_cents is the merchant's settled
+          # volume in the SAME calendar month BEFORE this capture (strict > threshold)
+          eff_markup_bps = FeePlan.discounted_markup_pct_bps if prior_month_settled_cents > FeePlan.volume_tier_threshold_cents else FeePlan.markup_pct_bps
+          markup = round_half_up(base * eff_markup_bps / 10000) + FeePlan.markup_fixed_cents
+          fee = ic + markup
+      return fee
+    input_set: "Single Charge being captured; for the tier branch, prior_month_settled_cents = sum of captured_amount_cents over this merchant's Charges with settlement_status=SETTLED whose settle posting fell in the current calendar month, excluding this charge."
+    constants:
+      INTERCHANGE_BPS: 165
+      INTERCHANGE_FIXED_CENTS: 10
+    precision: "cents are integers; round_half_up on each percentage component BEFORE summing components (round-then-sum, pinned)"
+    variants:
+      - name: flat_fee
+        when: "merchant FeePlan.pricing_model == FLAT"
+        difference: "single percentage component (flat_pct_bps) on amount + flat_fixed_cents; no interchange passthrough, no volume tier."
+      - name: interchange_plus_fee
+        when: "merchant FeePlan.pricing_model == INTERCHANGE_PLUS"
+        difference: "interchange passthrough (network cost) + platform markup, where markup_bps drops to discounted_markup_pct_bps once prior_month_settled_cents strictly exceeds the volume tier threshold; identical capture amount produces a different fee than FLAT."
+
+  - name: settlement_summary
+    trigger: "SettlementBatch OPEN -> SETTLED (POST /settlement-batches/{id}/settle)"
+    algorithm: aggregation
+    formula: |
+      gross_captured_cents = sum(c.captured_amount_cents
+                                 for c in batch.charges)            # charges with settlement_batch_id == batch.id
+      total_fees_cents     = sum(c.processing_fee_cents
+                                 for c in batch.charges)
+      # refunds: only Refunds that are SETTLED and whose settle posting fell on/before this batch's business_date,
+      #          on charges in THIS batch; ordered by Refund.created_at ASC for deterministic accumulation
+      total_refunds_cents  = sum(r.amount_cents
+                                 for r in refunds
+                                 if r.refund_status == SETTLED
+                                 and r.charge.settlement_batch_id == batch.id
+                                 and r.settle_date <= batch.business_date)
+      reserve_held_cents   = round_half_up(gross_captured_cents * Merchant.reserve_rate_bps / 10000)
+      net_funding_cents    = gross_captured_cents - total_fees_cents - total_refunds_cents - reserve_held_cents
+    input_set: "All Charges with settlement_batch_id == this batch (settlement_status SETTLED after the cascade hop); SETTLED Refunds on those charges whose settle_date <= business_date."
+    constants: {}
+    precision: "integer cents; reserve rounded round_half_up once on the gross total (sum-then-round on the aggregate, pinned)"
+
+  - name: chargeback_ledger_impact
+    trigger: "Dispute null -> OPEN (POST /charges/{id}/disputes) and Dispute REPRESENTED -> WON (POST /disputes/{id}/resolve)"
+    algorithm: projection
+    formula: |
+      # forward (open): debit disputed amount + chargeback fee
+      on_open:    available_delta = -(disputed_amount_cents + chargeback_fee_cents)
+      # compensation (won): credit ONLY the disputed amount back; fee retained
+      on_won:     available_delta = +disputed_amount_cents
+      # net effect of an OPEN then WON cycle on AVAILABLE = -chargeback_fee_cents (fee never returns)
+      net_open_then_won = -chargeback_fee_cents
+    input_set: "Single Dispute; disputed_amount_cents fixed at open (= net captured), chargeback_fee_cents copied from FeePlan at open."
+    constants: {}
+    precision: "integer cents; no rounding (all values already whole cents)"
+    variants:
+      - name: open_debit
+        when: "Dispute opens"
+        difference: "debits disputed + fee from AVAILABLE."
+      - name: won_compensation
+        when: "Dispute resolved WON after representment"
+        difference: "credits back ONLY disputed amount; the chargeback fee is NOT reversed, so an open->won round leaves AVAILABLE down by exactly chargeback_fee_cents (conserved-quantity drift is intentional and pinned)."
+
+  - name: tax_1099k_gross
+    trigger: "POST /merchants/{id}/tax-1099k (generate) for a tax_year"
+    algorithm: threshold
+    formula: |
+      included = [c for c in merchant.charges
+                  if c.settlement_status == SETTLED
+                  and year_of(c.settle_posting_date) == tax_year]
+      gross_amount_cents = sum(c.captured_amount_cents for c in included)   # NO netting of refunds/fees/chargebacks
+      transaction_count  = count(included)
+      reportable = gross_amount_cents > REPORTING_THRESHOLD_CENTS
+    input_set: "Charges of this merchant with settlement_status=SETTLED whose settle posting fell within tax_year; gross is pre-fee, pre-refund, pre-chargeback."
+    constants:
+      REPORTING_THRESHOLD_CENTS: 250000
+    precision: "integer cents; strict > comparison for reportable (250000 NOT reportable, 250001 reportable)"
+
+  - name: merchant_balance_recompute
+    trigger: "every LedgerEntry posting (batch funding, refund settle, dispute open/won chargeback fee, reserve hold/release, payout/return); capture posts NO ledger entry"
+    algorithm: aggregation
+    formula: |
+      available_balance_cents = sum(e.amount_cents for e in LedgerEntry
+                                    where e.merchant_id == merchant.id and e.account == AVAILABLE)
+      reserved_balance_cents  = sum(e.amount_cents for e in LedgerEntry
+                                    where e.merchant_id == merchant.id and e.account == RESERVE)
+    input_set: "All LedgerEntry rows for the merchant, partitioned by account."
+    constants: {}
+    precision: "integer cents; signed sum; available may be negative, reserve floored at 0 by construction (holds >= releases)"
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /merchants (registration is anonymous) and POST /fee-plans"
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for the operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: auth
+    check: "MerchantUser may only act on resources owned by the Merchant identified by X-User-ID (merchant_id chain matches)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "all MerchantUser endpoints"
+  - priority: 4
+    category: existence
+    check: "every path id resolves to an existing resource, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+  - priority: 5
+    category: existence
+    check: "FK fields in the body reference existing resources (fee_plan_id, charge_id, merchant_id)"
+    error_id: ERR_FK_NOT_FOUND
+    http_status: 404
+    applies_to: "creation endpoints with FK body fields"
+  - priority: 6
+    category: state
+    check: "target resource is in a state from which the requested transition is defined"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action/transition endpoints"
+  - priority: 7
+    category: state
+    check: "merchant is APPROVED (not PENDING_REVIEW/REJECTED/SUSPENDED) for authorization & capture & payout creation"
+    error_id: ERR_MERCHANT_NOT_APPROVED
+    http_status: 409
+    applies_to: "POST /merchants/{id}/charges, POST /charges/{id}/capture, POST /merchants/{id}/payouts"
+  - priority: 8
+    category: business_safety
+    check: "HIGH_RISK MCC merchant cannot be approved with assigned_risk_band other than HIGH"
+    error_id: ERR_RISK_BAND_POLICY_VIOLATION
+    http_status: 422
+    applies_to: "POST /merchants/{id}/risk-reviews/{rid}/approve"
+  - priority: 9
+    category: business_safety
+    check: "evidence representment submitted after evidence_due_at is rejected"
+    error_id: ERR_EVIDENCE_WINDOW_CLOSED
+    http_status: 422
+    applies_to: "POST /disputes/{id}/represent"
+  - priority: 10
+    category: business_constraint
+    check: "capture amount_cents must be between 1 and Charge.auth_amount_cents inclusive"
+    error_id: ERR_CAPTURE_EXCEEDS_AUTH
+    http_status: 422
+    applies_to: "POST /charges/{id}/capture"
+  - priority: 11
+    category: business_constraint
+    check: "representment_round must be < MAX_REPRESENTMENT_ROUNDS before a new represent"
+    error_id: ERR_REPRESENTMENT_LIMIT_REACHED
+    http_status: 422
+    applies_to: "POST /disputes/{id}/represent"
+  - priority: 12
+    category: business_referential
+    check: "a refund cannot be created while a non-terminal Dispute exists on the charge"
+    error_id: ERR_REFUND_BLOCKED_BY_DISPUTE
+    http_status: 409
+    applies_to: "POST /charges/{id}/refunds"
+  - priority: 13
+    category: business_referential
+    check: "disputed_amount_cents must equal Charge.captured_amount_cents - Charge.refunded_amount_cents at open"
+    error_id: ERR_DISPUTE_AMOUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /charges/{id}/disputes"
+  - priority: 14
+    category: business_temporal
+    check: "settlement batch can only fund on/after business_date + funding_delay_days"
+    error_id: ERR_FUNDING_DATE_NOT_REACHED
+    http_status: 409
+    applies_to: "POST /settlement-batches/{id}/fund"
+  - priority: 15
+    category: business_temporal
+    check: "payout cannot be marked paid before scheduled_for"
+    error_id: ERR_PAYOUT_DATE_NOT_REACHED
+    http_status: 409
+    applies_to: "POST /payouts/{id}/mark-paid"
+  - priority: 16
+    category: business_fiscal
+    check: "cumulative refunded_amount_cents + new refund amount_cents must not exceed captured_amount_cents"
+    error_id: ERR_REFUND_EXCEEDS_CAPTURED
+    http_status: 422
+    applies_to: "POST /charges/{id}/refunds"
+  - priority: 17
+    category: business_fiscal
+    check: "payout amount_cents must not exceed Merchant.available_balance_cents"
+    error_id: ERR_INSUFFICIENT_BALANCE
+    http_status: 422
+    applies_to: "POST /merchants/{id}/payouts"
+  - priority: 18
+    category: business_constraint
+    check: "OCC: expected_merchant_version must equal current Merchant.version"
+    error_id: ERR_STALE_MERCHANT_VERSION
+    http_status: 412
+    applies_to: "POST /settlement-batches/{id}/settle"
+  - priority: 19
+    category: business_constraint
+    check: "FeePlan with pricing_model=FLAT must provide flat_pct_bps & flat_fixed_cents; INTERCHANGE_PLUS must provide markup fields"
+    error_id: ERR_FEE_PLAN_INCOMPLETE
+    http_status: 422
+    applies_to: "POST /fee-plans"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # --- Fee plans ---
+  - method: POST
+    path: "/fee-plans"
+    description: "Create a fee plan (FLAT or INTERCHANGE_PLUS)."
+    roles: [PlatformOperator]
+    code: 201
+    input: [name, pricing_model, "flat_pct_bps?", "flat_fixed_cents?", "markup_pct_bps?", "markup_fixed_cents?", "volume_tier_threshold_cents?", "discounted_markup_pct_bps?", "chargeback_fee_cents?"]
+    output: FeePlan
+    side_effects: []
+  - method: GET
+    path: "/fee-plans/{id}"
+    description: "Fetch a fee plan."
+    roles: [PlatformOperator, UnderwritingOfficer, MerchantUser]
+    code: 200
+    input: []
+    output: FeePlan
+    side_effects: []
+  - method: GET
+    path: "/fee-plans"
+    description: "List fee plans."
+    roles: [PlatformOperator, UnderwritingOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: FeePlan[]
+    side_effects: []
+
+  # --- Merchant onboarding & underwriting ---
+  - method: POST
+    path: "/merchants"
+    description: "Register a new merchant (anonymous); creates an OPEN RiskReview."
+    roles: [Anonymous]
+    code: 201
+    input: [legal_name, mcc, fee_plan_id, requested_monthly_volume_cents, "payout_method?"]
+    output: Merchant
+    side_effects: ["create RiskReview OPEN for the merchant", "onboarding_status=PENDING_REVIEW"]
+  - method: GET
+    path: "/merchants/{id}"
+    description: "Fetch a merchant including derived balances."
+    roles: [PlatformOperator, UnderwritingOfficer, MerchantUser]
+    code: 200
+    input: []
+    output: Merchant
+    side_effects: []
+  - method: GET
+    path: "/merchants"
+    description: "List merchants, filterable by fee_plan_id."
+    roles: [PlatformOperator, UnderwritingOfficer]
+    code: 200
+    input: ["fee_plan_id?", "onboarding_status?", "limit?", "offset?"]
+    output: Merchant[]
+    side_effects: []
+  - method: GET
+    path: "/merchants/{id}/risk-reviews"
+    description: "List risk reviews for a merchant (reverse-reachability for RiskReview.merchant_id)."
+    roles: [PlatformOperator, UnderwritingOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RiskReview[]
+    side_effects: []
+  - method: POST
+    path: "/merchants/{id}/risk-reviews/{rid}/approve"
+    description: "Approve underwriting; assign risk band, reserve rate, funding delay."
+    roles: [UnderwritingOfficer]
+    code: 200
+    input: [assigned_risk_band, "notes?"]
+    output: Merchant
+    side_effects: ["onboarding_status PENDING_REVIEW->APPROVED", "RiskReview.decision=APPROVED", "set risk_band/reserve_rate_bps/funding_delay_days", "increments Merchant.version by 1"]
+  - method: POST
+    path: "/merchants/{id}/risk-reviews/{rid}/reject"
+    description: "Reject underwriting."
+    roles: [UnderwritingOfficer]
+    code: 200
+    input: ["notes?"]
+    output: Merchant
+    side_effects: ["onboarding_status PENDING_REVIEW->REJECTED", "RiskReview.decision=REJECTED", "increments Merchant.version by 1"]
+  - method: POST
+    path: "/merchants/{id}/suspend"
+    description: "Suspend an approved merchant."
+    roles: [UnderwritingOfficer]
+    code: 200
+    input: ["notes?"]
+    output: Merchant
+    side_effects: ["onboarding_status APPROVED->SUSPENDED", "increments Merchant.version by 1"]
+  - method: POST
+    path: "/merchants/{id}/reinstate"
+    description: "Reinstate a suspended merchant."
+    roles: [UnderwritingOfficer]
+    code: 200
+    input: ["notes?"]
+    output: Merchant
+    side_effects: ["onboarding_status SUSPENDED->APPROVED", "increments Merchant.version by 1"]
+
+  # --- Charges: authorization / capture / void ---
+  - method: POST
+    path: "/merchants/{id}/charges"
+    description: "Authorize a charge against the card (creates AUTHORIZED/PENDING)."
+    roles: [MerchantUser]
+    code: 201
+    input: [auth_amount_cents, card_last4]
+    output: Charge
+    side_effects: ["auth_status=AUTHORIZED, settlement_status=PENDING"]
+  - method: GET
+    path: "/charges/{id}"
+    description: "Fetch a charge with both status axes."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: []
+    output: Charge
+    side_effects: []
+  - method: GET
+    path: "/charges"
+    description: "List charges filterable by merchant_id and settlement_batch_id (reverse-reachability for Charge.merchant_id and Charge.settlement_batch_id)."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: ["merchant_id?", "settlement_batch_id?", "auth_status?", "settlement_status?", "limit?", "offset?"]
+    output: Charge[]
+    side_effects: []
+  - method: POST
+    path: "/charges/{id}/capture"
+    description: "Capture all or part of an authorization; computes processing fee."
+    roles: [MerchantUser]
+    code: 200
+    input: [amount_cents]
+    output: Charge
+    side_effects: ["auth_status AUTHORIZED->CAPTURED", "set captured_amount_cents", "compute processing_fee_cents (processing_fee calc); NO ledger posting at capture (fee deducted at funding)"]
+  - method: POST
+    path: "/charges/{id}/void"
+    description: "Void an uncaptured authorization."
+    roles: [MerchantUser]
+    code: 200
+    input: []
+    output: Charge
+    side_effects: ["auth_status AUTHORIZED->VOIDED"]
+
+  # --- Refunds ---
+  - method: POST
+    path: "/charges/{id}/refunds"
+    description: "Create a refund (full or partial) against a captured charge."
+    roles: [MerchantUser]
+    code: 201
+    input: [amount_cents, "reason?"]
+    output: Refund
+    side_effects: ["create Refund PENDING", "increment Charge.refunded_amount_cents"]
+  - method: GET
+    path: "/refunds/{id}"
+    description: "Fetch a refund."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: []
+    output: Refund
+    side_effects: []
+  - method: GET
+    path: "/charges/{id}/refunds"
+    description: "List refunds on a charge (reverse-reachability for Refund.charge_id)."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Refund[]
+    side_effects: []
+  - method: POST
+    path: "/refunds/{id}/settle"
+    description: "Settle a pending refund (posts merchant debit)."
+    roles: [PlatformOperator]
+    code: 200
+    input: []
+    output: Refund
+    side_effects: ["refund_status PENDING->SETTLED", "post REFUND LedgerEntry", "recompute available_balance_cents"]
+  - method: POST
+    path: "/refunds/{id}/fail"
+    description: "Mark a pending refund failed; restores refundable headroom."
+    roles: [PlatformOperator]
+    code: 200
+    input: []
+    output: Refund
+    side_effects: ["refund_status PENDING->FAILED", "decrement Charge.refunded_amount_cents (compensation)"]
+
+  # --- Disputes & representment ---
+  - method: POST
+    path: "/charges/{id}/disputes"
+    description: "Open a chargeback dispute on a settled charge."
+    roles: [MerchantUser]
+    code: 201
+    input: [disputed_amount_cents]
+    output: Dispute
+    side_effects: ["dispute_status=OPEN", "copy chargeback_fee_cents from FeePlan", "set evidence_due_at", "post CHARGEBACK + FEE LedgerEntries", "if full net disputed: settlement_status->REVERSED", "recompute available_balance_cents"]
+  - method: GET
+    path: "/disputes/{id}"
+    description: "Fetch a dispute."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: []
+  - method: GET
+    path: "/charges/{id}/disputes"
+    description: "List disputes on a charge (reverse-reachability for Dispute.charge_id)."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Dispute[]
+    side_effects: []
+  - method: POST
+    path: "/disputes/{id}/acknowledge"
+    description: "Acknowledge a dispute (OPEN->UNDER_REVIEW)."
+    roles: [MerchantUser]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["dispute_status OPEN->UNDER_REVIEW"]
+  - method: POST
+    path: "/disputes/{id}/represent"
+    description: "Submit representment evidence (UNDER_REVIEW->REPRESENTED)."
+    roles: [MerchantUser]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["dispute_status UNDER_REVIEW->REPRESENTED", "increment representment_round"]
+  - method: POST
+    path: "/disputes/{id}/reopen"
+    description: "Network requests more evidence (REPRESENTED->UNDER_REVIEW; cycle)."
+    roles: [PlatformOperator]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["dispute_status REPRESENTED->UNDER_REVIEW", "extend evidence_due_at"]
+  - method: POST
+    path: "/disputes/{id}/resolve"
+    description: "Resolve a represented dispute WON or LOST."
+    roles: [PlatformOperator]
+    code: 200
+    input: [outcome]
+    output: Dispute
+    side_effects: ["dispute_status REPRESENTED->WON|LOST", "WON: post CHARGEBACK_REVERSAL (disputed amount only, fee retained), restore settlement_status SETTLED", "recompute available_balance_cents"]
+  - method: POST
+    path: "/disputes/{id}/accept"
+    description: "Accept liability (OPEN|UNDER_REVIEW->ACCEPTED); chargeback retained."
+    roles: [MerchantUser]
+    code: 200
+    input: []
+    output: Dispute
+    side_effects: ["dispute_status ->ACCEPTED"]
+
+  # --- Settlement & funding ---
+  - method: POST
+    path: "/merchants/{id}/settlement-batches"
+    description: "Open a settlement batch; sweep eligible captured charges into it."
+    roles: [PlatformOperator]
+    code: 201
+    input: [business_date]
+    output: SettlementBatch
+    side_effects: ["batch_status=OPEN", "sweep CAPTURED/PENDING charges -> BATCHED, set settlement_batch_id"]
+  - method: GET
+    path: "/settlement-batches/{id}"
+    description: "Fetch a settlement batch with pinned aggregates."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: []
+    output: SettlementBatch
+    side_effects: []
+  - method: GET
+    path: "/merchants/{id}/settlement-batches"
+    description: "List settlement batches for a merchant (reverse-reachability for SettlementBatch.merchant_id)."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: ["batch_status?", "limit?", "offset?"]
+    output: SettlementBatch[]
+    side_effects: []
+  - method: POST
+    path: "/settlement-batches/{id}/settle"
+    description: "Settle the batch: cascade charges to SETTLED, pin aggregates, hold reserve. OCC on merchant version."
+    roles: [PlatformOperator]
+    code: 200
+    input: [expected_merchant_version]
+    output: SettlementBatch
+    side_effects: ["batch_status OPEN->SETTLED", "charges BATCHED->SETTLED (cascade hop 1)", "pin gross/fees/refunds (settlement_summary calc)", "create ReserveEntry HELD (cascade hop 2)", "post RESERVE_HOLD LedgerEntry (cascade hop 3)", "compute net_funding_cents", "increments Merchant.version by 1", "recompute reserved_balance_cents"]
+  - method: POST
+    path: "/settlement-batches/{id}/fund"
+    description: "Fund a settled batch on/after T+N; moves net funding to AVAILABLE."
+    roles: [PlatformOperator]
+    code: 200
+    input: []
+    output: SettlementBatch
+    side_effects: ["batch_status SETTLED->FUNDED", "post FUNDING LedgerEntry (+net_funding_cents)", "recompute available_balance_cents"]
+
+  # --- Reserve ---
+  - method: GET
+    path: "/merchants/{id}/reserve-entries"
+    description: "List reserve entries for a merchant (reverse-reachability for ReserveEntry.merchant_id)."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: ["reserve_status?", "limit?", "offset?"]
+    output: ReserveEntry[]
+    side_effects: []
+  - method: GET
+    path: "/settlement-batches/{id}/reserve-entries"
+    description: "List reserve entries from a batch (reverse-reachability for ReserveEntry.settlement_batch_id)."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ReserveEntry[]
+    side_effects: []
+  - method: POST
+    path: "/merchants/{id}/reserve-releases"
+    description: "Run the reserve release sweep; release all HELD entries whose release_date <= clock."
+    roles: [PlatformOperator]
+    code: 200
+    input: []
+    output: ReserveEntry[]
+    side_effects: ["release matured HELD entries -> RELEASED", "post RESERVE_RELEASE + ADJUSTMENT LedgerEntries per entry", "recompute reserved_balance_cents and available_balance_cents"]
+
+  # --- Payouts ---
+  - method: POST
+    path: "/merchants/{id}/payouts"
+    description: "Request a payout against available balance."
+    roles: [MerchantUser]
+    code: 201
+    input: [amount_cents, scheduled_for]
+    output: Payout
+    side_effects: ["payout_status=REQUESTED", "post PAYOUT LedgerEntry (-amount_cents)", "recompute available_balance_cents"]
+  - method: GET
+    path: "/payouts/{id}"
+    description: "Fetch a payout."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: []
+  - method: GET
+    path: "/merchants/{id}/payouts"
+    description: "List payouts for a merchant (reverse-reachability for Payout.merchant_id)."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: ["payout_status?", "limit?", "offset?"]
+    output: Payout[]
+    side_effects: []
+  - method: POST
+    path: "/payouts/{id}/mark-paid"
+    description: "Mark a requested payout paid on/after scheduled_for."
+    roles: [PlatformOperator]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: ["payout_status REQUESTED->PAID"]
+  - method: POST
+    path: "/payouts/{id}/return"
+    description: "Return a requested payout (bank rejected); restores available balance."
+    roles: [PlatformOperator]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: ["payout_status REQUESTED->RETURNED", "post PAYOUT_RETURN LedgerEntry (+amount_cents)", "recompute available_balance_cents"]
+
+  # --- Ledger & tax & reverse-reachability for LedgerEntry ---
+  - method: GET
+    path: "/merchants/{id}/ledger-entries"
+    description: "List ledger entries for a merchant (reverse-reachability for LedgerEntry.merchant_id)."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: ["account?", "entry_type?", "source_type?", "limit?", "offset?"]
+    output: LedgerEntry[]
+    side_effects: []
+  - method: POST
+    path: "/merchants/{id}/tax-1099k"
+    description: "Generate (or regenerate) the 1099-K form for a tax year."
+    roles: [PlatformOperator]
+    code: 201
+    input: [tax_year]
+    output: Tax1099K
+    side_effects: ["compute gross_amount_cents, transaction_count, reportable (tax_1099k_gross calc)"]
+  - method: GET
+    path: "/tax-1099k/{id}"
+    description: "Fetch a generated 1099-K form."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: []
+    output: Tax1099K
+    side_effects: []
+  - method: GET
+    path: "/merchants/{id}/tax-1099k"
+    description: "List 1099-K forms for a merchant (reverse-reachability for Tax1099K.merchant_id)."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: ["tax_year?", "limit?", "offset?"]
+    output: Tax1099K[]
+    side_effects: []
+
+  # --- Webhooks (idempotent emit) ---
+  - method: POST
+    path: "/merchants/{id}/webhook-events"
+    description: "Emit a webhook event with idempotency; repeated key returns the existing event."
+    roles: [PlatformOperator]
+    code: 201
+    input: [event_type, source_id, idempotency_key]
+    output: WebhookEvent
+    side_effects: ["create WebhookEvent unless idempotency_key already used (then return existing, code 200)"]
+  - method: GET
+    path: "/merchants/{id}/webhook-events"
+    description: "List webhook events for a merchant (reverse-reachability for WebhookEvent.merchant_id)."
+    roles: [PlatformOperator, MerchantUser]
+    code: 200
+    input: ["event_type?", "limit?", "offset?"]
+    output: WebhookEvent[]
+    side_effects: []
+
+  # --- Test-driving endpoints (clock control + auth expiry sweep) ---
+  - method: POST
+    path: "/_clock/set"
+    description: "Set the system clock to a fixed UTC instant (test-driving)."
+    roles: [PlatformOperator]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["sets system clock used for evidence windows, funding dates, reserve release, payout dates, settle posting year"]
+  - method: POST
+    path: "/_clock/advance"
+    description: "Advance the clock and run the authorization-expiry sweep (test-driving)."
+    roles: [PlatformOperator]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["advance clock", "sweep AUTHORIZED charges older than AUTH_HOLD_DAYS -> EXPIRED"]
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing or malformed X-User-Role / X-User-ID headers on a protected endpoint"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "acting role is not permitted for the operation"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "MerchantUser acting on a resource not owned by its merchant"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a path id does not resolve to an existing resource"
+  - id: ERR_FK_NOT_FOUND
+    http: 404
+    condition: "a body FK field references a non-existent resource (e.g. fee_plan_id)"
+  - id: ERR_VALIDATION
+    http: 400
+    condition: "malformed body, missing required field, or wrong scalar type"
+  - id: ERR_INVALID_ENUM
+    http: 422
+    condition: "an enum field carries a value outside its allowed set"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested transition is not defined from the resource's current state"
+  - id: ERR_MERCHANT_NOT_APPROVED
+    http: 409
+    condition: "authorization/capture/payout attempted while merchant not APPROVED"
+  - id: ERR_RISK_BAND_POLICY_VIOLATION
+    http: 422
+    condition: "approving a HIGH_RISK_MCC merchant with assigned_risk_band != HIGH"
+  - id: ERR_CAPTURE_EXCEEDS_AUTH
+    http: 422
+    condition: "capture amount_cents < 1 or > Charge.auth_amount_cents"
+  - id: ERR_REFUND_EXCEEDS_CAPTURED
+    http: 422
+    condition: "refunded_amount_cents + new amount_cents > captured_amount_cents"
+  - id: ERR_REFUND_BLOCKED_BY_DISPUTE
+    http: 409
+    condition: "refund attempted while a non-terminal Dispute exists on the charge"
+  - id: ERR_DISPUTE_AMOUNT_MISMATCH
+    http: 422
+    condition: "disputed_amount_cents != captured_amount_cents - refunded_amount_cents at open"
+  - id: ERR_EVIDENCE_WINDOW_CLOSED
+    http: 422
+    condition: "represent submitted after evidence_due_at"
+  - id: ERR_REPRESENTMENT_LIMIT_REACHED
+    http: 422
+    condition: "represent attempted when representment_round >= MAX_REPRESENTMENT_ROUNDS"
+  - id: ERR_FUNDING_DATE_NOT_REACHED
+    http: 409
+    condition: "fund attempted before business_date + funding_delay_days"
+  - id: ERR_PAYOUT_DATE_NOT_REACHED
+    http: 409
+    condition: "mark-paid attempted before scheduled_for"
+  - id: ERR_INSUFFICIENT_BALANCE
+    http: 422
+    condition: "payout amount_cents > Merchant.available_balance_cents"
+  - id: ERR_STALE_MERCHANT_VERSION
+    http: 412
+    condition: "expected_merchant_version != current Merchant.version on batch settle"
+  - id: ERR_FEE_PLAN_INCOMPLETE
+    http: 422
+    condition: "FLAT plan missing flat fields, or INTERCHANGE_PLUS plan missing markup fields"
+  - id: ERR_NO_ELIGIBLE_CHARGES
+    http: 409
+    condition: "opening a settlement batch with no CAPTURED/PENDING charges for the merchant on business_date"
+  - id: ERR_RESOLVE_OUTCOME_INVALID
+    http: 422
+    condition: "resolve called with outcome not in {WON, LOST}"
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: MerchantUser
+    description: "Acts on its own Merchant: authorize/capture/void charges, create refunds, manage disputes (acknowledge/represent/accept), request payouts, read own resources."
+    identity: "entity_backed:Merchant"
+    exclusive_operations:
+      - "POST /merchants/{id}/charges (authorize)"
+      - "POST /charges/{id}/capture"
+      - "POST /charges/{id}/void"
+      - "POST /charges/{id}/refunds"
+      - "POST /charges/{id}/disputes (open)"
+      - "POST /disputes/{id}/acknowledge"
+      - "POST /disputes/{id}/represent"
+      - "POST /disputes/{id}/accept"
+      - "POST /merchants/{id}/payouts"
+    shared_operations:
+      - "GET own merchant, charges, refunds, disputes, settlement-batches, reserve-entries, ledger-entries, payouts, tax-1099k, webhook-events"
+  - name: UnderwritingOfficer
+    description: "Owns underwriting: approve/reject risk reviews, suspend/reinstate merchants."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /merchants/{id}/risk-reviews/{rid}/approve"
+      - "POST /merchants/{id}/risk-reviews/{rid}/reject"
+      - "POST /merchants/{id}/suspend"
+      - "POST /merchants/{id}/reinstate"
+    shared_operations:
+      - "GET merchants, risk-reviews, fee-plans"
+  - name: PlatformOperator
+    description: "Runs the money-movement back office: fee plans, settlement batches, funding, refund settle/fail, dispute reopen/resolve, reserve releases, payouts paid/returned, 1099-K, webhooks, clock control."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /fee-plans"
+      - "POST /merchants/{id}/settlement-batches"
+      - "POST /settlement-batches/{id}/settle"
+      - "POST /settlement-batches/{id}/fund"
+      - "POST /refunds/{id}/settle"
+      - "POST /refunds/{id}/fail"
+      - "POST /disputes/{id}/reopen"
+      - "POST /disputes/{id}/resolve"
+      - "POST /merchants/{id}/reserve-releases"
+      - "POST /payouts/{id}/mark-paid"
+      - "POST /payouts/{id}/return"
+      - "POST /merchants/{id}/tax-1099k"
+      - "POST /merchants/{id}/webhook-events"
+      - "POST /_clock/set"
+      - "POST /_clock/advance"
+    shared_operations:
+      - "GET all back-office reads (merchants, charges, refunds, disputes, batches, reserve-entries, ledger, payouts, tax, webhooks)"
+  - name: Anonymous
+    description: "Unauthenticated caller; may only register a merchant."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /merchants (register)"
+    shared_operations: []
+
+# ---------------------------------------------------------------------------
+# Domain constants (referenced across §1.2–§1.4)
+# ---------------------------------------------------------------------------
+domain_constants:
+  HIGH_RISK_MCC_SET: ["5933", "5967", "7995", "5122"]   # pawn, telemarketing, gambling, drugs
+  RISK_BAND_RESERVE_BPS: { LOW: 0, MEDIUM: 500, HIGH: 1000 }      # 0% / 5% / 10%
+  RISK_BAND_FUNDING_DELAY: { LOW: 1, MEDIUM: 2, HIGH: 2 }          # T+1 / T+2 / T+2
+  RESERVE_HOLD_DAYS: 90
+  AUTH_HOLD_DAYS: 7
+  EVIDENCE_WINDOW_DAYS: 14
+  MAX_REPRESENTMENT_ROUNDS: 2
+  REPORTING_THRESHOLD_CENTS: 250000
+  INTERCHANGE_BPS: 165
+  INTERCHANGE_FIXED_CENTS: 10

@@ -1,0 +1,79 @@
+"""Error classes and error catalog for the surveillance API."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# HTTP status per error id (from PRD section 5 error catalogue)
+ERROR_HTTP = {
+    # Auth
+    "ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER": 400,
+    "ERR_INSUFFICIENT_PERMISSIONS": 403,
+    "ERR_JURISDICTION_SCOPE_VIOLATION": 403,
+    # Not found
+    "ERR_PROGRAM_NOT_FOUND": 404,
+    "ERR_JURISDICTION_NOT_FOUND": 404,
+    "ERR_CONDITION_NOT_FOUND": 404,
+    "ERR_CASE_NOT_FOUND": 404,
+    "ERR_CONTACT_NOT_FOUND": 404,
+    "ERR_LAB_RESULT_NOT_FOUND": 404,
+    "ERR_MONITORING_PERIOD_NOT_FOUND": 404,
+    "ERR_TRANSFER_NOT_FOUND": 404,
+    "ERR_CLUSTER_NOT_FOUND": 404,
+    "ERR_EXPORT_NOT_FOUND": 404,
+    "ERR_EXPOSURE_EVENT_NOT_FOUND": 404,
+    # Input validation
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_ONSET_OR_SPECIMEN_REQUIRED": 400,
+    "ERR_INVALID_CLASSIFICATION": 400,
+    "ERR_DUPLICATE_KEY": 409,
+    # Concurrency
+    "ERR_STALE_CASE_VERSION": 412,
+    # Case state
+    "ERR_CASE_NOT_INTERVIEWABLE": 409,
+    "ERR_CASE_NOT_CLASSIFIABLE": 409,
+    "ERR_INTERVIEW_NOT_COMPLETE": 409,
+    "ERR_CASE_NOT_CLOSEABLE": 409,
+    "ERR_CASE_NOT_REOPENABLE": 409,
+    "ERR_CASE_NOT_TRANSFERABLE": 409,
+    "ERR_CASE_NOT_LINKABLE": 409,
+    "ERR_ACTIVE_MONITORING_EXISTS": 409,
+    "ERR_TRANSFER_PENDING_EXISTS": 409,
+    "ERR_SAME_JURISDICTION_TRANSFER": 409,
+    "ERR_LAB_CONFIRMATION_REQUIRED": 409,
+    # Lab linkage
+    "ERR_LAB_NOT_LINKABLE": 409,
+    "ERR_LAB_CONDITION_MISMATCH": 409,
+    "ERR_LAB_PATIENT_MISMATCH": 409,
+    "ERR_LAB_NOT_SUPERSEDABLE": 409,
+    # Contact state
+    "ERR_CONTACT_NOT_QUEUEABLE": 409,
+    "ERR_CONTACT_NOT_PENDING_NOTIFICATION": 409,
+    "ERR_CONTACT_NOT_NOTIFIED": 409,
+    "ERR_CONTACT_NOT_MONITORING": 409,
+    "ERR_CONTACT_NOT_PROMOTABLE": 409,
+    "ERR_CONTACT_NOT_VOIDABLE": 409,
+    "ERR_QUARANTINE_WINDOW_MISSING": 409,
+    "ERR_NO_SCHEDULED_MONITORING": 409,
+    "ERR_MONITORING_NOT_ELAPSED": 409,
+    "ERR_MONITORING_PERIOD_OVERLAP": 409,
+    # Exposure window
+    "ERR_ENCOUNTER_OUTSIDE_INFECTIOUS_WINDOW": 409,
+    # Transfer state
+    "ERR_TRANSFER_NOT_RESOLVABLE": 409,
+    # Cluster / export state
+    "ERR_CLUSTER_NOT_CLOSEABLE": 409,
+    "ERR_EXPORT_CASE_NOT_REPORTABLE": 409,
+    "ERR_EXPORT_NOT_TRANSMITTABLE": 409,
+    "ERR_EXPORT_SNAPSHOT_STALE": 409,
+    "ERR_EXPORT_NOT_VOIDABLE": 409,
+}
+
+
+def err(error_id, message=None):
+    return ApiError(error_id, ERROR_HTTP.get(error_id, 400), message)

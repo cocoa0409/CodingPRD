@@ -1,0 +1,74 @@
+"""Error IDs and HTTP status mapping (PRD §5 Error Code Catalogue).
+
+After defining the mapping we register it with the framework so that
+validate_error() automatically cross-checks the HTTP status code.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    # auth / existence
+    ERR_MISSING_AUTH = "ERR_MISSING_AUTH"
+    ERR_INVALID_ROLE = "ERR_INVALID_ROLE"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_NOT_RESOURCE_OWNER = "ERR_NOT_RESOURCE_OWNER"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    # request validation
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_CROSS_FACILITY_REFERENCE = "ERR_CROSS_FACILITY_REFERENCE"
+    # state
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    # vaccination / temperament safety
+    ERR_VACCINATION_REQUIRED = "ERR_VACCINATION_REQUIRED"
+    ERR_TEMPERAMENT_NOT_CLEARED = "ERR_TEMPERAMENT_NOT_CLEARED"
+    # run / capacity / grouping
+    ERR_RUN_NOT_ELIGIBLE = "ERR_RUN_NOT_ELIGIBLE"
+    ERR_RUN_OVERLAP = "ERR_RUN_OVERLAP"
+    ERR_RUN_CAPACITY_EXCEEDED = "ERR_RUN_CAPACITY_EXCEEDED"
+    ERR_GROUP_INCOMPATIBLE = "ERR_GROUP_INCOMPATIBLE"
+    ERR_PET_DOUBLE_BOOKED = "ERR_PET_DOUBLE_BOOKED"
+    ERR_NO_RUN_ASSIGNED = "ERR_NO_RUN_ASSIGNED"
+    # fiscal / package
+    ERR_DEPOSIT_UNPAID = "ERR_DEPOSIT_UNPAID"
+    ERR_PACKAGE_NOT_REDEEMABLE = "ERR_PACKAGE_NOT_REDEEMABLE"
+    ERR_RENEWAL_NOT_ALLOWED = "ERR_RENEWAL_NOT_ALLOWED"
+    # lifecycle timing / blocking
+    ERR_CHECKIN_TOO_EARLY = "ERR_CHECKIN_TOO_EARLY"
+    ERR_NO_SHOW_TOO_EARLY = "ERR_NO_SHOW_TOO_EARLY"
+    ERR_ADDON_OUT_OF_WINDOW = "ERR_ADDON_OUT_OF_WINDOW"
+    ERR_BELONGINGS_OUTSTANDING = "ERR_BELONGINGS_OUTSTANDING"
+    # concurrency
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+
+
+HTTP_STATUS_CODES: dict[str, int] = {
+    ApiErrorId.ERR_MISSING_AUTH: 401,
+    ApiErrorId.ERR_INVALID_ROLE: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_NOT_RESOURCE_OWNER: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_REQUEST: 422,
+    ApiErrorId.ERR_CROSS_FACILITY_REFERENCE: 409,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_VACCINATION_REQUIRED: 409,
+    ApiErrorId.ERR_TEMPERAMENT_NOT_CLEARED: 409,
+    ApiErrorId.ERR_RUN_NOT_ELIGIBLE: 409,
+    ApiErrorId.ERR_RUN_OVERLAP: 409,
+    ApiErrorId.ERR_RUN_CAPACITY_EXCEEDED: 409,
+    ApiErrorId.ERR_GROUP_INCOMPATIBLE: 409,
+    ApiErrorId.ERR_PET_DOUBLE_BOOKED: 409,
+    ApiErrorId.ERR_NO_RUN_ASSIGNED: 409,
+    ApiErrorId.ERR_DEPOSIT_UNPAID: 409,
+    ApiErrorId.ERR_PACKAGE_NOT_REDEEMABLE: 409,
+    ApiErrorId.ERR_RENEWAL_NOT_ALLOWED: 409,
+    ApiErrorId.ERR_CHECKIN_TOO_EARLY: 409,
+    ApiErrorId.ERR_NO_SHOW_TOO_EARLY: 409,
+    ApiErrorId.ERR_ADDON_OUT_OF_WINDOW: 409,
+    ApiErrorId.ERR_BELONGINGS_OUTSTANDING: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+}
+
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(HTTP_STATUS_CODES)

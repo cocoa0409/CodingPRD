@@ -1,0 +1,1576 @@
+# =============================================================================
+# SCAFFOLD — Natural Gas Utility Billing (task_0394) — Expert band
+# §1.0–§1.7 only. §1.8 lives in SCAFFOLD_DIFFICULTY_DESIGN.yaml,
+# §1.9 lives in SCAFFOLD_CORNER_DESIGN.yaml.
+# =============================================================================
+
+scenario: "Natural Gas Utility Billing: meter read & therm/CCF conversion, fixed + commodity (PGA) charge, budget/levelized billing, shutoff/reconnect & winter moratorium, meter-set & service order, leak/odor emergency ticket, low-income credit, deposit"
+
+domain_name: natural-gas-utility-billing
+
+# api_prefix kept empty: this is a flat/hybrid topology with several peer
+# top-level resources (accounts, meters, service-orders, tickets, rate-schedules,
+# pga-schedules, clock). Collection segments are derived per-entity from
+# GET /<segment>/{id} endpoints (see §1.5).
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - dual_variant_calculation        # budget/levelized billing vs actual cyclic billing
+    - cascading_side_effects          # shutoff order completion → account suspend → moratorium gate; budget true-up
+    - rate_threshold_triggers         # winter moratorium temperature window, low-income tiers, deposit waiver thresholds
+    - optimistic_concurrency          # OCC on Account.version for bill issuance / budget plan creation
+
+  entity_topology: hybrid
+  # PremiseMeter / MeterRead / Bill / BudgetPlan / Payment / Deposit / LowIncomeCredit
+  # are children of Account; ServiceOrder, EmergencyTicket, RateSchedule, PgaSchedule
+  # are peer top-level resources cross-referencing Account/PremiseMeter by FK.
+
+  state_machine_shape: cyclic
+  # Account.service_status cycles ACTIVE → SHUTOFF_PENDING → DISCONNECTED → ACTIVE
+  # (reconnect), gated by winter moratorium. ServiceOrder, EmergencyTicket,
+  # Bill, BudgetPlan, PremiseMeter all carry their own lifecycles.
+
+  relationship_patterns:
+    - one_to_many        # Account 1→N MeterRead / Bill / Payment / ServiceOrder
+    - cross_aggregate    # ServiceOrder.premise_meter_id, EmergencyTicket.premise_meter_id
+    - self_referential   # Bill.corrects_bill_id (a rebill corrects a prior bill)
+
+  role_model: peer_roles
+  # CustomerService (billing/account ops), FieldTech (meter-set/service-order/emergency
+  # field work), BillingAdmin (rate & PGA config, bill issuance, budget true-up),
+  # Account (entity-backed customer self-service: read own data, request reconnect/budget).
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: RateSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - { name: code, type: string, source: input, description: "Unique rate-schedule code, e.g. RES-1", constraints: "unique across RateSchedule" }
+      - { name: customer_class, type: enum, source: input, description: "RESIDENTIAL | COMMERCIAL" }
+      - { name: fixed_customer_charge_cents, type: integer, source: input, description: "Flat monthly basic service charge in cents", constraints: ">= 0" }
+      - { name: distribution_rate_cents_per_therm, type: integer, source: input, description: "Delivery/distribution charge in cents per therm (integer cents, may be 0)", constraints: ">= 0" }
+      - { name: btu_factor, type: number, source: input, description: "Therm conversion factor = (heating value BTU/cf) / 100000; therms = CCF * btu_factor", default: 1.025, constraints: "0.9 <= btu_factor <= 1.2" }
+      - { name: minimum_bill_cents, type: integer, source: input, description: "Floor applied to total current charges before credits", default: 0, constraints: ">= 0" }
+      - { name: active, type: boolean, source: system, description: "Whether this schedule may be assigned to new accounts", default: true }
+
+  - name: PgaSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - { name: effective_month, type: string, source: input, description: "Billing month this PGA applies to, format YYYY-MM", constraints: "unique per (customer_class, effective_month)" }
+      - { name: customer_class, type: enum, source: input, description: "RESIDENTIAL | COMMERCIAL" }
+      - { name: commodity_rate_cents_per_therm, type: integer, source: input, description: "Purchased-gas commodity (PGA) rate in cents per therm for the month", constraints: ">= 0" }
+      - { name: supplier_refund_cents_per_therm, type: integer, source: input, description: "Per-therm credit netted against commodity (true-up of over-collection); subtracted from commodity rate, floored at 0", default: 0, constraints: ">= 0" }
+
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - { name: rate_schedule_id, type: string, source: input, description: "FK -> RateSchedule.id; pricing schedule for this account" }
+      - { name: customer_class, type: enum, source: computed, description: "RESIDENTIAL | COMMERCIAL — copied from the assigned RateSchedule.customer_class at creation" }
+      - { name: holder_name, type: string, source: input, description: "Account holder name" }
+      - { name: service_status, type: enum, source: system, description: "ACTIVE | SHUTOFF_PENDING | DISCONNECTED | FINALED", default: "ACTIVE", constraints: "lifecycle in §1.2" }
+      - { name: low_income_status, type: enum, source: system, description: "NONE | ENROLLED — ENROLLED when an APPROVED LowIncomeCredit exists", default: "NONE" }
+      - { name: low_income_tier, type: enum, source: system, description: "NONE | TIER_1 | TIER_2 — discount tier from the latest APPROVED LowIncomeCredit", default: "NONE" }
+      - { name: budget_enrolled, type: boolean, source: system, description: "True while an ACTIVE BudgetPlan exists", default: false }
+      - { name: balance_cents, type: integer, source: computed, description: "Account receivable: sum of ISSUED bill amount_due_cents minus sum of POSTED Payment.amount_cents (positive = owed by customer)", default: 0 }
+      - { name: past_due_cents, type: integer, source: computed, description: "Sum of amount_due_cents over ISSUED bills whose due_date is strictly before the current clock date and not fully paid", default: 0 }
+      - { name: deposit_held_cents, type: integer, source: computed, description: "Sum of HELD Deposit.amount_cents minus REFUNDED/APPLIED deposit amounts", default: 0 }
+      - { name: consecutive_ontime_payments, type: integer, source: system, description: "Count of consecutive on-time bill payments since last late payment; resets to 0 on a late payment", default: 0 }
+      - { name: shutoff_eligible, type: boolean, source: computed, description: "True when past_due_cents >= SHUTOFF_THRESHOLD_CENTS AND winter moratorium is not in effect (see §1.3 shutoff_eligibility)" }
+
+  - name: PremiseMeter
+    parent: Account
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: system, description: "FK -> Account.id; owning account" }
+      - { name: serial_no, type: string, source: input, description: "Physical meter serial number", constraints: "unique across PremiseMeter" }
+      - { name: uom, type: enum, source: input, description: "Register unit of measure: CCF | THERM (CCF requires btu_factor conversion; THERM meters read therms directly)", default: "CCF" }
+      - { name: status, type: enum, source: system, description: "PENDING_SET | SET | LOCKED | REMOVED", default: "PENDING_SET", constraints: "lifecycle in §1.2" }
+      - { name: install_index, type: number, source: input, description: "Register index reading at meter-set time (the baseline)", default: 0, constraints: ">= 0" }
+      - { name: last_index, type: number, source: computed, description: "Most recent reading_index from a non-VOID MeterRead, else install_index" }
+
+  - name: MeterRead
+    parent: PremiseMeter
+    common_fields: false
+    fields:
+      - { name: premise_meter_id, type: string, source: system, description: "FK -> PremiseMeter.id; meter that was read" }
+      - { name: account_id, type: string, source: system, description: "FK -> Account.id; copied from the meter's account_id" }
+      - { name: read_date, type: datetime, source: input, description: "ISO 8601 date the read was taken (uses clock if omitted)" }
+      - { name: reading_index, type: number, source: input, description: "Register index at read time", constraints: ">= 0" }
+      - { name: read_type, type: enum, source: input, description: "ACTUAL | ESTIMATED", default: "ACTUAL" }
+      - { name: status, type: enum, source: system, description: "POSTED | VOID — VOID reads are excluded from consumption", default: "POSTED" }
+      - { name: ccf_consumed, type: number, source: computed, description: "max(0, reading_index - prior non-VOID reading_index) when uom=CCF; raw register delta otherwise (see §1.3 consumption_conversion)" }
+      - { name: therms_consumed, type: number, source: computed, description: "CCF * RateSchedule.btu_factor when uom=CCF, else the register delta directly; rounded per §1.3" }
+      - { name: bill_id, type: string, source: system, description: "FK -> Bill.id; set when this read is consumed by an issued bill, else null", default: null }
+
+  - name: Bill
+    parent: Account
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: system, description: "FK -> Account.id; billed account" }
+      - { name: service_month, type: string, source: input, description: "Billing month YYYY-MM; matched to a PgaSchedule", constraints: "unique non-corrected bill per (account_id, service_month)" }
+      - { name: from_read_id, type: string, source: system, description: "FK -> MeterRead.id; opening read for the period (prior cycle read)", default: null }
+      - { name: to_read_id, type: string, source: system, description: "FK -> MeterRead.id; closing read for the period" }
+      - { name: corrects_bill_id, type: string, source: input, description: "FK -> Bill.id; the prior bill this rebill supersedes, else null", default: null }
+      - { name: therms_billed, type: number, source: computed, description: "therms_consumed of the closing read (or sum across reads in the window) per §1.3 bill_charges" }
+      - { name: commodity_charge_cents, type: integer, source: computed, description: "therms_billed * effective PGA commodity rate, rounded once at the end (§1.3 bill_charges)" }
+      - { name: distribution_charge_cents, type: integer, source: computed, description: "therms_billed * RateSchedule.distribution_rate_cents_per_therm" }
+      - { name: fixed_charge_cents, type: integer, source: computed, description: "RateSchedule.fixed_customer_charge_cents" }
+      - { name: low_income_credit_cents, type: integer, source: computed, description: "Credit applied this cycle from low-income tier (§1.3 low_income_credit)" }
+      - { name: amount_due_cents, type: integer, source: computed, description: "Net billed amount for the cycle (actual-cost path) per §1.3 bill_charges; for budget bills see budget_billed_cents" }
+      - { name: budget_billed_cents, type: integer, source: computed, description: "Levelized installment actually charged when the account is budget-enrolled (§1.3 budget_installment); equals amount_due_cents when not budget-enrolled", default: 0 }
+      - { name: status, type: enum, source: system, description: "DRAFT | ISSUED | PAID | VOID | CORRECTED", default: "DRAFT", constraints: "lifecycle in §1.2" }
+      - { name: due_date, type: datetime, source: computed, description: "issue date + PAYMENT_TERM_DAYS, stamped on ISSUE" }
+      - { name: paid_cents, type: integer, source: computed, description: "Sum of POSTED Payment.amount_cents allocated to this bill", default: 0 }
+
+  - name: BudgetPlan
+    parent: Account
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: system, description: "FK -> Account.id; enrolled account" }
+      - { name: anchor_month, type: string, source: input, description: "First service month the levelized installment applies to, YYYY-MM" }
+      - { name: monthly_installment_cents, type: integer, source: computed, description: "Levelized monthly amount = round(projected_annual_cents / 12) at enrollment (§1.3 budget_installment)" }
+      - { name: projected_annual_cents, type: integer, source: input, description: "Estimated 12-month total used to set the installment", constraints: ">= 0" }
+      - { name: accrued_actual_cents, type: integer, source: computed, description: "Running sum of actual (non-budget) amount_due_cents for bills issued under this plan", default: 0 }
+      - { name: accrued_budget_cents, type: integer, source: computed, description: "Running sum of budget_billed_cents charged under this plan", default: 0 }
+      - { name: status, type: enum, source: system, description: "ACTIVE | TRUED_UP | CANCELLED", default: "ACTIVE", constraints: "lifecycle in §1.2" }
+      - { name: trueup_balance_cents, type: integer, source: computed, description: "accrued_actual_cents - accrued_budget_cents, stamped at TRUE_UP (positive = customer underpaid)", default: 0 }
+
+  - name: Payment
+    parent: Account
+    common_fields: false
+    fields:
+      - { name: account_id, type: string, source: system, description: "FK -> Account.id; paying account" }
+      - { name: bill_id, type: string, source: input, description: "FK -> Bill.id; bill this payment is allocated to (required)" }
+      - { name: amount_cents, type: integer, source: input, description: "Payment amount in cents", constraints: "> 0" }
+      - { name: posted_date, type: datetime, source: input, description: "ISO 8601 date payment posted (uses clock if omitted)" }
+      - { name: status, type: enum, source: system, description: "POSTED | REVERSED", default: "POSTED" }
+      - { name: on_time, type: boolean, source: computed, description: "True when posted_date <= target bill.due_date (§1.3 payment_timeliness)" }
+
+  - name: ServiceOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; account the order serves" }
+      - { name: premise_meter_id, type: string, source: input, description: "FK -> PremiseMeter.id; meter the order acts on (required for METER_SET/SHUTOFF/RECONNECT)", default: null }
+      - { name: order_type, type: enum, source: input, description: "METER_SET | SHUTOFF | RECONNECT" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | DISPATCHED | COMPLETED | CANCELLED", default: "SCHEDULED", constraints: "lifecycle in §1.2" }
+      - { name: scheduled_date, type: datetime, source: input, description: "ISO 8601 date the field visit is scheduled" }
+      - { name: completed_index, type: number, source: input, description: "Register index captured at completion (METER_SET set-index / SHUTOFF final read)", default: null }
+
+  - name: EmergencyTicket
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; reporting account", default: null }
+      - { name: premise_meter_id, type: string, source: input, description: "FK -> PremiseMeter.id; meter/premise the hazard is at" }
+      - { name: kind, type: enum, source: input, description: "ODOR | LEAK | CARBON_MONOXIDE" }
+      - { name: severity, type: enum, source: computed, description: "GRADE_1 | GRADE_2 | GRADE_3 — derived from kind and reported_indoors (§1.3 ticket_severity)" }
+      - { name: reported_indoors, type: boolean, source: input, description: "Whether the hazard is reported inside an occupied structure", default: false }
+      - { name: status, type: enum, source: system, description: "OPEN | DISPATCHED | MADE_SAFE | RESOLVED | CANCELLED", default: "OPEN", constraints: "lifecycle in §1.2" }
+      - { name: response_due_minutes, type: integer, source: computed, description: "Target field-response SLA in minutes from severity (§1.3 ticket_severity)" }
+      - { name: gas_locked, type: boolean, source: system, description: "True once the technician locks the meter at MADE_SAFE for a GRADE_1 hazard", default: false }
+
+  - name: Deposit
+    parent: Account
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: system, description: "FK -> Account.id; account holding the deposit" }
+      - { name: amount_cents, type: integer, source: computed, description: "Required deposit = §1.3 deposit_requirement (0 when waived)", default: 0 }
+      - { name: reason, type: enum, source: input, description: "NEW_SERVICE | RECONNECT | DELINQUENCY" }
+      - { name: status, type: enum, source: system, description: "REQUIRED | HELD | WAIVED | REFUNDED | APPLIED", default: "REQUIRED", constraints: "lifecycle in §1.2" }
+
+  - name: LowIncomeCredit
+    parent: Account
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: system, description: "FK -> Account.id; applicant account" }
+      - { name: household_size, type: integer, source: input, description: "Reported household size", constraints: ">= 1" }
+      - { name: annual_income_cents, type: integer, source: input, description: "Reported annual household income in cents", constraints: ">= 0" }
+      - { name: tier, type: enum, source: computed, description: "NONE | TIER_1 | TIER_2 — eligibility tier from income vs household FPL (§1.3 low_income_eligibility)" }
+      - { name: status, type: enum, source: system, description: "SUBMITTED | APPROVED | DENIED | EXPIRED", default: "SUBMITTED", constraints: "lifecycle in §1.2" }
+
+  - name: Clock
+    parent: null
+    common_fields: false
+    fields:
+      - { name: current_utc, type: datetime, source: system, description: "Server logical clock used for due_date, past_due, on-time, and winter-moratorium computations", default: "2026-01-01T00:00:00.000Z" }
+      - { name: heating_season_active, type: boolean, source: system, description: "Operator-set flag asserting the regulatory cold-weather window is in effect (winter moratorium gate input)", default: false }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---------------------------------------------------------------------------
+  # Account.service_status — CYCLIC: ACTIVE -> SHUTOFF_PENDING -> DISCONNECTED
+  #   -> ACTIVE (reconnect), gated by the winter moratorium. FINALED is terminal.
+  # ---------------------------------------------------------------------------
+  - entity: Account
+    field: service_status
+    initial_state: ACTIVE
+    terminal_states: [FINALED]
+    transitions:
+      - from: ACTIVE
+        to: SHUTOFF_PENDING
+        trigger: "POST /accounts/{id}/shutoff-notice"
+        actor: CustomerService
+        preconditions:
+          - "Account.shutoff_eligible == true (past_due_cents >= SHUTOFF_THRESHOLD_CENTS AND winter moratorium NOT in effect) — else ERR_NOT_SHUTOFF_ELIGIBLE"
+          - "No OPEN/DISPATCHED/MADE_SAFE EmergencyTicket on any of the account's meters — else ERR_EMERGENCY_HOLD"
+        side_effects:
+          - "Account.service_status = SHUTOFF_PENDING"
+          - "Account.version += 1"
+          - "A SHUTOFF ServiceOrder is auto-created in SCHEDULED for the account's SET meter (cascade hop 1)"
+
+      - from: SHUTOFF_PENDING
+        to: ACTIVE
+        trigger: "POST /accounts/{id}/cancel-shutoff"
+        actor: CustomerService
+        preconditions: []
+        side_effects:
+          - "Account.service_status = ACTIVE"
+          - "Account.version += 1"
+          - "Any SCHEDULED/DISPATCHED SHUTOFF ServiceOrder for this account -> CANCELLED (cascade)"
+
+      - from: SHUTOFF_PENDING
+        to: DISCONNECTED
+        trigger: "POST /service-orders/{id}/complete (order_type=SHUTOFF)"
+        actor: FieldTech
+        preconditions:
+          - "Winter moratorium NOT in effect at completion time — else ERR_WINTER_MORATORIUM"
+          - "No OPEN/DISPATCHED/MADE_SAFE EmergencyTicket on the account's meters — else ERR_EMERGENCY_HOLD"
+        side_effects:
+          - "Account.service_status = DISCONNECTED"
+          - "PremiseMeter.status = LOCKED"
+          - "Account.version += 1"
+          - "A final MeterRead (read_type=ACTUAL) is POSTED from completed_index (cascade)"
+
+      - from: DISCONNECTED
+        to: ACTIVE
+        trigger: "POST /service-orders/{id}/complete (order_type=RECONNECT)"
+        actor: FieldTech
+        preconditions:
+          - "A RECONNECT ServiceOrder exists and is DISPATCHED"
+          - "past_due_cents == 0 (delinquency cleared) — else ERR_RECONNECT_BALANCE_DUE"
+          - "Deposit for reason=RECONNECT is HELD or WAIVED — else ERR_RECONNECT_DEPOSIT_REQUIRED"
+        side_effects:
+          - "Account.service_status = ACTIVE"
+          - "PremiseMeter.status = SET"
+          - "Account.version += 1"
+          - "consecutive_ontime_payments reset to 0"
+
+      - from: DISCONNECTED
+        to: FINALED
+        trigger: "POST /accounts/{id}/final-bill"
+        actor: BillingAdmin
+        preconditions:
+          - "Account.service_status == DISCONNECTED"
+        side_effects:
+          - "Account.service_status = FINALED"
+          - "Account.version += 1"
+          - "Any HELD Deposit -> APPLIED against balance, remainder REFUNDED (cascade)"
+          - "Any ACTIVE BudgetPlan -> TRUED_UP (cascade)"
+
+  # ---------------------------------------------------------------------------
+  # PremiseMeter — meter-set lifecycle. PENDING_SET -> SET via meter-set order
+  #   completion; SET <-> LOCKED via shutoff/reconnect; SET/LOCKED -> REMOVED.
+  # ---------------------------------------------------------------------------
+  - entity: PremiseMeter
+    initial_state: PENDING_SET
+    terminal_states: [REMOVED]
+    transitions:
+      - from: PENDING_SET
+        to: SET
+        trigger: "POST /service-orders/{id}/complete (order_type=METER_SET)"
+        actor: FieldTech
+        preconditions:
+          - "ServiceOrder is DISPATCHED and order_type == METER_SET"
+          - "completed_index >= PremiseMeter.install_index — else ERR_INDEX_ROLLBACK"
+        side_effects:
+          - "PremiseMeter.status = SET"
+          - "PremiseMeter.install_index = ServiceOrder.completed_index"
+          - "PremiseMeter.version += 1"
+
+      - from: SET
+        to: LOCKED
+        trigger: "system (SHUTOFF ServiceOrder completed)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "PremiseMeter.status = LOCKED"
+
+      - from: LOCKED
+        to: SET
+        trigger: "system (RECONNECT ServiceOrder completed)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "PremiseMeter.status = SET"
+
+      - from: SET
+        to: REMOVED
+        trigger: "POST /meters/{id}/remove"
+        actor: FieldTech
+        preconditions:
+          - "No DRAFT Bill referencing an unconsumed read on this meter"
+        side_effects:
+          - "PremiseMeter.status = REMOVED"
+          - "PremiseMeter.version += 1"
+
+      - from: LOCKED
+        to: REMOVED
+        trigger: "POST /meters/{id}/remove"
+        actor: FieldTech
+        preconditions: []
+        side_effects:
+          - "PremiseMeter.status = REMOVED"
+          - "PremiseMeter.version += 1"
+
+  # ---------------------------------------------------------------------------
+  # ServiceOrder — work-order lifecycle (parallel field-ops machine).
+  # ---------------------------------------------------------------------------
+  - entity: ServiceOrder
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: DISPATCHED
+        trigger: "POST /service-orders/{id}/dispatch"
+        actor: FieldTech
+        preconditions:
+          - "scheduled_date <= clock.current_utc — else ERR_ORDER_NOT_DUE"
+        side_effects:
+          - "ServiceOrder.status = DISPATCHED"
+          - "ServiceOrder.version += 1"
+
+      - from: DISPATCHED
+        to: COMPLETED
+        trigger: "POST /service-orders/{id}/complete"
+        actor: FieldTech
+        preconditions:
+          - "For SHUTOFF: winter moratorium NOT in effect — else ERR_WINTER_MORATORIUM"
+          - "For SHUTOFF/RECONNECT: per Account state machine preconditions above"
+          - "For METER_SET: completed_index >= PremiseMeter.install_index — else ERR_INDEX_ROLLBACK"
+          - "completed_index required for METER_SET and SHUTOFF — else ERR_MISSING_COMPLETION_INDEX"
+        side_effects:
+          - "ServiceOrder.status = COMPLETED"
+          - "ServiceOrder.version += 1"
+          - "Drives the matching Account / PremiseMeter transition (cascade across entities)"
+
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /service-orders/{id}/cancel"
+        actor: CustomerService
+        preconditions: []
+        side_effects:
+          - "ServiceOrder.status = CANCELLED"
+          - "ServiceOrder.version += 1"
+
+      - from: DISPATCHED
+        to: CANCELLED
+        trigger: "POST /service-orders/{id}/cancel"
+        actor: CustomerService
+        preconditions: []
+        side_effects:
+          - "ServiceOrder.status = CANCELLED"
+          - "ServiceOrder.version += 1"
+
+  # ---------------------------------------------------------------------------
+  # EmergencyTicket — safety lifecycle. OPEN -> DISPATCHED -> MADE_SAFE ->
+  #   RESOLVED, with OPEN/DISPATCHED -> CANCELLED (false alarm).
+  # ---------------------------------------------------------------------------
+  - entity: EmergencyTicket
+    initial_state: OPEN
+    terminal_states: [RESOLVED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: DISPATCHED
+        trigger: "POST /tickets/{id}/dispatch"
+        actor: FieldTech
+        preconditions: []
+        side_effects:
+          - "EmergencyTicket.status = DISPATCHED"
+          - "EmergencyTicket.version += 1"
+
+      - from: DISPATCHED
+        to: MADE_SAFE
+        trigger: "POST /tickets/{id}/make-safe"
+        actor: FieldTech
+        preconditions: []
+        side_effects:
+          - "EmergencyTicket.status = MADE_SAFE"
+          - "EmergencyTicket.version += 1"
+          - "If severity == GRADE_1: gas_locked = true AND the meter's PremiseMeter.status -> LOCKED (cascade hop 1)"
+
+      - from: MADE_SAFE
+        to: RESOLVED
+        trigger: "POST /tickets/{id}/resolve"
+        actor: FieldTech
+        preconditions: []
+        side_effects:
+          - "EmergencyTicket.status = RESOLVED"
+          - "EmergencyTicket.version += 1"
+
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /tickets/{id}/cancel"
+        actor: CustomerService
+        preconditions: []
+        side_effects:
+          - "EmergencyTicket.status = CANCELLED"
+          - "EmergencyTicket.version += 1"
+
+      - from: DISPATCHED
+        to: CANCELLED
+        trigger: "POST /tickets/{id}/cancel"
+        actor: CustomerService
+        preconditions: []
+        side_effects:
+          - "EmergencyTicket.status = CANCELLED"
+          - "EmergencyTicket.version += 1"
+
+  # ---------------------------------------------------------------------------
+  # Bill — billing-cycle lifecycle. DRAFT -> ISSUED -> PAID, with VOID and the
+  #   CORRECTED branch when a rebill supersedes it.
+  # ---------------------------------------------------------------------------
+  - entity: Bill
+    initial_state: DRAFT
+    terminal_states: [PAID, VOID, CORRECTED]
+    transitions:
+      - from: DRAFT
+        to: ISSUED
+        trigger: "POST /accounts/{id}/bills/{bill_id}/issue"
+        actor: BillingAdmin
+        preconditions:
+          - "expected_account_version matches Account.version — else ERR_STALE_ACCOUNT_VERSION (OCC)"
+          - "A PgaSchedule exists for (customer_class, service_month) — else ERR_PGA_NOT_FOUND"
+          - "to_read is a POSTED ACTUAL or ESTIMATED MeterRead newer than from_read — else ERR_READ_REQUIRED"
+        side_effects:
+          - "Bill.status = ISSUED; charges and amount_due_cents computed (§1.3 bill_charges)"
+          - "Bill.due_date = clock + PAYMENT_TERM_DAYS"
+          - "to_read.bill_id set; reads in window marked consumed"
+          - "Account.version += 1"
+          - "If budget-enrolled: BudgetPlan.accrued_actual_cents += amount_due_cents; accrued_budget_cents += budget_billed_cents (cascade)"
+
+      - from: ISSUED
+        to: PAID
+        trigger: "system (POST /payments brings paid_cents >= amount_due_cents)"
+        actor: system
+        preconditions:
+          - "Sum of POSTED Payment.amount_cents allocated to this bill >= amount_due_cents (budget_billed_cents for budget bills)"
+        side_effects:
+          - "Bill.status = PAID"
+          - "If payment on_time: Account.consecutive_ontime_payments += 1 (cascade); else reset to 0"
+
+      - from: ISSUED
+        to: CORRECTED
+        trigger: "POST /accounts/{id}/bills (corrects_bill_id set, then issue)"
+        actor: BillingAdmin
+        preconditions:
+          - "The new rebill references corrects_bill_id of an ISSUED bill in the same service_month"
+        side_effects:
+          - "Old Bill.status = CORRECTED"
+          - "New rebill carries recomputed charges; account balance reflects only the rebill (cascade)"
+
+      - from: DRAFT
+        to: VOID
+        trigger: "POST /accounts/{id}/bills/{bill_id}/void"
+        actor: BillingAdmin
+        preconditions: []
+        side_effects:
+          - "Bill.status = VOID"
+          - "to_read.bill_id cleared; reads released for re-billing (cascade)"
+
+  # ---------------------------------------------------------------------------
+  # BudgetPlan — levelized-billing lifecycle with annual true-up.
+  # ---------------------------------------------------------------------------
+  - entity: BudgetPlan
+    initial_state: ACTIVE
+    terminal_states: [TRUED_UP, CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: TRUED_UP
+        trigger: "POST /accounts/{id}/budget-plans/{plan_id}/true-up"
+        actor: BillingAdmin
+        preconditions:
+          - "At least one Bill issued under this plan — else ERR_NO_BILLS_TO_TRUE_UP"
+        side_effects:
+          - "BudgetPlan.status = TRUED_UP"
+          - "trueup_balance_cents = accrued_actual_cents - accrued_budget_cents (§1.3 budget_trueup)"
+          - "A true-up Bill (DRAFT) for the residual is created if trueup_balance_cents != 0 (cascade)"
+          - "Account.budget_enrolled = false"
+
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /accounts/{id}/budget-plans/{plan_id}/cancel"
+        actor: CustomerService
+        preconditions: []
+        side_effects:
+          - "BudgetPlan.status = CANCELLED"
+          - "Account.budget_enrolled = false"
+
+  # ---------------------------------------------------------------------------
+  # Deposit — security-deposit lifecycle.
+  # ---------------------------------------------------------------------------
+  - entity: Deposit
+    initial_state: REQUIRED
+    terminal_states: [REFUNDED, APPLIED, WAIVED]
+    transitions:
+      - from: REQUIRED
+        to: HELD
+        trigger: "POST /accounts/{id}/deposits/{deposit_id}/collect"
+        actor: CustomerService
+        preconditions:
+          - "Deposit.amount_cents > 0 — else ERR_DEPOSIT_WAIVED_NOT_PAYABLE"
+        side_effects:
+          - "Deposit.status = HELD"
+          - "Account.deposit_held_cents recomputed (cascade)"
+
+      - from: REQUIRED
+        to: WAIVED
+        trigger: "system (deposit_requirement yields 0) or POST /accounts/{id}/deposits/{deposit_id}/waive"
+        actor: CustomerService
+        preconditions: []
+        side_effects:
+          - "Deposit.status = WAIVED"
+
+      - from: HELD
+        to: REFUNDED
+        trigger: "POST /accounts/{id}/deposits/{deposit_id}/refund"
+        actor: BillingAdmin
+        preconditions:
+          - "Account.consecutive_ontime_payments >= DEPOSIT_REFUND_ONTIME_COUNT — else ERR_DEPOSIT_REFUND_NOT_DUE"
+        side_effects:
+          - "Deposit.status = REFUNDED"
+          - "Account.deposit_held_cents recomputed (cascade)"
+
+      - from: HELD
+        to: APPLIED
+        trigger: "system (account FINALED)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Deposit.status = APPLIED"
+          - "Applied against Account.balance_cents (cascade)"
+
+  # ---------------------------------------------------------------------------
+  # LowIncomeCredit — assistance application lifecycle.
+  # ---------------------------------------------------------------------------
+  - entity: LowIncomeCredit
+    initial_state: SUBMITTED
+    terminal_states: [DENIED, EXPIRED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /accounts/{id}/low-income-credits/{credit_id}/approve"
+        actor: CustomerService
+        preconditions:
+          - "Computed tier != NONE — else ERR_NOT_ELIGIBLE"
+        side_effects:
+          - "LowIncomeCredit.status = APPROVED"
+          - "Account.low_income_status = ENROLLED; Account.low_income_tier = this credit's tier (cascade)"
+
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /accounts/{id}/low-income-credits/{credit_id}/deny"
+        actor: CustomerService
+        preconditions: []
+        side_effects:
+          - "LowIncomeCredit.status = DENIED"
+
+      - from: APPROVED
+        to: EXPIRED
+        trigger: "POST /accounts/{id}/low-income-credits/{credit_id}/expire"
+        actor: BillingAdmin
+        preconditions: []
+        side_effects:
+          - "LowIncomeCredit.status = EXPIRED"
+          - "If no other APPROVED credit: Account.low_income_status = NONE; low_income_tier = NONE (cascade)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: bill-issue-stale-account
+    parent_entity: Account
+    write_endpoint: "POST /accounts/{id}/bills/{bill_id}/issue"
+    occ_field: "expected_account_version"
+    description: |
+      Issuing a bill against an Account whose version has advanced since the
+      client last observed it is rejected on a stale version. This captures the
+      case where another writer has already issued a bill (or completed a
+      shutoff/reconnect) for the account — both bump Account.version — and the
+      current writer's view of the account balance is therefore stale. The
+      losing issue carries an expected_account_version older than the current
+      Account.version.
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+
+  - rule_id: budget-enroll-stale-account
+    parent_entity: Account
+    write_endpoint: "POST /accounts/{id}/budget-plans"
+    occ_field: "expected_account_version"
+    description: |
+      Creating a BudgetPlan against an Account whose version has advanced since
+      the client last read it is rejected on a stale version. A BudgetPlan that
+      legitimately supersedes the prior enrollment view requires the writer to
+      have observed the account's current version; an older expected version
+      means another enrollment or billing mutation has intervened.
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: consumption_conversion
+    trigger: "MeterRead POST (read posting) and on bill issuance"
+    algorithm: threshold
+    formula: |
+      prior = most recent non-VOID MeterRead.reading_index for the same meter
+              with read_date strictly < this read_date; if none, PremiseMeter.install_index.
+      raw_delta = reading_index - prior
+      if raw_delta < 0: reject with ERR_INDEX_ROLLBACK   # register cannot run backward
+      ccf_consumed = raw_delta if uom == CCF else raw_delta   # register units are CCF or THERM
+      if uom == CCF:
+        therms_unrounded = ccf_consumed * RateSchedule.btu_factor
+      else:                                  # uom == THERM, register already in therms
+        therms_unrounded = ccf_consumed
+      therms_consumed = round_half_up(therms_unrounded, 1)    # therms to 1 decimal
+    input_set: "Single MeterRead vs its immediately-prior non-VOID read on the same meter (read_date ASC, tie-break created_at ASC)."
+    constants:
+      THERM_DECIMALS: 1
+    precision: "therms to 1 decimal place, round_half_up; ccf raw (no rounding)"
+
+  - name: bill_charges
+    trigger: "Bill issue (DRAFT -> ISSUED)"
+    algorithm: tiered_pricing
+    formula: |
+      # ---- evaluation order is PINNED; do not reorder ----
+      # 1) therms_billed: therms_consumed of to_read MINUS therms already billed by a
+      #    prior non-CORRECTED bill on the same meter window. For a single-cycle bill
+      #    this equals to_read.therms_consumed.
+      therms_billed = to_read.therms_consumed
+      # 2) commodity (PGA) buildup — compute the EFFECTIVE per-therm rate FIRST,
+      #    then multiply, then round ONCE at the end (round-then-... pinned: multiply
+      #    unrounded therms*rate, round the cents result, not per intermediate):
+      eff_pga = max(0, PgaSchedule.commodity_rate_cents_per_therm
+                       - PgaSchedule.supplier_refund_cents_per_therm)
+      commodity_charge_cents = round_half_up(therms_billed * eff_pga)        # single final round
+      # 3) distribution + fixed
+      distribution_charge_cents = round_half_up(therms_billed * RateSchedule.distribution_rate_cents_per_therm)
+      fixed_charge_cents = RateSchedule.fixed_customer_charge_cents
+      # 4) gross before credit and minimum bill
+      gross = commodity_charge_cents + distribution_charge_cents + fixed_charge_cents
+      gross = max(gross, RateSchedule.minimum_bill_cents)                    # minimum-bill floor
+      # 5) low-income credit (computed by low_income_credit calc; subtract, floor at 0)
+      amount_due_cents = max(0, gross - low_income_credit_cents)
+    input_set: "One closing read (to_read) on a SET/LOCKED meter; PgaSchedule for (customer_class, service_month); RateSchedule of the account."
+    constants:
+      PAYMENT_TERM_DAYS: 21
+    precision: "all money in integer cents; commodity rounded once after therms*rate; round_half_up"
+    variants:
+      - name: actual_cost
+        when: "account is NOT budget-enrolled at issue time"
+        difference: "budget_billed_cents = amount_due_cents; customer is charged the full computed cyclic amount."
+      - name: levelized_budget
+        when: "account IS budget-enrolled (ACTIVE BudgetPlan) at issue time"
+        difference: "budget_billed_cents = BudgetPlan.monthly_installment_cents (the flat installment), NOT amount_due_cents. amount_due_cents is still computed and accrued for the year-end true-up, but the customer is billed the levelized installment this cycle."
+
+  - name: budget_installment
+    trigger: "BudgetPlan creation (POST /accounts/{id}/budget-plans)"
+    algorithm: aggregation
+    formula: |
+      monthly_installment_cents = round_half_up(projected_annual_cents / 12)
+    input_set: "projected_annual_cents supplied at enrollment."
+    constants:
+      BUDGET_MONTHS: 12
+    precision: "integer cents, round_half_up"
+
+  - name: budget_trueup
+    trigger: "BudgetPlan TRUE_UP (ACTIVE -> TRUED_UP)"
+    algorithm: aggregation
+    formula: |
+      # accrued_actual_cents = sum of amount_due_cents over bills ISSUED/PAID/CORRECTED?->no:
+      #   sum over Bills with status IN {ISSUED, PAID} issued under this plan (anchor_month..)
+      #   (CORRECTED and VOID bills excluded; a rebill that CORRECTED a prior one replaces it).
+      # accrued_budget_cents = sum of budget_billed_cents over those same bills.
+      trueup_balance_cents = accrued_actual_cents - accrued_budget_cents
+      # trueup_balance_cents > 0  => customer underpaid: a true-up Bill (DRAFT) for that amount.
+      # trueup_balance_cents < 0  => customer overpaid: a credit Bill (DRAFT, amount_due_cents = balance).
+    input_set: "Bills with status IN {ISSUED, PAID} whose account is this plan's account, service_month >= anchor_month; tie-break service_month ASC then created_at ASC."
+    constants: {}
+    precision: "integer cents; difference is exact (no rounding needed)"
+    variants:
+      - name: underpaid_trueup
+        when: "accrued_actual_cents > accrued_budget_cents"
+        difference: "Residual is a debit true-up Bill the customer owes."
+      - name: overpaid_credit
+        when: "accrued_actual_cents < accrued_budget_cents"
+        difference: "Residual is a credit Bill (negative net) reducing the customer's balance."
+
+  - name: low_income_eligibility
+    trigger: "LowIncomeCredit submit and approve"
+    algorithm: tiered_pricing
+    formula: |
+      fpl = FPL_BASE_CENTS + (household_size - 1) * FPL_PER_PERSON_CENTS   # annual poverty line
+      ratio = annual_income_cents / fpl
+      if ratio <= TIER_1_FPL_RATIO: tier = TIER_1     # deepest need  (<= 1.00 * FPL)
+      elif ratio <= TIER_2_FPL_RATIO: tier = TIER_2   # moderate need (<= 1.50 * FPL)
+      else: tier = NONE
+    input_set: "household_size and annual_income_cents on the LowIncomeCredit."
+    constants:
+      FPL_BASE_CENTS: 1509000          # $15,090 annual for household of 1
+      FPL_PER_PERSON_CENTS: 532000     # +$5,320 per additional member
+      TIER_1_FPL_RATIO: 1.00
+      TIER_2_FPL_RATIO: 1.50
+    precision: "ratio compared with <= (inclusive at the boundary); exact"
+
+  - name: low_income_credit
+    trigger: "Bill issue, when account.low_income_status == ENROLLED"
+    algorithm: tiered_pricing
+    formula: |
+      if account.low_income_tier == TIER_1:
+        pct = TIER_1_DISCOUNT_PCT          # 0.20
+        cap = TIER_1_MONTHLY_CAP_CENTS     # 4000
+      elif account.low_income_tier == TIER_2:
+        pct = TIER_2_DISCOUNT_PCT          # 0.10
+        cap = TIER_2_MONTHLY_CAP_CENTS     # 2500
+      else:
+        low_income_credit_cents = 0; return
+      # credit applies to (commodity + distribution) only, NOT the fixed customer charge:
+      creditable = commodity_charge_cents + distribution_charge_cents
+      low_income_credit_cents = min(round_half_up(creditable * pct), cap)
+    input_set: "Per-bill, derived from this bill's commodity_charge_cents + distribution_charge_cents and the account tier."
+    constants:
+      TIER_1_DISCOUNT_PCT: 0.20
+      TIER_2_DISCOUNT_PCT: 0.10
+      TIER_1_MONTHLY_CAP_CENTS: 4000
+      TIER_2_MONTHLY_CAP_CENTS: 2500
+    precision: "integer cents, round_half_up before applying the cap (min taken after rounding)"
+
+  - name: deposit_requirement
+    trigger: "Deposit creation (NEW_SERVICE / RECONNECT / DELINQUENCY)"
+    algorithm: threshold
+    formula: |
+      if account.low_income_status == ENROLLED:
+        return 0          # low-income customers are deposit-exempt
+      if account.consecutive_ontime_payments >= DEPOSIT_WAIVE_ONTIME_COUNT:
+        return 0          # good-payment history waives deposit
+      base = DEPOSIT_RES_CENTS if account.customer_class == RESIDENTIAL else DEPOSIT_COM_CENTS
+      if reason == DELINQUENCY:
+        base = round_half_up(base * DELINQUENCY_MULTIPLIER)   # 1.5x for delinquency-triggered
+      return base
+    input_set: "Account low_income_status, consecutive_ontime_payments, customer_class, and the deposit reason."
+    constants:
+      DEPOSIT_RES_CENTS: 15000
+      DEPOSIT_COM_CENTS: 40000
+      DELINQUENCY_MULTIPLIER: 1.5
+      DEPOSIT_WAIVE_ONTIME_COUNT: 12
+      DEPOSIT_REFUND_ONTIME_COUNT: 12
+    precision: "integer cents, round_half_up on the multiplier"
+
+  - name: shutoff_eligibility
+    trigger: "computed on read of Account; checked at shutoff-notice"
+    algorithm: threshold
+    formula: |
+      moratorium = winter_moratorium_in_effect()    # see winter_moratorium calc
+      shutoff_eligible = (past_due_cents >= SHUTOFF_THRESHOLD_CENTS) and (not moratorium)
+    input_set: "Account.past_due_cents (computed) and the moratorium predicate."
+    constants:
+      SHUTOFF_THRESHOLD_CENTS: 7500     # $75.00 past-due floor to start shutoff
+    precision: "comparison is >= (a $75.00 past-due is eligible); integer cents"
+
+  - name: winter_moratorium
+    trigger: "shutoff-notice precondition and SHUTOFF ServiceOrder completion"
+    algorithm: threshold
+    formula: |
+      # Moratorium is in effect when BOTH:
+      #   (1) the calendar month of clock.current_utc is in the protected window, AND
+      #   (2) Clock.heating_season_active flag is true (regulator-asserted cold spell).
+      month = month_of(clock.current_utc)
+      in_window = month in MORATORIUM_MONTHS          # {11,12,1,2,3}
+      winter_moratorium_in_effect = in_window and clock.heating_season_active
+    input_set: "Clock.current_utc month and Clock.heating_season_active."
+    constants:
+      MORATORIUM_MONTHS: [11, 12, 1, 2, 3]
+    precision: "calendar-month membership; boolean AND"
+
+  - name: ticket_severity
+    trigger: "EmergencyTicket creation"
+    algorithm: threshold
+    formula: |
+      if kind == LEAK and reported_indoors: severity = GRADE_1; response_due_minutes = 60
+      elif kind == CARBON_MONOXIDE:        severity = GRADE_1; response_due_minutes = 60
+      elif kind == LEAK and not reported_indoors: severity = GRADE_2; response_due_minutes = 240
+      elif kind == ODOR and reported_indoors: severity = GRADE_2; response_due_minutes = 240
+      else:  # ODOR outdoors
+        severity = GRADE_3; response_due_minutes = 1440
+    input_set: "kind and reported_indoors on the EmergencyTicket."
+    constants:
+      GRADE_1_SLA_MIN: 60
+      GRADE_2_SLA_MIN: 240
+      GRADE_3_SLA_MIN: 1440
+    precision: "exact enum mapping"
+
+  - name: payment_timeliness
+    trigger: "Payment POST"
+    algorithm: threshold
+    formula: |
+      target_bill = Bill referenced by Payment.bill_id
+      on_time = (posted_date <= target_bill.due_date)     # inclusive: paying ON the due date is on-time
+      # On bill reaching PAID: if the last allocating payment was on_time ->
+      #   Account.consecutive_ontime_payments += 1; else reset to 0.
+    input_set: "Payment.posted_date vs target Bill.due_date."
+    constants: {}
+    precision: "<= comparison (on the due date counts as on-time); date comparison"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role header present and is a valid role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Role permitted for this operation (per §1.7); Account role may only act on its own account_id"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "All path/body resource ids exist (validated left-to-right): account, meter, bill, order, ticket, schedule"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: business_constraint
+    check: "Required body fields present and well-typed; enums valid; integers non-negative where constrained"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all write endpoints
+
+  - priority: 5
+    category: business_constraint
+    check: "Unique constraints: RateSchedule.code, PremiseMeter.serial_no, PgaSchedule (class, month), one non-CORRECTED Bill per (account, service_month)"
+    error_id: ERR_DUPLICATE
+    http_status: 409
+    applies_to: "create RateSchedule, PgaSchedule, PremiseMeter, Bill"
+
+  - priority: 5.1
+    category: business_temporal
+    check: "Bill billing-period overlap: a new bill's read-date window [from_read.read_date, to_read.read_date] (CLOSED interval; touching endpoints DO collide) must not overlap any existing non-VOID, non-CORRECTED bill window on the SAME meter. corrects_bill_id rebills are exempt for the bill they correct."
+    error_id: ERR_BILLING_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "create Bill"
+
+  - priority: 5.2
+    category: business_temporal
+    check: "BudgetPlan coverage-window overlap: a new plan's month window [anchor_month, anchor_month + BUDGET_MONTHS) (HALF-OPEN interval; an adjacent plan starting exactly at the prior plan's end month does NOT collide) must not overlap any ACTIVE BudgetPlan window on the same account."
+    error_id: ERR_BUDGET_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "create BudgetPlan"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in a valid state for the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: all transition endpoints
+
+  - priority: 7
+    category: business_safety
+    check: "No OPEN/DISPATCHED/MADE_SAFE EmergencyTicket on the account's meters blocks shutoff-notice and SHUTOFF completion (safety hold)"
+    error_id: ERR_EMERGENCY_HOLD
+    http_status: 409
+    applies_to: "shutoff-notice, SHUTOFF service-order complete"
+
+  - priority: 8
+    category: business_temporal
+    check: "Winter moratorium in effect blocks SHUTOFF service-order completion and shutoff-notice"
+    error_id: ERR_WINTER_MORATORIUM
+    http_status: 409
+    applies_to: "shutoff-notice, SHUTOFF service-order complete"
+
+  - priority: 9
+    category: business_constraint
+    check: "Meter register cannot roll backward: reading_index/completed_index >= prior non-VOID index / install_index"
+    error_id: ERR_INDEX_ROLLBACK
+    http_status: 409
+    applies_to: "POST meter-reads, METER_SET/SHUTOFF complete"
+
+  - priority: 10
+    category: business_referential
+    check: "Bill issuance requires a PgaSchedule for (customer_class, service_month) and a newer closing read than the opening read"
+    error_id: ERR_PGA_NOT_FOUND
+    http_status: 409
+    applies_to: "bill issue"
+
+  - priority: 11
+    category: business_fiscal
+    check: "OCC: expected_account_version must equal current Account.version on bill issue and budget-plan create"
+    error_id: ERR_STALE_ACCOUNT_VERSION
+    http_status: 412
+    applies_to: "bill issue, budget-plan create"
+
+  - priority: 12
+    category: business_fiscal
+    check: "Reconnect requires past_due_cents == 0 (ERR_RECONNECT_BALANCE_DUE) and a HELD/WAIVED reconnect deposit (ERR_RECONNECT_DEPOSIT_REQUIRED)"
+    error_id: ERR_RECONNECT_BALANCE_DUE
+    http_status: 409
+    applies_to: "RECONNECT service-order complete"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Clock (test-driving) ----
+  - method: POST
+    path: "/_clock/set"
+    description: "Set the server logical clock and heating-season flag"
+    roles: [BillingAdmin]
+    code: 200
+    input: ["current_utc?", "heating_season_active?"]
+    output: Clock
+    side_effects: ["Clock.current_utc / heating_season_active updated; recomputes past_due/moratorium on read"]
+
+  - method: GET
+    path: "/_clock"
+    description: "Read the current clock"
+    roles: [BillingAdmin, CustomerService, FieldTech]
+    code: 200
+    input: []
+    output: Clock
+    side_effects: []
+
+  - method: POST
+    path: "/_inject/account-ontime-count"
+    description: "Test-driving: set an account's consecutive_ontime_payments directly (avoids running a full year of billing cycles to reach the deposit-waive/refund thresholds)"
+    roles: [BillingAdmin]
+    code: 200
+    input: [account_id, count]
+    output: Account
+    side_effects: ["Account.consecutive_ontime_payments = count"]
+
+  # ---- RateSchedule (config) ----
+  - method: POST
+    path: "/rate-schedules"
+    description: "Create a rate schedule"
+    roles: [BillingAdmin]
+    code: 201
+    input: [code, customer_class, fixed_customer_charge_cents, distribution_rate_cents_per_therm, "btu_factor?", "minimum_bill_cents?"]
+    output: RateSchedule
+    side_effects: ["active=true"]
+
+  - method: GET
+    path: "/rate-schedules/{id}"
+    description: "Get a rate schedule"
+    roles: [BillingAdmin, CustomerService]
+    code: 200
+    input: []
+    output: RateSchedule
+    side_effects: []
+
+  # ---- PgaSchedule (config) ----
+  - method: POST
+    path: "/pga-schedules"
+    description: "Create a monthly PGA commodity rate"
+    roles: [BillingAdmin]
+    code: 201
+    input: [effective_month, customer_class, commodity_rate_cents_per_therm, "supplier_refund_cents_per_therm?"]
+    output: PgaSchedule
+    side_effects: []
+
+  - method: GET
+    path: "/pga-schedules/{id}"
+    description: "Get a PGA schedule"
+    roles: [BillingAdmin, CustomerService]
+    code: 200
+    input: []
+    output: PgaSchedule
+    side_effects: []
+
+  # ---- Account ----
+  - method: POST
+    path: "/accounts"
+    description: "Open a new account"
+    roles: [CustomerService]
+    code: 201
+    input: [rate_schedule_id, holder_name]
+    output: Account
+    side_effects: ["service_status=ACTIVE; customer_class copied from rate schedule; balance/deposit fields = 0"]
+
+  - method: GET
+    path: "/accounts"
+    description: "List accounts, optionally filtered by rate schedule (FK reverse-reachability for Account.rate_schedule_id)"
+    roles: [BillingAdmin, CustomerService]
+    code: 200
+    input: ["rate_schedule_id?"]
+    output: Account[]
+    side_effects: []
+
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Get an account (computed balances refreshed)"
+    roles: [BillingAdmin, CustomerService, FieldTech, Account]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["balance_cents, past_due_cents, deposit_held_cents, shutoff_eligible recomputed"]
+
+  - method: GET
+    path: "/meter-reads"
+    description: "List meter reads filtered by meter/account/bill (FK reverse-reachability for MeterRead.premise_meter_id, account_id, bill_id)"
+    roles: [BillingAdmin, CustomerService, FieldTech, Account]
+    code: 200
+    input: ["premise_meter_id?", "account_id?", "bill_id?"]
+    output: MeterRead[]
+    side_effects: []
+
+  - method: GET
+    path: "/meter-reads/{id}"
+    description: "Get a single meter read"
+    roles: [BillingAdmin, CustomerService, FieldTech, Account]
+    code: 200
+    input: []
+    output: MeterRead
+    side_effects: []
+
+  - method: POST
+    path: "/accounts/{id}/shutoff-notice"
+    description: "Begin shutoff (ACTIVE -> SHUTOFF_PENDING); auto-creates a SHUTOFF service order"
+    roles: [CustomerService]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["service_status=SHUTOFF_PENDING; SHUTOFF ServiceOrder created; Account.version += 1"]
+
+  - method: POST
+    path: "/accounts/{id}/cancel-shutoff"
+    description: "Cancel a pending shutoff (SHUTOFF_PENDING -> ACTIVE)"
+    roles: [CustomerService]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["service_status=ACTIVE; SHUTOFF orders CANCELLED; Account.version += 1"]
+
+  - method: POST
+    path: "/accounts/{id}/final-bill"
+    description: "Finalize a disconnected account (DISCONNECTED -> FINALED)"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["service_status=FINALED; deposits APPLIED/REFUNDED; budget plan TRUED_UP; Account.version += 1"]
+
+  # ---- PremiseMeter (child of Account) ----
+  - method: POST
+    path: "/accounts/{id}/meters"
+    description: "Register a premise meter (PENDING_SET); a METER_SET service order is created separately via POST /service-orders"
+    roles: [CustomerService, FieldTech]
+    code: 201
+    input: [serial_no, "uom?", "install_index?"]
+    output: PremiseMeter
+    side_effects: ["status=PENDING_SET; account_id set"]
+
+  - method: GET
+    path: "/accounts/{id}/meters"
+    description: "List meters for an account (FK reverse-reachability for PremiseMeter.account_id)"
+    roles: [BillingAdmin, CustomerService, FieldTech, Account]
+    code: 200
+    input: []
+    output: PremiseMeter[]
+    side_effects: []
+
+  - method: GET
+    path: "/meters/{id}"
+    description: "Get a premise meter"
+    roles: [BillingAdmin, CustomerService, FieldTech, Account]
+    code: 200
+    input: []
+    output: PremiseMeter
+    side_effects: []
+
+  - method: POST
+    path: "/meters/{id}/remove"
+    description: "Remove a meter (SET/LOCKED -> REMOVED)"
+    roles: [FieldTech]
+    code: 200
+    input: []
+    output: PremiseMeter
+    side_effects: ["status=REMOVED; version += 1"]
+
+  # ---- MeterRead (child of PremiseMeter) ----
+  - method: POST
+    path: "/meters/{id}/reads"
+    description: "Post a meter read; computes ccf/therms consumed"
+    roles: [FieldTech, BillingAdmin]
+    code: 201
+    input: [reading_index, "read_date?", "read_type?"]
+    output: MeterRead
+    side_effects: ["status=POSTED; ccf_consumed/therms_consumed computed; ERR_INDEX_ROLLBACK on backward index"]
+
+  - method: POST
+    path: "/meters/{id}/reads/{read_id}/void"
+    description: "Void a read (excluded from consumption)"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+    output: MeterRead
+    side_effects: ["status=VOID"]
+
+  # ---- Bill (child of Account) ----
+  - method: POST
+    path: "/accounts/{id}/bills"
+    description: "Create a DRAFT bill for a service month (optionally a rebill via corrects_bill_id); rejects billing-period overlap on the meter (ERR_BILLING_PERIOD_OVERLAP) and duplicate (account, service_month) (ERR_DUPLICATE)"
+    roles: [BillingAdmin]
+    code: 201
+    input: [service_month, to_read_id, "from_read_id?", "corrects_bill_id?"]
+    output: Bill
+    side_effects: ["status=DRAFT; billing-period-overlap and duplicate checks applied"]
+
+  - method: GET
+    path: "/bills"
+    description: "List bills filtered by account/read/correction (FK reverse-reachability for Bill.account_id, from_read_id, to_read_id, corrects_bill_id)"
+    roles: [BillingAdmin, CustomerService, Account]
+    code: 200
+    input: ["account_id?", "from_read_id?", "to_read_id?", "corrects_bill_id?"]
+    output: Bill[]
+    side_effects: []
+
+  - method: GET
+    path: "/bills/{id}"
+    description: "Get a bill with computed charges"
+    roles: [BillingAdmin, CustomerService, Account]
+    code: 200
+    input: []
+    output: Bill
+    side_effects: []
+
+  - method: POST
+    path: "/accounts/{id}/bills/{bill_id}/issue"
+    description: "Issue a DRAFT bill (DRAFT -> ISSUED); computes charges; OCC on Account.version"
+    roles: [BillingAdmin]
+    code: 200
+    input: [expected_account_version]
+    output: Bill
+    side_effects: ["status=ISSUED; charges computed; due_date stamped; Account.version += 1; budget accrual cascade"]
+
+  - method: POST
+    path: "/accounts/{id}/bills/{bill_id}/void"
+    description: "Void a DRAFT bill (DRAFT -> VOID)"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+    output: Bill
+    side_effects: ["status=VOID; reads released"]
+
+  # ---- Payment (child of Account) ----
+  - method: POST
+    path: "/accounts/{id}/payments"
+    description: "Post a payment allocated to a bill"
+    roles: [CustomerService, Account]
+    code: 201
+    input: [bill_id, amount_cents, "posted_date?"]
+    output: Payment
+    side_effects: ["status=POSTED; bill.paid_cents updated; bill -> PAID when covered; on_time/consecutive_ontime cascade"]
+
+  - method: GET
+    path: "/payments"
+    description: "List payments filtered by account/bill (FK reverse-reachability for Payment.account_id, Payment.bill_id)"
+    roles: [BillingAdmin, CustomerService, Account]
+    code: 200
+    input: ["account_id?", "bill_id?"]
+    output: Payment[]
+    side_effects: []
+
+  - method: GET
+    path: "/payments/{id}"
+    description: "Get a single payment"
+    roles: [BillingAdmin, CustomerService, Account]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+
+  # ---- BudgetPlan (child of Account) ----
+  - method: POST
+    path: "/accounts/{id}/budget-plans"
+    description: "Enroll account in levelized/budget billing; OCC on Account.version; rejects coverage-window overlap with an ACTIVE plan (ERR_BUDGET_PERIOD_OVERLAP)"
+    roles: [BillingAdmin, CustomerService]
+    code: 201
+    input: [anchor_month, projected_annual_cents, expected_account_version]
+    output: BudgetPlan
+    side_effects: ["status=ACTIVE; monthly_installment_cents computed; Account.budget_enrolled=true; Account.version += 1; budget-period-overlap check applied"]
+
+  - method: GET
+    path: "/accounts/{id}/budget-plans"
+    description: "List budget plans for an account (FK reverse-reachability for BudgetPlan.account_id)"
+    roles: [BillingAdmin, CustomerService, Account]
+    code: 200
+    input: []
+    output: BudgetPlan[]
+    side_effects: []
+
+  - method: POST
+    path: "/accounts/{id}/budget-plans/{plan_id}/true-up"
+    description: "Run the annual true-up (ACTIVE -> TRUED_UP)"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+    output: BudgetPlan
+    side_effects: ["status=TRUED_UP; trueup_balance computed; residual DRAFT Bill created; budget_enrolled=false"]
+
+  - method: POST
+    path: "/accounts/{id}/budget-plans/{plan_id}/cancel"
+    description: "Cancel a budget plan (ACTIVE -> CANCELLED)"
+    roles: [CustomerService]
+    code: 200
+    input: []
+    output: BudgetPlan
+    side_effects: ["status=CANCELLED; budget_enrolled=false"]
+
+  # ---- Deposit (child of Account) ----
+  - method: POST
+    path: "/accounts/{id}/deposits"
+    description: "Create a deposit requirement (amount computed by deposit_requirement)"
+    roles: [CustomerService]
+    code: 201
+    input: [reason]
+    output: Deposit
+    side_effects: ["amount_cents computed; status=WAIVED when amount==0 else REQUIRED"]
+
+  - method: GET
+    path: "/accounts/{id}/deposits"
+    description: "List deposits for an account (FK reverse-reachability for Deposit.account_id)"
+    roles: [BillingAdmin, CustomerService, Account]
+    code: 200
+    input: []
+    output: Deposit[]
+    side_effects: []
+
+  - method: POST
+    path: "/accounts/{id}/deposits/{deposit_id}/collect"
+    description: "Collect a required deposit (REQUIRED -> HELD)"
+    roles: [CustomerService]
+    code: 200
+    input: []
+    output: Deposit
+    side_effects: ["status=HELD; deposit_held_cents recomputed"]
+
+  - method: POST
+    path: "/accounts/{id}/deposits/{deposit_id}/waive"
+    description: "Waive a required deposit (REQUIRED -> WAIVED)"
+    roles: [CustomerService]
+    code: 200
+    input: []
+    output: Deposit
+    side_effects: ["status=WAIVED"]
+
+  - method: POST
+    path: "/accounts/{id}/deposits/{deposit_id}/refund"
+    description: "Refund a held deposit (HELD -> REFUNDED)"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+    output: Deposit
+    side_effects: ["status=REFUNDED; deposit_held_cents recomputed"]
+
+  # ---- LowIncomeCredit (child of Account) ----
+  - method: POST
+    path: "/accounts/{id}/low-income-credits"
+    description: "Submit a low-income assistance application; tier computed"
+    roles: [CustomerService, Account]
+    code: 201
+    input: [household_size, annual_income_cents]
+    output: LowIncomeCredit
+    side_effects: ["status=SUBMITTED; tier computed"]
+
+  - method: GET
+    path: "/accounts/{id}/low-income-credits"
+    description: "List credits for an account (FK reverse-reachability for LowIncomeCredit.account_id)"
+    roles: [BillingAdmin, CustomerService, Account]
+    code: 200
+    input: []
+    output: LowIncomeCredit[]
+    side_effects: []
+
+  - method: POST
+    path: "/accounts/{id}/low-income-credits/{credit_id}/approve"
+    description: "Approve an application (SUBMITTED -> APPROVED)"
+    roles: [CustomerService]
+    code: 200
+    input: []
+    output: LowIncomeCredit
+    side_effects: ["status=APPROVED; account low_income_status=ENROLLED; low_income_tier set"]
+
+  - method: POST
+    path: "/accounts/{id}/low-income-credits/{credit_id}/deny"
+    description: "Deny an application (SUBMITTED -> DENIED)"
+    roles: [CustomerService]
+    code: 200
+    input: []
+    output: LowIncomeCredit
+    side_effects: ["status=DENIED"]
+
+  - method: POST
+    path: "/accounts/{id}/low-income-credits/{credit_id}/expire"
+    description: "Expire an approved credit (APPROVED -> EXPIRED)"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+    output: LowIncomeCredit
+    side_effects: ["status=EXPIRED; account low_income_status/tier may reset"]
+
+  # ---- ServiceOrder (top-level) ----
+  - method: POST
+    path: "/service-orders"
+    description: "Create a service order (METER_SET / SHUTOFF / RECONNECT)"
+    roles: [CustomerService, FieldTech]
+    code: 201
+    input: [account_id, order_type, "premise_meter_id?", "scheduled_date?"]
+    output: ServiceOrder
+    side_effects: ["status=SCHEDULED"]
+
+  - method: GET
+    path: "/service-orders/{id}"
+    description: "Get a service order"
+    roles: [BillingAdmin, CustomerService, FieldTech, Account]
+    code: 200
+    input: []
+    output: ServiceOrder
+    side_effects: []
+
+  - method: GET
+    path: "/service-orders"
+    description: "List service orders, optionally filtered by account or meter (FK reverse-reachability for ServiceOrder.account_id and premise_meter_id)"
+    roles: [BillingAdmin, CustomerService, FieldTech, Account]
+    code: 200
+    input: ["account_id?", "premise_meter_id?"]
+    output: ServiceOrder[]
+    side_effects: []
+
+  - method: POST
+    path: "/service-orders/{id}/dispatch"
+    description: "Dispatch a scheduled order (SCHEDULED -> DISPATCHED)"
+    roles: [FieldTech]
+    code: 200
+    input: []
+    output: ServiceOrder
+    side_effects: ["status=DISPATCHED"]
+
+  - method: POST
+    path: "/service-orders/{id}/complete"
+    description: "Complete a dispatched order (DISPATCHED -> COMPLETED); drives meter/account transitions"
+    roles: [FieldTech]
+    code: 200
+    input: ["completed_index?"]
+    output: ServiceOrder
+    side_effects: ["status=COMPLETED; METER_SET sets meter; SHUTOFF disconnects; RECONNECT reconnects"]
+
+  - method: POST
+    path: "/service-orders/{id}/cancel"
+    description: "Cancel a service order (SCHEDULED/DISPATCHED -> CANCELLED)"
+    roles: [CustomerService]
+    code: 200
+    input: []
+    output: ServiceOrder
+    side_effects: ["status=CANCELLED"]
+
+  # ---- EmergencyTicket (top-level) ----
+  - method: POST
+    path: "/tickets"
+    description: "Open a leak/odor/CO emergency ticket; severity & SLA computed"
+    roles: [CustomerService, FieldTech, Account]
+    code: 201
+    input: [premise_meter_id, kind, "account_id?", "reported_indoors?"]
+    output: EmergencyTicket
+    side_effects: ["status=OPEN; severity/response_due_minutes computed"]
+
+  - method: GET
+    path: "/tickets/{id}"
+    description: "Get an emergency ticket"
+    roles: [BillingAdmin, CustomerService, FieldTech, Account]
+    code: 200
+    input: []
+    output: EmergencyTicket
+    side_effects: []
+
+  - method: GET
+    path: "/tickets"
+    description: "List emergency tickets, optionally filtered (FK reverse-reachability for EmergencyTicket.account_id and premise_meter_id)"
+    roles: [BillingAdmin, CustomerService, FieldTech, Account]
+    code: 200
+    input: ["account_id?", "premise_meter_id?"]
+    output: EmergencyTicket[]
+    side_effects: []
+
+  - method: POST
+    path: "/tickets/{id}/dispatch"
+    description: "Dispatch a ticket (OPEN -> DISPATCHED)"
+    roles: [FieldTech]
+    code: 200
+    input: []
+    output: EmergencyTicket
+    side_effects: ["status=DISPATCHED"]
+
+  - method: POST
+    path: "/tickets/{id}/make-safe"
+    description: "Mark hazard made safe (DISPATCHED -> MADE_SAFE); GRADE_1 locks the meter"
+    roles: [FieldTech]
+    code: 200
+    input: []
+    output: EmergencyTicket
+    side_effects: ["status=MADE_SAFE; GRADE_1 -> gas_locked & meter LOCKED"]
+
+  - method: POST
+    path: "/tickets/{id}/resolve"
+    description: "Resolve a ticket (MADE_SAFE -> RESOLVED)"
+    roles: [FieldTech]
+    code: 200
+    input: []
+    output: EmergencyTicket
+    side_effects: ["status=RESOLVED"]
+
+  - method: POST
+    path: "/tickets/{id}/cancel"
+    description: "Cancel a ticket / false alarm (OPEN/DISPATCHED -> CANCELLED)"
+    roles: [CustomerService]
+    code: 200
+    input: []
+    output: EmergencyTicket
+    side_effects: ["status=CANCELLED"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "X-User-Role header missing or not a valid role" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Role not permitted for this operation, or Account acting on another account's resources" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Referenced account/meter/bill/order/ticket/schedule id does not exist" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, bad enum, or constraint-violating value (negative cents, household_size < 1, etc.)" }
+  - { id: ERR_DUPLICATE, http: 409, condition: "Unique constraint violated: RateSchedule.code, PremiseMeter.serial_no, PgaSchedule (class, month), or duplicate non-CORRECTED bill for (account, service_month)" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a valid state for the requested transition" }
+  - { id: ERR_NOT_SHUTOFF_ELIGIBLE, http: 409, condition: "shutoff-notice attempted while past_due_cents < SHUTOFF_THRESHOLD_CENTS or moratorium active (shutoff_eligible false)" }
+  - { id: ERR_EMERGENCY_HOLD, http: 409, condition: "An OPEN/DISPATCHED/MADE_SAFE EmergencyTicket on the account's meters blocks shutoff-notice or SHUTOFF completion" }
+  - { id: ERR_WINTER_MORATORIUM, http: 409, condition: "SHUTOFF completion or shutoff-notice blocked by the winter moratorium (protected month AND heating_season_active)" }
+  - { id: ERR_INDEX_ROLLBACK, http: 409, condition: "reading_index/completed_index is below the prior non-VOID index or install_index (register cannot run backward)" }
+  - { id: ERR_PGA_NOT_FOUND, http: 409, condition: "No PgaSchedule for the bill's (customer_class, service_month) at issue time" }
+  - { id: ERR_READ_REQUIRED, http: 409, condition: "Bill issue without a valid closing read newer than the opening read" }
+  - { id: ERR_MISSING_COMPLETION_INDEX, http: 400, condition: "METER_SET/SHUTOFF service-order completion without completed_index" }
+  - { id: ERR_STALE_ACCOUNT_VERSION, http: 412, condition: "expected_account_version does not match current Account.version on bill issue or budget-plan create (OCC)" }
+  - { id: ERR_ORDER_NOT_DUE, http: 409, condition: "Dispatch attempted before scheduled_date relative to the clock" }
+  - { id: ERR_RECONNECT_BALANCE_DUE, http: 409, condition: "RECONNECT completion while past_due_cents != 0" }
+  - { id: ERR_RECONNECT_DEPOSIT_REQUIRED, http: 409, condition: "RECONNECT completion without a HELD or WAIVED reconnect deposit" }
+  - { id: ERR_DEPOSIT_WAIVED_NOT_PAYABLE, http: 409, condition: "collect attempted on a deposit whose amount is 0 (waived/exempt)" }
+  - { id: ERR_DEPOSIT_REFUND_NOT_DUE, http: 409, condition: "refund attempted before consecutive_ontime_payments >= DEPOSIT_REFUND_ONTIME_COUNT" }
+  - { id: ERR_NOT_ELIGIBLE, http: 409, condition: "low-income credit approve attempted when computed tier == NONE" }
+  - { id: ERR_NO_BILLS_TO_TRUE_UP, http: 409, condition: "budget true-up attempted with no bills issued under the plan" }
+  - { id: ERR_VALIDATION_PENDING_BILLS, http: 409, condition: "meter remove attempted while a DRAFT bill references an unconsumed read on the meter" }
+  - { id: ERR_BILLING_PERIOD_OVERLAP, http: 409, condition: "new bill's [from_read, to_read] read-date window overlaps an existing non-VOID/non-CORRECTED bill window on the same meter (closed interval)" }
+  - { id: ERR_BUDGET_PERIOD_OVERLAP, http: 409, condition: "new budget plan's [anchor_month, anchor_month+12) window overlaps an ACTIVE budget plan window on the same account (half-open interval)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: BillingAdmin
+    description: "Owns rate & PGA configuration, bill issuance/void, budget enrollment & true-up, deposit refunds, credit expiry, and account finalization."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /rate-schedules — create rate schedule"
+      - "POST /pga-schedules — create PGA schedule"
+      - "POST /accounts/{id}/bills — create draft bill"
+      - "POST /accounts/{id}/bills/{bill_id}/issue — issue bill (OCC)"
+      - "POST /accounts/{id}/bills/{bill_id}/void — void draft bill"
+      - "POST /accounts/{id}/budget-plans/{plan_id}/true-up — annual true-up"
+      - "POST /accounts/{id}/final-bill — finalize account"
+      - "POST /accounts/{id}/deposits/{deposit_id}/refund — refund deposit"
+      - "POST /accounts/{id}/low-income-credits/{credit_id}/expire — expire credit"
+      - "POST /meters/{id}/reads/{read_id}/void — void a read"
+      - "POST /_clock/set — set logical clock"
+      - "POST /_inject/account-ontime-count — test-driving on-time-count injection"
+    shared_operations:
+      - "POST /accounts/{id}/budget-plans — enroll budget (with CustomerService)"
+      - "POST /meters/{id}/reads — post reads (with FieldTech)"
+      - "GET endpoints — read access across resources"
+
+  - name: CustomerService
+    description: "Account lifecycle, shutoff/cancel-shutoff, deposits, low-income intake/approval, payments, ticket/order cancellation."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /accounts — open account"
+      - "POST /accounts/{id}/shutoff-notice — begin shutoff"
+      - "POST /accounts/{id}/cancel-shutoff — cancel shutoff"
+      - "POST /accounts/{id}/deposits — create deposit requirement"
+      - "POST /accounts/{id}/deposits/{deposit_id}/collect — collect deposit"
+      - "POST /accounts/{id}/deposits/{deposit_id}/waive — waive deposit"
+      - "POST /accounts/{id}/low-income-credits/{credit_id}/approve — approve credit"
+      - "POST /accounts/{id}/low-income-credits/{credit_id}/deny — deny credit"
+      - "POST /accounts/{id}/budget-plans/{plan_id}/cancel — cancel budget plan"
+      - "POST /service-orders/{id}/cancel — cancel service order"
+      - "POST /tickets/{id}/cancel — cancel ticket"
+    shared_operations:
+      - "POST /accounts/{id}/budget-plans — enroll budget (with BillingAdmin)"
+      - "POST /accounts/{id}/meters — register meter (with FieldTech)"
+      - "POST /accounts/{id}/payments — post payment (with Account)"
+      - "POST /accounts/{id}/low-income-credits — submit application (with Account)"
+      - "POST /service-orders — create order (with FieldTech)"
+      - "POST /tickets — open ticket (with FieldTech, Account)"
+      - "GET endpoints — read access across resources"
+
+  - name: FieldTech
+    description: "Field operations: meter-set/remove, reads, service-order dispatch/complete, emergency ticket dispatch/make-safe/resolve."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /meters/{id}/remove — remove a meter"
+      - "POST /service-orders/{id}/dispatch — dispatch order"
+      - "POST /service-orders/{id}/complete — complete order"
+      - "POST /tickets/{id}/dispatch — dispatch ticket"
+      - "POST /tickets/{id}/make-safe — make hazard safe"
+      - "POST /tickets/{id}/resolve — resolve ticket"
+    shared_operations:
+      - "POST /accounts/{id}/meters — register meter (with CustomerService)"
+      - "POST /meters/{id}/reads — post reads (with BillingAdmin)"
+      - "POST /service-orders — create order (with CustomerService)"
+      - "POST /tickets — open ticket (with CustomerService, Account)"
+      - "GET endpoints — read access across resources"
+
+  - name: Account
+    description: "Customer self-service: read own account/meters/bills/payments, submit low-income application, post own payment, open emergency ticket. X-User-ID equals the acted-on Account.id."
+    identity: "entity_backed:Account"
+    exclusive_operations: []
+    shared_operations:
+      - "GET /accounts/{id} and own child collections — read own data only"
+      - "POST /accounts/{id}/payments — post own payment (with CustomerService)"
+      - "POST /accounts/{id}/low-income-credits — submit own application (with CustomerService)"
+      - "POST /tickets — open ticket (with CustomerService, FieldTech)"
