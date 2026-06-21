@@ -1,0 +1,49 @@
+"""Error IDs and HTTP status mapping (PRD §5 Error Code Catalogue).
+
+After defining the mapping we register it with the framework so validate_error()
+can cross-check HTTP status codes automatically.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN_ROLE = "ERR_FORBIDDEN_ROLE"
+    ERR_NOT_RESOURCE_OWNER = "ERR_NOT_RESOURCE_OWNER"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_NO_ACTIVE_CARD = "ERR_NO_ACTIVE_CARD"
+    ERR_NOT_ELIGIBLE = "ERR_NOT_ELIGIBLE"
+    ERR_MEMBER_SUSPENDED = "ERR_MEMBER_SUSPENDED"
+    ERR_DAY_PASS_INVALID = "ERR_DAY_PASS_INVALID"
+    ERR_LOUNGE_OVERFLOW = "ERR_LOUNGE_OVERFLOW"
+    ERR_OVER_CAPACITY = "ERR_OVER_CAPACITY"
+    ERR_SHOWER_UNAVAILABLE = "ERR_SHOWER_UNAVAILABLE"
+    ERR_SHOWER_CONFLICT = "ERR_SHOWER_CONFLICT"
+    ERR_SETTLEMENT_NOT_PAYABLE = "ERR_SETTLEMENT_NOT_PAYABLE"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN_ROLE: 403,
+    ApiErrorId.ERR_NOT_RESOURCE_OWNER: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_NO_ACTIVE_CARD: 422,
+    ApiErrorId.ERR_NOT_ELIGIBLE: 422,
+    ApiErrorId.ERR_MEMBER_SUSPENDED: 409,
+    ApiErrorId.ERR_DAY_PASS_INVALID: 422,
+    ApiErrorId.ERR_LOUNGE_OVERFLOW: 409,
+    ApiErrorId.ERR_OVER_CAPACITY: 409,
+    ApiErrorId.ERR_SHOWER_UNAVAILABLE: 409,
+    ApiErrorId.ERR_SHOWER_CONFLICT: 409,
+    ApiErrorId.ERR_SETTLEMENT_NOT_PAYABLE: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_INVALID_REQUEST: 400,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(HTTP_STATUS_CODES)

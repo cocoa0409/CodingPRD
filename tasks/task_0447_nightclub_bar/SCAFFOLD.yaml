@@ -1,0 +1,1072 @@
+# =============================================================================
+# PRD Benchmark Scaffold — Nightclub & Bar Service
+# Sections 1.0 through 1.7 only; the difficulty-design and corner-design indexes live in their own sibling files.
+# =============================================================================
+
+scenario: "447. Nightclub & Bar Service: cover charge & guest list, table/bottle-service reservation & minimum, tab/bar POS & pre-authorization, occupancy (fire-code) count, age/ID verification & refusal log, comp & promoter tracking, security incident, last-call & responsible-service"
+
+domain_name: nightclub-bar
+api_prefix: /nightclub
+
+# -----------------------------------------------------------------------------
+# Complexity Profile
+# -----------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: "Quota / allocation"            # fire-code occupancy is a finite pool competed for by admissions
+  secondary_archetype: "Pricing engine"              # tab settlement, bottle-service minimum shortfall, tiered cover, comps
+  complexity_layers:
+    - "Optimistic concurrency"                       # OCC on Venue.version for admission/reservation creates
+    - "Cascading side effects"                       # venue close -> reservations -> tabs -> pre-auth release; entry exit -> occupancy -> posture
+    - "Dual-variant calculation"                     # provisional pre-auth vs final settlement; estimated vs actual occupancy gate
+    - "Rate / threshold triggers"                    # fire-code capacity boundary, last-call window, blackout BAC strike threshold
+
+  entity_topology: flat
+  # Every entity is a top-level flat collection under api_prefix /nightclub (e.g. /nightclub/venues,
+  # /nightclub/tabs, /nightclub/entries). Relationships are expressed via foreign-key fields in request
+  # bodies (venue_id, reservation_id, promoter_id, id_check_id, ...) and resolved through filtered-list
+  # GETs (e.g. GET /nightclub/tabs?reservation_id=...), not URL nesting. Venue is the aggregate root that
+  # the derived posture gates, but it is addressed as a peer collection, not a URL ancestor.
+
+  state_machine_shape: posture_driven
+  # Venue.posture (OPEN / AT_CAPACITY / LAST_CALL / CLOSED) is a derived aggregate that gates child operations;
+  # Tab is branching-with-revert, Reservation is branching fork (SEATED vs NO_SHOW), Entry is parallel-ish (inside/exited).
+
+  relationship_patterns:
+    - one_to_many        # Venue -> {Reservation, Tab, Entry, IdCheck, SecurityIncident, GuestListEntry}
+    - cross_aggregate    # Entry -> Reservation / GuestListEntry; Tab -> Reservation; GuestListEntry -> Promoter
+    - polymorphic        # SecurityIncident.subject_ref can reference an Entry, Tab, or Patron-by-id
+
+  role_model: peer_roles
+  # DoorHost owns guest list + ID checks + entries; Bartender owns tabs; FloorManager owns reservations + comps + posture;
+  # SecurityOfficer owns incidents + refusals + ejections; PlatformAdmin is the operator superset.
+
+  consistency_model: immediate
+
+# -----------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# -----------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Venue
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Venue display name" }
+      - { name: fire_code_capacity, type: integer, source: input, description: "Maximum legally-occupied head count per fire marshal certificate", constraints: "integer >= 1" }
+      - { name: last_call_offset_minutes, type: integer, source: input, default: 30, description: "Minutes before closing_time_utc at which LAST_CALL begins", constraints: "integer >= 0" }
+      - { name: closing_time_utc, type: datetime, source: input, description: "Scheduled close timestamp (ISO 8601 UTC); drives LAST_CALL and CLOSED auto-transitions" }
+      - { name: cover_base_cents, type: integer, source: input, default: 2000, description: "Base cover charge in cents before guest-list / promoter discount", constraints: "integer >= 0" }
+      - { name: cover_surge_pct, type: number, source: input, default: 0.5, description: "Fractional surcharge applied to cover when posture is AT_CAPACITY-adjacent surge band (see calc cover_charge_amount)", constraints: "0 <= cover_surge_pct <= 2" }
+      - { name: max_alcohol_strikes, type: integer, source: input, default: 4, description: "MAX_ALCOHOL_STRIKES — a Tab is refused further ALCOHOL items once bac_strikes reaches this value (responsible-service over-service cap)", constraints: "integer >= 1" }
+      - { name: occupancy_count, type: integer, source: computed, description: "Count of Entry rows for this venue whose status == INSIDE; recomputed on every admit/exit" }
+      - { name: tabs_open_count, type: integer, source: computed, description: "Count of Tab rows for this venue whose status IN {OPEN, RUNNING}" }
+      - { name: posture, type: enum, source: computed, description: "OPEN | AT_CAPACITY | LAST_CALL | CLOSED — derived aggregate gating child operations", constraints: "enum {OPEN, AT_CAPACITY, LAST_CALL, CLOSED}" }
+
+  - name: Promoter
+    parent: Venue
+    common_fields: true
+    fields:
+      - { name: venue_id, type: string, source: input, description: "FK -> Venue.id; promoter is scoped to one venue" }
+      - { name: name, type: string, source: input, description: "Promoter / host display name" }
+      - { name: comp_budget_cents, type: integer, source: input, description: "Total comp value (cents) this promoter may grant across guest-list entries", constraints: "integer >= 0" }
+      - { name: guest_discount_pct, type: number, source: input, default: 0.5, description: "Fractional cover discount applied to that promoter's guest-list entries", constraints: "0 <= guest_discount_pct <= 1" }
+      - { name: comp_committed_cents, type: integer, source: computed, description: "Sum of comp_value_cents over GuestListEntry rows for this promoter whose status IN {CONFIRMED, REDEEMED}" }
+      - { name: heads_credited, type: integer, source: computed, description: "Count of Entry rows admitted via a GuestListEntry of this promoter whose status == INSIDE or EXITED" }
+
+  - name: GuestListEntry
+    parent: Venue
+    common_fields: true
+    fields:
+      - { name: venue_id, type: string, source: input, description: "FK -> Venue.id" }
+      - { name: promoter_id, type: string, source: input, description: "FK -> Promoter.id; null if a house (non-promoter) guest-list add", default: null }
+      - { name: guest_name, type: string, source: input, description: "Name on the guest list" }
+      - { name: party_size, type: integer, source: input, description: "Heads reserved on the list under this name", constraints: "integer >= 1" }
+      - { name: comp_value_cents, type: integer, source: input, default: 0, description: "Cover value comped by the promoter for this entry (cents)", constraints: "integer >= 0" }
+      - { name: status, type: enum, source: system, description: "CONFIRMED (on add) | REDEEMED (on door admit) | CANCELLED (on cancel)", constraints: "enum {CONFIRMED, REDEEMED, CANCELLED}" }
+      - { name: redeemed_entry_id, type: string, source: system, description: "FK -> Entry.id; set when a door Entry redeems this list entry", default: null }
+
+  - name: Reservation
+    parent: Venue
+    common_fields: true
+    fields:
+      - { name: venue_id, type: string, source: input, description: "FK -> Venue.id" }
+      - { name: table_label, type: string, source: input, description: "Physical table identifier (e.g., 'VIP-3')" }
+      - { name: party_size, type: integer, source: input, description: "Booked head count for the table", constraints: "integer >= 1" }
+      - { name: window_start_utc, type: datetime, source: input, description: "Reservation hold start (ISO 8601 UTC)" }
+      - { name: window_end_utc, type: datetime, source: input, description: "Reservation hold end (ISO 8601 UTC); half-open [start, end)" }
+      - { name: spend_minimum_cents, type: integer, source: input, description: "Contracted minimum spend for the table over the window (cents)", constraints: "integer >= 0" }
+      - { name: deposit_cents, type: integer, source: input, default: 0, description: "Non-refundable deposit collected at booking (cents)", constraints: "integer >= 0" }
+      - { name: status, type: enum, source: system, description: "BOOKED | SEATED | SETTLED | NO_SHOW | CANCELLED", constraints: "enum {BOOKED, SEATED, SETTLED, NO_SHOW, CANCELLED}" }
+      - { name: minimum_shortfall_cents, type: integer, source: computed, description: "max(0, spend_minimum_cents - linked Tab.final_total_cents); computed at SETTLED" }
+
+  - name: Tab
+    parent: Venue
+    common_fields: true
+    fields:
+      - { name: venue_id, type: string, source: input, description: "FK -> Venue.id" }
+      - { name: reservation_id, type: string, source: input, description: "FK -> Reservation.id; null for a walk-up bar tab", default: null }
+      - { name: patron_name, type: string, source: input, description: "Name the tab is opened under" }
+      - { name: preauth_cents, type: integer, source: input, description: "Card pre-authorization hold amount (cents) placed when tab opens", constraints: "integer >= 0" }
+      - { name: gratuity_pct, type: number, source: input, default: 0.2, description: "Auto-gratuity fraction applied at settlement", constraints: "0 <= gratuity_pct <= 1" }
+      - { name: running_subtotal_cents, type: integer, source: computed, description: "Sum of (qty * unit_price_cents) over TabItem rows on this tab whose voided == false" }
+      - { name: final_total_cents, type: integer, source: computed, description: "Settled grand total incl. gratuity and bottle-service minimum top-up; 0 until SETTLED" }
+      - { name: bac_strikes, type: integer, source: computed, description: "Count of TabItem rows with category == ALCOHOL added after the patron's last logged responsible-service strike reset; gates over-service refusal", default: 0 }
+      - { name: status, type: enum, source: system, description: "OPEN | RUNNING | SETTLED | VOIDED", constraints: "enum {OPEN, RUNNING, SETTLED, VOIDED}" }
+
+  - name: TabItem
+    parent: Tab
+    common_fields: false
+    fields:
+      - { name: tab_id, type: string, source: input, description: "FK -> Tab.id" }
+      - { name: name, type: string, source: input, description: "Item name (e.g., 'House Vodka', 'Bottle Service - Tier 1')" }
+      - { name: category, type: enum, source: input, description: "ALCOHOL | FOOD | NA_BEVERAGE | SERVICE", constraints: "enum {ALCOHOL, FOOD, NA_BEVERAGE, SERVICE}" }
+      - { name: qty, type: integer, source: input, description: "Quantity ordered", constraints: "integer >= 1" }
+      - { name: unit_price_cents, type: integer, source: input, description: "Per-unit price (cents)", constraints: "integer >= 0" }
+      - { name: voided, type: boolean, source: system, default: false, description: "True if this line was voided (comped/error); excluded from running_subtotal_cents" }
+
+  - name: Entry
+    parent: Venue
+    common_fields: true
+    fields:
+      - { name: venue_id, type: string, source: input, description: "FK -> Venue.id" }
+      - { name: guest_list_entry_id, type: string, source: input, description: "FK -> GuestListEntry.id; set when admitting off the guest list", default: null }
+      - { name: id_check_id, type: string, source: input, description: "FK -> IdCheck.id; the passing ID verification authorizing this admission" }
+      - { name: cover_paid_cents, type: integer, source: computed, description: "Cover actually charged at admission (after comp/discount), per calc cover_charge_amount" }
+      - { name: admitted_at_utc, type: datetime, source: system, description: "Logical-clock timestamp when status became INSIDE" }
+      - { name: exited_at_utc, type: datetime, source: system, description: "Logical-clock timestamp when status became EXITED", default: null }
+      - { name: status, type: enum, source: system, description: "INSIDE | EXITED | EJECTED", constraints: "enum {INSIDE, EXITED, EJECTED}" }
+
+  - name: IdCheck
+    parent: Venue
+    common_fields: true
+    fields:
+      - { name: venue_id, type: string, source: input, description: "FK -> Venue.id" }
+      - { name: patron_name, type: string, source: input, description: "Name as printed on the ID" }
+      - { name: date_of_birth, type: string, source: input, description: "ID date of birth, 'YYYY-MM-DD'" }
+      - { name: id_expiry, type: string, source: input, description: "ID document expiry date, 'YYYY-MM-DD'" }
+      - { name: computed_age_years, type: integer, source: computed, description: "Whole years between date_of_birth and the logical clock at check time (per calc patron_age_years)" }
+      - { name: outcome, type: enum, source: computed, description: "PASS | REFUSED_UNDERAGE | REFUSED_EXPIRED_ID — set by calc id_check_outcome", constraints: "enum {PASS, REFUSED_UNDERAGE, REFUSED_EXPIRED_ID}" }
+      - { name: refusal_reason, type: string, source: computed, description: "Human-readable refusal note; null when outcome == PASS", default: null }
+
+  - name: SecurityIncident
+    parent: Venue
+    common_fields: true
+    fields:
+      - { name: venue_id, type: string, source: input, description: "FK -> Venue.id" }
+      - { name: subject_entry_id, type: string, source: input, description: "FK -> Entry.id; the patron involved, null for venue-wide incidents", default: null }
+      - { name: severity, type: enum, source: input, description: "MINOR | SERIOUS | CRITICAL", constraints: "enum {MINOR, SERIOUS, CRITICAL}" }
+      - { name: action, type: enum, source: input, description: "WARNING | EJECTION | REFUSAL_SERVICE", constraints: "enum {WARNING, EJECTION, REFUSAL_SERVICE}" }
+      - { name: narrative, type: string, source: input, description: "Free-text description of the incident" }
+      - { name: logged_at_utc, type: datetime, source: system, description: "Logical-clock timestamp the incident was filed" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Venue
+    field: posture
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    note: "posture is a derived aggregate recomputed after every child mutation and every clock advance; CLOSED is also reachable by explicit operator close. CLOSED is terminal."
+    transitions:
+      - from: OPEN
+        to: AT_CAPACITY
+        trigger: "system: recompute after POST /nightclub/entries when occupancy_count reaches fire_code_capacity"
+        actor: system
+        preconditions:
+          - "occupancy_count == fire_code_capacity (post-admit)"
+          - "current clock < (closing_time_utc - last_call_offset_minutes)"
+        side_effects:
+          - "further admit attempts are rejected with ERR_AT_CAPACITY until an Entry exits"
+      - from: AT_CAPACITY
+        to: OPEN
+        trigger: "system: recompute after POST /nightclub/entries/{id}/exit drops occupancy_count below fire_code_capacity"
+        actor: system
+        preconditions:
+          - "occupancy_count < fire_code_capacity (post-exit)"
+          - "current clock < (closing_time_utc - last_call_offset_minutes)"
+        side_effects:
+          - "admits permitted again"
+      - from: OPEN
+        to: LAST_CALL
+        trigger: "system: recompute after POST /_clock/set_current_utc reaches (closing_time_utc - last_call_offset_minutes)"
+        actor: system
+        preconditions:
+          - "current clock >= (closing_time_utc - last_call_offset_minutes)"
+          - "current clock < closing_time_utc"
+        side_effects:
+          - "new TabItem with category == ALCOHOL is rejected venue-wide (responsible-service last call)"
+          - "new Tab open is rejected; existing tabs may still be settled"
+      - from: AT_CAPACITY
+        to: LAST_CALL
+        trigger: "system: recompute after POST /_clock/set_current_utc reaches last-call window while at capacity"
+        actor: system
+        preconditions:
+          - "current clock >= (closing_time_utc - last_call_offset_minutes)"
+          - "current clock < closing_time_utc"
+        side_effects:
+          - "alcohol service stops; admits remain blocked while occupancy_count == fire_code_capacity"
+      - from: [OPEN, AT_CAPACITY, LAST_CALL]
+        to: CLOSED
+        trigger: "POST /nightclub/venues/{id}/close OR system recompute when current clock >= closing_time_utc"
+        actor: FloorManager
+        preconditions: []
+        side_effects:
+          - "every Reservation in {BOOKED} for this venue -> NO_SHOW (deposit forfeited; cascade hop 1)"
+          - "every Reservation in {SEATED} for this venue -> SETTLED (minimum_shortfall computed; cascade hop 1)"
+          - "every Tab in {OPEN, RUNNING} for this venue -> SETTLED (final_total computed, pre-auth captured/released; cascade hop 2 from the SEATED->SETTLED reservation that owns the tab)"
+          - "every Entry in {INSIDE} -> EXITED (exited_at_utc stamped; occupancy_count -> 0; cascade hop)"
+          - "increments Venue.version by 1"
+
+  - entity: Reservation
+    field: status
+    initial_state: BOOKED
+    terminal_states: [SETTLED, NO_SHOW, CANCELLED]
+    note: "branching fork: a BOOKED reservation forks to SEATED (party arrives) or NO_SHOW (window lapses / venue closes); only SEATED settles."
+    transitions:
+      - from: BOOKED
+        to: SEATED
+        trigger: "POST /nightclub/reservations/{id}/seat"
+        actor: FloorManager
+        preconditions:
+          - "Venue.posture IN {OPEN, AT_CAPACITY} (not LAST_CALL, not CLOSED)"
+          - "current clock IN [window_start_utc, window_end_utc)"
+        side_effects:
+          - "no occupancy change yet (heads enter via Entry rows linked to this table)"
+      - from: BOOKED
+        to: NO_SHOW
+        trigger: "POST /nightclub/reservations/{id}/no-show OR system at venue close"
+        actor: FloorManager
+        preconditions:
+          - "current clock >= window_end_utc OR triggered by venue CLOSED cascade"
+        side_effects:
+          - "deposit_cents forfeited (retained as venue revenue, not refunded)"
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /nightclub/reservations/{id}/cancel"
+        actor: FloorManager
+        preconditions:
+          - "current clock < window_start_utc"
+        side_effects:
+          - "deposit_cents refunded in full (cancellation before window open)"
+      - from: SEATED
+        to: SETTLED
+        trigger: "POST /nightclub/reservations/{id}/settle OR system at venue close"
+        actor: FloorManager
+        preconditions:
+          - "the linked Tab (Tab.reservation_id == this Reservation.id), if any, is in {SETTLED} or is settled as part of this cascade"
+        side_effects:
+          - "compute minimum_shortfall_cents = max(0, spend_minimum_cents - linked_tab.final_total_cents) (0 if no linked tab); cascade hop 2 -> charges shortfall as a SERVICE TabItem on the linked tab before the tab settles"
+
+  - entity: Tab
+    field: status
+    initial_state: OPEN
+    terminal_states: [SETTLED, VOIDED]
+    note: "branching with revert: OPEN<->RUNNING (items added/all voided back to empty), forward to SETTLED or VOIDED."
+    transitions:
+      - from: OPEN
+        to: RUNNING
+        trigger: "POST /nightclub/tabs/{id}/items (first non-voided item)"
+        actor: Bartender
+        preconditions:
+          - "Venue.posture != CLOSED"
+          - "if item.category == ALCOHOL then Venue.posture != LAST_CALL AND Tab.bac_strikes < MAX_ALCOHOL_STRIKES"
+        side_effects:
+          - "recompute running_subtotal_cents; if item.category == ALCOHOL increment bac_strikes"
+      - from: RUNNING
+        to: RUNNING
+        trigger: "POST /nightclub/tabs/{id}/items (subsequent item) OR POST /nightclub/tabs/{tid}/items/{itemid}/void"
+        actor: Bartender
+        preconditions:
+          - "Venue.posture != CLOSED"
+          - "if item.category == ALCOHOL then Venue.posture != LAST_CALL AND Tab.bac_strikes < MAX_ALCOHOL_STRIKES"
+        side_effects:
+          - "recompute running_subtotal_cents; alcohol add increments bac_strikes; void decrements bac_strikes if the voided line was ALCOHOL"
+      - from: RUNNING
+        to: OPEN
+        trigger: "POST /nightclub/tabs/{tid}/items/{itemid}/void (last remaining non-voided item voided)"
+        actor: Bartender
+        preconditions:
+          - "after this void, zero non-voided items remain"
+        side_effects:
+          - "running_subtotal_cents -> 0; bac_strikes -> 0"
+      - from: [OPEN, RUNNING]
+        to: SETTLED
+        trigger: "POST /nightclub/tabs/{id}/settle OR system at venue close OR cascade from Reservation settle"
+        actor: Bartender
+        preconditions:
+          - "preauth_cents >= projected final_total_cents OR settlement is forced by venue CLOSED cascade"
+        side_effects:
+          - "compute final_total_cents per calc tab_final_total; pre-auth captured up to final_total_cents, remainder released; cascade originates the Reservation minimum_shortfall top-up when reservation_id is set"
+      - from: [OPEN, RUNNING]
+        to: VOIDED
+        trigger: "POST /nightclub/tabs/{id}/void"
+        actor: FloorManager
+        preconditions:
+          - "running_subtotal_cents == 0 (cannot void a tab carrying charges; settle instead)"
+        side_effects:
+          - "full pre-authorization released; final_total_cents stays 0"
+
+  - entity: Entry
+    field: status
+    initial_state: INSIDE
+    terminal_states: [EXITED, EJECTED]
+    note: "admission increments occupancy; exit/eject decrements it; EJECTED is reached only via a security incident."
+    transitions:
+      - from: INSIDE
+        to: EXITED
+        trigger: "POST /nightclub/entries/{id}/exit OR system at venue close"
+        actor: DoorHost
+        preconditions:
+          - "Entry.status == INSIDE"
+        side_effects:
+          - "stamp exited_at_utc; decrement Venue.occupancy_count; recompute Venue.posture (AT_CAPACITY -> OPEN if it drops below fire_code_capacity)"
+      - from: INSIDE
+        to: EJECTED
+        trigger: "system: cascade from POST /nightclub/incidents with action == EJECTION and subject_entry_id == this Entry.id"
+        actor: system
+        preconditions:
+          - "Entry.status == INSIDE"
+          - "the triggering SecurityIncident.action == EJECTION"
+        side_effects:
+          - "stamp exited_at_utc; decrement Venue.occupancy_count; recompute Venue.posture; the patron's linked guest-list head no longer counts toward heads_credited"
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: admit-entry-stale-venue
+    parent_entity: Venue
+    write_endpoint: "POST /nightclub/entries"
+    occ_field: "expected_venue_version"
+    description: |
+      Admitting an Entry against a Venue whose version has advanced since the
+      client last observed it is rejected with a stale-version error. The last
+      free seat under fire_code_capacity is a finite resource: when another
+      admit (or an exit, or a posture recompute) has already mutated the venue,
+      the current client's view of occupancy_count / posture is stale and the
+      admit must re-read before competing for the seat.
+    error_id: ERR_STALE_VENUE_VERSION
+    http_status: 412
+
+  - rule_id: reserve-table-stale-venue
+    parent_entity: Venue
+    write_endpoint: "POST /nightclub/reservations"
+    occ_field: "expected_venue_version"
+    description: |
+      Booking a Reservation for a table_label/time-window against a Venue whose
+      version has advanced since the client last read it is rejected with a
+      stale-version error. A table for a given window is a finite resource that
+      another booking may legitimately have just claimed; the stale writer must
+      re-read the venue (and its reservation set) before re-attempting.
+    error_id: ERR_STALE_VENUE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: cover_charge_amount
+    trigger: "POST /nightclub/entries (admission); writes Entry.cover_paid_cents"
+    algorithm: threshold
+    formula: |
+      # Pricing engine on the Entry / Venue domain.
+      base = Venue.cover_base_cents
+      # 1) Surge band: posture-driven surcharge. Evaluate posture-as-observed-at-admit.
+      if Venue.occupancy_count >= ceil(0.9 * Venue.fire_code_capacity):
+          surged = round_half_up(base * (1 + Venue.cover_surge_pct))   # nearest cent
+      else:
+          surged = base
+      # 2) Guest-list / promoter discount, applied to the surged figure.
+      if guest_list_entry_id is not null:
+          gle = GuestListEntry[guest_list_entry_id]
+          if gle.promoter_id is not null:
+              disc = Promoter[gle.promoter_id].guest_discount_pct
+          else:
+              disc = 0            # house guest-list = surge waived but no pct discount; see variant
+          after_disc = round_half_up(surged * (1 - disc))
+          # 3) Comp absorbs remaining cover up to comp_value_cents.
+          cover_paid = max(0, after_disc - gle.comp_value_cents)
+      else:
+          cover_paid = surged     # walk-up full cover
+      return cover_paid
+    input_set: "single Entry being admitted; reads its Venue, optional GuestListEntry, that entry's Promoter"
+    constants:
+      SURGE_OCCUPANCY_FRACTION: 0.9
+    precision: "integer cents; round_half_up to nearest cent at each marked round_half_up step (surge first, then discount); comp subtraction is exact"
+    variants:
+      - name: walk_up_full
+        when: "guest_list_entry_id is null"
+        difference: "no discount and no comp; cover_paid == surged (full surged base)"
+      - name: house_list_surge_waived
+        when: "guest_list_entry_id set but its promoter_id is null"
+        difference: "surge is WAIVED (use base, not surged) and disc == 0; comp still applies — distinct from walk_up_full and from promoter discount"
+
+  - name: tab_final_total
+    trigger: "Tab OPEN/RUNNING -> SETTLED (POST /nightclub/tabs/{id}/settle, venue-close cascade, or reservation-settle cascade); writes Tab.final_total_cents"
+    algorithm: aggregation
+    formula: |
+      # Pricing engine on the Tab domain. Rounding ORDER IS PINNED:
+      #   gratuity is computed on the SUMMED non-voided subtotal (sum-then-gratuity),
+      #   NOT per-line. This is mode (b) of the combinatorial rule.
+      subtotal = sum(item.qty * item.unit_price_cents
+                     for item in TabItem where tab_id == Tab.id and voided == false)
+      gratuity = round_half_up(subtotal * Tab.gratuity_pct)   # ONE rounding, on the summed subtotal
+      grand = subtotal + gratuity
+      return grand
+    input_set: "non-voided TabItem rows on this tab only; voided lines and SERVICE shortfall lines added by the reservation cascade are part of subtotal if present at settle time"
+    constants: {}
+    precision: "integer cents; gratuity rounded round_half_up exactly once on the summed subtotal (sum-then-round, NOT round-per-line-then-sum)"
+    variants:
+      - name: walk_up_tab
+        when: "Tab.reservation_id is null"
+        difference: "final_total is just subtotal + gratuity; no minimum top-up"
+      - name: reservation_tab
+        when: "Tab.reservation_id set"
+        difference: "before this tab settles, the reservation-settle cascade may append a SERVICE 'minimum top-up' TabItem (see reservation_minimum_shortfall); that line is then part of subtotal here"
+
+  - name: reservation_minimum_shortfall
+    trigger: "Reservation SEATED -> SETTLED (POST /nightclub/reservations/{id}/settle or venue-close cascade); writes Reservation.minimum_shortfall_cents and appends a SERVICE TabItem to the linked tab"
+    algorithm: threshold
+    formula: |
+      # Circular-looking dependency PINNED (mode (c)): the tab's final_total depends
+      # on its line items, but the shortfall line we may add depends on the tab's
+      # pre-top-up subtotal+gratuity. Evaluation order is fixed:
+      #   STEP 1 compute the tab's pre-top-up grand = tab_final_total over EXISTING non-voided lines.
+      #   STEP 2 shortfall = max(0, Reservation.spend_minimum_cents - grand_step1)
+      #   STEP 3 if shortfall > 0 append TabItem{category: SERVICE, name: 'Minimum top-up',
+      #          qty: 1, unit_price_cents: shortfall}; this line does NOT itself attract gratuity
+      #          (it is added AFTER gratuity is computed in STEP 1).
+      #   STEP 4 the tab then settles; its final_total = grand_step1 + shortfall.
+      grand_step1 = tab_final_total(linked_tab)        # subtotal + gratuity, no top-up yet
+      shortfall = max(0, Reservation.spend_minimum_cents - grand_step1)
+      return shortfall
+    input_set: "the Reservation being settled and its linked Tab (Tab.reservation_id == Reservation.id); if no linked tab, grand_step1 == 0 so shortfall == spend_minimum_cents"
+    constants: {}
+    precision: "integer cents; comparison and subtraction exact; the appended top-up line is excluded from gratuity by construction (added after STEP 1)"
+    variants:
+      - name: met_minimum
+        when: "grand_step1 >= spend_minimum_cents"
+        difference: "shortfall == 0; no SERVICE line appended; tab final_total == grand_step1"
+      - name: under_minimum
+        when: "grand_step1 < spend_minimum_cents"
+        difference: "shortfall > 0; SERVICE line appended at unit_price_cents == shortfall; tab final_total == spend_minimum_cents exactly"
+
+  - name: patron_age_years
+    trigger: "POST /nightclub/id-checks; writes IdCheck.computed_age_years and (via id_check_outcome) IdCheck.outcome"
+    algorithm: threshold
+    formula: |
+      # Risk/compliance scoring on the IdCheck domain (distinct entity from the two
+      # pricing calcs above -> satisfies dual-variant across DIFFERENT domains).
+      now = logical_clock_date()                 # date portion of current UTC clock
+      dob = parse_date(IdCheck.date_of_birth)
+      age = now.year - dob.year
+      if (now.month, now.day) < (dob.month, dob.day):
+          age = age - 1                          # birthday not yet reached this year
+      return age                                  # whole completed years
+    input_set: "single IdCheck row at check time; reads the logical clock date"
+    constants:
+      LEGAL_DRINKING_AGE: 21
+    precision: "whole years; boundary is inclusive — age == 21 PASSES, age == 20 is REFUSED_UNDERAGE"
+    variants:
+      - name: birthday_today
+        when: "now.month == dob.month and now.day == dob.day"
+        difference: "age increments today; a patron turning 21 exactly today PASSES (boundary inclusive)"
+
+  - name: id_check_outcome
+    trigger: "POST /nightclub/id-checks (same call as patron_age_years); writes IdCheck.outcome and IdCheck.refusal_reason"
+    algorithm: threshold
+    formula: |
+      # Ordered gate: expiry checked BEFORE age, so an expired ID of a 25-year-old
+      # is REFUSED_EXPIRED_ID, not PASS. Order is pinned.
+      now = logical_clock_date()
+      if parse_date(IdCheck.id_expiry) < now:
+          outcome = REFUSED_EXPIRED_ID; reason = "ID expired"
+      elif IdCheck.computed_age_years < LEGAL_DRINKING_AGE:    # 21
+          outcome = REFUSED_UNDERAGE; reason = "Under legal drinking age"
+      else:
+          outcome = PASS; reason = null
+      return (outcome, reason)
+    input_set: "single IdCheck row; depends on patron_age_years output and id_expiry vs logical clock"
+    constants:
+      LEGAL_DRINKING_AGE: 21
+    precision: "expiry boundary is strict — id_expiry == today is still valid (PASS allowed); id_expiry strictly before today is REFUSED_EXPIRED_ID"
+    variants:
+      - name: expired_overrides_age
+        when: "id_expiry < now AND computed_age_years >= 21"
+        difference: "expiry gate fires first; outcome REFUSED_EXPIRED_ID even though the patron is of age"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /_clock/set_current_utc which requires PlatformAdmin only"
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this operation per §1.7 RBAC matrix"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "every path id resolves to an existing resource, validated left-to-right (venue before child)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all id-bearing paths"
+
+  - priority: 4
+    category: existence
+    check: "every FK in the request body (promoter_id, reservation_id, guest_list_entry_id, id_check_id, subject_entry_id) references an existing row belonging to the same venue"
+    error_id: ERR_FK_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /nightclub/entries, POST /nightclub/tabs, POST /nightclub/guest-list, POST /nightclub/incidents"
+
+  - priority: 5
+    category: existence
+    check: "required input fields present and well-typed; enum values in declared set; integers non-negative where constrained"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all writes"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_venue_version equals current Venue.version on guarded creates"
+    error_id: ERR_STALE_VENUE_VERSION
+    http_status: 412
+    applies_to: "POST /nightclub/entries, POST /nightclub/reservations"
+
+  - priority: 7
+    category: state
+    check: "venue-closed gate: no child mutation (admit, exit, reservation/tab lifecycle, item add/void, incident, guest-list add) is permitted while Venue.posture == CLOSED (terminal)"
+    error_id: ERR_VENUE_CLOSED
+    http_status: 409
+    applies_to: "all child write/transition endpoints under /nightclub/* (all child collections)"
+
+  - priority: 8
+    category: state
+    check: "target resource is in a state that admits the requested transition (e.g., tab not already SETTLED/VOIDED, reservation in correct from-state, entry INSIDE before exit)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 9
+    category: business_safety
+    check: "ID-verification gate: admission requires id_check_id referencing an IdCheck whose outcome == PASS"
+    error_id: ERR_ID_CHECK_NOT_PASSED
+    http_status: 422
+    applies_to: "POST /nightclub/entries"
+
+  - priority: 10
+    category: business_safety
+    check: "responsible-service / last-call gate: no new ALCOHOL TabItem while Venue.posture == LAST_CALL"
+    error_id: ERR_LAST_CALL_NO_ALCOHOL
+    http_status: 422
+    applies_to: "POST /nightclub/tabs/{id}/items"
+
+  - priority: 11
+    category: business_safety
+    check: "over-service gate: no new ALCOHOL TabItem when Tab.bac_strikes >= Venue.max_alcohol_strikes (MAX_ALCOHOL_STRIKES)"
+    error_id: ERR_OVER_SERVICE_REFUSED
+    http_status: 422
+    applies_to: "POST /nightclub/tabs/{id}/items"
+
+  - priority: 12
+    category: business_temporal
+    check: "reservation window: seat only when current clock in [window_start_utc, window_end_utc); cancel only before window_start_utc; window_end_utc > window_start_utc at booking"
+    error_id: ERR_RESERVATION_WINDOW
+    http_status: 422
+    applies_to: "POST /nightclub/reservations, /nightclub/reservations/{id}/seat, /nightclub/reservations/{id}/cancel"
+
+  - priority: 13
+    category: business_constraint
+    check: "table double-book: a new Reservation's [window_start_utc, window_end_utc) must not overlap any non-terminal (BOOKED/SEATED) Reservation on the same venue with the same table_label (half-open intervals; touching endpoints DO NOT conflict)"
+    error_id: ERR_TABLE_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /nightclub/reservations"
+
+  - priority: 14
+    category: business_temporal
+    check: "patron re-entry overlap: the IdCheck referenced by id_check_id must not already back an Entry whose status == INSIDE (an open-ended live occupancy interval [admitted_at_utc, +infinity) has no exit yet); a patron currently inside cannot be admitted a second time"
+    error_id: ERR_PATRON_ALREADY_INSIDE
+    http_status: 409
+    applies_to: "POST /nightclub/entries"
+
+  - priority: 15
+    category: business_constraint
+    check: "occupancy: admission rejected when occupancy_count would exceed fire_code_capacity (i.e., occupancy_count == fire_code_capacity at admit time)"
+    error_id: ERR_AT_CAPACITY
+    http_status: 409
+    applies_to: "POST /nightclub/entries"
+
+  - priority: 16
+    category: business_fiscal
+    check: "promoter comp budget: a GuestListEntry's comp_value_cents must not push Promoter.comp_committed_cents above Promoter.comp_budget_cents"
+    error_id: ERR_COMP_BUDGET_EXCEEDED
+    http_status: 422
+    applies_to: "POST /nightclub/guest-list"
+
+  - priority: 17
+    category: business_fiscal
+    check: "tab pre-authorization: at settle, if not forced by venue-close cascade, preauth_cents must be >= projected final_total_cents"
+    error_id: ERR_PREAUTH_INSUFFICIENT
+    http_status: 422
+    applies_to: "POST /nightclub/tabs/{id}/settle"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Venue ----------------------------------------------------------------
+  - method: POST
+    path: "/nightclub/venues"
+    description: "Create a venue (posture starts OPEN, occupancy_count 0, version 1)"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [name, fire_code_capacity, closing_time_utc, "last_call_offset_minutes?", "cover_base_cents?", "cover_surge_pct?", "max_alcohol_strikes?"]
+    output: Venue
+    side_effects: ["initialize posture=OPEN, occupancy_count=0, tabs_open_count=0, version=1"]
+
+  - method: GET
+    path: "/nightclub/venues/{id}"
+    description: "Read a venue including computed occupancy_count, tabs_open_count, posture, version"
+    roles: [PlatformAdmin, FloorManager, DoorHost, Bartender, SecurityOfficer]
+    code: 200
+    input: []
+    output: Venue
+    side_effects: []
+
+  - method: GET
+    path: "/nightclub/venues"
+    description: "List venues (paginated)"
+    roles: [PlatformAdmin, FloorManager, DoorHost, Bartender, SecurityOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Venue[]
+    side_effects: []
+
+  - method: POST
+    path: "/nightclub/venues/{id}/close"
+    description: "Operator close of a venue; runs the full close cascade over reservations, tabs, entries"
+    roles: [FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Venue
+    side_effects:
+      - "Reservation BOOKED->NO_SHOW, SEATED->SETTLED; Tab OPEN/RUNNING->SETTLED; Entry INSIDE->EXITED; posture->CLOSED; increments Venue.version by 1"
+
+  # ---- Promoter -------------------------------------------------------------
+  - method: POST
+    path: "/nightclub/promoters"
+    description: "Register a promoter under a venue (venue_id in body)"
+    roles: [FloorManager, PlatformAdmin]
+    code: 201
+    input: [venue_id, name, comp_budget_cents, "guest_discount_pct?"]
+    output: Promoter
+    side_effects: ["comp_committed_cents=0, heads_credited=0"]
+
+  - method: GET
+    path: "/nightclub/promoters"
+    description: "List promoters; filter by venue_id (reverse-reachability for Promoter.venue_id FK)"
+    roles: [FloorManager, PlatformAdmin, DoorHost]
+    code: 200
+    input: ["venue_id?", "limit?", "offset?"]
+    output: Promoter[]
+    side_effects: []
+
+  - method: GET
+    path: "/nightclub/promoters/{id}"
+    description: "Read a promoter incl. computed comp_committed_cents and heads_credited"
+    roles: [FloorManager, PlatformAdmin, DoorHost]
+    code: 200
+    input: []
+    output: Promoter
+    side_effects: []
+
+  # ---- Guest list -----------------------------------------------------------
+  - method: POST
+    path: "/nightclub/guest-list"
+    description: "Add a guest-list entry (venue_id in body; optionally promoter-backed with a comp value)"
+    roles: [DoorHost, FloorManager, PlatformAdmin]
+    code: 201
+    input: [venue_id, guest_name, party_size, "promoter_id?", "comp_value_cents?"]
+    output: GuestListEntry
+    side_effects: ["status=CONFIRMED; recompute promoter comp_committed_cents"]
+
+  - method: GET
+    path: "/nightclub/guest-list"
+    description: "List guest-list entries; filter by venue_id, promoter_id, redeemed_entry_id (reverse-reachability for GuestListEntry.venue_id, .promoter_id, .redeemed_entry_id FKs)"
+    roles: [DoorHost, FloorManager, PlatformAdmin]
+    code: 200
+    input: ["venue_id?", "promoter_id?", "redeemed_entry_id?", "limit?", "offset?"]
+    output: GuestListEntry[]
+    side_effects: []
+
+  - method: GET
+    path: "/nightclub/guest-list/{id}"
+    description: "Read a guest-list entry"
+    roles: [DoorHost, FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: GuestListEntry
+    side_effects: []
+
+  - method: POST
+    path: "/nightclub/guest-list/{id}/cancel"
+    description: "Cancel a guest-list entry"
+    roles: [DoorHost, FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: GuestListEntry
+    side_effects: ["status=CANCELLED; recompute promoter comp_committed_cents (releases the comp)"]
+
+  # ---- ID checks ------------------------------------------------------------
+  - method: POST
+    path: "/nightclub/id-checks"
+    description: "Run an ID/age verification (venue_id in body); server computes outcome (PASS / REFUSED_UNDERAGE / REFUSED_EXPIRED_ID) and refusal_reason"
+    roles: [DoorHost, SecurityOfficer, PlatformAdmin]
+    code: 201
+    input: [venue_id, patron_name, date_of_birth, id_expiry]
+    output: IdCheck
+    side_effects: ["compute computed_age_years (calc patron_age_years), outcome and refusal_reason (calc id_check_outcome)"]
+
+  - method: GET
+    path: "/nightclub/id-checks"
+    description: "List ID checks incl. refusal log; filter by venue_id, outcome (reverse-reachability for IdCheck.venue_id FK)"
+    roles: [DoorHost, SecurityOfficer, FloorManager, PlatformAdmin]
+    code: 200
+    input: ["venue_id?", "outcome?", "limit?", "offset?"]
+    output: IdCheck[]
+    side_effects: []
+
+  - method: GET
+    path: "/nightclub/id-checks/{id}"
+    description: "Read an ID check"
+    roles: [DoorHost, SecurityOfficer, FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: IdCheck
+    side_effects: []
+
+  # ---- Entries (occupancy) --------------------------------------------------
+  - method: POST
+    path: "/nightclub/entries"
+    description: "Admit a patron (venue_id in body; occupancy + cover charge); OCC-guarded on Venue.version"
+    roles: [DoorHost, PlatformAdmin]
+    code: 201
+    input: [venue_id, id_check_id, expected_venue_version, "guest_list_entry_id?"]
+    output: Entry
+    side_effects:
+      - "compute cover_paid_cents (calc cover_charge_amount); status=INSIDE; stamp admitted_at_utc; increment occupancy_count; if linked GuestListEntry: status->REDEEMED and set redeemed_entry_id; recompute posture (OPEN->AT_CAPACITY at fire_code_capacity); increments Venue.version by 1"
+
+  - method: GET
+    path: "/nightclub/entries"
+    description: "List entries; filter by venue_id, status, guest_list_entry_id, id_check_id (reverse-reachability for Entry.venue_id, .guest_list_entry_id, .id_check_id FKs)"
+    roles: [DoorHost, FloorManager, SecurityOfficer, PlatformAdmin]
+    code: 200
+    input: ["venue_id?", "status?", "guest_list_entry_id?", "id_check_id?", "limit?", "offset?"]
+    output: Entry[]
+    side_effects: []
+
+  - method: GET
+    path: "/nightclub/entries/{id}"
+    description: "Read an entry"
+    roles: [DoorHost, FloorManager, SecurityOfficer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Entry
+    side_effects: []
+
+  - method: POST
+    path: "/nightclub/entries/{id}/exit"
+    description: "Mark a patron exited; decrements occupancy and may revert posture AT_CAPACITY->OPEN"
+    roles: [DoorHost, SecurityOfficer, PlatformAdmin]
+    code: 200
+    input: []
+    output: Entry
+    side_effects: ["status=EXITED; stamp exited_at_utc; decrement occupancy_count; recompute posture"]
+
+  # ---- Reservations ---------------------------------------------------------
+  - method: POST
+    path: "/nightclub/reservations"
+    description: "Book a table reservation (venue_id in body) with a spend minimum and time window; OCC-guarded on Venue.version; rejects table double-booking"
+    roles: [FloorManager, PlatformAdmin]
+    code: 201
+    input: [venue_id, table_label, party_size, window_start_utc, window_end_utc, spend_minimum_cents, expected_venue_version, "deposit_cents?"]
+    output: Reservation
+    side_effects: ["status=BOOKED; increments Venue.version by 1"]
+
+  - method: GET
+    path: "/nightclub/reservations"
+    description: "List reservations; filter by venue_id, status, table_label (reverse-reachability for Reservation.venue_id FK)"
+    roles: [FloorManager, DoorHost, PlatformAdmin]
+    code: 200
+    input: ["venue_id?", "status?", "table_label?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+
+  - method: GET
+    path: "/nightclub/reservations/{id}"
+    description: "Read a reservation incl. computed minimum_shortfall_cents"
+    roles: [FloorManager, DoorHost, PlatformAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+
+  - method: POST
+    path: "/nightclub/reservations/{id}/seat"
+    description: "Seat a booked reservation (party arrives within window)"
+    roles: [FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["status=SEATED"]
+
+  - method: POST
+    path: "/nightclub/reservations/{id}/no-show"
+    description: "Mark a booked reservation a no-show (window lapsed); deposit forfeited"
+    roles: [FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["status=NO_SHOW; deposit_cents forfeited"]
+
+  - method: POST
+    path: "/nightclub/reservations/{id}/cancel"
+    description: "Cancel a booked reservation before its window opens; deposit refunded"
+    roles: [FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["status=CANCELLED; deposit_cents refunded"]
+
+  - method: POST
+    path: "/nightclub/reservations/{id}/settle"
+    description: "Settle a seated reservation: compute minimum shortfall and append top-up to the linked tab, then settle that tab"
+    roles: [FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects:
+      - "compute minimum_shortfall_cents (calc reservation_minimum_shortfall); if >0 append SERVICE TabItem to linked Tab; cascade settles linked Tab (calc tab_final_total); status=SETTLED"
+
+  # ---- Tabs (bar POS) -------------------------------------------------------
+  - method: POST
+    path: "/nightclub/tabs"
+    description: "Open a bar tab (venue_id in body) with a card pre-authorization hold; optionally linked to a seated reservation"
+    roles: [Bartender, FloorManager, PlatformAdmin]
+    code: 201
+    input: [venue_id, patron_name, preauth_cents, "reservation_id?", "gratuity_pct?"]
+    output: Tab
+    side_effects: ["status=OPEN; running_subtotal_cents=0; bac_strikes=0; final_total_cents=0; recompute Venue.tabs_open_count"]
+
+  - method: GET
+    path: "/nightclub/tabs"
+    description: "List tabs; filter by venue_id, status, reservation_id (reverse-reachability for Tab.venue_id and .reservation_id FKs)"
+    roles: [Bartender, FloorManager, PlatformAdmin]
+    code: 200
+    input: ["venue_id?", "status?", "reservation_id?", "limit?", "offset?"]
+    output: Tab[]
+    side_effects: []
+
+  - method: GET
+    path: "/nightclub/tabs/{id}"
+    description: "Read a tab incl. running_subtotal_cents, bac_strikes, final_total_cents"
+    roles: [Bartender, FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Tab
+    side_effects: []
+
+  - method: POST
+    path: "/nightclub/tabs/{id}/items"
+    description: "Add a line item to a tab (bar POS); ALCOHOL items gated by last-call and over-service rules"
+    roles: [Bartender, FloorManager, PlatformAdmin]
+    code: 201
+    input: [name, category, qty, unit_price_cents]
+    output: TabItem
+    side_effects: ["recompute Tab.running_subtotal_cents; OPEN->RUNNING; if category==ALCOHOL increment Tab.bac_strikes"]
+
+  - method: GET
+    path: "/nightclub/tabs/{id}/items"
+    description: "List items on a tab (sub-resource reverse-reachability for TabItem.tab_id FK)"
+    roles: [Bartender, FloorManager, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TabItem[]
+    side_effects: []
+
+  - method: POST
+    path: "/nightclub/tabs/{tid}/items/{itemid}/void"
+    description: "Void a line item (comp/error); excludes it from subtotal; may revert RUNNING->OPEN and adjust bac_strikes"
+    roles: [Bartender, FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: TabItem
+    side_effects: ["set voided=true; recompute running_subtotal_cents; if line was ALCOHOL decrement bac_strikes; if zero non-voided items remain RUNNING->OPEN and bac_strikes->0"]
+
+  - method: POST
+    path: "/nightclub/tabs/{id}/settle"
+    description: "Settle a tab: compute final_total (calc tab_final_total), capture pre-auth up to total, release remainder"
+    roles: [Bartender, FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Tab
+    side_effects: ["compute final_total_cents; status=SETTLED; recompute Venue.tabs_open_count"]
+
+  - method: POST
+    path: "/nightclub/tabs/{id}/void"
+    description: "Void an entire empty tab (no charges); releases full pre-auth"
+    roles: [FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: Tab
+    side_effects: ["status=VOIDED; release pre-auth; recompute Venue.tabs_open_count"]
+
+  # ---- Security incidents ---------------------------------------------------
+  - method: POST
+    path: "/nightclub/incidents"
+    description: "File a security incident (venue_id in body); action==EJECTION cascades the subject Entry INSIDE->EJECTED"
+    roles: [SecurityOfficer, FloorManager, PlatformAdmin]
+    code: 201
+    input: [venue_id, severity, action, narrative, "subject_entry_id?"]
+    output: SecurityIncident
+    side_effects: ["stamp logged_at_utc; if action==EJECTION and subject_entry_id set: cascade Entry INSIDE->EJECTED, decrement occupancy_count, recompute posture"]
+
+  - method: GET
+    path: "/nightclub/incidents"
+    description: "List security incidents; filter by venue_id, subject_entry_id, severity (reverse-reachability for SecurityIncident.venue_id and .subject_entry_id FKs)"
+    roles: [SecurityOfficer, FloorManager, PlatformAdmin]
+    code: 200
+    input: ["venue_id?", "subject_entry_id?", "severity?", "limit?", "offset?"]
+    output: SecurityIncident[]
+    side_effects: []
+
+  - method: GET
+    path: "/nightclub/incidents/{id}"
+    description: "Read a security incident"
+    roles: [SecurityOfficer, FloorManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: SecurityIncident
+    side_effects: []
+
+  # ---- Test-driving: logical clock -----------------------------------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock (ISO 8601 UTC). Server startup default is 2026-01-01T00:00:00Z; before any set call the clock reads exactly this default and never falls back to wall-clock time. Setting the clock recomputes posture for all venues (OPEN/AT_CAPACITY->LAST_CALL at closing-offset, ->CLOSED at closing_time_utc)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["advance logical clock; recompute every Venue.posture and run any due close cascade"]
+
+  - method: POST
+    path: "/_inject/occupancy"
+    description: "Test-driving: admit `target_inside` synthetic patrons into a venue so occupancy_count == target_inside, each backed by an auto-generated PASS IdCheck and an INSIDE Entry. Recomputes posture and bumps Venue.version by 1 (one mutation). Used only to set up the surge/occupancy band cheaply; outside the public business surface."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [venue_id, target_inside]
+    output: Venue
+    side_effects: ["create target_inside PASS IdCheck + INSIDE Entry rows; set occupancy_count=target_inside; recompute posture; increment Venue.version by 1"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "missing/invalid X-User-Role or X-User-ID header" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "acting role not permitted for this operation per RBAC" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "a path id does not resolve to an existing resource" }
+  - { id: ERR_FK_NOT_FOUND, http: 404, condition: "a body foreign key (promoter_id / reservation_id / guest_list_entry_id / id_check_id / subject_entry_id) references a row that does not exist in this venue" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "missing required field, bad type, enum out of range, or negative value where non-negative required" }
+  - { id: ERR_STALE_VENUE_VERSION, http: 412, condition: "expected_venue_version does not equal current Venue.version on an OCC-guarded create" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "target resource is not in a state that admits the requested transition (e.g., settle an already-SETTLED tab, seat a SEATED reservation, exit an EXITED entry)" }
+  - { id: ERR_ID_CHECK_NOT_PASSED, http: 422, condition: "admission references an IdCheck whose outcome != PASS (or omitted)" }
+  - { id: ERR_LAST_CALL_NO_ALCOHOL, http: 422, condition: "adding an ALCOHOL TabItem while Venue.posture == LAST_CALL" }
+  - { id: ERR_OVER_SERVICE_REFUSED, http: 422, condition: "adding an ALCOHOL TabItem when Tab.bac_strikes >= MAX_ALCOHOL_STRIKES" }
+  - { id: ERR_RESERVATION_WINDOW, http: 422, condition: "seat outside [window_start,window_end); cancel after window opens; or window_end <= window_start at booking" }
+  - { id: ERR_TABLE_DOUBLE_BOOKED, http: 409, condition: "a new reservation's half-open window overlaps an existing BOOKED/SEATED reservation on the same table_label" }
+  - { id: ERR_AT_CAPACITY, http: 409, condition: "admission would push occupancy_count past fire_code_capacity (occupancy_count already == fire_code_capacity)" }
+  - { id: ERR_PATRON_ALREADY_INSIDE, http: 409, condition: "the id_check_id already backs an Entry whose status == INSIDE (patron currently inside, live occupancy interval still open)" }
+  - { id: ERR_COMP_BUDGET_EXCEEDED, http: 422, condition: "guest-list comp_value_cents would push promoter comp_committed_cents above comp_budget_cents" }
+  - { id: ERR_PREAUTH_INSUFFICIENT, http: 422, condition: "tab settle (not forced by close cascade) where preauth_cents < projected final_total_cents" }
+  - { id: ERR_VENUE_CLOSED, http: 409, condition: "any child mutation attempted while Venue.posture == CLOSED" }
+  - { id: ERR_TAB_NOT_EMPTY, http: 409, condition: "voiding an entire tab whose running_subtotal_cents != 0 (settle instead)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Operator superset; can perform any operation and sets the logical clock"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /venues (create venue)"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "all read endpoints"
+      - "all child write/transition endpoints (override authority over every peer role)"
+
+  - name: FloorManager
+    description: "Owns reservations, comps/promoters, posture/close, and tab voids"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /nightclub/venues/{id}/close"
+      - "POST /nightclub/promoters"
+      - "reservation lifecycle: seat / no-show / cancel / settle"
+      - "POST /nightclub/tabs/{id}/void (whole-tab void)"
+    shared_operations:
+      - "POST /nightclub/reservations (shared with PlatformAdmin)"
+      - "POST /nightclub/guest-list (shared with DoorHost)"
+      - "tab item add/void/settle (shared with Bartender)"
+      - "incidents (shared with SecurityOfficer)"
+      - "all reads"
+
+  - name: DoorHost
+    description: "Owns the door: guest list, ID checks, admissions and exits"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /nightclub/entries (admit)"
+    shared_operations:
+      - "POST /nightclub/guest-list (shared with FloorManager)"
+      - "POST /nightclub/id-checks (shared with SecurityOfficer)"
+      - "POST /nightclub/entries/{id}/exit (shared with SecurityOfficer)"
+      - "reads of venue, promoters, guest-list, id-checks, entries, reservations"
+
+  - name: Bartender
+    description: "Owns bar tabs and POS line items"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /nightclub/tabs (open tab)"
+    shared_operations:
+      - "tab item add / void / settle (shared with FloorManager)"
+      - "reads of venue and tabs"
+
+  - name: SecurityOfficer
+    description: "Owns security incidents, refusals, ejections; assists at the door"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /nightclub/incidents (file incident / ejection)"
+    shared_operations:
+      - "POST /nightclub/id-checks (shared with DoorHost)"
+      - "POST /nightclub/entries/{id}/exit (shared with DoorHost)"
+      - "reads of venue, entries, id-checks, incidents"

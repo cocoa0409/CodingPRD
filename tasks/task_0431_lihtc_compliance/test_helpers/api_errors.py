@@ -1,0 +1,49 @@
+"""Error IDs and HTTP status mapping for the LIHTC Compliance API (PRD §5).
+
+After defining the mapping it is registered with the framework so validate_error()
+auto-checks the HTTP status that accompanies each error_id.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_VALIDATION = "ERR_VALIDATION"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+    ERR_STUDENT_INELIGIBLE = "ERR_STUDENT_INELIGIBLE"
+    ERR_INCOME_OVER_LIMIT = "ERR_INCOME_OVER_LIMIT"
+    ERR_RENT_OVER_LIMIT = "ERR_RENT_OVER_LIMIT"
+    ERR_LEASE_OVERLAP = "ERR_LEASE_OVERLAP"
+    ERR_INSPECTION_WINDOW_CONFLICT = "ERR_INSPECTION_WINDOW_CONFLICT"
+    ERR_AVAILABLE_UNIT_RULE = "ERR_AVAILABLE_UNIT_RULE"
+    ERR_SET_ASIDE_NOT_MET = "ERR_SET_ASIDE_NOT_MET"
+    ERR_OPEN_FINDINGS_BLOCK_CLOSE = "ERR_OPEN_FINDINGS_BLOCK_CLOSE"
+    ERR_RECAPTURE_REQUIRES_NONCOMPLIANT = "ERR_RECAPTURE_REQUIRES_NONCOMPLIANT"
+
+
+HTTP_STATUS_CODES: dict[str, int] = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_UNAUTHORIZED: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_VALIDATION: 400,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_SEGREGATION_OF_DUTIES: 403,
+    ApiErrorId.ERR_STUDENT_INELIGIBLE: 422,
+    ApiErrorId.ERR_INCOME_OVER_LIMIT: 422,
+    ApiErrorId.ERR_RENT_OVER_LIMIT: 422,
+    ApiErrorId.ERR_LEASE_OVERLAP: 409,
+    ApiErrorId.ERR_INSPECTION_WINDOW_CONFLICT: 409,
+    ApiErrorId.ERR_AVAILABLE_UNIT_RULE: 409,
+    ApiErrorId.ERR_SET_ASIDE_NOT_MET: 409,
+    ApiErrorId.ERR_OPEN_FINDINGS_BLOCK_CLOSE: 409,
+    ApiErrorId.ERR_RECAPTURE_REQUIRES_NONCOMPLIANT: 409,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

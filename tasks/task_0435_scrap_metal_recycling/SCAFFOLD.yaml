@@ -1,0 +1,1234 @@
+scenario: "435. Scrap Metal Recycling Yard: material grade & spot price, inbound/outbound weigh (scale ticket), ferrous/non-ferrous sort, seller ID & theft-prevention (state hold/report), cash/check payout & 1099, container/roll-off dispatch, mill shipment & settlement, commodity hedge"
+domain_name: scrap-metal-recycling
+api_prefix: /yard
+
+complexity_profile:
+  primary_archetype: "Ledger reconciliation"
+  secondary_archetype: "Compliance / audit"
+  complexity_layers:
+    - "Dual-variant calculation"     # spot-price valuation at intake vs mill-settlement reconciliation
+    - "Cascading side effects"       # ticket release -> seller YTD -> payout 1099; mill settle -> lots -> hedge realization
+    - "Rate / threshold triggers"    # 1099 $600 cumulative cash threshold; regulatory theft hold window
+    - "Optimistic concurrency"       # OCC on Container.version (load assignment) and HedgePosition.version (allocation)
+
+  entity_topology: flat
+  # Peer entities (Seller, ScaleTicket, Payout, Container, MillShipment, HedgePosition)
+  # linked by foreign keys in request bodies; no nested ownership tree in URL paths.
+
+  state_machine_shape: branching
+  # ScaleTicket: WEIGHED -> {RELEASED | REPORTED} via theft gate, with HOLD->WEIGHED revert.
+  # Divergent side-effect sets per branch (RELEASED enables payout; REPORTED freezes seller).
+
+  relationship_patterns:
+    - one_to_many        # ScaleTicket -> TicketLineItem; Container -> ScaleTicket; MillShipment -> SortLot
+    - cross_aggregate    # TicketLineItem references CommodityPrice grade; SortLot references MillShipment + HedgePosition
+
+  role_model: segregation_of_duties
+  # WeighMaster records the weigh and theft hold; PayoutClerk releases funds.
+  # The same X-User-ID cannot both release a ticket's theft hold and approve its payout.
+
+  consistency_model: immediate
+
+# ===========================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# ===========================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: Seller
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: "Seller legal name as printed on government ID."
+      - name: id_type
+        type: enum
+        source: input
+        description: "Government ID document type."
+        constraints: "one of {DRIVERS_LICENSE, STATE_ID, PASSPORT}"
+      - name: id_number
+        type: string
+        source: input
+        description: "Government ID number; recorded for theft-prevention reporting."
+      - name: tin
+        type: string
+        source: input
+        description: "Taxpayer identification number (SSN/EIN) used for 1099 reporting; optional at registration."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Seller lifecycle for theft prevention. Starts ACTIVE; FLAGGED blocks new ticket release until cleared."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, FLAGGED, BANNED}"
+      - name: ytd_cash_paid_cents
+        type: integer
+        source: computed
+        description: "Cumulative cash (not check) paid to this seller in the current tax year across all RELEASED+PAID tickets; drives the 1099 $600 threshold. Recomputed on every Payout that settles."
+        default: 0
+      - name: requires_1099
+        type: boolean
+        source: computed
+        description: "True once ytd_cash_paid_cents >= TIN_1099_THRESHOLD_CENTS (60000). Once true it never reverts to false within the tax year."
+        default: false
+      - name: open_theft_reports
+        type: integer
+        source: computed
+        description: "Count of TheftReport rows for this seller in OPEN status; > 0 forces ticket REPORTED branch."
+        default: 0
+
+  - name: CommodityPrice
+    parent: null
+    common_fields: true
+    fields:
+      - name: grade_code
+        type: string
+        source: input
+        description: "Unique material grade code (e.g., CU_BARE_BRIGHT, AL_CAST, SHRED_STEEL)."
+        constraints: "unique among CommodityPrice rows whose status=ACTIVE"
+      - name: category
+        type: enum
+        source: input
+        description: "Ferrous/non-ferrous sort classification for this grade."
+        constraints: "one of {FERROUS, NON_FERROUS}"
+      - name: spot_price_cents_per_lb
+        type: integer
+        source: input
+        description: "Yard buy price in cents per pound paid to sellers at intake."
+        constraints: ">= 0"
+      - name: mill_price_cents_per_lb
+        type: integer
+        source: input
+        description: "Expected mill sell price in cents per pound used for settlement reconciliation."
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "ACTIVE prices are usable for new line items; SUPERSEDED prices are retained for historical tickets but rejected on new line items."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUPERSEDED}"
+
+  - name: ScaleTicket
+    parent: null
+    common_fields: true
+    fields:
+      - name: seller_id
+        type: string
+        source: input
+        description: "FK -> Seller.id; the seller being weighed and (if released) paid."
+      - name: container_id
+        type: string
+        source: input
+        description: "FK -> Container.id; the roll-off container the sorted material is loaded into. Optional until release."
+        default: null
+      - name: gross_weight_lb
+        type: number
+        source: input
+        description: "Inbound (loaded vehicle) weight in pounds at the inbound weigh."
+        constraints: "> 0"
+      - name: tare_weight_lb
+        type: number
+        source: input
+        description: "Outbound (empty vehicle) weight in pounds at the outbound weigh; recorded when the ticket is weighed-out."
+        default: null
+        constraints: ">= 0 and < gross_weight_lb"
+      - name: net_weight_lb
+        type: number
+        source: computed
+        description: "gross_weight_lb - tare_weight_lb; the billable material weight. Null until outbound tare recorded."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Ticket lifecycle. See §1.2 ScaleTicket state machine."
+        default: DRAFT
+        constraints: "one of {DRAFT, WEIGHED, HOLD, RELEASED, REPORTED, PAID}"
+      - name: gross_valuation_cents
+        type: integer
+        source: computed
+        description: "Sum over line items of round_half_up(weight_lb * CommodityPrice.spot_price_cents_per_lb), per-line rounded then summed. Frozen at WEIGHED."
+        default: 0
+      - name: theft_hold_released_by
+        type: string
+        source: system
+        description: "X-User-ID of the WeighMaster who cleared the theft HOLD (HOLD->WEIGHED). Used by segregation-of-duties check on payout. Null until cleared."
+        default: null
+
+  - name: TicketLineItem
+    parent: null
+    common_fields: false
+    fields:
+      - name: ticket_id
+        type: string
+        source: input
+        description: "FK -> ScaleTicket.id; the weigh ticket this material line belongs to."
+      - name: grade_code
+        type: string
+        source: input
+        description: "Material grade code; must match an ACTIVE CommodityPrice.grade_code at line creation time."
+      - name: commodity_price_id
+        type: string
+        source: system
+        description: "FK -> CommodityPrice.id; the exact ACTIVE price row resolved for grade_code at line creation, pinning spot/mill price against later supersede."
+      - name: weight_lb
+        type: number
+        source: input
+        description: "Pounds of this grade on the ticket; must be > 0."
+        constraints: "> 0"
+      - name: line_valuation_cents
+        type: integer
+        source: computed
+        description: "round_half_up(weight_lb * CommodityPrice.spot_price_cents_per_lb) using the pinned commodity_price_id row."
+        default: 0
+
+  - name: Payout
+    parent: null
+    common_fields: true
+    fields:
+      - name: ticket_id
+        type: string
+        source: input
+        description: "FK -> ScaleTicket.id; the RELEASED ticket being paid. One Payout per ticket."
+        constraints: "unique among Payout rows"
+      - name: seller_id
+        type: string
+        source: system
+        description: "FK -> Seller.id; copied from the ticket's seller at payout creation."
+      - name: method
+        type: enum
+        source: input
+        description: "Disbursement method. CASH counts toward the 1099 cumulative threshold; CHECK does not."
+        constraints: "one of {CASH, CHECK}"
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "Equals the ticket's gross_valuation_cents at release; the amount disbursed to the seller."
+        default: 0
+      - name: form_1099_issued
+        type: boolean
+        source: computed
+        description: "True when method=CASH and the seller's post-payout ytd_cash_paid_cents >= TIN_1099_THRESHOLD_CENTS and a TIN is on file."
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: "PENDING on create; SETTLED when funds are disbursed (POST settle). See §1.2."
+        default: PENDING
+        constraints: "one of {PENDING, SETTLED, VOID}"
+
+  - name: Container
+    parent: null
+    common_fields: true
+    fields:
+      - name: category
+        type: enum
+        source: input
+        description: "Material class this roll-off accepts; tickets whose line items mix categories cannot load here."
+        constraints: "one of {FERROUS, NON_FERROUS}"
+      - name: capacity_lb
+        type: number
+        source: input
+        description: "Maximum net pounds the roll-off can hold before dispatch."
+        constraints: "> 0"
+      - name: loaded_weight_lb
+        type: number
+        source: computed
+        description: "Sum of net_weight_lb of all RELEASED tickets assigned to this container (status STAGED or DISPATCHED)."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "STAGED (accepting loads) -> DISPATCHED (sent to yard floor for shipment) -> CLOSED (consumed by a MillShipment). See §1.2."
+        default: STAGED
+        constraints: "one of {STAGED, DISPATCHED, CLOSED}"
+
+  - name: MillShipment
+    parent: null
+    common_fields: true
+    fields:
+      - name: container_id
+        type: string
+        source: input
+        description: "FK -> Container.id; the DISPATCHED container whose material is shipped to the mill."
+        constraints: "unique among MillShipment rows"
+      - name: category
+        type: enum
+        source: system
+        description: "Copied from the container; FERROUS or NON_FERROUS shipment."
+      - name: shipped_weight_lb
+        type: number
+        source: computed
+        description: "Copied from container.loaded_weight_lb at shipment creation."
+        default: 0
+      - name: expected_settlement_cents
+        type: integer
+        source: computed
+        description: "Forward-looking estimate: sum over the container's tickets' line items of round_half_up(weight_lb * mill_price_cents_per_lb). Frozen at shipment creation."
+        default: 0
+      - name: final_settlement_cents
+        type: integer
+        source: input
+        description: "Actual settlement amount the mill remits; supplied on POST settle."
+        default: null
+      - name: settlement_variance_cents
+        type: integer
+        source: computed
+        description: "final_settlement_cents - expected_settlement_cents; positive = favorable. Null until settled."
+        default: null
+      - name: hedge_position_id
+        type: string
+        source: input
+        description: "FK -> HedgePosition.id; an OPEN hedge whose locked lots are realized against this settlement. Optional."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "SHIPPED (in transit) -> SETTLED (mill paid). See §1.2."
+        default: SHIPPED
+        constraints: "one of {SHIPPED, SETTLED}"
+
+  - name: HedgePosition
+    parent: null
+    common_fields: true
+    fields:
+      - name: category
+        type: enum
+        source: input
+        description: "Commodity class hedged; only shipments of the same category may realize against it."
+        constraints: "one of {FERROUS, NON_FERROUS}"
+      - name: hedged_weight_lb
+        type: number
+        source: input
+        description: "Total pounds locked by this futures position."
+        constraints: "> 0"
+      - name: locked_price_cents_per_lb
+        type: integer
+        source: input
+        description: "The price per pound the hedge locks for hedged_weight_lb."
+        constraints: ">= 0"
+      - name: realized_weight_lb
+        type: number
+        source: computed
+        description: "Sum of shipped_weight_lb realized against this hedge so far; cannot exceed hedged_weight_lb."
+        default: 0
+      - name: realized_pnl_cents
+        type: integer
+        source: computed
+        description: "Cumulative hedge profit/loss: sum over realized shipments of round_half_up(realized_lb * (locked_price_cents_per_lb - effective_mill_price_cents_per_lb))."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "OPEN (accepting realizations) -> CLOSED (fully realized or manually closed). See §1.2."
+        default: OPEN
+        constraints: "one of {OPEN, CLOSED}"
+
+  - name: TheftReport
+    parent: null
+    common_fields: true
+    fields:
+      - name: seller_id
+        type: string
+        source: input
+        description: "FK -> Seller.id; the seller flagged for suspected stolen material."
+      - name: ticket_id
+        type: string
+        source: input
+        description: "FK -> ScaleTicket.id; the ticket whose WEIGHED->REPORTED transition raised this report. Optional for proactive reports."
+        default: null
+      - name: reason
+        type: string
+        source: input
+        description: "Free-text reason for the state hold/report (e.g., 'serial-number match on stolen catalytic converter')."
+      - name: status
+        type: enum
+        source: system
+        description: "OPEN (active hold on seller) -> CLEARED (investigation closed, seller may transact). See §1.2."
+        default: OPEN
+        constraints: "one of {OPEN, CLEARED}"
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  - entity: ScaleTicket
+    initial_state: DRAFT
+    terminal_states: [REPORTED, PAID]
+    transitions:
+      - from: DRAFT
+        to: DRAFT
+        trigger: "POST /yard/tickets/{id}/line-items"
+        actor: WeighMaster
+        preconditions:
+          - "ticket.status == DRAFT"
+          - "grade_code resolves to a CommodityPrice with status=ACTIVE"
+          - "weight_lb > 0"
+        side_effects:
+          - "create TicketLineItem with pinned commodity_price_id"
+          - "set line_valuation_cents = round_half_up(weight_lb * spot_price_cents_per_lb)"
+        note: "Line items may only be added while DRAFT (before inbound/outbound weigh is finalized)."
+      - from: DRAFT
+        to: WEIGHED
+        trigger: "POST /yard/tickets/{id}/weigh-out"
+        actor: WeighMaster
+        preconditions:
+          - "ticket.status == DRAFT"
+          - "ticket has >= 1 TicketLineItem"
+          - "tare_weight_lb >= 0 and tare_weight_lb < gross_weight_lb"
+          - "seller.status != BANNED"
+        side_effects:
+          - "set net_weight_lb = gross_weight_lb - tare_weight_lb"
+          - "freeze gross_valuation_cents = sum of line_valuation_cents (per-line rounded then summed)"
+          - "increments ScaleTicket.version by 1"
+        note: "Outbound weigh finalizes the material; valuation is frozen here against later price supersede."
+      - from: WEIGHED
+        to: HOLD
+        trigger: "POST /yard/tickets/{id}/theft-hold"
+        actor: WeighMaster
+        preconditions:
+          - "ticket.status == WEIGHED"
+        side_effects:
+          - "ticket awaits theft investigation; no payout permitted while HOLD"
+        note: "Discretionary hold a WeighMaster places when material looks suspicious before deciding release vs report."
+      - from: HOLD
+        to: WEIGHED
+        trigger: "POST /yard/tickets/{id}/clear-hold"
+        actor: WeighMaster
+        preconditions:
+          - "ticket.status == HOLD"
+          - "seller.open_theft_reports == 0"
+        side_effects:
+          - "set theft_hold_released_by = X-User-ID of acting WeighMaster"
+        note: "Records who cleared the hold; segregation-of-duties forbids this same user from approving the payout."
+      - from: WEIGHED
+        to: RELEASED
+        trigger: "POST /yard/tickets/{id}/release"
+        actor: WeighMaster
+        preconditions:
+          - "ticket.status == WEIGHED"
+          - "seller.status == ACTIVE"
+          - "seller.open_theft_reports == 0"
+          - "container_id provided and references a Container with status=STAGED and category matching all line item categories"
+          - "container.loaded_weight_lb + ticket.net_weight_lb <= container.capacity_lb"
+        side_effects:
+          - "assign ticket to container; bubble up container.loaded_weight_lb += ticket.net_weight_lb"
+        note: "Material is sorted into the matching roll-off; mixed-category tickets cannot be released."
+      - from: WEIGHED
+        to: REPORTED
+        trigger: "POST /yard/tickets/{id}/report"
+        actor: WeighMaster
+        preconditions:
+          - "ticket.status == WEIGHED"
+        side_effects:
+          - "create TheftReport(status=OPEN) for ticket.seller_id"
+          - "cross-entity: set seller.status = FLAGGED"
+          - "cross-entity: increment seller.open_theft_reports by 1"
+        note: "Terminal branch: material is impounded, not paid; freezes the seller."
+      - from: RELEASED
+        to: PAID
+        trigger: "POST /yard/payouts (then POST /yard/payouts/{id}/settle)"
+        actor: PayoutClerk
+        preconditions:
+          - "ticket.status == RELEASED"
+          - "a SETTLED Payout exists for the ticket"
+        side_effects:
+          - "ticket reaches terminal PAID once its Payout settles"
+        note: "Driven by the Payout state machine settle transition (see below)."
+
+  - entity: Payout
+    initial_state: PENDING
+    terminal_states: [SETTLED, VOID]
+    transitions:
+      - from: PENDING
+        to: PENDING
+        trigger: "POST /yard/payouts"
+        actor: PayoutClerk
+        preconditions:
+          - "ticket.status == RELEASED"
+          - "no existing Payout for the ticket"
+          - "acting X-User-ID != ticket.theft_hold_released_by (segregation of duties)"
+        side_effects:
+          - "set amount_cents = ticket.gross_valuation_cents"
+          - "copy seller_id from ticket"
+        note: "Creation only; method recorded but funds not yet disbursed."
+      - from: PENDING
+        to: SETTLED
+        trigger: "POST /yard/payouts/{id}/settle"
+        actor: PayoutClerk
+        preconditions:
+          - "payout.status == PENDING"
+          - "seller.status == ACTIVE"
+          - "if method == CASH and resulting ytd_cash_paid_cents >= TIN_1099_THRESHOLD_CENTS then seller.tin is non-null"
+        side_effects:
+          - "cross-entity: if method==CASH, increment seller.ytd_cash_paid_cents by amount_cents (ledger sync)"
+          - "cross-entity: recompute seller.requires_1099 (set true if ytd_cash_paid_cents >= 60000)"
+          - "set form_1099_issued per §1.3 rule_1099_issuance"
+          - "cross-entity: transition ticket WEIGHED... actually RELEASED -> PAID"
+        note: "CASH disbursement drives the 1099 cumulative ledger; CHECK does not."
+      - from: PENDING
+        to: VOID
+        trigger: "POST /yard/payouts/{id}/void"
+        actor: PayoutClerk
+        preconditions:
+          - "payout.status == PENDING"
+        side_effects:
+          - "payout closed without disbursement; ticket remains RELEASED"
+        note: "Compensating action; no ledger movement since no CASH was added."
+
+  - entity: Container
+    initial_state: STAGED
+    terminal_states: [CLOSED]
+    transitions:
+      - from: STAGED
+        to: DISPATCHED
+        trigger: "POST /yard/containers/{id}/dispatch"
+        actor: YardManager
+        preconditions:
+          - "container.status == STAGED"
+          - "container.loaded_weight_lb > 0"
+          - "expected_container_version matches container.version (OCC)"
+        side_effects:
+          - "container leaves the staging line and is eligible for a MillShipment"
+          - "increments Container.version by 1"
+        note: "OCC guards against a second load-then-dispatch acting on a stale view of the roll-off."
+      - from: DISPATCHED
+        to: CLOSED
+        trigger: "POST /yard/mill-shipments"
+        actor: YardManager
+        preconditions:
+          - "container.status == DISPATCHED"
+          - "no existing MillShipment for the container"
+        side_effects:
+          - "create MillShipment(status=SHIPPED) copying container weight and category"
+          - "container consumed"
+        note: "A dispatched container is shipped exactly once."
+
+  - entity: MillShipment
+    initial_state: SHIPPED
+    terminal_states: [SETTLED]
+    transitions:
+      - from: SHIPPED
+        to: SETTLED
+        trigger: "POST /yard/mill-shipments/{id}/settle"
+        actor: SettlementAccountant
+        preconditions:
+          - "shipment.status == SHIPPED"
+          - "final_settlement_cents >= 0"
+          - "if hedge_position_id provided: referenced HedgePosition status=OPEN, category matches, and expected_hedge_version matches (OCC)"
+        side_effects:
+          - "set settlement_variance_cents = final_settlement_cents - expected_settlement_cents"
+          - "cross-entity cascade: if hedge linked, realize hedge -> HedgePosition.realized_weight_lb += shipped_weight_lb"
+          - "cross-entity cascade: that realization recomputes HedgePosition.realized_pnl_cents"
+          - "cross-entity cascade: if realized_weight_lb >= hedged_weight_lb, transition HedgePosition OPEN -> CLOSED"
+          - "increments HedgePosition.version by 1 when a hedge is linked"
+        note: "Settlement reconciles mill estimate vs actual AND realizes the hedge in one cascade."
+
+  - entity: HedgePosition
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /yard/hedges/{id}/close (manual) or auto on full realization"
+        actor: SettlementAccountant
+        preconditions:
+          - "hedge.status == OPEN"
+        side_effects:
+          - "no further shipments may realize against this hedge"
+        note: "Auto-closed by the MillShipment settle cascade when fully realized; otherwise closable manually."
+
+  - entity: TheftReport
+    initial_state: OPEN
+    terminal_states: [CLEARED]
+    transitions:
+      - from: OPEN
+        to: CLEARED
+        trigger: "POST /yard/theft-reports/{id}/clear"
+        actor: ComplianceOfficer
+        preconditions:
+          - "report.status == OPEN"
+        side_effects:
+          - "cross-entity: decrement seller.open_theft_reports by 1"
+          - "cross-entity: if seller.open_theft_reports reaches 0, set seller.status = ACTIVE (only if not BANNED)"
+        note: "Compensating action that unfreezes a seller once all reports clear."
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: dispatch-stale-container
+    parent_entity: Container
+    write_endpoint: "POST /yard/containers/{id}/dispatch"
+    occ_field: "expected_container_version"
+    description: |
+      Dispatching a Container whose version has advanced since the client last
+      observed it is rejected. A ticket release legitimately supersedes the
+      client's view by loading additional net weight onto the same roll-off
+      (bumping container.version); a dispatch carrying the pre-load version is
+      therefore acting on a stale capacity view and is rejected with a
+      precondition-failed status.
+    error_id: ERR_STALE_CONTAINER_VERSION
+    http_status: 412
+  - rule_id: settle-stale-hedge
+    parent_entity: HedgePosition
+    write_endpoint: "POST /yard/mill-shipments/{id}/settle"
+    occ_field: "expected_hedge_version"
+    description: |
+      Settling a MillShipment against a HedgePosition whose version has advanced
+      since the client last observed it is rejected. Another shipment's
+      settlement legitimately realizes weight against the same hedge (bumping
+      hedge.version and possibly closing it); a settlement carrying the stale
+      hedge version is rejected with a precondition-failed status so it cannot
+      over-realize the position.
+    error_id: ERR_STALE_HEDGE_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: ticket_spot_valuation
+    trigger: "TicketLineItem creation (POST /yard/tickets/{id}/line-items) and frozen on ScaleTicket WEIGHED transition (POST /yard/tickets/{id}/weigh-out)"
+    algorithm: aggregation
+    formula: |
+      # Per-line round, THEN sum (rounding order pinned).
+      for each TicketLineItem li on ticket:
+        price = CommodityPrice[li.commodity_price_id].spot_price_cents_per_lb
+        li.line_valuation_cents = round_half_up(li.weight_lb * price)   # round at the line
+      ticket.gross_valuation_cents = sum(li.line_valuation_cents for li in ticket.line_items)  # then sum
+    input_set: "all TicketLineItem rows on the ticket; prices pinned via commodity_price_id (the ACTIVE row at line creation), unaffected by later supersede"
+    constants: {}
+    precision: "cents; round_half_up at the line; per-line-then-sum order is mandatory"
+    variants:
+      - name: intake_spot_valuation
+        when: "at intake / weigh-out — buy side, paid to seller"
+        difference: "uses spot_price_cents_per_lb; this is the amount disbursed in the Payout"
+
+  - name: mill_settlement_reconciliation
+    trigger: "MillShipment creation freezes expected; POST /yard/mill-shipments/{id}/settle records final and computes variance"
+    algorithm: forward_looking
+    formula: |
+      # expected (forward-looking, sell side) — frozen at shipment creation
+      expected_settlement_cents = 0
+      for each ScaleTicket t assigned to shipment.container (status in {RELEASED, PAID}):
+        for each TicketLineItem li on t:
+          mill_price = CommodityPrice[li.commodity_price_id].mill_price_cents_per_lb
+          expected_settlement_cents += round_half_up(li.weight_lb * mill_price)   # per-line round then accumulate
+      # final (actual) supplied by mill at settle:
+      settlement_variance_cents = final_settlement_cents - expected_settlement_cents
+    input_set: "TicketLineItem rows of every ScaleTicket assigned to the shipment's container whose status is RELEASED or PAID; mill prices pinned via commodity_price_id"
+    constants: {}
+    precision: "cents; round_half_up per line then accumulate; variance is a plain integer subtraction"
+    variants:
+      - name: expected_estimate
+        when: "at MillShipment creation"
+        difference: "forward-looking projection using mill_price_cents_per_lb over the container's released tickets"
+      - name: final_actual
+        when: "at settle"
+        difference: "mill-remitted final_settlement_cents; variance = final - expected can be negative (unfavorable) or positive (favorable)"
+
+  - name: rule_1099_issuance
+    trigger: "Payout settle (POST /yard/payouts/{id}/settle) when method == CASH"
+    algorithm: threshold
+    formula: |
+      if payout.method == CASH:
+        seller.ytd_cash_paid_cents += payout.amount_cents          # ledger increment FIRST
+        crosses = seller.ytd_cash_paid_cents >= TIN_1099_THRESHOLD_CENTS
+        if crosses:
+          seller.requires_1099 = true                              # sticky for the tax year
+        payout.form_1099_issued = (crosses and seller.tin is not null)
+      else:  # CHECK
+        payout.form_1099_issued = false   # CHECK never increments the cumulative ledger
+    input_set: "the seller's prior ytd_cash_paid_cents plus this CASH payout's amount_cents"
+    constants:
+      TIN_1099_THRESHOLD_CENTS: 60000      # $600.00 IRS aggregate cash threshold
+    precision: "integer cents; comparison is cumulative-post-increment and uses >= (60000 triggers, 59999 does not)"
+
+  - name: hedge_realization_pnl
+    trigger: "MillShipment settle (POST /yard/mill-shipments/{id}/settle) when hedge_position_id is set"
+    algorithm: aggregation
+    formula: |
+      # effective_mill_price = final_settlement_cents / shipped_weight_lb, the realized sell price per lb
+      effective_mill_price = round_half_up(shipment.final_settlement_cents / shipment.shipped_weight_lb)
+      realize_lb = min(shipment.shipped_weight_lb, hedge.hedged_weight_lb - hedge.realized_weight_lb)
+      leg_pnl = round_half_up(realize_lb * (hedge.locked_price_cents_per_lb - effective_mill_price))
+      hedge.realized_weight_lb += realize_lb
+      hedge.realized_pnl_cents += leg_pnl
+      if hedge.realized_weight_lb >= hedge.hedged_weight_lb:
+        hedge.status = CLOSED
+    input_set: "this shipment's shipped_weight_lb and final_settlement_cents; hedge's locked price and remaining capacity"
+    constants: {}
+    precision: "cents; round_half_up effective price first, then round_half_up the leg P&L; realize_lb caps at remaining hedge capacity"
+    variants:
+      - name: favorable_hedge
+        when: "locked_price_cents_per_lb > effective_mill_price"
+        difference: "leg_pnl positive — hedge gains while spot fell"
+      - name: unfavorable_hedge
+        when: "locked_price_cents_per_lb < effective_mill_price"
+        difference: "leg_pnl negative — hedge loses while spot rose"
+
+# ===========================================================================
+# §1.4 Validation Rules Table (Ordered by Priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except GET list/detail open reads"
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for the operation per §1.7 RBAC matrix"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: existence
+    check: "all path/body referenced resources exist (validated left-to-right in path), including FK targets"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+  - priority: 4
+    category: state
+    check: "target resource is in a state from which the requested transition is defined"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 5
+    category: business_safety
+    check: "segregation of duties — the X-User-ID approving a payout must differ from the ticket's theft_hold_released_by"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /yard/payouts"
+  - priority: 6
+    category: business_safety
+    check: "seller is not FLAGGED/BANNED and has no OPEN theft reports when releasing a ticket or settling a payout"
+    error_id: ERR_SELLER_FROZEN
+    http_status: 409
+    applies_to: "POST /yard/tickets/{id}/release, POST /yard/tickets/{id}/clear-hold, POST /yard/payouts/{id}/settle"
+  - priority: 7
+    category: business_referential
+    check: "on release, container.category must match the category of every TicketLineItem on the ticket (no mixed-category load)"
+    error_id: ERR_CATEGORY_MISMATCH
+    http_status: 409
+    applies_to: "POST /yard/tickets/{id}/release"
+  - priority: 8
+    category: business_constraint
+    check: "grade_code on a line item must resolve to a CommodityPrice with status=ACTIVE"
+    error_id: ERR_GRADE_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /yard/tickets/{id}/line-items"
+  - priority: 9
+    category: business_temporal
+    check: "tare_weight_lb must be >= 0 and strictly less than gross_weight_lb (outbound lighter than inbound)"
+    error_id: ERR_INVALID_WEIGHT
+    http_status: 422
+    applies_to: "POST /yard/tickets/{id}/weigh-out"
+  - priority: 10
+    category: business_constraint
+    check: "container has capacity — loaded_weight_lb + ticket.net_weight_lb must be <= capacity_lb on release"
+    error_id: ERR_CONTAINER_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /yard/tickets/{id}/release"
+  - priority: 11
+    category: business_constraint
+    check: "hedge realization must not over-realize — shipped_weight_lb must not push realized_weight_lb past hedged_weight_lb"
+    error_id: ERR_HEDGE_OVER_REALIZED
+    http_status: 409
+    applies_to: "POST /yard/mill-shipments/{id}/settle"
+  - priority: 12
+    category: business_fiscal
+    check: "1099 gating — a CASH payout whose settle would push ytd_cash_paid_cents >= TIN_1099_THRESHOLD_CENTS requires the seller to have a non-null TIN"
+    error_id: ERR_TIN_REQUIRED_FOR_1099
+    http_status: 422
+    applies_to: "POST /yard/payouts/{id}/settle"
+  - priority: 13
+    category: business_constraint
+    check: "OCC version match on guarded write endpoints (container dispatch, shipment settle with hedge)"
+    error_id: ERR_STALE_CONTAINER_VERSION
+    http_status: 412
+    applies_to: "POST /yard/containers/{id}/dispatch, POST /yard/mill-shipments/{id}/settle"
+  - priority: 14
+    category: business_constraint
+    check: "required body fields present and well-typed (enum membership, numeric ranges, positive weights)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # ---- Seller ----
+  - method: POST
+    path: "/yard/sellers"
+    description: "Register a seller with government ID; TIN optional."
+    roles: [WeighMaster, ComplianceOfficer]
+    code: 201
+    input: [legal_name, id_type, id_number, "tin?"]
+    output: Seller
+    side_effects: ["status=ACTIVE, ytd_cash_paid_cents=0, requires_1099=false, open_theft_reports=0"]
+  - method: GET
+    path: "/yard/sellers/{id}"
+    description: "Fetch a seller including 1099 ledger and theft status."
+    roles: [WeighMaster, PayoutClerk, ComplianceOfficer, YardManager, SettlementAccountant]
+    code: 200
+    input: []
+    output: Seller
+    side_effects: []
+  - method: GET
+    path: "/yard/sellers"
+    description: "List sellers (paginated); filter by status."
+    roles: [WeighMaster, PayoutClerk, ComplianceOfficer, YardManager, SettlementAccountant]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Seller[]
+    side_effects: []
+  - method: PATCH
+    path: "/yard/sellers/{id}"
+    description: "Add or correct a seller's TIN (e.g., before a 1099-triggering payout)."
+    roles: [WeighMaster, ComplianceOfficer]
+    code: 200
+    input: [tin]
+    output: Seller
+    side_effects: ["increments Seller.version by 1"]
+  - method: POST
+    path: "/yard/sellers/{id}/ban"
+    description: "Ban a seller; blocks new weigh-outs and releases."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Seller
+    side_effects: ["set status=BANNED"]
+
+  # ---- CommodityPrice ----
+  - method: POST
+    path: "/yard/commodity-prices"
+    description: "Publish an ACTIVE spot/mill price for a material grade. If an ACTIVE row already exists for grade_code, it is SUPERSEDED."
+    roles: [YardManager]
+    code: 201
+    input: [grade_code, category, spot_price_cents_per_lb, mill_price_cents_per_lb]
+    output: CommodityPrice
+    side_effects: ["supersede any prior ACTIVE row for grade_code (status=SUPERSEDED)"]
+  - method: GET
+    path: "/yard/commodity-prices/{id}"
+    description: "Fetch a single commodity price row."
+    roles: [WeighMaster, PayoutClerk, ComplianceOfficer, YardManager, SettlementAccountant]
+    code: 200
+    input: []
+    output: CommodityPrice
+    side_effects: []
+  - method: GET
+    path: "/yard/commodity-prices"
+    description: "List commodity prices; filter by grade_code, category, status."
+    roles: [WeighMaster, PayoutClerk, ComplianceOfficer, YardManager, SettlementAccountant]
+    code: 200
+    input: ["grade_code?", "category?", "status?", "limit?", "offset?"]
+    output: CommodityPrice[]
+    side_effects: []
+
+  # ---- ScaleTicket ----
+  - method: POST
+    path: "/yard/tickets"
+    description: "Open a DRAFT scale ticket at inbound weigh."
+    roles: [WeighMaster]
+    code: 201
+    input: [seller_id, gross_weight_lb]
+    output: ScaleTicket
+    side_effects: ["status=DRAFT, gross_valuation_cents=0"]
+  - method: GET
+    path: "/yard/tickets/{id}"
+    description: "Fetch a scale ticket with valuation and status."
+    roles: [WeighMaster, PayoutClerk, ComplianceOfficer, YardManager, SettlementAccountant]
+    code: 200
+    input: []
+    output: ScaleTicket
+    side_effects: []
+  - method: GET
+    path: "/yard/tickets"
+    description: "List tickets; filter by seller_id, container_id, status."
+    roles: [WeighMaster, PayoutClerk, ComplianceOfficer, YardManager, SettlementAccountant]
+    code: 200
+    input: ["seller_id?", "container_id?", "status?", "limit?", "offset?"]
+    output: ScaleTicket[]
+    side_effects: []
+  - method: POST
+    path: "/yard/tickets/{id}/line-items"
+    description: "Add a material grade line to a DRAFT ticket (ferrous/non-ferrous sort recorded via grade category)."
+    roles: [WeighMaster]
+    code: 201
+    input: [grade_code, weight_lb]
+    output: TicketLineItem
+    side_effects: ["pin commodity_price_id; line_valuation_cents = round_half_up(weight_lb * spot_price)"]
+  - method: GET
+    path: "/yard/tickets/{id}/line-items"
+    description: "List the line items of a ticket (reverse-reachability for TicketLineItem.ticket_id)."
+    roles: [WeighMaster, PayoutClerk, ComplianceOfficer, YardManager, SettlementAccountant]
+    code: 200
+    input: []
+    output: TicketLineItem[]
+    side_effects: []
+  - method: GET
+    path: "/yard/line-items/{id}"
+    description: "Fetch a single ticket line item (establishes the line-items collection segment)."
+    roles: [WeighMaster, PayoutClerk, ComplianceOfficer, YardManager, SettlementAccountant]
+    code: 200
+    input: []
+    output: TicketLineItem
+    side_effects: []
+  - method: GET
+    path: "/yard/line-items"
+    description: "List line items across tickets; filter by ticket_id or commodity_price_id (reverse-reachability for TicketLineItem.commodity_price_id)."
+    roles: [WeighMaster, PayoutClerk, ComplianceOfficer, YardManager, SettlementAccountant]
+    code: 200
+    input: ["ticket_id?", "commodity_price_id?", "limit?", "offset?"]
+    output: TicketLineItem[]
+    side_effects: []
+  - method: POST
+    path: "/yard/tickets/{id}/weigh-out"
+    description: "Record outbound tare, compute net weight, freeze gross_valuation_cents → WEIGHED."
+    roles: [WeighMaster]
+    code: 200
+    input: [tare_weight_lb]
+    output: ScaleTicket
+    side_effects: ["net_weight_lb set; gross_valuation_cents frozen; status=WEIGHED; increments ScaleTicket.version by 1"]
+  - method: POST
+    path: "/yard/tickets/{id}/theft-hold"
+    description: "Place a discretionary theft HOLD on a WEIGHED ticket."
+    roles: [WeighMaster]
+    code: 200
+    input: []
+    output: ScaleTicket
+    side_effects: ["status=HOLD"]
+  - method: POST
+    path: "/yard/tickets/{id}/clear-hold"
+    description: "Clear a theft HOLD back to WEIGHED, recording the clearing WeighMaster's id."
+    roles: [WeighMaster]
+    code: 200
+    input: []
+    output: ScaleTicket
+    side_effects: ["status=WEIGHED; theft_hold_released_by = X-User-ID"]
+  - method: POST
+    path: "/yard/tickets/{id}/release"
+    description: "Release a WEIGHED ticket, sorting its material into a matching STAGED container → RELEASED."
+    roles: [WeighMaster]
+    code: 200
+    input: [container_id]
+    output: ScaleTicket
+    side_effects: ["status=RELEASED; container.loaded_weight_lb += net_weight_lb"]
+  - method: POST
+    path: "/yard/tickets/{id}/report"
+    description: "File a theft report on a WEIGHED ticket → REPORTED (terminal); freezes the seller."
+    roles: [WeighMaster]
+    code: 200
+    input: [reason]
+    output: ScaleTicket
+    side_effects: ["status=REPORTED; create TheftReport(OPEN); seller.status=FLAGGED; seller.open_theft_reports += 1"]
+
+  # ---- Payout ----
+  - method: POST
+    path: "/yard/payouts"
+    description: "Create a PENDING payout for a RELEASED ticket (cash or check); enforces segregation of duties."
+    roles: [PayoutClerk]
+    code: 201
+    input: [ticket_id, method]
+    output: Payout
+    side_effects: ["amount_cents = ticket.gross_valuation_cents; copy seller_id; status=PENDING"]
+  - method: GET
+    path: "/yard/payouts/{id}"
+    description: "Fetch a payout including 1099 flag and status."
+    roles: [PayoutClerk, ComplianceOfficer, SettlementAccountant, YardManager]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: []
+  - method: GET
+    path: "/yard/payouts"
+    description: "List payouts; filter by ticket_id, seller_id, method, status."
+    roles: [PayoutClerk, ComplianceOfficer, SettlementAccountant, YardManager]
+    code: 200
+    input: ["ticket_id?", "seller_id?", "method?", "status?", "limit?", "offset?"]
+    output: Payout[]
+    side_effects: []
+  - method: POST
+    path: "/yard/payouts/{id}/settle"
+    description: "Disburse the payout → SETTLED; drives the 1099 cumulative cash ledger and transitions the ticket to PAID."
+    roles: [PayoutClerk]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: ["status=SETTLED; if CASH: seller.ytd_cash_paid_cents += amount_cents and recompute requires_1099; set form_1099_issued; ticket RELEASED->PAID"]
+  - method: POST
+    path: "/yard/payouts/{id}/void"
+    description: "Void a PENDING payout without disbursing (compensating action)."
+    roles: [PayoutClerk]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: ["status=VOID; ticket stays RELEASED; no ledger movement"]
+
+  # ---- Container ----
+  - method: POST
+    path: "/yard/containers"
+    description: "Stage a roll-off container for a given material category and capacity."
+    roles: [YardManager]
+    code: 201
+    input: [category, capacity_lb]
+    output: Container
+    side_effects: ["status=STAGED, loaded_weight_lb=0"]
+  - method: GET
+    path: "/yard/containers/{id}"
+    description: "Fetch a container including loaded weight and status."
+    roles: [WeighMaster, PayoutClerk, ComplianceOfficer, YardManager, SettlementAccountant]
+    code: 200
+    input: []
+    output: Container
+    side_effects: []
+  - method: GET
+    path: "/yard/containers"
+    description: "List containers; filter by category, status."
+    roles: [WeighMaster, PayoutClerk, ComplianceOfficer, YardManager, SettlementAccountant]
+    code: 200
+    input: ["category?", "status?", "limit?", "offset?"]
+    output: Container[]
+    side_effects: []
+  - method: POST
+    path: "/yard/containers/{id}/dispatch"
+    description: "Dispatch a STAGED non-empty container → DISPATCHED (OCC-guarded on container version)."
+    roles: [YardManager]
+    code: 200
+    input: [expected_container_version]
+    output: Container
+    side_effects: ["status=DISPATCHED; increments Container.version by 1"]
+
+  # ---- MillShipment ----
+  - method: POST
+    path: "/yard/mill-shipments"
+    description: "Ship a DISPATCHED container to the mill; freezes expected_settlement_cents."
+    roles: [YardManager, SettlementAccountant]
+    code: 201
+    input: [container_id, "hedge_position_id?"]
+    output: MillShipment
+    side_effects: ["status=SHIPPED; copy weight/category; expected_settlement_cents frozen; container CLOSED"]
+  - method: GET
+    path: "/yard/mill-shipments/{id}"
+    description: "Fetch a mill shipment including expected/final settlement and variance."
+    roles: [YardManager, SettlementAccountant, ComplianceOfficer]
+    code: 200
+    input: []
+    output: MillShipment
+    side_effects: []
+  - method: GET
+    path: "/yard/mill-shipments"
+    description: "List mill shipments; filter by container_id, hedge_position_id, status."
+    roles: [YardManager, SettlementAccountant, ComplianceOfficer]
+    code: 200
+    input: ["container_id?", "hedge_position_id?", "status?", "limit?", "offset?"]
+    output: MillShipment[]
+    side_effects: []
+  - method: POST
+    path: "/yard/mill-shipments/{id}/settle"
+    description: "Record the mill's final settlement, compute variance, and realize the linked hedge → SETTLED."
+    roles: [SettlementAccountant]
+    code: 200
+    input: [final_settlement_cents, "expected_hedge_version?"]
+    output: MillShipment
+    side_effects: ["status=SETTLED; settlement_variance_cents computed; if hedge: realize weight, recompute realized_pnl_cents, auto-close hedge if full, increments HedgePosition.version by 1"]
+
+  # ---- HedgePosition ----
+  - method: POST
+    path: "/yard/hedges"
+    description: "Open a commodity hedge position locking a price for a weight."
+    roles: [SettlementAccountant]
+    code: 201
+    input: [category, hedged_weight_lb, locked_price_cents_per_lb]
+    output: HedgePosition
+    side_effects: ["status=OPEN, realized_weight_lb=0, realized_pnl_cents=0"]
+  - method: GET
+    path: "/yard/hedges/{id}"
+    description: "Fetch a hedge including realized weight and P&L."
+    roles: [SettlementAccountant, YardManager, ComplianceOfficer]
+    code: 200
+    input: []
+    output: HedgePosition
+    side_effects: []
+  - method: GET
+    path: "/yard/hedges"
+    description: "List hedge positions; filter by category, status."
+    roles: [SettlementAccountant, YardManager, ComplianceOfficer]
+    code: 200
+    input: ["category?", "status?", "limit?", "offset?"]
+    output: HedgePosition[]
+    side_effects: []
+  - method: POST
+    path: "/yard/hedges/{id}/close"
+    description: "Manually close an OPEN hedge."
+    roles: [SettlementAccountant]
+    code: 200
+    input: []
+    output: HedgePosition
+    side_effects: ["status=CLOSED"]
+
+  # ---- TheftReport ----
+  - method: GET
+    path: "/yard/theft-reports/{id}"
+    description: "Fetch a theft report."
+    roles: [ComplianceOfficer, WeighMaster, YardManager]
+    code: 200
+    input: []
+    output: TheftReport
+    side_effects: []
+  - method: GET
+    path: "/yard/theft-reports"
+    description: "List theft reports; filter by seller_id, ticket_id, status (reverse-reachability for TheftReport.seller_id and TheftReport.ticket_id)."
+    roles: [ComplianceOfficer, WeighMaster, YardManager]
+    code: 200
+    input: ["seller_id?", "ticket_id?", "status?", "limit?", "offset?"]
+    output: TheftReport[]
+    side_effects: []
+  - method: POST
+    path: "/yard/theft-reports"
+    description: "File a proactive theft report against a seller (independent of a ticket)."
+    roles: [ComplianceOfficer]
+    code: 201
+    input: [seller_id, reason, "ticket_id?"]
+    output: TheftReport
+    side_effects: ["status=OPEN; seller.status=FLAGGED; seller.open_theft_reports += 1"]
+  - method: POST
+    path: "/yard/theft-reports/{id}/clear"
+    description: "Clear an OPEN theft report; decrements the seller's open count and may unfreeze them."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: TheftReport
+    side_effects: ["status=CLEARED; seller.open_theft_reports -= 1; if 0 and not BANNED, seller.status=ACTIVE"]
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID headers, or unknown role."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Authenticated role is not permitted for this operation per §1.7."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced resource (path id or FK in body) does not exist."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition is not defined from the resource's current state."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "Payout-approving X-User-ID equals the ticket's theft_hold_released_by."
+  - id: ERR_SELLER_FROZEN
+    http: 409
+    condition: "Seller is FLAGGED/BANNED or has OPEN theft reports during release/clear-hold/settle."
+  - id: ERR_CATEGORY_MISMATCH
+    http: 409
+    condition: "Container category does not match a line item's category on release."
+  - id: ERR_GRADE_NOT_ACTIVE
+    http: 409
+    condition: "Line-item grade_code has no ACTIVE CommodityPrice row."
+  - id: ERR_INVALID_WEIGHT
+    http: 422
+    condition: "tare_weight_lb negative or not strictly less than gross_weight_lb."
+  - id: ERR_CONTAINER_CAPACITY_EXCEEDED
+    http: 409
+    condition: "Releasing the ticket would push container.loaded_weight_lb past capacity_lb."
+  - id: ERR_HEDGE_OVER_REALIZED
+    http: 409
+    condition: "Settling would realize more weight than the hedge's remaining capacity."
+  - id: ERR_TIN_REQUIRED_FOR_1099
+    http: 422
+    condition: "CASH payout settle would cross the 1099 threshold but seller has no TIN."
+  - id: ERR_STALE_CONTAINER_VERSION
+    http: 412
+    condition: "expected_container_version does not match Container.version on dispatch (OCC)."
+  - id: ERR_STALE_HEDGE_VERSION
+    http: 412
+    condition: "expected_hedge_version does not match HedgePosition.version on shipment settle (OCC)."
+  - id: ERR_NO_LINE_ITEMS
+    http: 409
+    condition: "weigh-out attempted on a ticket with zero line items."
+  - id: ERR_DUPLICATE_PAYOUT
+    http: 409
+    condition: "A Payout already exists for the ticket."
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Missing required field, bad enum, or out-of-range numeric value."
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: WeighMaster
+    description: "Operates the scale: registers sellers, opens tickets, weighs in/out, sorts material, places/clears theft holds, releases tickets."
+    identity: opaque
+    exclusive_operations:
+      - "POST /yard/tickets"
+      - "POST /yard/tickets/{id}/line-items"
+      - "POST /yard/tickets/{id}/weigh-out"
+      - "POST /yard/tickets/{id}/theft-hold"
+      - "POST /yard/tickets/{id}/clear-hold"
+      - "POST /yard/tickets/{id}/release"
+      - "POST /yard/tickets/{id}/report"
+    shared_operations:
+      - "POST /yard/sellers"
+      - "PATCH /yard/sellers/{id}"
+      - "GET reads across yard resources"
+  - name: PayoutClerk
+    description: "Disburses funds: creates/settles/voids payouts; bound by segregation of duties against the hold-clearer."
+    identity: opaque
+    exclusive_operations:
+      - "POST /yard/payouts"
+      - "POST /yard/payouts/{id}/settle"
+      - "POST /yard/payouts/{id}/void"
+    shared_operations:
+      - "GET reads across yard resources"
+  - name: YardManager
+    description: "Manages prices and containers: publishes commodity prices, stages/dispatches roll-offs, can create mill shipments."
+    identity: opaque
+    exclusive_operations:
+      - "POST /yard/commodity-prices"
+      - "POST /yard/containers"
+      - "POST /yard/containers/{id}/dispatch"
+    shared_operations:
+      - "POST /yard/mill-shipments"
+      - "GET reads across yard resources"
+  - name: SettlementAccountant
+    description: "Runs mill settlement and commodity hedges: ships, settles, opens/closes hedges, realizes hedge P&L."
+    identity: opaque
+    exclusive_operations:
+      - "POST /yard/mill-shipments/{id}/settle"
+      - "POST /yard/hedges"
+      - "POST /yard/hedges/{id}/close"
+    shared_operations:
+      - "POST /yard/mill-shipments"
+      - "GET reads across yard resources"
+  - name: ComplianceOfficer
+    description: "Theft-prevention authority: files/clears theft reports, bans sellers, registers sellers."
+    identity: opaque
+    exclusive_operations:
+      - "POST /yard/theft-reports"
+      - "POST /yard/theft-reports/{id}/clear"
+      - "POST /yard/sellers/{id}/ban"
+    shared_operations:
+      - "POST /yard/sellers"
+      - "PATCH /yard/sellers/{id}"
+      - "GET reads across yard resources"

@@ -1,0 +1,1420 @@
+scenario: |
+  448. Ghost Kitchen & Virtual Brand Platform: kitchen-stall licensing & member, multi-brand
+  menu on aggregators, order ingestion (DoorDash/Uber Eats) & routing, shared-equipment
+  scheduling, commissary inventory & food cost, brand performance & commission, delivery-only
+  fulfillment, hours/availability sync
+
+domain_name: ghost-kitchen
+api_prefix: ""
+
+# Most resources are flat peers joined by FKs. Stalls own equipment + leases; VirtualBrands are
+# leased onto stalls; Menus/MenuItems belong to brands; aggregator Orders reference a brand and
+# (on routing) a stall + equipment booking; commissary IngredientLots and recipe BOM links bind
+# menu items to inventory. The interesting coupling is: an inbound order must (1) find an OPEN
+# brand whose stall is OPEN, (2) reserve a contiguous equipment time-window without overlap,
+# (3) deduct ingredient inventory by recipe BOM, and (4) at settlement reconcile food cost
+# (chronological FIFO) against commission (forward-looking estimate) on the brand ledger.
+
+complexity_profile:
+  primary_archetype: temporal_windowing
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - derived_field_reconciliation
+
+  entity_topology: flat
+  # Peer entities joined by FK references (a_id in body), not nested URL ownership.
+  # Stall, VirtualBrand, KitchenLease, Equipment, EquipmentBooking, MenuItem, IngredientLot,
+  # RecipeComponent, AggregatorOrder are all top-level collections cross-linked by FK.
+
+  state_machine_shape: branching
+  # AggregatorOrder forks INGESTED -> {ROUTED | REJECTED}; ROUTED -> {PREPARING -> FULFILLED |
+  # CANCELLED} with divergent compensation side-effect sets per branch. KitchenLease has a
+  # revert (SUSPENDED -> ACTIVE). VirtualBrand availability is a parallel dimension.
+
+  relationship_patterns:
+    - one_to_many       # Stall -> Equipment; VirtualBrand -> MenuItem; MenuItem -> RecipeComponent
+    - many_to_many      # VirtualBrand <-> Stall via KitchenLease (a brand may lease several stalls)
+    - cross_aggregate   # AggregatorOrder references VirtualBrand, Stall, EquipmentBooking
+    - polymorphic       # IngredientLot consumption logged against either an order or an adjustment
+
+  role_model: peer_roles
+  # PlatformOps (opaque operator), StallOperator (entity_backed:Stall, runs a physical kitchen),
+  # BrandOwner (entity_backed:VirtualBrand, owns a virtual brand), AggregatorGateway (opaque
+  # integration identity that pushes inbound orders). Each owns distinct resource types.
+
+  consistency_model: immediate
+  # All mutations (routing, inventory deduction, ledger debit) are atomic within one request.
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Stall
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Display name of the physical kitchen stall."
+      - name: timezone
+        type: string
+        source: input
+        description: "IANA timezone for interpreting operating hours, e.g. 'America/Los_Angeles'."
+      - name: open_minute_of_day
+        type: integer
+        source: input
+        description: "Daily opening time as minutes-from-midnight in the stall timezone, 0..1439."
+        constraints: "0 <= open_minute_of_day < 1440; must be < close_minute_of_day"
+      - name: close_minute_of_day
+        type: integer
+        source: input
+        description: "Daily closing time as minutes-from-midnight, 1..1440 (1440 == midnight)."
+        constraints: "0 < close_minute_of_day <= 1440; must be > open_minute_of_day"
+      - name: status
+        type: enum
+        source: computed
+        description: "Operational posture. OPEN when current clock minute is within hours and not manually closed; CLOSED otherwise. Set via manual override transitions; see §1.2 Stall machine."
+        default: OPEN
+        constraints: "one of {OPEN, CLOSED}"
+      - name: equipment_count
+        type: integer
+        source: computed
+        description: "Denormalized count of Equipment rows whose stall_id == this Stall.id and status != RETIRED. Reconciled on equipment create/retire."
+        default: 0
+
+  - name: VirtualBrand
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Consumer-facing virtual brand name (e.g. 'Midnight Wings')."
+      - name: owner_email
+        type: string
+        source: input
+        description: "Contact email of the brand owner."
+      - name: commission_rate_bps
+        type: integer
+        source: input
+        description: "Platform commission charged on gross order revenue, in basis points (100 bps = 1%)."
+        constraints: "0 <= commission_rate_bps <= 5000"
+      - name: availability
+        type: enum
+        source: computed
+        description: "Menu availability dimension, independent of lifecycle status. LISTED = orderable on aggregators; PAUSED = temporarily hidden. Toggled via §1.2 VirtualBrand availability transitions."
+        default: PAUSED
+        constraints: "one of {LISTED, PAUSED}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle status, independent of availability. ONBOARDING at creation; ACTIVE once at least one ACTIVE KitchenLease exists; DEACTIVATED when retired. See §1.2."
+        default: ONBOARDING
+        constraints: "one of {ONBOARDING, ACTIVE, DEACTIVATED}"
+      - name: ledger_balance_cents
+        type: integer
+        source: computed
+        description: "Net amount owed to the brand: cumulative payout_cents credited at order settlement minus commission_cents and food_cost_cents debited. Reconciled by side effects of order settlement and cancellation; see §1.3 brand_ledger_balance."
+        default: 0
+
+  - name: KitchenLease
+    parent: null
+    common_fields: true
+    fields:
+      - name: stall_id
+        type: string
+        source: input
+        description: "FK -> Stall.id; the physical stall being leased."
+      - name: brand_id
+        type: string
+        source: input
+        description: "FK -> VirtualBrand.id; the virtual brand occupying the stall."
+      - name: monthly_fee_cents
+        type: integer
+        source: input
+        description: "Monthly licensing fee for this lease, in cents."
+        constraints: "monthly_fee_cents > 0"
+      - name: priority_rank
+        type: integer
+        source: input
+        description: "Routing priority of this lease at the stall; lower number = higher priority when multiple leased brands could serve an order. Unique per stall among ACTIVE leases."
+        constraints: "priority_rank >= 1"
+      - name: status
+        type: enum
+        source: computed
+        description: "Lease lifecycle. PENDING at creation; ACTIVE once activated; SUSPENDED on non-payment (revertible); TERMINATED is terminal. See §1.2 KitchenLease."
+        default: PENDING
+        constraints: "one of {PENDING, ACTIVE, SUSPENDED, TERMINATED}"
+
+  - name: Equipment
+    parent: null
+    common_fields: true
+    fields:
+      - name: stall_id
+        type: string
+        source: input
+        description: "FK -> Stall.id; the stall this equipment physically resides in."
+      - name: equipment_type
+        type: enum
+        source: input
+        description: "Class of shared equipment."
+        constraints: "one of {FRYER, OVEN, GRILL, PREP_STATION}"
+      - name: turnaround_buffer_minutes
+        type: integer
+        source: input
+        description: "Mandatory cleaning/cooldown buffer enforced AFTER each booking on this unit before the next booking may start."
+        default: 0
+        constraints: "turnaround_buffer_minutes >= 0"
+      - name: status
+        type: enum
+        source: computed
+        description: "AVAILABLE = bookable; MAINTENANCE = temporarily unbookable; RETIRED is terminal. See §1.2 Equipment."
+        default: AVAILABLE
+        constraints: "one of {AVAILABLE, MAINTENANCE, RETIRED}"
+
+  - name: EquipmentBooking
+    parent: null
+    common_fields: true
+    fields:
+      - name: equipment_id
+        type: string
+        source: input
+        description: "FK -> Equipment.id; the unit reserved for this window."
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> AggregatorOrder.id; the order this booking serves. Null only for maintenance holds created via the booking endpoint with order_id omitted."
+      - name: start_minute
+        type: integer
+        source: input
+        description: "Absolute integer start of the reserved window, in minutes since the Unix epoch (UTC)."
+        constraints: "start_minute >= 0; start_minute < end_minute"
+      - name: end_minute
+        type: integer
+        source: input
+        description: "Absolute integer end of the reserved window (half-open: [start_minute, end_minute)), minutes since epoch UTC."
+        constraints: "end_minute > start_minute"
+      - name: status
+        type: enum
+        source: computed
+        description: "HELD = occupies the window; RELEASED is terminal (window freed). See §1.2 EquipmentBooking."
+        default: HELD
+        constraints: "one of {HELD, RELEASED}"
+
+  - name: MenuItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: brand_id
+        type: string
+        source: input
+        description: "FK -> VirtualBrand.id; the brand whose menu this item belongs to."
+      - name: name
+        type: string
+        source: input
+        description: "Menu item name (e.g. '8pc Wings')."
+      - name: price_cents
+        type: integer
+        source: input
+        description: "List price charged to the consumer on aggregators, in cents."
+        constraints: "price_cents > 0"
+      - name: prep_minutes
+        type: integer
+        source: input
+        description: "Equipment-occupancy minutes required to prepare one unit of this item."
+        constraints: "prep_minutes >= 1"
+      - name: required_equipment_type
+        type: enum
+        source: input
+        description: "Equipment class this item must be prepared on."
+        constraints: "one of {FRYER, OVEN, GRILL, PREP_STATION}"
+      - name: availability
+        type: enum
+        source: computed
+        description: "AVAILABLE = sellable; SOLD_OUT = auto-set when any required IngredientLot is insufficient for one unit (see §1.3 menu_item_availability). See §1.2 MenuItem."
+        default: AVAILABLE
+        constraints: "one of {AVAILABLE, SOLD_OUT}"
+
+  - name: RecipeComponent
+    parent: null
+    common_fields: false
+    fields:
+      - name: menu_item_id
+        type: string
+        source: input
+        description: "FK -> MenuItem.id; the item this bill-of-materials line belongs to."
+      - name: ingredient_name
+        type: string
+        source: input
+        description: "Canonical ingredient name; lots with this name at the serving stall are consumed FIFO."
+      - name: quantity_grams
+        type: integer
+        source: input
+        description: "Grams of the ingredient consumed per one unit of the menu item."
+        constraints: "quantity_grams > 0"
+
+  - name: IngredientLot
+    parent: null
+    common_fields: true
+    fields:
+      - name: stall_id
+        type: string
+        source: input
+        description: "FK -> Stall.id; the commissary stall holding this lot."
+      - name: ingredient_name
+        type: string
+        source: input
+        description: "Canonical ingredient name, matched against RecipeComponent.ingredient_name."
+      - name: received_at
+        type: datetime
+        source: input
+        description: "Timestamp the lot was received; FIFO consumption orders lots by received_at ASC, then created_at ASC as tie-break."
+      - name: unit_cost_cents_per_gram
+        type: integer
+        source: input
+        description: "Acquisition cost of this lot, in cents per gram; used for chronological food-cost accounting."
+        constraints: "unit_cost_cents_per_gram >= 0"
+      - name: grams_received
+        type: integer
+        source: input
+        description: "Total grams originally received in this lot."
+        constraints: "grams_received > 0"
+      - name: grams_remaining
+        type: integer
+        source: computed
+        description: "Grams still on hand; decremented FIFO on order routing, restored on order cancellation; see §1.3 fifo_inventory_consumption."
+        default: 0
+
+  - name: AggregatorOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: brand_id
+        type: string
+        source: input
+        description: "FK -> VirtualBrand.id; the brand the consumer ordered from on the aggregator."
+      - name: aggregator
+        type: enum
+        source: input
+        description: "Source marketplace."
+        constraints: "one of {DOORDASH, UBER_EATS}"
+      - name: external_ref
+        type: string
+        source: input
+        description: "Aggregator's order id; unique per (aggregator, external_ref) for idempotent ingestion."
+      - name: line_items
+        type: array
+        source: input
+        description: "Array of {menu_item_id, qty} objects; qty integer >= 1."
+      - name: routed_stall_id
+        type: string
+        source: computed
+        description: "FK -> Stall.id; the stall selected by the routing policy at INGESTED->ROUTED. Null until routed."
+      - name: booking_id
+        type: string
+        source: computed
+        description: "FK -> EquipmentBooking.id; the equipment window reserved at routing. Null until routed."
+      - name: gross_revenue_cents
+        type: integer
+        source: computed
+        description: "Sum over line_items of MenuItem.price_cents * qty, snapshotted at ingestion; see §1.3 order_gross_revenue."
+        default: 0
+      - name: commission_cents
+        type: integer
+        source: computed
+        description: "Forward-looking platform commission estimated at routing from gross_revenue_cents and brand.commission_rate_bps; see §1.3 order_commission."
+        default: 0
+      - name: food_cost_cents
+        type: integer
+        source: computed
+        description: "Chronological FIFO food cost finalized at FULFILLED from the actual lots consumed; see §1.3 order_food_cost. 0 until fulfilled."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "INGESTED at creation; forks to ROUTED or REJECTED; ROUTED -> PREPARING -> FULFILLED, or ROUTED/PREPARING -> CANCELLED. See §1.2 AggregatorOrder."
+        default: INGESTED
+        constraints: "one of {INGESTED, ROUTED, PREPARING, FULFILLED, CANCELLED, REJECTED}"
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Stall
+    initial_state: OPEN
+    terminal_states: []
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /stalls/{id}/close"
+        actor: StallOperator
+        preconditions:
+          - "acting StallOperator owns this Stall (X-User-ID == Stall.id)"
+          - "Stall.status == OPEN"
+        side_effects:
+          - "Stall.status := CLOSED"
+          - "increments Stall.version by 1"
+        note: "Manual close blocks new order routing to this stall regardless of operating hours."
+      - from: CLOSED
+        to: OPEN
+        trigger: "POST /stalls/{id}/open"
+        actor: StallOperator
+        preconditions:
+          - "acting StallOperator owns this Stall (X-User-ID == Stall.id)"
+          - "Stall.status == CLOSED"
+        side_effects:
+          - "Stall.status := OPEN"
+          - "increments Stall.version by 1"
+
+  - entity: VirtualBrand
+    initial_state: ONBOARDING
+    terminal_states: [DEACTIVATED]
+    transitions:
+      - from: ONBOARDING
+        to: ACTIVE
+        trigger: "system: first KitchenLease for this brand transitions to ACTIVE"
+        actor: system
+        preconditions:
+          - "VirtualBrand.status == ONBOARDING"
+          - "the activating KitchenLease.brand_id == this VirtualBrand.id"
+        side_effects:
+          - "VirtualBrand.status := ACTIVE"
+          - "increments VirtualBrand.version by 1"
+        note: "Bubble-up: brand becomes ACTIVE as a side effect of lease activation (cascade hop 2 of lease_activation_cascade)."
+      - from: ACTIVE
+        to: DEACTIVATED
+        trigger: "POST /brands/{id}/deactivate"
+        actor: BrandOwner
+        preconditions:
+          - "acting BrandOwner owns this VirtualBrand (X-User-ID == VirtualBrand.id)"
+          - "VirtualBrand.status == ACTIVE"
+          - "no AggregatorOrder with brand_id == this brand in status IN {ROUTED, PREPARING}"
+        side_effects:
+          - "VirtualBrand.status := DEACTIVATED"
+          - "VirtualBrand.availability := PAUSED"
+          - "every ACTIVE KitchenLease with brand_id == this brand transitions to TERMINATED (cascade)"
+          - "increments VirtualBrand.version by 1"
+      # Parallel availability dimension (independent of status):
+      - from: PAUSED
+        to: LISTED
+        trigger: "POST /brands/{id}/list"
+        actor: BrandOwner
+        preconditions:
+          - "acting BrandOwner owns this VirtualBrand (X-User-ID == VirtualBrand.id)"
+          - "VirtualBrand.availability == PAUSED"
+          - "VirtualBrand.status == ACTIVE"
+        side_effects:
+          - "VirtualBrand.availability := LISTED"
+          - "increments VirtualBrand.version by 1"
+        note: "availability is a parallel state dimension evolving independently of status (status is the {ONBOARDING,ACTIVE,DEACTIVATED} axis)."
+      - from: LISTED
+        to: PAUSED
+        trigger: "POST /brands/{id}/pause"
+        actor: BrandOwner
+        preconditions:
+          - "acting BrandOwner owns this VirtualBrand (X-User-ID == VirtualBrand.id)"
+          - "VirtualBrand.availability == LISTED"
+        side_effects:
+          - "VirtualBrand.availability := PAUSED"
+          - "increments VirtualBrand.version by 1"
+
+  - entity: KitchenLease
+    initial_state: PENDING
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: PENDING
+        to: ACTIVE
+        trigger: "POST /leases/{id}/activate"
+        actor: StallOperator
+        preconditions:
+          - "acting StallOperator owns the Stall referenced by KitchenLease.stall_id"
+          - "KitchenLease.status == PENDING"
+          - "referenced Stall exists and Stall.status != n/a (any) — Stall must exist"
+          - "no other ACTIVE KitchenLease at the same stall_id shares this lease.priority_rank"
+        side_effects:
+          - "KitchenLease.status := ACTIVE"
+          - "if the brand referenced by brand_id is in status ONBOARDING, that VirtualBrand transitions ONBOARDING->ACTIVE (cascade hop 2)"
+          - "increments KitchenLease.version by 1"
+        note: "Cascade origin: lease_activation_cascade depth 2 (lease ACTIVE -> brand ACTIVE)."
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /leases/{id}/suspend"
+        actor: PlatformOps
+        preconditions:
+          - "KitchenLease.status == ACTIVE"
+        side_effects:
+          - "KitchenLease.status := SUSPENDED"
+          - "increments KitchenLease.version by 1"
+        note: "Suspended leases are excluded from routing candidate sets; revertible."
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /leases/{id}/reinstate"
+        actor: PlatformOps
+        preconditions:
+          - "KitchenLease.status == SUSPENDED"
+          - "no other ACTIVE KitchenLease at the same stall_id shares this lease.priority_rank"
+        side_effects:
+          - "KitchenLease.status := ACTIVE"
+          - "increments KitchenLease.version by 1"
+        note: "Revert edge (SUSPENDED->ACTIVE) makes this machine non-linear."
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /leases/{id}/terminate"
+        actor: StallOperator
+        preconditions:
+          - "acting StallOperator owns the Stall referenced by KitchenLease.stall_id"
+          - "KitchenLease.status == ACTIVE"
+        side_effects:
+          - "KitchenLease.status := TERMINATED"
+          - "increments KitchenLease.version by 1"
+      - from: SUSPENDED
+        to: TERMINATED
+        trigger: "POST /leases/{id}/terminate"
+        actor: StallOperator
+        preconditions:
+          - "acting StallOperator owns the Stall referenced by KitchenLease.stall_id"
+          - "KitchenLease.status == SUSPENDED"
+        side_effects:
+          - "KitchenLease.status := TERMINATED"
+          - "increments KitchenLease.version by 1"
+
+  - entity: Equipment
+    initial_state: AVAILABLE
+    terminal_states: [RETIRED]
+    transitions:
+      - from: AVAILABLE
+        to: MAINTENANCE
+        trigger: "POST /equipment/{id}/maintenance"
+        actor: StallOperator
+        preconditions:
+          - "acting StallOperator owns the Stall referenced by Equipment.stall_id"
+          - "Equipment.status == AVAILABLE"
+        side_effects:
+          - "Equipment.status := MAINTENANCE"
+          - "increments Equipment.version by 1"
+      - from: MAINTENANCE
+        to: AVAILABLE
+        trigger: "POST /equipment/{id}/restore"
+        actor: StallOperator
+        preconditions:
+          - "acting StallOperator owns the Stall referenced by Equipment.stall_id"
+          - "Equipment.status == MAINTENANCE"
+        side_effects:
+          - "Equipment.status := AVAILABLE"
+          - "increments Equipment.version by 1"
+      - from: AVAILABLE
+        to: RETIRED
+        trigger: "POST /equipment/{id}/retire"
+        actor: StallOperator
+        preconditions:
+          - "acting StallOperator owns the Stall referenced by Equipment.stall_id"
+          - "Equipment.status == AVAILABLE"
+          - "no EquipmentBooking with equipment_id == this Equipment in status HELD"
+        side_effects:
+          - "Equipment.status := RETIRED"
+          - "owning Stall.equipment_count decremented by 1 (derived-field reconciliation)"
+          - "increments Equipment.version by 1"
+
+  - entity: EquipmentBooking
+    initial_state: HELD
+    terminal_states: [RELEASED]
+    transitions:
+      - from: HELD
+        to: RELEASED
+        trigger: "system: order CANCELLED or order FULFILLED, or POST /equipment-bookings/{id}/release for maintenance holds"
+        actor: system
+        preconditions:
+          - "EquipmentBooking.status == HELD"
+        side_effects:
+          - "EquipmentBooking.status := RELEASED"
+          - "frees the [start_minute, end_minute) window on the equipment"
+          - "increments EquipmentBooking.version by 1"
+
+  - entity: MenuItem
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: SOLD_OUT
+        trigger: "system: after order routing consumes inventory, any RecipeComponent ingredient lacks grams for one more unit"
+        actor: system
+        preconditions:
+          - "for some RecipeComponent of this MenuItem, sum of grams_remaining over matching IngredientLots at the serving stall < quantity_grams"
+        side_effects:
+          - "MenuItem.availability := SOLD_OUT"
+          - "increments MenuItem.version by 1"
+        note: "Cascade hop 3 of order_routing_cascade (route -> consume inventory -> some item flips SOLD_OUT)."
+      - from: SOLD_OUT
+        to: AVAILABLE
+        trigger: "system: an IngredientLot restock or order cancellation restores enough grams for one unit of every component"
+        actor: system
+        preconditions:
+          - "for every RecipeComponent of this MenuItem, sum of grams_remaining over matching IngredientLots at the relevant stall >= quantity_grams"
+        side_effects:
+          - "MenuItem.availability := AVAILABLE"
+          - "increments MenuItem.version by 1"
+
+  - entity: AggregatorOrder
+    initial_state: INGESTED
+    terminal_states: [FULFILLED, CANCELLED, REJECTED]
+    transitions:
+      - from: INGESTED
+        to: ROUTED
+        trigger: "POST /orders/{id}/route"
+        actor: PlatformOps
+        preconditions:
+          - "AggregatorOrder.status == INGESTED"
+          - "brand referenced by brand_id has status == ACTIVE AND availability == LISTED"
+          - "at least one routing-eligible Stall exists (see §1.3 order_routing_selection): leased to the brand via an ACTIVE KitchenLease, Stall.status == OPEN, owns an AVAILABLE Equipment of every required_equipment_type that can host the contiguous booking window without overlap, and has sufficient FIFO inventory for all line items"
+        side_effects:
+          - "select routed_stall_id per §1.3 order_routing_selection"
+          - "create one EquipmentBooking (HELD) covering the computed contiguous prep window per §1.3 order_prep_window; set booking_id"
+          - "deduct ingredient inventory FIFO per §1.3 fifo_inventory_consumption (cascade hop 2)"
+          - "any MenuItem left short flips AVAILABLE->SOLD_OUT (cascade hop 3)"
+          - "compute commission_cents (forward-looking) per §1.3 order_commission"
+          - "AggregatorOrder.status := ROUTED"
+          - "increments AggregatorOrder.version by 1"
+        note: "Cascade origin: order_routing_cascade depth 3 (route -> consume inventory -> SOLD_OUT)."
+      - from: INGESTED
+        to: REJECTED
+        trigger: "POST /orders/{id}/reject"
+        actor: PlatformOps
+        preconditions:
+          - "AggregatorOrder.status == INGESTED"
+        side_effects:
+          - "AggregatorOrder.status := REJECTED"
+          - "increments AggregatorOrder.version by 1"
+        note: "Branch divergence: REJECTED reserves no equipment and consumes no inventory (no compensation needed later)."
+      - from: ROUTED
+        to: PREPARING
+        trigger: "POST /orders/{id}/start-prep"
+        actor: StallOperator
+        preconditions:
+          - "acting StallOperator owns the Stall referenced by routed_stall_id"
+          - "AggregatorOrder.status == ROUTED"
+        side_effects:
+          - "AggregatorOrder.status := PREPARING"
+          - "increments AggregatorOrder.version by 1"
+      - from: PREPARING
+        to: FULFILLED
+        trigger: "POST /orders/{id}/fulfill"
+        actor: StallOperator
+        preconditions:
+          - "acting StallOperator owns the Stall referenced by routed_stall_id"
+          - "AggregatorOrder.status == PREPARING"
+        side_effects:
+          - "finalize food_cost_cents (chronological FIFO) per §1.3 order_food_cost"
+          - "credit brand ledger: VirtualBrand.ledger_balance_cents += (gross_revenue_cents - commission_cents - food_cost_cents) (cascade hop 2; §1.3 brand_ledger_balance)"
+          - "release the EquipmentBooking referenced by booking_id (HELD->RELEASED)"
+          - "AggregatorOrder.status := FULFILLED"
+          - "increments AggregatorOrder.version by 1"
+      - from: ROUTED
+        to: CANCELLED
+        trigger: "POST /orders/{id}/cancel"
+        actor: PlatformOps
+        preconditions:
+          - "AggregatorOrder.status == ROUTED"
+          - "expected_order_version matches AggregatorOrder.version"
+        side_effects:
+          - "restore consumed inventory: each IngredientLot credited back the exact grams this order deducted, restoring grams_remaining (compensation; cascade hop 2)"
+          - "any MenuItem previously flipped SOLD_OUT by this order that now again has enough grams flips SOLD_OUT->AVAILABLE (cascade hop 3)"
+          - "release the EquipmentBooking referenced by booking_id (HELD->RELEASED)"
+          - "AggregatorOrder.status := CANCELLED"
+          - "increments AggregatorOrder.version by 1"
+        note: "Compensation branch: exactly reverses the routing cascade (compensating_invariant: grams_remaining and brand ledger restored)."
+      - from: PREPARING
+        to: CANCELLED
+        trigger: "POST /orders/{id}/cancel"
+        actor: PlatformOps
+        preconditions:
+          - "AggregatorOrder.status == PREPARING"
+          - "expected_order_version matches AggregatorOrder.version"
+        side_effects:
+          - "restore consumed inventory: each IngredientLot credited back the exact grams this order deducted (compensation; cascade hop 2)"
+          - "any MenuItem previously flipped SOLD_OUT by this order that now has enough grams flips SOLD_OUT->AVAILABLE (cascade hop 3)"
+          - "release the EquipmentBooking referenced by booking_id (HELD->RELEASED)"
+          - "AggregatorOrder.status := CANCELLED"
+          - "increments AggregatorOrder.version by 1"
+        note: "Cancellation from PREPARING never credits the brand ledger (ledger credit only happens at FULFILLED); invariant: a cancelled order leaves ledger_balance_cents unchanged from its pre-route value."
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: order-cancel-stale-order
+    parent_entity: AggregatorOrder
+    write_endpoint: "POST /orders/{id}/cancel"
+    occ_field: "expected_order_version"
+    description: |
+      Cancelling an AggregatorOrder whose version has advanced since the client last
+      observed it is rejected. A routed order's version is silently bumped by cascaded
+      side effects (e.g. a fulfill that finalized food cost, or a prior cancel that
+      already released the booking and restored inventory). A cancel carrying a stale
+      expected_order_version is therefore acting on a view of the order that no longer
+      reflects its committed inventory/booking side effects, and is rejected on the
+      stale-version check.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: order_gross_revenue
+    trigger: "POST /orders (ingestion): snapshot at INGESTED"
+    algorithm: aggregation
+    formula: |
+      gross_revenue_cents = sum over each line_item of:
+          MenuItem(line_item.menu_item_id).price_cents * line_item.qty
+      Snapshotted at ingestion; later price changes do NOT alter an already-ingested order.
+    input_set: "all line_items on the order; MenuItem.price_cents read at ingestion time"
+    constants: {}
+    precision: "integer cents; no rounding (prices and qty are integers)"
+
+  - name: order_commission
+    trigger: "POST /orders/{id}/route (INGESTED->ROUTED): forward-looking estimate"
+    algorithm: forward_looking
+    formula: |
+      # Forward-looking: estimated from the snapshotted gross and the brand's current rate.
+      commission_cents = round_half_up( gross_revenue_cents * commission_rate_bps / 10000 )
+      # round_half_up applied ONCE to the single product (no per-line-item rounding).
+    input_set: "order.gross_revenue_cents and VirtualBrand.commission_rate_bps read at routing time"
+    constants:
+      BPS_DENOMINATOR: 10000
+    precision: "integer cents, round_half_up on the single final product"
+    variants:
+      - name: estimate_at_routing
+        when: "computed at INGESTED->ROUTED"
+        difference: "uses brand.commission_rate_bps as-of routing; this is the value debited at settlement (commission is NOT recomputed at FULFILLED), so the routing-time rate is authoritative."
+
+  - name: order_food_cost
+    trigger: "POST /orders/{id}/fulfill (PREPARING->FULFILLED): chronological finalize"
+    algorithm: chronological
+    formula: |
+      # Chronological FIFO over the lots ACTUALLY consumed at routing time. At routing the order
+      # consumed grams from IngredientLots ordered by (received_at ASC, created_at ASC). food_cost
+      # multiplies each consumed slice by THAT lot's unit_cost_cents_per_gram and sums.
+      food_cost_cents = sum over each consumption slice (lot, grams_taken) recorded at routing of:
+          grams_taken * lot.unit_cost_cents_per_gram
+      # No rounding: grams and per-gram cents are integers.
+    input_set: "the exact (lot, grams_taken) consumption slices this order recorded at routing; NOT recomputed against current inventory"
+    constants: {}
+    precision: "integer cents; exact"
+    variants:
+      - name: actual_at_fulfillment
+        when: "computed at PREPARING->FULFILLED from recorded consumption slices"
+        difference: "chronological/FIFO actual cost of the specific lots consumed — diverges from a forward-looking 'estimate at current cheapest lot' because the lots actually drawn depend on FIFO order at routing, not the cheapest lot now."
+
+  - name: order_prep_window
+    trigger: "POST /orders/{id}/route: compute the contiguous equipment booking window"
+    algorithm: interval_merge
+    formula: |
+      # Total occupancy = sum of prep_minutes over all units across line_items requiring the
+      # chosen equipment unit's type. The booking is a single contiguous half-open window
+      # [start_minute, end_minute) on ONE Equipment unit of each required type.
+      required_minutes(equipment_type) =
+          sum over line_items whose MenuItem.required_equipment_type == equipment_type of:
+              MenuItem.prep_minutes * line_item.qty
+      start_minute = current_clock_minute  # floor(current_clock_utc_epoch_seconds / 60)
+      end_minute   = start_minute + required_minutes(equipment_type)
+      # Overlap test against existing HELD bookings on the unit (see §1.4 overlap rules):
+      # the new [start,end) must not intersect any existing HELD [s,e), AND must respect the
+      # unit's turnaround_buffer_minutes AFTER each existing booking: a new booking may start at
+      # exactly existing.end_minute + turnaround_buffer_minutes (>= , inclusive lower bound),
+      # and an existing booking may start at exactly new.end_minute + turnaround_buffer_minutes.
+    input_set: "line_items grouped by required_equipment_type; current logical clock; existing HELD bookings on candidate units"
+    constants: {}
+    precision: "integer minutes since epoch"
+
+  - name: fifo_inventory_consumption
+    trigger: "POST /orders/{id}/route: deduct ingredient inventory (cascade hop 2)"
+    algorithm: chronological
+    formula: |
+      for each RecipeComponent rc of each line_item's MenuItem (need = rc.quantity_grams * qty):
+        candidate lots = IngredientLots where stall_id == routed_stall_id
+                         AND ingredient_name == rc.ingredient_name AND grams_remaining > 0
+        order candidate lots by (received_at ASC, created_at ASC)   # FIFO, created_at tie-break
+        draw from each lot in order until `need` grams are taken:
+            take = min(lot.grams_remaining, need_outstanding)
+            lot.grams_remaining -= take ; need_outstanding -= take
+            record consumption slice (lot.id, take) on the order for later food-cost + restore
+      # If total available across lots < need for ANY component, routing fails (no deduction
+      # is committed) — see §1.4 ERR_INSUFFICIENT_INVENTORY.
+    input_set: "IngredientLots at routed_stall_id matching each component's ingredient_name with grams_remaining > 0"
+    constants: {}
+    precision: "integer grams; tie-break received_at ASC then created_at ASC (never id)"
+
+  - name: order_routing_selection
+    trigger: "POST /orders/{id}/route: pick routed_stall_id from candidate stalls"
+    algorithm: weighted_scoring
+    formula: |
+      # Eligibility filter (candidate set): Stall S is eligible iff ALL hold:
+      #   (1) an ACTIVE KitchenLease exists with brand_id == order.brand_id AND stall_id == S.id
+      #   (2) S.status == OPEN
+      #   (3) for every required_equipment_type in the order, S has >=1 Equipment of that type in
+      #       status AVAILABLE with a free contiguous window per §1.3 order_prep_window
+      #   (4) S has sufficient FIFO inventory for ALL line items (§1.3 fifo_inventory_consumption
+      #       would fully satisfy every component)
+      # Ranking expression over the eligible set:
+      #   primary  : KitchenLease.priority_rank ASC (lower rank wins)
+      #   tie-break: KitchenLease.created_at ASC (earlier lease wins)   # never id
+      # Empty eligible set -> routing fails with ERR_NO_ELIGIBLE_STALL (do not mutate the order).
+    input_set: "ACTIVE KitchenLeases for the brand; their stalls' status, equipment, and inventory"
+    constants: {}
+    precision: "deterministic: priority_rank ASC, created_at ASC tie-break"
+
+  - name: brand_ledger_balance
+    trigger: "side effect of order FULFILLED (credit) and informational re-read"
+    algorithm: aggregation
+    formula: |
+      # Reconciled incrementally as a derived field on VirtualBrand. On FULFILLED:
+      net_payout_cents = gross_revenue_cents - commission_cents - food_cost_cents
+      VirtualBrand.ledger_balance_cents += net_payout_cents
+      # Cancellation/rejection never credit the ledger, so a cancelled order leaves the running
+      # balance equal to its value before this order existed (compensating invariant).
+    input_set: "per-order gross_revenue_cents, commission_cents, food_cost_cents at FULFILLED"
+    constants: {}
+    precision: "integer cents; running sum"
+
+  - name: menu_item_availability
+    trigger: "side effect of fifo_inventory_consumption (route) and inventory restore (cancel/restock)"
+    algorithm: threshold
+    formula: |
+      # Evaluated per MenuItem against the stall whose inventory just changed.
+      can_make_one_unit = for EVERY RecipeComponent rc of the item:
+          sum( grams_remaining of IngredientLots where stall_id == stall AND
+               ingredient_name == rc.ingredient_name ) >= rc.quantity_grams
+      if not can_make_one_unit and availability == AVAILABLE: flip to SOLD_OUT
+      if can_make_one_unit and availability == SOLD_OUT:        flip to AVAILABLE
+      # Boundary: exactly == quantity_grams remains AVAILABLE (>=); quantity_grams - 1 is SOLD_OUT.
+    input_set: "RecipeComponents of the item; IngredientLots at the affected stall"
+    constants: {}
+    precision: "boundary at grams_remaining sum >= quantity_grams (inclusive)"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /stalls, POST /brands which still require an authenticated PlatformOps"
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for the endpoint per §1.7 RBAC; entity_backed roles must own the targeted resource (X-User-ID matches the resource's owning entity id / FK)"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "all path ids and body FKs reference existing resources, validated left-to-right (path before body)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 4
+    category: existence
+    check: "ingestion idempotency: (aggregator, external_ref) must be unique; a duplicate is rejected (not silently re-created)"
+    error_id: ERR_DUPLICATE_ORDER
+    http_status: 409
+    applies_to: "POST /orders"
+
+  - priority: 5
+    category: state
+    check: "target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 6
+    category: business_constraint
+    check: "lease priority_rank uniqueness: activating/reinstating a lease whose priority_rank collides with another ACTIVE lease at the same stall is rejected"
+    error_id: ERR_DUPLICATE_PRIORITY_RANK
+    http_status: 409
+    applies_to: "POST /leases/{id}/activate, POST /leases/{id}/reinstate"
+
+  - priority: 7
+    category: business_referential
+    check: "order routing requires the brand to be status==ACTIVE AND availability==LISTED"
+    error_id: ERR_BRAND_NOT_LISTED
+    http_status: 409
+    applies_to: "POST /orders/{id}/route"
+
+  - priority: 8
+    category: business_safety
+    check: "order routing requires at least one eligible OPEN stall with required AVAILABLE equipment and a free contiguous window respecting turnaround buffers (no overlap); else reject"
+    error_id: ERR_NO_ELIGIBLE_STALL
+    http_status: 409
+    applies_to: "POST /orders/{id}/route"
+
+  - priority: 9
+    category: business_temporal
+    check: "explicit EquipmentBooking creation (maintenance hold) is rejected if its [start,end) overlaps an existing HELD booking on the unit or violates the unit's turnaround_buffer_minutes gap"
+    error_id: ERR_BOOKING_OVERLAP
+    http_status: 409
+    applies_to: "POST /equipment-bookings"
+
+  - priority: 10
+    category: business_fiscal
+    check: "order routing requires sufficient FIFO inventory across lots for every recipe component of every line item; else reject (no partial deduction)"
+    error_id: ERR_INSUFFICIENT_INVENTORY
+    http_status: 409
+    applies_to: "POST /orders/{id}/route"
+
+  - priority: 11
+    category: state
+    check: "OCC: expected_order_version on cancel must equal AggregatorOrder.version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /orders/{id}/cancel"
+
+  - priority: 12
+    category: business_constraint
+    check: "field-level input validity: required fields present, enums in range, integers within declared constraints (e.g. open_minute_of_day < close_minute_of_day, qty >= 1, commission_rate_bps in [0,5000])"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all write endpoints"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Stall ----
+  - method: POST
+    path: "/stalls"
+    description: "Register a physical kitchen stall. Defaults status=OPEN, equipment_count=0."
+    roles: [PlatformOps]
+    code: 201
+    input: [name, timezone, open_minute_of_day, close_minute_of_day]
+    output: Stall
+    side_effects: ["create Stall in status OPEN"]
+  - method: GET
+    path: "/stalls/{id}"
+    description: "Fetch one stall."
+    roles: [PlatformOps, StallOperator, BrandOwner]
+    code: 200
+    input: []
+    output: Stall
+    side_effects: []
+  - method: GET
+    path: "/stalls"
+    description: "List stalls (paginated)."
+    roles: [PlatformOps, StallOperator, BrandOwner]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Stall[]
+    side_effects: []
+  - method: POST
+    path: "/stalls/{id}/open"
+    description: "Manually reopen a stall (CLOSED->OPEN)."
+    roles: [StallOperator]
+    code: 200
+    input: []
+    output: Stall
+    side_effects: ["Stall.status->OPEN", "increments Stall.version by 1"]
+  - method: POST
+    path: "/stalls/{id}/close"
+    description: "Manually close a stall (OPEN->CLOSED); blocks new routing."
+    roles: [StallOperator]
+    code: 200
+    input: []
+    output: Stall
+    side_effects: ["Stall.status->CLOSED", "increments Stall.version by 1"]
+  - method: GET
+    path: "/stalls/{id}/equipment"
+    description: "List Equipment belonging to a stall (FK reverse-reachability for Equipment.stall_id)."
+    roles: [PlatformOps, StallOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Equipment[]
+    side_effects: []
+  - method: GET
+    path: "/stalls/{id}/ingredient-lots"
+    description: "List IngredientLots held at a stall (FK reverse-reachability for IngredientLot.stall_id)."
+    roles: [PlatformOps, StallOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: IngredientLot[]
+    side_effects: []
+
+  # ---- VirtualBrand ----
+  - method: POST
+    path: "/brands"
+    description: "Register a virtual brand. Defaults status=ONBOARDING, availability=PAUSED, ledger_balance_cents=0."
+    roles: [PlatformOps]
+    code: 201
+    input: [name, owner_email, commission_rate_bps]
+    output: VirtualBrand
+    side_effects: ["create VirtualBrand in ONBOARDING/PAUSED"]
+  - method: GET
+    path: "/brands/{id}"
+    description: "Fetch one brand (includes ledger_balance_cents, status, availability)."
+    roles: [PlatformOps, BrandOwner, StallOperator]
+    code: 200
+    input: []
+    output: VirtualBrand
+    side_effects: []
+  - method: GET
+    path: "/brands"
+    description: "List brands (paginated)."
+    roles: [PlatformOps, BrandOwner, StallOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: VirtualBrand[]
+    side_effects: []
+  - method: POST
+    path: "/brands/{id}/list"
+    description: "Set availability LISTED (PAUSED->LISTED); requires status ACTIVE."
+    roles: [BrandOwner]
+    code: 200
+    input: []
+    output: VirtualBrand
+    side_effects: ["VirtualBrand.availability->LISTED", "increments VirtualBrand.version by 1"]
+  - method: POST
+    path: "/brands/{id}/pause"
+    description: "Set availability PAUSED (LISTED->PAUSED)."
+    roles: [BrandOwner]
+    code: 200
+    input: []
+    output: VirtualBrand
+    side_effects: ["VirtualBrand.availability->PAUSED", "increments VirtualBrand.version by 1"]
+  - method: POST
+    path: "/brands/{id}/deactivate"
+    description: "Deactivate brand (ACTIVE->DEACTIVATED); cascades TERMINATE on ACTIVE leases."
+    roles: [BrandOwner]
+    code: 200
+    input: []
+    output: VirtualBrand
+    side_effects:
+      - "VirtualBrand.status->DEACTIVATED, availability->PAUSED"
+      - "cascade: ACTIVE KitchenLeases for this brand -> TERMINATED"
+      - "increments VirtualBrand.version by 1"
+  - method: GET
+    path: "/brands/{id}/menu-items"
+    description: "List MenuItems for a brand (FK reverse-reachability for MenuItem.brand_id)."
+    roles: [PlatformOps, BrandOwner, StallOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: MenuItem[]
+    side_effects: []
+  - method: GET
+    path: "/brands/{id}/performance"
+    description: "Computed read: brand performance summary (fulfilled order count, gross/commission/food-cost totals, ledger_balance_cents)."
+    roles: [PlatformOps, BrandOwner]
+    code: 200
+    input: []
+    output: VirtualBrand
+    side_effects: []
+
+  # ---- KitchenLease ----
+  - method: POST
+    path: "/leases"
+    description: "Create a kitchen lease binding a brand to a stall. Defaults status=PENDING."
+    roles: [PlatformOps]
+    code: 201
+    input: [stall_id, brand_id, monthly_fee_cents, priority_rank]
+    output: KitchenLease
+    side_effects: ["create KitchenLease in PENDING"]
+  - method: GET
+    path: "/leases/{id}"
+    description: "Fetch one lease."
+    roles: [PlatformOps, StallOperator, BrandOwner]
+    code: 200
+    input: []
+    output: KitchenLease
+    side_effects: []
+  - method: GET
+    path: "/leases"
+    description: "List leases, filterable by stall_id and/or brand_id (FK reverse-reachability for KitchenLease.stall_id and KitchenLease.brand_id)."
+    roles: [PlatformOps, StallOperator, BrandOwner]
+    code: 200
+    input: ["stall_id?", "brand_id?", "limit?", "offset?"]
+    output: KitchenLease[]
+    side_effects: []
+  - method: POST
+    path: "/leases/{id}/activate"
+    description: "Activate a lease (PENDING->ACTIVE); may cascade brand ONBOARDING->ACTIVE."
+    roles: [StallOperator]
+    code: 200
+    input: []
+    output: KitchenLease
+    side_effects:
+      - "KitchenLease.status->ACTIVE"
+      - "cascade: if brand ONBOARDING -> brand ACTIVE"
+      - "increments KitchenLease.version by 1"
+  - method: POST
+    path: "/leases/{id}/suspend"
+    description: "Suspend a lease (ACTIVE->SUSPENDED); excluded from routing."
+    roles: [PlatformOps]
+    code: 200
+    input: []
+    output: KitchenLease
+    side_effects: ["KitchenLease.status->SUSPENDED", "increments KitchenLease.version by 1"]
+  - method: POST
+    path: "/leases/{id}/reinstate"
+    description: "Reinstate a suspended lease (SUSPENDED->ACTIVE)."
+    roles: [PlatformOps]
+    code: 200
+    input: []
+    output: KitchenLease
+    side_effects: ["KitchenLease.status->ACTIVE", "increments KitchenLease.version by 1"]
+  - method: POST
+    path: "/leases/{id}/terminate"
+    description: "Terminate a lease (ACTIVE or SUSPENDED -> TERMINATED)."
+    roles: [StallOperator]
+    code: 200
+    input: []
+    output: KitchenLease
+    side_effects: ["KitchenLease.status->TERMINATED", "increments KitchenLease.version by 1"]
+
+  # ---- Equipment ----
+  - method: POST
+    path: "/equipment"
+    description: "Add a shared equipment unit to a stall. Defaults status=AVAILABLE; increments owning Stall.equipment_count."
+    roles: [StallOperator]
+    code: 201
+    input: [stall_id, equipment_type, "turnaround_buffer_minutes?"]
+    output: Equipment
+    side_effects: ["create Equipment AVAILABLE", "owning Stall.equipment_count += 1"]
+  - method: GET
+    path: "/equipment/{id}"
+    description: "Fetch one equipment unit."
+    roles: [PlatformOps, StallOperator]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: []
+  - method: POST
+    path: "/equipment/{id}/maintenance"
+    description: "Take equipment offline (AVAILABLE->MAINTENANCE)."
+    roles: [StallOperator]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: ["Equipment.status->MAINTENANCE", "increments Equipment.version by 1"]
+  - method: POST
+    path: "/equipment/{id}/restore"
+    description: "Bring equipment back online (MAINTENANCE->AVAILABLE)."
+    roles: [StallOperator]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: ["Equipment.status->AVAILABLE", "increments Equipment.version by 1"]
+  - method: POST
+    path: "/equipment/{id}/retire"
+    description: "Retire equipment (AVAILABLE->RETIRED); decrements owning Stall.equipment_count."
+    roles: [StallOperator]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: ["Equipment.status->RETIRED", "owning Stall.equipment_count -= 1", "increments Equipment.version by 1"]
+  - method: GET
+    path: "/equipment/{id}/bookings"
+    description: "List EquipmentBookings on a unit (FK reverse-reachability for EquipmentBooking.equipment_id)."
+    roles: [PlatformOps, StallOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: EquipmentBooking[]
+    side_effects: []
+
+  # ---- EquipmentBooking (maintenance holds + reverse lookups) ----
+  - method: POST
+    path: "/equipment-bookings"
+    description: "Create a manual maintenance hold on a unit (order_id omitted). Rejected on overlap/buffer violation. Defaults status=HELD."
+    roles: [StallOperator]
+    code: 201
+    input: [equipment_id, start_minute, end_minute]
+    output: EquipmentBooking
+    side_effects: ["create EquipmentBooking HELD covering [start_minute,end_minute)"]
+  - method: GET
+    path: "/equipment-bookings/{id}"
+    description: "Fetch one booking."
+    roles: [PlatformOps, StallOperator]
+    code: 200
+    input: []
+    output: EquipmentBooking
+    side_effects: []
+  - method: GET
+    path: "/equipment-bookings"
+    description: "List bookings filterable by order_id (FK reverse-reachability for EquipmentBooking.order_id)."
+    roles: [PlatformOps, StallOperator]
+    code: 200
+    input: ["order_id?", "limit?", "offset?"]
+    output: EquipmentBooking[]
+    side_effects: []
+  - method: POST
+    path: "/equipment-bookings/{id}/release"
+    description: "Release a HELD maintenance booking (HELD->RELEASED). Only bookings with order_id == null."
+    roles: [StallOperator]
+    code: 200
+    input: []
+    output: EquipmentBooking
+    side_effects: ["EquipmentBooking.status->RELEASED", "increments EquipmentBooking.version by 1"]
+
+  # ---- MenuItem + RecipeComponent ----
+  - method: POST
+    path: "/menu-items"
+    description: "Create a menu item under a brand. Defaults availability=AVAILABLE."
+    roles: [BrandOwner]
+    code: 201
+    input: [brand_id, name, price_cents, prep_minutes, required_equipment_type]
+    output: MenuItem
+    side_effects: ["create MenuItem AVAILABLE"]
+  - method: GET
+    path: "/menu-items/{id}"
+    description: "Fetch one menu item."
+    roles: [PlatformOps, BrandOwner, StallOperator]
+    code: 200
+    input: []
+    output: MenuItem
+    side_effects: []
+  - method: POST
+    path: "/menu-items/{id}/recipe-components"
+    description: "Add a bill-of-materials line (ingredient + grams per unit) to a menu item."
+    roles: [BrandOwner]
+    code: 201
+    input: [ingredient_name, quantity_grams]
+    output: RecipeComponent
+    side_effects: ["create RecipeComponent"]
+  - method: GET
+    path: "/menu-items/{id}/recipe-components"
+    description: "List recipe components of a menu item (FK reverse-reachability for RecipeComponent.menu_item_id)."
+    roles: [PlatformOps, BrandOwner, StallOperator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RecipeComponent[]
+    side_effects: []
+
+  # ---- IngredientLot ----
+  - method: POST
+    path: "/ingredient-lots"
+    description: "Receive a commissary ingredient lot at a stall. grams_remaining initialized to grams_received. May flip dependent SOLD_OUT MenuItems back to AVAILABLE."
+    roles: [StallOperator]
+    code: 201
+    input: [stall_id, ingredient_name, received_at, unit_cost_cents_per_gram, grams_received]
+    output: IngredientLot
+    side_effects:
+      - "create IngredientLot with grams_remaining = grams_received"
+      - "re-evaluate menu_item_availability for items whose recipes use this ingredient at this stall (SOLD_OUT->AVAILABLE if now sufficient)"
+  - method: GET
+    path: "/ingredient-lots/{id}"
+    description: "Fetch one ingredient lot (includes grams_remaining)."
+    roles: [PlatformOps, StallOperator]
+    code: 200
+    input: []
+    output: IngredientLot
+    side_effects: []
+
+  # ---- AggregatorOrder ----
+  - method: POST
+    path: "/orders"
+    description: "Ingest an inbound aggregator order. Idempotent on (aggregator, external_ref). Snapshots gross_revenue_cents. Defaults status=INGESTED."
+    roles: [AggregatorGateway]
+    code: 201
+    input: [brand_id, aggregator, external_ref, line_items]
+    output: AggregatorOrder
+    side_effects: ["create AggregatorOrder INGESTED", "compute gross_revenue_cents (§1.3 order_gross_revenue)"]
+  - method: GET
+    path: "/orders/{id}"
+    description: "Fetch one order (status, routed_stall_id, booking_id, gross/commission/food-cost cents, version)."
+    roles: [PlatformOps, BrandOwner, StallOperator, AggregatorGateway]
+    code: 200
+    input: []
+    output: AggregatorOrder
+    side_effects: []
+  - method: GET
+    path: "/orders"
+    description: "List orders filterable by brand_id, routed_stall_id, and/or booking_id (FK reverse-reachability for AggregatorOrder.brand_id, AggregatorOrder.routed_stall_id, and AggregatorOrder.booking_id)."
+    roles: [PlatformOps, BrandOwner, StallOperator]
+    code: 200
+    input: ["brand_id?", "routed_stall_id?", "booking_id?", "status?", "limit?", "offset?"]
+    output: AggregatorOrder[]
+    side_effects: []
+  - method: POST
+    path: "/orders/{id}/route"
+    description: "Route an ingested order to an eligible stall (INGESTED->ROUTED): selects stall, books equipment, deducts FIFO inventory, estimates commission."
+    roles: [PlatformOps]
+    code: 200
+    input: []
+    output: AggregatorOrder
+    side_effects:
+      - "set routed_stall_id (§1.3 order_routing_selection)"
+      - "create EquipmentBooking HELD (§1.3 order_prep_window); set booking_id"
+      - "deduct FIFO inventory (§1.3 fifo_inventory_consumption)"
+      - "flip short MenuItems AVAILABLE->SOLD_OUT (§1.3 menu_item_availability)"
+      - "compute commission_cents (§1.3 order_commission)"
+      - "increments AggregatorOrder.version by 1"
+  - method: POST
+    path: "/orders/{id}/reject"
+    description: "Reject an ingested order (INGESTED->REJECTED); no booking, no inventory deduction."
+    roles: [PlatformOps]
+    code: 200
+    input: []
+    output: AggregatorOrder
+    side_effects: ["AggregatorOrder.status->REJECTED", "increments AggregatorOrder.version by 1"]
+  - method: POST
+    path: "/orders/{id}/start-prep"
+    description: "Begin preparation (ROUTED->PREPARING)."
+    roles: [StallOperator]
+    code: 200
+    input: []
+    output: AggregatorOrder
+    side_effects: ["AggregatorOrder.status->PREPARING", "increments AggregatorOrder.version by 1"]
+  - method: POST
+    path: "/orders/{id}/fulfill"
+    description: "Fulfill (PREPARING->FULFILLED): finalize food cost, credit brand ledger, release booking."
+    roles: [StallOperator]
+    code: 200
+    input: []
+    output: AggregatorOrder
+    side_effects:
+      - "finalize food_cost_cents (§1.3 order_food_cost)"
+      - "credit VirtualBrand.ledger_balance_cents (§1.3 brand_ledger_balance)"
+      - "release EquipmentBooking (HELD->RELEASED)"
+      - "increments AggregatorOrder.version by 1"
+  - method: POST
+    path: "/orders/{id}/cancel"
+    description: "Cancel a routed/preparing order (->CANCELLED): restore inventory, restore SOLD_OUT items, release booking. OCC-guarded."
+    roles: [PlatformOps]
+    code: 200
+    input: [expected_order_version]
+    output: AggregatorOrder
+    side_effects:
+      - "restore consumed inventory grams (compensation)"
+      - "flip dependent SOLD_OUT MenuItems -> AVAILABLE if now sufficient"
+      - "release EquipmentBooking (HELD->RELEASED)"
+      - "AggregatorOrder.status->CANCELLED"
+      - "increments AggregatorOrder.version by 1"
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock for deterministic time-window math. Server startup default is 2026-01-01T00:00:00Z; before any call to this endpoint the clock reads exactly that default and never falls back to wall-clock time. start_minute in routing == floor(clock_epoch_seconds / 60)."
+    roles: [PlatformOps]
+    code: 200
+    input: [to_iso8601]
+    output: "null"
+    side_effects: ["sets logical clock used by §1.3 order_prep_window"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/invalid X-User-Role or X-User-ID headers, or unknown role"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "role not permitted for the endpoint, or entity_backed role does not own the targeted resource"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced path id or body FK does not resolve to an existing resource"
+  - id: ERR_DUPLICATE_ORDER
+    http: 409
+    condition: "ingestion with an (aggregator, external_ref) pair that already exists"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested transition is not defined from the resource's current state"
+  - id: ERR_DUPLICATE_PRIORITY_RANK
+    http: 409
+    condition: "activating/reinstating a lease whose priority_rank collides with another ACTIVE lease at the same stall"
+  - id: ERR_BRAND_NOT_LISTED
+    http: 409
+    condition: "routing an order whose brand is not (status ACTIVE AND availability LISTED)"
+  - id: ERR_NO_ELIGIBLE_STALL
+    http: 409
+    condition: "routing finds no eligible OPEN stall with required AVAILABLE equipment and a free contiguous non-overlapping window"
+  - id: ERR_BOOKING_OVERLAP
+    http: 409
+    condition: "a manual equipment booking [start,end) overlaps an existing HELD booking or violates the unit's turnaround buffer"
+  - id: ERR_INSUFFICIENT_INVENTORY
+    http: 409
+    condition: "routing cannot satisfy every recipe component from available FIFO lots at the chosen stall"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_order_version on cancel does not equal AggregatorOrder.version (OCC mismatch)"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "missing required field, enum out of range, or numeric/ordering constraint violated"
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlatformOps
+    description: "Platform operator: provisions stalls/brands/leases, drives order routing/rejection/cancellation, suspends/reinstates leases."
+    identity: opaque
+    exclusive_operations:
+      - "POST /stalls"
+      - "POST /brands"
+      - "POST /leases"
+      - "POST /leases/{id}/suspend"
+      - "POST /leases/{id}/reinstate"
+      - "POST /orders/{id}/route"
+      - "POST /orders/{id}/reject"
+      - "POST /orders/{id}/cancel"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "GET /stalls/{id}, GET /stalls, GET /brands/{id}, GET /brands, GET /leases/{id}, GET /leases, GET /orders/{id}, GET /orders"
+      - "GET /brands/{id}/performance"
+
+  - name: StallOperator
+    description: "Runs a physical stall: manages equipment, inventory lots, maintenance bookings, lease activation/termination, and order prep/fulfillment at its stall."
+    identity: entity_backed:Stall
+    exclusive_operations:
+      - "POST /stalls/{id}/open"
+      - "POST /stalls/{id}/close"
+      - "POST /equipment"
+      - "POST /equipment/{id}/maintenance"
+      - "POST /equipment/{id}/restore"
+      - "POST /equipment/{id}/retire"
+      - "POST /equipment-bookings"
+      - "POST /equipment-bookings/{id}/release"
+      - "POST /ingredient-lots"
+      - "POST /leases/{id}/activate"
+      - "POST /leases/{id}/terminate"
+      - "POST /orders/{id}/start-prep"
+      - "POST /orders/{id}/fulfill"
+    shared_operations:
+      - "GET endpoints for stalls, equipment, bookings, ingredient-lots, leases, brands, menu-items, orders"
+
+  - name: BrandOwner
+    description: "Owns a virtual brand: manages its menu/recipes and availability, and deactivates the brand."
+    identity: entity_backed:VirtualBrand
+    exclusive_operations:
+      - "POST /menu-items"
+      - "POST /menu-items/{id}/recipe-components"
+      - "POST /brands/{id}/list"
+      - "POST /brands/{id}/pause"
+      - "POST /brands/{id}/deactivate"
+    shared_operations:
+      - "GET /brands/{id}, GET /brands/{id}/menu-items, GET /brands/{id}/performance, GET /menu-items/{id}, GET /orders"
+
+  - name: AggregatorGateway
+    description: "Integration identity for DoorDash/Uber Eats inbound order ingestion."
+    identity: opaque
+    exclusive_operations:
+      - "POST /orders"
+    shared_operations:
+      - "GET /orders/{id}"

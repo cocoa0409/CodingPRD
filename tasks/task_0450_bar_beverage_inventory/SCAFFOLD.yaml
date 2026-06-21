@@ -1,0 +1,1505 @@
+scenario: "Bar & Beverage Inventory (BevSpot style): par level & SKU (bottle/keg), pour cost & recipe (cocktail spec), depletion & variance (theoretical vs actual), vendor order & invoice, weight-based count, keg line/yield, price & menu engineering, waste/spill log"
+
+domain_name: bar-beverage-inventory
+api_prefix: ""   # flat topology: every entity is a top-level collection at the API root
+
+# All monetary amounts are integer CENTS. All volumes are mL. All masses are grams.
+# Container "units" express a count of full containers (e.g., 1.0 bottle, 0.681 bottle);
+# stock and depletion are tracked in units of the product's own container.
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation       # theoretical (recipe-driven) vs actual (count-driven) depletion
+  secondary_archetype: quota_allocation           # par level / reorder-point inventory replenishment
+  complexity_layers:
+    - dual_variant_calculation                    # theoretical depletion vs actual depletion variance
+    - cascading_side_effects                      # invoice posting -> PO close -> product on_hand -> par reorder flag
+    - derived_field_reconciliation                # product.on_hand_units / variance fields kept consistent
+    - optimistic_concurrency                      # CountSession.version guards count-line writes & finalize
+
+  entity_topology: flat                           # peer entities linked by FK references, no deep URL nesting
+  state_machine_shape: branching                  # PO/Invoice/CountSession fork-join with reject/void reverts
+  relationship_patterns:
+    - one_to_many                                 # Product -> RecipeLine, PO -> POLine, Invoice -> InvoiceLine
+    - many_to_many                                # Product <-> RecipeSpec via RecipeLine junction
+    - cross_aggregate                             # InvoiceLine.product_id, POLine.product_id span aggregates
+  role_model: peer_roles                          # InventoryManager owns counts/products; PurchasingAgent owns POs/invoices; BarManager owns recipes/menu/waste
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - name: sku
+        type: string
+        source: input
+        description: "Human-readable stock-keeping code, unique across all non-archived products"
+        constraints: "1..40 chars; uniqueness enforced over status IN {ACTIVE, ARCHIVED is excluded}"
+      - name: name
+        type: string
+        source: input
+        description: "Display name of the product"
+      - name: container_type
+        type: enum
+        source: input
+        description: "Physical container form factor"
+        constraints: "one of {BOTTLE, KEG}"
+      - name: container_volume_ml
+        type: number
+        source: input
+        description: "Full container nominal volume in mL (e.g., 750 bottle, 58670 half-barrel keg)"
+        constraints: "> 0"
+      - name: empty_container_weight_g
+        type: number
+        source: input
+        description: "Tare weight of an empty container in grams; required for weight-based counting of BOTTLE products"
+        default: 0
+        constraints: ">= 0"
+      - name: density_g_per_ml
+        type: number
+        source: input
+        description: "Liquid density used to convert net weight to volume in weight-based counts"
+        default: 1.0
+        constraints: "> 0"
+      - name: unit_cost_cents
+        type: integer
+        source: input
+        description: "Latest landed cost in cents for one full container; updated when an invoice posts"
+        constraints: ">= 0"
+      - name: case_pack
+        type: integer
+        source: input
+        description: "Number of containers per ordering case; reorder quantities round up to a multiple of this"
+        default: 1
+        constraints: ">= 1"
+      - name: on_hand_units
+        type: number
+        source: computed
+        description: "Current stock in container units; recomputed from latest finalized count plus received-not-counted invoice quantities minus depletions; starts at 0"
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle status"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, ARCHIVED}"
+      - name: needs_reorder
+        type: boolean
+        source: computed
+        description: "True when on_hand_units < the product's active ParSetting.reorder_point_units; recomputed on every on_hand_units change"
+        default: false
+
+  - name: ParSetting
+    parent: null
+    common_fields: true
+    fields:
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; the product this par configuration governs"
+      - name: par_level_units
+        type: number
+        source: input
+        description: "Target full-stock level in container units"
+        constraints: "> 0"
+      - name: reorder_point_units
+        type: number
+        source: input
+        description: "Replenishment trigger threshold in container units"
+        constraints: ">= 0 and <= par_level_units"
+      - name: status
+        type: enum
+        source: system
+        description: "Only one ACTIVE ParSetting may exist per product; creating a new one supersedes the prior"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUPERSEDED}"
+
+  - name: RecipeSpec
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Cocktail / drink spec name"
+      - name: recipe_cost_cents
+        type: integer
+        source: computed
+        description: "Theoretical ingredient cost in cents, summed round-per-line across RecipeLines; recomputed when a line is added or a referenced Product unit_cost changes; starts at 0"
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "DRAFT recipes may be edited; PUBLISHED recipes are frozen and may be referenced by MenuItems"
+        default: DRAFT
+        constraints: "one of {DRAFT, PUBLISHED, RETIRED}"
+
+  - name: RecipeLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: recipe_id
+        type: string
+        source: input
+        description: "FK -> RecipeSpec.id; the spec this ingredient line belongs to"
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; the ingredient product poured"
+      - name: pour_ml
+        type: number
+        source: input
+        description: "Volume in mL poured for this ingredient per serving"
+        constraints: "> 0"
+      - name: line_cost_cents
+        type: integer
+        source: computed
+        description: "ceil-to-cent cost of this pour = round_half_up(Product.unit_cost_cents * pour_ml / Product.container_volume_ml); starts at 0"
+        default: 0
+
+  - name: MenuItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: recipe_id
+        type: string
+        source: input
+        description: "FK -> RecipeSpec.id; the PUBLISHED recipe this menu item sells"
+      - name: menu_price_cents
+        type: integer
+        source: input
+        description: "Selling price in cents"
+        constraints: "> 0"
+      - name: units_sold
+        type: integer
+        source: system
+        description: "Cumulative sold count fed by sales postings; drives depletion and menu engineering; starts at 0"
+        default: 0
+      - name: pour_cost_pct
+        type: number
+        source: computed
+        description: "RecipeSpec.recipe_cost_cents / menu_price_cents * 100, 2dp; recomputed on price change or recipe cost change; starts at 0"
+        default: 0
+      - name: menu_class
+        type: enum
+        source: computed
+        description: "Menu-engineering quadrant computed by the menu-engineering report; persisted on the item when the report runs"
+        default: UNCLASSIFIED
+        constraints: "one of {UNCLASSIFIED, STAR, PLOWHORSE, PUZZLE, DOG}"
+      - name: status
+        type: enum
+        source: system
+        description: "ACTIVE items sell; DELISTED items are excluded from sales and reports"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, DELISTED}"
+
+  - name: CountSession
+    parent: null
+    common_fields: true
+    fields:
+      - name: label
+        type: string
+        source: input
+        description: "Human label for the physical count (e.g., 'June month-end')"
+      - name: counted_at
+        type: datetime
+        source: input
+        description: "Logical timestamp the physical count represents; used to order theoretical-depletion windows"
+      - name: status
+        type: enum
+        source: system
+        description: "Count lifecycle"
+        default: OPEN
+        constraints: "one of {OPEN, FINALIZED, VOID}"
+      - name: total_variance_cost_cents
+        type: integer
+        source: computed
+        description: "Sum of signed per-line variance_cost_cents across all CountLines at finalize; starts at 0"
+        default: 0
+
+  - name: CountLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: count_session_id
+        type: string
+        source: input
+        description: "FK -> CountSession.id; the session this measurement belongs to"
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; the product measured"
+      - name: count_method
+        type: enum
+        source: input
+        description: "How quantity was measured"
+        constraints: "one of {UNITS, WEIGHT}"
+      - name: counted_units
+        type: number
+        source: input
+        description: "Direct full+partial container count; required when count_method == UNITS"
+        default: 0
+        constraints: ">= 0"
+      - name: gross_weight_g
+        type: number
+        source: input
+        description: "Gross weight of the partial container in grams; required when count_method == WEIGHT"
+        default: 0
+        constraints: ">= 0"
+      - name: closing_units
+        type: number
+        source: computed
+        description: "Resolved on-hand units for this product at the count; for WEIGHT = round_half_up((gross_weight_g - Product.empty_container_weight_g)/Product.density_g_per_ml,1)/container_volume_ml to 3dp, for UNITS = counted_units; starts at 0"
+        default: 0
+      - name: theoretical_units
+        type: number
+        source: computed
+        description: "Theoretical depletion of this product since the prior finalized count, derived from sales x recipe pours; starts at 0"
+        default: 0
+      - name: variance_units
+        type: number
+        source: computed
+        description: "Signed actual-minus-theoretical depletion variance in units; starts at 0"
+        default: 0
+      - name: variance_cost_cents
+        type: integer
+        source: computed
+        description: "round_half_up(variance_units * Product.unit_cost_cents) in cents; starts at 0"
+        default: 0
+
+  - name: PurchaseOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: vendor_name
+        type: string
+        source: input
+        description: "Vendor the order is placed with"
+      - name: expected_at
+        type: datetime
+        source: input
+        description: "Promised delivery datetime"
+      - name: status
+        type: enum
+        source: system
+        description: "PO lifecycle"
+        default: DRAFT
+        constraints: "one of {DRAFT, SUBMITTED, RECEIVED, CLOSED, CANCELLED}"
+      - name: ordered_total_cents
+        type: integer
+        source: computed
+        description: "Sum of POLine ordered extensions (ordered_qty * unit_cost_cents) at submit; starts at 0"
+        default: 0
+
+  - name: POLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: purchase_order_id
+        type: string
+        source: input
+        description: "FK -> PurchaseOrder.id; the order this line belongs to"
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; the product ordered"
+      - name: ordered_qty
+        type: integer
+        source: input
+        description: "Containers ordered"
+        constraints: "> 0"
+      - name: unit_cost_cents
+        type: integer
+        source: input
+        description: "Quoted per-container cost at order time"
+        constraints: ">= 0"
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: purchase_order_id
+        type: string
+        source: input
+        description: "FK -> PurchaseOrder.id; the PO this invoice reconciles against"
+      - name: vendor_invoice_no
+        type: string
+        source: input
+        description: "Vendor's invoice number, unique per vendor"
+      - name: freight_cents
+        type: integer
+        source: input
+        description: "Flat freight/delivery charge in cents"
+        default: 0
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "Invoice lifecycle"
+        default: DRAFT
+        constraints: "one of {DRAFT, POSTED, VOID}"
+      - name: subtotal_cents
+        type: integer
+        source: computed
+        description: "Sum of InvoiceLine extensions; starts at 0"
+        default: 0
+      - name: discount_cents
+        type: integer
+        source: computed
+        description: "Tier discount on subtotal; starts at 0"
+        default: 0
+      - name: tax_cents
+        type: integer
+        source: computed
+        description: "Tax on (subtotal - discount); starts at 0"
+        default: 0
+      - name: invoice_total_cents
+        type: integer
+        source: computed
+        description: "subtotal - discount + tax + freight; starts at 0"
+        default: 0
+
+  - name: InvoiceLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: invoice_id
+        type: string
+        source: input
+        description: "FK -> Invoice.id; the invoice this line belongs to"
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; the product billed"
+      - name: received_qty
+        type: integer
+        source: input
+        description: "Containers actually received"
+        constraints: "> 0"
+      - name: unit_cost_cents
+        type: integer
+        source: input
+        description: "Billed per-container cost"
+        constraints: ">= 0"
+      - name: extension_cents
+        type: integer
+        source: computed
+        description: "received_qty * unit_cost_cents; starts at 0"
+        default: 0
+
+  - name: WasteLog
+    parent: null
+    common_fields: true
+    fields:
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; the product spilled/wasted"
+      - name: reason
+        type: enum
+        source: input
+        description: "Categorized waste reason"
+        constraints: "one of {SPILL, BREAKAGE, EXPIRY, OVERPOUR, COMP}"
+      - name: wasted_units
+        type: number
+        source: input
+        description: "Container units wasted (may be fractional)"
+        constraints: "> 0"
+      - name: waste_cost_cents
+        type: integer
+        source: computed
+        description: "round_half_up(wasted_units * Product.unit_cost_cents) at log time; starts at 0"
+        default: 0
+
+  - name: KegTap
+    parent: null
+    common_fields: true
+    fields:
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; the keg product tapped onto a draft line (Product.container_type must be KEG)"
+      - name: draft_line_no
+        type: integer
+        source: input
+        description: "Physical draft line the keg occupies; capacity 1 keg per line at any instant"
+        constraints: ">= 1"
+      - name: tapped_from
+        type: datetime
+        source: input
+        description: "Inclusive start of the line occupation interval"
+      - name: tapped_until
+        type: datetime
+        source: input
+        description: "Inclusive end of the line occupation interval; adjacency (next.tapped_from == prev.tapped_until) is allowed (kegs swap instantaneously)"
+        constraints: ">= tapped_from"
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: PurchaseOrder
+    initial_state: DRAFT
+    terminal_states: [CLOSED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /purchase-orders/{id}/submit"
+        actor: PurchasingAgent
+        preconditions:
+          - "PurchaseOrder.status == DRAFT"
+          - "PurchaseOrder has >= 1 POLine"
+          - "every POLine.product_id references a Product with status == ACTIVE"
+        side_effects:
+          - "compute_ordered_total runs: ordered_total_cents = sum(POLine.ordered_qty * POLine.unit_cost_cents)"
+          - "increments PurchaseOrder.version by 1"
+      - from: SUBMITTED
+        to: RECEIVED
+        trigger: "POST /invoices/{id}/post (first invoice posting against this PO)"
+        actor: system
+        preconditions:
+          - "PurchaseOrder.status == SUBMITTED"
+        side_effects:
+          - "PurchaseOrder advances to RECEIVED when its first Invoice posts"
+          - "increments PurchaseOrder.version by 1"
+      - from: RECEIVED
+        to: CLOSED
+        trigger: "POST /purchase-orders/{id}/close"
+        actor: PurchasingAgent
+        preconditions:
+          - "PurchaseOrder.status == RECEIVED"
+          - "every InvoiceLine received_qty across posted invoices sums to >= the PO's ordered_qty per product (no short-receipt left open)"
+        side_effects:
+          - "increments PurchaseOrder.version by 1"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /purchase-orders/{id}/cancel"
+        actor: PurchasingAgent
+        preconditions:
+          - "PurchaseOrder.status == DRAFT"
+        side_effects:
+          - "increments PurchaseOrder.version by 1"
+      - from: SUBMITTED
+        to: CANCELLED
+        trigger: "POST /purchase-orders/{id}/cancel"
+        actor: PurchasingAgent
+        preconditions:
+          - "PurchaseOrder.status == SUBMITTED"
+          - "no Invoice with status == POSTED references this PurchaseOrder"
+        side_effects:
+          - "increments PurchaseOrder.version by 1"
+
+  - entity: Invoice
+    initial_state: DRAFT
+    terminal_states: [VOID]
+    transitions:
+      - from: DRAFT
+        to: POSTED
+        trigger: "POST /invoices/{id}/post"
+        actor: PurchasingAgent
+        preconditions:
+          - "Invoice.status == DRAFT"
+          - "Invoice has >= 1 InvoiceLine"
+          - "referenced PurchaseOrder.status IN {SUBMITTED, RECEIVED}"
+          - "every InvoiceLine.product_id appears on a POLine of the referenced PurchaseOrder"
+        side_effects:
+          - "reconcile_invoice runs: extension_cents per line, then subtotal -> discount -> tax -> invoice_total (pinned order)"
+          - "for each InvoiceLine: Product.unit_cost_cents := InvoiceLine.unit_cost_cents (latest landed cost)"
+          - "for each InvoiceLine: Product.on_hand_units += received_qty (received stock posted)"
+          - "each affected Product recomputes needs_reorder against its ACTIVE ParSetting"
+          - "if referenced PurchaseOrder.status == SUBMITTED it cascades to RECEIVED"
+          - "increments Invoice.version by 1"
+      - from: POSTED
+        to: VOID
+        trigger: "POST /invoices/{id}/void"
+        actor: PurchasingAgent
+        preconditions:
+          - "Invoice.status == POSTED"
+          - "referenced PurchaseOrder.status != CLOSED"
+        side_effects:
+          - "compensation: for each InvoiceLine, Product.on_hand_units -= received_qty (reverse received stock)"
+          - "each affected Product recomputes needs_reorder against its ACTIVE ParSetting"
+          - "if this was the only POSTED invoice on the PO, the PurchaseOrder reverts RECEIVED -> SUBMITTED"
+          - "increments Invoice.version by 1"
+      - from: DRAFT
+        to: VOID
+        trigger: "POST /invoices/{id}/void"
+        actor: PurchasingAgent
+        preconditions:
+          - "Invoice.status == DRAFT"
+        side_effects:
+          - "increments Invoice.version by 1"
+
+  - entity: CountSession
+    initial_state: OPEN
+    terminal_states: [FINALIZED, VOID]
+    transitions:
+      - from: OPEN
+        to: FINALIZED
+        trigger: "POST /count-sessions/{id}/finalize"
+        actor: InventoryManager
+        preconditions:
+          - "CountSession.status == OPEN"
+          - "CountSession has >= 1 CountLine"
+          - "expected_count_session_version matches CountSession.version (OCC)"
+          - "every CountLine.product_id is distinct within the session"
+          - "this.counted_at is strictly greater than the counted_at of the most recent FINALIZED CountSession that shares any product with this one (half-open depletion windows per product may not overlap or abut at equal counted_at)"
+        side_effects:
+          - "for each CountLine: resolve closing_units (UNITS direct, WEIGHT via net-weight conversion)"
+          - "for each CountLine: compute theoretical_units from sales since prior finalized session (depletion_variance calc)"
+          - "for each CountLine: variance_units = (prior_closing + received_since - closing_units) - theoretical_units; variance_cost_cents = round_half_up(variance_units * Product.unit_cost_cents)"
+          - "CountSession.total_variance_cost_cents = sum(CountLine.variance_cost_cents)"
+          - "for each counted Product: Product.on_hand_units := CountLine.closing_units (count becomes authoritative on-hand)"
+          - "each affected Product recomputes needs_reorder against its ACTIVE ParSetting"
+          - "increments CountSession.version by 1"
+      - from: OPEN
+        to: VOID
+        trigger: "POST /count-sessions/{id}/void"
+        actor: InventoryManager
+        preconditions:
+          - "CountSession.status == OPEN"
+        side_effects:
+          - "increments CountSession.version by 1"
+
+  - entity: RecipeSpec
+    initial_state: DRAFT
+    terminal_states: [RETIRED]
+    transitions:
+      - from: DRAFT
+        to: PUBLISHED
+        trigger: "POST /recipes/{id}/publish"
+        actor: BarManager
+        preconditions:
+          - "RecipeSpec.status == DRAFT"
+          - "RecipeSpec has >= 1 RecipeLine"
+          - "every RecipeLine.product_id references a Product with status == ACTIVE"
+        side_effects:
+          - "compute_recipe_cost runs: recipe_cost_cents = sum(RecipeLine.line_cost_cents)"
+          - "increments RecipeSpec.version by 1"
+      - from: PUBLISHED
+        to: DRAFT
+        trigger: "POST /recipes/{id}/revise"
+        actor: BarManager
+        preconditions:
+          - "RecipeSpec.status == PUBLISHED"
+          - "no MenuItem with status == ACTIVE references this RecipeSpec"
+        side_effects:
+          - "increments RecipeSpec.version by 1"
+      - from: PUBLISHED
+        to: RETIRED
+        trigger: "POST /recipes/{id}/retire"
+        actor: BarManager
+        preconditions:
+          - "RecipeSpec.status == PUBLISHED"
+          - "no MenuItem with status == ACTIVE references this RecipeSpec"
+        side_effects:
+          - "increments RecipeSpec.version by 1"
+
+  - entity: MenuItem
+    initial_state: ACTIVE
+    terminal_states: [DELISTED]
+    transitions:
+      - from: ACTIVE
+        to: DELISTED
+        trigger: "POST /menu-items/{id}/delist"
+        actor: BarManager
+        preconditions:
+          - "MenuItem.status == ACTIVE"
+        side_effects:
+          - "MenuItem excluded from sales recording and from menu-engineering/depletion universe"
+          - "increments MenuItem.version by 1"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: countline-add-stale-session
+    parent_entity: CountSession
+    write_endpoint: "POST /count-sessions/{id}/count-lines"
+    occ_field: "expected_count_session_version"
+    description: |
+      Adding a CountLine to a CountSession whose version has advanced since the
+      client last observed it is rejected. A prior add (or a finalize that the
+      client did not see) has already mutated the session and its derived
+      totals, so the current writer's view of the session is stale and the new
+      line would be appended against an outdated basis.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: count-finalize-stale-session
+    parent_entity: CountSession
+    write_endpoint: "POST /count-sessions/{id}/finalize"
+    occ_field: "expected_count_session_version"
+    description: |
+      Finalizing a CountSession whose version has advanced since the client last
+      observed it is rejected. Another writer added a count-line after the
+      finalizing client read the session, so the variance roll-up the client
+      intends to commit would omit the newer line; the stale-version guard
+      rejects the commit.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: compute_recipe_cost
+    trigger: "RecipeLine added/updated; referenced Product.unit_cost_cents changed; RecipeSpec publish"
+    algorithm: aggregation
+    formula: |
+      # Combinatorial mode (b): rounding order is pinned to ROUND-PER-LINE-THEN-SUM.
+      for each RecipeLine L of the recipe (ordered by RecipeLine.created_at ASC):
+        L.line_cost_cents = round_half_up( P.unit_cost_cents * L.pour_ml / P.container_volume_ml )
+                            where P = Product(L.product_id)
+      RecipeSpec.recipe_cost_cents = sum(L.line_cost_cents for L in lines)
+      # NOTE: "sum the raw fractional line costs then round once" is explicitly NOT used;
+      # the per-line rounding can differ from sum-then-round by +/- a cent.
+    input_set: "all RecipeLines whose recipe_id == RecipeSpec.id; no status filter (lines have no status)"
+    constants: {}
+    precision: "per-line round_half_up to whole cents; sum is exact integer addition"
+    variants:
+      - name: round_per_line
+        when: "the pinned production algorithm"
+        difference: "rounds each line to a cent before summing"
+      - name: sum_then_round
+        when: "a naive alternative that the spec explicitly rejects"
+        difference: "sums raw fractional line costs then rounds once; can yield a different cent total"
+
+  - name: depletion_variance
+    trigger: "CountSession finalize (per CountLine)"
+    algorithm: chronological
+    formula: |
+      # DUAL-VARIANT: theoretical (recipe-driven) depletion vs actual (count-driven) depletion.
+      # Window = (prior finalized CountSession.counted_at for this session's products, this.counted_at].
+      # prior_closing = closing_units of this product from the most recent FINALIZED CountSession
+      #                 with counted_at < this.counted_at (0 if none).
+      # received_since = sum(InvoiceLine.received_qty) for this product across Invoices that POSTED
+      #                  within the window.
+      # THEORETICAL depletion:
+      theoretical_units = sum over each MenuItem M selling a PUBLISHED recipe that contains this product:
+          ( M.units_sold_in_window
+            * (RecipeLine.pour_ml for this product in M's recipe)
+            / Product.container_volume_ml )
+        rounded_half_up to 4 dp at the end.
+      # ACTUAL depletion:
+      actual_depletion_units = prior_closing + received_since - this_line.closing_units
+      # VARIANCE (actual minus theoretical):
+      variance_units = round_half_up(actual_depletion_units - theoretical_units, 4)
+      variance_cost_cents = round_half_up(variance_units * Product.unit_cost_cents)
+    input_set: "MenuItems with status == ACTIVE selling a PUBLISHED RecipeSpec; sales within the half-open window (prior.counted_at, this.counted_at]"
+    constants: {}
+    precision: "theoretical_units and variance_units to 4 dp round_half_up; variance_cost_cents whole cents round_half_up"
+    variants:
+      - name: theoretical
+        when: "expected usage if every pour matched spec exactly"
+        difference: "derived forward from sales x recipe pours; ignores spillage and overpour"
+      - name: actual
+        when: "physically measured depletion"
+        difference: "derived from prior count + receipts - measured closing; captures real shrinkage"
+
+  - name: resolve_closing_units
+    trigger: "CountSession finalize (per CountLine); WEIGHT method"
+    algorithm: aggregation
+    formula: |
+      if count_method == UNITS:
+        closing_units = counted_units
+      else:  # WEIGHT
+        net_liquid_g = gross_weight_g - Product.empty_container_weight_g
+        remaining_ml = round_half_up(net_liquid_g / Product.density_g_per_ml, 1)
+        closing_units = round_half_up(remaining_ml / Product.container_volume_ml, 3)
+      # boundary: a gross_weight_g <= empty_container_weight_g yields net <= 0 -> ERR_WEIGHT_BELOW_TARE
+    input_set: "the single CountLine and its referenced Product container/tare/density"
+    constants: {}
+    precision: "remaining_ml 1 dp round_half_up; closing_units 3 dp round_half_up"
+
+  - name: keg_yield
+    trigger: "GET /products/{id}/keg-yield (computed read)"
+    algorithm: threshold
+    formula: |
+      # Combinatorial mode (a): >=3 inputs (volume, pour size, loss pct), floor non-linearity, branch on container_type.
+      require Product.container_type == KEG else ERR_NOT_A_KEG
+      servings_theoretical = floor(Product.container_volume_ml / pour_size_ml)
+      servings_net         = floor( (Product.container_volume_ml * (1 - line_loss_pct)) / pour_size_ml )
+      cost_per_serving_cents = round_half_up(Product.unit_cost_cents / servings_net)  # servings_net > 0 else ERR_VALIDATION
+    input_set: "the keg Product plus request pour_size_ml and line_loss_pct"
+    constants:
+      DEFAULT_LINE_LOSS_PCT: 0.05
+    precision: "servings via floor; cost_per_serving_cents whole cents round_half_up"
+
+  - name: reconcile_invoice
+    trigger: "Invoice post"
+    algorithm: tiered_pricing
+    formula: |
+      # Combinatorial mode (c): circular-looking dependency, evaluation order PINNED.
+      # Order: extensions -> subtotal -> discount(subtotal tier) -> tax(subtotal-discount) -> total.
+      for each InvoiceLine L: L.extension_cents = L.received_qty * L.unit_cost_cents
+      subtotal_cents = sum(L.extension_cents)
+      discount_pct = 0.05 if subtotal_cents >= TIER2_THRESHOLD_CENTS
+                     else 0.03 if subtotal_cents >= TIER1_THRESHOLD_CENTS
+                     else 0.00
+      discount_cents = round_half_up(subtotal_cents * discount_pct)
+      tax_cents = round_half_up((subtotal_cents - discount_cents) * TAX_RATE)
+      invoice_total_cents = subtotal_cents - discount_cents + tax_cents + freight_cents
+    input_set: "all InvoiceLines whose invoice_id == Invoice.id; the invoice's freight_cents"
+    constants:
+      TIER1_THRESHOLD_CENTS: 30000
+      TIER2_THRESHOLD_CENTS: 40000
+      TAX_RATE: 0.0875
+    precision: "discount_cents, tax_cents whole cents round_half_up; subtotal/total exact integer addition"
+    variants:
+      - name: tier_inclusive
+        when: "the pinned production algorithm"
+        difference: "tier boundary is inclusive: subtotal exactly == 40000 takes the 5% tier (>=)"
+
+  - name: reorder_quantity
+    trigger: "GET /products/{id}/reorder-suggestion (computed read)"
+    algorithm: threshold
+    formula: |
+      par = active ParSetting for product (status == ACTIVE); else ERR_NO_ACTIVE_PAR
+      if Product.on_hand_units >= par.reorder_point_units:
+        triggered = false; suggested_qty = 0
+      else:
+        triggered = true
+        raw = ceil(par.par_level_units - Product.on_hand_units)        # whole containers up to par
+        suggested_qty = ceil(raw / Product.case_pack) * Product.case_pack   # round up to a case multiple
+    input_set: "the product, its ACTIVE ParSetting, and Product.case_pack"
+    constants: {}
+    precision: "integer container counts via ceil"
+
+  - name: menu_engineering
+    trigger: "GET /menu-items/engineering (computed read over ACTIVE MenuItems)"
+    algorithm: weighted_scoring
+    formula: |
+      universe = MenuItems with status == ACTIVE selling a PUBLISHED recipe
+      total_units = sum(M.units_sold for M in universe)
+      n = count(universe); require n >= 1 and total_units >= 1 else ERR_EMPTY_MENU
+      pop_threshold = POPULARITY_FACTOR * (1.0 / n)
+      margin(M) = M.menu_price_cents - RecipeSpec(M.recipe_id).recipe_cost_cents
+      avg_margin = sum(margin(M))/n            # exact rational compared without rounding
+      for each M:
+        pop_index = round_half_up(M.units_sold / total_units, 4)
+        high_pop    = pop_index >= pop_threshold        # inclusive boundary
+        high_margin = margin(M) >= avg_margin           # inclusive boundary
+        M.menu_class = STAR if (high_pop and high_margin)
+                       else PLOWHORSE if (high_pop and not high_margin)
+                       else PUZZLE if (not high_pop and high_margin)
+                       else DOG
+    input_set: "ACTIVE MenuItems selling PUBLISHED recipes; uses cumulative units_sold"
+    constants:
+      POPULARITY_FACTOR: 0.70
+    precision: "pop_index 4 dp round_half_up; margin/avg_margin exact integer/rational comparison"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except GET endpoints which still require headers"
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted to perform this operation per RBAC matrix"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "every path/body referenced resource exists (validated left-to-right in path, then body FKs)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 4
+    category: state
+    check: "target resource is in a state from which this transition is allowed"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action/transition endpoints"
+
+  - priority: 5
+    category: state
+    check: "OCC: expected_count_session_version equals CountSession.version on count-line add and finalize"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /count-sessions/{id}/count-lines, POST /count-sessions/{id}/finalize"
+
+  - priority: 6
+    category: business_referential
+    check: "InvoiceLine.product_id must appear on a POLine of the invoice's PurchaseOrder"
+    error_id: ERR_PRODUCT_NOT_ON_PO
+    http_status: 422
+    applies_to: "POST /invoices/{id}/lines, POST /invoices/{id}/post"
+
+  - priority: 7
+    category: business_referential
+    check: "MenuItem may only reference a RecipeSpec whose status == PUBLISHED"
+    error_id: ERR_RECIPE_NOT_PUBLISHED
+    http_status: 422
+    applies_to: "POST /menu-items"
+
+  - priority: 8
+    category: business_constraint
+    check: "WEIGHT count line: gross_weight_g must exceed Product.empty_container_weight_g (net liquid > 0)"
+    error_id: ERR_WEIGHT_BELOW_TARE
+    http_status: 422
+    applies_to: "POST /count-sessions/{id}/finalize, POST /count-sessions/{id}/count-lines"
+
+  - priority: 9
+    category: business_constraint
+    check: "keg-yield / count operations on a product require the container_type matching the operation (KEG for keg-yield)"
+    error_id: ERR_NOT_A_KEG
+    http_status: 422
+    applies_to: "GET /products/{id}/keg-yield"
+
+  - priority: 10
+    category: business_constraint
+    check: "ParSetting.reorder_point_units <= par_level_units and both > 0/>=0 respectively"
+    error_id: ERR_INVALID_PAR
+    http_status: 422
+    applies_to: "POST /par-settings"
+
+  - priority: 11
+    category: business_constraint
+    check: "Product.sku must be unique across non-ARCHIVED products"
+    error_id: ERR_DUPLICATE_SKU
+    http_status: 409
+    applies_to: "POST /products"
+
+  - priority: 12
+    category: business_constraint
+    check: "a CountSession may contain at most one CountLine per product_id"
+    error_id: ERR_DUPLICATE_COUNT_LINE
+    http_status: 409
+    applies_to: "POST /count-sessions/{id}/count-lines"
+
+  - priority: 13
+    category: business_constraint
+    check: "reorder-suggestion / depletion require an ACTIVE ParSetting (reorder) for the product"
+    error_id: ERR_NO_ACTIVE_PAR
+    http_status: 422
+    applies_to: "GET /products/{id}/reorder-suggestion"
+
+  - priority: 14
+    category: business_constraint
+    check: "menu-engineering report requires >= 1 ACTIVE MenuItem with total cumulative units_sold >= 1"
+    error_id: ERR_EMPTY_MENU
+    http_status: 422
+    applies_to: "GET /menu-items/engineering"
+
+  - priority: 15
+    category: business_fiscal
+    check: "PurchaseOrder may only CLOSE when received quantities cover ordered quantities per product"
+    error_id: ERR_SHORT_RECEIPT
+    http_status: 422
+    applies_to: "POST /purchase-orders/{id}/close"
+
+  - priority: 16
+    category: business_temporal
+    check: "CountSession finalize: counted_at must be strictly after the most recent FINALIZED session sharing any product (per-product half-open depletion windows may not overlap nor abut at equal counted_at)"
+    error_id: ERR_COUNT_WINDOW_OVERLAP
+    http_status: 422
+    applies_to: "POST /count-sessions/{id}/finalize"
+
+  - priority: 17
+    category: business_temporal
+    check: "KegTap create: closed interval [tapped_from, tapped_until] must not overlap an existing KegTap on the same draft_line_no; adjacency (touching endpoints) is permitted"
+    error_id: ERR_LINE_OVERLAP
+    http_status: 422
+    applies_to: "POST /keg-taps"
+
+  - priority: 18
+    category: business_constraint
+    check: "request body conforms to schema: required fields present, enums valid, numbers in range"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST/PUT/PATCH"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Products ----
+  - method: POST
+    path: "/products"
+    description: "Create a bottle/keg SKU"
+    roles: [InventoryManager]
+    code: 201
+    input: [sku, name, container_type, container_volume_ml, unit_cost_cents, "empty_container_weight_g?", "density_g_per_ml?", "case_pack?"]
+    output: Product
+    side_effects: ["Product created with status ACTIVE, on_hand_units 0, needs_reorder false"]
+  - method: GET
+    path: "/products/{id}"
+    description: "Read a product"
+    roles: [InventoryManager, PurchasingAgent, BarManager]
+    code: 200
+    input: []
+    output: Product
+    side_effects: []
+  - method: GET
+    path: "/products"
+    description: "List products with pagination and optional filters"
+    roles: [InventoryManager, PurchasingAgent, BarManager]
+    code: 200
+    input: ["status?", "container_type?", "needs_reorder?", "limit?", "offset?"]
+    output: Product[]
+    side_effects: []
+  - method: POST
+    path: "/products/{id}/archive"
+    description: "Archive a product (soft delete); frees its SKU for reuse"
+    roles: [InventoryManager]
+    code: 200
+    input: []
+    output: Product
+    side_effects: ["Product.status := ARCHIVED", "increments Product.version by 1"]
+  - method: GET
+    path: "/products/{id}/keg-yield"
+    description: "Computed keg line/yield read (keg_yield calc)"
+    roles: [InventoryManager, BarManager]
+    code: 200
+    input: [pour_size_ml, "line_loss_pct?"]
+    output: "{ servings_theoretical: integer, servings_net: integer, cost_per_serving_cents: integer }"
+    side_effects: []
+  - method: GET
+    path: "/products/{id}/reorder-suggestion"
+    description: "Computed par/reorder suggestion (reorder_quantity calc)"
+    roles: [InventoryManager, PurchasingAgent]
+    code: 200
+    input: []
+    output: "{ triggered: boolean, suggested_qty: integer, par_level_units: number, on_hand_units: number }"
+    side_effects: []
+
+  # ---- Product sub-resources: reverse-reachability for child FKs pointing at Product.id ----
+  - method: GET
+    path: "/products/{id}/par-settings"
+    description: "List par settings for a product (reverse-reachability for ParSetting.product_id)"
+    roles: [InventoryManager, PurchasingAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ParSetting[]
+    side_effects: []
+  - method: GET
+    path: "/products/{id}/recipe-lines"
+    description: "List recipe lines that pour a product (reverse-reachability for RecipeLine.product_id)"
+    roles: [BarManager, InventoryManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RecipeLine[]
+    side_effects: []
+  - method: GET
+    path: "/products/{id}/count-lines"
+    description: "List count lines for a product (reverse-reachability for CountLine.product_id)"
+    roles: [InventoryManager]
+    code: 200
+    input: ["count_session_id?", "limit?", "offset?"]
+    output: CountLine[]
+    side_effects: []
+  - method: GET
+    path: "/products/{id}/po-lines"
+    description: "List PO lines for a product (reverse-reachability for POLine.product_id)"
+    roles: [PurchasingAgent, InventoryManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: POLine[]
+    side_effects: []
+  - method: GET
+    path: "/products/{id}/invoice-lines"
+    description: "List invoice lines for a product (reverse-reachability for InvoiceLine.product_id)"
+    roles: [PurchasingAgent, InventoryManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: InvoiceLine[]
+    side_effects: []
+  - method: GET
+    path: "/products/{id}/waste-logs"
+    description: "List waste logs for a product (reverse-reachability for WasteLog.product_id)"
+    roles: [BarManager, InventoryManager]
+    code: 200
+    input: ["reason?", "limit?", "offset?"]
+    output: WasteLog[]
+    side_effects: []
+  - method: GET
+    path: "/products/{id}/keg-taps"
+    description: "List keg taps for a product (reverse-reachability for KegTap.product_id)"
+    roles: [BarManager, InventoryManager]
+    code: 200
+    input: ["draft_line_no?", "limit?", "offset?"]
+    output: KegTap[]
+    side_effects: []
+
+  # ---- Par settings ----
+  - method: POST
+    path: "/par-settings"
+    description: "Create/supersede the ACTIVE par setting for a product"
+    roles: [InventoryManager]
+    code: 201
+    input: [product_id, par_level_units, reorder_point_units]
+    output: ParSetting
+    side_effects: ["any prior ACTIVE ParSetting for product := SUPERSEDED", "new ParSetting ACTIVE", "referenced Product recomputes needs_reorder"]
+  - method: GET
+    path: "/par-settings"
+    description: "List par settings, optionally filtered by product"
+    roles: [InventoryManager, PurchasingAgent]
+    code: 200
+    input: ["product_id?", "status?", "limit?", "offset?"]
+    output: ParSetting[]
+    side_effects: []
+
+  # ---- Recipes ----
+  - method: POST
+    path: "/recipes"
+    description: "Create a DRAFT cocktail recipe spec"
+    roles: [BarManager]
+    code: 201
+    input: [name]
+    output: RecipeSpec
+    side_effects: ["RecipeSpec created DRAFT, recipe_cost_cents 0"]
+  - method: GET
+    path: "/recipes/{id}"
+    description: "Read a recipe spec"
+    roles: [BarManager, InventoryManager]
+    code: 200
+    input: []
+    output: RecipeSpec
+    side_effects: []
+  - method: POST
+    path: "/recipes/{id}/lines"
+    description: "Add an ingredient pour line to a DRAFT recipe"
+    roles: [BarManager]
+    code: 201
+    input: [product_id, pour_ml]
+    output: RecipeLine
+    side_effects: ["RecipeLine.line_cost_cents computed", "RecipeSpec.recipe_cost_cents recomputed (round-per-line sum)"]
+  - method: GET
+    path: "/recipes/{id}/lines"
+    description: "List ingredient lines of a recipe (FK reverse-reachability for RecipeLine.recipe_id)"
+    roles: [BarManager, InventoryManager]
+    code: 200
+    input: []
+    output: RecipeLine[]
+    side_effects: []
+  - method: POST
+    path: "/recipes/{id}/publish"
+    description: "Publish a DRAFT recipe (freezes it; computes recipe_cost)"
+    roles: [BarManager]
+    code: 200
+    input: []
+    output: RecipeSpec
+    side_effects: ["recipe_cost recomputed", "RecipeSpec.status := PUBLISHED", "increments RecipeSpec.version by 1"]
+  - method: POST
+    path: "/recipes/{id}/revise"
+    description: "Send a PUBLISHED recipe back to DRAFT for editing"
+    roles: [BarManager]
+    code: 200
+    input: []
+    output: RecipeSpec
+    side_effects: ["RecipeSpec.status := DRAFT", "increments RecipeSpec.version by 1"]
+  - method: POST
+    path: "/recipes/{id}/retire"
+    description: "Retire a PUBLISHED recipe"
+    roles: [BarManager]
+    code: 200
+    input: []
+    output: RecipeSpec
+    side_effects: ["RecipeSpec.status := RETIRED", "increments RecipeSpec.version by 1"]
+
+  # ---- Menu items ----
+  - method: POST
+    path: "/menu-items"
+    description: "List a PUBLISHED recipe on the menu at a price"
+    roles: [BarManager]
+    code: 201
+    input: [recipe_id, menu_price_cents]
+    output: MenuItem
+    side_effects: ["pour_cost_pct computed", "MenuItem ACTIVE, units_sold 0, menu_class UNCLASSIFIED"]
+  - method: GET
+    path: "/menu-items/{id}"
+    description: "Read a menu item"
+    roles: [BarManager, InventoryManager]
+    code: 200
+    input: []
+    output: MenuItem
+    side_effects: []
+  - method: GET
+    path: "/menu-items"
+    description: "List menu items, optionally filtered by recipe (FK reverse-reachability for MenuItem.recipe_id)"
+    roles: [BarManager, InventoryManager]
+    code: 200
+    input: ["recipe_id?", "status?", "limit?", "offset?"]
+    output: MenuItem[]
+    side_effects: []
+  - method: POST
+    path: "/menu-items/{id}/record-sales"
+    description: "Record a batch of unit sales for a menu item (drives depletion + menu engineering)"
+    roles: [BarManager]
+    code: 200
+    input: [quantity, sold_at]
+    output: MenuItem
+    side_effects: ["MenuItem.units_sold += quantity"]
+  - method: POST
+    path: "/menu-items/{id}/delist"
+    description: "Delist a menu item: excludes it from sales recording and menu-engineering/depletion universe"
+    roles: [BarManager]
+    code: 200
+    input: []
+    output: MenuItem
+    side_effects: ["MenuItem.status := DELISTED", "increments MenuItem.version by 1"]
+  - method: GET
+    path: "/menu-items/engineering"
+    description: "Computed menu-engineering report (menu_engineering calc); persists menu_class on each ACTIVE item"
+    roles: [BarManager]
+    code: 200
+    input: []
+    output: MenuItem[]
+    side_effects: ["each ACTIVE MenuItem.menu_class persisted (STAR/PLOWHORSE/PUZZLE/DOG)"]
+
+  # ---- Count sessions ----
+  - method: POST
+    path: "/count-sessions"
+    description: "Open a physical count session"
+    roles: [InventoryManager]
+    code: 201
+    input: [label, counted_at]
+    output: CountSession
+    side_effects: ["CountSession OPEN, version 1"]
+  - method: GET
+    path: "/count-sessions/{id}"
+    description: "Read a count session"
+    roles: [InventoryManager]
+    code: 200
+    input: []
+    output: CountSession
+    side_effects: []
+  - method: POST
+    path: "/count-sessions/{id}/count-lines"
+    description: "Add a count line (UNITS or WEIGHT); OCC-guarded by session version"
+    roles: [InventoryManager]
+    code: 201
+    input: [product_id, count_method, expected_count_session_version, "counted_units?", "gross_weight_g?"]
+    output: CountLine
+    side_effects: ["CountLine appended", "increments CountSession.version by 1"]
+  - method: GET
+    path: "/count-sessions/{id}/count-lines"
+    description: "List count lines of a session (FK reverse-reachability for CountLine.count_session_id)"
+    roles: [InventoryManager]
+    code: 200
+    input: []
+    output: CountLine[]
+    side_effects: []
+  - method: POST
+    path: "/count-sessions/{id}/finalize"
+    description: "Finalize a count: resolve closing units, compute variance, post on-hand; OCC-guarded"
+    roles: [InventoryManager]
+    code: 200
+    input: [expected_count_session_version]
+    output: CountSession
+    side_effects: ["per-line closing_units/theoretical_units/variance computed", "total_variance_cost_cents set", "each counted Product.on_hand_units := closing_units and needs_reorder recomputed", "increments CountSession.version by 1"]
+  - method: POST
+    path: "/count-sessions/{id}/void"
+    description: "Void an OPEN count session"
+    roles: [InventoryManager]
+    code: 200
+    input: [expected_count_session_version]
+    output: CountSession
+    side_effects: ["CountSession.status := VOID", "increments CountSession.version by 1"]
+
+  # ---- Purchase orders ----
+  - method: POST
+    path: "/purchase-orders"
+    description: "Create a DRAFT purchase order"
+    roles: [PurchasingAgent]
+    code: 201
+    input: [vendor_name, expected_at]
+    output: PurchaseOrder
+    side_effects: ["PurchaseOrder DRAFT, ordered_total_cents 0"]
+  - method: GET
+    path: "/purchase-orders/{id}"
+    description: "Read a purchase order"
+    roles: [PurchasingAgent, InventoryManager]
+    code: 200
+    input: []
+    output: PurchaseOrder
+    side_effects: []
+  - method: GET
+    path: "/purchase-orders"
+    description: "List purchase orders with pagination"
+    roles: [PurchasingAgent, InventoryManager]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: PurchaseOrder[]
+    side_effects: []
+  - method: POST
+    path: "/purchase-orders/{id}/lines"
+    description: "Add an order line to a DRAFT PO"
+    roles: [PurchasingAgent]
+    code: 201
+    input: [product_id, ordered_qty, unit_cost_cents]
+    output: POLine
+    side_effects: ["POLine appended"]
+  - method: GET
+    path: "/purchase-orders/{id}/lines"
+    description: "List order lines of a PO (FK reverse-reachability for POLine.purchase_order_id)"
+    roles: [PurchasingAgent, InventoryManager]
+    code: 200
+    input: []
+    output: POLine[]
+    side_effects: []
+  - method: POST
+    path: "/purchase-orders/{id}/submit"
+    description: "Submit a DRAFT PO; computes ordered_total"
+    roles: [PurchasingAgent]
+    code: 200
+    input: []
+    output: PurchaseOrder
+    side_effects: ["ordered_total_cents computed", "PurchaseOrder.status := SUBMITTED", "increments PurchaseOrder.version by 1"]
+  - method: POST
+    path: "/purchase-orders/{id}/close"
+    description: "Close a fully-received PO"
+    roles: [PurchasingAgent]
+    code: 200
+    input: []
+    output: PurchaseOrder
+    side_effects: ["PurchaseOrder.status := CLOSED", "increments PurchaseOrder.version by 1"]
+  - method: POST
+    path: "/purchase-orders/{id}/cancel"
+    description: "Cancel a DRAFT or SUBMITTED PO with no posted invoices"
+    roles: [PurchasingAgent]
+    code: 200
+    input: []
+    output: PurchaseOrder
+    side_effects: ["PurchaseOrder.status := CANCELLED", "increments PurchaseOrder.version by 1"]
+
+  # ---- Invoices ----
+  - method: POST
+    path: "/invoices"
+    description: "Create a DRAFT invoice against a PO"
+    roles: [PurchasingAgent]
+    code: 201
+    input: [purchase_order_id, vendor_invoice_no, "freight_cents?"]
+    output: Invoice
+    side_effects: ["Invoice DRAFT, all money fields 0"]
+  - method: GET
+    path: "/invoices/{id}"
+    description: "Read an invoice"
+    roles: [PurchasingAgent, InventoryManager]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+  - method: GET
+    path: "/invoices"
+    description: "List invoices filtered by PO (FK reverse-reachability for Invoice.purchase_order_id)"
+    roles: [PurchasingAgent, InventoryManager]
+    code: 200
+    input: ["purchase_order_id?", "status?", "limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+  - method: POST
+    path: "/invoices/{id}/lines"
+    description: "Add a billed line to a DRAFT invoice"
+    roles: [PurchasingAgent]
+    code: 201
+    input: [product_id, received_qty, unit_cost_cents]
+    output: InvoiceLine
+    side_effects: ["InvoiceLine appended; extension computed at post"]
+  - method: GET
+    path: "/invoices/{id}/lines"
+    description: "List billed lines of an invoice (FK reverse-reachability for InvoiceLine.invoice_id)"
+    roles: [PurchasingAgent, InventoryManager]
+    code: 200
+    input: []
+    output: InvoiceLine[]
+    side_effects: []
+  - method: POST
+    path: "/invoices/{id}/post"
+    description: "Post an invoice: reconcile totals, land cost, post received stock; cascades PO to RECEIVED"
+    roles: [PurchasingAgent]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["reconcile_invoice runs (extensions->subtotal->discount->tax->total)", "per line Product.unit_cost_cents updated and on_hand_units += received_qty", "affected Products recompute needs_reorder", "PO SUBMITTED->RECEIVED if applicable", "increments Invoice.version by 1"]
+  - method: POST
+    path: "/invoices/{id}/void"
+    description: "Void an invoice; compensates received stock and reverts PO if last posted invoice"
+    roles: [PurchasingAgent]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["if POSTED: per line Product.on_hand_units -= received_qty and recompute needs_reorder", "PO RECEIVED->SUBMITTED if last posted invoice", "increments Invoice.version by 1"]
+
+  # ---- Waste log ----
+  - method: POST
+    path: "/waste-logs"
+    description: "Record a waste/spill event; depletes on-hand and computes cost"
+    roles: [BarManager, InventoryManager]
+    code: 201
+    input: [product_id, reason, wasted_units]
+    output: WasteLog
+    side_effects: ["waste_cost_cents computed", "Product.on_hand_units -= wasted_units (floored at 0)", "affected Product recomputes needs_reorder"]
+  - method: GET
+    path: "/waste-logs"
+    description: "List waste logs filtered by product (FK reverse-reachability for WasteLog.product_id)"
+    roles: [BarManager, InventoryManager]
+    code: 200
+    input: ["product_id?", "reason?", "limit?", "offset?"]
+    output: WasteLog[]
+    side_effects: []
+
+  # ---- Keg taps (draft-line occupation) ----
+  - method: POST
+    path: "/keg-taps"
+    description: "Tap a keg onto a draft line for a closed time interval; rejects line-occupation overlaps"
+    roles: [BarManager, InventoryManager]
+    code: 201
+    input: [product_id, draft_line_no, tapped_from, tapped_until]
+    output: KegTap
+    side_effects: ["KegTap created if its [tapped_from, tapped_until] does not overlap an existing KegTap on the same draft_line_no"]
+  - method: GET
+    path: "/keg-taps"
+    description: "List keg taps filtered by product (FK reverse-reachability for KegTap.product_id)"
+    roles: [BarManager, InventoryManager]
+    code: 200
+    input: ["product_id?", "draft_line_no?", "limit?", "offset?"]
+    output: KegTap[]
+    side_effects: []
+
+  # ---- Test-driving (logical clock) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock. Startup default is 2026-01-01T00:00:00Z; the clock never falls back to wall-clock time. All sold_at/counted_at windows resolve against this clock."
+    roles: [InventoryManager, PurchasingAgent, BarManager]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: datetime }"
+    side_effects: ["logical clock set to to_iso8601"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/invalid X-User-Role or X-User-ID headers"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "acting role not permitted for this operation"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "referenced resource (path id or body FK) does not exist"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "target resource not in a state allowing this transition"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_count_session_version does not match CountSession.version"
+  - id: ERR_PRODUCT_NOT_ON_PO
+    http: 422
+    condition: "InvoiceLine product is not present on any POLine of the invoice's PO"
+  - id: ERR_RECIPE_NOT_PUBLISHED
+    http: 422
+    condition: "MenuItem references a recipe whose status != PUBLISHED"
+  - id: ERR_WEIGHT_BELOW_TARE
+    http: 422
+    condition: "WEIGHT count line gross_weight_g <= Product.empty_container_weight_g (net liquid not positive)"
+  - id: ERR_NOT_A_KEG
+    http: 422
+    condition: "keg-yield requested on a product whose container_type != KEG"
+  - id: ERR_INVALID_PAR
+    http: 422
+    condition: "ParSetting reorder_point_units > par_level_units or out of range"
+  - id: ERR_DUPLICATE_SKU
+    http: 409
+    condition: "product sku collides with an existing non-ARCHIVED product"
+  - id: ERR_DUPLICATE_COUNT_LINE
+    http: 409
+    condition: "a CountLine already exists for this product in the session"
+  - id: ERR_NO_ACTIVE_PAR
+    http: 422
+    condition: "reorder-suggestion requested for a product with no ACTIVE ParSetting"
+  - id: ERR_EMPTY_MENU
+    http: 422
+    condition: "menu-engineering report run with no ACTIVE menu item or zero cumulative sales"
+  - id: ERR_SHORT_RECEIPT
+    http: 422
+    condition: "PO close attempted while received quantities do not cover ordered quantities"
+  - id: ERR_COUNT_WINDOW_OVERLAP
+    http: 422
+    condition: "CountSession finalize whose counted_at is not strictly after a prior FINALIZED session sharing a product"
+  - id: ERR_LINE_OVERLAP
+    http: 422
+    condition: "KegTap interval overlaps an existing tap on the same draft line"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "request body fails schema validation (missing required field, bad enum, out-of-range number, method-required field absent)"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "generic business-rule violation not covered by a more specific 422 (e.g., servings_net == 0 in keg-yield, freight negative after defaulting)"
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: InventoryManager
+    description: "Owns products, par settings, physical counts, and stock-level reads"
+    identity: opaque
+    exclusive_operations:
+      - "POST /products"
+      - "POST /products/{id}/archive"
+      - "POST /par-settings"
+      - "POST /count-sessions"
+      - "POST /count-sessions/{id}/count-lines"
+      - "POST /count-sessions/{id}/finalize"
+      - "POST /count-sessions/{id}/void"
+    shared_operations:
+      - "GET /products, GET /products/{id}, GET /products/{id}/keg-yield, GET /products/{id}/reorder-suggestion"
+      - "GET /par-settings, GET /purchase-orders, GET /invoices, GET /recipes/{id}, GET /menu-items"
+      - "POST /waste-logs, GET /waste-logs, POST /keg-taps, GET /keg-taps"
+      - "POST /_clock/set_current_utc"
+
+  - name: PurchasingAgent
+    description: "Owns purchase orders and vendor invoices"
+    identity: opaque
+    exclusive_operations:
+      - "POST /purchase-orders, POST /purchase-orders/{id}/lines"
+      - "POST /purchase-orders/{id}/submit, POST /purchase-orders/{id}/close, POST /purchase-orders/{id}/cancel"
+      - "POST /invoices, POST /invoices/{id}/lines"
+      - "POST /invoices/{id}/post, POST /invoices/{id}/void"
+    shared_operations:
+      - "GET /products, GET /products/{id}, GET /products/{id}/reorder-suggestion"
+      - "GET /products/{id}/po-lines, GET /products/{id}/invoice-lines, GET /products/{id}/par-settings"
+      - "GET /purchase-orders, GET /invoices, GET /par-settings"
+      - "POST /_clock/set_current_utc"
+
+  - name: BarManager
+    description: "Owns cocktail recipes, menu items, sales recording, and menu engineering"
+    identity: opaque
+    exclusive_operations:
+      - "POST /recipes, POST /recipes/{id}/lines"
+      - "POST /recipes/{id}/publish, POST /recipes/{id}/revise, POST /recipes/{id}/retire"
+      - "POST /menu-items, POST /menu-items/{id}/record-sales, POST /menu-items/{id}/delist"
+      - "GET /menu-items/engineering"
+    shared_operations:
+      - "GET /products, GET /products/{id}, GET /products/{id}/keg-yield"
+      - "GET /recipes/{id}, GET /recipes/{id}/lines, GET /menu-items, GET /menu-items/{id}"
+      - "POST /waste-logs, GET /waste-logs, POST /keg-taps, GET /keg-taps"
+      - "POST /_clock/set_current_utc"

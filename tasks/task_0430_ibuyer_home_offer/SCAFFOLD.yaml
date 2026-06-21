@@ -1,0 +1,972 @@
+# =============================================================================
+# Scaffold: iBuyer / Instant Home Offer (Opendoor-style)
+# Sections §1.0–§1.7. The §1.8 (difficulty) and §1.9 (corner) design indexes
+# live in sibling files SCAFFOLD_DIFFICULTY_DESIGN.yaml / SCAFFOLD_CORNER_DESIGN.yaml.
+# =============================================================================
+
+scenario: "430. iBuyer / Instant Home Offer (Opendoor style): address valuation (AVM) & offer, condition questionnaire & home assessment, offer expiration & service-fee/concession, repair-credit deduction, close-date selection & late-checkout lease-back, inspection re-trade, resale listing & spread, cancellation"
+
+domain_name: ibuyer-home-offer
+api_prefix: /   # flat topology: peer collections (/sellers, /properties, /offers, /transactions, /resales, /assessments, /repair-line-items) sit at the root
+
+# -----------------------------------------------------------------------------
+# Complexity profile
+# -----------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: ledger_reconciliation        # preliminary net proceeds vs final net proceeds: same inputs, two algorithms, divergent dollars
+  secondary_archetype: workflow_orchestration      # offer -> assessment -> close -> inspection re-trade -> resale lifecycle with branching + compensation
+  complexity_layers:
+    - dual_variant_calculation                     # provisional (at offer) vs final (at close) net proceeds; provisional vs final resale spread
+    - cascading_side_effects                        # re-trade -> revised AVM -> recomputed service_fee -> recomputed net proceeds -> property/offer fields
+    - optimistic_concurrency                        # OCC on Property.version for re-issue-offer-on-stale-property (CREATE-with-supersede)
+    - scheduled_actions                             # logical clock drives offer expiration, close-date / leaseback windows
+
+  entity_topology: flat                             # peer entities linked by FK body fields; no deep URL nesting
+  state_machine_shape: branching                    # Offer forks: accept->assessment->close OR expire/decline; Transaction branches at inspection (proceed vs re-trade vs cancel)
+  relationship_patterns:
+    - one_to_many                                   # Property -> Offers (re-issued), Transaction -> RepairLineItems
+    - cross_aggregate                               # Transaction references Offer references Property; Resale references Transaction
+
+  role_model: peer_roles                            # Seller (homeowner) vs PricingAnalyst vs OperationsAdmin own distinct operations
+  consistency_model: immediate                      # all derived fields reconciled within the mutating request
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — emitted verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Seller
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: email, type: string, source: input, description: "Login email; unique", constraints: "unique across Sellers" }
+      - { name: full_name, type: string, source: input, description: "Homeowner legal name" }
+      - { name: payout_method, type: enum, source: input, default: "ACH", description: "Where net proceeds are sent", constraints: "one of {ACH, WIRE}" }
+
+  - name: Property
+    parent: null
+    common_fields: true
+    fields:
+      - { name: seller_id, type: string, source: input, description: "FK -> Seller.id; the homeowner who registered this property" }
+      - { name: address_line, type: string, source: input, description: "Street address" }
+      - { name: zip_code, type: string, source: input, description: "5-digit ZIP, used to pick comparable-set" }
+      - { name: bedrooms, type: integer, source: input, description: "Bedroom count", constraints: ">= 0" }
+      - { name: living_area_sqft, type: integer, source: input, description: "Heated living area", constraints: ">= 1" }
+      - { name: comp_median_value, type: number, source: input, description: "Median sale price of comparable set supplied at registration (dollars)", constraints: ">= 0" }
+      - { name: market_trend_pct, type: number, source: input, default: 0.0, description: "Signed ZIP market trend applied to comps, e.g. 0.02 = +2%", constraints: "-0.50 <= x <= 0.50" }
+      - { name: avm_value, type: number, source: computed, description: "Automated valuation = round(comp_median_value * (1 + market_trend_pct), 2); recomputed on re-trade onto revised_avm_value" }
+      - { name: revised_avm_value, type: number, source: computed, default: null, description: "AVM after an accepted inspection re-trade (= avm_value - retrade_amount); null until a re-trade is applied" }
+      - { name: condition_score, type: enum, source: computed, default: null, description: "Set by the home Assessment: one of {EXCELLENT, GOOD, FAIR, POOR}; null until assessed" }
+      - { name: status, type: enum, source: system, default: "VALUED", description: "VALUED -> UNDER_OFFER -> IN_TRANSACTION -> SOLD / WITHDRAWN", constraints: "one of {VALUED, UNDER_OFFER, IN_TRANSACTION, SOLD, WITHDRAWN}" }
+      - { name: active_offer_id, type: string, source: computed, default: null, description: "Denormalized pointer to the single non-terminal Offer currently bound to this property (an Offer.id value), or null; reverse-lookup of offers for a property is via GET /properties/{id}/offers" }
+
+  - name: Offer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: property_id, type: string, source: system, description: "FK -> Property.id; property this offer values" }
+      - { name: avm_value_snapshot, type: number, source: computed, description: "Property.avm_value captured at issuance (offer is priced off this snapshot)" }
+      - { name: service_fee_pct, type: number, source: input, default: 0.05, description: "iBuyer service fee fraction of avm_value_snapshot", constraints: "0 <= x <= 0.15" }
+      - { name: service_fee, type: number, source: computed, description: "= round(avm_value_snapshot * service_fee_pct, 2)" }
+      - { name: estimated_concession, type: number, source: computed, description: "Provisional seller concession estimate = round(avm_value_snapshot * 0.01, 2) at issuance" }
+      - { name: preliminary_net_proceeds, type: number, source: computed, description: "Provisional payout = round(avm_value_snapshot - service_fee - estimated_concession, 2); repair credit assumed 0 at issuance" }
+      - { name: issued_at, type: datetime, source: system, description: "Logical-clock instant the offer was issued" }
+      - { name: expires_at, type: datetime, source: computed, description: "= issued_at + OFFER_TTL_DAYS; offer EXPIRED once clock >= expires_at" }
+      - { name: status, type: enum, source: system, default: "ISSUED", description: "ISSUED -> ACCEPTED / DECLINED / EXPIRED / SUPERSEDED", constraints: "one of {ISSUED, ACCEPTED, DECLINED, EXPIRED, SUPERSEDED}" }
+
+  - name: Assessment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: offer_id, type: string, source: system, description: "FK -> Offer.id; the accepted offer this assessment belongs to" }
+      - { name: roof_condition, type: enum, source: input, description: "one of {EXCELLENT, GOOD, FAIR, POOR}" }
+      - { name: hvac_condition, type: enum, source: input, description: "one of {EXCELLENT, GOOD, FAIR, POOR}" }
+      - { name: foundation_condition, type: enum, source: input, description: "one of {EXCELLENT, GOOD, FAIR, POOR}" }
+      - { name: questionnaire_flags, type: array, source: input, default: [], description: "Self-reported issue codes from the condition questionnaire (e.g. ['LEAK','MOLD'])" }
+      - { name: condition_score, type: enum, source: computed, description: "Worst of the three component conditions = min rank over {roof,hvac,foundation} (POOR worst); written back onto Property.condition_score" }
+      - { name: status, type: enum, source: system, default: "DRAFT", description: "DRAFT -> FINALIZED", constraints: "one of {DRAFT, FINALIZED}" }
+
+  - name: RepairLineItem
+    parent: null
+    common_fields: true
+    fields:
+      - { name: assessment_id, type: string, source: input, description: "FK -> Assessment.id; the assessment that scopes this repair" }
+      - { name: category, type: enum, source: input, description: "one of {ROOF, HVAC, FOUNDATION, COSMETIC, OTHER}" }
+      - { name: estimate_amount, type: number, source: input, description: "Repair estimate in dollars (may carry sub-cent precision before rounding)", constraints: ">= 0" }
+      - { name: rounded_amount, type: number, source: computed, description: "= round(estimate_amount, 2); per-line rounding pinned BEFORE summation into repair credit" }
+
+  - name: Transaction
+    parent: null
+    common_fields: true
+    fields:
+      - { name: offer_id, type: string, source: input, description: "FK -> Offer.id; the accepted offer being transacted" }
+      - { name: property_id, type: string, source: computed, description: "FK -> Property.id; copied from the offer's property at creation" }
+      - { name: repair_credit, type: number, source: computed, default: 0.0, description: "Sum of FINALIZED assessment's RepairLineItem.rounded_amount (round-per-line THEN sum)" }
+      - { name: final_concession, type: number, source: input, default: 0.0, description: "Negotiated buyer concession in dollars set at transaction creation", constraints: ">= 0" }
+      - { name: retrade_amount, type: number, source: computed, default: 0.0, description: "Inspection re-trade price reduction applied (0 if none); capped at avm_value_snapshot * RETRADE_CAP_PCT" }
+      - { name: close_date, type: datetime, source: input, description: "Seller-selected closing date; MIN_CLOSE_LEAD_DAYS..MAX_CLOSE_WINDOW_DAYS from now" }
+      - { name: leaseback_days, type: integer, source: input, default: 0, description: "Late-checkout lease-back nights the seller stays after close", constraints: "0 <= x <= MAX_LEASEBACK_DAYS" }
+      - { name: leaseback_daily_rate, type: number, source: computed, description: "= round(effective_avm * LEASEBACK_DAILY_PCT, 2) where effective_avm = revised_avm_value if a re-trade applied else avm_value_snapshot" }
+      - { name: leaseback_total, type: number, source: computed, description: "= round(leaseback_daily_rate * leaseback_days, 2); rounding order pinned (round daily THEN multiply)" }
+      - { name: final_net_proceeds, type: number, source: computed, description: "= round(effective_avm - service_fee_eff - final_concession - repair_credit - leaseback_total, 2)" }
+      - { name: status, type: enum, source: system, default: "PENDING_ASSESSMENT", description: "PENDING_ASSESSMENT -> SCHEDULED -> INSPECTION -> CLOSED / CANCELLED", constraints: "one of {PENDING_ASSESSMENT, SCHEDULED, INSPECTION, CLOSED, CANCELLED}" }
+
+  - name: Resale
+    parent: null
+    common_fields: true
+    fields:
+      - { name: transaction_id, type: string, source: input, description: "FK -> Transaction.id; the CLOSED acquisition being relisted" }
+      - { name: list_price, type: number, source: input, description: "Resale list price in dollars", constraints: ">= 0" }
+      - { name: sold_price, type: number, source: input, default: null, description: "Final resale sale price (set when sold); null while listed" }
+      - { name: resale_commission_pct, type: number, source: input, default: 0.03, description: "Buyer-side commission fraction of sold_price", constraints: "0 <= x <= 0.10" }
+      - { name: projected_spread, type: number, source: computed, description: "Provisional spread at listing = round(list_price - acquisition_cost - repair_credit - round(list_price * resale_commission_pct, 2), 2)" }
+      - { name: net_spread, type: number, source: computed, default: null, description: "Final spread at sale = round(sold_price - acquisition_cost - repair_credit - round(sold_price * resale_commission_pct, 2), 2); null until sold" }
+      - { name: status, type: enum, source: system, default: "LISTED", description: "LISTED -> SOLD / DELISTED", constraints: "one of {LISTED, SOLD, DELISTED}" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Property
+    initial_state: VALUED
+    terminal_states: [SOLD, WITHDRAWN]
+    transitions:
+      - from: VALUED
+        to: UNDER_OFFER
+        trigger: "POST /properties/{id}/offers"
+        actor: PricingAnalyst
+        preconditions:
+          - "Property.status == VALUED (no active offer bound)"
+          - "Property.avm_value >= MIN_OFFER_VALUE (else ERR_PROPERTY_BELOW_MIN_VALUE)"
+        side_effects:
+          - "Create Offer in ISSUED with avm_value_snapshot = Property.avm_value"
+          - "Set Property.active_offer_id = new Offer.id"
+        note: "First offer issuance binds the property."
+
+      - from: UNDER_OFFER
+        to: UNDER_OFFER
+        trigger: "POST /properties/{id}/offers (re-issue, supersede prior)"
+        actor: PricingAnalyst
+        preconditions:
+          - "expected_property_version matches Property.version (else ERR_STALE_VERSION)"
+          - "active offer is in {ISSUED, EXPIRED, DECLINED} (else ERR_OFFER_NOT_REISSUABLE)"
+        side_effects:
+          - "Prior active Offer.status -> SUPERSEDED"
+          - "Create new Offer in ISSUED; Property.active_offer_id = new Offer.id"
+          - "increments Property.version by 1"
+        note: "CREATE-with-supersede; guarded by OCC on Property.version (§1.2.1)."
+
+      - from: UNDER_OFFER
+        to: IN_TRANSACTION
+        trigger: "POST /offers/{id}/accept"
+        actor: Seller
+        preconditions:
+          - "active Offer.status == ISSUED and clock < Offer.expires_at (else ERR_OFFER_EXPIRED)"
+          - "acting Seller owns the property (Property.seller_id == X-User-ID)"
+        side_effects:
+          - "Offer.status -> ACCEPTED"
+          - "Create Assessment (DRAFT) bound to the offer; create Transaction (PENDING_ASSESSMENT)"
+
+      - from: UNDER_OFFER
+        to: WITHDRAWN
+        trigger: "POST /properties/{id}/withdraw"
+        actor: Seller
+        preconditions:
+          - "no Transaction exists past PENDING_ASSESSMENT (else ERR_PROPERTY_LOCKED)"
+        side_effects:
+          - "active Offer.status -> DECLINED; Property.active_offer_id = null"
+
+      - from: IN_TRANSACTION
+        to: SOLD
+        trigger: "POST /transactions/{id}/close"
+        actor: OperationsAdmin
+        preconditions:
+          - "Transaction.status == INSPECTION (inspection cleared, no open re-trade pending acceptance)"
+        side_effects:
+          - "Transaction.status -> CLOSED; recompute final_net_proceeds, leaseback_total"
+          - "Property.status -> SOLD"
+
+      - from: IN_TRANSACTION
+        to: WITHDRAWN
+        trigger: "POST /transactions/{id}/cancel"
+        actor: Seller
+        preconditions:
+          - "Transaction.status in {PENDING_ASSESSMENT, SCHEDULED, INSPECTION}"
+        side_effects:
+          - "Transaction.status -> CANCELLED; Offer.status -> DECLINED; Property.active_offer_id = null"
+
+  - entity: Offer
+    initial_state: ISSUED
+    terminal_states: [ACCEPTED, DECLINED, EXPIRED, SUPERSEDED]
+    transitions:
+      - from: ISSUED
+        to: ACCEPTED
+        trigger: "POST /offers/{id}/accept"
+        actor: Seller
+        preconditions:
+          - "clock < Offer.expires_at (else ERR_OFFER_EXPIRED)"
+          - "Property.status == UNDER_OFFER and Property.active_offer_id == this Offer.id"
+        side_effects:
+          - "Property.status -> IN_TRANSACTION"
+          - "Create Assessment(DRAFT) and Transaction(PENDING_ASSESSMENT)"
+
+      - from: ISSUED
+        to: EXPIRED
+        trigger: "POST /offers/{id}/decline OR system check at accept-time when clock >= expires_at"
+        actor: Seller
+        preconditions:
+          - "clock >= Offer.expires_at OR explicit decline"
+        side_effects:
+          - "If this is the active offer: Property.active_offer_id = null, Property.status -> VALUED"
+        note: "Expiry is observed lazily at the accept/decline call against the logical clock."
+
+      - from: ISSUED
+        to: SUPERSEDED
+        trigger: "POST /properties/{id}/offers (re-issue)"
+        actor: PricingAnalyst
+        preconditions:
+          - "a newer offer is being issued for the same property"
+        side_effects:
+          - "no payout effect; superseded offer is no longer acceptable"
+
+  - entity: Transaction
+    initial_state: PENDING_ASSESSMENT
+    terminal_states: [CLOSED, CANCELLED]
+    transitions:
+      - from: PENDING_ASSESSMENT
+        to: SCHEDULED
+        trigger: "POST /transactions/{id}/schedule-close"
+        actor: Seller
+        preconditions:
+          - "linked Assessment.status == FINALIZED (else ERR_ASSESSMENT_NOT_FINALIZED)"
+          - "close_date within [now + MIN_CLOSE_LEAD_DAYS, now + MAX_CLOSE_WINDOW_DAYS] (else ERR_CLOSE_DATE_OUT_OF_WINDOW)"
+          - "leaseback_days <= MAX_LEASEBACK_DAYS (else ERR_LEASEBACK_EXCEEDS_MAX)"
+          - "repair_credit <= avm_value_snapshot * REPAIR_CREDIT_CAP_PCT (else ERR_REPAIR_CREDIT_EXCEEDS_CAP)"
+        side_effects:
+          - "Set Transaction.repair_credit = sum of FINALIZED assessment RepairLineItem.rounded_amount"
+          - "Set close_date, leaseback_days, recompute leaseback_daily_rate, leaseback_total, final_net_proceeds"
+
+      - from: SCHEDULED
+        to: INSPECTION
+        trigger: "POST /transactions/{id}/start-inspection"
+        actor: OperationsAdmin
+        preconditions:
+          - "clock >= (close_date - INSPECTION_LEAD_DAYS) (inspection window open)"
+        side_effects: []
+
+      - from: INSPECTION
+        to: INSPECTION
+        trigger: "POST /transactions/{id}/retrade"
+        actor: PricingAnalyst
+        preconditions:
+          - "retrade_amount <= avm_value_snapshot * RETRADE_CAP_PCT (else ERR_RETRADE_EXCEEDS_CAP)"
+          - "no re-trade already applied to this transaction (Transaction.retrade_amount == 0, else ERR_RETRADE_ALREADY_APPLIED)"
+        side_effects:
+          - "Set Transaction.retrade_amount; Property.revised_avm_value = avm_value_snapshot - retrade_amount"
+          - "Recompute Property.avm_value baseline view, service fee on revised AVM, leaseback_daily_rate, leaseback_total, final_net_proceeds"
+        note: "Cascade: retrade -> revised_avm -> service_fee_eff -> leaseback -> final_net_proceeds."
+
+      - from: INSPECTION
+        to: CLOSED
+        trigger: "POST /transactions/{id}/close"
+        actor: OperationsAdmin
+        preconditions:
+          - "Transaction.status == INSPECTION"
+        side_effects:
+          - "Recompute final_net_proceeds; Property.status -> SOLD; Offer remains ACCEPTED"
+
+      - from: PENDING_ASSESSMENT
+        to: CANCELLED
+        trigger: "POST /transactions/{id}/cancel"
+        actor: Seller
+        preconditions: []
+        side_effects:
+          - "Offer.status -> DECLINED; Property.status -> VALUED; Property.active_offer_id = null"
+
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /transactions/{id}/cancel"
+        actor: Seller
+        preconditions: []
+        side_effects:
+          - "Offer.status -> DECLINED; Property.status -> VALUED; Property.active_offer_id = null"
+
+      - from: INSPECTION
+        to: CANCELLED
+        trigger: "POST /transactions/{id}/cancel"
+        actor: Seller
+        preconditions: []
+        side_effects:
+          - "If a re-trade was applied: revert Property.revised_avm_value = null"
+          - "Offer.status -> DECLINED; Property.status -> VALUED; Property.active_offer_id = null"
+        note: "Compensation: cancelling after a re-trade unwinds the revised AVM."
+
+  - entity: Assessment
+    initial_state: DRAFT
+    terminal_states: [FINALIZED]
+    transitions:
+      - from: DRAFT
+        to: FINALIZED
+        trigger: "POST /assessments/{id}/finalize"
+        actor: OperationsAdmin
+        preconditions:
+          - "all three component conditions present (roof, hvac, foundation)"
+        side_effects:
+          - "Compute condition_score = worst component; write Property.condition_score"
+          - "Lock RepairLineItems (no further additions); Transaction.repair_credit becomes computable"
+
+  - entity: Resale
+    initial_state: LISTED
+    terminal_states: [SOLD, DELISTED]
+    transitions:
+      - from: LISTED
+        to: SOLD
+        trigger: "POST /resales/{id}/sell"
+        actor: OperationsAdmin
+        preconditions:
+          - "sold_price >= 0"
+        side_effects:
+          - "Set sold_price; compute net_spread"
+
+      - from: LISTED
+        to: DELISTED
+        trigger: "POST /resales/{id}/delist"
+        actor: OperationsAdmin
+        preconditions: []
+        side_effects: []
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: reissue-offer-stale-property
+    parent_entity: Property
+    write_endpoint: "POST /properties/{id}/offers"
+    occ_field: "expected_property_version"
+    description: |
+      Re-issuing an Offer against a Property whose version has advanced since the
+      client last observed it is rejected. A re-issue legitimately supersedes the
+      prior active offer (the new offer is a valid product action that succeeds from
+      identical observed state), so a second writer carrying a stale property version
+      is rejected on the version check rather than by a state precondition.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: avm_valuation
+    trigger: "POST /properties (registration); revised on accepted re-trade"
+    algorithm: weighted_scoring
+    formula: |
+      avm_value = round(comp_median_value * (1 + market_trend_pct), 2)
+      # On an accepted re-trade:
+      revised_avm_value = round(avm_value_snapshot - retrade_amount, 2)
+      effective_avm = revised_avm_value if revised_avm_value is not null else avm_value_snapshot
+    input_set: "Property's own comp_median_value and market_trend_pct; retrade_amount from Transaction"
+    constants:
+      MIN_OFFER_VALUE: 50000
+    precision: "2 decimal places, round_half_up"
+
+  - name: preliminary_net_proceeds
+    trigger: "POST /properties/{id}/offers (Offer issuance, provisional variant)"
+    algorithm: forward_looking
+    formula: |
+      avm_value_snapshot = Property.avm_value                 # captured at issuance
+      service_fee        = round(avm_value_snapshot * service_fee_pct, 2)
+      estimated_concession = round(avm_value_snapshot * EST_CONCESSION_PCT, 2)
+      # repair credit assumed ZERO at issuance (no assessment yet)
+      preliminary_net_proceeds = round(avm_value_snapshot - service_fee - estimated_concession, 2)
+    input_set: "Offer-time snapshot of Property.avm_value; no assessment, no repairs, no leaseback"
+    constants:
+      EST_CONCESSION_PCT: 0.01
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: provisional
+        when: "at Offer issuance, before any Assessment exists"
+        difference: "repair_credit and leaseback are excluded (treated as 0); concession is the 1% ESTIMATE, not the negotiated final_concession"
+
+  - name: final_net_proceeds
+    trigger: "POST /transactions/{id}/schedule-close, /retrade, and /close (final variant)"
+    algorithm: chronological
+    formula: |
+      effective_avm   = revised_avm_value if (a re-trade applied) else avm_value_snapshot
+      service_fee_eff = round(effective_avm * service_fee_pct, 2)
+      repair_credit   = sum_over_FINALIZED_assessment( round(line.estimate_amount, 2) )   # round-per-line THEN sum
+      final_net_proceeds = round(effective_avm - service_fee_eff - final_concession - repair_credit - leaseback_total, 2)
+    input_set: "Effective AVM (post-retrade if any), FINALIZED assessment repair line items, negotiated final_concession, leaseback_total"
+    constants: {}
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: final
+        when: "at and after schedule-close, recomputed on re-trade and at close"
+        difference: "uses effective_avm (possibly re-traded), the ACTUAL repair credit (round-per-line-then-sum) and the negotiated final_concession plus leaseback_total — diverges from provisional which assumed repair=0, leaseback=0, concession=1% estimate"
+
+  - name: repair_credit_aggregation
+    trigger: "Assessment finalize and Transaction schedule-close"
+    algorithm: aggregation
+    formula: |
+      # ROUNDING ORDER PINNED: round each line to cents FIRST, THEN sum.
+      repair_credit = 0
+      for line in RepairLineItems where line.assessment_id == finalized_assessment.id:
+          rounded_amount = round(line.estimate_amount, 2)     # half-up, per line
+          repair_credit += rounded_amount
+      repair_credit = round(repair_credit, 2)
+      # Constraint: repair_credit <= avm_value_snapshot * REPAIR_CREDIT_CAP_PCT
+    input_set: "RepairLineItem rows of the FINALIZED assessment only; DRAFT-assessment lines excluded"
+    constants:
+      REPAIR_CREDIT_CAP_PCT: 0.10
+    precision: "2 decimal places, round_half_up; per-line rounding precedes summation"
+
+  - name: leaseback_charge
+    trigger: "Transaction schedule-close, recomputed on re-trade and close"
+    algorithm: tiered_pricing
+    formula: |
+      effective_avm      = revised_avm_value if (re-trade applied) else avm_value_snapshot
+      leaseback_daily_rate = round(effective_avm * LEASEBACK_DAILY_PCT, 2)   # round daily FIRST
+      leaseback_total      = round(leaseback_daily_rate * leaseback_days, 2)  # THEN multiply
+      # leaseback_days bounded 0..MAX_LEASEBACK_DAYS
+    input_set: "effective_avm and Transaction.leaseback_days"
+    constants:
+      LEASEBACK_DAILY_PCT: 0.0004
+      MAX_LEASEBACK_DAYS: 60
+    precision: "2 decimal places, round_half_up; rounding order is round-daily-then-multiply"
+
+  - name: resale_spread
+    trigger: "POST /resales (listing, projected variant) and POST /resales/{id}/sell (net variant)"
+    algorithm: aggregation
+    formula: |
+      acquisition_cost = effective_avm_of_transaction     # what the iBuyer paid the seller (purchase price)
+      # PROJECTED at listing:
+      projected_commission = round(list_price * resale_commission_pct, 2)
+      projected_spread = round(list_price - acquisition_cost - repair_credit - projected_commission, 2)
+      # NET at sale:
+      net_commission = round(sold_price * resale_commission_pct, 2)
+      net_spread = round(sold_price - acquisition_cost - repair_credit - net_commission, 2)
+    input_set: "Transaction.effective_avm (acquisition), Transaction.repair_credit, Resale list_price/sold_price, resale_commission_pct"
+    constants: {}
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: projected
+        when: "at listing (sold_price unknown) — uses list_price"
+        difference: "commission and spread keyed off list_price; sold_price null"
+      - name: net
+        when: "at sale — uses sold_price"
+        difference: "commission and spread keyed off actual sold_price; diverges from projected whenever sold_price != list_price"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except /_clock/set_current_utc"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all role-gated endpoints"
+
+  - priority: 3
+    category: existence
+    check: "Path-referenced resources exist (validated left-to-right); FK body references resolve"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all /{id} endpoints and FK-bearing creates"
+
+  - priority: 4
+    category: state
+    check: "Ownership: a Seller acting on a Property/Offer/Transaction must own the underlying Property (Property.seller_id == X-User-ID)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Seller-actor endpoints (accept, withdraw, schedule-close, cancel)"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a valid state for the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6
+    category: business_temporal
+    check: "Offer not expired: clock < Offer.expires_at at accept-time"
+    error_id: ERR_OFFER_EXPIRED
+    http_status: 409
+    applies_to: "POST /offers/{id}/accept"
+
+  - priority: 7
+    category: business_referential
+    check: "Linked Assessment must be FINALIZED before scheduling close"
+    error_id: ERR_ASSESSMENT_NOT_FINALIZED
+    http_status: 409
+    applies_to: "POST /transactions/{id}/schedule-close"
+
+  - priority: 8
+    category: business_safety
+    check: "Property AVM at or above minimum offerable value"
+    error_id: ERR_PROPERTY_BELOW_MIN_VALUE
+    http_status: 422
+    applies_to: "POST /properties/{id}/offers"
+
+  - priority: 9
+    category: business_temporal
+    check: "close_date within [now + MIN_CLOSE_LEAD_DAYS, now + MAX_CLOSE_WINDOW_DAYS]"
+    error_id: ERR_CLOSE_DATE_OUT_OF_WINDOW
+    http_status: 422
+    applies_to: "POST /transactions/{id}/schedule-close"
+
+  - priority: 10
+    category: business_constraint
+    check: "leaseback_days within [0, MAX_LEASEBACK_DAYS]"
+    error_id: ERR_LEASEBACK_EXCEEDS_MAX
+    http_status: 422
+    applies_to: "POST /transactions/{id}/schedule-close"
+
+  - priority: 11
+    category: business_constraint
+    check: "Inspection re-trade amount does not exceed avm_value_snapshot * RETRADE_CAP_PCT"
+    error_id: ERR_RETRADE_EXCEEDS_CAP
+    http_status: 422
+    applies_to: "POST /transactions/{id}/retrade"
+
+  - priority: 12
+    category: business_constraint
+    check: "At most one re-trade per transaction"
+    error_id: ERR_RETRADE_ALREADY_APPLIED
+    http_status: 409
+    applies_to: "POST /transactions/{id}/retrade"
+
+  - priority: 13
+    category: business_fiscal
+    check: "repair_credit does not exceed avm_value_snapshot * REPAIR_CREDIT_CAP_PCT"
+    error_id: ERR_REPAIR_CREDIT_EXCEEDS_CAP
+    http_status: 422
+    applies_to: "POST /transactions/{id}/schedule-close"
+
+  - priority: 14
+    category: business_referential
+    check: "Active offer must be re-issuable (in {ISSUED, EXPIRED, DECLINED}) to supersede"
+    error_id: ERR_OFFER_NOT_REISSUABLE
+    http_status: 409
+    applies_to: "POST /properties/{id}/offers (re-issue)"
+
+  - priority: 15
+    category: state
+    check: "OCC: expected_property_version must equal Property.version on re-issue"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /properties/{id}/offers (re-issue)"
+
+  - priority: 16
+    category: business_referential
+    check: "Resale can only be created from a CLOSED transaction"
+    error_id: ERR_TRANSACTION_NOT_CLOSED
+    http_status: 409
+    applies_to: "POST /resales"
+
+  - priority: 17
+    category: business_constraint
+    check: "Required body fields present and of correct type/enum domain"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all creates and updates"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Sellers ----
+  - method: POST
+    path: "/sellers"
+    description: "Register a Seller (homeowner)."
+    roles: [OperationsAdmin, Seller]
+    code: 201
+    input: ["email", "full_name", "payout_method?"]
+    output: Seller
+    side_effects: ["status none; version=1"]
+
+  - method: GET
+    path: "/sellers/{id}"
+    description: "Fetch a Seller."
+    roles: [OperationsAdmin, Seller, PricingAnalyst]
+    code: 200
+    input: []
+    output: Seller
+    side_effects: []
+
+  # ---- Properties ----
+  - method: POST
+    path: "/properties"
+    description: "Register a Property and compute its AVM. Body must include seller_id."
+    roles: [OperationsAdmin, PricingAnalyst]
+    code: 201
+    input: ["seller_id", "address_line", "zip_code", "bedrooms", "living_area_sqft", "comp_median_value", "market_trend_pct?"]
+    output: Property
+    side_effects: ["compute avm_value via avm_valuation; status=VALUED"]
+
+  - method: GET
+    path: "/properties"
+    description: "List Properties; filterable by seller_id."
+    roles: [OperationsAdmin, PricingAnalyst, Seller]
+    code: 200
+    input: ["seller_id?", "status?", "limit?", "offset?"]
+    output: Property[]
+    side_effects: []
+
+  - method: GET
+    path: "/properties/{id}"
+    description: "Fetch a Property with derived AVM and condition fields."
+    roles: [OperationsAdmin, PricingAnalyst, Seller]
+    code: 200
+    input: []
+    output: Property
+    side_effects: []
+
+  - method: POST
+    path: "/properties/{id}/offers"
+    description: "Issue an instant Offer for a Property; re-issue supersedes the prior active offer (OCC on Property.version required for re-issue)."
+    roles: [PricingAnalyst]
+    code: 201
+    input: ["service_fee_pct?", "expected_property_version?"]
+    output: Offer
+    side_effects:
+      - "compute service_fee, estimated_concession, preliminary_net_proceeds"
+      - "set issued_at, expires_at; Property.status=UNDER_OFFER, active_offer_id=new offer"
+      - "on re-issue: prior Offer -> SUPERSEDED; increments Property.version by 1"
+
+  - method: GET
+    path: "/properties/{id}/offers"
+    description: "List all Offers issued for a Property (current + superseded)."
+    roles: [OperationsAdmin, PricingAnalyst, Seller]
+    code: 200
+    input: []
+    output: Offer[]
+    side_effects: []
+
+  - method: POST
+    path: "/properties/{id}/withdraw"
+    description: "Seller withdraws the property from offer (declines active offer)."
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Property
+    side_effects: ["active Offer -> DECLINED; status -> WITHDRAWN; active_offer_id=null"]
+
+  # ---- Offers ----
+  - method: GET
+    path: "/offers/{id}"
+    description: "Fetch an Offer."
+    roles: [OperationsAdmin, PricingAnalyst, Seller]
+    code: 200
+    input: []
+    output: Offer
+    side_effects: []
+
+  - method: POST
+    path: "/offers/{id}/accept"
+    description: "Seller accepts an ISSUED, non-expired offer; spawns Assessment(DRAFT) + Transaction(PENDING_ASSESSMENT)."
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects:
+      - "Offer -> ACCEPTED; Property -> IN_TRANSACTION"
+      - "create Assessment(DRAFT) and Transaction(PENDING_ASSESSMENT)"
+
+  - method: POST
+    path: "/offers/{id}/decline"
+    description: "Seller declines an ISSUED offer; if expired the call reports the expiry transition."
+    roles: [Seller]
+    code: 200
+    input: []
+    output: Offer
+    side_effects: ["Offer -> DECLINED or EXPIRED; if active: Property -> VALUED, active_offer_id=null"]
+
+  # ---- Assessments + repair line items ----
+  - method: GET
+    path: "/offers/{id}/assessment"
+    description: "Find the Assessment created for an accepted Offer (array length 0 or 1)."
+    roles: [OperationsAdmin, PricingAnalyst, Seller]
+    code: 200
+    input: []
+    output: Assessment[]
+    side_effects: []
+
+  - method: GET
+    path: "/assessments/{id}"
+    description: "Fetch an Assessment."
+    roles: [OperationsAdmin, PricingAnalyst, Seller]
+    code: 200
+    input: []
+    output: Assessment
+    side_effects: []
+
+  - method: POST
+    path: "/assessments/{id}/repair-line-items"
+    description: "Attach a repair line item to a DRAFT assessment."
+    roles: [OperationsAdmin]
+    code: 201
+    input: [category, estimate_amount]
+    output: RepairLineItem
+    side_effects: ["compute rounded_amount = round(estimate_amount, 2)"]
+
+  - method: GET
+    path: "/assessments/{id}/repair-line-items"
+    description: "List repair line items of an Assessment."
+    roles: [OperationsAdmin, PricingAnalyst, Seller]
+    code: 200
+    input: []
+    output: RepairLineItem[]
+    side_effects: []
+
+  - method: GET
+    path: "/repair-line-items"
+    description: "List repair line items; filterable by assessment_id."
+    roles: [OperationsAdmin, PricingAnalyst, Seller]
+    code: 200
+    input: ["assessment_id?", "limit?", "offset?"]
+    output: RepairLineItem[]
+    side_effects: []
+
+  - method: POST
+    path: "/assessments/{id}/finalize"
+    description: "Finalize an assessment: compute condition_score, write Property.condition_score, lock repair line items."
+    roles: [OperationsAdmin]
+    code: 200
+    input: ["roof_condition", "hvac_condition", "foundation_condition", "questionnaire_flags?"]
+    output: Assessment
+    side_effects:
+      - "condition_score = worst component; Property.condition_score set"
+      - "Assessment -> FINALIZED"
+
+  # ---- Transactions ----
+  - method: GET
+    path: "/transactions"
+    description: "List Transactions; filterable by offer_id and property_id."
+    roles: [OperationsAdmin, PricingAnalyst, Seller]
+    code: 200
+    input: ["offer_id?", "property_id?", "status?", "limit?", "offset?"]
+    output: Transaction[]
+    side_effects: []
+
+  - method: GET
+    path: "/transactions/{id}"
+    description: "Fetch a Transaction with all computed proceeds fields."
+    roles: [OperationsAdmin, PricingAnalyst, Seller]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects: []
+
+  - method: POST
+    path: "/transactions/{id}/schedule-close"
+    description: "Seller selects close_date and leaseback; finalizes repair credit and proceeds. Requires FINALIZED assessment."
+    roles: [Seller]
+    code: 200
+    input: ["close_date", "leaseback_days?", "final_concession?"]
+    output: Transaction
+    side_effects:
+      - "compute repair_credit (round-per-line-then-sum), leaseback_daily_rate, leaseback_total, final_net_proceeds"
+      - "Transaction -> SCHEDULED"
+
+  - method: POST
+    path: "/transactions/{id}/start-inspection"
+    description: "Open the inspection window."
+    roles: [OperationsAdmin]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects: ["Transaction -> INSPECTION"]
+
+  - method: POST
+    path: "/transactions/{id}/retrade"
+    description: "Apply an inspection re-trade price reduction; cascades to revised AVM, service fee, leaseback, and final net proceeds."
+    roles: [PricingAnalyst]
+    code: 200
+    input: ["retrade_amount", "retrade_reason?"]
+    output: Transaction
+    side_effects:
+      - "Property.revised_avm_value = avm_value_snapshot - retrade_amount"
+      - "recompute service_fee_eff, leaseback_daily_rate, leaseback_total, final_net_proceeds"
+
+  - method: POST
+    path: "/transactions/{id}/close"
+    description: "Close the transaction; property becomes SOLD, final proceeds locked."
+    roles: [OperationsAdmin]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects: ["recompute final_net_proceeds; Transaction -> CLOSED; Property -> SOLD"]
+
+  - method: POST
+    path: "/transactions/{id}/cancel"
+    description: "Seller cancels a non-closed transaction; unwinds any re-trade, reverts property/offer."
+    roles: [Seller]
+    code: 200
+    input: ["cancel_reason?"]
+    output: Transaction
+    side_effects:
+      - "Transaction -> CANCELLED; Offer -> DECLINED; Property -> VALUED; active_offer_id=null"
+      - "if re-trade applied: Property.revised_avm_value -> null"
+
+  # ---- Resales ----
+  - method: POST
+    path: "/resales"
+    description: "List a CLOSED transaction's property for resale; compute projected spread."
+    roles: [OperationsAdmin, PricingAnalyst]
+    code: 201
+    input: ["transaction_id", "list_price", "resale_commission_pct?"]
+    output: Resale
+    side_effects: ["compute projected_spread; status=LISTED"]
+
+  - method: GET
+    path: "/resales"
+    description: "List Resales; filterable by transaction_id."
+    roles: [OperationsAdmin, PricingAnalyst, Seller]
+    code: 200
+    input: ["transaction_id?", "status?", "limit?", "offset?"]
+    output: Resale[]
+    side_effects: []
+
+  - method: GET
+    path: "/resales/{id}"
+    description: "Fetch a Resale."
+    roles: [OperationsAdmin, PricingAnalyst, Seller]
+    code: 200
+    input: []
+    output: Resale
+    side_effects: []
+
+  - method: POST
+    path: "/resales/{id}/sell"
+    description: "Record a resale sale; compute net_spread."
+    roles: [OperationsAdmin, PricingAnalyst]
+    code: 200
+    input: [sold_price]
+    output: Resale
+    side_effects: ["set sold_price; compute net_spread; status=SOLD"]
+
+  - method: POST
+    path: "/resales/{id}/delist"
+    description: "Delist a resale listing."
+    roles: [OperationsAdmin, PricingAnalyst]
+    code: 200
+    input: []
+    output: Resale
+    side_effects: ["status=DELISTED"]
+
+  # ---- Test-driving / logical clock ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the logical clock used for offer expiry and close/inspection windows. Server startup default is 2026-01-01T00:00:00Z; before any set call the clock reads exactly this default and never falls back to wall-clock time."
+    roles: [OperationsAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["logical clock advanced to to_iso8601"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing or malformed X-User-Role / X-User-ID headers" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Acting role not permitted for this operation" }
+  - { id: ERR_NOT_RESOURCE_OWNER, http: 403, condition: "Seller does not own the underlying Property" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path resource or FK reference does not exist" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, bad type, or out-of-domain enum/number" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a valid state for the requested transition" }
+  - { id: ERR_OFFER_EXPIRED, http: 409, condition: "Accept attempted when logical clock >= Offer.expires_at" }
+  - { id: ERR_OFFER_NOT_REISSUABLE, http: 409, condition: "Active offer is ACCEPTED or SUPERSEDED and cannot be superseded by a re-issue" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_property_version does not match Property.version on re-issue" }
+  - { id: ERR_PROPERTY_BELOW_MIN_VALUE, http: 422, condition: "Property.avm_value below MIN_OFFER_VALUE at offer issuance" }
+  - { id: ERR_PROPERTY_LOCKED, http: 409, condition: "Withdraw attempted while a transaction is past PENDING_ASSESSMENT" }
+  - { id: ERR_ASSESSMENT_NOT_FINALIZED, http: 409, condition: "schedule-close attempted before the linked assessment is FINALIZED" }
+  - { id: ERR_CLOSE_DATE_OUT_OF_WINDOW, http: 422, condition: "close_date outside [now+MIN_CLOSE_LEAD_DAYS, now+MAX_CLOSE_WINDOW_DAYS]" }
+  - { id: ERR_LEASEBACK_EXCEEDS_MAX, http: 422, condition: "leaseback_days exceeds MAX_LEASEBACK_DAYS" }
+  - { id: ERR_RETRADE_EXCEEDS_CAP, http: 422, condition: "retrade_amount exceeds avm_value_snapshot * RETRADE_CAP_PCT" }
+  - { id: ERR_RETRADE_ALREADY_APPLIED, http: 409, condition: "A re-trade has already been applied to this transaction" }
+  - { id: ERR_REPAIR_CREDIT_EXCEEDS_CAP, http: 422, condition: "repair_credit exceeds avm_value_snapshot * REPAIR_CREDIT_CAP_PCT" }
+  - { id: ERR_TRANSACTION_NOT_CLOSED, http: 409, condition: "Resale create attempted on a transaction not in CLOSED" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Seller
+    description: "Homeowner who registered the property; accepts/declines offers, schedules close, cancels."
+    identity: "entity_backed:Seller"
+    exclusive_operations:
+      - "POST /offers/{id}/accept"
+      - "POST /offers/{id}/decline"
+      - "POST /properties/{id}/withdraw"
+      - "POST /transactions/{id}/schedule-close"
+      - "POST /transactions/{id}/cancel"
+    shared_operations:
+      - "POST /sellers"
+      - "GET /sellers/{id}, GET /properties, GET /properties/{id}, GET /properties/{id}/offers"
+      - "GET /offers/{id}, GET /offers/{id}/assessment"
+      - "GET /assessments/{id}, GET /assessments/{id}/repair-line-items, GET /repair-line-items"
+      - "GET /transactions, GET /transactions/{id}"
+      - "GET /resales, GET /resales/{id}"
+
+  - name: PricingAnalyst
+    description: "iBuyer pricing operator; issues/re-issues offers and applies inspection re-trades."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /properties"
+      - "POST /properties/{id}/offers"
+      - "POST /transactions/{id}/retrade"
+    shared_operations:
+      - "GET endpoints across sellers/properties/offers/assessments/transactions/resales"
+      - "POST /resales"
+      - "POST /resales/{id}/sell"
+      - "POST /resales/{id}/delist"
+
+  - name: OperationsAdmin
+    description: "Back-office operator; manages assessments, inspections, closing, resale, and the logical clock."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /assessments/{id}/repair-line-items"
+      - "POST /assessments/{id}/finalize"
+      - "POST /transactions/{id}/start-inspection"
+      - "POST /transactions/{id}/close"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /sellers, POST /properties"
+      - "GET endpoints across all collections"
+      - "POST /resales, POST /resales/{id}/sell, POST /resales/{id}/delist"
+
+# -----------------------------------------------------------------------------
+# Shared constants reference (for downstream PRD/impl/test generators)
+# -----------------------------------------------------------------------------
+constants_reference:
+  MIN_OFFER_VALUE: 50000          # dollars; AVM must be >= this to issue an offer
+  EST_CONCESSION_PCT: 0.01        # provisional concession estimate fraction
+  OFFER_TTL_DAYS: 5               # offer validity from issued_at
+  REPAIR_CREDIT_CAP_PCT: 0.10     # repair credit cap as fraction of avm_value_snapshot
+  RETRADE_CAP_PCT: 0.03           # max re-trade as fraction of avm_value_snapshot
+  LEASEBACK_DAILY_PCT: 0.0004     # leaseback daily rate fraction of effective AVM
+  MAX_LEASEBACK_DAYS: 60          # leaseback nights cap
+  MIN_CLOSE_LEAD_DAYS: 7          # earliest close_date relative to now
+  MAX_CLOSE_WINDOW_DAYS: 90       # latest close_date relative to now
+  INSPECTION_LEAD_DAYS: 3         # inspection window opens this many days before close
+  CLOCK_DEFAULT_UTC: "2026-01-01T00:00:00Z"

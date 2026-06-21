@@ -1,0 +1,1392 @@
+scenario: |
+  441. Contract Packaging / Co-Packing: project/recipe & bill of materials, line
+  scheduling & changeover, lot coding & date/expiration, fill-weight checkweigher
+  & QA, component & finished-goods inventory, allergen-changeover validation,
+  customer-owned material reconciliation, run rate & waste
+domain_name: contract-packaging
+api_prefix: /copack
+
+complexity_profile:
+  primary_archetype: quota_allocation
+  secondary_archetype: workflow_orchestration
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+
+  entity_topology: graph
+  # Lots consume Components via a BOM (many-to-many through BomLine); ProductionRuns
+  # reference both a Recipe (graph of BomLines) and a Line; LotConsumption events
+  # form a many-to-many junction between ProductionRun and ComponentLot. No strict
+  # URL nesting tree — peers linked by FK, with junction entities.
+
+  state_machine_shape: branching
+  # ProductionRun forks at QA: RELEASED vs QUARANTINED with divergent side-effect
+  # sets; Recipe has an approve/reject revision loop. Not a single linear pipeline.
+
+  relationship_patterns:
+    - one_to_many        # Recipe -> BomLine; ProductionRun -> CheckweighSample
+    - many_to_many       # ProductionRun <-> ComponentLot via LotConsumption
+    - cross_aggregate    # ProductionRun on a Line references a Recipe's allergen set
+
+  role_model: peer_roles
+  # Scheduler owns Lines & ProductionRun scheduling; QAInspector owns QA release/hold
+  # and checkweigh review; Receiver owns inbound component lots & inventory; each
+  # role owns a distinct slice of the surface, with a few shared reads.
+
+  consistency_model: immediate
+
+# ---------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: legal name of the brand owner contracting the packaging run
+      - name: code
+        type: string
+        source: input
+        description: short unique customer code used in lot coding
+        constraints: 2-6 uppercase alphanumerics; unique across all Customers
+      - name: owns_components
+        type: boolean
+        source: input
+        default: false
+        description: when true, all Components this customer supplies are customer-owned (CMR-tracked)
+
+  - name: Component
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the brand owner that supplies/owns this component"
+      - name: sku
+        type: string
+        source: input
+        description: stock-keeping unit for the component
+        constraints: unique per customer_id (compound uniqueness)
+      - name: name
+        type: string
+        source: input
+        description: human label, e.g. "Roasted Almonds 5kg sack"
+      - name: kind
+        type: enum
+        source: input
+        description: role of the component in a recipe
+        constraints: one of {INGREDIENT, PACKAGING, LABEL}
+      - name: allergens
+        type: array
+        source: input
+        default: []
+        description: set of allergen codes present, e.g. ["PEANUT","MILK"]; empty if none
+      - name: customer_owned
+        type: boolean
+        source: computed
+        description: "true iff owning Customer.owns_components is true at component-create time; CMR applies when true"
+      - name: on_hand_qty
+        type: number
+        source: computed
+        description: "sum of received ComponentLot.remaining_qty for this component minus reserved_qty; recomputed on every lot receipt/consumption"
+        default: 0
+      - name: reserved_qty
+        type: number
+        source: computed
+        description: total quantity reserved by SCHEDULED production runs not yet started
+        default: 0
+
+  - name: ComponentLot
+    parent: null
+    common_fields: true
+    fields:
+      - name: component_id
+        type: string
+        source: input
+        description: "FK -> Component.id; the component this physical lot stocks"
+      - name: supplier_lot_code
+        type: string
+        source: input
+        description: supplier's lot identifier as received
+      - name: received_qty
+        type: number
+        source: input
+        description: quantity received in component base units
+        constraints: must be > 0
+      - name: remaining_qty
+        type: number
+        source: computed
+        description: received_qty minus all consumed_qty across LotConsumptions; never below 0
+      - name: expiration_date
+        type: datetime
+        source: input
+        description: lot expiry; lots expired at run start may not be consumed
+      - name: status
+        type: enum
+        source: system
+        description: lifecycle of the physical lot
+        constraints: one of {AVAILABLE, DEPLETED, QUARANTINED}; initial AVAILABLE
+
+  - name: Recipe
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; brand owner the recipe is packed for"
+      - name: name
+        type: string
+        source: input
+        description: recipe/project name
+      - name: target_fill_weight_g
+        type: number
+        source: input
+        description: nominal fill weight per finished unit in grams
+        constraints: must be > 0
+      - name: fill_tolerance_pct
+        type: number
+        source: input
+        description: allowed +/- deviation of a unit's weight from target before it is an under/over reject
+        constraints: 0 < value <= 50
+      - name: shelf_life_days
+        type: integer
+        source: input
+        description: days added to pack date to compute finished-goods expiration
+        constraints: must be >= 1
+      - name: allergen_profile
+        type: array
+        source: computed
+        description: "union of allergens across all INGREDIENT BomLines' components; recomputed when BomLines change while DRAFT"
+        default: []
+      - name: status
+        type: enum
+        source: system
+        description: approval lifecycle
+        constraints: one of {DRAFT, PENDING_APPROVAL, APPROVED, REJECTED, RETIRED}; initial DRAFT
+
+  - name: BomLine
+    parent: Recipe
+    common_fields: true
+    fields:
+      - name: recipe_id
+        type: string
+        source: input
+        description: "FK -> Recipe.id; recipe this bill-of-materials line belongs to"
+      - name: component_id
+        type: string
+        source: input
+        description: "FK -> Component.id; the component consumed by this line"
+      - name: qty_per_unit
+        type: number
+        source: input
+        description: quantity of the component consumed per finished unit produced
+        constraints: must be > 0
+      - name: scrap_factor_pct
+        type: number
+        source: input
+        default: 0
+        description: expected percentage of this component lost as waste during a run
+        constraints: 0 <= value < 100
+
+  - name: ProductionLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: physical line label, e.g. "Line A"
+      - name: rated_units_per_hour
+        type: number
+        source: input
+        description: nameplate throughput used to project scheduled duration
+        constraints: must be > 0
+      - name: changeover_minutes
+        type: integer
+        source: input
+        default: 30
+        description: base minutes required to change the line over between runs
+        constraints: must be >= 0
+      - name: current_allergen_residue
+        type: array
+        source: computed
+        description: "allergen codes left on the line by the most recently STARTED run's recipe; reset by a sanitation cleanout event"
+        default: []
+
+  - name: Crew
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: operator crew label, e.g. "Day Crew 1"
+      - name: rest_buffer_minutes
+        type: integer
+        source: input
+        default: 15
+        description: mandatory paid rest a crew needs between two runs; defines the CLOSED-interval gap for crew overlap detection
+        constraints: must be >= 0
+
+  - name: ProductionRun
+    parent: null
+    common_fields: true
+    fields:
+      - name: recipe_id
+        type: string
+        source: input
+        description: "FK -> Recipe.id; the APPROVED recipe being packed"
+      - name: line_id
+        type: string
+        source: input
+        description: "FK -> ProductionLine.id; the line the run is scheduled on"
+      - name: crew_id
+        type: string
+        source: input
+        description: "FK -> Crew.id; the operator crew staffing the run"
+      - name: planned_units
+        type: integer
+        source: input
+        description: number of finished units planned for this run
+        constraints: must be > 0
+      - name: scheduled_start
+        type: datetime
+        source: input
+        description: planned start instant on the line
+      - name: scheduled_end
+        type: datetime
+        source: computed
+        description: "scheduled_start + changeover + run duration (see calc project_run_window); used for overlap detection"
+      - name: actual_units_good
+        type: integer
+        source: input
+        default: 0
+        description: good finished units recorded at run completion
+      - name: actual_units_scrapped
+        type: integer
+        source: input
+        default: 0
+        description: scrapped finished units recorded at run completion
+      - name: lot_code
+        type: string
+        source: computed
+        description: "assigned at START from customer code + pack date + recipe + sequence (see calc assign_lot_code)"
+      - name: pack_date
+        type: datetime
+        source: computed
+        description: clock instant at which the run transitioned to RUNNING
+      - name: fg_expiration_date
+        type: datetime
+        source: computed
+        description: pack_date + Recipe.shelf_life_days (computed at RELEASE)
+      - name: run_rate_units_per_hour
+        type: number
+        source: computed
+        description: "actual good+scrapped units divided by actual elapsed hours (see calc run_rate)"
+      - name: status
+        type: enum
+        source: system
+        description: run lifecycle with QA fork
+        constraints: one of {SCHEDULED, RUNNING, PENDING_QA, RELEASED, QUARANTINED, CANCELLED}; initial SCHEDULED
+
+  - name: LotConsumption
+    parent: null
+    common_fields: false
+    fields:
+      - name: production_run_id
+        type: string
+        source: input
+        description: "FK -> ProductionRun.id; the run that consumed component lots"
+      - name: component_lot_id
+        type: string
+        source: input
+        description: "FK -> ComponentLot.id; the physical lot drawn down"
+      - name: bom_line_id
+        type: string
+        source: input
+        description: "FK -> BomLine.id; the BOM line that drove this consumption"
+      - name: consumed_qty
+        type: number
+        source: computed
+        description: "qty drawn from this lot during the run, including scrap_factor (see calc material_consumption)"
+      - name: customer_owned
+        type: boolean
+        source: computed
+        description: snapshot of Component.customer_owned at consumption time; drives CMR reconciliation
+
+  - name: CheckweighSample
+    parent: ProductionRun
+    common_fields: false
+    fields:
+      - name: production_run_id
+        type: string
+        source: input
+        description: "FK -> ProductionRun.id; the run this sampled unit belongs to"
+      - name: measured_weight_g
+        type: number
+        source: input
+        description: scale reading for one sampled finished unit in grams
+        constraints: must be > 0
+      - name: verdict
+        type: enum
+        source: computed
+        description: "PASS / UNDER / OVER vs the recipe fill tolerance band (see calc checkweigh_verdict)"
+        constraints: one of {PASS, UNDER, OVER}
+
+  - name: CmrLedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; owner whose customer-owned material moved"
+      - name: component_id
+        type: string
+        source: input
+        description: "FK -> Component.id; the customer-owned component the entry adjusts"
+      - name: production_run_id
+        type: string
+        source: input
+        description: "FK -> ProductionRun.id; the run whose transition emitted this entry"
+      - name: delta_qty
+        type: number
+        source: computed
+        description: signed change to the customer's reconciled balance (negative on consume, positive on return)
+      - name: reason
+        type: enum
+        source: computed
+        description: why the entry was emitted
+        constraints: one of {CONSUME, SCRAP_WASTE, RETURN_ON_CANCEL}
+
+  - name: SanitationEvent
+    parent: ProductionLine
+    common_fields: false
+    fields:
+      - name: line_id
+        type: string
+        source: input
+        description: "FK -> ProductionLine.id; the line that was cleaned out"
+      - name: cleared_allergens
+        type: array
+        source: computed
+        description: snapshot of the line's current_allergen_residue cleared by this event
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  - entity: Recipe
+    initial_state: DRAFT
+    terminal_states: [RETIRED]
+    transitions:
+      - from: DRAFT
+        to: PENDING_APPROVAL
+        trigger: "POST /copack/recipes/{id}/submit"
+        actor: Scheduler
+        preconditions:
+          - "Recipe.status == DRAFT"
+          - "at least one BomLine with kind==INGREDIENT exists for the recipe"
+          - "at least one BomLine with kind==PACKAGING exists for the recipe"
+        side_effects:
+          - "recompute Recipe.allergen_profile as union of INGREDIENT BomLines' Component.allergens"
+          - "increments Recipe.version by 1"
+      - from: PENDING_APPROVAL
+        to: APPROVED
+        trigger: "POST /copack/recipes/{id}/approve"
+        actor: QAInspector
+        preconditions:
+          - "Recipe.status == PENDING_APPROVAL"
+        side_effects:
+          - "Recipe becomes eligible to back ProductionRuns"
+          - "increments Recipe.version by 1"
+      - from: PENDING_APPROVAL
+        to: REJECTED
+        trigger: "POST /copack/recipes/{id}/reject"
+        actor: QAInspector
+        preconditions:
+          - "Recipe.status == PENDING_APPROVAL"
+        side_effects:
+          - "increments Recipe.version by 1"
+        note: "branch: approve vs reject diverge — reject does NOT make recipe eligible for runs"
+      - from: REJECTED
+        to: DRAFT
+        trigger: "POST /copack/recipes/{id}/revise"
+        actor: Scheduler
+        preconditions:
+          - "Recipe.status == REJECTED"
+        side_effects:
+          - "BomLines become editable again"
+          - "increments Recipe.version by 1"
+        note: "revision loop: REJECTED -> DRAFT -> PENDING_APPROVAL -> APPROVED/REJECTED (cyclic)"
+      - from: APPROVED
+        to: RETIRED
+        trigger: "POST /copack/recipes/{id}/retire"
+        actor: Scheduler
+        preconditions:
+          - "Recipe.status == APPROVED"
+          - "no ProductionRun referencing this recipe is in SCHEDULED or RUNNING or PENDING_QA"
+        side_effects:
+          - "increments Recipe.version by 1"
+
+  - entity: ProductionRun
+    initial_state: SCHEDULED
+    terminal_states: [RELEASED, QUARANTINED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: RUNNING
+        trigger: "POST /copack/production-runs/{id}/start"
+        actor: Scheduler
+        preconditions:
+          - "ProductionRun.status == SCHEDULED"
+          - "referenced Recipe.status == APPROVED"
+          - "allergen-changeover clears: line.current_allergen_residue minus recipe.allergen_profile has no allergen, UNLESS a SanitationEvent has cleared the line since the last STARTED run (see validation priority 21)"
+          - "for every BomLine, the chosen AVAILABLE ComponentLots (oldest expiration_date first, created_at ASC tie-break) supply enough remaining_qty to cover required consume qty AND none chosen is expired at the logical clock"
+        side_effects:
+          - "stamp ProductionRun.pack_date = current logical clock"
+          - "assign ProductionRun.lot_code via calc assign_lot_code"
+          - "consume ComponentLots FEFO: create LotConsumption rows; decrement each ComponentLot.remaining_qty; set ComponentLot.status=DEPLETED when remaining_qty hits 0 (cascade)"
+          - "recompute each consumed Component.on_hand_qty and release its reserved_qty for this run (cascade)"
+          - "set line.current_allergen_residue = recipe.allergen_profile"
+          - "for each customer-owned consumed component, emit a CmrLedgerEntry reason=CONSUME with delta_qty = -consumed_qty (cascade)"
+          - "increments ProductionRun.version by 1"
+      - from: RUNNING
+        to: PENDING_QA
+        trigger: "POST /copack/production-runs/{id}/complete"
+        actor: Scheduler
+        preconditions:
+          - "ProductionRun.status == RUNNING"
+          - "actual_units_good + actual_units_scrapped <= planned_units adjusted: not exceeding planned_units + over-run allowance is enforced in validation priority 24"
+        side_effects:
+          - "store actual_units_good and actual_units_scrapped from request body"
+          - "compute ProductionRun.run_rate_units_per_hour via calc run_rate"
+          - "for each customer-owned consumed component, emit a CmrLedgerEntry reason=SCRAP_WASTE with the waste share (see calc waste_reconciliation) (cascade)"
+          - "increments ProductionRun.version by 1"
+      - from: PENDING_QA
+        to: RELEASED
+        trigger: "POST /copack/production-runs/{id}/release"
+        actor: QAInspector
+        preconditions:
+          - "ProductionRun.status == PENDING_QA"
+          - "at least one CheckweighSample exists for the run"
+          - "checkweigh reject rate (UNDER+OVER)/total <= MAX_REJECT_RATE (see calc checkweigh_reject_rate, validation priority 27)"
+        side_effects:
+          - "compute ProductionRun.fg_expiration_date = pack_date + Recipe.shelf_life_days"
+          - "increments ProductionRun.version by 1"
+        note: "QA fork branch A: pass -> RELEASED, finished goods become sellable"
+      - from: PENDING_QA
+        to: QUARANTINED
+        trigger: "POST /copack/production-runs/{id}/quarantine"
+        actor: QAInspector
+        preconditions:
+          - "ProductionRun.status == PENDING_QA"
+        side_effects:
+          - "all ComponentLots consumed by this run move to status=QUARANTINED (cascade); their remaining_qty is held (excluded from on_hand_qty recompute)"
+          - "recompute affected Component.on_hand_qty excluding QUARANTINED lots (cascade)"
+          - "increments ProductionRun.version by 1"
+        note: "QA fork branch B: fail -> QUARANTINED, divergent side-effect set vs RELEASED (locks the source lots, no fg_expiration)"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /copack/production-runs/{id}/cancel"
+        actor: Scheduler
+        preconditions:
+          - "ProductionRun.status == SCHEDULED"
+        side_effects:
+          - "release reserved_qty held for this run on every BomLine Component (cascade)"
+          - "recompute affected Component.on_hand_qty (cascade)"
+          - "increments ProductionRun.version by 1"
+        note: "cancel before start; no lots consumed yet, only reservations released"
+      - from: RUNNING
+        to: CANCELLED
+        trigger: "POST /copack/production-runs/{id}/cancel"
+        actor: Scheduler
+        preconditions:
+          - "ProductionRun.status == RUNNING"
+        side_effects:
+          - "reverse every LotConsumption: restore consumed_qty to each ComponentLot.remaining_qty; flip ComponentLot.status DEPLETED->AVAILABLE where applicable (compensation cascade)"
+          - "recompute each affected Component.on_hand_qty (cascade)"
+          - "for each customer-owned consumed component, emit a CmrLedgerEntry reason=RETURN_ON_CANCEL with delta_qty = +consumed_qty so the CMR balance nets to zero (compensation cascade)"
+          - "increments ProductionRun.version by 1"
+        note: "compensation: a RUNNING cancel must restore the exact material it drew, leaving CMR net-zero per component"
+
+  - entity: ComponentLot
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: DEPLETED
+        trigger: "system: ProductionRun start consumes the lot to remaining_qty 0"
+        actor: system
+        preconditions:
+          - "ComponentLot.remaining_qty reaches 0 after a consumption"
+        side_effects:
+          - "lot no longer selectable for future runs"
+      - from: DEPLETED
+        to: AVAILABLE
+        trigger: "system: RUNNING ProductionRun cancel restores remaining_qty above 0"
+        actor: system
+        preconditions:
+          - "a compensation cascade restored remaining_qty > 0"
+        side_effects:
+          - "lot selectable again"
+      - from: AVAILABLE
+        to: QUARANTINED
+        trigger: "system: ProductionRun quarantine"
+        actor: system
+        preconditions:
+          - "the consuming ProductionRun moved PENDING_QA -> QUARANTINED"
+        side_effects:
+          - "remaining_qty excluded from Component.on_hand_qty"
+      - from: DEPLETED
+        to: QUARANTINED
+        trigger: "system: ProductionRun quarantine of a fully-consumed lot"
+        actor: system
+        preconditions:
+          - "the consuming ProductionRun moved PENDING_QA -> QUARANTINED"
+        side_effects:
+          - "lot flagged quarantined for traceability"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: run-start-stale-line
+    parent_entity: ProductionLine
+    write_endpoint: "POST /copack/production-runs/{id}/start"
+    occ_field: "expected_line_version"
+    description: |
+      Starting a ProductionRun against a ProductionLine whose version has
+      advanced since the client last observed it is rejected. Starting a run
+      legitimately mutates the line (sets current_allergen_residue), so a
+      writer holding a stale line view — e.g. one taken before another run
+      started on the same line and changed its allergen residue — has an
+      out-of-date basis for the allergen-changeover check and is rejected on
+      the stale version rather than being allowed to start on wrong residue.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: bomline-add-stale-recipe
+    parent_entity: Recipe
+    write_endpoint: "POST /copack/recipes/{id}/bom-lines"
+    occ_field: "expected_recipe_version"
+    description: |
+      Adding a BomLine to a Recipe whose version has advanced since the client
+      last observed it is rejected. A recipe submit recomputes allergen_profile
+      and bumps the recipe version; a writer whose view predates that submit
+      would be appending a line to an already-submitted recipe on a stale basis,
+      so the create is rejected on the stale version.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: material_consumption
+    trigger: "ProductionRun SCHEDULED -> RUNNING (start)"
+    algorithm: aggregation
+    formula: |
+      # Per BomLine, gross required quantity for the whole run, scrap inflated.
+      # qty_per_unit is per finished unit; scrap_factor inflates the draw.
+      gross_per_unit = qty_per_unit * (1 + scrap_factor_pct / 100)
+      required_qty   = round_half_up(gross_per_unit * planned_units, 3)
+      # Drawn FEFO across AVAILABLE, non-expired ComponentLots for component_id,
+      # ordered by expiration_date ASC, created_at ASC tie-break. consumed_qty
+      # per lot = min(lot.remaining_qty, residual_required). One LotConsumption
+      # row per (lot, bom_line) touched.
+    input_set: "AVAILABLE ComponentLots of the BomLine's component whose expiration_date > logical clock"
+    constants: {}
+    precision: "3 decimal places on quantities, round_half_up"
+    variants: []
+
+  - name: waste_reconciliation
+    trigger: "ProductionRun RUNNING -> PENDING_QA (complete)"
+    algorithm: dual_variant
+    formula: |
+      # Waste = material drawn that did not end up in good finished units.
+      # actual_good and actual_scrapped come from the complete payload.
+      total_produced = actual_units_good + actual_units_scrapped
+      # PLANNED basis: waste implied by the scrap_factor reserved at start.
+      planned_waste_qty_line = required_qty - (qty_per_unit * planned_units)
+      # ACTUAL basis: waste implied by what was really scrapped + reserved scrap
+      # not consumed, measured against good output only.
+      consumed_qty_line = sum(LotConsumption.consumed_qty for this bom_line)
+      actual_waste_qty_line = round_half_up(consumed_qty_line - (qty_per_unit * actual_units_good), 3)
+    input_set: "LotConsumptions of the run grouped by bom_line_id"
+    constants: {}
+    precision: "3 decimal places, round_half_up"
+    variants:
+      - name: planned_waste
+        when: "reported at schedule time / used for reservation"
+        difference: "uses scrap_factor_pct over planned_units; ignores actual output"
+      - name: actual_waste
+        when: "computed at complete from real good output"
+        difference: "consumed_qty minus material embodied in actual good units; diverges from planned whenever actual_units_good != planned_units"
+
+  - name: waste_totals
+    trigger: "GET /copack/production-runs/{id}/summary"
+    algorithm: aggregation
+    formula: |
+      # ROUNDING ORDER IS PINNED: round each per-bom-line waste to 3 decimals
+      # FIRST, then sum the rounded per-line figures. (round-per-line-then-sum,
+      # NOT sum-then-round). Both planned and actual totals follow this order.
+      planned_waste_total = sum( round_half_up(planned_waste_qty_line, 3)
+                                 for each bom_line of the run's recipe )
+      actual_waste_total  = sum( round_half_up(actual_waste_qty_line, 3)
+                                 for each bom_line that has LotConsumptions )
+    input_set: "per-BomLine planned_waste_qty_line and actual_waste_qty_line from waste_reconciliation"
+    constants: {}
+    precision: "round each line to 3 decimals THEN sum; the sum is not re-rounded"
+    variants: []
+
+  - name: project_run_window
+    trigger: "ProductionRun create (schedule)"
+    algorithm: threshold
+    formula: |
+      # Changeover is added ONLY when the line's current_allergen_residue differs
+      # from this recipe's allergen_profile (a real changeover is needed); a
+      # same-profile back-to-back run skips changeover. This makes scheduled_end
+      # state-dependent on the line, not a constant offset.
+      needs_changeover = (set(line.current_allergen_residue) != set(recipe.allergen_profile))
+      changeover_min   = line.changeover_minutes if needs_changeover else 0
+      run_hours        = planned_units / line.rated_units_per_hour
+      run_minutes      = run_hours * 60
+      scheduled_end    = scheduled_start + minutes(changeover_min + run_minutes)
+    input_set: "the run's ProductionLine and Recipe at schedule time"
+    constants: {}
+    precision: "scheduled_end to whole seconds, round_half_up on minutes->seconds"
+    variants: []
+
+  - name: assign_lot_code
+    trigger: "ProductionRun SCHEDULED -> RUNNING (start)"
+    algorithm: aggregation
+    formula: |
+      # Deterministic human-readable lot code minted at START.
+      # sequence = 1 + count of ProductionRuns for the same (customer, pack YYYYMMDD)
+      #            that already reached RUNNING (status in RUNNING/PENDING_QA/RELEASED/
+      #            QUARANTINED), ordered nowhere — it's a count.
+      pack_yyyymmdd = format(pack_date, "YYYYMMDD")   # pack_date = logical clock at start
+      seq = 1 + count(ProductionRun r where r.recipe.customer_id == this.recipe.customer_id
+                      and format(r.pack_date,"YYYYMMDD") == pack_yyyymmdd
+                      and r.status in {RUNNING,PENDING_QA,RELEASED,QUARANTINED}
+                      and r.id != this.id)
+      lot_code = f"{customer.code}-{pack_yyyymmdd}-{recipe_short}-{seq:03d}"
+      # recipe_short = first 4 uppercased alnum of recipe.name, padded with X.
+    input_set: "prior RUNNING+ ProductionRuns of the same customer on the same pack date"
+    constants: { SEQ_PAD: 3 }
+    precision: "integer sequence, zero-padded to 3"
+    variants: []
+
+  - name: checkweigh_verdict
+    trigger: "POST /copack/production-runs/{id}/checkweigh-samples (create sample)"
+    algorithm: threshold
+    formula: |
+      lower = target_fill_weight_g * (1 - fill_tolerance_pct/100)
+      upper = target_fill_weight_g * (1 + fill_tolerance_pct/100)
+      # Boundary is INCLUSIVE: a unit exactly at lower or upper PASSES.
+      if measured_weight_g < lower:      verdict = UNDER
+      elif measured_weight_g > upper:    verdict = OVER
+      else:                              verdict = PASS
+    input_set: "single CheckweighSample.measured_weight_g vs the run's recipe band"
+    constants: {}
+    precision: "compare in grams to 3 decimals; band endpoints round_half_up to 3 decimals"
+    variants: []
+
+  - name: checkweigh_reject_rate
+    trigger: "ProductionRun PENDING_QA -> RELEASED (release precondition) and read on summary"
+    algorithm: aggregation
+    formula: |
+      total   = count(CheckweighSample for run)
+      rejects = count(CheckweighSample for run where verdict in {UNDER, OVER})
+      reject_rate = round_half_up(rejects / total, 4)   # total > 0 guaranteed by release precondition
+      # release allowed iff reject_rate <= MAX_REJECT_RATE
+    input_set: "all CheckweighSamples of the run"
+    constants: { MAX_REJECT_RATE: 0.05 }
+    precision: "rate to 4 decimals, round_half_up"
+    variants: []
+
+  - name: inventory_on_hand
+    trigger: "any ComponentLot receipt/consumption/quarantine; read on GET component"
+    algorithm: dual_variant
+    formula: |
+      # available_on_hand: only lots that can still be drawn for a run.
+      available_on_hand = sum(lot.remaining_qty for lot in ComponentLots
+                              where lot.component_id == c.id and lot.status == AVAILABLE)
+      # physical_on_hand: everything still physically present including holds.
+      physical_on_hand  = sum(lot.remaining_qty for lot in ComponentLots
+                              where lot.component_id == c.id and lot.status in {AVAILABLE, QUARANTINED})
+      # Component.on_hand_qty stores the AVAILABLE variant minus reserved_qty.
+      Component.on_hand_qty = round_half_up(available_on_hand - reserved_qty, 3)
+    input_set: "ComponentLots of the component, partitioned by status; QUARANTINED lots split the two variants"
+    constants: {}
+    precision: "3 decimals, round_half_up"
+    variants:
+      - name: available_on_hand
+        when: "exposed as Component.on_hand_qty; drives material-sufficiency checks at run start"
+        difference: "sums only AVAILABLE lots, then subtracts reserved_qty"
+      - name: physical_on_hand
+        when: "traceability / audit view"
+        difference: "also counts QUARANTINED lots and ignores reservations; diverges from available whenever a run has been quarantined"
+
+  - name: run_rate
+    trigger: "ProductionRun RUNNING -> PENDING_QA (complete)"
+    algorithm: aggregation
+    formula: |
+      elapsed_hours = (logical_clock_at_complete - pack_date) in hours, as a float
+      total_units   = actual_units_good + actual_units_scrapped
+      # If elapsed_hours == 0 (complete at same clock instant as start), run_rate is 0
+      # by definition (cannot divide by zero) — boundary case, see validation note.
+      run_rate_units_per_hour = 0 if elapsed_hours == 0 else round_half_up(total_units / elapsed_hours, 2)
+    input_set: "the single run's actual output and elapsed wall time on the logical clock"
+    constants: {}
+    precision: "2 decimals, round_half_up"
+    variants: []
+
+# ===========================================================================
+# §1.4 Validation Rules Table (Ordered by Priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "the role is permitted to perform this operation per §1.7"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: existence
+    check: "path-referenced resources exist, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+  - priority: 4
+    category: business_constraint
+    check: "request body present and JSON-parseable with required fields of correct type"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all write endpoints
+  - priority: 5
+    category: business_referential
+    check: "Customer.code unique on Customer create"
+    error_id: ERR_DUPLICATE_CODE
+    http_status: 409
+    applies_to: "POST /copack/customers"
+  - priority: 6
+    category: business_referential
+    check: "Component.sku unique within its customer_id on Component create"
+    error_id: ERR_DUPLICATE_SKU
+    http_status: 409
+    applies_to: "POST /copack/components"
+  - priority: 7
+    category: business_referential
+    check: "body FK targets exist (customer_id, component_id, recipe_id, line_id, crew_id)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all create endpoints with FK body fields"
+  - priority: 8
+    category: business_constraint
+    check: "received_qty > 0 on ComponentLot receive; qty_per_unit > 0 on BomLine; planned_units > 0 on run schedule; target_fill_weight_g > 0, 0 < fill_tolerance_pct <= 50, shelf_life_days >= 1 on Recipe; measured_weight_g > 0 on sample"
+    error_id: ERR_INVALID_QUANTITY
+    http_status: 422
+    applies_to: "create endpoints with quantity fields"
+  - priority: 9
+    category: business_constraint
+    check: "Component.kind in {INGREDIENT,PACKAGING,LABEL}; ComponentLot.expiration_date is a valid future-or-past ISO instant"
+    error_id: ERR_INVALID_ENUM
+    http_status: 422
+    applies_to: "POST /copack/components, POST /copack/components/{id}/lots"
+  - priority: 20
+    category: state
+    check: "the target entity is in a state from which the requested transition is defined (e.g. start requires run SCHEDULED, approve requires recipe PENDING_APPROVAL)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 21
+    category: business_safety
+    check: "ALLERGEN CHANGEOVER: on run start, the referenced ProductionLine's current_allergen_residue must NOT contain any allergen absent from the recipe's allergen_profile unless a SanitationEvent has cleared the line since its last STARTED run; producing an allergen-free recipe on an allergen-dirty line is blocked"
+    error_id: ERR_ALLERGEN_CHANGEOVER_REQUIRED
+    http_status: 409
+    applies_to: "POST /copack/production-runs/{id}/start"
+  - priority: 22
+    category: business_safety
+    check: "EXPIRED LOT: no ComponentLot chosen for consumption may have expiration_date <= logical clock at run start"
+    error_id: ERR_LOT_EXPIRED
+    http_status: 409
+    applies_to: "POST /copack/production-runs/{id}/start"
+  - priority: 23
+    category: business_fiscal
+    check: "INSUFFICIENT MATERIAL: aggregate AVAILABLE non-expired remaining_qty for a BomLine's component must cover required_qty (scrap-inflated) for the run"
+    error_id: ERR_INSUFFICIENT_MATERIAL
+    http_status: 409
+    applies_to: "POST /copack/production-runs/{id}/start"
+  - priority: 24
+    category: business_constraint
+    check: "OVER-RUN: on complete, actual_units_good + actual_units_scrapped must not exceed planned_units * (1 + OVERRUN_ALLOWANCE_PCT/100), where OVERRUN_ALLOWANCE_PCT = 10"
+    error_id: ERR_OVERRUN_EXCEEDED
+    http_status: 422
+    applies_to: "POST /copack/production-runs/{id}/complete"
+  - priority: 25
+    category: business_temporal
+    check: "LINE OVERLAP: a run's [scheduled_start, scheduled_end) (HALF-OPEN) must not overlap any non-terminal (SCHEDULED/RUNNING/PENDING_QA) run already scheduled on the same line; back-to-back (this.start == other.end) is allowed since the interval is half-open"
+    error_id: ERR_LINE_OVERLAP
+    http_status: 409
+    applies_to: "POST /copack/production-runs"
+  - priority: 26
+    category: business_temporal
+    check: "CREW OVERLAP: a run's window expanded by the crew's rest buffer — [scheduled_start - rest_buffer, scheduled_end + rest_buffer] (CLOSED, buffer-padded) — must not overlap any non-terminal run already on the same crew; unlike the line, exact back-to-back is REJECTED because the closed buffered interval includes its endpoints"
+    error_id: ERR_CREW_OVERLAP
+    http_status: 409
+    applies_to: "POST /copack/production-runs"
+  - priority: 27
+    category: business_safety
+    check: "QA RELEASE GATE: release requires >=1 CheckweighSample and reject_rate <= MAX_REJECT_RATE (0.05)"
+    error_id: ERR_QA_REJECT_RATE_EXCEEDED
+    http_status: 409
+    applies_to: "POST /copack/production-runs/{id}/release"
+  - priority: 28
+    category: business_constraint
+    check: "OCC: expected_line_version (on run start) / expected_recipe_version (on bom-line add) must equal the parent's current version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /copack/production-runs/{id}/start, POST /copack/recipes/{id}/bom-lines"
+  - priority: 29
+    category: business_referential
+    check: "a ProductionRun may only be scheduled against an APPROVED Recipe; checkweigh samples may only be added while run is RUNNING or PENDING_QA"
+    error_id: ERR_RECIPE_NOT_APPROVED
+    http_status: 409
+    applies_to: "POST /copack/production-runs, POST /copack/production-runs/{id}/checkweigh-samples"
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # ---- Customers ----
+  - method: POST
+    path: "/copack/customers"
+    description: "register a brand-owner customer"
+    roles: [Receiver]
+    code: 201
+    input: [name, code, "owns_components?"]
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/copack/customers/{id}"
+    description: "fetch a customer"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/copack/customers"
+    description: "list customers"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Customer[]
+    side_effects: []
+
+  # ---- Components ----
+  - method: POST
+    path: "/copack/components"
+    description: "create a component owned by a customer; customer_owned snapshotted from Customer.owns_components"
+    roles: [Receiver]
+    code: 201
+    input: [customer_id, sku, name, kind, "allergens?"]
+    output: Component
+    side_effects: ["set Component.customer_owned from Customer.owns_components"]
+  - method: GET
+    path: "/copack/components/{id}"
+    description: "fetch a component including computed on_hand_qty and reserved_qty"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: []
+    output: Component
+    side_effects: []
+  - method: GET
+    path: "/copack/components"
+    description: "list components; filter by customer_id (FK reverse-reachability for Customer->Component)"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["customer_id?", "limit?", "offset?"]
+    output: Component[]
+    side_effects: []
+
+  # ---- Component Lots (inbound inventory) ----
+  - method: POST
+    path: "/copack/components/{id}/lots"
+    description: "receive a physical lot of a component into inventory"
+    roles: [Receiver]
+    code: 201
+    input: [supplier_lot_code, received_qty, expiration_date]
+    output: ComponentLot
+    side_effects: ["set remaining_qty = received_qty", "recompute Component.on_hand_qty"]
+  - method: GET
+    path: "/copack/components/{id}/lots"
+    description: "list lots of a component (FK reverse-reachability for Component->ComponentLot)"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ComponentLot[]
+    side_effects: []
+  - method: GET
+    path: "/copack/component-lots/{id}"
+    description: "fetch one component lot"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: []
+    output: ComponentLot
+    side_effects: []
+
+  # ---- Recipes & BOM ----
+  - method: POST
+    path: "/copack/recipes"
+    description: "create a DRAFT recipe for a customer"
+    roles: [Scheduler]
+    code: 201
+    input: [customer_id, name, target_fill_weight_g, fill_tolerance_pct, shelf_life_days]
+    output: Recipe
+    side_effects: []
+  - method: GET
+    path: "/copack/recipes/{id}"
+    description: "fetch a recipe including computed allergen_profile"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: []
+    output: Recipe
+    side_effects: []
+  - method: GET
+    path: "/copack/recipes"
+    description: "list recipes; filter by customer_id (FK reverse-reachability for Customer->Recipe)"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["customer_id?", "limit?", "offset?"]
+    output: Recipe[]
+    side_effects: []
+  - method: POST
+    path: "/copack/recipes/{id}/bom-lines"
+    description: "add a BOM line to a DRAFT recipe; OCC on the recipe version"
+    roles: [Scheduler]
+    code: 201
+    input: [component_id, qty_per_unit, "scrap_factor_pct?", expected_recipe_version]
+    output: BomLine
+    side_effects: ["recompute Recipe.allergen_profile while DRAFT", "increments Recipe.version by 1"]
+  - method: GET
+    path: "/copack/recipes/{id}/bom-lines"
+    description: "list BOM lines of a recipe (FK reverse-reachability for Recipe->BomLine)"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: BomLine[]
+    side_effects: []
+  - method: GET
+    path: "/copack/bom-lines/{id}"
+    description: "fetch one BOM line"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: []
+    output: BomLine
+    side_effects: []
+  - method: GET
+    path: "/copack/bom-lines"
+    description: "list BOM lines; filter by component_id (FK reverse-reachability for Component->BomLine)"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["component_id?", "recipe_id?", "limit?", "offset?"]
+    output: BomLine[]
+    side_effects: []
+  - method: POST
+    path: "/copack/recipes/{id}/submit"
+    description: "submit DRAFT recipe for QA approval"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: Recipe
+    side_effects: ["recompute allergen_profile", "increments Recipe.version by 1"]
+  - method: POST
+    path: "/copack/recipes/{id}/approve"
+    description: "QA approves a PENDING_APPROVAL recipe"
+    roles: [QAInspector]
+    code: 200
+    input: []
+    output: Recipe
+    side_effects: ["increments Recipe.version by 1"]
+  - method: POST
+    path: "/copack/recipes/{id}/reject"
+    description: "QA rejects a PENDING_APPROVAL recipe"
+    roles: [QAInspector]
+    code: 200
+    input: []
+    output: Recipe
+    side_effects: ["increments Recipe.version by 1"]
+  - method: POST
+    path: "/copack/recipes/{id}/revise"
+    description: "move a REJECTED recipe back to DRAFT for editing"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: Recipe
+    side_effects: ["increments Recipe.version by 1"]
+  - method: POST
+    path: "/copack/recipes/{id}/retire"
+    description: "retire an APPROVED recipe with no live runs"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: Recipe
+    side_effects: ["increments Recipe.version by 1"]
+
+  # ---- Production Lines ----
+  - method: POST
+    path: "/copack/production-lines"
+    description: "create a production line"
+    roles: [Scheduler]
+    code: 201
+    input: [name, rated_units_per_hour, "changeover_minutes?"]
+    output: ProductionLine
+    side_effects: []
+  - method: GET
+    path: "/copack/production-lines/{id}"
+    description: "fetch a line including current_allergen_residue"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: []
+    output: ProductionLine
+    side_effects: []
+  - method: GET
+    path: "/copack/production-lines"
+    description: "list lines"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ProductionLine[]
+    side_effects: []
+  - method: POST
+    path: "/copack/production-lines/{id}/sanitation-events"
+    description: "record a sanitation cleanout that clears the line's allergen residue"
+    roles: [QAInspector]
+    code: 201
+    input: []
+    output: SanitationEvent
+    side_effects: ["snapshot cleared_allergens from line.current_allergen_residue", "set line.current_allergen_residue = []", "increments ProductionLine.version by 1"]
+  - method: GET
+    path: "/copack/production-lines/{id}/sanitation-events"
+    description: "list a line's sanitation events (FK reverse-reachability for ProductionLine->SanitationEvent)"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: SanitationEvent[]
+    side_effects: []
+
+  # ---- Crews ----
+  - method: POST
+    path: "/copack/crews"
+    description: "create an operator crew"
+    roles: [Scheduler]
+    code: 201
+    input: [name, "rest_buffer_minutes?"]
+    output: Crew
+    side_effects: []
+  - method: GET
+    path: "/copack/crews/{id}"
+    description: "fetch a crew"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: []
+    output: Crew
+    side_effects: []
+  - method: GET
+    path: "/copack/crews"
+    description: "list crews"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Crew[]
+    side_effects: []
+
+  # ---- Production Runs ----
+  - method: POST
+    path: "/copack/production-runs"
+    description: "schedule a production run on a line + crew against an APPROVED recipe; computes scheduled_end; reserves material"
+    roles: [Scheduler]
+    code: 201
+    input: [recipe_id, line_id, crew_id, planned_units, scheduled_start]
+    output: ProductionRun
+    side_effects: ["compute scheduled_end via project_run_window", "reserve material: bump each BomLine Component.reserved_qty", "recompute Component.on_hand_qty"]
+  - method: GET
+    path: "/copack/production-runs/{id}"
+    description: "fetch a run including computed lot_code, run_rate, fg_expiration_date"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: []
+    output: ProductionRun
+    side_effects: []
+  - method: GET
+    path: "/copack/production-runs"
+    description: "list runs; filter by recipe_id, line_id, or crew_id (FK reverse-reachability for Recipe/ProductionLine/Crew -> ProductionRun)"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["recipe_id?", "line_id?", "crew_id?", "status?", "limit?", "offset?"]
+    output: ProductionRun[]
+    side_effects: []
+  - method: GET
+    path: "/copack/production-runs/{id}/summary"
+    description: "computed read: lot_code, run_rate, reject_rate, planned vs actual waste per bom line"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: []
+    output: "{ lot_code: string, run_rate_units_per_hour: number, reject_rate: number, planned_waste_total: number, actual_waste_total: number }"
+    side_effects: []
+  - method: POST
+    path: "/copack/production-runs/{id}/start"
+    description: "start a run: allergen-changeover + expiry + material checks, consume FEFO lots, mint lot_code, OCC on line version"
+    roles: [Scheduler]
+    code: 200
+    input: [expected_line_version]
+    output: ProductionRun
+    side_effects:
+      - "stamp pack_date = logical clock"
+      - "assign lot_code via assign_lot_code"
+      - "consume ComponentLots FEFO, create LotConsumption rows, decrement remaining_qty, set DEPLETED at 0"
+      - "release reserved_qty, recompute Component.on_hand_qty"
+      - "set line.current_allergen_residue = recipe.allergen_profile"
+      - "emit CmrLedgerEntry reason=CONSUME for customer-owned components"
+      - "increments ProductionLine.version by 1"
+      - "increments ProductionRun.version by 1"
+  - method: POST
+    path: "/copack/production-runs/{id}/complete"
+    description: "complete a RUNNING run: record good/scrapped units, compute run_rate, emit scrap-waste CMR entries"
+    roles: [Scheduler]
+    code: 200
+    input: [actual_units_good, actual_units_scrapped]
+    output: ProductionRun
+    side_effects:
+      - "store actual_units_good, actual_units_scrapped"
+      - "compute run_rate_units_per_hour via run_rate"
+      - "emit CmrLedgerEntry reason=SCRAP_WASTE per customer-owned component via waste_reconciliation"
+      - "increments ProductionRun.version by 1"
+  - method: POST
+    path: "/copack/production-runs/{id}/checkweigh-samples"
+    description: "record one checkweigher reading; verdict computed vs recipe tolerance"
+    roles: [QAInspector]
+    code: 201
+    input: [measured_weight_g]
+    output: CheckweighSample
+    side_effects: ["compute verdict via checkweigh_verdict"]
+  - method: GET
+    path: "/copack/production-runs/{id}/checkweigh-samples"
+    description: "list checkweigh samples for a run (FK reverse-reachability for ProductionRun->CheckweighSample)"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CheckweighSample[]
+    side_effects: []
+  - method: POST
+    path: "/copack/production-runs/{id}/release"
+    description: "QA releases a PENDING_QA run; computes fg_expiration_date; gated on reject rate"
+    roles: [QAInspector]
+    code: 200
+    input: []
+    output: ProductionRun
+    side_effects: ["compute fg_expiration_date = pack_date + shelf_life_days", "increments ProductionRun.version by 1"]
+  - method: POST
+    path: "/copack/production-runs/{id}/quarantine"
+    description: "QA quarantines a PENDING_QA run; locks consumed lots"
+    roles: [QAInspector]
+    code: 200
+    input: []
+    output: ProductionRun
+    side_effects: ["set consumed ComponentLots to QUARANTINED", "recompute Component.on_hand_qty excluding QUARANTINED lots", "increments ProductionRun.version by 1"]
+  - method: POST
+    path: "/copack/production-runs/{id}/cancel"
+    description: "cancel a SCHEDULED run (release reservations) or RUNNING run (compensate consumed material, net-zero CMR)"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: ProductionRun
+    side_effects:
+      - "SCHEDULED: release reserved_qty, recompute on_hand_qty"
+      - "RUNNING: reverse LotConsumptions, restore remaining_qty, flip DEPLETED->AVAILABLE, recompute on_hand_qty"
+      - "RUNNING: emit CmrLedgerEntry reason=RETURN_ON_CANCEL netting CMR to zero per component"
+      - "increments ProductionRun.version by 1"
+
+  # ---- LotConsumption & CMR reads ----
+  - method: GET
+    path: "/copack/production-runs/{id}/lot-consumptions"
+    description: "list LotConsumptions for a run (FK reverse-reachability for ProductionRun->LotConsumption)"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: LotConsumption[]
+    side_effects: []
+  - method: GET
+    path: "/copack/lot-consumptions/{id}"
+    description: "fetch one LotConsumption"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: []
+    output: LotConsumption
+    side_effects: []
+  - method: GET
+    path: "/copack/lot-consumptions"
+    description: "list LotConsumptions; filter by component_lot_id or bom_line_id (FK reverse-reachability for ComponentLot->LotConsumption and BomLine->LotConsumption)"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["component_lot_id?", "bom_line_id?", "limit?", "offset?"]
+    output: LotConsumption[]
+    side_effects: []
+  - method: GET
+    path: "/copack/cmr-ledger-entries/{id}"
+    description: "fetch one CMR ledger entry"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: []
+    output: CmrLedgerEntry
+    side_effects: []
+  - method: GET
+    path: "/copack/cmr-ledger-entries"
+    description: "customer-owned material reconciliation ledger; filter by customer_id, component_id, or production_run_id (FK reverse-reachability for Customer/Component/ProductionRun -> CmrLedgerEntry)"
+    roles: [Receiver, Scheduler, QAInspector]
+    code: 200
+    input: ["customer_id?", "component_id?", "production_run_id?", "limit?", "offset?"]
+    output: CmrLedgerEntry[]
+    side_effects: []
+
+  # ---- Test-driving: logical clock ----
+  - method: POST
+    path: "/copack/_clock/set_current_utc"
+    description: "set the server logical clock used for pack_date, lot expiry, run_rate elapsed time. Server startup default is 2026-01-01T00:00:00Z; before any set, the clock reads exactly this default and never falls back to wall-clock time."
+    roles: [Scheduler, QAInspector, Receiver]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: string }"
+    side_effects: ["advance the logical clock to to_iso8601"]
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/invalid X-User-Role or X-User-ID headers"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "role not permitted for this operation"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "referenced resource (path or body FK) does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "missing required field, malformed body, or wrong type"
+  - id: ERR_DUPLICATE_CODE
+    http: 409
+    condition: "Customer.code already used by another customer"
+  - id: ERR_DUPLICATE_SKU
+    http: 409
+    condition: "Component.sku already used within the same customer_id"
+  - id: ERR_INVALID_QUANTITY
+    http: 422
+    condition: "a quantity/weight/tolerance/shelf-life field violates its >0 / range constraint"
+  - id: ERR_INVALID_ENUM
+    http: 422
+    condition: "an enum field (e.g. Component.kind) holds a value outside its allowed set"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested transition not defined from the entity's current state"
+  - id: ERR_RECIPE_NOT_APPROVED
+    http: 409
+    condition: "scheduling a run against a recipe not in APPROVED, or sampling a run not RUNNING/PENDING_QA"
+  - id: ERR_ALLERGEN_CHANGEOVER_REQUIRED
+    http: 409
+    condition: "starting a run while the line carries allergen residue not in the recipe profile and no sanitation cleared it"
+  - id: ERR_LOT_EXPIRED
+    http: 409
+    condition: "a ComponentLot needed for consumption is expired at the logical clock at start"
+  - id: ERR_INSUFFICIENT_MATERIAL
+    http: 409
+    condition: "available non-expired remaining_qty cannot cover a BOM line's scrap-inflated required_qty"
+  - id: ERR_OVERRUN_EXCEEDED
+    http: 422
+    condition: "actual good+scrapped units exceed planned_units * (1 + OVERRUN_ALLOWANCE_PCT/100), OVERRUN_ALLOWANCE_PCT=10, on complete"
+  - id: ERR_LINE_OVERLAP
+    http: 409
+    condition: "a run's half-open scheduled window overlaps a non-terminal run already on the same line"
+  - id: ERR_CREW_OVERLAP
+    http: 409
+    condition: "a run's buffer-padded closed window overlaps a non-terminal run already on the same crew (back-to-back rejected)"
+  - id: ERR_QA_REJECT_RATE_EXCEEDED
+    http: 409
+    condition: "release attempted with no samples or with reject_rate above MAX_REJECT_RATE"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_line_version / expected_recipe_version does not equal the parent's current version"
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: Receiver
+    description: "warehouse receiving: registers customers, components, and inbound component lots; owns inventory inbound"
+    identity: opaque
+    exclusive_operations:
+      - "POST /copack/customers"
+      - "POST /copack/components"
+      - "POST /copack/components/{id}/lots"
+    shared_operations:
+      - "all GET reads"
+      - "POST /copack/_clock/set_current_utc"
+  - name: Scheduler
+    description: "production scheduling: authors recipes & BOM, creates lines, schedules/starts/completes/cancels runs"
+    identity: opaque
+    exclusive_operations:
+      - "POST /copack/recipes"
+      - "POST /copack/recipes/{id}/bom-lines"
+      - "POST /copack/recipes/{id}/submit"
+      - "POST /copack/recipes/{id}/revise"
+      - "POST /copack/recipes/{id}/retire"
+      - "POST /copack/production-lines"
+      - "POST /copack/production-runs"
+      - "POST /copack/production-runs/{id}/start"
+      - "POST /copack/production-runs/{id}/complete"
+      - "POST /copack/production-runs/{id}/cancel"
+    shared_operations:
+      - "all GET reads"
+      - "POST /copack/_clock/set_current_utc"
+  - name: QAInspector
+    description: "quality assurance: approves/rejects recipes, records checkweigh samples, releases/quarantines runs, records sanitation"
+    identity: opaque
+    exclusive_operations:
+      - "POST /copack/recipes/{id}/approve"
+      - "POST /copack/recipes/{id}/reject"
+      - "POST /copack/production-runs/{id}/checkweigh-samples"
+      - "POST /copack/production-runs/{id}/release"
+      - "POST /copack/production-runs/{id}/quarantine"
+      - "POST /copack/production-lines/{id}/sanitation-events"
+    shared_operations:
+      - "all GET reads"
+      - "POST /copack/_clock/set_current_utc"
