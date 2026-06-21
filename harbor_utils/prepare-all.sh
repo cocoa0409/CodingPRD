@@ -5,8 +5,8 @@
 #
 #  作用
 #  ----
-#  扫描 <repo>/tasks/task_*/，对每个任务在 <repo>/harbor_tasks/<task>/ 下
-#  做一次完整 hydrate（必要时 mkdir，然后调 harbor_utils/prepare.sh）。
+#  扫描 <repo>/tasks/task_*/，对每个任务调 harbor_utils/prepare.sh 做一次完整
+#  hydrate（目录由 prepare.sh 在源任务校验通过后自己建，校验失败不留空目录）。
 #  适合"一次性把整个仓库的任务全转成 Harbor 格式"。
 #
 #  用法
@@ -57,8 +57,8 @@ for i in "${!TASKS[@]}"; do
   task_name="$(basename "$src")"
   harbor_task="$HARBOR_DIR/$task_name"
 
-  mkdir -p "$harbor_task"
-
+  # 不在这里 mkdir —— prepare.sh 会先做源任务校验，校验通过后才自己建目录
+  # （mkdir -p 连 harbor_tasks/ 父目录一起建）。这样校验失败的任务连空目录都不留。
   printf "[%3d/%d] %s\n" "$((i+1))" "$total" "$task_name"
 
   if bash "$LIB_DIR/prepare.sh" "$harbor_task"; then

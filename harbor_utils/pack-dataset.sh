@@ -157,7 +157,7 @@ echo "<< dataset ready: $DATASET_TOML"
 echo "   contains $total task(s) as '$DATASET_NAME'"
 echo
 echo "   run oracle 8x each across the whole dataset:"
-echo "       harbor run -p harbor_tasks/ -a oracle -k 8 -n 8 --environment-build-timeout-multiplier 3.0 --ve SAVE_IMPLEMENTATION=0"
+echo "       harbor run -p harbor_tasks/ -a oracle -k 8 -n 8 --ve SAVE_IMPLEMENTATION=0"
 echo
 echo "   subset via glob:"
-echo "       harbor run -p harbor_tasks/ -a oracle -k 8 -n 8 -i 'task_0001*' --environment-build-timeout-multiplier 3.0 --ve SAVE_IMPLEMENTATION=0"
+echo "       harbor run -p harbor_tasks/ -a oracle -k 8 -n 8 -i 'task_0001*' --ve SAVE_IMPLEMENTATION=0"

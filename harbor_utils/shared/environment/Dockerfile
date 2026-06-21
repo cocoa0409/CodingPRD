@@ -51,6 +51,13 @@ RUN mv /usr/bin/curl /usr/bin/curl.real \
 
 WORKDIR /app
 
-# Bring every file from environment/ (e.g. INSTRUCTION.md, PRD.md) into /app so
-# the agent can read them. The .dockerignore excludes this Dockerfile itself.
-COPY . /app/
+# Copy only the files the agent reads into /app — list them explicitly (rather
+# than `COPY . /app/`) so the active PRD version is one obvious switch point.
+#
+# PRD.md and PRD_EASY.md are the two PRD versions; the agent reads /app/PRD.md.
+# To run against the EASY PRD, change the source of the PRD line below from
+# PRD.md to PRD_EASY.md while KEEPING the destination /app/PRD.md, so the agent
+# transparently picks up the easy version:
+#     COPY PRD_EASY.md /app/PRD.md
+COPY INSTRUCTION.md /app/INSTRUCTION.md
+COPY PRD.md         /app/PRD.md

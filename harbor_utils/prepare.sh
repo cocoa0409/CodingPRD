@@ -55,8 +55,6 @@ if [[ -z "$HARBOR_TASK_DIR" ]]; then
   echo "usage: $0 <harbor-task-dir>" >&2
   exit 2
 fi
-# 转成绝对路径，免得后面 cp/rsync 时被相对路径坑
-HARBOR_TASK_DIR="$(cd "$HARBOR_TASK_DIR" && pwd)"
 
 # 这个脚本自己的所在目录（= harbor_utils/）
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -70,43 +68,137 @@ REPO_ROOT="$(cd "$LIB_DIR/.." && pwd)"
 # 测试框架包的源头（永远在仓库根）
 LOCAL_RUNNER_DIR="$REPO_ROOT/prd-bench-local-runner"
 
+# 任务名 = 入参 basename。约定 harbor 任务名 == 原任务名，basename 就是
+# source_task 的真源（省掉解析 task.toml，也避免"配置写一个、目录叫另一个"）。
+# 注意：此处【不】cd 进 HARBOR_TASK_DIR —— 它可能还不存在，而且要先把源任务校验
+# 跑完（§2），校验失败就【不建】这个目录。basename 不要求目录存在、且会吃掉尾部
+# 斜杠。等 §2 校验全过之后才 mkdir + 用 cd&&pwd 把它规范化成绝对路径。
+TASK_NAME="$(basename "$HARBOR_TASK_DIR")"
+SOURCE_TASK="tasks/$TASK_NAME"
+SOURCE_TASK_DIR="$REPO_ROOT/$SOURCE_TASK"
+
 
 # -----------------------------------------------------------------------------
-# 1.5. 自动生成配置文件（task.toml / README.md）
+# 2. 源任务前置校验（失败就直接退出，绝不 mkdir / 写文件）
+# -----------------------------------------------------------------------------
+#
+# 在生成 / 拷贝任何东西之前，把源任务必须满足的条件一次性检清楚 —— 任何一条不
+# 满足就 exit，连 harbor 任务目录都不建，不留半成品现场：
+#
+#   - tasks/<name>/ 必须存在（harbor 任务名 == 原任务名，basename 即真源）
+#   - environment/PRD.md 来源：PRD_FINALIZED.md（优先）或 PRD.md，至少有一个
+#   - environment/PRD_EASY.md 来源：PRD_COMPLETED.md，必须有
+# -----------------------------------------------------------------------------
+
+if [[ ! -d "$SOURCE_TASK_DIR" ]]; then
+  echo "error: source task dir not found: $SOURCE_TASK_DIR" >&2
+  echo "       (expected because harbor task name '$TASK_NAME' should match tasks/<name>/)" >&2
+  exit 1
+fi
+
+WORKSPACE_DIR="$SOURCE_TASK_DIR/workspace"
+if [[ ! -f "$WORKSPACE_DIR/PRD_FINALIZED.md" && ! -f "$WORKSPACE_DIR/PRD.md" ]]; then
+  echo "error: neither PRD_FINALIZED.md nor PRD.md found in $WORKSPACE_DIR" >&2
+  echo "       (need at least one as the source for environment/PRD.md)" >&2
+  exit 1
+fi
+if [[ ! -f "$WORKSPACE_DIR/PRD_COMPLETED.md" ]]; then
+  echo "error: PRD_COMPLETED.md not found in $WORKSPACE_DIR" >&2
+  echo "       (required as the source for environment/PRD_EASY.md)" >&2
+  exit 1
+fi
+
+# 校验全过 —— 现在才创建 harbor 任务目录，并把路径规范化成绝对路径
+# （后面 cp/rsync 用绝对路径，免得相对路径坑）。
+mkdir -p "$HARBOR_TASK_DIR"
+HARBOR_TASK_DIR="$(cd "$HARBOR_TASK_DIR" && pwd)"
+
+
+# -----------------------------------------------------------------------------
+# 2.5. 自动生成配置文件（task.toml / README.md）
 # -----------------------------------------------------------------------------
 #
 # 整个 harbor_tasks/task_*/ 被仓库根 .gitignore 整目录忽略，所以这里
 # 生成的所有东西都不会被提交 —— 跑一次 prepare-all.sh 就重建。
 #
-# 约定：harbor 任务名与原任务名同名，即
-#     harbor_tasks/task_0001_food_delivery/  ↔  tasks/task_0001_food_delivery/
-# 万一原任务不存在，下一节 (#2) 会立刻报错退出，不会留下坏现场。
-#
 # 已存在的文件一律不动 —— 用户可能手调过 timeout、subtask 名字之类。想强制
 # 重新生成就先 `rm` 再跑。
 # -----------------------------------------------------------------------------
 
-TASK_NAME="$(basename "$HARBOR_TASK_DIR")"
-
 if [[ ! -f "$HARBOR_TASK_DIR/task.toml" ]]; then
   echo ">> generating task.toml (source_task = tasks/$TASK_NAME)"
-  cat > "$HARBOR_TASK_DIR/task.toml" <<EOF
-version = "1.0.0"
 
+  # --- 从源任务 SCAFFOLD.yaml 的 scenario 抽 description / keywords ----------
+  # description = scenario 全文（压成单行）
+  # keywords    = scenario 第一个冒号之后的部分，按 ',' split，逐个 trim + 去尾句号
+  # 兼容两种 YAML 写法：block scalar `scenario: |` 与 inline `scenario: "..."`。
+  # 纯 awk/sed，不引入 python/yaml 依赖，跟本脚本"只靠 bash+rsync"的约定一致。
+  # 解析不到（scaffold 缺失或无 scenario）就留空，生成 description = "" / keywords = []。
+  SCAFFOLD_FILE="$REPO_ROOT/tasks/$TASK_NAME/SCAFFOLD.yaml"
+  TASK_DESC=""
+  TASK_KEYWORDS=""
+  if [[ -f "$SCAFFOLD_FILE" ]]; then
+    SCENARIO_RAW="$(awk '
+      /^scenario:/ {
+        s = $0
+        sub(/^scenario:[[:space:]]*/, "", s)
+        if (s ~ /^[|>][-+]?[0-9]*[[:space:]]*$/) {          # block scalar `|`
+          out = ""
+          while ((getline l) > 0) {
+            if (l ~ /^[^[:space:]]/) break                   # 下一个顶层 key → 停
+            sub(/^[[:space:]]+/, "", l)
+            out = out l " "
+          }
+          print out
+        } else {                                             # inline（可能带引号）
+          sub(/^"/, "", s); sub(/"[[:space:]]*$/, "", s)
+          print s
+        }
+        exit
+      }
+    ' "$SCAFFOLD_FILE")"
+    # 压空白 + 去首尾空格
+    SCENARIO="$(printf '%s' "$SCENARIO_RAW" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')"
+    # description：转义 \ 和 "
+    TASK_DESC="${SCENARIO//\\/\\\\}"; TASK_DESC="${TASK_DESC//\"/\\\"}"
+    # keywords：冒号后 → ',' split → trim + 去尾句号 + 转义 + 包引号
+    KW_PART="${SCENARIO#*:}"
+    if [[ -n "$KW_PART" ]]; then
+      IFS=',' read -ra _KWS <<< "$KW_PART"
+      for _raw in "${_KWS[@]}"; do
+        kw="$(printf '%s' "$_raw" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[.[:space:]]*$//')"
+        [[ -z "$kw" ]] && continue
+        kw="${kw//\\/\\\\}"; kw="${kw//\"/\\\"}"
+        [[ -n "$TASK_KEYWORDS" ]] && TASK_KEYWORDS+=", "
+        TASK_KEYWORDS+="\"$kw\""
+      done
+    fi
+  fi
+
+  # 交付时间戳：取 prepare 运行当天的日期（只到年月日），动态生成，不写死。
+  DELIVERY_DATE="$(date +%F)"
+
+  cat > "$HARBOR_TASK_DIR/task.toml" <<EOF
 [task]
 name = "harbor_tasks/$TASK_NAME"
+keywords = [$TASK_KEYWORDS]
 
 [metadata]
 source_task = "tasks/$TASK_NAME"
+dataset = "PRD-to-Repo"
+dataset_version = "1.2.18"
+copyright = "© 2026 KULTA LABS CORPORATION. All rights reserved."
+batch_version = 1
+delivery_date = "$DELIVERY_DATE"
 
-# Verifier runs in the same container as the agent (default = "shared"). The
-# default timeout (~600s) is too short for our 100+ pytest suite — bump it.
 [verifier]
 timeout_sec = 900
 
-# Default agent timeout is too short for writing an entire service from scratch.
 [agent]
 timeout_sec = 7200
+
+[environment]
+build_timeout_sec = 1800
 EOF
 fi
 
@@ -126,30 +218,9 @@ harbor run -p harbor_tasks/$TASK_NAME -a oracle -n 8 -k 8
 \`\`\`bash
 ANTHROPIC_API_KEY=... harbor run \\
   -p harbor_tasks/$TASK_NAME \\
-  -a claude-code -m anthropic/claude-opus-4-7
+  -a claude-code -m anthropic/claude-opus-4-8
 \`\`\`
 EOF
-fi
-
-
-# -----------------------------------------------------------------------------
-# 2. 推断"原任务"目录
-# -----------------------------------------------------------------------------
-#
-# 约定：harbor 任务名 == 原任务名，basename 就是 source_task 的真源。
-# 这样既不用解析 task.toml（省掉 python / tomllib 依赖），也避免了
-# "task.toml 里写一个、目录叫另一个"这种容易踩的不一致。
-#
-# 注：§1.5 生成的 task.toml 里还是会保留 source_task = "tasks/<name>"，
-# 但那行是写给人看的备忘录，本脚本并不读它。
-# -----------------------------------------------------------------------------
-
-SOURCE_TASK="tasks/$TASK_NAME"
-SOURCE_TASK_DIR="$REPO_ROOT/$SOURCE_TASK"
-if [[ ! -d "$SOURCE_TASK_DIR" ]]; then
-  echo "error: source task dir not found: $SOURCE_TASK_DIR" >&2
-  echo "       (expected because harbor task name '$TASK_NAME' should match tasks/<name>/)" >&2
-  exit 1
 fi
 
 
@@ -198,27 +269,37 @@ cp "$SHARED_DIR/agent/instruction.md" "$HARBOR_TASK_DIR/instruction.md"
 # 6. 填充 environment/ —— agent 的运行环境
 # -----------------------------------------------------------------------------
 #
-# Harbor 用 environment/Dockerfile 给 agent 构建容器。Dockerfile 里有
-# `COPY . /app/`，所以 environment/ 里的 INSTRUCTION.md 和 PRD.md 会被一起
-# 拷进容器的 /app/，agent 进去就能读到。
+# Harbor 用 environment/Dockerfile 给 agent 构建容器。Dockerfile 里显式
+# `COPY INSTRUCTION.md /app/` 和 `COPY PRD.md /app/PRD.md`，所以 environment/ 里
+# 的这两个文件会进容器的 /app/，agent 进去就能读到。PRD_EASY.md 也拷进
+# environment/ 备着，默认不进 /app —— 想跑简单版时改 Dockerfile 的 COPY 源。
 #
 #   environment/Dockerfile     ← 通用模板 (harbor_utils)
 #   environment/.dockerignore  ← 通用模板 (harbor_utils)
 #   environment/INSTRUCTION.md ← 任务专属 (原任务的 workspace/)
-#   environment/PRD.md         ← 任务专属 (原任务的 workspace/)
+#   environment/PRD.md         ← 任务专属：PRD_FINALIZED.md（优先）或 PRD.md
+#   environment/PRD_EASY.md    ← 任务专属：PRD_COMPLETED.md
+#
+# 上面三个任务专属文件的来源，§2 已经校验过一定存在，所以这里直接 cp。
 # -----------------------------------------------------------------------------
 
 mkdir -p "$HARBOR_TASK_DIR/environment"
 cp "$SHARED_DIR/environment/Dockerfile"    "$HARBOR_TASK_DIR/environment/Dockerfile"
 cp "$SHARED_DIR/environment/.dockerignore" "$HARBOR_TASK_DIR/environment/.dockerignore"
 cp "$SOURCE_TASK_DIR/workspace/INSTRUCTION.md" "$HARBOR_TASK_DIR/environment/INSTRUCTION.md"
-cp "$SOURCE_TASK_DIR/workspace/PRD.md"         "$HARBOR_TASK_DIR/environment/PRD.md"
+
+# environment/PRD.md：优先 PRD_FINALIZED.md，否则回退 PRD.md（§2 已保证至少有一个）
 if [[ -f "$SOURCE_TASK_DIR/workspace/PRD_FINALIZED.md" ]]; then
   cp "$SOURCE_TASK_DIR/workspace/PRD_FINALIZED.md" "$HARBOR_TASK_DIR/environment/PRD.md"
-  echo ">> PRD_FINALIZED.md found, overriding PRD.md with finalized version"
+  echo ">> using PRD_FINALIZED.md as environment/PRD.md"
 else
-  echo ">> PRD_FINALIZED.md not found, using PRD.md as-is"
+  cp "$SOURCE_TASK_DIR/workspace/PRD.md" "$HARBOR_TASK_DIR/environment/PRD.md"
+  echo ">> using PRD.md as environment/PRD.md"
 fi
+
+# environment/PRD_EASY.md：来源 PRD_COMPLETED.md（§2 已保证存在）
+cp "$SOURCE_TASK_DIR/workspace/PRD_COMPLETED.md" "$HARBOR_TASK_DIR/environment/PRD_EASY.md"
+echo ">> using PRD_COMPLETED.md as environment/PRD_EASY.md"
 
 
 # -----------------------------------------------------------------------------
@@ -261,6 +342,18 @@ cp "$SHARED_DIR/solution/solve.sh" "$HARBOR_TASK_DIR/solution/solve.sh"
 chmod +x "$HARBOR_TASK_DIR/solution/solve.sh"
 "${RSYNC[@]}" "$SOURCE_TASK_DIR/workspace/implementation/" \
               "$HARBOR_TASK_DIR/solution/implementation/"
+
+# cp 进来的参考实现里常夹带不属于实现本身的产物，删掉，免得混进对外交付：
+#   - result*.json   上次跑测试遗留的结果（results.json / results.1.json / … /
+#                    results.8.json）。§4 的全局 rsync 只 exclude 了精确名
+#                    results.json，带数字后缀的会漏网，这里补删。
+#   - 隐藏文件/目录   .env / .DS_Store / .pytest_cache / .git 之类。递归删整棵
+#                    implementation 树里所有以 . 开头的条目（-mindepth 1 保证不
+#                    误伤 implementation 自身；-prune 命中隐藏目录就整个删掉、
+#                    不再往里钻）。
+find "$HARBOR_TASK_DIR/solution/implementation" -type f -name 'result*.json' -delete
+find "$HARBOR_TASK_DIR/solution/implementation" -mindepth 1 -name '.*' -prune -exec rm -rf {} +
+echo ">> removed result*.json + hidden files from solution/implementation"
 
 
 # -----------------------------------------------------------------------------
