@@ -1,0 +1,1693 @@
+scenario: "Small-Business Line of Credit (OnDeck/Kabbage style): application & cash-flow underwriting (Plaid feed), revolving draw/repay limit, daily/weekly remittance, fee-vs-APR & renewal, autopay & NSF retry, line-increase review, default/charge-off, statement"
+domain_name: "small-business-line-of-credit"
+api_prefix: "/"
+
+complexity_profile:
+  primary_archetype: "Ledger reconciliation"
+  secondary_archetype: "Compliance / audit"
+  complexity_layers:
+    - "Optimistic concurrency"
+    - "Cascading side effects"
+    - "Dual-variant calculation"
+    - "Rate / threshold triggers"
+
+  entity_topology: flat
+  # Peer entities (Application, CreditLine, Draw, Remittance, ...) linked by FK references.
+  # URL paths are flat collections (/credit-lines/{id}, /draws/{id}) with parent ids in body
+  # or in a single nested creation segment, never a deep nested tree.
+
+  state_machine_shape: cyclic
+  # CreditLine has a revolving draw/repay cycle (DRAWN balance rises and falls, OUTSTANDING
+  # <-> CURRENT loop); Remittance retries on NSF (SCHEDULED -> FAILED -> SCHEDULED) form a
+  # genuine cycle; Application has branching approve/decline + revision loop.
+
+  relationship_patterns:
+    - one_to_many        # CreditLine has many Draw, Remittance, Statement records
+    - flat               # peer entities linked by FK
+    - cross_aggregate    # Remittance references both CreditLine and the Draw principal it amortizes
+
+  role_model: segregation_of_duties
+  # Underwriter approves applications and credit decisions; Servicer runs remittance / NSF
+  # operations; CreditOfficer signs off line-increase and charge-off. The same operator
+  # identity that submitted an application cannot also approve it; charge-off requires a
+  # different officer than the one who declared default.
+
+  consistency_model: immediate
+  # All ledger mutations (balance debit on draw, principal credit on remittance, fee accrual)
+  # are atomic within the triggering request.
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ============================================================================
+# §1.1 Entity-Relationship Table
+# ============================================================================
+entities:
+  - name: Merchant
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: "Registered business name"
+      - name: ein
+        type: string
+        source: input
+        description: "Employer Identification Number (9 digits, unique)"
+        constraints: "exactly 9 digits; unique across all Merchant"
+      - name: state_code
+        type: string
+        source: input
+        description: "US state of registration (2-letter)"
+        constraints: "2 uppercase letters"
+      - name: status
+        type: enum
+        source: system
+        description: "Merchant lifecycle"
+        default: "ACTIVE"
+        constraints: "ACTIVE | BLOCKLISTED"
+      - name: monthly_revenue_cents
+        type: integer
+        source: input
+        description: "Self-reported average monthly revenue in cents"
+        constraints: ">= 0"
+
+  - name: BankFeed
+    parent: null
+    common_fields: true
+    fields:
+      - name: merchant_id
+        type: string
+        source: input
+        description: "FK -> Merchant.id; the merchant whose Plaid feed this snapshot belongs to"
+      - name: plaid_item_id
+        type: string
+        source: input
+        description: "Opaque Plaid item identifier for the linked bank account"
+      - name: pulled_at
+        type: datetime
+        source: input
+        description: "ISO8601 instant the feed snapshot was captured (drives recency checks)"
+      - name: avg_daily_balance_cents
+        type: integer
+        source: input
+        description: "Average daily balance over the feed window, in cents"
+        constraints: ">= 0"
+      - name: nsf_count_90d
+        type: integer
+        source: input
+        description: "Count of NSF / overdraft events in the trailing 90 days"
+        constraints: ">= 0"
+      - name: deposit_volume_cents
+        type: integer
+        source: input
+        description: "Total deposits over the feed window, in cents"
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "Feed freshness state"
+        default: "FRESH"
+        constraints: "FRESH | STALE"
+
+  - name: Application
+    parent: null
+    common_fields: true
+    fields:
+      - name: merchant_id
+        type: string
+        source: input
+        description: "FK -> Merchant.id; applicant merchant"
+      - name: bank_feed_id
+        type: string
+        source: input
+        description: "FK -> BankFeed.id; the feed snapshot underwriting is run against"
+      - name: requested_limit_cents
+        type: integer
+        source: input
+        description: "Credit limit the merchant is asking for, in cents"
+        constraints: "> 0"
+      - name: submitted_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the Underwriter who submitted the application (segregation-of-duties anchor)"
+      - name: status
+        type: enum
+        source: system
+        description: "Application lifecycle"
+        default: "DRAFT"
+        constraints: "DRAFT | SUBMITTED | NEEDS_REVISION | APPROVED | DECLINED | EXPIRED"
+      - name: risk_score
+        type: number
+        source: computed
+        description: "Computed underwriting risk score from BankFeed + Merchant (see calc: underwriting_risk_score)"
+      - name: approved_limit_cents
+        type: integer
+        source: computed
+        description: "Limit granted at approval; derived from risk tier and avg_daily_balance (see calc: approved_limit)"
+      - name: pricing_tier
+        type: enum
+        source: computed
+        description: "Risk-derived pricing tier set at approval"
+        constraints: "TIER_A | TIER_B | TIER_C | null"
+      - name: decline_reason
+        type: enum
+        source: system
+        description: "Why the application was declined"
+        constraints: "LOW_SCORE | STALE_FEED | EXCESS_NSF | BLOCKLISTED | null"
+
+  - name: CreditLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: application_id
+        type: string
+        source: input
+        description: "FK -> Application.id; the approved application that originated this line"
+      - name: merchant_id
+        type: string
+        source: input
+        description: "FK -> Merchant.id; borrower merchant (denormalized for ledger queries)"
+      - name: credit_limit_cents
+        type: integer
+        source: system
+        description: "Maximum revolving principal that may be outstanding, in cents"
+        constraints: "> 0"
+      - name: pricing_tier
+        type: enum
+        source: system
+        description: "Pricing tier copied from the originating Application at activation"
+        constraints: "TIER_A | TIER_B | TIER_C"
+      - name: fee_factor_bps
+        type: integer
+        source: system
+        description: "Flat fee factor in basis points charged on each draw principal (tier-derived)"
+      - name: remittance_cadence
+        type: enum
+        source: system
+        description: "How often autopay remittances are scheduled"
+        constraints: "DAILY | WEEKLY"
+      - name: outstanding_principal_cents
+        type: integer
+        source: computed
+        description: "Sum of unrepaid principal across all non-terminal Draws (see calc: outstanding_principal)"
+        default: 0
+      - name: outstanding_fee_cents
+        type: integer
+        source: computed
+        description: "Sum of unpaid fee across all non-terminal Draws"
+        default: 0
+      - name: available_credit_cents
+        type: integer
+        source: computed
+        description: "credit_limit_cents - outstanding_principal_cents (floored at 0)"
+        default: 0
+      - name: nsf_strike_count
+        type: integer
+        source: system
+        description: "Consecutive failed-remittance strikes; resets to 0 on any successful remittance"
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "CreditLine lifecycle"
+        default: "ACTIVE"
+        constraints: "ACTIVE | FROZEN | DELINQUENT | DEFAULTED | CHARGED_OFF | CLOSED"
+      - name: defaulted_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the CreditOfficer who declared DEFAULT (charge-off must differ; SoD anchor)"
+        constraints: "null until DEFAULTED"
+
+  - name: Draw
+    parent: null
+    common_fields: true
+    fields:
+      - name: credit_line_id
+        type: string
+        source: input
+        description: "FK -> CreditLine.id; the line this draw is taken against"
+      - name: principal_cents
+        type: integer
+        source: input
+        description: "Principal advanced to the merchant, in cents"
+        constraints: "> 0"
+      - name: fee_cents
+        type: integer
+        source: computed
+        description: "Flat origination fee on this draw = round(principal * fee_factor_bps / 10000) (see calc: draw_fee)"
+      - name: principal_repaid_cents
+        type: integer
+        source: computed
+        description: "Cumulative principal repaid against this draw via remittance allocation"
+        default: 0
+      - name: fee_repaid_cents
+        type: integer
+        source: computed
+        description: "Cumulative fee repaid against this draw"
+        default: 0
+      - name: drawn_at
+        type: datetime
+        source: system
+        description: "Logical-clock instant the draw was funded (drives FIFO remittance allocation order)"
+      - name: status
+        type: enum
+        source: system
+        description: "Draw repayment lifecycle"
+        default: "OUTSTANDING"
+        constraints: "OUTSTANDING | REPAID | WRITTEN_OFF"
+
+  - name: Remittance
+    parent: null
+    common_fields: true
+    fields:
+      - name: credit_line_id
+        type: string
+        source: input
+        description: "FK -> CreditLine.id; the line being remitted against"
+      - name: scheduled_for
+        type: datetime
+        source: input
+        description: "ISO8601 instant this remittance is scheduled to debit"
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "Total debit amount = principal allocation + fee allocation for this remittance (see calc: remittance_amount)"
+      - name: principal_applied_cents
+        type: integer
+        source: computed
+        description: "Portion of amount allocated to outstanding principal across Draws (FIFO)"
+        default: 0
+      - name: fee_applied_cents
+        type: integer
+        source: computed
+        description: "Portion of amount allocated to outstanding fee"
+        default: 0
+      - name: attempt_count
+        type: integer
+        source: system
+        description: "Number of debit attempts made (incremented on each settle/NSF)"
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Remittance lifecycle"
+        default: "SCHEDULED"
+        constraints: "SCHEDULED | SETTLED | FAILED | CANCELLED"
+      - name: failure_reason
+        type: enum
+        source: system
+        description: "Why a debit failed"
+        constraints: "NSF | ACCOUNT_CLOSED | null"
+      - name: next_retry_remittance_id
+        type: string
+        source: system
+        description: "Id of the retry Remittance spawned by this one's NSF failure (sibling pointer, surfaced in the settle response and resolvable via GET /remittances/{id}); null if no retry was spawned. Not an ownership FK — the owning parent of every Remittance is CreditLine via credit_line_id."
+        constraints: "nullable; set only on SCHEDULED->FAILED when a retry is spawned"
+
+  - name: LineIncreaseRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: credit_line_id
+        type: string
+        source: input
+        description: "FK -> CreditLine.id; the line for which an increase is requested"
+      - name: latest_bank_feed_id
+        type: string
+        source: input
+        description: "FK -> BankFeed.id; the refreshed feed snapshot supporting the increase"
+      - name: requested_limit_cents
+        type: integer
+        source: input
+        description: "New requested credit limit, in cents"
+        constraints: "> 0"
+      - name: approved_limit_cents
+        type: integer
+        source: computed
+        description: "Granted new limit on approval (>= current limit, <= requested)"
+      - name: status
+        type: enum
+        source: system
+        description: "Line-increase review lifecycle"
+        default: "PENDING"
+        constraints: "PENDING | APPROVED | DENIED"
+      - name: denial_reason
+        type: enum
+        source: system
+        description: "Why an increase was denied"
+        constraints: "STALE_FEED | SCORE_REGRESSION | LINE_NOT_ACTIVE | null"
+
+  - name: RenewalOffer
+    parent: null
+    common_fields: true
+    fields:
+      - name: credit_line_id
+        type: string
+        source: input
+        description: "FK -> CreditLine.id; the line being renewed"
+      - name: new_fee_factor_bps
+        type: integer
+        source: input
+        description: "Proposed new fee factor for the renewed term, basis points"
+        constraints: "> 0"
+      - name: term_days
+        type: integer
+        source: input
+        description: "Renewal term length in days"
+        constraints: "> 0"
+      - name: total_fee_cents
+        type: integer
+        source: computed
+        description: "Total fee over a representative draw of credit_limit (fee-vs-APR view; see calc: renewal_total_fee)"
+      - name: equivalent_apr_bps
+        type: integer
+        source: computed
+        description: "Annualized APR equivalent of the flat fee over the term (see calc: equivalent_apr)"
+      - name: status
+        type: enum
+        source: system
+        description: "Renewal offer lifecycle"
+        default: "OFFERED"
+        constraints: "OFFERED | ACCEPTED | DECLINED | EXPIRED"
+
+  - name: Statement
+    parent: null
+    common_fields: true
+    fields:
+      - name: credit_line_id
+        type: string
+        source: input
+        description: "FK -> CreditLine.id; line this statement covers"
+      - name: period_start
+        type: datetime
+        source: input
+        description: "ISO8601 inclusive start of the statement window"
+      - name: period_end
+        type: datetime
+        source: input
+        description: "ISO8601 exclusive end of the statement window"
+      - name: opening_principal_cents
+        type: integer
+        source: computed
+        description: "Outstanding principal at period_start"
+      - name: draws_total_cents
+        type: integer
+        source: computed
+        description: "Sum of Draw.principal_cents for draws funded in [period_start, period_end)"
+      - name: fees_assessed_cents
+        type: integer
+        source: computed
+        description: "Sum of Draw.fee_cents for draws funded in [period_start, period_end)"
+      - name: remittances_total_cents
+        type: integer
+        source: computed
+        description: "Sum of SETTLED Remittance.amount_cents settled in [period_start, period_end)"
+      - name: closing_principal_cents
+        type: integer
+        source: computed
+        description: "Outstanding principal at period_end (see calc: statement_closing_principal)"
+      - name: status
+        type: enum
+        source: system
+        description: "Statement lifecycle"
+        default: "OPEN"
+        constraints: "OPEN | FINALIZED"
+
+  - name: LedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: credit_line_id
+        type: string
+        source: input
+        description: "FK -> CreditLine.id; the line this immutable ledger row belongs to"
+      - name: draw_id
+        type: string
+        source: input
+        description: "FK -> Draw.id; the draw the entry touches (null for line-level adjustments)"
+        constraints: "nullable"
+      - name: remittance_id
+        type: string
+        source: input
+        description: "FK -> Remittance.id; the remittance that produced the entry (null for non-remittance entries)"
+        constraints: "nullable"
+      - name: entry_type
+        type: enum
+        source: system
+        description: "Kind of ledger movement"
+        constraints: "DRAW_PRINCIPAL | DRAW_FEE | PRINCIPAL_REPAYMENT | FEE_REPAYMENT | WRITE_OFF"
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Signed movement in cents (debit positive increases outstanding, credit negative reduces it)"
+      - name: balance_after_cents
+        type: integer
+        source: system
+        description: "Outstanding principal on the line immediately after this entry (running balance)"
+
+# ============================================================================
+# §1.2 State Machine Table
+# ============================================================================
+state_machines:
+  - entity: Application
+    initial_state: DRAFT
+    terminal_states: [APPROVED, DECLINED, EXPIRED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /applications/{id}/submit"
+        actor: Underwriter
+        preconditions:
+          - "application.status == DRAFT"
+          - "referenced BankFeed.status == FRESH"
+        side_effects:
+          - "set application.submitted_by_user_id = X-User-ID"
+          - "compute application.risk_score via calc:underwriting_risk_score"
+          - "increments CreditLine? no — Application.version increments by 1"
+
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /applications/{id}/approve"
+        actor: Underwriter
+        preconditions:
+          - "application.status == SUBMITTED"
+          - "X-User-ID != application.submitted_by_user_id (segregation of duties)"
+          - "referenced BankFeed.status == FRESH"
+          - "application.risk_score >= APPROVAL_SCORE_FLOOR"
+          - "referenced Merchant.status == ACTIVE"
+        side_effects:
+          - "compute application.approved_limit_cents via calc:approved_limit"
+          - "set application.pricing_tier from risk tier (TIER_A/B/C)"
+          - "increments Application.version by 1"
+        note: "Approval does NOT create the CreditLine; activation (POST /credit-lines) does."
+
+      - from: SUBMITTED
+        to: NEEDS_REVISION
+        trigger: "POST /applications/{id}/request-revision"
+        actor: Underwriter
+        preconditions:
+          - "application.status == SUBMITTED"
+          - "X-User-ID != application.submitted_by_user_id (segregation of duties)"
+        side_effects:
+          - "clear application.risk_score (set null)"
+          - "increments Application.version by 1"
+
+      - from: NEEDS_REVISION
+        to: SUBMITTED
+        trigger: "POST /applications/{id}/submit"
+        actor: Underwriter
+        preconditions:
+          - "application.status == NEEDS_REVISION"
+          - "referenced BankFeed.status == FRESH"
+        side_effects:
+          - "set application.submitted_by_user_id = X-User-ID"
+          - "recompute application.risk_score via calc:underwriting_risk_score"
+          - "increments Application.version by 1"
+        note: "Revision loop: SUBMITTED -> NEEDS_REVISION -> SUBMITTED (cyclic)."
+
+      - from: SUBMITTED
+        to: DECLINED
+        trigger: "POST /applications/{id}/decline"
+        actor: Underwriter
+        preconditions:
+          - "application.status == SUBMITTED"
+          - "X-User-ID != application.submitted_by_user_id (segregation of duties)"
+        side_effects:
+          - "set application.decline_reason (LOW_SCORE | STALE_FEED | EXCESS_NSF | BLOCKLISTED)"
+          - "increments Application.version by 1"
+
+      - from: SUBMITTED
+        to: EXPIRED
+        trigger: "system: clock advances >= APPLICATION_TTL_DAYS past SUBMITTED, swept by POST /_ops/expire-applications"
+        actor: system
+        preconditions:
+          - "application.status == SUBMITTED"
+          - "now - updated_at >= APPLICATION_TTL_DAYS"
+        side_effects:
+          - "increments Application.version by 1"
+
+  - entity: CreditLine
+    initial_state: ACTIVE
+    terminal_states: [CHARGED_OFF, CLOSED]
+    transitions:
+      - from: ACTIVE
+        to: FROZEN
+        trigger: "POST /credit-lines/{id}/freeze"
+        actor: Servicer
+        preconditions:
+          - "credit_line.status == ACTIVE"
+        side_effects:
+          - "no new Draw may be created while FROZEN"
+          - "increments CreditLine.version by 1"
+
+      - from: FROZEN
+        to: ACTIVE
+        trigger: "POST /credit-lines/{id}/unfreeze"
+        actor: Servicer
+        preconditions:
+          - "credit_line.status == FROZEN"
+        side_effects:
+          - "increments CreditLine.version by 1"
+        note: "Revolving: ACTIVE <-> FROZEN loop; draws resume after unfreeze."
+
+      - from: ACTIVE
+        to: DELINQUENT
+        trigger: "system: an NSF settle (POST /remittances/{id}/settle outcome NSF) bumps nsf_strike_count to NSF_DELINQUENCY_THRESHOLD"
+        actor: system
+        preconditions:
+          - "credit_line.status == ACTIVE"
+          - "credit_line.nsf_strike_count >= NSF_DELINQUENCY_THRESHOLD after this failure"
+        side_effects:
+          - "increments CreditLine.version by 1"
+        note: "Cascade hop 1 of remittance-NSF chain: settle->Remittance.FAILED->CreditLine.DELINQUENT."
+
+      - from: DELINQUENT
+        to: ACTIVE
+        trigger: "system: a Remittance SETTLES (POST /remittances/{id}/settle outcome SUCCESS) bringing nsf_strike_count to 0"
+        actor: system
+        preconditions:
+          - "credit_line.status == DELINQUENT"
+        side_effects:
+          - "reset credit_line.nsf_strike_count = 0"
+          - "increments CreditLine.version by 1"
+        note: "Cure loop: DELINQUENT -> ACTIVE on a successful debit (cyclic)."
+
+      - from: DELINQUENT
+        to: DEFAULTED
+        trigger: "POST /credit-lines/{id}/declare-default"
+        actor: CreditOfficer
+        preconditions:
+          - "credit_line.status == DELINQUENT"
+          - "credit_line.nsf_strike_count >= NSF_DEFAULT_THRESHOLD"
+          - "expected_credit_line_version matches credit_line.version (OCC)"
+        side_effects:
+          - "set credit_line.defaulted_by_user_id = X-User-ID"
+          - "cancel all SCHEDULED Remittance for this line (status -> CANCELLED)"
+          - "increments CreditLine.version by 1"
+
+      - from: DEFAULTED
+        to: CHARGED_OFF
+        trigger: "POST /credit-lines/{id}/charge-off"
+        actor: CreditOfficer
+        preconditions:
+          - "credit_line.status == DEFAULTED"
+          - "X-User-ID != credit_line.defaulted_by_user_id (segregation of duties)"
+          - "expected_credit_line_version matches credit_line.version (OCC)"
+        side_effects:
+          - "for each OUTSTANDING Draw: set Draw.status = WRITTEN_OFF (cascade hop 2)"
+          - "each WRITTEN_OFF Draw appends a WRITE_OFF LedgerEntry for its unrepaid principal (cascade hop 3)"
+          - "recompute credit_line.outstanding_principal_cents -> 0 via calc:outstanding_principal"
+          - "increments CreditLine.version by 1"
+        note: "Charge-off cascade: charge-off -> Draw.WRITTEN_OFF -> WRITE_OFF LedgerEntry -> outstanding recompute (depth 3)."
+
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /credit-lines/{id}/close"
+        actor: Servicer
+        preconditions:
+          - "credit_line.status == ACTIVE"
+          - "credit_line.outstanding_principal_cents == 0"
+          - "credit_line.outstanding_fee_cents == 0"
+        side_effects:
+          - "increments CreditLine.version by 1"
+
+  - entity: Draw
+    initial_state: OUTSTANDING
+    terminal_states: [REPAID, WRITTEN_OFF]
+    transitions:
+      - from: OUTSTANDING
+        to: REPAID
+        trigger: "system: a Remittance SETTLES and brings this Draw's principal_repaid_cents == principal_cents AND fee_repaid_cents == fee_cents"
+        actor: system
+        preconditions:
+          - "draw.status == OUTSTANDING"
+          - "draw.principal_repaid_cents == draw.principal_cents"
+          - "draw.fee_repaid_cents == draw.fee_cents"
+        side_effects:
+          - "recompute parent CreditLine.outstanding_principal_cents (bubble-up)"
+          - "increments Draw.version by 1"
+        note: "Bubble-up: Draw fully repaid -> CreditLine.outstanding_principal_cents recomputed."
+
+      - from: OUTSTANDING
+        to: WRITTEN_OFF
+        trigger: "system: parent CreditLine transitions DEFAULTED -> CHARGED_OFF"
+        actor: system
+        preconditions:
+          - "draw.status == OUTSTANDING"
+          - "parent CreditLine.status == DEFAULTED transitioning to CHARGED_OFF"
+        side_effects:
+          - "append WRITE_OFF LedgerEntry for unrepaid principal (principal_cents - principal_repaid_cents)"
+          - "increments Draw.version by 1"
+        note: "Cascade-down from CreditLine charge-off; only OUTSTANDING draws are written off."
+
+  - entity: Remittance
+    initial_state: SCHEDULED
+    terminal_states: [SETTLED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: SETTLED
+        trigger: "POST /remittances/{id}/settle with outcome=SUCCESS"
+        actor: Servicer
+        preconditions:
+          - "remittance.status == SCHEDULED"
+          - "parent CreditLine.status IN {ACTIVE, DELINQUENT}"
+          - "now >= remittance.scheduled_for"
+        side_effects:
+          - "increment remittance.attempt_count by 1"
+          - "compute remittance.amount_cents, principal_applied_cents, fee_applied_cents via calc:remittance_amount (FIFO over Draws)"
+          - "append PRINCIPAL_REPAYMENT and FEE_REPAYMENT LedgerEntry rows"
+          - "increment touched Draw.principal_repaid_cents / fee_repaid_cents; auto-transition fully-repaid Draws OUTSTANDING->REPAID"
+          - "reset CreditLine.nsf_strike_count = 0; if line was DELINQUENT auto-transition DELINQUENT->ACTIVE"
+          - "recompute CreditLine.outstanding_principal_cents / outstanding_fee_cents / available_credit_cents"
+          - "increments Remittance.version by 1"
+
+      - from: SCHEDULED
+        to: FAILED
+        trigger: "POST /remittances/{id}/settle with outcome=NSF"
+        actor: Servicer
+        preconditions:
+          - "remittance.status == SCHEDULED"
+          - "parent CreditLine.status IN {ACTIVE, DELINQUENT}"
+          - "now >= remittance.scheduled_for"
+        side_effects:
+          - "increment remittance.attempt_count by 1"
+          - "set remittance.failure_reason = NSF"
+          - "increment CreditLine.nsf_strike_count by 1"
+          - "if this remittance's post-increment attempt_count < NSF_MAX_RETRIES: spawn one retry Remittance (new SCHEDULED, scheduled_for = this.scheduled_for + NSF_RETRY_GAP_DAYS, attempt_count initialized to this remittance's post-increment attempt_count) and set this.next_retry_remittance_id to the spawned id; otherwise spawn nothing and leave next_retry_remittance_id null"
+          - "if CreditLine.nsf_strike_count >= NSF_DELINQUENCY_THRESHOLD and line ACTIVE: auto-transition CreditLine ACTIVE->DELINQUENT"
+          - "increments Remittance.version by 1"
+        note: "NSF retry cycle: FAILED spawns a fresh SCHEDULED retry (SCHEDULED->FAILED->SCHEDULED loop). The retry inherits attempt_count, so a single chain reaches at most NSF_MAX_RETRIES total failures."
+
+      - from: SCHEDULED
+        to: FAILED
+        trigger: "POST /remittances/{id}/settle with outcome=ACCOUNT_CLOSED"
+        actor: Servicer
+        preconditions:
+          - "remittance.status == SCHEDULED"
+          - "parent CreditLine.status IN {ACTIVE, DELINQUENT}"
+          - "now >= remittance.scheduled_for"
+        side_effects:
+          - "increment remittance.attempt_count by 1"
+          - "set remittance.failure_reason = ACCOUNT_CLOSED"
+          - "increment CreditLine.nsf_strike_count by 1"
+          - "do NOT spawn any retry (a closed account is permanent); leave next_retry_remittance_id null"
+          - "if CreditLine.nsf_strike_count >= NSF_DELINQUENCY_THRESHOLD and line ACTIVE: auto-transition CreditLine ACTIVE->DELINQUENT"
+          - "increments Remittance.version by 1"
+        note: "Terminal-account failure: ACCOUNT_CLOSED fails the debit and bumps a strike like NSF, but never spawns a retry."
+
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /remittances/{id}/cancel OR system cascade when parent CreditLine -> DEFAULTED"
+        actor: Servicer
+        preconditions:
+          - "remittance.status == SCHEDULED"
+        side_effects:
+          - "increments Remittance.version by 1"
+
+  - entity: LineIncreaseRequest
+    initial_state: PENDING
+    terminal_states: [APPROVED, DENIED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /line-increase-requests/{id}/approve"
+        actor: CreditOfficer
+        preconditions:
+          - "line_increase_request.status == PENDING"
+          - "parent CreditLine.status == ACTIVE"
+          - "referenced latest BankFeed.status == FRESH"
+          - "new_score >= prior_score, where new_score = calc:underwriting_risk_score over (latest_bank_feed_id, the line's merchant, line_increase_request.requested_limit_cents) and prior_score = the originating Application.risk_score (the application referenced by CreditLine.application_id)"
+          - "expected_credit_line_version matches CreditLine.version (OCC)"
+        side_effects:
+          - "compute line_increase_request.approved_limit_cents via calc:approved_limit (capped at requested)"
+          - "set CreditLine.credit_limit_cents = approved_limit_cents (cross-entity)"
+          - "recompute CreditLine.available_credit_cents"
+          - "increments CreditLine.version by 1"
+        note: "Cross-entity: increase approval mutates the parent CreditLine.credit_limit_cents."
+
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /line-increase-requests/{id}/deny"
+        actor: CreditOfficer
+        preconditions:
+          - "line_increase_request.status == PENDING"
+        side_effects:
+          - "set line_increase_request.denial_reason (STALE_FEED | SCORE_REGRESSION | LINE_NOT_ACTIVE)"
+          - "increments LineIncreaseRequest.version by 1"
+
+  - entity: RenewalOffer
+    initial_state: OFFERED
+    terminal_states: [ACCEPTED, DECLINED, EXPIRED]
+    transitions:
+      - from: OFFERED
+        to: ACCEPTED
+        trigger: "POST /renewal-offers/{id}/accept"
+        actor: Servicer
+        preconditions:
+          - "renewal_offer.status == OFFERED"
+          - "parent CreditLine.status == ACTIVE"
+        side_effects:
+          - "set CreditLine.fee_factor_bps = renewal_offer.new_fee_factor_bps (cross-entity)"
+          - "increments CreditLine.version by 1"
+        note: "Cross-entity: renewal acceptance reprices the CreditLine fee_factor_bps."
+
+      - from: OFFERED
+        to: DECLINED
+        trigger: "POST /renewal-offers/{id}/decline"
+        actor: Servicer
+        preconditions:
+          - "renewal_offer.status == OFFERED"
+        side_effects:
+          - "increments RenewalOffer.version by 1"
+
+      - from: OFFERED
+        to: EXPIRED
+        trigger: "system: clock advances past RENEWAL_TTL_DAYS, swept by POST /_ops/expire-renewals"
+        actor: system
+        preconditions:
+          - "renewal_offer.status == OFFERED"
+          - "now - created_at >= RENEWAL_TTL_DAYS"
+        side_effects:
+          - "increments RenewalOffer.version by 1"
+
+  - entity: Statement
+    initial_state: OPEN
+    terminal_states: [FINALIZED]
+    transitions:
+      - from: OPEN
+        to: FINALIZED
+        trigger: "POST /statements/{id}/finalize"
+        actor: Servicer
+        preconditions:
+          - "statement.status == OPEN"
+          - "now >= statement.period_end"
+        side_effects:
+          - "compute opening_principal_cents, draws_total_cents, fees_assessed_cents, remittances_total_cents, closing_principal_cents via calc:statement_closing_principal"
+          - "increments Statement.version by 1"
+
+# ----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules (OCC on parent version — true CREATE-with-supersede races only)
+# ----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: increase-approve-stale-line
+    parent_entity: CreditLine
+    write_endpoint: "POST /line-increase-requests/{id}/approve"
+    occ_field: "expected_credit_line_version"
+    description: |
+      Approving a LineIncreaseRequest writes a new credit_limit_cents onto the parent
+      CreditLine. If the CreditLine version has advanced since the officer last read it
+      (e.g., another increase already raised the limit, or a remittance changed the
+      balance), the officer's view is stale and the approval is rejected. The loser
+      legitimately could have succeeded against the older line state, so this is a true
+      CREATE/supersede race resolved by OCC rather than a state precondition.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: charge-off-stale-line
+    parent_entity: CreditLine
+    write_endpoint: "POST /credit-lines/{id}/charge-off"
+    occ_field: "expected_credit_line_version"
+    description: |
+      Charging off a DEFAULTED CreditLine writes off every OUTSTANDING Draw and zeroes
+      outstanding principal. If the line version has advanced since the officer read it
+      (e.g., a late remittance settled and reduced principal, or a parallel administrative
+      action bumped the version), the officer's loss-amount view is stale and the charge-off
+      is rejected so the write-off is recomputed against current principal.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ============================================================================
+# §1.3 Calculation Rules Table
+# ============================================================================
+calculations:
+  - name: underwriting_risk_score
+    trigger: "on Application SUBMITTED transition (POST /applications/{id}/submit) — both DRAFT->SUBMITTED and NEEDS_REVISION->SUBMITTED"
+    algorithm: weighted_scoring
+    formula: |
+      # Inputs: referenced BankFeed (avg_daily_balance_cents, nsf_count_90d, deposit_volume_cents),
+      #         Merchant.monthly_revenue_cents, Application.requested_limit_cents.
+      # Evaluation order is pinned: compute the three component sub-scores, then the weighted sum,
+      # then round the FINAL weighted sum once (sum-then-round). Component sub-scores are NOT
+      # individually rounded.
+      balance_ratio = min(1.0, avg_daily_balance_cents / max(1, requested_limit_cents))
+      revenue_ratio = min(1.0, deposit_volume_cents / max(1, monthly_revenue_cents * 3))
+      nsf_penalty   = min(1.0, nsf_count_90d * NSF_PENALTY_STEP)   # each NSF event costs NSF_PENALTY_STEP
+      raw = (W_BALANCE * balance_ratio) + (W_REVENUE * revenue_ratio) - (W_NSF * nsf_penalty)
+      raw = max(0.0, min(1.0, raw))                                # clamp to [0,1]
+      risk_score = round(raw * 100, 0)                             # single final round, 0 dp, half_up -> integer 0..100
+    input_set: "Exactly one BankFeed (Application.bank_feed_id) and one Merchant (Application.merchant_id); no aggregation across feeds."
+    constants:
+      W_BALANCE: 0.50
+      W_REVENUE: 0.35
+      W_NSF: 0.40
+      NSF_PENALTY_STEP: 0.15
+    precision: "component sub-scores kept full precision; final raw*100 rounded once, 0 decimal places, round_half_up; result is an integer 0..100"
+    variants:
+      - name: initial_submit
+        when: "DRAFT->SUBMITTED (first submission)"
+        difference: "uses the originally attached BankFeed"
+      - name: revision_resubmit
+        when: "NEEDS_REVISION->SUBMITTED (resubmission may attach a newer BankFeed)"
+        difference: "recomputed against whatever bank_feed_id is current; prior risk_score is discarded"
+
+  - name: approved_limit
+    trigger: "on Application SUBMITTED->APPROVED (POST /applications/{id}/approve) and on LineIncreaseRequest PENDING->APPROVED"
+    algorithm: tiered_pricing
+    formula: |
+      # Pricing tier is selected by risk_score band (threshold selection):
+      #   risk_score >= TIER_A_FLOOR        -> TIER_A, advance_multiple = 1.50, fee_factor_bps = FEE_BPS_A
+      #   TIER_B_FLOOR <= risk_score < A    -> TIER_B, advance_multiple = 1.00, fee_factor_bps = FEE_BPS_B
+      #   APPROVAL_SCORE_FLOOR <= s < B     -> TIER_C, advance_multiple = 0.60, fee_factor_bps = FEE_BPS_C
+      # The cap is the LESSER of requested and an advance multiple of avg_daily_balance:
+      #   raw_cap = floor(avg_daily_balance_cents * advance_multiple)
+      #   approved = min(requested_limit_cents, raw_cap)
+      # For LineIncreaseRequest, approved is additionally floored at the current credit_limit_cents
+      # (an increase never lowers the limit): approved = max(current_limit, min(requested, raw_cap)).
+      approved_limit_cents = min(requested_limit_cents, floor(avg_daily_balance_cents * advance_multiple))
+    input_set: "One Application (or LineIncreaseRequest) + its referenced BankFeed; advance_multiple from the score-derived tier."
+    constants:
+      TIER_A_FLOOR: 80
+      TIER_B_FLOOR: 65
+      APPROVAL_SCORE_FLOOR: 50
+      FEE_BPS_A: 800
+      FEE_BPS_B: 1200
+      FEE_BPS_C: 1800
+      NSF_UNDERWRITE_MAX: 3         # max BankFeed.nsf_count_90d permitted at approval (excess blocks origination)
+      APPLICATION_TTL_DAYS: 14      # SUBMITTED applications expire after this many days
+      RENEWAL_TTL_DAYS: 30          # OFFERED renewal offers expire after this many days
+    precision: "floor() on the advance cap (no fractional cents); approved_limit_cents is an integer number of cents"
+    variants:
+      - name: origination
+        when: "Application approval"
+        difference: "no current-limit floor; approved = min(requested, raw_cap)"
+      - name: increase
+        when: "LineIncreaseRequest approval"
+        difference: "approved = max(current credit_limit_cents, min(requested, raw_cap)); never decreases the limit"
+
+  - name: draw_fee
+    trigger: "on Draw creation (POST /credit-lines/{id}/draws)"
+    algorithm: threshold
+    formula: |
+      # Flat fee factor on principal, in basis points. Single multiply then round.
+      fee_cents = round(principal_cents * fee_factor_bps / 10000, 0)   # half_up to whole cents
+    input_set: "The single Draw being created and its parent CreditLine.fee_factor_bps."
+    constants:
+      BPS_DENOMINATOR: 10000
+    precision: "round_half_up to whole cents (0 decimal places on cents)"
+
+  - name: remittance_amount
+    trigger: "on Remittance SCHEDULED->SETTLED (POST /remittances/{id}/settle outcome SUCCESS)"
+    algorithm: waterfall_allocation
+    formula: |
+      # The scheduled remittance debits a target_amount; that amount is allocated across the
+      # line's OUTSTANDING Draws in FIFO order (oldest drawn_at first; tie-break drawn_at then
+      # created_at ASC — NEVER id). Within each Draw, FEE is repaid before PRINCIPAL.
+      #
+      # target_amount for DAILY cadence = round(outstanding_total * DAILY_REMIT_PCT, 0)
+      # target_amount for WEEKLY cadence = round(outstanding_total * WEEKLY_REMIT_PCT, 0)
+      #   where outstanding_total = outstanding_principal_cents + outstanding_fee_cents at settle time.
+      # The actual amount_cents debited is min(target_amount, outstanding_total) (never over-collect).
+      #
+      # Allocation (waterfall), iterating Draws oldest-first:
+      #   remaining = amount_cents
+      #   for draw in draws_ordered:
+      #     fee_due  = draw.fee_cents - draw.fee_repaid_cents
+      #     pay_fee  = min(remaining, fee_due);   draw.fee_repaid_cents += pay_fee;  remaining -= pay_fee
+      #     prin_due = draw.principal_cents - draw.principal_repaid_cents
+      #     pay_prin = min(remaining, prin_due);  draw.principal_repaid_cents += pay_prin; remaining -= pay_prin
+      #     if draw fully repaid: draw -> REPAID
+      #   principal_applied_cents = sum(pay_prin); fee_applied_cents = sum(pay_fee)
+      # amount_cents = principal_applied_cents + fee_applied_cents
+    input_set: "All Draws on the parent CreditLine with status == OUTSTANDING, ordered by drawn_at ASC, then created_at ASC."
+    constants:
+      DAILY_REMIT_PCT: 0.02
+      WEEKLY_REMIT_PCT: 0.10
+      NSF_MAX_RETRIES: 5            # max debit attempts in one retry chain before it stops spawning retries
+      NSF_RETRY_GAP_DAYS: 2         # days added to scheduled_for when spawning an NSF retry
+      NSF_DELINQUENCY_THRESHOLD: 3  # cumulative nsf_strike_count at which ACTIVE->DELINQUENT fires
+      NSF_DEFAULT_THRESHOLD: 5      # nsf_strike_count required to allow declare-default
+    precision: "target_amount rounded half_up to whole cents BEFORE the min() cap; allocation is integer-cent arithmetic with no further rounding"
+    variants:
+      - name: daily_cadence
+        when: "CreditLine.remittance_cadence == DAILY"
+        difference: "target_amount uses DAILY_REMIT_PCT (2% of outstanding_total)"
+      - name: weekly_cadence
+        when: "CreditLine.remittance_cadence == WEEKLY"
+        difference: "target_amount uses WEEKLY_REMIT_PCT (10% of outstanding_total)"
+
+  - name: outstanding_principal
+    trigger: "recomputed on every Draw create, Remittance settle, and CreditLine charge-off"
+    algorithm: aggregation
+    formula: |
+      outstanding_principal_cents = sum(d.principal_cents - d.principal_repaid_cents
+                                         for d in Draws where d.credit_line_id == line.id
+                                         and d.status == OUTSTANDING)
+      outstanding_fee_cents       = sum(d.fee_cents - d.fee_repaid_cents
+                                         for d in Draws where d.credit_line_id == line.id
+                                         and d.status == OUTSTANDING)
+      available_credit_cents      = max(0, line.credit_limit_cents - outstanding_principal_cents)
+    input_set: "Draws on the line with status == OUTSTANDING; REPAID and WRITTEN_OFF Draws are excluded."
+    constants: {}
+    precision: "integer cents; no rounding (sums of integer fields)"
+
+  - name: renewal_total_fee
+    trigger: "on RenewalOffer creation (POST /credit-lines/{id}/renewal-offers)"
+    algorithm: threshold
+    formula: |
+      # Fee-vs-APR view of a renewal: total flat fee on a representative full draw of the limit.
+      total_fee_cents = round(credit_line.credit_limit_cents * new_fee_factor_bps / 10000, 0)
+    input_set: "The parent CreditLine.credit_limit_cents and the offer's new_fee_factor_bps."
+    constants:
+      BPS_DENOMINATOR: 10000
+    precision: "round_half_up to whole cents"
+
+  - name: equivalent_apr
+    trigger: "on RenewalOffer creation (POST /credit-lines/{id}/renewal-offers) — computed alongside renewal_total_fee"
+    algorithm: chronological
+    formula: |
+      # Annualize the flat fee over the term to an APR, expressed in basis points.
+      # Order is pinned: first compute the flat periodic fee RATE on principal, THEN annualize by
+      # the day-count factor — annualize-after-rate, NOT rate-after-annualize.
+      flat_rate = new_fee_factor_bps / 10000               # e.g. 1200 bps -> 0.12 flat fee on principal
+      annualized = flat_rate * (DAYS_PER_YEAR / term_days) # extrapolate flat fee to a 365-day year
+      equivalent_apr_bps = round(annualized * 10000, 0)     # back to bps, single final round half_up
+    input_set: "The offer's new_fee_factor_bps and term_days; DAYS_PER_YEAR constant."
+    constants:
+      DAYS_PER_YEAR: 365
+      BPS_DENOMINATOR: 10000
+    precision: "single final round_half_up to whole basis points"
+
+  - name: statement_closing_principal
+    trigger: "on Statement OPEN->FINALIZED (POST /statements/{id}/finalize)"
+    algorithm: chronological
+    formula: |
+      # Reconstruct the window from LedgerEntry rows on the line, time-ordered by the entry's
+      # created_at ASC (tie-break created_at then ledger insertion order; NEVER id).
+      # opening_principal_cents = balance_after_cents of the latest LedgerEntry with
+      #   created_at < period_start (or 0 if none).
+      # draws_total_cents    = sum(Draw.principal_cents for draws with period_start <= drawn_at < period_end)
+      # fees_assessed_cents  = sum(Draw.fee_cents       for draws with period_start <= drawn_at < period_end)
+      # remittances_total_cents = sum(Remittance.amount_cents for SETTLED remittances whose
+      #   settle time (updated_at) is in [period_start, period_end))
+      # closing_principal_cents = balance_after_cents of the latest LedgerEntry with
+      #   created_at < period_end (or opening if no entry in window).
+    input_set: "LedgerEntry, Draw, and SETTLED Remittance rows for the line; window is [period_start, period_end) — start inclusive, end exclusive."
+    constants: {}
+    precision: "integer cents; window boundary is half-open [start, end)"
+
+# ============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /merchants and POST /_clock/set_current_utc"
+
+  - priority: 2
+    category: auth
+    check: "the acting role is permitted for this operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: "segregation of duties: the X-User-ID performing approve/decline/request-revision differs from Application.submitted_by_user_id; the X-User-ID performing charge-off differs from CreditLine.defaulted_by_user_id"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /applications/{id}/approve, /decline, /request-revision; POST /credit-lines/{id}/charge-off"
+
+  - priority: 4
+    category: existence
+    check: "every resource named in the path exists (validated left-to-right), and every FK in the body resolves"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all path/body references"
+
+  - priority: 5
+    category: existence
+    check: "required body fields present and well-typed; enum fields carry a declared value; integer fields satisfy declared constraints (e.g., principal_cents > 0)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all create/action endpoints"
+
+  - priority: 6
+    category: state
+    check: "the target resource is in a state from which the requested transition is defined (§1.2 from-state). For line-increase approve and renewal-offer accept ONLY, this slot also enforces the cross-entity guard 'parent CreditLine.status == ACTIVE' and returns ERR_INVALID_STATE when it fails. The draw endpoint's parent-line-status guard is NOT enforced here — it is handled by its own dedicated check (ERR_LINE_NOT_DRAWABLE) at a lower priority so that a draw against a non-ACTIVE line returns ERR_LINE_NOT_DRAWABLE, not ERR_INVALID_STATE."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action/transition endpoints (cross-entity ACTIVE guard scoped to line-increase approve and renewal-offer accept; excludes the draw endpoint)"
+
+  - priority: 7
+    category: business_referential
+    check: "OCC: expected_credit_line_version equals CreditLine.version on declare-default, charge-off, and line-increase approve"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /credit-lines/{id}/declare-default, /charge-off; POST /line-increase-requests/{id}/approve"
+
+  - priority: 8
+    category: business_referential
+    check: "Merchant referenced by an Application is not BLOCKLISTED at approval time"
+    error_id: ERR_MERCHANT_BLOCKLISTED
+    http_status: 409
+    applies_to: "POST /applications/{id}/approve"
+
+  - priority: 9
+    category: business_safety
+    check: "the BankFeed underwriting/increase relies on is FRESH (status == FRESH) at submit/approve/increase-approve time"
+    error_id: ERR_FEED_STALE
+    http_status: 409
+    applies_to: "POST /applications/{id}/submit, /approve; POST /line-increase-requests/{id}/approve"
+
+  - priority: 10
+    category: business_safety
+    check: "underwriting risk gate: BankFeed.nsf_count_90d <= NSF_UNDERWRITE_MAX at approval (excess NSF blocks origination)"
+    error_id: ERR_EXCESS_NSF
+    http_status: 409
+    applies_to: "POST /applications/{id}/approve"
+
+  - priority: 11
+    category: business_constraint
+    check: "risk_score gate: Application.risk_score >= APPROVAL_SCORE_FLOOR at approval; line increase requires new score >= prior score"
+    error_id: ERR_SCORE_BELOW_FLOOR
+    http_status: 409
+    applies_to: "POST /applications/{id}/approve; POST /line-increase-requests/{id}/approve"
+
+  - priority: 12
+    category: business_constraint
+    check: "a CreditLine may be created only from an APPROVED Application that has not already originated a line (one line per application)"
+    error_id: ERR_APPLICATION_NOT_APPROVED
+    http_status: 409
+    applies_to: "POST /credit-lines"
+
+  - priority: 13
+    category: business_temporal
+    check: "a Remittance may be settled only at/after its scheduled_for (now >= scheduled_for); settling early is rejected"
+    error_id: ERR_REMITTANCE_NOT_DUE
+    http_status: 409
+    applies_to: "POST /remittances/{id}/settle"
+
+  - priority: 14
+    category: business_temporal
+    check: "a Remittance's scheduled_for must not collide with another non-terminal Remittance window on the same CreditLine: DAILY lines require >= 1 calendar day gap (half-open, adjacency allowed); WEEKLY lines require >= 7 calendar days gap AND reject any overlap including shared endpoints (closed-interval, adjacency rejected)"
+    error_id: ERR_REMITTANCE_OVERLAP
+    http_status: 409
+    applies_to: "POST /credit-lines/{id}/remittances"
+
+  - priority: 15
+    category: business_temporal
+    check: "a Statement window [period_start, period_end) must not overlap any existing Statement window on the same CreditLine. Statement uses CLOSED-containment overlap: two windows collide iff new.period_start < existing.period_end AND existing.period_start < new.period_end; adjacency (new.period_start == existing.period_end) is ALLOWED (half-open touch, no overlap)."
+    error_id: ERR_STATEMENT_OVERLAP
+    http_status: 409
+    applies_to: "POST /credit-lines/{id}/statements"
+
+  - priority: 16
+    category: business_constraint
+    check: "no Draw may be created while parent CreditLine.status != ACTIVE (FROZEN/DELINQUENT/DEFAULTED/CHARGED_OFF/CLOSED block draws). This status check precedes the fiscal limit check, so a draw on a non-ACTIVE line returns ERR_LINE_NOT_DRAWABLE even if it would also exceed the limit."
+    error_id: ERR_LINE_NOT_DRAWABLE
+    http_status: 409
+    applies_to: "POST /credit-lines/{id}/draws"
+
+  - priority: 17
+    category: business_fiscal
+    check: "a Draw's principal must not push outstanding_principal_cents above credit_limit_cents: principal_cents <= available_credit_cents (would-exceed is rejected; principal_cents == available_credit_cents is allowed)"
+    error_id: ERR_LIMIT_EXCEEDED
+    http_status: 409
+    applies_to: "POST /credit-lines/{id}/draws"
+
+# ============================================================================
+# §1.5 API Endpoint Table
+# ============================================================================
+endpoints:
+  # --- Merchant ---
+  - method: POST
+    path: "/merchants"
+    description: "Register a merchant (open; pre-auth onboarding)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 201
+    input: [legal_name, ein, state_code, monthly_revenue_cents]
+    output: Merchant
+    side_effects: ["create Merchant in ACTIVE"]
+
+  - method: GET
+    path: "/merchants/{id}"
+    description: "Fetch a merchant."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: []
+    output: Merchant
+
+  - method: POST
+    path: "/merchants/{id}/blocklist"
+    description: "Mark a merchant BLOCKLISTED (fraud/compliance)."
+    roles: [CreditOfficer]
+    code: 200
+    input: []
+    output: Merchant
+    side_effects: ["set Merchant.status = BLOCKLISTED", "increments Merchant.version by 1"]
+
+  # --- BankFeed (Plaid snapshots) ---
+  - method: POST
+    path: "/merchants/{id}/bank-feeds"
+    description: "Ingest a Plaid bank-feed snapshot for a merchant."
+    roles: [Underwriter, Servicer]
+    code: 201
+    input: [plaid_item_id, pulled_at, avg_daily_balance_cents, nsf_count_90d, deposit_volume_cents]
+    output: BankFeed
+    side_effects: ["create BankFeed in FRESH"]
+
+  - method: GET
+    path: "/merchants/{id}/bank-feeds"
+    description: "List bank-feed snapshots for a merchant (reverse-reachability for BankFeed.merchant_id)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: ["status?"]
+    output: BankFeed[]
+
+  - method: POST
+    path: "/bank-feeds/{id}/mark-stale"
+    description: "Mark a bank-feed snapshot STALE (manual / test-driving freshness control)."
+    roles: [Underwriter, Servicer]
+    code: 200
+    input: []
+    output: BankFeed
+    side_effects: ["set BankFeed.status = STALE", "increments BankFeed.version by 1"]
+
+  # --- Application ---
+  - method: POST
+    path: "/applications"
+    description: "Create a DRAFT credit-line application."
+    roles: [Underwriter]
+    code: 201
+    input: [merchant_id, bank_feed_id, requested_limit_cents]
+    output: Application
+    side_effects: ["create Application in DRAFT"]
+
+  - method: GET
+    path: "/applications/{id}"
+    description: "Fetch an application (includes risk_score, approved_limit_cents, pricing_tier)."
+    roles: [Underwriter, CreditOfficer]
+    code: 200
+    input: []
+    output: Application
+
+  - method: GET
+    path: "/applications"
+    description: "List applications; filterable by merchant (reverse-reachability for Application.merchant_id and bank_feed_id)."
+    roles: [Underwriter, CreditOfficer]
+    code: 200
+    input: ["merchant_id?", "bank_feed_id?", "status?"]
+    output: Application[]
+
+  - method: POST
+    path: "/applications/{id}/submit"
+    description: "Submit (or resubmit from NEEDS_REVISION); computes risk_score."
+    roles: [Underwriter]
+    code: 200
+    input: ["bank_feed_id?"]
+    output: Application
+    side_effects: ["set submitted_by_user_id", "compute risk_score via calc:underwriting_risk_score", "increments Application.version by 1"]
+
+  - method: POST
+    path: "/applications/{id}/approve"
+    description: "Approve a submitted application (segregation of duties; sets approved_limit_cents + pricing_tier)."
+    roles: [Underwriter]
+    code: 200
+    input: []
+    output: Application
+    side_effects: ["compute approved_limit_cents via calc:approved_limit", "set pricing_tier", "increments Application.version by 1"]
+
+  - method: POST
+    path: "/applications/{id}/request-revision"
+    description: "Send a submitted application back for revision (segregation of duties)."
+    roles: [Underwriter]
+    code: 200
+    input: []
+    output: Application
+    side_effects: ["clear risk_score", "increments Application.version by 1"]
+
+  - method: POST
+    path: "/applications/{id}/decline"
+    description: "Decline a submitted application (segregation of duties; sets decline_reason)."
+    roles: [Underwriter]
+    code: 200
+    input: [decline_reason]
+    output: Application
+    side_effects: ["set decline_reason", "increments Application.version by 1"]
+
+  # --- CreditLine ---
+  - method: POST
+    path: "/credit-lines"
+    description: "Activate a CreditLine from an APPROVED Application."
+    roles: [CreditOfficer]
+    code: 201
+    input: [application_id, remittance_cadence]
+    output: CreditLine
+    side_effects: ["copy credit_limit_cents from application.approved_limit_cents", "copy pricing_tier", "derive fee_factor_bps from tier", "create CreditLine in ACTIVE"]
+
+  - method: GET
+    path: "/credit-lines/{id}"
+    description: "Fetch a credit line with computed balances (outstanding_principal_cents, available_credit_cents, nsf_strike_count)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: []
+    output: CreditLine
+
+  - method: GET
+    path: "/credit-lines"
+    description: "List credit lines; filterable (reverse-reachability for CreditLine.application_id and merchant_id)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: ["merchant_id?", "application_id?", "status?"]
+    output: CreditLine[]
+
+  - method: POST
+    path: "/credit-lines/{id}/freeze"
+    description: "Freeze a line (blocks new draws)."
+    roles: [Servicer]
+    code: 200
+    input: []
+    output: CreditLine
+    side_effects: ["set status = FROZEN", "increments CreditLine.version by 1"]
+
+  - method: POST
+    path: "/credit-lines/{id}/unfreeze"
+    description: "Unfreeze a frozen line."
+    roles: [Servicer]
+    code: 200
+    input: []
+    output: CreditLine
+    side_effects: ["set status = ACTIVE", "increments CreditLine.version by 1"]
+
+  - method: POST
+    path: "/credit-lines/{id}/declare-default"
+    description: "Declare DEFAULT on a delinquent line (OCC; records defaulted_by_user_id; cancels scheduled remittances)."
+    roles: [CreditOfficer]
+    code: 200
+    input: [expected_credit_line_version]
+    output: CreditLine
+    side_effects: ["set defaulted_by_user_id", "cancel all SCHEDULED Remittance -> CANCELLED", "set status = DEFAULTED", "increments CreditLine.version by 1"]
+
+  - method: POST
+    path: "/credit-lines/{id}/charge-off"
+    description: "Charge off a defaulted line (segregation of duties + OCC; writes off outstanding draws, appends WRITE_OFF ledger entries)."
+    roles: [CreditOfficer]
+    code: 200
+    input: [expected_credit_line_version]
+    output: CreditLine
+    side_effects: ["cascade: OUTSTANDING Draw -> WRITTEN_OFF -> WRITE_OFF LedgerEntry -> recompute outstanding_principal_cents = 0", "set status = CHARGED_OFF", "increments CreditLine.version by 1"]
+
+  - method: POST
+    path: "/credit-lines/{id}/close"
+    description: "Close a paid-off ACTIVE line."
+    roles: [Servicer]
+    code: 200
+    input: []
+    output: CreditLine
+    side_effects: ["set status = CLOSED", "increments CreditLine.version by 1"]
+
+  # --- Draw ---
+  - method: POST
+    path: "/credit-lines/{id}/draws"
+    description: "Take a draw against an ACTIVE line; computes fee, debits available credit, appends ledger entries."
+    roles: [Servicer]
+    code: 201
+    input: [principal_cents]
+    output: Draw
+    side_effects: ["compute fee_cents via calc:draw_fee", "stamp drawn_at from logical clock", "append DRAW_PRINCIPAL + DRAW_FEE LedgerEntry", "recompute CreditLine.outstanding_principal_cents/available_credit_cents", "increments CreditLine.version by 1"]
+
+  - method: GET
+    path: "/draws/{id}"
+    description: "Fetch a draw with repayment progress."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: []
+    output: Draw
+
+  - method: GET
+    path: "/credit-lines/{id}/draws"
+    description: "List draws on a line (reverse-reachability for Draw.credit_line_id)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: ["status?"]
+    output: Draw[]
+
+  # --- Remittance ---
+  - method: POST
+    path: "/credit-lines/{id}/remittances"
+    description: "Schedule a remittance for a line (overlap-checked against cadence interval semantics)."
+    roles: [Servicer]
+    code: 201
+    input: [scheduled_for]
+    output: Remittance
+    side_effects: ["create Remittance in SCHEDULED with attempt_count = 0"]
+
+  - method: GET
+    path: "/remittances/{id}"
+    description: "Fetch a remittance with applied amounts and attempt_count."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: []
+    output: Remittance
+
+  - method: GET
+    path: "/credit-lines/{id}/remittances"
+    description: "List remittances on a line (reverse-reachability for Remittance.credit_line_id)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: ["status?"]
+    output: Remittance[]
+
+  - method: POST
+    path: "/remittances/{id}/settle"
+    description: "Settle a due remittance with outcome SUCCESS, NSF, or ACCOUNT_CLOSED; drives FIFO allocation, NSF retry + delinquency cascade, or terminal-account failure. outcome enum: SUCCESS | NSF | ACCOUNT_CLOSED."
+    roles: [Servicer]
+    code: 200
+    input: [outcome]
+    output: Remittance
+    side_effects: ["SUCCESS: allocate FIFO via calc:remittance_amount, repay draws, reset nsf_strike_count, cure DELINQUENT->ACTIVE", "NSF: increment nsf_strike_count, spawn retry if attempt_count < NSF_MAX_RETRIES, cascade ACTIVE->DELINQUENT at threshold", "ACCOUNT_CLOSED: increment nsf_strike_count, no retry spawned, cascade ACTIVE->DELINQUENT at threshold", "increments Remittance.version by 1"]
+
+  - method: POST
+    path: "/remittances/{id}/cancel"
+    description: "Cancel a scheduled remittance."
+    roles: [Servicer]
+    code: 200
+    input: []
+    output: Remittance
+    side_effects: ["set status = CANCELLED", "increments Remittance.version by 1"]
+
+  # --- LineIncreaseRequest ---
+  - method: POST
+    path: "/credit-lines/{id}/line-increase-requests"
+    description: "Request a credit-line increase against a refreshed bank feed."
+    roles: [Servicer]
+    code: 201
+    input: [latest_bank_feed_id, requested_limit_cents]
+    output: LineIncreaseRequest
+    side_effects: ["create LineIncreaseRequest in PENDING"]
+
+  - method: GET
+    path: "/line-increase-requests/{id}"
+    description: "Fetch a line-increase request."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: []
+    output: LineIncreaseRequest
+
+  - method: GET
+    path: "/credit-lines/{id}/line-increase-requests"
+    description: "List increase requests for a line (reverse-reachability for LineIncreaseRequest.credit_line_id)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: ["status?"]
+    output: LineIncreaseRequest[]
+
+  - method: GET
+    path: "/line-increase-requests"
+    description: "List increase requests, filterable by feed (reverse-reachability for LineIncreaseRequest.latest_bank_feed_id and credit_line_id)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: ["credit_line_id?", "latest_bank_feed_id?", "status?"]
+    output: LineIncreaseRequest[]
+
+  - method: POST
+    path: "/line-increase-requests/{id}/approve"
+    description: "Approve an increase (OCC on parent line; raises credit_limit_cents)."
+    roles: [CreditOfficer]
+    code: 200
+    input: [expected_credit_line_version]
+    output: LineIncreaseRequest
+    side_effects: ["compute approved_limit_cents via calc:approved_limit (increase variant)", "set CreditLine.credit_limit_cents", "recompute available_credit_cents", "increments CreditLine.version by 1"]
+
+  - method: POST
+    path: "/line-increase-requests/{id}/deny"
+    description: "Deny an increase (records denial_reason)."
+    roles: [CreditOfficer]
+    code: 200
+    input: [denial_reason]
+    output: LineIncreaseRequest
+    side_effects: ["set denial_reason", "increments LineIncreaseRequest.version by 1"]
+
+  # --- RenewalOffer ---
+  - method: POST
+    path: "/credit-lines/{id}/renewal-offers"
+    description: "Create a renewal offer; computes total_fee_cents and equivalent_apr_bps (fee-vs-APR view)."
+    roles: [CreditOfficer]
+    code: 201
+    input: [new_fee_factor_bps, term_days]
+    output: RenewalOffer
+    side_effects: ["compute total_fee_cents via calc:renewal_total_fee", "compute equivalent_apr_bps via calc:equivalent_apr", "create RenewalOffer in OFFERED"]
+
+  - method: GET
+    path: "/renewal-offers/{id}"
+    description: "Fetch a renewal offer (fee + APR view)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: []
+    output: RenewalOffer
+
+  - method: GET
+    path: "/credit-lines/{id}/renewal-offers"
+    description: "List renewal offers for a line (reverse-reachability for RenewalOffer.credit_line_id)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: ["status?"]
+    output: RenewalOffer[]
+
+  - method: POST
+    path: "/renewal-offers/{id}/accept"
+    description: "Accept a renewal offer (reprices CreditLine.fee_factor_bps)."
+    roles: [Servicer]
+    code: 200
+    input: []
+    output: RenewalOffer
+    side_effects: ["set CreditLine.fee_factor_bps = new_fee_factor_bps", "increments CreditLine.version by 1"]
+
+  - method: POST
+    path: "/renewal-offers/{id}/decline"
+    description: "Decline a renewal offer."
+    roles: [Servicer]
+    code: 200
+    input: []
+    output: RenewalOffer
+    side_effects: ["set status = DECLINED", "increments RenewalOffer.version by 1"]
+
+  # --- Statement ---
+  - method: POST
+    path: "/credit-lines/{id}/statements"
+    description: "Open a statement window for a line."
+    roles: [Servicer]
+    code: 201
+    input: [period_start, period_end]
+    output: Statement
+    side_effects: ["create Statement in OPEN"]
+
+  - method: GET
+    path: "/statements/{id}"
+    description: "Fetch a statement with computed totals."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: []
+    output: Statement
+
+  - method: GET
+    path: "/credit-lines/{id}/statements"
+    description: "List statements for a line (reverse-reachability for Statement.credit_line_id)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: ["status?"]
+    output: Statement[]
+
+  - method: POST
+    path: "/statements/{id}/finalize"
+    description: "Finalize a statement (computes opening/closing principal and window totals)."
+    roles: [Servicer]
+    code: 200
+    input: []
+    output: Statement
+    side_effects: ["compute totals via calc:statement_closing_principal", "set status = FINALIZED", "increments Statement.version by 1"]
+
+  # --- LedgerEntry (read-only discovery) ---
+  - method: GET
+    path: "/credit-lines/{id}/ledger-entries"
+    description: "List immutable ledger entries for a line (reverse-reachability for LedgerEntry.credit_line_id)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: ["entry_type?"]
+    output: LedgerEntry[]
+
+  - method: GET
+    path: "/ledger-entries"
+    description: "List immutable ledger entries, filterable (reverse-reachability for LedgerEntry.draw_id and remittance_id)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: ["credit_line_id?", "draw_id?", "remittance_id?", "entry_type?"]
+    output: LedgerEntry[]
+
+  - method: GET
+    path: "/ledger-entries/{id}"
+    description: "Fetch a single immutable ledger entry by id."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: []
+    output: LedgerEntry
+
+  # --- Ops / test-driving ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock. Server startup default is 2026-05-01T00:00:00Z; before any call here the clock reads exactly that default (never wall-clock)."
+    roles: [Underwriter, Servicer, CreditOfficer]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["advance logical clock to to_iso8601"]
+
+  - method: POST
+    path: "/_ops/expire-applications"
+    description: "Sweep SUBMITTED applications past APPLICATION_TTL_DAYS to EXPIRED."
+    roles: [Underwriter]
+    code: 200
+    input: []
+    output: Application[]
+    side_effects: ["each swept Application SUBMITTED->EXPIRED; increments each Application.version by 1"]
+
+  - method: POST
+    path: "/_ops/expire-renewals"
+    description: "Sweep OFFERED renewal offers past RENEWAL_TTL_DAYS to EXPIRED."
+    roles: [CreditOfficer]
+    code: 200
+    input: []
+    output: RenewalOffer[]
+    side_effects: ["each swept RenewalOffer OFFERED->EXPIRED; increments each RenewalOffer.version by 1"]
+
+# ============================================================================
+# §1.6 Error Code Catalog
+# ============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/invalid X-User-Role or X-User-ID headers, or unknown role"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "acting role is not permitted for this operation"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "same operator attempts both a step and its conflicting prior step (approve/decline own submission; charge-off own default declaration)"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a path or FK-referenced resource does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "missing required field, bad type, undeclared enum value, or constraint violation (e.g., principal_cents <= 0)"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "target resource is not in a state from which the requested transition is defined"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_credit_line_version does not match CreditLine.version (OCC mismatch)"
+  - id: ERR_MERCHANT_BLOCKLISTED
+    http: 409
+    condition: "approving an application whose merchant is BLOCKLISTED"
+  - id: ERR_FEED_STALE
+    http: 409
+    condition: "the BankFeed required for underwriting/increase is STALE"
+  - id: ERR_EXCESS_NSF
+    http: 409
+    condition: "BankFeed.nsf_count_90d exceeds NSF_UNDERWRITE_MAX at approval"
+  - id: ERR_SCORE_BELOW_FLOOR
+    http: 409
+    condition: "risk_score below APPROVAL_SCORE_FLOOR at approval, or increase score regresses below prior score"
+  - id: ERR_APPLICATION_NOT_APPROVED
+    http: 409
+    condition: "creating a CreditLine from an application not in APPROVED, or one that already originated a line"
+  - id: ERR_REMITTANCE_NOT_DUE
+    http: 409
+    condition: "settling a remittance before its scheduled_for (now < scheduled_for)"
+  - id: ERR_REMITTANCE_OVERLAP
+    http: 409
+    condition: "scheduling a remittance whose window collides with another non-terminal remittance under the line's cadence interval rule"
+  - id: ERR_STATEMENT_OVERLAP
+    http: 409
+    condition: "opening a statement whose [period_start, period_end) window overlaps an existing statement window on the same line"
+  - id: ERR_LIMIT_EXCEEDED
+    http: 409
+    condition: "a draw's principal would push outstanding_principal_cents above credit_limit_cents"
+  - id: ERR_LINE_NOT_DRAWABLE
+    http: 409
+    condition: "taking a draw while the parent CreditLine is not ACTIVE"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "semantically invalid but well-formed request (e.g., period_end <= period_start on a Statement, term_days <= 0 on a RenewalOffer)"
+
+# ============================================================================
+# §1.7 RBAC Matrix
+# ============================================================================
+roles:
+  - name: Underwriter
+    description: "Originates and risk-assesses applications; ingests bank feeds; cannot approve own submission."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /applications (create)"
+      - "POST /applications/{id}/submit"
+      - "POST /applications/{id}/approve"
+      - "POST /applications/{id}/request-revision"
+      - "POST /applications/{id}/decline"
+      - "POST /_ops/expire-applications"
+    shared_operations:
+      - "POST /merchants"
+      - "POST /merchants/{id}/bank-feeds"
+      - "POST /bank-feeds/{id}/mark-stale"
+      - "GET reads on merchants, bank-feeds, applications, credit-lines, draws, remittances, line-increase-requests, renewal-offers, statements, ledger-entries"
+      - "POST /_clock/set_current_utc"
+
+  - name: Servicer
+    description: "Runs the active line: draws, remittances, NSF settlement, freeze/unfreeze, renewal accept/decline, statements; cannot make credit decisions."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /credit-lines/{id}/draws"
+      - "POST /credit-lines/{id}/remittances"
+      - "POST /remittances/{id}/settle"
+      - "POST /remittances/{id}/cancel"
+      - "POST /credit-lines/{id}/freeze"
+      - "POST /credit-lines/{id}/unfreeze"
+      - "POST /credit-lines/{id}/close"
+      - "POST /credit-lines/{id}/line-increase-requests"
+      - "POST /credit-lines/{id}/statements"
+      - "POST /statements/{id}/finalize"
+      - "POST /renewal-offers/{id}/accept"
+      - "POST /renewal-offers/{id}/decline"
+    shared_operations:
+      - "POST /merchants"
+      - "POST /merchants/{id}/bank-feeds"
+      - "POST /bank-feeds/{id}/mark-stale"
+      - "GET reads on all collections"
+      - "POST /_clock/set_current_utc"
+
+  - name: CreditOfficer
+    description: "Holds credit authority: activates lines, approves/denies increases, declares default and charge-off (charge-off must differ from default declarer), creates renewal offers, blocklists merchants."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /credit-lines (activate)"
+      - "POST /credit-lines/{id}/declare-default"
+      - "POST /credit-lines/{id}/charge-off"
+      - "POST /line-increase-requests/{id}/approve"
+      - "POST /line-increase-requests/{id}/deny"
+      - "POST /credit-lines/{id}/renewal-offers"
+      - "POST /merchants/{id}/blocklist"
+      - "POST /_ops/expire-renewals"
+    shared_operations:
+      - "POST /merchants"
+      - "GET reads on all collections"
+      - "POST /_clock/set_current_utc"

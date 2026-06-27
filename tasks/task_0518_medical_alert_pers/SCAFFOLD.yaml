@@ -1,0 +1,1811 @@
+scenario: "Medical Alert / PERS Monitoring (Life Alert/Bay Alarm Medical style): device & fall-detection enrollment, monitoring-plan tier, alarm signal → call-center response protocol, contact-tree & dispatch (911/caregiver), test & battery-health check, false-alarm handling, contract/cancellation & proration, equipment return"
+domain_name: medical-alert-pers
+api_prefix: /pers
+
+complexity_profile:
+  primary_archetype: workflow_orchestration
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - scheduled_actions
+  entity_topology: hybrid
+  # Subscriber is the hub: Contract, Device, EmergencyContact, AlarmEvent hang off it
+  # (one_to_many), while AlarmEvent->DispatchAction and Contract->EquipmentReturn are
+  # nested children. EquipmentReturn references both Contract and Device (cross_aggregate).
+  state_machine_shape: branching
+  # AlarmEvent forks SIGNAL→{911 dispatch, contact-tree escalation, false-alarm} with
+  # divergent side-effect sets; Contract has a SUSPENDED↔ACTIVE reinstatement cycle;
+  # EquipmentReturn forks RECEIVED→{INSPECTED_OK, DAMAGED}.
+  relationship_patterns:
+    - one_to_many
+    - self_referential   # EmergencyContact.escalates_to_contact_id forms the contact tree
+    - cross_aggregate    # EquipmentReturn references Contract + Device across aggregates
+  role_model: peer_roles
+  # Subscriber owns their own contract/device/contacts; CallCenterAgent owns alarm
+  # response & dispatch; PlatformAdmin owns plan config + billing/return admin. No role
+  # is a superset of another.
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: MonitoringPlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: tier
+        type: enum
+        source: input
+        description: Plan tier name
+        constraints: "one of {BASIC, PLUS, PREMIUM}; unique among non-archived plans"
+      - name: monthly_fee_cents
+        type: integer
+        source: input
+        description: Base recurring monthly monitoring fee in cents
+        constraints: ">= 0"
+      - name: fall_detection_addon_cents
+        type: integer
+        source: input
+        description: Additional monthly cents charged when fall detection is enabled on a device
+        constraints: ">= 0"
+      - name: included_test_interval_days
+        type: integer
+        source: input
+        description: Mandated number of days between device self-tests for this tier
+        constraints: ">= 1"
+      - name: response_sla_seconds
+        type: integer
+        source: input
+        description: Maximum seconds the call center may take to assign an agent to an alarm before SLA breach
+        constraints: ">= 1"
+      - name: early_termination_fee_cents
+        type: integer
+        source: input
+        description: Flat fee charged on cancellation inside the minimum commitment window
+        constraints: ">= 0"
+      - name: min_commitment_months
+        type: integer
+        source: input
+        description: Minimum contract commitment length in months; cancellation before this triggers the early-termination fee
+        constraints: ">= 0"
+      - name: archived
+        type: boolean
+        source: system
+        description: Whether the plan is archived (soft-deleted); archived plans cannot back new contracts
+        default: false
+
+  - name: Subscriber
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: Subscriber's legal name
+      - name: email
+        type: string
+        source: input
+        description: Subscriber contact email; unique among subscribers
+        constraints: "unique"
+      - name: residence_address
+        type: string
+        source: input
+        description: Street address used as the dispatch location for 911 escalation
+      - name: phone
+        type: string
+        source: input
+        description: Primary phone number the call center dials first
+      - name: status
+        type: enum
+        source: system
+        description: Subscriber account lifecycle status; set to ACTIVE on creation
+        constraints: "one of {ACTIVE}"
+        default: ACTIVE
+
+  - name: Contract
+    parent: null
+    common_fields: true
+    fields:
+      - name: subscriber_id
+        type: string
+        source: input
+        description: "FK -> Subscriber.id; the account holder this contract bills"
+      - name: plan_id
+        type: string
+        source: input
+        description: "FK -> MonitoringPlan.id; the plan that sets fees and SLA at activation time"
+      - name: pinned_monthly_fee_cents
+        type: integer
+        source: computed
+        description: MonitoringPlan.monthly_fee_cents copied (pinned) at activation; later plan edits do not change it
+      - name: pinned_addon_cents
+        type: integer
+        source: computed
+        description: MonitoringPlan.fall_detection_addon_cents copied at activation
+      - name: pinned_etf_cents
+        type: integer
+        source: computed
+        description: MonitoringPlan.early_termination_fee_cents copied at activation
+      - name: pinned_min_commitment_months
+        type: integer
+        source: computed
+        description: MonitoringPlan.min_commitment_months copied at activation
+      - name: billing_status
+        type: enum
+        source: system
+        description: Independent billing dimension (parallel to service_status)
+        constraints: "one of {CURRENT, PAST_DUE, WRITTEN_OFF}"
+        default: CURRENT
+      - name: service_status
+        type: enum
+        source: system
+        description: Independent service/monitoring dimension (parallel to billing_status)
+        constraints: "one of {PENDING_ACTIVATION, ACTIVE, SUSPENDED, CANCELLATION_REQUESTED, CANCELLED}"
+        default: PENDING_ACTIVATION
+      - name: activated_at
+        type: datetime
+        source: system
+        description: Logical-clock instant the contract entered ACTIVE service_status
+      - name: paid_through_at
+        type: datetime
+        source: system
+        description: Logical-clock instant through which monitoring has been prepaid; current billing cycle end
+      - name: cancellation_effective_at
+        type: datetime
+        source: system
+        description: Logical-clock instant the cancellation takes effect (end of current paid cycle for standard cancel, or now for immediate)
+      - name: refund_cents
+        type: computed
+        source: computed
+        description: Prorated unused-monitoring refund computed at cancellation; see calc prorated_cancellation_refund
+        default: 0
+      - name: etf_charged_cents
+        type: integer
+        source: computed
+        description: Early-termination fee actually charged at cancellation (0 if past commitment window)
+        default: 0
+      - name: outstanding_balance_cents
+        type: integer
+        source: computed
+        description: Running net amount owed by (positive) or to (negative) the subscriber; reconciled on cancellation and on damaged-return fee assessment
+
+  - name: Device
+    parent: null
+    common_fields: true
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> Contract.id; the contract this device is enrolled under"
+      - name: serial_number
+        type: string
+        source: input
+        description: Hardware serial; unique across all devices
+        constraints: "unique"
+      - name: device_type
+        type: enum
+        source: input
+        description: Device form factor
+        constraints: "one of {PENDANT, WRISTBAND, MOBILE_GPS, HOME_BASE}"
+      - name: fall_detection_enabled
+        type: boolean
+        source: input
+        description: Whether automatic fall detection is enabled (incurs plan add-on fee)
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: Device lifecycle status
+        constraints: "one of {REGISTERED, ENROLLED, ACTIVE, NEEDS_TEST, SUSPENDED, DEACTIVATED}"
+        default: REGISTERED
+      - name: battery_pct
+        type: integer
+        source: system
+        description: Last reported battery percentage from a DeviceTest
+        constraints: "0..100"
+        default: 100
+      - name: battery_health
+        type: enum
+        source: computed
+        description: Derived battery classification from battery_pct; see calc battery_health_class
+        constraints: "one of {GOOD, LOW, CRITICAL}"
+        default: GOOD
+      - name: last_test_at
+        type: datetime
+        source: system
+        description: Logical-clock instant of the most recent passing DeviceTest
+      - name: next_test_due_at
+        type: datetime
+        source: computed
+        description: last_test_at + plan.included_test_interval_days; when crossed, device auto-flags NEEDS_TEST on next alarm or test
+      - name: open_alarm_count
+        type: integer
+        source: system
+        description: Number of non-terminal AlarmEvents currently open against this device
+        default: 0
+
+  - name: EmergencyContact
+    parent: null
+    common_fields: true
+    fields:
+      - name: subscriber_id
+        type: string
+        source: input
+        description: "FK -> Subscriber.id; the subscriber whose contact tree this entry belongs to"
+      - name: name
+        type: string
+        source: input
+        description: Contact's name
+      - name: phone
+        type: string
+        source: input
+        description: Contact's phone number
+      - name: relationship
+        type: enum
+        source: input
+        description: Relationship to subscriber
+        constraints: "one of {CAREGIVER, FAMILY, NEIGHBOR, PHYSICIAN}"
+      - name: priority_rank
+        type: integer
+        source: input
+        description: Position in the contact tree; lower number is contacted earlier; unique per subscriber
+        constraints: ">= 1; unique within (subscriber_id)"
+      - name: escalates_to_contact_id
+        type: string
+        source: input
+        description: "FK -> EmergencyContact.id; self-referential next-fallback contact when this one does not answer; null for the last leaf"
+        default: null
+      - name: can_authorize_911
+        type: boolean
+        source: input
+        description: Whether this contact is permitted to authorize a 911 dispatch on the subscriber's behalf
+        default: false
+      - name: active
+        type: boolean
+        source: system
+        description: Whether the contact participates in escalation; deactivated contacts are skipped
+        default: true
+
+  - name: AlarmEvent
+    parent: null
+    common_fields: true
+    fields:
+      - name: device_id
+        type: string
+        source: input
+        description: "FK -> Device.id; the device that raised the alarm"
+      - name: assigned_agent_id
+        type: string
+        source: system
+        description: X-User-ID of the CallCenterAgent assigned to handle this alarm (opaque operator id)
+      - name: signal_type
+        type: enum
+        source: input
+        description: How the alarm originated
+        constraints: "one of {MANUAL_BUTTON, FALL_DETECTED, BATTERY_CRITICAL, PERIODIC_CHECKIN_MISSED}"
+      - name: priority
+        type: enum
+        source: computed
+        description: Triage priority derived from signal_type, fall_detection, and battery_health; see calc alarm_priority_score
+        constraints: "one of {ROUTINE, ELEVATED, CRITICAL}"
+      - name: status
+        type: enum
+        source: system
+        description: Alarm response lifecycle status
+        constraints: "one of {SIGNAL_RECEIVED, AGENT_ASSIGNED, CONTACTING_SUBSCRIBER, ESCALATING, DISPATCHED_911, RESOLVED_OK, FALSE_ALARM}"
+        default: SIGNAL_RECEIVED
+      - name: signal_received_at
+        type: datetime
+        source: system
+        description: Logical-clock instant the signal was received
+      - name: agent_assigned_at
+        type: datetime
+        source: system
+        description: Logical-clock instant an agent was assigned
+      - name: resolved_at
+        type: datetime
+        source: system
+        description: Logical-clock instant the alarm reached a terminal status
+      - name: sla_breached
+        type: boolean
+        source: computed
+        description: True when (agent_assigned_at - signal_received_at) exceeds plan.response_sla_seconds; see calc sla_breach_check
+        default: false
+      - name: current_escalation_rank
+        type: integer
+        source: system
+        description: priority_rank of the EmergencyContact currently being attempted during ESCALATING; 0 before escalation starts
+        default: 0
+      - name: dispatch_count
+        type: integer
+        source: system
+        description: Number of DispatchActions recorded against this alarm
+        default: 0
+
+  - name: DispatchAction
+    parent: AlarmEvent
+    common_fields: true
+    fields:
+      - name: alarm_event_id
+        type: string
+        source: input
+        description: "FK -> AlarmEvent.id; the alarm this dispatch step belongs to"
+      - name: action_type
+        type: enum
+        source: input
+        description: Kind of dispatch step
+        constraints: "one of {CALL_SUBSCRIBER, CALL_CONTACT, DISPATCH_911, MARK_FALSE_ALARM, RESOLVE_OK}"
+      - name: target_contact_id
+        type: string
+        source: input
+        description: "FK -> EmergencyContact.id; the contact dialed for a CALL_CONTACT action; null otherwise"
+        default: null
+      - name: outcome
+        type: enum
+        source: input
+        description: Result of the dispatch step
+        constraints: "one of {ANSWERED, NO_ANSWER, DISPATCHED, CONFIRMED_OK, CONFIRMED_FALSE}"
+      - name: recorded_at
+        type: datetime
+        source: system
+        description: Logical-clock instant the action was recorded
+
+  - name: DeviceTest
+    parent: Device
+    common_fields: false
+    fields:
+      - name: device_id
+        type: string
+        source: input
+        description: "FK -> Device.id; the device being tested"
+      - name: reported_battery_pct
+        type: integer
+        source: input
+        description: Battery percentage reported by this self-test
+        constraints: "0..100"
+      - name: signal_ok
+        type: boolean
+        source: input
+        description: Whether the device's connectivity/signal check passed
+      - name: result
+        type: enum
+        source: computed
+        description: Test result derived from signal_ok and reported_battery_pct; see calc device_test_result
+        constraints: "one of {PASS, FAIL_SIGNAL, FAIL_BATTERY}"
+      - name: tested_at
+        type: datetime
+        source: system
+        description: Logical-clock instant of the test
+
+  - name: EquipmentReturn
+    parent: Contract
+    common_fields: true
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> Contract.id; the cancelled contract whose equipment is being returned"
+      - name: device_id
+        type: string
+        source: input
+        description: "FK -> Device.id; the device being returned"
+      - name: status
+        type: enum
+        source: system
+        description: Return lifecycle status
+        constraints: "one of {INITIATED, KIT_SENT, RECEIVED, INSPECTED_OK, DAMAGED, CLOSED}"
+        default: INITIATED
+      - name: condition_grade
+        type: enum
+        source: input
+        description: Inspector's grade recorded at inspection; null until inspection
+        constraints: "one of {A, B, C, UNRETURNED}"
+        default: null
+      - name: damage_fee_cents
+        type: integer
+        source: computed
+        description: Fee assessed for damaged/unreturned equipment; see calc equipment_damage_fee
+        default: 0
+      - name: due_back_at
+        type: datetime
+        source: system
+        description: Logical-clock deadline by which equipment must be received before the unreturned fee applies
+      - name: received_at
+        type: datetime
+        source: system
+        description: Logical-clock instant the kit was marked RECEIVED
+
+  - name: AgentShift
+    parent: null
+    common_fields: true
+    fields:
+      - name: agent_user_id
+        type: string
+        source: input
+        description: X-User-ID of the CallCenterAgent this on-call shift covers (opaque operator id; not an FK to a persisted entity)
+      - name: starts_at
+        type: datetime
+        source: input
+        description: Inclusive start instant of the on-call coverage interval
+      - name: ends_at
+        type: datetime
+        source: input
+        description: Exclusive end instant of the on-call coverage interval; must be strictly after starts_at
+      - name: status
+        type: enum
+        source: system
+        description: Shift lifecycle
+        constraints: "one of {SCHEDULED, CANCELLED}"
+        default: SCHEDULED
+    note: |
+      Coverage intervals are HALF-OPEN [starts_at, ends_at). Two SCHEDULED shifts for the
+      SAME agent_user_id may be exactly adjacent (prev.ends_at == next.starts_at) but MUST
+      NOT overlap — see overlap rule resource_temporal_overlap / agent_shift_half_open_overlap.
+      An alarm assign requires a covering SCHEDULED shift for the agent (cross-entity).
+
+  - name: MonitoringHold
+    parent: Device
+    common_fields: true
+    fields:
+      - name: device_id
+        type: string
+        source: input
+        description: "FK -> Device.id; the device whose monitoring is paused for travel/hospital stay"
+      - name: starts_at
+        type: datetime
+        source: input
+        description: Inclusive start instant of the monitoring-suspension window
+      - name: ends_at
+        type: datetime
+        source: input
+        description: Exclusive end instant of the monitoring-suspension window; must be strictly after starts_at
+      - name: status
+        type: enum
+        source: system
+        description: Hold lifecycle
+        constraints: "one of {SCHEDULED, CANCELLED}"
+        default: SCHEDULED
+    note: |
+      Holds on the SAME device must be separated by a REQUIRED buffer of HOLD_GAP_DAYS (7)
+      between the prior hold's ends_at and the next hold's starts_at — i.e. a new hold is
+      rejected if its [starts_at, ends_at) window comes within 7 days of any existing
+      SCHEDULED hold on that device. This is a BUFFERED interval semantics, distinct from
+      AgentShift's zero-buffer adjacency — see overlap rule monitoring_hold_buffered_overlap.
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: Contract
+    initial_state: PENDING_ACTIVATION
+    terminal_states: [CANCELLED]
+    note: |
+      Contract carries TWO parallel state dimensions on the same row: service_status
+      (modeled below) and billing_status {CURRENT, PAST_DUE, WRITTEN_OFF}. They evolve
+      independently — a CANCELLATION_REQUESTED contract can still be CURRENT or PAST_DUE,
+      and a SUSPENDED contract is suspended for non-payment yet may later be CURRENT after
+      reinstatement. The transitions listed are on service_status; billing_status
+      transitions are listed as separate rows tagged [billing].
+    transitions:
+      - from: PENDING_ACTIVATION
+        to: ACTIVE
+        trigger: "POST /pers/contracts/{id}/activate"
+        actor: PlatformAdmin
+        preconditions:
+          - "service_status == PENDING_ACTIVATION"
+          - "plan referenced by plan_id is not archived"
+          - "at least one Device exists under this contract with status in {ENROLLED}"
+          - "subscriber.status == ACTIVE"
+        side_effects:
+          - "set service_status = ACTIVE"
+          - "pin pinned_monthly_fee_cents, pinned_addon_cents, pinned_etf_cents, pinned_min_commitment_months from the plan"
+          - "set activated_at = clock.now"
+          - "set paid_through_at = clock.now + 1 month (first cycle prepaid)"
+          - "transition every ENROLLED Device under this contract to ACTIVE (cascade down)"
+          - "for each Device set to ACTIVE, set last_test_at = clock.now and recompute next_test_due_at (cascade hop 2)"
+          - "increment Contract.version by 1"
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /pers/contracts/{id}/suspend"
+        actor: PlatformAdmin
+        preconditions:
+          - "service_status == ACTIVE"
+          - "billing_status == PAST_DUE"
+        side_effects:
+          - "set service_status = SUSPENDED"
+          - "transition every ACTIVE Device under this contract to SUSPENDED (cascade down)"
+          - "increment Contract.version by 1"
+        note: "Suspended devices reject new alarm signals (cross-entity precondition on AlarmEvent creation)."
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /pers/contracts/{id}/reinstate"
+        actor: PlatformAdmin
+        preconditions:
+          - "service_status == SUSPENDED"
+          - "billing_status == CURRENT"
+        side_effects:
+          - "set service_status = ACTIVE"
+          - "transition every SUSPENDED Device under this contract back to ACTIVE (cascade down)"
+          - "increment Contract.version by 1"
+        note: "Reinstatement cycle SUSPENDED -> ACTIVE makes the service_status machine non-linear (ACTIVE<->SUSPENDED loop)."
+      - from: ACTIVE
+        to: CANCELLATION_REQUESTED
+        trigger: "POST /pers/contracts/{id}/request-cancellation"
+        actor: Subscriber
+        preconditions:
+          - "service_status == ACTIVE"
+          - "expected_contract_version matches Contract.version (OCC)"
+        side_effects:
+          - "set service_status = CANCELLATION_REQUESTED"
+          - "compute refund_cents via prorated_cancellation_refund (variant = STANDARD)"
+          - "compute etf_charged_cents (pinned_etf_cents if clock.now < activated_at + pinned_min_commitment_months, else 0)"
+          - "set cancellation_effective_at = paid_through_at (service runs to end of paid cycle)"
+          - "set outstanding_balance_cents = etf_charged_cents - refund_cents"
+          - "increment Contract.version by 1"
+      - from: SUSPENDED
+        to: CANCELLATION_REQUESTED
+        trigger: "POST /pers/contracts/{id}/request-cancellation"
+        actor: Subscriber
+        preconditions:
+          - "service_status == SUSPENDED"
+          - "expected_contract_version matches Contract.version (OCC)"
+        side_effects:
+          - "set service_status = CANCELLATION_REQUESTED"
+          - "compute refund_cents via prorated_cancellation_refund (variant = IMMEDIATE; no remaining paid cycle while suspended)"
+          - "compute etf_charged_cents"
+          - "set cancellation_effective_at = clock.now"
+          - "set outstanding_balance_cents = etf_charged_cents - refund_cents"
+          - "increment Contract.version by 1"
+      - from: CANCELLATION_REQUESTED
+        to: CANCELLED
+        trigger: "POST /pers/contracts/{id}/finalize-cancellation"
+        actor: PlatformAdmin
+        preconditions:
+          - "service_status == CANCELLATION_REQUESTED"
+          - "clock.now >= cancellation_effective_at"
+          - "no Device under this contract has status in {ACTIVE, NEEDS_TEST} (devices must be deactivated first)"
+          - "no AlarmEvent under any device of this contract is in a non-terminal status"
+        side_effects:
+          - "set service_status = CANCELLED"
+          - "transition every non-DEACTIVATED Device under this contract to DEACTIVATED (cascade down)"
+          - "create one EquipmentReturn per DEACTIVATED Device with status INITIATED and due_back_at = clock.now + 14 days (cascade hop 2)"
+          - "increment Contract.version by 1"
+      # ---- billing_status dimension (parallel) ----
+      - from: CURRENT
+        to: PAST_DUE
+        trigger: "POST /pers/contracts/{id}/billing/mark-past-due"
+        actor: PlatformAdmin
+        preconditions:
+          - "billing_status == CURRENT"
+          - "clock.now > paid_through_at"
+        side_effects:
+          - "set billing_status = PAST_DUE"
+          - "increment Contract.version by 1"
+        note: "[billing] Parallel dimension; does NOT change service_status."
+      - from: PAST_DUE
+        to: CURRENT
+        trigger: "POST /pers/contracts/{id}/billing/record-payment"
+        actor: PlatformAdmin
+        preconditions:
+          - "billing_status == PAST_DUE"
+        side_effects:
+          - "set billing_status = CURRENT"
+          - "set paid_through_at = paid_through_at + 1 month"
+          - "increment Contract.version by 1"
+        note: "[billing] Payment clears past-due; service_status untouched (reinstatement is a separate service-dimension action)."
+      - from: PAST_DUE
+        to: WRITTEN_OFF
+        trigger: "POST /pers/contracts/{id}/billing/write-off"
+        actor: PlatformAdmin
+        preconditions:
+          - "billing_status == PAST_DUE"
+          - "service_status == CANCELLED"
+        side_effects:
+          - "set billing_status = WRITTEN_OFF"
+          - "increment Contract.version by 1"
+        note: "[billing] Terminal billing state; only after service is cancelled."
+
+  - entity: Device
+    initial_state: REGISTERED
+    terminal_states: [DEACTIVATED]
+    transitions:
+      - from: REGISTERED
+        to: ENROLLED
+        trigger: "POST /pers/devices/{id}/enroll"
+        actor: Subscriber
+        preconditions:
+          - "device.status == REGISTERED"
+          - "a passing DeviceTest exists for this device (result == PASS)"
+          - "if fall_detection_enabled then device_type in {PENDANT, WRISTBAND, MOBILE_GPS} (HOME_BASE cannot do fall detection)"
+        side_effects:
+          - "set status = ENROLLED"
+          - "increment Device.version by 1"
+      - from: ENROLLED
+        to: ACTIVE
+        trigger: "system: Contract.activate cascade"
+        actor: system
+        preconditions:
+          - "device.status == ENROLLED"
+          - "parent Contract transitioning PENDING_ACTIVATION -> ACTIVE"
+        side_effects:
+          - "set status = ACTIVE"
+          - "set last_test_at = clock.now; recompute next_test_due_at = last_test_at + plan.included_test_interval_days"
+          - "increment Device.version by 1"
+      - from: ACTIVE
+        to: NEEDS_TEST
+        trigger: "system: alarm-create or test-submit when clock.now >= next_test_due_at"
+        actor: system
+        preconditions:
+          - "device.status == ACTIVE"
+          - "clock.now >= next_test_due_at"
+        side_effects:
+          - "set status = NEEDS_TEST"
+          - "increment Device.version by 1"
+        note: "Auto-transition: an overdue device flags NEEDS_TEST. NEEDS_TEST devices still raise alarms (safety) but block contract finalize-cancellation until tested."
+      - from: NEEDS_TEST
+        to: ACTIVE
+        trigger: "POST /pers/devices/{id}/tests (result == PASS)"
+        actor: Subscriber
+        preconditions:
+          - "device.status == NEEDS_TEST"
+          - "submitted DeviceTest.result == PASS"
+        side_effects:
+          - "set status = ACTIVE"
+          - "set last_test_at = clock.now; recompute next_test_due_at"
+          - "increment Device.version by 1"
+        note: |
+          NEEDS_TEST <-> ACTIVE forms a maintenance cycle on Device (non-linear). NOTE:
+          battery_pct/battery_health are set by EVERY test (see the /tests endpoint
+          side_effects), independent of PASS/FAIL — only the status/timing fields are
+          gated on PASS. This keeps battery_health == CRITICAL reachable (a FAIL_BATTERY
+          test still records the low reading).
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "system: Contract.suspend cascade"
+        actor: system
+        preconditions:
+          - "device.status == ACTIVE"
+          - "parent Contract transitioning ACTIVE -> SUSPENDED"
+        side_effects:
+          - "set status = SUSPENDED"
+          - "increment Device.version by 1"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "system: Contract.reinstate cascade"
+        actor: system
+        preconditions:
+          - "device.status == SUSPENDED"
+          - "parent Contract transitioning SUSPENDED -> ACTIVE"
+        side_effects:
+          - "set status = ACTIVE"
+          - "increment Device.version by 1"
+      - from: ACTIVE
+        to: DEACTIVATED
+        trigger: "system: Contract.finalize-cancellation cascade"
+        actor: system
+        preconditions:
+          - "device.status in {ACTIVE, NEEDS_TEST, SUSPENDED}"
+          - "parent Contract transitioning CANCELLATION_REQUESTED -> CANCELLED"
+        side_effects:
+          - "set status = DEACTIVATED"
+          - "increment Device.version by 1"
+
+  - entity: AlarmEvent
+    initial_state: SIGNAL_RECEIVED
+    terminal_states: [RESOLVED_OK, FALSE_ALARM, DISPATCHED_911]
+    note: |
+      Branching machine: from CONTACTING_SUBSCRIBER the event forks into RESOLVED_OK
+      (subscriber fine), FALSE_ALARM (accidental press), or ESCALATING (no answer ->
+      walk contact tree). ESCALATING in turn forks to DISPATCHED_911 or RESOLVED_OK.
+      Each branch fires a different side-effect set.
+    transitions:
+      - from: SIGNAL_RECEIVED
+        to: AGENT_ASSIGNED
+        trigger: "POST /pers/alarms/{id}/assign"
+        actor: CallCenterAgent
+        preconditions:
+          - "status == SIGNAL_RECEIVED"
+          - "a SCHEDULED AgentShift for X-User-ID covers clock.now (starts_at <= clock.now < ends_at) — cross-entity gate"
+        side_effects:
+          - "set assigned_agent_id = X-User-ID"
+          - "set agent_assigned_at = clock.now"
+          - "recompute sla_breached via sla_breach_check"
+          - "increment AlarmEvent.version by 1"
+      - from: AGENT_ASSIGNED
+        to: CONTACTING_SUBSCRIBER
+        trigger: "POST /pers/alarms/{id}/dispatch-actions (action_type == CALL_SUBSCRIBER)"
+        actor: CallCenterAgent
+        preconditions:
+          - "status == AGENT_ASSIGNED"
+          - "assigned_agent_id == X-User-ID"
+        side_effects:
+          - "set status = CONTACTING_SUBSCRIBER"
+          - "create DispatchAction(action_type=CALL_SUBSCRIBER); increment dispatch_count"
+          - "increment AlarmEvent.version by 1"
+      - from: CONTACTING_SUBSCRIBER
+        to: RESOLVED_OK
+        trigger: "POST /pers/alarms/{id}/dispatch-actions (action_type == RESOLVE_OK, outcome == CONFIRMED_OK)"
+        actor: CallCenterAgent
+        preconditions:
+          - "status == CONTACTING_SUBSCRIBER"
+          - "assigned_agent_id == X-User-ID"
+        side_effects:
+          - "set status = RESOLVED_OK; set resolved_at = clock.now"
+          - "create DispatchAction(action_type=RESOLVE_OK); increment dispatch_count"
+          - "decrement Device.open_alarm_count by 1 (cross-entity)"
+          - "increment AlarmEvent.version by 1"
+      - from: CONTACTING_SUBSCRIBER
+        to: FALSE_ALARM
+        trigger: "POST /pers/alarms/{id}/dispatch-actions (action_type == MARK_FALSE_ALARM, outcome == CONFIRMED_FALSE)"
+        actor: CallCenterAgent
+        preconditions:
+          - "status == CONTACTING_SUBSCRIBER"
+          - "assigned_agent_id == X-User-ID"
+        side_effects:
+          - "set status = FALSE_ALARM; set resolved_at = clock.now"
+          - "create DispatchAction(action_type=MARK_FALSE_ALARM); increment dispatch_count"
+          - "decrement Device.open_alarm_count by 1 (cross-entity)"
+          - "increment AlarmEvent.version by 1"
+        note: "False-alarm path fires NO 911 dispatch and NO contact escalation — distinct side-effect set from RESOLVED_OK (which the prose treats as a confirmed-well outcome)."
+      - from: CONTACTING_SUBSCRIBER
+        to: ESCALATING
+        trigger: "POST /pers/alarms/{id}/dispatch-actions (action_type == CALL_SUBSCRIBER, outcome == NO_ANSWER)"
+        actor: CallCenterAgent
+        preconditions:
+          - "status == CONTACTING_SUBSCRIBER"
+          - "assigned_agent_id == X-User-ID"
+          - "subscriber has at least one active EmergencyContact"
+        side_effects:
+          - "set status = ESCALATING"
+          - "set current_escalation_rank = priority_rank of the lowest-priority_rank active EmergencyContact for the subscriber"
+          - "create DispatchAction(action_type=CALL_SUBSCRIBER, outcome=NO_ANSWER); increment dispatch_count"
+          - "increment AlarmEvent.version by 1"
+      - from: ESCALATING
+        to: ESCALATING
+        trigger: "POST /pers/alarms/{id}/dispatch-actions (action_type == CALL_CONTACT, outcome == NO_ANSWER)"
+        actor: CallCenterAgent
+        preconditions:
+          - "status == ESCALATING"
+          - "assigned_agent_id == X-User-ID"
+          - "target_contact_id is the active EmergencyContact whose priority_rank == current_escalation_rank"
+          - "that contact has a non-null escalates_to_contact_id pointing to an active contact"
+        side_effects:
+          - "set current_escalation_rank = priority_rank of the contact referenced by escalates_to_contact_id"
+          - "create DispatchAction(action_type=CALL_CONTACT, outcome=NO_ANSWER); increment dispatch_count"
+          - "increment AlarmEvent.version by 1"
+        note: "Self-loop walks the contact tree one hop per NO_ANSWER (cyclic on AlarmEvent)."
+      - from: ESCALATING
+        to: RESOLVED_OK
+        trigger: "POST /pers/alarms/{id}/dispatch-actions (action_type == CALL_CONTACT, outcome == ANSWERED, then RESOLVE_OK)"
+        actor: CallCenterAgent
+        preconditions:
+          - "status == ESCALATING"
+          - "assigned_agent_id == X-User-ID"
+        side_effects:
+          - "set status = RESOLVED_OK; set resolved_at = clock.now"
+          - "create DispatchAction(action_type=RESOLVE_OK); increment dispatch_count"
+          - "decrement Device.open_alarm_count by 1 (cross-entity)"
+          - "increment AlarmEvent.version by 1"
+      - from: ESCALATING
+        to: DISPATCHED_911
+        trigger: "POST /pers/alarms/{id}/dispatch-actions (action_type == DISPATCH_911, outcome == DISPATCHED)"
+        actor: CallCenterAgent
+        preconditions:
+          - "status == ESCALATING"
+          - "assigned_agent_id == X-User-ID"
+          - "either priority == CRITICAL, OR the target_contact answering authorized it (a CALL_CONTACT DispatchAction with outcome ANSWERED exists whose contact can_authorize_911 == true)"
+        side_effects:
+          - "set status = DISPATCHED_911; set resolved_at = clock.now"
+          - "create DispatchAction(action_type=DISPATCH_911, outcome=DISPATCHED); increment dispatch_count"
+          - "decrement Device.open_alarm_count by 1 (cross-entity)"
+          - "increment AlarmEvent.version by 1"
+        note: "911 path requires CRITICAL priority OR an authorizing contact — a contact-tree state gate."
+      - from: CONTACTING_SUBSCRIBER
+        to: DISPATCHED_911
+        trigger: "POST /pers/alarms/{id}/dispatch-actions (action_type == DISPATCH_911, outcome == DISPATCHED)"
+        actor: CallCenterAgent
+        preconditions:
+          - "status == CONTACTING_SUBSCRIBER"
+          - "assigned_agent_id == X-User-ID"
+          - "priority == CRITICAL"
+        side_effects:
+          - "set status = DISPATCHED_911; set resolved_at = clock.now"
+          - "create DispatchAction(action_type=DISPATCH_911, outcome=DISPATCHED); increment dispatch_count"
+          - "decrement Device.open_alarm_count by 1 (cross-entity)"
+          - "increment AlarmEvent.version by 1"
+        note: "Direct CRITICAL 911 skips contact tree."
+
+  - entity: EquipmentReturn
+    initial_state: INITIATED
+    terminal_states: [CLOSED]
+    transitions:
+      - from: INITIATED
+        to: KIT_SENT
+        trigger: "POST /pers/equipment-returns/{id}/send-kit"
+        actor: PlatformAdmin
+        preconditions:
+          - "status == INITIATED"
+        side_effects:
+          - "set status = KIT_SENT"
+          - "increment EquipmentReturn.version by 1"
+      - from: KIT_SENT
+        to: RECEIVED
+        trigger: "POST /pers/equipment-returns/{id}/mark-received"
+        actor: PlatformAdmin
+        preconditions:
+          - "status == KIT_SENT"
+        side_effects:
+          - "set status = RECEIVED; set received_at = clock.now"
+          - "increment EquipmentReturn.version by 1"
+      - from: RECEIVED
+        to: INSPECTED_OK
+        trigger: "POST /pers/equipment-returns/{id}/inspect (condition_grade in {A, B})"
+        actor: PlatformAdmin
+        preconditions:
+          - "status == RECEIVED"
+          - "condition_grade in {A, B}"
+        side_effects:
+          - "set status = INSPECTED_OK; set condition_grade"
+          - "set damage_fee_cents = 0"
+          - "increment EquipmentReturn.version by 1"
+      - from: RECEIVED
+        to: DAMAGED
+        trigger: "POST /pers/equipment-returns/{id}/inspect (condition_grade == C)"
+        actor: PlatformAdmin
+        preconditions:
+          - "status == RECEIVED"
+          - "condition_grade == C"
+        side_effects:
+          - "set status = DAMAGED; set condition_grade = C"
+          - "compute damage_fee_cents via equipment_damage_fee (variant = DAMAGED)"
+          - "add damage_fee_cents to Contract.outstanding_balance_cents (cross-entity, cross-aggregate)"
+          - "increment EquipmentReturn.version by 1"
+        note: "RECEIVED forks to INSPECTED_OK or DAMAGED with divergent fee side-effects."
+      - from: INITIATED
+        to: DAMAGED
+        trigger: "POST /pers/equipment-returns/{id}/inspect (condition_grade == UNRETURNED)"
+        actor: PlatformAdmin
+        preconditions:
+          - "status in {INITIATED, KIT_SENT}"
+          - "condition_grade == UNRETURNED"
+          - "clock.now > due_back_at"
+        side_effects:
+          - "set status = DAMAGED; set condition_grade = UNRETURNED"
+          - "compute damage_fee_cents via equipment_damage_fee (variant = UNRETURNED)"
+          - "add damage_fee_cents to Contract.outstanding_balance_cents (cross-entity, cross-aggregate)"
+          - "increment EquipmentReturn.version by 1"
+        note: "Unreturned-past-deadline assesses the full replacement fee."
+      - from: INSPECTED_OK
+        to: CLOSED
+        trigger: "POST /pers/equipment-returns/{id}/close"
+        actor: PlatformAdmin
+        preconditions:
+          - "status in {INSPECTED_OK, DAMAGED}"
+        side_effects:
+          - "set status = CLOSED"
+          - "increment EquipmentReturn.version by 1"
+      - from: DAMAGED
+        to: CLOSED
+        trigger: "POST /pers/equipment-returns/{id}/close"
+        actor: PlatformAdmin
+        preconditions:
+          - "status in {INSPECTED_OK, DAMAGED}"
+        side_effects:
+          - "set status = CLOSED"
+          - "increment EquipmentReturn.version by 1"
+
+  - entity: AgentShift
+    initial_state: SCHEDULED
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /pers/agent-shifts/{id}/cancel"
+        actor: PlatformAdmin
+        preconditions:
+          - "status == SCHEDULED"
+        side_effects:
+          - "set status = CANCELLED"
+          - "increment AgentShift.version by 1"
+        note: "Cancelled shifts no longer cover alarm assignment and free their interval for new shifts."
+
+  - entity: MonitoringHold
+    initial_state: SCHEDULED
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /pers/monitoring-holds/{id}/cancel"
+        actor: Subscriber
+        preconditions:
+          - "status == SCHEDULED"
+        side_effects:
+          - "set status = CANCELLED"
+          - "increment MonitoringHold.version by 1"
+        note: "Cancelled holds free their interval (plus buffer) for new holds on the device."
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: cancellation-request-stale-contract
+    parent_entity: Contract
+    write_endpoint: "POST /pers/contracts/{id}/request-cancellation"
+    occ_field: "expected_contract_version"
+    description: |
+      Requesting cancellation against a Contract whose version has advanced since the
+      client last observed it is rejected. A billing action (mark-past-due / record-payment)
+      or a suspend/reinstate cascade legitimately bumps Contract.version between the
+      client's read and this request; the cancellation must be computed against the
+      version the client actually saw, so a stale expected_contract_version is rejected.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: prorated_cancellation_refund
+    trigger: "Contract request-cancellation (ACTIVE->CANCELLATION_REQUESTED or SUSPENDED->CANCELLATION_REQUESTED)"
+    algorithm: forward_looking
+    formula: |
+      # Monthly fee that applies = pinned_monthly_fee_cents
+      #   + (pinned_addon_cents if ANY device under contract has fall_detection_enabled else 0)
+      monthly_cents = pinned_monthly_fee_cents
+                      + (pinned_addon_cents if any_device_fall_detection else 0)
+      # cycle is the prepaid month [paid_through_at - 1 month, paid_through_at]
+      cycle_start = paid_through_at minus 1 month   # whole-month subtraction
+      cycle_total_days = days_in_interval(cycle_start, paid_through_at)   # calendar days
+      if variant == STANDARD:
+        # service runs to end of paid cycle: NO unused days refunded; refund = 0
+        refund = 0
+      elif variant == IMMEDIATE:
+        # suspended: prorate unused days from clock.now to paid_through_at
+        unused_days = days_in_interval(clock.now, paid_through_at)   # 0 if now >= paid_through_at
+        # round per-DAY rate first, then multiply (per-line-item rounding, then sum)
+        per_day_cents = round_half_up(monthly_cents / cycle_total_days)   # round each day's rate
+        refund = per_day_cents * unused_days
+      return refund
+    input_set: "Single Contract plus all Devices under it (to test any_device_fall_detection)"
+    constants:
+      DAYS_ROUNDING: "round_half_up at the per-day rate, THEN multiply by unused_days"
+    precision: "integer cents; round_half_up applied to per-day rate BEFORE multiplying (per-line-item-then-sum order pinned)"
+    variants:
+      - name: STANDARD
+        when: "service_status was ACTIVE at request — service continues to paid_through_at"
+        difference: "refund = 0 (subscriber keeps service through the prepaid cycle they already paid for)"
+      - name: IMMEDIATE
+        when: "service_status was SUSPENDED at request — service already stopped"
+        difference: "refund = round_half_up(monthly_cents / cycle_total_days) * unused_days (per-day rounding then multiply)"
+
+  - name: equipment_damage_fee
+    trigger: "EquipmentReturn inspect (RECEIVED->DAMAGED, or INITIATED/KIT_SENT->DAMAGED for UNRETURNED)"
+    algorithm: tiered_pricing
+    formula: |
+      # Replacement cost depends on device_type; UNRETURNED charges 100%, grade-C charges a fraction.
+      base = REPLACEMENT_COST_CENTS[device_type]
+      if variant == DAMAGED:        # condition_grade == C
+        fee = round_half_up(base * GRADE_C_FRACTION)
+      elif variant == UNRETURNED:   # condition_grade == UNRETURNED, past due_back_at
+        fee = base                  # full replacement
+      return fee
+    input_set: "Single EquipmentReturn + its Device.device_type"
+    constants:
+      REPLACEMENT_COST_CENTS: "{ PENDANT: 8000, WRISTBAND: 9000, MOBILE_GPS: 18000, HOME_BASE: 12000 }"
+      GRADE_C_FRACTION: 0.5
+    precision: "integer cents; round_half_up"
+    variants:
+      - name: DAMAGED
+        when: "condition_grade == C"
+        difference: "fee = 50% of replacement cost"
+      - name: UNRETURNED
+        when: "condition_grade == UNRETURNED and clock.now > due_back_at"
+        difference: "fee = 100% of replacement cost"
+
+  - name: alarm_priority_score
+    trigger: "AlarmEvent creation (POST /pers/devices/{id}/alarms)"
+    algorithm: weighted_scoring
+    formula: |
+      # >=3 inputs, non-linear interaction via nested conditionals and max()
+      base = SIGNAL_WEIGHT[signal_type]            # see constants
+      fall_bonus = FALL_BONUS if (device.fall_detection_enabled and signal_type == FALL_DETECTED) else 0
+      battery_bonus = BATTERY_BONUS if device.battery_health == CRITICAL else 0
+      score = base + fall_bonus + battery_bonus
+      # tier selection is non-linear: CRITICAL if score >= CRITICAL_CUTOFF, else ELEVATED if score >= ELEVATED_CUTOFF, else ROUTINE
+      if score >= CRITICAL_CUTOFF: priority = CRITICAL
+      elif score >= ELEVATED_CUTOFF: priority = ELEVATED
+      else: priority = ROUTINE
+      return priority
+    input_set: "Single AlarmEvent + its Device (signal_type, fall_detection_enabled, battery_health)"
+    constants:
+      SIGNAL_WEIGHT: "{ MANUAL_BUTTON: 40, FALL_DETECTED: 60, BATTERY_CRITICAL: 20, PERIODIC_CHECKIN_MISSED: 50 }"
+      FALL_BONUS: 30
+      BATTERY_BONUS: 25
+      ELEVATED_CUTOFF: 50
+      CRITICAL_CUTOFF: 80
+    precision: "integer score; >= at each cutoff boundary"
+
+  - name: sla_breach_check
+    trigger: "AlarmEvent assign (SIGNAL_RECEIVED->AGENT_ASSIGNED)"
+    algorithm: threshold
+    formula: |
+      elapsed_seconds = (agent_assigned_at - signal_received_at) in whole seconds
+      # boundary precision: breach when elapsed STRICTLY exceeds the SLA (> not >=)
+      sla_breached = (elapsed_seconds > plan.response_sla_seconds)
+      return sla_breached
+    input_set: "Single AlarmEvent + the plan pinned on the device's contract (response_sla_seconds)"
+    constants:
+      BOUNDARY: "strict greater-than: elapsed == response_sla_seconds is NOT a breach"
+    precision: "whole seconds; strict > comparison"
+
+  - name: battery_health_class
+    trigger: "DeviceTest submit; recomputed on Device when battery_pct changes"
+    algorithm: threshold
+    formula: |
+      # boundary precision distinct from sla: uses >= at the LOW/CRITICAL cutoffs
+      if battery_pct >= GOOD_CUTOFF: battery_health = GOOD
+      elif battery_pct >= LOW_CUTOFF: battery_health = LOW
+      else: battery_health = CRITICAL
+      return battery_health
+    input_set: "Single Device.battery_pct"
+    constants:
+      GOOD_CUTOFF: 40
+      LOW_CUTOFF: 20
+    precision: "integer percent; >= at GOOD_CUTOFF and LOW_CUTOFF"
+
+  - name: device_test_result
+    trigger: "DeviceTest submit (POST /pers/devices/{id}/tests)"
+    algorithm: threshold
+    formula: |
+      # signal failure dominates battery failure (ordered, non-commutative)
+      if not signal_ok: result = FAIL_SIGNAL
+      elif reported_battery_pct < LOW_CUTOFF: result = FAIL_BATTERY   # CRITICAL band fails the test
+      else: result = PASS
+      return result
+    input_set: "Single DeviceTest (signal_ok, reported_battery_pct)"
+    constants:
+      LOW_CUTOFF: 20
+    precision: "integer percent; strict < at LOW_CUTOFF — battery == 20 PASSes (LOW but not failing)"
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /pers/_clock/set_current_utc which still requires headers"
+  - priority: 2
+    category: auth
+    check: "Role is permitted to perform the operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "Every path/body referenced resource exists, validated left-to-right in the path"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+  - priority: 4
+    category: state
+    check: "Subscriber owning the resource must be the acting Subscriber (X-User-ID == subscriber_id) for subscriber-scoped writes"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Subscriber-role writes on contracts/devices/contacts they do not own"
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which this transition is legal (state-machine from: matches)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 6
+    category: state
+    check: "Assigned-agent ownership: dispatch actions require AlarmEvent.assigned_agent_id == X-User-ID"
+    error_id: ERR_NOT_ASSIGNED_AGENT
+    http_status: 403
+    applies_to: "POST /pers/alarms/{id}/dispatch-actions, POST /pers/alarms/{id}/assign(re-assign)"
+  - priority: 7
+    category: business_safety
+    check: "Cannot finalize-cancellation while any Device under the contract is ACTIVE or NEEDS_TEST, or any AlarmEvent is non-terminal (life-safety: never strand a live monitored device)"
+    error_id: ERR_LIVE_MONITORING_BLOCKS_CANCEL
+    http_status: 409
+    applies_to: "POST /pers/contracts/{id}/finalize-cancellation"
+  - priority: 8
+    category: business_safety
+    check: "911 dispatch requires priority == CRITICAL OR an authorizing contact (a CALL_CONTACT DispatchAction with outcome ANSWERED whose contact can_authorize_911 == true)"
+    error_id: ERR_911_NOT_AUTHORIZED
+    http_status: 409
+    applies_to: "POST /pers/alarms/{id}/dispatch-actions with action_type == DISPATCH_911"
+  - priority: 9
+    category: business_referential
+    check: "Alarm assign requires a SCHEDULED AgentShift for the acting agent (X-User-ID) covering clock.now: starts_at <= clock.now < ends_at"
+    error_id: ERR_NO_SHIFT_COVERAGE
+    http_status: 409
+    applies_to: "POST /pers/alarms/{id}/assign"
+  - priority: 10
+    category: business_referential
+    check: "An alarm cannot be raised on a device whose contract service_status is not ACTIVE (SUSPENDED/cancelled contracts do not monitor)"
+    error_id: ERR_CONTRACT_NOT_MONITORING
+    http_status: 409
+    applies_to: "POST /pers/devices/{id}/alarms"
+  - priority: 11
+    category: business_referential
+    check: "Escalation CALL_CONTACT must target the contact whose priority_rank == current_escalation_rank and is active; out-of-order contact-tree calls rejected"
+    error_id: ERR_ESCALATION_ORDER
+    http_status: 409
+    applies_to: "POST /pers/alarms/{id}/dispatch-actions with action_type == CALL_CONTACT"
+  - priority: 12
+    category: business_temporal
+    check: "AgentShift half-open overlap: a new SCHEDULED shift for an agent_user_id whose [starts_at, ends_at) intersects an existing SCHEDULED shift for the SAME agent is rejected. Adjacency (existing.ends_at == new.starts_at) is allowed (zero buffer); intervals are half-open [start, end)."
+    error_id: ERR_SHIFT_OVERLAP
+    http_status: 409
+    applies_to: "POST /pers/agent-shifts"
+  - priority: 13
+    category: business_temporal
+    check: "MonitoringHold buffered overlap: a new SCHEDULED hold for a device is rejected if its [starts_at, ends_at) comes within HOLD_GAP_DAYS (7 days) of any existing SCHEDULED hold on that device — i.e. rejected unless new.starts_at >= existing.ends_at + 7d OR new.ends_at + 7d <= existing.starts_at. Distinct buffered semantics from the zero-buffer shift rule."
+    error_id: ERR_HOLD_OVERLAP
+    http_status: 409
+    applies_to: "POST /pers/monitoring-holds"
+  - priority: 14
+    category: business_constraint
+    check: "Device enroll requires a prior passing DeviceTest; fall_detection_enabled requires a fall-capable device_type"
+    error_id: ERR_ENROLL_PRECONDITION
+    http_status: 422
+    applies_to: "POST /pers/devices/{id}/enroll"
+  - priority: 15
+    category: business_constraint
+    check: "EmergencyContact.priority_rank must be unique within a subscriber; escalates_to_contact_id must reference an existing contact of the same subscriber and must not form a cycle"
+    error_id: ERR_CONTACT_TREE_INVALID
+    http_status: 422
+    applies_to: "POST /pers/emergency-contacts, PATCH /pers/emergency-contacts/{id}"
+  - priority: 16
+    category: business_constraint
+    check: "Device serial_number unique; MonitoringPlan.tier unique among non-archived; Subscriber.email unique"
+    error_id: ERR_DUPLICATE
+    http_status: 409
+    applies_to: "POST /pers/devices, POST /pers/monitoring-plans, POST /pers/subscribers"
+  - priority: 17
+    category: business_temporal
+    check: "Cannot mark-past-due unless clock.now > paid_through_at; cannot finalize-cancellation unless clock.now >= cancellation_effective_at; UNRETURNED inspect requires clock.now > due_back_at"
+    error_id: ERR_TEMPORAL_NOT_DUE
+    http_status: 409
+    applies_to: "billing/mark-past-due, contracts/finalize-cancellation, equipment-returns/inspect(UNRETURNED)"
+  - priority: 18
+    category: business_fiscal
+    check: "OCC: expected_contract_version must equal Contract.version on cancellation request"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /pers/contracts/{id}/request-cancellation"
+  - priority: 19
+    category: business_constraint
+    check: "Field-level input validity: enum membership, integer ranges (battery 0..100), required fields present, positive amounts, ends_at strictly after starts_at on shifts/holds"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # ---- test-driving clock ----
+  - method: POST
+    path: "/pers/_clock/set_current_utc"
+    description: "Set the server logical clock. Startup default is 2026-05-01T00:00:00Z; before any set call the clock reads exactly this default and never falls back to wall-clock time."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["sets logical clock used by all time-dependent rules"]
+
+  # ---- MonitoringPlan ----
+  - method: POST
+    path: "/pers/monitoring-plans"
+    description: "Create a monitoring plan tier"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [tier, monthly_fee_cents, fall_detection_addon_cents, included_test_interval_days, response_sla_seconds, early_termination_fee_cents, min_commitment_months]
+    output: MonitoringPlan
+    side_effects: []
+  - method: GET
+    path: "/pers/monitoring-plans"
+    description: "List monitoring plans (paginated)"
+    roles: [PlatformAdmin, Subscriber]
+    code: 200
+    input:
+      - "archived?"
+      - "limit?"
+      - "offset?"
+    output: MonitoringPlan[]
+    side_effects: []
+  - method: GET
+    path: "/pers/monitoring-plans/{id}"
+    description: "Get a monitoring plan"
+    roles: [PlatformAdmin, Subscriber]
+    code: 200
+    input: []
+    output: MonitoringPlan
+    side_effects: []
+  - method: POST
+    path: "/pers/monitoring-plans/{id}/archive"
+    description: "Archive a plan so it cannot back new contracts"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: MonitoringPlan
+    side_effects: ["sets archived = true"]
+
+  # ---- Subscriber ----
+  - method: POST
+    path: "/pers/subscribers"
+    description: "Create a subscriber account"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [full_name, email, residence_address, phone]
+    output: Subscriber
+    side_effects: []
+  - method: GET
+    path: "/pers/subscribers/{id}"
+    description: "Get a subscriber"
+    roles: [PlatformAdmin, Subscriber]
+    code: 200
+    input: []
+    output: Subscriber
+    side_effects: []
+
+  # ---- Contract ----
+  - method: POST
+    path: "/pers/contracts"
+    description: "Create a contract (PENDING_ACTIVATION) for a subscriber on a plan"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [subscriber_id, plan_id]
+    output: Contract
+    side_effects: []
+  - method: GET
+    path: "/pers/contracts/{id}"
+    description: "Get a contract"
+    roles: [PlatformAdmin, Subscriber]
+    code: 200
+    input: []
+    output: Contract
+    side_effects: []
+  - method: GET
+    path: "/pers/contracts"
+    description: "List contracts, filterable by subscriber_id and plan_id"
+    roles: [PlatformAdmin, Subscriber]
+    code: 200
+    input:
+      - "subscriber_id?"
+      - "plan_id?"
+      - "limit?"
+      - "offset?"
+    output: Contract[]
+    side_effects: []
+  - method: POST
+    path: "/pers/contracts/{id}/activate"
+    description: "Activate a contract; pins plan fees and cascades enrolled devices to ACTIVE"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Contract
+    side_effects: ["service_status->ACTIVE", "pin fees", "set activated_at, paid_through_at", "cascade ENROLLED devices->ACTIVE then set last_test_at/next_test_due_at", "increments Contract.version by 1"]
+  - method: POST
+    path: "/pers/contracts/{id}/suspend"
+    description: "Suspend monitoring on a past-due contract; cascades devices to SUSPENDED"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Contract
+    side_effects: ["service_status->SUSPENDED", "cascade ACTIVE devices->SUSPENDED", "increments Contract.version by 1"]
+  - method: POST
+    path: "/pers/contracts/{id}/reinstate"
+    description: "Reinstate a suspended contract once billing is current; cascades devices back to ACTIVE"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Contract
+    side_effects: ["service_status->ACTIVE", "cascade SUSPENDED devices->ACTIVE", "increments Contract.version by 1"]
+  - method: POST
+    path: "/pers/contracts/{id}/request-cancellation"
+    description: "Subscriber requests cancellation; computes refund, ETF, outstanding balance"
+    roles: [Subscriber]
+    code: 200
+    input: [expected_contract_version]
+    output: Contract
+    side_effects: ["service_status->CANCELLATION_REQUESTED", "compute refund_cents, etf_charged_cents, outstanding_balance_cents", "set cancellation_effective_at", "increments Contract.version by 1"]
+  - method: POST
+    path: "/pers/contracts/{id}/finalize-cancellation"
+    description: "Finalize cancellation after effective date; deactivates devices and opens equipment returns"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Contract
+    side_effects: ["service_status->CANCELLED", "cascade devices->DEACTIVATED", "create one EquipmentReturn per device (INITIATED)", "increments Contract.version by 1"]
+  - method: POST
+    path: "/pers/contracts/{id}/billing/mark-past-due"
+    description: "Mark contract billing PAST_DUE when paid_through_at has elapsed"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Contract
+    side_effects: ["billing_status->PAST_DUE", "increments Contract.version by 1"]
+  - method: POST
+    path: "/pers/contracts/{id}/billing/record-payment"
+    description: "Record a payment clearing PAST_DUE and advancing paid_through_at"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Contract
+    side_effects: ["billing_status->CURRENT", "paid_through_at += 1 month", "increments Contract.version by 1"]
+  - method: POST
+    path: "/pers/contracts/{id}/billing/write-off"
+    description: "Write off a cancelled, past-due contract balance"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Contract
+    side_effects: ["billing_status->WRITTEN_OFF", "increments Contract.version by 1"]
+
+  # ---- Device ----
+  - method: POST
+    path: "/pers/devices"
+    description: "Register a device under a contract (REGISTERED)"
+    roles: [PlatformAdmin, Subscriber]
+    code: 201
+    input:
+      - contract_id
+      - serial_number
+      - device_type
+      - "fall_detection_enabled?"
+    output: Device
+    side_effects: []
+  - method: GET
+    path: "/pers/devices/{id}"
+    description: "Get a device"
+    roles: [PlatformAdmin, Subscriber, CallCenterAgent]
+    code: 200
+    input: []
+    output: Device
+    side_effects: []
+  - method: GET
+    path: "/pers/devices"
+    description: "List devices, filterable by contract_id"
+    roles: [PlatformAdmin, Subscriber, CallCenterAgent]
+    code: 200
+    input:
+      - "contract_id?"
+      - "limit?"
+      - "offset?"
+    output: Device[]
+    side_effects: []
+  - method: GET
+    path: "/pers/contracts/{id}/devices"
+    description: "List devices enrolled under a contract"
+    roles: [PlatformAdmin, Subscriber]
+    code: 200
+    input: []
+    output: Device[]
+    side_effects: []
+  - method: POST
+    path: "/pers/devices/{id}/enroll"
+    description: "Enroll a registered device after a passing test"
+    roles: [Subscriber]
+    code: 200
+    input: []
+    output: Device
+    side_effects: ["status->ENROLLED", "increments Device.version by 1"]
+  - method: POST
+    path: "/pers/devices/{id}/tests"
+    description: "Submit a device self-test / battery-health check"
+    roles: [Subscriber]
+    code: 201
+    input: [reported_battery_pct, signal_ok]
+    output: DeviceTest
+    side_effects: ["compute result via device_test_result", "ALWAYS set Device.battery_pct = reported_battery_pct and recompute battery_health via battery_health_class (every test, PASS or FAIL)", "if PASS set last_test_at = clock.now and recompute next_test_due_at", "if device NEEDS_TEST and result PASS -> ACTIVE", "if device ACTIVE and clock.now >= next_test_due_at -> NEEDS_TEST first (auto-transition)", "increments Device.version by 1"]
+  - method: GET
+    path: "/pers/devices/{id}/tests"
+    description: "List a device's tests"
+    roles: [PlatformAdmin, Subscriber]
+    code: 200
+    input: []
+    output: DeviceTest[]
+    side_effects: []
+
+  # ---- EmergencyContact ----
+  - method: POST
+    path: "/pers/emergency-contacts"
+    description: "Add an emergency contact to a subscriber's contact tree"
+    roles: [Subscriber]
+    code: 201
+    input:
+      - subscriber_id
+      - name
+      - phone
+      - relationship
+      - priority_rank
+      - "escalates_to_contact_id?"
+      - "can_authorize_911?"
+    output: EmergencyContact
+    side_effects: []
+  - method: GET
+    path: "/pers/emergency-contacts/{id}"
+    description: "Get an emergency contact"
+    roles: [PlatformAdmin, Subscriber, CallCenterAgent]
+    code: 200
+    input: []
+    output: EmergencyContact
+    side_effects: []
+  - method: GET
+    path: "/pers/emergency-contacts"
+    description: "List emergency contacts, filterable by subscriber_id and escalates_to_contact_id (ordered by priority_rank ASC)"
+    roles: [PlatformAdmin, Subscriber, CallCenterAgent]
+    code: 200
+    input:
+      - "subscriber_id?"
+      - "escalates_to_contact_id?"
+      - "limit?"
+      - "offset?"
+    output: EmergencyContact[]
+    side_effects: []
+  - method: PATCH
+    path: "/pers/emergency-contacts/{id}"
+    description: "Update an emergency contact (rank, escalation target, active, can_authorize_911)"
+    roles: [Subscriber]
+    code: 200
+    input:
+      - "priority_rank?"
+      - "escalates_to_contact_id?"
+      - "can_authorize_911?"
+      - "active?"
+    output: EmergencyContact
+    side_effects: ["increments EmergencyContact.version by 1"]
+
+  # ---- AlarmEvent + DispatchAction ----
+  - method: POST
+    path: "/pers/devices/{id}/alarms"
+    description: "Raise an alarm signal from a device (SIGNAL_RECEIVED); computes priority"
+    roles: [Subscriber, CallCenterAgent]
+    code: 201
+    input: [signal_type]
+    output: AlarmEvent
+    side_effects: ["compute priority via alarm_priority_score", "increment Device.open_alarm_count", "if device overdue -> NEEDS_TEST"]
+  - method: GET
+    path: "/pers/alarms/{id}"
+    description: "Get an alarm event"
+    roles: [PlatformAdmin, CallCenterAgent, Subscriber]
+    code: 200
+    input: []
+    output: AlarmEvent
+    side_effects: []
+  - method: GET
+    path: "/pers/alarms"
+    description: "List alarms, filterable by device_id and status"
+    roles: [PlatformAdmin, CallCenterAgent, Subscriber]
+    code: 200
+    input:
+      - "device_id?"
+      - "status?"
+      - "limit?"
+      - "offset?"
+    output: AlarmEvent[]
+    side_effects: []
+  - method: GET
+    path: "/pers/devices/{id}/alarms"
+    description: "List alarms raised by a device"
+    roles: [PlatformAdmin, CallCenterAgent, Subscriber]
+    code: 200
+    input: []
+    output: AlarmEvent[]
+    side_effects: []
+  - method: POST
+    path: "/pers/alarms/{id}/assign"
+    description: "Call-center agent claims/assigns an alarm; computes SLA breach"
+    roles: [CallCenterAgent]
+    code: 200
+    input: []
+    output: AlarmEvent
+    side_effects: ["set assigned_agent_id, agent_assigned_at", "compute sla_breached", "status->AGENT_ASSIGNED", "increments AlarmEvent.version by 1"]
+  - method: POST
+    path: "/pers/alarms/{id}/dispatch-actions"
+    description: "Record a dispatch step (call subscriber/contact, dispatch 911, resolve, false-alarm); advances alarm status"
+    roles: [CallCenterAgent]
+    code: 201
+    input:
+      - action_type
+      - outcome
+      - "target_contact_id?"
+    output: DispatchAction
+    side_effects: ["advance AlarmEvent.status per branch", "increment dispatch_count", "update current_escalation_rank", "on terminal: set resolved_at, decrement Device.open_alarm_count", "increments AlarmEvent.version by 1"]
+  - method: GET
+    path: "/pers/alarms/{id}/dispatch-actions"
+    description: "List dispatch actions for an alarm (ordered by recorded_at ASC)"
+    roles: [PlatformAdmin, CallCenterAgent, Subscriber]
+    code: 200
+    input: []
+    output: DispatchAction[]
+    side_effects: []
+  - method: GET
+    path: "/pers/dispatch-actions/{id}"
+    description: "Get a single dispatch action"
+    roles: [PlatformAdmin, CallCenterAgent, Subscriber]
+    code: 200
+    input: []
+    output: DispatchAction
+    side_effects: []
+  - method: GET
+    path: "/pers/dispatch-actions"
+    description: "List dispatch actions, filterable by alarm_event_id and target_contact_id"
+    roles: [PlatformAdmin, CallCenterAgent, Subscriber]
+    code: 200
+    input:
+      - "alarm_event_id?"
+      - "target_contact_id?"
+      - "limit?"
+      - "offset?"
+    output: DispatchAction[]
+    side_effects: []
+
+  # ---- EquipmentReturn ----
+  - method: GET
+    path: "/pers/equipment-returns/{id}"
+    description: "Get an equipment return"
+    roles: [PlatformAdmin, Subscriber]
+    code: 200
+    input: []
+    output: EquipmentReturn
+    side_effects: []
+  - method: GET
+    path: "/pers/equipment-returns"
+    description: "List equipment returns, filterable by contract_id and device_id"
+    roles: [PlatformAdmin, Subscriber]
+    code: 200
+    input:
+      - "contract_id?"
+      - "device_id?"
+      - "limit?"
+      - "offset?"
+    output: EquipmentReturn[]
+    side_effects: []
+  - method: GET
+    path: "/pers/contracts/{id}/equipment-returns"
+    description: "List equipment returns opened under a contract"
+    roles: [PlatformAdmin, Subscriber]
+    code: 200
+    input: []
+    output: EquipmentReturn[]
+    side_effects: []
+  - method: POST
+    path: "/pers/equipment-returns/{id}/send-kit"
+    description: "Mail the return kit (INITIATED->KIT_SENT)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: EquipmentReturn
+    side_effects: ["status->KIT_SENT", "increments EquipmentReturn.version by 1"]
+  - method: POST
+    path: "/pers/equipment-returns/{id}/mark-received"
+    description: "Mark the kit received (KIT_SENT->RECEIVED)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: EquipmentReturn
+    side_effects: ["status->RECEIVED", "set received_at", "increments EquipmentReturn.version by 1"]
+  - method: POST
+    path: "/pers/equipment-returns/{id}/inspect"
+    description: "Inspect returned equipment; grade A/B closes clean, C is damaged, UNRETURNED past deadline charges full replacement"
+    roles: [PlatformAdmin]
+    code: 200
+    input: [condition_grade]
+    output: EquipmentReturn
+    side_effects: ["status->INSPECTED_OK or DAMAGED", "compute damage_fee_cents", "on DAMAGED add damage_fee_cents to Contract.outstanding_balance_cents", "increments EquipmentReturn.version by 1"]
+  - method: POST
+    path: "/pers/equipment-returns/{id}/close"
+    description: "Close an inspected/damaged return (->CLOSED)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: EquipmentReturn
+    side_effects: ["status->CLOSED", "increments EquipmentReturn.version by 1"]
+
+  # ---- AgentShift ----
+  - method: POST
+    path: "/pers/agent-shifts"
+    description: "Schedule an on-call coverage shift for a call-center agent; rejects half-open overlap with the agent's existing SCHEDULED shifts"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [agent_user_id, starts_at, ends_at]
+    output: AgentShift
+    side_effects: []
+  - method: GET
+    path: "/pers/agent-shifts/{id}"
+    description: "Get an agent shift"
+    roles: [PlatformAdmin, CallCenterAgent]
+    code: 200
+    input: []
+    output: AgentShift
+    side_effects: []
+  - method: GET
+    path: "/pers/agent-shifts"
+    description: "List agent shifts, filterable by agent_user_id and status"
+    roles: [PlatformAdmin, CallCenterAgent]
+    code: 200
+    input:
+      - "agent_user_id?"
+      - "status?"
+      - "limit?"
+      - "offset?"
+    output: AgentShift[]
+    side_effects: []
+  - method: POST
+    path: "/pers/agent-shifts/{id}/cancel"
+    description: "Cancel a scheduled shift (frees its interval)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: AgentShift
+    side_effects: ["status->CANCELLED", "increments AgentShift.version by 1"]
+
+  # ---- MonitoringHold ----
+  - method: POST
+    path: "/pers/monitoring-holds"
+    description: "Schedule a monitoring-suspension window on a device; rejects buffered overlap (within 7 days) of existing SCHEDULED holds on the device"
+    roles: [Subscriber]
+    code: 201
+    input: [device_id, starts_at, ends_at]
+    output: MonitoringHold
+    side_effects: []
+  - method: GET
+    path: "/pers/monitoring-holds/{id}"
+    description: "Get a monitoring hold"
+    roles: [PlatformAdmin, Subscriber]
+    code: 200
+    input: []
+    output: MonitoringHold
+    side_effects: []
+  - method: GET
+    path: "/pers/monitoring-holds"
+    description: "List monitoring holds, filterable by device_id and status"
+    roles: [PlatformAdmin, Subscriber, CallCenterAgent]
+    code: 200
+    input:
+      - "device_id?"
+      - "status?"
+      - "limit?"
+      - "offset?"
+    output: MonitoringHold[]
+    side_effects: []
+  - method: GET
+    path: "/pers/devices/{id}/monitoring-holds"
+    description: "List monitoring holds scheduled on a device"
+    roles: [PlatformAdmin, Subscriber, CallCenterAgent]
+    code: 200
+    input: []
+    output: MonitoringHold[]
+    side_effects: []
+  - method: POST
+    path: "/pers/monitoring-holds/{id}/cancel"
+    description: "Cancel a scheduled hold (frees its interval + buffer)"
+    roles: [Subscriber]
+    code: 200
+    input: []
+    output: MonitoringHold
+    side_effects: ["status->CANCELLED", "increments MonitoringHold.version by 1"]
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing or malformed X-User-Role / X-User-ID headers"
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Role not permitted for this operation per RBAC"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Subscriber acts on a contract/device/contact they do not own"
+  - id: ERR_NOT_ASSIGNED_AGENT
+    http: 403
+    condition: "Dispatch action attempted by an agent who is not AlarmEvent.assigned_agent_id"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced resource (path id or FK) does not exist"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource not in a legal state for the requested transition"
+  - id: ERR_LIVE_MONITORING_BLOCKS_CANCEL
+    http: 409
+    condition: "finalize-cancellation while a device is ACTIVE/NEEDS_TEST or an alarm is non-terminal"
+  - id: ERR_911_NOT_AUTHORIZED
+    http: 409
+    condition: "DISPATCH_911 without CRITICAL priority and without an authorizing answered contact"
+  - id: ERR_CONTRACT_NOT_MONITORING
+    http: 409
+    condition: "Alarm raised on a device whose contract service_status != ACTIVE"
+  - id: ERR_ESCALATION_ORDER
+    http: 409
+    condition: "CALL_CONTACT targets a contact whose priority_rank != current_escalation_rank, or an inactive contact"
+  - id: ERR_NO_SHIFT_COVERAGE
+    http: 409
+    condition: "Alarm assign by an agent with no SCHEDULED AgentShift covering clock.now"
+  - id: ERR_SHIFT_OVERLAP
+    http: 409
+    condition: "New SCHEDULED AgentShift half-open interval intersects an existing SCHEDULED shift for the same agent_user_id"
+  - id: ERR_HOLD_OVERLAP
+    http: 409
+    condition: "New SCHEDULED MonitoringHold within HOLD_GAP_DAYS (7d) buffer of an existing SCHEDULED hold on the same device"
+  - id: ERR_DUPLICATE
+    http: 409
+    condition: "Duplicate device serial_number, plan tier (non-archived), or subscriber email"
+  - id: ERR_TEMPORAL_NOT_DUE
+    http: 409
+    condition: "Time-gated action attempted before its due instant (mark-past-due, finalize-cancellation, UNRETURNED inspect)"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_contract_version != Contract.version on cancellation request (OCC)"
+  - id: ERR_ENROLL_PRECONDITION
+    http: 422
+    condition: "Enroll without a passing DeviceTest, or fall detection on a non-fall-capable device_type"
+  - id: ERR_CONTACT_TREE_INVALID
+    http: 422
+    condition: "Duplicate priority_rank within subscriber, escalation target of a different subscriber, or escalation cycle"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, invalid enum, out-of-range integer (e.g. battery not in 0..100), negative amount"
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: PlatformAdmin
+    description: "Operator who configures plans, manages contracts/billing, runs equipment-return processing, and sets the logical clock"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pers/monitoring-plans (and /{id}/archive)"
+      - "POST /pers/subscribers"
+      - "POST /pers/contracts"
+      - "POST /pers/contracts/{id}/activate, /suspend, /reinstate, /finalize-cancellation"
+      - "POST /pers/contracts/{id}/billing/* (mark-past-due, record-payment, write-off)"
+      - "POST /pers/equipment-returns/{id}/* (send-kit, mark-received, inspect, close)"
+      - "POST /pers/agent-shifts (and /{id}/cancel)"
+      - "POST /pers/_clock/set_current_utc"
+    shared_operations:
+      - "GET reads on plans, subscribers, contracts, devices, alarms, equipment-returns, agent-shifts, monitoring-holds"
+  - name: Subscriber
+    description: "Account holder who registers/enrolls/tests their own devices, manages their contact tree, requests cancellation, and may raise their own alarms"
+    identity: "entity_backed:Subscriber"
+    exclusive_operations:
+      - "POST /pers/contracts/{id}/request-cancellation"
+      - "POST /pers/devices/{id}/enroll"
+      - "POST /pers/devices/{id}/tests"
+      - "POST /pers/emergency-contacts, PATCH /pers/emergency-contacts/{id}"
+      - "POST /pers/monitoring-holds (and /{id}/cancel)"
+    shared_operations:
+      - "POST /pers/devices (register; also allowed to PlatformAdmin)"
+      - "POST /pers/devices/{id}/alarms (also allowed to CallCenterAgent)"
+      - "GET reads on own contracts, devices, contacts, alarms, equipment-returns, plans"
+  - name: CallCenterAgent
+    description: "Monitoring-center operator who assigns alarms and records dispatch actions through the response protocol"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pers/alarms/{id}/assign"
+      - "POST /pers/alarms/{id}/dispatch-actions"
+    shared_operations:
+      - "POST /pers/devices/{id}/alarms (also allowed to Subscriber)"
+      - "GET reads on alarms, devices, emergency-contacts, dispatch-actions"

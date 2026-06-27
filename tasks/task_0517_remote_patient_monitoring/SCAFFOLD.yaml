@@ -1,0 +1,1716 @@
+scenario: "Remote Patient Monitoring & Chronic Care Management (CCM/RPM): device enrollment & vitals capture, threshold alert & escalation, monthly care-time (20-min) tracking, CPT 99453/99454/99457 billing, care plan & consent, patient-engagement compliance days, provider review queue, payer reimbursement"
+domain_name: remote-patient-monitoring
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: ledger_reconciliation
+  complexity_layers:
+    - rate_threshold_triggers          # 16 device-days, 20-min care time, vitals threshold breaches
+    - dual_variant_calculation         # provisional accrual vs finalized monthly claim
+    - cascading_side_effects           # vitals breach -> alert -> review-queue item -> escalation
+    - optimistic_concurrency           # finalize-claim with supersede semantics on BillingPeriod
+    - derived_field_reconciliation     # care-minute totals, device-day counts kept consistent
+
+  entity_topology: hybrid
+  # Patient is the aggregate root; Device, ConsentRecord, CarePlan, BillingPeriod hang off it.
+  # VitalsReading, ThresholdAlert, CareActivity, ReviewTask, BillingLineItem, Claim cross-reference
+  # via FKs that span aggregate boundaries (Claim -> Payer, ReviewTask -> ThresholdAlert).
+
+  state_machine_shape: parallel
+  # Patient carries two independent dimensions (enrollment_status x monitoring_status).
+  # ThresholdAlert has a branching/revert cycle; Claim has a cyclic resubmit loop.
+
+  relationship_patterns:
+    - one_to_many                      # Patient -> Device, VitalsReading, CareActivity
+    - cross_aggregate                  # Claim references Payer; ReviewTask references ThresholdAlert
+    - self_referential                 # ReviewTask.escalated_from_task_id -> ReviewTask.id
+
+  role_model: segregation_of_duties
+  # The clinician who logs a CareActivity minute-block cannot also sign the provider review that
+  # attests it; the billing specialist who finalizes a claim cannot author care minutes.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Payer
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Insurer / payer organization name."
+      - name: payer_type
+        type: enum
+        source: input
+        description: "Reimbursement schedule selector."
+        constraints: "one of {MEDICARE, MEDICARE_ADVANTAGE, COMMERCIAL}"
+      - name: rate_99453_cents
+        type: integer
+        source: input
+        description: "Reimbursement for one-time device-setup/education CPT 99453, in cents."
+        constraints: ">= 0"
+      - name: rate_99454_cents
+        type: integer
+        source: input
+        description: "Reimbursement for the 99454 device-supply/transmission unit, in cents."
+        constraints: ">= 0"
+      - name: rate_99457_cents
+        type: integer
+        source: input
+        description: "Reimbursement for the first 99457 care-management 20-minute block, in cents."
+        constraints: ">= 0"
+      - name: requires_active_consent
+        type: boolean
+        source: input
+        default: true
+        description: "If true, claims for this payer are rejected unless patient consent is ACTIVE for the full billing period."
+      - name: timely_filing_days
+        type: integer
+        source: input
+        default: 90
+        description: "Days after the billing period's last calendar day within which a claim must be submitted; later submission is rejected."
+        constraints: ">= 1"
+
+  - name: Patient
+    parent: null
+    common_fields: true
+    fields:
+      - name: payer_id
+        type: string
+        source: input
+        description: "FK -> Payer.id; the patient's reimbursing payer."
+      - name: mrn
+        type: string
+        source: input
+        description: "Medical record number; unique across active (non-DISCHARGED) patients."
+        constraints: "non-empty; uniqueness enforced over enrollment_status IN {PENDING_CONSENT, ENROLLED, SUSPENDED}"
+      - name: full_name
+        type: string
+        source: input
+        description: "Patient legal name."
+      - name: enrollment_status
+        type: enum
+        source: system
+        default: PENDING_CONSENT
+        description: "Program enrollment dimension."
+        constraints: "one of {PENDING_CONSENT, ENROLLED, SUSPENDED, DISCHARGED}"
+      - name: monitoring_status
+        type: enum
+        source: system
+        default: INACTIVE
+        description: "Device-monitoring dimension; evolves independently of enrollment_status."
+        constraints: "one of {INACTIVE, MONITORING, PAUSED}"
+      - name: care_plan_id
+        type: string
+        source: computed
+        description: "Denormalized lifecycle pointer to the patient's current ACTIVE CarePlan id, or null when none. The owning relationship is CarePlan.patient_id; this is a convenience back-pointer set when a care plan is activated and cleared on retirement."
+        default: null
+
+  - name: ConsentRecord
+    parent: Patient
+    common_fields: false
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; the consenting patient."
+      - name: consent_type
+        type: enum
+        source: input
+        description: "Scope of consent."
+        constraints: "one of {RPM, CCM, BOTH}"
+      - name: effective_at
+        type: datetime
+        source: input
+        description: "Instant the consent takes effect (inclusive)."
+      - name: revoked_at
+        type: datetime
+        source: system
+        default: null
+        description: "Instant consent was revoked (exclusive); null while ACTIVE."
+      - name: status
+        type: enum
+        source: system
+        default: ACTIVE
+        description: "Consent lifecycle."
+        constraints: "one of {ACTIVE, REVOKED, SUPERSEDED}"
+
+  - name: CarePlan
+    parent: Patient
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; owning patient."
+      - name: diagnosis_code
+        type: string
+        source: input
+        description: "ICD-10 chronic-condition code the plan addresses."
+      - name: goal_text
+        type: string
+        source: input
+        description: "Free-text care goal."
+      - name: required_care_minutes
+        type: integer
+        source: input
+        default: 20
+        description: "Monthly care-minute target this plan commits to (CCM/RPM care-time floor)."
+        constraints: ">= 20"
+      - name: status
+        type: enum
+        source: system
+        default: DRAFT
+        description: "Care-plan lifecycle."
+        constraints: "one of {DRAFT, ACTIVE, REVISED, RETIRED}"
+      - name: superseded_by_plan_id
+        type: string
+        source: system
+        default: null
+        description: "Lifecycle pointer to the revising CarePlan id; set on this (old) plan when a revision supersedes it. The reverse navigation is the new plan's own row, discoverable via the patient's care-plan list."
+
+  - name: Device
+    parent: Patient
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; the patient the device is assigned to."
+      - name: device_type
+        type: enum
+        source: input
+        description: "Class of monitored vital."
+        constraints: "one of {BP_CUFF, GLUCOMETER, PULSE_OX, WEIGHT_SCALE}"
+      - name: serial_number
+        type: string
+        source: input
+        description: "Manufacturer serial; unique across devices in status IN {ENROLLED, ACTIVE}."
+      - name: status
+        type: enum
+        source: system
+        default: ENROLLED
+        description: "Device lifecycle."
+        constraints: "one of {ENROLLED, ACTIVE, RETURNED}"
+      - name: activated_at
+        type: datetime
+        source: system
+        default: null
+        description: "Instant the device was activated (first eligible transmission window begins)."
+      - name: setup_billed
+        type: boolean
+        source: system
+        default: false
+        description: "True once a 99453 setup line item has been accrued for this device; prevents double-billing setup."
+
+  - name: VitalsReading
+    parent: Patient
+    common_fields: false
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; patient who transmitted the reading."
+      - name: device_id
+        type: string
+        source: input
+        description: "FK -> Device.id; transmitting device."
+      - name: reading_value
+        type: number
+        source: input
+        description: "Primary measured value (e.g., systolic mmHg, glucose mg/dL)."
+      - name: secondary_value
+        type: number
+        source: input
+        default: null
+        description: "Optional secondary value (e.g., diastolic mmHg)."
+      - name: measured_at
+        type: datetime
+        source: input
+        description: "Instant the vital was measured by the device."
+      - name: service_date
+        type: string
+        source: computed
+        description: "Calendar date (YYYY-MM-DD, UTC) derived from measured_at; the device-day this reading counts toward."
+      - name: breach_flag
+        type: boolean
+        source: computed
+        default: false
+        description: "True if reading_value (or secondary_value) crossed the active CarePlan threshold band; see breach_evaluation calc."
+
+  - name: ThresholdAlert
+    parent: Patient
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; patient whose reading breached."
+      - name: vitals_reading_id
+        type: string
+        source: input
+        description: "FK -> VitalsReading.id; the breaching reading."
+      - name: severity
+        type: enum
+        source: computed
+        description: "Breach severity band."
+        constraints: "one of {WARNING, CRITICAL}"
+      - name: status
+        type: enum
+        source: system
+        default: OPEN
+        description: "Alert lifecycle."
+        constraints: "one of {OPEN, ACKNOWLEDGED, ESCALATED, RESOLVED}"
+      - name: acknowledged_by_user_id
+        type: string
+        source: system
+        default: null
+        description: "Opaque clinician user id that acknowledged the alert."
+
+  - name: ReviewTask
+    parent: null
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; subject patient."
+      - name: threshold_alert_id
+        type: string
+        source: input
+        description: "FK -> ThresholdAlert.id; the alert that spawned this review task."
+      - name: escalated_from_task_id
+        type: string
+        source: system
+        default: null
+        description: "FK -> ReviewTask.id; set when this task was created by escalating an earlier task (self-referential chain)."
+      - name: priority
+        type: enum
+        source: computed
+        description: "Queue priority derived from alert severity."
+        constraints: "one of {ROUTINE, URGENT}"
+      - name: status
+        type: enum
+        source: system
+        default: QUEUED
+        description: "Review-task lifecycle."
+        constraints: "one of {QUEUED, IN_REVIEW, SIGNED, ESCALATED}"
+      - name: reviewer_user_id
+        type: string
+        source: system
+        default: null
+        description: "Opaque provider user id that claimed the task."
+
+  - name: CareActivity
+    parent: Patient
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; patient the care minutes were spent on."
+      - name: billing_period_id
+        type: string
+        source: input
+        description: "FK -> BillingPeriod.id; the OPEN monthly period this activity accrues into."
+      - name: clinician_user_id
+        type: string
+        source: input
+        description: "Opaque clinician user id that performed and logged the minutes."
+      - name: activity_type
+        type: enum
+        source: input
+        description: "Nature of care-management work."
+        constraints: "one of {REVIEW, OUTREACH, CARE_COORDINATION, EDUCATION}"
+      - name: minutes
+        type: integer
+        source: input
+        description: "Care minutes logged for this activity."
+        constraints: ">= 1 and <= 120"
+      - name: performed_at
+        type: datetime
+        source: input
+        description: "Instant the care work was performed; must fall inside the billing period's month."
+      - name: counted_minutes
+        type: integer
+        source: computed
+        description: "Minutes that count toward the period total after per-day and interactive-time rules; see care_time_aggregation calc."
+
+  - name: BillingPeriod
+    parent: Patient
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; patient the period bills for."
+      - name: period_year
+        type: integer
+        source: input
+        description: "Calendar year of the billing month."
+        constraints: ">= 2024"
+      - name: period_month
+        type: integer
+        source: input
+        description: "Calendar month (1-12) of the billing month."
+        constraints: ">= 1 and <= 12"
+      - name: status
+        type: enum
+        source: system
+        default: OPEN
+        description: "Period lifecycle."
+        constraints: "one of {OPEN, FINALIZED, CLAIMED, REOPENED}"
+      - name: provisional_total_minutes
+        type: integer
+        source: computed
+        default: 0
+        description: "Running sum of CareActivity.counted_minutes for this period; provisional variant, updated as activities are logged."
+      - name: distinct_device_days
+        type: integer
+        source: computed
+        default: 0
+        description: "Count of distinct VitalsReading.service_date values in this period across the patient's devices; drives 99454 eligibility."
+      - name: finalized_total_minutes
+        type: integer
+        source: computed
+        default: null
+        description: "Frozen care-minute total computed at finalize-time; null until FINALIZED. Finalized variant of the minute total."
+      - name: finalized_total_cents
+        type: integer
+        source: computed
+        default: null
+        description: "Sum of accrued BillingLineItem.amount_cents at finalize-time; null until FINALIZED."
+
+  - name: BillingLineItem
+    parent: BillingPeriod
+    common_fields: true
+    fields:
+      - name: billing_period_id
+        type: string
+        source: input
+        description: "FK -> BillingPeriod.id; owning period."
+      - name: cpt_code
+        type: enum
+        source: computed
+        description: "CPT code billed."
+        constraints: "one of {CPT_99453, CPT_99454, CPT_99457}"
+      - name: units
+        type: integer
+        source: computed
+        description: "Billable units (always 1 in this scaffold; 99453/99454/99457-first-block each bill at most 1 unit per period)."
+        constraints: "== 1"
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "units * payer rate for cpt_code, captured at accrual time."
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        default: ACCRUED
+        description: "Line-item lifecycle."
+        constraints: "one of {ACCRUED, VOIDED, FINALIZED}"
+
+  - name: Claim
+    parent: null
+    common_fields: true
+    fields:
+      - name: billing_period_id
+        type: string
+        source: input
+        description: "FK -> BillingPeriod.id; the FINALIZED period this claim bills."
+      - name: payer_id
+        type: string
+        source: input
+        description: "FK -> Payer.id; payer the claim is submitted to (copied from patient at submit)."
+      - name: claimed_cents
+        type: integer
+        source: computed
+        description: "Total claimed amount; equals the period's finalized_total_cents at submission."
+        constraints: ">= 0"
+      - name: reimbursed_cents
+        type: integer
+        source: system
+        default: 0
+        description: "Amount the payer remitted; set on remittance posting."
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        default: SUBMITTED
+        description: "Claim lifecycle (cyclic: DENIED can resubmit)."
+        constraints: "one of {SUBMITTED, ACCEPTED, PARTIALLY_PAID, PAID, DENIED}"
+      - name: expected_billing_period_version
+        type: integer
+        source: input
+        description: "OCC guard: the BillingPeriod.version the client observed when finalizing; rejected if stale."
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- Patient: PARALLEL dimensions (enrollment_status x monitoring_status) ----
+  - entity: Patient
+    initial_state: "enrollment_status=PENDING_CONSENT, monitoring_status=INACTIVE"
+    terminal_states: ["enrollment_status=DISCHARGED"]
+    note: "Two independent dimensions evolve on the same row; enrollment governs program membership, monitoring governs device data flow."
+    transitions:
+      - from: "enrollment_status=PENDING_CONSENT"
+        to: "enrollment_status=ENROLLED"
+        trigger: "POST /patients/{id}/enroll"
+        actor: CareCoordinator
+        preconditions:
+          - "patient.enrollment_status == PENDING_CONSENT"
+          - "an ACTIVE ConsentRecord exists for the patient covering RPM or BOTH"
+          - "an ACTIVE CarePlan exists for the patient"
+        side_effects:
+          - "set enrollment_status = ENROLLED"
+          - "increments Patient.version by 1"
+      - from: "enrollment_status=ENROLLED"
+        to: "enrollment_status=SUSPENDED"
+        trigger: "POST /patients/{id}/suspend"
+        actor: CareCoordinator
+        preconditions:
+          - "patient.enrollment_status == ENROLLED"
+        side_effects:
+          - "set enrollment_status = SUSPENDED"
+          - "if monitoring_status == MONITORING, set monitoring_status = PAUSED (cross-dimension cascade)"
+          - "increments Patient.version by 1"
+      - from: "enrollment_status=SUSPENDED"
+        to: "enrollment_status=ENROLLED"
+        trigger: "POST /patients/{id}/enroll"
+        actor: CareCoordinator
+        preconditions:
+          - "patient.enrollment_status == SUSPENDED"
+          - "an ACTIVE ConsentRecord exists for the patient covering RPM or BOTH"
+        side_effects:
+          - "set enrollment_status = ENROLLED"
+          - "increments Patient.version by 1"
+      - from: "enrollment_status IN {PENDING_CONSENT, ENROLLED, SUSPENDED}"
+        to: "enrollment_status=DISCHARGED"
+        trigger: "POST /patients/{id}/discharge"
+        actor: CareCoordinator
+        preconditions:
+          - "patient.enrollment_status != DISCHARGED"
+          - "no BillingPeriod for this patient is in status OPEN with provisional_total_minutes > 0"
+        side_effects:
+          - "set enrollment_status = DISCHARGED"
+          - "set monitoring_status = INACTIVE"
+          - "cascade: every Device with status IN {ENROLLED, ACTIVE} -> RETURNED"
+          - "cascade: each Device->RETURNED with monitoring active sets patient monitoring_status=INACTIVE"
+          - "increments Patient.version by 1"
+      - from: "monitoring_status=INACTIVE"
+        to: "monitoring_status=MONITORING"
+        trigger: "system: first Device activation while enrollment_status == ENROLLED"
+        actor: system
+        preconditions:
+          - "patient.enrollment_status == ENROLLED"
+          - "a Device transitions ENROLLED -> ACTIVE"
+        side_effects:
+          - "set monitoring_status = MONITORING"
+          - "increments Patient.version by 1"
+      - from: "monitoring_status=MONITORING"
+        to: "monitoring_status=PAUSED"
+        trigger: "POST /patients/{id}/suspend (cross-dimension) or system on enrollment SUSPENDED"
+        actor: system
+        preconditions:
+          - "patient.monitoring_status == MONITORING"
+          - "patient.enrollment_status transitions to SUSPENDED"
+        side_effects:
+          - "set monitoring_status = PAUSED"
+          - "increments Patient.version by 1"
+      - from: "monitoring_status=PAUSED"
+        to: "monitoring_status=MONITORING"
+        trigger: "POST /patients/{id}/enroll (resume from SUSPENDED with an ACTIVE device)"
+        actor: system
+        preconditions:
+          - "patient.enrollment_status transitions SUSPENDED -> ENROLLED"
+          - "at least one Device with status == ACTIVE exists"
+        side_effects:
+          - "set monitoring_status = MONITORING"
+          - "increments Patient.version by 1"
+
+  # ---- Device: linear with activation cross-effect ----
+  - entity: Device
+    initial_state: ENROLLED
+    terminal_states: [RETURNED]
+    transitions:
+      - from: ENROLLED
+        to: ACTIVE
+        trigger: "POST /patients/{id}/devices/{device_id}/activate"
+        actor: CareCoordinator
+        preconditions:
+          - "device.status == ENROLLED"
+          - "patient.enrollment_status == ENROLLED"
+        side_effects:
+          - "set device.status = ACTIVE; set device.activated_at = clock now"
+          - "cross-entity cascade: if patient.monitoring_status == INACTIVE, set patient.monitoring_status = MONITORING"
+          - "accrue 99453 setup line item once: see billing_setup_accrual calc (sets device.setup_billed = true)"
+          - "increments Device.version by 1"
+      - from: ACTIVE
+        to: RETURNED
+        trigger: "POST /patients/{id}/devices/{device_id}/return"
+        actor: CareCoordinator
+        preconditions:
+          - "device.status == ACTIVE"
+        side_effects:
+          - "set device.status = RETURNED"
+          - "cross-entity cascade: if no remaining Device with status == ACTIVE for the patient, set patient.monitoring_status = PAUSED"
+          - "increments Device.version by 1"
+      - from: ENROLLED
+        to: RETURNED
+        trigger: "POST /patients/{id}/devices/{device_id}/return"
+        actor: CareCoordinator
+        preconditions:
+          - "device.status == ENROLLED"
+        side_effects:
+          - "set device.status = RETURNED"
+          - "increments Device.version by 1"
+
+  # ---- CarePlan: cyclic (DRAFT->ACTIVE->REVISED->ACTIVE'...) via revision supersede ----
+  - entity: CarePlan
+    initial_state: DRAFT
+    terminal_states: [RETIRED]
+    note: "Revision creates a new ACTIVE plan and flips the old one to REVISED, forming a revision loop across plan rows for the same patient."
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /patients/{id}/care-plans/{plan_id}/activate"
+        actor: Physician
+        preconditions:
+          - "care_plan.status == DRAFT"
+          - "no other CarePlan for this patient is in status ACTIVE"
+        side_effects:
+          - "set care_plan.status = ACTIVE"
+          - "set patient.care_plan_id = care_plan.id"
+          - "increments CarePlan.version by 1"
+      - from: ACTIVE
+        to: REVISED
+        trigger: "system: a new CarePlan is activated as a revision of this one (POST /patients/{id}/care-plans/{plan_id}/activate with supersede)"
+        actor: system
+        preconditions:
+          - "care_plan.status == ACTIVE"
+        side_effects:
+          - "set care_plan.status = REVISED"
+          - "set care_plan.superseded_by_plan_id = new plan id"
+          - "increments CarePlan.version by 1"
+      - from: ACTIVE
+        to: RETIRED
+        trigger: "system: patient discharged"
+        actor: system
+        preconditions:
+          - "patient.enrollment_status transitions to DISCHARGED"
+        side_effects:
+          - "set care_plan.status = RETIRED"
+          - "set patient.care_plan_id = null"
+          - "increments CarePlan.version by 1"
+
+  # ---- ThresholdAlert: branching with revert (OPEN->ACKNOWLEDGED->RESOLVED, OPEN/ACK->ESCALATED) ----
+  - entity: ThresholdAlert
+    initial_state: OPEN
+    terminal_states: [RESOLVED]
+    note: "Branching fork from OPEN: acknowledge path vs escalate path; ESCALATED reverts to ACKNOWLEDGED once a provider claims the spawned review task (de-escalation on ownership)."
+    transitions:
+      - from: OPEN
+        to: ACKNOWLEDGED
+        trigger: "POST /alerts/{id}/acknowledge"
+        actor: Clinician
+        preconditions:
+          - "alert.status == OPEN"
+        side_effects:
+          - "set alert.status = ACKNOWLEDGED; set acknowledged_by_user_id = X-User-ID"
+          - "increments ThresholdAlert.version by 1"
+      - from: OPEN
+        to: ESCALATED
+        trigger: "POST /alerts/{id}/escalate"
+        actor: Clinician
+        preconditions:
+          - "alert.status == OPEN"
+          - "alert.severity == CRITICAL"
+        side_effects:
+          - "set alert.status = ESCALATED"
+          - "cascade: create a ReviewTask (priority=URGENT) linked to this alert (review_task_spawn)"
+          - "increments ThresholdAlert.version by 1"
+      - from: ACKNOWLEDGED
+        to: ESCALATED
+        trigger: "POST /alerts/{id}/escalate"
+        actor: Clinician
+        preconditions:
+          - "alert.status == ACKNOWLEDGED"
+          - "alert.severity == CRITICAL"
+        side_effects:
+          - "set alert.status = ESCALATED"
+          - "cascade: create a ReviewTask (priority=URGENT) linked to this alert"
+          - "increments ThresholdAlert.version by 1"
+      - from: ESCALATED
+        to: ACKNOWLEDGED
+        trigger: "system: the spawned ReviewTask is claimed (QUEUED -> IN_REVIEW) (revert loop)"
+        actor: system
+        preconditions:
+          - "alert.status == ESCALATED"
+          - "the linked ReviewTask transitions QUEUED -> IN_REVIEW"
+        side_effects:
+          - "set alert.status = ACKNOWLEDGED"
+          - "increments ThresholdAlert.version by 1"
+      - from: ACKNOWLEDGED
+        to: RESOLVED
+        trigger: "POST /alerts/{id}/resolve"
+        actor: Clinician
+        preconditions:
+          - "alert.status == ACKNOWLEDGED"
+          - "no linked ReviewTask is in status IN {QUEUED, IN_REVIEW, ESCALATED}"
+        side_effects:
+          - "set alert.status = RESOLVED"
+          - "increments ThresholdAlert.version by 1"
+
+  # ---- ReviewTask: linear with escalate fork (self-referential chain) ----
+  - entity: ReviewTask
+    initial_state: QUEUED
+    terminal_states: [SIGNED]
+    transitions:
+      - from: QUEUED
+        to: IN_REVIEW
+        trigger: "POST /review-tasks/{id}/claim"
+        actor: Physician
+        preconditions:
+          - "review_task.status == QUEUED"
+        side_effects:
+          - "set review_task.status = IN_REVIEW; set reviewer_user_id = X-User-ID"
+          - "cascade: if the linked ThresholdAlert is ESCALATED, revert it ESCALATED -> ACKNOWLEDGED (alert_revert_on_claim)"
+          - "increments ReviewTask.version by 1"
+      - from: IN_REVIEW
+        to: SIGNED
+        trigger: "POST /review-tasks/{id}/sign"
+        actor: Physician
+        preconditions:
+          - "review_task.status == IN_REVIEW"
+          - "reviewer_user_id == X-User-ID (same physician who claimed it signs it)"
+          - "segregation of duties: X-User-ID is NOT equal to the clinician_user_id of ANY CareActivity whose patient_id == review_task.patient_id (the task attests this patient's care minutes; the signer must not be a logger of them)"
+        side_effects:
+          - "set review_task.status = SIGNED"
+          - "increments ReviewTask.version by 1"
+      - from: IN_REVIEW
+        to: ESCALATED
+        trigger: "POST /review-tasks/{id}/escalate"
+        actor: Physician
+        preconditions:
+          - "review_task.status == IN_REVIEW"
+        side_effects:
+          - "set review_task.status = ESCALATED"
+          - "cascade: create a new ReviewTask with escalated_from_task_id = this task id, threshold_alert_id = this task's threshold_alert_id, patient_id = this task's patient_id, priority=URGENT, status=QUEUED (self-referential escalation chain)"
+          - "increments ReviewTask.version by 1"
+
+  # ---- BillingPeriod: OPEN->FINALIZED->CLAIMED with REOPENED revert ----
+  - entity: BillingPeriod
+    initial_state: OPEN
+    terminal_states: [CLAIMED]
+    note: "FINALIZED freezes the dual-variant totals; REOPENED voids the claim path and re-enables accrual."
+    transitions:
+      - from: OPEN
+        to: FINALIZED
+        trigger: "POST /billing-periods/{id}/finalize"
+        actor: BillingSpecialist
+        preconditions:
+          - "billing_period.status == OPEN"
+          - "request carries expected_billing_period_version matching current BillingPeriod.version (OCC)"
+          - "the calendar month identified by (period_year, period_month) has fully elapsed relative to the logical clock"
+        side_effects:
+          - "compute finalized_total_minutes (finalized variant of care_time_aggregation)"
+          - "accrue eligible CPT line items: 99454 if distinct_device_days >= 16; 99457 if finalized_total_minutes >= 20 (billing_eligibility)"
+          - "set finalized_total_cents = sum of ACCRUED BillingLineItem.amount_cents; flip those line items ACCRUED -> FINALIZED"
+          - "set billing_period.status = FINALIZED"
+          - "increments BillingPeriod.version by 1"
+      - from: FINALIZED
+        to: CLAIMED
+        trigger: "POST /billing-periods/{id}/claims (submit claim)"
+        actor: BillingSpecialist
+        preconditions:
+          - "billing_period.status == FINALIZED"
+          - "consent and timely-filing validations pass"
+        side_effects:
+          - "create Claim with claimed_cents = finalized_total_cents"
+          - "set billing_period.status = CLAIMED"
+          - "increments BillingPeriod.version by 1"
+      - from: FINALIZED
+        to: REOPENED
+        trigger: "POST /billing-periods/{id}/reopen"
+        actor: BillingSpecialist
+        preconditions:
+          - "billing_period.status == FINALIZED"
+          - "no Claim exists for this period in status NOT IN {DENIED}"
+        side_effects:
+          - "void all FINALIZED BillingLineItem for this period (FINALIZED -> VOIDED)"
+          - "clear finalized_total_minutes and finalized_total_cents to null"
+          - "set billing_period.status = REOPENED"
+          - "increments BillingPeriod.version by 1"
+      - from: REOPENED
+        to: FINALIZED
+        trigger: "POST /billing-periods/{id}/finalize"
+        actor: BillingSpecialist
+        preconditions:
+          - "billing_period.status == REOPENED"
+          - "request carries expected_billing_period_version matching current BillingPeriod.version (OCC)"
+        side_effects:
+          - "recompute finalized totals and re-accrue line items as in OPEN->FINALIZED"
+          - "set billing_period.status = FINALIZED"
+          - "increments BillingPeriod.version by 1"
+
+  # ---- Claim: cyclic resubmit (SUBMITTED->ACCEPTED->PAID; DENIED->SUBMITTED loop) ----
+  - entity: Claim
+    initial_state: SUBMITTED
+    terminal_states: [PAID]
+    note: "DENIED claims may be resubmitted, forming a cycle SUBMITTED->DENIED->SUBMITTED."
+    transitions:
+      - from: SUBMITTED
+        to: ACCEPTED
+        trigger: "POST /claims/{id}/accept"
+        actor: PayerAgent
+        preconditions:
+          - "claim.status == SUBMITTED"
+        side_effects:
+          - "set claim.status = ACCEPTED"
+          - "increments Claim.version by 1"
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /claims/{id}/deny"
+        actor: PayerAgent
+        preconditions:
+          - "claim.status == SUBMITTED"
+        side_effects:
+          - "set claim.status = DENIED"
+          - "cascade: set the linked BillingPeriod back to FINALIZED so it can be corrected and resubmitted (claim_denial_reopen)"
+          - "increments Claim.version by 1"
+      - from: ACCEPTED
+        to: PARTIALLY_PAID
+        trigger: "POST /claims/{id}/remit (reimbursed_cents < claimed_cents)"
+        actor: PayerAgent
+        preconditions:
+          - "claim.status == ACCEPTED"
+          - "0 < remittance amount < claim.claimed_cents"
+        side_effects:
+          - "set claim.reimbursed_cents = remittance amount"
+          - "set claim.status = PARTIALLY_PAID"
+          - "increments Claim.version by 1"
+      - from: ACCEPTED
+        to: PAID
+        trigger: "POST /claims/{id}/remit (reimbursed_cents == claimed_cents)"
+        actor: PayerAgent
+        preconditions:
+          - "claim.status == ACCEPTED"
+          - "remittance amount == claim.claimed_cents"
+        side_effects:
+          - "set claim.reimbursed_cents = claimed_cents"
+          - "set claim.status = PAID"
+          - "increments Claim.version by 1"
+      - from: PARTIALLY_PAID
+        to: PAID
+        trigger: "POST /claims/{id}/remit (cumulative reimbursed reaches claimed_cents)"
+        actor: PayerAgent
+        preconditions:
+          - "claim.status == PARTIALLY_PAID"
+          - "claim.reimbursed_cents + remittance amount == claim.claimed_cents"
+        side_effects:
+          - "set claim.reimbursed_cents += remittance amount"
+          - "set claim.status = PAID"
+          - "increments Claim.version by 1"
+      - from: DENIED
+        to: SUBMITTED
+        trigger: "POST /billing-periods/{id}/claims (resubmit on a FINALIZED period)"
+        actor: BillingSpecialist
+        preconditions:
+          - "claim.status == DENIED"
+          - "the linked BillingPeriod has been re-finalized (status FINALIZED)"
+        side_effects:
+          - "set claim.status = SUBMITTED; set claim.claimed_cents = period.finalized_total_cents"
+          - "increments Claim.version by 1"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: finalize-period-stale-version
+    parent_entity: BillingPeriod
+    write_endpoint: "POST /billing-periods/{id}/finalize"
+    occ_field: "expected_billing_period_version"
+    description: |
+      Finalizing a BillingPeriod whose version has advanced since the client
+      last observed it is rejected. A care-time activity logged against the
+      OPEN period (or a vitals transmission bumping distinct_device_days)
+      legitimately mutates the period and advances its version; a finalize
+      request still carrying the pre-mutation version is operating on a stale
+      view of the period's accrued totals and is refused.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: breach_evaluation
+    trigger: "POST /patients/{id}/vitals (on every VitalsReading creation)"
+    algorithm: threshold
+    formula: |
+      Resolve the patient's ACTIVE CarePlan and the device_type's threshold band:
+        BP_CUFF:     warning if systolic >= 140 or diastolic >= 90;
+                     critical if systolic >= 180 or diastolic >= 120
+        GLUCOMETER:  warning if value >= 250 or value < 70;
+                     critical if value >= 400 or value < 54
+        PULSE_OX:    warning if value <= 92 (and > 88); critical if value <= 88
+        WEIGHT_SCALE: warning if value >= prior_reading + 1.4 (kg) within 24h; never critical
+      breach_flag = (severity band is WARNING or CRITICAL)
+      Boundary rule: thresholds use >= for high bands and <= / < exactly as written;
+      a BP systolic of exactly 140 is a WARNING breach (>=), 139 is not.
+      If no ACTIVE CarePlan exists, breach_flag = false (no band to evaluate against).
+    input_set: "the single reading being created, plus the patient's ACTIVE CarePlan band and (for WEIGHT_SCALE) the immediately prior reading within 24h"
+    constants:
+      BP_SYS_WARN: 140
+      BP_SYS_CRIT: 180
+      BP_DIA_WARN: 90
+      BP_DIA_CRIT: 120
+      GLU_HI_WARN: 250
+      GLU_HI_CRIT: 400
+      GLU_LO_WARN: 70
+      GLU_LO_CRIT: 54
+      SPO2_WARN: 92
+      SPO2_CRIT: 88
+      WEIGHT_GAIN_KG: 1.4
+    precision: "integer mmHg/mg-dL/% comparisons; weight to 1 decimal place, round_half_up"
+    variants:
+      - name: warning_band
+        when: "reading enters the WARNING band but not the CRITICAL band"
+        difference: "creates a ThresholdAlert with severity=WARNING; does NOT permit escalate (escalate requires CRITICAL)"
+      - name: critical_band
+        when: "reading enters the CRITICAL band"
+        difference: "creates a ThresholdAlert with severity=CRITICAL; eligible for escalate -> ReviewTask spawn"
+
+  - name: care_time_aggregation
+    trigger: "POST /patients/{id}/care-activities (provisional) and POST /billing-periods/{id}/finalize (finalized)"
+    algorithm: aggregation
+    formula: |
+      counted_minutes per CareActivity:
+        cap the per-calendar-day sum of minutes (by performed_at UTC date) at MAX_MINUTES_PER_DAY;
+        when a day's logged minutes exceed the cap, allocate the cap to activities in
+        ascending performed_at order (ties broken by created_at ASC), filling earlier
+        activities first; later activities on that day receive 0 counted_minutes.
+      period total = sum of counted_minutes over all CareActivity rows whose
+        performed_at falls within the billing month AND billing_period_id == period.id.
+      PROVISIONAL variant: recomputed and written to provisional_total_minutes on every
+        care-activity create, over CareActivity rows currently present.
+      FINALIZED variant: computed once at finalize-time into finalized_total_minutes,
+        over the same rows, and then frozen (later activity creation is rejected because
+        the period is no longer OPEN).
+    input_set: "CareActivity rows with billing_period_id == period.id and performed_at within (period_year, period_month); excludes rows on any other period"
+    constants:
+      MAX_MINUTES_PER_DAY: 60
+      CARE_TIME_FLOOR: 20
+    precision: "integer minutes; no rounding"
+    variants:
+      - name: provisional_total
+        when: "during the OPEN period, after each care-activity create"
+        difference: "writes provisional_total_minutes; reflects only rows logged so far and is NOT frozen"
+      - name: finalized_total
+        when: "at finalize-time"
+        difference: "writes finalized_total_minutes and freezes it; identical inputs can diverge from provisional if activities are added/voided between the last provisional recompute and finalize"
+
+  - name: payer_reimbursement_settlement
+    trigger: "POST /claims/{id}/remit (each remittance posting on a Claim)"
+    algorithm: aggregation
+    formula: |
+      Given a remittance amount R against a claim with claimed_cents C and prior reimbursed_cents P:
+        new_reimbursed = P + R
+        status:
+          if new_reimbursed == C  -> PAID
+          if 0 < new_reimbursed < C -> PARTIALLY_PAID
+        invariant: new_reimbursed MUST be <= C; a remittance that would push reimbursed_cents
+          above claimed_cents is rejected (ERR_REMITTANCE_EXCEEDS_CLAIM).
+      Conserved-quantity invariant (write_off ledger): for any claim, the sum
+        reimbursed_cents + outstanding_cents == claimed_cents at all times, where
+        outstanding_cents = claimed_cents - reimbursed_cents. A remittance posting
+        moves value from outstanding into reimbursed without changing claimed_cents.
+    input_set: "the target Claim's claimed_cents and current reimbursed_cents, plus the posted remittance amount"
+    constants: {}
+    precision: "integer cents; no rounding"
+    variants:
+      - name: partial_settlement
+        when: "0 < cumulative reimbursed < claimed_cents"
+        difference: "status -> PARTIALLY_PAID; outstanding remains positive"
+      - name: full_settlement
+        when: "cumulative reimbursed == claimed_cents"
+        difference: "status -> PAID; outstanding == 0"
+
+  - name: billing_eligibility
+    trigger: "POST /billing-periods/{id}/finalize (accrue CPT line items)"
+    algorithm: threshold
+    formula: |
+      Evaluate, in this pinned order, against the period being finalized:
+        (1) 99454 device-supply unit: eligible iff distinct_device_days >= DEVICE_DAY_FLOOR (16).
+            distinct_device_days = COUNT(DISTINCT VitalsReading.service_date) over readings
+            whose patient_id == period.patient_id and service_date within (period_year, period_month).
+            Boundary: exactly 16 distinct days qualifies (>=); 15 does not.
+        (2) 99457 care-management block: eligible iff finalized_total_minutes >= CARE_TIME_FLOOR (20).
+            Boundary: exactly 20 minutes qualifies (>=); 19 does not.
+        (3) 99453 one-time setup: accrued at device-activation time (NOT at finalize), once per device
+            via billing_setup_accrual; finalize does not re-accrue 99453.
+      For each eligible code create a BillingLineItem with units=1 and
+        amount_cents = the payer's rate for that code (snapshot of Payer.rate_*).
+    input_set: "the period's distinct_device_days, finalized_total_minutes, and the patient's Payer rates"
+    constants:
+      DEVICE_DAY_FLOOR: 16
+      CARE_TIME_FLOOR: 20
+    precision: "integer counts and cents"
+    variants:
+      - name: device_day_met
+        when: "distinct_device_days >= 16"
+        difference: "accrues a 99454 line item"
+      - name: care_time_met
+        when: "finalized_total_minutes >= 20"
+        difference: "accrues a 99457 line item independently of 99454"
+
+  - name: billing_setup_accrual
+    trigger: "POST /patients/{id}/devices/{device_id}/activate (device ENROLLED -> ACTIVE)"
+    algorithm: aggregation
+    formula: |
+      When a device is activated and device.setup_billed == false:
+        resolve the patient's OPEN BillingPeriod for the activation month
+          (period_year/period_month == calendar year/month of clock now);
+        if none exists, the 99453 accrual is deferred and NOT created (no auto-period creation);
+        else create a BillingLineItem(cpt_code=CPT_99453, units=1,
+          amount_cents = Payer.rate_99453_cents) and set device.setup_billed = true.
+      Idempotency: a device whose setup_billed is already true never accrues a second 99453.
+    input_set: "the activating device, its patient's OPEN BillingPeriod for the activation month, and the Payer.rate_99453_cents"
+    constants: {}
+    precision: "integer cents"
+
+  - name: review_queue_priority
+    trigger: "ReviewTask creation (alert escalate spawn or review-task escalate spawn)"
+    algorithm: weighted_scoring
+    formula: |
+      priority = URGENT if the source ThresholdAlert.severity == CRITICAL else ROUTINE.
+      Queue ordering when a Physician calls GET /review-tasks?status=QUEUED is:
+        URGENT before ROUTINE; within the same priority, ascending created_at;
+        if created_at ties exactly, ascending threshold_alert_id is NOT used —
+        instead ascending created_at then ascending escalated_from_task_id (created_at);
+        the final deterministic tie-break is created_at ASC of the ReviewTask itself.
+      No random id ever participates in ordering.
+    input_set: "the spawning ThresholdAlert's severity and the ReviewTask.created_at"
+    constants: {}
+    precision: "n/a (categorical priority + created_at ordering)"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "the role in X-User-Role is permitted to perform this operation per §1.7"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "every resource named in the path exists, validated left-to-right (patient before device before reading)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all path-parameterized endpoints"
+  - priority: 4
+    category: existence
+    check: "every FK referenced in the body resolves to an existing entity (payer_id, billing_period_id, vitals_reading_id, threshold_alert_id)"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "all create/link endpoints with body FKs"
+  - priority: 5
+    category: existence
+    check: "all required body fields present and of declared type/enum domain"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all create/action endpoints"
+  - priority: 6
+    category: state
+    check: "the target entity is in a state from which this transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 7
+    category: business_constraint
+    check: "OCC: expected_billing_period_version equals the current BillingPeriod.version on finalize"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /billing-periods/{id}/finalize"
+  # ---- Safety / clinical compliance ahead of fiscal ----
+  - priority: 8
+    category: business_safety
+    check: "escalate on a ThresholdAlert requires alert.severity == CRITICAL"
+    error_id: ERR_ESCALATION_NOT_PERMITTED
+    http_status: 409
+    applies_to: "POST /alerts/{id}/escalate"
+  - priority: 9
+    category: business_safety
+    check: "a ThresholdAlert may not be RESOLVED while a linked ReviewTask is in status IN {QUEUED, IN_REVIEW, ESCALATED}"
+    error_id: ERR_OPEN_REVIEW_TASK
+    http_status: 409
+    applies_to: "POST /alerts/{id}/resolve"
+  - priority: 10
+    category: business_safety
+    check: "segregation of duties: the signing Physician's X-User-ID must not equal the clinician_user_id of any CareActivity whose patient_id == review_task.patient_id (the signer cannot have logged care minutes for the patient whose review they attest)"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /review-tasks/{id}/sign"
+  - priority: 11
+    category: business_referential
+    check: "a Physician may only sign a ReviewTask they personally claimed (reviewer_user_id == X-User-ID)"
+    error_id: ERR_NOT_TASK_OWNER
+    http_status: 403
+    applies_to: "POST /review-tasks/{id}/sign"
+  - priority: 12
+    category: business_constraint
+    check: "enrollment readiness: POST /patients/{id}/enroll requires BOTH (a) an ACTIVE ConsentRecord covering RPM or BOTH AND (b) an ACTIVE CarePlan for the patient; either missing yields ERR_CONSENT_REQUIRED. Additionally vitals and care-activity require enrollment_status == ENROLLED (else ERR_CONSENT_REQUIRED). The consent sub-condition is evaluated before the care-plan sub-condition."
+    error_id: ERR_CONSENT_REQUIRED
+    http_status: 409
+    applies_to: "POST /patients/{id}/enroll, POST /patients/{id}/vitals, POST /patients/{id}/care-activities"
+  - priority: 13
+    category: business_temporal
+    check: "a BillingPeriod may only be finalized after its calendar month has fully elapsed relative to the logical clock"
+    error_id: ERR_PERIOD_NOT_CLOSED
+    http_status: 409
+    applies_to: "POST /billing-periods/{id}/finalize"
+  - priority: 14
+    category: business_temporal
+    check: "CareActivity.performed_at must fall inside the billing period's calendar month"
+    error_id: ERR_ACTIVITY_OUT_OF_PERIOD
+    http_status: 422
+    applies_to: "POST /patients/{id}/care-activities"
+  - priority: 15
+    category: business_temporal
+    check: "billing-period overlap: a new BillingPeriod must not collide with an existing non-REOPENED BillingPeriod for the same patient on the same (period_year, period_month). The month is treated as the half-open calendar interval [first-day-00:00Z, next-month-first-day-00:00Z); two periods collide when their month intervals are identical."
+    error_id: ERR_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /patients/{id}/billing-periods"
+  - priority: 16
+    category: business_constraint
+    check: "uniqueness: Device.serial_number unique across devices in status IN {ENROLLED, ACTIVE}; Patient.mrn unique across enrollment_status IN {PENDING_CONSENT, ENROLLED, SUSPENDED}"
+    error_id: ERR_DUPLICATE_RESOURCE
+    http_status: 409
+    applies_to: "POST /patients, POST /patients/{id}/devices"
+  - priority: 17
+    category: business_constraint
+    check: "at most one CarePlan per patient may be ACTIVE at a time; activating a second without supersede flag is rejected"
+    error_id: ERR_ACTIVE_PLAN_EXISTS
+    http_status: 409
+    applies_to: "POST /patients/{id}/care-plans/{plan_id}/activate"
+  - priority: 18
+    category: business_temporal
+    check: "timely filing: a claim's submission instant must be within Payer.timely_filing_days of the billing period's last calendar day"
+    error_id: ERR_TIMELY_FILING_EXPIRED
+    http_status: 409
+    applies_to: "POST /billing-periods/{id}/claims"
+  - priority: 19
+    category: business_constraint
+    check: "consent for billing: if Payer.requires_active_consent, an ACTIVE consent interval [effective_at, revoked_at) must fully contain the billing month interval before a claim is submitted; a consent whose effective_at is after the month start (or whose revoked_at is before the month end) leaves an uncovered gap"
+    error_id: ERR_BILLING_CONSENT_GAP
+    http_status: 409
+    applies_to: "POST /billing-periods/{id}/claims"
+  - priority: 20
+    category: business_fiscal
+    check: "a FINALIZED period with finalized_total_cents == 0 (no eligible CPT line items) cannot be claimed"
+    error_id: ERR_NOTHING_TO_CLAIM
+    http_status: 409
+    applies_to: "POST /billing-periods/{id}/claims"
+  - priority: 21
+    category: business_fiscal
+    check: "a remittance must not push cumulative reimbursed_cents above claimed_cents"
+    error_id: ERR_REMITTANCE_EXCEEDS_CLAIM
+    http_status: 422
+    applies_to: "POST /claims/{id}/remit"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Payer ----
+  - method: POST
+    path: "/payers"
+    description: "Register a payer with reimbursement rates."
+    roles: [BillingSpecialist]
+    code: 201
+    input: [name, payer_type, rate_99453_cents, rate_99454_cents, rate_99457_cents, "requires_active_consent?", "timely_filing_days?"]
+    output: Payer
+    side_effects: []
+  - method: GET
+    path: "/payers/{id}"
+    description: "Fetch a payer."
+    roles: [BillingSpecialist, CareCoordinator]
+    code: 200
+    input: []
+    output: Payer
+    side_effects: []
+  - method: GET
+    path: "/payers"
+    description: "List payers (paginated)."
+    roles: [BillingSpecialist, CareCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Payer[]
+    side_effects: []
+
+  # ---- Patient ----
+  - method: POST
+    path: "/patients"
+    description: "Create a patient in PENDING_CONSENT/INACTIVE."
+    roles: [CareCoordinator]
+    code: 201
+    input: [payer_id, mrn, full_name]
+    output: Patient
+    side_effects: ["validate payer exists (ERR_REFERENCE_NOT_FOUND)", "enforce mrn uniqueness over active enrollment statuses"]
+  - method: GET
+    path: "/patients/{id}"
+    description: "Fetch a patient (both status dimensions)."
+    roles: [CareCoordinator, Physician, Clinician, BillingSpecialist]
+    code: 200
+    input: []
+    output: Patient
+    side_effects: []
+  - method: GET
+    path: "/patients"
+    description: "List patients; filter by payer_id."
+    roles: [CareCoordinator, Physician, Clinician, BillingSpecialist]
+    code: 200
+    input: ["payer_id?", "enrollment_status?", "limit?", "offset?"]
+    output: Patient[]
+    side_effects: []
+  - method: POST
+    path: "/patients/{id}/enroll"
+    description: "Enroll (or resume) a patient; requires active consent + active care plan."
+    roles: [CareCoordinator]
+    code: 200
+    input: []
+    output: Patient
+    side_effects: ["set enrollment_status=ENROLLED", "resume monitoring if a device is ACTIVE", "increments Patient.version by 1"]
+  - method: POST
+    path: "/patients/{id}/suspend"
+    description: "Suspend an enrolled patient; pauses monitoring."
+    roles: [CareCoordinator]
+    code: 200
+    input: []
+    output: Patient
+    side_effects: ["set enrollment_status=SUSPENDED", "if MONITORING set monitoring_status=PAUSED", "increments Patient.version by 1"]
+  - method: POST
+    path: "/patients/{id}/discharge"
+    description: "Discharge a patient; cascades device returns and care-plan retirement."
+    roles: [CareCoordinator]
+    code: 200
+    input: []
+    output: Patient
+    side_effects: ["set enrollment_status=DISCHARGED, monitoring_status=INACTIVE", "cascade devices ACTIVE/ENROLLED -> RETURNED", "cascade ACTIVE CarePlan -> RETIRED, clear care_plan_id", "increments Patient.version by 1"]
+
+  # ---- ConsentRecord ----
+  - method: POST
+    path: "/patients/{id}/consents"
+    description: "Record patient consent (RPM/CCM/BOTH)."
+    roles: [CareCoordinator]
+    code: 201
+    input: [consent_type, effective_at]
+    output: ConsentRecord
+    side_effects: ["if a prior ACTIVE consent exists, set it SUPERSEDED"]
+  - method: GET
+    path: "/patients/{id}/consents"
+    description: "List a patient's consent records (reverse-reachability for ConsentRecord.patient_id)."
+    roles: [CareCoordinator, Physician, BillingSpecialist]
+    code: 200
+    input: []
+    output: ConsentRecord[]
+    side_effects: []
+  - method: POST
+    path: "/patients/{id}/consents/{consent_id}/revoke"
+    description: "Revoke an active consent."
+    roles: [CareCoordinator]
+    code: 200
+    input: []
+    output: ConsentRecord
+    side_effects: ["set status=REVOKED, revoked_at=clock now"]
+
+  # ---- CarePlan ----
+  - method: POST
+    path: "/patients/{id}/care-plans"
+    description: "Draft a care plan."
+    roles: [Physician]
+    code: 201
+    input: [diagnosis_code, goal_text, "required_care_minutes?"]
+    output: CarePlan
+    side_effects: []
+  - method: GET
+    path: "/patients/{id}/care-plans"
+    description: "List a patient's care plans (reverse-reachability for CarePlan.patient_id)."
+    roles: [Physician, CareCoordinator, Clinician]
+    code: 200
+    input: ["status?"]
+    output: CarePlan[]
+    side_effects: []
+  - method: GET
+    path: "/care-plans/{id}"
+    description: "Fetch a care plan."
+    roles: [Physician, CareCoordinator, Clinician]
+    code: 200
+    input: []
+    output: CarePlan
+    side_effects: []
+  - method: POST
+    path: "/patients/{id}/care-plans/{plan_id}/activate"
+    description: "Activate a DRAFT care plan; supersede flag revises the current ACTIVE plan."
+    roles: [Physician]
+    code: 200
+    input: ["supersede?"]
+    output: CarePlan
+    side_effects: ["set status=ACTIVE; set patient.care_plan_id", "if supersede: prior ACTIVE plan -> REVISED with superseded_by_plan_id (cascade)", "increments CarePlan.version by 1"]
+
+  # ---- Device ----
+  - method: POST
+    path: "/patients/{id}/devices"
+    description: "Enroll a device for a patient."
+    roles: [CareCoordinator]
+    code: 201
+    input: [device_type, serial_number]
+    output: Device
+    side_effects: ["enforce serial uniqueness over ENROLLED/ACTIVE devices"]
+  - method: GET
+    path: "/patients/{id}/devices"
+    description: "List a patient's devices (reverse-reachability for Device.patient_id)."
+    roles: [CareCoordinator, Physician, Clinician]
+    code: 200
+    input: ["status?"]
+    output: Device[]
+    side_effects: []
+  - method: GET
+    path: "/devices/{id}"
+    description: "Fetch a device."
+    roles: [CareCoordinator, Physician, Clinician]
+    code: 200
+    input: []
+    output: Device
+    side_effects: []
+  - method: POST
+    path: "/patients/{id}/devices/{device_id}/activate"
+    description: "Activate an enrolled device; may start monitoring and accrue 99453 setup."
+    roles: [CareCoordinator]
+    code: 200
+    input: []
+    output: Device
+    side_effects: ["set status=ACTIVE, activated_at", "start patient monitoring if INACTIVE (cross-entity)", "accrue 99453 once into the OPEN period (billing_setup_accrual)", "increments Device.version by 1"]
+  - method: POST
+    path: "/patients/{id}/devices/{device_id}/return"
+    description: "Return a device; may pause monitoring."
+    roles: [CareCoordinator]
+    code: 200
+    input: []
+    output: Device
+    side_effects: ["set status=RETURNED", "pause patient monitoring if no ACTIVE device remains (cross-entity)", "increments Device.version by 1"]
+
+  # ---- VitalsReading ----
+  - method: POST
+    path: "/patients/{id}/vitals"
+    description: "Transmit a vitals reading; evaluates breach and may spawn an alert + update device-day count."
+    roles: [Clinician, CareCoordinator]
+    code: 201
+    input: [device_id, reading_value, "secondary_value?", measured_at]
+    output: VitalsReading
+    side_effects: ["compute service_date and breach_flag (breach_evaluation)", "if breach, create ThresholdAlert (WARNING/CRITICAL)", "recompute owning OPEN period distinct_device_days; increments BillingPeriod.version by 1 if a new device-day is added"]
+  - method: GET
+    path: "/patients/{id}/vitals"
+    description: "List a patient's vitals readings (reverse-reachability for VitalsReading.patient_id)."
+    roles: [Clinician, CareCoordinator, Physician]
+    code: 200
+    input: ["device_id?", "limit?", "offset?"]
+    output: VitalsReading[]
+    side_effects: []
+  - method: GET
+    path: "/devices/{id}/vitals"
+    description: "List a device's vitals readings (reverse-reachability for VitalsReading.device_id)."
+    roles: [Clinician, CareCoordinator, Physician]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: VitalsReading[]
+    side_effects: []
+
+  # ---- ThresholdAlert ----
+  - method: GET
+    path: "/alerts"
+    description: "List threshold alerts; filter by patient_id, vitals_reading_id, status (reverse-reachability for ThresholdAlert.patient_id and ThresholdAlert.vitals_reading_id)."
+    roles: [Clinician, Physician, CareCoordinator]
+    code: 200
+    input: ["patient_id?", "vitals_reading_id?", "status?", "limit?", "offset?"]
+    output: ThresholdAlert[]
+    side_effects: []
+  - method: GET
+    path: "/alerts/{id}"
+    description: "Fetch a threshold alert."
+    roles: [Clinician, Physician, CareCoordinator]
+    code: 200
+    input: []
+    output: ThresholdAlert
+    side_effects: []
+  - method: POST
+    path: "/alerts/{id}/acknowledge"
+    description: "Acknowledge an OPEN alert."
+    roles: [Clinician]
+    code: 200
+    input: []
+    output: ThresholdAlert
+    side_effects: ["set status=ACKNOWLEDGED, acknowledged_by_user_id=X-User-ID", "increments ThresholdAlert.version by 1"]
+  - method: POST
+    path: "/alerts/{id}/escalate"
+    description: "Escalate a CRITICAL alert; spawns an URGENT review task."
+    roles: [Clinician]
+    code: 200
+    input: []
+    output: ThresholdAlert
+    side_effects: ["set status=ESCALATED", "cascade: create ReviewTask priority=URGENT (review_task_spawn)", "increments ThresholdAlert.version by 1"]
+  - method: POST
+    path: "/alerts/{id}/resolve"
+    description: "Resolve an acknowledged alert with no open review tasks."
+    roles: [Clinician]
+    code: 200
+    input: []
+    output: ThresholdAlert
+    side_effects: ["set status=RESOLVED", "increments ThresholdAlert.version by 1"]
+
+  # ---- ReviewTask ----
+  - method: GET
+    path: "/review-tasks"
+    description: "Provider review queue; filter by status/priority, ordered URGENT-first then created_at ASC. Also reverse-reachability for ReviewTask.patient_id, threshold_alert_id, escalated_from_task_id via filters."
+    roles: [Physician]
+    code: 200
+    input: ["status?", "priority?", "patient_id?", "threshold_alert_id?", "escalated_from_task_id?", "limit?", "offset?"]
+    output: ReviewTask[]
+    side_effects: []
+  - method: GET
+    path: "/review-tasks/{id}"
+    description: "Fetch a review task."
+    roles: [Physician]
+    code: 200
+    input: []
+    output: ReviewTask
+    side_effects: []
+  - method: POST
+    path: "/review-tasks/{id}/claim"
+    description: "Claim a QUEUED task for review; reverts the linked escalated alert to ACKNOWLEDGED."
+    roles: [Physician]
+    code: 200
+    input: []
+    output: ReviewTask
+    side_effects: ["set status=IN_REVIEW, reviewer_user_id=X-User-ID", "cascade: linked ThresholdAlert ESCALATED -> ACKNOWLEDGED (alert_revert_on_claim)", "increments ReviewTask.version by 1"]
+  - method: POST
+    path: "/review-tasks/{id}/sign"
+    description: "Sign an in-review task (segregation of duties enforced)."
+    roles: [Physician]
+    code: 200
+    input: []
+    output: ReviewTask
+    side_effects: ["set status=SIGNED", "increments ReviewTask.version by 1"]
+  - method: POST
+    path: "/review-tasks/{id}/escalate"
+    description: "Escalate an in-review task; spawns a new self-referenced QUEUED task."
+    roles: [Physician]
+    code: 200
+    input: []
+    output: ReviewTask
+    side_effects: ["set status=ESCALATED", "cascade: create child ReviewTask escalated_from_task_id=this.id, priority=URGENT", "increments ReviewTask.version by 1"]
+
+  # ---- BillingPeriod ----
+  - method: POST
+    path: "/patients/{id}/billing-periods"
+    description: "Open a monthly billing period for a patient."
+    roles: [BillingSpecialist]
+    code: 201
+    input: [period_year, period_month]
+    output: BillingPeriod
+    side_effects: ["initialize provisional_total_minutes=0, distinct_device_days=0"]
+  - method: GET
+    path: "/patients/{id}/billing-periods"
+    description: "List a patient's billing periods (reverse-reachability for BillingPeriod.patient_id)."
+    roles: [BillingSpecialist, CareCoordinator]
+    code: 200
+    input: ["status?"]
+    output: BillingPeriod[]
+    side_effects: []
+  - method: GET
+    path: "/billing-periods/{id}"
+    description: "Fetch a billing period with provisional + finalized totals."
+    roles: [BillingSpecialist, CareCoordinator, Physician]
+    code: 200
+    input: []
+    output: BillingPeriod
+    side_effects: []
+  - method: POST
+    path: "/billing-periods/{id}/finalize"
+    description: "Finalize a closed period (OCC-guarded); accrues eligible CPT line items and freezes totals."
+    roles: [BillingSpecialist]
+    code: 200
+    input: [expected_billing_period_version]
+    output: BillingPeriod
+    side_effects: ["compute finalized_total_minutes (care_time_aggregation finalized)", "accrue 99454/99457 per billing_eligibility", "set finalized_total_cents; FINALIZED line items", "set status=FINALIZED", "increments BillingPeriod.version by 1"]
+  - method: POST
+    path: "/billing-periods/{id}/reopen"
+    description: "Reopen a finalized period with no live claim; voids finalized line items."
+    roles: [BillingSpecialist]
+    code: 200
+    input: []
+    output: BillingPeriod
+    side_effects: ["void FINALIZED line items -> VOIDED", "clear finalized totals", "set status=REOPENED", "increments BillingPeriod.version by 1"]
+
+  # ---- BillingLineItem ----
+  - method: GET
+    path: "/billing-periods/{id}/line-items"
+    description: "List a period's billing line items (reverse-reachability for BillingLineItem.billing_period_id)."
+    roles: [BillingSpecialist, CareCoordinator]
+    code: 200
+    input: ["cpt_code?", "status?"]
+    output: BillingLineItem[]
+    side_effects: []
+
+  # ---- CareActivity ----
+  - method: POST
+    path: "/patients/{id}/care-activities"
+    description: "Log a care-management minute block into an OPEN period (provisional recompute)."
+    roles: [Clinician, Physician]
+    code: 201
+    input: [billing_period_id, clinician_user_id, activity_type, minutes, performed_at]
+    output: CareActivity
+    side_effects: ["compute counted_minutes with daily cap (care_time_aggregation provisional)", "recompute period.provisional_total_minutes; increments BillingPeriod.version by 1"]
+  - method: GET
+    path: "/patients/{id}/care-activities"
+    description: "List a patient's care activities (reverse-reachability for CareActivity.patient_id)."
+    roles: [Clinician, Physician, BillingSpecialist]
+    code: 200
+    input: ["billing_period_id?", "limit?", "offset?"]
+    output: CareActivity[]
+    side_effects: []
+  - method: GET
+    path: "/billing-periods/{id}/care-activities"
+    description: "List a billing period's care activities (reverse-reachability for CareActivity.billing_period_id)."
+    roles: [Clinician, Physician, BillingSpecialist]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CareActivity[]
+    side_effects: []
+
+  # ---- Claim ----
+  - method: POST
+    path: "/billing-periods/{id}/claims"
+    description: "Submit (or resubmit) a claim for a FINALIZED period; enforces consent + timely filing."
+    roles: [BillingSpecialist]
+    code: 201
+    input: []
+    output: Claim
+    side_effects: ["create or resubmit Claim with claimed_cents=finalized_total_cents", "set period status=CLAIMED", "increments BillingPeriod.version by 1"]
+  - method: GET
+    path: "/billing-periods/{id}/claims"
+    description: "List claims for a period (reverse-reachability for Claim.billing_period_id)."
+    roles: [BillingSpecialist, PayerAgent]
+    code: 200
+    input: ["status?"]
+    output: Claim[]
+    side_effects: []
+  - method: GET
+    path: "/claims"
+    description: "List claims; filter by payer_id (reverse-reachability for Claim.payer_id)."
+    roles: [BillingSpecialist, PayerAgent]
+    code: 200
+    input: ["payer_id?", "status?", "limit?", "offset?"]
+    output: Claim[]
+    side_effects: []
+  - method: GET
+    path: "/claims/{id}"
+    description: "Fetch a claim."
+    roles: [BillingSpecialist, PayerAgent]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: []
+  - method: POST
+    path: "/claims/{id}/accept"
+    description: "Payer accepts a submitted claim."
+    roles: [PayerAgent]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["set status=ACCEPTED", "increments Claim.version by 1"]
+  - method: POST
+    path: "/claims/{id}/deny"
+    description: "Payer denies a submitted claim; reopens period to FINALIZED for correction."
+    roles: [PayerAgent]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["set status=DENIED", "cascade: linked BillingPeriod CLAIMED -> FINALIZED (claim_denial_reopen)", "increments Claim.version by 1"]
+  - method: POST
+    path: "/claims/{id}/remit"
+    description: "Payer posts a remittance; partial or full settlement (payer_reimbursement_settlement)."
+    roles: [PayerAgent]
+    code: 200
+    input: [remittance_cents]
+    output: Claim
+    side_effects: ["set reimbursed_cents += remittance_cents", "set status PARTIALLY_PAID or PAID", "increments Claim.version by 1"]
+
+  # ---- Test-driving clock endpoint ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the logical clock to an ISO-8601 instant. Server startup default is 2026-05-01T00:00:00Z; before any set call the clock reads exactly this default and never falls back to wall-clock time. All deadline/expiry/period-elapsed rules read this clock."
+    roles: [BillingSpecialist, CareCoordinator]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["advance logical clock"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing or malformed X-User-Role / X-User-ID headers"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "role not permitted for the operation per §1.7"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a path-referenced resource does not exist"
+  - id: ERR_REFERENCE_NOT_FOUND
+    http: 404
+    condition: "a body FK (payer_id, billing_period_id, device_id, vitals_reading_id, threshold_alert_id) does not resolve"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "missing required field, wrong type, or out-of-domain enum value"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "transition not defined from the entity's current state"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_billing_period_version does not match current BillingPeriod.version on finalize"
+  - id: ERR_ESCALATION_NOT_PERMITTED
+    http: 409
+    condition: "escalate attempted on a non-CRITICAL ThresholdAlert"
+  - id: ERR_OPEN_REVIEW_TASK
+    http: 409
+    condition: "resolve attempted while a linked ReviewTask is QUEUED/IN_REVIEW/ESCALATED"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "the signing Physician's X-User-ID equals the clinician_user_id of a CareActivity for the same patient_id as the ReviewTask"
+  - id: ERR_NOT_TASK_OWNER
+    http: 403
+    condition: "Physician signing a ReviewTask they did not claim (reviewer_user_id != X-User-ID)"
+  - id: ERR_CONSENT_REQUIRED
+    http: 409
+    condition: "enroll/vitals/care-activity attempted without ACTIVE consent or required enrollment status"
+  - id: ERR_PERIOD_NOT_CLOSED
+    http: 409
+    condition: "finalize attempted before the period's calendar month has fully elapsed"
+  - id: ERR_ACTIVITY_OUT_OF_PERIOD
+    http: 422
+    condition: "CareActivity.performed_at falls outside the billing period's calendar month"
+  - id: ERR_DUPLICATE_RESOURCE
+    http: 409
+    condition: "duplicate Device.serial_number among active devices or duplicate Patient.mrn among active patients"
+  - id: ERR_PERIOD_OVERLAP
+    http: 409
+    condition: "a new BillingPeriod's calendar month collides with an existing non-REOPENED period for the same patient"
+  - id: ERR_ACTIVE_PLAN_EXISTS
+    http: 409
+    condition: "activating a second CarePlan as ACTIVE without the supersede flag"
+  - id: ERR_TIMELY_FILING_EXPIRED
+    http: 409
+    condition: "claim submitted beyond Payer.timely_filing_days after the period's last calendar day"
+  - id: ERR_BILLING_CONSENT_GAP
+    http: 409
+    condition: "claim submitted for a consent-required payer without ACTIVE consent spanning the entire billing month"
+  - id: ERR_NOTHING_TO_CLAIM
+    http: 409
+    condition: "claim submitted for a FINALIZED period whose finalized_total_cents == 0"
+  - id: ERR_REMITTANCE_EXCEEDS_CLAIM
+    http: 422
+    condition: "a remittance would push cumulative reimbursed_cents above claimed_cents"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: CareCoordinator
+    description: "Manages patient enrollment, consents, devices, and vitals intake."
+    identity: opaque
+    exclusive_operations:
+      - "POST /patients"
+      - "POST /patients/{id}/enroll"
+      - "POST /patients/{id}/suspend"
+      - "POST /patients/{id}/discharge"
+      - "POST /patients/{id}/consents"
+      - "POST /patients/{id}/consents/{consent_id}/revoke"
+      - "POST /patients/{id}/devices"
+      - "POST /patients/{id}/devices/{device_id}/activate"
+      - "POST /patients/{id}/devices/{device_id}/return"
+    shared_operations:
+      - "GET (patients, devices, vitals, alerts, care-plans, consents, payers, billing-periods)"
+      - "POST /patients/{id}/vitals"
+      - "POST /_clock/set_current_utc"
+  - name: Clinician
+    description: "Monitors vitals, triages alerts, and logs care-management minutes."
+    identity: opaque
+    exclusive_operations:
+      - "POST /alerts/{id}/acknowledge"
+      - "POST /alerts/{id}/escalate"
+      - "POST /alerts/{id}/resolve"
+    shared_operations:
+      - "POST /patients/{id}/vitals"
+      - "POST /patients/{id}/care-activities"
+      - "GET (patients, vitals, alerts, care-plans, devices, care-activities)"
+  - name: Physician
+    description: "Authors/activates care plans and signs the provider review queue."
+    identity: opaque
+    exclusive_operations:
+      - "POST /patients/{id}/care-plans"
+      - "POST /patients/{id}/care-plans/{plan_id}/activate"
+      - "POST /review-tasks/{id}/claim"
+      - "POST /review-tasks/{id}/sign"
+      - "POST /review-tasks/{id}/escalate"
+    shared_operations:
+      - "POST /patients/{id}/care-activities"
+      - "GET (patients, care-plans, alerts, vitals, review-tasks, billing-periods, devices, care-activities)"
+  - name: BillingSpecialist
+    description: "Manages payers, billing periods, finalization, claim submission."
+    identity: opaque
+    exclusive_operations:
+      - "POST /payers"
+      - "POST /patients/{id}/billing-periods"
+      - "POST /billing-periods/{id}/finalize"
+      - "POST /billing-periods/{id}/reopen"
+      - "POST /billing-periods/{id}/claims"
+    shared_operations:
+      - "GET (payers, patients, billing-periods, line-items, claims, care-activities, consents)"
+      - "POST /_clock/set_current_utc"
+  - name: PayerAgent
+    description: "Acts on behalf of the payer to adjudicate claims and post remittances."
+    identity: opaque
+    exclusive_operations:
+      - "POST /claims/{id}/accept"
+      - "POST /claims/{id}/deny"
+      - "POST /claims/{id}/remit"
+    shared_operations:
+      - "GET (claims, billing-periods/{id}/claims)"

@@ -1,0 +1,1303 @@
+scenario: "Check Cashing, Money Order & Bill Pay (ACE Cash Express style): instrument verification & risk hold, fee by check type/amount, ID/KYC & OFAC screen, money-order/wire/bill-pay issuance, prepaid-card load, daily-limit & velocity rules, returned-item recovery, end-of-day cash reconciliation"
+domain_name: check-cashing-money-services
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: ledger_reconciliation
+  complexity_layers:
+    - rate_threshold_triggers      # daily-limit & velocity breakpoints
+    - cascading_side_effects       # check cash -> drawer debit, customer velocity bump, returned-item recovery cascade
+    - dual_variant_calculation     # check-cash fee (gross float vs verified net) and customer risk score (provisional vs confirmed)
+    - optimistic_concurrency       # OCC on CashDrawer.version for close-out, on Customer.version for limit-window reset
+
+  entity_topology: flat
+  # Peer entities tied together by foreign keys (Customer, CashDrawer, Transaction, MoneyOrder...). No nested URL ownership tree.
+
+  state_machine_shape: branching
+  # CheckItem forks VERIFYING -> {CLEARED, RISK_HELD}; RISK_HELD -> {CLEARED, REJECTED}; Transaction has parallel settlement vs lifecycle dimensions.
+
+  relationship_patterns:
+    - one_to_many        # Customer 1..* Transaction; CashDrawer 1..* Transaction
+    - flat               # FK references between peers
+    - cross_aggregate    # Transaction references Customer, CashDrawer, FeeSchedule, ComplianceScreen
+
+  role_model: segregation_of_duties
+  # The Teller who issues an instrument cannot be the StoreManager who approves a risk-held check or closes the drawer.
+
+  consistency_model: immediate
+  # All cascades (drawer debit, velocity bump, recovery offset) settle atomically within the triggering request.
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: Legal name of the KYC subject.
+      - name: id_type
+        type: enum
+        source: input
+        description: Government ID presented.
+        constraints: "one of {DRIVERS_LICENSE, STATE_ID, PASSPORT, MILITARY_ID}"
+      - name: id_number
+        type: string
+        source: input
+        description: Government ID number (used for KYC dedupe).
+      - name: date_of_birth
+        type: string
+        source: input
+        description: ISO date (YYYY-MM-DD); used to confirm age >= 18.
+      - name: kyc_status
+        type: enum
+        source: computed
+        description: Result of the most recent ComplianceScreen for this customer.
+        default: PENDING
+        constraints: "one of {PENDING, VERIFIED, OFAC_BLOCKED, REJECTED}"
+      - name: risk_tier
+        type: enum
+        source: computed
+        description: Derived from confirmed risk_score; gates per-transaction ceilings.
+        default: STANDARD
+        constraints: "one of {STANDARD, ELEVATED, HIGH}; STANDARD<350, ELEVATED 350..699, HIGH>=700"
+      - name: risk_score
+        type: number
+        source: computed
+        description: Confirmed cumulative risk score (see calc customer_risk_score variant=confirmed). Starts 0.
+        default: 0
+        constraints: "0..1000 clamp"
+      - name: daily_cashed_amount_cents
+        type: integer
+        source: computed
+        description: Sum of CLEARED check-cash face amounts for this customer within the current limit window.
+        default: 0
+      - name: daily_transaction_count
+        type: integer
+        source: computed
+        description: Count of non-VOIDED transactions for this customer within the current limit window.
+        default: 0
+      - name: limit_window_opened_at
+        type: datetime
+        source: computed
+        description: Start of the current rolling 24h limit window for this customer.
+      - name: outstanding_recovery_cents
+        type: integer
+        source: computed
+        description: Net unrecovered balance owed by customer from returned items (face + return_fee less recovered). Starts 0.
+        default: 0
+
+  - name: ComplianceScreen
+    parent: null
+    common_fields: false
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the screened subject."
+      - name: ofac_list_hit
+        type: boolean
+        source: input
+        description: Whether the screening vendor returned an OFAC sanctions-list match.
+      - name: kyc_documents_valid
+        type: boolean
+        source: input
+        description: Whether presented identity documents passed verification.
+      - name: outcome
+        type: enum
+        source: computed
+        description: Screen result; written to Customer.kyc_status.
+        constraints: "one of {VERIFIED, OFAC_BLOCKED, REJECTED}; OFAC_BLOCKED if ofac_list_hit, else REJECTED if !kyc_documents_valid, else VERIFIED"
+
+  - name: FeeSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - name: check_type
+        type: enum
+        source: input
+        description: Instrument category this schedule prices.
+        constraints: "one of {PAYROLL, GOVERNMENT, PERSONAL, MONEY_ORDER_CHECK, INSURANCE}"
+      - name: base_fee_cents
+        type: integer
+        source: input
+        description: Flat fee floor applied regardless of percentage.
+      - name: percent_rate_bps
+        type: integer
+        source: input
+        description: Percentage fee in basis points (e.g. 200 = 2.00%) of check face amount.
+      - name: tier_breakpoint_cents
+        type: integer
+        source: input
+        description: Face amount at or above which the high_percent_rate_bps applies marginally to the excess.
+      - name: high_percent_rate_bps
+        type: integer
+        source: input
+        description: Marginal basis points applied to face amount in excess of tier_breakpoint_cents.
+      - name: max_fee_cents
+        type: integer
+        source: input
+        description: Ceiling on total fee for this schedule.
+      - name: active
+        type: boolean
+        source: input
+        description: Whether this schedule may be selected for new transactions.
+        default: true
+
+  - name: CashDrawer
+    parent: null
+    common_fields: true
+    fields:
+      - name: store_code
+        type: string
+        source: input
+        description: Branch identifier this drawer belongs to.
+      - name: business_date
+        type: string
+        source: input
+        description: ISO date the drawer is opened for (YYYY-MM-DD).
+      - name: opening_float_cents
+        type: integer
+        source: input
+        description: Starting cash counted into the drawer at open.
+      - name: status
+        type: enum
+        source: computed
+        description: Drawer lifecycle state.
+        default: OPEN
+        constraints: "one of {OPEN, RECONCILING, CLOSED, OVER_SHORT}"
+      - name: expected_cash_cents
+        type: integer
+        source: computed
+        description: opening_float + net cash impact of all posted transactions (see calc drawer_expected_cash). Recomputed on every posting cascade.
+        default: 0
+      - name: counted_cash_cents
+        type: integer
+        source: input
+        description: Physical cash counted at close; null until reconciliation begins.
+      - name: variance_cents
+        type: integer
+        source: computed
+        description: counted_cash_cents - expected_cash_cents at close (signed).
+        default: 0
+
+  - name: Transaction
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the acting customer."
+      - name: drawer_id
+        type: string
+        source: input
+        description: "FK -> CashDrawer.id; the drawer cash flows through."
+      - name: txn_type
+        type: enum
+        source: input
+        description: Product category.
+        constraints: "one of {CHECK_CASH, MONEY_ORDER, WIRE, BILL_PAY, PREPAID_LOAD}"
+      - name: face_amount_cents
+        type: integer
+        source: input
+        description: Instrument principal — check face for CHECK_CASH, send amount otherwise.
+        constraints: ">= 1"
+      - name: fee_schedule_id
+        type: string
+        source: input
+        description: "FK -> FeeSchedule.id; required only for txn_type=CHECK_CASH, must be null otherwise."
+      - name: fee_cents
+        type: integer
+        source: computed
+        description: Service fee computed at posting (see calc check_cash_fee for CHECK_CASH, calc service_fee otherwise).
+        default: 0
+      - name: net_disbursed_cents
+        type: integer
+        source: computed
+        description: Cash handed to/collected from customer (see calc drawer_expected_cash for sign convention).
+        default: 0
+      - name: lifecycle_state
+        type: enum
+        source: computed
+        description: Posting/voiding dimension of the transaction.
+        default: DRAFT
+        constraints: "one of {DRAFT, POSTED, VOIDED}"
+      - name: settlement_state
+        type: enum
+        source: computed
+        description: Settlement dimension (independent of lifecycle); only meaningful once POSTED.
+        default: UNSETTLED
+        constraints: "one of {UNSETTLED, SETTLED, RETURNED, RECOVERED}"
+
+  - name: CheckItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: transaction_id
+        type: string
+        source: input
+        description: "FK -> Transaction.id; the CHECK_CASH transaction this physical check backs (1:1)."
+      - name: check_face_cents
+        type: integer
+        source: system
+        description: Copied from the parent Transaction.face_amount_cents at creation.
+      - name: maker_account_risk
+        type: enum
+        source: input
+        description: Vendor risk signal on the check maker's account.
+        constraints: "one of {LOW, MEDIUM, HIGH}"
+      - name: verification_state
+        type: enum
+        source: computed
+        description: Instrument verification / risk-hold dimension.
+        default: VERIFYING
+        constraints: "one of {VERIFYING, CLEARED, RISK_HELD, REJECTED}"
+      - name: hold_reason
+        type: enum
+        source: computed
+        description: Why a check entered RISK_HELD; null otherwise.
+        constraints: "one of {AMOUNT_THRESHOLD, MAKER_RISK, VELOCITY} or null"
+
+  - name: MoneyOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: transaction_id
+        type: string
+        source: input
+        description: "FK -> Transaction.id; the MONEY_ORDER transaction that funded this instrument (1:1)."
+      - name: serial_number
+        type: string
+        source: system
+        description: Server-minted printed serial; unique across all MoneyOrders.
+      - name: payee_name
+        type: string
+        source: input
+        description: Named payee printed on the money order.
+      - name: amount_cents
+        type: integer
+        source: system
+        description: Copied from parent Transaction.face_amount_cents at issuance.
+      - name: status
+        type: enum
+        source: computed
+        description: Money-order lifecycle.
+        default: ISSUED
+        constraints: "one of {ISSUED, VOIDED}"
+
+  - name: WireTransfer
+    parent: null
+    common_fields: true
+    fields:
+      - name: transaction_id
+        type: string
+        source: input
+        description: "FK -> Transaction.id; the WIRE transaction (1:1)."
+      - name: destination_country
+        type: string
+        source: input
+        description: ISO 3166 alpha-2 country code of the wire destination.
+      - name: beneficiary_name
+        type: string
+        source: input
+        description: Wire beneficiary.
+      - name: status
+        type: enum
+        source: computed
+        description: Wire lifecycle.
+        default: SENT
+        constraints: "one of {SENT, RECALLED}"
+
+  - name: BillPayment
+    parent: null
+    common_fields: true
+    fields:
+      - name: transaction_id
+        type: string
+        source: input
+        description: "FK -> Transaction.id; the BILL_PAY transaction (1:1)."
+      - name: biller_code
+        type: string
+        source: input
+        description: Registered biller identifier.
+      - name: account_reference
+        type: string
+        source: input
+        description: Customer's account number with the biller.
+      - name: status
+        type: enum
+        source: computed
+        description: Bill-payment lifecycle.
+        default: SUBMITTED
+        constraints: "one of {SUBMITTED, VOIDED}"
+
+  - name: PrepaidCardLoad
+    parent: null
+    common_fields: true
+    fields:
+      - name: transaction_id
+        type: string
+        source: input
+        description: "FK -> Transaction.id; the PREPAID_LOAD transaction (1:1)."
+      - name: card_last_four
+        type: string
+        source: input
+        description: Last four digits of the prepaid card being loaded.
+      - name: loaded_amount_cents
+        type: integer
+        source: system
+        description: Copied from parent Transaction.face_amount_cents at load.
+      - name: status
+        type: enum
+        source: computed
+        description: Load lifecycle.
+        default: LOADED
+        constraints: "one of {LOADED, REVERSED}"
+
+  - name: ReturnedItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: transaction_id
+        type: string
+        source: input
+        description: "FK -> Transaction.id; the originally-cashed CHECK_CASH transaction returned unpaid (1:1)."
+      - name: customer_id
+        type: string
+        source: system
+        description: "FK -> Customer.id; copied from the parent Transaction.customer_id."
+      - name: return_reason
+        type: enum
+        source: input
+        description: Bank return reason.
+        constraints: "one of {NSF, ACCOUNT_CLOSED, STOP_PAYMENT, FRAUD}"
+      - name: return_fee_cents
+        type: integer
+        source: system
+        description: Flat returned-item fee assessed (see calc returned_item_recovery).
+      - name: recovered_cents
+        type: integer
+        source: computed
+        description: Cumulative amount recovered against this item (face + return_fee).
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: Recovery lifecycle.
+        default: OUTSTANDING
+        constraints: "one of {OUTSTANDING, PARTIALLY_RECOVERED, RECOVERED, WRITTEN_OFF}"
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: CheckItem
+    initial_state: VERIFYING
+    terminal_states: [REJECTED]
+    note: |
+      verification_state is the risk dimension. CLEARED is the success terminal for the check itself
+      but the check can still later be RETURNED at the Transaction.settlement_state level.
+    transitions:
+      - from: VERIFYING
+        to: CLEARED
+        trigger: "POST /transactions (CHECK_CASH posting) when no hold condition is met"
+        actor: system
+        preconditions:
+          - "parent Transaction.lifecycle_state transitions to POSTED in the same request"
+          - "face_amount_cents < FEE/HOLD threshold AND maker_account_risk != HIGH AND velocity within window"
+        side_effects:
+          - "Transaction.settlement_state set to SETTLED"
+          - "set Customer.daily_cashed_amount_cents += check_face_cents (cascade: customer_velocity_accrual)"
+          - "CashDrawer.expected_cash_cents recomputed (cascade: drawer posting)"
+      - from: VERIFYING
+        to: RISK_HELD
+        trigger: "POST /transactions (CHECK_CASH posting) when a hold condition is met"
+        actor: system
+        preconditions:
+          - "face_amount_cents >= HOLD_THRESHOLD_CENTS OR maker_account_risk == HIGH OR daily_transaction_count >= VELOCITY_HOLD_COUNT"
+        side_effects:
+          - "hold_reason set to AMOUNT_THRESHOLD | MAKER_RISK | VELOCITY (first matching, evaluated in that order)"
+          - "Transaction.lifecycle_state remains DRAFT (no cash moves, drawer untouched)"
+          - "Customer.risk_score provisional increment recorded but NOT confirmed until release decision"
+      - from: RISK_HELD
+        to: CLEARED
+        trigger: "POST /check-items/{id}/release"
+        actor: StoreManager
+        preconditions:
+          - "CheckItem.verification_state == RISK_HELD"
+          - "acting StoreManager.id != the Teller who created the parent Transaction (segregation of duties)"
+          - "parent Customer.kyc_status == VERIFIED"
+        side_effects:
+          - "parent Transaction.lifecycle_state -> POSTED; settlement_state -> SETTLED"
+          - "Customer.daily_cashed_amount_cents += check_face_cents (cascade: customer_velocity_accrual)"
+          - "CashDrawer.expected_cash_cents recomputed (cascade: drawer posting)"
+          - "Customer.risk_score confirmed += hold-derived risk delta (calc customer_risk_score variant=confirmed)"
+      - from: RISK_HELD
+        to: REJECTED
+        trigger: "POST /check-items/{id}/reject"
+        actor: StoreManager
+        preconditions:
+          - "CheckItem.verification_state == RISK_HELD"
+          - "acting StoreManager.id != the Teller who created the parent Transaction (segregation of duties)"
+        side_effects:
+          - "parent Transaction.lifecycle_state -> VOIDED; settlement_state stays UNSETTLED"
+          - "Customer.risk_score confirmed += hold-derived risk delta (calc customer_risk_score variant=confirmed)"
+          - "no cash moves; drawer untouched"
+
+  - entity: Transaction
+    initial_state: DRAFT
+    terminal_states: [VOIDED]
+    note: |
+      Two parallel dimensions on one row: lifecycle_state {DRAFT,POSTED,VOIDED} and
+      settlement_state {UNSETTLED,SETTLED,RETURNED,RECOVERED}. They evolve independently —
+      a POSTED txn can later become RETURNED then RECOVERED while lifecycle stays POSTED.
+    transitions:
+      - from: "lifecycle=DRAFT"
+        to: "lifecycle=POSTED"
+        trigger: "POST /transactions for non-CHECK_CASH types, or auto on CHECK_CASH with no hold, or via release"
+        actor: Teller | system | StoreManager
+        preconditions:
+          - "Customer.kyc_status == VERIFIED"
+          - "Customer.risk_tier ceiling not exceeded by face_amount_cents"
+          - "daily-limit and velocity checks pass (see validations)"
+          - "CashDrawer.status == OPEN"
+        side_effects:
+          - "fee_cents and net_disbursed_cents computed"
+          - "settlement_state -> SETTLED for CHECK_CASH; product child (MoneyOrder/Wire/BillPayment/PrepaidCardLoad) created for others"
+          - "CashDrawer.expected_cash_cents recomputed; Customer velocity counters bumped"
+      - from: "settlement=SETTLED"
+        to: "settlement=RETURNED"
+        trigger: "POST /transactions/{id}/return (creates ReturnedItem)"
+        actor: StoreManager
+        preconditions:
+          - "Transaction.txn_type == CHECK_CASH"
+          - "Transaction.lifecycle_state == POSTED AND settlement_state == SETTLED"
+        side_effects:
+          - "ReturnedItem created with status OUTSTANDING (cascade root: returned_item_recovery)"
+          - "Customer.outstanding_recovery_cents += (check face + return_fee) (cascade hop 1)"
+          - "Customer.risk_score confirmed += RETURN_RISK_DELTA which may bump Customer.risk_tier (cascade hop 2)"
+      - from: "settlement=RETURNED"
+        to: "settlement=RECOVERED"
+        trigger: "POST /returned-items/{id}/recover fully satisfying the balance"
+        actor: Teller
+        preconditions:
+          - "linked ReturnedItem.status transitions to RECOVERED in the same request"
+        side_effects:
+          - "Customer.outstanding_recovery_cents -= recovered portion (cascade)"
+      - from: "lifecycle=POSTED"
+        to: "lifecycle=VOIDED"
+        trigger: "POST /transactions/{id}/void"
+        actor: StoreManager
+        preconditions:
+          - "Transaction.lifecycle_state == POSTED"
+          - "settlement_state NOT IN {RETURNED, RECOVERED}"
+          - "parent CashDrawer.status == OPEN"
+        side_effects:
+          - "product child status -> VOIDED/REVERSED/RECALLED as applicable"
+          - "CashDrawer.expected_cash_cents recomputed (reverse the original net cash impact)"
+          - "Customer.daily_cashed_amount_cents and daily_transaction_count decremented (compensation)"
+
+  - entity: CashDrawer
+    initial_state: OPEN
+    terminal_states: [CLOSED, OVER_SHORT]
+    note: "Branching at close: variance==0 -> CLOSED, variance!=0 -> OVER_SHORT. RECONCILING is the intermediate count state."
+    transitions:
+      - from: OPEN
+        to: RECONCILING
+        trigger: "POST /cash-drawers/{id}/begin-reconcile"
+        actor: StoreManager
+        preconditions:
+          - "CashDrawer.status == OPEN"
+          - "no Transaction on this drawer has lifecycle_state == DRAFT (no open risk-held items)"
+        side_effects:
+          - "expected_cash_cents frozen at current value; no further postings accepted"
+      - from: RECONCILING
+        to: CLOSED
+        trigger: "POST /cash-drawers/{id}/close with counted_cash_cents (variance == 0)"
+        actor: StoreManager
+        preconditions:
+          - "CashDrawer.status == RECONCILING"
+          - "expected_drawer_version matches (OCC)"
+          - "counted_cash_cents == expected_cash_cents"
+        side_effects:
+          - "variance_cents set to 0"
+          - "increments CashDrawer.version by 1"
+      - from: RECONCILING
+        to: OVER_SHORT
+        trigger: "POST /cash-drawers/{id}/close with counted_cash_cents (variance != 0)"
+        actor: StoreManager
+        preconditions:
+          - "CashDrawer.status == RECONCILING"
+          - "expected_drawer_version matches (OCC)"
+          - "counted_cash_cents != expected_cash_cents"
+        side_effects:
+          - "variance_cents = counted_cash_cents - expected_cash_cents (signed)"
+          - "increments CashDrawer.version by 1"
+
+  - entity: ReturnedItem
+    initial_state: OUTSTANDING
+    terminal_states: [RECOVERED, WRITTEN_OFF]
+    note: "Cyclic-capable recovery: OUTSTANDING -> PARTIALLY_RECOVERED -> PARTIALLY_RECOVERED (repeated partial recoveries) -> RECOVERED."
+    transitions:
+      - from: OUTSTANDING
+        to: PARTIALLY_RECOVERED
+        trigger: "POST /returned-items/{id}/recover with amount < remaining balance"
+        actor: Teller
+        preconditions:
+          - "ReturnedItem.status == OUTSTANDING"
+          - "0 < amount_cents < (check face + return_fee - recovered_cents)"
+        side_effects:
+          - "recovered_cents += amount_cents"
+          - "Customer.outstanding_recovery_cents -= amount_cents (cascade)"
+      - from: PARTIALLY_RECOVERED
+        to: PARTIALLY_RECOVERED
+        trigger: "POST /returned-items/{id}/recover with amount < remaining balance (another partial)"
+        actor: Teller
+        preconditions:
+          - "ReturnedItem.status == PARTIALLY_RECOVERED"
+          - "0 < amount_cents < (check face + return_fee - recovered_cents)"
+        side_effects:
+          - "recovered_cents += amount_cents"
+          - "Customer.outstanding_recovery_cents -= amount_cents (cascade)"
+      - from: PARTIALLY_RECOVERED
+        to: RECOVERED
+        trigger: "POST /returned-items/{id}/recover with amount == remaining balance"
+        actor: Teller
+        preconditions:
+          - "ReturnedItem.status IN {OUTSTANDING, PARTIALLY_RECOVERED}"
+          - "amount_cents == (check face + return_fee - recovered_cents)"
+        side_effects:
+          - "recovered_cents = check face + return_fee"
+          - "Customer.outstanding_recovery_cents -= amount_cents (cascade)"
+          - "linked Transaction.settlement_state -> RECOVERED"
+      - from: OUTSTANDING
+        to: RECOVERED
+        trigger: "POST /returned-items/{id}/recover with amount == full balance"
+        actor: Teller
+        preconditions:
+          - "ReturnedItem.status == OUTSTANDING"
+          - "amount_cents == (check face + return_fee - recovered_cents)"
+        side_effects:
+          - "recovered_cents = check face + return_fee"
+          - "Customer.outstanding_recovery_cents -= amount_cents (cascade)"
+          - "linked Transaction.settlement_state -> RECOVERED"
+      - from: OUTSTANDING
+        to: WRITTEN_OFF
+        trigger: "POST /returned-items/{id}/write-off"
+        actor: StoreManager
+        preconditions:
+          - "ReturnedItem.status IN {OUTSTANDING, PARTIALLY_RECOVERED}"
+        side_effects:
+          - "Customer.outstanding_recovery_cents -= (check face + return_fee - recovered_cents) (remaining cleared)"
+          - "Customer.risk_score confirmed += WRITE_OFF_RISK_DELTA"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: drawer-close-stale-version
+    parent_entity: CashDrawer
+    write_endpoint: "POST /cash-drawers/{id}/close"
+    occ_field: "expected_drawer_version"
+    description: |
+      Closing a CashDrawer whose version has advanced since the client last observed it is
+      rejected. A transaction void or returned-item posting cascade can recompute
+      expected_cash_cents and bump the drawer version after the StoreManager read the drawer
+      to count cash; closing against that stale view would lock in a wrong expected balance.
+    error_id: ERR_STALE_DRAWER_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: check_cash_fee
+    trigger: "Transaction posting where txn_type == CHECK_CASH (POST /transactions, or CheckItem release)"
+    algorithm: tiered_pricing
+    formula: |
+      base = FeeSchedule.base_fee_cents
+      face = Transaction.face_amount_cents
+      bp   = FeeSchedule.tier_breakpoint_cents
+      if face <= bp:
+        pct = face * FeeSchedule.percent_rate_bps / 10000      # integer floor division
+      else:
+        low  = bp * FeeSchedule.percent_rate_bps / 10000        # integer floor
+        high = (face - bp) * FeeSchedule.high_percent_rate_bps / 10000  # integer floor (marginal on excess)
+        pct  = low + high
+      raw_fee = base + pct
+      fee = min(raw_fee, FeeSchedule.max_fee_cents)
+    input_set: "single Transaction + its selected FeeSchedule (active==true). Marginal tiered rate on the excess above the breakpoint."
+    constants:
+      HOLD_THRESHOLD_CENTS: 300000      # check face >= this -> CheckItem RISK_HELD with hold_reason=AMOUNT_THRESHOLD
+      VELOCITY_HOLD_COUNT: 8            # daily_transaction_count >= this at posting -> hold_reason=VELOCITY
+    precision: |
+      integer cents; PINNED ORDER: each percent leg (low tier, high tier) is floor-divided independently
+      BEFORE summing (round per-leg, then add) — this diverges from sum-then-floor by up to 1 cent when
+      both legs carry fractional remainders; then base added; then min-capped at max_fee_cents.
+    variants:
+      - name: float_gross
+        when: "this is the only fee variant for CHECK_CASH; computed against the full face amount"
+        difference: "fee is charged on the full check face regardless of any later return"
+
+  - name: service_fee
+    trigger: "Transaction posting where txn_type IN {MONEY_ORDER, WIRE, BILL_PAY, PREPAID_LOAD}"
+    algorithm: tiered_pricing
+    formula: |
+      face = Transaction.face_amount_cents
+      if txn_type == MONEY_ORDER:  fee = min(MO_FLAT_CENTS + face*MO_BPS/10000, MO_MAX_CENTS)
+      if txn_type == WIRE:         fee = WIRE_FLAT_CENTS + face*WIRE_BPS/10000      # uncapped
+      if txn_type == BILL_PAY:     fee = BILLPAY_FLAT_CENTS                          # flat, face-independent
+      if txn_type == PREPAID_LOAD: fee = max(PREPAID_FLAT_CENTS, face*PREPAID_BPS/10000)  # greater-of
+    input_set: "single Transaction; fee_schedule_id MUST be null for these types — uses these hard constants."
+    constants:
+      MO_FLAT_CENTS: 99
+      MO_BPS: 50
+      MO_MAX_CENTS: 500
+      WIRE_FLAT_CENTS: 1500
+      WIRE_BPS: 100
+      BILLPAY_FLAT_CENTS: 195
+      PREPAID_FLAT_CENTS: 395
+      PREPAID_BPS: 30
+    precision: "integer cents; percent legs floored before combining"
+
+  - name: drawer_expected_cash
+    trigger: "any posting/void cascade affecting a CashDrawer; recomputed on begin-reconcile freeze"
+    algorithm: aggregation
+    formula: |
+      # net_disbursed_cents sign convention per transaction (computed at posting):
+      #   CHECK_CASH:   net = +(face - fee)        # cash OUT of drawer to customer
+      #   MONEY_ORDER:  net = -(face + fee)        # cash IN from customer
+      #   WIRE:         net = -(face + fee)        # cash IN
+      #   BILL_PAY:     net = -(face + fee)        # cash IN
+      #   PREPAID_LOAD: net = -(face + fee)        # cash IN
+      # drawer effect: cash leaves on CHECK_CASH, enters on the others.
+      cash_out = sum(t.face - t.fee for t in CHECK_CASH txns on drawer where lifecycle_state==POSTED)
+      cash_in  = sum(t.face + t.fee for t in non-CHECK_CASH txns on drawer where lifecycle_state==POSTED)
+      expected_cash_cents = opening_float_cents - cash_out + cash_in
+    input_set: "all Transactions on this drawer with lifecycle_state == POSTED (VOIDED excluded). DRAFT/risk-held excluded."
+    constants: {}
+    precision: "integer cents; exact sum, no rounding"
+
+  - name: customer_risk_score
+    trigger: "ComplianceScreen creation (provisional seed), CheckItem release/reject, Transaction return, ReturnedItem write-off"
+    algorithm: weighted_scoring
+    formula: |
+      delta = 0
+      delta += HIGH_MAKER_PTS    if the held check had maker_account_risk == HIGH
+      delta += AMOUNT_HOLD_PTS   if hold_reason == AMOUNT_THRESHOLD
+      delta += VELOCITY_HOLD_PTS if hold_reason == VELOCITY
+      delta += RETURN_RISK_DELTA on a Transaction return
+      delta += WRITE_OFF_RISK_DELTA on a ReturnedItem write-off
+      new_score = clamp(old_score + delta, 0, 1000)
+      risk_tier = HIGH if new_score>=700 else ELEVATED if new_score>=350 else STANDARD
+    input_set: "single Customer; accumulates across the customer's lifetime events."
+    constants:
+      HIGH_MAKER_PTS: 120
+      AMOUNT_HOLD_PTS: 60
+      VELOCITY_HOLD_PTS: 90
+      RETURN_RISK_DELTA: 250
+      WRITE_OFF_RISK_DELTA: 200
+    precision: "integer points; clamp 0..1000"
+    variants:
+      - name: provisional
+        when: "computed at the moment a CheckItem enters RISK_HELD — shows the prospective score if the hold is confirmed"
+        difference: "NOT written to Customer.risk_score; a what-if value surfaced on the check, reverted to zero contribution if never released/rejected"
+      - name: confirmed
+        when: "computed when the hold is resolved (release or reject) or on return/write-off"
+        difference: "written to Customer.risk_score and may bump risk_tier, gating future per-transaction ceilings"
+
+  - name: returned_item_recovery
+    trigger: "Transaction return (creates ReturnedItem); each POST /returned-items/{id}/recover"
+    algorithm: waterfall_allocation
+    formula: |
+      total_owed = check_face_cents + RETURN_FEE_CENTS
+      # recovery waterfall: each payment first fills RETURN_FEE_CENTS, then check face principal
+      on return:   ReturnedItem.return_fee_cents = RETURN_FEE_CENTS; recovered_cents = 0; status = OUTSTANDING
+      on recover(amount):
+        remaining = total_owed - recovered_cents
+        applied   = min(amount, remaining)          # over-payment rejected by validation, not silently capped
+        recovered_cents += applied
+        status = RECOVERED if recovered_cents == total_owed
+                 else PARTIALLY_RECOVERED
+        Customer.outstanding_recovery_cents -= applied
+    input_set: "single ReturnedItem; total_owed is fixed at return time and never re-derived."
+    constants:
+      RETURN_FEE_CENTS: 2500
+    precision: "integer cents; waterfall fills fee bucket then principal bucket"
+
+  - name: velocity_window
+    trigger: "every POST /transactions (before posting); evaluated against the logical clock"
+    algorithm: aggregation
+    formula: |
+      now = logical_clock()
+      if Customer.limit_window_opened_at is null OR now >= Customer.limit_window_opened_at + 24h:
+        # half-open rollover: a posting AT exactly +24h starts a fresh window
+        Customer.limit_window_opened_at = now
+        Customer.daily_transaction_count = 0
+        Customer.daily_cashed_amount_cents = 0
+      # after rollover (if any), enforce caps INCLUDING the posting under test:
+      projected_count  = Customer.daily_transaction_count + 1
+      projected_cashed = Customer.daily_cashed_amount_cents + (face if txn_type==CHECK_CASH else 0)
+      reject if projected_count > DAILY_TXN_LIMIT                 -> ERR_VELOCITY_LIMIT_EXCEEDED
+      reject if projected_cashed > DAILY_CASH_LIMIT_CENTS         -> ERR_DAILY_LIMIT_EXCEEDED
+      # on success: counters take the projected values; CHECK_CASH face only counts toward daily_cashed
+    input_set: "single Customer's window counters; window is the half-open interval [opened_at, opened_at+24h)."
+    constants:
+      DAILY_TXN_LIMIT: 12
+      DAILY_CASH_LIMIT_CENTS: 1000000
+      STANDARD_CEILING_CENTS: 500000
+      ELEVATED_CEILING_CENTS: 200000
+      HIGH_CEILING_CENTS: 50000
+    precision: "integer; window rollover is half-open (>= upper bound rolls)"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "role permitted for the operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "all path/body referenced resources exist (Customer, CashDrawer, FeeSchedule, Transaction, CheckItem, ReturnedItem), validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 4
+    category: state
+    check: "target resource in a valid state for the requested transition (e.g., release only from RISK_HELD; close only from RECONCILING; void only from POSTED)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints"
+
+  - priority: 5
+    category: business_constraint
+    check: "segregation of duties: the StoreManager releasing/rejecting a check or voiding a transaction MUST NOT be the Teller (X-User-ID) recorded as that Transaction's creator"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /check-items/{id}/release, POST /check-items/{id}/reject, POST /transactions/{id}/void"
+
+  - priority: 6
+    category: business_safety
+    check: "Customer.kyc_status == VERIFIED before posting any transaction (OFAC/KYC compliance gate)"
+    error_id: ERR_KYC_NOT_VERIFIED
+    http_status: 403
+    applies_to: "POST /transactions, POST /check-items/{id}/release"
+
+  - priority: 7
+    category: business_safety
+    check: "Customer.kyc_status != OFAC_BLOCKED (sanctioned customer is hard-blocked even if a stale VERIFIED elsewhere)"
+    error_id: ERR_OFAC_BLOCKED
+    http_status: 403
+    applies_to: "POST /transactions, POST /compliance-screens, POST /check-items/{id}/release"
+
+  - priority: 8
+    category: business_constraint
+    check: "fee_schedule_id required and active for txn_type==CHECK_CASH; MUST be null for all other txn_types"
+    error_id: ERR_FEE_SCHEDULE_INVALID
+    http_status: 422
+    applies_to: "POST /transactions"
+
+  - priority: 9
+    category: business_temporal
+    check: "CashDrawer.status == OPEN to accept new postings or voids (RECONCILING/CLOSED/OVER_SHORT drawers reject)"
+    error_id: ERR_DRAWER_NOT_OPEN
+    http_status: 409
+    applies_to: "POST /transactions, POST /transactions/{id}/void, POST /check-items/{id}/release"
+
+  - priority: 10
+    category: business_referential
+    check: "wire destination_country MUST NOT be on the embargoed-country set {CU, IR, KP, SY}"
+    error_id: ERR_EMBARGOED_DESTINATION
+    http_status: 422
+    applies_to: "POST /transactions (txn_type==WIRE)"
+
+  - priority: 11
+    category: business_constraint
+    check: "face_amount_cents MUST NOT exceed the Customer.risk_tier per-transaction ceiling (STANDARD 500000, ELEVATED 200000, HIGH 50000)"
+    error_id: ERR_RISK_CEILING_EXCEEDED
+    http_status: 422
+    applies_to: "POST /transactions"
+
+  - priority: 12
+    category: business_fiscal
+    check: "daily velocity: posting MUST NOT push Customer.daily_transaction_count above DAILY_TXN_LIMIT (12) within the rolling 24h window"
+    error_id: ERR_VELOCITY_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /transactions"
+
+  - priority: 13
+    category: business_fiscal
+    check: "daily amount: a CHECK_CASH posting MUST NOT push Customer.daily_cashed_amount_cents above DAILY_CASH_LIMIT_CENTS (1000000) within the window"
+    error_id: ERR_DAILY_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /transactions (txn_type==CHECK_CASH)"
+
+  - priority: 14
+    category: business_fiscal
+    check: "recover amount_cents MUST be > 0 and MUST NOT exceed the ReturnedItem remaining balance (total_owed - recovered_cents)"
+    error_id: ERR_RECOVERY_OVERPAYMENT
+    http_status: 422
+    applies_to: "POST /returned-items/{id}/recover"
+
+  - priority: 15
+    category: business_constraint
+    check: "close requires counted_cash_cents present and >= 0; begin-reconcile requires no DRAFT (risk-held) transactions remain on the drawer"
+    error_id: ERR_OPEN_ITEMS_REMAIN
+    http_status: 409
+    applies_to: "POST /cash-drawers/{id}/begin-reconcile"
+
+  - priority: 16
+    category: business_temporal
+    check: |
+      Single-occupancy drawer conflict: at most one CashDrawer may be in status==OPEN for a given
+      (store_code, business_date) key. Opening a second drawer for the same key while one is OPEN is
+      rejected (point/key occupation — closed equality on the (store_code, business_date) pair, no
+      buffer, no aggregate capacity).
+    error_id: ERR_DRAWER_CONFLICT
+    http_status: 409
+    applies_to: "POST /cash-drawers"
+
+  - priority: 17
+    category: business_temporal
+    check: |
+      Rolling-window velocity occupation: the limit window is the half-open interval
+      [Customer.limit_window_opened_at, limit_window_opened_at + 24h). A posting whose clock time falls
+      inside this interval occupies the same window and accumulates against DAILY_TXN_LIMIT /
+      DAILY_CASH_LIMIT_CENTS (aggregate capacity). A posting at or after the upper bound rolls the window
+      (window_opened_at := now, counters reset) and starts a fresh aggregate. The boundary is half-open:
+      a posting exactly at limit_window_opened_at + 24h rolls (it is NOT inside the prior window).
+    error_id: ERR_VELOCITY_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /transactions"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Customers / KYC ----
+  - method: POST
+    path: "/customers"
+    description: "Register a KYC subject (kyc_status starts PENDING)."
+    roles: [Teller, StoreManager]
+    code: 201
+    input: [full_name, id_type, id_number, date_of_birth]
+    output: Customer
+    side_effects: ["Customer created with kyc_status=PENDING, risk_tier=STANDARD, risk_score=0"]
+
+  - method: GET
+    path: "/customers/{id}"
+    description: "Fetch a customer."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  - method: GET
+    path: "/customers"
+    description: "List customers (paginated)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: ["kyc_status?", "limit?", "offset?"]
+    output: Customer[]
+    side_effects: []
+
+  - method: GET
+    path: "/customers/{id}/compliance-screens"
+    description: "List a customer's ComplianceScreens (FK reverse-reachability for ComplianceScreen.customer_id)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: ComplianceScreen[]
+
+  - method: GET
+    path: "/customers/{id}/returned-items"
+    description: "List a customer's ReturnedItems (FK reverse-reachability for ReturnedItem.customer_id)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: ReturnedItem[]
+
+  - method: POST
+    path: "/compliance-screens"
+    description: "Run an OFAC/KYC screen on a customer; writes outcome to Customer.kyc_status and seeds provisional risk."
+    roles: [StoreManager]
+    code: 201
+    input: [customer_id, ofac_list_hit, kyc_documents_valid]
+    output: ComplianceScreen
+    side_effects:
+      - "outcome computed: OFAC_BLOCKED if ofac_list_hit else REJECTED if !kyc_documents_valid else VERIFIED"
+      - "Customer.kyc_status set to outcome (cascade: cross-entity)"
+
+  # ---- Fee schedules ----
+  - method: POST
+    path: "/fee-schedules"
+    description: "Create a check-cashing fee schedule for a check_type."
+    roles: [StoreManager]
+    code: 201
+    input: [check_type, base_fee_cents, percent_rate_bps, tier_breakpoint_cents, high_percent_rate_bps, max_fee_cents, "active?"]
+    output: FeeSchedule
+    side_effects: []
+
+  - method: GET
+    path: "/fee-schedules/{id}"
+    description: "Fetch a fee schedule."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: FeeSchedule
+
+  - method: GET
+    path: "/fee-schedules"
+    description: "List fee schedules (filter by check_type/active)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: ["check_type?", "active?", "limit?", "offset?"]
+    output: FeeSchedule[]
+
+  # ---- Cash drawers ----
+  - method: POST
+    path: "/cash-drawers"
+    description: "Open a cash drawer for a store/business date with an opening float."
+    roles: [StoreManager]
+    code: 201
+    input: [store_code, business_date, opening_float_cents]
+    output: CashDrawer
+    side_effects: ["status=OPEN, expected_cash_cents=opening_float_cents"]
+
+  - method: GET
+    path: "/cash-drawers/{id}"
+    description: "Fetch a drawer (expected_cash_cents, variance, version)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: CashDrawer
+
+  - method: GET
+    path: "/cash-drawers/{id}/transactions"
+    description: "List transactions posted to a drawer (FK reverse-reachability for Transaction.drawer_id)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: ["lifecycle_state?", "limit?", "offset?"]
+    output: Transaction[]
+
+  - method: POST
+    path: "/cash-drawers/{id}/begin-reconcile"
+    description: "Move drawer OPEN -> RECONCILING; freezes expected_cash_cents."
+    roles: [StoreManager]
+    code: 200
+    input: []
+    output: CashDrawer
+    side_effects: ["status=RECONCILING; expected_cash_cents frozen"]
+
+  - method: POST
+    path: "/cash-drawers/{id}/close"
+    description: "Close drawer with a physical count; OCC-guarded by expected_drawer_version. variance==0 -> CLOSED else OVER_SHORT."
+    roles: [StoreManager]
+    code: 200
+    input: [counted_cash_cents, expected_drawer_version]
+    output: CashDrawer
+    side_effects:
+      - "variance_cents = counted_cash_cents - expected_cash_cents"
+      - "status -> CLOSED (variance==0) or OVER_SHORT (variance!=0)"
+      - "increments CashDrawer.version by 1"
+
+  # ---- Transactions ----
+  - method: POST
+    path: "/transactions"
+    description: "Create + post a transaction of any txn_type. CHECK_CASH also creates a CheckItem (auto-clears or risk-holds). Records creator Teller id."
+    roles: [Teller, StoreManager]
+    code: 201
+    input: [customer_id, drawer_id, txn_type, face_amount_cents, "fee_schedule_id?", "maker_account_risk?", "payee_name?", "destination_country?", "beneficiary_name?", "biller_code?", "account_reference?", "card_last_four?"]
+    output: Transaction
+    side_effects:
+      - "fee_cents & net_disbursed_cents computed (calc check_cash_fee or service_fee)"
+      - "CHECK_CASH: CheckItem created; auto-clear posts (lifecycle POSTED, settlement SETTLED) else RISK_HELD keeps lifecycle DRAFT"
+      - "non-CHECK_CASH: lifecycle POSTED, settlement SETTLED, product child created"
+      - "POSTED txns recompute CashDrawer.expected_cash_cents and bump Customer velocity counters"
+
+  - method: GET
+    path: "/transactions/{id}"
+    description: "Fetch a transaction (both state dimensions, fee, net)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: Transaction
+
+  - method: GET
+    path: "/transactions"
+    description: "List transactions (filter by customer_id, drawer_id, fee_schedule_id, txn_type)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: ["customer_id?", "drawer_id?", "fee_schedule_id?", "txn_type?", "limit?", "offset?"]
+    output: Transaction[]
+
+  - method: POST
+    path: "/transactions/{id}/void"
+    description: "Void a POSTED transaction (StoreManager, segregation of duties); reverses drawer cash and velocity counters."
+    roles: [StoreManager]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects:
+      - "lifecycle_state -> VOIDED; product child -> VOIDED/REVERSED/RECALLED"
+      - "CashDrawer.expected_cash_cents recomputed (reverse net impact)"
+      - "Customer.daily_cashed_amount_cents/daily_transaction_count decremented (compensation)"
+
+  - method: POST
+    path: "/transactions/{id}/return"
+    description: "Mark a POSTED+SETTLED CHECK_CASH transaction as RETURNED; creates a ReturnedItem and accrues recovery + risk."
+    roles: [StoreManager]
+    code: 201
+    input: [return_reason]
+    output: ReturnedItem
+    side_effects:
+      - "settlement_state -> RETURNED; ReturnedItem created (status OUTSTANDING)"
+      - "Customer.outstanding_recovery_cents += (check face + RETURN_FEE_CENTS) (cascade hop 1)"
+      - "Customer.risk_score += RETURN_RISK_DELTA, may bump risk_tier (cascade hop 2)"
+
+  # ---- Check items ----
+  - method: GET
+    path: "/check-items/{id}"
+    description: "Fetch a check item (verification_state, hold_reason)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: CheckItem
+
+  - method: GET
+    path: "/transactions/{id}/check-items"
+    description: "List the CheckItem(s) for a transaction (FK reverse-reachability for CheckItem.transaction_id; array len 0 or 1)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: CheckItem[]
+
+  - method: POST
+    path: "/check-items/{id}/release"
+    description: "StoreManager releases a RISK_HELD check; posts the transaction (segregation of duties enforced)."
+    roles: [StoreManager]
+    code: 200
+    input: []
+    output: CheckItem
+    side_effects:
+      - "verification_state -> CLEARED; parent Transaction lifecycle POSTED, settlement SETTLED"
+      - "CashDrawer.expected_cash_cents recomputed; Customer velocity bumped"
+      - "Customer.risk_score confirmed += hold-derived delta"
+
+  - method: POST
+    path: "/check-items/{id}/reject"
+    description: "StoreManager rejects a RISK_HELD check; voids the transaction (segregation of duties enforced)."
+    roles: [StoreManager]
+    code: 200
+    input: []
+    output: CheckItem
+    side_effects:
+      - "verification_state -> REJECTED; parent Transaction lifecycle VOIDED"
+      - "Customer.risk_score confirmed += hold-derived delta"
+
+  # ---- Product children (reverse-reachability for transaction_id FKs) ----
+  - method: GET
+    path: "/transactions/{id}/money-order"
+    description: "List the MoneyOrder for a transaction (FK reverse-reachability for MoneyOrder.transaction_id)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: MoneyOrder[]
+
+  - method: GET
+    path: "/transactions/{id}/wire-transfer"
+    description: "List the WireTransfer for a transaction (FK reverse-reachability for WireTransfer.transaction_id)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: WireTransfer[]
+
+  - method: GET
+    path: "/transactions/{id}/bill-payment"
+    description: "List the BillPayment for a transaction (FK reverse-reachability for BillPayment.transaction_id)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: BillPayment[]
+
+  - method: GET
+    path: "/transactions/{id}/prepaid-card-load"
+    description: "List the PrepaidCardLoad for a transaction (FK reverse-reachability for PrepaidCardLoad.transaction_id)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: PrepaidCardLoad[]
+
+  # ---- Returned-item recovery ----
+  - method: GET
+    path: "/returned-items/{id}"
+    description: "Fetch a returned item (recovered_cents, status). FK reverse-reachability for ReturnedItem.transaction_id is via filtered transactions list."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: []
+    output: ReturnedItem
+
+  - method: GET
+    path: "/returned-items"
+    description: "List returned items (filter by transaction_id, customer_id, status). FK reverse-reachability for ReturnedItem.transaction_id."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: ["transaction_id?", "customer_id?", "status?", "limit?", "offset?"]
+    output: ReturnedItem[]
+
+  - method: POST
+    path: "/returned-items/{id}/recover"
+    description: "Apply a recovery payment to a returned item (waterfall: fee then principal)."
+    roles: [Teller, StoreManager]
+    code: 200
+    input: [amount_cents]
+    output: ReturnedItem
+    side_effects:
+      - "recovered_cents += applied; status -> PARTIALLY_RECOVERED or RECOVERED"
+      - "Customer.outstanding_recovery_cents -= applied"
+      - "on full recovery: linked Transaction.settlement_state -> RECOVERED"
+
+  - method: POST
+    path: "/returned-items/{id}/write-off"
+    description: "StoreManager writes off an outstanding returned item."
+    roles: [StoreManager]
+    code: 200
+    input: []
+    output: ReturnedItem
+    side_effects:
+      - "status -> WRITTEN_OFF; Customer.outstanding_recovery_cents cleared of remaining"
+      - "Customer.risk_score += WRITE_OFF_RISK_DELTA"
+
+  # ---- Test-driving ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock. Startup default is 2026-05-01T00:00:00Z (the logical clock reads exactly this before any set call; it never falls back to wall-clock). Governs the rolling 24h limit window."
+    roles: [StoreManager]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["logical clock advanced; limit-window rollover evaluated lazily on next velocity check"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role or X-User-ID header missing/invalid"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "role not permitted for this operation per RBAC"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "referenced Customer/CashDrawer/FeeSchedule/Transaction/CheckItem/ReturnedItem does not exist"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "target resource not in a valid state for the requested transition"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "approver/voider is the same X-User-ID as the Transaction's creating Teller"
+  - id: ERR_KYC_NOT_VERIFIED
+    http: 403
+    condition: "Customer.kyc_status != VERIFIED on a posting attempt"
+  - id: ERR_OFAC_BLOCKED
+    http: 403
+    condition: "Customer.kyc_status == OFAC_BLOCKED"
+  - id: ERR_FEE_SCHEDULE_INVALID
+    http: 422
+    condition: "missing/inactive fee_schedule_id for CHECK_CASH, or non-null fee_schedule_id for another txn_type"
+  - id: ERR_DRAWER_NOT_OPEN
+    http: 409
+    condition: "CashDrawer.status != OPEN when a posting or void is attempted"
+  - id: ERR_EMBARGOED_DESTINATION
+    http: 422
+    condition: "WIRE destination_country in {CU, IR, KP, SY}"
+  - id: ERR_RISK_CEILING_EXCEEDED
+    http: 422
+    condition: "face_amount_cents exceeds the Customer.risk_tier per-transaction ceiling"
+  - id: ERR_VELOCITY_LIMIT_EXCEEDED
+    http: 422
+    condition: "posting would push daily_transaction_count above DAILY_TXN_LIMIT in the window"
+  - id: ERR_DAILY_LIMIT_EXCEEDED
+    http: 422
+    condition: "CHECK_CASH posting would push daily_cashed_amount_cents above DAILY_CASH_LIMIT_CENTS in the window"
+  - id: ERR_RECOVERY_OVERPAYMENT
+    http: 422
+    condition: "recover amount_cents <= 0 or exceeds the returned item's remaining balance"
+  - id: ERR_OPEN_ITEMS_REMAIN
+    http: 409
+    condition: "begin-reconcile attempted while DRAFT (risk-held) transactions remain on the drawer"
+  - id: ERR_DRAWER_CONFLICT
+    http: 409
+    condition: "opening a CashDrawer for a (store_code, business_date) that already has an OPEN drawer"
+  - id: ERR_STALE_DRAWER_VERSION
+    http: 412
+    condition: "expected_drawer_version does not match CashDrawer.version on close (OCC)"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "malformed body, missing required field, or out-of-domain value (e.g. face_amount_cents < 1, bad enum)"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Teller
+    description: "Front-line clerk who registers customers, posts ordinary transactions, and applies recovery payments."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /returned-items/{id}/recover (recovery collection)"
+    shared_operations:
+      - "POST /customers"
+      - "GET /customers, GET /customers/{id}"
+      - "POST /transactions (creates transaction; recorded as the creating Teller)"
+      - "GET /transactions, GET /transactions/{id}"
+      - "GET /cash-drawers/{id}, GET /cash-drawers/{id}/transactions"
+      - "GET /fee-schedules, GET /fee-schedules/{id}"
+      - "GET on all child/returned-item read endpoints"
+
+  - name: StoreManager
+    description: "Branch supervisor who runs compliance screens, manages fee schedules and drawers, and approves/voids/returns/writes-off — kept separate from the posting Teller (segregation of duties)."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /compliance-screens"
+      - "POST /fee-schedules"
+      - "POST /cash-drawers, POST /cash-drawers/{id}/begin-reconcile, POST /cash-drawers/{id}/close"
+      - "POST /check-items/{id}/release, POST /check-items/{id}/reject"
+      - "POST /transactions/{id}/void"
+      - "POST /transactions/{id}/return"
+      - "POST /returned-items/{id}/write-off"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /customers"
+      - "POST /transactions (may also post; still recorded as creator for SoD)"
+      - "POST /returned-items/{id}/recover"
+      - "all GET endpoints"

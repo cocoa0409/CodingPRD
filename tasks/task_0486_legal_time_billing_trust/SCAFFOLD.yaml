@@ -1,0 +1,1856 @@
+scenario: "486. Legal Time, Billing & Trust (Clio/LEDES style): matter & client intake, time/expense capture & billable rate, LEDES/UTBMS code & e-billing, trust (IOLTA) deposit/disbursement & three-way reconciliation, retainer replenishment, invoice & write-down, collections & A/R, conflict check"
+domain_name: legal-time-billing-trust
+api_prefix: /firm
+
+complexity_profile:
+  primary_archetype: Ledger reconciliation
+  secondary_archetype: Compliance / audit
+  complexity_layers:
+    - Optimistic concurrency        # OCC on Invoice.version for the post-invoice trust-sweep race
+    - Cascading side effects        # invoice finalize -> ledger debits -> A/R; trust sweep -> client-ledger -> three-way
+    - Dual-variant calculation      # billable-rate resolution (matter vs timekeeper vs client override) AND realization (provisional vs final write-down)
+    - Derived field reconciliation  # TrustAccount.book_balance_cents = sum of ClientTrustLedger.balance_cents; the three-way invariant
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (Client, Matter, Timekeeper, TimeEntry, ExpenseEntry,
+  # Invoice, TrustAccount, ClientTrustLedger, TrustTransaction, Payment, ConflictCheck).
+  # No deep URL nesting; everything links via *_id fields.
+
+  state_machine_shape: parallel
+  # Invoice carries TWO independent state dimensions evolving on the same row:
+  #   billing_status   (DRAFT -> ISSUED -> PARTIALLY_PAID -> PAID, with WRITTEN_OFF / VOID branches)
+  #   collection_status (CURRENT -> DUE -> OVERDUE -> IN_COLLECTIONS, plus SETTLED)
+  # Also: Matter has a branching/cyclic conflict→intake lifecycle; TrustTransaction is append-only.
+
+  relationship_patterns:
+    - one_to_many        # Client -> Matter; Matter -> TimeEntry / ExpenseEntry / Invoice
+    - cross_aggregate    # Invoice.matter_id and trust sweep crosses Invoice <-> TrustAccount <-> ClientTrustLedger
+    - self_referential   # ConflictCheck.adverse_party_client_id references another Client
+
+  role_model: segregation_of_duties
+  # IOLTA controls: the Attorney who APPROVES a trust disbursement cannot be the BillingClerk who
+  # initiates it; an Invoice cannot be both finalized and trust-swept by the same actor when the
+  # firm requires dual control. PlatformAdmin is the operational/superuser role.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: Client
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits. Canonical tie-break / chronological-order key."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation incl. cascaded side effects."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; +1 on every mutation."
+      - name: display_name
+        type: string
+        source: input
+        description: "Client legal name; used for conflict-check name matching (case-insensitive, trimmed)."
+        constraints: "1-200 chars; required"
+      - name: client_type
+        type: enum
+        source: input
+        description: "INDIVIDUAL or ORGANIZATION."
+        constraints: "enum: {INDIVIDUAL, ORGANIZATION}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle: PROSPECT at create; ACTIVE once a matter opens; INACTIVE when all matters closed."
+        default: PROSPECT
+        constraints: "enum: {PROSPECT, ACTIVE, INACTIVE}"
+      - name: ar_balance_cents
+        type: integer
+        source: computed
+        description: "Derived A/R: sum over this client's Invoices of (total_cents - amount_paid_cents - written_off_cents) for billing_status IN {ISSUED, PARTIALLY_PAID}. Recomputed on invoice finalize / payment / write-down."
+        default: 0
+
+  - name: Timekeeper
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; +1 on every mutation."
+      - name: full_name
+        type: string
+        source: input
+        description: "Timekeeper legal name; used for conflict-check matching against client/adverse names."
+        constraints: "1-200 chars; required"
+      - name: role_kind
+        type: enum
+        source: input
+        description: "PARTNER, ASSOCIATE, or PARALEGAL. Drives default standard rate tier."
+        constraints: "enum: {PARTNER, ASSOCIATE, PARALEGAL}"
+      - name: standard_rate_cents
+        type: integer
+        source: input
+        description: "Timekeeper's default hourly billing rate in cents. Lowest-precedence rate in the resolution ladder."
+        constraints: ">= 0; required"
+      - name: is_active
+        type: boolean
+        source: input
+        description: "When false the timekeeper may not be assigned new time entries."
+        default: true
+
+  - name: Matter
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation incl. cascaded side effects."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; +1 on every mutation."
+      - name: client_id
+        type: string
+        source: input
+        description: "FK -> Client.id; owning client of this matter."
+      - name: responsible_timekeeper_id
+        type: string
+        source: input
+        description: "FK -> Timekeeper.id; responsible attorney for the matter."
+      - name: title
+        type: string
+        source: input
+        description: "Matter title/description."
+        constraints: "1-200 chars; required"
+      - name: matter_rate_cents
+        type: integer
+        source: input
+        description: "Optional matter-level negotiated hourly rate in cents. Highest-precedence rate when present (non-null)."
+        default: null
+        constraints: ">= 0 when present"
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle: INTAKE -> CONFLICT_PENDING -> CONFLICT_CLEARED -> OPEN -> CLOSED, with CONFLICT_BLOCKED branch. Time/expense capture allowed only when OPEN."
+        default: INTAKE
+        constraints: "enum: {INTAKE, CONFLICT_PENDING, CONFLICT_CLEARED, CONFLICT_BLOCKED, OPEN, CLOSED}"
+      - name: wip_fees_cents
+        type: integer
+        source: computed
+        description: "Work-in-progress: sum of billable_amount_cents over this matter's TimeEntries with status=CAPTURED (not yet on an invoice)."
+        default: 0
+      - name: wip_expenses_cents
+        type: integer
+        source: computed
+        description: "Sum of amount_cents over this matter's ExpenseEntries with status=CAPTURED."
+        default: 0
+
+  - name: ConflictCheck
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits. Replay/tie-break key for matched-name ordering."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; +1 on every mutation."
+      - name: matter_id
+        type: string
+        source: input
+        description: "FK -> Matter.id; the matter this conflict check screens."
+      - name: adverse_party_client_id
+        type: string
+        source: input
+        description: "FK -> Client.id; an existing client named as adverse party (self-referential client linkage). Null when the adverse party is only a free-text name."
+        default: null
+      - name: adverse_party_name
+        type: string
+        source: input
+        description: "Free-text adverse-party name screened against existing Client.display_name and Timekeeper.full_name."
+        constraints: "1-200 chars; required"
+      - name: result
+        type: enum
+        source: computed
+        description: "CLEAR (no match), FLAGGED (name match, needs waiver), or WAIVED (partner override). Drives Matter conflict transition."
+        default: CLEAR
+        constraints: "enum: {CLEAR, FLAGGED, WAIVED}"
+      - name: matched_client_id
+        type: string
+        source: computed
+        description: "FK -> Client.id; the existing client whose display_name matched the adverse party (earliest created_at among matches), else null."
+        default: null
+
+  - name: TimeEntry
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits. Chronological key for invoice line ordering."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; +1 on every mutation."
+      - name: matter_id
+        type: string
+        source: input
+        description: "FK -> Matter.id; matter the time was worked on."
+      - name: timekeeper_id
+        type: string
+        source: input
+        description: "FK -> Timekeeper.id; who performed the work."
+      - name: worked_at
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC start instant of the work. The entry occupies the half-open interval [worked_at, worked_at + minutes) on its timekeeper's calendar; two entries for one timekeeper may not overlap (adjacency where one ends exactly as the next begins IS allowed)."
+      - name: minutes
+        type: integer
+        source: input
+        description: "Duration worked, in minutes. Billed in 6-minute (0.1 hr) increments rounded up. Also the length of the [worked_at, worked_at+minutes) occupation interval."
+        constraints: "> 0; required"
+      - name: utbms_task_code
+        type: string
+        source: input
+        description: "FK -> BillingCode.code; UTBMS task code (e.g. L110). Must reference a BillingCode of kind=TASK."
+      - name: utbms_activity_code
+        type: string
+        source: input
+        description: "FK -> BillingCode.code; UTBMS activity code (e.g. A101). Must reference a BillingCode of kind=ACTIVITY."
+      - name: resolved_rate_cents
+        type: integer
+        source: computed
+        description: "Hourly rate resolved at capture via the rate ladder (matter_rate > client_override > timekeeper.standard_rate). Frozen on the entry once captured."
+        default: 0
+      - name: billable_amount_cents
+        type: integer
+        source: computed
+        description: "Computed = resolved_rate_cents * billable_hours, where billable_hours = ceil(minutes/6)/10 (6-min increments). Rounded per RoundingPolicy."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "CAPTURED at create; INVOICED when attached to a finalized invoice; WRITTEN_DOWN when individually struck before invoicing."
+        default: CAPTURED
+        constraints: "enum: {CAPTURED, INVOICED, WRITTEN_DOWN}"
+      - name: invoice_id
+        type: string
+        source: computed
+        description: "FK -> Invoice.id; set when this entry is rolled onto a finalized invoice, else null."
+        default: null
+
+  - name: ExpenseEntry
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; +1 on every mutation."
+      - name: matter_id
+        type: string
+        source: input
+        description: "FK -> Matter.id; matter the expense belongs to."
+      - name: utbms_expense_code
+        type: string
+        source: input
+        description: "FK -> BillingCode.code; UTBMS expense code (e.g. E101). Must reference a BillingCode of kind=EXPENSE."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Hard-cost expense amount in cents (already final; no rate applied)."
+        constraints: "> 0; required"
+      - name: status
+        type: enum
+        source: computed
+        description: "CAPTURED at create; INVOICED when on a finalized invoice; WRITTEN_DOWN when struck before invoicing."
+        default: CAPTURED
+        constraints: "enum: {CAPTURED, INVOICED, WRITTEN_DOWN}"
+      - name: invoice_id
+        type: string
+        source: computed
+        description: "FK -> Invoice.id; set when rolled onto a finalized invoice, else null."
+        default: null
+
+  - name: BillingCode
+    parent: null
+    common_fields: false
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: code
+        type: string
+        source: input
+        description: "UTBMS/LEDES code string (e.g. L110, A101, E101). Unique across all BillingCodes."
+        constraints: "unique; 2-10 chars; required"
+      - name: kind
+        type: enum
+        source: input
+        description: "TASK (L-codes), ACTIVITY (A-codes), or EXPENSE (E-codes). Restricts which entry type may reference it."
+        constraints: "enum: {TASK, ACTIVITY, EXPENSE}"
+      - name: label
+        type: string
+        source: input
+        description: "Human-readable description of the code."
+        constraints: "1-120 chars; required"
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation incl. cascaded side effects."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; +1 on every mutation. OCC field for the post-finalize trust-sweep race."
+      - name: matter_id
+        type: string
+        source: input
+        description: "FK -> Matter.id; matter being billed."
+      - name: client_id
+        type: string
+        source: computed
+        description: "FK -> Client.id; copied from matter.client_id at draft; the responsible payor."
+      - name: issue_date
+        type: datetime
+        source: input
+        description: "Invoice issue date (ISO 8601). Sets the collections clock; due_date = issue_date + net_terms_days."
+      - name: net_terms_days
+        type: integer
+        source: input
+        description: "Payment terms in days (e.g. 30). due_date = issue_date + net_terms_days."
+        default: 30
+        constraints: ">= 0"
+      - name: fees_subtotal_cents
+        type: integer
+        source: computed
+        description: "Sum of billable_amount_cents over attached TimeEntries minus per-line fee write-downs. Pinned at finalize."
+        default: 0
+      - name: expenses_subtotal_cents
+        type: integer
+        source: computed
+        description: "Sum of amount_cents over attached ExpenseEntries. Pinned at finalize."
+        default: 0
+      - name: written_off_cents
+        type: integer
+        source: computed
+        description: "Cumulative write-down applied to this invoice (line write-downs at finalize + post-issue write-offs)."
+        default: 0
+      - name: total_cents
+        type: integer
+        source: computed
+        description: "= fees_subtotal_cents + expenses_subtotal_cents (after write-downs). The billed amount due. Pinned at finalize."
+        default: 0
+      - name: amount_paid_cents
+        type: integer
+        source: computed
+        description: "Cumulative payments applied (from operating Payments and trust sweeps)."
+        default: 0
+      - name: billing_status
+        type: enum
+        source: computed
+        description: "Dimension 1: DRAFT -> ISSUED -> PARTIALLY_PAID -> PAID; branches VOID (from DRAFT/ISSUED) and WRITTEN_OFF."
+        default: DRAFT
+        constraints: "enum: {DRAFT, ISSUED, PARTIALLY_PAID, PAID, WRITTEN_OFF, VOID}"
+      - name: collection_status
+        type: enum
+        source: computed
+        description: "Dimension 2 (independent of billing_status while ISSUED): CURRENT -> DUE -> OVERDUE -> IN_COLLECTIONS; SETTLED once PAID/WRITTEN_OFF. Advances via /_clock and explicit collection actions."
+        default: CURRENT
+        constraints: "enum: {CURRENT, DUE, OVERDUE, IN_COLLECTIONS, SETTLED}"
+
+  - name: TrustAccount
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation incl. cascaded side effects."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; +1 on every mutation."
+      - name: name
+        type: string
+        source: input
+        description: "IOLTA pooled trust account label."
+        constraints: "1-120 chars; required"
+      - name: bank_balance_cents
+        type: integer
+        source: computed
+        description: "Reconciliation leg A (bank statement): adjusted only by CONFIRMED TrustTransactions (cleared at the bank). Deposits/disbursements with status=PENDING do not move it."
+        default: 0
+      - name: book_balance_cents
+        type: integer
+        source: computed
+        description: "Reconciliation leg B (firm cash book): adjusted by every POSTED TrustTransaction (PENDING or CONFIRMED). Three-way invariant: book_balance_cents == sum over ClientTrustLedgers of balance_cents (leg C)."
+        default: 0
+
+  - name: ClientTrustLedger
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation incl. cascaded side effects."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; +1 on every mutation."
+      - name: trust_account_id
+        type: string
+        source: input
+        description: "FK -> TrustAccount.id; the pooled account this sub-ledger lives in."
+      - name: client_id
+        type: string
+        source: input
+        description: "FK -> Client.id; the client whose trust funds this sub-ledger tracks."
+      - name: balance_cents
+        type: integer
+        source: computed
+        description: "Reconciliation leg C (per-client sub-ledger): adjusted by every POSTED TrustTransaction for this client. Must never go negative (no commingling/overdraw). Sum across all ledgers in an account == that account's book_balance_cents."
+        default: 0
+      - name: retainer_floor_cents
+        type: integer
+        source: input
+        description: "Replenishment threshold; when balance_cents < retainer_floor_cents after a sweep, the matter/client is flagged for retainer replenishment."
+        default: 0
+        constraints: ">= 0"
+
+  - name: RetainerHold
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; +1 on every mutation."
+      - name: client_trust_ledger_id
+        type: string
+        source: input
+        description: "FK -> ClientTrustLedger.id; the sub-ledger whose funds are reserved for an anticipated cost."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Reserved magnitude in cents; informational reservation against the ledger balance for the hold window."
+        constraints: "> 0; required"
+      - name: hold_start_at
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC inclusive start of the CLOSED reservation interval [hold_start_at, hold_end_at]. Two holds on the same ledger may not overlap; because the interval is closed, touching endpoints (one hold ending exactly when another begins) DO collide — distinct from the half-open time-entry interval."
+      - name: hold_end_at
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC inclusive end of the closed reservation interval; must be > hold_start_at."
+      - name: status
+        type: enum
+        source: computed
+        description: "ACTIVE at create; RELEASED when explicitly released (frees the window for a new overlapping hold)."
+        default: ACTIVE
+        constraints: "enum: {ACTIVE, RELEASED}"
+
+  - name: TrustTransaction
+    parent: null
+    common_fields: false
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits. Append-only ordering key for the trust ledger replay."
+      - name: client_trust_ledger_id
+        type: string
+        source: input
+        description: "FK -> ClientTrustLedger.id; sub-ledger this transaction posts to."
+      - name: kind
+        type: enum
+        source: input
+        description: "DEPOSIT (+), DISBURSEMENT (-), or SWEEP_TO_OPERATING (-, pays an Invoice). Append-only; reversal is a separate compensating DEPOSIT/DISBURSEMENT."
+        constraints: "enum: {DEPOSIT, DISBURSEMENT, SWEEP_TO_OPERATING}"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Absolute magnitude in cents (always positive); sign implied by kind."
+        constraints: "> 0; required"
+      - name: status
+        type: enum
+        source: computed
+        description: "PENDING at create (moves book + ledger, not bank); CONFIRMED when cleared at bank (moves bank); VOIDED when a reversal/compensation supersedes it (reverses book + ledger, and bank if it was CONFIRMED)."
+        default: PENDING
+        constraints: "enum: {PENDING, CONFIRMED, VOIDED}"
+      - name: invoice_id
+        type: string
+        source: input
+        description: "FK -> Invoice.id; set only for kind=SWEEP_TO_OPERATING (the invoice paid from trust), else null."
+        default: null
+      - name: initiated_by_user_id
+        type: string
+        source: input
+        description: "X-User-ID of the BillingClerk/Attorney that created the disbursement (segregation-of-duties anchor)."
+      - name: approved_by_user_id
+        type: string
+        source: computed
+        description: "X-User-ID of the Attorney that approved a DISBURSEMENT/SWEEP; must differ from initiated_by_user_id. Null for DEPOSIT."
+        default: null
+
+  - name: Payment
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: "Server-minted UUID, no type prefix. Identity only; never a business-decision input."
+      - name: created_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC, three fractional digits. Chronological order for A/R application."
+      - name: updated_at
+        type: datetime
+        source: system
+        description: "ISO 8601 UTC; refreshed on every mutation."
+      - name: version
+        type: integer
+        source: system
+        description: "Starts at 1; +1 on every mutation."
+      - name: invoice_id
+        type: string
+        source: input
+        description: "FK -> Invoice.id; the invoice this operating-account payment is applied to."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Operating-account payment amount in cents (client paid the firm directly, not from trust)."
+        constraints: "> 0; required"
+      - name: method
+        type: enum
+        source: input
+        description: "How the client paid."
+        constraints: "enum: {CHECK, ACH, CARD}"
+      - name: status
+        type: enum
+        source: computed
+        description: "APPLIED at create; REVERSED when the payment is voided/bounced (compensating reversal)."
+        default: APPLIED
+        constraints: "enum: {APPLIED, REVERSED}"
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  - entity: Matter
+    initial_state: INTAKE
+    terminal_states: [CLOSED, CONFLICT_BLOCKED]
+    note: "Branching + cyclic conflict lifecycle. CONFLICT_PENDING can loop back to itself on a re-run; a FLAGGED check can be WAIVED to clear."
+    transitions:
+      - from: INTAKE
+        to: CONFLICT_PENDING
+        trigger: "POST /firm/matters/{id}/conflict-checks"
+        actor: BillingClerk
+        preconditions:
+          - "matter.status == INTAKE"
+          - "matter.client_id references an existing Client"
+        side_effects:
+          - "create ConflictCheck (result computed via §1.3 conflict_screen)"
+          - "matter.status -> CONFLICT_PENDING"
+        note: "Running the screen moves the matter out of INTAKE."
+      - from: CONFLICT_PENDING
+        to: CONFLICT_CLEARED
+        trigger: "system: conflict_screen result == CLEAR"
+        actor: system
+        preconditions:
+          - "the just-created ConflictCheck.result == CLEAR"
+        side_effects:
+          - "matter.status -> CONFLICT_CLEARED"
+      - from: CONFLICT_PENDING
+        to: CONFLICT_BLOCKED
+        trigger: "system: conflict_screen result == FLAGGED"
+        actor: system
+        preconditions:
+          - "the just-created ConflictCheck.result == FLAGGED"
+        side_effects:
+          - "matter.status -> CONFLICT_BLOCKED"
+        note: "Terminal unless a partner waiver re-opens it."
+      - from: CONFLICT_BLOCKED
+        to: CONFLICT_CLEARED
+        trigger: "POST /firm/conflict-checks/{id}/waive"
+        actor: Attorney
+        preconditions:
+          - "conflict_check.result == FLAGGED"
+          - "matter.status == CONFLICT_BLOCKED"
+        side_effects:
+          - "conflict_check.result -> WAIVED"
+          - "conflict_check.approved-by recorded (Attorney X-User-ID)"
+          - "matter.status -> CONFLICT_CLEARED"
+        note: "Partner override; re-opens a blocked matter."
+      - from: CONFLICT_CLEARED
+        to: OPEN
+        trigger: "POST /firm/matters/{id}/open"
+        actor: Attorney
+        preconditions:
+          - "matter.status == CONFLICT_CLEARED"
+        side_effects:
+          - "matter.status -> OPEN"
+          - "client.status -> ACTIVE (if PROSPECT) [cascade up to Client]"
+          - "create ClientTrustLedger for (matter.client_id, default TrustAccount) if none exists"
+        note: "Capture of time/expense becomes legal only here."
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /firm/matters/{id}/close"
+        actor: Attorney
+        preconditions:
+          - "matter.status == OPEN"
+          - "matter.wip_fees_cents == 0 and matter.wip_expenses_cents == 0 (no un-invoiced WIP)"
+          - "no Invoice on this matter with billing_status IN {ISSUED, PARTIALLY_PAID} (A/R settled)"
+        side_effects:
+          - "matter.status -> CLOSED"
+          - "if all sibling matters of the client are CLOSED, client.status -> INACTIVE [cascade up]"
+
+  - entity: Invoice
+    initial_state: DRAFT
+    terminal_states: [PAID, WRITTEN_OFF, VOID]
+    note: "PARALLEL dimensions. billing_status and collection_status evolve independently while ISSUED. The collection dimension is driven by clock advancement and explicit collection actions; the billing dimension by payments and write-offs."
+    transitions:
+      # --- billing_status dimension ---
+      - from: "billing_status=DRAFT"
+        to: "billing_status=ISSUED"
+        trigger: "POST /firm/invoices/{id}/finalize"
+        actor: BillingClerk
+        preconditions:
+          - "invoice.billing_status == DRAFT"
+          - "matter.status == OPEN"
+          - "at least one CAPTURED TimeEntry or ExpenseEntry attached (total_cents > 0 after write-downs)"
+        side_effects:
+          - "compute fees_subtotal_cents, expenses_subtotal_cents, written_off_cents, total_cents via §1.3 invoice_total (CASCADE start)"
+          - "each attached TimeEntry.status CAPTURED -> INVOICED; entry.invoice_id = invoice.id [cascade to TimeEntry]"
+          - "each attached ExpenseEntry.status CAPTURED -> INVOICED; entry.invoice_id = invoice.id [cascade to ExpenseEntry]"
+          - "matter.wip_fees_cents and wip_expenses_cents decremented by the invoiced amounts [cascade up to Matter]"
+          - "client.ar_balance_cents += invoice.total_cents [cascade up to Client]"
+          - "invoice.collection_status = CURRENT; invoice.issue_date set"
+          - "invoice.version +1"
+      - from: "billing_status=ISSUED"
+        to: "billing_status=PARTIALLY_PAID"
+        trigger: "POST /firm/invoices/{id}/payments  OR  trust sweep partially covering"
+        actor: BillingClerk
+        preconditions:
+          - "invoice.billing_status == ISSUED"
+          - "0 < new cumulative amount_paid_cents < total_cents - written_off_cents"
+        side_effects:
+          - "invoice.amount_paid_cents += payment.amount_cents"
+          - "client.ar_balance_cents recomputed [cascade up to Client]"
+          - "invoice.version +1"
+      - from: "billing_status=ISSUED"
+        to: "billing_status=PAID"
+        trigger: "POST /firm/invoices/{id}/payments  OR  trust sweep fully covering"
+        actor: BillingClerk
+        preconditions:
+          - "invoice.billing_status IN {ISSUED, PARTIALLY_PAID}"
+          - "new cumulative amount_paid_cents == total_cents - written_off_cents"
+        side_effects:
+          - "invoice.amount_paid_cents updated"
+          - "invoice.collection_status -> SETTLED [parallel-dim cross-effect]"
+          - "client.ar_balance_cents recomputed [cascade up to Client]"
+          - "invoice.version +1"
+      - from: "billing_status=PARTIALLY_PAID"
+        to: "billing_status=PAID"
+        trigger: "POST /firm/invoices/{id}/payments OR trust sweep"
+        actor: BillingClerk
+        preconditions:
+          - "invoice.billing_status == PARTIALLY_PAID"
+          - "new cumulative amount_paid_cents == total_cents - written_off_cents"
+        side_effects:
+          - "invoice.amount_paid_cents updated"
+          - "invoice.collection_status -> SETTLED [parallel-dim cross-effect]"
+          - "client.ar_balance_cents recomputed [cascade up to Client]"
+          - "invoice.version +1"
+      - from: "billing_status IN {ISSUED, PARTIALLY_PAID}"
+        to: "billing_status=WRITTEN_OFF"
+        trigger: "POST /firm/invoices/{id}/write-off"
+        actor: Attorney
+        preconditions:
+          - "invoice.billing_status IN {ISSUED, PARTIALLY_PAID}"
+          - "write_off amount_cents == total_cents - amount_paid_cents (writes off the full remaining balance)"
+        side_effects:
+          - "invoice.written_off_cents += remaining; invoice.collection_status -> SETTLED [parallel-dim cross-effect]"
+          - "client.ar_balance_cents recomputed (this invoice drops out of A/R) [cascade up to Client]"
+          - "invoice.version +1"
+      - from: "billing_status=DRAFT"
+        to: "billing_status=VOID"
+        trigger: "POST /firm/invoices/{id}/void"
+        actor: BillingClerk
+        preconditions:
+          - "invoice.billing_status == DRAFT (only un-issued drafts may be voided)"
+        side_effects:
+          - "any attached TimeEntry/ExpenseEntry detached (status stays CAPTURED, invoice_id cleared)"
+          - "invoice.version +1"
+      # --- collection_status dimension (independent while ISSUED) ---
+      - from: "collection_status=CURRENT"
+        to: "collection_status=DUE"
+        trigger: "system: clock advanced to >= issue_date AND < due_date is CURRENT; at clock >= due_date -> recompute"
+        actor: system
+        preconditions:
+          - "invoice.billing_status IN {ISSUED, PARTIALLY_PAID}"
+          - "current_clock >= issue_date (DUE window opens at issue) — see §1.3 collection_aging"
+        side_effects:
+          - "invoice.collection_status -> DUE"
+        note: "Aging is recomputed by §1.3 collection_aging whenever /_clock/set_current_utc fires."
+      - from: "collection_status=DUE"
+        to: "collection_status=OVERDUE"
+        trigger: "system: clock advanced past due_date"
+        actor: system
+        preconditions:
+          - "current_clock > due_date (strictly past, exclusive boundary)"
+          - "invoice.billing_status IN {ISSUED, PARTIALLY_PAID}"
+        side_effects:
+          - "invoice.collection_status -> OVERDUE"
+      - from: "collection_status=OVERDUE"
+        to: "collection_status=IN_COLLECTIONS"
+        trigger: "POST /firm/invoices/{id}/send-to-collections"
+        actor: BillingClerk
+        preconditions:
+          - "invoice.collection_status == OVERDUE"
+          - "current_clock > due_date + COLLECTIONS_GRACE_DAYS"
+          - "invoice.billing_status IN {ISSUED, PARTIALLY_PAID}"
+        side_effects:
+          - "invoice.collection_status -> IN_COLLECTIONS"
+          - "invoice.version +1"
+
+  - entity: TrustTransaction
+    initial_state: PENDING
+    terminal_states: [VOIDED]
+    note: "Append-only ledger event. PENDING moves book + client-ledger immediately; CONFIRMED additionally moves bank; VOIDED is reached via a compensating reversal that supersedes a prior tx."
+    transitions:
+      - from: PENDING
+        to: CONFIRMED
+        trigger: "POST /firm/trust-transactions/{id}/confirm"
+        actor: BillingClerk
+        preconditions:
+          - "tx.status == PENDING"
+        side_effects:
+          - "trust_account.bank_balance_cents += signed(tx) [cascade to TrustAccount; bank leg catches up to book leg]"
+          - "trust_account.version +1"
+      - from: PENDING
+        to: VOIDED
+        trigger: "POST /firm/trust-transactions/{id}/reverse"
+        actor: Attorney
+        preconditions:
+          - "tx.status == PENDING"
+          - "reversing actor X-User-ID != tx.initiated_by_user_id (segregation of duties)"
+        side_effects:
+          - "tx.status -> VOIDED"
+          - "client_trust_ledger.balance_cents -= signed(tx) (compensation reverses book leg) [cascade to ClientTrustLedger]"
+          - "trust_account.book_balance_cents -= signed(tx) [cascade to TrustAccount]"
+          - "trust_account.version +1; client_trust_ledger.version +1"
+        note: "Bank leg untouched because a PENDING tx never reached the bank."
+      - from: CONFIRMED
+        to: VOIDED
+        trigger: "POST /firm/trust-transactions/{id}/reverse"
+        actor: Attorney
+        preconditions:
+          - "tx.status == CONFIRMED"
+          - "reversing actor X-User-ID != tx.initiated_by_user_id (segregation of duties)"
+        side_effects:
+          - "tx.status -> VOIDED"
+          - "client_trust_ledger.balance_cents -= signed(tx) [cascade to ClientTrustLedger]"
+          - "trust_account.book_balance_cents -= signed(tx) AND bank_balance_cents -= signed(tx) (both legs reversed) [cascade to TrustAccount]"
+          - "trust_account.version +1; client_trust_ledger.version +1"
+        note: "Compensation must leave the three-way invariant intact (§1.3 three_way_reconcile)."
+
+  - entity: Payment
+    initial_state: APPLIED
+    terminal_states: [REVERSED]
+    transitions:
+      - from: APPLIED
+        to: REVERSED
+        trigger: "POST /firm/payments/{id}/reverse"
+        actor: BillingClerk
+        preconditions:
+          - "payment.status == APPLIED"
+          - "invoice.billing_status != WRITTEN_OFF"
+        side_effects:
+          - "invoice.amount_paid_cents -= payment.amount_cents [cascade to Invoice]"
+          - "if invoice was PAID -> PARTIALLY_PAID or ISSUED (recompute) [billing-dim cross-effect]"
+          - "invoice.collection_status recomputed from clock (un-SETTLE) [parallel-dim cross-effect]"
+          - "client.ar_balance_cents recomputed [cascade up to Client]"
+          - "invoice.version +1"
+
+  - entity: RetainerHold
+    initial_state: ACTIVE
+    terminal_states: [RELEASED]
+    transitions:
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /firm/retainer-holds/{id}/release"
+        actor: BillingClerk
+        preconditions:
+          - "hold.status == ACTIVE"
+        side_effects:
+          - "hold.status -> RELEASED (the [hold_start_at, hold_end_at] window is freed; a later ACTIVE hold may now occupy it)"
+          - "hold.version +1"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: trust-sweep-stale-invoice
+    parent_entity: Invoice
+    write_endpoint: "POST /firm/invoices/{id}/trust-sweep"
+    occ_field: "expected_invoice_version"
+    description: |
+      Sweeping trust funds to pay an Invoice whose version has advanced since
+      the client last observed it is rejected. A trust sweep both reads the
+      invoice's remaining balance and writes amount_paid_cents; if another
+      writer has already applied an operating Payment (legitimately advancing
+      the invoice's version and reducing the remaining balance), the current
+      sweep's view of how much is owed is stale and would over-pay the
+      invoice. The OCC check on Invoice.version catches the stale read.
+    error_id: ERR_STALE_INVOICE_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: billable_rate_resolution
+    trigger: "On POST /firm/time-entries (capture). Frozen into TimeEntry.resolved_rate_cents."
+    algorithm: constraint_propagation
+    formula: |
+      # Precedence ladder (highest wins; stop at first non-null):
+      # 1. matter.matter_rate_cents               (if non-null)
+      # 2. client_override_rate_cents             (ClientRateOverride for this client+timekeeper.role_kind, if present)
+      # 3. timekeeper.standard_rate_cents         (always present, lowest precedence)
+      if matter.matter_rate_cents is not null:
+          resolved = matter.matter_rate_cents
+      elif client_override_rate_cents(client_id, timekeeper.role_kind) is not null:
+          resolved = client_override_rate_cents
+      else:
+          resolved = timekeeper.standard_rate_cents
+    input_set: "The owning Matter, its Client, the Timekeeper, and any ClientRateOverride matching (client_id, role_kind)."
+    constants: {}
+    precision: "integer cents; no rounding (rates are pre-rounded)"
+    variants:
+      - name: matter_negotiated
+        when: "matter.matter_rate_cents is non-null"
+        difference: "Matter rate overrides everything; client override and standard rate ignored."
+      - name: client_standard
+        when: "matter.matter_rate_cents is null but a ClientRateOverride exists for the role_kind"
+        difference: "Client-negotiated rate for the role tier applies; standard rate ignored."
+
+  - name: conflict_screen
+    trigger: "On POST /firm/matters/{id}/conflict-checks. Pins ConflictCheck.result and matched_client_id; drives the Matter conflict transition."
+    algorithm: chronological
+    formula: |
+      # Name-match screen. norm(x) = trim+casefold(x).
+      candidates = []
+      if adverse_party_client_id is not null:
+          candidates.append(that Client)                       # explicit linked adverse client always matches
+      candidates += [ c for c in all Clients
+                      if norm(c.display_name) == norm(adverse_party_name) ]
+      candidates += [ t for t in all Timekeepers
+                      if norm(t.full_name) == norm(adverse_party_name) ]
+      if candidates is empty:
+          result = CLEAR;   matched_client_id = null
+      else:
+          result = FLAGGED
+          # matched_client_id = earliest-created MATCHING Client (Timekeeper matches set FLAGGED but
+          # leave matched_client_id null when no Client matched). Tie-break: created_at ASC.
+          client_matches = [c for c in candidates if c is a Client] sorted by created_at ASC
+          matched_client_id = client_matches[0].id if client_matches else null
+    input_set: "All existing Clients and Timekeepers; the supplied adverse_party_name and optional adverse_party_client_id."
+    constants: {}
+    precision: "exact case-insensitive trimmed string equality"
+    variants: []
+
+  - name: time_entry_amount
+    trigger: "On POST /firm/time-entries (after rate resolution); pinned into TimeEntry.billable_amount_cents."
+    algorithm: tiered_pricing
+    formula: |
+      # 6-minute (0.1 hr) billing increments, ALWAYS ROUNDED UP:
+      billable_tenths = ceil(minutes / 6)            # tenths of an hour
+      billable_amount_cents = round_half_up( resolved_rate_cents * billable_tenths / 10 )
+      # ROUNDING ORDER IS PINNED: compute the cents amount PER ENTRY here, then sum
+      # per-entry amounts at invoice finalize. Never sum raw (rate*minutes) then round.
+    input_set: "Single TimeEntry: minutes + resolved_rate_cents."
+    constants:
+      INCREMENT_MINUTES: 6
+    precision: "2 decimal places of an hour intermediate; final round_half_up to integer cents"
+    variants: []
+
+  - name: invoice_total
+    trigger: "On POST /firm/invoices/{id}/finalize. Pins fees_subtotal_cents, expenses_subtotal_cents, written_off_cents, total_cents."
+    algorithm: aggregation
+    formula: |
+      # ROUNDING ORDER PINNED (round-per-line-then-sum):
+      fees_subtotal_cents     = sum( te.billable_amount_cents for te in attached TimeEntries
+                                     with status==CAPTURED )            # each already rounded per time_entry_amount
+      line_write_downs_cents  = sum( wd.amount_cents for wd in line write-downs supplied at finalize )
+      fees_subtotal_cents     = fees_subtotal_cents - line_write_downs_cents
+      expenses_subtotal_cents = sum( ee.amount_cents for ee in attached ExpenseEntries with status==CAPTURED )
+      written_off_cents       = line_write_downs_cents
+      total_cents             = fees_subtotal_cents + expenses_subtotal_cents
+      # ATTACHMENT SET FILTER: only entries whose matter_id == invoice.matter_id AND status==CAPTURED
+      # AND invoice_id is null are eligible; INVOICED/WRITTEN_DOWN entries are excluded.
+    input_set: "TimeEntries and ExpenseEntries with matter_id == invoice.matter_id, status==CAPTURED, invoice_id==null. Ordered by created_at ASC for deterministic line numbering."
+    constants: {}
+    precision: "integer cents; subtotal is sum of already-rounded per-line cents"
+    variants:
+      - name: provisional_wip
+        when: "GET /firm/matters/{id}/wip-summary (before finalize)"
+        difference: "Same formula over CAPTURED entries but NOT pinned; recomputes live as entries are added. No line write-downs applied."
+      - name: final_invoiced
+        when: "At finalize"
+        difference: "Pinned onto the Invoice; line write-downs subtracted; entries flip to INVOICED so they never re-enter another invoice's WIP."
+
+  - name: collection_aging
+    trigger: "On POST /_clock/set_current_utc (recompute all ISSUED/PARTIALLY_PAID invoices) and on read of GET /firm/invoices/{id}."
+    algorithm: threshold
+    formula: |
+      # current = logical clock. Boundaries PINNED:
+      if billing_status in {PAID, WRITTEN_OFF, VOID}:
+          collection_status = SETTLED   # (VOID stays VOID/no collections)
+      elif current <= due_date:                       # at or before due_date inclusive -> DUE window
+          collection_status = DUE if current >= issue_date else CURRENT
+      elif current <= due_date + COLLECTIONS_GRACE_DAYS_in_seconds:   # past due, within grace
+          collection_status = OVERDUE
+      else:
+          collection_status = OVERDUE   # IN_COLLECTIONS requires the explicit send-to-collections action, never auto
+      # BOUNDARY: at exactly current == due_date the invoice is DUE (inclusive), not OVERDUE.
+      #           OVERDUE requires current > due_date strictly.
+    input_set: "All Invoices with billing_status IN {ISSUED, PARTIALLY_PAID}; their issue_date, due_date."
+    constants:
+      COLLECTIONS_GRACE_DAYS: 15
+    precision: "second-resolution datetime comparison; boundaries inclusive at due_date, exclusive after"
+    variants: []
+
+  - name: three_way_reconcile
+    trigger: "On GET /firm/trust-accounts/{id}/reconciliation; recomputed defensively after every TrustTransaction post/confirm/reverse and every trust sweep."
+    algorithm: aggregation
+    formula: |
+      # THREE-WAY RECONCILIATION (the conserved invariant):
+      leg_book   = trust_account.book_balance_cents
+      leg_client = sum( ledger.balance_cents for ledger in ClientTrustLedgers
+                        where ledger.trust_account_id == account.id )
+      leg_bank   = trust_account.bank_balance_cents
+      # INVARIANT (must always hold after any POSTED tx; PENDING tx make bank lag):
+      assert leg_book == leg_client                 # book == sum of client sub-ledgers (always)
+      reconciled = (leg_book == leg_client == leg_bank)   # fully reconciled only when no PENDING tx outstanding
+      unconfirmed_cents = leg_book - leg_bank        # the magnitude still PENDING at the bank
+    input_set: "One TrustAccount + all its ClientTrustLedgers + the running balances. PENDING vs CONFIRMED tx distinguishes book from bank."
+    constants: {}
+    precision: "integer cents; exact equality required for book==client leg"
+    variants:
+      - name: book_vs_client
+        when: "always (after any POSTED transaction)"
+        difference: "book_balance_cents must EXACTLY equal sum of client sub-ledger balances — hard invariant, never drifts."
+      - name: book_vs_bank
+        when: "when PENDING transactions are outstanding"
+        difference: "bank lags book by the sum of PENDING-transaction signed amounts; equality restored only when all are CONFIRMED."
+
+  - name: ar_realization
+    trigger: "On GET /firm/clients/{id}/ar-summary and recomputed on every invoice finalize / payment / write-down."
+    algorithm: aggregation
+    formula: |
+      # A/R outstanding (provisional, lifecycle-sensitive):
+      ar_balance_cents = sum( inv.total_cents - inv.amount_paid_cents - inv.written_off_cents
+                              for inv in client's Invoices
+                              where inv.billing_status IN {ISSUED, PARTIALLY_PAID} )
+      # Realization rate (FINAL, only over closed-out invoices):
+      billed_final   = sum( inv.total_cents + inv.written_off_cents
+                            for inv in client's Invoices
+                            where billing_status IN {PAID, WRITTEN_OFF} )
+      collected_final= sum( inv.amount_paid_cents
+                            for inv in same set )
+      realization_pct = round_half_up( collected_final * 10000 / billed_final ) / 100   # percent, 2dp; 0 if billed_final==0
+    input_set: "All Invoices for the client; A/R uses {ISSUED, PARTIALLY_PAID}; realization uses {PAID, WRITTEN_OFF}."
+    constants: {}
+    precision: "ar_balance_cents integer cents; realization_pct 2 decimal places, round_half_up"
+    variants:
+      - name: provisional_ar
+        when: "invoice still ISSUED/PARTIALLY_PAID"
+        difference: "Counts remaining balance as outstanding A/R; excluded once PAID/WRITTEN_OFF."
+      - name: final_realization
+        when: "invoice PAID or WRITTEN_OFF"
+        difference: "Feeds realization_pct: write-offs lower realization without lowering billed; this is the dual of provisional A/R on the same invoice set but a different conserved quantity (collected vs outstanding)."
+
+# ===========================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except GET /firm/health"
+
+  - priority: 2
+    category: auth
+    check: "X-User-Role is permitted for this operation per §1.7 RBAC."
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all role-gated endpoints"
+
+  - priority: 3
+    category: existence
+    check: "Every path/body referenced resource exists, validated left-to-right in the path (matter before sub-resources, then body FKs)."
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 4
+    category: business_referential
+    check: "FK body fields reference entities of the correct kind: utbms_task_code -> BillingCode.kind==TASK; utbms_activity_code -> ACTIVITY; utbms_expense_code -> EXPENSE; ConflictCheck.adverse_party_client_id -> existing Client."
+    error_id: ERR_CODE_KIND_MISMATCH
+    http_status: 422
+    applies_to: "POST /firm/time-entries, POST /firm/expense-entries, POST /firm/matters/{id}/conflict-checks"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a valid state for the operation (matter OPEN for capture; invoice DRAFT for finalize/void; tx PENDING/CONFIRMED for confirm/reverse; matter status precondition for conflict actions)."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_invoice_version on trust-sweep matches current Invoice.version."
+    error_id: ERR_STALE_INVOICE_VERSION
+    http_status: 412
+    applies_to: "POST /firm/invoices/{id}/trust-sweep"
+
+  - priority: 7
+    category: business_safety
+    check: "Segregation of duties: the actor approving/reversing a trust DISBURSEMENT or SWEEP_TO_OPERATING (X-User-ID) must differ from the transaction's initiated_by_user_id."
+    error_id: ERR_SOD_SAME_ACTOR
+    http_status: 403
+    applies_to: "POST /firm/trust-transactions/{id}/reverse, POST /firm/invoices/{id}/trust-sweep (approval leg)"
+
+  - priority: 8
+    category: business_safety
+    check: "Conflict gating: a Matter cannot be opened nor have time/expense captured unless its latest ConflictCheck.result IN {CLEAR, WAIVED}; a FLAGGED matter is CONFLICT_BLOCKED."
+    error_id: ERR_CONFLICT_NOT_CLEARED
+    http_status: 409
+    applies_to: "POST /firm/matters/{id}/open, POST /firm/time-entries, POST /firm/expense-entries"
+
+  - priority: 9
+    category: business_safety
+    check: "No-commingle / no-overdraw: a DISBURSEMENT or SWEEP_TO_OPERATING may not drive ClientTrustLedger.balance_cents below 0 (a client's trust funds may never pay another client's obligation)."
+    error_id: ERR_TRUST_OVERDRAW
+    http_status: 422
+    applies_to: "POST /firm/trust-transactions (DISBURSEMENT), POST /firm/invoices/{id}/trust-sweep"
+
+  - priority: 10
+    category: business_referential
+    check: "Trust sweep's client_trust_ledger_id must belong to the same client as the invoice's client_id (a client's trust may only pay that client's invoices)."
+    error_id: ERR_LEDGER_ACCOUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /firm/invoices/{id}/trust-sweep"
+
+  - priority: 11
+    category: business_temporal
+    check: "Time-entry overlap: a new TimeEntry's half-open interval [worked_at, worked_at+minutes) may not overlap any existing non-WRITTEN_DOWN entry for the SAME timekeeper. Touching endpoints (prev.end == new.start) are allowed (half-open)."
+    error_id: ERR_TIME_OVERLAP
+    http_status: 409
+    applies_to: "POST /firm/time-entries"
+
+  - priority: 12
+    category: business_temporal
+    check: "Retainer-hold overlap: a new RetainerHold's CLOSED interval [hold_start_at, hold_end_at] may not overlap any ACTIVE hold on the SAME ledger. Because intervals are closed, touching endpoints (a.end == b.start) DO collide — stricter adjacency than time entries."
+    error_id: ERR_HOLD_OVERLAP
+    http_status: 409
+    applies_to: "POST /firm/retainer-holds"
+
+  - priority: 13
+    category: business_constraint
+    check: "Trust sweep amount may not exceed the invoice remaining balance (total_cents - amount_paid_cents - written_off_cents); over-payment of an invoice is rejected."
+    error_id: ERR_OVERPAYMENT
+    http_status: 422
+    applies_to: "POST /firm/invoices/{id}/trust-sweep, POST /firm/invoices/{id}/payments"
+
+  - priority: 14
+    category: business_constraint
+    check: "Write-off amount must equal the full remaining balance (total - paid); partial write-offs are not supported and rejected."
+    error_id: ERR_PARTIAL_WRITEOFF
+    http_status: 422
+    applies_to: "POST /firm/invoices/{id}/write-off"
+
+  - priority: 15
+    category: business_constraint
+    check: "Matter close requires zero WIP and no outstanding A/R (no ISSUED/PARTIALLY_PAID invoices)."
+    error_id: ERR_MATTER_HAS_OPEN_BALANCE
+    http_status: 409
+    applies_to: "POST /firm/matters/{id}/close"
+
+  - priority: 16
+    category: business_constraint
+    check: "Timekeeper must be active (is_active==true) to receive a new time entry."
+    error_id: ERR_TIMEKEEPER_INACTIVE
+    http_status: 422
+    applies_to: "POST /firm/time-entries"
+
+  - priority: 17
+    category: business_constraint
+    check: "Required body fields present and well-typed; enums valid; minutes>0, amount_cents>0; BillingCode.code unique (duplicate -> ERR_DUPLICATE_CODE); pagination limit in [1,100], offset>=0 (-> ERR_VALIDATION_LIMIT)."
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST/PUT/PATCH"
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # ---- Clients ----
+  - method: POST
+    path: "/firm/clients"
+    description: "Create a client (PROSPECT)."
+    roles: [PlatformAdmin, BillingClerk]
+    code: 201
+    input: [display_name, client_type]
+    output: Client
+    side_effects: ["client.status=PROSPECT", "ar_balance_cents=0"]
+  - method: GET
+    path: "/firm/clients/{id}"
+    description: "Fetch a client."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: Client
+    side_effects: []
+  - method: GET
+    path: "/firm/clients"
+    description: "List clients (paginated)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Client[]
+    side_effects: []
+  - method: GET
+    path: "/firm/clients/{id}/matters"
+    description: "Reverse lookup: matters of a client."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: Matter[]
+    side_effects: []
+  - method: GET
+    path: "/firm/clients/{id}/ar-summary"
+    description: "Computed A/R + realization summary for a client (§1.3 ar_realization)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: "{ ar_balance_cents: integer, realization_pct: number, billed_final_cents: integer, collected_final_cents: integer }"
+    side_effects: ["recompute client.ar_balance_cents"]
+  - method: GET
+    path: "/firm/clients/{id}/trust-ledgers"
+    description: "Reverse lookup: trust sub-ledgers for a client."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: ClientTrustLedger[]
+    side_effects: []
+  - method: GET
+    path: "/firm/clients/{id}/conflict-checks"
+    description: "Reverse lookup: conflict checks whose adverse_party_client_id (or matched_client_id) is this client."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: ConflictCheck[]
+    side_effects: []
+
+  # ---- Timekeepers ----
+  - method: POST
+    path: "/firm/timekeepers"
+    description: "Create a timekeeper with a standard rate."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [full_name, role_kind, standard_rate_cents, "is_active?"]
+    output: Timekeeper
+    side_effects: []
+  - method: GET
+    path: "/firm/timekeepers/{id}"
+    description: "Fetch a timekeeper."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: Timekeeper
+    side_effects: []
+  - method: GET
+    path: "/firm/timekeepers"
+    description: "List timekeepers."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: ["is_active?", "limit?", "offset?"]
+    output: Timekeeper[]
+    side_effects: []
+
+  # ---- Client rate overrides (general business endpoint for the rate ladder middle tier) ----
+  - method: POST
+    path: "/firm/clients/{id}/rate-overrides"
+    description: "Set a client-negotiated hourly rate for a role tier (middle precedence in billable_rate_resolution). Replaces any prior override for the same role_kind."
+    roles: [PlatformAdmin, BillingClerk]
+    code: 201
+    input: [role_kind, rate_cents]
+    output: "{ id: string, client_id: string, role_kind: string, rate_cents: integer }"
+    side_effects: ["upsert ClientRateOverride for (client_id, role_kind)"]
+  - method: GET
+    path: "/firm/clients/{id}/rate-overrides"
+    description: "List a client's rate overrides."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: "{ id: string, client_id: string, role_kind: string, rate_cents: integer }[]"
+    side_effects: []
+
+  # ---- Billing codes (LEDES/UTBMS) ----
+  - method: POST
+    path: "/firm/billing-codes"
+    description: "Create a UTBMS/LEDES code."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [code, kind, label]
+    output: BillingCode
+    side_effects: []
+  - method: GET
+    path: "/firm/billing-codes"
+    description: "List billing codes."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: ["kind?", "limit?", "offset?"]
+    output: BillingCode[]
+    side_effects: []
+
+  # ---- Matters ----
+  - method: POST
+    path: "/firm/matters"
+    description: "Create a matter (INTAKE) for a client."
+    roles: [PlatformAdmin, BillingClerk]
+    code: 201
+    input: [client_id, responsible_timekeeper_id, title, "matter_rate_cents?"]
+    output: Matter
+    side_effects: ["matter.status=INTAKE", "wip_fees_cents=0", "wip_expenses_cents=0"]
+  - method: GET
+    path: "/firm/matters/{id}"
+    description: "Fetch a matter."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: Matter
+    side_effects: []
+  - method: GET
+    path: "/firm/matters"
+    description: "List matters (filterable by client_id, responsible_timekeeper_id, status)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: ["client_id?", "responsible_timekeeper_id?", "status?", "limit?", "offset?"]
+    output: Matter[]
+    side_effects: []
+  - method: GET
+    path: "/firm/matters/{id}/wip-summary"
+    description: "Provisional WIP totals (§1.3 invoice_total provisional_wip variant)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: "{ wip_fees_cents: integer, wip_expenses_cents: integer, time_entry_count: integer, expense_entry_count: integer }"
+    side_effects: ["recompute matter.wip_fees_cents/wip_expenses_cents"]
+  - method: POST
+    path: "/firm/matters/{id}/conflict-checks"
+    description: "Run a conflict screen for a matter (§1.3 conflict_screen). Moves matter INTAKE -> CONFLICT_PENDING -> CLEARED/BLOCKED."
+    roles: [PlatformAdmin, BillingClerk]
+    code: 201
+    input: [adverse_party_name, "adverse_party_client_id?"]
+    output: ConflictCheck
+    side_effects: ["create ConflictCheck", "matter.status transitions", "matter.version +1"]
+  - method: GET
+    path: "/firm/matters/{id}/conflict-checks"
+    description: "Reverse lookup: conflict checks for a matter."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: ConflictCheck[]
+    side_effects: []
+  - method: POST
+    path: "/firm/matters/{id}/open"
+    description: "Open a CONFLICT_CLEARED matter for work."
+    roles: [Attorney, PlatformAdmin]
+    code: 200
+    input: []
+    output: Matter
+    side_effects: ["matter.status=OPEN", "client.status->ACTIVE", "create ClientTrustLedger if absent", "matter.version +1"]
+  - method: POST
+    path: "/firm/matters/{id}/close"
+    description: "Close an OPEN matter (zero WIP, no open A/R)."
+    roles: [Attorney, PlatformAdmin]
+    code: 200
+    input: []
+    output: Matter
+    side_effects: ["matter.status=CLOSED", "client.status->INACTIVE if all matters closed", "matter.version +1"]
+
+  # ---- Conflict checks ----
+  - method: GET
+    path: "/firm/conflict-checks/{id}"
+    description: "Fetch a conflict check."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: ConflictCheck
+    side_effects: []
+  - method: POST
+    path: "/firm/conflict-checks/{id}/waive"
+    description: "Partner waiver of a FLAGGED conflict; re-opens a CONFLICT_BLOCKED matter to CONFLICT_CLEARED."
+    roles: [Attorney]
+    code: 200
+    input: []
+    output: ConflictCheck
+    side_effects: ["conflict_check.result=WAIVED", "matter.status->CONFLICT_CLEARED", "matter.version +1"]
+
+  # ---- Time / expense capture ----
+  - method: POST
+    path: "/firm/time-entries"
+    description: "Capture a time entry (resolves rate via §1.3 billable_rate_resolution; amount via §1.3 time_entry_amount). Rejected if it overlaps another entry for the same timekeeper (§1.4 time-overlap)."
+    roles: [Attorney, BillingClerk, PlatformAdmin]
+    code: 201
+    input: [matter_id, timekeeper_id, worked_at, minutes, utbms_task_code, utbms_activity_code]
+    output: TimeEntry
+    side_effects: ["resolve resolved_rate_cents", "compute billable_amount_cents", "matter.wip_fees_cents += amount", "matter.version +1"]
+  - method: GET
+    path: "/firm/time-entries/{id}"
+    description: "Fetch a time entry."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: TimeEntry
+    side_effects: []
+  - method: GET
+    path: "/firm/time-entries"
+    description: "List time entries (filter by matter_id, timekeeper_id, invoice_id, status)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: ["matter_id?", "timekeeper_id?", "invoice_id?", "status?", "limit?", "offset?"]
+    output: TimeEntry[]
+    side_effects: []
+  - method: POST
+    path: "/firm/time-entries/{id}/write-down"
+    description: "Strike a CAPTURED time entry before invoicing (status -> WRITTEN_DOWN; removed from WIP)."
+    roles: [Attorney]
+    code: 200
+    input: []
+    output: TimeEntry
+    side_effects: ["status=WRITTEN_DOWN", "matter.wip_fees_cents -= billable_amount_cents", "matter.version +1"]
+  - method: POST
+    path: "/firm/expense-entries"
+    description: "Capture an expense entry."
+    roles: [Attorney, BillingClerk, PlatformAdmin]
+    code: 201
+    input: [matter_id, utbms_expense_code, amount_cents]
+    output: ExpenseEntry
+    side_effects: ["matter.wip_expenses_cents += amount_cents", "matter.version +1"]
+  - method: GET
+    path: "/firm/expense-entries/{id}"
+    description: "Fetch an expense entry."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: ExpenseEntry
+    side_effects: []
+  - method: GET
+    path: "/firm/expense-entries"
+    description: "List expense entries (filter by matter_id, invoice_id, status)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: ["matter_id?", "invoice_id?", "status?", "limit?", "offset?"]
+    output: ExpenseEntry[]
+    side_effects: []
+
+  # ---- Invoices ----
+  - method: POST
+    path: "/firm/invoices"
+    description: "Create a DRAFT invoice for a matter."
+    roles: [BillingClerk, PlatformAdmin]
+    code: 201
+    input: [matter_id, issue_date, "net_terms_days?"]
+    output: Invoice
+    side_effects: ["invoice.billing_status=DRAFT", "client_id copied from matter", "collection_status=CURRENT"]
+  - method: GET
+    path: "/firm/invoices/{id}"
+    description: "Fetch an invoice (recomputes collection_status from clock per §1.3 collection_aging)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["recompute collection_status"]
+  - method: GET
+    path: "/firm/invoices"
+    description: "List invoices (filter by matter_id, client_id, billing_status, collection_status)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: ["matter_id?", "client_id?", "billing_status?", "collection_status?", "limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+  - method: POST
+    path: "/firm/invoices/{id}/finalize"
+    description: "Finalize a DRAFT invoice: roll up attached CAPTURED entries, apply line write-downs, pin totals, issue (§1.3 invoice_total)."
+    roles: [BillingClerk, PlatformAdmin]
+    code: 200
+    input: ["line_write_downs?"]
+    output: Invoice
+    side_effects: ["pin totals", "entries -> INVOICED", "matter WIP decremented", "client.ar_balance_cents += total", "billing_status=ISSUED", "invoice.version +1"]
+  - method: POST
+    path: "/firm/invoices/{id}/void"
+    description: "Void a DRAFT invoice (detaches entries)."
+    roles: [BillingClerk, PlatformAdmin]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["billing_status=VOID", "detach entries", "invoice.version +1"]
+  - method: POST
+    path: "/firm/invoices/{id}/payments"
+    description: "Apply an operating-account payment to an ISSUED/PARTIALLY_PAID invoice."
+    roles: [BillingClerk, PlatformAdmin]
+    code: 201
+    input: [amount_cents, method]
+    output: Payment
+    side_effects: ["create Payment", "invoice.amount_paid_cents += amount", "billing_status advances", "client.ar_balance_cents recomputed", "invoice.version +1"]
+  - method: GET
+    path: "/firm/invoices/{id}/payments"
+    description: "Reverse lookup: payments applied to an invoice."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: Payment[]
+    side_effects: []
+  - method: POST
+    path: "/firm/invoices/{id}/trust-sweep"
+    description: "Pay (sweep) an ISSUED/PARTIALLY_PAID invoice from the client's trust sub-ledger. OCC-guarded on Invoice.version. Records a SWEEP_TO_OPERATING TrustTransaction (PENDING). SoD: approver must differ from initiator."
+    roles: [Attorney, PlatformAdmin]
+    code: 201
+    input: [amount_cents, client_trust_ledger_id, initiated_by_user_id, expected_invoice_version]
+    output: TrustTransaction
+    side_effects: ["create SWEEP_TO_OPERATING TrustTransaction PENDING", "client_ledger.balance_cents -= amount", "trust_account.book_balance_cents -= amount", "invoice.amount_paid_cents += amount", "billing_status advances", "client.ar_balance_cents recomputed", "invoice.version +1", "flag retainer replenishment if ledger < floor"]
+  - method: POST
+    path: "/firm/invoices/{id}/write-off"
+    description: "Write off the full remaining balance of an ISSUED/PARTIALLY_PAID invoice."
+    roles: [Attorney]
+    code: 200
+    input: [amount_cents]
+    output: Invoice
+    side_effects: ["written_off_cents += remaining", "billing_status=WRITTEN_OFF", "collection_status=SETTLED", "client.ar_balance_cents recomputed", "invoice.version +1"]
+  - method: POST
+    path: "/firm/invoices/{id}/send-to-collections"
+    description: "Move an OVERDUE invoice past grace into IN_COLLECTIONS."
+    roles: [BillingClerk, PlatformAdmin]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["collection_status=IN_COLLECTIONS", "invoice.version +1"]
+
+  # ---- Payments ----
+  - method: GET
+    path: "/firm/payments/{id}"
+    description: "Fetch a payment."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+  - method: POST
+    path: "/firm/payments/{id}/reverse"
+    description: "Reverse an APPLIED operating payment (bounced check etc.); un-applies from the invoice."
+    roles: [BillingClerk, PlatformAdmin]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: ["status=REVERSED", "invoice.amount_paid_cents -= amount", "billing_status recomputed", "collection_status recomputed", "client.ar_balance_cents recomputed", "invoice.version +1"]
+
+  # ---- Trust ----
+  - method: POST
+    path: "/firm/trust-accounts"
+    description: "Create a pooled IOLTA trust account."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [name]
+    output: TrustAccount
+    side_effects: ["book_balance_cents=0", "bank_balance_cents=0"]
+  - method: GET
+    path: "/firm/trust-accounts/{id}"
+    description: "Fetch a trust account."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: TrustAccount
+    side_effects: []
+  - method: GET
+    path: "/firm/trust-accounts/{id}/ledgers"
+    description: "Reverse lookup: client sub-ledgers in this account."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: ClientTrustLedger[]
+    side_effects: []
+  - method: GET
+    path: "/firm/trust-accounts/{id}/reconciliation"
+    description: "Three-way reconciliation report (§1.3 three_way_reconcile)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: "{ leg_book_cents: integer, leg_client_cents: integer, leg_bank_cents: integer, reconciled: boolean, unconfirmed_cents: integer }"
+    side_effects: ["recompute book/bank/client legs"]
+  - method: POST
+    path: "/firm/trust-ledgers"
+    description: "Open a client trust sub-ledger in a trust account (idempotent per (account,client))."
+    roles: [PlatformAdmin, BillingClerk]
+    code: 201
+    input: [trust_account_id, client_id, "retainer_floor_cents?"]
+    output: ClientTrustLedger
+    side_effects: ["balance_cents=0"]
+  - method: GET
+    path: "/firm/trust-ledgers/{id}"
+    description: "Fetch a client trust sub-ledger."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: ClientTrustLedger
+    side_effects: []
+  - method: GET
+    path: "/firm/trust-ledgers"
+    description: "List sub-ledgers (filter by trust_account_id, client_id)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: ["trust_account_id?", "client_id?", "limit?", "offset?"]
+    output: ClientTrustLedger[]
+    side_effects: []
+  - method: GET
+    path: "/firm/trust-ledgers/{id}/transactions"
+    description: "Reverse lookup: transactions on a sub-ledger (append-only history)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: TrustTransaction[]
+    side_effects: []
+  - method: POST
+    path: "/firm/trust-transactions"
+    description: "Post a DEPOSIT (retainer in) or DISBURSEMENT (refund/3rd-party out) to a sub-ledger. DISBURSEMENT requires an approving Attorney distinct from initiator (SoD). PENDING moves book + ledger, not bank."
+    roles: [BillingClerk, Attorney, PlatformAdmin]
+    code: 201
+    input: [client_trust_ledger_id, kind, amount_cents, initiated_by_user_id]
+    output: TrustTransaction
+    side_effects: ["client_ledger.balance_cents += signed(amount)", "trust_account.book_balance_cents += signed(amount)", "ledger.version +1", "trust_account.version +1"]
+  - method: GET
+    path: "/firm/trust-transactions/{id}"
+    description: "Fetch a trust transaction."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: TrustTransaction
+    side_effects: []
+  - method: GET
+    path: "/firm/trust-transactions"
+    description: "List trust transactions (filter by client_trust_ledger_id, invoice_id, status, kind)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: ["client_trust_ledger_id?", "invoice_id?", "status?", "kind?", "limit?", "offset?"]
+    output: TrustTransaction[]
+    side_effects: []
+  - method: POST
+    path: "/firm/trust-transactions/{id}/confirm"
+    description: "Confirm a PENDING transaction cleared at the bank (moves bank leg)."
+    roles: [BillingClerk, PlatformAdmin]
+    code: 200
+    input: []
+    output: TrustTransaction
+    side_effects: ["status=CONFIRMED", "trust_account.bank_balance_cents += signed(amount)", "trust_account.version +1"]
+  - method: POST
+    path: "/firm/trust-transactions/{id}/reverse"
+    description: "Reverse (VOID) a PENDING or CONFIRMED transaction via a compensating adjustment. Approver (X-User-ID) must differ from the transaction's initiated_by_user_id (SoD)."
+    roles: [Attorney, PlatformAdmin]
+    code: 200
+    input: []
+    output: TrustTransaction
+    side_effects: ["status=VOIDED", "reverse book + ledger legs", "reverse bank leg if was CONFIRMED", "versions +1"]
+
+  # ---- Retainer holds ----
+  - method: POST
+    path: "/firm/retainer-holds"
+    description: "Place a closed-interval reservation hold on a client's trust sub-ledger. Rejected if it overlaps an ACTIVE hold on the same ledger (§1.4 retainer-hold overlap)."
+    roles: [BillingClerk, Attorney, PlatformAdmin]
+    code: 201
+    input: [client_trust_ledger_id, amount_cents, hold_start_at, hold_end_at]
+    output: RetainerHold
+    side_effects: ["hold.status=ACTIVE"]
+  - method: GET
+    path: "/firm/retainer-holds/{id}"
+    description: "Fetch a retainer hold."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: RetainerHold
+    side_effects: []
+  - method: GET
+    path: "/firm/retainer-holds"
+    description: "List retainer holds (filter by client_trust_ledger_id, status)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: ["client_trust_ledger_id?", "status?", "limit?", "offset?"]
+    output: RetainerHold[]
+    side_effects: []
+  - method: POST
+    path: "/firm/retainer-holds/{id}/release"
+    description: "Release an ACTIVE hold, freeing its window for a new overlapping hold."
+    roles: [BillingClerk, Attorney, PlatformAdmin]
+    code: 200
+    input: []
+    output: RetainerHold
+    side_effects: ["status=RELEASED", "hold.version +1"]
+
+  # ---- Test-driving (logical clock) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock to an arbitrary UTC instant; recomputes collection_status for all ISSUED/PARTIALLY_PAID invoices (§1.3 collection_aging). Server default before any call is 2026-01-01T00:00:00Z (never real wall-clock)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: string }"
+    side_effects: ["advance logical clock", "recompute all invoice collection_status"]
+  - method: GET
+    path: "/firm/health"
+    description: "Liveness probe (no auth)."
+    roles: [PlatformAdmin, BillingClerk, Attorney]
+    code: 200
+    input: []
+    output: "{ status: string, current_utc: string }"
+    side_effects: []
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing X-User-ID or X-User-Role header."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Role not permitted for this operation per §1.7."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced path id or FK body id does not exist."
+  - id: ERR_CODE_KIND_MISMATCH
+    http: 422
+    condition: "UTBMS code referenced is of the wrong kind for the field (task/activity/expense), or adverse_party_client_id is not an existing Client."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource not in a valid state for the requested transition."
+  - id: ERR_STALE_INVOICE_VERSION
+    http: 412
+    condition: "expected_invoice_version on a trust sweep does not match current Invoice.version (OCC)."
+  - id: ERR_SOD_SAME_ACTOR
+    http: 403
+    condition: "Segregation of duties: trust disbursement/sweep approver/reverser equals the transaction's initiator."
+  - id: ERR_CONFLICT_NOT_CLEARED
+    http: 409
+    condition: "Matter's latest conflict check is not CLEAR/WAIVED (matter open or capture blocked)."
+  - id: ERR_TRUST_OVERDRAW
+    http: 422
+    condition: "Disbursement/sweep would drive a ClientTrustLedger.balance_cents below 0."
+  - id: ERR_COLLECTIONS_TOO_EARLY
+    http: 409
+    condition: "send-to-collections before due_date + COLLECTIONS_GRACE_DAYS has elapsed."
+  - id: ERR_OVERPAYMENT
+    http: 422
+    condition: "Payment or sweep amount exceeds the invoice remaining balance."
+  - id: ERR_PARTIAL_WRITEOFF
+    http: 422
+    condition: "Write-off amount does not equal the full remaining balance."
+  - id: ERR_MATTER_HAS_OPEN_BALANCE
+    http: 409
+    condition: "Matter close attempted with non-zero WIP or outstanding ISSUED/PARTIALLY_PAID invoices."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing/invalid body field, bad enum, non-positive minutes/amount, or duplicate BillingCode.code."
+  - id: ERR_TIMEKEEPER_INACTIVE
+    http: 422
+    condition: "Time entry references a Timekeeper with is_active=false."
+  - id: ERR_DUPLICATE_CODE
+    http: 409
+    condition: "BillingCode.code already exists."
+  - id: ERR_VALIDATION_LIMIT
+    http: 422
+    condition: "Pagination limit/offset out of bounds (limit < 1 or > 100, offset < 0)."
+  - id: ERR_LEDGER_ACCOUNT_MISMATCH
+    http: 422
+    condition: "Trust sweep's client_trust_ledger_id belongs to a different client than the invoice's client_id."
+  - id: ERR_TIME_OVERLAP
+    http: 409
+    condition: "New time entry's [worked_at, worked_at+minutes) interval overlaps an existing non-WRITTEN_DOWN entry for the same timekeeper."
+  - id: ERR_HOLD_OVERLAP
+    http: 409
+    condition: "New retainer hold's closed [hold_start_at, hold_end_at] interval overlaps (incl. touching endpoints) an ACTIVE hold on the same ledger."
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Firm operator/superuser; can configure timekeepers, billing codes, trust accounts, the clock, and perform any business action."
+    identity: opaque
+    exclusive_operations:
+      - "POST /firm/timekeepers"
+      - "POST /firm/billing-codes"
+      - "POST /firm/trust-accounts"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "all client/matter/invoice/trust/payment business operations (superset)"
+
+  - name: BillingClerk
+    description: "Back-office: client/matter intake, time/expense capture, draft & finalize invoices, post operating payments, confirm trust transactions, initiate trust disbursements/sweeps, run conflict screens, send to collections."
+    identity: opaque
+    exclusive_operations:
+      - "POST /firm/invoices/{id}/finalize"
+      - "POST /firm/invoices/{id}/send-to-collections"
+      - "POST /firm/trust-transactions/{id}/confirm"
+    shared_operations:
+      - "POST /firm/clients"
+      - "POST /firm/matters"
+      - "POST /firm/matters/{id}/conflict-checks"
+      - "POST /firm/time-entries / POST /firm/expense-entries"
+      - "POST /firm/invoices / POST /firm/invoices/{id}/payments / void"
+      - "POST /firm/trust-transactions (initiate)"
+      - "POST /firm/retainer-holds / release"
+      - "POST /firm/clients/{id}/rate-overrides"
+
+  - name: Attorney
+    description: "Licensed attorney: opens/closes matters, waives conflicts, writes down time, writes off invoices, APPROVES/initiates trust disbursements & sweeps, reverses trust transactions. The segregation-of-duties counterparty to BillingClerk on trust controls."
+    identity: opaque
+    exclusive_operations:
+      - "POST /firm/matters/{id}/open"
+      - "POST /firm/matters/{id}/close"
+      - "POST /firm/conflict-checks/{id}/waive"
+      - "POST /firm/time-entries/{id}/write-down"
+      - "POST /firm/invoices/{id}/write-off"
+      - "POST /firm/trust-transactions/{id}/reverse"
+    shared_operations:
+      - "POST /firm/invoices/{id}/trust-sweep (approval leg; X-User-ID must differ from initiated_by_user_id)"
+      - "POST /firm/time-entries / POST /firm/expense-entries"
+      - "POST /firm/trust-transactions (as approving Attorney on a disbursement)"
+      - "all GET read endpoints"

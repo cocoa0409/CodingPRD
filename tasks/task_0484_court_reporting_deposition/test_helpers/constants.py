@@ -1,0 +1,45 @@
+"""Domain thresholds — numeric constants from PRD calculations (§3.6, §3.11, §3.13).
+
+Generic NON_EXISTENT_UUID comes from the framework.
+"""
+
+# Logical-clock startup default (PRD §2.8).
+DEFAULT_CLOCK = "2026-01-01T00:00:00Z"
+
+# Appearance-fee constants (PRD §3.6).
+MIN_BILLABLE_HOURS = 2
+REALTIME_SURCHARGE_PCT = 0.20
+
+# Read-and-sign deadline window (PRD §3.8): certify-time + 30 days.
+READ_SIGN_WINDOW_DAYS = 30
+
+# Page-rate constants (PRD §3.11).
+JURISDICTION_PAGE_RATE_CENTS = {
+    "FEDERAL": 380,
+    "STATE_CA": 325,
+    "STATE_NY": 400,
+    "STATE_TX": 300,
+}
+TURNAROUND_MULTIPLIER = {
+    "STANDARD": 1.00,
+    "EXPEDITE_14": 1.25,
+    "EXPEDITE_7": 1.50,
+    "EXPEDITE_3": 2.00,
+    "DAILY": 3.00,
+}
+CERTIFICATION_FLAT_CENTS = 2500
+TIER1_MAX_PAGE = 50
+TIER2_MAX_PAGE = 150
+TIER2_MARGINAL_PCT = 0.90
+TIER3_MARGINAL_PCT = 0.80
+
+# Exhibit-charge constant (PRD §3.13).
+EXHIBIT_PAGE_RATE_CENTS = 75
+
+THRESHOLDS = {
+    "MIN_BILLABLE_HOURS": MIN_BILLABLE_HOURS,
+    "REALTIME_SURCHARGE_PCT": REALTIME_SURCHARGE_PCT,
+    "READ_SIGN_WINDOW_DAYS": READ_SIGN_WINDOW_DAYS,
+    "CERTIFICATION_FLAT_CENTS": CERTIFICATION_FLAT_CENTS,
+    "EXHIBIT_PAGE_RATE_CENTS": EXHIBIT_PAGE_RATE_CENTS,
+}

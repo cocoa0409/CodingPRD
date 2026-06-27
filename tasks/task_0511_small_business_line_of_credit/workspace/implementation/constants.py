@@ -1,0 +1,44 @@
+"""Calculation constants (SCAFFOLD §1.3)."""
+
+# underwriting_risk_score
+W_BALANCE = 0.50
+W_REVENUE = 0.35
+W_NSF = 0.40
+NSF_PENALTY_STEP = 0.15
+
+# approved_limit / tiers
+TIER_A_FLOOR = 80
+TIER_B_FLOOR = 65
+APPROVAL_SCORE_FLOOR = 50
+FEE_BPS_A = 800
+FEE_BPS_B = 1200
+FEE_BPS_C = 1800
+NSF_UNDERWRITE_MAX = 3
+APPLICATION_TTL_DAYS = 14
+RENEWAL_TTL_DAYS = 30
+
+# tier advance multiples
+ADVANCE_MULTIPLE = {
+    "TIER_A": 1.50,
+    "TIER_B": 1.00,
+    "TIER_C": 0.60,
+}
+TIER_FEE_BPS = {
+    "TIER_A": FEE_BPS_A,
+    "TIER_B": FEE_BPS_B,
+    "TIER_C": FEE_BPS_C,
+}
+
+# bps
+BPS_DENOMINATOR = 10000
+
+# remittance
+DAILY_REMIT_PCT = 0.02
+WEEKLY_REMIT_PCT = 0.10
+NSF_MAX_RETRIES = 5
+NSF_RETRY_GAP_DAYS = 2
+NSF_DELINQUENCY_THRESHOLD = 3
+NSF_DEFAULT_THRESHOLD = 5
+
+# apr
+DAYS_PER_YEAR = 365

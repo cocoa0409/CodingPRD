@@ -1,0 +1,57 @@
+"""Logical clock. Server-wide, starts at 2026-01-01T00:00:00Z, advanced only
+via POST /_clock/set_current_utc. Never falls back to wall-clock time."""
+from datetime import datetime, timezone
+
+DEFAULT_NOW = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+class Clock:
+    def __init__(self):
+        self._now = DEFAULT_NOW
+
+    def now(self):
+        return self._now
+
+    def set(self, dt):
+        self._now = dt
+
+
+clock = Clock()
+
+
+def iso(dt):
+    """ISO 8601 UTC with three fractional digits, Z suffix."""
+    if dt is None:
+        return None
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + ("%03d" % (dt.microsecond // 1000)) + "Z"
+
+
+def parse_iso(s):
+    """Parse an ISO 8601 datetime string into a tz-aware UTC datetime.
+    Raises ValueError on malformed input."""
+    if not isinstance(s, str):
+        raise ValueError("not a string")
+    raw = s.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def add_months(dt, months):
+    """Add a number of calendar months to a datetime."""
+    month_index = dt.month - 1 + months
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    # clamp day to last day of target month
+    day = dt.day
+    while True:
+        try:
+            return dt.replace(year=year, month=month, day=day)
+        except ValueError:
+            day -= 1
+            if day < 1:
+                raise

@@ -1,0 +1,1480 @@
+scenario: |
+  506. Equity Crowdfunding Portal (Reg CF — StartEngine/Wefunder style): issuer onboarding & Form C,
+  offering page & min/max target, investor accreditation & annual-limit check, escrow funding & rolling
+  close, share/SAFE issuance to cap table, auto-refund on failed raise, Reg A+ tier & secondary listing,
+  investor updates
+domain_name: equity-crowdfunding-regcf
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - dual_variant_calculation        # committed-amount vs swept-at-close amount; equity vs SAFE issuance
+    - cascading_side_effects          # rolling close -> issuance -> cap-table -> escrow ledger -> offering totals
+    - rate_threshold_triggers         # min_target / max_target crossings; Reg CF annual limit boundary
+    - optimistic_concurrency          # OCC on Offering.version for commit-against-stale-offering
+    - derived_field_reconciliation    # Offering.committed_amount_cents / escrow.held_amount_cents stay consistent
+
+  entity_topology: flat               # peer entities linked by FK (Issuer, Offering, Investor, Investment, CapTableEntry, ...)
+  state_machine_shape: branching      # Offering forks to FUNDED vs FAILED; Investment forks to ISSUED vs REFUNDED
+  relationship_patterns:
+    - one_to_many                     # Issuer -> Offerings; Offering -> Investments
+    - cross_aggregate                 # Investment references both Offering and Investor across aggregate boundaries
+    - self_referential                # InvestorUpdate.supersedes_update_id references a prior InvestorUpdate
+
+  role_model: segregation_of_duties   # Issuer cannot self-approve Form C; CSC reviewer cannot also act as Issuer
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 Entity-Relationship Table
+# =====================================================================
+entities:
+  - name: Issuer
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: Registered legal name of the issuing company.
+      - name: ein
+        type: string
+        source: input
+        description: Employer Identification Number; unique across all Issuers.
+        constraints: unique; 9 digits
+      - name: home_state_code
+        type: string
+        source: input
+        description: Two-letter US state of incorporation.
+      - name: entity_type
+        type: enum
+        source: input
+        description: Legal form of the issuer.
+        constraints: one of {C_CORP, LLC, BENEFIT_CORP}
+      - name: bad_actor_flag
+        type: boolean
+        source: input
+        description: Whether any covered person triggers a Rule 503 bad-actor disqualification.
+        default: false
+      - name: status
+        type: enum
+        source: computed
+        description: Onboarding lifecycle state of the issuer.
+        constraints: one of {ONBOARDING, VERIFIED, BARRED}; see §1.2
+      - name: total_raised_trailing_12mo_cents
+        type: integer
+        source: computed
+        description: >-
+          Sum of swept (closed) gross proceeds across this Issuer's FUNDED offerings whose
+          close_at is within the trailing 12 months of the logical clock; used for the Reg CF
+          $5,000,000 per-issuer 12-month cap. See calculations.issuer_trailing_12mo_proceeds.
+
+  - name: Offering
+    parent: null
+    common_fields: true
+    fields:
+      - name: issuer_id
+        type: string
+        source: input
+        description: FK -> Issuer.id; the company conducting the raise.
+      - name: regulation
+        type: enum
+        source: input
+        description: Securities exemption used for the raise.
+        constraints: one of {REG_CF, REG_A_TIER_1, REG_A_TIER_2}
+      - name: security_type
+        type: enum
+        source: input
+        description: Instrument offered to investors.
+        constraints: one of {EQUITY, SAFE}
+      - name: price_per_security_cents
+        type: integer
+        source: input
+        description: >-
+          Whole-cent price of one share (EQUITY only). Required and must be > 0 when
+          security_type==EQUITY; must be omitted/null when security_type==SAFE.
+      - name: min_target_cents
+        type: integer
+        source: input
+        description: Minimum aggregate commitment that must be reached to close successfully.
+        constraints: "> 0"
+      - name: max_target_cents
+        type: integer
+        source: input
+        description: Maximum aggregate commitment the offering will accept.
+        constraints: ">= min_target_cents"
+      - name: per_investor_cap_cents
+        type: integer
+        source: input
+        description: Optional ceiling on any single investor's cumulative commitment to THIS offering.
+        default: null
+      - name: deadline_at
+        type: datetime
+        source: input
+        description: ISO 8601 UTC instant after which the offering may no longer accept commitments.
+      - name: live_at
+        type: datetime
+        source: system
+        description: >-
+          Logical-clock instant the offering went LIVE; null while DRAFT. The campaign window is the
+          CLOSED interval [live_at, deadline_at]. Two LIVE REG_CF offerings of the SAME issuer may not
+          have overlapping campaign windows; touching endpoints (one window's deadline_at == the other's
+          live_at) are permitted. See validations priority 9b / ERR_CAMPAIGN_WINDOW_OVERLAP.
+        default: null
+      - name: form_c_status
+        type: enum
+        source: computed
+        description: Disclosure-review sub-state of the Form C filing.
+        constraints: one of {DRAFT, SUBMITTED, QUALIFIED, REJECTED}; see §1.2
+      - name: status
+        type: enum
+        source: computed
+        description: Primary offering lifecycle state.
+        constraints: one of {DRAFT, LIVE, FUNDED, FAILED, CANCELLED}; see §1.2
+      - name: committed_amount_cents
+        type: integer
+        source: computed
+        description: >-
+          Live running sum of amount_cents over Investments on this offering in state
+          {COMMITTED, RECONFIRMED} (NOT yet swept). See calculations.offering_committed_amount.
+        default: 0
+      - name: swept_amount_cents
+        type: integer
+        source: computed
+        description: >-
+          Cumulative gross proceeds swept into closes for this offering (Investments in state
+          {ISSUED}). Distinct from committed_amount_cents. See calculations.offering_swept_amount.
+        default: 0
+      - name: secondary_listing_enabled
+        type: boolean
+        source: computed
+        description: >-
+          Whether resale/secondary listing of issued securities is permitted. Only ever true for
+          REG_A_TIER_2 offerings that have reached FUNDED. See §1.2 enable-secondary transition.
+        default: false
+      - name: close_at
+        type: datetime
+        source: system
+        description: Logical-clock instant of the final close that moved the offering to FUNDED; null otherwise.
+        default: null
+
+  - name: Investor
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: Investor contact email; unique across all Investors.
+        constraints: unique
+      - name: legal_name
+        type: string
+        source: input
+        description: Investor's full legal name.
+      - name: annual_income_cents
+        type: integer
+        source: input
+        description: Self-reported annual income in cents; >= 0.
+      - name: net_worth_cents
+        type: integer
+        source: input
+        description: Self-reported net worth in cents; >= 0.
+      - name: accreditation_status
+        type: enum
+        source: computed
+        description: >-
+          Whether the investor is accredited. Starts UNACCREDITED; set ACCREDITED only by an
+          approved verification (see §1.2). Accredited investors are exempt from the Reg CF annual limit.
+        constraints: one of {UNACCREDITED, ACCREDITED}
+      - name: annual_limit_cents
+        type: integer
+        source: computed
+        description: >-
+          Reg CF per-investor 12-month investment ceiling for UNACCREDITED investors, derived from
+          annual_income_cents and net_worth_cents. See calculations.investor_annual_limit. Ignored
+          while accreditation_status==ACCREDITED.
+
+  - name: AccreditationRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: investor_id
+        type: string
+        source: input
+        description: FK -> Investor.id; the investor seeking accredited status.
+      - name: method
+        type: enum
+        source: input
+        description: Basis claimed for accreditation.
+        constraints: one of {INCOME, NET_WORTH, THIRD_PARTY_LETTER}
+      - name: status
+        type: enum
+        source: computed
+        description: Review state of the accreditation request.
+        constraints: one of {PENDING, APPROVED, DENIED}; see §1.2
+      - name: reviewed_by_user_id
+        type: string
+        source: system
+        description: Opaque ComplianceOfficer user id that decided the request; null while PENDING.
+        default: null
+
+  - name: Investment
+    parent: null
+    common_fields: true
+    fields:
+      - name: offering_id
+        type: string
+        source: input
+        description: FK -> Offering.id; the offering the commitment is placed against.
+      - name: investor_id
+        type: string
+        source: input
+        description: FK -> Investor.id; the committing investor.
+      - name: amount_cents
+        type: integer
+        source: input
+        description: Gross committed dollar amount in cents; must be > 0.
+        constraints: "> 0"
+      - name: expected_offering_version
+        type: integer
+        source: input
+        description: >-
+          OCC guard — the Offering.version the investor last observed. Rejected with
+          ERR_STALE_OFFERING_VERSION (412) if it no longer matches Offering.version.
+      - name: status
+        type: enum
+        source: computed
+        description: Commitment lifecycle state.
+        constraints: one of {COMMITTED, RECONFIRMED, ISSUED, REFUNDED, CANCELLED}; see §1.2
+      - name: securities_issued
+        type: integer
+        source: computed
+        description: >-
+          Number of EQUITY shares minted to the cap table on close (0 for SAFE and until ISSUED).
+          See calculations.equity_issuance.
+        default: 0
+      - name: refund_amount_cents
+        type: integer
+        source: computed
+        description: >-
+          Amount returned to the investor wallet — either the full amount on auto-refund of a failed
+          raise / cancellation, or the per-share rounding remainder on equity issuance. See
+          calculations.equity_issuance and §1.2 refund transitions.
+        default: 0
+      - name: reconfirm_required
+        type: boolean
+        source: computed
+        description: >-
+          True when a material Form C amendment (re-QUALIFIED after change) obligates this COMMITTED
+          investment to re-affirm before it may be swept. Set by the offering amend cascade (§1.2).
+        default: false
+
+  - name: EscrowAccount
+    parent: null
+    common_fields: true
+    fields:
+      - name: offering_id
+        type: string
+        source: input
+        description: FK -> Offering.id; one escrow account per offering (1:1).
+      - name: held_amount_cents
+        type: integer
+        source: computed
+        description: >-
+          Funds currently held in escrow = sum of amount_cents over Investments on the offering in
+          {COMMITTED, RECONFIRMED}. Debited as investments are swept (to issuer) or refunded (to wallet).
+          See calculations.escrow_held_amount.
+        default: 0
+      - name: disbursed_amount_cents
+        type: integer
+        source: computed
+        description: Cumulative net proceeds released to the issuer across all closes on this offering.
+        default: 0
+      - name: refunded_amount_cents
+        type: integer
+        source: computed
+        description: Cumulative funds returned to investor wallets (failed-raise auto-refunds + cancellations + rounding remainders).
+        default: 0
+
+  - name: CapTableEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: offering_id
+        type: string
+        source: input
+        description: FK -> Offering.id; the offering whose close minted this position.
+      - name: investor_id
+        type: string
+        source: input
+        description: FK -> Investor.id; the holder of the position.
+      - name: investment_id
+        type: string
+        source: input
+        description: FK -> Investment.id; the swept investment that produced this position.
+      - name: instrument
+        type: enum
+        source: system
+        description: Instrument class of the position.
+        constraints: one of {EQUITY, SAFE}
+      - name: quantity
+        type: integer
+        source: system
+        description: Number of EQUITY shares held; null for SAFE positions.
+        default: null
+      - name: principal_cents
+        type: integer
+        source: system
+        description: Capital recorded for the position — share consideration (EQUITY) or full principal (SAFE).
+
+  - name: InvestorUpdate
+    parent: null
+    common_fields: true
+    fields:
+      - name: offering_id
+        type: string
+        source: input
+        description: FK -> Offering.id; the offering this disclosure update belongs to.
+      - name: title
+        type: string
+        source: input
+        description: Short headline of the update.
+      - name: body
+        type: string
+        source: input
+        description: Free-text body of the update.
+      - name: supersedes_update_id
+        type: string
+        source: input
+        description: FK -> InvestorUpdate.id; the prior update this one corrects/replaces (self-referential), or null.
+        default: null
+      - name: published_at
+        type: datetime
+        source: system
+        description: >-
+          Logical-clock instant the update was PUBLISHED; null while DRAFT. Disclosure quiet-period rule:
+          on the SAME offering, a new update may not be PUBLISHED unless its publish instant is strictly
+          MORE than QUIET_PERIOD_HOURS (24h) after the most recent prior PUBLISHED update's published_at —
+          a point-event-with-mandatory-gap-buffer (NOT an interval overlap). See validations priority 9c /
+          ERR_UPDATE_QUIET_PERIOD. A superseding republish (supersedes_update_id set) is exempt from the gap.
+        default: null
+      - name: status
+        type: enum
+        source: computed
+        description: Publication state of the update.
+        constraints: one of {DRAFT, PUBLISHED, SUPERSEDED}; see §1.2
+
+# =====================================================================
+# §1.2 State Machine Table
+# =====================================================================
+state_machines:
+  - entity: Issuer
+    initial_state: ONBOARDING
+    terminal_states: [BARRED]
+    transitions:
+      - from: ONBOARDING
+        to: VERIFIED
+        trigger: "POST /issuers/{id}/verify"
+        actor: ComplianceOfficer
+        preconditions:
+          - "issuer.status == ONBOARDING"
+          - "issuer.bad_actor_flag == false (a flagged issuer cannot be verified)"
+        side_effects:
+          - "increments Issuer.version by 1"
+        note: "A barred bad actor is gated here, not at issuer creation, so the flag can be recorded then reviewed."
+      - from: ONBOARDING
+        to: BARRED
+        trigger: "POST /issuers/{id}/bar"
+        actor: ComplianceOfficer
+        preconditions:
+          - "issuer.status == ONBOARDING"
+        side_effects:
+          - "increments Issuer.version by 1"
+
+  - entity: Offering
+    initial_state: DRAFT
+    terminal_states: [FUNDED, FAILED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: LIVE
+        trigger: "POST /offerings/{id}/go-live"
+        actor: Issuer
+        preconditions:
+          - "offering.status == DRAFT"
+          - "offering.form_c_status == QUALIFIED"
+          - "parent Issuer.status == VERIFIED (cross-entity guard)"
+          - "logical clock < offering.deadline_at"
+          - "no other LIVE REG_CF offering of the same issuer has a campaign window [live_at, deadline_at] that overlaps [logical clock, this.deadline_at] (closed interval, touching endpoints allowed)"
+        side_effects:
+          - "creates the EscrowAccount for this offering with held_amount_cents=0 if not already present"
+          - "sets Offering.live_at = logical clock"
+          - "increments Offering.version by 1"
+        note: "Form C must be QUALIFIED and the Issuer VERIFIED before commitments can be taken; campaign windows of an issuer's concurrent REG_CF raises may not overlap."
+      - from: LIVE
+        to: FUNDED
+        trigger: "POST /offerings/{id}/close (final close; swept total >= min_target_cents)"
+        actor: Issuer
+        preconditions:
+          - "offering.status == LIVE"
+          - "offering.form_c_status == QUALIFIED (not pending a material-amendment re-qualification)"
+          - "the close batch (Investments in COMMITTED with reconfirm_required==false, plus RECONFIRMED) sums to >= offering.min_target_cents when added to swept_amount_cents"
+        side_effects:
+          - "for each Investment in the close batch: COMMITTED/RECONFIRMED -> ISSUED, computes equity_issuance, mints a CapTableEntry, debits escrow held -> disbursed/refunded (see calculations.close_disbursement)"
+          - "sets Offering.swept_amount_cents += swept gross; Offering.committed_amount_cents recomputed; EscrowAccount.disbursed_amount_cents and refunded_amount_cents advanced"
+          - "sets Offering.close_at = logical clock; sets Offering.status=FUNDED"
+          - "increments Issuer.total_raised_trailing_12mo_proceeds basis (recomputed)"
+          - "increments Offering.version by 1"
+        note: "Final close. Rolling (interim) closes use POST /offerings/{id}/rolling-close and keep status LIVE."
+      - from: LIVE
+        to: LIVE
+        trigger: "POST /offerings/{id}/rolling-close (interim close; swept-to-date >= min_target_cents)"
+        actor: Issuer
+        preconditions:
+          - "offering.status == LIVE"
+          - "offering.form_c_status == QUALIFIED"
+          - "swept_amount_cents + close batch >= offering.min_target_cents (the minimum must already be met cumulatively before any rolling close)"
+        side_effects:
+          - "sweeps the close batch exactly as the FUNDED transition does (ISSUED, cap-table mint, escrow debit) but LEAVES status=LIVE so the raise keeps accepting commitments up to max_target_cents"
+          - "advances Offering.swept_amount_cents; recomputes committed_amount_cents"
+          - "increments Offering.version by 1"
+        note: "Rolling close (cyclic self-loop): may fire repeatedly while LIVE; each sweep is a transitive cascade (close -> issuance -> cap-table -> escrow -> offering totals)."
+      - from: LIVE
+        to: FAILED
+        trigger: "POST /offerings/{id}/close OR system deadline pass with swept_amount_cents + committed < min_target_cents"
+        actor: Issuer
+        preconditions:
+          - "offering.status == LIVE"
+          - "swept_amount_cents + committed_amount_cents < offering.min_target_cents (minimum not reached)"
+        side_effects:
+          - "for each Investment in {COMMITTED, RECONFIRMED}: -> REFUNDED, refund_amount_cents = amount_cents, wallet credited"
+          - "EscrowAccount.held_amount_cents -> 0; refunded_amount_cents += total refunded"
+          - "sets Offering.status=FAILED"
+          - "increments Offering.version by 1"
+        note: "Auto-refund on failed raise. No CapTableEntry is minted."
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /offerings/{id}/cancel"
+        actor: Issuer
+        preconditions:
+          - "offering.status == DRAFT"
+        side_effects:
+          - "increments Offering.version by 1"
+        note: "A DRAFT offering with no commitments may be cancelled outright."
+      - from: LIVE
+        to: CANCELLED
+        trigger: "POST /offerings/{id}/cancel"
+        actor: Issuer
+        preconditions:
+          - "offering.status == LIVE"
+        side_effects:
+          - "for each Investment in {COMMITTED, RECONFIRMED}: -> CANCELLED, refund_amount_cents = amount_cents, wallet credited"
+          - "EscrowAccount.held_amount_cents -> 0; refunded_amount_cents += total refunded"
+          - "increments Offering.version by 1"
+        note: "Cancelling a LIVE raise refunds all un-swept commitments (already-ISSUED positions are untouched)."
+      - from: FUNDED
+        to: FUNDED
+        trigger: "POST /offerings/{id}/enable-secondary"
+        actor: ComplianceOfficer
+        preconditions:
+          - "offering.status == FUNDED"
+          - "offering.regulation == REG_A_TIER_2 (secondary listing is only permitted for Reg A+ Tier 2)"
+          - "offering.secondary_listing_enabled == false"
+        side_effects:
+          - "sets Offering.secondary_listing_enabled = true"
+          - "increments Offering.version by 1"
+        note: "Reg A+ Tier 2 secondary listing toggle. Self-loop on a terminal-primary offering."
+
+  - entity: Offering.form_c
+    initial_state: DRAFT
+    terminal_states: []
+    note: "Parallel sub-dimension on Offering: form_c_status evolves independently of status while DRAFT/LIVE."
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /offerings/{id}/form-c/submit"
+        actor: Issuer
+        preconditions:
+          - "offering.form_c_status == DRAFT"
+          - "offering.status == DRAFT"
+        side_effects:
+          - "increments Offering.version by 1"
+      - from: SUBMITTED
+        to: QUALIFIED
+        trigger: "POST /offerings/{id}/form-c/qualify"
+        actor: ComplianceOfficer
+        preconditions:
+          - "offering.form_c_status == SUBMITTED"
+          - "acting ComplianceOfficer.user_id != offering's Issuer.id (segregation of duties — the issuer cannot self-qualify)"
+        side_effects:
+          - "increments Offering.version by 1"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /offerings/{id}/form-c/reject"
+        actor: ComplianceOfficer
+        preconditions:
+          - "offering.form_c_status == SUBMITTED"
+        side_effects:
+          - "increments Offering.version by 1"
+      - from: REJECTED
+        to: SUBMITTED
+        trigger: "POST /offerings/{id}/form-c/submit (revision loop)"
+        actor: Issuer
+        preconditions:
+          - "offering.form_c_status == REJECTED"
+        side_effects:
+          - "increments Offering.version by 1"
+        note: "Cyclic revision loop: REJECTED -> SUBMITTED -> (QUALIFIED|REJECTED) may repeat."
+      - from: QUALIFIED
+        to: SUBMITTED
+        trigger: "POST /offerings/{id}/form-c/amend (material amendment while LIVE)"
+        actor: Issuer
+        preconditions:
+          - "offering.form_c_status == QUALIFIED"
+          - "offering.status IN {DRAFT, LIVE}"
+        side_effects:
+          - "sets every Investment on the offering in COMMITTED state to reconfirm_required=true (cascade); those investments are excluded from any close batch until re-affirmed (see Investment.RECONFIRMED transition)"
+          - "increments Offering.version by 1"
+        note: "Material Form C amendment forces investor reconfirmation (Reg CF reconfirmation right)."
+
+  - entity: AccreditationRequest
+    initial_state: PENDING
+    terminal_states: [APPROVED, DENIED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /accreditation-requests/{id}/approve"
+        actor: ComplianceOfficer
+        preconditions:
+          - "request.status == PENDING"
+        side_effects:
+          - "sets Investor.accreditation_status = ACCREDITED (cross-entity); records reviewed_by_user_id"
+          - "increments AccreditationRequest.version by 1"
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /accreditation-requests/{id}/deny"
+        actor: ComplianceOfficer
+        preconditions:
+          - "request.status == PENDING"
+        side_effects:
+          - "records reviewed_by_user_id; Investor.accreditation_status unchanged"
+          - "increments AccreditationRequest.version by 1"
+
+  - entity: Investment
+    initial_state: COMMITTED
+    terminal_states: [ISSUED, REFUNDED, CANCELLED]
+    transitions:
+      - from: COMMITTED
+        to: RECONFIRMED
+        trigger: "POST /investments/{id}/reconfirm"
+        actor: Investor
+        preconditions:
+          - "investment.status == COMMITTED"
+          - "investment.reconfirm_required == true (only investments flagged by a material amendment may reconfirm)"
+          - "acting Investor.id == investment.investor_id"
+        side_effects:
+          - "sets investment.reconfirm_required = false; investment becomes eligible for the next close batch"
+          - "increments Investment.version by 1"
+        note: "Reconfirmation right exercised after a material Form C amendment."
+      - from: COMMITTED
+        to: ISSUED
+        trigger: "system: included in a rolling-close or final-close batch"
+        actor: system
+        preconditions:
+          - "investment.status == COMMITTED AND investment.reconfirm_required == false"
+        side_effects:
+          - "computes securities_issued + refund_amount_cents (rounding remainder) via calculations.equity_issuance; mints CapTableEntry; escrow debit"
+          - "increments Investment.version by 1"
+      - from: RECONFIRMED
+        to: ISSUED
+        trigger: "system: included in a rolling-close or final-close batch"
+        actor: system
+        preconditions:
+          - "investment.status == RECONFIRMED"
+        side_effects:
+          - "computes securities_issued + refund_amount_cents via calculations.equity_issuance; mints CapTableEntry; escrow debit"
+          - "increments Investment.version by 1"
+      - from: COMMITTED
+        to: REFUNDED
+        trigger: "system: offering FAILED (deadline passed / minimum not met)"
+        actor: system
+        preconditions:
+          - "investment.status == COMMITTED"
+          - "parent Offering.status transitions to FAILED (cross-entity guard)"
+        side_effects:
+          - "refund_amount_cents = amount_cents; wallet credited; escrow held debited"
+          - "increments Investment.version by 1"
+      - from: RECONFIRMED
+        to: REFUNDED
+        trigger: "system: offering FAILED"
+        actor: system
+        preconditions:
+          - "investment.status == RECONFIRMED"
+          - "parent Offering.status transitions to FAILED"
+        side_effects:
+          - "refund_amount_cents = amount_cents; wallet credited; escrow held debited"
+          - "increments Investment.version by 1"
+      - from: COMMITTED
+        to: CANCELLED
+        trigger: "POST /investments/{id}/withdraw OR system: offering CANCELLED"
+        actor: Investor | system
+        preconditions:
+          - "investment.status == COMMITTED"
+          - "(investor-initiated) logical clock < parent Offering.deadline_at AND acting Investor.id == investment.investor_id"
+        side_effects:
+          - "refund_amount_cents = amount_cents; wallet credited; escrow held debited; Offering.committed_amount_cents recomputed"
+          - "increments Investment.version by 1"
+        note: "Reg CF: an investor may withdraw a commitment any time before the deadline."
+      - from: RECONFIRMED
+        to: CANCELLED
+        trigger: "POST /investments/{id}/withdraw OR system: offering CANCELLED"
+        actor: Investor | system
+        preconditions:
+          - "investment.status == RECONFIRMED"
+          - "(investor-initiated) logical clock < parent Offering.deadline_at AND acting Investor.id == investment.investor_id"
+        side_effects:
+          - "refund_amount_cents = amount_cents; wallet credited; escrow held debited; Offering.committed_amount_cents recomputed"
+          - "increments Investment.version by 1"
+
+  - entity: InvestorUpdate
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: DRAFT
+        to: PUBLISHED
+        trigger: "POST /investor-updates/{id}/publish"
+        actor: Issuer
+        preconditions:
+          - "update.status == DRAFT"
+          - "parent Offering.status IN {LIVE, FUNDED} (cross-entity guard — cannot publish updates on a DRAFT/CANCELLED/FAILED offering)"
+          - "if supersedes_update_id is null: logical clock is strictly > 24h after the most recent prior PUBLISHED update's published_at on the same offering (quiet-period gap); a superseding republish is exempt"
+        side_effects:
+          - "sets InvestorUpdate.published_at = logical clock"
+          - "if update.supersedes_update_id is non-null: that prior InvestorUpdate (must be PUBLISHED) -> SUPERSEDED (cascade)"
+          - "increments InvestorUpdate.version by 1"
+      - from: PUBLISHED
+        to: SUPERSEDED
+        trigger: "system: a newer InvestorUpdate that supersedes this one is published"
+        actor: system
+        preconditions:
+          - "update.status == PUBLISHED"
+        side_effects:
+          - "increments InvestorUpdate.version by 1"
+
+# =====================================================================
+# §1.2.1 Concurrency Rules
+# =====================================================================
+concurrency_rules:
+  - rule_id: commit-against-stale-offering
+    parent_entity: Offering
+    write_endpoint: "POST /investments"
+    occ_field: "expected_offering_version"
+    description: |
+      Placing an Investment against an Offering whose version has advanced since the investor last
+      observed it is rejected. A commit legitimately succeeds against the offering's current state,
+      but the offering's version is bumped by every sweep (rolling close), material amendment, and
+      go-live; an investor who read an older version and then commits is acting on a stale view of
+      remaining capacity (max_target_cents) and Form C status, so the commit is rejected as stale.
+    error_id: ERR_STALE_OFFERING_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 Calculation Rules Table
+# =====================================================================
+calculations:
+  - name: investor_annual_limit
+    trigger: "on Investor creation/update of income/net worth, and re-read whenever the limit is consulted at commit time"
+    algorithm: threshold
+    formula: |
+      # Reg CF (2021 amended) per-investor 12-month limit, cents, integer math.
+      lesser  = min(annual_income_cents, net_worth_cents)
+      greater = max(annual_income_cents, net_worth_cents)
+      if annual_income_cents >= CAP_CENTS and net_worth_cents >= CAP_CENTS:
+          pct = (lesser  * 10) // 100      # 10% of the LESSER when both >= 124,000
+      else:
+          pct = (greater *  5) // 100      # 5%  of the GREATER otherwise
+      annual_limit_cents = min( max(FLOOR_CENTS, pct), CAP_CENTS )
+    input_set: "the single Investor row; ACCREDITED investors ignore this field entirely (treated as unlimited)"
+    constants:
+      FLOOR_CENTS: 250000      # $2,500
+      CAP_CENTS: 12400000      # $124,000
+    precision: "integer cents; floor on the percentage step (// 100)"
+    variants:
+      - name: both_above_cap
+        when: "annual_income_cents >= 124,000 AND net_worth_cents >= 124,000"
+        difference: "uses 10% of the LESSER of the two figures"
+      - name: at_least_one_below_cap
+        when: "either annual_income_cents < 124,000 OR net_worth_cents < 124,000"
+        difference: "uses 5% of the GREATER of the two figures"
+
+  - name: investor_trailing_12mo_committed
+    trigger: "on POST /investments, to enforce the annual limit across ALL of the investor's offerings"
+    algorithm: aggregation
+    formula: |
+      # Sum the investor's gross commitments that count against the 12-month window.
+      window_start = logical_clock - 365 days        # inclusive lower bound
+      total = sum( inv.amount_cents
+                   for inv in Investments
+                   where inv.investor_id == this.investor_id
+                     and inv.status IN {COMMITTED, RECONFIRMED, ISSUED}    # CANCELLED/REFUNDED excluded
+                     and inv.created_at >= window_start )                  # half-open [window_start, now]
+      # the new commitment is admissible iff total + new_amount_cents <= Investor.annual_limit_cents
+    input_set: "Investments for one investor across all offerings in {COMMITTED, RECONFIRMED, ISSUED}, created in trailing 365 days"
+    constants:
+      WINDOW_DAYS: 365
+    precision: "integer cents"
+    variants:
+      - name: accredited_bypass
+        when: "Investor.accreditation_status == ACCREDITED"
+        difference: "the entire limit check is skipped; no upper bound applies"
+
+  - name: offering_committed_amount
+    trigger: "recomputed on every Investment status change (create, withdraw, reconfirm, sweep, refund) on the offering"
+    algorithm: aggregation
+    formula: |
+      Offering.committed_amount_cents = sum( inv.amount_cents
+                                             for inv in Investments
+                                             where inv.offering_id == this.id
+                                               and inv.status IN {COMMITTED, RECONFIRMED} )
+    input_set: "Investments on this offering in {COMMITTED, RECONFIRMED} (un-swept, un-refunded)"
+    precision: "integer cents"
+
+  - name: offering_swept_amount
+    trigger: "recomputed on every rolling-close / final-close sweep"
+    algorithm: aggregation
+    formula: |
+      Offering.swept_amount_cents = sum( inv.amount_cents
+                                        for inv in Investments
+                                        where inv.offering_id == this.id
+                                          and inv.status == ISSUED )
+    input_set: "Investments on this offering in ISSUED"
+    precision: "integer cents"
+
+  - name: escrow_held_amount
+    trigger: "recomputed on every Investment status change affecting escrow"
+    algorithm: aggregation
+    formula: |
+      EscrowAccount.held_amount_cents = sum( inv.amount_cents
+                                            for inv in Investments
+                                            where inv.offering_id == escrow.offering_id
+                                              and inv.status IN {COMMITTED, RECONFIRMED} )
+    input_set: "un-swept, un-refunded Investments on the escrow's offering"
+    precision: "integer cents"
+    variants:
+      - name: invariant_held_equals_committed
+        when: "always"
+        difference: "held_amount_cents MUST equal Offering.committed_amount_cents at all times (escrow conservation invariant)"
+
+  - name: equity_issuance
+    trigger: "system: an Investment is included in a close batch (COMMITTED/RECONFIRMED -> ISSUED)"
+    algorithm: waterfall_allocation
+    formula: |
+      if Offering.security_type == EQUITY:
+          securities_issued    = inv.amount_cents // Offering.price_per_security_cents   # floor
+          consideration_cents  = securities_issued * Offering.price_per_security_cents
+          refund_amount_cents  = inv.amount_cents - consideration_cents                  # whole-share rounding remainder
+          CapTableEntry: instrument=EQUITY, quantity=securities_issued, principal_cents=consideration_cents
+      else:   # SAFE
+          securities_issued    = 0
+          refund_amount_cents  = 0
+          CapTableEntry: instrument=SAFE, quantity=null, principal_cents=inv.amount_cents
+    input_set: "one Investment + its parent Offering's security_type and price_per_security_cents"
+    precision: "integer division (floor) on shares; the remainder is refunded to wallet, never rolled into the next share"
+    variants:
+      - name: equity_with_remainder
+        when: "security_type == EQUITY and amount_cents not divisible by price_per_security_cents"
+        difference: "mints floor(amount/price) shares and refunds the sub-share remainder to the investor wallet"
+      - name: safe_full_principal
+        when: "security_type == SAFE"
+        difference: "no share math; full amount_cents recorded as SAFE principal, zero refund remainder"
+
+  - name: close_disbursement
+    trigger: "system: a rolling-close or final-close sweep completes the close batch"
+    algorithm: waterfall_allocation
+    formula: |
+      # Order is pinned: (1) sum the batch gross, (2) compute platform fee on the SUM (round_half_up),
+      # (3) net = gross - fee, (4) the per-investment sub-share remainders (equity_issuance) are
+      # carved out and refunded FIRST, then the platform fee, then the remaining net is disbursed.
+      batch_gross_cents = sum( inv.amount_cents for inv in close_batch )           # step 1
+      platform_fee_cents = round_half_up( batch_gross_cents * FEE_BPS / 10000 )    # step 2, on the SUM
+      sum_remainders     = sum( equity_issuance(inv).refund_amount_cents for inv in close_batch )
+      net_disbursed_cents = batch_gross_cents - platform_fee_cents - sum_remainders
+      # EscrowAccount: held -= batch_gross; disbursed += net_disbursed; refunded += sum_remainders + platform_fee
+    input_set: "the close batch — Investments swept in THIS close (COMMITTED with reconfirm_required==false, plus RECONFIRMED)"
+    constants:
+      FEE_BPS: 750             # 7.5% platform fee in basis points
+    precision: "round_half_up to the cent on the platform fee, computed on the batch SUM (NOT per-investment)"
+    variants:
+      - name: fee_on_sum
+        when: "always (pinned order)"
+        difference: "fee is computed once on the summed batch gross — summing per-line fees would diverge by rounding"
+
+  - name: issuer_trailing_12mo_proceeds
+    trigger: "recomputed on every offering close (FUNDED transition / rolling close)"
+    algorithm: aggregation
+    formula: |
+      window_start = logical_clock - 365 days
+      Issuer.total_raised_trailing_12mo_cents =
+          sum( off.swept_amount_cents
+               for off in Offerings
+               where off.issuer_id == this.id
+                 and off.regulation == REG_CF
+                 and off.close_at != null
+                 and off.close_at >= window_start )
+      # a new REG_CF offering's max_target_cents is rejected if it would push this sum past ISSUER_CAP_CENTS
+    input_set: "the issuer's REG_CF offerings closed within trailing 365 days"
+    constants:
+      ISSUER_CAP_CENTS: 500000000   # $5,000,000 Reg CF 12-month per-issuer cap
+      WINDOW_DAYS: 365
+    precision: "integer cents"
+
+  - name: offering_campaign_overlap
+    trigger: "on POST /offerings/{id}/go-live, to reject overlapping concurrent REG_CF campaigns of one issuer"
+    algorithm: interval_merge
+    formula: |
+      # New campaign window is the CLOSED interval [now, this.deadline_at] (now = logical clock at go-live).
+      # Two closed intervals [a1,a2] and [b1,b2] OVERLAP iff a1 < b2 AND b1 < a2 (STRICT inequalities,
+      # so touching endpoints a2 == b1 do NOT overlap). Reject go-live if ANY other offering of the same
+      # issuer with regulation==REG_CF and status==LIVE has [live_at, deadline_at] overlapping [now, deadline_at].
+      conflict = exists off in Offerings
+                 where off.id != this.id
+                   and off.issuer_id == this.issuer_id
+                   and off.regulation == REG_CF
+                   and off.status == LIVE
+                   and off.live_at < this.deadline_at
+                   and now          < off.deadline_at
+    input_set: "the issuer's LIVE REG_CF offerings other than this one"
+    precision: "datetime comparison; strict < so adjacency (deadline_at == other.live_at) is allowed"
+    variants:
+      - name: closed_interval_touching_allowed
+        when: "always"
+        difference: "uses strict < on both endpoints, so back-to-back windows that touch at a single instant do not conflict"
+
+  - name: update_quiet_period
+    trigger: "on POST /investor-updates/{id}/publish for a NON-superseding update"
+    algorithm: interval_merge
+    formula: |
+      # Point-event-with-mandatory-gap (NOT interval overlap): the prior PUBLISHED update on the same
+      # offering defines a forbidden trailing buffer of QUIET_PERIOD_HOURS. The new publish instant `now`
+      # is admissible iff now - last_published_at > 24h (STRICT; exactly 24h is still too soon).
+      last = max( u.published_at for u in InvestorUpdates
+                  where u.offering_id == this.offering_id and u.status == PUBLISHED )   # may be null
+      ok = (last is null) or (now - last > QUIET_PERIOD_HOURS) or (this.supersedes_update_id != null)
+    input_set: "PUBLISHED InvestorUpdates on the same offering; latest by published_at"
+    constants:
+      QUIET_PERIOD_HOURS: 24
+    precision: "datetime delta; STRICT > 24h (a publish exactly 24h after is rejected)"
+    variants:
+      - name: gap_buffer_strict
+        when: "supersedes_update_id is null"
+        difference: "requires a strictly-greater-than-24h gap from the prior publish (point-with-buffer, distinct from the campaign closed-interval overlap)"
+      - name: supersede_exempt
+        when: "supersedes_update_id is non-null"
+        difference: "a corrective republish bypasses the quiet-period gap entirely"
+
+# =====================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =====================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /investors and POST /issuers (public registration) and GET reads"
+
+  - priority: 2
+    category: auth
+    check: "the role is permitted for this operation per §1.7 RBAC matrix"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: auth
+    check: "ownership — an Issuer may only act on its own offerings/updates; an Investor only on its own investments/accreditation-requests (X-User-ID == resource FK)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "Issuer/Investor write endpoints on owned resources"
+
+  - priority: 4
+    category: auth
+    check: "segregation of duties — the ComplianceOfficer qualifying/rejecting a Form C must not share user id with the offering's Issuer"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /offerings/{id}/form-c/qualify, POST /offerings/{id}/form-c/reject"
+
+  - priority: 5
+    category: existence
+    check: "all path/body referenced resources exist, validated left-to-right in the path"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+
+  - priority: 6
+    category: state
+    check: "the target resource is in a state from which the requested transition is defined (§1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 7
+    category: business_temporal
+    check: "the offering deadline has not passed (logical clock < deadline_at) for commit / withdraw / go-live"
+    error_id: ERR_OFFERING_DEADLINE_PASSED
+    http_status: 409
+    applies_to: "POST /investments, POST /investments/{id}/withdraw, POST /offerings/{id}/go-live"
+
+  - priority: 8
+    category: business_safety
+    check: "a bad-actor-flagged Issuer cannot be VERIFIED (Rule 503 disqualification)"
+    error_id: ERR_BAD_ACTOR_DISQUALIFIED
+    http_status: 422
+    applies_to: "POST /issuers/{id}/verify"
+
+  - priority: 9
+    category: business_referential
+    check: "the offering's parent Issuer must be VERIFIED before go-live (cross-entity)"
+    error_id: ERR_ISSUER_NOT_VERIFIED
+    http_status: 409
+    applies_to: "POST /offerings/{id}/go-live"
+
+  - priority: 9.1
+    category: business_temporal
+    check: "no other LIVE REG_CF offering of the same issuer has a campaign window [live_at, deadline_at] overlapping [logical clock, this.deadline_at]; closed interval, touching endpoints (deadline_at == other.live_at) permitted"
+    error_id: ERR_CAMPAIGN_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /offerings/{id}/go-live"
+
+  - priority: 9.2
+    category: business_temporal
+    check: "publishing a non-superseding update requires logical clock strictly > 24h after the most recent prior PUBLISHED update's published_at on the same offering (quiet-period gap; point-event-with-buffer semantics)"
+    error_id: ERR_UPDATE_QUIET_PERIOD
+    http_status: 409
+    applies_to: "POST /investor-updates/{id}/publish"
+
+  - priority: 10
+    category: business_safety
+    check: "an UNACCREDITED investor's trailing-12mo committed + new amount must not exceed annual_limit_cents (Reg CF)"
+    error_id: ERR_ANNUAL_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /investments"
+
+  - priority: 11
+    category: business_constraint
+    check: "a per-investor cap, if set on the offering, bounds the investor's cumulative commitment to THIS offering"
+    error_id: ERR_PER_INVESTOR_CAP_EXCEEDED
+    http_status: 422
+    applies_to: "POST /investments"
+
+  - priority: 12
+    category: business_fiscal
+    check: "committing must not push swept_amount_cents + committed_amount_cents + new amount past max_target_cents (oversubscription)"
+    error_id: ERR_OVERSUBSCRIBED
+    http_status: 409
+    applies_to: "POST /investments"
+
+  - priority: 13
+    category: business_fiscal
+    check: "a final close / rolling close requires the batch to bring cumulative swept to >= min_target_cents"
+    error_id: ERR_MINIMUM_NOT_MET
+    http_status: 409
+    applies_to: "POST /offerings/{id}/close, POST /offerings/{id}/rolling-close"
+
+  - priority: 14
+    category: business_referential
+    check: "an Issuer's new REG_CF offering max_target_cents + trailing-12mo proceeds must not exceed the $5,000,000 per-issuer cap"
+    error_id: ERR_ISSUER_CAP_EXCEEDED
+    http_status: 422
+    applies_to: "POST /offerings"
+
+  - priority: 15
+    category: business_constraint
+    check: "EQUITY offerings require price_per_security_cents > 0; SAFE offerings must omit it; max_target_cents >= min_target_cents > 0"
+    error_id: ERR_INVALID_OFFERING_TERMS
+    http_status: 422
+    applies_to: "POST /offerings"
+
+  - priority: 16
+    category: business_constraint
+    check: "secondary listing toggle requires regulation == REG_A_TIER_2"
+    error_id: ERR_SECONDARY_NOT_PERMITTED
+    http_status: 422
+    applies_to: "POST /offerings/{id}/enable-secondary"
+
+  - priority: 17
+    category: business_constraint
+    check: "unique constraints: Issuer.ein, Investor.email"
+    error_id: ERR_DUPLICATE_RESOURCE
+    http_status: 409
+    applies_to: "POST /issuers, POST /investors"
+
+  - priority: 18
+    category: business_constraint
+    check: "OCC — expected_offering_version must equal current Offering.version on commit"
+    error_id: ERR_STALE_OFFERING_VERSION
+    http_status: 412
+    applies_to: "POST /investments"
+
+  - priority: 19
+    category: business_constraint
+    check: "request body fields well-formed (types, required present, amount_cents > 0)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all
+
+# =====================================================================
+# §1.5 API Endpoint Table
+# =====================================================================
+endpoints:
+  # --- Issuer ---
+  - method: POST
+    path: "/issuers"
+    description: "Onboard a new issuer (public; status starts ONBOARDING)."
+    roles: [Anonymous, ComplianceOfficer]
+    code: 201
+    input: [legal_name, ein, home_state_code, entity_type, "bad_actor_flag?"]
+    output: Issuer
+    side_effects: ["creates Issuer in ONBOARDING"]
+  - method: GET
+    path: "/issuers/{id}"
+    description: "Fetch an issuer."
+    roles: [Anonymous, Issuer, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Issuer
+    side_effects: []
+  - method: GET
+    path: "/issuers"
+    description: "List issuers (paginated)."
+    roles: [Anonymous, ComplianceOfficer]
+    code: 200
+    input: ["home_state_code?", "status?", "limit?", "offset?"]
+    output: Issuer[]
+    side_effects: []
+  - method: POST
+    path: "/issuers/{id}/verify"
+    description: "ComplianceOfficer verifies an issuer (ONBOARDING -> VERIFIED)."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Issuer
+    side_effects: ["ONBOARDING -> VERIFIED", "increments Issuer.version by 1"]
+  - method: POST
+    path: "/issuers/{id}/bar"
+    description: "ComplianceOfficer bars an issuer (ONBOARDING -> BARRED)."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Issuer
+    side_effects: ["ONBOARDING -> BARRED", "increments Issuer.version by 1"]
+
+  # --- Offering + Form C ---
+  - method: POST
+    path: "/offerings"
+    description: "Issuer creates a DRAFT offering (Form C starts DRAFT). Enforces issuer cap and offering-terms validity."
+    roles: [Issuer]
+    code: 201
+    input: [issuer_id, regulation, security_type, "price_per_security_cents?", min_target_cents, max_target_cents, "per_investor_cap_cents?", deadline_at]
+    output: Offering
+    side_effects: ["creates Offering in DRAFT/form_c=DRAFT", "validates issuer_trailing_12mo_proceeds cap"]
+  - method: GET
+    path: "/offerings/{id}"
+    description: "Fetch an offering with computed totals."
+    roles: [Anonymous, Issuer, Investor, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Offering
+    side_effects: []
+  - method: GET
+    path: "/offerings"
+    description: "List offerings; filter by issuer_id (FK reverse-reachability for Issuer->Offering)."
+    roles: [Anonymous, Issuer, Investor, ComplianceOfficer]
+    code: 200
+    input: ["issuer_id?", "regulation?", "status?", "limit?", "offset?"]
+    output: Offering[]
+    side_effects: []
+  - method: POST
+    path: "/offerings/{id}/form-c/submit"
+    description: "Issuer submits Form C for review (DRAFT|REJECTED -> SUBMITTED)."
+    roles: [Issuer]
+    code: 200
+    input: []
+    output: Offering
+    side_effects: ["form_c_status -> SUBMITTED", "increments Offering.version by 1"]
+  - method: POST
+    path: "/offerings/{id}/form-c/qualify"
+    description: "ComplianceOfficer qualifies Form C (SUBMITTED -> QUALIFIED). Segregation of duties enforced."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Offering
+    side_effects: ["form_c_status -> QUALIFIED", "increments Offering.version by 1"]
+  - method: POST
+    path: "/offerings/{id}/form-c/reject"
+    description: "ComplianceOfficer rejects Form C (SUBMITTED -> REJECTED)."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Offering
+    side_effects: ["form_c_status -> REJECTED", "increments Offering.version by 1"]
+  - method: POST
+    path: "/offerings/{id}/form-c/amend"
+    description: "Issuer files a material Form C amendment (QUALIFIED -> SUBMITTED); flags COMMITTED investments for reconfirmation."
+    roles: [Issuer]
+    code: 200
+    input: []
+    output: Offering
+    side_effects: ["form_c_status -> SUBMITTED", "sets reconfirm_required=true on all COMMITTED investments (cascade)", "increments Offering.version by 1"]
+  - method: POST
+    path: "/offerings/{id}/go-live"
+    description: "Issuer takes a qualified offering LIVE (DRAFT -> LIVE); provisions escrow."
+    roles: [Issuer]
+    code: 200
+    input: []
+    output: Offering
+    side_effects: ["DRAFT -> LIVE", "creates EscrowAccount", "increments Offering.version by 1"]
+  - method: POST
+    path: "/offerings/{id}/rolling-close"
+    description: "Issuer triggers an interim rolling close (LIVE -> LIVE); sweeps eligible batch, mints cap table, disburses net."
+    roles: [Issuer]
+    code: 200
+    input: []
+    output: Offering
+    side_effects: ["sweep batch: Investments -> ISSUED", "mint CapTableEntry per investment", "escrow debit (close_disbursement)", "advance swept_amount_cents", "recompute issuer_trailing_12mo_proceeds", "increments Offering.version by 1"]
+  - method: POST
+    path: "/offerings/{id}/close"
+    description: "Issuer triggers a final close: -> FUNDED if minimum met, else -> FAILED with auto-refunds."
+    roles: [Issuer]
+    code: 200
+    input: []
+    output: Offering
+    side_effects: ["LIVE -> FUNDED (sweep + cap table + disburse) OR LIVE -> FAILED (auto-refund all)", "sets close_at", "increments Offering.version by 1"]
+  - method: POST
+    path: "/offerings/{id}/cancel"
+    description: "Issuer cancels an offering (DRAFT|LIVE -> CANCELLED); refunds un-swept commitments."
+    roles: [Issuer]
+    code: 200
+    input: []
+    output: Offering
+    side_effects: ["-> CANCELLED", "refund all un-swept Investments (LIVE only)", "increments Offering.version by 1"]
+  - method: POST
+    path: "/offerings/{id}/enable-secondary"
+    description: "ComplianceOfficer enables secondary listing for a FUNDED Reg A+ Tier 2 offering."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Offering
+    side_effects: ["sets secondary_listing_enabled=true", "increments Offering.version by 1"]
+  - method: GET
+    path: "/offerings/{id}/escrow"
+    description: "Fetch the escrow account for an offering (FK reverse-reachability Offering->EscrowAccount, array of 0-1)."
+    roles: [Issuer, ComplianceOfficer]
+    code: 200
+    input: []
+    output: EscrowAccount[]
+    side_effects: []
+  - method: GET
+    path: "/offerings/{id}/cap-table"
+    description: "List cap-table positions minted by this offering (FK reverse-reachability Offering->CapTableEntry)."
+    roles: [Issuer, Investor, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CapTableEntry[]
+    side_effects: []
+  - method: GET
+    path: "/cap-table-entries/{id}"
+    description: "Fetch a single cap-table position."
+    roles: [Issuer, Investor, ComplianceOfficer]
+    code: 200
+    input: []
+    output: CapTableEntry
+    side_effects: []
+  - method: GET
+    path: "/cap-table-entries"
+    description: "List cap-table positions; filter by investor_id / investment_id / offering_id (FK reverse-reachability for CapTableEntry's investor_id and investment_id FKs)."
+    roles: [Issuer, Investor, ComplianceOfficer]
+    code: 200
+    input: ["offering_id?", "investor_id?", "investment_id?", "limit?", "offset?"]
+    output: CapTableEntry[]
+    side_effects: []
+
+  # --- Investor + accreditation ---
+  - method: POST
+    path: "/investors"
+    description: "Register an investor (public; accreditation_status starts UNACCREDITED, annual_limit computed)."
+    roles: [Anonymous, ComplianceOfficer]
+    code: 201
+    input: [email, legal_name, annual_income_cents, net_worth_cents]
+    output: Investor
+    side_effects: ["creates Investor; computes annual_limit_cents"]
+  - method: GET
+    path: "/investors/{id}"
+    description: "Fetch an investor."
+    roles: [Anonymous, Investor, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Investor
+    side_effects: []
+  - method: POST
+    path: "/accreditation-requests"
+    description: "Investor files an accreditation request (PENDING)."
+    roles: [Investor]
+    code: 201
+    input: [investor_id, method]
+    output: AccreditationRequest
+    side_effects: ["creates AccreditationRequest in PENDING"]
+  - method: GET
+    path: "/accreditation-requests/{id}"
+    description: "Fetch a single accreditation request."
+    roles: [Investor, ComplianceOfficer]
+    code: 200
+    input: []
+    output: AccreditationRequest
+    side_effects: []
+  - method: GET
+    path: "/accreditation-requests"
+    description: "List accreditation requests; filter by investor_id (FK reverse-reachability Investor->AccreditationRequest)."
+    roles: [Investor, ComplianceOfficer]
+    code: 200
+    input: ["investor_id?", "status?", "limit?", "offset?"]
+    output: AccreditationRequest[]
+    side_effects: []
+  - method: POST
+    path: "/accreditation-requests/{id}/approve"
+    description: "ComplianceOfficer approves (PENDING -> APPROVED); sets investor ACCREDITED."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: AccreditationRequest
+    side_effects: ["PENDING -> APPROVED", "sets Investor.accreditation_status=ACCREDITED", "increments AccreditationRequest.version by 1"]
+  - method: POST
+    path: "/accreditation-requests/{id}/deny"
+    description: "ComplianceOfficer denies (PENDING -> DENIED)."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: AccreditationRequest
+    side_effects: ["PENDING -> DENIED", "increments AccreditationRequest.version by 1"]
+
+  # --- Investment ---
+  - method: POST
+    path: "/investments"
+    description: "Investor commits to a LIVE offering. Runs accreditation/annual-limit/per-investor-cap/oversubscription/OCC checks."
+    roles: [Investor]
+    code: 201
+    input: [offering_id, investor_id, amount_cents, expected_offering_version]
+    output: Investment
+    side_effects: ["creates Investment COMMITTED", "recompute offering_committed_amount + escrow_held_amount", "increments Offering.version by 1"]
+  - method: GET
+    path: "/investments/{id}"
+    description: "Fetch an investment."
+    roles: [Investor, Issuer, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Investment
+    side_effects: []
+  - method: GET
+    path: "/investments"
+    description: "List investments; filter by offering_id or investor_id (FK reverse-reachability for both FKs)."
+    roles: [Investor, Issuer, ComplianceOfficer]
+    code: 200
+    input: ["offering_id?", "investor_id?", "status?", "limit?", "offset?"]
+    output: Investment[]
+    side_effects: []
+  - method: POST
+    path: "/investments/{id}/reconfirm"
+    description: "Investor reconfirms a commitment flagged by a material amendment (COMMITTED -> RECONFIRMED)."
+    roles: [Investor]
+    code: 200
+    input: []
+    output: Investment
+    side_effects: ["COMMITTED -> RECONFIRMED", "reconfirm_required -> false", "increments Investment.version by 1"]
+  - method: POST
+    path: "/investments/{id}/withdraw"
+    description: "Investor withdraws a commitment before the deadline (COMMITTED|RECONFIRMED -> CANCELLED); refunds to wallet."
+    roles: [Investor]
+    code: 200
+    input: []
+    output: Investment
+    side_effects: ["-> CANCELLED", "refund to wallet", "recompute offering_committed_amount + escrow_held_amount", "increments Investment.version by 1"]
+
+  # --- Investor updates ---
+  - method: POST
+    path: "/investor-updates"
+    description: "Issuer drafts an investor update on its offering (DRAFT)."
+    roles: [Issuer]
+    code: 201
+    input: [offering_id, title, body, "supersedes_update_id?"]
+    output: InvestorUpdate
+    side_effects: ["creates InvestorUpdate in DRAFT"]
+  - method: GET
+    path: "/investor-updates/{id}"
+    description: "Fetch a single investor update."
+    roles: [Anonymous, Issuer, Investor, ComplianceOfficer]
+    code: 200
+    input: []
+    output: InvestorUpdate
+    side_effects: []
+  - method: GET
+    path: "/investor-updates"
+    description: "List investor updates; filter by offering_id (FK reverse-reachability Offering->InvestorUpdate) or supersedes_update_id (self-ref FK)."
+    roles: [Anonymous, Issuer, Investor, ComplianceOfficer]
+    code: 200
+    input: ["offering_id?", "supersedes_update_id?", "status?", "limit?", "offset?"]
+    output: InvestorUpdate[]
+    side_effects: []
+  - method: POST
+    path: "/investor-updates/{id}/publish"
+    description: "Issuer publishes an update (DRAFT -> PUBLISHED); supersedes a prior update if linked."
+    roles: [Issuer]
+    code: 200
+    input: []
+    output: InvestorUpdate
+    side_effects: ["DRAFT -> PUBLISHED", "if supersedes_update_id set: prior PUBLISHED update -> SUPERSEDED (cascade)", "increments InvestorUpdate.version by 1"]
+
+  # --- Test-driving clock ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock. Server boots at default 2026-01-01T00:00:00Z; before any set, the clock reads exactly this default and never falls back to wall-clock time."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["advances the logical clock used by all deadline/window rules"]
+
+# =====================================================================
+# §1.6 Error Code Catalog
+# =====================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing or malformed X-User-Role / X-User-ID on a protected endpoint"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "the acting role is not permitted to call this endpoint"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "an Issuer/Investor acts on a resource it does not own (X-User-ID != owning FK)"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "the ComplianceOfficer qualifying/rejecting a Form C shares user id with the offering's Issuer"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced resource does not exist"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "the resource is not in a state from which the requested transition is defined"
+  - id: ERR_OFFERING_DEADLINE_PASSED
+    http: 409
+    condition: "the offering deadline has passed (logical clock >= deadline_at)"
+  - id: ERR_BAD_ACTOR_DISQUALIFIED
+    http: 422
+    condition: "attempt to verify an issuer whose bad_actor_flag is true"
+  - id: ERR_ISSUER_NOT_VERIFIED
+    http: 409
+    condition: "go-live attempted while the parent Issuer is not VERIFIED"
+  - id: ERR_ANNUAL_LIMIT_EXCEEDED
+    http: 422
+    condition: "an UNACCREDITED investor's trailing-12mo committed + new amount exceeds annual_limit_cents"
+  - id: ERR_PER_INVESTOR_CAP_EXCEEDED
+    http: 422
+    condition: "cumulative commitment to one offering exceeds its per_investor_cap_cents"
+  - id: ERR_OVERSUBSCRIBED
+    http: 409
+    condition: "commit would push swept + committed + new past max_target_cents"
+  - id: ERR_MINIMUM_NOT_MET
+    http: 409
+    condition: "a rolling/final close cannot reach min_target_cents cumulatively"
+  - id: ERR_ISSUER_CAP_EXCEEDED
+    http: 422
+    condition: "a new REG_CF offering's max_target_cents + trailing-12mo proceeds exceeds the $5,000,000 per-issuer cap"
+  - id: ERR_INVALID_OFFERING_TERMS
+    http: 422
+    condition: "EQUITY missing price, SAFE with a price, or max_target_cents < min_target_cents <= 0"
+  - id: ERR_SECONDARY_NOT_PERMITTED
+    http: 422
+    condition: "enable-secondary on a non-Reg-A-Tier-2 offering"
+  - id: ERR_CAMPAIGN_WINDOW_OVERLAP
+    http: 409
+    condition: "go-live would create a campaign window overlapping another LIVE REG_CF offering of the same issuer (closed interval; touching endpoints allowed)"
+  - id: ERR_UPDATE_QUIET_PERIOD
+    http: 409
+    condition: "a non-superseding update is published within 24h of the prior PUBLISHED update on the same offering"
+  - id: ERR_DUPLICATE_RESOURCE
+    http: 409
+    condition: "duplicate Issuer.ein or Investor.email"
+  - id: ERR_STALE_OFFERING_VERSION
+    http: 412
+    condition: "expected_offering_version does not match current Offering.version on commit"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "malformed body: missing required field, wrong type, amount_cents <= 0, bad enum"
+
+# =====================================================================
+# §1.7 RBAC Matrix
+# =====================================================================
+roles:
+  - name: Anonymous
+    description: "Unauthenticated public — registration and public reads only."
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "POST /issuers"
+      - "POST /investors"
+      - "GET /issuers, GET /issuers/{id}, GET /offerings, GET /offerings/{id}, GET /investor-updates, GET /investors/{id}"
+
+  - name: Issuer
+    description: "A company conducting a raise; acts only on its own offerings, investments-view, updates."
+    identity: "entity_backed:Issuer"
+    exclusive_operations:
+      - "POST /offerings"
+      - "POST /offerings/{id}/form-c/submit"
+      - "POST /offerings/{id}/form-c/amend"
+      - "POST /offerings/{id}/go-live"
+      - "POST /offerings/{id}/rolling-close"
+      - "POST /offerings/{id}/close"
+      - "POST /offerings/{id}/cancel"
+      - "POST /investor-updates"
+      - "POST /investor-updates/{id}/publish"
+    shared_operations:
+      - "GET /offerings, GET /offerings/{id}, GET /offerings/{id}/escrow, GET /offerings/{id}/cap-table"
+      - "GET /investments, GET /investments/{id}"
+
+  - name: Investor
+    description: "A person/entity committing capital; acts only on its own investments and accreditation."
+    identity: "entity_backed:Investor"
+    exclusive_operations:
+      - "POST /accreditation-requests"
+      - "POST /investments"
+      - "POST /investments/{id}/reconfirm"
+      - "POST /investments/{id}/withdraw"
+    shared_operations:
+      - "GET /offerings, GET /offerings/{id}, GET /offerings/{id}/cap-table"
+      - "GET /investments, GET /investments/{id}, GET /accreditation-requests, GET /investors/{id}"
+
+  - name: ComplianceOfficer
+    description: "Platform regulator/operator — issuer verification, Form C qualification, accreditation review, secondary toggle. Cannot self-deal as an Issuer (segregation of duties)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /issuers/{id}/verify"
+      - "POST /issuers/{id}/bar"
+      - "POST /offerings/{id}/form-c/qualify"
+      - "POST /offerings/{id}/form-c/reject"
+      - "POST /offerings/{id}/enable-secondary"
+      - "POST /accreditation-requests/{id}/approve"
+      - "POST /accreditation-requests/{id}/deny"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /issuers, POST /investors"
+      - "GET (all read endpoints)"

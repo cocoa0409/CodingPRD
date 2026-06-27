@@ -1,0 +1,1807 @@
+scenario: |
+  471. Wine & Spirits Retail (Total Wine style): SKU & vintage/allocation, age-verification & ID scan,
+  case/mixed-case discount, ABC license & purchase-limit compliance, taxed/bonded inventory,
+  special order & club, growler/keg (state rule), delivery & shipping-state restriction
+
+domain_name: wine-spirits-retail
+api_prefix: ""
+
+# =============================================================================
+# Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - optimistic_concurrency        # OCC on Order.version for allocation-draw race (CREATE-with-supersede)
+    - cascading_side_effects        # order submit -> reservations -> bonded->taxed conversion -> club accrual
+    - dual_variant_calculation      # provisional vs settled order pricing; estimated vs verified excise
+    - rate_threshold_triggers       # case-discount tiers, ABC per-customer monthly volume limits, club spend tiers
+    - derived_field_reconciliation  # Customer.compliance_status derived from purchase-window ledger
+
+  entity_topology: flat
+  # Flat peer entities linked by foreign keys: Order, OrderLine, Product, Vintage,
+  # InventoryLot, Customer, IdScan, ClubMembership, Shipment, SpecialOrder, ComplianceWindow.
+
+  state_machine_shape: parallel
+  # Order carries two independent state dimensions: payment_status x fulfillment_status.
+  # Plus cyclic SpecialOrder (QUOTED <-> COUNTERED revision loop) and branching Shipment.
+
+  relationship_patterns:
+    - one_to_many        # Order -> OrderLine; Product -> Vintage; Vintage -> InventoryLot
+    - flat_fk            # OrderLine -> Vintage/InventoryLot; Order -> Customer
+    - cross_aggregate    # OrderLine reservation debits InventoryLot.qty_reserved across aggregate boundary
+
+  role_model: peer_roles
+  # Customer (entity-backed, acts on own orders/club), StoreAssociate (POS + ID scan + fulfillment),
+  # ComplianceOfficer (license/limit overrides, bonded conversions), Admin (opaque, catalog + clock + seed).
+
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - name: sku
+        type: string
+        source: input
+        description: "Stable catalog SKU code; unique across all Products."
+        constraints: "Required, unique among all Products."
+      - name: name
+        type: string
+        source: input
+        description: "Display name of the product."
+      - name: category
+        type: enum
+        source: input
+        description: "Beverage category; drives age and shipping rules."
+        constraints: "One of {WINE, SPIRITS, BEER, GROWLER, KEG}."
+      - name: container_type
+        type: enum
+        source: input
+        description: "Container shape; GROWLER/KEG categories require matching container."
+        constraints: "One of {BOTTLE, CAN, GROWLER_FILL, KEG_HALF_BBL}."
+      - name: bottle_volume_ml
+        type: integer
+        source: input
+        description: "Per-unit liquid volume in milliliters; used for excise and growler/keg state-rule checks."
+        constraints: "Integer >= 1."
+      - name: abv_pct
+        type: number
+        source: input
+        description: "Alcohol by volume percentage; used for age category and excise band selection."
+        constraints: "0 <= abv_pct <= 95, two decimal places."
+      - name: min_purchase_age
+        type: integer
+        source: computed
+        description: "Minimum buyer age in years, derived from category/abv (see calc minimum_purchase_age)."
+      - name: is_allocated
+        type: boolean
+        source: input
+        description: "True if product is an allocation-controlled scarce item (e.g., rare bourbon)."
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: "Catalog lifecycle status; initialized ACTIVE on create and not transitioned in this version."
+        default: ACTIVE
+        constraints: "One of {ACTIVE}; initialized ACTIVE."
+
+  - name: Vintage
+    parent: null
+    common_fields: true
+    fields:
+      - name: product_id
+        type: string
+        source: input
+        description: "FK -> Product.id; the catalog product this vintage belongs to."
+      - name: vintage_year
+        type: integer
+        source: input
+        description: "Vintage/release year; (product_id, vintage_year) is unique."
+        constraints: "Integer in [1900, 2100]; unique per product_id."
+      - name: list_price_cents
+        type: integer
+        source: input
+        description: "Per-unit shelf price in cents (tax-exclusive)."
+        constraints: "Integer >= 1."
+      - name: allocation_cap_per_customer
+        type: integer
+        source: input
+        description: "Max units of this vintage one Customer may purchase across all orders; null = uncapped."
+        default: null
+        constraints: "Null or integer >= 1; only meaningful when parent Product.is_allocated == true."
+      - name: case_pack_size
+        type: integer
+        source: input
+        description: "Number of units that constitute one full case of this vintage."
+        constraints: "Integer >= 1; commonly 6 or 12."
+      - name: status
+        type: enum
+        source: system
+        description: "Vintage availability state machine value."
+        default: DRAFT
+        constraints: "One of {DRAFT, RELEASED, ALLOCATION_OPEN, SOLD_OUT, DELISTED}."
+      - name: units_committed
+        type: integer
+        source: computed
+        description: "Sum of qty across all OrderLines in COMMITTED/FULFILLED reservation state for this vintage."
+        default: 0
+
+  - name: InventoryLot
+    parent: null
+    common_fields: true
+    fields:
+      - name: vintage_id
+        type: string
+        source: input
+        description: "FK -> Vintage.id; the vintage stocked in this lot."
+      - name: tax_status
+        type: enum
+        source: input
+        description: "Whether the lot sits in bonded (tax-deferred) or duty-paid (taxed) storage."
+        constraints: "One of {BONDED, TAXED}."
+      - name: qty_on_hand
+        type: integer
+        source: input
+        description: "Physical units in this lot."
+        constraints: "Integer >= 0."
+      - name: qty_reserved
+        type: integer
+        source: computed
+        description: "Units of this lot reserved by uncaptured OrderLines (debited on submit, released on cancel)."
+        default: 0
+      - name: excise_band_cents_per_unit
+        type: integer
+        source: input
+        description: "Federal+state excise owed per unit when this lot is withdrawn from BONDED to TAXED."
+        constraints: "Integer >= 0."
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Login email; unique across Customers."
+        constraints: "Required, unique."
+      - name: full_name
+        type: string
+        source: input
+        description: "Legal name as printed on ID."
+      - name: date_of_birth
+        type: datetime
+        source: input
+        description: "ISO date of birth; drives age verification."
+      - name: ship_state_code
+        type: string
+        source: input
+        description: "Two-letter US state code of the customer's shipping address."
+        constraints: "Two uppercase letters."
+      - name: age_verified
+        type: boolean
+        source: computed
+        description: "True once a non-expired matching IdScan in VERIFIED state is on file."
+        default: false
+      - name: compliance_status
+        type: enum
+        source: computed
+        description: "Derived buyer compliance posture (see calc customer_compliance_status)."
+        default: CLEAR
+        constraints: "One of {CLEAR, WATCH, BLOCKED}; gates new order submission."
+      - name: lifetime_spend_cents
+        type: integer
+        source: computed
+        description: "Sum of settled_total_cents across this customer's Orders in CAPTURED payment state."
+        default: 0
+
+  - name: IdScan
+    parent: null
+    common_fields: false
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the customer whose ID was scanned."
+      - name: id_state_code
+        type: string
+        source: input
+        description: "Two-letter state code that issued the scanned ID."
+        constraints: "Two uppercase letters."
+      - name: id_expiry_date
+        type: datetime
+        source: input
+        description: "ISO date the scanned ID expires."
+      - name: scanned_dob
+        type: datetime
+        source: input
+        description: "ISO date of birth read off the scanned ID."
+      - name: status
+        type: enum
+        source: system
+        description: "Scan review state machine value."
+        default: PENDING
+        constraints: "One of {PENDING, VERIFIED, REJECTED}."
+      - name: reject_reason
+        type: enum
+        source: system
+        description: "Populated when status==REJECTED."
+        default: null
+        constraints: "Null or one of {EXPIRED, DOB_MISMATCH, UNDERAGE}."
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the buyer who owns this order."
+      - name: channel
+        type: enum
+        source: input
+        description: "Sales channel; PICKUP/POS skip shipping-state checks, DELIVERY/SHIP enforce them."
+        constraints: "One of {POS, PICKUP, DELIVERY, SHIP}."
+      - name: dest_state_code
+        type: string
+        source: input
+        description: "Two-letter destination state; required for DELIVERY/SHIP, ignored for POS/PICKUP."
+        constraints: "Null or two uppercase letters."
+      - name: payment_status
+        type: enum
+        source: system
+        description: "Independent payment dimension (parallel state machine)."
+        default: UNPAID
+        constraints: "One of {UNPAID, AUTHORIZED, CAPTURED, REFUNDED}."
+      - name: fulfillment_status
+        type: enum
+        source: system
+        description: "Independent fulfillment dimension (parallel state machine)."
+        default: CART
+        constraints: "One of {CART, SUBMITTED, READY, COMPLETED, CANCELLED}."
+      - name: provisional_total_cents
+        type: integer
+        source: computed
+        description: "Tax-inclusive estimate computed at submit from list prices + case discount + estimated tax."
+        default: 0
+      - name: settled_total_cents
+        type: integer
+        source: computed
+        description: "Final tax-inclusive total computed at payment capture from verified lot excise + final tax."
+        default: 0
+      - name: discount_cents
+        type: integer
+        source: computed
+        description: "Case/mixed-case discount applied at submit (see calc case_discount)."
+        default: 0
+
+  - name: OrderLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; the order this line belongs to."
+      - name: vintage_id
+        type: string
+        source: input
+        description: "FK -> Vintage.id; the vintage being purchased on this line."
+      - name: qty
+        type: integer
+        source: input
+        description: "Units purchased on this line."
+        constraints: "Integer >= 1."
+      - name: lot_id
+        type: string
+        source: computed
+        description: "FK -> InventoryLot.id; the lot selected to fulfill this line at submit (see selector lot_selection)."
+        default: null
+      - name: reservation_state
+        type: enum
+        source: system
+        description: "Line-level reservation lifecycle (cross-aggregate with InventoryLot)."
+        default: PENDING
+        constraints: "One of {PENDING, COMMITTED, FULFILLED, RELEASED}."
+      - name: unit_price_cents
+        type: integer
+        source: computed
+        description: "Snapshot of Vintage.list_price_cents at submit."
+        default: 0
+      - name: line_excise_cents
+        type: integer
+        source: computed
+        description: "Excise owed for this line if drawn from a BONDED lot, computed at payment capture."
+        default: 0
+
+  - name: ClubMembership
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the club member."
+        constraints: "At most one ACTIVE/SUSPENDED ClubMembership per customer."
+      - name: tier
+        type: enum
+        source: system
+        description: "Loyalty tier derived from rolling spend (see calc club_tier)."
+        default: BRONZE
+        constraints: "One of {BRONZE, SILVER, GOLD}."
+      - name: status
+        type: enum
+        source: system
+        description: "Membership state machine value."
+        default: ACTIVE
+        constraints: "One of {ACTIVE, SUSPENDED, CANCELLED}."
+      - name: accrued_points
+        type: integer
+        source: computed
+        description: "Loyalty points accrued from captured orders; 1 point per 100 settled cents at tier multiplier."
+        default: 0
+
+  - name: SpecialOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the requester."
+      - name: description
+        type: string
+        source: input
+        description: "Free-text description of the requested rare/non-stock item."
+      - name: requested_qty
+        type: integer
+        source: input
+        description: "Units requested."
+        constraints: "Integer >= 1."
+      - name: quoted_unit_price_cents
+        type: integer
+        source: system
+        description: "Associate's quoted per-unit price (set on QUOTE, may change across counter rounds)."
+        default: null
+      - name: customer_counter_price_cents
+        type: integer
+        source: system
+        description: "Customer's last counter-offer per-unit price."
+        default: null
+      - name: round_count
+        type: integer
+        source: computed
+        description: "Number of completed quote/counter negotiation rounds."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Negotiation state machine value (cyclic)."
+        default: REQUESTED
+        constraints: "One of {REQUESTED, QUOTED, COUNTERED, ACCEPTED, CONVERTED, DECLINED}."
+      - name: converted_order_id
+        type: string
+        source: system
+        description: "FK -> Order.id; the order created when the special order is CONVERTED."
+        default: null
+
+  - name: Shipment
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; the order being shipped/delivered."
+        constraints: "At most one non-CANCELLED Shipment per order."
+      - name: carrier
+        type: enum
+        source: input
+        description: "Shipping carrier; LICENSED_COMMON_CARRIER required for SHIP channel out-of-state."
+        constraints: "One of {STORE_COURIER, LICENSED_COMMON_CARRIER}."
+      - name: dest_state_code
+        type: string
+        source: computed
+        description: "Snapshot of Order.dest_state_code at shipment creation."
+      - name: adult_signature_required
+        type: boolean
+        source: computed
+        description: "True when dest_state_code is in the signature-required set (see calc shipment_signature_rule)."
+        default: true
+      - name: status
+        type: enum
+        source: system
+        description: "Shipment branching state machine value."
+        default: LABELED
+        constraints: "One of {LABELED, DISPATCHED, DELIVERED, RETURNED}."
+
+  - name: StateRule
+    parent: null
+    common_fields: true
+    fields:
+      - name: state_code
+        type: string
+        source: input
+        description: "Two-letter US state code this rule governs; unique."
+        constraints: "Two uppercase letters, unique among StateRules."
+      - name: ship_allowed
+        type: boolean
+        source: input
+        description: "Whether DELIVERY/SHIP orders may be sent to this destination state at all."
+        default: true
+      - name: growler_keg_allowed
+        type: boolean
+        source: input
+        description: "Whether GROWLER/KEG category lines may ship to this state."
+        default: true
+      - name: monthly_volume_limit_ml
+        type: integer
+        source: input
+        description: "ABC per-customer per-calendar-month total volume cap (ml) for this destination state; null = uncapped."
+        default: null
+        constraints: "Null or integer >= 1."
+      - name: requires_adult_signature
+        type: boolean
+        source: input
+        description: "Whether shipments to this state require an adult signature."
+        default: true
+
+  - name: ComplianceWindow
+    parent: null
+    common_fields: false
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; the buyer this ledger row tracks."
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> Order.id; the order that produced this ledger entry."
+      - name: state_code
+        type: string
+        source: input
+        description: "Destination state whose monthly volume cap this entry counts against."
+        constraints: "Two uppercase letters."
+      - name: volume_ml
+        type: integer
+        source: system
+        description: "Total alcohol volume (ml) committed by the order, counted against the month cap."
+        constraints: "Integer >= 0."
+      - name: window_month
+        type: string
+        source: system
+        description: "Calendar month bucket 'YYYY-MM' (UTC) the order's submit timestamp falls in."
+      - name: active
+        type: boolean
+        source: system
+        description: "True while the producing order counts against the cap; flipped false on order cancel/refund."
+        default: true
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # --- Order: PARALLEL dimensions (payment_status x fulfillment_status) ---
+  - entity: Order
+    dimension: fulfillment_status
+    initial_state: CART
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: CART
+        to: SUBMITTED
+        trigger: "POST /orders/{id}/submit"
+        actor: Customer
+        preconditions:
+          - "Order.fulfillment_status == CART"
+          - "Order has >= 1 OrderLine"
+          - "acting Customer.compliance_status != BLOCKED"
+          - "acting Customer.age_verified == true"
+          - "for every line: parent Vintage.status IN {RELEASED, ALLOCATION_OPEN}"
+          - "for every line: a single InventoryLot of that vintage has qty_on_hand - qty_reserved >= line.qty (selector lot_selection)"
+          - "every allocation/limit/shipping/state validation in §1.4 passes"
+        side_effects:
+          - "select a lot per selector lot_selection; set OrderLine.lot_id and OrderLine.unit_price_cents = Vintage.list_price_cents"
+          - "each OrderLine.reservation_state PENDING -> COMMITTED; debit InventoryLot.qty_reserved += line.qty (cascade hop 1)"
+          - "recompute owning Vintage.units_committed for each affected vintage (cascade hop 2)"
+          - "compute Order.discount_cents (calc case_discount) and Order.provisional_total_cents (calc provisional_order_total)"
+          - "for DELIVERY/SHIP: create a ComplianceWindow row {volume_ml, window_month, active:true} (calc order_alcohol_volume)"
+          - "recompute owning Customer.compliance_status (calc customer_compliance_status) (cascade)"
+          - "increments Order.version by 1"
+      - from: SUBMITTED
+        to: READY
+        trigger: "POST /orders/{id}/mark-ready"
+        actor: StoreAssociate
+        preconditions:
+          - "Order.fulfillment_status == SUBMITTED"
+          - "Order.payment_status == CAPTURED"
+        side_effects:
+          - "each OrderLine.reservation_state COMMITTED -> FULFILLED"
+          - "for each FULFILLED line whose lot is BONDED: nothing further (conversion already done at capture)"
+          - "increments Order.version by 1"
+      - from: READY
+        to: COMPLETED
+        trigger: "POST /orders/{id}/complete"
+        actor: StoreAssociate
+        preconditions:
+          - "Order.fulfillment_status == READY"
+          - "if channel IN {DELIVERY, SHIP}: a Shipment exists in status DELIVERED for this order"
+        side_effects:
+          - "recompute Customer.lifetime_spend_cents (calc customer_lifetime_spend)"
+          - "recompute Customer.compliance_status (calc customer_compliance_status) (cascade)"
+          - "if customer has ACTIVE ClubMembership: accrue points and re-derive tier (calc club_tier) (cascade)"
+          - "increments Order.version by 1"
+      - from: CART
+        to: CANCELLED
+        trigger: "POST /orders/{id}/cancel"
+        actor: Customer
+        preconditions: ["Order.fulfillment_status == CART"]
+        side_effects: ["increments Order.version by 1"]
+      - from: SUBMITTED
+        to: CANCELLED
+        trigger: "POST /orders/{id}/cancel"
+        actor: Customer
+        preconditions:
+          - "Order.fulfillment_status == SUBMITTED"
+          - "Order.payment_status IN {UNPAID, AUTHORIZED}"
+        side_effects:
+          - "each OrderLine.reservation_state COMMITTED -> RELEASED; credit InventoryLot.qty_reserved -= line.qty (compensation hop 1)"
+          - "recompute affected Vintage.units_committed (compensation hop 2)"
+          - "if Order.payment_status == AUTHORIZED: void authorization, payment_status AUTHORIZED -> UNPAID (compensation)"
+          - "if a ComplianceWindow row exists for this order: set active=false (compensating invariant: month volume restored)"
+          - "increments Order.version by 1"
+
+  - entity: Order
+    dimension: payment_status
+    initial_state: UNPAID
+    terminal_states: [REFUNDED]
+    transitions:
+      - from: UNPAID
+        to: AUTHORIZED
+        trigger: "POST /orders/{id}/authorize-payment"
+        actor: Customer
+        preconditions:
+          - "Order.payment_status == UNPAID"
+          - "Order.fulfillment_status == SUBMITTED"
+        side_effects:
+          - "place a hold equal to Order.provisional_total_cents"
+          - "increments Order.version by 1"
+      - from: AUTHORIZED
+        to: CAPTURED
+        trigger: "POST /orders/{id}/capture-payment"
+        actor: StoreAssociate
+        preconditions:
+          - "Order.payment_status == AUTHORIZED"
+          - "Order.fulfillment_status == SUBMITTED"
+        side_effects:
+          - "for each OrderLine whose lot.tax_status == BONDED: withdraw lot from bond -> set line_excise_cents (calc line_excise); decrement that lot's qty_on_hand by line.qty and its qty_reserved by line.qty; mint/append a TAXED InventoryLot with qty_on_hand += line.qty for the same vintage; set OrderLine.lot_id to the TAXED lot (cascade hops 1-3: line -> bonded lot -> taxed lot)"
+          - "compute Order.settled_total_cents (calc settled_order_total)"
+          - "increments Order.version by 1"
+      - from: CAPTURED
+        to: REFUNDED
+        trigger: "POST /orders/{id}/refund"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Order.payment_status == CAPTURED"
+          - "Order.fulfillment_status != COMPLETED"
+        side_effects:
+          - "each OrderLine.reservation_state -> RELEASED; credit qty_reserved back and restore qty_on_hand on the lot the line drew from (compensation)"
+          - "set fulfillment_status -> CANCELLED"
+          - "if a ComplianceWindow row exists: set active=false (compensating invariant)"
+          - "recompute Customer.lifetime_spend_cents and compliance_status (cascade)"
+          - "increments Order.version by 1"
+
+  # --- Vintage: branching availability ---
+  - entity: Vintage
+    initial_state: DRAFT
+    terminal_states: [DELISTED]
+    transitions:
+      - from: DRAFT
+        to: RELEASED
+        trigger: "POST /vintages/{id}/release"
+        actor: Admin
+        preconditions:
+          - "Vintage.status == DRAFT"
+          - "parent Product.is_allocated == false"
+          - "at least one InventoryLot exists for this vintage with qty_on_hand >= 1"
+        side_effects: ["increments Vintage.version by 1"]
+      - from: DRAFT
+        to: ALLOCATION_OPEN
+        trigger: "POST /vintages/{id}/open-allocation"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Vintage.status == DRAFT"
+          - "parent Product.is_allocated == true"
+          - "Vintage.allocation_cap_per_customer is not null"
+        side_effects: ["increments Vintage.version by 1"]
+      - from: RELEASED
+        to: SOLD_OUT
+        trigger: "system: on submit when last available unit committed"
+        actor: system
+        preconditions:
+          - "Vintage.status == RELEASED"
+          - "after the triggering submit, sum over lots of (qty_on_hand - qty_reserved) == 0"
+        side_effects: ["increments Vintage.version by 1"]
+      - from: ALLOCATION_OPEN
+        to: SOLD_OUT
+        trigger: "system: on submit when last available unit committed"
+        actor: system
+        preconditions:
+          - "Vintage.status == ALLOCATION_OPEN"
+          - "after the triggering submit, sum over lots of (qty_on_hand - qty_reserved) == 0"
+        side_effects: ["increments Vintage.version by 1"]
+      - from: SOLD_OUT
+        to: RELEASED
+        trigger: "system: on cancel/refund when availability returns and parent not allocated"
+        actor: system
+        preconditions:
+          - "Vintage.status == SOLD_OUT"
+          - "parent Product.is_allocated == false"
+          - "after the triggering release, sum over lots of (qty_on_hand - qty_reserved) >= 1"
+        side_effects: ["increments Vintage.version by 1"]
+      - from: RELEASED
+        to: DELISTED
+        trigger: "POST /vintages/{id}/delist"
+        actor: Admin
+        preconditions:
+          - "Vintage.status IN {RELEASED, SOLD_OUT, DRAFT}"
+          - "no OrderLine of this vintage in reservation_state IN {PENDING, COMMITTED}"
+        side_effects: ["increments Vintage.version by 1"]
+
+  # --- IdScan: linear review ---
+  - entity: IdScan
+    initial_state: PENDING
+    terminal_states: [VERIFIED, REJECTED]
+    transitions:
+      - from: PENDING
+        to: VERIFIED
+        trigger: "POST /id-scans/{id}/verify"
+        actor: StoreAssociate
+        preconditions:
+          - "IdScan.status == PENDING"
+          - "IdScan.id_expiry_date >= current_utc (not expired)"
+          - "IdScan.scanned_dob == owning Customer.date_of_birth (match)"
+          - "age in whole years at current_utc derived from scanned_dob >= 21"
+        side_effects:
+          - "set owning Customer.age_verified = true (cross-entity)"
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /id-scans/{id}/reject"
+        actor: StoreAssociate
+        preconditions: ["IdScan.status == PENDING"]
+        side_effects: ["set IdScan.reject_reason to one of {EXPIRED, DOB_MISMATCH, UNDERAGE}"]
+
+  # --- SpecialOrder: CYCLIC negotiation ---
+  - entity: SpecialOrder
+    initial_state: REQUESTED
+    terminal_states: [CONVERTED, DECLINED]
+    transitions:
+      - from: REQUESTED
+        to: QUOTED
+        trigger: "POST /special-orders/{id}/quote"
+        actor: StoreAssociate
+        preconditions: ["SpecialOrder.status == REQUESTED"]
+        side_effects: ["set quoted_unit_price_cents from request body"]
+      - from: QUOTED
+        to: COUNTERED
+        trigger: "POST /special-orders/{id}/counter"
+        actor: Customer
+        preconditions:
+          - "SpecialOrder.status == QUOTED"
+          - "round_count < 3"
+        side_effects:
+          - "set customer_counter_price_cents from request body"
+          - "increment round_count by 1"
+      - from: COUNTERED
+        to: QUOTED
+        trigger: "POST /special-orders/{id}/quote"
+        actor: StoreAssociate
+        preconditions:
+          - "SpecialOrder.status == COUNTERED"
+          - "round_count < 3"
+        side_effects: ["set quoted_unit_price_cents from request body (revision loop)"]
+      - from: QUOTED
+        to: ACCEPTED
+        trigger: "POST /special-orders/{id}/accept"
+        actor: Customer
+        preconditions: ["SpecialOrder.status == QUOTED"]
+        side_effects: []
+      - from: ACCEPTED
+        to: CONVERTED
+        trigger: "POST /special-orders/{id}/convert"
+        actor: StoreAssociate
+        preconditions:
+          - "SpecialOrder.status == ACCEPTED"
+          - "owning Customer.age_verified == true"
+          - "owning Customer.compliance_status != BLOCKED"
+        side_effects:
+          - "create an Order (channel PICKUP) for the customer with one OrderLine derived from the special order"
+          - "set converted_order_id to the new Order.id (cross-entity)"
+      - from: REQUESTED
+        to: DECLINED
+        trigger: "POST /special-orders/{id}/decline"
+        actor: Customer
+        preconditions: ["SpecialOrder.status IN {REQUESTED, QUOTED, COUNTERED}"]
+        side_effects: []
+      - from: QUOTED
+        to: DECLINED
+        trigger: "POST /special-orders/{id}/decline"
+        actor: Customer
+        preconditions: ["SpecialOrder.status IN {REQUESTED, QUOTED, COUNTERED}"]
+        side_effects: []
+      - from: COUNTERED
+        to: DECLINED
+        trigger: "POST /special-orders/{id}/decline"
+        actor: Customer
+        preconditions: ["SpecialOrder.status IN {REQUESTED, QUOTED, COUNTERED}"]
+        side_effects: []
+
+  # --- ClubMembership: lifecycle ---
+  - entity: ClubMembership
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /club-memberships/{id}/suspend"
+        actor: ComplianceOfficer
+        preconditions: ["ClubMembership.status == ACTIVE"]
+        side_effects: ["increments ClubMembership.version by 1"]
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /club-memberships/{id}/reinstate"
+        actor: ComplianceOfficer
+        preconditions: ["ClubMembership.status == SUSPENDED"]
+        side_effects: ["increments ClubMembership.version by 1"]
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /club-memberships/{id}/cancel"
+        actor: Customer
+        preconditions: ["ClubMembership.status == ACTIVE"]
+        side_effects: ["increments ClubMembership.version by 1"]
+      - from: SUSPENDED
+        to: CANCELLED
+        trigger: "POST /club-memberships/{id}/cancel"
+        actor: Customer
+        preconditions: ["ClubMembership.status == SUSPENDED"]
+        side_effects: ["increments ClubMembership.version by 1"]
+
+  # --- Shipment: BRANCHING (deliver vs return) ---
+  - entity: Shipment
+    initial_state: LABELED
+    terminal_states: [DELIVERED, RETURNED]
+    transitions:
+      - from: LABELED
+        to: DISPATCHED
+        trigger: "POST /shipments/{id}/dispatch"
+        actor: StoreAssociate
+        preconditions:
+          - "Shipment.status == LABELED"
+          - "owning Order.fulfillment_status == READY"
+          - "owning Order.payment_status == CAPTURED"
+        side_effects: ["increments Shipment.version by 1"]
+      - from: DISPATCHED
+        to: DELIVERED
+        trigger: "POST /shipments/{id}/confirm-delivery"
+        actor: StoreAssociate
+        preconditions:
+          - "Shipment.status == DISPATCHED"
+          - "if Shipment.adult_signature_required == true: request body provides signature_captured == true"
+        side_effects: ["increments Shipment.version by 1"]
+      - from: DISPATCHED
+        to: RETURNED
+        trigger: "POST /shipments/{id}/return"
+        actor: StoreAssociate
+        preconditions: ["Shipment.status == DISPATCHED"]
+        side_effects:
+          - "owning Order.fulfillment_status READY -> CANCELLED via compensation (release reservations, restore lots, deactivate ComplianceWindow) (cross-entity cascade)"
+          - "increments Shipment.version by 1"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: order-submit-stale-allocation
+    parent_entity: Order
+    write_endpoint: "POST /orders/{id}/submit"
+    occ_field: "expected_order_version"
+    description: |
+      Submitting an Order whose version has advanced since the client last
+      observed it is rejected with a stale-version error. This captures the
+      CREATE-with-supersede case where the order's lines were re-priced or its
+      cart was mutated (each such mutation legitimately bumps Order.version)
+      after the client read the order, so the submit would otherwise commit
+      reservations against a now-stale view of the cart and allocation draw.
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: minimum_purchase_age
+    trigger: "computed on Product create and read; stored on Product.min_purchase_age"
+    algorithm: threshold
+    formula: |
+      if category == BEER and abv_pct < 8.00: min_purchase_age = 21   # US federal floor is 21 for all alcohol
+      else: min_purchase_age = 21
+      # Single legal floor in scope; field exists so PRD/tests can assert it is
+      # always 21 and never read off a random source. abv banding reserved for
+      # future state variance but pinned to 21 here.
+    input_set: "single Product row"
+    constants:
+      LEGAL_FLOOR_AGE: 21
+    precision: "integer years"
+
+  - name: case_discount
+    trigger: "state_machines.Order.fulfillment_status CART_to_SUBMITTED side_effect (compute Order.discount_cents)"
+    algorithm: tiered_pricing
+    formula: |
+      # MIXED-CASE vs FULL-CASE distinction. Evaluation order is PINNED:
+      # (1) gross_cents = sum over lines of (line.qty * Vintage.list_price_cents)   [no rounding yet]
+      # (2) total_units = sum over lines of line.qty
+      # (3) full_case_units = sum over lines of (line.qty - (line.qty mod Vintage.case_pack_size))
+      #         i.e. only whole multiples of each line's own case_pack_size qualify as full-case units
+      # (4) mixed_case_units = total_units - full_case_units
+      # (5) discount_rate selection by TOTAL units (tier), applied differentially:
+      #         full-case units always earn FULL_CASE_RATE
+      #         mixed-case units earn MIXED_CASE_RATE only if total_units >= MIXED_CASE_MIN_UNITS, else 0
+      # (6) full_case_value  = sum over lines of ((line.qty - line.qty mod case_pack_size) * list_price_cents)
+      #     mixed_case_value = gross_cents - full_case_value
+      # (7) discount_cents = round_half_up(full_case_value * FULL_CASE_RATE)
+      #                    + round_half_up(mixed_case_value * mixed_rate)
+      #     ROUNDING ORDER PINNED: round each of the two components independently
+      #     THEN sum (round-per-component-then-sum), NOT round(total*rate).
+      # GROWLER and KEG category lines are EXCLUDED from both gross and unit counts
+      # for discount purposes (state rule: no case discount on draft containers).
+    input_set: "all OrderLines of the Order whose parent Product.category NOT IN {GROWLER, KEG}"
+    constants:
+      FULL_CASE_RATE: 0.15
+      MIXED_CASE_RATE: 0.10
+      MIXED_CASE_MIN_UNITS: 12
+    precision: "cents, round_half_up, per-component before summing"
+    variants:
+      - name: full_case_only
+        when: "every discountable line qty is an exact multiple of its case_pack_size"
+        difference: "mixed_case_value == 0; discount = round_half_up(full_case_value * 0.15)"
+      - name: mixed_below_threshold
+        when: "total discountable units < 12"
+        difference: "mixed-case units earn 0; only full-case units (if any) earn 0.15"
+
+  - name: provisional_order_total
+    trigger: "state_machines.Order.fulfillment_status CART_to_SUBMITTED side_effect (compute Order.provisional_total_cents)"
+    algorithm: aggregation
+    formula: |
+      subtotal_cents = sum over lines of (line.qty * line.unit_price_cents)   # unit_price snapshotted at submit
+      discounted_cents = subtotal_cents - Order.discount_cents
+      # ESTIMATED tax: destination-state sales tax applied to discounted subtotal.
+      # Provisional uses the ESTIMATED excise of 0 (bonded inventory not yet withdrawn).
+      est_tax_cents = round_half_up(discounted_cents * sales_tax_rate(dest_state_code_or_store_state))
+      provisional_total_cents = discounted_cents + est_tax_cents
+    input_set: "all OrderLines of the Order (post-discount)"
+    constants:
+      DEFAULT_SALES_TAX_RATE: 0.0725
+    precision: "cents, round_half_up"
+    variants:
+      - name: provisional
+        when: "computed at submit before any bonded withdrawal"
+        difference: "excise contribution is 0; tax on discounted subtotal only"
+
+  - name: settled_order_total
+    trigger: "state_machines.Order.payment_status AUTHORIZED_to_CAPTURED side_effect (compute Order.settled_total_cents)"
+    algorithm: aggregation
+    formula: |
+      subtotal_cents = sum over lines of (line.qty * line.unit_price_cents)
+      discounted_cents = subtotal_cents - Order.discount_cents
+      excise_cents = sum over lines of line.line_excise_cents   # verified at capture from actual lot withdrawn
+      taxable_base = discounted_cents + excise_cents            # PINNED: tax applies AFTER excise added (excise is taxable)
+      final_tax_cents = round_half_up(taxable_base * sales_tax_rate(dest_state_code_or_store_state))
+      settled_total_cents = discounted_cents + excise_cents + final_tax_cents
+    input_set: "all OrderLines of the Order, with line_excise_cents resolved from the lot actually withdrawn"
+    constants:
+      DEFAULT_SALES_TAX_RATE: 0.0725
+    precision: "cents, round_half_up"
+    variants:
+      - name: settled
+        when: "computed at capture after bonded->taxed withdrawal"
+        difference: "includes real excise and taxes the excise-inclusive base; diverges from provisional whenever any line drew from a BONDED lot"
+
+  - name: line_excise
+    trigger: "state_machines.Order.payment_status AUTHORIZED_to_CAPTURED side_effect (set OrderLine.line_excise_cents)"
+    algorithm: aggregation
+    formula: |
+      if the lot the line drew from had tax_status == BONDED at capture:
+          line_excise_cents = line.qty * lot.excise_band_cents_per_unit
+      else (lot was already TAXED):
+          line_excise_cents = 0
+    input_set: "single OrderLine and the InventoryLot it drew from"
+    precision: "cents, exact integer"
+
+  - name: order_alcohol_volume
+    trigger: "state_machines.Order.fulfillment_status CART_to_SUBMITTED side_effect (ComplianceWindow.volume_ml) and §1.4 monthly-cap check"
+    algorithm: aggregation
+    formula: |
+      volume_ml = sum over lines of (line.qty * parent_Product.bottle_volume_ml)
+      # counted against the destination state's monthly_volume_limit_ml.
+    input_set: "all OrderLines of the Order"
+    precision: "integer ml"
+
+  - name: customer_monthly_volume_used
+    trigger: "§1.4 priority business_constraint check on submit for DELIVERY/SHIP orders"
+    algorithm: aggregation
+    formula: |
+      # window_month = UTC 'YYYY-MM' of the SUBMITTING order's clock timestamp.
+      used_ml = sum of ComplianceWindow.volume_ml
+                over rows where customer_id == buyer
+                  AND state_code == dest_state_code
+                  AND window_month == submit_month
+                  AND active == true
+      # boundary: order is REJECTED when (used_ml + this_order_volume_ml) > monthly_volume_limit_ml
+      # i.e. exactly hitting the limit is ALLOWED ( > , not >= ).
+    input_set: "active ComplianceWindow rows for (customer, state, month)"
+    constants: {}
+    precision: "integer ml"
+
+  - name: customer_lifetime_spend
+    trigger: "Order COMPLETED and Order REFUNDED side_effects (recompute Customer.lifetime_spend_cents)"
+    algorithm: aggregation
+    formula: |
+      lifetime_spend_cents = sum of Order.settled_total_cents
+                             over this customer's Orders where payment_status == CAPTURED
+                                AND fulfillment_status != CANCELLED
+      # tie-break / ordering not needed (pure sum); refunded orders (REFUNDED) excluded.
+    input_set: "this customer's Orders in payment_status CAPTURED and fulfillment_status != CANCELLED"
+    precision: "cents, exact integer"
+
+  - name: customer_compliance_status
+    trigger: "recomputed after IdScan verify/reject, Order submit, Order complete, Order refund (Customer.compliance_status)"
+    algorithm: threshold
+    formula: |
+      # Risk scoring on the CUSTOMER domain (distinct from order cost accounting).
+      score = 0
+      score += 2 if NOT customer.age_verified
+      score += 1 per REJECTED IdScan on file for this customer
+      score += 3 if exists any active ComplianceWindow row where running monthly used_ml
+                   for its (state, month) is within LIMIT_GRACE_ML of the state's monthly cap
+      if score == 0: compliance_status = CLEAR
+      elif score <= 2: compliance_status = WATCH
+      else: compliance_status = BLOCKED          # PINNED: >2 => BLOCKED, exactly 2 => WATCH
+    input_set: "customer's IdScans, age_verified flag, and active ComplianceWindow rows"
+    constants:
+      LIMIT_GRACE_ML: 750
+      WATCH_MAX_SCORE: 2
+    precision: "integer score"
+    variants:
+      - name: at_watch_boundary
+        when: "score == 2 (e.g., one unverified-age contribution)"
+        difference: "WATCH not BLOCKED; submission still allowed (only BLOCKED blocks)"
+
+  - name: club_tier
+    trigger: "Order COMPLETED side_effect (re-derive ClubMembership.tier and accrue points)"
+    algorithm: tiered_pricing
+    formula: |
+      rolling_spend = customer.lifetime_spend_cents     # already recomputed this cascade
+      if rolling_spend >= GOLD_THRESHOLD_CENTS: tier = GOLD; mult = 1.50
+      elif rolling_spend >= SILVER_THRESHOLD_CENTS: tier = SILVER; mult = 1.25
+      else: tier = BRONZE; mult = 1.00
+      # points for THIS order: base = floor(Order.settled_total_cents / 100)
+      # accrued_points += round_half_up(base * mult)    # tier multiplier applied then rounded
+      # boundary PINNED: spend EXACTLY at a threshold qualifies for that tier (>=).
+    input_set: "customer.lifetime_spend_cents and the just-completed Order.settled_total_cents"
+    constants:
+      SILVER_THRESHOLD_CENTS: 50000
+      GOLD_THRESHOLD_CENTS: 200000
+    precision: "points integer, round_half_up after multiplier"
+    variants:
+      - name: silver_boundary
+        when: "rolling_spend == 50000 exactly"
+        difference: "tier becomes SILVER (>= threshold), not BRONZE; multiplier 1.25"
+
+  - name: shipment_signature_rule
+    trigger: "Shipment create side_effect (set adult_signature_required)"
+    algorithm: threshold
+    formula: |
+      adult_signature_required = StateRule(dest_state_code).requires_adult_signature
+      # if no StateRule row exists for dest_state_code: default true.
+    input_set: "destination StateRule row"
+    precision: "boolean"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role; the Anonymous role needs no X-User-ID"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all (POST /customers/register accepts the Anonymous role and requires no X-User-ID)"
+
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this operation per §1.7; entity-backed Customer acting on a resource must own it"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all role-gated endpoints"
+
+  - priority: 3
+    category: existence
+    check: "every path/body-referenced resource (Order, OrderLine, Vintage, Product, InventoryLot, Customer, IdScan, ClubMembership, SpecialOrder, Shipment, StateRule) exists; validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 4
+    category: state
+    check: "target resource is in a state from which the requested transition is defined in §1.2 (correct dimension for Order)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 5
+    category: state
+    check: "OCC: expected_order_version on submit equals current Order.version"
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+    applies_to: "POST /orders/{id}/submit"
+
+  - priority: 6
+    category: business_safety
+    check: "on submit: acting Customer.age_verified == true (a non-expired VERIFIED IdScan whose scanned_dob proves >=21 is on file)"
+    error_id: ERR_AGE_NOT_VERIFIED
+    http_status: 422
+    applies_to: "POST /orders/{id}/submit, POST /special-orders/{id}/convert"
+
+  - priority: 7
+    category: business_safety
+    check: "on submit: acting Customer.compliance_status != BLOCKED"
+    error_id: ERR_CUSTOMER_BLOCKED
+    http_status: 422
+    applies_to: "POST /orders/{id}/submit, POST /special-orders/{id}/convert"
+
+  - priority: 8
+    category: business_safety
+    check: "on submit/add-line: for GROWLER or KEG category lines on a DELIVERY/SHIP order, destination StateRule.growler_keg_allowed == true"
+    error_id: ERR_GROWLER_KEG_STATE_BANNED
+    http_status: 422
+    applies_to: "POST /orders/{id}/submit"
+
+  - priority: 9
+    category: business_referential
+    check: "on submit: for DELIVERY/SHIP orders, a StateRule exists for dest_state_code and StateRule.ship_allowed == true"
+    error_id: ERR_SHIP_STATE_RESTRICTED
+    http_status: 422
+    applies_to: "POST /orders/{id}/submit"
+
+  - priority: 10
+    category: business_constraint
+    check: "on submit: for each line whose parent Product.is_allocated, customer's existing committed/fulfilled units of that vintage + line.qty <= Vintage.allocation_cap_per_customer"
+    error_id: ERR_ALLOCATION_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /orders/{id}/submit"
+
+  - priority: 11
+    category: business_constraint
+    check: "on submit: for DELIVERY/SHIP orders, customer_monthly_volume_used(state,month) + order volume <= StateRule.monthly_volume_limit_ml (exceeding strictly => reject; equal allowed)"
+    error_id: ERR_ABC_MONTHLY_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /orders/{id}/submit"
+
+  - priority: 12
+    category: business_constraint
+    check: "on submit: for each line, a single InventoryLot of the vintage has (qty_on_hand - qty_reserved) >= line.qty (no split across lots)"
+    error_id: ERR_INSUFFICIENT_INVENTORY
+    http_status: 422
+    applies_to: "POST /orders/{id}/submit"
+
+  - priority: 13
+    category: business_constraint
+    check: "field-level: enum values legal, qty >= 1, abv in range, two-letter state codes, (product_id, vintage_year) unique, sku unique, email unique, at most one active Shipment per order"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all create/update endpoints"
+
+  - priority: 14
+    category: business_constraint
+    check: "required body fields present and well-typed for the endpoint"
+    error_id: ERR_MISSING_FIELD
+    http_status: 400
+    applies_to: "all create/update endpoints"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Clock (test-driving; default 2026-01-01T00:00:00Z) ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's logical clock. Server startup default is 2026-01-01T00:00:00Z; before any call here the logical clock reads exactly this default and never falls back to wall-clock time. Drives age/expiry/month-window determinism."
+    roles: [Admin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: string }"
+    side_effects: ["sets logical clock used by age verification, ID expiry, and ComplianceWindow.window_month bucketing"]
+
+  # --- Customers ---
+  - method: POST
+    path: "/customers/register"
+    description: "Register a new Customer (open, no auth)."
+    roles: [Anonymous]
+    code: 201
+    input: [email, full_name, date_of_birth, ship_state_code]
+    output: Customer
+    side_effects: ["compliance_status initialized CLEAR; age_verified false"]
+  - method: GET
+    path: "/customers/{id}"
+    description: "Read a customer with derived age_verified, compliance_status, lifetime_spend."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/customers"
+    description: "List customers (paginated)."
+    roles: [StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: ["ship_state_code?", "compliance_status?", "limit?", "offset?"]
+    output: Customer[]
+    side_effects: []
+
+  # --- ID scans ---
+  - method: POST
+    path: "/id-scans"
+    description: "Submit an ID scan for a customer (StoreAssociate at POS, or Customer self-upload)."
+    roles: [StoreAssociate, Customer]
+    code: 201
+    input: [customer_id, id_state_code, id_expiry_date, scanned_dob]
+    output: IdScan
+    side_effects: ["IdScan created in PENDING"]
+  - method: GET
+    path: "/id-scans/{id}"
+    description: "Read an ID scan."
+    roles: [StoreAssociate, ComplianceOfficer, Admin, Customer]
+    code: 200
+    input: []
+    output: IdScan
+    side_effects: []
+  - method: GET
+    path: "/customers/{id}/id-scans"
+    description: "List ID scans for a customer (FK reverse-reachability for IdScan.customer_id)."
+    roles: [StoreAssociate, ComplianceOfficer, Admin, Customer]
+    code: 200
+    input: []
+    output: IdScan[]
+    side_effects: []
+  - method: POST
+    path: "/id-scans/{id}/verify"
+    description: "Verify an ID scan; on success sets owning Customer.age_verified=true."
+    roles: [StoreAssociate]
+    code: 200
+    input: []
+    output: IdScan
+    side_effects: ["IdScan PENDING->VERIFIED", "Customer.age_verified=true", "recompute Customer.compliance_status"]
+  - method: POST
+    path: "/id-scans/{id}/reject"
+    description: "Reject an ID scan with a reason."
+    roles: [StoreAssociate]
+    code: 200
+    input: [reject_reason]
+    output: IdScan
+    side_effects: ["IdScan PENDING->REJECTED", "recompute Customer.compliance_status"]
+
+  # --- Catalog: Products / Vintages / Lots ---
+  - method: POST
+    path: "/products"
+    description: "Create a catalog product."
+    roles: [Admin]
+    code: 201
+    input: [sku, name, category, container_type, bottle_volume_ml, abv_pct, "is_allocated?"]
+    output: Product
+    side_effects: ["min_purchase_age computed", "status ACTIVE"]
+  - method: GET
+    path: "/products/{id}"
+    description: "Read a product."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: Product
+    side_effects: []
+  - method: GET
+    path: "/products"
+    description: "List products."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: ["category?", "status?", "limit?", "offset?"]
+    output: Product[]
+    side_effects: []
+  - method: POST
+    path: "/products/{id}/vintages"
+    description: "Create a vintage under a product."
+    roles: [Admin]
+    code: 201
+    input: [vintage_year, list_price_cents, case_pack_size, "allocation_cap_per_customer?"]
+    output: Vintage
+    side_effects: ["Vintage created in DRAFT"]
+  - method: GET
+    path: "/vintages/{id}"
+    description: "Read a vintage with derived units_committed."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: Vintage
+    side_effects: []
+  - method: GET
+    path: "/products/{id}/vintages"
+    description: "List vintages of a product (FK reverse-reachability for Vintage.product_id)."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: Vintage[]
+    side_effects: []
+  - method: POST
+    path: "/vintages/{id}/release"
+    description: "Release a non-allocated vintage for sale."
+    roles: [Admin]
+    code: 200
+    input: []
+    output: Vintage
+    side_effects: ["Vintage DRAFT->RELEASED"]
+  - method: POST
+    path: "/vintages/{id}/open-allocation"
+    description: "Open allocation for an allocation-controlled vintage."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Vintage
+    side_effects: ["Vintage DRAFT->ALLOCATION_OPEN"]
+  - method: POST
+    path: "/vintages/{id}/delist"
+    description: "Delist a vintage."
+    roles: [Admin]
+    code: 200
+    input: []
+    output: Vintage
+    side_effects: ["Vintage ->DELISTED"]
+  - method: POST
+    path: "/vintages/{id}/lots"
+    description: "Add an inventory lot (bonded or taxed) for a vintage."
+    roles: [ComplianceOfficer, Admin]
+    code: 201
+    input: [tax_status, qty_on_hand, excise_band_cents_per_unit]
+    output: InventoryLot
+    side_effects: ["InventoryLot created with qty_reserved=0"]
+  - method: GET
+    path: "/lots/{id}"
+    description: "Read an inventory lot."
+    roles: [StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: InventoryLot
+    side_effects: []
+  - method: GET
+    path: "/vintages/{id}/lots"
+    description: "List inventory lots of a vintage (FK reverse-reachability for InventoryLot.vintage_id)."
+    roles: [StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: ["tax_status?"]
+    output: InventoryLot[]
+    side_effects: []
+
+  # --- State rules ---
+  - method: POST
+    path: "/state-rules"
+    description: "Create or upsert a per-state ABC/shipping rule."
+    roles: [ComplianceOfficer, Admin]
+    code: 201
+    input: [state_code, "ship_allowed?", "growler_keg_allowed?", "monthly_volume_limit_ml?", "requires_adult_signature?"]
+    output: StateRule
+    side_effects: []
+  - method: GET
+    path: "/state-rules/{id}"
+    description: "Read a state rule by id."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: StateRule
+    side_effects: []
+  - method: GET
+    path: "/state-rules"
+    description: "List state rules (optionally filter by state_code)."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: ["state_code?", "limit?", "offset?"]
+    output: StateRule[]
+    side_effects: []
+
+  # --- Orders ---
+  - method: POST
+    path: "/orders"
+    description: "Create a cart Order for a customer."
+    roles: [Customer, StoreAssociate]
+    code: 201
+    input: [customer_id, channel, "dest_state_code?"]
+    output: Order
+    side_effects: ["Order created fulfillment_status=CART, payment_status=UNPAID, version=1"]
+  - method: GET
+    path: "/orders/{id}"
+    description: "Read an order with computed totals and both status dimensions."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+  - method: GET
+    path: "/orders"
+    description: "List orders, optionally filtered by customer (FK reverse-reachability for Order.customer_id)."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: ["customer_id?", "fulfillment_status?", "payment_status?", "limit?", "offset?"]
+    output: Order[]
+    side_effects: []
+  - method: POST
+    path: "/orders/{id}/lines"
+    description: "Add a line to a CART order."
+    roles: [Customer, StoreAssociate]
+    code: 201
+    input: [vintage_id, qty]
+    output: OrderLine
+    side_effects: ["OrderLine created reservation_state=PENDING; bumps Order.version"]
+  - method: GET
+    path: "/orders/{id}/lines"
+    description: "List lines of an order (FK reverse-reachability for OrderLine.order_id)."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: OrderLine[]
+    side_effects: []
+  - method: GET
+    path: "/order-lines/{id}"
+    description: "Read a single order line."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects: []
+  - method: GET
+    path: "/order-lines"
+    description: "List order lines filtered by vintage or lot (FK reverse-reachability for OrderLine.vintage_id and OrderLine.lot_id)."
+    roles: [StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: ["vintage_id?", "lot_id?", "limit?", "offset?"]
+    output: OrderLine[]
+    side_effects: []
+  - method: DELETE
+    path: "/order-lines/{id}"
+    description: "Remove a PENDING line from a CART order."
+    roles: [Customer, StoreAssociate]
+    code: 204
+    input: []
+    output: null
+    side_effects: ["OrderLine deleted; bumps Order.version"]
+  - method: POST
+    path: "/orders/{id}/submit"
+    description: "Submit a cart: reserve inventory, run all compliance checks, compute discount and provisional total. OCC-guarded by expected_order_version."
+    roles: [Customer, StoreAssociate]
+    code: 200
+    input: [expected_order_version]
+    output: Order
+    side_effects:
+      - "select lots; OrderLine PENDING->COMMITTED; debit InventoryLot.qty_reserved (cascade)"
+      - "recompute Vintage.units_committed; auto-transition Vintage RELEASED/ALLOCATION_OPEN->SOLD_OUT when depleted (cascade)"
+      - "compute Order.discount_cents and Order.provisional_total_cents"
+      - "for DELIVERY/SHIP: create ComplianceWindow row"
+      - "recompute owning Customer.compliance_status"
+      - "increments Order.version by 1"
+  - method: POST
+    path: "/orders/{id}/authorize-payment"
+    description: "Place a payment hold for provisional_total_cents."
+    roles: [Customer, StoreAssociate]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["Order.payment_status UNPAID->AUTHORIZED; bumps Order.version"]
+  - method: POST
+    path: "/orders/{id}/capture-payment"
+    description: "Capture payment: withdraw bonded lots to taxed, compute line excise and settled total."
+    roles: [StoreAssociate]
+    code: 200
+    input: []
+    output: Order
+    side_effects:
+      - "for BONDED lines: bonded->taxed withdrawal (cascade line->bonded lot->taxed lot); set OrderLine.line_excise_cents"
+      - "compute Order.settled_total_cents"
+      - "Order.payment_status AUTHORIZED->CAPTURED; bumps Order.version"
+  - method: POST
+    path: "/orders/{id}/mark-ready"
+    description: "Mark a captured order ready (lines FULFILLED)."
+    roles: [StoreAssociate]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["OrderLine COMMITTED->FULFILLED; bumps Order.version"]
+  - method: POST
+    path: "/orders/{id}/complete"
+    description: "Complete an order; recompute lifetime spend, compliance, club tier/points."
+    roles: [StoreAssociate]
+    code: 200
+    input: []
+    output: Order
+    side_effects:
+      - "Order.fulfillment_status READY->COMPLETED"
+      - "recompute Customer.lifetime_spend_cents and compliance_status (cascade)"
+      - "accrue ClubMembership points and re-derive tier if ACTIVE membership (cascade)"
+      - "bumps Order.version"
+  - method: POST
+    path: "/orders/{id}/cancel"
+    description: "Cancel a cart or submitted (unpaid/authorized) order; releases reservations."
+    roles: [Customer, StoreAssociate]
+    code: 200
+    input: []
+    output: Order
+    side_effects:
+      - "OrderLine COMMITTED->RELEASED; credit qty_reserved back (compensation)"
+      - "recompute Vintage.units_committed; SOLD_OUT->RELEASED if availability returns (cascade)"
+      - "void AUTHORIZED hold -> UNPAID; deactivate ComplianceWindow"
+      - "bumps Order.version"
+  - method: POST
+    path: "/orders/{id}/refund"
+    description: "Refund a captured order; reverses reservations, lots, compliance, spend."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: Order
+    side_effects:
+      - "Order.payment_status CAPTURED->REFUNDED; fulfillment_status->CANCELLED"
+      - "release reservations, restore lot quantities (compensation)"
+      - "deactivate ComplianceWindow; recompute Customer.lifetime_spend_cents and compliance_status (cascade)"
+      - "bumps Order.version"
+  - method: GET
+    path: "/customers/{id}/compliance-windows"
+    description: "List a customer's ComplianceWindow ledger rows (FK reverse-reachability for ComplianceWindow.customer_id)."
+    roles: [ComplianceOfficer, Admin]
+    code: 200
+    input: ["state_code?", "window_month?", "active?"]
+    output: ComplianceWindow[]
+    side_effects: []
+  - method: GET
+    path: "/orders/{id}/compliance-windows"
+    description: "List ComplianceWindow rows produced by an order (FK reverse-reachability for ComplianceWindow.order_id)."
+    roles: [ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: ComplianceWindow[]
+    side_effects: []
+
+  # --- Shipments ---
+  - method: POST
+    path: "/orders/{id}/shipments"
+    description: "Create a shipment for a READY DELIVERY/SHIP order."
+    roles: [StoreAssociate]
+    code: 201
+    input: [carrier]
+    output: Shipment
+    side_effects: ["Shipment created LABELED; snapshot dest_state_code; compute adult_signature_required"]
+  - method: GET
+    path: "/shipments/{id}"
+    description: "Read a shipment."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: []
+  - method: GET
+    path: "/orders/{id}/shipments"
+    description: "List shipments of an order (FK reverse-reachability for Shipment.order_id)."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: Shipment[]
+    side_effects: []
+  - method: POST
+    path: "/shipments/{id}/dispatch"
+    description: "Dispatch a labeled shipment."
+    roles: [StoreAssociate]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: ["Shipment LABELED->DISPATCHED; bumps Shipment.version"]
+  - method: POST
+    path: "/shipments/{id}/confirm-delivery"
+    description: "Confirm delivery (signature if required)."
+    roles: [StoreAssociate]
+    code: 200
+    input: ["signature_captured?"]
+    output: Shipment
+    side_effects: ["Shipment DISPATCHED->DELIVERED; bumps Shipment.version"]
+  - method: POST
+    path: "/shipments/{id}/return"
+    description: "Mark a dispatched shipment returned; cancels the order via compensation."
+    roles: [StoreAssociate]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: ["Shipment DISPATCHED->RETURNED; cancel owning Order (release reservations, restore lots, deactivate window) (cross-entity cascade); bumps Shipment.version"]
+
+  # --- Club memberships ---
+  - method: POST
+    path: "/club-memberships"
+    description: "Enroll a customer in the wine club."
+    roles: [Customer, StoreAssociate]
+    code: 201
+    input: [customer_id]
+    output: ClubMembership
+    side_effects: ["ClubMembership created ACTIVE, tier BRONZE, accrued_points 0"]
+  - method: GET
+    path: "/club-memberships/{id}"
+    description: "Read a club membership."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: ClubMembership
+    side_effects: []
+  - method: GET
+    path: "/customers/{id}/club-memberships"
+    description: "List a customer's club memberships (FK reverse-reachability for ClubMembership.customer_id)."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: ClubMembership[]
+    side_effects: []
+  - method: POST
+    path: "/club-memberships/{id}/suspend"
+    description: "Suspend a membership."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: ClubMembership
+    side_effects: ["ClubMembership ACTIVE->SUSPENDED; bumps version"]
+  - method: POST
+    path: "/club-memberships/{id}/reinstate"
+    description: "Reinstate a suspended membership."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: ClubMembership
+    side_effects: ["ClubMembership SUSPENDED->ACTIVE; bumps version"]
+  - method: POST
+    path: "/club-memberships/{id}/cancel"
+    description: "Cancel a membership."
+    roles: [Customer]
+    code: 200
+    input: []
+    output: ClubMembership
+    side_effects: ["ClubMembership ->CANCELLED; bumps version"]
+
+  # --- Special orders ---
+  - method: POST
+    path: "/special-orders"
+    description: "Request a special (non-stock) order."
+    roles: [Customer, StoreAssociate]
+    code: 201
+    input: [customer_id, description, requested_qty]
+    output: SpecialOrder
+    side_effects: ["SpecialOrder created REQUESTED, round_count 0"]
+  - method: GET
+    path: "/special-orders/{id}"
+    description: "Read a special order."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: SpecialOrder
+    side_effects: []
+  - method: GET
+    path: "/customers/{id}/special-orders"
+    description: "List a customer's special orders (FK reverse-reachability for SpecialOrder.customer_id)."
+    roles: [Customer, StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: []
+    output: SpecialOrder[]
+    side_effects: []
+  - method: GET
+    path: "/special-orders"
+    description: "List special orders, optionally filtered by the order they converted into (FK reverse-reachability for SpecialOrder.converted_order_id)."
+    roles: [StoreAssociate, ComplianceOfficer, Admin]
+    code: 200
+    input: ["converted_order_id?", "status?", "limit?", "offset?"]
+    output: SpecialOrder[]
+    side_effects: []
+  - method: POST
+    path: "/special-orders/{id}/quote"
+    description: "Quote/re-quote a special order (revision loop from COUNTERED)."
+    roles: [StoreAssociate]
+    code: 200
+    input: [quoted_unit_price_cents]
+    output: SpecialOrder
+    side_effects: ["REQUESTED->QUOTED or COUNTERED->QUOTED; set quoted_unit_price_cents"]
+  - method: POST
+    path: "/special-orders/{id}/counter"
+    description: "Customer counter-offers (cyclic; max 3 rounds)."
+    roles: [Customer]
+    code: 200
+    input: [customer_counter_price_cents]
+    output: SpecialOrder
+    side_effects: ["QUOTED->COUNTERED; set customer_counter_price_cents; increment round_count"]
+  - method: POST
+    path: "/special-orders/{id}/accept"
+    description: "Customer accepts the current quote."
+    roles: [Customer]
+    code: 200
+    input: []
+    output: SpecialOrder
+    side_effects: ["QUOTED->ACCEPTED"]
+  - method: POST
+    path: "/special-orders/{id}/decline"
+    description: "Decline the special order at any pre-acceptance state."
+    roles: [Customer]
+    code: 200
+    input: []
+    output: SpecialOrder
+    side_effects: ["->DECLINED"]
+  - method: POST
+    path: "/special-orders/{id}/convert"
+    description: "Convert an accepted special order into a PICKUP order."
+    roles: [StoreAssociate]
+    code: 200
+    input: []
+    output: SpecialOrder
+    side_effects: ["ACCEPTED->CONVERTED; create Order + OrderLine; set converted_order_id"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID on an authed endpoint."
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Role not permitted, or entity-backed Customer acting on a resource it does not own."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced resource (any entity) does not exist."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not defined from the resource's current state (per dimension for Order)."
+  - id: ERR_STALE_ORDER_VERSION
+    http: 412
+    condition: "expected_order_version on submit does not equal current Order.version."
+  - id: ERR_AGE_NOT_VERIFIED
+    http: 422
+    condition: "Submit/convert attempted while acting Customer.age_verified == false."
+  - id: ERR_CUSTOMER_BLOCKED
+    http: 422
+    condition: "Submit/convert attempted while acting Customer.compliance_status == BLOCKED."
+  - id: ERR_GROWLER_KEG_STATE_BANNED
+    http: 422
+    condition: "GROWLER/KEG line on a DELIVERY/SHIP order whose destination StateRule.growler_keg_allowed == false."
+  - id: ERR_SHIP_STATE_RESTRICTED
+    http: 422
+    condition: "DELIVERY/SHIP order to a state with no StateRule or StateRule.ship_allowed == false."
+  - id: ERR_ALLOCATION_LIMIT_EXCEEDED
+    http: 422
+    condition: "Allocated vintage purchase would push customer's committed/fulfilled units over allocation_cap_per_customer."
+  - id: ERR_ABC_MONTHLY_LIMIT_EXCEEDED
+    http: 422
+    condition: "DELIVERY/SHIP order volume would push the customer's monthly state volume strictly over monthly_volume_limit_ml."
+  - id: ERR_INSUFFICIENT_INVENTORY
+    http: 422
+    condition: "No single InventoryLot of the vintage has enough (qty_on_hand - qty_reserved) for the line."
+  - id: ERR_VINTAGE_NOT_PURCHASABLE
+    http: 422
+    condition: "Line references a vintage not in status RELEASED or ALLOCATION_OPEN at submit."
+  - id: ERR_ALLOCATION_OPEN_REQUIRES_FLAG
+    http: 422
+    condition: "open-allocation called on a vintage whose parent Product.is_allocated == false or allocation_cap_per_customer is null."
+  - id: ERR_RELEASE_REQUIRES_STOCK
+    http: 422
+    condition: "release called on a vintage with no lot holding qty_on_hand >= 1, or on an allocated product."
+  - id: ERR_NEGOTIATION_ROUNDS_EXCEEDED
+    http: 422
+    condition: "counter/quote attempted when SpecialOrder.round_count >= 3."
+  - id: ERR_SIGNATURE_REQUIRED
+    http: 422
+    condition: "confirm-delivery without signature_captured==true on a shipment with adult_signature_required==true."
+  - id: ERR_DUPLICATE_ACTIVE_SHIPMENT
+    http: 409
+    condition: "Creating a second non-CANCELLED Shipment for an order that already has one."
+  - id: ERR_DUPLICATE_MEMBERSHIP
+    http: 409
+    condition: "Enrolling a customer who already has an ACTIVE/SUSPENDED ClubMembership."
+  - id: ERR_SHIPMENT_CHANNEL_INVALID
+    http: 422
+    condition: "Creating a shipment for a POS/PICKUP order, or order not READY/CAPTURED."
+  - id: ERR_EMPTY_ORDER
+    http: 422
+    condition: "Submit attempted on an order with zero OrderLines."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Field-level invalid value (bad enum, qty<1, abv out of range, bad state code, uniqueness violation)."
+  - id: ERR_MISSING_FIELD
+    http: 400
+    condition: "Required request body field absent or wrong type."
+  - id: ERR_INVALID_PAGINATION
+    http: 400
+    condition: "limit/offset outside [1,100]/[0,inf)."
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Customer
+    description: "End buyer; acts on own customer record, orders, club, special orders."
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /orders/{id}/counter (as SpecialOrder counter)"
+      - "POST /special-orders/{id}/counter"
+      - "POST /special-orders/{id}/accept"
+      - "POST /special-orders/{id}/decline"
+      - "POST /club-memberships/{id}/cancel"
+    shared_operations:
+      - "POST /customers/register (Anonymous)"
+      - "POST /orders, POST /orders/{id}/lines, DELETE /order-lines/{id}"
+      - "POST /orders/{id}/submit, /authorize-payment, /cancel"
+      - "POST /id-scans"
+      - "POST /club-memberships, POST /special-orders"
+      - "GET reads on own resources"
+  - name: StoreAssociate
+    description: "Point-of-sale operator; runs ID scans, fulfillment, payment capture, shipments, quotes."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /id-scans/{id}/verify"
+      - "POST /id-scans/{id}/reject"
+      - "POST /orders/{id}/capture-payment"
+      - "POST /orders/{id}/mark-ready"
+      - "POST /orders/{id}/complete"
+      - "POST /orders/{id}/shipments and all /shipments/{id}/* transitions"
+      - "POST /special-orders/{id}/quote, /convert"
+    shared_operations:
+      - "POST /orders, /orders/{id}/lines, /orders/{id}/submit, /authorize-payment, /cancel (on behalf at POS)"
+      - "POST /id-scans, /club-memberships, /special-orders"
+      - "GET reads"
+  - name: ComplianceOfficer
+    description: "Regulatory operator; bonded lot management, allocation opening, refunds, membership suspension, state rules."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /vintages/{id}/open-allocation"
+      - "POST /orders/{id}/refund"
+      - "POST /club-memberships/{id}/suspend"
+      - "POST /club-memberships/{id}/reinstate"
+      - "GET /customers/{id}/compliance-windows, GET /orders/{id}/compliance-windows"
+    shared_operations:
+      - "POST /vintages/{id}/lots, POST /state-rules"
+      - "GET reads"
+  - name: Admin
+    description: "Catalog and platform operator; products, vintages, release/delist, clock, seed."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /products, POST /products/{id}/vintages"
+      - "POST /vintages/{id}/release, /vintages/{id}/delist"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /vintages/{id}/lots, POST /state-rules"
+      - "GET reads"
+  - name: Anonymous
+    description: "Unauthenticated caller; may only register a new customer."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /customers/register"
+    shared_operations: []

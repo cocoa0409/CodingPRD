@@ -1,0 +1,828 @@
+# =============================================================================
+# SCAFFOLD — Invoice Factoring & A/R Funding (BlueVine style)
+# §1.0–§1.7. Difficulty tier: EXPERT (12 entities). Flat (graph) URL topology.
+# =============================================================================
+
+scenario: |
+  Invoice Factoring & A/R Funding (BlueVine style): client/debtor onboarding & credit,
+  invoice purchase & advance rate, verification & notice-of-assignment, reserve +
+  fee/discount accrual, collection & aging, recourse/non-recourse buyback,
+  debtor-concentration limit, settlement/rebate
+
+domain_name: invoice-factoring-ar-funding
+api_prefix: /factoring
+
+complexity_profile:
+  primary_archetype: ledger-reconciliation
+  secondary_archetype: compliance-audit
+  complexity_layers:
+    - dual_variant_calculation        # provisional per-diem fee vs final tiered fee
+    - cascading_side_effects          # collection -> settlement -> reserve/ledger/debtor cascade
+    - rate_threshold_triggers         # aging buckets, concentration limit, credit limit boundaries
+    - optimistic_concurrency          # OCC on Client.version for funding-window races
+    - derived_field_reconciliation    # reserve_balance / funded_exposure / outstanding_face denormalized fields
+  entity_topology: flat
+  # Clients and Debtors are peer entities joined by a ClientDebtorRelationship junction
+  # (many-to-many). Invoices reference Client, Debtor and ClientDebtorRelationship via FK.
+  # Postings/Adjustments/Settlement/Buyback/Verification reference invoices by FK; LedgerEntry
+  # is an append-only event log keyed by client_id. Every entity is a flat collection under
+  # /factoring with FK filter params (no deep URL nesting).
+  state_machine_shape: branching
+  # Invoice forks at collection into {SETTLED} (full pay) or {SHORT_PAID -> BOUGHT_BACK /
+  # WRITTEN_OFF} (short pay), each branch with a divergent side-effect set. Relationship has a
+  # revert cycle (NOTICED -> SUSPENDED -> NOTICED).
+  relationship_patterns:
+    - many_to_many       # Client <-> Debtor via ClientDebtorRelationship
+    - one_to_many        # Client -> Invoice; Invoice -> CollectionPosting/Adjustment
+    - cross_aggregate    # Invoice references Client, Debtor, and ClientDebtorRelationship
+  role_model: segregation_of_duties
+  # An UnderwritingOfficer who issued the credit decision for a party cannot also fund an
+  # invoice against it; FundingOfficer funds but cannot post collections; CollectionsOfficer
+  # posts collections and triggers settlement/buyback. PlatformAdmin is opaque/operational.
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table  (12 entities)
+# =============================================================================
+entities:
+  - name: FactoringProgram
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Program / factor display name" }
+      - { name: currency, type: string, source: input, default: "USD", description: "ISO currency code; all cent amounts are in this currency" }
+      - { name: default_fee_rate_per_day, type: number, source: input, default: 0.0005, description: "Base factoring discount rate per day (e.g. 0.0005 = 0.05%/day); snapshot to invoices at purchase" }
+      - { name: tier2_multiplier, type: number, source: input, default: 1.5, description: "Per-diem rate multiplier for aging days 31-60 (FINAL fee)" }
+      - { name: tier3_multiplier, type: number, source: input, default: 2.0, description: "Per-diem rate multiplier for aging days 61+ (FINAL fee)" }
+      - { name: recourse_grace_days, type: integer, source: input, default: 90, description: "Days after due_date a RECOURSE invoice may remain OUTSTANDING before it is eligible for buyback" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "Lifecycle status; SUSPENDED blocks all new funding", constraints: "enum: ACTIVE, SUSPENDED" }
+
+  - name: Client
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> FactoringProgram.id" }
+      - { name: legal_name, type: string, source: input, description: "Client legal entity name" }
+      - { name: requested_advance_rate_pct, type: number, source: input, description: "Advance rate the client requested at onboarding (e.g. 0.85)", constraints: "0 < x < 1" }
+      - { name: approved_advance_rate_pct, type: number, source: system, default: null, description: "Advance rate set by underwriting at approval; snapshot at every purchase" }
+      - { name: credit_limit_cents, type: integer, source: system, default: null, description: "Maximum total advance principal outstanding the factor will fund for this client; set at credit approval" }
+      - { name: default_concentration_limit_pct, type: number, source: system, default: null, description: "Default per-debtor concentration ceiling applied to new relationships; set at approval (e.g. 0.50)" }
+      - { name: reserve_balance_cents, type: integer, source: computed, default: 0, description: "Denormalized: sum of reserve_held_cents over invoices in {FUNDED, OUTSTANDING, SHORT_PAID}; client equity the factor still holds" }
+      - { name: funded_advance_outstanding_cents, type: integer, source: computed, default: 0, description: "Denormalized: sum of advance_outstanding_cents over invoices in {FUNDED, OUTSTANDING, SHORT_PAID}" }
+      - { name: credit_decision_user_id, type: string, source: system, default: null, description: "X-User-ID of the UnderwritingOfficer who issued this client's credit decision; used by segregation-of-duties check at funding" }
+      - { name: status, type: enum, source: system, default: "PENDING", description: "Lifecycle status", constraints: "enum: PENDING, APPROVED, REJECTED, SUSPENDED, CLOSED" }
+
+  - name: Debtor
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> FactoringProgram.id" }
+      - { name: legal_name, type: string, source: input, description: "Debtor (account-debtor) legal entity name" }
+      - { name: credit_rating, type: enum, source: input, description: "Submitted credit rating bucket", constraints: "enum: AAA, A, BBB, BB, C" }
+      - { name: approved_credit_ceiling_cents, type: integer, source: system, default: null, description: "Total funded face the factor will accept against this debtor across all clients; set at credit approval" }
+      - { name: verification_required, type: boolean, source: system, default: true, description: "Whether invoices on this debtor require explicit verification before funding; set at approval" }
+      - { name: outstanding_face_cents, type: integer, source: computed, default: 0, description: "Denormalized: sum of face_amount_cents over invoices on this debtor in {FUNDED, OUTSTANDING, SHORT_PAID}" }
+      - { name: credit_decision_user_id, type: string, source: system, default: null, description: "X-User-ID of the UnderwritingOfficer who issued this debtor's credit decision; used by segregation-of-duties check at funding" }
+      - { name: status, type: enum, source: system, default: "PENDING", description: "Lifecycle status", constraints: "enum: PENDING, APPROVED, REJECTED, INSOLVENT" }
+
+  - name: ClientDebtorRelationship
+    parent: null
+    common_fields: true
+    fields:
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id" }
+      - { name: debtor_id, type: string, source: input, description: "FK -> Debtor.id" }
+      - { name: recourse_type, type: enum, source: input, description: "RECOURSE: client must buy back uncollected invoices; NON_RECOURSE: factor absorbs debtor-insolvency credit loss only (dilution always stays client liability)", constraints: "enum: RECOURSE, NON_RECOURSE" }
+      - { name: concentration_limit_pct, type: number, source: input, required: false, default: null, description: "Per-debtor concentration ceiling for this relationship; falls back to Client.default_concentration_limit_pct when null" }
+      - { name: notice_status, type: enum, source: system, default: "PENDING", description: "Notice-of-assignment posture", constraints: "enum: PENDING, NOTICED, SUSPENDED" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "Relationship status (always ACTIVE; lifecycle is carried by notice_status)", constraints: "enum: ACTIVE" }
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id" }
+      - { name: debtor_id, type: string, source: input, description: "FK -> Debtor.id" }
+      - { name: relationship_id, type: string, source: system, default: null, description: "FK -> ClientDebtorRelationship.id; resolved from the ACTIVE relationship for (client_id, debtor_id) at submission" }
+      - { name: invoice_number, type: string, source: input, description: "Client-supplied invoice number; unique per client across invoices not in {REJECTED}" }
+      - { name: face_amount_cents, type: integer, source: input, description: "Gross invoice face value", constraints: "> 0" }
+      - { name: issue_date, type: datetime, source: input, description: "Date the invoice was issued to the debtor (ISO 8601 UTC)" }
+      - { name: due_date, type: datetime, source: input, description: "Date payment is due from the debtor (ISO 8601 UTC); must be > issue_date" }
+      - { name: advance_rate_pct, type: number, source: system, default: null, description: "Snapshot of Client.approved_advance_rate_pct at funding" }
+      - { name: fee_rate_per_day, type: number, source: system, default: null, description: "Snapshot of FactoringProgram.default_fee_rate_per_day at funding" }
+      - { name: advance_amount_cents, type: integer, source: computed, default: 0, description: "Principal advanced to client at funding = round_half_up(face_amount_cents * advance_rate_pct)" }
+      - { name: reserve_held_cents, type: integer, source: computed, default: 0, description: "Holdback = face_amount_cents - advance_amount_cents" }
+      - { name: amount_collected_cents, type: integer, source: computed, default: 0, description: "Sum of CollectionPosting.amount_cents in status POSTED on this invoice" }
+      - { name: dilution_cents, type: integer, source: computed, default: 0, description: "Sum of Adjustment.amount_cents for type in {DILUTION, CREDIT_MEMO}; reduces collectible face" }
+      - { name: advance_outstanding_cents, type: integer, source: computed, default: 0, description: "advance_amount_cents minus principal repaid by the collections waterfall; 0 once principal fully repaid" }
+      - { name: accrued_fee_cents, type: integer, source: computed, default: 0, description: "Provisional factoring fee accrued to the current logical clock (calc factoring_fee variant PROVISIONAL)" }
+      - { name: final_fee_cents, type: integer, source: computed, default: null, description: "Finalized tiered fee pinned at terminalization (calc factoring_fee variant FINAL); null until SETTLED/SHORT_PAID/BOUGHT_BACK/WRITTEN_OFF" }
+      - { name: funded_at, type: datetime, source: system, default: null, description: "Logical-clock timestamp when invoice moved to FUNDED" }
+      - { name: aging_bucket, type: enum, source: computed, description: "Derived from days past due at the current clock (calc aging_bucket)", constraints: "enum: CURRENT, DPD_1_30, DPD_31_60, DPD_61_90, DPD_90_PLUS" }
+      - { name: status, type: enum, source: system, default: "SUBMITTED", description: "Lifecycle status", constraints: "enum: SUBMITTED, VERIFIED, FUNDED, OUTSTANDING, SHORT_PAID, SETTLED, BOUGHT_BACK, WRITTEN_OFF, REJECTED" }
+
+  - name: PurchaseBatch
+    parent: null
+    common_fields: true
+    fields:
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id" }
+      - { name: batch_reference, type: string, source: input, description: "Operator reference for this funding batch" }
+      - { name: invoice_ids, type: array, source: input, description: "Ordered list of Invoice.id (all status VERIFIED) to fund together; funded in array order" }
+      - { name: total_advance_cents, type: integer, source: computed, default: 0, description: "Sum of advance_amount_cents over invoices funded by this batch" }
+      - { name: failure_error_id, type: string, source: system, default: null, description: "When status==FAILED, the error_id of the first invoice that failed a funding precondition" }
+      - { name: status, type: enum, source: system, default: "DRAFT", description: "Batch status", constraints: "enum: DRAFT, FUNDED, FAILED" }
+
+  - name: Verification
+    parent: null
+    common_fields: false
+    fields:
+      - { name: invoice_id, type: string, source: input, description: "FK -> Invoice.id" }
+      - { name: method, type: enum, source: input, description: "How the debtor obligation was confirmed", constraints: "enum: PHONE, EMAIL, PORTAL, WAIVED" }
+      - { name: confirmed_amount_cents, type: integer, source: input, description: "Amount the debtor confirmed owing; must equal Invoice.face_amount_cents to verify when verification_required" }
+      - { name: notice_of_assignment_sent, type: boolean, source: system, default: false, description: "Whether the notice-of-assignment was confirmed dispatched as part of this verification" }
+      - { name: verified_at, type: datetime, source: system, default: null, description: "Logical-clock timestamp of verification" }
+
+  - name: CollectionPosting
+    parent: null
+    common_fields: true
+    fields:
+      - { name: invoice_id, type: string, source: input, description: "FK -> Invoice.id" }
+      - { name: amount_cents, type: integer, source: input, description: "Cash received from the payer on this posting", constraints: "> 0" }
+      - { name: received_at, type: datetime, source: input, description: "Logical-clock date the cash was received (ISO 8601 UTC); the latest POSTED received_at is the FINAL-fee cutoff date" }
+      - { name: payer, type: enum, source: input, default: "DEBTOR", description: "Who paid", constraints: "enum: DEBTOR, CLIENT" }
+      - { name: status, type: enum, source: system, default: "POSTED", description: "Posting status", constraints: "enum: POSTED, REVERSED" }
+
+  - name: Adjustment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: invoice_id, type: string, source: input, description: "FK -> Invoice.id" }
+      - { name: type, type: enum, source: input, description: "DILUTION (short-ship/dispute reducing collectible face) | CREDIT_MEMO (client-issued credit) | CHARGEBACK_FEE (uncovered factor fee billed to client)", constraints: "enum: DILUTION, CREDIT_MEMO, CHARGEBACK_FEE" }
+      - { name: amount_cents, type: integer, source: input, description: "Adjustment magnitude", constraints: "> 0" }
+      - { name: reason, type: string, source: input, description: "Free-text reason" }
+
+  - name: Buyback
+    parent: null
+    common_fields: true
+    fields:
+      - { name: invoice_id, type: string, source: input, description: "FK -> Invoice.id" }
+      - { name: trigger_reason, type: enum, source: input, description: "RECOURSE_OVERDUE (grace elapsed unpaid) | DEBTOR_DISPUTE (dilution dispute) | CLIENT_REQUEST", constraints: "enum: RECOURSE_OVERDUE, DEBTOR_DISPUTE, CLIENT_REQUEST" }
+      - { name: buyback_amount_cents, type: integer, source: computed, default: 0, description: "advance_outstanding_cents + (FINAL tiered fee to buyback date - fee already covered by collections); the client must remit this to make the factor whole" }
+      - { name: reserve_released_cents, type: integer, source: computed, default: 0, description: "reserve_held_cents released back to Client.reserve_balance_cents on buyback" }
+      - { name: status, type: enum, source: system, default: "COMPLETED", description: "Buyback status; created COMPLETED (synchronous remittance)", constraints: "enum: COMPLETED" }
+
+  - name: Settlement
+    parent: null
+    common_fields: true
+    fields:
+      - { name: invoice_id, type: string, source: input, description: "FK -> Invoice.id" }
+      - { name: collected_total_cents, type: integer, source: computed, default: 0, description: "Sum of POSTED CollectionPosting.amount_cents at settlement" }
+      - { name: principal_applied_cents, type: integer, source: computed, default: 0, description: "Collected funds applied to advance principal (waterfall step 1)" }
+      - { name: fee_applied_cents, type: integer, source: computed, default: 0, description: "Collected funds applied to FINAL fee (waterfall step 2)" }
+      - { name: rebate_cents, type: integer, source: computed, default: 0, description: "Net rebate released to client (waterfall step 3), floored at 0" }
+      - { name: fee_shortfall_cents, type: integer, source: computed, default: 0, description: "FINAL fee not covered by collections; billed to client as a CHARGEBACK_FEE residual" }
+
+  - name: LedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id" }
+      - { name: invoice_id, type: string, source: system, default: null, description: "FK -> Invoice.id; the invoice that produced this movement" }
+      - { name: entry_type, type: enum, source: system, description: "Append-only ledger movement type", constraints: "enum: ADVANCE_DISBURSED, RESERVE_HELD, FEE_ACCRUED, COLLECTION_POSTED, REBATE_PAID, RESERVE_RELEASED, BUYBACK_RECEIVED, WRITE_OFF" }
+      - { name: amount_cents, type: integer, source: system, description: "Signed movement amount; sign convention per entry_type" }
+      - { name: reserve_balance_after_cents, type: integer, source: system, description: "Client.reserve_balance_cents immediately after this entry (audit snapshot)" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Client
+    initial_state: PENDING
+    terminal_states: [REJECTED, CLOSED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /factoring/clients/{clientId}/credit-decision (decision=APPROVE)"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Client.status == PENDING"
+          - "FactoringProgram.status == ACTIVE"
+          - "body sets approved_advance_rate_pct in (0,1), credit_limit_cents > 0, default_concentration_limit_pct in (0,1]"
+        side_effects:
+          - "set approved_advance_rate_pct, credit_limit_cents, default_concentration_limit_pct from body"
+          - "set credit_decision_user_id = acting X-User-ID (for segregation-of-duties at funding)"
+          - "increments Client.version by 1"
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /factoring/clients/{clientId}/credit-decision (decision=REJECT)"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Client.status == PENDING"
+        side_effects:
+          - "increments Client.version by 1"
+      - from: APPROVED
+        to: SUSPENDED
+        trigger: "POST /factoring/clients/{clientId}/suspend"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Client.status == APPROVED"
+        side_effects:
+          - "no new invoice funding permitted while SUSPENDED (enforced at funding)"
+          - "increments Client.version by 1"
+      - from: SUSPENDED
+        to: APPROVED
+        trigger: "POST /factoring/clients/{clientId}/reinstate"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Client.status == SUSPENDED"
+        side_effects:
+          - "increments Client.version by 1"
+      - from: APPROVED
+        to: CLOSED
+        trigger: "POST /factoring/clients/{clientId}/close"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Client.status in {APPROVED, SUSPENDED}"
+          - "funded_advance_outstanding_cents == 0 — else ERR_CLIENT_HAS_OUTSTANDING"
+          - "reserve_balance_cents == 0 — else ERR_CLIENT_HAS_OUTSTANDING"
+        side_effects:
+          - "increments Client.version by 1"
+      - from: SUSPENDED
+        to: CLOSED
+        trigger: "POST /factoring/clients/{clientId}/close"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Client.status in {APPROVED, SUSPENDED}"
+          - "funded_advance_outstanding_cents == 0 AND reserve_balance_cents == 0 — else ERR_CLIENT_HAS_OUTSTANDING"
+        side_effects:
+          - "increments Client.version by 1"
+
+  - entity: Debtor
+    initial_state: PENDING
+    terminal_states: [REJECTED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /factoring/debtors/{debtorId}/credit-decision (decision=APPROVE)"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Debtor.status == PENDING"
+          - "body sets approved_credit_ceiling_cents > 0"
+        side_effects:
+          - "set approved_credit_ceiling_cents and verification_required from body"
+          - "set credit_decision_user_id = acting X-User-ID"
+          - "increments Debtor.version by 1"
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /factoring/debtors/{debtorId}/credit-decision (decision=REJECT)"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Debtor.status == PENDING"
+        side_effects:
+          - "increments Debtor.version by 1"
+      - from: APPROVED
+        to: INSOLVENT
+        trigger: "POST /factoring/debtors/{debtorId}/declare-insolvent"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Debtor.status == APPROVED"
+        side_effects:
+          - "CASCADE depth-3 origin: every ClientDebtorRelationship row on this debtor whose notice_status==NOTICED -> notice_status=SUSPENDED (hop 1: Debtor mutation triggers Relationship mutation)"
+          - "each newly SUSPENDED relationship's invoices in {FUNDED, OUTSTANDING} become eligible for write-off (NON_RECOURSE) or buyback (RECOURSE) — see Invoice transitions"
+          - "increments Debtor.version by 1"
+
+  - entity: ClientDebtorRelationship
+    initial_state: PENDING
+    terminal_states: []
+    note: "State machine tracks the notice_status field (PENDING/NOTICED/SUSPENDED); cyclic (NOTICED<->SUSPENDED), no terminal state. The status field is always ACTIVE."
+    transitions:
+      - from: PENDING
+        to: NOTICED
+        trigger: "POST /factoring/relationships/{relationshipId}/send-notice"
+        actor: FundingOfficer
+        preconditions:
+          - "ClientDebtorRelationship.notice_status == PENDING"
+          - "Client.status == APPROVED AND Debtor.status == APPROVED (cross-entity guard) — else ERR_PARTY_NOT_APPROVED"
+        side_effects:
+          - "notice_status -> NOTICED; debtor instructed to remit directly to factor"
+          - "increments ClientDebtorRelationship.version by 1"
+      - from: NOTICED
+        to: SUSPENDED
+        trigger: "POST /factoring/relationships/{relationshipId}/suspend (or system on Debtor INSOLVENT cascade)"
+        actor: FundingOfficer | system
+        preconditions:
+          - "ClientDebtorRelationship.notice_status == NOTICED"
+        side_effects:
+          - "notice_status -> SUSPENDED; new invoice funding on this relationship blocked"
+          - "increments ClientDebtorRelationship.version by 1"
+      - from: SUSPENDED
+        to: NOTICED
+        trigger: "POST /factoring/relationships/{relationshipId}/resume"
+        actor: FundingOfficer
+        preconditions:
+          - "ClientDebtorRelationship.notice_status == SUSPENDED"
+          - "Debtor.status == APPROVED (cross-entity guard) — else ERR_PARTY_NOT_APPROVED"
+        side_effects:
+          - "notice_status -> NOTICED"
+          - "increments ClientDebtorRelationship.version by 1"
+
+  - entity: Invoice
+    initial_state: SUBMITTED
+    terminal_states: [SETTLED, BOUGHT_BACK, WRITTEN_OFF, REJECTED]
+    transitions:
+      - from: SUBMITTED
+        to: VERIFIED
+        trigger: "POST /factoring/invoices/{invoiceId}/verify"
+        actor: FundingOfficer
+        preconditions:
+          - "Invoice.status == SUBMITTED"
+          - "ClientDebtorRelationship.notice_status == NOTICED (cross-entity guard) — else ERR_NOTICE_NOT_SENT"
+          - "if Debtor.verification_required == true: body.confirmed_amount_cents == Invoice.face_amount_cents AND method != WAIVED — else ERR_VERIFICATION_MISMATCH"
+        side_effects:
+          - "create Verification child (notice_of_assignment_sent=true, verified_at=clock now)"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /factoring/invoices/{invoiceId}/reject"
+        actor: FundingOfficer
+        preconditions:
+          - "Invoice.status == SUBMITTED"
+        side_effects: []
+      - from: VERIFIED
+        to: FUNDED
+        trigger: "POST /factoring/purchase-batches/{batchId}/fund (invoice listed in batch)"
+        actor: FundingOfficer
+        preconditions:
+          - "Invoice.status == VERIFIED"
+          - "Client.status == APPROVED AND FactoringProgram.status == ACTIVE (cross-entity guard) — else ERR_FUNDING_BLOCKED"
+          - "ClientDebtorRelationship.notice_status == NOTICED — else ERR_FUNDING_BLOCKED"
+          - "concentration check: post-add debtor exposure ratio <= relationship limit — else ERR_CONCENTRATION_EXCEEDED (calc debtor_concentration)"
+          - "debtor ceiling check: Debtor.outstanding_face_cents + face <= Debtor.approved_credit_ceiling_cents — else ERR_DEBTOR_CEILING_EXCEEDED"
+          - "credit-limit check: advance_amount_cents <= (Client.credit_limit_cents - Client.funded_advance_outstanding_cents) — else ERR_CREDIT_LIMIT_EXCEEDED"
+        side_effects:
+          - "compute advance_amount_cents = round_half_up(face_amount_cents * advance_rate_pct); reserve_held_cents = face - advance (calc advance_split)"
+          - "advance_outstanding_cents = advance_amount_cents; funded_at = clock now; aging_bucket recomputed (calc aging_bucket)"
+          - "Client.reserve_balance_cents += reserve_held_cents; Client.funded_advance_outstanding_cents += advance_amount_cents (derived recompute)"
+          - "Debtor.outstanding_face_cents += face_amount_cents"
+          - "append LedgerEntry ADVANCE_DISBURSED then RESERVE_HELD (in that order)"
+          - "increments Client.version by 1"
+      - from: FUNDED
+        to: OUTSTANDING
+        trigger: "system (automatic on POST /_clock/set_current_utc when clock passes Invoice.due_date with no full collection)"
+        actor: system
+        preconditions:
+          - "Invoice.status == FUNDED"
+          - "clock now > due_date AND amount_collected_cents < (face_amount_cents - dilution_cents)"
+        side_effects:
+          - "aging_bucket recomputed (calc aging_bucket)"
+      - from: FUNDED
+        to: SETTLED
+        trigger: "POST /factoring/invoices/{invoiceId}/postings (system settlement when fully collected)"
+        actor: CollectionsOfficer | system
+        preconditions:
+          - "Invoice.status in {FUNDED, OUTSTANDING}"
+          - "amount_collected_cents >= (face_amount_cents - dilution_cents)"
+        side_effects:
+          - "CASCADE depth-3 origin (hop1): compute final_fee_cents (calc factoring_fee FINAL, cutoff=latest POSTED received_at); run settlement waterfall (calc settlement_rebate)"
+          - "create Settlement child; set final_fee_cents; advance_outstanding_cents -> 0"
+          - "hop2: Client.reserve_balance_cents -= reserve_held_cents; Client.funded_advance_outstanding_cents -= advance_amount_cents (derived recompute on Client)"
+          - "Debtor.outstanding_face_cents -= face_amount_cents"
+          - "hop3: append LedgerEntry FEE_ACCRUED, REBATE_PAID, RESERVE_RELEASED with reserve_balance_after_cents snapshots"
+          - "if fee_shortfall_cents > 0: create Adjustment CHARGEBACK_FEE for the shortfall"
+          - "increments Client.version by 1"
+      - from: OUTSTANDING
+        to: SETTLED
+        trigger: "POST /factoring/invoices/{invoiceId}/postings (system settlement when fully collected)"
+        actor: CollectionsOfficer | system
+        preconditions:
+          - "Invoice.status == OUTSTANDING"
+          - "amount_collected_cents >= (face_amount_cents - dilution_cents)"
+        side_effects:
+          - "same settlement side-effects as FUNDED->SETTLED"
+          - "increments Client.version by 1"
+      - from: OUTSTANDING
+        to: SHORT_PAID
+        trigger: "POST /factoring/invoices/{invoiceId}/close-collection"
+        actor: CollectionsOfficer
+        preconditions:
+          - "Invoice.status == OUTSTANDING"
+          - "0 < amount_collected_cents < (face_amount_cents - dilution_cents)"
+        side_effects:
+          - "run partial settlement waterfall (calc settlement_rebate): principal then fee then rebate"
+          - "advance_outstanding_cents = advance_amount_cents - principal_applied_cents; pin final_fee_cents (calc factoring_fee FINAL, cutoff=latest POSTED received_at)"
+          - "Client.reserve_balance_cents and funded_advance_outstanding_cents stay until buyback/write-off (residual advance still at risk)"
+          - "append LedgerEntry COLLECTION_POSTED, FEE_ACCRUED"
+          - "increments Client.version by 1"
+      - from: SHORT_PAID
+        to: BOUGHT_BACK
+        trigger: "POST /factoring/invoices/{invoiceId}/buyback"
+        actor: CollectionsOfficer
+        preconditions:
+          - "Invoice.status == SHORT_PAID"
+          - "ClientDebtorRelationship.recourse_type == RECOURSE OR an Adjustment(type=DILUTION) exists on the invoice (dilution stays client liability even when NON_RECOURSE) — else ERR_NON_RECOURSE_NO_BUYBACK"
+        side_effects:
+          - "compute buyback_amount_cents = advance_outstanding_cents + uncovered FINAL fee (calc recourse_buyback)"
+          - "create Buyback (COMPLETED); reserve_released_cents = reserve_held_cents"
+          - "Client.reserve_balance_cents -= reserve_held_cents; Client.funded_advance_outstanding_cents -= advance_outstanding_cents; advance_outstanding_cents -> 0"
+          - "Debtor.outstanding_face_cents -= face_amount_cents"
+          - "append LedgerEntry BUYBACK_RECEIVED then RESERVE_RELEASED"
+          - "increments Client.version by 1"
+      - from: OUTSTANDING
+        to: BOUGHT_BACK
+        trigger: "POST /factoring/invoices/{invoiceId}/buyback"
+        actor: CollectionsOfficer
+        preconditions:
+          - "Invoice.status == OUTSTANDING"
+          - "ClientDebtorRelationship.recourse_type == RECOURSE — else ERR_NON_RECOURSE_NO_BUYBACK"
+          - "clock now > (due_date + program.recourse_grace_days) — else ERR_RECOURSE_GRACE_ACTIVE"
+        side_effects:
+          - "same buyback side-effects as SHORT_PAID->BOUGHT_BACK (advance_outstanding_cents == advance_amount_cents here)"
+          - "increments Client.version by 1"
+      - from: OUTSTANDING
+        to: WRITTEN_OFF
+        trigger: "POST /factoring/invoices/{invoiceId}/write-off"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Invoice.status == OUTSTANDING"
+          - "ClientDebtorRelationship.recourse_type == NON_RECOURSE AND Debtor.status == INSOLVENT — else ERR_WRITEOFF_NOT_ELIGIBLE"
+          - "no DILUTION Adjustment exists on the invoice — else ERR_WRITEOFF_NOT_ELIGIBLE"
+        side_effects:
+          - "pin final_fee_cents to accrued fee at write-off date (calc factoring_fee FINAL, cutoff=clock now)"
+          - "Client.reserve_balance_cents -= reserve_held_cents; Client.funded_advance_outstanding_cents -= advance_outstanding_cents; advance_outstanding_cents -> 0"
+          - "Debtor.outstanding_face_cents -= face_amount_cents"
+          - "append LedgerEntry WRITE_OFF (factor absorbs advance_outstanding loss) then RESERVE_RELEASED"
+          - "increments Client.version by 1"
+      - from: SHORT_PAID
+        to: WRITTEN_OFF
+        trigger: "POST /factoring/invoices/{invoiceId}/write-off"
+        actor: UnderwritingOfficer
+        preconditions:
+          - "Invoice.status == SHORT_PAID"
+          - "ClientDebtorRelationship.recourse_type == NON_RECOURSE AND Debtor.status == INSOLVENT — else ERR_WRITEOFF_NOT_ELIGIBLE"
+          - "no DILUTION Adjustment exists on the invoice — else ERR_WRITEOFF_NOT_ELIGIBLE"
+        side_effects:
+          - "same write-off side-effects as OUTSTANDING->WRITTEN_OFF"
+          - "increments Client.version by 1"
+
+  - entity: PurchaseBatch
+    initial_state: DRAFT
+    terminal_states: [FUNDED, FAILED]
+    transitions:
+      - from: DRAFT
+        to: FUNDED
+        trigger: "POST /factoring/purchase-batches/{batchId}/fund"
+        actor: FundingOfficer
+        preconditions:
+          - "PurchaseBatch.status == DRAFT"
+          - "expected_client_version matches Client.version (OCC) — else ERR_STALE_VERSION"
+          - "segregation: funding X-User-ID != Client.credit_decision_user_id AND != Debtor.credit_decision_user_id for every invoice's parties — else ERR_SEGREGATION_OF_DUTIES"
+          - "every Invoice in invoice_ids is VERIFIED and passes all per-invoice funding preconditions evaluated in array order"
+        side_effects:
+          - "fund each invoice in invoice_ids order (each VERIFIED->FUNDED with its full side-effect set)"
+          - "total_advance_cents = sum of funded advance_amount_cents"
+          - "increments Client.version by 1 per funded invoice; increments PurchaseBatch.version by 1"
+      - from: DRAFT
+        to: FAILED
+        trigger: "POST /factoring/purchase-batches/{batchId}/fund (any invoice fails a funding precondition when reached in array order)"
+        actor: FundingOfficer
+        preconditions:
+          - "PurchaseBatch.status == DRAFT"
+          - "at least one invoice in invoice_ids fails a funding precondition when reached in array order"
+        side_effects:
+          - "transactional all-or-nothing rollback: NO invoice in the batch is funded; no Client/Debtor balance changes persist"
+          - "batch -> FAILED; failure_error_id = the first failing invoice's error_id"
+          - "increments PurchaseBatch.version by 1"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: fund-batch-stale-client
+    parent_entity: Client
+    write_endpoint: "POST /factoring/purchase-batches/{batchId}/fund"
+    occ_field: "expected_client_version"
+    description: |
+      Funding a PurchaseBatch consumes the client's remaining credit headroom
+      (credit_limit_cents - funded_advance_outstanding_cents) and concentration
+      capacity. A funding call carrying a Client.version older than the server's
+      current value is rejected: another funding has already advanced principal
+      against this client since the caller last observed it, so the caller's
+      headroom view is stale and the credit/concentration checks would evaluate
+      against outdated denormalized balances.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: settlement-stale-client
+    parent_entity: Client
+    write_endpoint: "POST /factoring/invoices/{invoiceId}/postings"
+    occ_field: "expected_client_version"
+    description: |
+      Posting a collection can fully collect the invoice and trigger settlement,
+      which releases reserve and recomputes Client.reserve_balance_cents. A posting
+      whose expected_client_version is older than the server's current Client.version
+      is rejected: a prior settlement or buyback has already moved the client's
+      reserve balance since the caller's last read, so the collection would be
+      applied against a stale reserve/ledger snapshot.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: advance_split
+    trigger: "Invoice VERIFIED->FUNDED (purchase-batch fund)"
+    algorithm: threshold
+    formula: |
+      advance_amount_cents      = round_half_up(face_amount_cents * advance_rate_pct)
+      reserve_held_cents        = face_amount_cents - advance_amount_cents
+      advance_outstanding_cents = advance_amount_cents
+      # advance_rate_pct is the snapshot of Client.approved_advance_rate_pct at funding
+    input_set: "Single invoice at funding; advance_rate_pct snapshot from Client.approved_advance_rate_pct"
+    constants: {}
+    precision: "round_half_up to whole cents; reserve is exact remainder so face = advance + reserve always holds"
+
+  - name: factoring_fee
+    trigger: "PROVISIONAL: recomputed on every GET /factoring/invoices/{invoiceId} while FUNDED/OUTSTANDING. FINAL: pinned at Invoice ->SETTLED, ->SHORT_PAID, ->BOUGHT_BACK, ->WRITTEN_OFF"
+    algorithm: chronological
+    formula: |
+      # PROVISIONAL variant: flat per-diem to the current logical clock
+      days_p = max(0, floor((clock_now - funded_at) / DAY_SECONDS))
+      accrued_fee_cents = round_half_up(face_amount_cents * fee_rate_per_day * days_p)
+
+      # FINAL variant: tiered per-diem to the cutoff date, ROUND-PER-TIER-THEN-SUM (pinned order)
+      # cutoff = latest POSTED CollectionPosting.received_at (settlement/short-pay),
+      #          else clock_now (buyback/write-off with no qualifying posting)
+      days_f = max(0, floor((cutoff - funded_at) / DAY_SECONDS))
+      d1 = min(days_f, 30)
+      d2 = min(max(days_f - 30, 0), 30)
+      d3 = max(days_f - 60, 0)
+      f1 = round_half_up(face_amount_cents * fee_rate_per_day * d1)
+      f2 = round_half_up(face_amount_cents * fee_rate_per_day * tier2_multiplier * d2)
+      f3 = round_half_up(face_amount_cents * fee_rate_per_day * tier3_multiplier * d3)
+      final_fee_cents = f1 + f2 + f3      # PIN: round each tier to cents, THEN sum
+    input_set: "Single invoice; fee_rate_per_day, tier2_multiplier, tier3_multiplier snapshot at funding from FactoringProgram"
+    constants:
+      DAY_SECONDS: 86400
+    precision: "round_half_up per tier to whole cents, THEN sum (Rule 2 mode b: nested-rounding order pinned)"
+    variants:
+      - name: PROVISIONAL
+        when: "Any GET while FUNDED/OUTSTANDING; flat single rate to the live clock; no tiering"
+        difference: "Flat single-rate accrual to clock_now; ignores aging tiers; recomputed on every read"
+      - name: FINAL
+        when: "Pinned once at terminalization; cutoff is the collection/buyback/write-off date"
+        difference: "Tiered escalating per-diem with round-per-tier-then-sum; diverges from PROVISIONAL once days span >30 (e.g. 45 days on a 100000-cent face: PROVISIONAL=2250, FINAL=2625)"
+
+  - name: settlement_rebate
+    trigger: "Invoice ->SETTLED or ->SHORT_PAID (collection waterfall)"
+    algorithm: waterfall_allocation
+    formula: |
+      collected  = sum(CollectionPosting.amount_cents where status==POSTED)
+      final_fee  = factoring_fee.FINAL(cutoff = latest POSTED received_at)
+      remaining  = collected
+      principal_applied_cents = min(remaining, advance_amount_cents); remaining -= principal_applied_cents
+      fee_applied_cents       = min(remaining, final_fee);            remaining -= fee_applied_cents
+      rebate_cents            = max(0, remaining)
+      fee_shortfall_cents     = final_fee - fee_applied_cents
+      # post: advance_outstanding_cents = advance_amount_cents - principal_applied_cents
+    input_set: "All POSTED CollectionPosting on the invoice; REVERSED postings excluded; postings ordered received_at ASC, created_at ASC on ties"
+    constants: {}
+    precision: "integer cents; waterfall buckets filled in pinned order [principal, fee, rebate]; rebate floored at 0"
+
+  - name: recourse_buyback
+    trigger: "Invoice SHORT_PAID/OUTSTANDING -> BOUGHT_BACK"
+    algorithm: aggregation
+    formula: |
+      final_fee           = factoring_fee.FINAL(cutoff = clock_now)
+      fee_already_covered = fee_applied_cents from any prior settlement_rebate run (0 if none)
+      uncovered_fee       = max(0, final_fee - fee_already_covered)
+      buyback_amount_cents   = advance_outstanding_cents + uncovered_fee
+      reserve_released_cents = reserve_held_cents
+    input_set: "Single invoice; advance_outstanding_cents reflects prior partial collections"
+    constants: {}
+    precision: "integer cents"
+
+  - name: debtor_concentration
+    trigger: "Invoice VERIFIED->FUNDED (concentration precondition)"
+    algorithm: threshold
+    formula: |
+      # exposure measured on FACE of FUNDED/OUTSTANDING/SHORT_PAID invoices, candidate INCLUDED
+      debtor_exposure_after = Debtor.outstanding_face_cents + candidate.face_amount_cents
+      portfolio_after       = (sum face over client invoices in {FUNDED,OUTSTANDING,SHORT_PAID}) + candidate.face_amount_cents
+      limit = relationship.concentration_limit_pct
+              (falls back to Client.default_concentration_limit_pct when relationship value is null)
+      # REJECT iff strictly greater (boundary: ratio == limit is ALLOWED)
+      reject iff  debtor_exposure_after  >  limit * portfolio_after     # cross-multiplied; no float compare
+    input_set: "Client portfolio face over invoices in {FUNDED, OUTSTANDING, SHORT_PAID}; candidate included in numerator and denominator"
+    constants: {}
+    precision: "exact integer cross-multiplication: compare debtor_exposure_after vs limit*portfolio_after; '>' rejects, '==' allows"
+
+  - name: aging_bucket
+    trigger: "Invoice FUNDED/OUTSTANDING (recomputed on GET and on POST /_clock/set_current_utc)"
+    algorithm: threshold
+    formula: |
+      dpd = floor((clock_now - due_date) / DAY_SECONDS)     # days past due
+      if   dpd <= 0:  CURRENT
+      elif dpd <= 30: DPD_1_30
+      elif dpd <= 60: DPD_31_60
+      elif dpd <= 90: DPD_61_90
+      else:           DPD_90_PLUS
+    input_set: "Single invoice; due_date vs current logical clock"
+    constants:
+      DAY_SECONDS: 86400
+      BUCKET1_MAX: 30
+      BUCKET2_MAX: 60
+      BUCKET3_MAX: 90
+    precision: "integer days; upper edge inclusive (dpd==30 is DPD_1_30, dpd==31 is DPD_31_60, dpd==90 is DPD_61_90, dpd==91 is DPD_90_PLUS)"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all" }
+  - { priority: 2, category: auth, check: "Acting role permitted for this operation per §1.7 RBAC", error_id: ERR_UNAUTHORIZED, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: existence, check: "All path resources resolve, validated left-to-right (program/client/debtor/invoice/relationship/batch/posting)", error_id: ERR_NOT_FOUND, http_status: 404, applies_to: "all" }
+  - { priority: 4, category: existence, check: "FK body references resolve (program_id, client_id, debtor_id, invoice_id, invoice_ids[] members exist)", error_id: ERR_NOT_FOUND, http_status: 404, applies_to: "POST endpoints with body FKs" }
+  - { priority: 5, category: business_constraint, check: "Required body fields present and well-typed; enums in allowed set; face_amount_cents>0; amount_cents>0; due_date>issue_date; advance/concentration rates in range", error_id: ERR_INVALID_REQUEST, http_status: 422, applies_to: "all writes" }
+  - { priority: 6, category: business_constraint, check: "invoice_number unique per client across invoices not in {REJECTED}", error_id: ERR_DUPLICATE_INVOICE_NUMBER, http_status: 409, applies_to: "POST /factoring/invoices" }
+  - { priority: 7, category: business_constraint, check: "(client_id, debtor_id) relationship unique among rows with status==ACTIVE", error_id: ERR_DUPLICATE_RELATIONSHIP, http_status: 409, applies_to: "POST /factoring/relationships" }
+  - { priority: 8, category: state, check: "OCC: expected_client_version matches current Client.version on guarded writes", error_id: ERR_STALE_VERSION, http_status: 412, applies_to: "POST /factoring/purchase-batches/{batchId}/fund, POST /factoring/invoices/{invoiceId}/postings" }
+  - { priority: 9, category: auth, check: "Segregation of duties: the funding X-User-ID must differ from credit_decision_user_id of BOTH the client and the debtor of every invoice in the batch", error_id: ERR_SEGREGATION_OF_DUTIES, http_status: 403, applies_to: "POST /factoring/purchase-batches/{batchId}/fund" }
+  - { priority: 10, category: state, check: "Target resource is in a state from which the requested transition is defined (§1.2)", error_id: ERR_INVALID_STATE, http_status: 409, applies_to: "all transition endpoints" }
+  - { priority: 11, category: business_referential, check: "send-notice/resume require Client.status==APPROVED and Debtor.status==APPROVED", error_id: ERR_PARTY_NOT_APPROVED, http_status: 409, applies_to: "POST /factoring/relationships/{relationshipId}/send-notice, POST /factoring/relationships/{relationshipId}/resume" }
+  - { priority: 12, category: business_referential, check: "verify/fund require ClientDebtorRelationship.notice_status==NOTICED", error_id: ERR_NOTICE_NOT_SENT, http_status: 409, applies_to: "POST /factoring/invoices/{invoiceId}/verify" }
+  - { priority: 13, category: business_safety, check: "Verification: confirmed_amount_cents must equal Invoice.face_amount_cents (and method != WAIVED) when Debtor.verification_required==true", error_id: ERR_VERIFICATION_MISMATCH, http_status: 409, applies_to: "POST /factoring/invoices/{invoiceId}/verify" }
+  - { priority: 14, category: business_safety, check: "Funding blocked when Client.status!=APPROVED or FactoringProgram.status!=ACTIVE or relationship notice_status!=NOTICED", error_id: ERR_FUNDING_BLOCKED, http_status: 409, applies_to: "POST /factoring/purchase-batches/{batchId}/fund" }
+  - { priority: 15, category: business_constraint, check: "Concentration: post-add debtor exposure ratio must not exceed relationship limit (calc debtor_concentration; '>' rejects, '==' allows)", error_id: ERR_CONCENTRATION_EXCEEDED, http_status: 409, applies_to: "POST /factoring/purchase-batches/{batchId}/fund" }
+  - { priority: 16, category: business_constraint, check: "Debtor ceiling: outstanding_face + candidate face must not exceed Debtor.approved_credit_ceiling_cents", error_id: ERR_DEBTOR_CEILING_EXCEEDED, http_status: 409, applies_to: "POST /factoring/purchase-batches/{batchId}/fund" }
+  - { priority: 17, category: business_fiscal, check: "Client credit limit: candidate advance must not exceed credit_limit_cents - funded_advance_outstanding_cents", error_id: ERR_CREDIT_LIMIT_EXCEEDED, http_status: 409, applies_to: "POST /factoring/purchase-batches/{batchId}/fund" }
+  - { priority: 18, category: business_constraint, check: "Buyback eligibility: RECOURSE or a DILUTION Adjustment exists (SHORT_PAID); RECOURSE (OUTSTANDING)", error_id: ERR_NON_RECOURSE_NO_BUYBACK, http_status: 409, applies_to: "POST /factoring/invoices/{invoiceId}/buyback" }
+  - { priority: 19, category: business_temporal, check: "Buyback from OUTSTANDING requires clock now > due_date + program.recourse_grace_days", error_id: ERR_RECOURSE_GRACE_ACTIVE, http_status: 409, applies_to: "POST /factoring/invoices/{invoiceId}/buyback" }
+  - { priority: 20, category: business_constraint, check: "Write-off eligibility: NON_RECOURSE relationship AND Debtor.status==INSOLVENT AND no DILUTION Adjustment", error_id: ERR_WRITEOFF_NOT_ELIGIBLE, http_status: 409, applies_to: "POST /factoring/invoices/{invoiceId}/write-off" }
+  - { priority: 21, category: business_constraint, check: "Client close requires funded_advance_outstanding_cents==0 AND reserve_balance_cents==0", error_id: ERR_CLIENT_HAS_OUTSTANDING, http_status: 409, applies_to: "POST /factoring/clients/{clientId}/close" }
+  - { priority: 22, category: business_constraint, check: "Posting amount_cents must not exceed remaining collectible face (face - dilution - amount_collected); reverse only a POSTED posting", error_id: ERR_OVERPAYMENT, http_status: 409, applies_to: "POST /factoring/invoices/{invoiceId}/postings, POST /factoring/postings/{postingId}/reverse" }
+
+# =============================================================================
+# §1.5 API Endpoint Table  (flat collections under /factoring)
+# =============================================================================
+endpoints:
+  # ---- FactoringProgram ----
+  - { method: POST, path: "/factoring/programs", description: "Create factoring program (factor config)", roles: [PlatformAdmin], code: 201, input: [name, "currency?", "default_fee_rate_per_day?", "tier2_multiplier?", "tier3_multiplier?", "recourse_grace_days?"], output: FactoringProgram, side_effects: ["status=ACTIVE"] }
+  - { method: GET, path: "/factoring/programs", description: "List factoring programs", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: ["status?", "limit?", "offset?"], output: "FactoringProgram[]", side_effects: [] }
+  - { method: GET, path: "/factoring/programs/{programId}", description: "Read program", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: [], output: FactoringProgram, side_effects: [] }
+  - { method: POST, path: "/factoring/programs/{programId}/suspend", description: "Suspend program (blocks new funding)", roles: [PlatformAdmin], code: 200, input: [], output: FactoringProgram, side_effects: ["status=SUSPENDED"] }
+
+  # ---- Client ----
+  - { method: POST, path: "/factoring/clients", description: "Onboard client (PENDING)", roles: [PlatformAdmin, UnderwritingOfficer], code: 201, input: [program_id, legal_name, requested_advance_rate_pct], output: Client, side_effects: ["status=PENDING"] }
+  - { method: GET, path: "/factoring/clients", description: "List clients (filter by program_id, status); reverse-reachability for Client.program_id", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: ["program_id?", "status?", "limit?", "offset?"], output: "Client[]", side_effects: [] }
+  - { method: GET, path: "/factoring/clients/{clientId}", description: "Read client incl. computed reserve_balance_cents / funded_advance_outstanding_cents", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: [], output: Client, side_effects: ["recompute reserve_balance_cents, funded_advance_outstanding_cents"] }
+  - { method: POST, path: "/factoring/clients/{clientId}/credit-decision", description: "Underwriting credit decision on client", roles: [UnderwritingOfficer], code: 200, input: [decision, "approved_advance_rate_pct?", "credit_limit_cents?", "default_concentration_limit_pct?"], output: Client, side_effects: ["PENDING->APPROVED or PENDING->REJECTED; set credit fields & credit_decision_user_id; version+1"] }
+  - { method: POST, path: "/factoring/clients/{clientId}/suspend", description: "Suspend client", roles: [UnderwritingOfficer], code: 200, input: [], output: Client, side_effects: ["APPROVED->SUSPENDED; version+1"] }
+  - { method: POST, path: "/factoring/clients/{clientId}/reinstate", description: "Reinstate suspended client", roles: [UnderwritingOfficer], code: 200, input: [], output: Client, side_effects: ["SUSPENDED->APPROVED; version+1"] }
+  - { method: POST, path: "/factoring/clients/{clientId}/close", description: "Close client", roles: [UnderwritingOfficer], code: 200, input: [], output: Client, side_effects: ["->CLOSED if zero outstanding & reserve; version+1"] }
+  - { method: GET, path: "/factoring/ledger-entries", description: "List append-only LedgerEntry rows (filter by client_id, invoice_id); reverse-reachability for LedgerEntry.client_id and LedgerEntry.invoice_id", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: ["client_id?", "invoice_id?", "limit?", "offset?"], output: "LedgerEntry[]", side_effects: [] }
+  - { method: GET, path: "/factoring/ledger-entries/{ledgerEntryId}", description: "Read a single ledger entry", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: [], output: LedgerEntry, side_effects: [] }
+
+  # ---- Debtor ----
+  - { method: POST, path: "/factoring/debtors", description: "Onboard debtor (PENDING)", roles: [PlatformAdmin, UnderwritingOfficer], code: 201, input: [program_id, legal_name, credit_rating], output: Debtor, side_effects: ["status=PENDING"] }
+  - { method: GET, path: "/factoring/debtors", description: "List debtors (filter by program_id, status); reverse-reachability for Debtor.program_id", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: ["program_id?", "status?", "limit?", "offset?"], output: "Debtor[]", side_effects: [] }
+  - { method: GET, path: "/factoring/debtors/{debtorId}", description: "Read debtor incl. computed outstanding_face_cents", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: [], output: Debtor, side_effects: ["recompute outstanding_face_cents"] }
+  - { method: POST, path: "/factoring/debtors/{debtorId}/credit-decision", description: "Underwriting credit decision on debtor", roles: [UnderwritingOfficer], code: 200, input: [decision, "approved_credit_ceiling_cents?", "verification_required?"], output: Debtor, side_effects: ["PENDING->APPROVED/REJECTED; set ceiling, verification_required & credit_decision_user_id; version+1"] }
+  - { method: POST, path: "/factoring/debtors/{debtorId}/declare-insolvent", description: "Declare debtor insolvent (cascade suspends NOTICED relationships)", roles: [UnderwritingOfficer], code: 200, input: [], output: Debtor, side_effects: ["APPROVED->INSOLVENT; cascade NOTICED relationships notice_status->SUSPENDED; version+1"] }
+
+  # ---- ClientDebtorRelationship ----
+  - { method: POST, path: "/factoring/relationships", description: "Create client-debtor relationship", roles: [FundingOfficer, UnderwritingOfficer], code: 201, input: [client_id, debtor_id, recourse_type, "concentration_limit_pct?"], output: ClientDebtorRelationship, side_effects: ["notice_status=PENDING; status=ACTIVE"] }
+  - { method: GET, path: "/factoring/relationships", description: "List relationships (filter by client_id, debtor_id); reverse-reachability for ClientDebtorRelationship.client_id and .debtor_id", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: ["client_id?", "debtor_id?", "notice_status?", "limit?", "offset?"], output: "ClientDebtorRelationship[]", side_effects: [] }
+  - { method: GET, path: "/factoring/relationships/{relationshipId}", description: "Read relationship", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: [], output: ClientDebtorRelationship, side_effects: [] }
+  - { method: POST, path: "/factoring/relationships/{relationshipId}/send-notice", description: "Send notice-of-assignment to debtor", roles: [FundingOfficer], code: 200, input: [], output: ClientDebtorRelationship, side_effects: ["PENDING->NOTICED; version+1"] }
+  - { method: POST, path: "/factoring/relationships/{relationshipId}/suspend", description: "Suspend relationship", roles: [FundingOfficer], code: 200, input: [], output: ClientDebtorRelationship, side_effects: ["NOTICED->SUSPENDED; version+1"] }
+  - { method: POST, path: "/factoring/relationships/{relationshipId}/resume", description: "Resume suspended relationship", roles: [FundingOfficer], code: 200, input: [], output: ClientDebtorRelationship, side_effects: ["SUSPENDED->NOTICED; version+1"] }
+
+  # ---- Invoice ----
+  - { method: POST, path: "/factoring/invoices", description: "Submit invoice for factoring (SUBMITTED)", roles: [FundingOfficer], code: 201, input: [client_id, debtor_id, invoice_number, face_amount_cents, issue_date, due_date], output: Invoice, side_effects: ["status=SUBMITTED; resolve relationship_id from ACTIVE (client_id, debtor_id) relationship"] }
+  - { method: GET, path: "/factoring/invoices", description: "List invoices (filter by client_id, debtor_id, relationship_id, status); reverse-reachability for Invoice.client_id, .debtor_id, .relationship_id", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: ["client_id?", "debtor_id?", "relationship_id?", "status?", "limit?", "offset?"], output: "Invoice[]", side_effects: [] }
+  - { method: GET, path: "/factoring/invoices/{invoiceId}", description: "Read invoice incl. computed accrued_fee_cents (PROVISIONAL), aging_bucket, advance_outstanding_cents", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: [], output: Invoice, side_effects: ["recompute accrued_fee_cents, aging_bucket, advance_outstanding_cents"] }
+  - { method: POST, path: "/factoring/invoices/{invoiceId}/verify", description: "Verify invoice & confirm debtor obligation", roles: [FundingOfficer], code: 200, input: [method, confirmed_amount_cents], output: Invoice, side_effects: ["SUBMITTED->VERIFIED; create Verification; notice_of_assignment_sent=true"] }
+  - { method: POST, path: "/factoring/invoices/{invoiceId}/reject", description: "Reject submitted invoice", roles: [FundingOfficer], code: 200, input: [], output: Invoice, side_effects: ["SUBMITTED->REJECTED"] }
+  - { method: GET, path: "/factoring/verifications", description: "List verifications (filter by invoice_id); reverse-reachability for Verification.invoice_id", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: ["invoice_id?", "limit?", "offset?"], output: "Verification[]", side_effects: [] }
+  - { method: GET, path: "/factoring/verifications/{verificationId}", description: "Read a single verification", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: [], output: Verification, side_effects: [] }
+  - { method: POST, path: "/factoring/invoices/{invoiceId}/postings", description: "Post a collection against invoice; may trigger settlement when fully collected", roles: [CollectionsOfficer], code: 201, input: [amount_cents, received_at, "payer?", expected_client_version], output: CollectionPosting, side_effects: ["create POSTED CollectionPosting; recompute amount_collected; if fully collected -> SETTLED (settlement_rebate + cascade); Client.version+1"] }
+  - { method: GET, path: "/factoring/collection-postings", description: "List collection postings (filter by invoice_id, status); reverse-reachability for CollectionPosting.invoice_id", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: ["invoice_id?", "status?", "limit?", "offset?"], output: "CollectionPosting[]", side_effects: [] }
+  - { method: GET, path: "/factoring/collection-postings/{postingId}", description: "Read a collection posting", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: [], output: CollectionPosting, side_effects: [] }
+  - { method: POST, path: "/factoring/postings/{postingId}/reverse", description: "Reverse a posted collection", roles: [CollectionsOfficer], code: 200, input: [], output: CollectionPosting, side_effects: ["POSTED->REVERSED; recompute amount_collected"] }
+  - { method: POST, path: "/factoring/invoices/{invoiceId}/adjustments", description: "Record dilution/credit-memo/chargeback adjustment", roles: [CollectionsOfficer, FundingOfficer], code: 201, input: [type, amount_cents, reason], output: Adjustment, side_effects: ["recompute dilution_cents when type in {DILUTION, CREDIT_MEMO}"] }
+  - { method: GET, path: "/factoring/adjustments", description: "List adjustments (filter by invoice_id, type); reverse-reachability for Adjustment.invoice_id", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: ["invoice_id?", "type?", "limit?", "offset?"], output: "Adjustment[]", side_effects: [] }
+  - { method: GET, path: "/factoring/adjustments/{adjustmentId}", description: "Read a single adjustment", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: [], output: Adjustment, side_effects: [] }
+  - { method: POST, path: "/factoring/invoices/{invoiceId}/close-collection", description: "Close partially-collected OUTSTANDING invoice as SHORT_PAID", roles: [CollectionsOfficer], code: 200, input: [], output: Invoice, side_effects: ["OUTSTANDING->SHORT_PAID; partial settlement waterfall; Client.version+1"] }
+  - { method: POST, path: "/factoring/invoices/{invoiceId}/buyback", description: "Client recourse buyback of an invoice", roles: [CollectionsOfficer], code: 200, input: [trigger_reason], output: Buyback, side_effects: ["SHORT_PAID/OUTSTANDING->BOUGHT_BACK; compute buyback_amount; release reserve; Client.version+1"] }
+  - { method: GET, path: "/factoring/buybacks", description: "List buybacks (filter by invoice_id); reverse-reachability for Buyback.invoice_id", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: ["invoice_id?", "limit?", "offset?"], output: "Buyback[]", side_effects: [] }
+  - { method: GET, path: "/factoring/buybacks/{buybackId}", description: "Read a single buyback", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: [], output: Buyback, side_effects: [] }
+  - { method: POST, path: "/factoring/invoices/{invoiceId}/write-off", description: "Write off uncollectible NON_RECOURSE invoice", roles: [UnderwritingOfficer], code: 200, input: [], output: Invoice, side_effects: ["OUTSTANDING/SHORT_PAID->WRITTEN_OFF; factor absorbs loss; release reserve; Client.version+1"] }
+  - { method: GET, path: "/factoring/settlements", description: "List settlements (filter by invoice_id); reverse-reachability for Settlement.invoice_id", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: ["invoice_id?", "limit?", "offset?"], output: "Settlement[]", side_effects: [] }
+  - { method: GET, path: "/factoring/settlements/{settlementId}", description: "Read a single settlement", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: [], output: Settlement, side_effects: [] }
+
+  # ---- PurchaseBatch ----
+  - { method: POST, path: "/factoring/purchase-batches", description: "Create funding batch (DRAFT)", roles: [FundingOfficer], code: 201, input: [client_id, batch_reference, invoice_ids], output: PurchaseBatch, side_effects: ["status=DRAFT"] }
+  - { method: GET, path: "/factoring/purchase-batches", description: "List purchase batches (filter by client_id, status); reverse-reachability for PurchaseBatch.client_id", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: ["client_id?", "status?", "limit?", "offset?"], output: "PurchaseBatch[]", side_effects: [] }
+  - { method: GET, path: "/factoring/purchase-batches/{batchId}", description: "Read purchase batch", roles: [PlatformAdmin, UnderwritingOfficer, FundingOfficer, CollectionsOfficer], code: 200, input: [], output: PurchaseBatch, side_effects: [] }
+  - { method: POST, path: "/factoring/purchase-batches/{batchId}/fund", description: "Fund all VERIFIED invoices in the batch (all-or-nothing); OCC on Client.version", roles: [FundingOfficer], code: 200, input: [expected_client_version], output: PurchaseBatch, side_effects: ["DRAFT->FUNDED (each invoice VERIFIED->FUNDED) or DRAFT->FAILED rollback; Client.version+1 per funded invoice"] }
+
+  # ---- Logical clock (test-driving) ----
+  - { method: POST, path: "/_clock/set_current_utc", description: "Set the server logical clock. Server startup default is 2026-05-01T00:00:00Z; before any set call the clock reads exactly this default and never falls back to wall-clock time. All due_date/aging/fee-accrual rules read this clock; advancing it recomputes aging_bucket and fires FUNDED->OUTSTANDING for invoices now past due.", roles: [PlatformAdmin], code: 200, input: [to_iso8601], output: null, side_effects: ["advance logical clock; recompute aging_bucket; auto FUNDED->OUTSTANDING for invoices now past due"] }
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/invalid X-User-Role or X-User-ID headers" }
+  - { id: ERR_UNAUTHORIZED, http: 403, condition: "Role not permitted for this operation" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "Funding X-User-ID equals the credit_decision_user_id of the client or debtor of an invoice in the batch" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path resource or referenced FK does not exist" }
+  - { id: ERR_INVALID_REQUEST, http: 422, condition: "Missing/ill-typed field, enum out of set, non-positive amount, due_date<=issue_date, rate out of range" }
+  - { id: ERR_DUPLICATE_INVOICE_NUMBER, http: 409, condition: "invoice_number already used by a non-REJECTED invoice of the same client" }
+  - { id: ERR_DUPLICATE_RELATIONSHIP, http: 409, condition: "An ACTIVE (client_id, debtor_id) relationship already exists" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_client_version does not match current Client.version (OCC)" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Requested transition not defined from the resource's current state" }
+  - { id: ERR_NOTICE_NOT_SENT, http: 409, condition: "Verify/fund attempted while relationship notice_status != NOTICED" }
+  - { id: ERR_PARTY_NOT_APPROVED, http: 409, condition: "send-notice/resume requires Client and Debtor both APPROVED" }
+  - { id: ERR_VERIFICATION_MISMATCH, http: 409, condition: "confirmed_amount_cents != face_amount_cents or method WAIVED while verification_required==true" }
+  - { id: ERR_FUNDING_BLOCKED, http: 409, condition: "Funding blocked: client not APPROVED, program SUSPENDED, or relationship not NOTICED" }
+  - { id: ERR_CONCENTRATION_EXCEEDED, http: 409, condition: "Post-add debtor exposure ratio exceeds relationship concentration limit" }
+  - { id: ERR_DEBTOR_CEILING_EXCEEDED, http: 409, condition: "Debtor outstanding face + candidate face exceeds approved_credit_ceiling_cents" }
+  - { id: ERR_CREDIT_LIMIT_EXCEEDED, http: 409, condition: "Candidate advance exceeds client remaining credit headroom" }
+  - { id: ERR_NON_RECOURSE_NO_BUYBACK, http: 409, condition: "Buyback on a NON_RECOURSE invoice with no dilution, or OUTSTANDING buyback on a NON_RECOURSE relationship" }
+  - { id: ERR_RECOURSE_GRACE_ACTIVE, http: 409, condition: "OUTSTANDING buyback before due_date + recourse_grace_days has elapsed" }
+  - { id: ERR_WRITEOFF_NOT_ELIGIBLE, http: 409, condition: "Write-off without NON_RECOURSE + INSOLVENT debtor, or a DILUTION adjustment present" }
+  - { id: ERR_CLIENT_HAS_OUTSTANDING, http: 409, condition: "Client close with nonzero funded_advance_outstanding_cents or reserve_balance_cents" }
+  - { id: ERR_OVERPAYMENT, http: 409, condition: "Posting amount exceeds remaining collectible face, or reversing a non-POSTED posting" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Operational super-user: creates programs/clients/debtors, suspends program. Cannot make credit decisions, fund, or post collections."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /factoring/programs"
+      - "POST /factoring/programs/{programId}/suspend"
+    shared_operations:
+      - "POST /factoring/clients"
+      - "POST /factoring/debtors"
+      - "all GET reads"
+
+  - name: UnderwritingOfficer
+    description: "Makes client & debtor credit decisions, suspends/reinstates/closes clients, declares insolvency, writes off. Cannot fund an invoice whose client/debtor it credit-approved (segregation of duties)."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /factoring/clients/{clientId}/credit-decision"
+      - "POST /factoring/debtors/{debtorId}/credit-decision"
+      - "POST /factoring/clients/{clientId}/suspend"
+      - "POST /factoring/clients/{clientId}/reinstate"
+      - "POST /factoring/clients/{clientId}/close"
+      - "POST /factoring/debtors/{debtorId}/declare-insolvent"
+      - "POST /factoring/invoices/{invoiceId}/write-off"
+    shared_operations:
+      - "POST /factoring/clients"
+      - "POST /factoring/debtors"
+      - "POST /factoring/relationships"
+      - "all GET reads"
+
+  - name: FundingOfficer
+    description: "Submits/verifies/rejects invoices, manages relationships & notices, creates and funds purchase batches. Cannot make credit decisions or post collections."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /factoring/invoices"
+      - "POST /factoring/invoices/{invoiceId}/verify"
+      - "POST /factoring/invoices/{invoiceId}/reject"
+      - "POST /factoring/relationships/{relationshipId}/send-notice"
+      - "POST /factoring/relationships/{relationshipId}/suspend"
+      - "POST /factoring/relationships/{relationshipId}/resume"
+      - "POST /factoring/purchase-batches"
+      - "POST /factoring/purchase-batches/{batchId}/fund"
+    shared_operations:
+      - "POST /factoring/relationships"
+      - "POST /factoring/invoices/{invoiceId}/adjustments"
+      - "all GET reads"
+
+  - name: CollectionsOfficer
+    description: "Posts/reverses collections, records adjustments, closes short-paid invoices, triggers settlement and recourse buyback. Cannot fund or make credit decisions."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /factoring/invoices/{invoiceId}/postings"
+      - "POST /factoring/postings/{postingId}/reverse"
+      - "POST /factoring/invoices/{invoiceId}/close-collection"
+      - "POST /factoring/invoices/{invoiceId}/buyback"
+    shared_operations:
+      - "POST /factoring/invoices/{invoiceId}/adjustments"
+      - "all GET reads"

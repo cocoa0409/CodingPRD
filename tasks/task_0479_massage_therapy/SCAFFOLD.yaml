@@ -1,0 +1,1795 @@
+scenario: "Massage Therapy Practice: therapist license & modality, appointment & room/table, intake & SOAP/contraindication, membership/package & rollover credit, insurance/HSA & superbill, gratuity & commission, draping/consent policy, no-show fee"
+domain_name: massage-therapy-practice
+api_prefix: /practice
+
+complexity_profile:
+  primary_archetype: temporal_windowing
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - scheduled_deferred_actions      # logical clock drives appointment windows, credit expiry, no-show grace
+    - rate_threshold_triggers         # commission tiers, no-show fee proration breakpoints, rollover cap
+    - derived_field_reconciliation    # package credit_balance, therapist commission accrual, client wallet
+    - optimistic_concurrency          # OCC on Table.version for double-booking-on-supersede
+
+  entity_topology: flat
+  # Peer entities linked by FK references (client_id, therapist_id, table_id, package_id, appointment_id).
+  # No nested ownership URL chains; everything is /practice/<collection>/{id} with FK fields in bodies.
+
+  state_machine_shape: parallel
+  # Appointment carries two independent state axes: scheduling_status × settlement_status.
+  # Package has a cyclic ACTIVE<->SUSPENDED loop. SoapNote has a branching revise/finalize loop.
+
+  relationship_patterns:
+    - one_to_many        # Client -> Appointment, Therapist -> Appointment, Package -> CreditLedgerEntry
+    - cross_aggregate    # Appointment references Client, Therapist, Table, Package, ConsentRecord
+
+  role_model: peer_roles
+  # FrontDesk books/settles; Therapist documents SOAP and owns commission; Client holds membership/package;
+  # PracticeAdmin configures plans, modalities, commission tiers, and drives the clock.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+
+  - name: Modality
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Modality name (e.g. Swedish, Deep Tissue, Prenatal, Lymphatic)."
+        constraints: "unique among non-archived modalities, case-insensitive"
+      - name: code
+        type: string
+        source: input
+        description: "Short uppercase code, immutable after creation."
+        constraints: "matches ^[A-Z]{2,8}$; unique among all modalities"
+      - name: requires_certification
+        type: boolean
+        source: input
+        description: "When true, a therapist must hold an ACTIVE certification entry for this modality.code to be assignable to appointments of this modality."
+        default: false
+      - name: base_price_cents
+        type: integer
+        source: input
+        description: "List price for a 60-minute session of this modality, in cents."
+        constraints: ">= 0"
+      - name: contraindication_tags
+        type: array
+        source: input
+        description: "Tags (e.g. PREGNANCY, HYPERTENSION, RECENT_SURGERY) that, if present on a client's intake risk_flags, block booking this modality unless a clearing SOAP note exists."
+        default: "[]"
+      - name: archived
+        type: boolean
+        source: system
+        description: "Soft-delete flag; archived modalities are hidden from default lists and cannot be assigned to new appointments."
+        default: false
+
+  - name: Therapist
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Therapist legal name."
+      - name: license_number
+        type: string
+        source: input
+        description: "State massage therapy license number, immutable after creation."
+        constraints: "unique among all therapists; matches ^LMT-[0-9]{6}$"
+      - name: license_expiry
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC instant the license expires. A therapist whose license_expiry <= clock.now is LICENSE_EXPIRED and cannot be assigned to appointments."
+      - name: license_status
+        type: enum
+        source: computed
+        description: "Derived from license_expiry vs clock.now: ACTIVE when license_expiry > now, LICENSE_EXPIRED when license_expiry <= now."
+        constraints: "one of {ACTIVE, LICENSE_EXPIRED}"
+      - name: commission_scheme
+        type: enum
+        source: input
+        description: "Which commission table applies: FLAT (single rate) or TIERED (monthly cumulative breakpoints)."
+        default: TIERED
+        constraints: "one of {FLAT, TIERED}"
+      - name: flat_commission_pct
+        type: number
+        source: input
+        description: "Commission rate as a fraction (e.g. 0.40) used only when commission_scheme == FLAT."
+        default: "0.40"
+        constraints: ">= 0 and <= 1"
+      - name: accrued_commission_cents
+        type: integer
+        source: computed
+        description: "Running total of commission credited to this therapist for the current commission month (since last commission reset). Recomputed on every appointment that reaches settlement_status PAID."
+        default: 0
+      - name: mtd_service_revenue_cents
+        type: integer
+        source: computed
+        description: "Month-to-date service revenue (pre-gratuity, post-discount service charge) attributed to this therapist, used to select the active commission tier. Reset by the commission reset endpoint."
+        default: 0
+
+  - name: TherapistCertification
+    parent: null
+    common_fields: true
+    fields:
+      - name: therapist_id
+        type: string
+        source: input
+        description: "FK -> Therapist.id; the therapist holding this certification."
+      - name: modality_code
+        type: string
+        source: input
+        description: "FK -> Modality.code is NOT used; this is the Modality.code value (string match), naming which modality the certification authorizes."
+        constraints: "must equal the code of a non-archived Modality"
+      - name: cert_status
+        type: enum
+        source: computed
+        description: "ACTIVE when clock.now < cert_expiry, EXPIRED when clock.now >= cert_expiry. Only ACTIVE certifications satisfy a modality's requires_certification gate."
+        constraints: "one of {ACTIVE, EXPIRED}"
+      - name: cert_expiry
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC instant this certification expires."
+
+  - name: Table
+    parent: null
+    common_fields: true
+    fields:
+      - name: label
+        type: string
+        source: input
+        description: "Human label for the table/room (e.g. Room 1 Table A)."
+        constraints: "unique among non-archived tables"
+      - name: room
+        type: string
+        source: input
+        description: "Room grouping the table sits in."
+      - name: turnover_buffer_minutes
+        type: integer
+        source: input
+        description: "Minimum gap, in minutes, the table needs between the end of one appointment and the start of the next (cleaning/turnover). Two appointments on this table whose intervals are closer than this buffer collide."
+        default: 15
+        constraints: ">= 0 and <= 120"
+      - name: supports_prenatal
+        type: boolean
+        source: input
+        description: "When false, an appointment whose modality.code == 'PRENATAL' cannot be booked on this table."
+        default: true
+      - name: archived
+        type: boolean
+        source: system
+        description: "Soft-delete flag; archived tables reject new appointment bookings."
+        default: false
+
+  - name: Client
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Client legal name."
+      - name: email
+        type: string
+        source: input
+        description: "Client email, unique among non-archived clients."
+        constraints: "unique; matches a basic email pattern"
+      - name: hsa_balance_cents
+        type: integer
+        source: input
+        description: "Available HSA/FSA card balance in cents, decremented when an appointment is settled with payer HSA."
+        default: 0
+        constraints: ">= 0"
+      - name: wallet_credit_cents
+        type: integer
+        source: computed
+        description: "Store credit balance in cents (e.g. from package refunds or overpayment), applied before card charges at settlement."
+        default: 0
+      - name: no_show_strikes
+        type: integer
+        source: computed
+        description: "Count of NO_SHOW appointments in the trailing strike window; the third strike within the window raises the no-show fee multiplier. Incremented when an appointment transitions to NO_SHOW, decremented when that NO_SHOW is waived."
+        default: 0
+      - name: archived
+        type: boolean
+        source: system
+        description: "Soft-delete flag."
+        default: false
+
+  - name: Intake
+    parent: null
+    common_fields: true
+    fields:
+      - name: client_id
+        type: string
+        source: input
+        description: "FK -> Client.id; the client this intake belongs to."
+      - name: risk_flags
+        type: array
+        source: input
+        description: "Contraindication risk tags declared by the client (e.g. PREGNANCY, HYPERTENSION, RECENT_SURGERY). Matched against a modality's contraindication_tags at booking time."
+        default: "[]"
+      - name: intake_status
+        type: enum
+        source: system
+        description: "DRAFT on creation; ACTIVE once signed. Only an ACTIVE intake satisfies the booking precondition that a client has a valid intake."
+        default: DRAFT
+        constraints: "one of {DRAFT, ACTIVE, SUPERSEDED}"
+      - name: signed_at
+        type: datetime
+        source: system
+        description: "Clock instant the intake was signed (moved DRAFT -> ACTIVE); null while DRAFT."
+      - name: expires_at
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC instant after which the intake is stale; an intake with expires_at <= clock.now does not satisfy the booking precondition even while intake_status == ACTIVE."
+
+  - name: ConsentRecord
+    parent: null
+    common_fields: true
+    fields:
+      - name: client_id
+        type: string
+        source: input
+        description: "FK -> Client.id; the client granting consent."
+      - name: draping_policy
+        type: enum
+        source: input
+        description: "The draping arrangement the client consents to: FULL_DRAPE, PARTIAL_DRAPE, or DECLINE_TREATMENT. DECLINE_TREATMENT cannot be used to book."
+        constraints: "one of {FULL_DRAPE, PARTIAL_DRAPE, DECLINE_TREATMENT}"
+      - name: sensitive_area_consent
+        type: boolean
+        source: input
+        description: "Whether the client consents to glute/abdominal work; required true for modalities tagged sensitive (DEEP_TISSUE)."
+        default: false
+      - name: consent_status
+        type: enum
+        source: system
+        description: "ACTIVE on creation; REVOKED once revoked. Only ACTIVE consent satisfies booking. Revoking consent referenced by a non-terminal appointment cascades to cancel that appointment."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, REVOKED}"
+
+  - name: MembershipPlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Plan name (e.g. Monthly 1-Session, Monthly 2-Session)."
+        constraints: "unique among non-archived plans"
+      - name: monthly_fee_cents
+        type: integer
+        source: input
+        description: "Recurring monthly membership fee in cents."
+        constraints: ">= 0"
+      - name: included_sessions
+        type: integer
+        source: input
+        description: "Number of 60-minute session credits granted each billing cycle."
+        constraints: ">= 1"
+      - name: member_discount_pct
+        type: number
+        source: input
+        description: "Discount fraction applied to the modality base price for sessions beyond the included credits, and to add-ons (e.g. 0.20)."
+        default: "0.15"
+        constraints: ">= 0 and <= 1"
+      - name: rollover_cap_sessions
+        type: integer
+        source: input
+        description: "Maximum number of unused session credits that may roll into the next cycle; credits above this cap are forfeited at renewal."
+        default: 1
+        constraints: ">= 0"
+      - name: archived
+        type: boolean
+        source: system
+        description: "Soft-delete flag."
+        default: false
+
+  - name: Package
+    parent: null
+    common_fields: true
+    fields:
+      - name: client_id
+        type: string
+        source: input
+        description: "FK -> Client.id; the member who owns this package/membership."
+      - name: plan_id
+        type: string
+        source: input
+        description: "FK -> MembershipPlan.id; the plan this package instantiates."
+      - name: credit_balance_sessions
+        type: integer
+        source: computed
+        description: "Current unused session credits available to spend on appointments. Debited 1 per membership-redeemed appointment, credited at each renewal (subject to rollover cap), refunded on appointment cancellation."
+        default: 0
+      - name: cycle_anchor_day
+        type: integer
+        source: input
+        description: "Day-of-month (1-28) the membership renews; renewal grants included_sessions and applies the rollover cap."
+        default: 1
+        constraints: ">= 1 and <= 28"
+      - name: current_cycle_end
+        type: datetime
+        source: computed
+        description: "ISO 8601 UTC instant the current cycle ends; the renewal endpoint advances this and re-grants credits."
+      - name: package_status
+        type: enum
+        source: system
+        description: "ACTIVE | SUSPENDED | CANCELLED. SUSPENDED packages keep their credit_balance but cannot be redeemed; renewals are skipped while SUSPENDED."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED, CANCELLED}"
+
+  - name: CreditLedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: package_id
+        type: string
+        source: input
+        description: "FK -> Package.id; the package whose credit balance this entry adjusts."
+      - name: delta_sessions
+        type: integer
+        source: system
+        description: "Signed change to credit_balance_sessions (+included on renewal, -forfeited on rollover cap, -1 on redemption, +1 on cancellation refund)."
+      - name: reason
+        type: enum
+        source: system
+        description: "Why the entry was written."
+        constraints: "one of {GRANT, ROLLOVER_FORFEIT, REDEEM, REFUND, EXPIRE}"
+      - name: balance_after
+        type: integer
+        source: system
+        description: "credit_balance_sessions immediately after this entry was applied; the running ledger invariant: latest balance_after == Package.credit_balance_sessions."
+
+  - name: CommissionTier
+    parent: null
+    common_fields: true
+    fields:
+      - name: tier_index
+        type: integer
+        source: input
+        description: "Ordering index (0-based) of this tier among the global TIERED schedule; lower index = lower revenue band."
+        constraints: ">= 0; unique among non-archived tiers"
+      - name: floor_revenue_cents
+        type: integer
+        source: input
+        description: "Inclusive lower bound (>=) of month-to-date service revenue, in cents, at which this tier's rate begins to apply marginally."
+        constraints: ">= 0"
+      - name: commission_pct
+        type: number
+        source: input
+        description: "Marginal commission fraction applied to the slice of MTD revenue at or above this tier's floor and below the next tier's floor."
+        constraints: ">= 0 and <= 1"
+      - name: archived
+        type: boolean
+        source: system
+        description: "Soft-delete flag."
+        default: false
+
+  - name: Appointment
+    parent: null
+    common_fields: true
+    fields:
+      - name: client_id
+        type: string
+        source: input
+        description: "FK -> Client.id; the client receiving the session."
+      - name: therapist_id
+        type: string
+        source: input
+        description: "FK -> Therapist.id; the assigned therapist."
+      - name: table_id
+        type: string
+        source: input
+        description: "FK -> Table.id; the table/room occupied for the session."
+      - name: modality_id
+        type: string
+        source: input
+        description: "FK -> Modality.id; the modality of the session."
+      - name: consent_id
+        type: string
+        source: input
+        description: "FK -> ConsentRecord.id; the active consent governing this session."
+      - name: package_id
+        type: string
+        source: input
+        description: "FK -> Package.id; set when the session is redeemed against a membership package; null for cash/insurance sessions."
+      - name: start_at
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC session start instant."
+      - name: duration_minutes
+        type: integer
+        source: input
+        description: "Session length in minutes; drives price proration (price = base_price_cents * duration/60) and table interval [start_at, start_at + duration]."
+        default: 60
+        constraints: "one of {30, 60, 90, 120}"
+      - name: end_at
+        type: datetime
+        source: computed
+        description: "start_at + duration_minutes; the exclusive end of the table occupation interval."
+      - name: payer
+        type: enum
+        source: input
+        description: "Who pays the client-owed portion at settlement: CASH (card/cash), HSA (decrements Client.hsa_balance_cents), or MEMBERSHIP (redeems a package credit). Insurance is handled via superbill, not as payer."
+        default: CASH
+        constraints: "one of {CASH, HSA, MEMBERSHIP}"
+      - name: gratuity_cents
+        type: integer
+        source: input
+        description: "Tip amount in cents, captured at settlement; excluded from the commission revenue base but paid 100% to the therapist."
+        default: 0
+        constraints: ">= 0"
+      - name: scheduling_status
+        type: enum
+        source: system
+        description: "Scheduling axis: SCHEDULED -> CHECKED_IN -> COMPLETED, or SCHEDULED -> {CANCELLED, NO_SHOW}. Independent of settlement_status."
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, CHECKED_IN, COMPLETED, CANCELLED, NO_SHOW}"
+      - name: settlement_status
+        type: enum
+        source: system
+        description: "Settlement axis: UNSETTLED -> PRICED -> PAID, or UNSETTLED/PRICED -> VOID. Evolves independently of scheduling_status until settlement requires COMPLETED or NO_SHOW."
+        default: UNSETTLED
+        constraints: "one of {UNSETTLED, PRICED, PAID, VOID}"
+      - name: service_charge_cents
+        type: integer
+        source: computed
+        description: "The priced service amount (post-discount, pre-gratuity, pre-credit) for this appointment; set when settlement_status moves to PRICED."
+        default: 0
+      - name: client_owed_cents
+        type: integer
+        source: computed
+        description: "Amount the client must pay after wallet credit and membership redemption are applied; the figure charged to CASH/HSA payers at PAID."
+        default: 0
+      - name: commission_credited_cents
+        type: integer
+        source: computed
+        description: "Commission credited to the therapist for this appointment when it reaches PAID; computed from the active tier(s) over the therapist's MTD revenue slice this appointment occupies, net of gratuity."
+        default: 0
+      - name: no_show_fee_cents
+        type: integer
+        source: computed
+        description: "Fee assessed when the appointment becomes NO_SHOW; prorated by lead time before start_at and scaled by the client's strike multiplier."
+        default: 0
+      - name: cancel_reason
+        type: enum
+        source: input
+        description: "Reason supplied on cancellation; CLIENT_REQUEST within the free window waives any fee, LATE_CANCEL inside the window may incur a prorated fee."
+        constraints: "one of {CLIENT_REQUEST, LATE_CANCEL, CONSENT_REVOKED, PRACTICE_CANCEL}"
+
+  - name: SoapNote
+    parent: null
+    common_fields: true
+    fields:
+      - name: appointment_id
+        type: string
+        source: input
+        description: "FK -> Appointment.id; the session this clinical note documents."
+      - name: subjective
+        type: string
+        source: input
+        description: "S: client-reported symptoms."
+      - name: objective
+        type: string
+        source: input
+        description: "O: therapist findings."
+      - name: assessment
+        type: string
+        source: input
+        description: "A: assessment."
+      - name: plan
+        type: string
+        source: input
+        description: "P: treatment plan."
+      - name: clears_contraindication_tags
+        type: array
+        source: input
+        description: "Contraindication tags this note clears (therapist documents that the client's risk for these tags has been evaluated and cleared), unblocking future bookings of modalities carrying those tags for this client."
+        default: "[]"
+      - name: note_status
+        type: enum
+        source: system
+        description: "DRAFT -> FINALIZED, with FINALIZED -> DRAFT allowed once (amendment loop) before re-finalizing. Only a FINALIZED note clears contraindication tags and unlocks the appointment's settlement gate for COMPLETED."
+        default: DRAFT
+        constraints: "one of {DRAFT, FINALIZED, AMENDED}"
+
+  - name: Superbill
+    parent: null
+    common_fields: true
+    fields:
+      - name: appointment_id
+        type: string
+        source: input
+        description: "FK -> Appointment.id; the PAID appointment this insurance superbill documents."
+      - name: client_id
+        type: string
+        source: input
+        description: "FK -> Client.id; the patient on the superbill (denormalized from the appointment for the claim form)."
+      - name: diagnosis_codes
+        type: array
+        source: input
+        description: "ICD-10 codes supporting medical necessity."
+        constraints: "at least one code"
+      - name: cpt_code
+        type: string
+        source: input
+        description: "CPT/service code for the bodywork rendered (e.g. 97124, 97140)."
+      - name: billable_amount_cents
+        type: integer
+        source: computed
+        description: "The reimbursable service amount placed on the superbill: equals the appointment service_charge_cents (gratuity and membership discounts excluded from insurance claims)."
+        default: 0
+      - name: superbill_status
+        type: enum
+        source: system
+        description: "ISSUED on creation; VOID when explicitly voided via POST /practice/superbills/{id}/void (e.g. claim correction/rebill)."
+        default: ISSUED
+        constraints: "one of {ISSUED, VOID}"
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+
+  - entity: Appointment
+    initial_state: SCHEDULED          # scheduling_status axis
+    terminal_states: [COMPLETED, CANCELLED, NO_SHOW]
+    note: |
+      Appointment has TWO parallel state axes that evolve independently:
+        (A) scheduling_status: SCHEDULED -> CHECKED_IN -> COMPLETED ; SCHEDULED -> CANCELLED ; SCHEDULED|CHECKED_IN -> NO_SHOW
+        (B) settlement_status: UNSETTLED -> PRICED -> PAID ; UNSETTLED|PRICED -> VOID
+      The two axes are coupled only at named guard points (price requires COMPLETED or NO_SHOW; pay requires PRICED).
+    transitions:
+      # ---- scheduling axis ----
+      - from: SCHEDULED
+        to: CHECKED_IN
+        trigger: "POST /practice/appointments/{id}/check-in"
+        actor: FrontDesk
+        preconditions:
+          - "scheduling_status == SCHEDULED"
+          - "clock.now < end_at (cannot check in after the session window has fully elapsed)"
+          - "assigned Therapist.license_status == ACTIVE at clock.now"
+          - "ConsentRecord.consent_status == ACTIVE"
+        side_effects:
+          - "set scheduling_status = CHECKED_IN"
+          - "increments Appointment.version by 1"
+      - from: CHECKED_IN
+        to: COMPLETED
+        trigger: "POST /practice/appointments/{id}/complete"
+        actor: Therapist
+        preconditions:
+          - "scheduling_status == CHECKED_IN"
+          - "a SoapNote for this appointment exists with note_status == FINALIZED"
+        side_effects:
+          - "set scheduling_status = COMPLETED"
+          - "increments Appointment.version by 1"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /practice/appointments/{id}/cancel"
+        actor: FrontDesk
+        preconditions:
+          - "scheduling_status == SCHEDULED"
+          - "cancel_reason provided"
+        side_effects:
+          - "set scheduling_status = CANCELLED"
+          - "if payer == MEMBERSHIP and a credit was debited at booking: write CreditLedgerEntry(reason=REFUND, delta=+1) and recompute Package.credit_balance_sessions (cascade: REFUND -> Package.credit_balance recompute -> latest ledger balance_after invariant)"
+          - "if cancel inside free window (clock.now > start_at - free_cancel_window): compute no_show_fee_cents via late-cancel proration calc and set settlement to PRICED with that fee; else no_show_fee_cents = 0"
+          - "release table interval (table no longer occupied)"
+          - "increments Appointment.version by 1"
+      - from: CHECKED_IN
+        to: CANCELLED
+        trigger: "POST /practice/appointments/{id}/cancel"
+        actor: FrontDesk
+        preconditions:
+          - "scheduling_status == CHECKED_IN"
+          - "cancel_reason provided"
+        side_effects:
+          - "set scheduling_status = CANCELLED"
+          - "if payer == MEMBERSHIP: write CreditLedgerEntry(reason=REFUND, delta=+1) and recompute Package.credit_balance_sessions"
+          - "release table interval"
+          - "increments Appointment.version by 1"
+      - from: SCHEDULED
+        to: NO_SHOW
+        trigger: "POST /practice/appointments/{id}/no-show"
+        actor: FrontDesk
+        preconditions:
+          - "scheduling_status == SCHEDULED"
+          - "clock.now >= start_at (cannot mark no-show before the slot starts)"
+        side_effects:
+          - "set scheduling_status = NO_SHOW"
+          - "increment Client.no_show_strikes by 1 (cascade: strike bump -> recompute strike multiplier used by next no-show fee)"
+          - "compute no_show_fee_cents via no-show proration calc (uses strike multiplier just updated)"
+          - "set settlement_status = PRICED, service_charge_cents = 0, client_owed_cents = no_show_fee_cents"
+          - "if payer == MEMBERSHIP and a credit was debited at booking: write CreditLedgerEntry(reason=REFUND, delta=+1) and recompute Package.credit_balance_sessions"
+          - "release table interval"
+          - "increments Appointment.version by 1"
+      - from: CHECKED_IN
+        to: NO_SHOW
+        trigger: "POST /practice/appointments/{id}/no-show"
+        actor: FrontDesk
+        preconditions:
+          - "scheduling_status == CHECKED_IN"
+          - "clock.now >= start_at"
+        side_effects:
+          - "same side-effects as SCHEDULED -> NO_SHOW"
+          - "increments Appointment.version by 1"
+      - from: NO_SHOW
+        to: SCHEDULED
+        trigger: "POST /practice/appointments/{id}/waive-no-show"
+        actor: PracticeAdmin
+        preconditions:
+          - "scheduling_status == NO_SHOW"
+          - "settlement_status != PAID (cannot waive a collected fee)"
+        side_effects:
+          - "set scheduling_status = SCHEDULED (re-open) — this is the cyclic revert"
+          - "decrement Client.no_show_strikes by 1 (compensating: undoes the strike bump; floor at 0)"
+          - "set settlement_status = UNSETTLED, no_show_fee_cents = 0, client_owed_cents = 0 (compensation: undo PRICED no-show fee)"
+          - "increments Appointment.version by 1"
+        note: "Compensating revert; the conserved quantity 'strikes minus waives' must net to zero across NO_SHOW then waive."
+      # ---- settlement axis ----
+      - from: UNSETTLED
+        to: PRICED
+        trigger: "POST /practice/appointments/{id}/price"
+        actor: FrontDesk
+        preconditions:
+          - "settlement_status == UNSETTLED"
+          - "scheduling_status == COMPLETED (priced via service; NO_SHOW pricing is automatic on the no-show transition, not via this endpoint)"
+        side_effects:
+          - "compute service_charge_cents via service-pricing calc (modality base prorated by duration, member discount applied, add-on rules)"
+          - "compute client_owed_cents = service_charge_cents minus wallet credit applied minus membership redemption value (calc: client-owed-resolution)"
+          - "if payer == MEMBERSHIP and credit_balance_sessions >= 1 and not already debited: write CreditLedgerEntry(reason=REDEEM, delta=-1), recompute Package.credit_balance_sessions"
+          - "set settlement_status = PRICED"
+          - "increments Appointment.version by 1"
+      - from: PRICED
+        to: PAID
+        trigger: "POST /practice/appointments/{id}/pay"
+        actor: FrontDesk
+        preconditions:
+          - "settlement_status == PRICED"
+          - "if payer == HSA: Client.hsa_balance_cents >= client_owed_cents"
+        side_effects:
+          - "set gratuity_cents from request (override booking value)"
+          - "if payer == HSA: decrement Client.hsa_balance_cents by client_owed_cents"
+          - "if wallet credit was applied at PRICED: decrement Client.wallet_credit_cents by the applied amount"
+          - "credit therapist: compute commission_credited_cents via tiered-commission calc over (service_charge_cents added to Therapist.mtd_service_revenue_cents); add gratuity_cents 100% to therapist payout; cascade: pay -> Therapist.mtd_service_revenue_cents += service_charge_cents -> Therapist.accrued_commission_cents += commission_credited_cents + gratuity_cents"
+          - "set settlement_status = PAID"
+          - "increments Appointment.version by 1"
+      - from: UNSETTLED
+        to: VOID
+        trigger: "POST /practice/appointments/{id}/void"
+        actor: PracticeAdmin
+        preconditions:
+          - "settlement_status == UNSETTLED"
+        side_effects:
+          - "set settlement_status = VOID"
+          - "increments Appointment.version by 1"
+      - from: PRICED
+        to: VOID
+        trigger: "POST /practice/appointments/{id}/void"
+        actor: PracticeAdmin
+        preconditions:
+          - "settlement_status == PRICED"
+        side_effects:
+          - "set settlement_status = VOID"
+          - "if a membership credit was redeemed at PRICED: write CreditLedgerEntry(reason=REFUND, delta=+1) and recompute Package.credit_balance_sessions (compensation: undo the redemption)"
+          - "increments Appointment.version by 1"
+        note: "A PRICED appointment never has a Superbill (superbills require PAID), so no superbill cascade fires here."
+
+  - entity: Package
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    note: "Cyclic ACTIVE <-> SUSPENDED loop with a terminal CANCELLED."
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /practice/packages/{id}/suspend"
+        actor: PracticeAdmin
+        preconditions:
+          - "package_status == ACTIVE"
+        side_effects:
+          - "set package_status = SUSPENDED (credits frozen, not forfeited)"
+          - "increments Package.version by 1"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /practice/packages/{id}/resume"
+        actor: PracticeAdmin
+        preconditions:
+          - "package_status == SUSPENDED"
+        side_effects:
+          - "set package_status = ACTIVE"
+          - "increments Package.version by 1"
+        note: "Cyclic revert back to ACTIVE."
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /practice/packages/{id}/renew"
+        actor: PracticeAdmin
+        preconditions:
+          - "package_status == ACTIVE"
+          - "clock.now >= current_cycle_end"
+        side_effects:
+          - "apply rollover: forfeited = max(0, credit_balance_sessions - rollover_cap_sessions); if forfeited > 0 write CreditLedgerEntry(reason=ROLLOVER_FORFEIT, delta=-forfeited)"
+          - "grant: write CreditLedgerEntry(reason=GRANT, delta=+plan.included_sessions)"
+          - "recompute credit_balance_sessions = min(credit_balance_sessions, rollover_cap_sessions) + included_sessions"
+          - "advance current_cycle_end by one cycle"
+          - "increments Package.version by 1"
+        note: "Self-loop renewal; rollover cap applied BEFORE grant (cap then add)."
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /practice/packages/{id}/cancel-membership"
+        actor: PracticeAdmin
+        preconditions:
+          - "package_status == ACTIVE"
+        side_effects:
+          - "if credit_balance_sessions > 0: convert remaining credits to wallet credit on Client (cascade: cancel-membership -> write CreditLedgerEntry(reason=EXPIRE, delta=-credit_balance_sessions) recomputing credit_balance to 0 -> Client.wallet_credit_cents += credit_balance_sessions * round_half_up(plan.monthly_fee_cents / plan.included_sessions))"
+          - "set package_status = CANCELLED"
+          - "increments Package.version by 1"
+      - from: SUSPENDED
+        to: CANCELLED
+        trigger: "POST /practice/packages/{id}/cancel-membership"
+        actor: PracticeAdmin
+        preconditions:
+          - "package_status == SUSPENDED"
+        side_effects:
+          - "same credit-to-wallet conversion as ACTIVE -> CANCELLED"
+          - "increments Package.version by 1"
+
+  - entity: SoapNote
+    initial_state: DRAFT
+    terminal_states: []
+    note: "Branching amendment loop: DRAFT -> FINALIZED -> DRAFT(reopen) -> AMENDED(re-finalize)."
+    transitions:
+      - from: DRAFT
+        to: FINALIZED
+        trigger: "POST /practice/soap-notes/{id}/finalize"
+        actor: Therapist
+        preconditions:
+          - "note_status == DRAFT"
+          - "subjective, objective, assessment, plan all non-empty"
+          - "acting Therapist.id == Appointment.therapist_id (only the assigned therapist finalizes)"
+        side_effects:
+          - "set note_status = FINALIZED"
+          - "for each tag in clears_contraindication_tags: record as cleared for the client (unblocks future bookings of modalities carrying that tag)"
+          - "increments SoapNote.version by 1"
+      - from: FINALIZED
+        to: DRAFT
+        trigger: "POST /practice/soap-notes/{id}/reopen"
+        actor: Therapist
+        preconditions:
+          - "note_status == FINALIZED"
+          - "linked Appointment.settlement_status != PAID (cannot amend after payment)"
+        side_effects:
+          - "set note_status = DRAFT"
+          - "revoke contraindication clearances previously granted by this note (compensation: reopen un-clears the tags it cleared)"
+          - "increments SoapNote.version by 1"
+        note: "Branching revert enabling amendment."
+      - from: DRAFT
+        to: AMENDED
+        trigger: "POST /practice/soap-notes/{id}/finalize"
+        actor: Therapist
+        preconditions:
+          - "note_status == DRAFT AND this note was previously FINALIZED at least once"
+          - "subjective, objective, assessment, plan all non-empty"
+        side_effects:
+          - "set note_status = AMENDED (re-finalize after reopen)"
+          - "re-apply contraindication clearances"
+          - "increments SoapNote.version by 1"
+        note: "AMENDED is treated as finalized for the COMPLETE precondition."
+
+  - entity: Intake
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED]
+    note: "Linear with a sign step; superseded when a newer intake is signed for the same client."
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /practice/intakes/{id}/sign"
+        actor: Client
+        preconditions:
+          - "intake_status == DRAFT"
+          - "acting Client.id == Intake.client_id"
+        side_effects:
+          - "set intake_status = ACTIVE, signed_at = clock.now"
+          - "if the client had a prior ACTIVE intake: set that prior intake intake_status = SUPERSEDED (cascade: sign new -> supersede old)"
+          - "increments Intake.version by 1"
+
+  - entity: ConsentRecord
+    initial_state: ACTIVE
+    terminal_states: [REVOKED]
+    transitions:
+      - from: ACTIVE
+        to: REVOKED
+        trigger: "POST /practice/consent-records/{id}/revoke"
+        actor: Client
+        preconditions:
+          - "consent_status == ACTIVE"
+          - "acting Client.id == ConsentRecord.client_id"
+        side_effects:
+          - "set consent_status = REVOKED"
+          - "for each non-terminal Appointment referencing this consent (scheduling_status in {SCHEDULED, CHECKED_IN}): cancel it with cancel_reason = CONSENT_REVOKED, no fee, and refund membership credit if redeemed (cascade: revoke consent -> cancel appointment -> refund package credit -> Package.credit_balance recompute)"
+          - "increments ConsentRecord.version by 1"
+
+  - entity: Superbill
+    initial_state: ISSUED
+    terminal_states: [VOID]
+    note: "Linear with a single void step for claim correction/rebill."
+    transitions:
+      - from: ISSUED
+        to: VOID
+        trigger: "POST /practice/superbills/{id}/void"
+        actor: FrontDesk
+        preconditions:
+          - "superbill_status == ISSUED"
+        side_effects:
+          - "set superbill_status = VOID"
+          - "increments Superbill.version by 1"
+
+concurrency_rules:
+  - rule_id: appointment-create-stale-table
+    parent_entity: Table
+    write_endpoint: "POST /practice/appointments"
+    occ_field: "expected_table_version"
+    description: |
+      Creating an Appointment that occupies a Table whose version has advanced
+      since the client last observed it is rejected. A prior booking against the
+      same table legitimately advanced the table's version (the table's
+      occupied-interval set changed); the current writer's view of the table is
+      therefore stale, and proceeding could place a colliding interval.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+
+  - name: service_pricing
+    trigger: "On UNSETTLED -> PRICED (POST /practice/appointments/{id}/price), and to derive Superbill.billable_amount_cents."
+    algorithm: threshold
+    formula: |
+      # All money in integer cents; rounding only at the final per-line step.
+      base = modality.base_price_cents * (duration_minutes / 60)          # exact rational
+      if payer == MEMBERSHIP:
+          # MEMBERSHIP always redeems a credit here; the priority-15 gate guarantees
+          # credit_balance_sessions >= 1 has already been enforced before this calc runs,
+          # so this branch never sees a zero balance.
+          service_charge_cents = 0                                        # credit debited instead of a charge
+      elif payer in (CASH, HSA) and the appointment's package_id references a Package
+           whose package_status == ACTIVE and whose client_id == appointment.client_id:
+          # out-of-pocket session for an active member -> member discount applies
+          discounted = base * (1 - plan.member_discount_pct)
+          service_charge_cents = round_half_up(discounted)               # round once, at the end
+      else:
+          # CASH or HSA, no active membership attached
+          service_charge_cents = round_half_up(base)
+      # NO_SHOW path does not use this calc; service_charge_cents = 0 there.
+    input_set: "Single appointment at PRICE time; reads modality.base_price_cents, duration_minutes, payer, package (status + ownership), plan.member_discount_pct."
+    constants:
+      MINUTES_PER_HOUR: 60
+    precision: "round_half_up to integer cents, applied exactly once after the discount multiply (single line; the pinned order is multiply-then-round)."
+    variants:
+      - name: redeemed
+        when: "payer == MEMBERSHIP (credit_balance_sessions >= 1 guaranteed by priority-15 gate)"
+        difference: "service_charge_cents == 0; a credit is debited instead of a charge."
+      - name: member_out_of_pocket_discounted
+        when: "payer in {CASH, HSA} AND an ACTIVE package owned by the client is attached via package_id"
+        difference: "discount multiply then round_half_up; differs from non-member cash by the member_discount_pct factor (e.g. 12000 -> 9600 at 0.20)."
+
+  - name: client_owed_resolution
+    trigger: "On UNSETTLED -> PRICED, after service_pricing, to set client_owed_cents."
+    algorithm: waterfall_allocation
+    formula: |
+      # Waterfall: apply wallet credit first, then the remainder is owed.
+      # Ordered buckets, highest priority first: (1) membership redemption (handled in pricing),
+      # (2) wallet_credit, (3) client_owed remainder.
+      owed = service_charge_cents
+      wallet_applied = min(Client.wallet_credit_cents, owed)             # bucket 2
+      owed = owed - wallet_applied
+      client_owed_cents = owed                                            # bucket 3 (charged at PAID)
+      # wallet_applied is recorded; Client.wallet_credit_cents decrements at PAID, not at PRICE.
+    input_set: "service_charge_cents (from service_pricing), Client.wallet_credit_cents at price time."
+    constants: {}
+    precision: "integer cents; no rounding (all inputs integer)."
+
+  - name: no_show_fee_proration
+    trigger: "On SCHEDULED|CHECKED_IN -> NO_SHOW, and on late cancel (cancel inside the free window)."
+    algorithm: tiered_pricing
+    formula: |
+      # Lead time = minutes between clock.now and start_at at the moment of no-show/cancel.
+      # For NO_SHOW, clock.now >= start_at so lead_minutes <= 0 -> full fee band.
+      lead_minutes = (start_at - clock.now) in minutes                    # may be negative for true no-show
+      base_session = modality.base_price_cents * (duration_minutes / 60)  # exact rational
+      if lead_minutes >= FREE_CANCEL_MINUTES:                # >= 1440 (>=24h): no fee
+          fee_fraction = 0.00
+      elif lead_minutes >= LATE_CANCEL_MINUTES:              # >= 120 and < 1440: 50%
+          fee_fraction = 0.50
+      elif lead_minutes > 0:                                 # > 0 and < 120: 75%
+          fee_fraction = 0.75
+      else:                                                  # <= 0 (no-show): 100%
+          fee_fraction = 1.00
+      strike_multiplier = STRIKE_PENALTY_MULT if Client.no_show_strikes >= STRIKE_THRESHOLD else 1.00
+      raw = base_session * fee_fraction * strike_multiplier
+      no_show_fee_cents = round_half_up(raw)                 # round once at the end (multiply chain then round)
+      # Boundary precision: lead_minutes == 1440 exactly -> 0 fee (>=); lead_minutes == 120 exactly -> 50%.
+      # strike_multiplier uses >= STRIKE_THRESHOLD: the THIRD strike (no_show_strikes == 3) triggers 1.5x.
+    input_set: "modality.base_price_cents, duration_minutes, start_at, clock.now, Client.no_show_strikes (post-increment for no-show, pre for cancel)."
+    constants:
+      FREE_CANCEL_MINUTES: 1440
+      LATE_CANCEL_MINUTES: 120
+      STRIKE_THRESHOLD: 3
+      STRIKE_PENALTY_MULT: 1.50
+    precision: "round_half_up to integer cents, applied once after the full multiply chain (fraction * multiplier). Pinned order: multiply-all-then-round."
+    variants:
+      - name: late_cancel
+        when: "invoked from cancel transition with lead_minutes > 0"
+        difference: "uses pre-increment strike count and a positive lead_minutes band (0.50 or 0.75), never 1.00."
+      - name: true_no_show
+        when: "invoked from no-show transition with lead_minutes <= 0"
+        difference: "always fee_fraction == 1.00 and uses the POST-increment strike count (the strike just added counts)."
+
+  - name: tiered_commission
+    trigger: "On PRICED -> PAID (POST /practice/appointments/{id}/pay); credits the therapist."
+    algorithm: tiered_pricing
+    formula: |
+      # Commission is MARGINAL across global CommissionTier rows, computed on the
+      # therapist's month-to-date service revenue BEFORE and AFTER this appointment's
+      # service_charge_cents is added. Gratuity is NOT part of the revenue base.
+      if therapist.commission_scheme == FLAT:
+          commission_credited_cents = round_half_up(service_charge_cents * therapist.flat_commission_pct)
+      else:  # TIERED
+          tiers = CommissionTier rows where archived == false, sorted by tier_index ASC
+                  (tie-break by floor_revenue_cents ASC, then created_at ASC)
+          old_rev = therapist.mtd_service_revenue_cents
+          new_rev = old_rev + service_charge_cents
+          commission = 0
+          for i, tier in enumerate(tiers):
+              tier_floor = tier.floor_revenue_cents
+              tier_ceiling = tiers[i+1].floor_revenue_cents if i+1 < len(tiers) else +infinity
+              # slice of [old_rev, new_rev) that falls in [tier_floor, tier_ceiling)
+              slice_lo = max(old_rev, tier_floor)
+              slice_hi = min(new_rev, tier_ceiling)
+              slice_amt = max(0, slice_hi - slice_lo)
+              commission += slice_amt * tier.commission_pct              # exact rational accumulation
+          commission_credited_cents = round_half_up(commission)          # round ONCE after summing all slices
+      # gratuity_cents is paid to the therapist in full but is NOT inside commission_credited_cents.
+    input_set: "service_charge_cents, therapist.commission_scheme, therapist.flat_commission_pct, therapist.mtd_service_revenue_cents, all non-archived CommissionTier rows."
+    constants: {}
+    precision: "Exact rational accumulation across tier slices; round_half_up to integer cents ONCE after the full sum (pinned: sum-then-round, NOT round-per-tier)."
+    variants:
+      - name: flat_scheme
+        when: "therapist.commission_scheme == FLAT"
+        difference: "single multiply by flat_commission_pct; tiers ignored."
+      - name: tiered_marginal
+        when: "therapist.commission_scheme == TIERED"
+        difference: "marginal slice accumulation across the MTD-revenue band this appointment occupies; the SAME service_charge can yield different commission depending on where mtd_service_revenue sits."
+
+  - name: package_rollover
+    trigger: "On Package ACTIVE -> ACTIVE renewal (POST /practice/packages/{id}/renew)."
+    algorithm: aggregation
+    formula: |
+      # Pinned evaluation order: CAP THEN GRANT (forfeit excess first, then add the new cycle's credits).
+      kept = min(credit_balance_sessions, plan.rollover_cap_sessions)
+      forfeited = credit_balance_sessions - kept                         # >= 0
+      credit_balance_sessions_new = kept + plan.included_sessions
+      # Ledger: if forfeited > 0 -> CreditLedgerEntry(ROLLOVER_FORFEIT, -forfeited);
+      #         then CreditLedgerEntry(GRANT, +included_sessions).
+      # Invariant: latest CreditLedgerEntry.balance_after == Package.credit_balance_sessions.
+    input_set: "Package.credit_balance_sessions at renewal, plan.rollover_cap_sessions, plan.included_sessions."
+    constants: {}
+    precision: "integer sessions; no rounding."
+    variants:
+      - name: under_cap
+        when: "credit_balance_sessions <= rollover_cap_sessions"
+        difference: "forfeited == 0; all unused credits roll, then grant adds included."
+      - name: over_cap
+        when: "credit_balance_sessions > rollover_cap_sessions"
+        difference: "forfeited == credit_balance_sessions - cap; a ROLLOVER_FORFEIT ledger entry is written before GRANT."
+
+# ===========================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+
+  - priority: 1
+    category: auth
+    check: "X-User-Role header present and is one of the declared roles; X-User-ID present for entity-backed roles."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to call this endpoint per §1.7 RBAC."
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "All path/body referenced resources (client_id, therapist_id, table_id, modality_id, consent_id, package_id, plan_id, appointment_id) exist; validated left-to-right as listed in the path then body."
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 4
+    category: business_constraint
+    check: "Request body well-formed: required fields present, enums valid, integers in declared ranges (duration in {30,60,90,120}, gratuity >= 0, etc.)."
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all writes"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which the requested transition is allowed (e.g., check-in requires scheduling_status == SCHEDULED; pay requires settlement_status == PRICED; finalize requires note_status == DRAFT)."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_table_version on appointment-create matches Table.version; stale -> reject."
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /practice/appointments"
+
+  - priority: 7
+    category: business_safety
+    check: "Consent gate: ConsentRecord.consent_status == ACTIVE, draping_policy != DECLINE_TREATMENT, and (modality not sensitive OR consent.sensitive_area_consent == true) at booking."
+    error_id: ERR_CONSENT_REQUIRED
+    http_status: 422
+    applies_to: "POST /practice/appointments, POST /practice/appointments/{id}/check-in"
+
+  - priority: 8
+    category: business_safety
+    check: "Contraindication gate: for each tag in modality.contraindication_tags that is present in the client's ACTIVE intake.risk_flags, a FINALIZED/AMENDED SoapNote clearing that tag must exist for the client; otherwise booking is blocked."
+    error_id: ERR_CONTRAINDICATION
+    http_status: 422
+    applies_to: "POST /practice/appointments"
+
+  - priority: 9
+    category: business_safety
+    check: "Intake gate: client has an intake with intake_status == ACTIVE and expires_at > clock.now."
+    error_id: ERR_INTAKE_INVALID
+    http_status: 422
+    applies_to: "POST /practice/appointments"
+
+  - priority: 10
+    category: business_referential
+    check: "License gate: assigned Therapist.license_status == ACTIVE (license_expiry > clock.now) at booking and check-in."
+    error_id: ERR_LICENSE_EXPIRED
+    http_status: 422
+    applies_to: "POST /practice/appointments, POST /practice/appointments/{id}/check-in"
+
+  - priority: 11
+    category: business_referential
+    check: "Certification gate: if modality.requires_certification, the therapist holds a TherapistCertification with matching modality_code and cert_status == ACTIVE."
+    error_id: ERR_CERTIFICATION_REQUIRED
+    http_status: 422
+    applies_to: "POST /practice/appointments"
+
+  - priority: 12
+    category: business_constraint
+    check: "Table-suitability gate: if modality.code == 'PRENATAL', Table.supports_prenatal must be true; table not archived."
+    error_id: ERR_TABLE_UNSUITABLE
+    http_status: 422
+    applies_to: "POST /practice/appointments"
+
+  - priority: 13
+    category: business_temporal
+    check: "Table overlap gate: [start_at, end_at] plus turnover_buffer_minutes must not collide with any non-terminal appointment already on the same table (interval-with-buffer adjacency)."
+    error_id: ERR_TABLE_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /practice/appointments"
+
+  - priority: 14
+    category: business_temporal
+    check: "Therapist overlap gate: [start_at, end_at] must not collide with any other non-terminal appointment for the same therapist (closed-interval, no buffer — back-to-back touching is allowed)."
+    error_id: ERR_THERAPIST_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /practice/appointments"
+
+  - priority: 15
+    category: business_fiscal
+    check: "Membership redemption gate: if payer == MEMBERSHIP, package_id provided, Package.package_status == ACTIVE, Package belongs to the appointment's client, and credit_balance_sessions >= 1 at price time (checked at PRICE)."
+    error_id: ERR_NO_CREDITS
+    http_status: 422
+    applies_to: "POST /practice/appointments/{id}/price"
+
+  - priority: 16
+    category: business_fiscal
+    check: "HSA funds gate: if payer == HSA at pay time, Client.hsa_balance_cents >= client_owed_cents."
+    error_id: ERR_INSUFFICIENT_HSA
+    http_status: 422
+    applies_to: "POST /practice/appointments/{id}/pay"
+
+  - priority: 17
+    category: business_referential
+    check: "Superbill gate: appointment.settlement_status == PAID and payer != MEMBERSHIP (membership-redeemed sessions are not insurance-billable)."
+    error_id: ERR_NOT_BILLABLE
+    http_status: 422
+    applies_to: "POST /practice/superbills"
+
+  - priority: 18
+    category: business_temporal
+    check: "Renewal gate: clock.now >= Package.current_cycle_end (cannot renew before cycle end)."
+    error_id: ERR_RENEWAL_TOO_EARLY
+    http_status: 422
+    applies_to: "POST /practice/packages/{id}/renew"
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+
+  # ---- Modality ----
+  - method: POST
+    path: "/practice/modalities"
+    description: "Create a modality."
+    roles: [PracticeAdmin]
+    code: 201
+    input: ["name", "code", "requires_certification?", "base_price_cents", "contraindication_tags?"]
+    output: Modality
+    side_effects: []
+  - method: GET
+    path: "/practice/modalities"
+    description: "List modalities (default excludes archived)."
+    roles: [PracticeAdmin, FrontDesk, Therapist]
+    code: 200
+    input: ["include_archived?", "limit?", "offset?"]
+    output: Modality[]
+    side_effects: []
+  - method: GET
+    path: "/practice/modalities/{id}"
+    description: "Fetch a modality."
+    roles: [PracticeAdmin, FrontDesk, Therapist]
+    code: 200
+    input: []
+    output: Modality
+    side_effects: []
+
+  # ---- Therapist ----
+  - method: POST
+    path: "/practice/therapists"
+    description: "Create a therapist."
+    roles: [PracticeAdmin]
+    code: 201
+    input: ["full_name", "license_number", "license_expiry", "commission_scheme?", "flat_commission_pct?"]
+    output: Therapist
+    side_effects: ["license_status computed from license_expiry vs clock.now"]
+  - method: GET
+    path: "/practice/therapists"
+    description: "List therapists."
+    roles: [PracticeAdmin, FrontDesk]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Therapist[]
+    side_effects: []
+  - method: GET
+    path: "/practice/therapists/{id}"
+    description: "Fetch a therapist (includes accrued_commission_cents, mtd_service_revenue_cents, license_status)."
+    roles: [PracticeAdmin, FrontDesk, Therapist]
+    code: 200
+    input: []
+    output: Therapist
+    side_effects: []
+  - method: POST
+    path: "/practice/therapists/{id}/reset-commission"
+    description: "Reset the therapist's monthly commission accumulators (start a new commission month)."
+    roles: [PracticeAdmin]
+    code: 200
+    input: []
+    output: Therapist
+    side_effects: ["set mtd_service_revenue_cents = 0", "set accrued_commission_cents = 0", "increments Therapist.version by 1"]
+
+  # ---- TherapistCertification ----
+  - method: POST
+    path: "/practice/certifications"
+    description: "Grant a modality certification to a therapist."
+    roles: [PracticeAdmin]
+    code: 201
+    input: [therapist_id, modality_code, cert_expiry]
+    output: TherapistCertification
+    side_effects: ["cert_status computed from cert_expiry vs clock.now"]
+  - method: GET
+    path: "/practice/certifications"
+    description: "List certifications; filter by therapist_id (reverse-reachability for TherapistCertification.therapist_id FK)."
+    roles: [PracticeAdmin, FrontDesk]
+    code: 200
+    input: ["therapist_id?", "limit?", "offset?"]
+    output: TherapistCertification[]
+    side_effects: []
+  - method: GET
+    path: "/practice/certifications/{id}"
+    description: "Fetch a certification."
+    roles: [PracticeAdmin, FrontDesk]
+    code: 200
+    input: []
+    output: TherapistCertification
+    side_effects: []
+
+  # ---- Table ----
+  - method: POST
+    path: "/practice/tables"
+    description: "Create a table/room."
+    roles: [PracticeAdmin]
+    code: 201
+    input: ["label", "room", "turnover_buffer_minutes?", "supports_prenatal?"]
+    output: Table
+    side_effects: []
+  - method: GET
+    path: "/practice/tables"
+    description: "List tables (default excludes archived)."
+    roles: [PracticeAdmin, FrontDesk]
+    code: 200
+    input: ["include_archived?", "limit?", "offset?"]
+    output: Table[]
+    side_effects: []
+  - method: GET
+    path: "/practice/tables/{id}"
+    description: "Fetch a table (includes version for OCC)."
+    roles: [PracticeAdmin, FrontDesk]
+    code: 200
+    input: []
+    output: Table
+    side_effects: []
+
+  # ---- Client ----
+  - method: POST
+    path: "/practice/clients"
+    description: "Create a client."
+    roles: [PracticeAdmin, FrontDesk]
+    code: 201
+    input: ["full_name", "email", "hsa_balance_cents?"]
+    output: Client
+    side_effects: []
+  - method: GET
+    path: "/practice/clients"
+    description: "List clients."
+    roles: [PracticeAdmin, FrontDesk]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Client[]
+    side_effects: []
+  - method: GET
+    path: "/practice/clients/{id}"
+    description: "Fetch a client (includes wallet_credit_cents, hsa_balance_cents, no_show_strikes)."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 200
+    input: []
+    output: Client
+    side_effects: []
+  - method: POST
+    path: "/practice/clients/{id}/wallet-adjustments"
+    description: "Admin adjustment of a client's wallet credit (e.g., goodwill credit, manual correction)."
+    roles: [PracticeAdmin]
+    code: 200
+    input: [delta_cents]
+    output: Client
+    side_effects: ["Client.wallet_credit_cents += delta_cents (floored at 0)", "increments Client.version by 1"]
+
+  # ---- Intake ----
+  - method: POST
+    path: "/practice/intakes"
+    description: "Create a DRAFT intake for a client."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 201
+    input: ["client_id", "risk_flags?", "expires_at"]
+    output: Intake
+    side_effects: []
+  - method: GET
+    path: "/practice/intakes"
+    description: "List intakes; filter by client_id (reverse-reachability for Intake.client_id FK)."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 200
+    input: ["client_id?", "limit?", "offset?"]
+    output: Intake[]
+    side_effects: []
+  - method: GET
+    path: "/practice/intakes/{id}"
+    description: "Fetch an intake."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 200
+    input: []
+    output: Intake
+    side_effects: []
+  - method: POST
+    path: "/practice/intakes/{id}/sign"
+    description: "Sign a DRAFT intake -> ACTIVE."
+    roles: [Client, FrontDesk]
+    code: 200
+    input: []
+    output: Intake
+    side_effects: ["set intake_status = ACTIVE, signed_at = clock.now", "supersede prior ACTIVE intake for the same client", "increments Intake.version by 1"]
+
+  # ---- ConsentRecord ----
+  - method: POST
+    path: "/practice/consent-records"
+    description: "Create an ACTIVE consent record for a client."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 201
+    input: ["client_id", "draping_policy", "sensitive_area_consent?"]
+    output: ConsentRecord
+    side_effects: []
+  - method: GET
+    path: "/practice/consent-records"
+    description: "List consent records; filter by client_id (reverse-reachability for ConsentRecord.client_id FK)."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 200
+    input: ["client_id?", "limit?", "offset?"]
+    output: ConsentRecord[]
+    side_effects: []
+  - method: GET
+    path: "/practice/consent-records/{id}"
+    description: "Fetch a consent record."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 200
+    input: []
+    output: ConsentRecord
+    side_effects: []
+  - method: POST
+    path: "/practice/consent-records/{id}/revoke"
+    description: "Revoke consent -> REVOKED; cascades to cancel non-terminal appointments referencing it."
+    roles: [Client, PracticeAdmin]
+    code: 200
+    input: []
+    output: ConsentRecord
+    side_effects: ["set consent_status = REVOKED", "cancel non-terminal appointments referencing this consent (cancel_reason = CONSENT_REVOKED), refund membership credit if redeemed", "increments ConsentRecord.version by 1"]
+
+  # ---- MembershipPlan ----
+  - method: POST
+    path: "/practice/plans"
+    description: "Create a membership plan."
+    roles: [PracticeAdmin]
+    code: 201
+    input: ["name", "monthly_fee_cents", "included_sessions", "member_discount_pct?", "rollover_cap_sessions?"]
+    output: MembershipPlan
+    side_effects: []
+  - method: GET
+    path: "/practice/plans"
+    description: "List membership plans (default excludes archived)."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 200
+    input: ["include_archived?", "limit?", "offset?"]
+    output: MembershipPlan[]
+    side_effects: []
+  - method: GET
+    path: "/practice/plans/{id}"
+    description: "Fetch a plan."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 200
+    input: []
+    output: MembershipPlan
+    side_effects: []
+
+  # ---- Package ----
+  - method: POST
+    path: "/practice/packages"
+    description: "Enroll a client into a plan (create a Package). Grants included_sessions as initial credits and sets current_cycle_end."
+    roles: [PracticeAdmin, FrontDesk]
+    code: 201
+    input: ["client_id", "plan_id", "cycle_anchor_day?"]
+    output: Package
+    side_effects: ["credit_balance_sessions = plan.included_sessions via CreditLedgerEntry(GRANT)", "set current_cycle_end = clock.now + one cycle", "set package_status = ACTIVE"]
+  - method: GET
+    path: "/practice/packages"
+    description: "List packages; filter by client_id (reverse-reachability for Package.client_id and plan_id FKs) or plan_id."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 200
+    input: ["client_id?", "plan_id?", "limit?", "offset?"]
+    output: Package[]
+    side_effects: []
+  - method: GET
+    path: "/practice/packages/{id}"
+    description: "Fetch a package (includes credit_balance_sessions, current_cycle_end, package_status, version)."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 200
+    input: []
+    output: Package
+    side_effects: []
+  - method: GET
+    path: "/practice/packages/{id}/ledger"
+    description: "List the package's credit ledger entries (reverse-reachability for CreditLedgerEntry.package_id FK)."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CreditLedgerEntry[]
+    side_effects: []
+  - method: POST
+    path: "/practice/packages/{id}/renew"
+    description: "Renew a package: apply rollover cap then grant new credits."
+    roles: [PracticeAdmin]
+    code: 200
+    input: []
+    output: Package
+    side_effects: ["package_rollover calc", "CreditLedgerEntry(ROLLOVER_FORFEIT) if over cap, then CreditLedgerEntry(GRANT)", "advance current_cycle_end", "increments Package.version by 1"]
+  - method: POST
+    path: "/practice/packages/{id}/suspend"
+    description: "Suspend a package (freeze credits)."
+    roles: [PracticeAdmin]
+    code: 200
+    input: []
+    output: Package
+    side_effects: ["set package_status = SUSPENDED", "increments Package.version by 1"]
+  - method: POST
+    path: "/practice/packages/{id}/resume"
+    description: "Resume a suspended package."
+    roles: [PracticeAdmin]
+    code: 200
+    input: []
+    output: Package
+    side_effects: ["set package_status = ACTIVE", "increments Package.version by 1"]
+  - method: POST
+    path: "/practice/packages/{id}/cancel-membership"
+    description: "Cancel a membership; convert remaining credits to wallet credit."
+    roles: [PracticeAdmin]
+    code: 200
+    input: []
+    output: Package
+    side_effects: ["convert credit_balance_sessions to Client.wallet_credit_cents via CreditLedgerEntry(EXPIRE)", "set package_status = CANCELLED", "increments Package.version by 1", "increments Client.version by 1"]
+
+  # ---- CommissionTier ----
+  - method: POST
+    path: "/practice/commission-tiers"
+    description: "Create a global commission tier."
+    roles: [PracticeAdmin]
+    code: 201
+    input: [tier_index, floor_revenue_cents, commission_pct]
+    output: CommissionTier
+    side_effects: []
+  - method: GET
+    path: "/practice/commission-tiers"
+    description: "List commission tiers (default excludes archived), sorted by tier_index."
+    roles: [PracticeAdmin, FrontDesk]
+    code: 200
+    input: ["include_archived?", "limit?", "offset?"]
+    output: CommissionTier[]
+    side_effects: []
+
+  # ---- Appointment ----
+  - method: POST
+    path: "/practice/appointments"
+    description: "Book an appointment (runs consent, contraindication, intake, license, certification, table-suitability, table-overlap, therapist-overlap, and OCC gates). If payer == MEMBERSHIP, the credit is not debited until PRICE."
+    roles: [FrontDesk, PracticeAdmin]
+    code: 201
+    input: ["client_id", "therapist_id", "table_id", "modality_id", "consent_id", "package_id?", "start_at", "duration_minutes?", "payer?", "gratuity_cents?", "expected_table_version"]
+    output: Appointment
+    side_effects: ["compute end_at = start_at + duration_minutes", "occupy table interval [start_at, end_at] with turnover buffer", "increments Table.version by 1 (OCC anchor)", "scheduling_status = SCHEDULED, settlement_status = UNSETTLED"]
+  - method: GET
+    path: "/practice/appointments"
+    description: "List appointments; filter by client_id, therapist_id, table_id, modality_id, consent_id, or package_id (reverse-reachability for all Appointment FKs)."
+    roles: [PracticeAdmin, FrontDesk, Therapist, Client]
+    code: 200
+    input: ["client_id?", "therapist_id?", "table_id?", "modality_id?", "consent_id?", "package_id?", "scheduling_status?", "settlement_status?", "limit?", "offset?"]
+    output: Appointment[]
+    side_effects: []
+  - method: GET
+    path: "/practice/appointments/{id}"
+    description: "Fetch an appointment (includes both status axes, all computed money fields, version)."
+    roles: [PracticeAdmin, FrontDesk, Therapist, Client]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: []
+  - method: POST
+    path: "/practice/appointments/{id}/check-in"
+    description: "Check in a SCHEDULED appointment (re-validates license + consent within check-in window)."
+    roles: [FrontDesk]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["set scheduling_status = CHECKED_IN", "increments Appointment.version by 1"]
+  - method: POST
+    path: "/practice/appointments/{id}/complete"
+    description: "Complete a CHECKED_IN appointment; requires a FINALIZED/AMENDED SoapNote."
+    roles: [Therapist, FrontDesk]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["set scheduling_status = COMPLETED", "increments Appointment.version by 1"]
+  - method: POST
+    path: "/practice/appointments/{id}/cancel"
+    description: "Cancel a SCHEDULED/CHECKED_IN appointment; refund membership credit; possible late-cancel fee."
+    roles: [FrontDesk, PracticeAdmin]
+    code: 200
+    input: [cancel_reason]
+    output: Appointment
+    side_effects: ["set scheduling_status = CANCELLED", "refund membership credit if redeemed (CreditLedgerEntry REFUND)", "no_show_fee_proration if inside free window -> settlement PRICED", "release table interval", "increments Appointment.version by 1"]
+  - method: POST
+    path: "/practice/appointments/{id}/no-show"
+    description: "Mark a missed appointment NO_SHOW; assess prorated fee; bump client strike."
+    roles: [FrontDesk, PracticeAdmin]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["set scheduling_status = NO_SHOW", "increment Client.no_show_strikes", "no_show_fee_proration", "settlement_status = PRICED with no_show_fee_cents", "refund membership credit if redeemed", "release table interval", "increments Appointment.version by 1", "increments Client.version by 1"]
+  - method: POST
+    path: "/practice/appointments/{id}/waive-no-show"
+    description: "Waive a NO_SHOW: revert scheduling to SCHEDULED, decrement strike, void the fee."
+    roles: [PracticeAdmin]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["set scheduling_status = SCHEDULED", "decrement Client.no_show_strikes (floor 0)", "settlement_status = UNSETTLED, no_show_fee_cents = 0", "increments Appointment.version by 1", "increments Client.version by 1"]
+  - method: POST
+    path: "/practice/appointments/{id}/price"
+    description: "Price a COMPLETED appointment (service_pricing + client_owed_resolution); redeem membership credit if applicable."
+    roles: [FrontDesk, PracticeAdmin]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["compute service_charge_cents, client_owed_cents", "redeem membership credit (CreditLedgerEntry REDEEM) if payer == MEMBERSHIP", "set settlement_status = PRICED", "increments Appointment.version by 1"]
+  - method: POST
+    path: "/practice/appointments/{id}/pay"
+    description: "Pay a PRICED appointment; charge HSA/wallet, credit therapist commission + gratuity."
+    roles: [FrontDesk, PracticeAdmin]
+    code: 200
+    input: ["gratuity_cents?"]
+    output: Appointment
+    side_effects: ["decrement Client.hsa_balance_cents if payer == HSA", "decrement Client.wallet_credit_cents by applied amount", "tiered_commission calc; Therapist.mtd_service_revenue_cents += service_charge_cents; Therapist.accrued_commission_cents += commission + gratuity", "set settlement_status = PAID", "increments Appointment.version by 1", "increments Therapist.version by 1"]
+  - method: POST
+    path: "/practice/appointments/{id}/void"
+    description: "Void an UNSETTLED/PRICED appointment; refund redeemed credit; void any superbill."
+    roles: [PracticeAdmin]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["set settlement_status = VOID", "refund membership credit if redeemed at PRICED", "void linked superbill", "increments Appointment.version by 1"]
+
+  # ---- SoapNote ----
+  - method: POST
+    path: "/practice/soap-notes"
+    description: "Create a DRAFT SOAP note for an appointment."
+    roles: [Therapist]
+    code: 201
+    input: ["appointment_id", "subjective?", "objective?", "assessment?", "plan?", "clears_contraindication_tags?"]
+    output: SoapNote
+    side_effects: []
+  - method: GET
+    path: "/practice/soap-notes"
+    description: "List SOAP notes; filter by appointment_id (reverse-reachability for SoapNote.appointment_id FK)."
+    roles: [PracticeAdmin, Therapist, FrontDesk]
+    code: 200
+    input: ["appointment_id?", "limit?", "offset?"]
+    output: SoapNote[]
+    side_effects: []
+  - method: GET
+    path: "/practice/soap-notes/{id}"
+    description: "Fetch a SOAP note."
+    roles: [PracticeAdmin, Therapist, FrontDesk]
+    code: 200
+    input: []
+    output: SoapNote
+    side_effects: []
+  - method: PATCH
+    path: "/practice/soap-notes/{id}"
+    description: "Edit a DRAFT SOAP note's S/O/A/P content."
+    roles: [Therapist]
+    code: 200
+    input: ["subjective?", "objective?", "assessment?", "plan?", "clears_contraindication_tags?", "expected_soap_note_version"]
+    output: SoapNote
+    side_effects: ["update fields", "increments SoapNote.version by 1"]
+  - method: POST
+    path: "/practice/soap-notes/{id}/finalize"
+    description: "Finalize a DRAFT note (DRAFT -> FINALIZED, or DRAFT -> AMENDED if previously finalized); applies contraindication clearances."
+    roles: [Therapist]
+    code: 200
+    input: []
+    output: SoapNote
+    side_effects: ["set note_status = FINALIZED or AMENDED", "apply contraindication clearances", "increments SoapNote.version by 1"]
+  - method: POST
+    path: "/practice/soap-notes/{id}/reopen"
+    description: "Reopen a FINALIZED note for amendment (FINALIZED -> DRAFT); revokes clearances."
+    roles: [Therapist]
+    code: 200
+    input: []
+    output: SoapNote
+    side_effects: ["set note_status = DRAFT", "revoke contraindication clearances", "increments SoapNote.version by 1"]
+
+  # ---- Superbill ----
+  - method: POST
+    path: "/practice/superbills"
+    description: "Issue an insurance superbill for a PAID, non-membership appointment."
+    roles: [FrontDesk, PracticeAdmin]
+    code: 201
+    input: [appointment_id, diagnosis_codes, cpt_code]
+    output: Superbill
+    side_effects: ["set client_id from appointment", "billable_amount_cents = appointment.service_charge_cents", "superbill_status = ISSUED"]
+  - method: GET
+    path: "/practice/superbills"
+    description: "List superbills; filter by appointment_id or client_id (reverse-reachability for Superbill.appointment_id and client_id FKs)."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 200
+    input: ["appointment_id?", "client_id?", "limit?", "offset?"]
+    output: Superbill[]
+    side_effects: []
+  - method: GET
+    path: "/practice/superbills/{id}"
+    description: "Fetch a superbill."
+    roles: [PracticeAdmin, FrontDesk, Client]
+    code: 200
+    input: []
+    output: Superbill
+    side_effects: []
+  - method: POST
+    path: "/practice/superbills/{id}/void"
+    description: "Void an ISSUED superbill (claim correction/rebill)."
+    roles: [FrontDesk, PracticeAdmin]
+    code: 200
+    input: []
+    output: Superbill
+    side_effects: ["set superbill_status = VOID", "increments Superbill.version by 1"]
+
+  # ---- Clock (test-driving) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock to an explicit UTC instant. Server startup default is 2026-01-01T00:00:00Z; before any set call, the logical clock reads exactly this default and never falls back to wall-clock time. All license/cert/intake expiry, cycle-end, check-in/no-show windows, and no-show lead-time proration read this clock."
+    roles: [PracticeAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ now: datetime }"
+    side_effects: ["logical clock advanced/rewound to to_iso8601"]
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role, or missing X-User-ID for an entity-backed role."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Acting role not permitted for the endpoint, or entity-backed identity acting on a resource it does not own."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced resource (by path id or FK body field) does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Malformed body: missing required field, invalid enum, out-of-range integer, bad duration value."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not allowed from the resource's current state (wrong scheduling_status / settlement_status / note_status / package_status / intake_status / consent_status)."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_table_version on appointment-create does not match current Table.version (OCC)."
+  - id: ERR_CONSENT_REQUIRED
+    http: 422
+    condition: "No ACTIVE consent, draping_policy == DECLINE_TREATMENT, or sensitive modality without sensitive_area_consent."
+  - id: ERR_CONTRAINDICATION
+    http: 422
+    condition: "Modality contraindication tag matches a client intake risk_flag with no clearing FINALIZED/AMENDED SOAP note."
+  - id: ERR_INTAKE_INVALID
+    http: 422
+    condition: "Client has no ACTIVE intake, or the ACTIVE intake's expires_at <= clock.now."
+  - id: ERR_LICENSE_EXPIRED
+    http: 422
+    condition: "Assigned therapist's license_expiry <= clock.now at booking or check-in."
+  - id: ERR_CERTIFICATION_REQUIRED
+    http: 422
+    condition: "Modality requires certification and the therapist lacks an ACTIVE matching TherapistCertification."
+  - id: ERR_TABLE_UNSUITABLE
+    http: 422
+    condition: "PRENATAL modality on a table with supports_prenatal == false, or table archived."
+  - id: ERR_TABLE_DOUBLE_BOOKED
+    http: 409
+    condition: "Requested interval (with turnover buffer) collides with another non-terminal appointment on the same table."
+  - id: ERR_THERAPIST_DOUBLE_BOOKED
+    http: 409
+    condition: "Requested interval collides with another non-terminal appointment for the same therapist."
+  - id: ERR_NO_CREDITS
+    http: 422
+    condition: "MEMBERSHIP payer at price time with credit_balance_sessions < 1, non-ACTIVE package, or package not owned by the client."
+  - id: ERR_INSUFFICIENT_HSA
+    http: 422
+    condition: "HSA payer at pay time with hsa_balance_cents < client_owed_cents."
+  - id: ERR_NOT_BILLABLE
+    http: 422
+    condition: "Superbill requested for a non-PAID appointment or a MEMBERSHIP-payer appointment."
+  - id: ERR_RENEWAL_TOO_EARLY
+    http: 422
+    condition: "Package renewal attempted before current_cycle_end <= clock.now."
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: PracticeAdmin
+    description: "Practice owner/manager: configures modalities, plans, tables, commission tiers, certifications; drives renewals, suspensions, voids, waivers, and the logical clock."
+    identity: opaque
+    exclusive_operations:
+      - "POST /practice/modalities"
+      - "POST /practice/therapists"
+      - "POST /practice/therapists/{id}/reset-commission"
+      - "POST /practice/certifications"
+      - "POST /practice/tables"
+      - "POST /practice/plans"
+      - "POST /practice/commission-tiers"
+      - "POST /practice/packages/{id}/renew"
+      - "POST /practice/packages/{id}/suspend"
+      - "POST /practice/packages/{id}/resume"
+      - "POST /practice/packages/{id}/cancel-membership"
+      - "POST /practice/clients/{id}/wallet-adjustments"
+      - "POST /practice/appointments/{id}/waive-no-show"
+      - "POST /practice/appointments/{id}/void"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /practice/clients"
+      - "POST /practice/intakes"
+      - "POST /practice/consent-records"
+      - "POST /practice/consent-records/{id}/revoke"
+      - "POST /practice/packages"
+      - "POST /practice/appointments"
+      - "POST /practice/appointments/{id}/cancel"
+      - "POST /practice/appointments/{id}/no-show"
+      - "POST /practice/appointments/{id}/complete"
+      - "POST /practice/appointments/{id}/price"
+      - "POST /practice/appointments/{id}/pay"
+      - "POST /practice/superbills"
+      - "POST /practice/superbills/{id}/void"
+      - "all GET endpoints"
+
+  - name: FrontDesk
+    description: "Reception staff: registers clients, books/checks-in/cancels/no-shows, prices and collects payment, issues superbills."
+    identity: opaque
+    exclusive_operations:
+      - "POST /practice/appointments/{id}/check-in"
+    shared_operations:
+      - "POST /practice/clients"
+      - "POST /practice/intakes"
+      - "POST /practice/intakes/{id}/sign"
+      - "POST /practice/consent-records"
+      - "POST /practice/packages"
+      - "POST /practice/appointments"
+      - "POST /practice/appointments/{id}/complete"
+      - "POST /practice/appointments/{id}/cancel"
+      - "POST /practice/appointments/{id}/no-show"
+      - "POST /practice/appointments/{id}/price"
+      - "POST /practice/appointments/{id}/pay"
+      - "POST /practice/superbills"
+      - "POST /practice/superbills/{id}/void"
+      - "GET endpoints (non-clinical)"
+
+  - name: Therapist
+    description: "Licensed massage therapist: documents SOAP notes, finalizes/reopens, completes sessions; earns commission. Identity equals a Therapist row."
+    identity: "entity_backed:Therapist"
+    exclusive_operations:
+      - "POST /practice/soap-notes"
+      - "PATCH /practice/soap-notes/{id}"
+      - "POST /practice/soap-notes/{id}/finalize"
+      - "POST /practice/soap-notes/{id}/reopen"
+    shared_operations:
+      - "POST /practice/appointments/{id}/complete"
+      - "GET /practice/appointments (own)"
+      - "GET /practice/soap-notes"
+      - "GET /practice/modalities"
+      - "GET /practice/therapists/{id}"
+
+  - name: Client
+    description: "Patient/member: signs intake, grants/revokes consent, views own appointments/packages/superbills. Identity equals a Client row."
+    identity: "entity_backed:Client"
+    exclusive_operations:
+      - "POST /practice/intakes/{id}/sign (own intake)"
+    shared_operations:
+      - "POST /practice/intakes"
+      - "POST /practice/consent-records"
+      - "POST /practice/consent-records/{id}/revoke (own consent)"
+      - "GET /practice/clients/{id} (own)"
+      - "GET /practice/appointments (own)"
+      - "GET /practice/packages (own)"
+      - "GET /practice/superbills (own)"

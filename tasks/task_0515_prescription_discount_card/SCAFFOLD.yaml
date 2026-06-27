@@ -1,0 +1,1779 @@
+scenario: "Prescription Discount Card & Price Comparison (GoodRx style): drug/dosage search & pharmacy price compare, coupon (BIN-PCN-Group) generation, discount-vs-insurance choice, pharmacy adjudication & savings calc, gold-membership tier, mail-order option, telehealth referral, manufacturer copay-card linkage"
+domain_name: "rx-discount-card"
+api_prefix: ""
+
+# ============================================================================
+# §0 Complexity Profile
+# ============================================================================
+complexity_profile:
+  primary_archetype: "Pricing engine"
+  secondary_archetype: "Compliance / audit"
+  complexity_layers:
+    - "Dual-variant calculation"     # discount-vs-insurance net-cost; gold-vs-standard quote
+    - "Optimistic concurrency"        # OCC on Claim.version for reversal/re-adjudication
+    - "Selector policy"               # best-price pharmacy selection out of a quote pool
+    - "Derived field reconciliation"  # Member.lifetime_savings_cents reconciled from terminal Claims
+
+  entity_topology: flat
+  # Peer entities linked by FK references (Member, Pharmacy, Drug, PriceQuote,
+  # PriceComparison, DiscountCard, Claim, CopayCard, CopayLink, GoldMembership,
+  # MailOrderFulfillment, TelehealthReferral, InsuranceEstimate). No nested URL
+  # ownership chain; everything is found via FK filtered-list GETs.
+
+  state_machine_shape: parallel
+  # GoldMembership carries two independent dimensions (billing_status × access_status).
+  # Claim is branching-with-revert (ADJUDICATED can REVERSE back to a non-terminal
+  # state, then RE-ADJUDICATE). MailOrderFulfillment is a linear-with-revert pipeline.
+
+  relationship_patterns:
+    - one_to_many        # Member -> DiscountCard, Member -> Claim, Drug -> PriceQuote
+    - many_to_many       # CopayLink junction between CopayCard and Claim
+    - cross_aggregate    # Claim references DiscountCard, PriceComparison, Pharmacy, Drug
+
+  role_model: peer_roles
+  # Member owns search/cards/membership; PharmacyOperator owns price quotes and
+  # adjudicates claims at its own pharmacy; PlatformAdmin seeds catalog/copay cards;
+  # CopayCardSponsor (manufacturer) owns copay-card configuration.
+
+  consistency_model: immediate
+
+# ============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# ============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ============================================================================
+# §1.1 Entity-Relationship Table
+# ============================================================================
+entities:
+  - name: Drug
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Brand or generic drug name, e.g. 'Atorvastatin'."
+      - name: ndc
+        type: string
+        source: input
+        description: "National Drug Code; unique per (dosage_mg, form)."
+        constraints: "non-empty"
+      - name: dosage_mg
+        type: number
+        source: input
+        description: "Strength in milligrams, e.g. 20."
+        constraints: "> 0"
+      - name: form
+        type: enum
+        source: input
+        description: "Dosage form."
+        constraints: "one of {TABLET, CAPSULE, LIQUID, INJECTION}"
+      - name: is_controlled
+        type: boolean
+        source: input
+        description: "Whether the drug is a controlled substance (gates telehealth & mail-order rules)."
+        default: false
+      - name: awp_cents
+        type: integer
+        source: input
+        description: "Average Wholesale Price per fill, in integer cents. Reference ceiling for all quotes."
+        constraints: ">= 1"
+
+  - name: Pharmacy
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Pharmacy display name."
+      - name: chain_code
+        type: string
+        source: input
+        description: "Chain identifier, e.g. 'CVS', 'INDIE'."
+      - name: state_code
+        type: string
+        source: input
+        description: "Two-letter US state the pharmacy operates in."
+        constraints: "exactly 2 uppercase letters"
+      - name: is_mail_order
+        type: boolean
+        source: input
+        description: "True if this pharmacy services mail-order fulfillment."
+        default: false
+      - name: dispense_fee_cents
+        type: integer
+        source: input
+        description: "Flat dispensing fee the pharmacy adds at adjudication, in cents."
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "Pharmacy lifecycle state (see §1.2)."
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, SUSPENDED}"
+
+  - name: PriceQuote
+    parent: null
+    common_fields: true
+    fields:
+      - name: drug_id
+        type: string
+        source: input
+        description: "FK -> Drug.id"
+      - name: pharmacy_id
+        type: string
+        source: input
+        description: "FK -> Pharmacy.id; the quote's pharmacy must be ACTIVE at quote time."
+      - name: cash_price_cents
+        type: integer
+        source: input
+        description: "Pharmacy's undiscounted cash price for one fill, in cents."
+        constraints: ">= 1; <= Drug.awp_cents"
+      - name: discount_price_cents
+        type: integer
+        source: input
+        description: "Negotiated discount-network price for one fill, in cents (what the card pays)."
+        constraints: ">= 1; <= cash_price_cents"
+      - name: gold_price_cents
+        type: integer
+        source: input
+        description: "Gold-tier price for one fill, in cents (Gold members only)."
+        constraints: ">= 1; <= discount_price_cents"
+      - name: effective_at
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC start of the quote validity window (interval is HALF-OPEN [effective_at, expires_at))."
+      - name: expires_at
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC end of the quote validity window (exclusive). Must be strictly after effective_at."
+        constraints: "expires_at > effective_at"
+      - name: status
+        type: enum
+        source: system
+        description: "Quote lifecycle state (see §1.2)."
+        default: "PUBLISHED"
+        constraints: "one of {PUBLISHED, EXPIRED}"
+
+  - name: Member
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Member login email; globally unique."
+        constraints: "unique"
+      - name: full_name
+        type: string
+        source: input
+        description: "Member full name."
+      - name: state_code
+        type: string
+        source: input
+        description: "Member's two-letter US state of residence."
+        constraints: "exactly 2 uppercase letters"
+      - name: has_insurance
+        type: boolean
+        source: input
+        description: "Whether the member carries pharmacy insurance (enables insurance estimates)."
+        default: false
+      - name: lifetime_savings_cents
+        type: integer
+        source: computed
+        description: "Reconciled sum of savings_cents over this member's Claims in terminal state ADJUDICATED. Recomputed on every Claim terminal transition."
+        default: 0
+      - name: active_gold_membership_id
+        type: string
+        source: computed
+        description: "Computed denormalized pointer to the id of the member's single GoldMembership whose access_status == ACTIVE, else null. Not an ownership FK; the membership->member relation is discovered via GET /gold-memberships?member_id=."
+        default: null
+
+  - name: GoldMembership
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; owner of this membership."
+      - name: tier
+        type: enum
+        source: input
+        description: "Membership tier."
+        constraints: "one of {GOLD_INDIVIDUAL, GOLD_FAMILY}"
+      - name: monthly_fee_cents
+        type: integer
+        source: system
+        description: "Monthly fee in cents, set from tier at creation (see §1.3 gold_fee_resolution)."
+        constraints: ">= 0"
+      - name: billing_status
+        type: enum
+        source: system
+        description: "Billing dimension of the parallel state machine (see §1.2)."
+        default: "PENDING_PAYMENT"
+        constraints: "one of {PENDING_PAYMENT, PAID, PAST_DUE}"
+      - name: access_status
+        type: enum
+        source: system
+        description: "Access dimension of the parallel state machine (see §1.2)."
+        default: "INACTIVE"
+        constraints: "one of {INACTIVE, ACTIVE, REVOKED}"
+      - name: covered_member_ids
+        type: array
+        source: input
+        description: "Member ids covered under a GOLD_FAMILY plan (max 5). Empty for GOLD_INDIVIDUAL."
+        default: []
+      - name: coverage_start
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC start of the membership coverage window (interval is CLOSED [coverage_start, coverage_end] with a mandatory adjacency buffer; see §1.4 ERR_MEMBERSHIP_PERIOD_OVERLAP)."
+      - name: coverage_end
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC end of the membership coverage window (inclusive). Must be strictly after coverage_start."
+        constraints: "coverage_end > coverage_start"
+
+  - name: DiscountCard
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the member the card was generated for."
+      - name: drug_id
+        type: string
+        source: input
+        description: "FK -> Drug.id; the drug the card is scoped to."
+      - name: comparison_id
+        type: string
+        source: input
+        description: "FK -> PriceComparison.id; the comparison that produced this card."
+      - name: pharmacy_id
+        type: string
+        source: input
+        description: "FK -> Pharmacy.id; the chosen pharmacy (the comparison's selected_pharmacy_id)."
+      - name: bin
+        type: string
+        source: system
+        description: "Coupon Bank Identification Number; fixed network value (see §1.3 coupon_credential_assignment)."
+      - name: pcn
+        type: string
+        source: system
+        description: "Coupon Processor Control Number; tier-derived (see §1.3)."
+      - name: group_code
+        type: string
+        source: system
+        description: "Coupon Group code; tier-derived (see §1.3)."
+      - name: member_code
+        type: string
+        source: system
+        description: "Coupon Member ID printed on the card; derived from Member.id suffix and drug."
+      - name: pricing_basis
+        type: enum
+        source: system
+        description: "Which quote price tier this card honors at adjudication."
+        constraints: "one of {DISCOUNT, GOLD}"
+      - name: status
+        type: enum
+        source: system
+        description: "Card lifecycle state (see §1.2)."
+        default: "ISSUED"
+        constraints: "one of {ISSUED, REDEEMED, VOID}"
+
+  - name: PriceComparison
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the searching member."
+      - name: drug_id
+        type: string
+        source: input
+        description: "FK -> Drug.id searched."
+      - name: state_code
+        type: string
+        source: input
+        description: "Two-letter US state used to scope candidate pharmacies."
+        constraints: "exactly 2 uppercase letters"
+      - name: selected_pharmacy_id
+        type: string
+        source: computed
+        description: "Computed denormalized pointer to the id of the best-price pharmacy chosen by the selector (see §1.3 best_price_selection). Not an ownership FK; it is the selection RESULT, discovered by reading the comparison itself."
+        default: null
+      - name: best_price_cents
+        type: integer
+        source: computed
+        description: "The selected pharmacy's effective price under the member's pricing basis, in cents."
+        default: null
+      - name: candidate_count
+        type: integer
+        source: computed
+        description: "Number of eligible PUBLISHED quotes that entered the selection pool."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Comparison lifecycle state (see §1.2)."
+        default: "OPEN"
+        constraints: "one of {OPEN, RESOLVED, NO_RESULTS, CONVERTED}"
+
+  - name: InsuranceEstimate
+    parent: null
+    common_fields: false
+    fields:
+      - name: comparison_id
+        type: string
+        source: input
+        description: "FK -> PriceComparison.id; the comparison this estimate decorates."
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; must have has_insurance == true."
+      - name: copay_cents
+        type: integer
+        source: input
+        description: "Member's insurance copay for one fill of the comparison's drug, in cents."
+        constraints: ">= 0"
+      - name: deductible_remaining_cents
+        type: integer
+        source: input
+        description: "Member's remaining insurance deductible in cents (applied before copay)."
+        constraints: ">= 0"
+      - name: recommended_path
+        type: enum
+        source: computed
+        description: "Cheaper path for the member (see §1.3 discount_vs_insurance_choice)."
+        constraints: "one of {DISCOUNT, INSURANCE, TIE_DISCOUNT}"
+
+  - name: Claim
+    parent: null
+    common_fields: true
+    fields:
+      - name: discount_card_id
+        type: string
+        source: input
+        description: "FK -> DiscountCard.id; the card being adjudicated."
+      - name: pharmacy_id
+        type: string
+        source: input
+        description: "FK -> Pharmacy.id; the adjudicating pharmacy (must equal the card's pharmacy_id)."
+      - name: drug_id
+        type: string
+        source: computed
+        description: "FK -> Drug.id; copied from the card at adjudication."
+      - name: quantity
+        type: integer
+        source: input
+        description: "Number of fills adjudicated in this claim."
+        constraints: ">= 1"
+      - name: gross_cents
+        type: integer
+        source: computed
+        description: "Cash basis: quantity * quote.cash_price_cents + pharmacy.dispense_fee_cents (see §1.3 savings_calculation)."
+        default: 0
+      - name: net_cents
+        type: integer
+        source: computed
+        description: "Discounted basis the member pays (see §1.3 savings_calculation), including any copay-card offset."
+        default: 0
+      - name: savings_cents
+        type: integer
+        source: computed
+        description: "gross_cents - net_cents; the headline savings (see §1.3 savings_calculation)."
+        default: 0
+      - name: copay_offset_cents
+        type: integer
+        source: computed
+        description: "Manufacturer copay-card offset applied to net (see §1.3 copay_offset_calculation). 0 if no linked copay card."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Claim lifecycle state (see §1.2)."
+        default: "SUBMITTED"
+        constraints: "one of {SUBMITTED, ADJUDICATED, REVERSED, REJECTED}"
+
+  - name: CopayCard
+    parent: null
+    common_fields: true
+    fields:
+      - name: sponsor_name
+        type: string
+        source: input
+        description: "Manufacturer/sponsor name."
+      - name: drug_id
+        type: string
+        source: input
+        description: "FK -> Drug.id; the brand drug this copay card subsidizes."
+      - name: max_benefit_cents
+        type: integer
+        source: input
+        description: "Maximum total benefit a single linkage may draw, in cents."
+        constraints: ">= 1"
+      - name: per_fill_cap_cents
+        type: integer
+        source: input
+        description: "Maximum offset applied to any single claim, in cents."
+        constraints: ">= 1"
+      - name: remaining_benefit_cents
+        type: integer
+        source: computed
+        description: "max_benefit_cents minus cumulative offsets drawn by ADJUDICATED claims via links (see §1.3 copay_offset_calculation)."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Copay-card lifecycle (see §1.2)."
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, EXHAUSTED, WITHDRAWN}"
+
+  - name: CopayLink
+    parent: null
+    common_fields: true
+    fields:
+      - name: copay_card_id
+        type: string
+        source: input
+        description: "FK -> CopayCard.id; the copay card linked."
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the member linking the copay card."
+      - name: claim_id
+        type: string
+        source: input
+        description: "FK -> Claim.id; the claim the offset is drawn against (null until applied)."
+        default: null
+      - name: applied_offset_cents
+        type: integer
+        source: computed
+        description: "Offset actually drawn from the copay card for this link's claim (see §1.3 copay_offset_calculation)."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Link lifecycle (see §1.2)."
+        default: "LINKED"
+        constraints: "one of {LINKED, APPLIED, RELEASED}"
+
+  - name: MailOrderFulfillment
+    parent: null
+    common_fields: true
+    fields:
+      - name: discount_card_id
+        type: string
+        source: input
+        description: "FK -> DiscountCard.id; the card whose pricing the mail order honors."
+      - name: pharmacy_id
+        type: string
+        source: input
+        description: "FK -> Pharmacy.id; the mail-order pharmacy (must have is_mail_order == true)."
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the ordering member."
+      - name: quantity
+        type: integer
+        source: input
+        description: "Number of fills ordered."
+        constraints: ">= 1; <= 3"
+      - name: ship_to_state
+        type: string
+        source: input
+        description: "Destination two-letter US state."
+        constraints: "exactly 2 uppercase letters"
+      - name: total_cents
+        type: integer
+        source: computed
+        description: "quantity * card-basis price + pharmacy.dispense_fee_cents (see §1.3 mail_order_total)."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Fulfillment lifecycle (see §1.2)."
+        default: "PLACED"
+        constraints: "one of {PLACED, SHIPPED, DELIVERED, CANCELLED}"
+
+  - name: TelehealthReferral
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the referred member."
+      - name: comparison_id
+        type: string
+        source: input
+        description: "FK -> PriceComparison.id; the comparison that prompted the referral."
+      - name: drug_id
+        type: string
+        source: computed
+        description: "FK -> Drug.id; copied from the comparison."
+      - name: reason
+        type: enum
+        source: input
+        description: "Why the referral was raised."
+        constraints: "one of {NO_RESULTS, PRICE_TOO_HIGH, NEW_PRESCRIPTION}"
+      - name: status
+        type: enum
+        source: system
+        description: "Referral lifecycle (see §1.2)."
+        default: "REQUESTED"
+        constraints: "one of {REQUESTED, SCHEDULED, COMPLETED, CANCELLED}"
+
+# ============================================================================
+# §1.2 State Machine Table
+# ============================================================================
+state_machines:
+  - entity: Pharmacy
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /pharmacies/{id}/suspend"
+        actor: PlatformAdmin
+        preconditions: ["pharmacy.status == ACTIVE"]
+        side_effects:
+          - "every PriceQuote with pharmacy_id == this pharmacy and status == PUBLISHED transitions PUBLISHED -> EXPIRED (cascade down, conditional: only PUBLISHED quotes)"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /pharmacies/{id}/reactivate"
+        actor: PlatformAdmin
+        preconditions: ["pharmacy.status == SUSPENDED"]
+        side_effects: ["refresh updated_at; quotes are NOT auto-republished (operator must re-publish)"]
+
+  - entity: PriceQuote
+    initial_state: PUBLISHED
+    terminal_states: [EXPIRED]
+    transitions:
+      - from: PUBLISHED
+        to: EXPIRED
+        trigger: "POST /price-quotes/{id}/expire OR system cascade from Pharmacy suspend"
+        actor: PharmacyOperator
+        preconditions: ["quote.status == PUBLISHED"]
+        side_effects: ["refresh updated_at"]
+
+  - entity: GoldMembership
+    initial_state: "PENDING_PAYMENT|INACTIVE"
+    terminal_states: ["PAST_DUE|REVOKED"]
+    note: "Parallel dimensions: billing_status (PENDING_PAYMENT, PAID, PAST_DUE) evolves independently of access_status (INACTIVE, ACTIVE, REVOKED). A transition names which dimension it moves."
+    transitions:
+      - from: "billing_status==PENDING_PAYMENT"
+        to: "billing_status==PAID"
+        trigger: "POST /gold-memberships/{id}/record-payment"
+        actor: PlatformAdmin
+        preconditions: ["billing_status == PENDING_PAYMENT"]
+        side_effects:
+          - "billing dimension -> PAID"
+          - "access_status PENDING side-effect: if access_status == INACTIVE, set access_status -> ACTIVE (cross-dimension activation on first successful payment)"
+          - "set Member.active_gold_membership_id = this membership id (derived-field reconciliation on owner Member)"
+      - from: "billing_status==PAID"
+        to: "billing_status==PAST_DUE"
+        trigger: "POST /gold-memberships/{id}/lapse"
+        actor: PlatformAdmin
+        preconditions: ["billing_status == PAID"]
+        side_effects:
+          - "billing dimension -> PAST_DUE"
+          - "access dimension: access_status ACTIVE -> REVOKED (cross-dimension revocation)"
+          - "clear Member.active_gold_membership_id = null"
+          - "every ISSUED DiscountCard with pricing_basis == GOLD owned by this member transitions ISSUED -> VOID (cascade down, conditional: only GOLD-basis ISSUED cards)"
+      - from: "access_status==ACTIVE"
+        to: "access_status==REVOKED"
+        trigger: "POST /gold-memberships/{id}/revoke"
+        actor: Member
+        preconditions: ["access_status == ACTIVE"]
+        side_effects:
+          - "access dimension -> REVOKED"
+          - "clear Member.active_gold_membership_id = null"
+          - "billing_status is left unchanged (dimensions are independent under explicit revoke)"
+
+  - entity: PriceComparison
+    initial_state: OPEN
+    terminal_states: [CONVERTED, NO_RESULTS]
+    note: "Branching: OPEN forks to RESOLVED (>=1 candidate) or NO_RESULTS (empty pool); RESOLVED converts to CONVERTED on card issuance."
+    transitions:
+      - from: OPEN
+        to: RESOLVED
+        trigger: "POST /comparisons/{id}/run"
+        actor: Member
+        preconditions: ["comparison.status == OPEN", "at least one PUBLISHED PriceQuote matches drug_id and a pharmacy whose state_code == comparison.state_code and status == ACTIVE"]
+        side_effects:
+          - "run best_price_selection (§1.3): set selected_pharmacy_id, best_price_cents, candidate_count"
+      - from: OPEN
+        to: NO_RESULTS
+        trigger: "POST /comparisons/{id}/run"
+        actor: Member
+        preconditions: ["comparison.status == OPEN", "zero eligible PUBLISHED quotes in the candidate pool"]
+        side_effects: ["set candidate_count = 0; selected_pharmacy_id stays null"]
+      - from: RESOLVED
+        to: CONVERTED
+        trigger: "POST /discount-cards (with this comparison_id)"
+        actor: Member
+        preconditions: ["comparison.status == RESOLVED", "comparison.selected_pharmacy_id is not null"]
+        side_effects:
+          - "create DiscountCard ISSUED scoped to comparison.drug_id and comparison.selected_pharmacy_id (cross-entity)"
+
+  - entity: DiscountCard
+    initial_state: ISSUED
+    terminal_states: [REDEEMED, VOID]
+    transitions:
+      - from: ISSUED
+        to: REDEEMED
+        trigger: "system cascade from Claim SUBMITTED -> ADJUDICATED"
+        actor: system
+        preconditions: ["card.status == ISSUED"]
+        side_effects: ["refresh updated_at"]
+      - from: ISSUED
+        to: VOID
+        trigger: "POST /discount-cards/{id}/void OR system cascade from GoldMembership lapse"
+        actor: Member
+        preconditions: ["card.status == ISSUED"]
+        side_effects: ["refresh updated_at"]
+      - from: REDEEMED
+        to: ISSUED
+        trigger: "system cascade from Claim ADJUDICATED -> REVERSED"
+        actor: system
+        preconditions: ["card.status == REDEEMED"]
+        side_effects: ["refresh updated_at (card becomes re-adjudicable)"]
+
+  - entity: Claim
+    initial_state: SUBMITTED
+    terminal_states: [REJECTED]
+    note: "Branching-with-revert + cycle: SUBMITTED forks to ADJUDICATED or REJECTED; ADJUDICATED can REVERSE back to SUBMITTED-equivalent re-adjudication loop via the card returning to ISSUED, supporting reversal/re-adjudication rounds."
+    transitions:
+      - from: SUBMITTED
+        to: ADJUDICATED
+        trigger: "POST /claims/{id}/adjudicate"
+        actor: PharmacyOperator
+        preconditions:
+          - "claim.status == SUBMITTED"
+          - "DiscountCard(claim.discount_card_id).status == ISSUED"
+          - "DiscountCard.pharmacy_id == claim.pharmacy_id (cross-entity state dependency)"
+          - "Pharmacy(claim.pharmacy_id).status == ACTIVE (cross-entity state dependency)"
+        side_effects:
+          - "run savings_calculation (§1.3): set gross_cents, net_cents, savings_cents"
+          - "if a LINKED CopayLink references this claim's id: run copay_offset_calculation (§1.3), set claim.copay_offset_cents, reduce net_cents, set link.applied_offset_cents, transition CopayLink LINKED -> APPLIED, decrement CopayCard.remaining_benefit_cents (transitive cascade: claim -> link -> copay card)"
+          - "if CopayCard.remaining_benefit_cents reaches 0 after the draw: transition CopayCard ACTIVE -> EXHAUSTED (further transitive hop)"
+          - "cascade: DiscountCard ISSUED -> REDEEMED"
+          - "recompute Member.lifetime_savings_cents (derived-field reconciliation)"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /claims/{id}/adjudicate (precondition fails on card/pharmacy mismatch handled as validation) OR POST /claims/{id}/reject"
+        actor: PharmacyOperator
+        preconditions: ["claim.status == SUBMITTED"]
+        side_effects: ["refresh updated_at; no pricing fields set"]
+      - from: ADJUDICATED
+        to: REVERSED
+        trigger: "POST /claims/{id}/reverse"
+        actor: PharmacyOperator
+        preconditions:
+          - "claim.status == ADJUDICATED"
+          - "expected_claim_version matches claim.version (OCC)"
+        side_effects:
+          - "cascade: DiscountCard REDEEMED -> ISSUED (compensation: card re-adjudicable)"
+          - "if claim had a copay offset: transition the APPLIED CopayLink APPLIED -> RELEASED, restore CopayCard.remaining_benefit_cents by applied_offset_cents, and if CopayCard was EXHAUSTED transition EXHAUSTED -> ACTIVE (compensation cascade: claim -> link -> copay card, conserves CopayCard total)"
+          - "recompute Member.lifetime_savings_cents (savings of a REVERSED claim no longer counts)"
+          - "increment Claim.version by 1"
+
+  - entity: CopayCard
+    initial_state: ACTIVE
+    terminal_states: [WITHDRAWN]
+    transitions:
+      - from: ACTIVE
+        to: EXHAUSTED
+        trigger: "system cascade from Claim adjudication draw"
+        actor: system
+        preconditions: ["copay_card.status == ACTIVE", "remaining_benefit_cents == 0 after draw"]
+        side_effects: ["refresh updated_at"]
+      - from: EXHAUSTED
+        to: ACTIVE
+        trigger: "system cascade from Claim reversal (offset restored)"
+        actor: system
+        preconditions: ["copay_card.status == EXHAUSTED", "remaining_benefit_cents > 0 after restore"]
+        side_effects: ["refresh updated_at"]
+      - from: ACTIVE
+        to: WITHDRAWN
+        trigger: "POST /copay-cards/{id}/withdraw"
+        actor: CopayCardSponsor
+        preconditions: ["copay_card.status == ACTIVE"]
+        side_effects:
+          - "every LINKED CopayLink referencing this card transitions LINKED -> RELEASED (cascade down, conditional: only LINKED, not APPLIED)"
+
+  - entity: CopayLink
+    initial_state: LINKED
+    terminal_states: [RELEASED]
+    transitions:
+      - from: LINKED
+        to: APPLIED
+        trigger: "system cascade from Claim SUBMITTED -> ADJUDICATED"
+        actor: system
+        preconditions: ["link.status == LINKED", "link.claim_id is not null"]
+        side_effects: ["set applied_offset_cents; decrement CopayCard.remaining_benefit_cents"]
+      - from: APPLIED
+        to: RELEASED
+        trigger: "system cascade from Claim ADJUDICATED -> REVERSED"
+        actor: system
+        preconditions: ["link.status == APPLIED"]
+        side_effects: ["restore CopayCard.remaining_benefit_cents by applied_offset_cents; set applied_offset_cents = 0"]
+      - from: LINKED
+        to: RELEASED
+        trigger: "system cascade from CopayCard withdraw OR POST /copay-links/{id}/release"
+        actor: Member
+        preconditions: ["link.status == LINKED"]
+        side_effects: ["refresh updated_at"]
+
+  - entity: MailOrderFulfillment
+    initial_state: PLACED
+    terminal_states: [DELIVERED, CANCELLED]
+    transitions:
+      - from: PLACED
+        to: SHIPPED
+        trigger: "POST /mail-orders/{id}/ship"
+        actor: PharmacyOperator
+        preconditions: ["fulfillment.status == PLACED", "Pharmacy(fulfillment.pharmacy_id).status == ACTIVE (cross-entity state dependency)"]
+        side_effects: ["refresh updated_at"]
+      - from: SHIPPED
+        to: DELIVERED
+        trigger: "POST /mail-orders/{id}/deliver"
+        actor: PharmacyOperator
+        preconditions: ["fulfillment.status == SHIPPED"]
+        side_effects: ["refresh updated_at"]
+      - from: PLACED
+        to: CANCELLED
+        trigger: "POST /mail-orders/{id}/cancel"
+        actor: Member
+        preconditions: ["fulfillment.status == PLACED"]
+        side_effects: ["refresh updated_at"]
+
+  - entity: TelehealthReferral
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: SCHEDULED
+        trigger: "POST /telehealth-referrals/{id}/schedule"
+        actor: PlatformAdmin
+        preconditions: ["referral.status == REQUESTED"]
+        side_effects: ["refresh updated_at"]
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "POST /telehealth-referrals/{id}/complete"
+        actor: PlatformAdmin
+        preconditions: ["referral.status == SCHEDULED"]
+        side_effects: ["refresh updated_at"]
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /telehealth-referrals/{id}/cancel"
+        actor: Member
+        preconditions: ["referral.status == REQUESTED"]
+        side_effects: ["refresh updated_at"]
+
+# ============================================================================
+# §1.2.1 Concurrency Rules
+# ============================================================================
+concurrency_rules:
+  - rule_id: claim-reverse-stale-version
+    parent_entity: Claim
+    write_endpoint: "POST /claims/{id}/reverse"
+    occ_field: "expected_claim_version"
+    description: |
+      Reversing a Claim whose version has advanced since the client last
+      observed it is rejected. The canonical case: a client reads the claim
+      at version N, an unrelated re-adjudication path (a copay-card draw on
+      adjudicate, then this same reverse) advances the claim's version, and a
+      second reverse still carrying the stale expected_claim_version is
+      rejected on a stale-version check. The reverse endpoint advances
+      Claim.version on success so the next stale request fails deterministically.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ============================================================================
+# §1.3 Calculation Rules Table
+# ============================================================================
+calculations:
+  - name: best_price_selection
+    trigger: "on POST /comparisons/{id}/run (OPEN -> RESOLVED)"
+    algorithm: "selector"
+    formula: |
+      # Candidate pool: PriceQuotes where
+      #   quote.drug_id == comparison.drug_id
+      #   AND quote.status == PUBLISHED
+      #   AND quote.effective_at <= current_clock_utc < quote.expires_at  (half-open window in effect)
+      #   AND Pharmacy(quote.pharmacy_id).status == ACTIVE
+      #   AND Pharmacy(quote.pharmacy_id).state_code == comparison.state_code
+      # Effective price per candidate depends on the searching member's gold access:
+      #   member_is_gold = (Member(comparison.member_id).active_gold_membership_id is not null)
+      #   eff_price(quote) = quote.gold_price_cents IF member_is_gold ELSE quote.discount_price_cents
+      # Selection:
+      #   candidate_count = size(pool)
+      #   IF candidate_count == 0: NO_RESULTS (selected_pharmacy_id = null, best_price_cents = null)
+      #   ELSE:
+      #     sort pool ascending by eff_price(quote);
+      #     tie-break 1: lower Pharmacy.dispense_fee_cents;
+      #     tie-break 2: earlier PriceQuote.created_at (ASC);
+      #     winner = pool[0]
+      #     selected_pharmacy_id = winner.pharmacy_id
+      #     best_price_cents = eff_price(winner)
+    input_set: "PUBLISHED PriceQuotes for the drug at ACTIVE pharmacies in the comparison's state_code, effective_at <= clock"
+    constants: {}
+    precision: "integer cents; no rounding (prices are already integer cents)"
+    variants:
+      - name: gold_basis
+        when: "searching member has an ACTIVE GoldMembership (active_gold_membership_id not null)"
+        difference: "eff_price uses quote.gold_price_cents instead of quote.discount_price_cents — yields a different winner and lower best_price_cents for the same pool"
+      - name: standard_basis
+        when: "searching member has no ACTIVE GoldMembership"
+        difference: "eff_price uses quote.discount_price_cents"
+
+  - name: savings_calculation
+    trigger: "on POST /claims/{id}/adjudicate (SUBMITTED -> ADJUDICATED)"
+    algorithm: "aggregation"
+    formula: |
+      # Resolve the winning quote for the card's pharmacy and drug:
+      #   quote = the PriceQuote with pharmacy_id == card.pharmacy_id,
+      #           drug_id == card.drug_id, status == PUBLISHED,
+      #           effective_at <= clock < expires_at; if multiple, the one with
+      #           greatest effective_at, tie-break earliest created_at ASC.
+      #   basis_price = quote.gold_price_cents IF card.pricing_basis == GOLD
+      #                 ELSE quote.discount_price_cents
+      #   dispense = Pharmacy(card.pharmacy_id).dispense_fee_cents
+      # PINNED EVALUATION ORDER (round per-line is moot — integer cents):
+      #   gross_cents = quantity * quote.cash_price_cents + dispense
+      #   discounted_cents = quantity * basis_price + dispense
+      #   net_cents = discounted_cents - copay_offset_cents   # copay_offset_cents computed by copay_offset_calculation, 0 if no link
+      #   net_cents = max(net_cents, 0)                        # net floored at zero
+      #   savings_cents = gross_cents - net_cents
+    input_set: "the single matching PUBLISHED quote; the claim's quantity; the pharmacy's dispense fee; the linked copay offset if any"
+    constants: {}
+    precision: "integer cents; net floored at 0"
+    variants:
+      - name: discount_basis_claim
+        when: "card.pricing_basis == DISCOUNT"
+        difference: "discounted_cents uses quote.discount_price_cents"
+      - name: gold_basis_claim
+        when: "card.pricing_basis == GOLD"
+        difference: "discounted_cents uses quote.gold_price_cents — different net_cents and savings_cents for identical quantity/quote inputs"
+
+  - name: discount_vs_insurance_choice
+    trigger: "on POST /comparisons/{id}/insurance-estimate (creates InsuranceEstimate)"
+    algorithm: "threshold"
+    formula: |
+      # Requires comparison.status == RESOLVED with best_price_cents set.
+      #   discount_net = comparison.best_price_cents   # single-fill basis
+      #   insurance_net = min(estimate.deductible_remaining_cents, discount_net_reference) ... NO:
+      #   insurance_out_of_pocket:
+      #     IF estimate.deductible_remaining_cents >= 0:
+      #        insurance_net = estimate.copay_cents + min(estimate.deductible_remaining_cents,
+      #                                                   single_fill_awp)
+      #        where single_fill_awp = Drug(comparison.drug_id).awp_cents
+      #   recommended_path:
+      #     IF discount_net < insurance_net: DISCOUNT
+      #     ELSE IF discount_net > insurance_net: INSURANCE
+      #     ELSE (exactly equal): TIE_DISCOUNT   # ties resolve to the discount path
+    input_set: "comparison.best_price_cents; estimate.copay_cents; estimate.deductible_remaining_cents; Drug.awp_cents"
+    constants: {}
+    precision: "integer cents; strict < / > comparison, equality -> TIE_DISCOUNT"
+    variants:
+      - name: insurance_wins
+        when: "insurance_net < discount_net"
+        difference: "recommended_path == INSURANCE"
+      - name: discount_wins_or_ties
+        when: "discount_net <= insurance_net"
+        difference: "recommended_path == DISCOUNT (strict win) or TIE_DISCOUNT (exact equality) — same data, different label vs the insurance_wins variant"
+
+  - name: copay_offset_calculation
+    trigger: "on POST /claims/{id}/adjudicate when a LINKED CopayLink references the claim"
+    algorithm: "waterfall_allocation"
+    formula: |
+      # A claim may have at most one LINKED CopayLink (enforced by §1.4).
+      # Pre-offset member cost = discounted_cents (from savings_calculation,
+      #   before subtracting offset) = quantity * basis_price + dispense.
+      # Three ordered caps the offset must respect (waterfall):
+      #   cap_a = CopayCard.per_fill_cap_cents          # per-claim cap
+      #   cap_b = CopayCard.remaining_benefit_cents     # remaining program benefit
+      #   cap_c = discounted_cents                       # cannot offset more than owed
+      # PINNED ORDER: offset = min(cap_a, cap_b, cap_c)
+      #   link.applied_offset_cents = offset
+      #   claim.copay_offset_cents = offset
+      #   CopayCard.remaining_benefit_cents -= offset   # bucket drawn down
+    input_set: "the single LINKED CopayLink for this claim; the copay card's caps and remaining benefit; the claim's discounted_cents"
+    constants: {}
+    precision: "integer cents; offset = min of the three caps"
+    variants:
+      - name: capped_by_per_fill
+        when: "per_fill_cap_cents is the binding minimum"
+        difference: "offset == per_fill_cap_cents; remaining_benefit_cents reduced by that amount"
+      - name: capped_by_remaining
+        when: "remaining_benefit_cents is the binding minimum"
+        difference: "offset == remaining_benefit_cents; copay card transitions to EXHAUSTED"
+
+  - name: gold_fee_resolution
+    trigger: "on POST /gold-memberships (creation)"
+    algorithm: "threshold"
+    formula: |
+      # monthly_fee_cents is derived from tier, NOT taken from input:
+      #   IF tier == GOLD_INDIVIDUAL: monthly_fee_cents = INDIVIDUAL_FEE_CENTS
+      #   IF tier == GOLD_FAMILY:     monthly_fee_cents = FAMILY_FEE_CENTS
+      # covered_member_ids validity:
+      #   IF tier == GOLD_INDIVIDUAL: covered_member_ids MUST be empty
+      #   IF tier == GOLD_FAMILY:     0 <= len(covered_member_ids) <= MAX_FAMILY_COVERED
+    input_set: "tier; covered_member_ids"
+    constants:
+      INDIVIDUAL_FEE_CENTS: 999
+      FAMILY_FEE_CENTS: 1999
+      MAX_FAMILY_COVERED: 5
+      MEMBERSHIP_BUFFER_SECONDS: 86400
+    precision: "integer cents"
+
+  - name: coupon_credential_assignment
+    trigger: "on POST /discount-cards (DiscountCard creation)"
+    algorithm: "constraint_propagation"
+    formula: |
+      # BIN-PCN-Group credentials derived deterministically, never random:
+      #   bin = NETWORK_BIN   (fixed network constant)
+      #   pricing_basis = GOLD IF Member(member_id).active_gold_membership_id is not null
+      #                   ELSE DISCOUNT
+      #   IF pricing_basis == GOLD: pcn = GOLD_PCN,     group_code = GOLD_GROUP
+      #   ELSE:                     pcn = STANDARD_PCN, group_code = STANDARD_GROUP
+      #   member_code = uppercase(last 8 hex chars of Member.id, '-' removed) + '-' + Drug.ndc
+    input_set: "Member.active_gold_membership_id; Member.id; Drug.ndc"
+    constants:
+      NETWORK_BIN: "610279"
+      GOLD_PCN: "GDX"
+      STANDARD_PCN: "STD"
+      GOLD_GROUP: "GOLDRX"
+      STANDARD_GROUP: "DISCRX"
+    precision: "string credentials; deterministic"
+
+  - name: mail_order_total
+    trigger: "on POST /mail-orders (MailOrderFulfillment creation)"
+    algorithm: "aggregation"
+    formula: |
+      # basis_price chosen by the card's pricing_basis against the mail-order
+      #   pharmacy's PUBLISHED quote for the card's drug:
+      #   quote = PUBLISHED PriceQuote with pharmacy_id == fulfillment.pharmacy_id
+      #           AND drug_id == card.drug_id AND effective_at <= clock < expires_at;
+      #           if multiple, greatest effective_at, tie-break earliest created_at ASC.
+      #   basis_price = quote.gold_price_cents IF card.pricing_basis == GOLD
+      #                 ELSE quote.discount_price_cents
+      #   total_cents = quantity * basis_price + Pharmacy(pharmacy_id).dispense_fee_cents
+    input_set: "the mail-order pharmacy's PUBLISHED quote for the card's drug; quantity; dispense fee"
+    constants: {}
+    precision: "integer cents"
+
+  - name: lifetime_savings_reconciliation
+    trigger: "on any Claim terminal/reversal transition (SUBMITTED->ADJUDICATED, ADJUDICATED->REVERSED)"
+    algorithm: "aggregation"
+    formula: |
+      # Reconcile owner Member's denormalized total from source Claims:
+      #   Member.lifetime_savings_cents =
+      #     SUM(claim.savings_cents) over Claims where
+      #       Claim references a DiscountCard owned by this member (card.member_id == member.id)
+      #       AND claim.status == ADJUDICATED
+      #   REVERSED and REJECTED claims are excluded from the sum.
+    input_set: "all Claims whose card belongs to the member, filtered to status == ADJUDICATED"
+    constants: {}
+    precision: "integer cents"
+
+# ============================================================================
+# §1.4 Validation Rules Table (Ordered by Priority)
+# ============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /members and POST /_clock/set_current_utc and GET (public reads of drugs)"
+
+  - priority: 2
+    category: auth
+    check: "the role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all role-gated endpoints"
+
+  - priority: 3
+    category: auth
+    check: "for entity_backed roles acting on an owned resource, X-User-ID equals the resource's owning member_id"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /comparisons/{id}/run, POST /discount-cards, POST /discount-cards/{id}/void, POST /gold-memberships/{id}/revoke, POST /mail-orders, POST /mail-orders/{id}/cancel, POST /copay-links, POST /copay-links/{id}/release, POST /telehealth-referrals, POST /telehealth-referrals/{id}/cancel, POST /comparisons/{id}/insurance-estimate"
+
+  - priority: 4
+    category: existence
+    check: "every path id and every FK in the body references an existing resource, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 5
+    category: state
+    check: "target resource is in a state from which the requested transition is defined in §1.2; for POST /claims the referenced DiscountCard must be ISSUED (claim creation is gated on the card's state)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints AND POST /claims (card must be ISSUED)"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_claim_version equals Claim.version on POST /claims/{id}/reverse"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /claims/{id}/reverse"
+
+  - priority: 7
+    category: business_safety
+    check: "telehealth referral and mail-order for a controlled drug (Drug.is_controlled == true) require the member's state_code to equal the comparison/ship state and is otherwise blocked"
+    error_id: ERR_CONTROLLED_SUBSTANCE_BLOCKED
+    http_status: 422
+    applies_to: "POST /telehealth-referrals, POST /mail-orders"
+
+  - priority: 8
+    category: business_referential
+    check: "on adjudication, DiscountCard.pharmacy_id must equal the claim's pharmacy_id (the card is pharmacy-scoped)"
+    error_id: ERR_PHARMACY_MISMATCH
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/adjudicate"
+
+  - priority: 9
+    category: business_referential
+    check: "a CopayLink's copay card drug_id must equal the claim's card drug_id; linking a copay card for a different drug is rejected"
+    error_id: ERR_COPAY_DRUG_MISMATCH
+    http_status: 422
+    applies_to: "POST /copay-links"
+
+  - priority: 10
+    category: business_constraint
+    check: "at most one LINKED CopayLink may reference a given claim_id (a claim cannot stack manufacturer offsets)"
+    error_id: ERR_COPAY_ALREADY_LINKED
+    http_status: 409
+    applies_to: "POST /copay-links"
+
+  - priority: 11
+    category: business_constraint
+    check: "PriceQuote.cash_price_cents <= Drug.awp_cents AND discount_price_cents <= cash_price_cents AND gold_price_cents <= discount_price_cents"
+    error_id: ERR_PRICE_ORDER_VIOLATION
+    http_status: 422
+    applies_to: "POST /price-quotes"
+
+  - priority: 11.5
+    category: business_temporal
+    check: "no two PUBLISHED PriceQuotes for the same (pharmacy_id, drug_id) may have overlapping validity windows. Interval is HALF-OPEN [effective_at, expires_at): a new quote whose [effective_at, expires_at) intersects an existing PUBLISHED quote's window is rejected; abutment (new.effective_at == existing.expires_at) is allowed (no overlap)."
+    error_id: ERR_QUOTE_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /price-quotes"
+
+  - priority: 11.6
+    category: business_temporal
+    check: "a Member may not hold two GoldMemberships with overlapping or adjacent coverage windows. Interval is CLOSED [coverage_start, coverage_end] with a mandatory 1-day (86400 s) buffer: a new membership is rejected unless its coverage_start is at least MEMBERSHIP_BUFFER_SECONDS after an existing membership's coverage_end (and symmetrically). Closed-endpoint touching (new.coverage_start == existing.coverage_end) collides."
+    error_id: ERR_MEMBERSHIP_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /gold-memberships"
+
+  - priority: 12
+    category: business_constraint
+    check: "GOLD_INDIVIDUAL must have empty covered_member_ids; GOLD_FAMILY may have at most MAX_FAMILY_COVERED (5)"
+    error_id: ERR_COVERAGE_LIMIT
+    http_status: 422
+    applies_to: "POST /gold-memberships"
+
+  - priority: 13
+    category: business_constraint
+    check: "mail-order pharmacy must have is_mail_order == true"
+    error_id: ERR_NOT_MAIL_ORDER_PHARMACY
+    http_status: 422
+    applies_to: "POST /mail-orders"
+
+  - priority: 14
+    category: business_constraint
+    check: "InsuranceEstimate requires Member.has_insurance == true"
+    error_id: ERR_NO_INSURANCE_ON_FILE
+    http_status: 422
+    applies_to: "POST /comparisons/{id}/insurance-estimate"
+
+  - priority: 15
+    category: business_constraint
+    check: "InsuranceEstimate requires comparison.status == RESOLVED (best_price_cents set)"
+    error_id: ERR_COMPARISON_NOT_RESOLVED
+    http_status: 409
+    applies_to: "POST /comparisons/{id}/insurance-estimate"
+
+  - priority: 16
+    category: business_constraint
+    check: "quantity within bounds (claim quantity >= 1; mail-order quantity in [1,3])"
+    error_id: ERR_QUANTITY_OUT_OF_RANGE
+    http_status: 422
+    applies_to: "POST /claims, POST /mail-orders"
+
+  - priority: 16.5
+    category: business_constraint
+    check: "POST /copay-links requires the referenced CopayCard.status == ACTIVE (cannot link an EXHAUSTED or WITHDRAWN copay card); generic business-rule guard"
+    error_id: ERR_VALIDATION
+    http_status: 422
+    applies_to: "POST /copay-links"
+
+  - priority: 17
+    category: business_constraint
+    check: "required input fields present and well-typed; enum values within declared sets"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all"
+
+# ============================================================================
+# §1.5 API Endpoint Table
+# ============================================================================
+endpoints:
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock. Server startup default is 2026-05-01T00:00:00Z; before any call the clock reads exactly this default and never falls back to wall-clock."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["logical clock advanced to to_iso8601"]
+
+  # ---- Member ----
+  - method: POST
+    path: "/members"
+    description: "Register a member (public)."
+    roles: [Anonymous]
+    code: 201
+    input: [email, full_name, state_code, "has_insurance?"]
+    output: Member
+    side_effects: ["create Member with lifetime_savings_cents=0, active_gold_membership_id=null"]
+  - method: GET
+    path: "/members/{id}"
+    description: "Fetch a member (includes computed lifetime_savings_cents, active_gold_membership_id)."
+    roles: [Member, PlatformAdmin]
+    code: 200
+    input: []
+    output: Member
+    side_effects: []
+  - method: GET
+    path: "/members"
+    description: "List members (admin), optional email filter."
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["email?", "limit?", "offset?"]
+    output: Member[]
+    side_effects: []
+
+  # ---- Drug ----
+  - method: POST
+    path: "/drugs"
+    description: "Create a drug catalog entry."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [name, ndc, dosage_mg, form, awp_cents, "is_controlled?"]
+    output: Drug
+    side_effects: []
+  - method: GET
+    path: "/drugs/{id}"
+    description: "Fetch a drug (public)."
+    roles: [Anonymous, Member, PlatformAdmin, PharmacyOperator, CopayCardSponsor]
+    code: 200
+    input: []
+    output: Drug
+    side_effects: []
+  - method: GET
+    path: "/drugs"
+    description: "Search/list drugs by name (public)."
+    roles: [Anonymous, Member, PlatformAdmin, PharmacyOperator, CopayCardSponsor]
+    code: 200
+    input: ["name?", "limit?", "offset?"]
+    output: Drug[]
+    side_effects: []
+
+  # ---- Pharmacy ----
+  - method: POST
+    path: "/pharmacies"
+    description: "Create a pharmacy."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [name, chain_code, state_code, dispense_fee_cents, "is_mail_order?"]
+    output: Pharmacy
+    side_effects: ["create Pharmacy ACTIVE"]
+  - method: GET
+    path: "/pharmacies/{id}"
+    description: "Fetch a pharmacy."
+    roles: [Anonymous, Member, PlatformAdmin, PharmacyOperator]
+    code: 200
+    input: []
+    output: Pharmacy
+    side_effects: []
+  - method: GET
+    path: "/pharmacies"
+    description: "List pharmacies, optional state_code filter."
+    roles: [Anonymous, Member, PlatformAdmin, PharmacyOperator]
+    code: 200
+    input: ["state_code?", "limit?", "offset?"]
+    output: Pharmacy[]
+    side_effects: []
+  - method: POST
+    path: "/pharmacies/{id}/suspend"
+    description: "Suspend a pharmacy; cascades PUBLISHED quotes to EXPIRED."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Pharmacy
+    side_effects: ["Pharmacy ACTIVE->SUSPENDED", "cascade PUBLISHED PriceQuotes -> EXPIRED"]
+  - method: POST
+    path: "/pharmacies/{id}/reactivate"
+    description: "Reactivate a suspended pharmacy."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Pharmacy
+    side_effects: ["Pharmacy SUSPENDED->ACTIVE"]
+
+  # ---- PriceQuote ----
+  - method: POST
+    path: "/price-quotes"
+    description: "Publish a pharmacy's price quote for a drug. Operator's X-User-ID is recorded but pricing is per-pharmacy."
+    roles: [PharmacyOperator, PlatformAdmin]
+    code: 201
+    input: [drug_id, pharmacy_id, cash_price_cents, discount_price_cents, gold_price_cents, effective_at, expires_at]
+    output: PriceQuote
+    side_effects: ["create PriceQuote PUBLISHED"]
+  - method: GET
+    path: "/price-quotes/{id}"
+    description: "Fetch a price quote."
+    roles: [Anonymous, Member, PlatformAdmin, PharmacyOperator]
+    code: 200
+    input: []
+    output: PriceQuote
+    side_effects: []
+  - method: GET
+    path: "/price-quotes"
+    description: "List/filter price quotes by drug_id and/or pharmacy_id (FK reverse-reachability for both)."
+    roles: [Anonymous, Member, PlatformAdmin, PharmacyOperator]
+    code: 200
+    input: ["drug_id?", "pharmacy_id?", "status?", "limit?", "offset?"]
+    output: PriceQuote[]
+    side_effects: []
+  - method: POST
+    path: "/price-quotes/{id}/expire"
+    description: "Expire a published quote."
+    roles: [PharmacyOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: PriceQuote
+    side_effects: ["PriceQuote PUBLISHED->EXPIRED"]
+
+  # ---- PriceComparison ----
+  - method: POST
+    path: "/comparisons"
+    description: "Open a price comparison (search session) for a drug in a state."
+    roles: [Member]
+    code: 201
+    input: [member_id, drug_id, state_code]
+    output: PriceComparison
+    side_effects: ["create PriceComparison OPEN"]
+  - method: GET
+    path: "/comparisons/{id}"
+    description: "Fetch a comparison (includes selected_pharmacy_id, best_price_cents, candidate_count)."
+    roles: [Member, PlatformAdmin]
+    code: 200
+    input: []
+    output: PriceComparison
+    side_effects: []
+  - method: GET
+    path: "/comparisons"
+    description: "List comparisons, optional member_id filter (FK reverse-reachability for Member)."
+    roles: [Member, PlatformAdmin]
+    code: 200
+    input: ["member_id?", "drug_id?", "limit?", "offset?"]
+    output: PriceComparison[]
+    side_effects: []
+  - method: POST
+    path: "/comparisons/{id}/run"
+    description: "Run the best-price selection; resolves to RESOLVED or NO_RESULTS."
+    roles: [Member]
+    code: 200
+    input: [member_id]
+    output: PriceComparison
+    side_effects: ["run best_price_selection", "OPEN->RESOLVED or OPEN->NO_RESULTS"]
+  - method: POST
+    path: "/comparisons/{id}/insurance-estimate"
+    description: "Attach an insurance estimate and compute the discount-vs-insurance recommendation."
+    roles: [Member]
+    code: 201
+    input: [member_id, copay_cents, deductible_remaining_cents]
+    output: InsuranceEstimate
+    side_effects: ["create InsuranceEstimate", "run discount_vs_insurance_choice -> recommended_path"]
+  - method: GET
+    path: "/insurance-estimates/{id}"
+    description: "Fetch an insurance estimate (includes recommended_path)."
+    roles: [Member, PlatformAdmin]
+    code: 200
+    input: []
+    output: InsuranceEstimate
+    side_effects: []
+  - method: GET
+    path: "/insurance-estimates"
+    description: "List insurance estimates, filter by comparison_id and/or member_id (FK reverse-reachability)."
+    roles: [Member, PlatformAdmin]
+    code: 200
+    input: ["comparison_id?", "member_id?", "limit?", "offset?"]
+    output: InsuranceEstimate[]
+    side_effects: []
+
+  # ---- DiscountCard ----
+  - method: POST
+    path: "/discount-cards"
+    description: "Generate a discount card (coupon) from a RESOLVED comparison; assigns BIN-PCN-Group; converts the comparison."
+    roles: [Member]
+    code: 201
+    input: [member_id, comparison_id]
+    output: DiscountCard
+    side_effects: ["run coupon_credential_assignment", "create DiscountCard ISSUED", "PriceComparison RESOLVED->CONVERTED"]
+  - method: GET
+    path: "/discount-cards/{id}"
+    description: "Fetch a discount card."
+    roles: [Member, PlatformAdmin, PharmacyOperator]
+    code: 200
+    input: []
+    output: DiscountCard
+    side_effects: []
+  - method: GET
+    path: "/discount-cards"
+    description: "List discount cards, filter by member_id, drug_id, comparison_id, pharmacy_id (FK reverse-reachability)."
+    roles: [Member, PlatformAdmin, PharmacyOperator]
+    code: 200
+    input: ["member_id?", "drug_id?", "comparison_id?", "pharmacy_id?", "limit?", "offset?"]
+    output: DiscountCard[]
+    side_effects: []
+  - method: POST
+    path: "/discount-cards/{id}/void"
+    description: "Void an issued card."
+    roles: [Member]
+    code: 200
+    input: [member_id]
+    output: DiscountCard
+    side_effects: ["DiscountCard ISSUED->VOID"]
+
+  # ---- Claim ----
+  - method: POST
+    path: "/claims"
+    description: "Pharmacy submits a claim against a discount card. Requires card.status==ISSUED (else ERR_INVALID_STATE) and DiscountCard.pharmacy_id==pharmacy_id (else ERR_PHARMACY_MISMATCH)."
+    roles: [PharmacyOperator]
+    code: 201
+    input: [discount_card_id, pharmacy_id, quantity]
+    output: Claim
+    side_effects: ["create Claim SUBMITTED; copy drug_id from card"]
+  - method: GET
+    path: "/claims/{id}"
+    description: "Fetch a claim (includes gross_cents, net_cents, savings_cents, copay_offset_cents)."
+    roles: [PharmacyOperator, PlatformAdmin, Member]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: []
+  - method: GET
+    path: "/claims"
+    description: "List claims, filter by discount_card_id, pharmacy_id, drug_id (FK reverse-reachability)."
+    roles: [PharmacyOperator, PlatformAdmin, Member]
+    code: 200
+    input: ["discount_card_id?", "pharmacy_id?", "drug_id?", "status?", "limit?", "offset?"]
+    output: Claim[]
+    side_effects: []
+  - method: POST
+    path: "/claims/{id}/adjudicate"
+    description: "Adjudicate a submitted claim; computes savings, applies any linked copay offset, redeems the card."
+    roles: [PharmacyOperator]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["run savings_calculation", "run copay_offset_calculation if linked", "Claim SUBMITTED->ADJUDICATED", "DiscountCard ISSUED->REDEEMED", "CopayLink LINKED->APPLIED + CopayCard draw", "recompute Member.lifetime_savings_cents"]
+  - method: POST
+    path: "/claims/{id}/reject"
+    description: "Reject a submitted claim."
+    roles: [PharmacyOperator]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["Claim SUBMITTED->REJECTED"]
+  - method: POST
+    path: "/claims/{id}/reverse"
+    description: "Reverse an adjudicated claim (OCC-guarded); compensates copay draw and re-issues the card."
+    roles: [PharmacyOperator]
+    code: 200
+    input: [expected_claim_version]
+    output: Claim
+    side_effects: ["Claim ADJUDICATED->REVERSED", "DiscountCard REDEEMED->ISSUED", "CopayLink APPLIED->RELEASED + restore CopayCard", "recompute Member.lifetime_savings_cents", "increment Claim.version by 1"]
+
+  # ---- CopayCard ----
+  - method: POST
+    path: "/copay-cards"
+    description: "Sponsor publishes a manufacturer copay card for a brand drug."
+    roles: [CopayCardSponsor, PlatformAdmin]
+    code: 201
+    input: [sponsor_name, drug_id, max_benefit_cents, per_fill_cap_cents]
+    output: CopayCard
+    side_effects: ["create CopayCard ACTIVE with remaining_benefit_cents = max_benefit_cents"]
+  - method: GET
+    path: "/copay-cards/{id}"
+    description: "Fetch a copay card (includes remaining_benefit_cents)."
+    roles: [CopayCardSponsor, PlatformAdmin, Member]
+    code: 200
+    input: []
+    output: CopayCard
+    side_effects: []
+  - method: GET
+    path: "/copay-cards"
+    description: "List copay cards, filter by drug_id (FK reverse-reachability)."
+    roles: [CopayCardSponsor, PlatformAdmin, Member]
+    code: 200
+    input: ["drug_id?", "limit?", "offset?"]
+    output: CopayCard[]
+    side_effects: []
+  - method: POST
+    path: "/copay-cards/{id}/withdraw"
+    description: "Sponsor withdraws a copay card; releases LINKED (not APPLIED) links."
+    roles: [CopayCardSponsor]
+    code: 200
+    input: []
+    output: CopayCard
+    side_effects: ["CopayCard ACTIVE->WITHDRAWN", "cascade LINKED CopayLinks -> RELEASED"]
+
+  # ---- CopayLink ----
+  - method: POST
+    path: "/copay-links"
+    description: "Member links a copay card to a SUBMITTED claim so the offset applies on adjudication."
+    roles: [Member]
+    code: 201
+    input: [copay_card_id, member_id, claim_id]
+    output: CopayLink
+    side_effects: ["create CopayLink LINKED"]
+  - method: GET
+    path: "/copay-links/{id}"
+    description: "Fetch a copay link."
+    roles: [Member, PlatformAdmin, CopayCardSponsor]
+    code: 200
+    input: []
+    output: CopayLink
+    side_effects: []
+  - method: GET
+    path: "/copay-links"
+    description: "List copay links, filter by copay_card_id, member_id, claim_id (FK reverse-reachability)."
+    roles: [Member, PlatformAdmin, CopayCardSponsor]
+    code: 200
+    input: ["copay_card_id?", "member_id?", "claim_id?", "limit?", "offset?"]
+    output: CopayLink[]
+    side_effects: []
+  - method: POST
+    path: "/copay-links/{id}/release"
+    description: "Member releases a LINKED (un-applied) copay link."
+    roles: [Member]
+    code: 200
+    input: [member_id]
+    output: CopayLink
+    side_effects: ["CopayLink LINKED->RELEASED"]
+
+  # ---- GoldMembership ----
+  - method: POST
+    path: "/gold-memberships"
+    description: "Member subscribes to a Gold tier; fee resolved from tier."
+    roles: [Member]
+    code: 201
+    input: [member_id, tier, coverage_start, coverage_end, "covered_member_ids?"]
+    output: GoldMembership
+    side_effects: ["run gold_fee_resolution", "create GoldMembership billing_status=PENDING_PAYMENT, access_status=INACTIVE"]
+  - method: GET
+    path: "/gold-memberships/{id}"
+    description: "Fetch a gold membership (billing_status, access_status)."
+    roles: [Member, PlatformAdmin]
+    code: 200
+    input: []
+    output: GoldMembership
+    side_effects: []
+  - method: GET
+    path: "/gold-memberships"
+    description: "List gold memberships, filter by member_id (FK reverse-reachability)."
+    roles: [Member, PlatformAdmin]
+    code: 200
+    input: ["member_id?", "limit?", "offset?"]
+    output: GoldMembership[]
+    side_effects: []
+  - method: POST
+    path: "/gold-memberships/{id}/record-payment"
+    description: "Record a payment; billing PENDING_PAYMENT->PAID and activates access on first payment."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: GoldMembership
+    side_effects: ["billing PENDING_PAYMENT->PAID", "access INACTIVE->ACTIVE", "set Member.active_gold_membership_id"]
+  - method: POST
+    path: "/gold-memberships/{id}/lapse"
+    description: "Mark billing PAST_DUE; revokes access and voids GOLD-basis cards."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: GoldMembership
+    side_effects: ["billing PAID->PAST_DUE", "access ACTIVE->REVOKED", "clear Member.active_gold_membership_id", "cascade GOLD-basis ISSUED cards -> VOID"]
+  - method: POST
+    path: "/gold-memberships/{id}/revoke"
+    description: "Member voluntarily revokes access (billing untouched)."
+    roles: [Member]
+    code: 200
+    input: [member_id]
+    output: GoldMembership
+    side_effects: ["access ACTIVE->REVOKED", "clear Member.active_gold_membership_id"]
+
+  # ---- MailOrderFulfillment ----
+  - method: POST
+    path: "/mail-orders"
+    description: "Member places a mail-order fill against a discount card at a mail-order pharmacy."
+    roles: [Member]
+    code: 201
+    input: [discount_card_id, pharmacy_id, member_id, quantity, ship_to_state]
+    output: MailOrderFulfillment
+    side_effects: ["run mail_order_total", "create MailOrderFulfillment PLACED"]
+  - method: GET
+    path: "/mail-orders/{id}"
+    description: "Fetch a mail-order fulfillment (includes total_cents)."
+    roles: [Member, PlatformAdmin, PharmacyOperator]
+    code: 200
+    input: []
+    output: MailOrderFulfillment
+    side_effects: []
+  - method: GET
+    path: "/mail-orders"
+    description: "List mail orders, filter by member_id, discount_card_id, pharmacy_id (FK reverse-reachability)."
+    roles: [Member, PlatformAdmin, PharmacyOperator]
+    code: 200
+    input: ["member_id?", "discount_card_id?", "pharmacy_id?", "limit?", "offset?"]
+    output: MailOrderFulfillment[]
+    side_effects: []
+  - method: POST
+    path: "/mail-orders/{id}/ship"
+    description: "Ship a placed mail order."
+    roles: [PharmacyOperator]
+    code: 200
+    input: []
+    output: MailOrderFulfillment
+    side_effects: ["MailOrderFulfillment PLACED->SHIPPED"]
+  - method: POST
+    path: "/mail-orders/{id}/deliver"
+    description: "Deliver a shipped mail order."
+    roles: [PharmacyOperator]
+    code: 200
+    input: []
+    output: MailOrderFulfillment
+    side_effects: ["MailOrderFulfillment SHIPPED->DELIVERED"]
+  - method: POST
+    path: "/mail-orders/{id}/cancel"
+    description: "Cancel a placed mail order."
+    roles: [Member]
+    code: 200
+    input: [member_id]
+    output: MailOrderFulfillment
+    side_effects: ["MailOrderFulfillment PLACED->CANCELLED"]
+
+  # ---- TelehealthReferral ----
+  - method: POST
+    path: "/telehealth-referrals"
+    description: "Member requests a telehealth referral from a comparison."
+    roles: [Member]
+    code: 201
+    input: [member_id, comparison_id, reason]
+    output: TelehealthReferral
+    side_effects: ["create TelehealthReferral REQUESTED; copy drug_id from comparison"]
+  - method: GET
+    path: "/telehealth-referrals/{id}"
+    description: "Fetch a telehealth referral."
+    roles: [Member, PlatformAdmin]
+    code: 200
+    input: []
+    output: TelehealthReferral
+    side_effects: []
+  - method: GET
+    path: "/telehealth-referrals"
+    description: "List telehealth referrals, filter by member_id, comparison_id, drug_id (FK reverse-reachability)."
+    roles: [Member, PlatformAdmin]
+    code: 200
+    input: ["member_id?", "comparison_id?", "drug_id?", "limit?", "offset?"]
+    output: TelehealthReferral[]
+    side_effects: []
+  - method: POST
+    path: "/telehealth-referrals/{id}/schedule"
+    description: "Schedule a requested referral."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: TelehealthReferral
+    side_effects: ["TelehealthReferral REQUESTED->SCHEDULED"]
+  - method: POST
+    path: "/telehealth-referrals/{id}/complete"
+    description: "Complete a scheduled referral."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: TelehealthReferral
+    side_effects: ["TelehealthReferral SCHEDULED->COMPLETED"]
+  - method: POST
+    path: "/telehealth-referrals/{id}/cancel"
+    description: "Cancel a requested referral."
+    roles: [Member]
+    code: 200
+    input: [member_id]
+    output: TelehealthReferral
+    side_effects: ["TelehealthReferral REQUESTED->CANCELLED"]
+
+# ============================================================================
+# §1.6 Error Code Catalog
+# ============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/unknown X-User-Role or missing X-User-ID on a protected endpoint"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "role not permitted for this operation per §1.7"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "entity_backed role's X-User-ID does not match the owning member_id of the targeted resource"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "referenced path id or FK does not resolve to an existing resource"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested transition not defined from the resource's current state"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_claim_version does not match Claim.version on reverse (OCC)"
+  - id: ERR_CONTROLLED_SUBSTANCE_BLOCKED
+    http: 422
+    condition: "controlled-drug telehealth/mail-order attempted where state rules forbid it"
+  - id: ERR_PHARMACY_MISMATCH
+    http: 422
+    condition: "claim pharmacy_id != DiscountCard.pharmacy_id"
+  - id: ERR_COPAY_DRUG_MISMATCH
+    http: 422
+    condition: "CopayCard.drug_id != the linked claim's card drug_id"
+  - id: ERR_COPAY_ALREADY_LINKED
+    http: 409
+    condition: "a LINKED CopayLink already references this claim_id"
+  - id: ERR_PRICE_ORDER_VIOLATION
+    http: 422
+    condition: "quote price ordering cash<=awp, discount<=cash, gold<=discount violated"
+  - id: ERR_QUOTE_PERIOD_OVERLAP
+    http: 409
+    condition: "new PUBLISHED quote's half-open [effective_at, expires_at) intersects an existing PUBLISHED quote for the same (pharmacy_id, drug_id)"
+  - id: ERR_MEMBERSHIP_PERIOD_OVERLAP
+    http: 409
+    condition: "new GoldMembership coverage window violates the closed-interval + 1-day-buffer rule against an existing membership for the same member"
+  - id: ERR_COVERAGE_LIMIT
+    http: 422
+    condition: "GOLD_INDIVIDUAL has non-empty covered_member_ids, or GOLD_FAMILY exceeds 5 covered ids"
+  - id: ERR_NOT_MAIL_ORDER_PHARMACY
+    http: 422
+    condition: "mail-order placed at a pharmacy whose is_mail_order == false"
+  - id: ERR_NO_INSURANCE_ON_FILE
+    http: 422
+    condition: "insurance estimate requested for a member with has_insurance == false"
+  - id: ERR_COMPARISON_NOT_RESOLVED
+    http: 409
+    condition: "insurance estimate or card generation attempted while comparison is not RESOLVED"
+  - id: ERR_QUANTITY_OUT_OF_RANGE
+    http: 422
+    condition: "claim quantity < 1, or mail-order quantity outside [1,3]"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "missing required field, wrong type, or enum value outside declared set"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "generic business-rule violation not covered by a more specific code"
+  - id: ERR_PAGINATION_INVALID
+    http: 400
+    condition: "limit/offset outside allowed bounds (limit 1..100, offset >= 0)"
+
+# ============================================================================
+# §1.7 RBAC Matrix
+# ============================================================================
+roles:
+  - name: Anonymous
+    description: "Unauthenticated public caller; can register and browse drugs/pharmacies/quotes."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /members"
+    shared_operations:
+      - "GET /drugs, GET /drugs/{id}, GET /pharmacies, GET /pharmacies/{id}, GET /price-quotes, GET /price-quotes/{id}"
+
+  - name: Member
+    description: "App user who searches prices, generates cards, subscribes Gold, links copay cards, places mail orders, requests telehealth."
+    identity: "entity_backed:Member"
+    exclusive_operations:
+      - "POST /comparisons"
+      - "POST /comparisons/{id}/run"
+      - "POST /comparisons/{id}/insurance-estimate"
+      - "POST /discount-cards"
+      - "POST /discount-cards/{id}/void"
+      - "POST /gold-memberships"
+      - "POST /gold-memberships/{id}/revoke"
+      - "POST /copay-links"
+      - "POST /copay-links/{id}/release"
+      - "POST /mail-orders"
+      - "POST /mail-orders/{id}/cancel"
+      - "POST /telehealth-referrals"
+      - "POST /telehealth-referrals/{id}/cancel"
+    shared_operations:
+      - "GET own comparisons, discount-cards, gold-memberships, copay-links, mail-orders, telehealth-referrals, claims, members/{id}, copay-cards"
+
+  - name: PharmacyOperator
+    description: "Operator acting on behalf of pharmacies; publishes quotes, submits/adjudicates/reverses/rejects claims, ships/delivers mail orders."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /claims"
+      - "POST /claims/{id}/adjudicate"
+      - "POST /claims/{id}/reject"
+      - "POST /claims/{id}/reverse"
+      - "POST /mail-orders/{id}/ship"
+      - "POST /mail-orders/{id}/deliver"
+    shared_operations:
+      - "POST /price-quotes, POST /price-quotes/{id}/expire (with PlatformAdmin)"
+      - "GET price-quotes, claims, discount-cards, mail-orders, pharmacies, drugs"
+
+  - name: CopayCardSponsor
+    description: "Manufacturer/sponsor that publishes and withdraws copay cards."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /copay-cards/{id}/withdraw"
+    shared_operations:
+      - "POST /copay-cards (with PlatformAdmin)"
+      - "GET copay-cards, copay-links, drugs"
+
+  - name: PlatformAdmin
+    description: "Operator with catalog, pharmacy lifecycle, gold-membership billing, and telehealth scheduling authority."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /drugs"
+      - "POST /pharmacies"
+      - "POST /pharmacies/{id}/suspend"
+      - "POST /pharmacies/{id}/reactivate"
+      - "POST /gold-memberships/{id}/record-payment"
+      - "POST /gold-memberships/{id}/lapse"
+      - "POST /telehealth-referrals/{id}/schedule"
+      - "POST /telehealth-referrals/{id}/complete"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /price-quotes, POST /price-quotes/{id}/expire (with PharmacyOperator)"
+      - "POST /copay-cards (with CopayCardSponsor)"
+      - "GET on all collections"

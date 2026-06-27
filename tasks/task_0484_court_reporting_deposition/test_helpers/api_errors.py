@@ -1,0 +1,74 @@
+"""Error IDs and HTTP status mapping (PRD §5).
+
+After defining the mapping, register it with the framework so validate_error()
+can cross-check HTTP status codes automatically.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    # --- Auth ---
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN_ROLE = "ERR_FORBIDDEN_ROLE"
+    ERR_NOT_CASE_PARTY = "ERR_NOT_CASE_PARTY"
+    # --- Not found / request ---
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    # --- Uniqueness ---
+    ERR_DUPLICATE_KEY = "ERR_DUPLICATE_KEY"
+    ERR_DUPLICATE_EXHIBIT_LABEL = "ERR_DUPLICATE_EXHIBIT_LABEL"
+    # --- State ---
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    # --- Time / scheduling ---
+    ERR_INVALID_TIME_WINDOW = "ERR_INVALID_TIME_WINDOW"
+    ERR_RESOURCE_DOUBLE_BOOKED = "ERR_RESOURCE_DOUBLE_BOOKED"
+    ERR_REPORTER_BUFFER_CONFLICT = "ERR_REPORTER_BUFFER_CONFLICT"
+    # --- Assignment business rules ---
+    ERR_ROLE_KIND_MISMATCH = "ERR_ROLE_KIND_MISMATCH"
+    ERR_RESOURCE_INACTIVE = "ERR_RESOURCE_INACTIVE"
+    ERR_ROLE_ALREADY_FILLED = "ERR_ROLE_ALREADY_FILLED"
+    ERR_INTERPRETER_LANGUAGE_MISMATCH = "ERR_INTERPRETER_LANGUAGE_MISMATCH"
+    ERR_REALTIME_NOT_CAPABLE = "ERR_REALTIME_NOT_CAPABLE"
+    # --- Transcript / errata ---
+    ERR_JOB_NOT_ADJOURNED = "ERR_JOB_NOT_ADJOURNED"
+    ERR_INVALID_PAGE_COUNT = "ERR_INVALID_PAGE_COUNT"
+    ERR_READ_SIGN_WINDOW_CLOSED = "ERR_READ_SIGN_WINDOW_CLOSED"
+    # --- Invoice ---
+    ERR_INVOICE_NOT_READY = "ERR_INVOICE_NOT_READY"
+    # --- OCC ---
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    # --- Realtime ---
+    ERR_REALTIME_NOT_PROVISIONABLE = "ERR_REALTIME_NOT_PROVISIONABLE"
+    # --- Generic ---
+    ERR_VALIDATION = "ERR_VALIDATION"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN_ROLE: 403,
+    ApiErrorId.ERR_NOT_CASE_PARTY: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_REQUEST: 400,
+    ApiErrorId.ERR_DUPLICATE_KEY: 409,
+    ApiErrorId.ERR_DUPLICATE_EXHIBIT_LABEL: 409,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_INVALID_TIME_WINDOW: 422,
+    ApiErrorId.ERR_RESOURCE_DOUBLE_BOOKED: 409,
+    ApiErrorId.ERR_REPORTER_BUFFER_CONFLICT: 409,
+    ApiErrorId.ERR_ROLE_KIND_MISMATCH: 422,
+    ApiErrorId.ERR_RESOURCE_INACTIVE: 422,
+    ApiErrorId.ERR_ROLE_ALREADY_FILLED: 422,
+    ApiErrorId.ERR_INTERPRETER_LANGUAGE_MISMATCH: 422,
+    ApiErrorId.ERR_REALTIME_NOT_CAPABLE: 422,
+    ApiErrorId.ERR_JOB_NOT_ADJOURNED: 422,
+    ApiErrorId.ERR_INVALID_PAGE_COUNT: 422,
+    ApiErrorId.ERR_READ_SIGN_WINDOW_CLOSED: 409,
+    ApiErrorId.ERR_INVOICE_NOT_READY: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_REALTIME_NOT_PROVISIONABLE: 422,
+    ApiErrorId.ERR_VALIDATION: 422,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

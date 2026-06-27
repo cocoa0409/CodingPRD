@@ -1,0 +1,33 @@
+"""Domain thresholds — numeric constants from PRD calculations."""
+
+# Messaging SLA (PRD §3.12).
+BUSINESS_OPEN_HOUR = 8
+BUSINESS_CLOSE_HOUR = 18
+ROUTINE_SLA_HOURS = 24
+AFTER_HOURS_SLA_HOURS = 4
+
+# Billing-period lengths (PRD §3.3, §3.9).
+MONTHLY_PERIOD_DAYS = 30
+ANNUAL_PERIOD_DAYS = 365
+
+# Referral authorization validity (PRD §3.11).
+REFERRAL_AUTH_VALID_DAYS = 30
+
+# Practice configuration defaults (PRD §3.1).
+DEFAULT_ANNUAL_FEE_DISCOUNT_PCT = 0.15
+DEFAULT_INSURANCE_COINSURANCE_PCT = 0.20
+DEFAULT_LATE_FEE_CENTS = 2500
+DEFAULT_GRACE_PERIOD_DAYS = 14
+
+# Employer sponsorship default (PRD §3.2).
+DEFAULT_SPONSORSHIP_PCT = 1.0
+
+# Slot capacity default (PRD §3.5).
+DEFAULT_VIRTUAL_CAPACITY = 1
+
+TEST_DEFAULTS = {
+    "MONTHLY_FEE_CENTS": 15000,
+    "PANEL_TARGET": 50,
+    "PANEL_HARD_CAP": 100,
+    "SPONSORED_SEAT_LIMIT": 5,
+}

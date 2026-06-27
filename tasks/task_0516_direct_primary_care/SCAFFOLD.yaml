@@ -1,0 +1,1744 @@
+scenario: "Direct Primary Care / Concierge Membership (One Medical style): membership enrollment & monthly fee, same-day & virtual visit booking, panel-size & PCP assignment, annual physical & care plan, employer-sponsored roster, specialist referral, after-hours messaging, insurance-vs-DPC billing split"
+
+domain_name: direct-primary-care
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - derived_field_reconciliation
+    - scheduled_actions
+
+  entity_topology: hybrid
+  # Practice is a configuration root; Provider/Member/Employer are peer resources
+  # linked by FKs; Visit/VisitSlot/CarePlan/Referral/Message/Invoice/Payment hang
+  # off Member and Provider via cross-aggregate references.
+
+  state_machine_shape: parallel
+  # Visit carries two independent dimensions (clinical_status x billing_status).
+  # CarePlan is cyclic (DRAFT->ACTIVE->UNDER_REVISION->ACTIVE). Membership has a
+  # branching grace/reinstate path. Referral and Invoice are linear-with-revert.
+
+  relationship_patterns:
+    - one_to_many       # Provider 1..* Member (panel); Member 1..* Visit
+    - many_to_many      # Employer <-> Member via EmployerSeat junction
+    - cross_aggregate   # Invoice references Visit; Referral references Visit; Payment references Membership/Invoice
+
+  role_model: peer_roles
+  # Provider owns clinical resources (Visit clinical outcome, CarePlan, Referral);
+  # Member owns booking + messaging + own membership lifecycle; Employer owns its
+  # roster + seat sponsorship; PlatformAdmin operates config & billing runs.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Practice
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Practice display name."
+      - name: panel_target
+        type: integer
+        source: input
+        description: "Soft panel target per provider; used to flag UNDER_TARGET vs AT_TARGET load buckets."
+        constraints: "> 0"
+      - name: panel_hard_cap
+        type: integer
+        source: input
+        description: "Hard ceiling on active members per provider; assignment is rejected once reached."
+        constraints: ">= panel_target"
+      - name: monthly_fee_cents
+        type: integer
+        source: input
+        description: "Standard individual DPC monthly membership fee in cents."
+        constraints: "> 0"
+      - name: annual_fee_discount_pct
+        type: number
+        source: input
+        description: "Fractional discount applied to the prepaid annual plan (e.g., 0.15 = 15% off 12 months)."
+        default: 0.15
+        constraints: "0 <= x < 1"
+      - name: dpc_covered_service_codes
+        type: array
+        source: input
+        description: "Service codes fully covered by the DPC membership (member pays 0 to the practice for these)."
+      - name: insurance_coinsurance_pct
+        type: number
+        source: input
+        description: "Member coinsurance share for insurance-billed (non-DPC-covered) service lines."
+        default: 0.20
+        constraints: "0 <= x < 1"
+      - name: late_fee_cents
+        type: integer
+        source: input
+        description: "Flat late fee added when a monthly charge enters PAST_DUE."
+        default: 2500
+        constraints: ">= 0"
+      - name: grace_period_days
+        type: integer
+        source: input
+        description: "Days a PAST_DUE membership may remain before auto-suspension."
+        default: 14
+        constraints: ">= 0"
+
+  - name: Provider
+    parent: null
+    common_fields: true
+    fields:
+      - name: practice_id
+        type: string
+        source: input
+        description: "FK -> Practice.id"
+      - name: full_name
+        type: string
+        source: input
+        description: "Provider full name."
+      - name: npi
+        type: string
+        source: input
+        description: "National Provider Identifier; unique within the practice."
+        constraints: "unique per practice_id"
+      - name: panel_capacity
+        type: integer
+        source: input
+        description: "Per-provider override hard cap; if null the Practice.panel_hard_cap applies."
+        default: null
+        constraints: "null or > 0"
+      - name: accepting_new_members
+        type: boolean
+        source: input
+        description: "When false the provider is excluded from auto-assignment candidate pools."
+        default: true
+      - name: active_panel_count
+        type: integer
+        source: computed
+        description: "Count of Members assigned to this provider whose membership_status IN {ACTIVE, PAST_DUE}. Recomputed on every assignment, unassignment, suspension, and reinstatement."
+      - name: panel_load_bucket
+        type: enum
+        source: computed
+        description: "Derived load tier: UNDER_TARGET if active_panel_count < Practice.panel_target, AT_TARGET if panel_target <= active_panel_count < effective_cap, FULL if active_panel_count == effective_cap."
+        constraints: "UNDER_TARGET | AT_TARGET | FULL"
+
+  - name: Employer
+    parent: null
+    common_fields: true
+    fields:
+      - name: practice_id
+        type: string
+        source: input
+        description: "FK -> Practice.id"
+      - name: company_name
+        type: string
+        source: input
+        description: "Sponsoring company name."
+      - name: sponsored_seat_limit
+        type: integer
+        source: input
+        description: "Maximum number of concurrently-occupied sponsored seats the employer will fund."
+        constraints: "> 0"
+      - name: sponsorship_pct
+        type: number
+        source: input
+        description: "Fraction of each sponsored member's monthly fee the employer covers; member pays the remainder."
+        default: 1.0
+        constraints: "0 < x <= 1"
+      - name: occupied_seat_count
+        type: integer
+        source: computed
+        description: "Count of EmployerSeat rows for this employer with seat_status == OCCUPIED. Recomputed on seat occupy/release."
+
+  - name: Member
+    parent: null
+    common_fields: true
+    fields:
+      - name: practice_id
+        type: string
+        source: input
+        description: "FK -> Practice.id"
+      - name: assigned_provider_id
+        type: string
+        source: system
+        description: "FK -> Provider.id; set by PCP assignment, cleared on unassign."
+        default: null
+      - name: email
+        type: string
+        source: input
+        description: "Login/contact email; unique within the practice."
+        constraints: "unique per practice_id"
+      - name: full_name
+        type: string
+        source: input
+        description: "Member full name."
+      - name: plan_type
+        type: enum
+        source: input
+        description: "Billing plan chosen at enrollment."
+        default: MONTHLY
+        constraints: "MONTHLY | ANNUAL_PREPAID"
+      - name: membership_status
+        type: enum
+        source: system
+        description: "Lifecycle state of the membership (see §1.2)."
+        default: PENDING_PAYMENT
+        constraints: "PENDING_PAYMENT | ACTIVE | PAST_DUE | SUSPENDED | CANCELLED"
+      - name: has_insurance
+        type: boolean
+        source: input
+        description: "Whether the member carries third-party insurance (drives the insurance-vs-DPC billing split)."
+        default: false
+      - name: wallet_credit_cents
+        type: integer
+        source: computed
+        description: "Member account credit in cents from refunds/overpayments; applied before charging a card. Never negative."
+        default: 0
+      - name: annual_physical_due_on
+        type: datetime
+        source: computed
+        description: "Date the next annual physical becomes due; advanced by 365 days when an ANNUAL_PHYSICAL visit completes."
+        default: null
+
+  - name: Membership
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; 1:1 with the member."
+      - name: plan_type
+        type: enum
+        source: input
+        description: "Snapshot of plan at activation."
+        constraints: "MONTHLY | ANNUAL_PREPAID"
+      - name: monthly_fee_cents
+        type: integer
+        source: system
+        description: "Fee snapshot taken from Practice.monthly_fee_cents at enrollment."
+      - name: employer_seat_id
+        type: string
+        source: system
+        description: "FK -> EmployerSeat.id; non-null while an employer sponsors this membership."
+        default: null
+      - name: member_share_cents
+        type: integer
+        source: computed
+        description: "Per-cycle amount the member personally owes after employer sponsorship and any annual discount (see member_monthly_share calc)."
+      - name: current_period_start
+        type: datetime
+        source: system
+        description: "Start of the current billing period (UTC)."
+      - name: current_period_end
+        type: datetime
+        source: computed
+        description: "End of current billing period: current_period_start + 30 days for MONTHLY, + 365 days for ANNUAL_PREPAID."
+      - name: past_due_since
+        type: datetime
+        source: system
+        description: "Timestamp the membership entered PAST_DUE; null when not past due."
+        default: null
+
+  - name: EmployerSeat
+    parent: null
+    common_fields: true
+    fields:
+      - name: employer_id
+        type: string
+        source: input
+        description: "FK -> Employer.id"
+      - name: member_id
+        type: string
+        source: system
+        description: "FK -> Member.id; null while the seat is OPEN, set when OCCUPIED."
+        default: null
+      - name: seat_status
+        type: enum
+        source: system
+        description: "OPEN (allocated, unfilled), OCCUPIED (sponsoring a member), RELEASED (returned to pool, terminal)."
+        default: OPEN
+        constraints: "OPEN | OCCUPIED | RELEASED"
+
+  - name: VisitSlot
+    parent: null
+    common_fields: true
+    fields:
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> Provider.id"
+      - name: slot_type
+        type: enum
+        source: input
+        description: "IN_PERSON slots are exclusive (one visit per interval); VIRTUAL slots permit aggregate double-booking up to virtual_capacity."
+        constraints: "IN_PERSON | VIRTUAL"
+      - name: starts_at
+        type: datetime
+        source: input
+        description: "Slot interval start (UTC, inclusive)."
+      - name: ends_at
+        type: datetime
+        source: input
+        description: "Slot interval end (UTC, exclusive); must be strictly after starts_at."
+      - name: virtual_capacity
+        type: integer
+        source: input
+        description: "For VIRTUAL slots, max concurrent visits bookable in this interval; ignored for IN_PERSON (treated as 1)."
+        default: 1
+        constraints: ">= 1"
+      - name: booked_count
+        type: integer
+        source: computed
+        description: "Count of Visits referencing this slot with clinical_status NOT IN {CANCELLED, NO_SHOW}. Recomputed on book and on cancel."
+        default: 0
+      - name: slot_state
+        type: enum
+        source: computed
+        description: "OPEN while booked_count < effective capacity, FULL once booked_count == effective capacity."
+        default: OPEN
+        constraints: "OPEN | FULL"
+
+  - name: Visit
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id"
+      - name: provider_id
+        type: string
+        source: system
+        description: "FK -> Provider.id; copied from the member's assigned PCP at booking."
+      - name: slot_id
+        type: string
+        source: input
+        description: "FK -> VisitSlot.id"
+      - name: visit_type
+        type: enum
+        source: input
+        description: "SAME_DAY (urgent in-person), VIRTUAL (telehealth), ANNUAL_PHYSICAL (yearly wellness exam)."
+        constraints: "SAME_DAY | VIRTUAL | ANNUAL_PHYSICAL"
+      - name: clinical_status
+        type: enum
+        source: system
+        description: "Clinical dimension of the visit lifecycle (independent of billing_status)."
+        default: BOOKED
+        constraints: "BOOKED | CHECKED_IN | COMPLETED | CANCELLED | NO_SHOW"
+      - name: billing_status
+        type: enum
+        source: system
+        description: "Billing dimension of the visit lifecycle (independent of clinical_status)."
+        default: NOT_BILLABLE
+        constraints: "NOT_BILLABLE | BILLABLE | INVOICED | WRITTEN_OFF"
+      - name: service_lines
+        type: array
+        source: input
+        description: "List of {service_code, units, unit_charge_cents} captured at completion; drives invoice split. Empty until completion."
+        default: []
+      - name: checked_in_at
+        type: datetime
+        source: system
+        description: "Timestamp of check-in; null until CHECKED_IN."
+        default: null
+
+  - name: CarePlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; 1:1 with the member's active care plan."
+      - name: origin_visit_id
+        type: string
+        source: input
+        description: "FK -> Visit.id; the ANNUAL_PHYSICAL visit that generated this plan."
+      - name: plan_status
+        type: enum
+        source: system
+        description: "DRAFT (provider editing), ACTIVE (in effect), UNDER_REVISION (re-opened for edits), ARCHIVED (superseded, terminal)."
+        default: DRAFT
+        constraints: "DRAFT | ACTIVE | UNDER_REVISION | ARCHIVED"
+      - name: goal_count
+        type: integer
+        source: input
+        description: "Number of care goals in this plan; must be >= 1 to activate."
+        default: 0
+        constraints: ">= 0"
+      - name: revision_number
+        type: integer
+        source: system
+        description: "Increments by 1 each time the plan re-enters UNDER_REVISION."
+        default: 0
+
+  - name: Referral
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id"
+      - name: origin_visit_id
+        type: string
+        source: input
+        description: "FK -> Visit.id; the visit that prompted the specialist referral."
+      - name: specialty
+        type: string
+        source: input
+        description: "Requested specialty (e.g., CARDIOLOGY)."
+      - name: referral_status
+        type: enum
+        source: system
+        description: "REQUESTED (awaiting authorization), AUTHORIZED (approved, sendable), SENT (dispatched to specialist), DENIED (terminal), EXPIRED (auto-expired, terminal)."
+        default: REQUESTED
+        constraints: "REQUESTED | AUTHORIZED | SENT | DENIED | EXPIRED"
+      - name: authorized_at
+        type: datetime
+        source: system
+        description: "Timestamp of authorization; null until AUTHORIZED."
+        default: null
+      - name: expires_at
+        type: datetime
+        source: system
+        description: "AUTHORIZED referrals expire 30 days after authorized_at if not SENT."
+        default: null
+
+  - name: MessageThread
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id"
+      - name: provider_id
+        type: string
+        source: system
+        description: "FK -> Provider.id; the member's assigned PCP at thread creation."
+      - name: priority
+        type: enum
+        source: computed
+        description: "ROUTINE if opened during business hours, AFTER_HOURS if opened outside 08:00-18:00 UTC. Drives response-deadline SLA."
+        constraints: "ROUTINE | AFTER_HOURS"
+      - name: thread_status
+        type: enum
+        source: system
+        description: "OPEN (awaiting provider), ANSWERED (provider replied), ESCALATED (SLA breached, routed to on-call), CLOSED (terminal)."
+        default: OPEN
+        constraints: "OPEN | ANSWERED | ESCALATED | CLOSED"
+      - name: response_deadline
+        type: datetime
+        source: computed
+        description: "created_at + ROUTINE_SLA_HOURS (24h) for ROUTINE, + AFTER_HOURS_SLA_HOURS (4h) for AFTER_HOURS."
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id"
+      - name: visit_id
+        type: string
+        source: input
+        description: "FK -> Visit.id; the completed visit being billed."
+      - name: gross_charge_cents
+        type: integer
+        source: computed
+        description: "Sum over service_lines of units * unit_charge_cents."
+      - name: dpc_covered_cents
+        type: integer
+        source: computed
+        description: "Portion of gross attributable to DPC-covered service codes (member owes 0 on these)."
+      - name: insurance_billed_cents
+        type: integer
+        source: computed
+        description: "Portion of gross billed to insurance (non-DPC-covered lines), present only when member has_insurance."
+      - name: member_responsibility_cents
+        type: integer
+        source: computed
+        description: "Final amount the member owes the practice for this visit (see invoice_split calc; differs by has_insurance)."
+      - name: invoice_status
+        type: enum
+        source: system
+        description: "ISSUED (member owes), PAID (settled), VOID (terminal, reversed)."
+        default: ISSUED
+        constraints: "ISSUED | PAID | VOID"
+
+  - name: Payment
+    parent: null
+    common_fields: false
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id"
+      - name: membership_id
+        type: string
+        source: input
+        description: "FK -> Membership.id; set for membership-fee charges, null for invoice charges."
+        default: null
+      - name: invoice_id
+        type: string
+        source: input
+        description: "FK -> Invoice.id; set for invoice charges, null for membership-fee charges."
+        default: null
+      - name: charge_kind
+        type: enum
+        source: input
+        description: "MEMBERSHIP_FEE (recurring dues) or INVOICE (per-visit member responsibility)."
+        constraints: "MEMBERSHIP_FEE | INVOICE"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Charge amount in cents."
+        constraints: ">= 0"
+      - name: outcome
+        type: enum
+        source: input
+        description: "Simulated processor result supplied to the charge endpoint."
+        constraints: "SUCCEEDED | FAILED"
+      - name: wallet_applied_cents
+        type: integer
+        source: computed
+        description: "Portion of this charge satisfied from the member's wallet_credit_cents before the card was charged."
+        default: 0
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Member
+    initial_state: PENDING_PAYMENT
+    terminal_states: [CANCELLED]
+    note: "membership_status dimension. Branching grace/reinstate path; SUSPENDED can reinstate to ACTIVE (cycle)."
+    transitions:
+      - from: PENDING_PAYMENT
+        to: ACTIVE
+        trigger: "POST /memberships/{id}/charge with charge_kind=MEMBERSHIP_FEE and outcome=SUCCEEDED"
+        actor: system
+        preconditions:
+          - "Member.assigned_provider_id is non-null (a PCP has been assigned)"
+          - "the successful Payment.amount_cents == Membership.member_share_cents"
+        side_effects:
+          - "set Membership.current_period_start = clock now; recompute Membership.current_period_end"
+          - "recompute assigned Provider.active_panel_count (PENDING_PAYMENT->ACTIVE adds this member to the active panel) and Provider.panel_load_bucket"
+      - from: ACTIVE
+        to: PAST_DUE
+        trigger: "POST /memberships/{id}/charge with charge_kind=MEMBERSHIP_FEE and outcome=FAILED at period rollover"
+        actor: system
+        preconditions:
+          - "clock now >= Membership.current_period_end"
+        side_effects:
+          - "set Membership.past_due_since = clock now"
+          - "add Practice.late_fee_cents to the next member_share owed (recorded on the failed Payment retry)"
+      - from: PAST_DUE
+        to: ACTIVE
+        trigger: "POST /memberships/{id}/charge with charge_kind=MEMBERSHIP_FEE and outcome=SUCCEEDED"
+        actor: system
+        preconditions:
+          - "Member.membership_status == PAST_DUE"
+          - "clock now < Membership.past_due_since + Practice.grace_period_days"
+        side_effects:
+          - "clear Membership.past_due_since; advance current_period_start/current_period_end one period"
+      - from: PAST_DUE
+        to: SUSPENDED
+        trigger: "POST /_billing/run_suspension_sweep"
+        actor: system
+        preconditions:
+          - "clock now >= Membership.past_due_since + Practice.grace_period_days days"
+        side_effects:
+          - "recompute assigned Provider.active_panel_count (SUSPENDED leaves the active panel: active_panel_count counts ACTIVE+PAST_DUE only) and Provider.panel_load_bucket"
+          - "cancel all of this member's Visits with clinical_status IN {BOOKED, CHECKED_IN} (cross-entity cascade); each cancelled Visit decrements its VisitSlot.booked_count and recomputes slot_state"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /memberships/{id}/charge with charge_kind=MEMBERSHIP_FEE and outcome=SUCCEEDED"
+        actor: system
+        preconditions:
+          - "Member.membership_status == SUSPENDED"
+          - "assigned Provider effective panel still has room: Provider.active_panel_count < effective_cap (reinstatement re-occupies a panel slot)"
+        side_effects:
+          - "clear Membership.past_due_since; advance billing period"
+          - "recompute assigned Provider.active_panel_count and Provider.panel_load_bucket (member re-enters active panel)"
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /members/{id}/cancel"
+        actor: Member
+        preconditions:
+          - "Member.membership_status == ACTIVE"
+        side_effects:
+          - "issue prorated wallet credit per membership_proration calc to Member.wallet_credit_cents"
+          - "if Membership.employer_seat_id non-null: set that EmployerSeat.seat_status=RELEASED, clear its member_id, recompute Employer.occupied_seat_count (cross-entity cascade)"
+          - "recompute assigned Provider.active_panel_count and Provider.panel_load_bucket (member leaves active panel)"
+          - "cancel all this member's Visits with clinical_status IN {BOOKED, CHECKED_IN}; each decrements its VisitSlot.booked_count and recomputes slot_state"
+      - from: PAST_DUE
+        to: CANCELLED
+        trigger: "POST /members/{id}/cancel"
+        actor: Member
+        preconditions:
+          - "Member.membership_status == PAST_DUE"
+        side_effects:
+          - "no proration credit when cancelling from PAST_DUE (dues already lapsed)"
+          - "if employer_seat_id non-null: RELEASE seat, recompute Employer.occupied_seat_count"
+          - "recompute Provider.active_panel_count and panel_load_bucket"
+      - from: SUSPENDED
+        to: CANCELLED
+        trigger: "POST /members/{id}/cancel"
+        actor: Member
+        preconditions:
+          - "Member.membership_status == SUSPENDED"
+        side_effects:
+          - "if employer_seat_id non-null: RELEASE seat, recompute Employer.occupied_seat_count"
+
+  - entity: Visit
+    initial_state: BOOKED
+    terminal_states: [COMPLETED, CANCELLED, NO_SHOW]
+    note: >
+      PARALLEL dimensions: clinical_status (BOOKED->CHECKED_IN->COMPLETED, plus CANCELLED/NO_SHOW)
+      evolves independently of billing_status (NOT_BILLABLE->BILLABLE->INVOICED, plus WRITTEN_OFF).
+      The transitions below are tagged [clinical] or [billing].
+    transitions:
+      - from: BOOKED
+        to: CHECKED_IN
+        trigger: "POST /visits/{id}/check-in  [clinical]"
+        actor: Provider
+        preconditions:
+          - "Visit.clinical_status == BOOKED"
+          - "owning Member.membership_status IN {ACTIVE, PAST_DUE} (cross-entity: SUSPENDED/CANCELLED members cannot be seen)"
+        side_effects:
+          - "set Visit.checked_in_at = clock now"
+      - from: CHECKED_IN
+        to: COMPLETED
+        trigger: "POST /visits/{id}/complete with service_lines  [clinical]"
+        actor: Provider
+        preconditions:
+          - "Visit.clinical_status == CHECKED_IN"
+        side_effects:
+          - "store service_lines on the Visit"
+          - "if service_lines non-empty: set billing_status=BILLABLE [billing dimension advances independently]; if empty: billing_status stays NOT_BILLABLE"
+          - "if visit_type==ANNUAL_PHYSICAL: advance Member.annual_physical_due_on by 365 days from clock now (cross-entity)"
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /visits/{id}/cancel  [clinical]"
+        actor: Member
+        preconditions:
+          - "Visit.clinical_status == BOOKED"
+        side_effects:
+          - "decrement VisitSlot.booked_count for Visit.slot_id; recompute that slot's slot_state (cross-entity)"
+      - from: BOOKED
+        to: NO_SHOW
+        trigger: "POST /visits/{id}/no-show  [clinical]"
+        actor: Provider
+        preconditions:
+          - "Visit.clinical_status == BOOKED"
+          - "clock now >= VisitSlot.ends_at for Visit.slot_id"
+        side_effects:
+          - "decrement VisitSlot.booked_count; recompute slot_state (cross-entity)"
+      - from: BILLABLE
+        to: INVOICED
+        trigger: "POST /visits/{id}/invoice  [billing]"
+        actor: Provider
+        preconditions:
+          - "Visit.billing_status == BILLABLE"
+          - "Visit.clinical_status == COMPLETED"
+        side_effects:
+          - "create an Invoice; compute its split per invoice_split calc; set Visit.billing_status=INVOICED"
+      - from: BILLABLE
+        to: WRITTEN_OFF
+        trigger: "POST /visits/{id}/write-off  [billing]"
+        actor: Provider
+        preconditions:
+          - "Visit.billing_status == BILLABLE"
+        side_effects:
+          - "set Visit.billing_status=WRITTEN_OFF; no Invoice is created"
+
+  - entity: CarePlan
+    initial_state: DRAFT
+    terminal_states: [ARCHIVED]
+    note: "CYCLIC: ACTIVE <-> UNDER_REVISION revision loop."
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /care-plans/{id}/activate"
+        actor: Provider
+        preconditions:
+          - "CarePlan.plan_status == DRAFT"
+          - "CarePlan.goal_count >= 1"
+          - "the origin Visit.clinical_status == COMPLETED and Visit.visit_type == ANNUAL_PHYSICAL (cross-entity)"
+        side_effects:
+          - "no field cascade beyond updated_at/version"
+      - from: ACTIVE
+        to: UNDER_REVISION
+        trigger: "POST /care-plans/{id}/reopen"
+        actor: Provider
+        preconditions:
+          - "CarePlan.plan_status == ACTIVE"
+        side_effects:
+          - "increment CarePlan.revision_number by 1"
+      - from: UNDER_REVISION
+        to: ACTIVE
+        trigger: "POST /care-plans/{id}/activate"
+        actor: Provider
+        preconditions:
+          - "CarePlan.plan_status == UNDER_REVISION"
+          - "CarePlan.goal_count >= 1"
+        side_effects:
+          - "no field cascade beyond updated_at/version"
+      - from: ACTIVE
+        to: ARCHIVED
+        trigger: "POST /care-plans/{id}/archive"
+        actor: Provider
+        preconditions:
+          - "CarePlan.plan_status == ACTIVE"
+        side_effects: []
+
+  - entity: Referral
+    initial_state: REQUESTED
+    terminal_states: [SENT, DENIED, EXPIRED]
+    note: "Branching with revert: REQUESTED forks to AUTHORIZED or DENIED; AUTHORIZED forks to SENT or EXPIRED."
+    transitions:
+      - from: REQUESTED
+        to: AUTHORIZED
+        trigger: "POST /referrals/{id}/authorize"
+        actor: Provider
+        preconditions:
+          - "Referral.referral_status == REQUESTED"
+          - "owning Member.membership_status == ACTIVE (cross-entity: only active members get authorizations)"
+        side_effects:
+          - "set authorized_at = clock now; set expires_at = clock now + REFERRAL_AUTH_VALID_DAYS days"
+      - from: REQUESTED
+        to: DENIED
+        trigger: "POST /referrals/{id}/deny"
+        actor: Provider
+        preconditions:
+          - "Referral.referral_status == REQUESTED"
+        side_effects: []
+      - from: AUTHORIZED
+        to: SENT
+        trigger: "POST /referrals/{id}/send"
+        actor: Provider
+        preconditions:
+          - "Referral.referral_status == AUTHORIZED"
+          - "clock now < Referral.expires_at"
+        side_effects: []
+      - from: AUTHORIZED
+        to: EXPIRED
+        trigger: "POST /_billing/run_suspension_sweep (referral expiry pass) or system"
+        actor: system
+        preconditions:
+          - "Referral.referral_status == AUTHORIZED"
+          - "clock now >= Referral.expires_at"
+        side_effects: []
+
+  - entity: Invoice
+    initial_state: ISSUED
+    terminal_states: [VOID]
+    note: "Linear-with-revert: ISSUED->PAID; ISSUED->VOID (compensating reversal)."
+    transitions:
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /invoices/{id}/charge with outcome=SUCCEEDED"
+        actor: Member
+        preconditions:
+          - "Invoice.invoice_status == ISSUED"
+          - "the successful Payment.amount_cents == Invoice.member_responsibility_cents - min(wallet_applied, ...)"
+        side_effects:
+          - "decrement Member.wallet_credit_cents by wallet_applied_cents (never below 0)"
+      - from: ISSUED
+        to: VOID
+        trigger: "POST /invoices/{id}/void"
+        actor: Provider
+        preconditions:
+          - "Invoice.invoice_status == ISSUED"
+        side_effects:
+          - "set the linked Visit.billing_status = WRITTEN_OFF (cross-entity compensation; the visit is no longer INVOICED)"
+
+  - entity: MessageThread
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    note: "Branching: OPEN->ANSWERED or OPEN->ESCALATED; both reach CLOSED."
+    transitions:
+      - from: OPEN
+        to: ANSWERED
+        trigger: "POST /message-threads/{id}/reply"
+        actor: Provider
+        preconditions:
+          - "MessageThread.thread_status == OPEN"
+          - "clock now < MessageThread.response_deadline"
+        side_effects: []
+      - from: OPEN
+        to: ESCALATED
+        trigger: "POST /_billing/run_suspension_sweep (SLA pass) or system"
+        actor: system
+        preconditions:
+          - "MessageThread.thread_status == OPEN"
+          - "clock now >= MessageThread.response_deadline"
+        side_effects: []
+      - from: ESCALATED
+        to: ANSWERED
+        trigger: "POST /message-threads/{id}/reply"
+        actor: Provider
+        preconditions:
+          - "MessageThread.thread_status == ESCALATED"
+        side_effects: []
+      - from: ANSWERED
+        to: CLOSED
+        trigger: "POST /message-threads/{id}/close"
+        actor: Member
+        preconditions:
+          - "MessageThread.thread_status == ANSWERED"
+        side_effects: []
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: visit-book-stale-slot
+    parent_entity: VisitSlot
+    write_endpoint: "POST /visits"
+    occ_field: "expected_slot_version"
+    description: |
+      Booking a Visit against a VisitSlot whose version has advanced since the
+      client last observed it is rejected with a stale-version error. This
+      captures the true race in which another booking already filled the last
+      remaining IN_PERSON capacity (or consumed a VIRTUAL seat) and bumped the
+      slot's version, so the current writer's view of the slot's booked_count is
+      stale. Under the product spec a second booking on an OPEN slot legitimately
+      succeeds, so this is not reducible to a state precondition; OCC on the
+      slot's version serializes it deterministically.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: seat-occupy-stale-employer
+    parent_entity: Employer
+    write_endpoint: "POST /employers/{id}/seats/{seatId}/occupy"
+    occ_field: "expected_employer_version"
+    description: |
+      Occupying an EmployerSeat against an Employer whose version has advanced
+      since the client last observed it is rejected with a stale-version error.
+      This captures the case where another occupy call has just filled the last
+      open sponsored seat (legitimately, under the seat-limit policy) and bumped
+      the employer's version, leaving the current writer's view of
+      occupied_seat_count stale. OCC on Employer.version serializes the two.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: invoice_split
+    trigger: "Invoice creation on POST /visits/{id}/invoice (Visit BILLABLE->INVOICED)"
+    algorithm: forward_looking
+    formula: |
+      # Per-line classification then dual-variant split.
+      gross_charge_cents = sum over service_lines L of (L.units * L.unit_charge_cents)
+      dpc_covered_cents  = sum over L of (L.units * L.unit_charge_cents)
+                           for L where L.service_code IN Practice.dpc_covered_service_codes
+      non_dpc_cents      = gross_charge_cents - dpc_covered_cents
+
+      if Member.has_insurance == false:
+        # CASH/DPC variant: practice bills the member directly for the non-DPC lines
+        # at full charge; DPC-covered lines are member-free.
+        insurance_billed_cents      = 0
+        member_responsibility_cents = non_dpc_cents          # full non-DPC charge
+      else:
+        # INSURANCE variant: non-DPC lines are routed to insurance; member owes
+        # only coinsurance on those lines. DPC-covered lines remain member-free.
+        insurance_billed_cents      = non_dpc_cents
+        # round the coinsurance ONCE on the aggregated non-DPC total (sum-then-round),
+        # NOT per line, so the pinned order is: sum non-DPC lines, then apply pct, then round.
+        member_responsibility_cents = round_half_up(non_dpc_cents * Practice.insurance_coinsurance_pct)
+    input_set: "All service_lines stored on the Visit at COMPLETED; only lines whose service_code is NOT in dpc_covered_service_codes contribute to member responsibility."
+    constants: {}
+    precision: "integer cents; round_half_up applied exactly once after summing non-DPC lines"
+    variants:
+      - name: cash_dpc
+        when: "Member.has_insurance == false"
+        difference: "member owes full non-DPC charge; insurance_billed_cents = 0"
+      - name: insurance_coinsurance
+        when: "Member.has_insurance == true"
+        difference: "non-DPC charge billed to insurance; member owes round_half_up(non_dpc * coinsurance_pct), a strictly smaller number for the same service_lines"
+
+  - name: member_monthly_share
+    trigger: "Membership activation (PENDING_PAYMENT->ACTIVE) and every billing-period rollover; recomputed when an EmployerSeat occupies/releases this membership"
+    algorithm: tiered_pricing
+    formula: |
+      base_fee = Membership.monthly_fee_cents
+      # ANNUAL_PREPAID divides a discounted year into a per-period figure.
+      if Membership.plan_type == ANNUAL_PREPAID:
+        annual_total = round_half_up(base_fee * 12 * (1 - Practice.annual_fee_discount_pct))
+        period_fee   = annual_total        # charged once up front for the whole year
+      else:
+        period_fee   = base_fee            # MONTHLY: charged each 30-day period
+      # Employer sponsorship reduces the member's out-of-pocket on the PERIOD fee.
+      if Membership.employer_seat_id is non-null:
+        employer_covers = round_half_up(period_fee * Employer.sponsorship_pct)
+        member_share    = period_fee - employer_covers
+      else:
+        member_share    = period_fee
+      # Late fee (if past due) is additive on the next charge only.
+      member_share_cents = member_share + (Practice.late_fee_cents if entering from PAST_DUE retry else 0)
+    input_set: "Single Membership and (if sponsored) its linked Employer; plan_type and employer_seat_id pin the branch."
+    constants: {}
+    precision: "integer cents; round_half_up applied at each named round step (annual_total, employer_covers) in the order shown"
+    variants:
+      - name: monthly_individual
+        when: "plan_type==MONTHLY, no employer_seat_id"
+        difference: "member_share = monthly_fee_cents, no discount"
+      - name: annual_prepaid_sponsored
+        when: "plan_type==ANNUAL_PREPAID with employer_seat_id"
+        difference: "annual discount applied first (round), then sponsorship applied to the discounted annual figure (round) — evaluation order is fixed: discount before sponsorship"
+
+  - name: membership_proration
+    trigger: "Member cancellation from ACTIVE (POST /members/{id}/cancel)"
+    algorithm: chronological
+    formula: |
+      # Refund the unused portion of the current period as wallet credit.
+      period_len_days   = 30 if plan_type==MONTHLY else 365
+      elapsed_days      = floor((clock_now - Membership.current_period_start) / 1 day)   # whole days elapsed, floor
+      remaining_days    = max(0, period_len_days - elapsed_days)
+      # Proration is on the MEMBER SHARE actually paid this period (not gross fee).
+      daily_share_cents = Membership.member_share_cents / period_len_days     # exact rational
+      refund_cents      = round_half_up(daily_share_cents * remaining_days)    # round once at the end
+      wallet_credit_delta = refund_cents
+    input_set: "The single Membership being cancelled; clock now vs current_period_start."
+    constants:
+      MONTHLY_PERIOD_DAYS: 30
+      ANNUAL_PERIOD_DAYS: 365
+    precision: "integer cents; division kept exact, round_half_up applied once after multiplying by remaining_days"
+    variants:
+      - name: same_day_cancel
+        when: "elapsed_days == 0"
+        difference: "remaining_days == period_len_days => full member_share refunded"
+      - name: boundary_last_day_cancel
+        when: "elapsed_days == period_len_days"
+        difference: "remaining_days == 0 => zero refund (boundary: cancel exactly at period end refunds nothing)"
+
+  - name: panel_assignment_selector
+    trigger: "PCP auto-assignment on POST /members/{id}/assign-pcp with mode=AUTO"
+    algorithm: weighted_scoring
+    formula: |
+      # Candidate set: Providers in the same practice that can accept the member.
+      candidates = Providers P where
+                     P.practice_id == Member.practice_id
+                     AND P.accepting_new_members == true
+                     AND P.active_panel_count < effective_cap(P)
+      where effective_cap(P) = P.panel_capacity if P.panel_capacity is non-null
+                               else Practice.panel_hard_cap
+      # Rank: fewest members first (load-balance), then earliest-created provider.
+      rank by (P.active_panel_count ASC, P.created_at ASC)
+      selected = first candidate after ranking
+      if candidates is empty: reject with ERR_NO_PANEL_CAPACITY
+    input_set: "All same-practice Providers; only accepting_new_members==true and active_panel_count<effective_cap are eligible."
+    constants: {}
+    precision: "integer counts; no rounding"
+    variants:
+      - name: load_balanced_pick
+        when: "two or more candidates with different active_panel_count"
+        difference: "lowest active_panel_count wins"
+      - name: tie_break_created_at
+        when: "two candidates share the lowest active_panel_count"
+        difference: "earliest Provider.created_at wins (never id); deterministic tie-break"
+
+  - name: thread_sla_deadline
+    trigger: "MessageThread creation on POST /members/{id}/message-threads"
+    algorithm: threshold
+    formula: |
+      hour_utc = hour-of-day of created_at in UTC
+      if BUSINESS_OPEN_HOUR <= hour_utc < BUSINESS_CLOSE_HOUR:
+        priority = ROUTINE
+        response_deadline = created_at + ROUTINE_SLA_HOURS hours
+      else:
+        priority = AFTER_HOURS
+        response_deadline = created_at + AFTER_HOURS_SLA_HOURS hours
+      # Boundary: hour == BUSINESS_OPEN_HOUR is ROUTINE (>=); hour == BUSINESS_CLOSE_HOUR is AFTER_HOURS (<).
+    input_set: "Single MessageThread's created_at; clock now at creation."
+    constants:
+      BUSINESS_OPEN_HOUR: 8
+      BUSINESS_CLOSE_HOUR: 18
+      ROUTINE_SLA_HOURS: 24
+      AFTER_HOURS_SLA_HOURS: 4
+    precision: "whole hours; comparison uses UTC hour-of-day"
+    variants:
+      - name: business_hours_routine
+        when: "08 <= UTC hour < 18"
+        difference: "24h SLA"
+      - name: after_hours_fast
+        when: "UTC hour < 08 or >= 18"
+        difference: "4h SLA"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /members/register and POST /providers and POST /practices and POST /employers"
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted to call this endpoint per §1.7; entity_backed role's X-User-ID owns the targeted resource where ownership applies"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all role-guarded endpoints"
+  - priority: 3
+    category: existence
+    check: "Every path/body id resolves to an existing resource, validated left-to-right in the path"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints referencing an id"
+  - priority: 4
+    category: existence
+    check: "Required request-body fields present and well-typed; enum values within declared domain"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined (§1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 6
+    category: state
+    check: "OCC: when expected_<parent>_version is supplied, it equals the live parent version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /visits, POST /employers/{id}/seats/{seatId}/occupy"
+  - priority: 7
+    category: business_referential
+    check: "Cross-entity preconditions hold: visit owner membership_status IN {ACTIVE, PAST_DUE} to check-in; referral authorize requires owner ACTIVE; care-plan activate requires origin ANNUAL_PHYSICAL visit COMPLETED"
+    error_id: ERR_MEMBER_NOT_ELIGIBLE
+    http_status: 409
+    applies_to: "POST /visits/{id}/check-in, POST /referrals/{id}/authorize, POST /care-plans/{id}/activate"
+  - priority: 8
+    category: business_temporal
+    check: "VisitSlot interval is not exhausted: for IN_PERSON the slot has booked_count==0; for VIRTUAL booked_count < virtual_capacity; slot starts_at < ends_at"
+    error_id: ERR_SLOT_UNAVAILABLE
+    http_status: 409
+    applies_to: "POST /visits"
+  - priority: 9
+    category: business_temporal
+    check: "A member may not hold two BOOKED/CHECKED_IN visits whose slot intervals overlap (half-open [starts_at, ends_at))"
+    error_id: ERR_MEMBER_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /visits"
+  - priority: 10
+    category: business_constraint
+    check: "Annual physical may only be booked when Member.annual_physical_due_on is null or <= clock now (not before due)"
+    error_id: ERR_PHYSICAL_NOT_DUE
+    http_status: 409
+    applies_to: "POST /visits (visit_type==ANNUAL_PHYSICAL)"
+  - priority: 11
+    category: business_constraint
+    check: "Provider panel has room for assignment: target/selected Provider.active_panel_count < effective_cap"
+    error_id: ERR_NO_PANEL_CAPACITY
+    http_status: 409
+    applies_to: "POST /members/{id}/assign-pcp"
+  - priority: 12
+    category: business_constraint
+    check: "Employer has an OPEN seat and occupied_seat_count < sponsored_seat_limit before occupying"
+    error_id: ERR_SEAT_LIMIT_REACHED
+    http_status: 409
+    applies_to: "POST /employers/{id}/seats/{seatId}/occupy"
+  - priority: 13
+    category: business_constraint
+    check: "CarePlan.goal_count >= 1 to activate"
+    error_id: ERR_CARE_PLAN_EMPTY
+    http_status: 409
+    applies_to: "POST /care-plans/{id}/activate"
+  - priority: 14
+    category: business_constraint
+    check: "An AUTHORIZED referral may only be sent before expires_at"
+    error_id: ERR_REFERRAL_EXPIRED
+    http_status: 409
+    applies_to: "POST /referrals/{id}/send"
+  - priority: 15
+    category: business_fiscal
+    check: "Charge amount equals the computed amount owed (member_share_cents for membership fee; member_responsibility_cents net of wallet for invoice)"
+    error_id: ERR_AMOUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /memberships/{id}/charge, POST /invoices/{id}/charge"
+  - priority: 16
+    category: business_referential
+    check: "Membership must reference a Member with a non-null assigned_provider_id before its first activating charge"
+    error_id: ERR_PCP_REQUIRED
+    http_status: 409
+    applies_to: "POST /memberships/{id}/charge (PENDING_PAYMENT->ACTIVE)"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Practice (config) ---
+  - method: POST
+    path: "/practices"
+    description: "Create a practice (config root)."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [name, panel_target, panel_hard_cap, monthly_fee_cents, "annual_fee_discount_pct?", dpc_covered_service_codes, "insurance_coinsurance_pct?", "late_fee_cents?", "grace_period_days?"]
+    output: Practice
+    side_effects: []
+  - method: GET
+    path: "/practices/{id}"
+    description: "Fetch a practice."
+    roles: [PlatformAdmin, Provider, Member, Employer]
+    code: 200
+    input: []
+    output: Practice
+    side_effects: []
+
+  # --- Provider ---
+  - method: POST
+    path: "/providers"
+    description: "Register a provider under a practice."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [practice_id, full_name, npi, "panel_capacity?", "accepting_new_members?"]
+    output: Provider
+    side_effects: ["initialize active_panel_count=0, panel_load_bucket=UNDER_TARGET"]
+  - method: GET
+    path: "/providers/{id}"
+    description: "Fetch a provider including computed panel fields."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: []
+    output: Provider
+    side_effects: []
+  - method: GET
+    path: "/providers"
+    description: "List/filter providers; filter by practice."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: ["practice_id?", "accepting_new_members?", "limit?", "offset?"]
+    output: Provider[]
+    side_effects: []
+  - method: GET
+    path: "/providers/{id}/members"
+    description: "List the members on a provider's panel (reverse-reachability for Member.assigned_provider_id)."
+    roles: [PlatformAdmin, Provider]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Member[]
+    side_effects: []
+  - method: GET
+    path: "/providers/{id}/visit-slots"
+    description: "List a provider's slots (reverse-reachability for VisitSlot.provider_id)."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: VisitSlot[]
+    side_effects: []
+
+  # --- Employer ---
+  - method: POST
+    path: "/employers"
+    description: "Register an employer sponsor under a practice."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [practice_id, company_name, sponsored_seat_limit, "sponsorship_pct?"]
+    output: Employer
+    side_effects: ["initialize occupied_seat_count=0"]
+  - method: GET
+    path: "/employers/{id}"
+    description: "Fetch an employer including occupied_seat_count."
+    roles: [PlatformAdmin, Employer]
+    code: 200
+    input: []
+    output: Employer
+    side_effects: []
+  - method: GET
+    path: "/employers"
+    description: "List/filter employers by practice (reverse-reachability for Employer.practice_id)."
+    roles: [PlatformAdmin, Employer]
+    code: 200
+    input: ["practice_id?", "limit?", "offset?"]
+    output: Employer[]
+    side_effects: []
+  - method: POST
+    path: "/employers/{id}/seats"
+    description: "Allocate a new OPEN sponsored seat under an employer."
+    roles: [PlatformAdmin, Employer]
+    code: 201
+    input: []
+    output: EmployerSeat
+    side_effects: ["create EmployerSeat seat_status=OPEN, member_id=null"]
+  - method: GET
+    path: "/employers/{id}/seats"
+    description: "List an employer's seats (reverse-reachability for EmployerSeat.employer_id)."
+    roles: [PlatformAdmin, Employer]
+    code: 200
+    input: ["seat_status?", "limit?", "offset?"]
+    output: EmployerSeat[]
+    side_effects: []
+  - method: GET
+    path: "/employer-seats/{id}"
+    description: "Fetch a single sponsored seat."
+    roles: [PlatformAdmin, Employer]
+    code: 200
+    input: []
+    output: EmployerSeat
+    side_effects: []
+  - method: GET
+    path: "/employer-seats"
+    description: "List/filter sponsored seats by employer or occupying member (reverse-reachability for EmployerSeat.member_id and EmployerSeat.employer_id)."
+    roles: [PlatformAdmin, Employer]
+    code: 200
+    input: ["employer_id?", "member_id?", "seat_status?", "limit?", "offset?"]
+    output: EmployerSeat[]
+    side_effects: []
+  - method: POST
+    path: "/employers/{id}/seats/{seatId}/occupy"
+    description: "Assign a member to an OPEN sponsored seat. OCC-guarded on Employer.version."
+    roles: [PlatformAdmin, Employer]
+    code: 200
+    input: [member_id, expected_employer_version]
+    output: EmployerSeat
+    side_effects:
+      - "set seat_status=OCCUPIED, member_id; set Membership.employer_seat_id; recompute member_monthly_share"
+      - "increment Employer.occupied_seat_count"
+      - "increments Employer.version by 1"
+
+  # --- Member + Membership ---
+  - method: POST
+    path: "/members/register"
+    description: "Self-register a member (creates Member PENDING_PAYMENT + its Membership in one call)."
+    roles: [Anonymous]
+    code: 201
+    input: [practice_id, email, full_name, "plan_type?", "has_insurance?"]
+    output: Member
+    side_effects:
+      - "create Membership (plan_type snapshot, monthly_fee_cents snapshot, current_period_start=null); compute member_monthly_share (unsponsored)"
+  - method: GET
+    path: "/members/{id}"
+    description: "Fetch a member."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: []
+    output: Member
+    side_effects: []
+  - method: GET
+    path: "/members"
+    description: "List/filter members; filter by practice or assigned provider."
+    roles: [PlatformAdmin, Provider]
+    code: 200
+    input: ["practice_id?", "assigned_provider_id?", "membership_status?", "limit?", "offset?"]
+    output: Member[]
+    side_effects: []
+  - method: POST
+    path: "/members/{id}/assign-pcp"
+    description: "Assign a PCP to a member. mode=AUTO runs panel_assignment_selector; mode=MANUAL pins provider_id."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [mode, "provider_id?"]
+    output: Member
+    side_effects:
+      - "set Member.assigned_provider_id; if member is ACTIVE/PAST_DUE recompute selected Provider.active_panel_count and panel_load_bucket"
+  - method: POST
+    path: "/members/{id}/cancel"
+    description: "Member cancels membership; issues prorated wallet credit, releases employer seat, cancels open visits."
+    roles: [Member]
+    code: 200
+    input: []
+    output: Member
+    side_effects:
+      - "membership_status->CANCELLED; membership_proration credit; cascade seat release + Employer.occupied_seat_count; cascade visit cancellation + VisitSlot.booked_count; recompute Provider.active_panel_count + panel_load_bucket"
+  - method: GET
+    path: "/members/{id}/memberships"
+    description: "List the member's membership record (reverse-reachability for Membership.member_id; 1:1 returns array of length 1)."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Membership[]
+    side_effects: []
+  - method: GET
+    path: "/memberships/{id}"
+    description: "Fetch a membership including member_share_cents and period boundaries."
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: []
+  - method: GET
+    path: "/memberships"
+    description: "List/filter memberships by member or sponsoring seat (reverse-reachability for Membership.employer_seat_id)."
+    roles: [PlatformAdmin, Member, Employer]
+    code: 200
+    input: ["member_id?", "employer_seat_id?", "limit?", "offset?"]
+    output: Membership[]
+    side_effects: []
+  - method: POST
+    path: "/memberships/{id}/charge"
+    description: "Charge the membership fee (simulated outcome). Drives PENDING_PAYMENT/PAST_DUE/SUSPENDED -> ACTIVE on SUCCEEDED."
+    roles: [PlatformAdmin, Member]
+    code: 201
+    input: [charge_kind, amount_cents, outcome]
+    output: Payment
+    side_effects:
+      - "create Payment(charge_kind=MEMBERSHIP_FEE); apply wallet credit first; on SUCCEEDED advance membership_status per §1.2 and recompute Provider panel counts"
+
+  # --- VisitSlot + Visit ---
+  - method: POST
+    path: "/providers/{id}/visit-slots"
+    description: "Provider publishes an availability slot."
+    roles: [PlatformAdmin, Provider]
+    code: 201
+    input: [slot_type, starts_at, ends_at, "virtual_capacity?"]
+    output: VisitSlot
+    side_effects: ["initialize booked_count=0, slot_state=OPEN"]
+  - method: GET
+    path: "/visit-slots/{id}"
+    description: "Fetch a slot including booked_count and slot_state."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: []
+    output: VisitSlot
+    side_effects: []
+  - method: POST
+    path: "/visits"
+    description: "Book a visit into a slot for the acting member's assigned PCP. OCC-guarded on VisitSlot.version."
+    roles: [Member]
+    code: 201
+    input: [member_id, slot_id, visit_type, expected_slot_version]
+    output: Visit
+    side_effects:
+      - "create Visit clinical_status=BOOKED, billing_status=NOT_BILLABLE; copy provider_id from member's PCP; increment VisitSlot.booked_count; recompute slot_state"
+      - "increments VisitSlot.version by 1"
+  - method: GET
+    path: "/visits/{id}"
+    description: "Fetch a visit including both status dimensions."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: []
+    output: Visit
+    side_effects: []
+  - method: GET
+    path: "/visits"
+    description: "List/filter visits by member, provider, or slot."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: ["member_id?", "provider_id?", "slot_id?", "clinical_status?", "billing_status?", "limit?", "offset?"]
+    output: Visit[]
+    side_effects: []
+  - method: POST
+    path: "/visits/{id}/check-in"
+    description: "Provider checks the member in (BOOKED->CHECKED_IN)."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: Visit
+    side_effects: ["set checked_in_at"]
+  - method: POST
+    path: "/visits/{id}/complete"
+    description: "Provider completes the visit, recording service_lines (CHECKED_IN->COMPLETED)."
+    roles: [Provider]
+    code: 200
+    input: [service_lines]
+    output: Visit
+    side_effects:
+      - "store service_lines; if non-empty set billing_status=BILLABLE; if ANNUAL_PHYSICAL advance Member.annual_physical_due_on +365d"
+  - method: POST
+    path: "/visits/{id}/cancel"
+    description: "Member cancels a BOOKED visit."
+    roles: [Member]
+    code: 200
+    input: []
+    output: Visit
+    side_effects: ["decrement VisitSlot.booked_count; recompute slot_state"]
+  - method: POST
+    path: "/visits/{id}/no-show"
+    description: "Provider marks a past-due BOOKED visit as NO_SHOW."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: Visit
+    side_effects: ["decrement VisitSlot.booked_count; recompute slot_state"]
+  - method: POST
+    path: "/visits/{id}/invoice"
+    description: "Provider issues an invoice for a BILLABLE completed visit (BILLABLE->INVOICED)."
+    roles: [Provider]
+    code: 201
+    input: []
+    output: Invoice
+    side_effects: ["create Invoice via invoice_split; set billing_status=INVOICED"]
+  - method: POST
+    path: "/visits/{id}/write-off"
+    description: "Provider writes off a BILLABLE visit (BILLABLE->WRITTEN_OFF); no invoice."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: Visit
+    side_effects: ["set billing_status=WRITTEN_OFF"]
+
+  # --- CarePlan ---
+  - method: POST
+    path: "/care-plans"
+    description: "Provider drafts a care plan from a completed annual-physical visit."
+    roles: [Provider]
+    code: 201
+    input: [member_id, origin_visit_id, "goal_count?"]
+    output: CarePlan
+    side_effects: ["create CarePlan plan_status=DRAFT, revision_number=0"]
+  - method: GET
+    path: "/care-plans/{id}"
+    description: "Fetch a care plan."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: []
+    output: CarePlan
+    side_effects: []
+  - method: GET
+    path: "/care-plans"
+    description: "List/filter care plans by member or origin visit."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: ["member_id?", "origin_visit_id?", "limit?", "offset?"]
+    output: CarePlan[]
+    side_effects: []
+  - method: PATCH
+    path: "/care-plans/{id}"
+    description: "Provider edits a DRAFT/UNDER_REVISION plan's goal_count."
+    roles: [Provider]
+    code: 200
+    input: [goal_count]
+    output: CarePlan
+    side_effects: []
+  - method: POST
+    path: "/care-plans/{id}/activate"
+    description: "Activate a plan (DRAFT or UNDER_REVISION -> ACTIVE)."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: CarePlan
+    side_effects: []
+  - method: POST
+    path: "/care-plans/{id}/reopen"
+    description: "Reopen an ACTIVE plan for revision (ACTIVE->UNDER_REVISION); increments revision_number."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: CarePlan
+    side_effects: ["increment revision_number"]
+  - method: POST
+    path: "/care-plans/{id}/archive"
+    description: "Archive an ACTIVE plan (terminal)."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: CarePlan
+    side_effects: []
+
+  # --- Referral ---
+  - method: POST
+    path: "/referrals"
+    description: "Provider requests a specialist referral from a visit."
+    roles: [Provider]
+    code: 201
+    input: [member_id, origin_visit_id, specialty]
+    output: Referral
+    side_effects: ["create Referral referral_status=REQUESTED"]
+  - method: GET
+    path: "/referrals/{id}"
+    description: "Fetch a referral."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: []
+    output: Referral
+    side_effects: []
+  - method: GET
+    path: "/referrals"
+    description: "List/filter referrals by member or origin visit."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: ["member_id?", "origin_visit_id?", "referral_status?", "limit?", "offset?"]
+    output: Referral[]
+    side_effects: []
+  - method: POST
+    path: "/referrals/{id}/authorize"
+    description: "Provider authorizes a REQUESTED referral; sets expires_at."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: Referral
+    side_effects: ["set authorized_at, expires_at"]
+  - method: POST
+    path: "/referrals/{id}/deny"
+    description: "Provider denies a REQUESTED referral (terminal)."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: Referral
+    side_effects: []
+  - method: POST
+    path: "/referrals/{id}/send"
+    description: "Provider sends an AUTHORIZED, unexpired referral (terminal)."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: Referral
+    side_effects: []
+
+  # --- MessageThread ---
+  - method: POST
+    path: "/members/{id}/message-threads"
+    description: "Member opens a message thread to their PCP; priority + response_deadline computed via thread_sla_deadline."
+    roles: [Member]
+    code: 201
+    input: [body]
+    output: MessageThread
+    side_effects: ["compute priority, response_deadline from clock now"]
+  - method: GET
+    path: "/message-threads/{id}"
+    description: "Fetch a message thread."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: []
+    output: MessageThread
+    side_effects: []
+  - method: GET
+    path: "/message-threads"
+    description: "List/filter message threads by member or assigned provider (reverse-reachability for MessageThread.provider_id and MessageThread.member_id)."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: ["member_id?", "provider_id?", "thread_status?", "limit?", "offset?"]
+    output: MessageThread[]
+    side_effects: []
+  - method: GET
+    path: "/members/{id}/message-threads"
+    description: "List a member's message threads (reverse-reachability for MessageThread.member_id)."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: ["thread_status?", "limit?", "offset?"]
+    output: MessageThread[]
+    side_effects: []
+  - method: POST
+    path: "/message-threads/{id}/reply"
+    description: "Provider replies to an OPEN/ESCALATED thread (-> ANSWERED)."
+    roles: [Provider]
+    code: 200
+    input: [body]
+    output: MessageThread
+    side_effects: []
+  - method: POST
+    path: "/message-threads/{id}/close"
+    description: "Member closes an ANSWERED thread (terminal)."
+    roles: [Member]
+    code: 200
+    input: []
+    output: MessageThread
+    side_effects: []
+
+  # --- Invoice ---
+  - method: GET
+    path: "/invoices/{id}"
+    description: "Fetch an invoice with its split breakdown."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+  - method: GET
+    path: "/invoices"
+    description: "List/filter invoices by member or visit."
+    roles: [PlatformAdmin, Provider, Member]
+    code: 200
+    input: ["member_id?", "visit_id?", "invoice_status?", "limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+  - method: POST
+    path: "/invoices/{id}/charge"
+    description: "Member pays an ISSUED invoice (wallet applied first); ISSUED->PAID on SUCCEEDED."
+    roles: [Member]
+    code: 201
+    input: [amount_cents, outcome]
+    output: Payment
+    side_effects: ["create Payment(charge_kind=INVOICE); apply wallet first; on SUCCEEDED set invoice_status=PAID and debit wallet"]
+  - method: POST
+    path: "/invoices/{id}/void"
+    description: "Provider voids an ISSUED invoice; compensating write-off of the linked visit (ISSUED->VOID)."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["set invoice_status=VOID; set linked Visit.billing_status=WRITTEN_OFF"]
+
+  # --- Payment reverse-reachability ---
+  - method: GET
+    path: "/payments/{id}"
+    description: "Fetch a payment."
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+  - method: GET
+    path: "/payments"
+    description: "List/filter payments by member, membership, or invoice (reverse-reachability for Payment FKs)."
+    roles: [PlatformAdmin, Member]
+    code: 200
+    input: ["member_id?", "membership_id?", "invoice_id?", "charge_kind?", "limit?", "offset?"]
+    output: Payment[]
+    side_effects: []
+
+  # --- Test-driving endpoints ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock. Startup default is 2026-05-01T00:00:00Z; before any set, the clock reads exactly this default and never falls back to wall-clock time."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["advance logical clock used by all deadline/expiry/period rules"]
+  - method: POST
+    path: "/_billing/run_suspension_sweep"
+    description: "Run the periodic sweep: PAST_DUE memberships beyond grace -> SUSPENDED (with cascades); AUTHORIZED referrals past expires_at -> EXPIRED; OPEN message threads past response_deadline -> ESCALATED."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: null
+    side_effects:
+      - "for each eligible Membership: SUSPENDED cascade per §1.2; for each eligible Referral: EXPIRED; for each eligible MessageThread: ESCALATED"
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID on a guarded endpoint."
+  - id: ERR_FORBIDDEN
+    http: 403
+    condition: "Acting role not permitted, or entity_backed user acting on a resource it does not own."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced practice/provider/member/membership/employer/seat/slot/visit/care-plan/referral/thread/invoice/payment id does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, wrong type, or enum value outside the declared domain."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition is not defined from the resource's current state."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "Supplied expected_<parent>_version does not match the live parent version (OCC)."
+  - id: ERR_MEMBER_NOT_ELIGIBLE
+    http: 409
+    condition: "Cross-entity precondition fails: visit owner not ACTIVE/PAST_DUE at check-in, referral owner not ACTIVE at authorize, or care-plan origin visit not a completed ANNUAL_PHYSICAL."
+  - id: ERR_SLOT_UNAVAILABLE
+    http: 409
+    condition: "Booking a slot whose effective capacity is exhausted (IN_PERSON booked_count>=1, VIRTUAL booked_count>=virtual_capacity)."
+  - id: ERR_MEMBER_DOUBLE_BOOKED
+    http: 409
+    condition: "Member already holds a BOOKED/CHECKED_IN visit overlapping the requested slot interval."
+  - id: ERR_PHYSICAL_NOT_DUE
+    http: 409
+    condition: "ANNUAL_PHYSICAL booked before Member.annual_physical_due_on."
+  - id: ERR_NO_PANEL_CAPACITY
+    http: 409
+    condition: "Target/auto-selected provider's active_panel_count has reached effective_cap, or AUTO found no eligible provider."
+  - id: ERR_SEAT_LIMIT_REACHED
+    http: 409
+    condition: "Employer occupied_seat_count has reached sponsored_seat_limit, or no OPEN seat is available."
+  - id: ERR_CARE_PLAN_EMPTY
+    http: 409
+    condition: "Activating a care plan with goal_count < 1."
+  - id: ERR_REFERRAL_EXPIRED
+    http: 409
+    condition: "Sending an AUTHORIZED referral at/after expires_at."
+  - id: ERR_AMOUNT_MISMATCH
+    http: 422
+    condition: "Charge amount_cents != the computed amount owed (membership member_share_cents, or invoice member_responsibility_cents net of wallet)."
+  - id: ERR_PCP_REQUIRED
+    http: 409
+    condition: "Activating a membership (first charge) before a PCP has been assigned."
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "Numeric/business constraint violated (e.g., panel_hard_cap < panel_target, sponsorship_pct out of (0,1], ends_at <= starts_at)."
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Operates practice config, provider/employer setup, billing runs, and the logical clock."
+    identity: opaque
+    exclusive_operations:
+      - "POST /practices"
+      - "POST /providers"
+      - "POST /employers"
+      - "POST /members/{id}/assign-pcp"
+      - "POST /_clock/set_current_utc"
+      - "POST /_billing/run_suspension_sweep"
+    shared_operations:
+      - "POST /employers/{id}/seats"
+      - "POST /employers/{id}/seats/{seatId}/occupy"
+      - "POST /providers/{id}/visit-slots"
+      - "POST /memberships/{id}/charge"
+      - "GET reads across resources"
+  - name: Provider
+    description: "Owns clinical resources: visit clinical lifecycle, completion/billing actions, care plans, referrals, message replies."
+    identity: "entity_backed:Provider"
+    exclusive_operations:
+      - "POST /visits/{id}/check-in"
+      - "POST /visits/{id}/complete"
+      - "POST /visits/{id}/no-show"
+      - "POST /visits/{id}/invoice"
+      - "POST /visits/{id}/write-off"
+      - "POST /care-plans, PATCH/activate/reopen/archive care-plans"
+      - "POST /referrals and authorize/deny/send"
+      - "POST /message-threads/{id}/reply"
+      - "POST /invoices/{id}/void"
+    shared_operations:
+      - "POST /providers/{id}/visit-slots"
+      - "GET reads on owned panel resources"
+  - name: Member
+    description: "Owns own membership lifecycle, visit booking/cancellation, messaging, and payments."
+    identity: "entity_backed:Member"
+    exclusive_operations:
+      - "POST /visits"
+      - "POST /visits/{id}/cancel"
+      - "POST /members/{id}/cancel"
+      - "POST /members/{id}/message-threads"
+      - "POST /message-threads/{id}/close"
+      - "POST /invoices/{id}/charge"
+    shared_operations:
+      - "POST /memberships/{id}/charge"
+      - "GET reads on own resources"
+  - name: Employer
+    description: "Owns its sponsored-seat roster: allocate seats and occupy them with members."
+    identity: "entity_backed:Employer"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /employers/{id}/seats"
+      - "POST /employers/{id}/seats/{seatId}/occupy"
+      - "GET reads on own employer + seats"
+  - name: Anonymous
+    description: "Unauthenticated self-service registration only."
+    identity: opaque
+    exclusive_operations:
+      - "POST /members/register"
+    shared_operations: []
