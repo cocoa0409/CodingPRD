@@ -1,0 +1,1618 @@
+# =============================================================================
+# Scaffold: Usage-Based / Telematics Auto Insurance (task_0607)
+# Difficulty tier: Expert (§0.4) — 14 entities / 29 endpoints / 26 validations /
+#                  6 calculations / 5 state machines (cycles + parallel dims)
+# =============================================================================
+
+scenario: |
+  607. Usage-Based / Telematics Auto Insurance (Root/Progressive Snapshot style):
+  test-drive scoring period & quote, telematics trip capture
+  (braking/speed/phone-use), risk-score & rate adjustment, mileage-based premium,
+  renewal recalculation, crash detection & FNOL trigger, discount banking,
+  opt-out/privacy
+
+domain_name: telematics-auto-insurance
+api_prefix: ""
+# Flat topology: every entity is a top-level collection (/drivers, /rate-plans,
+# /enrollments, /quotes, /policies, /trips, /trip-events, /risk-snapshots,
+# /statements, /renewals, /claims, /discount-banks, /discount-grants,
+# /privacy-consents). Parent/child links are foreign keys discovered via
+# filtered-list GETs (?<fk>=). api_prefix is the root ("").
+
+# -----------------------------------------------------------------------------
+# Complexity profile (§0.1–§0.3)
+# -----------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: event_sourcing
+  complexity_layers:
+    - rate_threshold_triggers
+    - dual_variant_calculation
+    - cascading_side_effects
+    - optimistic_concurrency
+    - derived_field_reconciliation
+
+  entity_topology: flat
+  # Flat with foreign-key references. Every entity is its own top-level
+  # collection; there are no nested URL paths. Driver, RatePlan, Enrollment,
+  # Quote, Policy, Trip, etc. are peers linked by FK fields (driver_id,
+  # policy_id, enrollment_id, rate_plan_id, trip_id, ...). Children are
+  # discovered by filtered-list GETs (e.g. GET /trips?policy_id=...).
+
+  state_machine_shape: parallel
+  # Policy carries two independent dimensions: billing_status (mileage premium
+  # billing cycle) × telematics_status (capture/opt-out). Claim has a cyclic
+  # reopen loop (CLOSED -> REOPENED -> CLOSED). Enrollment is linear with a
+  # scoring revert. Renewal and Trip are linear/branching.
+
+  relationship_patterns:
+    - one_to_many        # Driver->Policy, Policy->Trip, Trip->TripEvent (via FK)
+    - cross_aggregate    # Quote.enrollment_id, Trip.enrollment_id, *.rate_plan_id
+
+  role_model: peer_roles
+  # DriverUser acts on its own resources; UnderwritingOps owns rate plans,
+  # quotes, binding, renewals; ClaimsAdjuster owns claims/FNOL lifecycle.
+
+  consistency_model: immediate
+
+# -----------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — emitted verbatim)
+# -----------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  # ---------------------------------------------------------------------------
+  # RatePlan — configuration: base rates, tier breakpoints, scoring weights.
+  # ---------------------------------------------------------------------------
+  - name: RatePlan
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Rate plan display name" }
+      - { name: state_code, type: string, source: input, description: "Two-letter US state this plan applies to, e.g. CA" }
+      - { name: base_premium_cents, type: integer, source: input, description: "Base annual premium floor in cents before telematics adjustment (>= 0)" }
+      - { name: per_mile_rate_cents, type: number, source: input, description: "Cents charged per mile driven within an allowance band (>= 0)" }
+      - { name: included_miles_per_period, type: integer, source: input, description: "Miles included per billing period before per-mile billing applies (>= 0)" }
+      - { name: hard_brake_weight, type: number, source: input, description: "Weight applied to hard-brake event count in risk scoring" }
+      - { name: speeding_weight, type: number, source: input, description: "Weight applied to speeding event count in risk scoring" }
+      - { name: phone_use_weight, type: number, source: input, description: "Weight applied to phone-use event count in risk scoring" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | RETIRED — retired plans cannot back new quotes", constraints: "ACTIVE, RETIRED" }
+
+  # ---------------------------------------------------------------------------
+  # Driver — aggregate root, entity_backed by DriverUser role.
+  # ---------------------------------------------------------------------------
+  - name: Driver
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Unique driver email (case-insensitive unique)" }
+      - { name: full_name, type: string, source: input, description: "Driver full name" }
+      - { name: state_code, type: string, source: input, description: "Two-letter US state of residence, e.g. CA" }
+      - { name: telematics_opted_out, type: boolean, source: computed, default: false, description: "True after the driver exercises opt-out; gates all trip capture across the driver's policies" }
+      - { name: lifetime_safe_miles, type: integer, source: computed, default: 0, description: "Conserved odometer: sum of distance_miles across all ACCEPTED trips on this driver's policies; never decreases except by compensating trip voiding" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | DEACTIVATED", constraints: "ACTIVE, DEACTIVATED" }
+
+  # ---------------------------------------------------------------------------
+  # PrivacyConsent — opt-out / privacy ledger (append-only event per driver).
+  # ---------------------------------------------------------------------------
+  - name: PrivacyConsent
+    parent: Driver
+    common_fields: false
+    fields:
+      - { name: driver_id, type: string, source: system, description: "FK -> Driver.id" }
+      - { name: action, type: enum, source: input, description: "GRANT | REVOKE — REVOKE is the opt-out that suspends telematics capture", constraints: "GRANT, REVOKE" }
+      - { name: reason, type: string, source: input, description: "Free-text reason for the consent change" }
+      - { name: effective_at, type: datetime, source: system, description: "Logical-clock timestamp the consent change took effect" }
+
+  # ---------------------------------------------------------------------------
+  # Enrollment — test-drive scoring period. Trips captured here feed the quote.
+  # ---------------------------------------------------------------------------
+  - name: Enrollment
+    parent: Driver
+    common_fields: true
+    fields:
+      - { name: driver_id, type: string, source: system, description: "FK -> Driver.id" }
+      - { name: rate_plan_id, type: string, source: input, description: "FK -> RatePlan.id; the plan being test-driven" }
+      - { name: scoring_days, type: integer, source: input, description: "Length of the scoring window in days (1..90)" }
+      - { name: scoring_started_at, type: datetime, source: system, description: "Logical-clock instant the scoring window opened" }
+      - { name: scoring_deadline, type: datetime, source: computed, description: "= scoring_started_at + scoring_days days; trips after this instant are rejected" }
+      - { name: captured_trip_count, type: integer, source: computed, default: 0, description: "Count of ACCEPTED trips attached to this enrollment" }
+      - { name: provisional_risk_score, type: number, source: computed, default: 0, description: "Provisional weighted risk score over enrollment trips (test-drive variant); see calc provisional_risk_score" }
+      - { name: status, type: enum, source: system, default: SCORING, description: "SCORING -> READY_TO_QUOTE -> QUOTED / EXPIRED / ABANDONED", constraints: "SCORING, READY_TO_QUOTE, QUOTED, EXPIRED, ABANDONED" }
+
+  # ---------------------------------------------------------------------------
+  # Quote — priced offer derived from an enrollment's scoring result.
+  # ---------------------------------------------------------------------------
+  - name: Quote
+    parent: Driver
+    common_fields: true
+    fields:
+      - { name: driver_id, type: string, source: system, description: "FK -> Driver.id" }
+      - { name: enrollment_id, type: string, source: input, description: "FK -> Enrollment.id; the scoring source" }
+      - { name: rate_plan_id, type: string, source: system, description: "FK -> RatePlan.id; copied from the enrollment at quote time" }
+      - { name: locked_risk_score, type: number, source: computed, description: "Enrollment provisional_risk_score snapshotted at quote generation (immutable thereafter)" }
+      - { name: risk_multiplier, type: number, source: computed, description: "Multiplier derived from locked_risk_score tiers; see calc risk_multiplier" }
+      - { name: quoted_annual_premium_cents, type: integer, source: computed, description: "= round_half_up(base_premium_cents * risk_multiplier); see calc quoted_premium" }
+      - { name: expires_at, type: datetime, source: computed, description: "= created_at + QUOTE_VALIDITY_DAYS; a quote cannot be bound after this instant" }
+      - { name: status, type: enum, source: system, default: OPEN, description: "OPEN -> BOUND / EXPIRED / DECLINED", constraints: "OPEN, BOUND, EXPIRED, DECLINED" }
+
+  # ---------------------------------------------------------------------------
+  # Policy — the active insurance contract. PARALLEL state dimensions.
+  # ---------------------------------------------------------------------------
+  - name: Policy
+    parent: Driver
+    common_fields: true
+    fields:
+      - { name: driver_id, type: string, source: system, description: "FK -> Driver.id" }
+      - { name: quote_id, type: string, source: input, description: "FK -> Quote.id; the bound quote" }
+      - { name: rate_plan_id, type: string, source: system, description: "FK -> RatePlan.id; copied from the quote at bind" }
+      - { name: bound_premium_cents, type: integer, source: system, description: "Annual premium copied from the quote at bind (the contract baseline)" }
+      - { name: current_risk_score, type: number, source: computed, default: 0, description: "Live operational risk score recomputed from ACCEPTED policy trips (operational variant); see calc operational_risk_score" }
+      - { name: current_risk_multiplier, type: number, source: computed, description: "Multiplier from current_risk_score tiers; see calc risk_multiplier" }
+      - { name: period_index, type: integer, source: computed, default: 0, description: "Current billing period ordinal; advances when a PremiumStatement is finalized" }
+      - { name: billing_status, type: enum, source: system, default: PERIOD_OPEN, description: "Dimension A (billing): PERIOD_OPEN -> PERIOD_CLOSING -> PERIOD_SETTLED -> PERIOD_OPEN (cycle)", constraints: "PERIOD_OPEN, PERIOD_CLOSING, PERIOD_SETTLED" }
+      - { name: telematics_status, type: enum, source: system, default: CAPTURING, description: "Dimension B (telematics): CAPTURING <-> SUSPENDED; independent of billing_status", constraints: "CAPTURING, SUSPENDED" }
+      - { name: lifecycle_status, type: enum, source: system, default: ACTIVE, description: "ACTIVE -> LAPSED / CANCELLED (terminal); gates billing and telematics dimensions", constraints: "ACTIVE, LAPSED, CANCELLED" }
+
+  # ---------------------------------------------------------------------------
+  # Trip — telematics trip capture (append-only fact; braking/speed/phone events
+  # attach as children). Belongs to a Policy OR an Enrollment (test-drive).
+  # ---------------------------------------------------------------------------
+  - name: Trip
+    parent: Policy
+    common_fields: true
+    fields:
+      - { name: policy_id, type: string, source: input, required: false, description: "FK -> Policy.id; set when the trip is on a bound policy (null during test-drive)" }
+      - { name: enrollment_id, type: string, source: input, required: false, description: "FK -> Enrollment.id; set when the trip is a test-drive scoring trip (null on a policy)" }
+      - { name: started_at, type: datetime, source: input, description: "Trip start instant (ISO 8601 UTC)" }
+      - { name: ended_at, type: datetime, source: input, description: "Trip end instant; MUST be strictly after started_at" }
+      - { name: distance_miles, type: number, source: input, description: "Odometer distance for the trip (> 0)" }
+      - { name: hard_brake_count, type: integer, source: computed, default: 0, description: "Count of attached HARD_BRAKE TripEvents" }
+      - { name: speeding_count, type: integer, source: computed, default: 0, description: "Count of attached SPEEDING TripEvents" }
+      - { name: phone_use_count, type: integer, source: computed, default: 0, description: "Count of attached PHONE_USE TripEvents" }
+      - { name: crash_detected, type: boolean, source: computed, default: false, description: "True once a CRASH TripEvent attaches; triggers the FNOL cascade" }
+      - { name: billed_period_index, type: integer, source: computed, default: -1, description: "For policy-bound trips: the owning policy's period_index captured at ACCEPT time; -1 until accepted or for enrollment trips. Pins which billing period the trip's miles fall into (no clock-window ambiguity)." }
+      - { name: status, type: enum, source: system, default: OPEN, description: "OPEN -> ACCEPTED / REJECTED / VOIDED; only ACCEPTED trips count toward scores and miles", constraints: "OPEN, ACCEPTED, REJECTED, VOIDED" }
+
+  # ---------------------------------------------------------------------------
+  # TripEvent — braking / speed / phone-use / crash micro-event (append-only).
+  # ---------------------------------------------------------------------------
+  - name: TripEvent
+    parent: Trip
+    common_fields: false
+    fields:
+      - { name: trip_id, type: string, source: system, description: "FK -> Trip.id" }
+      - { name: event_type, type: enum, source: input, description: "HARD_BRAKE | SPEEDING | PHONE_USE | CRASH", constraints: "HARD_BRAKE, SPEEDING, PHONE_USE, CRASH" }
+      - { name: severity, type: integer, source: input, description: "Severity 1..5; CRASH severity >= CRASH_FNOL_SEVERITY triggers automatic FNOL" }
+      - { name: occurred_at, type: datetime, source: input, description: "Instant the event occurred; MUST fall within [trip.started_at, trip.ended_at]" }
+
+  # ---------------------------------------------------------------------------
+  # RiskScoreSnapshot — append-only score history for a policy (event sourcing).
+  # ---------------------------------------------------------------------------
+  - name: RiskScoreSnapshot
+    parent: Policy
+    common_fields: false
+    fields:
+      - { name: policy_id, type: string, source: system, description: "FK -> Policy.id" }
+      - { name: trigger_reason, type: enum, source: system, description: "TRIP_ACCEPTED | TRIP_VOIDED | RENEWAL | MANUAL", constraints: "TRIP_ACCEPTED, TRIP_VOIDED, RENEWAL, MANUAL" }
+      - { name: risk_score, type: number, source: system, description: "operational_risk_score value at snapshot time" }
+      - { name: risk_multiplier, type: number, source: system, description: "risk_multiplier value at snapshot time" }
+      - { name: snapshot_at, type: datetime, source: system, description: "Logical-clock instant the snapshot was taken" }
+
+  # ---------------------------------------------------------------------------
+  # PremiumStatement — mileage-based premium for one billing period.
+  # ---------------------------------------------------------------------------
+  - name: PremiumStatement
+    parent: Policy
+    common_fields: true
+    fields:
+      - { name: policy_id, type: string, source: system, description: "FK -> Policy.id" }
+      - { name: period_index, type: integer, source: system, description: "Billing period ordinal this statement covers" }
+      - { name: billed_miles, type: number, source: computed, description: "Sum of distance_miles over ACCEPTED policy trips in the period window" }
+      - { name: overage_miles, type: number, source: computed, description: "max(0, billed_miles - rate_plan.included_miles_per_period)" }
+      - { name: base_charge_cents, type: integer, source: computed, description: "Per-period share of bound_premium_cents * current_risk_multiplier" }
+      - { name: mileage_charge_cents, type: integer, source: computed, description: "Per-mile charge over the overage band; see calc mileage_premium" }
+      - { name: applied_discount_cents, type: integer, source: computed, default: 0, description: "Discount drawn from the driver's DiscountBank at settlement" }
+      - { name: total_due_cents, type: integer, source: computed, description: "max(0, base_charge_cents + mileage_charge_cents - applied_discount_cents)" }
+      - { name: status, type: enum, source: system, default: DRAFT, description: "DRAFT -> ISSUED -> SETTLED / VOIDED", constraints: "DRAFT, ISSUED, SETTLED, VOIDED" }
+
+  # ---------------------------------------------------------------------------
+  # Renewal — renewal recalculation at end of policy term.
+  # ---------------------------------------------------------------------------
+  - name: Renewal
+    parent: Policy
+    common_fields: true
+    fields:
+      - { name: policy_id, type: string, source: system, description: "FK -> Policy.id" }
+      - { name: prior_premium_cents, type: integer, source: system, description: "bound_premium_cents at the moment the renewal opened" }
+      - { name: recalculated_risk_score, type: number, source: computed, description: "operational_risk_score snapshotted at renewal open" }
+      - { name: recalculated_premium_cents, type: integer, source: computed, description: "= round_half_up(base_premium_cents * renewal_risk_multiplier); see calc renewal_premium" }
+      - { name: banked_discount_applied_cents, type: integer, source: computed, default: 0, description: "Discount swept from DiscountBank into the renewed premium" }
+      - { name: status, type: enum, source: system, default: PROPOSED, description: "PROPOSED -> ACCEPTED / DECLINED", constraints: "PROPOSED, ACCEPTED, DECLINED" }
+
+  # ---------------------------------------------------------------------------
+  # Claim — crash detection & FNOL (First Notice Of Loss). Cyclic reopen loop.
+  # ---------------------------------------------------------------------------
+  - name: Claim
+    parent: Policy
+    common_fields: true
+    fields:
+      - { name: policy_id, type: string, source: system, description: "FK -> Policy.id" }
+      - { name: trip_id, type: string, source: system, required: false, description: "FK -> Trip.id; the crash trip that auto-triggered FNOL (null for manual claims)" }
+      - { name: origin, type: enum, source: system, description: "AUTO_FNOL | MANUAL", constraints: "AUTO_FNOL, MANUAL" }
+      - { name: reported_severity, type: integer, source: system, description: "Severity copied from the triggering CRASH TripEvent (manual claims: from input)" }
+      - { name: reserve_cents, type: integer, source: computed, default: 0, description: "Loss reserve set by the adjuster" }
+      - { name: reopen_count, type: integer, source: computed, default: 0, description: "Number of times the claim has cycled CLOSED -> REOPENED" }
+      - { name: status, type: enum, source: system, default: FNOL, description: "FNOL -> UNDER_REVIEW -> CLOSED <-> REOPENED; CLOSED with reopen exhausted is terminal", constraints: "FNOL, UNDER_REVIEW, CLOSED, REOPENED" }
+
+  # ---------------------------------------------------------------------------
+  # DiscountBank — discount banking ledger (one per driver). Conserved balance.
+  # ---------------------------------------------------------------------------
+  - name: DiscountBank
+    parent: Driver
+    common_fields: true
+    fields:
+      - { name: driver_id, type: string, source: system, description: "FK -> Driver.id" }
+      - { name: earned_cents, type: integer, source: computed, default: 0, description: "Cumulative discount earned from safe-driving grants (monotonic non-decreasing)" }
+      - { name: redeemed_cents, type: integer, source: computed, default: 0, description: "Cumulative discount consumed by statements/renewals (monotonic non-decreasing)" }
+      - { name: available_cents, type: integer, source: computed, default: 0, description: "= earned_cents - redeemed_cents; invariant: always >= 0" }
+
+  # ---------------------------------------------------------------------------
+  # DiscountGrant — individual banked discount entry (earn or redeem leg).
+  # ---------------------------------------------------------------------------
+  - name: DiscountGrant
+    parent: DiscountBank
+    common_fields: false
+    fields:
+      - { name: discount_bank_id, type: string, source: system, description: "FK -> DiscountBank.id" }
+      - { name: leg, type: enum, source: system, description: "EARN | REDEEM | REVERSAL", constraints: "EARN, REDEEM, REVERSAL" }
+      - { name: amount_cents, type: integer, source: system, description: "Positive magnitude of this grant leg in cents" }
+      - { name: source_reason, type: enum, source: system, description: "SAFE_TRIP | STATEMENT_REDEEM | RENEWAL_REDEEM | TRIP_VOID_REVERSAL", constraints: "SAFE_TRIP, STATEMENT_REDEEM, RENEWAL_REDEEM, TRIP_VOID_REVERSAL" }
+      - { name: granted_at, type: datetime, source: system, description: "Logical-clock instant the grant was posted" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---------------------------------------------------------------------------
+  # Enrollment — linear with a single revert (READY_TO_QUOTE -> SCORING).
+  # ---------------------------------------------------------------------------
+  - entity: Enrollment
+    initial_state: SCORING
+    terminal_states: [QUOTED, EXPIRED, ABANDONED]
+    transitions:
+      - from: SCORING
+        to: READY_TO_QUOTE
+        trigger: "POST /enrollments/{id}/finalize-scoring"
+        actor: DriverUser
+        preconditions:
+          - "Enrollment.status == SCORING (ERR_ENROLLMENT_NOT_SCORING)"
+          - "captured_trip_count >= MIN_SCORING_TRIPS (ERR_INSUFFICIENT_SCORING_TRIPS)"
+          - "clock <= scoring_deadline (ERR_SCORING_WINDOW_EXPIRED)"
+        side_effects:
+          - "Recompute provisional_risk_score over ACCEPTED enrollment trips (calc provisional_risk_score)"
+      - from: READY_TO_QUOTE
+        to: SCORING
+        trigger: "POST /enrollments/{id}/reopen-scoring"
+        actor: DriverUser
+        preconditions:
+          - "Enrollment.status == READY_TO_QUOTE (ERR_ENROLLMENT_NOT_READY)"
+          - "clock <= scoring_deadline (ERR_SCORING_WINDOW_EXPIRED)"
+        side_effects:
+          - "Driver may capture additional trips; provisional_risk_score stays stale until next finalize-scoring"
+      - from: READY_TO_QUOTE
+        to: QUOTED
+        trigger: "POST /quotes (system marks the source enrollment)"
+        actor: UnderwritingOps
+        preconditions:
+          - "Enrollment.status == READY_TO_QUOTE (ERR_ENROLLMENT_NOT_READY)"
+        side_effects:
+          - "Quote created; locked_risk_score = enrollment.provisional_risk_score"
+      - from: SCORING
+        to: EXPIRED
+        trigger: "POST /_clock/set_current_utc advancing past scoring_deadline, then GET refresh; or POST /enrollments/{id}/expire"
+        actor: system
+        preconditions:
+          - "clock > scoring_deadline (ERR_SCORING_WINDOW_NOT_EXPIRED if called early)"
+        side_effects:
+          - "Enrollment frozen; no further trips accepted"
+      - from: SCORING
+        to: ABANDONED
+        trigger: "POST /enrollments/{id}/abandon"
+        actor: DriverUser
+        preconditions:
+          - "Enrollment.status == SCORING (ERR_ENROLLMENT_NOT_SCORING)"
+        side_effects: []
+
+  # ---------------------------------------------------------------------------
+  # Quote — linear branch (OPEN -> BOUND / EXPIRED / DECLINED).
+  # ---------------------------------------------------------------------------
+  - entity: Quote
+    initial_state: OPEN
+    terminal_states: [BOUND, EXPIRED, DECLINED]
+    transitions:
+      - from: OPEN
+        to: BOUND
+        trigger: "POST /policies"
+        actor: UnderwritingOps
+        preconditions:
+          - "Quote.status == OPEN (ERR_QUOTE_NOT_OPEN)"
+          - "clock <= expires_at (ERR_QUOTE_EXPIRED)"
+          - "rate_plan.status == ACTIVE (ERR_RATE_PLAN_RETIRED)"
+        side_effects:
+          - "Policy created in lifecycle_status=ACTIVE, billing_status=PERIOD_OPEN, telematics_status=CAPTURING"
+          - "Policy.bound_premium_cents = quote.quoted_annual_premium_cents"
+          - "Policy.current_risk_score = quote.locked_risk_score; current_risk_multiplier = quote.risk_multiplier"
+          - "RiskScoreSnapshot appended (trigger_reason=MANUAL) recording the bound baseline"
+      - from: OPEN
+        to: EXPIRED
+        trigger: "POST /quotes/{id}/expire (clock past expires_at)"
+        actor: system
+        preconditions:
+          - "clock > expires_at (ERR_QUOTE_NOT_EXPIRED if called early)"
+        side_effects: []
+      - from: OPEN
+        to: DECLINED
+        trigger: "POST /quotes/{id}/decline"
+        actor: DriverUser
+        preconditions:
+          - "Quote.status == OPEN (ERR_QUOTE_NOT_OPEN)"
+        side_effects: []
+
+  # ---------------------------------------------------------------------------
+  # Policy — PARALLEL dimensions: billing_status (cyclic) × telematics_status
+  # (toggle). lifecycle_status gates both. This is the non-linear machine.
+  # ---------------------------------------------------------------------------
+  - entity: Policy
+    initial_state: ACTIVE        # lifecycle_status; billing/telematics dims tracked separately
+    terminal_states: [LAPSED, CANCELLED]
+    transitions:
+      # --- billing dimension (cycle PERIOD_OPEN -> PERIOD_CLOSING -> PERIOD_SETTLED -> PERIOD_OPEN) ---
+      - from: PERIOD_OPEN
+        to: PERIOD_CLOSING
+        trigger: "POST /statements"
+        actor: UnderwritingOps
+        dimension: billing_status
+        preconditions:
+          - "lifecycle_status == ACTIVE (ERR_POLICY_NOT_ACTIVE)"
+          - "billing_status == PERIOD_OPEN (ERR_PERIOD_NOT_OPEN)"
+          - "No OPEN trips remain in the current period window (ERR_OPEN_TRIPS_IN_PERIOD)"
+        side_effects:
+          - "PremiumStatement(status=DRAFT) created; billed_miles/overage_miles/base_charge/mileage_charge computed (calc mileage_premium)"
+      - from: PERIOD_CLOSING
+        to: PERIOD_SETTLED
+        trigger: "POST /statements/{id}/settle"
+        actor: UnderwritingOps
+        dimension: billing_status
+        preconditions:
+          - "lifecycle_status == ACTIVE (ERR_POLICY_NOT_ACTIVE)"
+          - "billing_status == PERIOD_CLOSING (ERR_PERIOD_NOT_CLOSING)"
+          - "Statement.status == ISSUED (ERR_STATEMENT_NOT_ISSUED)"
+        side_effects:
+          - "applied_discount_cents drawn from DiscountBank.available_cents (calc discount_redemption)"
+          - "Statement -> SETTLED; DiscountBank.redeemed_cents += applied_discount_cents; DiscountGrant(leg=REDEEM) appended"
+          - "total_due_cents finalized"
+      - from: PERIOD_SETTLED
+        to: PERIOD_OPEN
+        trigger: "POST /policies/{id}/advance-period"
+        actor: UnderwritingOps
+        dimension: billing_status
+        preconditions:
+          - "lifecycle_status == ACTIVE (ERR_POLICY_NOT_ACTIVE)"
+          - "billing_status == PERIOD_SETTLED (ERR_PERIOD_NOT_SETTLED)"
+        side_effects:
+          - "period_index += 1; billing_status -> PERIOD_OPEN; new period window opens"
+      # --- telematics dimension (CAPTURING <-> SUSPENDED) ---
+      - from: CAPTURING
+        to: SUSPENDED
+        trigger: "POST /drivers/{id}/privacy-consents (action=REVOKE) cascades to every ACTIVE policy"
+        actor: DriverUser
+        dimension: telematics_status
+        preconditions:
+          - "Driver.telematics_opted_out flips false->true (ERR_ALREADY_OPTED_OUT if already true)"
+        side_effects:
+          - "Every ACTIVE policy of the driver: telematics_status -> SUSPENDED (cascade)"
+      - from: SUSPENDED
+        to: CAPTURING
+        trigger: "POST /drivers/{id}/privacy-consents (action=GRANT) cascades to every ACTIVE policy"
+        actor: DriverUser
+        dimension: telematics_status
+        preconditions:
+          - "Driver.telematics_opted_out flips true->false (ERR_NOT_OPTED_OUT if already false)"
+        side_effects:
+          - "Every ACTIVE policy of the driver: telematics_status -> CAPTURING (cascade)"
+      # --- lifecycle dimension ---
+      - from: ACTIVE
+        to: LAPSED
+        trigger: "POST /policies/{id}/lapse"
+        actor: UnderwritingOps
+        dimension: lifecycle_status
+        preconditions:
+          - "lifecycle_status == ACTIVE (ERR_POLICY_NOT_ACTIVE)"
+          - "No statement in ISSUED status awaiting settlement (ERR_UNSETTLED_STATEMENT)"
+        side_effects:
+          - "telematics_status -> SUSPENDED; billing dimension frozen"
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /policies/{id}/cancel"
+        actor: UnderwritingOps
+        dimension: lifecycle_status
+        preconditions:
+          - "lifecycle_status == ACTIVE (ERR_POLICY_NOT_ACTIVE)"
+          - "No Claim in FNOL/UNDER_REVIEW/REOPENED status (ERR_OPEN_CLAIM_BLOCKS_CANCEL)"
+        side_effects:
+          - "telematics_status -> SUSPENDED; billing dimension frozen"
+
+  # ---------------------------------------------------------------------------
+  # Trip — OPEN -> ACCEPTED / REJECTED / VOIDED. ACCEPT fires the big cascade.
+  # ---------------------------------------------------------------------------
+  - entity: Trip
+    initial_state: OPEN
+    terminal_states: [ACCEPTED, REJECTED, VOIDED]
+    transitions:
+      - from: OPEN
+        to: ACCEPTED
+        trigger: "POST /trips/{id}/accept"
+        actor: DriverUser
+        preconditions:
+          - "Trip.status == OPEN (ERR_TRIP_NOT_OPEN)"
+          - "If policy-bound: policy.telematics_status == CAPTURING (ERR_TELEMATICS_SUSPENDED)"
+          - "If policy-bound: policy.billing_status == PERIOD_OPEN (ERR_PERIOD_NOT_OPEN)"
+          - "If enrollment-bound: enrollment.status == SCORING and clock <= scoring_deadline (ERR_SCORING_WINDOW_EXPIRED)"
+          - "distance_miles > 0 (ERR_INVALID_TRIP_DISTANCE)"
+        side_effects:
+          - "(L1) Trip per-type event counts frozen from attached TripEvents; if policy-bound, billed_period_index stamped = policy.period_index"
+          - "(L2) If enrollment-bound: enrollment.captured_trip_count += 1"
+          - "(L2) If policy-bound: driver.lifetime_safe_miles += distance_miles; policy.current_risk_score recomputed (calc operational_risk_score)"
+          - "(L3) policy.current_risk_multiplier recomputed from new score (calc risk_multiplier); RiskScoreSnapshot(trigger_reason=TRIP_ACCEPTED) appended"
+          - "(L3) If trip has zero hard_brake/speeding/phone_use events AND distance_miles >= SAFE_TRIP_MIN_MILES: DiscountBank.earned_cents += SAFE_TRIP_DISCOUNT_CENTS; DiscountGrant(leg=EARN, source_reason=SAFE_TRIP) appended (calc safe_trip_discount)"
+          - "(L4) If crash_detected: Claim auto-created (see Claim FNOL cascade)"
+      - from: OPEN
+        to: REJECTED
+        trigger: "POST /trips/{id}/reject"
+        actor: DriverUser
+        preconditions:
+          - "Trip.status == OPEN (ERR_TRIP_NOT_OPEN)"
+        side_effects:
+          - "Trip excluded from all scores and miles"
+      - from: ACCEPTED
+        to: VOIDED
+        trigger: "POST /trips/{id}/void"
+        actor: UnderwritingOps
+        preconditions:
+          - "Trip.status == ACCEPTED (ERR_TRIP_NOT_ACCEPTED)"
+          - "No SETTLED PremiumStatement covers this trip's period (ERR_TRIP_PERIOD_SETTLED)"
+        side_effects:
+          - "(C1) If policy-bound: driver.lifetime_safe_miles -= distance_miles (compensating; invariant restored)"
+          - "(C2) policy.current_risk_score recomputed without this trip (calc operational_risk_score); RiskScoreSnapshot(trigger_reason=TRIP_VOIDED) appended"
+          - "(C3) If this trip earned a SAFE_TRIP grant: DiscountBank.earned_cents -= SAFE_TRIP_DISCOUNT_CENTS; DiscountGrant(leg=REVERSAL, source_reason=TRIP_VOID_REVERSAL) appended (available_cents invariant preserved)"
+
+  # ---------------------------------------------------------------------------
+  # Claim — FNOL -> UNDER_REVIEW -> CLOSED <-> REOPENED (CYCLE).
+  # ---------------------------------------------------------------------------
+  - entity: Claim
+    initial_state: FNOL
+    terminal_states: [CLOSED]      # CLOSED is terminal only when reopen budget exhausted
+    transitions:
+      - from: FNOL
+        to: UNDER_REVIEW
+        trigger: "POST /claims/{id}/triage"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "Claim.status == FNOL (ERR_CLAIM_NOT_FNOL)"
+          - "policy.lifecycle_status == ACTIVE (ERR_POLICY_NOT_ACTIVE)"
+        side_effects:
+          - "reserve_cents set from request (calc claim_reserve)"
+      - from: UNDER_REVIEW
+        to: CLOSED
+        trigger: "POST /claims/{id}/close"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "Claim.status == UNDER_REVIEW (ERR_CLAIM_NOT_UNDER_REVIEW)"
+        side_effects:
+          - "Claim closed; reserve released"
+      - from: CLOSED
+        to: REOPENED
+        trigger: "POST /claims/{id}/reopen"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "Claim.status == CLOSED (ERR_CLAIM_NOT_CLOSED)"
+          - "reopen_count < MAX_CLAIM_REOPENS (ERR_REOPEN_LIMIT_REACHED)"
+          - "expected_claim_version matches (ERR_STALE_VERSION)"
+        side_effects:
+          - "reopen_count += 1; reserve restored; claim returns to active handling"
+      - from: REOPENED
+        to: CLOSED
+        trigger: "POST /claims/{id}/close"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "Claim.status == REOPENED (ERR_CLAIM_NOT_REOPENABLE)"
+        side_effects:
+          - "Claim closed again; if reopen_count == MAX_CLAIM_REOPENS this CLOSED is terminal"
+
+  # ---------------------------------------------------------------------------
+  # Renewal — PROPOSED -> ACCEPTED / DECLINED.
+  # ---------------------------------------------------------------------------
+  - entity: Renewal
+    initial_state: PROPOSED
+    terminal_states: [ACCEPTED, DECLINED]
+    transitions:
+      - from: PROPOSED
+        to: ACCEPTED
+        trigger: "POST /renewals/{id}/accept"
+        actor: UnderwritingOps
+        preconditions:
+          - "Renewal.status == PROPOSED (ERR_RENEWAL_NOT_PROPOSED)"
+          - "policy.lifecycle_status == ACTIVE (ERR_POLICY_NOT_ACTIVE)"
+          - "expected_policy_version matches (ERR_STALE_VERSION)"
+        side_effects:
+          - "policy.bound_premium_cents = recalculated_premium_cents - banked_discount_applied_cents"
+          - "DiscountBank.redeemed_cents += banked_discount_applied_cents; DiscountGrant(leg=REDEEM, source_reason=RENEWAL_REDEEM) appended"
+      - from: PROPOSED
+        to: DECLINED
+        trigger: "POST /renewals/{id}/decline"
+        actor: UnderwritingOps
+        preconditions:
+          - "Renewal.status == PROPOSED (ERR_RENEWAL_NOT_PROPOSED)"
+        side_effects:
+          - "Renewal discarded; policy premium unchanged"
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules — only true CREATE-with-supersede races (OCC).
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: renewal-create-stale-policy
+    parent_entity: Policy
+    write_endpoint: "POST /renewals"
+    occ_field: "expected_policy_version"
+    description: |
+      Opening a Renewal against a Policy whose version has advanced since the
+      client last observed it is rejected. A renewal proposal snapshots the
+      policy's current risk score and premium baseline; if another writer has
+      since accepted a prior renewal (which legitimately supersedes the
+      baseline) or settled a statement, the current writer's view of the policy
+      is stale and the new renewal would price off an out-of-date baseline.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: statement-create-stale-policy
+    parent_entity: Policy
+    write_endpoint: "POST /statements"
+    occ_field: "expected_policy_version"
+    description: |
+      Creating a PremiumStatement against a Policy whose version has advanced
+      since the client last observed it is rejected. A statement snapshots the
+      period's billed miles and the live risk multiplier; if another writer has
+      accepted a trip or voided one (advancing the policy version and changing
+      the multiplier) the current writer's snapshot inputs are stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  # ---- DUAL-VARIANT pair (different entity domains): risk scoring ----
+  - name: provisional_risk_score
+    trigger: "Enrollment finalize-scoring (READY_TO_QUOTE transition)"
+    algorithm: weighted_scoring
+    formula: |
+      # TEST-DRIVE VARIANT — operates on Enrollment, forward-looking over the
+      # short scoring window. Counts are normalized PER 100 MILES so a short
+      # test-drive is not penalized for low absolute mileage.
+      trips        = ACCEPTED trips with enrollment_id == this enrollment
+      total_miles  = sum(distance_miles for t in trips)        # > 0 guaranteed by MIN_SCORING_TRIPS
+      hb = sum(t.hard_brake_count for t in trips)
+      sp = sum(t.speeding_count   for t in trips)
+      pu = sum(t.phone_use_count  for t in trips)
+      per100 = 100 / total_miles
+      raw = rate_plan.hard_brake_weight * (hb * per100)
+          + rate_plan.speeding_weight   * (sp * per100)
+          + rate_plan.phone_use_weight  * (pu * per100)
+      provisional_risk_score = round_half_up(raw, 2)
+    input_set: "ACCEPTED enrollment trips only (OPEN/REJECTED/VOIDED excluded)"
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: test_drive_per_100_miles
+        when: "Enrollment scoring (short window)"
+        difference: "Normalizes event counts per 100 miles so absolute mileage does not dominate; this is the divergence point from operational_risk_score which uses absolute lifetime counts."
+
+  - name: operational_risk_score
+    trigger: "Trip ACCEPT (TRIP_ACCEPTED side-effect) and Trip VOID (TRIP_VOIDED side-effect) on a bound Policy"
+    algorithm: weighted_scoring
+    formula: |
+      # OPERATIONAL VARIANT — operates on Policy, chronological accumulation over
+      # the policy lifetime. Counts are ABSOLUTE (not per-100-miles): a driver
+      # who drives more accumulates more exposure. SAME plan weights, DIFFERENT
+      # normalization -> different number for identical event/mileage inputs.
+      trips = ACCEPTED trips with policy_id == this policy
+      hb = sum(t.hard_brake_count for t in trips)
+      sp = sum(t.speeding_count   for t in trips)
+      pu = sum(t.phone_use_count  for t in trips)
+      raw = rate_plan.hard_brake_weight * hb
+          + rate_plan.speeding_weight   * sp
+          + rate_plan.phone_use_weight  * pu
+      operational_risk_score = round_half_up(raw, 2)
+    input_set: "ACCEPTED policy trips only; recomputed full (not incremental) on each accept/void"
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: lifetime_absolute
+        when: "Bound policy operation"
+        difference: "Uses absolute counts (no per-100-miles normalization) — for identical trips this yields a different score than provisional_risk_score, which divides by mileage."
+
+  # ---- COMBINATORIAL mode (a): nonlinear multi-input tiered selection ----
+  - name: risk_multiplier
+    trigger: "Quote generation; Trip accept/void (recompute current_risk_multiplier); Renewal open"
+    algorithm: tiered_pricing
+    formula: |
+      # >=3 inputs (score, floor, ceiling) with nested clamp + tier selection.
+      # Tier boundaries use HALF-OPEN [lo, hi) semantics with strict-less upper.
+      s = risk_score
+      if   s <  10.0:  m = 0.85    # tier SAFE      : (-inf, 10)
+      elif s <  25.0:  m = 1.00    # tier STANDARD  : [10, 25)
+      elif s <  50.0:  m = 1.25    # tier ELEVATED  : [25, 50)
+      else:            m = 1.60    # tier HIGH      : [50, +inf)
+      risk_multiplier = clamp(m, MULT_FLOOR, MULT_CEILING)   # nested min/max
+    input_set: "single risk_score scalar + plan-independent tier table + floor/ceiling clamp"
+    constants:
+      MULT_FLOOR: 0.85
+      MULT_CEILING: 1.60
+      TIER_SAFE_UPPER: 10.0
+      TIER_STANDARD_UPPER: 25.0
+      TIER_ELEVATED_UPPER: 50.0
+    precision: "multiplier exact (2dp table values)"
+
+  - name: quoted_premium
+    trigger: "Quote generation"
+    algorithm: aggregation
+    formula: |
+      quoted_annual_premium_cents = round_half_up(rate_plan.base_premium_cents * risk_multiplier)
+    input_set: "rate_plan.base_premium_cents and risk_multiplier(locked_risk_score)"
+    precision: "integer cents, round_half_up at the cent"
+
+  # ---- COMBINATORIAL mode (b): nested rounding, ORDER PINNED ----
+  - name: mileage_premium
+    trigger: "PremiumStatement creation (PERIOD_OPEN -> PERIOD_CLOSING)"
+    algorithm: tiered_pricing
+    formula: |
+      # ROUNDING ORDER IS PINNED: compute base_charge and mileage_charge as
+      # SEPARATE cent amounts, round EACH to a whole cent independently, THEN sum.
+      # ("round-per-component then sum", NOT "sum then round".)
+      billed_miles   = sum(distance_miles for ACCEPTED policy trips whose billed_period_index == policy.period_index)
+      overage_miles  = max(0, billed_miles - rate_plan.included_miles_per_period)
+      # base charge: per-period share = annual baseline / PERIODS_PER_YEAR, scaled by live multiplier
+      base_raw_cents = (policy.bound_premium_cents / PERIODS_PER_YEAR) * policy.current_risk_multiplier
+      base_charge_cents    = round_half_up(base_raw_cents)            # round component 1
+      mileage_raw_cents    = overage_miles * rate_plan.per_mile_rate_cents
+      mileage_charge_cents = round_half_up(mileage_raw_cents)         # round component 2
+      total_before_discount = base_charge_cents + mileage_charge_cents   # sum AFTER each rounded
+    input_set: "ACCEPTED policy trips whose billed_period_index equals the statement's period_index (stamped at accept time = policy.period_index then)"
+    constants:
+      PERIODS_PER_YEAR: 12
+    precision: "round_half_up per component, then integer sum"
+    variants:
+      - name: round_per_component_then_sum
+        when: "always"
+        difference: "Differs from a 'sum raw then round once' implementation when both components have fractional cents; the scaffold pins per-component rounding."
+
+  # ---- COMBINATORIAL mode (c): circular-looking dependency, ORDER PINNED ----
+  - name: discount_redemption
+    trigger: "PremiumStatement settle (PERIOD_CLOSING -> PERIOD_SETTLED)"
+    algorithm: waterfall_allocation
+    formula: |
+      # CIRCULAR-LOOKING: total_due depends on applied_discount, but
+      # applied_discount is capped by total_before_discount which depends on the
+      # charges. Evaluation order is PINNED:
+      #   1. total_before_discount = base_charge_cents + mileage_charge_cents   (already fixed at DRAFT)
+      #   2. cap = min(DiscountBank.available_cents, total_before_discount)     (cannot discount below zero)
+      #   3. applied_discount_cents = cap
+      #   4. total_due_cents = total_before_discount - applied_discount_cents   (>= 0 by construction)
+      # DiscountBank then: redeemed_cents += applied_discount_cents (available_cents = earned - redeemed).
+      applied_discount_cents = min(DiscountBank.available_cents, base_charge_cents + mileage_charge_cents)
+      total_due_cents        = (base_charge_cents + mileage_charge_cents) - applied_discount_cents
+    input_set: "DiscountBank.available_cents at settle time and the statement's pre-discount total"
+    precision: "integer cents"
+    variants:
+      - name: cap_at_total_then_subtract
+        when: "settle"
+        difference: "Pins evaluation order so total_due is well-defined despite the apparent circular dependency between total_due and applied_discount."
+
+  - name: renewal_premium
+    trigger: "Renewal open (POST renewals)"
+    algorithm: aggregation
+    formula: |
+      recalculated_risk_score   = policy.current_risk_score (snapshotted at open)
+      renewal_risk_multiplier   = risk_multiplier(recalculated_risk_score)
+      recalculated_premium_cents = round_half_up(rate_plan.base_premium_cents * renewal_risk_multiplier)
+      banked_discount_applied_cents = min(DiscountBank.available_cents, RENEWAL_MAX_DISCOUNT_CENTS)
+    input_set: "policy.current_risk_score, rate_plan.base_premium_cents, DiscountBank.available_cents"
+    constants:
+      RENEWAL_MAX_DISCOUNT_CENTS: 50000
+    precision: "integer cents, round_half_up"
+
+  - name: safe_trip_discount
+    trigger: "Trip ACCEPT (L3 side-effect) when the trip is clean and long enough"
+    algorithm: threshold
+    formula: |
+      # Boundary: distance_miles >= SAFE_TRIP_MIN_MILES (inclusive) AND
+      # all three event counts == 0. A trip of exactly SAFE_TRIP_MIN_MILES earns;
+      # SAFE_TRIP_MIN_MILES - epsilon does not.
+      if hard_brake_count == 0 and speeding_count == 0 and phone_use_count == 0
+         and distance_miles >= SAFE_TRIP_MIN_MILES:
+        earned = SAFE_TRIP_DISCOUNT_CENTS
+      else:
+        earned = 0
+    input_set: "single ACCEPTED policy trip's event counts and distance"
+    constants:
+      SAFE_TRIP_MIN_MILES: 5.0
+      SAFE_TRIP_DISCOUNT_CENTS: 250
+    precision: "integer cents"
+
+  - name: claim_reserve
+    trigger: "Claim triage (FNOL -> UNDER_REVIEW)"
+    algorithm: threshold
+    formula: |
+      reserve_cents = RESERVE_BASE_CENTS * reported_severity
+    input_set: "claim.reported_severity (1..5)"
+    constants:
+      RESERVE_BASE_CENTS: 100000
+    precision: "integer cents"
+
+# Shared constants referenced across §1.2 / §1.3:
+#   MIN_SCORING_TRIPS = 3
+#   QUOTE_VALIDITY_DAYS = 14
+#   CRASH_FNOL_SEVERITY = 4
+#   MAX_CLAIM_REOPENS = 2
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and well-formed"
+    error_id: ERR_MISSING_USER_CONTEXT
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Role is permitted to perform this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: auth
+    check: "DriverUser acting on a driver-scoped resource must be the owning driver (X-User-ID == driver_id of the resource chain)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "all DriverUser write endpoints whose resource chain resolves to a driver_id (enrollments, quotes, trips, privacy-consents, claims)"
+
+  - priority: 4
+    category: existence
+    check: "Every path id resolves to an existing resource, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all resource endpoints
+
+  - priority: 5
+    category: state
+    check: "OCC: when expected_<parent>_version is supplied it must equal the parent's current version (checked before business logic)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST renewals, POST statements, POST claims/{id}/reopen"
+
+  - priority: 6
+    category: state
+    check: "Target resource is in the required state for the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints (domain-specific error_id overrides per §1.2)"
+
+  - priority: 7
+    category: business_referential
+    check: "rate_plan referenced by an enrollment/quote/policy must exist and be ACTIVE at the binding step"
+    error_id: ERR_RATE_PLAN_RETIRED
+    http_status: 409
+    applies_to: "POST quotes, POST policies"
+
+  - priority: 8
+    category: business_referential
+    check: "A trip body sets EXACTLY ONE of policy_id / enrollment_id, not both and not neither"
+    error_id: ERR_TRIP_PARENT_AMBIGUOUS
+    http_status: 422
+    applies_to: "POST /trips"
+
+  - priority: 9
+    category: business_referential
+    check: "A quote's enrollment must be in READY_TO_QUOTE; an enrollment already QUOTED cannot back a second quote"
+    error_id: ERR_ENROLLMENT_NOT_READY
+    http_status: 409
+    applies_to: "POST /quotes"
+
+  - priority: 10
+    category: business_safety
+    check: "Telematics capture (trip accept) is blocked when the owning driver has opted out (policy.telematics_status == SUSPENDED)"
+    error_id: ERR_TELEMATICS_SUSPENDED
+    http_status: 409
+    applies_to: "POST /trips/{id}/accept (policy-bound trips)"
+
+  - priority: 11
+    category: business_safety
+    check: "A CRASH TripEvent with severity >= CRASH_FNOL_SEVERITY on a policy-bound trip MUST auto-trigger FNOL on accept; cannot be suppressed"
+    error_id: ERR_CRASH_FNOL_REQUIRED
+    http_status: 409
+    applies_to: "POST /trips/{id}/accept"
+
+  - priority: 12
+    category: business_temporal
+    check: "Trip ended_at strictly after started_at"
+    error_id: ERR_TRIP_TIME_ORDER
+    http_status: 422
+    applies_to: "POST /trips"
+
+  - priority: 13
+    category: business_temporal
+    check: "TripEvent.occurred_at within the half-open interval [trip.started_at, trip.ended_at)"
+    error_id: ERR_EVENT_OUTSIDE_TRIP
+    http_status: 422
+    applies_to: "POST /trips/{id}/events"
+
+  - priority: 14
+    category: business_temporal
+    check: "Enrollment scoring trips rejected after scoring_deadline (clock-gated)"
+    error_id: ERR_SCORING_WINDOW_EXPIRED
+    http_status: 409
+    applies_to: "POST /trips/{id}/accept (enrollment-bound), finalize-scoring, reopen-scoring"
+
+  - priority: 15
+    category: business_temporal
+    check: "A quote can be bound only at or before expires_at"
+    error_id: ERR_QUOTE_EXPIRED
+    http_status: 409
+    applies_to: "POST /policies"
+
+  - priority: 16
+    category: business_constraint
+    check: "Enrollment finalize-scoring requires captured_trip_count >= MIN_SCORING_TRIPS"
+    error_id: ERR_INSUFFICIENT_SCORING_TRIPS
+    http_status: 422
+    applies_to: "POST finalize-scoring"
+
+  - priority: 17
+    category: business_constraint
+    check: "distance_miles must be > 0 on trip creation and accept"
+    error_id: ERR_INVALID_TRIP_DISTANCE
+    http_status: 422
+    applies_to: "POST /trips, POST /trips/{id}/accept"
+
+  - priority: 18
+    category: business_constraint
+    check: "TripEvent.severity in 1..5; event_type in the declared enum"
+    error_id: ERR_INVALID_EVENT
+    http_status: 422
+    applies_to: "POST /trips/{id}/events"
+
+  - priority: 19
+    category: business_constraint
+    check: "A statement cannot be created while OPEN trips remain in the period (must be accepted/rejected first)"
+    error_id: ERR_OPEN_TRIPS_IN_PERIOD
+    http_status: 409
+    applies_to: "POST /statements"
+
+  - priority: 20
+    category: business_constraint
+    check: "A statement can be settled only from ISSUED status"
+    error_id: ERR_STATEMENT_NOT_ISSUED
+    http_status: 409
+    applies_to: "POST statements/{id}/settle"
+
+  - priority: 21
+    category: business_constraint
+    check: "A trip cannot be voided when a SETTLED statement already covers its period"
+    error_id: ERR_TRIP_PERIOD_SETTLED
+    http_status: 409
+    applies_to: "POST /trips/{id}/void"
+
+  - priority: 22
+    category: business_constraint
+    check: "Claim reopen blocked once reopen_count == MAX_CLAIM_REOPENS"
+    error_id: ERR_REOPEN_LIMIT_REACHED
+    http_status: 409
+    applies_to: "POST claims/{id}/reopen"
+
+  - priority: 23
+    category: business_constraint
+    check: "Policy cancel blocked while any Claim is in FNOL/UNDER_REVIEW/REOPENED"
+    error_id: ERR_OPEN_CLAIM_BLOCKS_CANCEL
+    http_status: 409
+    applies_to: "POST /policies/{id}/cancel"
+
+  - priority: 24
+    category: business_constraint
+    check: "Opt-out REVOKE rejected if driver already opted out; GRANT rejected if not opted out"
+    error_id: ERR_CONSENT_NOOP
+    http_status: 409
+    applies_to: "POST /drivers/{id}/privacy-consents"
+
+  - priority: 25
+    category: business_fiscal
+    check: "Discount redemption cannot exceed the statement pre-discount total nor DiscountBank.available_cents (available never goes negative)"
+    error_id: ERR_DISCOUNT_OVERDRAW
+    http_status: 409
+    applies_to: "POST statements/{id}/settle, POST renewals/{id}/accept"
+
+  - priority: 26
+    category: business_constraint
+    check: "Unique driver email (case-insensitive); duplicate registration rejected"
+    error_id: ERR_DUPLICATE_EMAIL
+    http_status: 409
+    applies_to: "POST /drivers"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Test-driving clock (logical clock; default 2026-01-01T00:00:00Z) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock to an absolute UTC instant. Server startup default is exactly 2026-01-01T00:00:00Z; before any call the clock reads this default and never falls back to wall-clock time. All deadline/expiry/window checks read this clock."
+    roles: [UnderwritingOps]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: datetime }"
+    side_effects: ["Logical clock advanced/reset to to_iso8601"]
+
+  # ---- RatePlan (config) ----
+  - method: POST
+    path: "/rate-plans"
+    description: "Create a rate plan (config)"
+    roles: [UnderwritingOps]
+    code: 201
+    input: [name, state_code, base_premium_cents, per_mile_rate_cents, included_miles_per_period, hard_brake_weight, speeding_weight, phone_use_weight]
+    output: RatePlan
+    side_effects: ["status defaults to ACTIVE"]
+
+  - method: GET
+    path: "/rate-plans"
+    description: "List rate plans (paginated; filter by state_code)"
+    roles: [UnderwritingOps, DriverUser, ClaimsAdjuster]
+    code: 200
+    input: ["state_code?", "limit?", "offset?"]
+    output: "RatePlan[]"
+    side_effects: []
+
+  - method: GET
+    path: "/rate-plans/{id}"
+    description: "Get a rate plan"
+    roles: [UnderwritingOps, DriverUser, ClaimsAdjuster]
+    code: 200
+    input: []
+    output: RatePlan
+    side_effects: []
+
+  - method: POST
+    path: "/rate-plans/{id}/retire"
+    description: "Retire a rate plan; retired plans cannot back new quotes/policies"
+    roles: [UnderwritingOps]
+    code: 200
+    input: []
+    output: RatePlan
+    side_effects: ["status -> RETIRED"]
+
+  # ---- Driver ----
+  - method: POST
+    path: "/drivers"
+    description: "Register a driver"
+    roles: [DriverUser, UnderwritingOps]
+    code: 201
+    input: [email, full_name, state_code]
+    output: Driver
+    side_effects: ["status=ACTIVE; telematics_opted_out=false; lifetime_safe_miles=0; a DiscountBank is created for the driver"]
+
+  - method: GET
+    path: "/drivers"
+    description: "List drivers (paginated; filter by email)"
+    roles: [UnderwritingOps, ClaimsAdjuster]
+    code: 200
+    input: ["email?", "limit?", "offset?"]
+    output: "Driver[]"
+    side_effects: []
+
+  - method: GET
+    path: "/drivers/{id}"
+    description: "Get a driver"
+    roles: [DriverUser, UnderwritingOps, ClaimsAdjuster]
+    code: 200
+    input: []
+    output: Driver
+    side_effects: []
+
+  # ---- PrivacyConsent (opt-out) — sub-resource under /drivers ----
+  - method: POST
+    path: "/drivers/{id}/privacy-consents"
+    description: "Record a consent change. action=REVOKE is the opt-out: sets driver.telematics_opted_out=true and cascades telematics_status->SUSPENDED on every ACTIVE policy. action=GRANT reverses it."
+    roles: [DriverUser]
+    code: 201
+    input: [action, "reason?"]
+    output: PrivacyConsent
+    side_effects:
+      - "REVOKE: driver.telematics_opted_out=true; every ACTIVE policy telematics_status->SUSPENDED (cascade)"
+      - "GRANT: driver.telematics_opted_out=false; every ACTIVE policy telematics_status->CAPTURING (cascade)"
+      - "effective_at stamped from logical clock"
+
+  - method: GET
+    path: "/drivers/{id}/privacy-consents"
+    description: "List a driver's consent events (reverse-reachability for PrivacyConsent.driver_id)"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "PrivacyConsent[]"
+    side_effects: []
+
+  # ---- DiscountBank / DiscountGrant ----
+  - method: GET
+    path: "/discount-banks"
+    description: "List discount banks; filter by driver_id (reverse-reachability for DiscountBank.driver_id; array length 1 per driver)"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: ["driver_id?", "limit?", "offset?"]
+    output: "DiscountBank[]"
+    side_effects: []
+
+  - method: GET
+    path: "/discount-banks/{id}"
+    description: "Get a discount bank with current earned/redeemed/available"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: []
+    output: DiscountBank
+    side_effects: []
+
+  - method: GET
+    path: "/discount-banks/{id}/grants"
+    description: "List grant legs (reverse-reachability for DiscountGrant.discount_bank_id)"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "DiscountGrant[]"
+    side_effects: []
+
+  # ---- Enrollment (test-drive scoring) ----
+  - method: POST
+    path: "/enrollments"
+    description: "Open a test-drive scoring enrollment against a rate plan for a driver"
+    roles: [DriverUser]
+    code: 201
+    input: [driver_id, rate_plan_id, scoring_days]
+    output: Enrollment
+    side_effects: ["status=SCORING; scoring_started_at stamped from clock; scoring_deadline = started_at + scoring_days days"]
+
+  - method: GET
+    path: "/enrollments"
+    description: "List enrollments; filter by driver_id or rate_plan_id (reverse-reachability for Enrollment.driver_id and Enrollment.rate_plan_id)"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: ["driver_id?", "rate_plan_id?", "status?", "limit?", "offset?"]
+    output: "Enrollment[]"
+    side_effects: []
+
+  - method: GET
+    path: "/enrollments/{id}"
+    description: "Get an enrollment"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: []
+
+  - method: POST
+    path: "/enrollments/{id}/finalize-scoring"
+    description: "Finalize scoring: SCORING -> READY_TO_QUOTE, compute provisional_risk_score"
+    roles: [DriverUser]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: ["provisional_risk_score recomputed (calc provisional_risk_score); status -> READY_TO_QUOTE"]
+
+  - method: POST
+    path: "/enrollments/{id}/reopen-scoring"
+    description: "Reopen scoring: READY_TO_QUOTE -> SCORING (revert) to capture more trips"
+    roles: [DriverUser]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: ["status -> SCORING; provisional_risk_score left stale until next finalize"]
+
+  - method: POST
+    path: "/enrollments/{id}/abandon"
+    description: "Abandon a SCORING enrollment"
+    roles: [DriverUser]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: ["status -> ABANDONED"]
+
+  - method: POST
+    path: "/enrollments/{id}/expire"
+    description: "Expire a SCORING enrollment whose scoring_deadline has passed (clock-gated)"
+    roles: [UnderwritingOps]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: ["status -> EXPIRED (only if clock > scoring_deadline)"]
+
+  # ---- Quote ----
+  - method: POST
+    path: "/quotes"
+    description: "Generate a quote from a READY_TO_QUOTE enrollment"
+    roles: [UnderwritingOps]
+    code: 201
+    input: [enrollment_id]
+    output: Quote
+    side_effects:
+      - "locked_risk_score = enrollment.provisional_risk_score; risk_multiplier computed; quoted_annual_premium_cents computed (calc quoted_premium)"
+      - "driver_id and rate_plan_id copied from the enrollment; expires_at = created_at + QUOTE_VALIDITY_DAYS; enrollment.status -> QUOTED"
+
+  - method: GET
+    path: "/quotes"
+    description: "List quotes; filter by driver_id, enrollment_id, rate_plan_id (reverse-reachability for those three FKs)"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: ["driver_id?", "enrollment_id?", "rate_plan_id?", "status?", "limit?", "offset?"]
+    output: "Quote[]"
+    side_effects: []
+
+  - method: GET
+    path: "/quotes/{id}"
+    description: "Get a quote"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: []
+    output: Quote
+    side_effects: []
+
+  - method: POST
+    path: "/quotes/{id}/decline"
+    description: "Decline an OPEN quote"
+    roles: [DriverUser]
+    code: 200
+    input: []
+    output: Quote
+    side_effects: ["status -> DECLINED"]
+
+  - method: POST
+    path: "/quotes/{id}/expire"
+    description: "Expire an OPEN quote whose expires_at has passed (clock-gated)"
+    roles: [UnderwritingOps]
+    code: 200
+    input: []
+    output: Quote
+    side_effects: ["status -> EXPIRED (only if clock > expires_at)"]
+
+  # ---- Policy ----
+  - method: POST
+    path: "/policies"
+    description: "Bind an OPEN, unexpired quote into a policy"
+    roles: [UnderwritingOps]
+    code: 201
+    input: [quote_id]
+    output: Policy
+    side_effects:
+      - "Quote -> BOUND; Policy created lifecycle_status=ACTIVE, billing_status=PERIOD_OPEN, telematics_status=CAPTURING, period_index=0"
+      - "driver_id and rate_plan_id copied from the quote; bound_premium_cents = quote.quoted_annual_premium_cents; current_risk_score/current_risk_multiplier copied from quote"
+      - "RiskScoreSnapshot(trigger_reason=MANUAL) appended"
+
+  - method: GET
+    path: "/policies"
+    description: "List policies; filter by driver_id, quote_id, rate_plan_id (reverse-reachability for those three FKs)"
+    roles: [DriverUser, UnderwritingOps, ClaimsAdjuster]
+    code: 200
+    input: ["driver_id?", "quote_id?", "rate_plan_id?", "lifecycle_status?", "limit?", "offset?"]
+    output: "Policy[]"
+    side_effects: []
+
+  - method: GET
+    path: "/policies/{id}"
+    description: "Get a policy (all three status dimensions + computed scores)"
+    roles: [DriverUser, UnderwritingOps, ClaimsAdjuster]
+    code: 200
+    input: []
+    output: Policy
+    side_effects: []
+
+  - method: POST
+    path: "/policies/{id}/lapse"
+    description: "Lapse an ACTIVE policy (lifecycle)"
+    roles: [UnderwritingOps]
+    code: 200
+    input: []
+    output: Policy
+    side_effects: ["lifecycle_status -> LAPSED; telematics_status -> SUSPENDED"]
+
+  - method: POST
+    path: "/policies/{id}/cancel"
+    description: "Cancel an ACTIVE policy (blocked by open claims)"
+    roles: [UnderwritingOps]
+    code: 200
+    input: []
+    output: Policy
+    side_effects: ["lifecycle_status -> CANCELLED; telematics_status -> SUSPENDED"]
+
+  - method: POST
+    path: "/policies/{id}/advance-period"
+    description: "Advance the billing dimension PERIOD_SETTLED -> PERIOD_OPEN (period_index += 1)"
+    roles: [UnderwritingOps]
+    code: 200
+    input: []
+    output: Policy
+    side_effects: ["period_index += 1; billing_status -> PERIOD_OPEN"]
+
+  - method: GET
+    path: "/policies/{id}/risk-snapshots"
+    description: "List a policy's risk-score snapshots (reverse-reachability for RiskScoreSnapshot.policy_id)"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "RiskScoreSnapshot[]"
+    side_effects: []
+
+  # ---- Trip + TripEvent ----
+  - method: POST
+    path: "/trips"
+    description: "Create an OPEN trip on a policy (policy_id) OR an enrollment (enrollment_id) — exactly one parent"
+    roles: [DriverUser]
+    code: 201
+    input: ["policy_id?", "enrollment_id?", started_at, ended_at, distance_miles]
+    output: Trip
+    side_effects: ["status=OPEN; per-type counts initialized to 0"]
+
+  - method: GET
+    path: "/trips"
+    description: "List trips; filter by policy_id or enrollment_id (reverse-reachability for Trip.policy_id and Trip.enrollment_id)"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: ["policy_id?", "enrollment_id?", "status?", "limit?", "offset?"]
+    output: "Trip[]"
+    side_effects: []
+
+  - method: GET
+    path: "/trips/{id}"
+    description: "Get a trip with frozen event counts and crash_detected"
+    roles: [DriverUser, UnderwritingOps, ClaimsAdjuster]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: []
+
+  - method: POST
+    path: "/trips/{id}/events"
+    description: "Attach a braking/speed/phone-use/crash micro-event to an OPEN trip"
+    roles: [DriverUser]
+    code: 201
+    input: [event_type, severity, occurred_at]
+    output: TripEvent
+    side_effects:
+      - "Trip per-type count for event_type += 1"
+      - "If event_type==CRASH and severity>=CRASH_FNOL_SEVERITY: trip.crash_detected=true (FNOL fires on accept)"
+
+  - method: GET
+    path: "/trips/{id}/events"
+    description: "List a trip's events (reverse-reachability for TripEvent.trip_id)"
+    roles: [DriverUser, UnderwritingOps, ClaimsAdjuster]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "TripEvent[]"
+    side_effects: []
+
+  - method: POST
+    path: "/trips/{id}/accept"
+    description: "Accept an OPEN trip; fires the L1->L4 cascade (counts freeze, miles/score update, multiplier+snapshot, safe-trip discount, crash FNOL)"
+    roles: [DriverUser]
+    code: 200
+    input: []
+    output: Trip
+    side_effects:
+      - "status -> ACCEPTED; enrollment.captured_trip_count or policy lifetime_safe_miles + score cascade"
+      - "RiskScoreSnapshot(TRIP_ACCEPTED) appended; safe_trip_discount possibly granted; Claim auto-created if crash_detected"
+
+  - method: POST
+    path: "/trips/{id}/reject"
+    description: "Reject an OPEN trip (excluded from scores/miles)"
+    roles: [DriverUser]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: ["status -> REJECTED"]
+
+  - method: POST
+    path: "/trips/{id}/void"
+    description: "Void an ACCEPTED trip; fires the C1->C3 compensating cascade (miles restored, score recomputed, safe-trip grant reversed)"
+    roles: [UnderwritingOps]
+    code: 200
+    input: []
+    output: Trip
+    side_effects:
+      - "status -> VOIDED; lifetime_safe_miles -= distance_miles; score recomputed; RiskScoreSnapshot(TRIP_VOIDED) appended; safe-trip grant reversed if any"
+
+  # ---- PremiumStatement (mileage-based premium) ----
+  - method: POST
+    path: "/statements"
+    description: "Create a DRAFT statement for a policy's current period (PERIOD_OPEN -> PERIOD_CLOSING); OCC on policy version"
+    roles: [UnderwritingOps]
+    code: 201
+    input: [policy_id, expected_policy_version]
+    output: PremiumStatement
+    side_effects:
+      - "billing_status -> PERIOD_CLOSING; billed_miles/overage/base_charge/mileage_charge computed (calc mileage_premium)"
+      - "increments Policy.version by 1"
+
+  - method: GET
+    path: "/statements"
+    description: "List statements; filter by policy_id (reverse-reachability for PremiumStatement.policy_id)"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: ["policy_id?", "period_index?", "status?", "limit?", "offset?"]
+    output: "PremiumStatement[]"
+    side_effects: []
+
+  - method: GET
+    path: "/statements/{id}"
+    description: "Get a statement"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: []
+    output: PremiumStatement
+    side_effects: []
+
+  - method: POST
+    path: "/statements/{id}/issue"
+    description: "Issue a DRAFT statement (DRAFT -> ISSUED) so it can be settled"
+    roles: [UnderwritingOps]
+    code: 200
+    input: []
+    output: PremiumStatement
+    side_effects: ["status -> ISSUED"]
+
+  - method: POST
+    path: "/statements/{id}/settle"
+    description: "Settle an ISSUED statement (PERIOD_CLOSING -> PERIOD_SETTLED); draws discount from the bank"
+    roles: [UnderwritingOps]
+    code: 200
+    input: []
+    output: PremiumStatement
+    side_effects:
+      - "applied_discount_cents drawn (calc discount_redemption); total_due_cents finalized; status -> SETTLED"
+      - "DiscountBank.redeemed_cents += applied_discount_cents; DiscountGrant(leg=REDEEM) appended; billing_status -> PERIOD_SETTLED"
+
+  # ---- Renewal ----
+  - method: POST
+    path: "/renewals"
+    description: "Open a renewal recalculation for a policy (OCC on policy version)"
+    roles: [UnderwritingOps]
+    code: 201
+    input: [policy_id, expected_policy_version]
+    output: Renewal
+    side_effects:
+      - "recalculated_risk_score = policy.current_risk_score; recalculated_premium_cents + banked_discount_applied_cents computed (calc renewal_premium)"
+      - "increments Policy.version by 1"
+
+  - method: GET
+    path: "/renewals"
+    description: "List renewals; filter by policy_id (reverse-reachability for Renewal.policy_id)"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: ["policy_id?", "status?", "limit?", "offset?"]
+    output: "Renewal[]"
+    side_effects: []
+
+  - method: GET
+    path: "/renewals/{id}"
+    description: "Get a renewal"
+    roles: [DriverUser, UnderwritingOps]
+    code: 200
+    input: []
+    output: Renewal
+    side_effects: []
+
+  - method: POST
+    path: "/renewals/{id}/accept"
+    description: "Accept a PROPOSED renewal (OCC on policy version); rebaselines premium and sweeps banked discount"
+    roles: [UnderwritingOps]
+    code: 200
+    input: [expected_policy_version]
+    output: Renewal
+    side_effects:
+      - "policy.bound_premium_cents = recalculated_premium_cents - banked_discount_applied_cents; DiscountBank.redeemed_cents += banked_discount_applied_cents; DiscountGrant(leg=REDEEM, RENEWAL_REDEEM) appended"
+      - "increments Policy.version by 1; status -> ACCEPTED"
+
+  - method: POST
+    path: "/renewals/{id}/decline"
+    description: "Decline a PROPOSED renewal"
+    roles: [UnderwritingOps]
+    code: 200
+    input: []
+    output: Renewal
+    side_effects: ["status -> DECLINED"]
+
+  # ---- Claim (FNOL) ----
+  - method: POST
+    path: "/claims"
+    description: "File a MANUAL claim against a policy (auto FNOL claims are created by the trip-accept crash cascade, not here)"
+    roles: [DriverUser, ClaimsAdjuster]
+    code: 201
+    input: [policy_id, reported_severity, "reason?"]
+    output: Claim
+    side_effects: ["origin=MANUAL; status=FNOL; reported_severity from input"]
+
+  - method: GET
+    path: "/claims"
+    description: "List claims; filter by policy_id or trip_id (reverse-reachability for Claim.policy_id and Claim.trip_id)"
+    roles: [DriverUser, UnderwritingOps, ClaimsAdjuster]
+    code: 200
+    input: ["policy_id?", "trip_id?", "status?", "origin?", "limit?", "offset?"]
+    output: "Claim[]"
+    side_effects: []
+
+  - method: GET
+    path: "/claims/{id}"
+    description: "Get a claim"
+    roles: [DriverUser, UnderwritingOps, ClaimsAdjuster]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: []
+
+  - method: POST
+    path: "/claims/{id}/triage"
+    description: "Triage a claim (FNOL -> UNDER_REVIEW), set reserve"
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: ["reserve_severity_override?"]
+    output: Claim
+    side_effects: ["reserve_cents = RESERVE_BASE_CENTS * reported_severity (calc claim_reserve); status -> UNDER_REVIEW"]
+
+  - method: POST
+    path: "/claims/{id}/close"
+    description: "Close a claim (UNDER_REVIEW -> CLOSED or REOPENED -> CLOSED)"
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["status -> CLOSED; reserve released"]
+
+  - method: POST
+    path: "/claims/{id}/reopen"
+    description: "Reopen a CLOSED claim (CLOSED -> REOPENED); OCC on claim version; capped at MAX_CLAIM_REOPENS"
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: [expected_claim_version]
+    output: Claim
+    side_effects: ["reopen_count += 1; status -> REOPENED; increments Claim.version by 1"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- auth ---
+  - { id: ERR_MISSING_USER_CONTEXT, http: 401, condition: "X-User-ID or X-User-Role header missing or malformed" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Role not permitted for this operation" }
+  - { id: ERR_NOT_RESOURCE_OWNER, http: 403, condition: "DriverUser X-User-ID is not the owning driver of the resource chain" }
+  # --- existence ---
+  - { id: ERR_NOT_FOUND, http: 404, condition: "A path id does not resolve to an existing resource" }
+  # --- concurrency / state ---
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_<parent>_version does not match the parent's current version" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Generic: resource not in a state permitting this transition (specific errors below override)" }
+  # --- rate plan ---
+  - { id: ERR_RATE_PLAN_RETIRED, http: 409, condition: "Referenced rate plan is RETIRED at quote/bind time" }
+  # --- enrollment ---
+  - { id: ERR_ENROLLMENT_NOT_SCORING, http: 409, condition: "Enrollment is not in SCORING for the requested action" }
+  - { id: ERR_ENROLLMENT_NOT_READY, http: 409, condition: "Enrollment is not READY_TO_QUOTE (finalize required, or already quoted)" }
+  - { id: ERR_INSUFFICIENT_SCORING_TRIPS, http: 422, condition: "captured_trip_count < MIN_SCORING_TRIPS at finalize-scoring" }
+  - { id: ERR_SCORING_WINDOW_EXPIRED, http: 409, condition: "Action attempted after the enrollment scoring_deadline" }
+  - { id: ERR_SCORING_WINDOW_NOT_EXPIRED, http: 409, condition: "expire called while clock <= scoring_deadline" }
+  # --- quote ---
+  - { id: ERR_QUOTE_NOT_OPEN, http: 409, condition: "Quote is not OPEN for the requested action" }
+  - { id: ERR_QUOTE_EXPIRED, http: 409, condition: "Quote bind attempted after expires_at" }
+  - { id: ERR_QUOTE_NOT_EXPIRED, http: 409, condition: "expire called while clock <= expires_at" }
+  # --- policy ---
+  - { id: ERR_POLICY_NOT_ACTIVE, http: 409, condition: "Policy lifecycle_status is not ACTIVE" }
+  - { id: ERR_PERIOD_NOT_OPEN, http: 409, condition: "Policy billing_status is not PERIOD_OPEN" }
+  - { id: ERR_PERIOD_NOT_CLOSING, http: 409, condition: "Policy billing_status is not PERIOD_CLOSING" }
+  - { id: ERR_PERIOD_NOT_SETTLED, http: 409, condition: "Policy billing_status is not PERIOD_SETTLED for advance-period" }
+  - { id: ERR_OPEN_TRIPS_IN_PERIOD, http: 409, condition: "OPEN trips remain in the period at statement creation" }
+  - { id: ERR_UNSETTLED_STATEMENT, http: 409, condition: "Policy lapse blocked by an ISSUED statement awaiting settlement" }
+  - { id: ERR_OPEN_CLAIM_BLOCKS_CANCEL, http: 409, condition: "Policy cancel blocked while a claim is FNOL/UNDER_REVIEW/REOPENED" }
+  # --- trip ---
+  - { id: ERR_TRIP_PARENT_AMBIGUOUS, http: 422, condition: "Trip body did not set exactly one of policy_id / enrollment_id" }
+  - { id: ERR_TRIP_NOT_OPEN, http: 409, condition: "Trip is not OPEN for accept/reject" }
+  - { id: ERR_TRIP_NOT_ACCEPTED, http: 409, condition: "Trip is not ACCEPTED for void" }
+  - { id: ERR_TELEMATICS_SUSPENDED, http: 409, condition: "Trip accept blocked: owning policy telematics_status is SUSPENDED (opt-out)" }
+  - { id: ERR_CRASH_FNOL_REQUIRED, http: 409, condition: "Internal guard: crash trip accepted without firing FNOL (must not occur)" }
+  - { id: ERR_TRIP_TIME_ORDER, http: 422, condition: "Trip ended_at is not strictly after started_at" }
+  - { id: ERR_EVENT_OUTSIDE_TRIP, http: 422, condition: "TripEvent.occurred_at outside [trip.started_at, trip.ended_at)" }
+  - { id: ERR_INVALID_TRIP_DISTANCE, http: 422, condition: "distance_miles <= 0" }
+  - { id: ERR_INVALID_EVENT, http: 422, condition: "TripEvent severity out of 1..5 or event_type not in enum" }
+  - { id: ERR_TRIP_PERIOD_SETTLED, http: 409, condition: "Void blocked: a SETTLED statement already covers the trip's period" }
+  # --- statement ---
+  - { id: ERR_STATEMENT_NOT_ISSUED, http: 409, condition: "Settle attempted on a statement not in ISSUED" }
+  - { id: ERR_DISCOUNT_OVERDRAW, http: 409, condition: "Discount redemption would exceed available_cents or the statement total" }
+  # --- renewal ---
+  - { id: ERR_RENEWAL_NOT_PROPOSED, http: 409, condition: "Renewal accept/decline on a renewal not in PROPOSED" }
+  # --- claim ---
+  - { id: ERR_CLAIM_NOT_FNOL, http: 409, condition: "Triage attempted on a claim not in FNOL" }
+  - { id: ERR_CLAIM_NOT_UNDER_REVIEW, http: 409, condition: "Close attempted on a claim not in UNDER_REVIEW (or REOPENED)" }
+  - { id: ERR_CLAIM_NOT_CLOSED, http: 409, condition: "Reopen attempted on a claim not in CLOSED" }
+  - { id: ERR_CLAIM_NOT_REOPENABLE, http: 409, condition: "Close attempted on a claim not in REOPENED via the reopened-close path" }
+  - { id: ERR_REOPEN_LIMIT_REACHED, http: 409, condition: "Reopen attempted with reopen_count == MAX_CLAIM_REOPENS" }
+  # --- privacy ---
+  - { id: ERR_ALREADY_OPTED_OUT, http: 409, condition: "REVOKE while already opted out" }
+  - { id: ERR_NOT_OPTED_OUT, http: 409, condition: "GRANT while not opted out" }
+  - { id: ERR_CONSENT_NOOP, http: 409, condition: "Consent change is a no-op for the current opt-out state" }
+  # --- input / uniqueness ---
+  - { id: ERR_VALIDATION, http: 422, condition: "Malformed request body: missing required field or type mismatch" }
+  - { id: ERR_DUPLICATE_EMAIL, http: 409, condition: "Driver email already registered (case-insensitive)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: DriverUser
+    description: "The insured driver. Acts on its own driver-scoped resources: enrollments, trips, consents, quote decline."
+    identity: "entity_backed:Driver"
+    exclusive_operations:
+      - "POST /enrollments — open scoring enrollment"
+      - "POST /enrollments/{id}/finalize-scoring"
+      - "POST /enrollments/{id}/reopen-scoring"
+      - "POST /enrollments/{id}/abandon"
+      - "POST /drivers/{id}/privacy-consents — opt-out/opt-in"
+      - "POST /trips — create trip"
+      - "POST /trips/{id}/events — attach telematics event"
+      - "POST /trips/{id}/accept"
+      - "POST /trips/{id}/reject"
+      - "POST /quotes/{id}/decline"
+    shared_operations:
+      - "POST /drivers — register (shared with UnderwritingOps)"
+      - "POST /claims — file manual claim (shared with ClaimsAdjuster)"
+      - "GET endpoints on own driver/policy/trip/discount-bank resources"
+
+  - name: UnderwritingOps
+    description: "Underwriting/operations. Owns rate plans, quoting, binding, billing periods, statements, renewals, policy lifecycle, trip void, and the logical clock."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /_clock/set_current_utc"
+      - "POST /rate-plans, POST /rate-plans/{id}/retire"
+      - "POST /quotes — generate quote"
+      - "POST /quotes/{id}/expire"
+      - "POST /enrollments/{id}/expire"
+      - "POST /policies — bind quote"
+      - "POST /policies/{id}/lapse|cancel|advance-period"
+      - "POST /statements (+issue/settle)"
+      - "POST /renewals (+accept/decline)"
+      - "POST /trips/{id}/void"
+    shared_operations:
+      - "POST /drivers — register (shared with DriverUser)"
+      - "GET endpoints across drivers/policies/statements/renewals/discount-banks"
+
+  - name: ClaimsAdjuster
+    description: "Claims handling. Owns the claim FNOL lifecycle: triage, close, reopen. May file manual claims."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /claims/{id}/triage"
+      - "POST /claims/{id}/close"
+      - "POST /claims/{id}/reopen"
+    shared_operations:
+      - "POST /claims — file manual claim (shared with DriverUser)"
+      - "GET endpoints on drivers/policies/trips/claims"

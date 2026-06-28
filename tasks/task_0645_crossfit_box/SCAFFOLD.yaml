@@ -1,0 +1,1459 @@
+scenario: "645. CrossFit / Functional-Fitness Box: membership tier (unlimited/punch) & contract, class (WOD) capacity & reservation, on-ramp/foundations prerequisite, drop-in & visiting-athlete, coach & program track, benchmark/PR & leaderboard, competition team, freeze/cancel & billing"
+domain_name: "crossfit-box"
+api_prefix: "/box"
+
+# ---------------------------------------------------------------------------
+# Complexity Profile
+# ---------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: "Quota / allocation"          # finite class (WOD) seats reserved/committed/released, waitlist promotion
+  secondary_archetype: "Temporal windowing"        # reservation cut-off windows, freeze intervals, no-show grace windows
+  complexity_layers:
+    - optimistic_concurrency                        # OCC on ClassSession.version for seat reservation (CREATE-with-supersede)
+    - cascading_side_effects                        # cancel/freeze cascade: membership -> reservations -> session seat counts -> waitlist promotion
+    - rate_threshold_triggers                       # no-show strike thresholds, punch-pass depletion at zero, late-cancel window boundary
+    - derived_field_reconciliation                  # ClassSession.seats_reserved / waitlist_count denormalized from Reservation rows
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (Member, Membership, ClassSession, Reservation, Coach,
+  # ProgramTrack, BenchmarkResult). No deep URL nesting; FK references in bodies/filters.
+
+  state_machine_shape: branching
+  # Membership: ACTIVE -> {FROZEN, CANCEL_PENDING} with reverts (FROZEN -> ACTIVE).
+  # Reservation: parallel/branching with no-show + late-cancel side-effect divergence.
+
+  relationship_patterns:
+    - one_to_many        # Member 1..N Membership; ClassSession 1..N Reservation; Member 1..N BenchmarkResult
+    - cross_aggregate    # Reservation references both Member (via Membership) and ClassSession across aggregates
+
+  role_model: peer_roles
+  # Member acts on own memberships/reservations/PRs; Coach owns sessions of own track + verifies PRs;
+  # BoxManager owns plans, contracts, billing, strike adjustments (opaque operator); Anonymous registers.
+
+  consistency_model: immediate
+  # All seat-count, strike, and balance mutations are atomic within the triggering request.
+
+# ---------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: MembershipPlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Display name of the plan (e.g., 'Unlimited Monthly')."
+      - name: plan_type
+        type: enum
+        source: input
+        description: "Billing/usage model of the plan."
+        constraints: "one of {UNLIMITED, PUNCH}"
+      - name: monthly_fee_cents
+        type: integer
+        source: input
+        description: "Recurring monthly fee in cents. Charged at activation and on each billing cycle. Must be >= 0."
+        constraints: ">= 0"
+      - name: punch_count
+        type: integer
+        source: input
+        description: "Number of class punches granted on activation for PUNCH plans. Required and must be >= 1 when plan_type=PUNCH; MUST be null for UNLIMITED."
+        default: null
+        constraints: "null for UNLIMITED; integer >= 1 for PUNCH"
+      - name: commitment_months
+        type: integer
+        source: input
+        description: "Contract commitment length in months. Cancelling before commitment_months elapse incurs an early-termination fee. 0 means no commitment."
+        default: 0
+        constraints: ">= 0"
+      - name: early_termination_fee_cents
+        type: integer
+        source: input
+        description: "Flat fee charged on cancellation while still inside the commitment window. Must be >= 0."
+        default: 0
+        constraints: ">= 0"
+      - name: requires_foundations
+        type: boolean
+        source: input
+        description: "When true, a Member on this plan may only reserve REGULAR-track sessions after their Membership.foundations_completed flag is true."
+        default: true
+      - name: active
+        type: boolean
+        source: system
+        description: "Whether the plan can be selected for new memberships. Set false by archive endpoint."
+        default: true
+
+  - name: Member
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Unique login email. Lowercased and unique across all members."
+        constraints: "unique (case-insensitive)"
+      - name: full_name
+        type: string
+        source: input
+        description: "Member full name."
+      - name: home_box_member
+        type: boolean
+        source: input
+        description: "True for home-box athletes who hold memberships; false for visiting/drop-in athletes who book via drop-in passes only."
+        default: true
+      - name: no_show_strikes
+        type: integer
+        source: system
+        description: "Rolling count of no-show strikes accrued from missed reserved sessions. Incremented on no-show mark, reset by BoxManager strike clear. At >= NO_SHOW_SUSPEND_THRESHOLD the member is reservation-suspended."
+        default: 0
+      - name: reservation_suspended
+        type: boolean
+        source: computed
+        description: "Computed: true iff no_show_strikes >= 3 (NO_SHOW_SUSPEND_THRESHOLD). Blocks new reservations while true."
+        default: false
+
+  - name: Membership
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the owning member of this membership."
+      - name: plan_id
+        type: string
+        source: input
+        description: "FK -> MembershipPlan.id; the plan this membership instantiates."
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle status of the membership."
+        constraints: "one of {PENDING_PAYMENT, ACTIVE, FROZEN, CANCEL_PENDING, CANCELLED}"
+        default: PENDING_PAYMENT
+      - name: punches_remaining
+        type: integer
+        source: system
+        description: "Remaining class punches for PUNCH-plan memberships; null for UNLIMITED. Decremented on reservation commit, restored on eligible cancellation."
+        default: null
+      - name: foundations_completed
+        type: boolean
+        source: system
+        description: "True once the member's on-ramp/foundations prerequisite is signed off by a Coach. Required to reserve REGULAR sessions when the plan requires_foundations."
+        default: false
+      - name: contract_start_date
+        type: datetime
+        source: system
+        description: "UTC timestamp set when the membership transitions to ACTIVE (payment confirmed)."
+        default: null
+      - name: commitment_end_date
+        type: datetime
+        source: system
+        description: "Computed at activation as contract_start_date + plan.commitment_months months. Used to decide early-termination fees."
+        default: null
+      - name: freeze_started_at
+        type: datetime
+        source: system
+        description: "UTC timestamp when the current freeze began; null when not FROZEN."
+        default: null
+      - name: total_frozen_days
+        type: integer
+        source: system
+        description: "Cumulative frozen days across all freeze episodes; commitment_end_date is pushed forward by the freeze duration on unfreeze."
+        default: 0
+      - name: cancellation_fee_cents
+        type: integer
+        source: computed
+        description: "Computed at cancellation request time; see §1.3 cancellation_fee. 0 when past commitment_end_date."
+        default: 0
+
+  - name: ProgramTrack
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Track name (e.g., 'CrossFit', 'Olympic Lifting', 'On-Ramp')."
+      - name: track_type
+        type: enum
+        source: input
+        description: "Determines prerequisite/eligibility semantics."
+        constraints: "one of {FOUNDATIONS, REGULAR, COMPETITION}"
+      - name: head_coach_id
+        type: string
+        source: input
+        description: "FK -> Coach.id; the coach who owns this track and may create its sessions."
+
+  - name: Coach
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Coach full name."
+      - name: email
+        type: string
+        source: input
+        description: "Unique coach email."
+        constraints: "unique (case-insensitive)"
+      - name: certified
+        type: boolean
+        source: input
+        description: "Whether the coach is certified to lead and verify benchmark PRs."
+        default: true
+
+  - name: ClassSession
+    parent: null
+    common_fields: true
+    fields:
+      - name: track_id
+        type: string
+        source: input
+        description: "FK -> ProgramTrack.id; the program track this WOD session belongs to."
+      - name: coach_id
+        type: string
+        source: input
+        description: "FK -> Coach.id; the coach leading this session."
+      - name: starts_at
+        type: datetime
+        source: input
+        description: "UTC start time of the session."
+      - name: duration_minutes
+        type: integer
+        source: input
+        description: "Session length in minutes. Must be >= 1."
+        constraints: ">= 1"
+      - name: capacity
+        type: integer
+        source: input
+        description: "Maximum committed reservations (seats). Must be >= 1."
+        constraints: ">= 1"
+      - name: drop_in_fee_cents
+        type: integer
+        source: input
+        description: "Per-seat fee charged to drop-in / visiting athletes reserving this session. Must be >= 0."
+        default: 0
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "Session lifecycle state."
+        constraints: "one of {SCHEDULED, CANCELLED, COMPLETED}"
+        default: SCHEDULED
+      - name: seats_reserved
+        type: integer
+        source: computed
+        description: "Denormalized count of Reservation rows on this session with status=RESERVED. Reconciled on every reservation create/cancel/no-show/promotion."
+        default: 0
+      - name: waitlist_count
+        type: integer
+        source: computed
+        description: "Denormalized count of Reservation rows on this session with status=WAITLISTED."
+        default: 0
+
+  - name: Reservation
+    parent: null
+    common_fields: true
+    fields:
+      - name: session_id
+        type: string
+        source: input
+        description: "FK -> ClassSession.id; the session being reserved."
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the athlete holding the reservation (home-box or visiting)."
+      - name: membership_id
+        type: string
+        source: input
+        description: "FK -> Membership.id; the membership consuming a seat. MUST be null for DROP_IN reservations by visiting athletes."
+        default: null
+      - name: reservation_kind
+        type: enum
+        source: input
+        description: "Whether this seat is consumed against a membership or paid as a drop-in."
+        constraints: "one of {MEMBERSHIP, DROP_IN}"
+      - name: status
+        type: enum
+        source: system
+        description: "Reservation lifecycle state."
+        constraints: "one of {RESERVED, WAITLISTED, CANCELLED, NO_SHOW, ATTENDED}"
+        default: RESERVED
+      - name: waitlist_position
+        type: integer
+        source: system
+        description: "1-based queue position among WAITLISTED reservations on the same session, ordered by created_at ASC; null when not WAITLISTED."
+        default: null
+      - name: drop_in_fee_charged_cents
+        type: integer
+        source: system
+        description: "Fee charged for a DROP_IN reservation; 0 for MEMBERSHIP reservations. Refunded on eligible cancellation."
+        default: 0
+      - name: punch_consumed
+        type: boolean
+        source: system
+        description: "True iff a punch was decremented from the membership for this reservation (PUNCH-plan MEMBERSHIP reservations only)."
+        default: false
+
+  - name: BenchmarkResult
+    parent: null
+    common_fields: true
+    fields:
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the athlete who recorded the result."
+      - name: benchmark_name
+        type: enum
+        source: input
+        description: "Named benchmark WOD."
+        constraints: "one of {FRAN, GRACE, MURPH, BACK_SQUAT_1RM, DEADLIFT_1RM}"
+      - name: metric_kind
+        type: enum
+        source: input
+        description: "Whether the benchmark scores by lower-is-better time or higher-is-better load."
+        constraints: "one of {TIME_SECONDS, LOAD_KG}"
+      - name: value
+        type: number
+        source: input
+        description: "Recorded value: seconds for TIME_SECONDS benchmarks, kilograms for LOAD_KG benchmarks. Must be > 0."
+        constraints: "> 0"
+      - name: recorded_at
+        type: datetime
+        source: input
+        description: "UTC timestamp the result was achieved."
+      - name: verified
+        type: boolean
+        source: system
+        description: "True once a certified Coach verifies the result. Only verified results count toward the leaderboard."
+        default: false
+      - name: is_pr
+        type: boolean
+        source: computed
+        description: "True iff this verified result beats the member's prior best verified result for the same benchmark_name; see §1.3 pr_determination."
+        default: false
+
+  - name: CompetitionTeam
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Team name; unique among non-DISBANDED teams."
+        constraints: "unique among teams with status != DISBANDED"
+      - name: captain_member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the team captain. Counts as a roster member."
+      - name: max_roster_size
+        type: integer
+        source: input
+        description: "Maximum number of members on the roster including the captain. Must be >= 1."
+        constraints: ">= 1"
+      - name: roster_size
+        type: integer
+        source: computed
+        description: "Denormalized count of TeamMember rows with status=ACCEPTED for this team (captain included)."
+        default: 1
+      - name: status
+        type: enum
+        source: system
+        description: "Team lifecycle state."
+        constraints: "one of {FORMING, LOCKED, DISBANDED}"
+        default: FORMING
+
+  - name: TeamMember
+    parent: null
+    common_fields: true
+    fields:
+      - name: team_id
+        type: string
+        source: input
+        description: "FK -> CompetitionTeam.id; the team this roster slot belongs to."
+      - name: member_id
+        type: string
+        source: input
+        description: "FK -> Member.id; the rostered athlete."
+      - name: status
+        type: enum
+        source: system
+        description: "Roster slot state."
+        constraints: "one of {INVITED, ACCEPTED, DECLINED, REMOVED}"
+        default: INVITED
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: Membership
+    initial_state: PENDING_PAYMENT
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: PENDING_PAYMENT
+        to: ACTIVE
+        trigger: "POST /box/memberships/{id}/confirm-payment"
+        actor: BoxManager
+        preconditions:
+          - "membership.status == PENDING_PAYMENT"
+        side_effects:
+          - "set contract_start_date = current clock time"
+          - "set commitment_end_date = contract_start_date + plan.commitment_months months"
+          - "for PUNCH plans: set punches_remaining = plan.punch_count"
+          - "for UNLIMITED plans: punches_remaining stays null"
+          - "increment Membership.version by 1"
+      - from: ACTIVE
+        to: FROZEN
+        trigger: "POST /box/memberships/{id}/freeze"
+        actor: Member
+        preconditions:
+          - "membership.status == ACTIVE"
+          - "member.reservation_suspended == false is NOT required here (freeze always allowed when ACTIVE)"
+        side_effects:
+          - "set freeze_started_at = current clock time"
+          - "CASCADE: every Reservation of this membership on a SCHEDULED session with starts_at in the future and status=RESERVED is transitioned RESERVED->CANCELLED (see Reservation machine); this in turn decrements that session's seats_reserved and triggers waitlist promotion on that session"
+          - "increment Membership.version by 1"
+      - from: FROZEN
+        to: ACTIVE
+        trigger: "POST /box/memberships/{id}/unfreeze"
+        actor: Member
+        preconditions:
+          - "membership.status == FROZEN"
+        side_effects:
+          - "compute frozen_days = ceil((current clock time - freeze_started_at) / 1 day)"
+          - "add frozen_days to total_frozen_days"
+          - "push commitment_end_date forward by frozen_days days"
+          - "clear freeze_started_at = null"
+          - "increment Membership.version by 1"
+      - from: ACTIVE
+        to: CANCEL_PENDING
+        trigger: "POST /box/memberships/{id}/cancel"
+        actor: Member
+        preconditions:
+          - "membership.status == ACTIVE"
+        side_effects:
+          - "compute and store cancellation_fee_cents per §1.3 cancellation_fee"
+          - "CASCADE: every future RESERVED Reservation of this membership is transitioned RESERVED->CANCELLED, decrementing each session's seats_reserved and promoting that session's waitlist"
+          - "increment Membership.version by 1"
+        note: "Cancellation takes effect at end of current cycle; membership is CANCEL_PENDING until the cycle-close batch finalizes it."
+      - from: FROZEN
+        to: CANCEL_PENDING
+        trigger: "POST /box/memberships/{id}/cancel"
+        actor: Member
+        preconditions:
+          - "membership.status == FROZEN"
+        side_effects:
+          - "compute and store cancellation_fee_cents per §1.3 cancellation_fee (frozen days already folded into commitment_end_date are honored)"
+          - "clear freeze_started_at = null"
+          - "increment Membership.version by 1"
+        note: "A FROZEN membership has no future RESERVED reservations (freeze cancelled them), so no reservation cascade fires here."
+      - from: CANCEL_PENDING
+        to: CANCELLED
+        trigger: "POST /box/_billing/run-cycle-close"
+        actor: BoxManager
+        preconditions:
+          - "membership.status == CANCEL_PENDING"
+        side_effects:
+          - "set punches_remaining = 0 for PUNCH plans"
+          - "increment Membership.version by 1"
+        note: "System batch transition finalizing all pending cancellations as of the close date."
+
+  - entity: Reservation
+    initial_state: RESERVED
+    terminal_states: [CANCELLED, NO_SHOW, ATTENDED]
+    transitions:
+      - from: RESERVED
+        to: WAITLISTED
+        trigger: "POST /box/reservations (when session is full at commit time)"
+        actor: system
+        preconditions:
+          - "session.seats_reserved == session.capacity at evaluation time"
+          - "session.status == SCHEDULED"
+        side_effects:
+          - "assign waitlist_position = (current waitlist_count + 1)"
+          - "increment session.waitlist_count by 1"
+          - "do NOT consume punch and do NOT charge drop_in_fee while WAITLISTED"
+        note: "Created directly into WAITLISTED rather than RESERVED when seats are exhausted; modeled as the create-time branch."
+      - from: WAITLISTED
+        to: RESERVED
+        trigger: "system: waitlist promotion when a RESERVED seat is freed"
+        actor: system
+        preconditions:
+          - "this reservation has the lowest waitlist_position among WAITLISTED reservations on the session (created_at ASC tie-break)"
+          - "session.seats_reserved < session.capacity after the freeing event"
+        side_effects:
+          - "set status=RESERVED, waitlist_position=null"
+          - "increment session.seats_reserved by 1, decrement session.waitlist_count by 1"
+          - "for PUNCH MEMBERSHIP reservations: decrement membership.punches_remaining by 1 and set punch_consumed=true"
+          - "for DROP_IN reservations: charge drop_in_fee, set drop_in_fee_charged_cents = session.drop_in_fee_cents"
+          - "renumber remaining WAITLISTED waitlist_position values to stay contiguous from 1"
+        note: "Promotion is the C-hop of the freeze/cancel cascade (membership cancel -> reservation cancel -> seat freed -> waitlist promote)."
+      - from: RESERVED
+        to: CANCELLED
+        trigger: "POST /box/reservations/{id}/cancel"
+        actor: Member
+        preconditions:
+          - "reservation.status == RESERVED"
+          - "session.status == SCHEDULED"
+        side_effects:
+          - "decrement session.seats_reserved by 1"
+          - "if cancelled within LATE_CANCEL_WINDOW_HOURS of starts_at: keep punch consumed and keep drop-in fee (no refund) — see §1.3 refund_on_cancel"
+          - "else (outside window): restore punch (punches_remaining += 1 if punch_consumed) and refund drop_in_fee (drop_in_fee_charged_cents -> refunded)"
+          - "CASCADE: promote the head of this session's waitlist (WAITLISTED->RESERVED) if any waitlisted reservations remain"
+      - from: WAITLISTED
+        to: CANCELLED
+        trigger: "POST /box/reservations/{id}/cancel"
+        actor: Member
+        preconditions:
+          - "reservation.status == WAITLISTED"
+          - "session.status == SCHEDULED"
+        side_effects:
+          - "decrement session.waitlist_count by 1"
+          - "renumber remaining WAITLISTED waitlist_position values contiguous from 1"
+        note: "No seat was held, so no punch/fee adjustment and no promotion."
+      - from: RESERVED
+        to: NO_SHOW
+        trigger: "POST /box/sessions/{id}/complete (per-attendee no-show marking)"
+        actor: Coach
+        preconditions:
+          - "reservation.status == RESERVED"
+          - "session.status == SCHEDULED transitioning to COMPLETED"
+        side_effects:
+          - "increment member.no_show_strikes by 1"
+          - "recompute member.reservation_suspended = (no_show_strikes >= 3)"
+          - "punch stays consumed; drop-in fee stays charged (no refund for no-shows)"
+      - from: RESERVED
+        to: ATTENDED
+        trigger: "POST /box/sessions/{id}/complete (per-attendee attendance marking)"
+        actor: Coach
+        preconditions:
+          - "reservation.status == RESERVED"
+          - "session.status == SCHEDULED transitioning to COMPLETED"
+        side_effects:
+          - "no strike change; punch stays consumed; drop-in fee stays charged"
+
+  - entity: ClassSession
+    initial_state: SCHEDULED
+    terminal_states: [CANCELLED, COMPLETED]
+    transitions:
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /box/sessions/{id}/cancel"
+        actor: Coach
+        preconditions:
+          - "session.status == SCHEDULED"
+        side_effects:
+          - "CASCADE: every RESERVED reservation on this session is transitioned RESERVED->CANCELLED with full refund/punch-restore regardless of the late-cancel window (box-initiated cancellation always refunds)"
+          - "CASCADE: every WAITLISTED reservation on this session is transitioned WAITLISTED->CANCELLED"
+          - "set seats_reserved=0, waitlist_count=0"
+          - "increment ClassSession.version by 1"
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "POST /box/sessions/{id}/complete"
+        actor: Coach
+        preconditions:
+          - "session.status == SCHEDULED"
+          - "current clock time >= session.starts_at"
+        side_effects:
+          - "every still-RESERVED reservation not explicitly marked is defaulted to NO_SHOW per the attendee map (each NO_SHOW increments that member's no_show_strikes — see Reservation machine)"
+          - "every WAITLISTED reservation is transitioned WAITLISTED->CANCELLED (the class has run)"
+          - "increment ClassSession.version by 1"
+
+  - entity: CompetitionTeam
+    initial_state: FORMING
+    terminal_states: [DISBANDED]
+    transitions:
+      - from: FORMING
+        to: LOCKED
+        trigger: "POST /box/teams/{id}/lock"
+        actor: Member
+        preconditions:
+          - "team.status == FORMING"
+          - "team.roster_size >= 1"
+          - "acting member is team.captain_member_id"
+        side_effects:
+          - "CASCADE: every INVITED TeamMember on this team is transitioned INVITED->DECLINED (lock finalizes the roster, expiring outstanding invites)"
+          - "increment CompetitionTeam.version by 1"
+      - from: FORMING
+        to: DISBANDED
+        trigger: "POST /box/teams/{id}/disband"
+        actor: Member
+        preconditions:
+          - "team.status == FORMING"
+          - "acting member is team.captain_member_id"
+        side_effects:
+          - "CASCADE: every ACCEPTED or INVITED TeamMember on this team is transitioned to REMOVED"
+          - "set roster_size = 0"
+          - "increment CompetitionTeam.version by 1"
+
+  - entity: TeamMember
+    initial_state: INVITED
+    terminal_states: [DECLINED, REMOVED]
+    transitions:
+      - from: INVITED
+        to: ACCEPTED
+        trigger: "POST /box/team-members/{id}/accept"
+        actor: Member
+        preconditions:
+          - "teamMember.status == INVITED"
+          - "parent team.status == FORMING"
+          - "team.roster_size < team.max_roster_size"
+          - "acting member is teamMember.member_id"
+        side_effects:
+          - "increment parent CompetitionTeam.roster_size by 1 (BUBBLE-UP derived count)"
+      - from: INVITED
+        to: DECLINED
+        trigger: "POST /box/team-members/{id}/decline"
+        actor: Member
+        preconditions:
+          - "teamMember.status == INVITED"
+          - "acting member is teamMember.member_id"
+        side_effects:
+          - "no roster_size change (was never counted)"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: reservation-create-stale-session
+    parent_entity: ClassSession
+    write_endpoint: "POST /box/reservations"
+    occ_field: "expected_session_version"
+    description: |
+      Creating a Reservation against a ClassSession whose version has advanced
+      since the client last observed it is rejected as stale. A reservation
+      that lands on the last open seat (or that fills the session) legitimately
+      supersedes the client's earlier view of seat availability by bumping the
+      session version; a subsequent create still carrying the older version is
+      rejected so the client must re-read current seat state before committing.
+    error_id: ERR_STALE_SESSION_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: cancellation_fee
+    trigger: "Membership ACTIVE->CANCEL_PENDING or FROZEN->CANCEL_PENDING (POST /box/memberships/{id}/cancel)"
+    algorithm: threshold
+    formula: |
+      # Early-termination logic keyed on whether the contract commitment is still in force.
+      # commitment_end_date already includes any frozen-day extensions applied at unfreeze.
+      if plan.commitment_months == 0:
+          fee = 0
+      elif now < membership.commitment_end_date:
+          # still inside commitment window -> early-termination fee applies
+          fee = plan.early_termination_fee_cents
+      else:
+          # commitment satisfied (now >= commitment_end_date) -> no fee
+          fee = 0
+      cancellation_fee_cents = fee
+    input_set: "Single Membership and its MembershipPlan; uses the logical clock 'now'."
+    constants: {}
+    precision: "integer cents, no rounding (flat fee)"
+    variants:
+      - name: inside_commitment
+        when: "now < commitment_end_date AND commitment_months > 0"
+        difference: "charges plan.early_termination_fee_cents"
+      - name: commitment_satisfied
+        when: "now >= commitment_end_date OR commitment_months == 0"
+        difference: "fee is 0"
+
+  - name: refund_on_cancel
+    trigger: "Reservation RESERVED->CANCELLED via POST /box/reservations/{id}/cancel"
+    algorithm: threshold
+    formula: |
+      # Late-cancel window boundary decides whether the seat cost is refunded.
+      hours_before = (session.starts_at - now) / 1 hour
+      if hours_before < LATE_CANCEL_WINDOW_HOURS:    # strictly inside the window
+          # late cancel: forfeit — punch stays consumed, drop-in fee NOT refunded
+          punch_restored = 0
+          drop_in_refund_cents = 0
+      else:                                          # hours_before >= LATE_CANCEL_WINDOW_HOURS
+          # timely cancel: restore punch and refund the drop-in fee
+          punch_restored = 1 if reservation.punch_consumed else 0
+          drop_in_refund_cents = reservation.drop_in_fee_charged_cents
+      # boundary: hours_before == LATE_CANCEL_WINDOW_HOURS is a TIMELY cancel (refund granted)
+    input_set: "Single Reservation, its ClassSession, and the consuming Membership; uses logical clock 'now'."
+    constants:
+      LATE_CANCEL_WINDOW_HOURS: 12
+    precision: "integer cents; punch as integer count"
+    variants:
+      - name: late_cancel_forfeit
+        when: "hours_before < 12"
+        difference: "no punch restore, no fee refund"
+      - name: timely_cancel_refund
+        when: "hours_before >= 12"
+        difference: "punch restored if consumed, drop-in fee fully refunded"
+
+  - name: pr_determination
+    trigger: "Coach verifies a BenchmarkResult via POST /box/benchmark-results/{id}/verify"
+    algorithm: aggregation
+    formula: |
+      # Determine whether the just-verified result is a personal record (PR) for the member+benchmark.
+      # Only VERIFIED results compete. metric_kind fixes the comparison direction.
+      prior = { r in BenchmarkResult :
+                  r.member_id == this.member_id
+                  AND r.benchmark_name == this.benchmark_name
+                  AND r.verified == true
+                  AND r.id != this.id }
+      if prior is empty:
+          is_pr = true                         # first verified result is always a PR
+      elif this.metric_kind == TIME_SECONDS:   # lower is better
+          best_prior = min(r.value for r in prior)
+          is_pr = (this.value < best_prior)    # strictly faster
+      else:                                     # LOAD_KG, higher is better
+          best_prior = max(r.value for r in prior)
+          is_pr = (this.value > best_prior)    # strictly heavier
+      # ties (equal value) are NOT a PR
+    input_set: "All verified BenchmarkResult rows for the same member_id and benchmark_name, excluding this row."
+    constants: {}
+    precision: "value compared as number; exact equality is NOT a PR (strict < / strict >)"
+    variants:
+      - name: time_lower_is_better
+        when: "metric_kind == TIME_SECONDS"
+        difference: "PR iff value strictly less than prior best"
+      - name: load_higher_is_better
+        when: "metric_kind == LOAD_KG"
+        difference: "PR iff value strictly greater than prior best"
+
+  - name: leaderboard_ranking
+    trigger: "GET /box/program-tracks/{id}/leaderboard?benchmark_name=X"
+    algorithm: weighted_scoring
+    formula: |
+      # Rank each member's BEST verified result for the given benchmark_name.
+      # Candidate set: verified BenchmarkResult rows for that benchmark_name whose member
+      # holds an ACTIVE Membership on a plan attached to a session of the requested track
+      # (eligibility filter), one best row per member.
+      for each member with >=1 qualifying verified result:
+          if metric_kind == TIME_SECONDS: member_best = min(value)   # fastest
+          else:                            member_best = max(value)   # heaviest
+      # Rank order:
+      #   TIME_SECONDS: ascending member_best (smaller time ranks higher)
+      #   LOAD_KG:      descending member_best (larger load ranks higher)
+      # Tie-break when member_best ties: earlier recorded_at of the best-defining result ranks higher;
+      #   if recorded_at also ties, earlier BenchmarkResult.created_at ranks higher.
+      rank = 1-based position in this ordering
+    input_set: "Verified BenchmarkResult rows for one benchmark_name; one best row per member."
+    constants: {}
+    precision: "value compared as number; rank is 1-based integer"
+    variants:
+      - name: time_ascending
+        when: "metric_kind == TIME_SECONDS"
+        difference: "ascending sort, fastest first"
+      - name: load_descending
+        when: "metric_kind == LOAD_KG"
+        difference: "descending sort, heaviest first"
+
+  - name: cycle_close_billing
+    trigger: "POST /box/_billing/run-cycle-close"
+    algorithm: aggregation
+    formula: |
+      # Batch finalizing memberships and computing the billing total charged in this cycle close.
+      # Processing order: memberships sorted by created_at ASC, then id is NEVER used as a tiebreak.
+      total_charged_cents = 0
+      for each Membership m in {status == CANCEL_PENDING} ordered by created_at ASC:
+          total_charged_cents += m.cancellation_fee_cents     # finalize early-termination fees
+          transition m CANCEL_PENDING -> CANCELLED
+      for each Membership m in {status == ACTIVE} ordered by created_at ASC:
+          total_charged_cents += m.plan.monthly_fee_cents      # recurring monthly charge
+      # FROZEN memberships are NOT charged the monthly fee for the cycle.
+      return total_charged_cents
+    input_set: "All Memberships with status in {CANCEL_PENDING, ACTIVE}; FROZEN excluded from monthly charge."
+    constants: {}
+    precision: "integer cents; sum, no rounding"
+    variants:
+      - name: cancel_pending_fees
+        when: "membership.status == CANCEL_PENDING at close"
+        difference: "adds cancellation_fee_cents and finalizes to CANCELLED"
+      - name: active_monthly
+        when: "membership.status == ACTIVE at close"
+        difference: "adds plan.monthly_fee_cents, stays ACTIVE"
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed (X-User-ID may be omitted only for Anonymous and opaque-role audit-less calls)"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /box/members/register"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for the operation per §1.7 RBAC"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: "Ownership: entity_backed Member acting on a Membership/Reservation/BenchmarkResult/Team they do not own"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "member-owned mutation endpoints"
+
+  - priority: 4
+    category: existence
+    check: "All path and body referenced resources exist, validated left-to-right (Member, MembershipPlan, Membership, ClassSession, Reservation, ProgramTrack, Coach, BenchmarkResult, CompetitionTeam, TeamMember)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+
+  - priority: 5
+    category: business_constraint
+    check: "Request body required fields present and typed correctly; enum values within declared set; numeric constraints (capacity>=1, value>0, monthly_fee>=0)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all write endpoints"
+
+  - priority: 6
+    category: business_constraint
+    check: "PUNCH plan must supply punch_count>=1 and UNLIMITED must omit it; DROP_IN reservation must omit membership_id and MEMBERSHIP reservation must supply it"
+    error_id: ERR_PLAN_SHAPE_INVALID
+    http_status: 422
+    applies_to: "POST /box/membership-plans, POST /box/reservations"
+
+  - priority: 7
+    category: state
+    check: "Target entity is in a state from which the requested transition is defined (§1.2)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 8
+    category: business_referential
+    check: "Membership used by a reservation belongs to the reserving member (Reservation.membership_id -> Membership.member_id == Reservation.member_id)"
+    error_id: ERR_MEMBERSHIP_NOT_OWNED
+    http_status: 409
+    applies_to: "POST /box/reservations"
+
+  - priority: 9
+    category: business_safety
+    check: "Member.reservation_suspended must be false to create a new reservation (NO_SHOW_SUSPEND_THRESHOLD = 3; no_show_strikes >= 3 blocks reservations)"
+    error_id: ERR_RESERVATION_SUSPENDED
+    http_status: 409
+    applies_to: "POST /box/reservations"
+
+  - priority: 10
+    category: business_referential
+    check: "Foundations prerequisite: when the session's track_type == REGULAR and the plan.requires_foundations, the consuming Membership.foundations_completed must be true"
+    error_id: ERR_FOUNDATIONS_NOT_COMPLETED
+    http_status: 409
+    applies_to: "POST /box/reservations"
+
+  - priority: 11
+    category: business_temporal
+    check: "Session must be reservable: session.status == SCHEDULED and current clock time <= session.starts_at - RESERVATION_CUTOFF_MINUTES (RESERVATION_CUTOFF_MINUTES = 60; reservations close 60 minutes before start). Boundary: now == starts_at - 60min is still OPEN (allowed); now > starts_at - 60min is CLOSED."
+    error_id: ERR_RESERVATION_WINDOW_CLOSED
+    http_status: 409
+    applies_to: "POST /box/reservations"
+
+  - priority: 12
+    category: business_temporal
+    check: "Visiting/drop-in athletes (home_box_member=false, DROP_IN kind) may only book sessions whose track_type != COMPETITION"
+    error_id: ERR_DROP_IN_NOT_ALLOWED
+    http_status: 409
+    applies_to: "POST /box/reservations"
+
+  - priority: 13
+    category: business_constraint
+    check: "A member may hold at most one non-terminal Reservation (RESERVED or WAITLISTED) per ClassSession"
+    error_id: ERR_DUPLICATE_RESERVATION
+    http_status: 409
+    applies_to: "POST /box/reservations"
+
+  - priority: 14
+    category: business_temporal
+    check: "Reservation must not overlap in time with another non-terminal (RESERVED/WAITLISTED) reservation the same member already holds: [starts_at, starts_at+duration) intervals must be disjoint (touching endpoints allowed)"
+    error_id: ERR_SESSION_TIME_CONFLICT
+    http_status: 409
+    applies_to: "POST /box/reservations"
+
+  - priority: 15
+    category: business_constraint
+    check: "Coach scheduling overlap: a Coach cannot lead two SCHEDULED sessions whose windows, each expanded by COACH_TURNAROUND_MINUTES = 15 of trailing buffer, overlap. Concretely the busy interval of a session is [starts_at, starts_at + duration_minutes + 15min); two such intervals must be disjoint (touching endpoints allowed). This buffer-inclusive geometry differs from the member time-conflict rule (priority 14) which uses the bare [starts_at, starts_at+duration) window with no buffer."
+    error_id: ERR_COACH_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /box/sessions"
+
+  - priority: 16
+    category: business_fiscal
+    check: "PUNCH MEMBERSHIP reservation requires punches_remaining >= 1 at commit time (RESERVED, not WAITLISTED)"
+    error_id: ERR_NO_PUNCHES_REMAINING
+    http_status: 409
+    applies_to: "POST /box/reservations"
+
+  - priority: 17
+    category: business_constraint
+    check: "Team roster full: accepting a TeamMember invite when team.roster_size >= team.max_roster_size"
+    error_id: ERR_ROSTER_FULL
+    http_status: 409
+    applies_to: "POST /box/team-members/{id}/accept"
+
+  - priority: 18
+    category: business_referential
+    check: "Only a certified Coach may verify a BenchmarkResult"
+    error_id: ERR_COACH_NOT_CERTIFIED
+    http_status: 409
+    applies_to: "POST /box/benchmark-results/{id}/verify"
+
+  - priority: 19
+    category: business_constraint
+    check: "OCC: expected_session_version on reservation create must equal the session's current version"
+    error_id: ERR_STALE_SESSION_VERSION
+    http_status: 412
+    applies_to: "POST /box/reservations"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # ---- MembershipPlan ----
+  - method: POST
+    path: "/box/membership-plans"
+    description: "Create a membership plan (UNLIMITED or PUNCH)."
+    roles: [BoxManager]
+    code: 201
+    input: [name, plan_type, monthly_fee_cents, "punch_count?", "commitment_months?", "early_termination_fee_cents?", "requires_foundations?"]
+    output: MembershipPlan
+    side_effects: ["creates MembershipPlan with active=true"]
+  - method: GET
+    path: "/box/membership-plans"
+    description: "List membership plans (paginated; filter by active or plan_type)."
+    roles: [BoxManager, Member, Coach, Anonymous]
+    code: 200
+    input: ["active?", "plan_type?", "limit?", "offset?"]
+    output: MembershipPlan[]
+    side_effects: []
+  - method: GET
+    path: "/box/membership-plans/{id}"
+    description: "Fetch one plan."
+    roles: [BoxManager, Member, Coach, Anonymous]
+    code: 200
+    input: []
+    output: MembershipPlan
+    side_effects: []
+  - method: POST
+    path: "/box/membership-plans/{id}/archive"
+    description: "Archive a plan (active=false); no new memberships may select it."
+    roles: [BoxManager]
+    code: 200
+    input: []
+    output: MembershipPlan
+    side_effects: ["set active=false", "increment MembershipPlan.version by 1"]
+
+  # ---- Member ----
+  - method: POST
+    path: "/box/members/register"
+    description: "Register a new member or visiting athlete (Anonymous)."
+    roles: [Anonymous]
+    code: 201
+    input: [email, full_name, "home_box_member?"]
+    output: Member
+    side_effects: ["creates Member with no_show_strikes=0, reservation_suspended=false"]
+  - method: GET
+    path: "/box/members/{id}"
+    description: "Fetch a member (includes computed reservation_suspended)."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: []
+    output: Member
+    side_effects: []
+  - method: GET
+    path: "/box/members"
+    description: "List members (paginated; filter by home_box_member)."
+    roles: [BoxManager, Coach]
+    code: 200
+    input: ["home_box_member?", "limit?", "offset?"]
+    output: Member[]
+    side_effects: []
+  - method: POST
+    path: "/box/members/{id}/clear-strikes"
+    description: "BoxManager resets a member's no-show strikes to 0 (lifts reservation suspension)."
+    roles: [BoxManager]
+    code: 200
+    input: []
+    output: Member
+    side_effects: ["set no_show_strikes=0", "recompute reservation_suspended=false", "increment Member.version by 1"]
+
+  # ---- Membership ----
+  - method: POST
+    path: "/box/memberships"
+    description: "Create a membership for a member on a plan (PENDING_PAYMENT)."
+    roles: [BoxManager, Member]
+    code: 201
+    input: [member_id, plan_id]
+    output: Membership
+    side_effects: ["creates Membership in PENDING_PAYMENT; punches_remaining/contract dates null until activation"]
+  - method: GET
+    path: "/box/memberships/{id}"
+    description: "Fetch a membership."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: []
+  - method: GET
+    path: "/box/memberships"
+    description: "List memberships (paginated; filter by member_id or plan_id or status)."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: ["member_id?", "plan_id?", "status?", "limit?", "offset?"]
+    output: Membership[]
+    side_effects: []
+  - method: POST
+    path: "/box/memberships/{id}/confirm-payment"
+    description: "Confirm initial payment, activating the membership."
+    roles: [BoxManager]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["PENDING_PAYMENT->ACTIVE", "set contract_start_date, commitment_end_date", "set punches_remaining for PUNCH", "increment Membership.version by 1"]
+  - method: POST
+    path: "/box/memberships/{id}/freeze"
+    description: "Freeze an active membership (member self-service)."
+    roles: [Member]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["ACTIVE->FROZEN", "set freeze_started_at", "CASCADE cancel future RESERVED reservations -> free seats -> promote waitlists", "increment Membership.version by 1"]
+  - method: POST
+    path: "/box/memberships/{id}/unfreeze"
+    description: "Unfreeze a frozen membership and extend commitment by frozen days."
+    roles: [Member]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["FROZEN->ACTIVE", "add frozen_days to total_frozen_days", "push commitment_end_date forward", "clear freeze_started_at", "increment Membership.version by 1"]
+  - method: POST
+    path: "/box/memberships/{id}/cancel"
+    description: "Request cancellation; computes cancellation_fee_cents and cascades reservation cancels."
+    roles: [Member]
+    code: 200
+    input: []
+    output: Membership
+    side_effects: ["ACTIVE/FROZEN->CANCEL_PENDING", "compute cancellation_fee_cents (§1.3 cancellation_fee)", "CASCADE cancel future RESERVED reservations -> promote waitlists", "increment Membership.version by 1"]
+
+  # ---- Coach ----
+  - method: POST
+    path: "/box/coaches"
+    description: "Create a coach."
+    roles: [BoxManager]
+    code: 201
+    input: [full_name, email, "certified?"]
+    output: Coach
+    side_effects: ["creates Coach"]
+  - method: GET
+    path: "/box/coaches/{id}"
+    description: "Fetch a coach."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: []
+    output: Coach
+    side_effects: []
+  - method: GET
+    path: "/box/coaches"
+    description: "List coaches (paginated)."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: ["certified?", "limit?", "offset?"]
+    output: Coach[]
+    side_effects: []
+
+  # ---- ProgramTrack ----
+  - method: POST
+    path: "/box/program-tracks"
+    description: "Create a program track owned by a head coach."
+    roles: [BoxManager]
+    code: 201
+    input: [name, track_type, head_coach_id]
+    output: ProgramTrack
+    side_effects: ["creates ProgramTrack"]
+  - method: GET
+    path: "/box/program-tracks/{id}"
+    description: "Fetch a program track."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: []
+    output: ProgramTrack
+    side_effects: []
+  - method: GET
+    path: "/box/program-tracks"
+    description: "List program tracks (paginated; filter by track_type or head_coach_id)."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: ["track_type?", "head_coach_id?", "limit?", "offset?"]
+    output: ProgramTrack[]
+    side_effects: []
+  - method: GET
+    path: "/box/program-tracks/{id}/leaderboard"
+    description: "Computed read: ranked leaderboard of members' best verified results for a benchmark on this track (§1.3 leaderboard_ranking)."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: [benchmark_name, "limit?", "offset?"]
+    output: BenchmarkResult[]
+    side_effects: []
+
+  # ---- ClassSession ----
+  - method: POST
+    path: "/box/sessions"
+    description: "Schedule a WOD class session on a track led by a coach."
+    roles: [BoxManager, Coach]
+    code: 201
+    input: [track_id, coach_id, starts_at, duration_minutes, capacity, "drop_in_fee_cents?"]
+    output: ClassSession
+    side_effects: ["creates ClassSession SCHEDULED with seats_reserved=0, waitlist_count=0"]
+  - method: GET
+    path: "/box/sessions/{id}"
+    description: "Fetch a session (includes seats_reserved, waitlist_count, version)."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: []
+    output: ClassSession
+    side_effects: []
+  - method: GET
+    path: "/box/sessions"
+    description: "List sessions (paginated; filter by track_id, coach_id, or status)."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: ["track_id?", "coach_id?", "status?", "limit?", "offset?"]
+    output: ClassSession[]
+    side_effects: []
+  - method: POST
+    path: "/box/sessions/{id}/cancel"
+    description: "Cancel a scheduled session; refunds and releases all reservations."
+    roles: [BoxManager, Coach]
+    code: 200
+    input: []
+    output: ClassSession
+    side_effects: ["SCHEDULED->CANCELLED", "CASCADE cancel all RESERVED (full refund) + WAITLISTED reservations", "set seats_reserved=0, waitlist_count=0", "increment ClassSession.version by 1"]
+  - method: POST
+    path: "/box/sessions/{id}/complete"
+    description: "Complete a session, marking attendance/no-shows per attendee map."
+    roles: [BoxManager, Coach]
+    code: 200
+    input: [attendance]
+    output: ClassSession
+    side_effects: ["SCHEDULED->COMPLETED", "per-attendee RESERVED->ATTENDED or RESERVED->NO_SHOW (NO_SHOW increments member.no_show_strikes)", "WAITLISTED->CANCELLED", "increment ClassSession.version by 1"]
+
+  # ---- Reservation ----
+  - method: POST
+    path: "/box/reservations"
+    description: "Reserve a seat (or waitlist) on a session; OCC on session version."
+    roles: [Member]
+    code: 201
+    input: [session_id, member_id, "membership_id?", reservation_kind, expected_session_version]
+    output: Reservation
+    side_effects: ["creates Reservation RESERVED (or WAITLISTED if full)", "increment session.seats_reserved or waitlist_count", "decrement punch for PUNCH MEMBERSHIP RESERVED", "charge drop_in_fee for DROP_IN RESERVED", "increment ClassSession.version by 1"]
+  - method: GET
+    path: "/box/reservations/{id}"
+    description: "Fetch a reservation."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+  - method: GET
+    path: "/box/reservations"
+    description: "List reservations (paginated; filter by session_id, member_id, membership_id, or status)."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: ["session_id?", "member_id?", "membership_id?", "status?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+  - method: POST
+    path: "/box/reservations/{id}/cancel"
+    description: "Cancel a reservation; refund/punch-restore per late-cancel window; promote waitlist."
+    roles: [Member]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["RESERVED/WAITLISTED->CANCELLED", "refund/punch-restore per §1.3 refund_on_cancel", "decrement session counts", "CASCADE promote waitlist head", "increment ClassSession.version by 1"]
+
+  # ---- BenchmarkResult ----
+  - method: POST
+    path: "/box/benchmark-results"
+    description: "Record a benchmark/PR result for a member (unverified)."
+    roles: [Member]
+    code: 201
+    input: [member_id, benchmark_name, metric_kind, value, recorded_at]
+    output: BenchmarkResult
+    side_effects: ["creates BenchmarkResult verified=false, is_pr=false"]
+  - method: GET
+    path: "/box/benchmark-results/{id}"
+    description: "Fetch a benchmark result."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: []
+    output: BenchmarkResult
+    side_effects: []
+  - method: GET
+    path: "/box/benchmark-results"
+    description: "List benchmark results (paginated; filter by member_id, benchmark_name, or verified)."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: ["member_id?", "benchmark_name?", "verified?", "limit?", "offset?"]
+    output: BenchmarkResult[]
+    side_effects: []
+  - method: POST
+    path: "/box/benchmark-results/{id}/verify"
+    description: "Certified coach verifies a result; recomputes is_pr (§1.3 pr_determination)."
+    roles: [Coach]
+    code: 200
+    input: []
+    output: BenchmarkResult
+    side_effects: ["set verified=true", "recompute is_pr (§1.3 pr_determination)", "increment BenchmarkResult.version by 1"]
+
+  # ---- CompetitionTeam ----
+  - method: POST
+    path: "/box/teams"
+    description: "Create a competition team (captain is first roster member)."
+    roles: [Member]
+    code: 201
+    input: [name, captain_member_id, max_roster_size]
+    output: CompetitionTeam
+    side_effects: ["creates CompetitionTeam FORMING with roster_size=1", "creates captain TeamMember ACCEPTED"]
+  - method: GET
+    path: "/box/teams/{id}"
+    description: "Fetch a competition team."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: []
+    output: CompetitionTeam
+    side_effects: []
+  - method: GET
+    path: "/box/teams"
+    description: "List competition teams (paginated; filter by status or captain_member_id)."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: ["status?", "captain_member_id?", "limit?", "offset?"]
+    output: CompetitionTeam[]
+    side_effects: []
+  - method: POST
+    path: "/box/teams/{id}/lock"
+    description: "Lock the roster (captain only); expires outstanding invites."
+    roles: [Member]
+    code: 200
+    input: [expected_team_version]
+    output: CompetitionTeam
+    side_effects: ["FORMING->LOCKED", "CASCADE INVITED TeamMembers -> DECLINED", "increment CompetitionTeam.version by 1"]
+  - method: POST
+    path: "/box/teams/{id}/disband"
+    description: "Disband a forming team (captain only)."
+    roles: [Member]
+    code: 200
+    input: [expected_team_version]
+    output: CompetitionTeam
+    side_effects: ["FORMING->DISBANDED", "CASCADE all TeamMembers -> REMOVED", "set roster_size=0", "increment CompetitionTeam.version by 1"]
+
+  # ---- TeamMember ----
+  - method: POST
+    path: "/box/team-members"
+    description: "Invite a member to a competition team (captain only)."
+    roles: [Member]
+    code: 201
+    input: [team_id, member_id]
+    output: TeamMember
+    side_effects: ["creates TeamMember INVITED"]
+  - method: GET
+    path: "/box/team-members/{id}"
+    description: "Fetch a team-member roster slot."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: []
+    output: TeamMember
+    side_effects: []
+  - method: GET
+    path: "/box/team-members"
+    description: "List team-member roster slots (paginated; filter by team_id, member_id, or status)."
+    roles: [BoxManager, Member, Coach]
+    code: 200
+    input: ["team_id?", "member_id?", "status?", "limit?", "offset?"]
+    output: TeamMember[]
+    side_effects: []
+  - method: POST
+    path: "/box/team-members/{id}/accept"
+    description: "Invited athlete accepts; bumps team roster_size (roster-full guarded)."
+    roles: [Member]
+    code: 200
+    input: []
+    output: TeamMember
+    side_effects: ["INVITED->ACCEPTED", "BUBBLE-UP increment team.roster_size by 1", "increment CompetitionTeam.version by 1"]
+  - method: POST
+    path: "/box/team-members/{id}/decline"
+    description: "Invited athlete declines."
+    roles: [Member]
+    code: 200
+    input: []
+    output: TeamMember
+    side_effects: ["INVITED->DECLINED"]
+
+  # ---- Test-driving / batch endpoints ----
+  - method: POST
+    path: "/box/_clock/set_current_utc"
+    description: "Set the server logical clock to an arbitrary UTC instant for deterministic time-gated tests. The server logical clock defaults to 2026-01-01T00:00:00Z at startup and MUST NOT fall back to wall-clock time before any set call."
+    roles: [BoxManager]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["sets logical clock used by all time-based rules and recomputations"]
+  - method: POST
+    path: "/box/_membership/complete-foundations"
+    description: "Coach signs off a membership's on-ramp/foundations prerequisite (sets foundations_completed=true)."
+    roles: [Coach]
+    code: 200
+    input: [membership_id]
+    output: Membership
+    side_effects: ["set Membership.foundations_completed=true", "increment Membership.version by 1"]
+  - method: POST
+    path: "/box/_billing/run-cycle-close"
+    description: "BoxManager runs the billing cycle-close batch: finalizes CANCEL_PENDING memberships to CANCELLED and charges monthly fees (§1.3 cycle_close_billing). Returns the cycle total."
+    roles: [BoxManager]
+    code: 200
+    input: []
+    output: "{ total_charged_cents: integer, finalized_membership_ids: string[] }"
+    side_effects: ["CANCEL_PENDING->CANCELLED for all pending", "computes total_charged_cents (§1.3 cycle_close_billing)"]
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing or malformed auth headers on a protected endpoint."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for the operation per RBAC."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "Entity-backed Member acting on a resource they do not own."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Referenced path or FK resource does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "Missing required field, wrong type, out-of-range numeric, or invalid enum value."
+  - id: ERR_PLAN_SHAPE_INVALID
+    http: 422
+    condition: "PUNCH plan missing punch_count / UNLIMITED supplying it, or reservation_kind vs membership_id mismatch."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Entity not in a state from which the requested transition is defined."
+  - id: ERR_MEMBERSHIP_NOT_OWNED
+    http: 409
+    condition: "Reservation's membership_id does not belong to the reserving member."
+  - id: ERR_RESERVATION_SUSPENDED
+    http: 409
+    condition: "Member has >= 3 no-show strikes and is reservation-suspended."
+  - id: ERR_FOUNDATIONS_NOT_COMPLETED
+    http: 409
+    condition: "Reserving a REGULAR-track session before completing the foundations prerequisite on a plan that requires it."
+  - id: ERR_RESERVATION_WINDOW_CLOSED
+    http: 409
+    condition: "Session not SCHEDULED or current time is past the reservation cut-off relative to starts_at."
+  - id: ERR_DROP_IN_NOT_ALLOWED
+    http: 409
+    condition: "Drop-in / visiting athlete attempting to book a COMPETITION-track session."
+  - id: ERR_DUPLICATE_RESERVATION
+    http: 409
+    condition: "Member already holds a non-terminal reservation on the same session."
+  - id: ERR_SESSION_TIME_CONFLICT
+    http: 409
+    condition: "Reservation's session time overlaps another non-terminal reservation the member holds."
+  - id: ERR_COACH_DOUBLE_BOOKED
+    http: 409
+    condition: "Coach already leads a SCHEDULED session overlapping (incl. turnaround buffer) the new session's window."
+  - id: ERR_NO_PUNCHES_REMAINING
+    http: 409
+    condition: "PUNCH membership has 0 punches remaining at reservation commit."
+  - id: ERR_ROSTER_FULL
+    http: 409
+    condition: "Accepting an invite when the team roster is already at max_roster_size."
+  - id: ERR_COACH_NOT_CERTIFIED
+    http: 409
+    condition: "A non-certified coach attempts to verify a benchmark result."
+  - id: ERR_STALE_SESSION_VERSION
+    http: 412
+    condition: "expected_session_version does not match the session's current version on reservation create."
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: BoxManager
+    description: "Box operator/owner: manages plans, billing, payment confirmation, strike clearing, and session administration."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /box/membership-plans"
+      - "POST /box/membership-plans/{id}/archive"
+      - "POST /box/coaches"
+      - "POST /box/program-tracks"
+      - "POST /box/memberships/{id}/confirm-payment"
+      - "POST /box/members/{id}/clear-strikes"
+      - "POST /box/_clock/set_current_utc"
+      - "POST /box/_billing/run-cycle-close"
+    shared_operations:
+      - "POST /box/memberships"
+      - "POST /box/sessions"
+      - "POST /box/sessions/{id}/cancel"
+      - "POST /box/sessions/{id}/complete"
+      - "GET (all read endpoints)"
+
+  - name: Coach
+    description: "Certified or non-certified coach: schedules sessions on owned tracks, completes/cancels sessions, signs off foundations, verifies PRs."
+    identity: "entity_backed:Coach"
+    exclusive_operations:
+      - "POST /box/benchmark-results/{id}/verify"
+      - "POST /box/_membership/complete-foundations"
+    shared_operations:
+      - "POST /box/sessions"
+      - "POST /box/sessions/{id}/cancel"
+      - "POST /box/sessions/{id}/complete"
+      - "GET (all read endpoints)"
+
+  - name: Member
+    description: "Home-box or visiting athlete: manages own memberships, reservations, benchmark results, and competition teams."
+    identity: "entity_backed:Member"
+    exclusive_operations:
+      - "POST /box/memberships/{id}/freeze"
+      - "POST /box/memberships/{id}/unfreeze"
+      - "POST /box/memberships/{id}/cancel"
+      - "POST /box/reservations"
+      - "POST /box/reservations/{id}/cancel"
+      - "POST /box/benchmark-results"
+      - "POST /box/teams"
+      - "POST /box/teams/{id}/lock"
+      - "POST /box/teams/{id}/disband"
+      - "POST /box/team-members"
+      - "POST /box/team-members/{id}/accept"
+      - "POST /box/team-members/{id}/decline"
+    shared_operations:
+      - "POST /box/memberships"
+      - "GET (own and public read endpoints)"
+
+  - name: Anonymous
+    description: "Unauthenticated visitor: may register and browse public plan catalog."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /box/members/register"
+    shared_operations:
+      - "GET /box/membership-plans"
+      - "GET /box/membership-plans/{id}"

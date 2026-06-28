@@ -1,0 +1,52 @@
+"""Domain thresholds — numeric constants from PRD calculations and system rules."""
+
+# System constants (PRD §2.5, §3.9, §3.10, §3.4).
+SYSTEM = {
+    "MAX_TRANSFERS": 3,
+    "SERVICE_GRACE_DAYS": 30,
+    "MIN_VISIT_GAP_DAYS": 7,
+    "CLOCK_DEFAULT_UTC": "2026-04-01T00:00:00Z",
+    "QUOTE_VALIDITY_DAYS": 30,
+}
+
+# Quote pricing constants (PRD §3.4).
+PRICING = {
+    "FOOTPRINT_TIER_1_MAX": 800,
+    "FOOTPRINT_TIER_1_BASE_CENTS": 250000,
+    "FOOTPRINT_TIER_2_MAX": 1500,
+    "FOOTPRINT_TIER_2_BASE_CENTS": 400000,
+    "FOOTPRINT_TIER_3_BASE_CENTS": 600000,
+    "VAPOR_RATE_CENTS_PER_SQFT": 180,
+    "SUMP_CENTS": 120000,
+    "DEHU_CENTS": 165000,
+    "BACKUP_CENTS": 90000,
+    "DRAIN_FREE_FT": 20,
+    "DRAIN_CENTS_PER_FT": 4500,
+    "TAX_RATE": 0.07,
+}
+
+# Assessment-severity scoring constants (PRD §3.2).
+SEVERITY = {
+    "MOISTURE_MID": 60.0,
+    "MOISTURE_HIGH": 80.0,
+    "STRUCT_CAP": 4,
+    "STRUCT_WEIGHT": 2,
+    "MODERATE_THRESHOLD": 4,
+    "SEVERE_THRESHOLD": 7,
+}
+
+# Financing amortization constants (PRD §3.6).
+FINANCING = {
+    "APR_PRIME_SHORT_BPS": 599,
+    "APR_PRIME_LONG_BPS": 799,
+    "APR_NEAR_PRIME_SHORT_BPS": 1099,
+    "APR_NEAR_PRIME_LONG_BPS": 1399,
+    "APR_SUBPRIME_SHORT_BPS": 1999,
+    "APR_SUBPRIME_LONG_BPS": 2399,
+    "MAX_FINANCE_PRIME_CENTS": 5000000,
+    "MAX_FINANCE_NEAR_PRIME_CENTS": 3000000,
+    "MAX_FINANCE_SUBPRIME_CENTS": 1500000,
+}
+
+# A well-formed UUID guaranteed not to resolve to any seeded entity.
+MISSING_UUID = "00000000-0000-4000-8000-000000000000"

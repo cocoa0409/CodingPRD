@@ -1,0 +1,1589 @@
+scenario: "668. Auto Title & Tag Service / DMV Runner: customer & transaction type (title/registration/transfer/lien), document collection & verification, fee + tax calculation, state submission & DMV-runner queue, expedite, lien-perfection & lender packet, error/rejection rework, business/fleet account"
+domain_name: "auto-title-tag-dmv-runner"
+api_prefix: "/dmv"
+
+complexity_profile:
+  primary_archetype: workflow_orchestration
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - dual_variant_calculation        # estimate fee quote vs final settlement quote
+    - cascading_side_effects          # submission/rejection cascades across Transaction -> Submission -> RunnerTrip -> Account
+    - rate_threshold_triggers         # fleet volume-discount tier breakpoints + expedite SLA windows
+    - optimistic_concurrency          # claiming a queued RunnerTrip leg / superseding a fee quote
+    - derived_field_reconciliation    # Account.outstanding_balance_cents and trip leg counts
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys; URLs are flat collections (/dmv/transactions/{id}),
+  # cross-references carried in request bodies, not nested deeply in paths.
+
+  state_machine_shape: cyclic
+  # Transaction has a rework cycle (SUBMITTED -> REJECTED -> SUBMITTED) AND parallel
+  # document_status vs lifecycle_status dimensions; RunnerTrip is branching fork-join.
+
+  relationship_patterns:
+    - one_to_many        # Account -> Transaction; Transaction -> DocumentItem; RunnerTrip -> RunnerLeg
+    - cross_aggregate    # FeeQuote, Submission, LienPacket reference Transaction across boundaries
+    - polymorphic        # DocumentItem.checklist_code keyed off Transaction.transaction_type
+
+  role_model: peer_roles
+  # IntakeClerk owns intake & documents; FeeAnalyst owns quotes; RunnerDispatcher owns trips;
+  # LienOfficer owns lien perfection (segregation: the clerk who submitted cannot perfect the lien).
+  # PlatformAdmin is the operational superset for config + clock; AccountHolder is the customer.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_type
+        type: enum
+        source: input
+        description: "Retail individual vs business/fleet account."
+        constraints: "one of {RETAIL, FLEET}"
+      - name: legal_name
+        type: string
+        source: input
+        description: "Customer or business legal name."
+      - name: state_code
+        type: string
+        source: input
+        description: "Two-letter US state the account is domiciled in; drives tax/fee schedule selection."
+        constraints: "must equal the state_code of an existing FeeSchedule"
+      - name: credit_terms
+        type: boolean
+        source: input
+        description: "FLEET accounts may run a postpaid outstanding balance; RETAIL must prepay."
+        default: false
+      - name: ytd_completed_count
+        type: integer
+        source: computed
+        description: "Count of this account's Transactions that have reached COMPLETED in the current fee-period; resets when PlatformAdmin advances the fee period. Drives the fleet volume-discount tier."
+        default: 0
+      - name: outstanding_balance_cents
+        type: integer
+        source: computed
+        description: "Sum over this account's settled FeeQuote.total_cents for unpaid COMPLETED transactions minus sum of Payment.amount_cents applied to the account; >=0. Reconciled on every settle/pay/refund."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "ACTIVE on create; SUSPENDED when outstanding_balance_cents exceeds credit_limit_cents; reactivated to ACTIVE by an admin reinstate."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED}"
+      - name: credit_limit_cents
+        type: integer
+        source: input
+        description: "Postpaid ceiling for FLEET accounts; ignored when credit_terms is false."
+        default: 0
+
+  - name: FeeSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - name: state_code
+        type: string
+        source: input
+        description: "Two-letter US state this schedule governs; unique among non-superseded schedules."
+        constraints: "unique where status == ACTIVE"
+      - name: title_fee_cents
+        type: integer
+        source: input
+        description: "Flat state title-certificate fee."
+      - name: registration_fee_cents
+        type: integer
+        source: input
+        description: "Flat state registration/tag fee."
+      - name: transfer_fee_cents
+        type: integer
+        source: input
+        description: "Flat state title-transfer fee."
+      - name: lien_recording_fee_cents
+        type: integer
+        source: input
+        description: "Flat state lien-recording fee added when a lien is being perfected."
+      - name: use_tax_rate_bps
+        type: integer
+        source: input
+        description: "Sales/use tax rate in basis points applied to the declared vehicle purchase price for TITLE and TRANSFER transactions."
+        constraints: ">= 0"
+      - name: trade_in_credit_allowed
+        type: boolean
+        source: input
+        description: "Whether this state lets a trade-in allowance reduce the taxable purchase price."
+        default: true
+      - name: status
+        type: enum
+        source: computed
+        description: "ACTIVE on create; SUPERSEDED when a newer schedule for the same state_code is published."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUPERSEDED}"
+
+  - name: Transaction
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the owning account."
+      - name: transaction_type
+        type: enum
+        source: input
+        description: "Kind of DMV work requested; drives required document checklist and fee components."
+        constraints: "one of {TITLE, REGISTRATION, TRANSFER, LIEN}"
+      - name: vin
+        type: string
+        source: input
+        description: "17-character vehicle identification number."
+        constraints: "length == 17"
+      - name: declared_price_cents
+        type: integer
+        source: input
+        description: "Declared vehicle purchase price; tax base for TITLE/TRANSFER. Required for TITLE and TRANSFER, must be 0 for REGISTRATION and LIEN."
+        default: 0
+      - name: trade_in_allowance_cents
+        type: integer
+        source: input
+        description: "Declared trade-in allowance; reduces taxable base only when the account's FeeSchedule.trade_in_credit_allowed is true."
+        default: 0
+      - name: expedite
+        type: boolean
+        source: input
+        description: "Whether the customer purchased expedited handling (priority + SLA + surcharge)."
+        default: false
+      - name: lifecycle_status
+        type: enum
+        source: computed
+        description: "Primary workflow dimension. Initial DRAFT."
+        default: DRAFT
+        constraints: "one of {DRAFT, QUOTED, SUBMITTED, REJECTED, APPROVED, COMPLETED, CANCELLED}"
+      - name: document_status
+        type: enum
+        source: computed
+        description: "Parallel dimension tracking document collection independent of lifecycle_status. Initial COLLECTING."
+        default: COLLECTING
+        constraints: "one of {COLLECTING, VERIFIED, INCOMPLETE}"
+      - name: rejection_round
+        type: integer
+        source: computed
+        description: "Number of times this Transaction has entered REJECTED; increments on each DMV rejection. Drives rework surcharge and the auto-cancel cap."
+        default: 0
+      - name: active_quote_id
+        type: string
+        source: computed
+        description: "Denormalized pointer (not a child FK): the id of the most recent FeeQuote whose status is ACTIVE for this Transaction; null until first quote. Discover quotes via GET /dmv/transactions/{id}/fee-quotes."
+        default: null
+      - name: submitted_by_user_id
+        type: string
+        source: computed
+        description: "X-User-ID of the IntakeClerk who last submitted this Transaction; stamped on QUOTED->SUBMITTED and REJECTED->SUBMITTED; compared against the LienOfficer on lien perfection (segregation of duties). Null until first submit."
+        default: null
+
+  - name: DocumentItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: transaction_id
+        type: string
+        source: input
+        description: "FK -> Transaction.id; the transaction this document belongs to."
+      - name: checklist_code
+        type: enum
+        source: input
+        description: "Which checklist slot this document fills; the required set depends on Transaction.transaction_type."
+        constraints: "one of {TITLE_CERT, BILL_OF_SALE, ODOMETER, ID_PROOF, INSURANCE, LIEN_RELEASE, LIEN_INSTRUMENT, POWER_OF_ATTORNEY}"
+      - name: doc_status
+        type: enum
+        source: computed
+        description: "PENDING on upload; VERIFIED when a clerk verifies; REJECTED when a clerk rejects (e.g., illegible)."
+        default: PENDING
+        constraints: "one of {PENDING, VERIFIED, REJECTED}"
+      - name: file_ref
+        type: string
+        source: input
+        description: "Opaque storage reference for the uploaded file."
+
+  - name: FeeQuote
+    parent: null
+    common_fields: true
+    fields:
+      - name: transaction_id
+        type: string
+        source: input
+        description: "FK -> Transaction.id; the transaction being priced."
+      - name: variant
+        type: enum
+        source: computed
+        description: "ESTIMATE when produced before submission; FINAL when settled at completion. Drives which fee inputs are frozen."
+        constraints: "one of {ESTIMATE, FINAL}"
+      - name: schedule_id
+        type: string
+        source: computed
+        description: "Denormalized version-pin pointer (not a child FK): the id of the FeeSchedule version frozen at the moment this quote was computed. Resolve the schedule via GET /dmv/fee-schedules/{id}."
+      - name: tax_cents
+        type: integer
+        source: computed
+        description: "Computed use/sales tax component."
+        default: 0
+      - name: state_fees_cents
+        type: integer
+        source: computed
+        description: "Sum of applicable flat state fees for the transaction_type."
+        default: 0
+      - name: service_fee_cents
+        type: integer
+        source: computed
+        description: "Runner service fee including expedite surcharge and rework surcharge, after fleet volume discount."
+        default: 0
+      - name: total_cents
+        type: integer
+        source: computed
+        description: "tax_cents + state_fees_cents + service_fee_cents."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "ACTIVE on create; SUPERSEDED when a newer quote is generated for the same Transaction; SETTLED when the FINAL quote is locked at completion."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUPERSEDED, SETTLED}"
+
+  - name: Submission
+    parent: null
+    common_fields: true
+    fields:
+      - name: transaction_id
+        type: string
+        source: input
+        description: "FK -> Transaction.id; the transaction being filed at the DMV."
+      - name: submission_status
+        type: enum
+        source: computed
+        description: "QUEUED on create; ASSIGNED when attached to a RunnerLeg; ACCEPTED or DMV_REJECTED on DMV decision; SUPERSEDED when a rework submission replaces it."
+        default: QUEUED
+        constraints: "one of {QUEUED, ASSIGNED, ACCEPTED, DMV_REJECTED, SUPERSEDED}"
+      - name: priority_class
+        type: enum
+        source: computed
+        description: "EXPEDITE when the Transaction.expedite is true, else STANDARD; used as the queue ordering key."
+        constraints: "one of {EXPEDITE, STANDARD}"
+      - name: sla_deadline_at
+        type: datetime
+        source: computed
+        description: "Logical-clock deadline by which an EXPEDITE submission must be ACCEPTED; clock-now + EXPEDITE_SLA_HOURS at queue time. Null for STANDARD."
+        default: null
+      - name: leg_id
+        type: string
+        source: computed
+        description: "FK -> RunnerLeg.id; the runner leg this submission is assigned to; null while QUEUED."
+        default: null
+      - name: rejection_reason
+        type: string
+        source: input
+        description: "DMV-provided reason text supplied on a DMV_REJECTED decision; null otherwise."
+        default: null
+
+  - name: RunnerTrip
+    parent: null
+    common_fields: true
+    fields:
+      - name: dmv_office_code
+        type: string
+        source: input
+        description: "Identifier of the DMV office this trip visits."
+      - name: trip_status
+        type: enum
+        source: computed
+        description: "PLANNED on create; DISPATCHED when the runner departs; RETURNED when results are recorded; CLOSED when all legs are resolved."
+        default: PLANNED
+        constraints: "one of {PLANNED, DISPATCHED, RETURNED, CLOSED}"
+      - name: capacity
+        type: integer
+        source: input
+        description: "Maximum number of RunnerLegs this trip can carry."
+        constraints: ">= 1"
+      - name: window_start_at
+        type: datetime
+        source: input
+        description: "Planned departure time of this trip to the DMV office."
+      - name: window_end_at
+        type: datetime
+        source: input
+        description: "Planned return time; the occupation interval is HALF-OPEN [window_start_at, window_end_at): a trip ending exactly when another starts does NOT collide."
+        constraints: "must be strictly after window_start_at"
+      - name: assigned_leg_count
+        type: integer
+        source: computed
+        description: "Number of RunnerLegs currently attached to this trip; reconciled on every leg attach/detach."
+        default: 0
+
+  - name: RunnerLeg
+    parent: null
+    common_fields: true
+    fields:
+      - name: trip_id
+        type: string
+        source: input
+        description: "FK -> RunnerTrip.id; the trip carrying this leg."
+      - name: submission_id
+        type: string
+        source: input
+        description: "FK -> Submission.id; the submission this leg files at the DMV."
+      - name: leg_status
+        type: enum
+        source: computed
+        description: "ATTACHED on create; FILED when the trip is dispatched; RESOLVED when its submission's DMV decision is recorded."
+        default: ATTACHED
+        constraints: "one of {ATTACHED, FILED, RESOLVED}"
+      - name: sequence_index
+        type: integer
+        source: computed
+        description: "Position within the trip, assigned by queue priority then created_at ASC at attach time; lower index files first."
+        default: 0
+
+  - name: LienPacket
+    parent: null
+    common_fields: true
+    fields:
+      - name: transaction_id
+        type: string
+        source: input
+        description: "FK -> Transaction.id; the LIEN or TITLE transaction whose lien is being perfected."
+      - name: lender_name
+        type: string
+        source: input
+        description: "Name of the secured lender."
+      - name: lien_amount_cents
+        type: integer
+        source: input
+        description: "Principal amount of the lien."
+        constraints: ">= 1"
+      - name: packet_status
+        type: enum
+        source: computed
+        description: "DRAFT on create; PERFECTED when the LienOfficer perfects after DMV ACCEPTED; VOIDED on transaction cancel."
+        default: DRAFT
+        constraints: "one of {DRAFT, PERFECTED, VOIDED}"
+      - name: perfected_by_user_id
+        type: string
+        source: computed
+        description: "X-User-ID of the LienOfficer who perfected the packet; must differ from the user who submitted the transaction (segregation of duties)."
+        default: null
+
+  - name: Payment
+    parent: null
+    common_fields: false
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account this payment is applied to."
+      - name: transaction_id
+        type: string
+        source: input
+        description: "FK -> Transaction.id; the transaction this payment settles; required, must reference a COMPLETED transaction."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Payment amount in cents; must equal the SETTLED FeeQuote.total_cents of the referenced transaction."
+        constraints: ">= 1"
+      - name: kind
+        type: enum
+        source: input
+        description: "CHARGE reduces outstanding_balance_cents; REFUND increases it (compensation on cancel)."
+        constraints: "one of {CHARGE, REFUND}"
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+
+  - entity: Transaction
+    initial_state: DRAFT          # lifecycle_status
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: QUOTED
+        trigger: "POST /dmv/transactions/{id}/quote"
+        actor: FeeAnalyst
+        preconditions:
+          - "lifecycle_status == DRAFT"
+          - "an ACTIVE FeeSchedule exists for the account's state_code"
+        side_effects:
+          - "compute ESTIMATE FeeQuote via calculations.fee_quote_estimate"
+          - "create FeeQuote {variant: ESTIMATE, status: ACTIVE}; set any prior ACTIVE quote to SUPERSEDED"
+          - "set Transaction.active_quote_id to the new quote id"
+          - "increment Transaction.version by 1"
+        note: "Quoting may be re-run while in DRAFT or QUOTED; each run supersedes the previous ACTIVE quote."
+      - from: QUOTED
+        to: QUOTED
+        trigger: "POST /dmv/transactions/{id}/quote"
+        actor: FeeAnalyst
+        preconditions:
+          - "lifecycle_status == QUOTED"
+        side_effects:
+          - "recompute ESTIMATE FeeQuote; supersede prior ACTIVE quote; update active_quote_id"
+          - "increment Transaction.version by 1"
+      - from: QUOTED
+        to: SUBMITTED
+        trigger: "POST /dmv/transactions/{id}/submit"
+        actor: IntakeClerk
+        preconditions:
+          - "lifecycle_status == QUOTED"
+          - "document_status == VERIFIED"
+          - "Transaction.active_quote_id is not null"
+          - "owning Account.status == ACTIVE"
+        side_effects:
+          - "create Submission {submission_status: QUEUED, priority_class derived from expedite}"
+          - "if expedite, set Submission.sla_deadline_at = clock_now + EXPEDITE_SLA_HOURS (EXPEDITE_SLA_HOURS = 48)"
+          - "stamp X-User-ID onto Transaction as the submitting user (for segregation-of-duties on lien perfection)"
+          - "increment Transaction.version by 1"
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /dmv/submissions/{id}/decision (outcome=ACCEPTED) — system reflects onto Transaction"
+        actor: RunnerDispatcher
+        preconditions:
+          - "lifecycle_status == SUBMITTED"
+          - "the Submission for this Transaction has submission_status == ASSIGNED"
+          - "the assigned RunnerLeg's trip_status == RETURNED"
+        side_effects:
+          - "set Submission.submission_status = ACCEPTED; RunnerLeg.leg_status = RESOLVED"
+          - "if a DRAFT LienPacket exists, leave it DRAFT (awaiting LienOfficer perfection)"
+          - "increment Transaction.version by 1"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /dmv/submissions/{id}/decision (outcome=DMV_REJECTED) — system reflects onto Transaction"
+        actor: RunnerDispatcher
+        preconditions:
+          - "lifecycle_status == SUBMITTED"
+          - "the Submission for this Transaction has submission_status == ASSIGNED"
+          - "the assigned RunnerLeg's trip_status == RETURNED"
+          - "rejection_reason is provided"
+        side_effects:
+          - "set Submission.submission_status = DMV_REJECTED; RunnerLeg.leg_status = RESOLVED"
+          - "increment Transaction.rejection_round by 1"
+          - "set document_status = INCOMPLETE (re-verification required for rework)"
+          - "increment Transaction.version by 1"
+        note: "Cascade origin: Submission decision mutates Transaction, whose rejection_round bump later changes the rework surcharge feeding the next FeeQuote."
+      - from: REJECTED
+        to: SUBMITTED
+        trigger: "POST /dmv/transactions/{id}/submit (rework resubmission)"
+        actor: IntakeClerk
+        preconditions:
+          - "lifecycle_status == REJECTED"
+          - "document_status == VERIFIED"
+          - "rejection_round < MAX_REJECTION_ROUNDS (MAX_REJECTION_ROUNDS = 3)"
+          - "a re-run quote exists (active_quote_id reflects current rejection_round surcharge)"
+        side_effects:
+          - "set prior Submission.submission_status = SUPERSEDED"
+          - "create new Submission {submission_status: QUEUED}"
+          - "increment Transaction.version by 1"
+        note: "Cyclic edge: REJECTED -> SUBMITTED forms the rework loop."
+      - from: REJECTED
+        to: CANCELLED
+        trigger: "system auto-cancel when rejection_round reaches MAX_REJECTION_ROUNDS at the moment of a DMV_REJECTED decision"
+        actor: system
+        preconditions:
+          - "rejection_round == MAX_REJECTION_ROUNDS (MAX_REJECTION_ROUNDS = 3)"
+        side_effects:
+          - "set lifecycle_status = CANCELLED"
+          - "void any DRAFT LienPacket -> VOIDED"
+          - "increment Transaction.version by 1"
+      - from: APPROVED
+        to: COMPLETED
+        trigger: "POST /dmv/transactions/{id}/complete"
+        actor: FeeAnalyst
+        preconditions:
+          - "lifecycle_status == APPROVED"
+          - "if transaction_type == LIEN, the LienPacket.packet_status == PERFECTED"
+        side_effects:
+          - "compute FINAL FeeQuote via calculations.fee_quote_final; supersede the ACTIVE ESTIMATE; new FINAL quote status SETTLED"
+          - "set Transaction.active_quote_id to the FINAL quote id"
+          - "increment owning Account.ytd_completed_count by 1"
+          - "recompute Account.outstanding_balance_cents via calculations.account_balance (adds the SETTLED total for credit-terms accounts; RETAIL must pay same request via prior CHARGE)"
+          - "if Account.outstanding_balance_cents > Account.credit_limit_cents, set Account.status = SUSPENDED"
+          - "increment Transaction.version by 1"
+        note: "Cascade origin: completion mutates FeeQuote (settle), which mutates Account.outstanding_balance_cents, which may mutate Account.status."
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /dmv/transactions/{id}/cancel"
+        actor: AccountHolder
+        preconditions:
+          - "lifecycle_status in {DRAFT, QUOTED, REJECTED}"
+        side_effects:
+          - "set ACTIVE FeeQuote status = SUPERSEDED"
+          - "void any DRAFT LienPacket -> VOIDED"
+          - "increment Transaction.version by 1"
+      - from: COMPLETED
+        to: CANCELLED
+        trigger: "POST /dmv/transactions/{id}/cancel (post-completion reversal)"
+        actor: AccountHolder
+        preconditions:
+          - "lifecycle_status == COMPLETED"
+          - "a CHARGE Payment exists for this Transaction (so a compensating REFUND is possible)"
+        side_effects:
+          - "create REFUND Payment for the SETTLED total; recompute Account.outstanding_balance_cents via calculations.account_balance (REFUND restores balance to its pre-CHARGE value -> compensating invariant)"
+          - "decrement Account.ytd_completed_count by 1 (compensating invariant on completed-count)"
+          - "void any PERFECTED LienPacket -> VOIDED"
+          - "increment Transaction.version by 1"
+
+  - entity: Transaction
+    initial_state: COLLECTING      # document_status (parallel dimension)
+    terminal_states: []
+    transitions:
+      - from: COLLECTING
+        to: VERIFIED
+        trigger: "POST /dmv/transactions/{id}/verify-documents"
+        actor: IntakeClerk
+        preconditions:
+          - "every required checklist_code for the transaction_type has a DocumentItem with doc_status == VERIFIED"
+          - "no DocumentItem for this transaction has doc_status == REJECTED"
+        side_effects:
+          - "set document_status = VERIFIED"
+          - "increment Transaction.version by 1"
+        note: |
+          Required checklist by transaction_type (the polymorphic checklist):
+            TITLE        = {TITLE_CERT, BILL_OF_SALE, ODOMETER, ID_PROOF}
+            REGISTRATION = {ID_PROOF, INSURANCE}
+            TRANSFER     = {TITLE_CERT, BILL_OF_SALE, ID_PROOF}
+            LIEN         = {LIEN_INSTRUMENT, ID_PROOF}
+          Extra docs beyond the required set are ignored for completeness.
+      - from: COLLECTING
+        to: INCOMPLETE
+        trigger: "POST /dmv/transactions/{id}/verify-documents"
+        actor: IntakeClerk
+        preconditions:
+          - "at least one required checklist_code is missing OR has a DocumentItem with doc_status in {PENDING, REJECTED}"
+        side_effects:
+          - "set document_status = INCOMPLETE"
+          - "increment Transaction.version by 1"
+        note: "verify-documents is idempotent on outcome: same document set => same document_status."
+      - from: INCOMPLETE
+        to: VERIFIED
+        trigger: "POST /dmv/transactions/{id}/verify-documents (after uploading missing/replacement docs)"
+        actor: IntakeClerk
+        preconditions:
+          - "every required checklist_code now has a VERIFIED DocumentItem and none is REJECTED"
+        side_effects:
+          - "set document_status = VERIFIED"
+          - "increment Transaction.version by 1"
+      - from: VERIFIED
+        to: INCOMPLETE
+        trigger: "system on DMV_REJECTED decision"
+        actor: system
+        preconditions:
+          - "the Transaction's submission was DMV_REJECTED"
+        side_effects:
+          - "set document_status = INCOMPLETE"
+
+  - entity: DocumentItem
+    initial_state: PENDING
+    terminal_states: []
+    transitions:
+      - from: PENDING
+        to: VERIFIED
+        trigger: "POST /dmv/documents/{id}/verify (decision=VERIFIED)"
+        actor: IntakeClerk
+        preconditions:
+          - "owning Transaction.lifecycle_status in {DRAFT, QUOTED, REJECTED}"
+        side_effects:
+          - "set doc_status = VERIFIED"
+          - "increment DocumentItem.version by 1"
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /dmv/documents/{id}/verify (decision=REJECTED)"
+        actor: IntakeClerk
+        preconditions:
+          - "owning Transaction.lifecycle_status in {DRAFT, QUOTED, REJECTED}"
+        side_effects:
+          - "set doc_status = REJECTED"
+          - "increment DocumentItem.version by 1"
+      - from: REJECTED
+        to: PENDING
+        trigger: "POST /dmv/documents/{id}/verify (decision=RESET after re-upload)"
+        actor: IntakeClerk
+        preconditions:
+          - "owning Transaction.lifecycle_status in {DRAFT, QUOTED, REJECTED}"
+        side_effects:
+          - "set doc_status = PENDING"
+          - "increment DocumentItem.version by 1"
+
+  - entity: RunnerTrip
+    initial_state: PLANNED
+    terminal_states: [CLOSED]
+    transitions:
+      - from: PLANNED
+        to: DISPATCHED
+        trigger: "POST /dmv/runner-trips/{id}/dispatch"
+        actor: RunnerDispatcher
+        preconditions:
+          - "trip_status == PLANNED"
+          - "assigned_leg_count >= 1"
+        side_effects:
+          - "set every attached RunnerLeg.leg_status = FILED (fork: each leg advances)"
+          - "set every attached leg's Submission.submission_status = ASSIGNED (already ASSIGNED at attach; idempotent confirm)"
+          - "increment RunnerTrip.version by 1"
+        note: "Fork-join branch: dispatch fans out to all attached legs; the join is the RETURN that requires every leg resolvable."
+      - from: DISPATCHED
+        to: RETURNED
+        trigger: "POST /dmv/runner-trips/{id}/return"
+        actor: RunnerDispatcher
+        preconditions:
+          - "trip_status == DISPATCHED"
+        side_effects:
+          - "mark the trip RETURNED so DMV decisions can be recorded per leg"
+          - "increment RunnerTrip.version by 1"
+      - from: RETURNED
+        to: CLOSED
+        trigger: "POST /dmv/runner-trips/{id}/close"
+        actor: RunnerDispatcher
+        preconditions:
+          - "trip_status == RETURNED"
+          - "every attached RunnerLeg.leg_status == RESOLVED (join: all branches complete)"
+        side_effects:
+          - "set trip_status = CLOSED"
+          - "increment RunnerTrip.version by 1"
+
+  - entity: Submission
+    initial_state: QUEUED
+    terminal_states: [ACCEPTED, DMV_REJECTED, SUPERSEDED]
+    transitions:
+      - from: QUEUED
+        to: ASSIGNED
+        trigger: "POST /dmv/runner-trips/{id}/legs"
+        actor: RunnerDispatcher
+        preconditions:
+          - "submission_status == QUEUED"
+          - "target RunnerTrip.trip_status == PLANNED"
+          - "target RunnerTrip.assigned_leg_count < RunnerTrip.capacity"
+        side_effects:
+          - "create RunnerLeg {leg_status: ATTACHED}; set sequence_index by priority then created_at ASC"
+          - "set Submission.submission_status = ASSIGNED; set Submission.leg_id"
+          - "increment RunnerTrip.assigned_leg_count by 1; increment RunnerTrip.version by 1"
+      - from: ASSIGNED
+        to: ACCEPTED
+        trigger: "POST /dmv/submissions/{id}/decision (outcome=ACCEPTED)"
+        actor: RunnerDispatcher
+        preconditions:
+          - "submission_status == ASSIGNED"
+          - "the leg's RunnerTrip.trip_status == RETURNED"
+        side_effects:
+          - "set submission_status = ACCEPTED; RunnerLeg.leg_status = RESOLVED"
+          - "reflect onto Transaction: SUBMITTED -> APPROVED"
+      - from: ASSIGNED
+        to: DMV_REJECTED
+        trigger: "POST /dmv/submissions/{id}/decision (outcome=DMV_REJECTED)"
+        actor: RunnerDispatcher
+        preconditions:
+          - "submission_status == ASSIGNED"
+          - "the leg's RunnerTrip.trip_status == RETURNED"
+          - "rejection_reason provided"
+        side_effects:
+          - "set submission_status = DMV_REJECTED; RunnerLeg.leg_status = RESOLVED"
+          - "reflect onto Transaction: SUBMITTED -> REJECTED (rejection cascade)"
+      - from: QUEUED
+        to: SUPERSEDED
+        trigger: "system on rework resubmission of the same Transaction"
+        actor: system
+        preconditions:
+          - "a newer Submission has been created for the same Transaction"
+        side_effects:
+          - "set submission_status = SUPERSEDED"
+
+  - entity: LienPacket
+    initial_state: DRAFT
+    terminal_states: [PERFECTED, VOIDED]
+    transitions:
+      - from: DRAFT
+        to: PERFECTED
+        trigger: "POST /dmv/lien-packets/{id}/perfect"
+        actor: LienOfficer
+        preconditions:
+          - "owning Transaction.lifecycle_status == APPROVED"
+          - "the Transaction's Submission.submission_status == ACCEPTED"
+          - "X-User-ID != the Transaction's submitting user (segregation of duties)"
+        side_effects:
+          - "set packet_status = PERFECTED; set perfected_by_user_id = X-User-ID"
+          - "increment LienPacket.version by 1"
+      - from: DRAFT
+        to: VOIDED
+        trigger: "system on Transaction cancel or auto-cancel"
+        actor: system
+        preconditions:
+          - "owning Transaction.lifecycle_status transitions to CANCELLED"
+        side_effects:
+          - "set packet_status = VOIDED"
+      - from: PERFECTED
+        to: VOIDED
+        trigger: "system on post-completion Transaction cancel"
+        actor: system
+        preconditions:
+          - "owning Transaction.lifecycle_status transitions COMPLETED -> CANCELLED"
+        side_effects:
+          - "set packet_status = VOIDED"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: leg-attach-stale-trip
+    parent_entity: RunnerTrip
+    write_endpoint: "POST /dmv/runner-trips/{id}/legs"
+    occ_field: "expected_runnertrip_version"
+    description: |
+      Attaching a RunnerLeg to a RunnerTrip whose version has advanced since
+      the dispatcher last observed it is rejected. A prior leg-attach has
+      legitimately consumed a capacity slot and bumped the trip's version; the
+      current attach carries a stale version and is rejected so two attaches
+      cannot both believe they took the last free slot. This is a true create-
+      with-supersede contention point because, on identical observed state, a
+      second attach would itself succeed under §1.2 (QUEUED submission, PLANNED
+      trip with a free slot).
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: quote-supersede-stale-transaction
+    parent_entity: Transaction
+    write_endpoint: "POST /dmv/transactions/{id}/quote"
+    occ_field: "expected_transaction_version"
+    description: |
+      Generating a new FeeQuote against a Transaction whose version has advanced
+      since the analyst last observed it is rejected. A new quote legitimately
+      supersedes the prior ACTIVE quote and re-points active_quote_id; if the
+      analyst's view of the transaction is stale (e.g., its rejection_round or
+      document_status moved underneath them), the supersede is rejected so the
+      surcharge inputs the quote freezes are not computed against an outdated
+      transaction snapshot.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+
+  - name: fee_quote_estimate
+    trigger: "POST /dmv/transactions/{id}/quote (Transaction DRAFT->QUOTED or QUOTED->QUOTED)"
+    algorithm: tiered_pricing
+    formula: |
+      # Evaluation order is fixed: (1) taxable base, (2) tax, (3) state fees,
+      # (4) service fee with tiered fleet discount + surcharges, (5) total.
+      sched = ACTIVE FeeSchedule for Account.state_code   # pinned -> quote.schedule_id
+
+      # (1) taxable base (TITLE & TRANSFER only)
+      if transaction_type in {TITLE, TRANSFER}:
+          base = declared_price_cents
+          if sched.trade_in_credit_allowed:
+              base = max(0, declared_price_cents - trade_in_allowance_cents)
+      else:
+          base = 0
+
+      # (2) tax — round the single tax line half-up to whole cents
+      tax_cents = round_half_up(base * sched.use_tax_rate_bps / 10000)
+
+      # (3) state fees by transaction_type
+      state_fees_cents =
+            (sched.title_fee_cents        if transaction_type == TITLE)
+          + (sched.transfer_fee_cents     if transaction_type == TRANSFER)
+          + (sched.registration_fee_cents if transaction_type == REGISTRATION)
+          + (sched.lien_recording_fee_cents if (transaction_type == LIEN
+                                                or a LienPacket exists for this txn))
+
+      # (4) service fee — PINNED ROUNDING ORDER: sum the un-discounted service
+      # components FIRST, apply the single fleet discount to that sum, then
+      # round ONCE (sum-then-round). Rounding each surcharge line separately and
+      # then summing (round-each-then-sum) is FORBIDDEN and yields a different
+      # cent at fractional discount tiers (e.g. 1250 bps, expedite+rework).
+      svc = BASE_SERVICE_FEE_CENTS
+      if expedite: svc += EXPEDITE_SURCHARGE_CENTS
+      svc += rejection_round * REWORK_SURCHARGE_CENTS
+      # fleet volume discount tier keyed on Account.ytd_completed_count (ESTIMATE uses CURRENT count)
+      disc_bps = fleet_tier_discount_bps(Account)     # see fleet_volume_discount
+      service_fee_cents = round_half_up(svc * (10000 - disc_bps) / 10000)   # ONE rounding
+
+      # (5) total — integer sum of three already-whole-cent lines, NO further rounding
+      total_cents = tax_cents + state_fees_cents + service_fee_cents
+    input_set: "The single Transaction being quoted, its owning Account (ESTIMATE reads Account.ytd_completed_count as-is), and the ACTIVE FeeSchedule for the account's state_code."
+    constants:
+      BASE_SERVICE_FEE_CENTS: 4500
+      EXPEDITE_SURCHARGE_CENTS: 6000
+      REWORK_SURCHARGE_CENTS: 2500
+    precision: "All money in integer cents. Two rounded lines: tax (one round_half_up) and service_fee (ONE round_half_up applied to the discounted SUM of service components — never per component). total is an integer sum of the three whole-cent lines with NO second rounding."
+    variants:
+      - name: estimate
+        when: "produced before submission, on quote"
+        difference: "Uses Account.ytd_completed_count as-is at quote time; service-fee rework component uses the CURRENT rejection_round; quote.variant = ESTIMATE, status ACTIVE."
+
+  - name: fee_quote_final
+    trigger: "POST /dmv/transactions/{id}/complete (Transaction APPROVED->COMPLETED)"
+    algorithm: tiered_pricing
+    formula: |
+      # Same five-step order as fee_quote_estimate, but the fleet discount tier
+      # is computed AFTER excluding THIS transaction from the completed count
+      # (the transaction is being completed now, so its own completion must not
+      # discount itself), and the rework component freezes the FINAL rejection_round.
+      sched = ACTIVE FeeSchedule for Account.state_code at completion time   # re-pinned
+      ... base, tax_cents, state_fees_cents exactly as estimate ...
+      svc = BASE_SERVICE_FEE_CENTS
+          + (EXPEDITE_SURCHARGE_CENTS if expedite else 0)
+          + rejection_round * REWORK_SURCHARGE_CENTS
+      disc_bps = fleet_tier_discount_bps_for_count(Account.ytd_completed_count)  # PRE-increment count
+      service_fee_cents = round_half_up(svc * (10000 - disc_bps) / 10000)
+      total_cents = tax_cents + state_fees_cents + service_fee_cents
+    input_set: "The Transaction at completion, owning Account with ytd_completed_count BEFORE this completion's increment, and the ACTIVE FeeSchedule re-pinned at completion (may differ from the estimate's schedule if a newer schedule was published)."
+    constants:
+      BASE_SERVICE_FEE_CENTS: 4500
+      EXPEDITE_SURCHARGE_CENTS: 6000
+      REWORK_SURCHARGE_CENTS: 2500
+    precision: "Same as estimate."
+    variants:
+      - name: final
+        when: "settled at completion"
+        difference: "Re-pins the FeeSchedule (estimate froze the schedule at quote time; FINAL re-reads the ACTIVE schedule, so a schedule republished between quote and completion changes the FINAL total but not the ESTIMATE). Same data can thus yield a different FINAL than ESTIMATE. quote.variant = FINAL, status SETTLED."
+
+  - name: fleet_volume_discount
+    trigger: "evaluated inside fee_quote_estimate and fee_quote_final to pick the service-fee discount"
+    algorithm: threshold
+    formula: |
+      # Tier boundaries are on ytd_completed_count (>= semantics, marginal NOT applied;
+      # the whole service fee gets the single tier's discount rate).
+      def fleet_tier_discount_bps_for_count(n):
+          if account_type != FLEET: return 0
+          if n >= 50: return 1875      # 18.75%
+          if n >= 20: return 1250      # 12.5%
+          if n >= 5:  return 625       #  6.25%
+          return 0
+      # ESTIMATE passes the current count; FINAL passes the PRE-increment count.
+      # Boundary semantics are >= (n==5 is already TIER1, n==4 is no discount).
+    input_set: "Account.account_type and Account.ytd_completed_count."
+    constants:
+      TIER1_MIN: 5
+      TIER1_BPS: 625
+      TIER2_MIN: 20
+      TIER2_BPS: 1250
+      TIER3_MIN: 50
+      TIER3_BPS: 1875
+    precision: "Discount applied as bps against the pre-discount service-fee SUM, single tier (not marginal); the discounted sum is rounded half-up exactly once inside the service-fee line. The fractional tiers (625/1250/1875 bps) make sum-then-round vs round-each diverge."
+
+  - name: account_balance
+    trigger: "Transaction APPROVED->COMPLETED, COMPLETED->CANCELLED (refund), and POST /dmv/accounts/{id}/payments"
+    algorithm: aggregation
+    formula: |
+      # Reconcile the denormalized Account.outstanding_balance_cents.
+      charges = sum(p.amount_cents for p in Payments
+                    where p.account_id == A.id and p.kind == CHARGE)
+      refunds = sum(p.amount_cents for p in Payments
+                    where p.account_id == A.id and p.kind == REFUND)
+      settled = sum(q.total_cents for q in FeeQuotes
+                    where q.status == SETTLED
+                      and q.transaction_id in A's COMPLETED transactions)
+      outstanding_balance_cents = max(0, settled - charges + refunds_offset)
+      # Compensating invariant: for any COMPLETED txn later CANCELLED, a REFUND
+      # Payment of exactly the CHARGE amount is created so the net contribution
+      # of that txn to outstanding_balance_cents returns to 0.
+    input_set: "All SETTLED FeeQuotes for the account's COMPLETED transactions and all CHARGE/REFUND Payments on the account. Order-independent (pure sums)."
+    constants: {}
+    precision: "Integer cents; clamped at floor 0."
+    variants:
+      - name: postpaid
+        when: "Account.credit_terms == true (FLEET)"
+        difference: "Completion adds the SETTLED total to outstanding_balance_cents without a prior CHARGE; a later CHARGE Payment draws it down."
+      - name: prepaid
+        when: "Account.credit_terms == false (RETAIL)"
+        difference: "A CHARGE Payment equal to the SETTLED total must be recorded; outstanding_balance_cents nets to 0 immediately at completion."
+
+# ===========================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for this operation per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "Path-referenced resources exist (validated left-to-right in the path), then body FK references exist"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 4
+    category: business_referential
+    check: "AccountHolder acting on a Transaction must own it: X-User-ID == Transaction.account_id"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "transaction cancel; account payments"
+
+  - priority: 5
+    category: state
+    check: "Target resource is in a state from which this transition is allowed (lifecycle_status / document_status / trip_status / submission_status / packet_status)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 6
+    category: state
+    check: "On COMPLETED->CANCELLED, a CHARGE Payment for the transaction must exist so a compensating REFUND is possible"
+    error_id: ERR_NO_CHARGE_TO_REFUND
+    http_status: 409
+    applies_to: "POST /dmv/transactions/{id}/cancel"
+
+  - priority: 7
+    category: business_safety
+    check: "Segregation of duties: the LienOfficer perfecting a LienPacket must not be the X-User-ID that submitted the owning Transaction"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /dmv/lien-packets/{id}/perfect"
+
+  - priority: 8
+    category: business_referential
+    check: "Document checklist completeness for the transaction_type must be satisfied before submit (every required checklist_code has a VERIFIED DocumentItem, none REJECTED)"
+    error_id: ERR_DOCUMENTS_INCOMPLETE
+    http_status: 409
+    applies_to: "POST /dmv/transactions/{id}/submit"
+
+  - priority: 9
+    category: business_constraint
+    check: "declared_price_cents must be > 0 for TITLE/TRANSFER and == 0 for REGISTRATION/LIEN; vin length == 17; trade_in_allowance_cents <= declared_price_cents"
+    error_id: ERR_INVALID_TRANSACTION_FIELDS
+    http_status: 422
+    applies_to: "POST /dmv/transactions"
+
+  - priority: 10
+    category: business_temporal
+    check: "RunnerTrip window overlap: a new trip's half-open [window_start_at, window_end_at) must not overlap any existing trip to the SAME dmv_office_code whose trip_status in {PLANNED, DISPATCHED, RETURNED}. Adjacency (new.start == existing.end) does NOT overlap."
+    error_id: ERR_TRIP_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /dmv/runner-trips"
+
+  - priority: 11
+    category: business_temporal
+    check: "EXPEDITE SLA window: an EXPEDITE submission may only be attached while clock_now is strictly before sla_deadline_at (open upper bound); attaching at-or-after sla_deadline_at is rejected as an expired window."
+    error_id: ERR_SLA_EXPIRED
+    http_status: 409
+    applies_to: "POST /dmv/runner-trips/{id}/legs"
+
+  - priority: 12
+    category: business_constraint
+    check: "RunnerTrip capacity not exceeded: assigned_leg_count < capacity before attach (the aggregate-capacity occupation of the trip's slot pool)"
+    error_id: ERR_TRIP_AT_CAPACITY
+    http_status: 409
+    applies_to: "POST /dmv/runner-trips/{id}/legs"
+
+  - priority: 13
+    category: business_constraint
+    check: "Rework cap: cannot resubmit when rejection_round >= MAX_REJECTION_ROUNDS"
+    error_id: ERR_REWORK_LIMIT_REACHED
+    http_status: 409
+    applies_to: "POST /dmv/transactions/{id}/submit"
+
+  - priority: 14
+    category: business_constraint
+    check: "A Submission decision may only be recorded when its leg's RunnerTrip.trip_status == RETURNED"
+    error_id: ERR_TRIP_NOT_RETURNED
+    http_status: 409
+    applies_to: "POST /dmv/submissions/{id}/decision"
+
+  - priority: 15
+    category: business_referential
+    check: "Payment.amount_cents must equal the referenced Transaction's SETTLED FeeQuote.total_cents and kind must be valid for the account's terms"
+    error_id: ERR_PAYMENT_AMOUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /dmv/accounts/{id}/payments"
+
+  - priority: 16
+    category: business_fiscal
+    check: "A completion that would push a postpaid (FLEET, credit_terms) account's outstanding_balance_cents over credit_limit_cents is rejected"
+    error_id: ERR_CREDIT_LIMIT_EXCEEDED
+    http_status: 409
+    applies_to: "POST /dmv/transactions/{id}/complete"
+
+  - priority: 17
+    category: business_constraint
+    check: "OCC: expected_<parent>_version on guarded writes must equal the parent's current version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /dmv/runner-trips/{id}/legs; POST /dmv/transactions/{id}/quote"
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+
+  # ---- Config / clock (PlatformAdmin) ----
+  - method: POST
+    path: "/dmv/_clock/set_current_utc"
+    description: "Set the logical clock. Server startup default is 2026-04-01T00:00:00Z; before any call the clock reads exactly this default and never falls back to wall-clock time."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["logical clock advanced"]
+
+  - method: POST
+    path: "/dmv/_fee-periods/advance"
+    description: "Advance the fleet fee period; resets every Account.ytd_completed_count to 0 (tier reset event)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: null
+    side_effects: ["set every Account.ytd_completed_count = 0; bump each Account.version"]
+
+  - method: POST
+    path: "/dmv/_inject/account_counters"
+    description: "Test-driving endpoint: directly set an Account's ytd_completed_count to a target value so a fleet discount tier can be reached without running dozens of full completions. Returns the updated Account."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [account_id, ytd_completed_count]
+    output: Account
+    side_effects: ["set Account.ytd_completed_count; recompute fleet tier eligibility; bump Account.version by 1"]
+
+  - method: POST
+    path: "/dmv/_inject/rejection_round"
+    description: "Test-driving endpoint: directly set a Transaction's rejection_round to a target value so the rework surcharge can be exercised without a real DMV rejection cycle. Returns the updated Transaction."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [transaction_id, rejection_round]
+    output: Transaction
+    side_effects: ["set Transaction.rejection_round; bump Transaction.version by 1"]
+
+  - method: POST
+    path: "/dmv/fee-schedules"
+    description: "Publish a FeeSchedule for a state; supersedes any prior ACTIVE schedule for the same state_code."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [state_code, title_fee_cents, registration_fee_cents, transfer_fee_cents, lien_recording_fee_cents, use_tax_rate_bps, "trade_in_credit_allowed?"]
+    output: FeeSchedule
+    side_effects: ["prior ACTIVE schedule for state_code -> SUPERSEDED"]
+
+  - method: GET
+    path: "/dmv/fee-schedules"
+    description: "List fee schedules; filter by state_code or status."
+    roles: [PlatformAdmin, FeeAnalyst]
+    code: 200
+    input: ["state_code?", "status?", "limit?", "offset?"]
+    output: FeeSchedule[]
+    side_effects: []
+
+  - method: GET
+    path: "/dmv/fee-schedules/{id}"
+    description: "Fetch one fee schedule."
+    roles: [PlatformAdmin, FeeAnalyst]
+    code: 200
+    input: []
+    output: FeeSchedule
+    side_effects: []
+
+  # ---- Accounts ----
+  - method: POST
+    path: "/dmv/accounts"
+    description: "Create a RETAIL or FLEET account."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [account_type, legal_name, state_code, "credit_terms?", "credit_limit_cents?"]
+    output: Account
+    side_effects: ["status = ACTIVE; counters zeroed"]
+
+  - method: GET
+    path: "/dmv/accounts/{id}"
+    description: "Fetch an account including computed balance and counters."
+    roles: [PlatformAdmin, FeeAnalyst, AccountHolder]
+    code: 200
+    input: []
+    output: Account
+    side_effects: []
+
+  - method: POST
+    path: "/dmv/accounts/{id}/reinstate"
+    description: "Reinstate a SUSPENDED account to ACTIVE."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["status = ACTIVE; bump Account.version"]
+
+  - method: POST
+    path: "/dmv/accounts/{id}/payments"
+    description: "Record a CHARGE or REFUND Payment against the account; reconciles outstanding_balance_cents."
+    roles: [PlatformAdmin, AccountHolder]
+    code: 201
+    input: [transaction_id, amount_cents, kind]
+    output: Payment
+    side_effects: ["recompute Account.outstanding_balance_cents via account_balance; bump Account.version; may clear SUSPENDED"]
+
+  - method: GET
+    path: "/dmv/payments"
+    description: "List payments; filter by account_id or transaction_id."
+    roles: [PlatformAdmin, FeeAnalyst, AccountHolder]
+    code: 200
+    input: ["account_id?", "transaction_id?", "limit?", "offset?"]
+    output: Payment[]
+    side_effects: []
+
+  - method: GET
+    path: "/dmv/payments/{id}"
+    description: "Fetch one Payment (also the single-resource read anchoring the payments collection)."
+    roles: [PlatformAdmin, FeeAnalyst, AccountHolder]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+
+  - method: GET
+    path: "/dmv/transactions"
+    description: "List transactions; filter by account_id, lifecycle_status, document_status."
+    roles: [PlatformAdmin, FeeAnalyst, IntakeClerk, AccountHolder]
+    code: 200
+    input: ["account_id?", "lifecycle_status?", "document_status?", "limit?", "offset?"]
+    output: Transaction[]
+    side_effects: []
+
+  # ---- Transactions ----
+  - method: POST
+    path: "/dmv/transactions"
+    description: "Open a Transaction (TITLE/REGISTRATION/TRANSFER/LIEN) in DRAFT/COLLECTING."
+    roles: [IntakeClerk]
+    code: 201
+    input: [account_id, transaction_type, vin, "declared_price_cents?", "trade_in_allowance_cents?", "expedite?"]
+    output: Transaction
+    side_effects: ["lifecycle_status = DRAFT; document_status = COLLECTING"]
+
+  - method: GET
+    path: "/dmv/transactions/{id}"
+    description: "Fetch a transaction with both status dimensions and counters."
+    roles: [PlatformAdmin, FeeAnalyst, IntakeClerk, AccountHolder, RunnerDispatcher, LienOfficer]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects: []
+
+  - method: POST
+    path: "/dmv/transactions/{id}/quote"
+    description: "Compute/refresh the ESTIMATE FeeQuote; supersedes the prior ACTIVE quote. OCC-guarded on the transaction."
+    roles: [FeeAnalyst]
+    code: 200
+    input: [expected_transaction_version]
+    output: FeeQuote
+    side_effects: ["fee_quote_estimate; supersede prior ACTIVE FeeQuote; set active_quote_id; increment Transaction.version by 1"]
+
+  - method: POST
+    path: "/dmv/transactions/{id}/verify-documents"
+    description: "Evaluate the document checklist for the transaction_type; sets document_status VERIFIED or INCOMPLETE."
+    roles: [IntakeClerk]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects: ["set document_status; increment Transaction.version by 1"]
+
+  - method: POST
+    path: "/dmv/transactions/{id}/submit"
+    description: "Submit (or rework-resubmit) the transaction to the DMV; creates a QUEUED Submission."
+    roles: [IntakeClerk]
+    code: 201
+    input: []
+    output: Submission
+    side_effects: ["create Submission; supersede prior Submission on rework; stamp submitting user; increment Transaction.version by 1"]
+
+  - method: POST
+    path: "/dmv/transactions/{id}/complete"
+    description: "Complete an APPROVED transaction; settles the FINAL FeeQuote and reconciles the account."
+    roles: [FeeAnalyst]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects: ["fee_quote_final settled; increment ytd_completed_count; recompute outstanding_balance_cents; may SUSPEND account; increment Transaction.version by 1"]
+
+  - method: POST
+    path: "/dmv/transactions/{id}/cancel"
+    description: "Cancel a transaction; from DRAFT/QUOTED/REJECTED voids quotes, from COMPLETED issues a compensating REFUND."
+    roles: [AccountHolder]
+    code: 200
+    input: []
+    output: Transaction
+    side_effects: ["supersede/void quotes & lien packet; on post-completion create REFUND Payment + decrement ytd_completed_count + recompute balance; increment Transaction.version by 1"]
+
+  - method: GET
+    path: "/dmv/transactions/{id}/fee-quotes"
+    description: "List all FeeQuotes for a transaction (ESTIMATE/FINAL history)."
+    roles: [PlatformAdmin, FeeAnalyst, AccountHolder]
+    code: 200
+    input: []
+    output: FeeQuote[]
+    side_effects: []
+
+  - method: GET
+    path: "/dmv/transactions/{id}/documents"
+    description: "List DocumentItems for a transaction."
+    roles: [PlatformAdmin, FeeAnalyst, IntakeClerk, AccountHolder]
+    code: 200
+    input: []
+    output: DocumentItem[]
+    side_effects: []
+
+  - method: GET
+    path: "/dmv/transactions/{id}/submissions"
+    description: "List Submissions for a transaction (current + superseded rework history)."
+    roles: [PlatformAdmin, FeeAnalyst, IntakeClerk, RunnerDispatcher]
+    code: 200
+    input: []
+    output: Submission[]
+    side_effects: []
+
+  - method: GET
+    path: "/dmv/transactions/{id}/lien-packets"
+    description: "List LienPackets for a transaction."
+    roles: [PlatformAdmin, FeeAnalyst, LienOfficer, AccountHolder]
+    code: 200
+    input: []
+    output: LienPacket[]
+    side_effects: []
+
+  # ---- Documents ----
+  - method: POST
+    path: "/dmv/documents"
+    description: "Upload a DocumentItem for a transaction; doc_status = PENDING."
+    roles: [IntakeClerk]
+    code: 201
+    input: [transaction_id, checklist_code, file_ref]
+    output: DocumentItem
+    side_effects: ["create DocumentItem PENDING"]
+
+  - method: GET
+    path: "/dmv/documents/{id}"
+    description: "Fetch a document item."
+    roles: [PlatformAdmin, FeeAnalyst, IntakeClerk, AccountHolder]
+    code: 200
+    input: []
+    output: DocumentItem
+    side_effects: []
+
+  - method: POST
+    path: "/dmv/documents/{id}/verify"
+    description: "Clerk decision on a document: VERIFIED, REJECTED, or RESET."
+    roles: [IntakeClerk]
+    code: 200
+    input: [decision]
+    output: DocumentItem
+    side_effects: ["set doc_status; increment DocumentItem.version by 1"]
+
+  # ---- Fee quotes ----
+  - method: GET
+    path: "/dmv/fee-quotes"
+    description: "List fee quotes; filter by transaction_id or status."
+    roles: [PlatformAdmin, FeeAnalyst, AccountHolder]
+    code: 200
+    input: ["transaction_id?", "status?", "limit?", "offset?"]
+    output: FeeQuote[]
+    side_effects: []
+
+  - method: GET
+    path: "/dmv/fee-quotes/{id}"
+    description: "Fetch one fee quote with its component breakdown."
+    roles: [PlatformAdmin, FeeAnalyst, AccountHolder]
+    code: 200
+    input: []
+    output: FeeQuote
+    side_effects: []
+
+  # ---- Submissions & runner trips ----
+  - method: GET
+    path: "/dmv/submissions"
+    description: "List submissions; filter by transaction_id, submission_status, priority_class."
+    roles: [PlatformAdmin, RunnerDispatcher, IntakeClerk]
+    code: 200
+    input: ["transaction_id?", "submission_status?", "priority_class?", "leg_id?", "limit?", "offset?"]
+    output: Submission[]
+    side_effects: []
+
+  - method: GET
+    path: "/dmv/submissions/{id}"
+    description: "Fetch a submission."
+    roles: [PlatformAdmin, RunnerDispatcher, IntakeClerk, FeeAnalyst]
+    code: 200
+    input: []
+    output: Submission
+    side_effects: []
+
+  - method: POST
+    path: "/dmv/submissions/{id}/decision"
+    description: "Record the DMV decision for an ASSIGNED submission whose trip has RETURNED; reflects onto the Transaction."
+    roles: [RunnerDispatcher]
+    code: 200
+    input: [outcome, "rejection_reason?"]
+    output: Submission
+    side_effects: ["set submission_status; resolve leg; reflect Transaction APPROVED/REJECTED; on reject bump rejection_round + set document_status INCOMPLETE; auto-cancel at MAX rounds"]
+
+  - method: POST
+    path: "/dmv/runner-trips"
+    description: "Create a RunnerTrip for a DMV office over a half-open [window_start_at, window_end_at) window; trip_status = PLANNED. Rejected if it overlaps an existing non-terminal trip to the same dmv_office_code."
+    roles: [RunnerDispatcher]
+    code: 201
+    input: [dmv_office_code, capacity, window_start_at, window_end_at]
+    output: RunnerTrip
+    side_effects: ["assigned_leg_count = 0"]
+
+  - method: GET
+    path: "/dmv/runner-trips/{id}"
+    description: "Fetch a runner trip with leg count."
+    roles: [PlatformAdmin, RunnerDispatcher]
+    code: 200
+    input: []
+    output: RunnerTrip
+    side_effects: []
+
+  - method: POST
+    path: "/dmv/runner-trips/{id}/legs"
+    description: "Attach a QUEUED submission to a PLANNED trip as a RunnerLeg. OCC-guarded on the trip; capacity- and SLA-checked."
+    roles: [RunnerDispatcher]
+    code: 201
+    input: [submission_id, expected_runnertrip_version]
+    output: RunnerLeg
+    side_effects: ["create RunnerLeg ATTACHED; submission ASSIGNED; assign sequence_index by priority then created_at ASC; increment RunnerTrip.assigned_leg_count by 1; increment RunnerTrip.version by 1"]
+
+  - method: GET
+    path: "/dmv/runner-trips/{id}/legs"
+    description: "List the legs attached to a trip, ordered by sequence_index."
+    roles: [PlatformAdmin, RunnerDispatcher]
+    code: 200
+    input: []
+    output: RunnerLeg[]
+    side_effects: []
+
+  - method: POST
+    path: "/dmv/runner-trips/{id}/dispatch"
+    description: "Dispatch a PLANNED trip; fans out FILED to every attached leg."
+    roles: [RunnerDispatcher]
+    code: 200
+    input: []
+    output: RunnerTrip
+    side_effects: ["each leg -> FILED; trip -> DISPATCHED; increment RunnerTrip.version by 1"]
+
+  - method: POST
+    path: "/dmv/runner-trips/{id}/return"
+    description: "Mark a DISPATCHED trip RETURNED so per-leg DMV decisions can be recorded."
+    roles: [RunnerDispatcher]
+    code: 200
+    input: []
+    output: RunnerTrip
+    side_effects: ["trip -> RETURNED; increment RunnerTrip.version by 1"]
+
+  - method: POST
+    path: "/dmv/runner-trips/{id}/close"
+    description: "Close a RETURNED trip once all legs are RESOLVED (join)."
+    roles: [RunnerDispatcher]
+    code: 200
+    input: []
+    output: RunnerTrip
+    side_effects: ["trip -> CLOSED; increment RunnerTrip.version by 1"]
+
+  - method: GET
+    path: "/dmv/runner-legs"
+    description: "List runner legs; filter by trip_id or submission_id."
+    roles: [PlatformAdmin, RunnerDispatcher]
+    code: 200
+    input: ["trip_id?", "submission_id?", "leg_status?", "limit?", "offset?"]
+    output: RunnerLeg[]
+    side_effects: []
+
+  - method: GET
+    path: "/dmv/runner-legs/{id}"
+    description: "Fetch one RunnerLeg (also the single-resource read anchoring the runner-legs collection)."
+    roles: [PlatformAdmin, RunnerDispatcher]
+    code: 200
+    input: []
+    output: RunnerLeg
+    side_effects: []
+
+  # ---- Lien packets ----
+  - method: POST
+    path: "/dmv/lien-packets"
+    description: "Create a DRAFT lender packet for a LIEN or TITLE transaction."
+    roles: [LienOfficer, IntakeClerk]
+    code: 201
+    input: [transaction_id, lender_name, lien_amount_cents]
+    output: LienPacket
+    side_effects: ["packet_status = DRAFT"]
+
+  - method: GET
+    path: "/dmv/lien-packets/{id}"
+    description: "Fetch a lien packet."
+    roles: [PlatformAdmin, LienOfficer, FeeAnalyst, AccountHolder]
+    code: 200
+    input: []
+    output: LienPacket
+    side_effects: []
+
+  - method: POST
+    path: "/dmv/lien-packets/{id}/perfect"
+    description: "Perfect a DRAFT lien packet after DMV acceptance; segregation of duties enforced against the submitting user."
+    roles: [LienOfficer]
+    code: 200
+    input: []
+    output: LienPacket
+    side_effects: ["packet_status = PERFECTED; set perfected_by_user_id = X-User-ID; increment LienPacket.version by 1"]
+
+  - method: GET
+    path: "/dmv/lien-packets"
+    description: "List lien packets; filter by transaction_id or packet_status."
+    roles: [PlatformAdmin, LienOfficer, FeeAnalyst, AccountHolder]
+    code: 200
+    input: ["transaction_id?", "packet_status?", "limit?", "offset?"]
+    output: LienPacket[]
+    side_effects: []
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID header."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Acting role not permitted for this endpoint per §1.7."
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "AccountHolder X-User-ID does not match the Transaction.account_id / target account."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "LienOfficer perfecting a packet is the same user who submitted the transaction."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A path-referenced or body-referenced resource does not exist."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition not allowed from the resource's current state (lifecycle/document/trip/submission/packet)."
+  - id: ERR_NO_CHARGE_TO_REFUND
+    http: 409
+    condition: "Post-completion cancel attempted but no CHARGE Payment exists to compensate."
+  - id: ERR_DOCUMENTS_INCOMPLETE
+    http: 409
+    condition: "Submit attempted while the required checklist is not fully VERIFIED (or a doc is REJECTED)."
+  - id: ERR_TRIP_WINDOW_OVERLAP
+    http: 409
+    condition: "A new RunnerTrip's half-open window overlaps a non-terminal trip to the same dmv_office_code."
+  - id: ERR_SLA_EXPIRED
+    http: 409
+    condition: "Attaching an EXPEDITE submission at-or-after its sla_deadline_at (expired SLA window)."
+  - id: ERR_TRIP_AT_CAPACITY
+    http: 409
+    condition: "Leg attach would exceed RunnerTrip.capacity."
+  - id: ERR_REWORK_LIMIT_REACHED
+    http: 409
+    condition: "Resubmit attempted at rejection_round >= MAX_REJECTION_ROUNDS."
+  - id: ERR_TRIP_NOT_RETURNED
+    http: 409
+    condition: "Submission decision recorded before the leg's trip is RETURNED."
+  - id: ERR_CREDIT_LIMIT_EXCEEDED
+    http: 409
+    condition: "Completion would push a postpaid account's outstanding_balance over credit_limit_cents."
+  - id: ERR_INVALID_TRANSACTION_FIELDS
+    http: 422
+    condition: "VIN length != 17, or declared_price_cents inconsistent with transaction_type, or trade_in_allowance_cents > declared_price_cents."
+  - id: ERR_PAYMENT_AMOUNT_MISMATCH
+    http: 422
+    condition: "Payment.amount_cents != referenced transaction's SETTLED FeeQuote.total_cents, or kind invalid for account terms."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_<parent>_version does not match the parent's current version (OCC)."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Malformed body, missing required field, bad enum value, or pagination param out of range."
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "Field present but fails a typed constraint not covered by a more specific 4xx (e.g., negative amount_cents, capacity < 1, lien_amount_cents < 1)."
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Operational superset: configures fee schedules, accounts, the logical clock and fee periods; can read everything."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /dmv/_clock/set_current_utc"
+      - "POST /dmv/_fee-periods/advance"
+      - "POST /dmv/fee-schedules"
+      - "POST /dmv/accounts"
+      - "POST /dmv/accounts/{id}/reinstate"
+    shared_operations:
+      - "POST /dmv/accounts/{id}/payments"
+      - "all GET reads"
+
+  - name: IntakeClerk
+    description: "Owns intake: opens transactions, uploads & verifies documents, submits/rework-resubmits."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /dmv/transactions"
+      - "POST /dmv/transactions/{id}/verify-documents"
+      - "POST /dmv/transactions/{id}/submit"
+      - "POST /dmv/documents"
+      - "POST /dmv/documents/{id}/verify"
+    shared_operations:
+      - "POST /dmv/lien-packets"
+      - "GET reads on transactions/documents/submissions"
+
+  - name: FeeAnalyst
+    description: "Owns pricing: computes ESTIMATE quotes and completes transactions (settles FINAL quote)."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /dmv/transactions/{id}/quote"
+      - "POST /dmv/transactions/{id}/complete"
+    shared_operations:
+      - "GET reads on fee schedules/quotes/accounts/transactions"
+
+  - name: RunnerDispatcher
+    description: "Owns the DMV-runner queue: builds trips, attaches legs, dispatches, returns, closes, records DMV decisions."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /dmv/runner-trips"
+      - "POST /dmv/runner-trips/{id}/legs"
+      - "POST /dmv/runner-trips/{id}/dispatch"
+      - "POST /dmv/runner-trips/{id}/return"
+      - "POST /dmv/runner-trips/{id}/close"
+      - "POST /dmv/submissions/{id}/decision"
+    shared_operations:
+      - "GET reads on submissions/runner-trips/runner-legs"
+
+  - name: LienOfficer
+    description: "Owns lien perfection; separate from the submitting clerk (segregation of duties)."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /dmv/lien-packets/{id}/perfect"
+    shared_operations:
+      - "POST /dmv/lien-packets"
+      - "GET reads on lien-packets/transactions"
+
+  - name: AccountHolder
+    description: "The customer; owns their account and transactions; can cancel transactions and record payments on their own account."
+    identity: "entity_backed:Account"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /dmv/transactions/{id}/cancel"
+      - "POST /dmv/accounts/{id}/payments"
+      - "GET reads on own account/transactions/quotes/payments"
