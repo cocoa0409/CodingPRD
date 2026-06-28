@@ -1,0 +1,33 @@
+"""Calculation constants (scaffold §1.3)."""
+
+# Pricing / duration
+MULTI_SYSTEM_THRESHOLD = 2
+
+# Duration estimate (work_order_duration)
+SETUP_MINUTES = 20
+DUCT_MINUTES_PER_LINE = 35
+SANITIZE_MINUTES_PER_LINE = 15
+DRYER_MINUTES_PER_LINE = 25
+ADDON_MINUTES_EACH = 10
+LARGE_HOME_SQFT = 3000
+BIG_HOME_FACTOR = 1.25
+
+# Contamination risk score
+SEVERITY_WEIGHT = 8
+DENSITY_WEIGHT = 2
+RISK_CEILING = 100
+REFERRAL_RISK_THRESHOLD = 40
+
+# Route slot overlap
+BUFFER_MINUTES = 15
+
+# Completion
+MIN_AFTER_PHOTOS = 1
+
+# Referral TTL
+REFERRAL_TTL_DAYS = 30
+
+# Enum sets
+SERVICE_TYPES = {"DUCT", "DRYER_VENT", "SANITIZE"}
+ADDON_CODES = {"SANITIZER", "UV", "COIL"}
+CADENCE_MONTHS = {6, 12, 24}

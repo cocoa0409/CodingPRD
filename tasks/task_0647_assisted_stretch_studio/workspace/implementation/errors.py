@@ -1,0 +1,35 @@
+"""Error catalog (scaffold §1.6 / PRD §5). Exact error_id strings and HTTP codes."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Error IDs -> HTTP status (verbatim from scaffold §1.6 / PRD §5).
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_FORBIDDEN = ("ERR_FORBIDDEN", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_VALIDATION = ("ERR_VALIDATION", 400)
+ERR_LOCATION_MISMATCH = ("ERR_LOCATION_MISMATCH", 422)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_STALE_MEMBERSHIP_VERSION = ("ERR_STALE_MEMBERSHIP_VERSION", 412)
+ERR_MEMBER_SUSPENDED = ("ERR_MEMBER_SUSPENDED", 409)
+ERR_INTRO_REQUIRED = ("ERR_INTRO_REQUIRED", 409)
+ERR_OUTSIDE_BUSINESS_HOURS = ("ERR_OUTSIDE_BUSINESS_HOURS", 422)
+ERR_TABLE_UNAVAILABLE = ("ERR_TABLE_UNAVAILABLE", 409)
+ERR_FLEXOLOGIST_UNAVAILABLE = ("ERR_FLEXOLOGIST_UNAVAILABLE", 409)
+ERR_FLEXOLOGIST_NOT_CERTIFIED = ("ERR_FLEXOLOGIST_NOT_CERTIFIED", 422)
+ERR_INSUFFICIENT_CREDITS = ("ERR_INSUFFICIENT_CREDITS", 409)
+ERR_MEMBERSHIP_NOT_ALLOWED = ("ERR_MEMBERSHIP_NOT_ALLOWED", 409)
+ERR_ADDON_NOT_ALLOWED = ("ERR_ADDON_NOT_ALLOWED", 409)
+ERR_LOCATION_CLOSED = ("ERR_LOCATION_CLOSED", 409)
+ERR_SERIES_OCCURRENCE_LIMIT = ("ERR_SERIES_OCCURRENCE_LIMIT", 422)
+
+
+def err(spec, message=None):
+    """Build an ApiError from one of the (id, status) tuples above."""
+    return ApiError(spec[0], spec[1], message)

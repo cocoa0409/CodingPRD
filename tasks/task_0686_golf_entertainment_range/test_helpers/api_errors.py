@@ -1,0 +1,53 @@
+"""Error IDs and HTTP status mapping (PRD §5).
+
+After defining the mapping it is registered with the framework so that
+validate_error() can cross-check HTTP status codes automatically.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN_ROLE = "ERR_FORBIDDEN_ROLE"
+    ERR_NOT_RESOURCE_OWNER = "ERR_NOT_RESOURCE_OWNER"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_BAY_WINDOW_CONFLICT = "ERR_BAY_WINDOW_CONFLICT"
+    ERR_BAY_UNAVAILABLE = "ERR_BAY_UNAVAILABLE"
+    ERR_NO_BAY_AVAILABLE = "ERR_NO_BAY_AVAILABLE"
+    ERR_NOT_QUEUE_HEAD = "ERR_NOT_QUEUE_HEAD"
+    ERR_CARD_DEPLETED = "ERR_CARD_DEPLETED"
+    ERR_INSUFFICIENT_FUNDS = "ERR_INSUFFICIENT_FUNDS"
+    ERR_HOLD_EXPIRED = "ERR_HOLD_EXPIRED"
+    ERR_FBTAB_NOT_CLOSED = "ERR_FBTAB_NOT_CLOSED"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    ERR_VALIDATION_RANGE = "ERR_VALIDATION_RANGE"
+    ERR_DUPLICATE_EMAIL = "ERR_DUPLICATE_EMAIL"
+    ERR_PAGINATION_INVALID = "ERR_PAGINATION_INVALID"
+
+
+HTTP_STATUS_CODES: dict[str, int] = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN_ROLE: 403,
+    ApiErrorId.ERR_NOT_RESOURCE_OWNER: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_REQUEST: 400,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_BAY_WINDOW_CONFLICT: 409,
+    ApiErrorId.ERR_BAY_UNAVAILABLE: 409,
+    ApiErrorId.ERR_NO_BAY_AVAILABLE: 409,
+    ApiErrorId.ERR_NOT_QUEUE_HEAD: 409,
+    ApiErrorId.ERR_CARD_DEPLETED: 409,
+    ApiErrorId.ERR_INSUFFICIENT_FUNDS: 402,
+    ApiErrorId.ERR_HOLD_EXPIRED: 409,
+    ApiErrorId.ERR_FBTAB_NOT_CLOSED: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_VALIDATION_RANGE: 422,
+    ApiErrorId.ERR_DUPLICATE_EMAIL: 409,
+    ApiErrorId.ERR_PAGINATION_INVALID: 400,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(HTTP_STATUS_CODES)

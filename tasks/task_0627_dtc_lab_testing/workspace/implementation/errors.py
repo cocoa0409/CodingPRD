@@ -1,0 +1,55 @@
+"""Error classes and the complete error catalog (PRD §5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# HTTP status per error id (PRD §5 / SCAFFOLD §1.6)
+ERROR_STATUS = {
+    "ERR_MISSING_USER_CONTEXT": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 422,
+    "ERR_DUPLICATE_CODE": 409,
+    "ERR_INVALID_BUNDLE_MEMBERS": 422,
+    "ERR_OFFERING_NOT_ADDABLE": 409,
+    "ERR_EMPTY_CART": 409,
+    "ERR_STALE_CART_VERSION": 412,
+    "ERR_STALE_ORDER_VERSION": 412,
+    "ERR_ORDER_LINE_NOT_COLLECTIBLE": 409,
+    "ERR_ORDER_NOT_COLLECTABLE_STATE": 409,
+    "ERR_PHYSICIAN_ORDER_REQUIRED": 409,
+    "ERR_PHYSICIAN_ORDER_NOT_REVIEWABLE": 409,
+    "ERR_PHYSICIAN_ORDER_NOT_RESUBMITTABLE": 409,
+    "ERR_PWN_STATE_UNLICENSED": 409,
+    "ERR_PWN_AGE_INELIGIBLE": 409,
+    "ERR_APPOINTMENT_NOT_CHECKED_IN": 409,
+    "ERR_INVALID_SLOT_WINDOW": 422,
+    "ERR_SLOT_OVERLAP": 409,
+    "ERR_ANALYZER_RUN_OVERLAP": 409,
+    "ERR_ANALYZER_RUN_NOT_RELEASABLE": 409,
+    "ERR_FASTING_NOT_CONFIRMED": 409,
+    "ERR_HOME_KIT_STATE_BANNED": 409,
+    "ERR_SPECIMEN_NOT_REJECTABLE": 409,
+    "ERR_RESULT_NOT_RELEASABLE": 409,
+    "ERR_CRITICAL_CALLBACK_REQUIRED": 409,
+    "ERR_SOD_COLLECTOR_CANNOT_RELEASE": 403,
+    "ERR_RESULT_NOT_AMENDABLE": 409,
+    "ERR_CONSENT_REQUIRED": 403,
+    "ERR_ORDER_HAS_RESULTED_LINES": 409,
+    "ERR_ORDER_NOT_COMPLETE_FOR_CAPTURE": 409,
+    "ERR_PAYMENT_NOT_CAPTURABLE": 409,
+    "ERR_PAYMENT_NOT_REFUNDABLE": 409,
+    "ERR_INSUFFICIENT_HSA_FUNDS": 402,
+    "ERR_RESULT_NOT_PROCESSABLE": 409,
+}
+
+
+def err(error_id, message=None):
+    return ApiError(error_id, ERROR_STATUS.get(error_id, 400), message)

@@ -1,0 +1,31 @@
+"""Domain thresholds — numeric constants from the PRD pricing and clinical rules."""
+
+# Pricing (PRD Section 3.3 / 3.6)
+REPEAT_DISCOUNT_RATE = 0.15
+PLATFORM_TIER1_CENTS = 20000   # subtotal >= $200 -> 10%
+PLATFORM_TIER1_RATE = 0.10
+PLATFORM_TIER2_CENTS = 50000   # subtotal >= $500 -> 15%
+PLATFORM_TIER2_RATE = 0.15
+
+# Clinical delta-check (PRD Section 3.8)
+DELTA_CHECK_ABS = 50
+
+# PWN / fulfillment geography (PRD Section 3.5)
+PWN_LICENSED_STATES = ["CA", "TX", "FL"]
+PWN_MIN_AGE_YEARS = 18
+HOME_KIT_BANNED_STATES = ["NY", "NJ", "RI"]
+
+# Repeat-discount lookback (PRD Section 3.2)
+REPEAT_LOOKBACK_DAYS = 365
+
+# Logical clock default (PRD Section 2.4)
+CLOCK_DEFAULT = "2026-01-01T00:00:00Z"
+
+THRESHOLDS = {
+    "REPEAT_DISCOUNT_RATE": REPEAT_DISCOUNT_RATE,
+    "PLATFORM_TIER1_CENTS": PLATFORM_TIER1_CENTS,
+    "PLATFORM_TIER1_RATE": PLATFORM_TIER1_RATE,
+    "PLATFORM_TIER2_CENTS": PLATFORM_TIER2_CENTS,
+    "PLATFORM_TIER2_RATE": PLATFORM_TIER2_RATE,
+    "DELTA_CHECK_ABS": DELTA_CHECK_ABS,
+}

@@ -1,0 +1,43 @@
+"""Domain thresholds — numeric constants from PRD calculations (§2, §3)."""
+
+# --- Quote pricing (§3.4) ---
+SYSTEM_RATE = {"FLAKE_STANDARD": 350, "FLAKE_PREMIUM": 500, "METALLIC": 800}
+PREP_RATE = {"LIGHT": 150, "MODERATE": 275, "HEAVY": 450}
+CRACK_INCLUDED_FT = {"LIGHT": 0, "MODERATE": 10, "HEAVY": 25}
+CRACK_RATE_PER_FT = 900
+MIN_BILLABLE_SQFT = 250
+METALLIC_MULT = 1.20
+SEASON_MULT = {"PEAK": 1.15, "STANDARD": 1.00, "OFF": 0.90}
+MOBILIZATION_CENTS = 25000
+VOLUME_TIER_1_MIN = 300000   # >= 300000 -> 5% (500 bps)
+VOLUME_TIER_2_MIN = 600000   # >= 600000 -> 10% (1000 bps)
+
+# --- Condition score / prep tier (§3.3) ---
+W_OIL = 0.30
+W_CRACK = 0.40
+W_SPALL = 0.20
+W_MOIST = 0.10
+CRACK_DENSITY_CAP = 50
+TIER_HEAVY_MIN = 70
+TIER_MODERATE_MIN = 35
+
+# --- Warranty proration (§3.7) ---
+DEFAULT_TERM_MONTHS = 180
+PEEL_FACTOR = 1.00
+HOT_TIRE_FACTOR = 0.50
+
+# --- Cure window (§3.6) ---
+INSTALL_DURATION_HOURS = 8
+FOOT_TRAFFIC_HOURS = 24
+VEHICLE_TRAFFIC_HOURS = 72
+METALLIC_EXTRA_CURE_HOURS = 24
+
+# --- Referral credit ledger (§3.2, §3.8) ---
+REFERRAL_CREDIT_CENTS = 15000
+
+# --- Pagination defaults (§2.3) ---
+DEFAULT_LIMIT = 10
+MAX_LIMIT = 100
+
+# --- Logical-clock default (§2.5) ---
+CLOCK_STARTUP_DEFAULT = "2026-04-01T00:00:00Z"

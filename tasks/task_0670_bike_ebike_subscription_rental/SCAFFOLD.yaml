@@ -1,0 +1,1557 @@
+scenario: |
+  670. Bike & E-Bike Subscription / Long-Term Rental: fleet & model availability,
+  monthly subscription vs daily, delivery & swap, maintenance included & service ticket,
+  theft/damage coverage & deposit, buyout option, fleet (delivery-rider) account,
+  return/inspection
+domain_name: bike-ebike-subscription-rental
+api_prefix: ""
+
+# =============================================================================
+# Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: quota_allocation          # finite per-model bike fleet reserved/committed/released
+  secondary_archetype: pricing_engine          # monthly subscription vs daily, prorate, tiered, buyout decay
+  complexity_layers:
+    - rate_threshold_triggers                  # weekly/monthly tier breakpoints, equity cap, fleet volume discount
+    - cascading_side_effects                   # return -> inspection -> claim -> deposit settle -> bike release
+    - dual_variant_calculation                 # buyout (subscription equity vs daily flat); cost (monthly vs daily)
+    - optimistic_concurrency                   # reserve bike against stale BikeModel version
+    - derived_field_reconciliation             # BikeModel.available_count, Account.active_rental_count
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys; no nested ownership URL chain. Bike -> BikeModel,
+  # RentalAgreement -> {Account, Bike}, Delivery/ServiceTicket/InspectionReport/CoverageClaim/
+  # BuyoutOffer -> RentalAgreement, FleetInvoice -> Account.
+
+  state_machine_shape: parallel
+  # RentalAgreement carries two independent dimensions (lifecycle_status x billing_status);
+  # ServiceTicket is branching with revert; Bike is branching; CoverageClaim is branching fork-join.
+
+  relationship_patterns:
+    - one_to_many        # BikeModel 1:N Bike; Account 1:N RentalAgreement; RentalAgreement 1:N ServiceTicket
+    - flat_with_references
+    - cross_aggregate    # RentalAgreement references both Account and Bike (different aggregates)
+
+  role_model: peer_roles
+  # Subscriber owns its own RentalAgreements; FleetManager owns a fleet Account and its bikes;
+  # FieldTech services bikes and files inspections; OpsAdmin (opaque) runs fleet/clock/payment admin.
+
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — EMIT VERBATIM)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: BikeModel
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Marketing name of the model, e.g. 'City Cruiser 3'."
+      - name: model_class
+        type: enum
+        source: input
+        description: "Pricing/availability class."
+        constraints: "one of {STANDARD, EBIKE, CARGO_EBIKE}"
+      - name: monthly_fee_cents
+        type: integer
+        source: input
+        description: "Base monthly subscription fee in cents (before class surcharge), per 30-day cycle."
+        constraints: ">= 0"
+      - name: daily_rate_cents
+        type: integer
+        source: input
+        description: "Base full daily rate in cents (before class surcharge and tiered discount)."
+        constraints: ">= 0"
+      - name: purchase_price_cents
+        type: integer
+        source: input
+        description: "Base buyout/purchase price in cents used by BuyoutOffer."
+        constraints: ">= 0"
+      - name: deposit_cents
+        type: integer
+        source: input
+        description: "Refundable deposit amount held at rental start for this model."
+        constraints: ">= 0"
+      - name: fleet_size
+        type: integer
+        source: input
+        description: "Declared total intended fleet size for this model (informational cap target)."
+        constraints: ">= 0"
+      - name: total_bikes
+        type: integer
+        source: computed
+        description: "Count of Bike rows whose model_id == this.id, regardless of bike status."
+      - name: available_count
+        type: integer
+        source: computed
+        description: "Count of Bike rows for this model with bike_status == AVAILABLE. Reconciled on every reserve/release/retire."
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle state."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, RETIRED}"
+
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_type
+        type: enum
+        source: input
+        description: "SUBSCRIBER for an individual; FLEET for a delivery-rider business with many bikes."
+        constraints: "one of {SUBSCRIBER, FLEET}"
+      - name: display_name
+        type: string
+        source: input
+        description: "Account holder or business name."
+      - name: email
+        type: string
+        source: input
+        description: "Contact email; unique across all accounts."
+        constraints: "globally unique, case-insensitive"
+      - name: rental_cap
+        type: integer
+        source: input
+        description: "Maximum number of concurrently ACTIVE rentals this account may hold."
+        default: 1
+        constraints: ">= 1; SUBSCRIBER typically 1, FLEET larger"
+      - name: wallet_credit_cents
+        type: integer
+        source: system
+        description: "Refundable credit balance in cents (deposit refunds, overpayments land here)."
+        default: 0
+        constraints: ">= 0"
+      - name: outstanding_balance_cents
+        type: integer
+        source: computed
+        description: "Sum of FleetInvoice.amount_due_cents for invoices in status ISSUED for this account, plus uncovered settlement overflow billed but unpaid."
+      - name: active_rental_count
+        type: integer
+        source: computed
+        description: "Count of RentalAgreement rows for this account whose lifecycle_status IN {RESERVED, DELIVERED, ACTIVE, IN_SERVICE}. Reconciled on every lifecycle transition."
+      - name: status
+        type: enum
+        source: system
+        description: "Account standing."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED}; SUSPENDED blocks new reservations"
+
+  - name: RentalAgreement
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account that holds this rental."
+      - name: bike_id
+        type: string
+        source: system
+        description: "FK -> Bike.id; the specific bike reserved for this agreement (server-selected from the model pool)."
+      - name: model_id
+        type: string
+        source: input
+        description: "FK -> BikeModel.id; the requested model whose pool a bike is drawn from."
+      - name: rental_mode
+        type: enum
+        source: input
+        description: "MONTHLY subscription (billed per 30-day cycle) or DAILY rental (billed per day on return)."
+        constraints: "one of {MONTHLY, DAILY}"
+      - name: lifecycle_status
+        type: enum
+        source: system
+        description: "Fulfillment dimension (parallel to billing_status)."
+        default: RESERVED
+        constraints: "one of {RESERVED, DELIVERED, ACTIVE, IN_SERVICE, RETURN_REQUESTED, RETURNED, BOUGHT_OUT, CANCELLED}"
+      - name: billing_status
+        type: enum
+        source: system
+        description: "Billing dimension (parallel to lifecycle_status), evolves independently."
+        default: DEPOSIT_HELD
+        constraints: "one of {DEPOSIT_HELD, BILLING_ACTIVE, SETTLED, WRITTEN_OFF}"
+      - name: reserved_at_clock
+        type: datetime
+        source: system
+        description: "Logical-clock instant the reservation was created (cycle/day anchor)."
+      - name: activated_at_clock
+        type: datetime
+        source: system
+        description: "Logical-clock instant the rental was activated (start of daily billing window / first cycle)."
+      - name: return_due_clock
+        type: datetime
+        source: input
+        description: "Scheduled return-due instant; late fees accrue past this for DAILY mode."
+      - name: returned_at_clock
+        type: datetime
+        source: system
+        description: "Logical-clock instant the return was completed (set on RETURNED)."
+      - name: deposit_cents
+        type: integer
+        source: system
+        description: "Deposit amount held for this agreement, snapshotted from BikeModel.deposit_cents at reservation."
+        constraints: ">= 0"
+      - name: completed_cycles
+        type: integer
+        source: system
+        description: "Number of fully completed 30-day billing cycles (MONTHLY mode); drives buyout equity."
+        default: 0
+        constraints: ">= 0"
+      - name: accrued_charge_cents
+        type: integer
+        source: computed
+        description: "Running rental cost accrued to date per §1.3 cost_of_rental for the mode."
+      - name: expected_model_version
+        type: integer
+        source: input
+        description: "OCC: BikeModel.version the client last observed; checked at reserve time."
+
+  - name: Delivery
+    parent: null
+    common_fields: true
+    fields:
+      - name: rental_id
+        type: string
+        source: input
+        description: "FK -> RentalAgreement.id; the agreement this delivery fulfills."
+      - name: delivery_type
+        type: enum
+        source: input
+        description: "INITIAL drop-off, SWAP (exchange current bike for a replacement), or PICKUP (return collection)."
+        constraints: "one of {INITIAL, SWAP, PICKUP}"
+      - name: address
+        type: string
+        source: input
+        description: "Delivery street address."
+      - name: window_start_clock
+        type: datetime
+        source: input
+        description: "Inclusive start of the requested delivery window."
+      - name: window_end_clock
+        type: datetime
+        source: input
+        description: "Exclusive end of the requested delivery window (half-open [start, end))."
+      - name: swap_to_bike_id
+        type: string
+        source: system
+        description: "FK -> Bike.id; for SWAP, the replacement bike selected from the same model pool (null otherwise)."
+      - name: status
+        type: enum
+        source: system
+        description: "Delivery lifecycle."
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, COMPLETED, CANCELLED}"
+
+  - name: ServiceTicket
+    parent: null
+    common_fields: true
+    fields:
+      - name: rental_id
+        type: string
+        source: input
+        description: "FK -> RentalAgreement.id; the rental whose bike needs service."
+      - name: issue_type
+        type: enum
+        source: input
+        description: "Reported problem category."
+        constraints: "one of {FLAT_TIRE, BRAKE, BATTERY, MOTOR, OTHER}"
+      - name: severity
+        type: enum
+        source: input
+        description: "Service severity; CRITICAL forces the rental into IN_SERVICE."
+        constraints: "one of {MINOR, MAJOR, CRITICAL}"
+      - name: description
+        type: string
+        source: input
+        description: "Free-text problem description."
+      - name: status
+        type: enum
+        source: system
+        description: "Ticket lifecycle (branching with revert)."
+        default: OPEN
+        constraints: "one of {OPEN, IN_PROGRESS, RESOLVED, REOPENED, CLOSED}"
+      - name: resolution_note
+        type: string
+        source: system
+        description: "Tech-supplied resolution note (set on RESOLVED)."
+
+  - name: InspectionReport
+    parent: null
+    common_fields: false
+    fields:
+      - name: rental_id
+        type: string
+        source: input
+        description: "FK -> RentalAgreement.id; the rental being inspected on return."
+      - name: bike_condition
+        type: enum
+        source: input
+        description: "Overall returned bike condition."
+        constraints: "one of {GOOD, WORN, DAMAGED}"
+      - name: damage_charge_cents
+        type: integer
+        source: input
+        description: "Assessed damage charge in cents for this return (0 when GOOD)."
+        constraints: ">= 0"
+      - name: cleaning_fee_cents
+        type: integer
+        source: input
+        description: "Assessed cleaning fee in cents."
+        constraints: ">= 0"
+      - name: late_fee_cents
+        type: integer
+        source: computed
+        description: "Late fee computed per §1.3 late_fee from returned_at_clock vs return_due_clock."
+      - name: total_assessed_cents
+        type: computed
+        source: computed
+        description: "damage_charge_cents + cleaning_fee_cents + late_fee_cents."
+      - name: deposit_applied_cents
+        type: integer
+        source: computed
+        description: "Portion of deposit applied to assessed charges per §1.3 return_settlement waterfall."
+      - name: deposit_refund_cents
+        type: integer
+        source: computed
+        description: "Portion of deposit refunded to the account wallet."
+      - name: overflow_billed_cents
+        type: integer
+        source: computed
+        description: "Assessed charges exceeding the deposit, billed to the account."
+
+  - name: CoverageClaim
+    parent: null
+    common_fields: true
+    fields:
+      - name: rental_id
+        type: string
+        source: input
+        description: "FK -> RentalAgreement.id; the rental the claim is filed against."
+      - name: claim_type
+        type: enum
+        source: input
+        description: "THEFT (bike stolen) or DAMAGE (accidental damage beyond normal wear)."
+        constraints: "one of {THEFT, DAMAGE}"
+      - name: incident_clock
+        type: datetime
+        source: input
+        description: "Logical-clock instant the incident is reported to have occurred."
+      - name: claimed_amount_cents
+        type: integer
+        source: input
+        description: "Amount claimed in cents."
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "Claim lifecycle (branching fork-join: review forks into APPROVED or DENIED, both join into CLOSED)."
+        default: FILED
+        constraints: "one of {FILED, UNDER_REVIEW, APPROVED, DENIED, CLOSED}"
+      - name: approved_payout_cents
+        type: integer
+        source: system
+        description: "Payout approved by OpsAdmin (<= claimed_amount_cents and <= coverage_cap per §1.3)."
+        default: 0
+        constraints: ">= 0"
+
+  - name: BuyoutOffer
+    parent: null
+    common_fields: true
+    fields:
+      - name: rental_id
+        type: string
+        source: input
+        description: "FK -> RentalAgreement.id; the rental being bought out."
+      - name: quoted_price_cents
+        type: integer
+        source: computed
+        description: "Buyout price computed per §1.3 buyout_price (dual-variant: subscription equity vs daily flat)."
+      - name: equity_credit_cents
+        type: integer
+        source: computed
+        description: "Equity credit subtracted from base purchase price (0 for DAILY mode)."
+      - name: status
+        type: enum
+        source: system
+        description: "Offer lifecycle. Expiry is enforced at accept-time against expires_at_clock (ERR_OFFER_EXPIRED); there is no separate EXPIRED status flip."
+        default: QUOTED
+        constraints: "one of {QUOTED, ACCEPTED}"
+      - name: expires_at_clock
+        type: datetime
+        source: input
+        description: "Logical-clock instant after which the quote may no longer be accepted."
+
+  - name: FleetInvoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the FLEET account being invoiced."
+      - name: cycle_index
+        type: integer
+        source: input
+        description: "Sequential billing-cycle index this invoice covers (0-based)."
+        constraints: ">= 0"
+      - name: line_count
+        type: integer
+        source: computed
+        description: "Number of qualifying ACTIVE MONTHLY rentals included as invoice lines."
+      - name: gross_amount_cents
+        type: integer
+        source: computed
+        description: "Sum of per-line monthly charges before volume discount."
+      - name: discount_cents
+        type: integer
+        source: computed
+        description: "Total volume discount applied per §1.3 fleet_invoice."
+      - name: amount_due_cents
+        type: integer
+        source: computed
+        description: "Net amount due after discount (gross - discount)."
+      - name: status
+        type: enum
+        source: system
+        description: "Invoice lifecycle."
+        default: ISSUED
+        constraints: "one of {ISSUED, PAID}"
+
+  - name: Bike
+    parent: null
+    common_fields: true
+    fields:
+      - name: model_id
+        type: string
+        source: input
+        description: "FK -> BikeModel.id; the model this physical bike belongs to."
+      - name: serial_number
+        type: string
+        source: input
+        description: "Physical serial; unique across all bikes."
+        constraints: "globally unique"
+      - name: bike_status
+        type: enum
+        source: system
+        description: "Physical-unit availability state (branching)."
+        default: AVAILABLE
+        constraints: "one of {AVAILABLE, RESERVED, OUT, SERVICING, RETIRED}"
+      - name: current_rental_id
+        type: string
+        source: system
+        description: "FK -> RentalAgreement.id; the agreement currently holding this bike (null when AVAILABLE/RETIRED)."
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: RentalAgreement
+    note: |
+      Parallel state dimensions: lifecycle_status (fulfillment) and billing_status (money)
+      evolve on the same row independently. Transitions below are grouped by dimension.
+    initial_state: RESERVED          # lifecycle_status initial; billing_status initial = DEPOSIT_HELD
+    terminal_states: [RETURNED, BOUGHT_OUT, CANCELLED]
+    transitions:
+      # ---- lifecycle_status dimension ----
+      - from: RESERVED
+        to: DELIVERED
+        trigger: "POST /deliveries/{id}/complete (delivery_type INITIAL)"
+        actor: FieldTech
+        preconditions:
+          - "RentalAgreement.lifecycle_status == RESERVED"
+          - "the INITIAL Delivery for this rental is in status SCHEDULED"
+          - "Bike.bike_status == RESERVED"
+        side_effects:
+          - "set Bike.bike_status = OUT"
+          - "set Delivery.status = COMPLETED"
+          - "increments RentalAgreement.version by 1"
+      - from: DELIVERED
+        to: ACTIVE
+        trigger: "POST /rentals/{id}/activate"
+        actor: Subscriber | FleetManager
+        preconditions:
+          - "RentalAgreement.lifecycle_status == DELIVERED"
+        side_effects:
+          - "set activated_at_clock = current logical clock"
+          - "set billing_status = BILLING_ACTIVE"
+          - "for MONTHLY: charge prorated first cycle per §1.3 cost_of_rental; for DAILY: begin daily accrual"
+          - "increments RentalAgreement.version by 1"
+      - from: ACTIVE
+        to: IN_SERVICE
+        trigger: "POST /service-tickets (severity CRITICAL) — automatic side effect"
+        actor: system
+        preconditions:
+          - "RentalAgreement.lifecycle_status == ACTIVE"
+        side_effects:
+          - "set Bike.bike_status = SERVICING"
+          - "increments RentalAgreement.version by 1"
+        note: "Cascade hop 1 of service cascade: critical ticket freezes the rental."
+      - from: IN_SERVICE
+        to: ACTIVE
+        trigger: "POST /service-tickets/{id}/close (after RESOLVED) — automatic side effect"
+        actor: system
+        preconditions:
+          - "RentalAgreement.lifecycle_status == IN_SERVICE"
+          - "the triggering ServiceTicket.status == RESOLVED"
+          - "no other ServiceTicket for this rental is in {OPEN, IN_PROGRESS, REOPENED}"
+        side_effects:
+          - "set Bike.bike_status = OUT"
+          - "increments RentalAgreement.version by 1"
+      - from: ACTIVE
+        to: RETURN_REQUESTED
+        trigger: "POST /rentals/{id}/request-return"
+        actor: Subscriber | FleetManager
+        preconditions:
+          - "RentalAgreement.lifecycle_status == ACTIVE"
+        side_effects:
+          - "create a SCHEDULED Delivery of delivery_type PICKUP for this rental"
+          - "increments RentalAgreement.version by 1"
+      - from: RETURN_REQUESTED
+        to: RETURNED
+        trigger: "POST /rentals/{id}/inspect (files InspectionReport)"
+        actor: FieldTech
+        preconditions:
+          - "RentalAgreement.lifecycle_status == RETURN_REQUESTED"
+          - "no InspectionReport already exists for this rental"
+        side_effects:
+          - "set returned_at_clock = current logical clock"
+          - "compute late_fee per §1.3 late_fee and run §1.3 return_settlement waterfall (cascade hop 1)"
+          - "set Bike.bike_status = AVAILABLE and Bike.current_rental_id = null (cascade hop 2)"
+          - "decrement BikeModel.available_count reconciliation (recompute) (cascade hop 3)"
+          - "set billing_status = SETTLED; refund deposit_refund_cents to Account.wallet_credit_cents"
+          - "increments RentalAgreement.version by 1"
+        note: "Return cascade depth 3: inspect -> settlement -> bike release -> model availability reconcile."
+      - from: ACTIVE
+        to: BOUGHT_OUT
+        trigger: "POST /buyout-offers/{id}/accept"
+        actor: Subscriber | FleetManager
+        preconditions:
+          - "RentalAgreement.lifecycle_status == ACTIVE"
+          - "the BuyoutOffer.status == QUOTED"
+          - "BuyoutOffer.expires_at_clock > current logical clock"
+        side_effects:
+          - "set BuyoutOffer.status = ACCEPTED"
+          - "set Bike.bike_status = RETIRED and Bike.current_rental_id = null (cascade hop 1)"
+          - "recompute BikeModel.available_count and BikeModel.total_bikes (cascade hop 2)"
+          - "set billing_status = SETTLED; refund full deposit_cents to Account.wallet_credit_cents (compensating: deposit released since unit is sold)"
+          - "increments RentalAgreement.version by 1"
+        note: "Buyout cascade depth 2."
+      - from: RESERVED
+        to: CANCELLED
+        trigger: "POST /rentals/{id}/cancel"
+        actor: Subscriber | FleetManager
+        preconditions:
+          - "RentalAgreement.lifecycle_status == RESERVED"
+        side_effects:
+          - "set Bike.bike_status = AVAILABLE and Bike.current_rental_id = null"
+          - "recompute BikeModel.available_count"
+          - "set billing_status = SETTLED; refund full deposit_cents to Account.wallet_credit_cents (compensating: reservation never consumed)"
+          - "cancel any SCHEDULED Delivery for this rental"
+          - "increments RentalAgreement.version by 1"
+      # ---- billing_status dimension ----
+      - from: BILLING_ACTIVE
+        to: WRITTEN_OFF
+        trigger: "POST /coverage-claims/{id}/approve (claim_type THEFT) — automatic side effect"
+        actor: system
+        preconditions:
+          - "RentalAgreement.billing_status == BILLING_ACTIVE"
+          - "the approved CoverageClaim.claim_type == THEFT"
+        side_effects:
+          - "set lifecycle_status = CANCELLED"
+          - "set Bike.bike_status = RETIRED and Bike.current_rental_id = null"
+          - "recompute BikeModel.available_count and BikeModel.total_bikes"
+          - "credit approved_payout_cents to Account.wallet_credit_cents"
+          - "increments RentalAgreement.version by 1"
+        note: "Theft cascade depth 3: claim approve -> rental write-off + cancel -> bike retire -> model reconcile."
+
+  - entity: ServiceTicket
+    note: "Branching with revert: OPEN->IN_PROGRESS->RESOLVED, RESOLVED->REOPENED->IN_PROGRESS (revision loop), RESOLVED->CLOSED."
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: IN_PROGRESS
+        trigger: "POST /service-tickets/{id}/start"
+        actor: FieldTech
+        preconditions:
+          - "ServiceTicket.status == OPEN"
+        side_effects:
+          - "increments ServiceTicket.version by 1"
+      - from: IN_PROGRESS
+        to: RESOLVED
+        trigger: "POST /service-tickets/{id}/resolve"
+        actor: FieldTech
+        preconditions:
+          - "ServiceTicket.status == IN_PROGRESS"
+        side_effects:
+          - "set resolution_note"
+          - "increments ServiceTicket.version by 1"
+      - from: RESOLVED
+        to: REOPENED
+        trigger: "POST /service-tickets/{id}/reopen"
+        actor: Subscriber | FleetManager
+        preconditions:
+          - "ServiceTicket.status == RESOLVED"
+        side_effects:
+          - "increments ServiceTicket.version by 1"
+        note: "Revert/revision loop."
+      - from: REOPENED
+        to: IN_PROGRESS
+        trigger: "POST /service-tickets/{id}/start"
+        actor: FieldTech
+        preconditions:
+          - "ServiceTicket.status == REOPENED"
+        side_effects:
+          - "increments ServiceTicket.version by 1"
+      - from: RESOLVED
+        to: CLOSED
+        trigger: "POST /service-tickets/{id}/close"
+        actor: FieldTech
+        preconditions:
+          - "ServiceTicket.status == RESOLVED"
+        side_effects:
+          - "if this rental's lifecycle_status == IN_SERVICE and no other open ticket exists, auto-transition rental IN_SERVICE->ACTIVE (see RentalAgreement)"
+          - "increments ServiceTicket.version by 1"
+
+  - entity: CoverageClaim
+    note: "Branching fork-join: FILED->UNDER_REVIEW, then UNDER_REVIEW forks to APPROVED or DENIED (divergent side-effects), both join to CLOSED."
+    initial_state: FILED
+    terminal_states: [CLOSED]
+    transitions:
+      - from: FILED
+        to: UNDER_REVIEW
+        trigger: "POST /coverage-claims/{id}/review"
+        actor: OpsAdmin
+        preconditions:
+          - "CoverageClaim.status == FILED"
+        side_effects:
+          - "increments CoverageClaim.version by 1"
+      - from: UNDER_REVIEW
+        to: APPROVED
+        trigger: "POST /coverage-claims/{id}/approve"
+        actor: OpsAdmin
+        preconditions:
+          - "CoverageClaim.status == UNDER_REVIEW"
+          - "approved_payout_cents <= claimed_amount_cents and <= §1.3 coverage_cap"
+        side_effects:
+          - "set approved_payout_cents"
+          - "for THEFT: trigger RentalAgreement BILLING_ACTIVE->WRITTEN_OFF cascade; for DAMAGE: credit payout to Account.wallet_credit_cents only"
+          - "increments CoverageClaim.version by 1"
+        note: "Fork branch A — payout side-effects diverge by claim_type."
+      - from: UNDER_REVIEW
+        to: DENIED
+        trigger: "POST /coverage-claims/{id}/deny"
+        actor: OpsAdmin
+        preconditions:
+          - "CoverageClaim.status == UNDER_REVIEW"
+        side_effects:
+          - "set approved_payout_cents = 0"
+          - "increments CoverageClaim.version by 1"
+        note: "Fork branch B — no payout, no rental cascade."
+      - from: APPROVED
+        to: CLOSED
+        trigger: "POST /coverage-claims/{id}/close"
+        actor: OpsAdmin
+        preconditions:
+          - "CoverageClaim.status == APPROVED"
+        side_effects:
+          - "increments CoverageClaim.version by 1"
+      - from: DENIED
+        to: CLOSED
+        trigger: "POST /coverage-claims/{id}/close"
+        actor: OpsAdmin
+        preconditions:
+          - "CoverageClaim.status == DENIED"
+        side_effects:
+          - "increments CoverageClaim.version by 1"
+
+  - entity: Bike
+    note: "Branching physical-unit machine; transitions are side-effects of RentalAgreement/Delivery/ServiceTicket transitions, except RETIRE which is operator-driven."
+    initial_state: AVAILABLE
+    terminal_states: [RETIRED]
+    transitions:
+      - from: AVAILABLE
+        to: RESERVED
+        trigger: "POST /rentals (reservation selects this bike) — system"
+        actor: system
+        preconditions:
+          - "Bike.bike_status == AVAILABLE"
+        side_effects:
+          - "set Bike.current_rental_id = new RentalAgreement.id"
+          - "recompute BikeModel.available_count"
+      - from: RESERVED
+        to: OUT
+        trigger: "INITIAL Delivery completed — system"
+        actor: system
+        preconditions:
+          - "Bike.bike_status == RESERVED"
+      - from: OUT
+        to: SERVICING
+        trigger: "CRITICAL ServiceTicket filed — system"
+        actor: system
+        preconditions:
+          - "Bike.bike_status == OUT"
+      - from: SERVICING
+        to: OUT
+        trigger: "ServiceTicket closed / rental back to ACTIVE — system"
+        actor: system
+        preconditions:
+          - "Bike.bike_status == SERVICING"
+      - from: OUT
+        to: AVAILABLE
+        trigger: "Return inspection completed / rental cancelled — system"
+        actor: system
+        preconditions:
+          - "Bike.bike_status == OUT"
+        side_effects:
+          - "set Bike.current_rental_id = null; recompute BikeModel.available_count"
+      - from: AVAILABLE
+        to: RETIRED
+        trigger: "POST /bikes/{id}/retire"
+        actor: OpsAdmin
+        preconditions:
+          - "Bike.bike_status == AVAILABLE"
+        side_effects:
+          - "recompute BikeModel.available_count and BikeModel.total_bikes"
+      - from: OUT
+        to: RETIRED
+        trigger: "Buyout accepted / theft claim approved — system"
+        actor: system
+        preconditions:
+          - "Bike.bike_status == OUT"
+        side_effects:
+          - "set Bike.current_rental_id = null; recompute BikeModel.available_count and BikeModel.total_bikes"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: reserve-bike-stale-model
+    parent_entity: BikeModel
+    write_endpoint: "POST /rentals"
+    occ_field: "expected_model_version"
+    description: |
+      Creating a RentalAgreement against a BikeModel whose version has advanced
+      since the client last observed it is rejected. A reservation draws a unit
+      from the model pool and mutates BikeModel.available_count (advancing its
+      version); a second create still carrying the pre-advance version is acting
+      on a stale view of pool availability and is rejected with a stale-version
+      error.
+    error_id: ERR_STALE_MODEL_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: cost_of_rental
+    trigger: "on rental activation and recomputed on inspect/return; populates RentalAgreement.accrued_charge_cents"
+    algorithm: tiered_pricing
+    formula: |
+      class_surcharge = SURCHARGE[model.model_class]      # MONTHLY adds to monthly_fee; DAILY adds to daily_rate
+      # ---- variant MONTHLY (first partial cycle, prorated) ----
+      effective_monthly = model.monthly_fee_cents + class_surcharge
+      cycle_anchor = rental.reserved_at_clock                            # first cycle begins at reservation instant
+      day_offset = floor((activated_at_clock - cycle_anchor) / 1 day)    # 0-based whole days within first cycle
+      remaining_days = CYCLE_DAYS - day_offset
+      first_cycle_charge = round_half_up(effective_monthly * remaining_days / 30)
+      accrued_charge_cents = first_cycle_charge
+      # ---- variant DAILY (tiered marginal day rate) ----
+      effective_daily = model.daily_rate_cents + class_surcharge
+      billed_days = max(1, ceil((returned_at_clock - activated_at_clock) / 1 day))
+      total = 0
+      for d in 1..billed_days:
+        if d <= 6:        total += effective_daily                       # tier 1: full rate
+        elif d <= 29:     total += round_half_up(effective_daily * 0.85) # tier 2: 7th..29th day
+        else:             total += round_half_up(effective_daily * 0.70) # tier 3: 30th day onward
+      accrued_charge_cents = total
+    input_set: "single RentalAgreement; MONTHLY uses activation offset within first 30-day cycle; DAILY uses [activated_at_clock, returned_at_clock)"
+    constants:
+      SURCHARGE_STANDARD: 0
+      SURCHARGE_EBIKE: 2000
+      SURCHARGE_CARGO_EBIKE: 4000
+      TIER2_RATE: 0.85
+      TIER3_RATE: 0.70
+      TIER1_DAYS: 6
+      TIER2_LAST_DAY: 29
+      CYCLE_DAYS: 30
+    precision: "all money in integer cents; per-day rate rounded half-up before summation (round-then-sum)"
+    variants:
+      - name: monthly_prorated_first_cycle
+        when: "rental_mode == MONTHLY"
+        difference: "prorates effective_monthly by remaining days in the first 30-day cycle; later cycles billed in full via FleetInvoice/cycle advance"
+      - name: daily_tiered
+        when: "rental_mode == DAILY"
+        difference: "sums per-day rate across tier breakpoints at day 6/7 and day 29/30; no proration"
+
+  - name: buyout_price
+    trigger: "on POST /rentals/{id}/buyout-offers (quote creation); populates BuyoutOffer.quoted_price_cents and equity_credit_cents"
+    algorithm: decay_function
+    formula: |
+      base = model.purchase_price_cents
+      # ---- variant SUBSCRIPTION (equity decays the price by completed cycles) ----
+      raw_equity = round_half_up(base * EQUITY_PCT_PER_CYCLE * rental.completed_cycles)
+      equity_cap = round_half_up(base * EQUITY_CAP_PCT)
+      equity_credit_cents = min(raw_equity, equity_cap)
+      quoted_price_cents = base - equity_credit_cents
+      # ---- variant DAILY (no equity earned) ----
+      equity_credit_cents = 0
+      quoted_price_cents = base
+    input_set: "single RentalAgreement; SUBSCRIPTION variant reads completed_cycles; DAILY variant ignores it"
+    constants:
+      EQUITY_PCT_PER_CYCLE: 0.03
+      EQUITY_CAP_PCT: 0.60
+    precision: "integer cents; raw_equity rounded half-up then capped"
+    variants:
+      - name: subscription_equity
+        when: "rental.rental_mode == MONTHLY"
+        difference: "subtracts equity credit (3% of base per completed cycle, capped at 60%) from base purchase price"
+      - name: daily_flat
+        when: "rental.rental_mode == DAILY"
+        difference: "no equity; quoted_price == base purchase price regardless of duration"
+
+  - name: return_settlement
+    trigger: "on POST /rentals/{id}/inspect; populates InspectionReport.{late_fee_cents,total_assessed_cents,deposit_applied_cents,deposit_refund_cents,overflow_billed_cents}"
+    algorithm: waterfall_allocation
+    formula: |
+      total_assessed = damage_charge_cents + cleaning_fee_cents + late_fee_cents
+      deposit_applied = min(rental.deposit_cents, total_assessed)         # bucket 1: deposit absorbs charges first
+      overflow_billed = max(0, total_assessed - rental.deposit_cents)     # bucket 2: excess billed to account
+      deposit_refund  = max(0, rental.deposit_cents - total_assessed)     # remainder refunded to wallet
+    input_set: "single InspectionReport + its RentalAgreement.deposit_cents"
+    constants: {}
+    precision: "integer cents; no rounding (all inputs integer)"
+
+  - name: late_fee
+    trigger: "on POST /rentals/{id}/inspect; populates InspectionReport.late_fee_cents"
+    algorithm: threshold
+    formula: |
+      if returned_at_clock <= rental.return_due_clock:
+        late_fee_cents = 0
+      else:
+        days_late = ceil((returned_at_clock - rental.return_due_clock) / 1 day)   # strictly-positive overage rounds up
+        late_fee_cents = days_late * LATE_FEE_PER_DAY_CENTS
+    input_set: "single RentalAgreement; boundary at returned_at_clock == return_due_clock (no fee) vs strictly after (fee)"
+    constants:
+      LATE_FEE_PER_DAY_CENTS: 1500
+    precision: "integer cents"
+
+  - name: fleet_invoice
+    trigger: "on POST /accounts/{id}/fleet-invoices; populates FleetInvoice.{line_count,gross_amount_cents,discount_cents,amount_due_cents}"
+    algorithm: aggregation
+    formula: |
+      lines = RentalAgreement rows where account_id == account.id
+              AND rental_mode == MONTHLY
+              AND lifecycle_status IN {ACTIVE, IN_SERVICE}        # explicit status filter
+              ordered by created_at ASC                          # deterministic line order
+      line_count = count(lines)
+      per_line[i] = model_of(lines[i]).monthly_fee_cents + SURCHARGE[model_class]
+      gross_amount_cents = sum(per_line[i])
+      # Volume discount: >= VOLUME_THRESHOLD active monthly lines -> per-line discount,
+      # PINNED ORDER: discount each line, round_half_up per line, THEN sum (round-then-sum).
+      if line_count >= VOLUME_THRESHOLD:
+        net_per_line[i] = round_half_up(per_line[i] * (1 - VOLUME_DISCOUNT_PCT))
+        amount_due_cents = sum(net_per_line[i])
+      else:
+        amount_due_cents = gross_amount_cents
+      discount_cents = gross_amount_cents - amount_due_cents
+    input_set: "all MONTHLY RentalAgreements for the account in {ACTIVE, IN_SERVICE}; DELIVERED/RESERVED/terminal excluded"
+    constants:
+      VOLUME_THRESHOLD: 5
+      VOLUME_DISCOUNT_PCT: 0.10
+    precision: "integer cents; discount applied PER LINE then rounded half-up then summed (round-then-sum, NOT sum-then-round)"
+
+  - name: coverage_cap
+    trigger: "on POST /coverage-claims/{id}/approve; bounds approved_payout_cents"
+    algorithm: threshold
+    formula: |
+      base = model.purchase_price_cents
+      cap = round_half_up(base * (THEFT_CAP_PCT if claim.claim_type == THEFT else DAMAGE_CAP_PCT))
+      max_payout = min(claim.claimed_amount_cents, cap)
+      # approve is rejected if requested approved_payout_cents > max_payout
+    input_set: "single CoverageClaim + its rental's BikeModel.purchase_price_cents"
+    constants:
+      THEFT_CAP_PCT: 1.00
+      DAMAGE_CAP_PCT: 0.40
+    precision: "integer cents; cap rounded half-up"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /accounts and POST /bike-models and POST /_clock/set_current_utc"
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for the operation per §1.7 RBAC; entity_backed roles acting on a resource must own it (Subscriber/FleetManager X-User-ID == RentalAgreement.account_id)"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all role-restricted endpoints"
+  - priority: 3
+    category: existence
+    check: "every path/body id resolves to an existing resource, validated left-to-right (account, model, rental, bike, ticket, claim, offer, invoice, delivery)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints referencing an id"
+  - priority: 4
+    category: state
+    check: "target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 5
+    category: state
+    check: "OCC: expected_model_version equals current BikeModel.version at POST /rentals"
+    error_id: ERR_STALE_MODEL_VERSION
+    http_status: 412
+    applies_to: "POST /rentals"
+  - priority: 6
+    category: business_safety
+    check: "cannot file a non-CRITICAL action on a rental whose bike is RETIRED; cannot inspect/return a rental that has an open THEFT claim APPROVED (already written off)"
+    error_id: ERR_BIKE_RETIRED
+    http_status: 409
+    applies_to: "POST /service-tickets, POST /rentals/{id}/inspect, POST /rentals/{id}/request-return"
+  - priority: 7
+    category: business_referential
+    check: "Delivery.delivery_type INITIAL requires rental in RESERVED; PICKUP requires rental in RETURN_REQUESTED; SWAP requires rental in {DELIVERED, ACTIVE}"
+    error_id: ERR_DELIVERY_TYPE_MISMATCH
+    http_status: 409
+    applies_to: "POST /deliveries"
+  - priority: 8
+    category: business_temporal
+    check: "Delivery window must be well-formed: window_start_clock < window_end_clock (half-open [start,end)); a new Delivery for a rental must not overlap an existing SCHEDULED Delivery for the SAME rental (point-overlap: shared instant in [start,end))"
+    error_id: ERR_DELIVERY_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /deliveries"
+  - priority: 9
+    category: business_temporal
+    check: "A bike's SERVICING window (modeled by ServiceTicket created..closed) must not be double-booked: a new ServiceTicket on a bike already in SERVICING is rejected (closed-interval mutual exclusion on the physical unit; buffer = whole servicing span)"
+    error_id: ERR_BIKE_ALREADY_SERVICING
+    http_status: 409
+    applies_to: "POST /service-tickets"
+  - priority: 10
+    category: business_constraint
+    check: "BuyoutOffer.expires_at_clock must be strictly after current logical clock at creation; accept rejected when expires_at_clock <= current clock"
+    error_id: ERR_OFFER_EXPIRED
+    http_status: 409
+    applies_to: "POST /buyout-offers/{id}/accept"
+  - priority: 11
+    category: business_constraint
+    check: "approved_payout_cents must be <= claimed_amount_cents and <= coverage_cap per §1.3"
+    error_id: ERR_PAYOUT_EXCEEDS_CAP
+    http_status: 422
+    applies_to: "POST /coverage-claims/{id}/approve"
+  - priority: 12
+    category: business_constraint
+    check: "Account must not exceed rental_cap: a new reservation is rejected when active_rental_count >= rental_cap"
+    error_id: ERR_RENTAL_CAP_EXCEEDED
+    http_status: 409
+    applies_to: "POST /rentals"
+  - priority: 13
+    category: business_constraint
+    check: "Reservation requires model pool availability: BikeModel.available_count >= 1 (at least one AVAILABLE Bike for the model)"
+    error_id: ERR_NO_BIKES_AVAILABLE
+    http_status: 409
+    applies_to: "POST /rentals"
+  - priority: 14
+    category: business_constraint
+    check: "SUSPENDED accounts cannot create reservations"
+    error_id: ERR_ACCOUNT_SUSPENDED
+    http_status: 409
+    applies_to: "POST /rentals"
+  - priority: 15
+    category: business_constraint
+    check: "request body fields well-formed: required fields present, enums valid, integer money >= 0, window_start < window_end"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST/PATCH with a body"
+  - priority: 16
+    category: business_referential
+    check: "uniqueness: Account.email globally unique; Bike.serial_number globally unique"
+    error_id: ERR_DUPLICATE_RESOURCE
+    http_status: 409
+    applies_to: "POST /accounts, POST /bikes"
+  - priority: 17
+    category: business_fiscal
+    check: "fleet invoice mode: FleetInvoice may only be created for account_type == FLEET"
+    error_id: ERR_NOT_FLEET_ACCOUNT
+    http_status: 409
+    applies_to: "POST /accounts/{id}/fleet-invoices"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- BikeModel ----
+  - method: POST
+    path: "/bike-models"
+    description: "Create a bike model (catalog entry)."
+    roles: [OpsAdmin]
+    code: 201
+    input: [name, model_class, monthly_fee_cents, daily_rate_cents, purchase_price_cents, deposit_cents, fleet_size]
+    output: BikeModel
+    side_effects: ["total_bikes=0, available_count=0, status=ACTIVE"]
+  - method: GET
+    path: "/bike-models/{id}"
+    description: "Fetch a model (includes computed available_count, total_bikes)."
+    roles: [OpsAdmin, Subscriber, FleetManager, FieldTech]
+    code: 200
+    input: []
+    output: BikeModel
+    side_effects: []
+  - method: GET
+    path: "/bike-models"
+    description: "List models (paginated)."
+    roles: [OpsAdmin, Subscriber, FleetManager, FieldTech]
+    code: 200
+    input: ["model_class?", "limit?", "offset?"]
+    output: BikeModel[]
+    side_effects: []
+  - method: GET
+    path: "/bike-models/{id}/bikes"
+    description: "List the physical bikes for a model (reverse-reachability for Bike.model_id)."
+    roles: [OpsAdmin, FieldTech]
+    code: 200
+    input: ["bike_status?", "limit?", "offset?"]
+    output: Bike[]
+    side_effects: []
+
+  # ---- Bike ----
+  - method: POST
+    path: "/bikes"
+    description: "Add a physical bike to a model's fleet."
+    roles: [OpsAdmin]
+    code: 201
+    input: [model_id, serial_number]
+    output: Bike
+    side_effects: ["bike_status=AVAILABLE", "recompute BikeModel.available_count and total_bikes"]
+  - method: GET
+    path: "/bikes/{id}"
+    description: "Fetch a bike."
+    roles: [OpsAdmin, FieldTech, Subscriber, FleetManager]
+    code: 200
+    input: []
+    output: Bike
+    side_effects: []
+  - method: GET
+    path: "/bikes"
+    description: "List/filter physical bikes (reverse-reachability for Bike.model_id and Bike.current_rental_id)."
+    roles: [OpsAdmin, FieldTech, Subscriber, FleetManager]
+    code: 200
+    input: ["model_id?", "current_rental_id?", "bike_status?", "limit?", "offset?"]
+    output: Bike[]
+    side_effects: []
+  - method: POST
+    path: "/bikes/{id}/retire"
+    description: "Retire an AVAILABLE bike (removes it from the pool)."
+    roles: [OpsAdmin]
+    code: 200
+    input: []
+    output: Bike
+    side_effects: ["bike_status=RETIRED", "recompute BikeModel.available_count and total_bikes"]
+
+  # ---- Account ----
+  - method: POST
+    path: "/accounts"
+    description: "Open a SUBSCRIBER or FLEET account. Public (no auth)."
+    roles: [Anonymous, OpsAdmin]
+    code: 201
+    input: ["account_type", "display_name", "email", "rental_cap?"]
+    output: Account
+    side_effects: ["wallet_credit_cents=0, status=ACTIVE, active_rental_count=0"]
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Fetch an account (includes computed active_rental_count, outstanding_balance_cents)."
+    roles: [OpsAdmin, Subscriber, FleetManager]
+    code: 200
+    input: []
+    output: Account
+    side_effects: []
+  - method: POST
+    path: "/accounts/{id}/suspend"
+    description: "Suspend an account (blocks new reservations)."
+    roles: [OpsAdmin]
+    code: 200
+    input: []
+    output: Account
+    side_effects: ["status=SUSPENDED"]
+  - method: GET
+    path: "/accounts/{id}/rentals"
+    description: "List rental agreements for an account (reverse-reachability for RentalAgreement.account_id)."
+    roles: [OpsAdmin, Subscriber, FleetManager]
+    code: 200
+    input: ["lifecycle_status?", "limit?", "offset?"]
+    output: RentalAgreement[]
+    side_effects: []
+
+  # ---- RentalAgreement ----
+  - method: POST
+    path: "/rentals"
+    description: "Reserve a bike from a model pool (MONTHLY or DAILY). Server selects an AVAILABLE bike. OCC on BikeModel.version."
+    roles: [Subscriber, FleetManager]
+    code: 201
+    input: [account_id, model_id, rental_mode, return_due_clock, expected_model_version]
+    output: RentalAgreement
+    side_effects:
+      - "select AVAILABLE Bike (lowest created_at ASC) -> bike_status=RESERVED, current_rental_id set"
+      - "snapshot deposit_cents from model; hold deposit (billing_status=DEPOSIT_HELD)"
+      - "recompute BikeModel.available_count; recompute Account.active_rental_count"
+      - "increments BikeModel.version by 1"
+  - method: GET
+    path: "/rentals/{id}"
+    description: "Fetch a rental (parallel lifecycle_status x billing_status, accrued_charge_cents)."
+    roles: [OpsAdmin, Subscriber, FleetManager, FieldTech]
+    code: 200
+    input: []
+    output: RentalAgreement
+    side_effects: []
+  - method: GET
+    path: "/rentals"
+    description: "List/filter rental agreements (reverse-reachability for RentalAgreement.account_id/model_id/bike_id)."
+    roles: [OpsAdmin, Subscriber, FleetManager, FieldTech]
+    code: 200
+    input: ["account_id?", "model_id?", "bike_id?", "rental_mode?", "lifecycle_status?", "limit?", "offset?"]
+    output: RentalAgreement[]
+    side_effects: []
+  - method: POST
+    path: "/rentals/{id}/activate"
+    description: "Activate a DELIVERED rental; begins billing."
+    roles: [Subscriber, FleetManager]
+    code: 200
+    input: []
+    output: RentalAgreement
+    side_effects: ["set activated_at_clock", "billing_status=BILLING_ACTIVE", "MONTHLY: charge prorated first cycle; DAILY: begin accrual"]
+  - method: POST
+    path: "/rentals/{id}/request-return"
+    description: "Request return of an ACTIVE rental; schedules a PICKUP delivery."
+    roles: [Subscriber, FleetManager]
+    code: 200
+    input: [return_address]
+    output: RentalAgreement
+    side_effects: ["lifecycle_status=RETURN_REQUESTED", "create SCHEDULED PICKUP Delivery"]
+  - method: POST
+    path: "/rentals/{id}/inspect"
+    description: "File the return InspectionReport; runs late_fee + return_settlement; releases bike."
+    roles: [FieldTech]
+    code: 201
+    input: [bike_condition, damage_charge_cents, cleaning_fee_cents]
+    output: InspectionReport
+    side_effects:
+      - "compute late_fee_cents; run return_settlement waterfall"
+      - "set returned_at_clock; lifecycle_status=RETURNED; billing_status=SETTLED"
+      - "refund deposit_refund_cents to Account.wallet_credit_cents; bill overflow_billed_cents"
+      - "Bike OUT->AVAILABLE; recompute BikeModel.available_count"
+  - method: POST
+    path: "/rentals/{id}/cancel"
+    description: "Cancel a RESERVED rental before delivery."
+    roles: [Subscriber, FleetManager]
+    code: 200
+    input: []
+    output: RentalAgreement
+    side_effects: ["lifecycle_status=CANCELLED", "Bike RESERVED->AVAILABLE", "refund full deposit", "cancel SCHEDULED deliveries", "recompute BikeModel.available_count"]
+  - method: POST
+    path: "/rentals/{id}/advance-cycle"
+    description: "Advance a MONTHLY rental by one completed 30-day billing cycle (operator cycle close)."
+    roles: [OpsAdmin]
+    code: 200
+    input: []
+    output: RentalAgreement
+    side_effects: ["completed_cycles += 1 (only when rental_mode==MONTHLY and lifecycle_status IN {ACTIVE, IN_SERVICE})"]
+
+  # ---- Delivery ----
+  - method: POST
+    path: "/deliveries"
+    description: "Schedule a delivery (INITIAL/SWAP/PICKUP) for a rental within a half-open window."
+    roles: [OpsAdmin, FieldTech]
+    code: 201
+    input: [rental_id, delivery_type, address, window_start_clock, window_end_clock]
+    output: Delivery
+    side_effects: ["status=SCHEDULED", "for SWAP: select replacement AVAILABLE bike from same model -> swap_to_bike_id"]
+  - method: GET
+    path: "/deliveries/{id}"
+    description: "Fetch a delivery."
+    roles: [OpsAdmin, FieldTech, Subscriber, FleetManager]
+    code: 200
+    input: []
+    output: Delivery
+    side_effects: []
+  - method: GET
+    path: "/deliveries"
+    description: "List deliveries, optionally filtered by rental or replacement bike (reverse-reachability for Delivery.rental_id and Delivery.swap_to_bike_id)."
+    roles: [OpsAdmin, FieldTech, Subscriber, FleetManager]
+    code: 200
+    input: ["rental_id?", "swap_to_bike_id?", "status?", "limit?", "offset?"]
+    output: Delivery[]
+    side_effects: []
+  - method: POST
+    path: "/deliveries/{id}/complete"
+    description: "Mark a delivery COMPLETED; INITIAL moves rental to DELIVERED; SWAP exchanges bikes."
+    roles: [FieldTech]
+    code: 200
+    input: []
+    output: Delivery
+    side_effects:
+      - "status=COMPLETED"
+      - "INITIAL: rental RESERVED->DELIVERED, Bike RESERVED->OUT"
+      - "SWAP: old Bike OUT->AVAILABLE, swap_to_bike Bike RESERVED->OUT, rental.bike_id=swap_to_bike_id; recompute BikeModel.available_count"
+
+  # ---- ServiceTicket ----
+  - method: POST
+    path: "/service-tickets"
+    description: "Open a maintenance ticket against a rental's bike (maintenance included). CRITICAL freezes rental."
+    roles: [Subscriber, FleetManager, FieldTech]
+    code: 201
+    input: [rental_id, issue_type, severity, description]
+    output: ServiceTicket
+    side_effects: ["status=OPEN", "if severity==CRITICAL: Bike OUT->SERVICING, rental ACTIVE->IN_SERVICE"]
+  - method: GET
+    path: "/service-tickets/{id}"
+    description: "Fetch a service ticket."
+    roles: [OpsAdmin, FieldTech, Subscriber, FleetManager]
+    code: 200
+    input: []
+    output: ServiceTicket
+    side_effects: []
+  - method: GET
+    path: "/service-tickets"
+    description: "List service tickets, optionally by rental (reverse-reachability for ServiceTicket.rental_id)."
+    roles: [OpsAdmin, FieldTech, Subscriber, FleetManager]
+    code: 200
+    input: ["rental_id?", "status?", "limit?", "offset?"]
+    output: ServiceTicket[]
+    side_effects: []
+  - method: POST
+    path: "/service-tickets/{id}/start"
+    description: "Begin work (OPEN/REOPENED -> IN_PROGRESS)."
+    roles: [FieldTech]
+    code: 200
+    input: []
+    output: ServiceTicket
+    side_effects: []
+  - method: POST
+    path: "/service-tickets/{id}/resolve"
+    description: "Resolve a ticket (IN_PROGRESS -> RESOLVED)."
+    roles: [FieldTech]
+    code: 200
+    input: [resolution_note]
+    output: ServiceTicket
+    side_effects: ["set resolution_note"]
+  - method: POST
+    path: "/service-tickets/{id}/reopen"
+    description: "Reopen a RESOLVED ticket (revision loop)."
+    roles: [Subscriber, FleetManager]
+    code: 200
+    input: []
+    output: ServiceTicket
+    side_effects: []
+  - method: POST
+    path: "/service-tickets/{id}/close"
+    description: "Close a RESOLVED ticket; may auto-return rental to ACTIVE."
+    roles: [FieldTech]
+    code: 200
+    input: []
+    output: ServiceTicket
+    side_effects: ["if rental IN_SERVICE and no other open ticket: rental IN_SERVICE->ACTIVE, Bike SERVICING->OUT"]
+
+  # ---- InspectionReport ----
+  - method: GET
+    path: "/inspection-reports/{id}"
+    description: "Fetch an inspection report (settlement breakdown)."
+    roles: [OpsAdmin, FieldTech, Subscriber, FleetManager]
+    code: 200
+    input: []
+    output: InspectionReport
+    side_effects: []
+  - method: GET
+    path: "/inspection-reports"
+    description: "List inspection reports, optionally by rental (reverse-reachability for InspectionReport.rental_id)."
+    roles: [OpsAdmin, FieldTech, Subscriber, FleetManager]
+    code: 200
+    input: ["rental_id?", "limit?", "offset?"]
+    output: InspectionReport[]
+    side_effects: []
+
+  # ---- CoverageClaim ----
+  - method: POST
+    path: "/coverage-claims"
+    description: "File a theft/damage coverage claim against a rental."
+    roles: [Subscriber, FleetManager]
+    code: 201
+    input: [rental_id, claim_type, incident_clock, claimed_amount_cents]
+    output: CoverageClaim
+    side_effects: ["status=FILED"]
+  - method: GET
+    path: "/coverage-claims/{id}"
+    description: "Fetch a coverage claim."
+    roles: [OpsAdmin, Subscriber, FleetManager]
+    code: 200
+    input: []
+    output: CoverageClaim
+    side_effects: []
+  - method: GET
+    path: "/coverage-claims"
+    description: "List coverage claims, optionally by rental (reverse-reachability for CoverageClaim.rental_id)."
+    roles: [OpsAdmin, Subscriber, FleetManager]
+    code: 200
+    input: ["rental_id?", "status?", "limit?", "offset?"]
+    output: CoverageClaim[]
+    side_effects: []
+  - method: POST
+    path: "/coverage-claims/{id}/review"
+    description: "Move a FILED claim to UNDER_REVIEW."
+    roles: [OpsAdmin]
+    code: 200
+    input: []
+    output: CoverageClaim
+    side_effects: []
+  - method: POST
+    path: "/coverage-claims/{id}/approve"
+    description: "Approve a claim with a payout (bounded by coverage_cap). THEFT triggers rental write-off."
+    roles: [OpsAdmin]
+    code: 200
+    input: [approved_payout_cents]
+    output: CoverageClaim
+    side_effects: ["status=APPROVED", "credit payout to wallet", "THEFT: rental BILLING_ACTIVE->WRITTEN_OFF + cancel + bike RETIRE"]
+  - method: POST
+    path: "/coverage-claims/{id}/deny"
+    description: "Deny a claim (no payout)."
+    roles: [OpsAdmin]
+    code: 200
+    input: []
+    output: CoverageClaim
+    side_effects: ["status=DENIED", "approved_payout_cents=0"]
+  - method: POST
+    path: "/coverage-claims/{id}/close"
+    description: "Close an APPROVED or DENIED claim."
+    roles: [OpsAdmin]
+    code: 200
+    input: []
+    output: CoverageClaim
+    side_effects: ["status=CLOSED"]
+
+  # ---- BuyoutOffer ----
+  - method: POST
+    path: "/rentals/{id}/buyout-offers"
+    description: "Quote a buyout for a rental (dual-variant price per §1.3)."
+    roles: [Subscriber, FleetManager]
+    code: 201
+    input: [expires_at_clock]
+    output: BuyoutOffer
+    side_effects: ["compute quoted_price_cents + equity_credit_cents; status=QUOTED"]
+  - method: GET
+    path: "/buyout-offers/{id}"
+    description: "Fetch a buyout offer."
+    roles: [OpsAdmin, Subscriber, FleetManager]
+    code: 200
+    input: []
+    output: BuyoutOffer
+    side_effects: []
+  - method: GET
+    path: "/rentals/{id}/buyout-offers"
+    description: "List buyout offers for a rental (reverse-reachability for BuyoutOffer.rental_id)."
+    roles: [OpsAdmin, Subscriber, FleetManager]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: BuyoutOffer[]
+    side_effects: []
+  - method: POST
+    path: "/buyout-offers/{id}/accept"
+    description: "Accept a QUOTED, non-expired offer; rental -> BOUGHT_OUT, bike retired."
+    roles: [Subscriber, FleetManager]
+    code: 200
+    input: []
+    output: BuyoutOffer
+    side_effects: ["status=ACCEPTED", "rental ACTIVE->BOUGHT_OUT", "Bike OUT->RETIRED", "refund deposit; recompute model counts"]
+
+  # ---- FleetInvoice ----
+  - method: POST
+    path: "/accounts/{id}/fleet-invoices"
+    description: "Generate a fleet invoice for a FLEET account's ACTIVE MONTHLY rentals (volume discount per §1.3)."
+    roles: [OpsAdmin, FleetManager]
+    code: 201
+    input: [cycle_index]
+    output: FleetInvoice
+    side_effects: ["compute line_count/gross/discount/amount_due; status=ISSUED"]
+  - method: GET
+    path: "/fleet-invoices/{id}"
+    description: "Fetch a fleet invoice."
+    roles: [OpsAdmin, FleetManager]
+    code: 200
+    input: []
+    output: FleetInvoice
+    side_effects: []
+  - method: GET
+    path: "/accounts/{id}/fleet-invoices"
+    description: "List fleet invoices for an account (reverse-reachability for FleetInvoice.account_id)."
+    roles: [OpsAdmin, FleetManager]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: FleetInvoice[]
+    side_effects: []
+  - method: POST
+    path: "/fleet-invoices/{id}/pay"
+    description: "Mark a fleet invoice PAID."
+    roles: [OpsAdmin, FleetManager]
+    code: 200
+    input: []
+    output: FleetInvoice
+    side_effects: ["status=PAID; recompute Account.outstanding_balance_cents"]
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's logical clock to an ISO-8601 UTC instant. Server startup default is 2026-04-01T00:00:00Z; before any set call the clock reads exactly this default and never falls back to wall-clock time."
+    roles: [OpsAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["logical clock = to_iso8601 for all subsequent clock reads"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/unknown X-User-Role or missing X-User-ID on an authenticated endpoint"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "acting role not permitted for the operation, or entity_backed owner mismatch (acting on another account's rental)"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "referenced account/model/bike/rental/ticket/claim/offer/invoice/delivery id does not exist"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested transition not defined from the resource's current state (lifecycle_status, billing_status, ticket/claim/bike/delivery status)"
+  - id: ERR_STALE_MODEL_VERSION
+    http: 412
+    condition: "expected_model_version != current BikeModel.version at POST /rentals"
+  - id: ERR_BIKE_RETIRED
+    http: 409
+    condition: "operation attempted on a rental whose bike is RETIRED or already written off"
+  - id: ERR_DELIVERY_TYPE_MISMATCH
+    http: 409
+    condition: "delivery_type incompatible with rental lifecycle_status (INITIAL not RESERVED, PICKUP not RETURN_REQUESTED, SWAP not in {DELIVERED, ACTIVE})"
+  - id: ERR_DELIVERY_WINDOW_CONFLICT
+    http: 409
+    condition: "window_start_clock >= window_end_clock, or new delivery window shares an instant with an existing SCHEDULED delivery for the same rental"
+  - id: ERR_BIKE_ALREADY_SERVICING
+    http: 409
+    condition: "a new ServiceTicket is opened on a bike whose bike_status is already SERVICING"
+  - id: ERR_OFFER_EXPIRED
+    http: 409
+    condition: "buyout offer accepted at or after expires_at_clock, or quoted with expires_at_clock <= current clock"
+  - id: ERR_PAYOUT_EXCEEDS_CAP
+    http: 422
+    condition: "approved_payout_cents > claimed_amount_cents or > coverage_cap"
+  - id: ERR_RENTAL_CAP_EXCEEDED
+    http: 409
+    condition: "reservation would push account active_rental_count above rental_cap"
+  - id: ERR_NO_BIKES_AVAILABLE
+    http: 409
+    condition: "BikeModel.available_count == 0 at reservation time"
+  - id: ERR_ACCOUNT_SUSPENDED
+    http: 409
+    condition: "reservation attempted by a SUSPENDED account"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "malformed body: missing required field, bad enum, negative money, or window_start >= window_end"
+  - id: ERR_DUPLICATE_RESOURCE
+    http: 409
+    condition: "Account.email or Bike.serial_number already exists"
+  - id: ERR_NOT_FLEET_ACCOUNT
+    http: 409
+    condition: "fleet invoice requested for a non-FLEET account"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Subscriber
+    description: "Individual customer; owns SUBSCRIBER-type Account and its rentals."
+    identity: "entity_backed:Account"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /rentals"
+      - "POST /rentals/{id}/activate"
+      - "POST /rentals/{id}/request-return"
+      - "POST /rentals/{id}/cancel"
+      - "POST /service-tickets"
+      - "POST /service-tickets/{id}/reopen"
+      - "POST /coverage-claims"
+      - "POST /rentals/{id}/buyout-offers"
+      - "POST /buyout-offers/{id}/accept"
+      - "GET own account/rentals/deliveries/tickets/claims/offers"
+  - name: FleetManager
+    description: "Delivery-rider business operator; owns a FLEET-type Account with many rentals; can generate fleet invoices."
+    identity: "entity_backed:Account"
+    exclusive_operations:
+      - "POST /accounts/{id}/fleet-invoices (own FLEET account)"
+    shared_operations:
+      - "POST /rentals"
+      - "POST /rentals/{id}/activate"
+      - "POST /rentals/{id}/request-return"
+      - "POST /rentals/{id}/cancel"
+      - "POST /service-tickets"
+      - "POST /service-tickets/{id}/reopen"
+      - "POST /coverage-claims"
+      - "POST /rentals/{id}/buyout-offers"
+      - "POST /buyout-offers/{id}/accept"
+      - "POST /fleet-invoices/{id}/pay"
+  - name: FieldTech
+    description: "Field technician; completes deliveries, services bikes, files return inspections."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /deliveries/{id}/complete"
+      - "POST /rentals/{id}/inspect"
+      - "POST /service-tickets/{id}/start"
+      - "POST /service-tickets/{id}/resolve"
+      - "POST /service-tickets/{id}/close"
+    shared_operations:
+      - "POST /deliveries"
+      - "POST /service-tickets"
+  - name: OpsAdmin
+    description: "Platform operator; manages catalog/fleet, runs cycle advance, reviews claims, sets clock."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /bike-models"
+      - "POST /bikes"
+      - "POST /bikes/{id}/retire"
+      - "POST /accounts/{id}/suspend"
+      - "POST /rentals/{id}/advance-cycle"
+      - "POST /coverage-claims/{id}/review"
+      - "POST /coverage-claims/{id}/approve"
+      - "POST /coverage-claims/{id}/deny"
+      - "POST /coverage-claims/{id}/close"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /deliveries"
+      - "POST /accounts/{id}/fleet-invoices"
+      - "POST /fleet-invoices/{id}/pay"
+  - name: Anonymous
+    description: "Unauthenticated caller; may only open an account."
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /accounts"

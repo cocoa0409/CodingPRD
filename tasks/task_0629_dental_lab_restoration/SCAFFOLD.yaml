@@ -1,0 +1,1639 @@
+scenario: |
+  Dental Lab & Restoration Fabrication: case intake (Rx/impression/scan) & doctor account,
+  restoration type (crown/bridge/denture/aligner) & material, CAD/CAM & milling/printing schedule,
+  shade/remake & try-in, turnaround SLA & rush, shipping/pickup route, per-unit pricing & invoice,
+  redo/warranty
+
+domain_name: dental-lab-restoration
+api_prefix: ""
+
+# Expert-difficulty design.
+# Primary archetype: workflow orchestration (multi-step fabrication pipeline with branching +
+# revision/remake cycles). Secondary archetype: pricing engine (per-unit pricing, tiered doctor
+# discount, rush surcharge, SLA credit, provisional vs final invoice). The two non-linear state
+# machines (Case revision/remake cycle; Invoice parallel billing×delivery dimensions) plus the
+# milling-vs-route temporal-overlap pair carry the difficulty.
+
+complexity_profile:
+  primary_archetype: workflow_orchestration
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - dual_variant_calculation        # provisional invoice at submit vs final invoice at ship
+    - cascading_side_effects          # case advance -> units -> invoice -> doctor ledger -> credit memo
+    - rate_threshold_triggers         # doctor volume discount tier; route capacity; SLA breach boundary
+    - optimistic_concurrency          # OCC on Case.version for try-in verdict + on MillMachine.version for scheduling
+
+  entity_topology: hybrid
+  # Case -> Restoration -> FabricationUnit is a strict ownership tree; Material, MillMachine,
+  # CourierRoute are flat peer configuration/resource entities referenced by FK; Invoice, CreditMemo,
+  # RemakeRequest, ShadeRecord, MillJob, RouteStop are cross-cutting satellites.
+
+  state_machine_shape: cyclic
+  # Case: INTAKE -> DESIGN -> FABRICATION -> TRY_IN -> (revision loop back to DESIGN/FABRICATION) ->
+  #       SHIPPED -> DELIVERED, with a redo/warranty loop reopening from DELIVERED.
+  # Invoice carries parallel dimensions (billing_status x delivery_status).
+
+  relationship_patterns:
+    - one_to_many        # Case 1..* Restoration; Restoration 1..* FabricationUnit
+    - cross_aggregate    # MillJob -> FabricationUnit + MillMachine; RouteStop -> Case + CourierRoute
+    - self_referential   # FabricationUnit.remade_from_unit_id -> FabricationUnit.id (remake chain)
+
+  role_model: peer_roles
+  # Doctor owns intake + try-in verdicts on their own cases; LabTech owns design/fabrication/QC;
+  # Scheduler owns milling + courier routing; Billing owns invoices/credits; LabAdmin overrides + config.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Doctor
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only; never used in business decisions.
+      - name: full_name
+        type: string
+        source: input
+        description: Prescribing doctor / practice contact name.
+      - name: practice_name
+        type: string
+        source: input
+        description: Dental practice the doctor bills under.
+      - name: email
+        type: string
+        source: input
+        description: Unique login/contact email.
+        constraints: unique across all Doctor rows
+      - name: completed_case_count
+        type: integer
+        source: computed
+        description: >-
+          Count of this doctor's Cases whose status is DELIVERED. Drives the volume discount tier.
+          Recomputed each time one of the doctor's cases enters DELIVERED.
+        default: 0
+      - name: account_credit_cents
+        type: integer
+        source: computed
+        description: >-
+          Running ledger of un-applied account credit owed to the doctor, in integer cents. Incremented
+          when an SLA CreditMemo is ISSUED against one of their cases; decremented by the exact same amount
+          when that memo is VOIDED. Conserved quantity (see calc credit_ledger_conservation).
+        default: 0
+
+  - name: Material
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only.
+      - name: code
+        type: string
+        source: input
+        description: Short material code, unique.
+        constraints: unique; e.g. ZIRCONIA, EMAX, PFM, ACRYLIC, PMMA
+      - name: name
+        type: string
+        source: input
+        description: Human-readable material name.
+      - name: base_unit_price_cents
+        type: integer
+        source: input
+        description: Base per-unit price for this material in integer cents, before type complexity factor.
+        constraints: integer >= 1
+      - name: fabrication_process
+        type: enum
+        source: input
+        description: Whether units in this material are MILLED or PRINTED. Determines machine eligibility.
+        constraints: one of {MILLED, PRINTED}
+      - name: is_active
+        type: boolean
+        source: input
+        description: Whether the material may be selected on new restorations.
+        default: true
+
+  - name: MillMachine
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only.
+      - name: name
+        type: string
+        source: input
+        description: Machine label, e.g. "Mill-A".
+      - name: capability
+        type: enum
+        source: input
+        description: Which process this machine performs. A MillJob is only schedulable on a machine whose capability matches the unit's material fabrication_process.
+        constraints: one of {MILLED, PRINTED}
+      - name: status
+        type: enum
+        source: computed
+        description: Lifecycle status (see MillMachine state machine).
+        default: AVAILABLE
+        constraints: one of {AVAILABLE, MAINTENANCE}
+
+  - name: CourierRoute
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only.
+      - name: label
+        type: string
+        source: input
+        description: Route label, e.g. "North Loop AM".
+      - name: service_date
+        type: datetime
+        source: input
+        description: Calendar date (ISO 8601 UTC) the route runs.
+      - name: max_stops
+        type: integer
+        source: input
+        description: Maximum number of RouteStops this route may carry.
+        constraints: integer >= 1
+      - name: buffer_minutes
+        type: integer
+        source: input
+        description: Mandatory gap, in minutes, required between consecutive stop windows on this route.
+        default: 30
+        constraints: integer >= 0
+      - name: stop_count
+        type: integer
+        source: computed
+        description: Number of RouteStops currently attached whose status is not CANCELLED.
+        default: 0
+
+  - name: Case
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only; never used in business decisions.
+      - name: doctor_id
+        type: string
+        source: input
+        description: FK -> Doctor.id; the prescribing doctor who owns this case.
+      - name: intake_method
+        type: enum
+        source: input
+        description: How the case was received.
+        constraints: one of {RX_PAPER, IMPRESSION, INTRAORAL_SCAN}
+      - name: is_rush
+        type: boolean
+        source: input
+        description: Whether the doctor requested rush turnaround at intake. Affects SLA hours and pricing surcharge.
+        default: false
+      - name: status
+        type: enum
+        source: computed
+        description: Case lifecycle status (see Case state machine).
+        default: INTAKE
+        constraints: one of {INTAKE, DESIGN, FABRICATION, TRY_IN, REVISION, SHIPPED, DELIVERED, CANCELLED}
+      - name: scheduled_start_at
+        type: datetime
+        source: computed
+        description: >-
+          Logical-clock timestamp at which the case left INTAKE (the SUBMIT_TO_DESIGN transition). Null until then.
+          Anchors promised_ready_at.
+      - name: promised_ready_at
+        type: datetime
+        source: computed
+        description: >-
+          scheduled_start_at + promised turnaround hours for the slowest restoration type on the case (see calc
+          turnaround_promise). Null until the case leaves INTAKE.
+      - name: shipped_at
+        type: datetime
+        source: computed
+        description: Logical-clock timestamp at which the case entered SHIPPED. Null until then.
+      - name: sla_breached
+        type: boolean
+        source: computed
+        description: True iff shipped_at > promised_ready_at, fixed at ship time. Drives SLA CreditMemo issuance.
+        default: false
+      - name: revision_count
+        type: integer
+        source: computed
+        description: Number of times the case has cycled TRY_IN -> REVISION. Capped by MAX_REVISIONS.
+        default: 0
+      - name: billable_unit_count
+        type: integer
+        source: computed
+        description: >-
+          Count of this case's FabricationUnits with is_billable=true. Equal to the estimated unit count at submit;
+          unchanged by warranty remakes (remake units carry is_billable=false). Conserved quantity.
+        default: 0
+
+  - name: Restoration
+    parent: Case
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only.
+      - name: case_id
+        type: string
+        source: input
+        description: FK -> Case.id; the parent case.
+      - name: material_id
+        type: string
+        source: input
+        description: FK -> Material.id; selected material. Must be is_active=true at creation.
+      - name: restoration_type
+        type: enum
+        source: input
+        description: Restoration category. Determines the type complexity factor and the SLA turnaround hours.
+        constraints: one of {CROWN, BRIDGE, DENTURE, ALIGNER}
+      - name: unit_count
+        type: integer
+        source: input
+        description: >-
+          Declared billable unit count (crown=teeth, bridge=pontics+abutments, denture=arches, aligner=steps).
+          Each becomes a FabricationUnit at SUBMIT_TO_DESIGN.
+        constraints: integer >= 1
+      - name: requested_shade
+        type: string
+        source: input
+        description: Doctor-requested VITA shade code, e.g. "A2".
+      - name: unit_price_cents
+        type: integer
+        source: computed
+        description: >-
+          Per-unit price for this restoration = round_half_up(material.base_unit_price_cents * type_complexity_factor),
+          rounded to whole cents PER UNIT before any summation (see calc line_item_pricing).
+        default: 0
+
+  - name: FabricationUnit
+    parent: Restoration
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only.
+      - name: restoration_id
+        type: string
+        source: input
+        description: FK -> Restoration.id; the parent restoration.
+      - name: remade_from_unit_id
+        type: string
+        source: input
+        description: >-
+          FK -> FabricationUnit.id; set only on a remake unit, pointing at the unit it replaces. Null for original units.
+        default: null
+      - name: status
+        type: enum
+        source: computed
+        description: Unit lifecycle status (see FabricationUnit state machine).
+        default: QUEUED
+        constraints: one of {QUEUED, MILLING, MILLED, TRIED_IN, PASSED, REMADE_OUT}
+      - name: is_billable
+        type: boolean
+        source: computed
+        description: >-
+          True for original units (billed on the invoice); false for warranty remake units. Set at creation and
+          never mutated thereafter, so billable_unit_count and invoice subtotal are conserved across remakes.
+        default: true
+
+  - name: ShadeRecord
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only.
+      - name: restoration_id
+        type: string
+        source: input
+        description: FK -> Restoration.id; the restoration whose shade was captured/adjusted.
+      - name: shade_code
+        type: string
+        source: input
+        description: Recorded VITA shade code at try-in.
+      - name: matched
+        type: boolean
+        source: input
+        description: Whether the recorded shade matched the doctor's requested_shade at try-in.
+
+  - name: MillJob
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only.
+      - name: fabrication_unit_id
+        type: string
+        source: input
+        description: FK -> FabricationUnit.id; the unit being milled/printed.
+      - name: mill_machine_id
+        type: string
+        source: input
+        description: FK -> MillMachine.id; the machine reserved for this job.
+      - name: start_at
+        type: datetime
+        source: input
+        description: ISO 8601 UTC start of the machine occupation interval.
+      - name: duration_minutes
+        type: integer
+        source: input
+        description: Length of the occupation in minutes; end_at = start_at + duration_minutes (half-open interval).
+        constraints: integer >= 1
+      - name: end_at
+        type: datetime
+        source: computed
+        description: start_at + duration_minutes; exclusive end of the half-open occupation interval [start_at, end_at).
+      - name: status
+        type: enum
+        source: computed
+        description: MillJob lifecycle status (see MillJob state machine).
+        default: SCHEDULED
+        constraints: one of {SCHEDULED, RUNNING, DONE, CANCELLED}
+
+  - name: RouteStop
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only.
+      - name: courier_route_id
+        type: string
+        source: input
+        description: FK -> CourierRoute.id; the route this stop belongs to.
+      - name: case_id
+        type: string
+        source: input
+        description: FK -> Case.id; the case being delivered/picked up at this stop.
+      - name: window_start_at
+        type: datetime
+        source: input
+        description: ISO 8601 UTC start of the on-site service window (closed interval).
+      - name: window_minutes
+        type: integer
+        source: input
+        description: Length of the service window in minutes; window_end_at = window_start_at + window_minutes.
+        constraints: integer >= 1
+      - name: window_end_at
+        type: datetime
+        source: computed
+        description: window_start_at + window_minutes; inclusive end of the closed service window.
+      - name: status
+        type: enum
+        source: computed
+        description: RouteStop lifecycle status.
+        default: PLANNED
+        constraints: one of {PLANNED, COMPLETED, CANCELLED}
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only.
+      - name: case_id
+        type: string
+        source: input
+        description: FK -> Case.id; the case this invoice bills. One PROVISIONAL invoice per case.
+      - name: kind
+        type: enum
+        source: computed
+        description: PROVISIONAL (issued at submit) or FINAL (recomputed at ship). The same Invoice row flips kind at ship.
+        default: PROVISIONAL
+        constraints: one of {PROVISIONAL, FINAL}
+      - name: subtotal_cents
+        type: integer
+        source: computed
+        description: Sum over the case's is_billable=true FabricationUnits of their restoration's unit_price_cents.
+        default: 0
+      - name: rush_surcharge_cents
+        type: integer
+        source: computed
+        description: round_half_up(subtotal_cents * RUSH_PCT) when case.is_rush, else 0.
+        default: 0
+      - name: discount_cents
+        type: integer
+        source: computed
+        description: round_half_up((subtotal_cents + rush_surcharge_cents) * doctor volume tier pct). See calc invoice_total.
+        default: 0
+      - name: tax_cents
+        type: integer
+        source: computed
+        description: round_half_up((subtotal+rush-discount) * TAX_PCT).
+        default: 0
+      - name: sla_credit_cents
+        type: integer
+        source: computed
+        description: round_half_up(subtotal_cents * SLA_CREDIT_PCT) on FINAL invoices when case.sla_breached, else 0.
+        default: 0
+      - name: total_cents
+        type: integer
+        source: computed
+        description: subtotal + rush - discount + tax - sla_credit. The single source of truth for the amount due.
+        default: 0
+      - name: billing_status
+        type: enum
+        source: computed
+        description: Billing dimension of the invoice (parallel to delivery_status; see Invoice state machine).
+        default: DRAFT
+        constraints: one of {DRAFT, ISSUED, PAID, VOID}
+      - name: delivery_status
+        type: enum
+        source: computed
+        description: Delivery dimension of the invoice (parallel to billing_status).
+        default: PENDING
+        constraints: one of {PENDING, IN_TRANSIT, DELIVERED}
+
+  - name: CreditMemo
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only.
+      - name: case_id
+        type: string
+        source: input
+        description: FK -> Case.id; the case the SLA credit relates to.
+      - name: invoice_id
+        type: string
+        source: input
+        description: FK -> Invoice.id; the FINAL invoice the credit was applied against.
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: SLA credit amount in cents, equal to the invoice's sla_credit_cents at issuance.
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: ISSUED when first created at ship; VOID when reversed by a within-SLA warranty re-ship.
+        default: ISSUED
+        constraints: one of {ISSUED, VOID}
+
+  - name: RemakeRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: id
+        type: string
+        source: system
+        description: Server-minted UUID, no prefix. Identity only.
+      - name: case_id
+        type: string
+        source: input
+        description: FK -> Case.id; the case being redone under warranty.
+      - name: fabrication_unit_id
+        type: string
+        source: input
+        description: FK -> FabricationUnit.id; the delivered unit the doctor reports as failed.
+      - name: reason
+        type: enum
+        source: input
+        description: Why the redo is requested.
+        constraints: one of {SHADE_MISMATCH, POOR_FIT, FRACTURE, CONTACT_OPEN}
+      - name: status
+        type: enum
+        source: computed
+        description: RemakeRequest lifecycle status.
+        default: OPEN
+        constraints: one of {OPEN, APPROVED, DENIED, COMPLETED}
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Case
+    initial_state: INTAKE
+    terminal_states: [DELIVERED, CANCELLED]
+    transitions:
+      - from: INTAKE
+        to: DESIGN
+        trigger: "POST /cases/{id}/submit"
+        actor: LabTech
+        preconditions:
+          - "case has >= 1 Restoration"
+          - "every Restoration references a Material with is_active=true"
+        side_effects:
+          - "for each Restoration, create unit_count FabricationUnits in QUEUED with is_billable=true and remade_from_unit_id=null"
+          - "set Case.billable_unit_count = sum of Restoration.unit_count"
+          - "set Case.scheduled_start_at = current logical clock"
+          - "run calc line_item_pricing for each Restoration (sets Restoration.unit_price_cents)"
+          - "run calc turnaround_promise -> set Case.promised_ready_at"
+          - "create one Invoice (kind=PROVISIONAL, billing_status=DRAFT, delivery_status=PENDING); run calc invoice_total to populate its amounts"
+          - "increments Case.version by 1"
+      - from: DESIGN
+        to: FABRICATION
+        trigger: "POST /cases/{id}/start-fabrication"
+        actor: LabTech
+        preconditions:
+          - "every FabricationUnit of the case in QUEUED has a SCHEDULED or DONE MillJob"
+        side_effects:
+          - "increments Case.version by 1"
+      - from: FABRICATION
+        to: TRY_IN
+        trigger: "POST /cases/{id}/ready-tryin"
+        actor: LabTech
+        preconditions:
+          - "every is_billable FabricationUnit of the case is in MILLED"
+        side_effects:
+          - "increments Case.version by 1"
+      - from: TRY_IN
+        to: REVISION
+        trigger: "POST /cases/{id}/tryin-verdict (verdict=REVISE)"
+        actor: Doctor
+        preconditions:
+          - "Case.revision_count < MAX_REVISIONS"
+          - "expected_case_version matches Case.version (OCC)"
+        side_effects:
+          - "increment Case.revision_count by 1"
+          - "set each MILLED is_billable FabricationUnit back to QUEUED"
+          - "create a ShadeRecord (matched=false) for each restoration flagged in the verdict"
+          - "increments Case.version by 1"
+        note: "Cyclic revision loop; from REVISION the case re-enters DESIGN."
+      - from: TRY_IN
+        to: SHIPPED
+        trigger: "POST /cases/{id}/tryin-verdict (verdict=ACCEPT)"
+        actor: Doctor
+        preconditions:
+          - "every is_billable FabricationUnit of the case is in PASSED or MILLED"
+          - "expected_case_version matches Case.version (OCC)"
+          - "case has a RouteStop in PLANNED"
+        side_effects:
+          - "set every is_billable MILLED unit to PASSED"
+          - "set Case.shipped_at = current logical clock"
+          - "set Case.sla_breached = (shipped_at > promised_ready_at)"
+          - "flip the case Invoice kind=FINAL; rerun calc invoice_total (final variant) including SLA credit if breached"
+          - "if sla_breached: create CreditMemo (ISSUED) for Invoice.sla_credit_cents and run calc credit_ledger_conservation (Doctor.account_credit_cents += amount)"
+          - "set Invoice.billing_status=ISSUED and Invoice.delivery_status=IN_TRANSIT"
+          - "increments Case.version by 1"
+      - from: REVISION
+        to: DESIGN
+        trigger: "POST /cases/{id}/start-fabrication"
+        actor: LabTech
+        preconditions:
+          - "every requeued FabricationUnit has a fresh SCHEDULED or DONE MillJob"
+        side_effects:
+          - "increments Case.version by 1"
+        note: "Re-entry leg of the cycle; identical trigger as DESIGN->FABRICATION but from REVISION it lands in DESIGN to re-walk design->fab."
+      - from: SHIPPED
+        to: DELIVERED
+        trigger: "POST /cases/{id}/confirm-delivery"
+        actor: Scheduler
+        preconditions:
+          - "case has a RouteStop in COMPLETED"
+        side_effects:
+          - "set Invoice.delivery_status=DELIVERED"
+          - "recompute Doctor.completed_case_count (+1 for this DELIVERED case)"
+          - "increments Case.version by 1"
+      - from: INTAKE
+        to: CANCELLED
+        trigger: "POST /cases/{id}/cancel"
+        actor: Doctor
+        preconditions:
+          - "case has no SHIPPED/DELIVERED history"
+        side_effects:
+          - "set any DRAFT Invoice billing_status=VOID"
+          - "increments Case.version by 1"
+      - from: DESIGN
+        to: CANCELLED
+        trigger: "POST /cases/{id}/cancel"
+        actor: Doctor
+        preconditions: []
+        side_effects:
+          - "cancel every SCHEDULED MillJob of the case's units (status->CANCELLED), which frees each reserved MillMachine interval"
+          - "set the case Invoice billing_status=VOID"
+          - "increments Case.version by 1"
+        note: "Cascade: case cancel -> MillJob cancel -> machine interval freed."
+
+  - entity: FabricationUnit
+    initial_state: QUEUED
+    terminal_states: [PASSED, REMADE_OUT]
+    transitions:
+      - from: QUEUED
+        to: MILLING
+        trigger: "POST /mill-jobs/{id}/start"
+        actor: Scheduler
+        preconditions:
+          - "the unit's MillJob is SCHEDULED"
+        side_effects:
+          - "set MillJob.status=RUNNING"
+          - "increments FabricationUnit.version by 1"
+      - from: MILLING
+        to: MILLED
+        trigger: "POST /mill-jobs/{id}/complete"
+        actor: Scheduler
+        preconditions:
+          - "the unit's MillJob is RUNNING"
+        side_effects:
+          - "set MillJob.status=DONE"
+          - "increments FabricationUnit.version by 1"
+      - from: MILLED
+        to: TRIED_IN
+        trigger: "POST /cases/{id}/tryin-verdict"
+        actor: Doctor
+        preconditions:
+          - "parent Case is in TRY_IN"
+        side_effects:
+          - "increments FabricationUnit.version by 1"
+        note: "Branch point: from TRIED_IN the unit either reaches PASSED (ACCEPT) or REMADE_OUT (remake)."
+      - from: TRIED_IN
+        to: PASSED
+        trigger: "POST /cases/{id}/tryin-verdict (verdict=ACCEPT)"
+        actor: Doctor
+        preconditions: []
+        side_effects:
+          - "increments FabricationUnit.version by 1"
+      - from: MILLED
+        to: QUEUED
+        trigger: "POST /cases/{id}/tryin-verdict (verdict=REVISE)"
+        actor: Doctor
+        preconditions:
+          - "parent Case revision_count < MAX_REVISIONS"
+        side_effects:
+          - "increments FabricationUnit.version by 1"
+        note: "Revision loop sends the unit back to QUEUED for re-milling."
+      - from: PASSED
+        to: REMADE_OUT
+        trigger: "POST /remake-requests/{id}/approve"
+        actor: LabAdmin
+        preconditions:
+          - "parent Case is DELIVERED"
+          - "the RemakeRequest targets this PASSED unit and is OPEN"
+        side_effects:
+          - "create a new FabricationUnit (status=QUEUED, is_billable=false, remade_from_unit_id=this unit)"
+          - "set RemakeRequest.status=APPROVED"
+          - "increments FabricationUnit.version by 1"
+        note: "Warranty redo branch. Conserves billable_unit_count: replacement unit is is_billable=false."
+
+  - entity: MillJob
+    initial_state: SCHEDULED
+    terminal_states: [DONE, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: RUNNING
+        trigger: "POST /mill-jobs/{id}/start"
+        actor: Scheduler
+        preconditions:
+          - "MillMachine.status=AVAILABLE"
+          - "expected_machine_version matches MillMachine.version (OCC)"
+        side_effects:
+          - "set FabricationUnit.status=MILLING"
+          - "increments MillMachine.version by 1"
+      - from: RUNNING
+        to: DONE
+        trigger: "POST /mill-jobs/{id}/complete"
+        actor: Scheduler
+        preconditions: []
+        side_effects:
+          - "set FabricationUnit.status=MILLED"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /mill-jobs/{id}/cancel OR cascade from Case cancel"
+        actor: Scheduler
+        preconditions: []
+        side_effects:
+          - "free the MillMachine occupation interval [start_at, end_at) for re-scheduling"
+
+  - entity: MillMachine
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: MAINTENANCE
+        trigger: "POST /mill-machines/{id}/maintenance"
+        actor: Scheduler
+        preconditions:
+          - "no MillJob on this machine is currently RUNNING"
+        side_effects:
+          - "increments MillMachine.version by 1"
+        note: "While in MAINTENANCE the machine fails the MillJob start precondition MillMachine.status=AVAILABLE."
+      - from: MAINTENANCE
+        to: AVAILABLE
+        trigger: "POST /mill-machines/{id}/release"
+        actor: Scheduler
+        preconditions: []
+        side_effects:
+          - "increments MillMachine.version by 1"
+
+  - entity: Invoice
+    initial_state: DRAFT
+    terminal_states: [VOID]
+    note: >-
+      Parallel dimensions: billing_status (DRAFT->ISSUED->PAID, or ->VOID) evolves independently of
+      delivery_status (PENDING->IN_TRANSIT->DELIVERED). Terminal applies to the billing dimension.
+    transitions:
+      - from: DRAFT
+        to: ISSUED
+        trigger: "case ship (POST /cases/{id}/tryin-verdict verdict=ACCEPT)"
+        actor: Doctor
+        preconditions:
+          - "Invoice.kind has flipped to FINAL"
+        side_effects:
+          - "set delivery_status=IN_TRANSIT"
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /invoices/{id}/pay"
+        actor: Billing
+        preconditions:
+          - "billing_status=ISSUED"
+        side_effects:
+          - "increments Invoice.version by 1"
+      - from: DRAFT
+        to: VOID
+        trigger: "case cancel (POST /cases/{id}/cancel)"
+        actor: Doctor
+        preconditions:
+          - "billing_status=DRAFT"
+        side_effects:
+          - "increments Invoice.version by 1"
+      - from: PENDING
+        to: IN_TRANSIT
+        trigger: "case ship"
+        actor: Doctor
+        preconditions: []
+        side_effects: []
+        note: "delivery dimension; fires together with DRAFT->ISSUED at ship."
+      - from: IN_TRANSIT
+        to: DELIVERED
+        trigger: "POST /cases/{id}/confirm-delivery"
+        actor: Scheduler
+        preconditions:
+          - "billing_status IN {ISSUED, PAID}"
+        side_effects: []
+        note: "delivery dimension only; billing dimension untouched."
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: tryin-verdict-stale-case
+    parent_entity: Case
+    write_endpoint: "POST /cases/{id}/tryin-verdict"
+    occ_field: "expected_case_version"
+    description: |
+      Recording a try-in verdict against a Case whose version has advanced since the client last
+      observed it is rejected. A LabTech re-milling step or a sibling restoration's shade update
+      legitimately bumps Case.version; a verdict carrying a stale expected_case_version is rejected
+      so the doctor cannot accept/revise a case whose fabrication state has moved underneath them.
+    error_id: ERR_STALE_CASE_VERSION
+    http_status: 412
+
+  - rule_id: milljob-start-stale-machine
+    parent_entity: MillMachine
+    write_endpoint: "POST /mill-jobs/{id}/start"
+    occ_field: "expected_machine_version"
+    description: |
+      Starting a MillJob against a MillMachine whose version has advanced since the client last read it
+      is rejected. Another job legitimately started on (and thus advanced the version of) the same
+      machine; the second start carrying a stale expected_machine_version is rejected, since the machine
+      is now occupied and the caller's view is stale.
+    error_id: ERR_STALE_MACHINE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: line_item_pricing
+    trigger: "Case SUBMIT_TO_DESIGN (INTAKE->DESIGN); recomputed only if never set"
+    algorithm: tiered_pricing
+    formula: |
+      type_factor = TYPE_COMPLEXITY[restoration_type]   # CROWN 1.00, BRIDGE 1.25, DENTURE 2.00, ALIGNER 0.30
+      Restoration.unit_price_cents =
+        round_half_up( Material.base_unit_price_cents * type_factor )   # ROUND PER UNIT (whole cents) FIRST
+    input_set: "the restoration's material.base_unit_price_cents and its restoration_type"
+    constants:
+      TYPE_COMPLEXITY_CROWN: 1.00
+      TYPE_COMPLEXITY_BRIDGE: 1.25
+      TYPE_COMPLEXITY_DENTURE: 2.00
+      TYPE_COMPLEXITY_ALIGNER: 0.30
+    precision: "round per unit to whole cents, round_half_up; this per-unit-then-sum order is pinned (see invoice_subtotal note)"
+    variants:
+      - name: per_unit_round
+        when: "always — the only sanctioned order"
+        difference: >-
+          Each unit_price is rounded to whole cents BEFORE the subtotal multiplies by unit_count and sums across
+          restorations. 'Sum the unrounded products then round once' is explicitly NOT used and diverges by up to a
+          cent per line (e.g. base 9999, factor 1.25, 3 units: per-unit-round sum = 37497, sum-then-round = 37496).
+
+  - name: invoice_total
+    trigger: "Case SUBMIT_TO_DESIGN (provisional variant); Case ship ACCEPT (final variant)"
+    algorithm: aggregation
+    formula: |
+      subtotal       = sum over case FabricationUnits where is_billable=true of (their Restoration.unit_price_cents)
+      rush_surcharge = round_half_up(subtotal * RUSH_PCT) if Case.is_rush else 0
+      pre_discount   = subtotal + rush_surcharge
+      tier_pct       = volume_tier(doctor.completed_case_count)   # see constants
+      discount       = round_half_up(pre_discount * tier_pct)
+      taxable        = pre_discount - discount
+      tax            = round_half_up(taxable * TAX_PCT)
+      sla_credit     = round_half_up(subtotal * SLA_CREDIT_PCT) if (FINAL variant AND Case.sla_breached) else 0
+      total          = taxable + tax - sla_credit
+      # Evaluation order is pinned: rush before discount, discount before tax, sla_credit subtracted last.
+    input_set: "case's is_billable FabricationUnits and their parent Restorations; the owning Doctor's completed_case_count snapshot"
+    constants:
+      RUSH_PCT: 0.50
+      TAX_PCT: 0.0825
+      SLA_CREDIT_PCT: 0.20
+      TIER_0_MAX: 4        # completed_case_count 0..4 -> 0%
+      TIER_1_MIN: 5        # 5..19 -> 5%
+      TIER_1_PCT: 0.05
+      TIER_2_MIN: 20       # 20+ -> 10%
+      TIER_2_PCT: 0.10
+    precision: "integer cents throughout; round_half_up at each named step (rush, discount, tax, sla_credit) in the pinned order"
+    variants:
+      - name: provisional
+        when: "computed at SUBMIT_TO_DESIGN, before any try-in"
+        difference: >-
+          Uses doctor.completed_case_count as it stands at submit; never includes sla_credit (no ship has occurred);
+          Invoice.kind=PROVISIONAL.
+      - name: final
+        when: "recomputed at ship ACCEPT"
+        difference: >-
+          Re-reads doctor.completed_case_count at ship (a tier may have crossed between submit and ship, changing the
+          discount); includes sla_credit when Case.sla_breached; Invoice.kind flips to FINAL. Same data, different
+          number than provisional whenever the tier moved or the SLA broke.
+
+  - name: turnaround_promise
+    trigger: "Case SUBMIT_TO_DESIGN"
+    algorithm: threshold
+    formula: |
+      base_hours = max over the case's Restorations of TURN_HOURS[restoration_type]   # CROWN 120, BRIDGE 168, DENTURE 240, ALIGNER 336
+      promised_hours = base_hours if not Case.is_rush
+                       else max(base_hours // 2, RUSH_FLOOR_HOURS)                     # integer floor division, floor at 24h
+      Case.promised_ready_at = Case.scheduled_start_at + promised_hours hours
+    input_set: "the restoration_type of every Restoration on the case; the case is_rush flag"
+    constants:
+      TURN_HOURS_CROWN: 120
+      TURN_HOURS_BRIDGE: 168
+      TURN_HOURS_DENTURE: 240
+      TURN_HOURS_ALIGNER: 336
+      RUSH_FLOOR_HOURS: 24
+    precision: "whole hours; integer floor division on the rush halving"
+
+  - name: sla_breach_evaluation
+    trigger: "Case ship ACCEPT (TRY_IN->SHIPPED)"
+    algorithm: threshold
+    formula: |
+      Case.sla_breached = (Case.shipped_at > Case.promised_ready_at)   # strict >; shipping exactly at the deadline is NOT a breach
+    input_set: "Case.shipped_at (current logical clock at ship) and Case.promised_ready_at"
+    constants: {}
+    precision: "instant comparison on the logical clock; boundary is strict greater-than"
+
+  - name: credit_ledger_conservation
+    trigger: "CreditMemo ISSUED at ship; CreditMemo VOID at within-SLA warranty re-ship"
+    algorithm: aggregation
+    formula: |
+      on ISSUE: Doctor.account_credit_cents += CreditMemo.amount_cents
+      on VOID:  Doctor.account_credit_cents -= CreditMemo.amount_cents   # exact same amount
+      INVARIANT: Doctor.account_credit_cents == sum(CreditMemo.amount_cents where status=ISSUED for that doctor's cases)
+    input_set: "all CreditMemos whose case.doctor_id == this doctor, partitioned by status"
+    constants: {}
+    precision: "integer cents; issue and void move the ledger by identical magnitude so the invariant never drifts"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "the acting role is permitted to invoke this endpoint per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: "for Doctor-owned operations (cancel, tryin-verdict), X-User-ID equals the case's doctor_id"
+    error_id: ERR_NOT_CASE_OWNER
+    http_status: 403
+    applies_to: "POST /cases/{id}/cancel, POST /cases/{id}/tryin-verdict"
+
+  - priority: 4
+    category: existence
+    check: "every path id and FK in the body resolves to an existing resource, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 5
+    category: state
+    check: "target resource is in a state from which the requested transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_case_version equals Case.version on tryin-verdict"
+    error_id: ERR_STALE_CASE_VERSION
+    http_status: 412
+    applies_to: "POST /cases/{id}/tryin-verdict"
+
+  - priority: 7
+    category: state
+    check: "OCC: expected_machine_version equals MillMachine.version on mill-job start"
+    error_id: ERR_STALE_MACHINE_VERSION
+    http_status: 412
+    applies_to: "POST /mill-jobs/{id}/start"
+
+  - priority: 8
+    category: business_safety
+    check: "selected Material.is_active is true when creating a Restoration"
+    error_id: ERR_MATERIAL_INACTIVE
+    http_status: 422
+    applies_to: "POST /cases/{id}/restorations"
+
+  - priority: 9
+    category: business_safety
+    check: "MillMachine.capability equals the unit's Material.fabrication_process when scheduling a MillJob"
+    error_id: ERR_MACHINE_CAPABILITY_MISMATCH
+    http_status: 422
+    applies_to: "POST /mill-jobs"
+
+  - priority: 10
+    category: business_constraint
+    check: "a case being submitted has at least one Restoration with unit_count >= 1 (non-empty fabrication)"
+    error_id: ERR_EMPTY_FABRICATION
+    http_status: 422
+    applies_to: "POST /cases/{id}/submit"
+
+  - priority: 11
+    category: business_constraint
+    check: "Case.revision_count < MAX_REVISIONS before accepting a REVISE verdict"
+    error_id: ERR_MAX_REVISIONS_EXCEEDED
+    http_status: 422
+    applies_to: "POST /cases/{id}/tryin-verdict"
+
+  - priority: 12
+    category: business_temporal
+    check: "a new MillJob's half-open interval [start_at, end_at) does not intersect any non-CANCELLED MillJob on the same MillMachine"
+    error_id: ERR_MACHINE_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /mill-jobs"
+
+  - priority: 13
+    category: business_temporal
+    check: "a new RouteStop's window, expanded by the route's buffer_minutes on both sides, does not overlap any non-CANCELLED stop's window on the same CourierRoute"
+    error_id: ERR_ROUTE_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /route-stops"
+
+  - priority: 14
+    category: business_constraint
+    check: "CourierRoute.stop_count < CourierRoute.max_stops before attaching a new RouteStop"
+    error_id: ERR_ROUTE_AT_CAPACITY
+    http_status: 422
+    applies_to: "POST /route-stops"
+
+  - priority: 15
+    category: business_referential
+    check: "a RemakeRequest targets a FabricationUnit whose status is PASSED on a DELIVERED case"
+    error_id: ERR_UNIT_NOT_WARRANTABLE
+    http_status: 422
+    applies_to: "POST /cases/{id}/remake-requests"
+
+  - priority: 16
+    category: business_constraint
+    check: "request body conforms (required fields present, enums valid, integers in range)"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- clock (test-driving) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: >-
+      Set the server logical clock to an arbitrary ISO 8601 UTC instant. Server startup default is
+      2026-01-01T00:00:00Z; before any call here the logical clock reads exactly that default and never
+      falls back to wall-clock time. All deadline/SLA/interval rules read this clock.
+    roles: [LabAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: datetime }"
+    side_effects: ["advance or rewind the logical clock to to_iso8601"]
+
+  # ---- Doctor ----
+  - method: POST
+    path: "/doctors"
+    description: "Register a prescribing doctor account."
+    roles: [LabAdmin]
+    code: 201
+    input: [full_name, practice_name, email]
+    output: Doctor
+    side_effects: ["create Doctor with completed_case_count=0, account_credit_cents=0"]
+  - method: GET
+    path: "/doctors/{id}"
+    description: "Fetch a doctor including computed completed_case_count and account_credit_cents."
+    roles: [LabAdmin, Billing, Doctor]
+    code: 200
+    input: []
+    output: Doctor
+    side_effects: []
+  - method: GET
+    path: "/doctors"
+    description: "List doctors (paginated)."
+    roles: [LabAdmin, Billing]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Doctor[]
+    side_effects: []
+  - method: GET
+    path: "/doctors/{id}/cases"
+    description: "List a doctor's cases (FK reverse-reachability for Case.doctor_id)."
+    roles: [LabAdmin, Billing, Doctor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Case[]
+    side_effects: []
+
+  # ---- Material ----
+  - method: POST
+    path: "/materials"
+    description: "Create a material in the catalog."
+    roles: [LabAdmin]
+    code: 201
+    input: [code, name, base_unit_price_cents, fabrication_process, "is_active?"]
+    output: Material
+    side_effects: []
+  - method: GET
+    path: "/materials/{id}"
+    description: "Fetch a material."
+    roles: [LabAdmin, LabTech, Billing]
+    code: 200
+    input: []
+    output: Material
+    side_effects: []
+  - method: GET
+    path: "/materials"
+    description: "List materials (paginated)."
+    roles: [LabAdmin, LabTech, Billing]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Material[]
+    side_effects: []
+
+  # ---- MillMachine ----
+  - method: POST
+    path: "/mill-machines"
+    description: "Register a milling/printing machine."
+    roles: [LabAdmin, Scheduler]
+    code: 201
+    input: [name, capability]
+    output: MillMachine
+    side_effects: ["create MillMachine with status=AVAILABLE"]
+  - method: GET
+    path: "/mill-machines/{id}"
+    description: "Fetch a machine including its version (for OCC) and status."
+    roles: [LabAdmin, Scheduler, LabTech]
+    code: 200
+    input: []
+    output: MillMachine
+    side_effects: []
+  - method: GET
+    path: "/mill-machines/{id}/mill-jobs"
+    description: "List mill jobs on a machine (FK reverse-reachability for MillJob.mill_machine_id)."
+    roles: [LabAdmin, Scheduler, LabTech]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: MillJob[]
+    side_effects: []
+  - method: POST
+    path: "/mill-machines/{id}/maintenance"
+    description: "Take an AVAILABLE machine offline into MAINTENANCE (no RUNNING job allowed)."
+    roles: [Scheduler, LabAdmin]
+    code: 200
+    input: []
+    output: MillMachine
+    side_effects: ["MillMachine AVAILABLE->MAINTENANCE; bump MillMachine.version"]
+  - method: POST
+    path: "/mill-machines/{id}/release"
+    description: "Return a MAINTENANCE machine to AVAILABLE."
+    roles: [Scheduler, LabAdmin]
+    code: 200
+    input: []
+    output: MillMachine
+    side_effects: ["MillMachine MAINTENANCE->AVAILABLE; bump MillMachine.version"]
+
+  # ---- CourierRoute ----
+  - method: POST
+    path: "/courier-routes"
+    description: "Create a courier route."
+    roles: [LabAdmin, Scheduler]
+    code: 201
+    input: [label, service_date, max_stops, "buffer_minutes?"]
+    output: CourierRoute
+    side_effects: ["create CourierRoute with stop_count=0"]
+  - method: GET
+    path: "/courier-routes/{id}"
+    description: "Fetch a courier route including stop_count."
+    roles: [LabAdmin, Scheduler]
+    code: 200
+    input: []
+    output: CourierRoute
+    side_effects: []
+  - method: GET
+    path: "/courier-routes/{id}/route-stops"
+    description: "List stops on a route (FK reverse-reachability for RouteStop.courier_route_id)."
+    roles: [LabAdmin, Scheduler]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RouteStop[]
+    side_effects: []
+
+  # ---- Case ----
+  - method: POST
+    path: "/cases"
+    description: "Create a case in INTAKE (doctor account + intake method)."
+    roles: [LabAdmin, LabTech, Doctor]
+    code: 201
+    input: [doctor_id, intake_method, "is_rush?"]
+    output: Case
+    side_effects: ["create Case in INTAKE with billable_unit_count=0, revision_count=0"]
+  - method: GET
+    path: "/cases/{id}"
+    description: "Fetch a case including computed status, SLA timestamps, version."
+    roles: [LabAdmin, LabTech, Doctor, Billing, Scheduler]
+    code: 200
+    input: []
+    output: Case
+    side_effects: []
+  - method: GET
+    path: "/cases"
+    description: "List cases (paginated)."
+    roles: [LabAdmin, LabTech, Billing, Scheduler]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Case[]
+    side_effects: []
+  - method: POST
+    path: "/cases/{id}/restorations"
+    description: "Add a restoration (type + material + unit_count + shade) to an INTAKE case."
+    roles: [LabAdmin, LabTech]
+    code: 201
+    input: [material_id, restoration_type, unit_count, requested_shade]
+    output: Restoration
+    side_effects: ["create Restoration with unit_price_cents=0 (priced at submit)"]
+  - method: GET
+    path: "/cases/{id}/restorations"
+    description: "List restorations on a case (FK reverse-reachability for Restoration.case_id)."
+    roles: [LabAdmin, LabTech, Doctor, Billing]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Restoration[]
+    side_effects: []
+  - method: GET
+    path: "/restorations/{id}"
+    description: "Fetch a single restoration including its computed unit_price_cents."
+    roles: [LabAdmin, LabTech, Doctor, Billing]
+    code: 200
+    input: []
+    output: Restoration
+    side_effects: []
+  - method: GET
+    path: "/materials/{id}/restorations"
+    description: "List restorations using a material (FK reverse-reachability for Restoration.material_id)."
+    roles: [LabAdmin, LabTech, Billing]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Restoration[]
+    side_effects: []
+  - method: GET
+    path: "/fabrication-units/{id}"
+    description: "Fetch a single fabrication unit including status and is_billable."
+    roles: [LabAdmin, LabTech, Doctor]
+    code: 200
+    input: []
+    output: FabricationUnit
+    side_effects: []
+  - method: GET
+    path: "/fabrication-units/{id}/remakes"
+    description: "List replacement units spawned from this unit (FK reverse-reachability for FabricationUnit.remade_from_unit_id)."
+    roles: [LabAdmin, LabTech, Doctor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: FabricationUnit[]
+    side_effects: []
+  - method: GET
+    path: "/fabrication-units/{id}/remake-requests"
+    description: "List remake requests targeting this unit (FK reverse-reachability for RemakeRequest.fabrication_unit_id)."
+    roles: [LabAdmin, LabTech, Doctor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RemakeRequest[]
+    side_effects: []
+  - method: GET
+    path: "/restorations/{id}/fabrication-units"
+    description: "List fabrication units of a restoration (FK reverse-reachability for FabricationUnit.restoration_id and the self-FK remade_from_unit_id)."
+    roles: [LabAdmin, LabTech, Doctor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: FabricationUnit[]
+    side_effects: []
+  - method: GET
+    path: "/restorations/{id}/shade-records"
+    description: "List shade records of a restoration (FK reverse-reachability for ShadeRecord.restoration_id)."
+    roles: [LabAdmin, LabTech, Doctor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ShadeRecord[]
+    side_effects: []
+  - method: POST
+    path: "/cases/{id}/submit"
+    description: "Submit an INTAKE case to DESIGN: materialize units, price, set SLA promise, issue provisional invoice."
+    roles: [LabTech, LabAdmin]
+    code: 200
+    input: []
+    output: Case
+    side_effects: ["INTAKE->DESIGN per §1.2; runs line_item_pricing, turnaround_promise, invoice_total(provisional)"]
+  - method: POST
+    path: "/cases/{id}/start-fabrication"
+    description: "Advance DESIGN (or REVISION) -> FABRICATION once all units are scheduled."
+    roles: [LabTech, LabAdmin]
+    code: 200
+    input: []
+    output: Case
+    side_effects: ["DESIGN/REVISION -> FABRICATION per §1.2"]
+  - method: POST
+    path: "/cases/{id}/ready-tryin"
+    description: "Advance FABRICATION -> TRY_IN once every billable unit is MILLED."
+    roles: [LabTech, LabAdmin]
+    code: 200
+    input: []
+    output: Case
+    side_effects: ["FABRICATION -> TRY_IN per §1.2"]
+  - method: POST
+    path: "/cases/{id}/tryin-verdict"
+    description: "Doctor records the try-in verdict (ACCEPT ships the case; REVISE loops it back). OCC on Case.version."
+    roles: [Doctor]
+    code: 200
+    input: [verdict, expected_case_version, "revise_restoration_ids?"]
+    output: Case
+    side_effects: ["TRY_IN->SHIPPED or TRY_IN->REVISION per §1.2; finalizes invoice and issues SLA credit on breach"]
+  - method: POST
+    path: "/cases/{id}/confirm-delivery"
+    description: "Scheduler confirms delivery (requires a COMPLETED RouteStop) -> DELIVERED."
+    roles: [Scheduler, LabAdmin]
+    code: 200
+    input: []
+    output: Case
+    side_effects: ["SHIPPED->DELIVERED; Invoice.delivery_status=DELIVERED; recompute completed_case_count"]
+  - method: POST
+    path: "/cases/{id}/cancel"
+    description: "Doctor cancels a case (INTAKE or DESIGN) -> CANCELLED, voiding the draft invoice and cascading mill-job cancels."
+    roles: [Doctor, LabAdmin]
+    code: 200
+    input: []
+    output: Case
+    side_effects: ["->CANCELLED; cascade MillJob cancels; void Invoice"]
+  - method: GET
+    path: "/cases/{id}/invoice"
+    description: "Fetch the case's invoice (FK reverse-reachability for Invoice.case_id)."
+    roles: [LabAdmin, Billing, Doctor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+  - method: GET
+    path: "/cases/{id}/credit-memos"
+    description: "List SLA credit memos on a case (FK reverse-reachability for CreditMemo.case_id)."
+    roles: [LabAdmin, Billing, Doctor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CreditMemo[]
+    side_effects: []
+  - method: GET
+    path: "/cases/{id}/remake-requests"
+    description: "List remake requests on a case (FK reverse-reachability for RemakeRequest.case_id)."
+    roles: [LabAdmin, LabTech, Doctor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RemakeRequest[]
+    side_effects: []
+
+  # ---- MillJob ----
+  - method: POST
+    path: "/mill-jobs"
+    description: "Schedule a mill/print job reserving a machine interval for a QUEUED unit."
+    roles: [Scheduler, LabTech, LabAdmin]
+    code: 201
+    input: [fabrication_unit_id, mill_machine_id, start_at, duration_minutes]
+    output: MillJob
+    side_effects: ["create MillJob SCHEDULED; reserve [start_at, end_at) on the machine"]
+  - method: GET
+    path: "/mill-jobs/{id}"
+    description: "Fetch a mill job."
+    roles: [LabAdmin, Scheduler, LabTech]
+    code: 200
+    input: []
+    output: MillJob
+    side_effects: []
+  - method: GET
+    path: "/fabrication-units/{id}/mill-jobs"
+    description: "List mill jobs for a unit (FK reverse-reachability for MillJob.fabrication_unit_id)."
+    roles: [LabAdmin, Scheduler, LabTech]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: MillJob[]
+    side_effects: []
+  - method: POST
+    path: "/mill-jobs/{id}/start"
+    description: "Start a SCHEDULED job -> RUNNING (unit -> MILLING). OCC on MillMachine.version."
+    roles: [Scheduler, LabAdmin]
+    code: 200
+    input: [expected_machine_version]
+    output: MillJob
+    side_effects: ["MillJob SCHEDULED->RUNNING; FabricationUnit QUEUED->MILLING; bump MillMachine.version"]
+  - method: POST
+    path: "/mill-jobs/{id}/complete"
+    description: "Complete a RUNNING job -> DONE (unit -> MILLED)."
+    roles: [Scheduler, LabAdmin]
+    code: 200
+    input: []
+    output: MillJob
+    side_effects: ["MillJob RUNNING->DONE; FabricationUnit MILLING->MILLED"]
+  - method: POST
+    path: "/mill-jobs/{id}/cancel"
+    description: "Cancel a SCHEDULED job -> CANCELLED, freeing the reserved machine interval."
+    roles: [Scheduler, LabAdmin]
+    code: 200
+    input: []
+    output: MillJob
+    side_effects: ["MillJob SCHEDULED->CANCELLED; free machine interval"]
+
+  # ---- RouteStop ----
+  - method: POST
+    path: "/route-stops"
+    description: "Attach a delivery/pickup stop to a courier route (capacity + buffered-window checks)."
+    roles: [Scheduler, LabAdmin]
+    code: 201
+    input: [courier_route_id, case_id, window_start_at, window_minutes]
+    output: RouteStop
+    side_effects: ["create RouteStop PLANNED; increment CourierRoute.stop_count"]
+  - method: GET
+    path: "/route-stops/{id}"
+    description: "Fetch a route stop."
+    roles: [LabAdmin, Scheduler]
+    code: 200
+    input: []
+    output: RouteStop
+    side_effects: []
+  - method: GET
+    path: "/cases/{id}/route-stops"
+    description: "List a case's route stops (FK reverse-reachability for RouteStop.case_id)."
+    roles: [LabAdmin, Scheduler, Doctor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: RouteStop[]
+    side_effects: []
+  - method: POST
+    path: "/route-stops/{id}/complete"
+    description: "Mark a PLANNED stop COMPLETED (the on-site delivery happened)."
+    roles: [Scheduler, LabAdmin]
+    code: 200
+    input: []
+    output: RouteStop
+    side_effects: ["RouteStop PLANNED->COMPLETED"]
+
+  # ---- Invoice ----
+  - method: GET
+    path: "/invoices/{id}"
+    description: "Fetch an invoice with all computed amounts and both status dimensions."
+    roles: [LabAdmin, Billing, Doctor]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+  - method: GET
+    path: "/invoices/{id}/credit-memos"
+    description: "List credit memos applied against an invoice (FK reverse-reachability for CreditMemo.invoice_id)."
+    roles: [LabAdmin, Billing, Doctor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CreditMemo[]
+    side_effects: []
+  - method: POST
+    path: "/invoices/{id}/pay"
+    description: "Billing marks an ISSUED invoice PAID (billing dimension)."
+    roles: [Billing, LabAdmin]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["Invoice billing_status ISSUED->PAID"]
+
+  # ---- RemakeRequest (warranty) ----
+  - method: POST
+    path: "/cases/{id}/remake-requests"
+    description: "Doctor opens a warranty remake request against a delivered PASSED unit."
+    roles: [Doctor, LabAdmin]
+    code: 201
+    input: [fabrication_unit_id, reason]
+    output: RemakeRequest
+    side_effects: ["create RemakeRequest OPEN"]
+  - method: GET
+    path: "/remake-requests/{id}"
+    description: "Fetch a remake request."
+    roles: [LabAdmin, LabTech, Doctor]
+    code: 200
+    input: []
+    output: RemakeRequest
+    side_effects: []
+  - method: POST
+    path: "/remake-requests/{id}/approve"
+    description: "LabAdmin approves a remake: spawns a non-billable replacement unit (warranty), conserving billable_unit_count."
+    roles: [LabAdmin]
+    code: 200
+    input: []
+    output: RemakeRequest
+    side_effects: ["RemakeRequest OPEN->APPROVED; PASSED unit->REMADE_OUT; create non-billable QUEUED replacement unit"]
+  - method: POST
+    path: "/remake-requests/{id}/deny"
+    description: "LabAdmin denies a remake request."
+    roles: [LabAdmin]
+    code: 200
+    input: []
+    output: RemakeRequest
+    side_effects: ["RemakeRequest OPEN->DENIED"]
+  - method: POST
+    path: "/credit-memos/{id}/void"
+    description: >-
+      Billing voids an SLA credit memo (e.g. when a within-SLA warranty re-ship makes the credit moot),
+      decrementing the doctor's account_credit_cents by the exact memo amount.
+    roles: [Billing, LabAdmin]
+    code: 200
+    input: []
+    output: CreditMemo
+    side_effects: ["CreditMemo ISSUED->VOID; Doctor.account_credit_cents -= amount_cents (credit_ledger_conservation)"]
+  - method: GET
+    path: "/credit-memos/{id}"
+    description: "Fetch a credit memo."
+    roles: [LabAdmin, Billing, Doctor]
+    code: 200
+    input: []
+    output: CreditMemo
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID header."
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Authenticated role is not permitted to invoke this endpoint."
+  - id: ERR_NOT_CASE_OWNER
+    http: 403
+    condition: "Doctor acting on a case whose doctor_id does not equal X-User-ID."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A path id or body FK does not resolve to an existing resource."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition is not defined from the resource's current state."
+  - id: ERR_STALE_CASE_VERSION
+    http: 412
+    condition: "expected_case_version does not match Case.version on tryin-verdict (OCC)."
+  - id: ERR_STALE_MACHINE_VERSION
+    http: 412
+    condition: "expected_machine_version does not match MillMachine.version on mill-job start (OCC)."
+  - id: ERR_MATERIAL_INACTIVE
+    http: 422
+    condition: "Restoration references a Material whose is_active is false."
+  - id: ERR_MACHINE_CAPABILITY_MISMATCH
+    http: 422
+    condition: "MillMachine.capability does not match the unit material's fabrication_process."
+  - id: ERR_EMPTY_FABRICATION
+    http: 422
+    condition: "Submitting a case with no Restoration (zero billable units)."
+  - id: ERR_MAX_REVISIONS_EXCEEDED
+    http: 422
+    condition: "A REVISE verdict is recorded when Case.revision_count is already at MAX_REVISIONS."
+  - id: ERR_MACHINE_DOUBLE_BOOKED
+    http: 409
+    condition: "A new MillJob's half-open interval intersects an existing non-CANCELLED job on the same machine."
+  - id: ERR_ROUTE_WINDOW_CONFLICT
+    http: 409
+    condition: "A new RouteStop's buffer-expanded window overlaps an existing non-CANCELLED stop on the same route."
+  - id: ERR_ROUTE_AT_CAPACITY
+    http: 422
+    condition: "Attaching a RouteStop when CourierRoute.stop_count already equals max_stops."
+  - id: ERR_UNIT_NOT_WARRANTABLE
+    http: 422
+    condition: "RemakeRequest targets a unit that is not PASSED on a DELIVERED case."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Body fails schema validation: missing required field, bad enum, out-of-range integer."
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "Generic business-rule violation not covered by a more specific code (reserved fallback)."
+  - id: ERR_PAGINATION_INVALID
+    http: 400
+    condition: "limit/offset out of the allowed pagination bounds."
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Doctor
+    description: "Prescribing doctor; owns intake, try-in verdicts, cancellation, and warranty requests on their own cases."
+    identity: "entity_backed:Doctor"
+    exclusive_operations:
+      - "POST /cases/{id}/tryin-verdict (ACCEPT/REVISE)"
+      - "POST /cases/{id}/remake-requests"
+    shared_operations:
+      - "POST /cases"
+      - "POST /cases/{id}/cancel"
+      - "GET own cases / restorations / units / invoice / credit-memos / route-stops"
+
+  - name: LabTech
+    description: "Lab technician; owns design and fabrication advancement and restoration setup."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /cases/{id}/submit"
+      - "POST /cases/{id}/start-fabrication"
+      - "POST /cases/{id}/ready-tryin"
+      - "POST /cases/{id}/restorations"
+    shared_operations:
+      - "POST /cases"
+      - "POST /mill-jobs"
+      - "GET cases / materials / machines"
+
+  - name: Scheduler
+    description: "Owns milling/printing scheduling and courier routing/delivery."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /mill-jobs/{id}/start"
+      - "POST /mill-jobs/{id}/complete"
+      - "POST /mill-jobs/{id}/cancel"
+      - "POST /route-stops"
+      - "POST /route-stops/{id}/complete"
+      - "POST /cases/{id}/confirm-delivery"
+    shared_operations:
+      - "POST /mill-jobs"
+      - "POST /mill-machines"
+      - "POST /courier-routes"
+
+  - name: Billing
+    description: "Owns invoices and SLA credit memos."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /invoices/{id}/pay"
+      - "POST /credit-memos/{id}/void"
+    shared_operations:
+      - "GET invoices / credit-memos / doctors"
+
+  - name: LabAdmin
+    description: "Lab administrator; superset operational role plus catalog/machine/route configuration, remake adjudication, and clock control."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /doctors"
+      - "POST /materials"
+      - "POST /remake-requests/{id}/approve"
+      - "POST /remake-requests/{id}/deny"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "every shared operation of Doctor (except ownership-gated), LabTech, Scheduler, Billing"
