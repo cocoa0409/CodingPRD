@@ -180,10 +180,11 @@ if [[ ! -f "$HARBOR_TASK_DIR/task.toml" ]]; then
 
   cat > "$HARBOR_TASK_DIR/task.toml" <<EOF
 [task]
-name = "harbor_tasks/$TASK_NAME"
+name = "prd_to_repo/$TASK_NAME"
 keywords = [$TASK_KEYWORDS]
 
 [metadata]
+name = "prd_to_repo/$TASK_NAME"
 source_task = "tasks/$TASK_NAME"
 dataset = "PRD-to-Repo"
 dataset_version = "1.2.18"
