@@ -1,0 +1,1294 @@
+# =============================================================================
+# PRD Benchmark Scaffold — Refill & Zero-Waste Store (task_0737)
+# Difficulty tier: EXPERT
+# Files: SCAFFOLD.yaml (§1.0–§1.7) + SCAFFOLD_DIFFICULTY_DESIGN.yaml (§1.8)
+#        + SCAFFOLD_CORNER_DESIGN.yaml (§1.9)
+# =============================================================================
+
+scenario: |
+  737. Refill & Zero-Waste Store: bulk SKU & tare/weight pricing, container
+  deposit/BYO, refill-station inventory & restock, membership/loyalty, delivery
+  (container return loop), allergen/bulk labeling, subscription refill, shrink
+
+domain_name: refill-zero-waste-store
+api_prefix: /v1
+
+# -----------------------------------------------------------------------------
+# Complexity profile (§0.1–§0.4)
+# -----------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: pricing_engine          # tare/weight + bulk-tier pricing
+  secondary_archetype: ledger_reconciliation # deposit float + shrink reconciliation
+  complexity_layers:
+    - dual_variant_calculation      # provisional (cart) vs final (weighed) pricing & loyalty
+    - cascading_side_effects        # fill -> line -> bin depletion -> LOW -> restock task
+    - optimistic_concurrency        # OCC on Subscription.version for run-supersede
+    - derived_field_reconciliation  # member wallet/liability/loyalty projected from WalletLedger
+
+  entity_topology: flat             # peer entities linked by FK; no URL nesting except reverse-reachability GETs
+  state_machine_shape: parallel     # Order carries independent fulfillment_status x payment_status; Container is cyclic
+  relationship_patterns:
+    - one_to_many                   # Order 1..* RefillLine; BulkBin 1..* RestockTask; Member 1..* WalletLedger
+    - cross_aggregate               # RefillLine -> Container, RefillLine -> BulkBin(via Product), Delivery -> Order
+    - polymorphic                   # WalletLedger.source_id references Order|Container|Delivery|Subscription (audit only, not a validated FK)
+  role_model: peer_roles            # Member owns own orders/containers/subs; StoreClerk fills; InventoryManager owns catalog/inventory/logistics
+  consistency_model: immediate      # all mutations + cascades atomic within the request
+
+# -----------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — verbatim)
+# -----------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  # ---- Member (customer, wallet/loyalty/deposit projections) ----
+  - name: Member
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Login/contact email", constraints: "unique across Members" }
+      - { name: full_name, type: string, source: input, description: "Member display name" }
+      - { name: membership_tier, type: enum, source: input, default: "BASIC", description: "BASIC | PLUS — PLUS grants a 10% goods discount and 1.5x loyalty; BASIC no discount" }
+      - { name: wallet_balance_cents, type: integer, source: computed, description: "= sum(WalletLedger.wallet_delta_cents) for this member; deposit refunds only, never negative by construction" }
+      - { name: deposit_liability_cents, type: integer, source: computed, description: "= sum(WalletLedger.liability_delta_cents) for this member; outstanding container deposits committed to the store" }
+      - { name: loyalty_points_balance, type: integer, source: computed, description: "= sum(WalletLedger.points_delta) for this member" }
+
+  # ---- Product (bulk SKU catalog + tare/tier/allergen config) ----
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "SKU display name" }
+      - { name: category, type: enum, source: input, description: "GRAINS | LIQUIDS | SPICES | CLEANING" }
+      - { name: unit_price_cents_per_100g, type: integer, source: input, description: "Base rate in cents per 100 grams net", constraints: ">= 1" }
+      - { name: bulk_tier_threshold_g, type: integer, source: input, description: "Net grams at or above which the bulk rate applies (>= boundary)", constraints: ">= 1" }
+      - { name: bulk_tier_price_cents_per_100g, type: integer, source: input, description: "Discounted rate in cents per 100 grams for net >= bulk_tier_threshold_g", constraints: "<= unit_price_cents_per_100g" }
+      - { name: allergen_tags, type: array, source: input, default: [], description: "Allergen labels this product carries, e.g. [PEANUT] | [GLUTEN] | []; used for container cross-contamination checks" }
+      - { name: taxable, type: boolean, source: input, default: false, description: "If true, line goods are taxed at TAX_RATE after discount" }
+
+  # ---- RefillStation (physical dispensing station; hosts bins; fill-window resource) ----
+  - name: RefillStation
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Station label" }
+      - { name: station_status, type: enum, source: input, default: "OPEN", description: "OPEN | MAINTENANCE — MAINTENANCE blocks new order fill-windows" }
+
+  # ---- BulkBin (per-product inventory at a station; shrink-reconciled) ----
+  - name: BulkBin
+    parent: null
+    common_fields: true
+    fields:
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the SKU dispensed from this bin" }
+      - { name: station_id, type: string, source: input, description: "FK -> RefillStation.id; station hosting this bin" }
+      - { name: capacity_g, type: integer, source: input, description: "Maximum net grams the bin holds", constraints: ">= 1" }
+      - { name: reorder_threshold_g, type: integer, source: input, description: "on_hand_g at or below which the bin auto-flips to LOW and a RestockTask is created", constraints: ">= 0" }
+      - { name: on_hand_g, type: integer, source: computed, description: "Current net grams available; initialized to last_recount_g, decremented on line FINAL fill, incremented on line void and restock" }
+      - { name: last_recount_g, type: integer, source: input, description: "Physical grams recorded at the most recent recount; the shrink reconciliation baseline" }
+      - { name: last_recount_at, type: datetime, source: system, description: "Logical-clock timestamp of the last recount (server startup default 2026-03-01T00:00:00Z until first recount)" }
+      - { name: last_shrink_g, type: integer, source: computed, default: 0, description: "= book_on_hand_g - physical_g at the most recent recount; positive means missing inventory (shrink)" }
+      - { name: status, type: enum, source: system, default: "OPEN", description: "OPEN | LOW | QUARANTINED — LOW auto-set on threshold cross; QUARANTINED blocks dispensing. Exactly one non-RETIRED bin exists per (product_id, station_id), so fill resolves a unique bin." }
+
+  # ---- Container (deposit / BYO; cyclic return loop; allergen residue) ----
+  - name: Container
+    parent: null
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: input, default: null, description: "FK -> Member.id; owner once issued/registered; null for unissued store stock" }
+      - { name: container_type, type: enum, source: input, description: "GLASS_500 | GLASS_1000 | BYO — GLASS_* are store deposit containers, BYO is member-owned with zero deposit" }
+      - { name: declared_tare_g, type: integer, source: input, description: "Member-declared empty weight used for PROVISIONAL line pricing", constraints: ">= 0" }
+      - { name: measured_tare_g, type: integer, source: system, default: null, description: "Clerk-weighed empty weight captured at fill; used for FINAL line pricing" }
+      - { name: deposit_cents, type: integer, source: system, description: "Deposit value: GLASS_500=150, GLASS_1000=250, BYO=0 (set from container_type at registration)" }
+      - { name: allergen_hold, type: enum, source: system, default: "NONE", description: "NONE | PEANUT | GLUTEN | DAIRY — residual allergen from the last product filled; blocks incompatible fills until inspected clean" }
+      - { name: status, type: enum, source: system, default: "AVAILABLE", description: "AVAILABLE | ISSUED | IN_USE | RETURNED | QUARANTINED | RETIRED — cyclic AVAILABLE->ISSUED->IN_USE->RETURNED->(inspect)->AVAILABLE" }
+
+  # ---- Order (cart -> filled -> completed; parallel fulfillment x payment; station fill-window) ----
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: input, description: "FK -> Member.id; ordering member" }
+      - { name: station_id, type: string, source: input, description: "FK -> RefillStation.id; station where the order is filled and whose fill-window it occupies" }
+      - { name: fulfillment_channel, type: enum, source: input, default: "IN_STORE", description: "IN_STORE | DELIVERY" }
+      - { name: fill_window_start_at, type: datetime, source: input, description: "Half-open [start,end) occupation of station_id; adjacency (start==other.end) allowed" }
+      - { name: fill_window_end_at, type: datetime, source: input, description: "Exclusive end of the station fill-window", constraints: "> fill_window_start_at" }
+      - { name: fulfillment_status, type: enum, source: system, default: "CART", description: "CART | FILLING | FILLED | COMPLETED | CANCELLED (independent of payment_status)" }
+      - { name: payment_status, type: enum, source: system, default: "UNPAID", description: "UNPAID | CAPTURED (independent of fulfillment_status; advances only at checkout)" }
+      - { name: subtotal_cents, type: integer, source: computed, description: "= sum over FINAL non-VOIDED RefillLine.line_price_cents (per-line-rounded then summed)" }
+      - { name: discount_cents, type: integer, source: computed, description: "Order-level loyalty redemption applied at checkout (0 unless redeem_points supplied)" }
+      - { name: deposit_total_cents, type: integer, source: computed, description: "= sum of deposit_cents over containers committed (IN_USE) via this order's lines" }
+      - { name: tax_cents, type: integer, source: computed, description: "= round_half_up(TAX_RATE * sum(taxable FINAL line goods) - taxable share of discount); 0 when no taxable lines" }
+      - { name: total_cents, type: integer, source: computed, description: "= subtotal_cents - discount_cents + deposit_total_cents + tax_cents" }
+      - { name: loyalty_points_earned, type: integer, source: computed, description: "Points credited at checkout (FINAL settlement); provisional estimate not persisted here" }
+
+  # ---- RefillLine (the tare/weight pricing unit; child of Order) ----
+  - name: RefillLine
+    parent: Order
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: system, description: "FK -> Order.id; owning order (set from path on add-line)" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; SKU being refilled" }
+      - { name: container_id, type: string, source: input, description: "FK -> Container.id; container this line dispenses into" }
+      - { name: bin_id, type: string, source: system, description: "FK -> BulkBin.id; the OPEN/LOW bin for product_id at the order's station, bound at fill time" }
+      - { name: declared_tare_g, type: integer, source: input, description: "Copied from container.declared_tare_g at add-line for PROVISIONAL pricing", constraints: ">= 0" }
+      - { name: estimated_gross_g, type: integer, source: input, description: "Member's intended full weight for the PROVISIONAL cart estimate", constraints: ">= 1" }
+      - { name: gross_weight_g, type: integer, source: system, default: null, description: "Clerk-weighed full weight captured at FINAL fill" }
+      - { name: net_weight_g, type: integer, source: computed, description: "PROVISIONAL = estimated_gross_g - declared_tare_g; FINAL = gross_weight_g - container.measured_tare_g" }
+      - { name: line_price_cents, type: integer, source: computed, description: "Tiered tare/weight price for this line; recomputed with FINAL inputs at fill (see refill_line_price)" }
+      - { name: pricing_stage, type: enum, source: system, default: "PROVISIONAL", description: "PROVISIONAL | FINAL | VOIDED — PROVISIONAL at add-line, FINAL at fill, VOIDED on line void" }
+
+  # ---- RestockTask (auto-created on LOW; restock loop) ----
+  - name: RestockTask
+    parent: null
+    common_fields: true
+    fields:
+      - { name: bin_id, type: string, source: system, description: "FK -> BulkBin.id; bin needing restock" }
+      - { name: requested_fill_g, type: integer, source: system, description: "= bin.capacity_g - bin.on_hand_g at creation time" }
+      - { name: restocked_g, type: integer, source: system, default: null, description: "Grams actually added at completion" }
+      - { name: status, type: enum, source: system, default: "OPEN", description: "OPEN | COMPLETED | CANCELLED" }
+
+  # ---- Subscription (recurring refill; OCC on run) ----
+  - name: Subscription
+    parent: null
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: input, description: "FK -> Member.id; subscribing member" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; SKU refilled each cycle" }
+      - { name: station_id, type: string, source: input, description: "FK -> RefillStation.id; default fulfillment station for generated orders" }
+      - { name: target_net_g, type: integer, source: input, description: "Net grams to dispense each cycle", constraints: ">= 1" }
+      - { name: interval_days, type: integer, source: input, description: "Days between runs", constraints: ">= 1" }
+      - { name: next_run_at, type: datetime, source: system, description: "Logical-clock time the next run is due; = last run time + interval_days" }
+      - { name: last_run_order_id, type: string, source: system, default: null, description: "Id of the Order produced by the most recent run (audit back-reference; not a validated foreign key)" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | CANCELLED" }
+
+  # ---- DeliveryVehicle (route resource; delivery windows occupy it with turnaround buffer) ----
+  - name: DeliveryVehicle
+    parent: null
+    common_fields: true
+    fields:
+      - { name: plate, type: string, source: input, description: "Vehicle plate/label", constraints: "unique across DeliveryVehicles" }
+      - { name: capacity_orders, type: integer, source: input, description: "Max concurrent orders per run (informational)", constraints: ">= 1" }
+
+  # ---- Delivery (container return loop; window occupies a DeliveryVehicle) ----
+  - name: Delivery
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> Order.id; the filled order being delivered" }
+      - { name: vehicle_id, type: string, source: input, description: "FK -> DeliveryVehicle.id; assigned vehicle whose window this delivery occupies" }
+      - { name: member_id, type: string, source: system, description: "FK -> Member.id; copied from the order's member" }
+      - { name: window_start_at, type: datetime, source: input, description: "Closed [start,end] window on vehicle_id; requires >= TURNAROUND_BUFFER_MIN gap from other windows on the same vehicle" }
+      - { name: window_end_at, type: datetime, source: input, description: "Closed end of the delivery window", constraints: "> window_start_at" }
+      - { name: status, type: enum, source: system, default: "SCHEDULED", description: "SCHEDULED | DISPATCHED | DELIVERED | RETURNED | CANCELLED — RETURNED closes the container return loop" }
+
+  # ---- WalletLedger (append-only movement log; projects member money/loyalty) ----
+  - name: WalletLedger
+    parent: null
+    common_fields: false   # id + created_at only; immutable event
+    fields:
+      - { name: member_id, type: string, source: system, description: "FK -> Member.id; member the movement applies to" }
+      - { name: entry_type, type: enum, source: system, description: "DEPOSIT_COMMIT | DEPOSIT_REFUND | LOYALTY_ACCRUAL | LOYALTY_REDEEM" }
+      - { name: wallet_delta_cents, type: integer, source: system, default: 0, description: "Signed change to spendable wallet balance (refunds/adjustments positive)" }
+      - { name: liability_delta_cents, type: integer, source: system, default: 0, description: "Signed change to outstanding deposit liability (+deposit on commit, -deposit on refund)" }
+      - { name: points_delta, type: integer, source: system, default: 0, description: "Signed change to loyalty points" }
+      - { name: source_kind, type: enum, source: system, description: "ORDER | CONTAINER | DELIVERY" }
+      - { name: source_id, type: string, source: system, default: null, description: "Polymorphic audit reference to the originating resource id (source_kind selects the entity); not a validated foreign key" }
+      - { name: memo, type: string, source: system, default: null, description: "Human-readable movement note" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  # ---- Container: CYCLIC return loop (non-linear, Rule 3) ----
+  - entity: Container
+    initial_state: AVAILABLE
+    terminal_states: [RETIRED]
+    transitions:
+      - from: AVAILABLE
+        to: ISSUED
+        trigger: "POST /v1/containers/{containerId}/issue"
+        actor: StoreClerk
+        preconditions:
+          - "container.status == AVAILABLE"
+          - "target member exists"
+        side_effects:
+          - "member_id := payload.member_id"
+          - "status := ISSUED"
+
+      - from: ISSUED
+        to: IN_USE
+        trigger: "system (Order checkout commits the container's deposit)"
+        actor: system
+        preconditions:
+          - "container is referenced by a FINAL non-VOIDED RefillLine on the order being checked out"
+        side_effects:
+          - "status := IN_USE"
+          - "WalletLedger DEPOSIT_COMMIT (liability_delta_cents = +deposit_cents) appended for member_id"
+
+      - from: IN_USE
+        to: RETURNED
+        trigger: "POST /v1/containers/{containerId}/return OR POST /v1/deliveries/{deliveryId}/return-received"
+        actor: StoreClerk
+        preconditions:
+          - "container.status == IN_USE"
+        side_effects:
+          - "status := RETURNED"
+          - "WalletLedger DEPOSIT_REFUND (wallet_delta_cents = +deposit_cents, liability_delta_cents = -deposit_cents) appended for member_id"
+
+      - from: RETURNED
+        to: AVAILABLE
+        trigger: "POST /v1/containers/{containerId}/inspect (result=CLEAN)"
+        actor: StoreClerk
+        preconditions:
+          - "container.status == RETURNED"
+        side_effects:
+          - "allergen_hold := NONE"
+          - "measured_tare_g := null"
+          - "member_id := null"
+          - "status := AVAILABLE (re-enters the loop)"
+
+      - from: RETURNED
+        to: QUARANTINED
+        trigger: "POST /v1/containers/{containerId}/inspect (result=RESIDUE)"
+        actor: StoreClerk
+        preconditions:
+          - "container.status == RETURNED"
+        side_effects:
+          - "status := QUARANTINED (allergen residue detected; must be deep-cleaned)"
+
+      - from: QUARANTINED
+        to: AVAILABLE
+        trigger: "POST /v1/containers/{containerId}/inspect (result=CLEAN)"
+        actor: StoreClerk
+        preconditions:
+          - "container.status == QUARANTINED"
+        side_effects:
+          - "allergen_hold := NONE"
+          - "status := AVAILABLE"
+
+      - from: QUARANTINED
+        to: RETIRED
+        trigger: "POST /v1/containers/{containerId}/inspect (result=RETIRE)"
+        actor: StoreClerk
+        preconditions:
+          - "container.status == QUARANTINED"
+        side_effects:
+          - "status := RETIRED (permanently removed)"
+
+  # ---- Order fulfillment dimension (parallel with payment, Rule 3) ----
+  - entity: Order
+    initial_state: CART
+    terminal_states: [COMPLETED, CANCELLED]
+    note: "fulfillment_status dimension; evolves independently of payment_status"
+    transitions:
+      - from: CART
+        to: FILLING
+        trigger: "POST /v1/orders/{orderId}/start-fill"
+        actor: StoreClerk
+        preconditions:
+          - "order.fulfillment_status == CART"
+          - "order has >= 1 non-VOIDED RefillLine (else ERR_EMPTY_ORDER)"
+          - "station.station_status == OPEN"
+        side_effects:
+          - "fulfillment_status := FILLING"
+
+      - from: FILLING
+        to: FILLED
+        trigger: "POST /v1/orders/{orderId}/checkout"
+        actor: [Member, StoreClerk]
+        preconditions:
+          - "order.fulfillment_status == FILLING"
+          - "every non-VOIDED RefillLine has pricing_stage == FINAL"
+          - "at least one FINAL non-VOIDED line (else ERR_EMPTY_ORDER)"
+        side_effects:
+          - "fulfillment_status := FILLED"
+          - "payment_status := CAPTURED (payment dimension advances in the same request)"
+          - "recompute order_totals (subtotal, deposit_total, tax, discount, total)"
+          - "each ISSUED container referenced by a FINAL line -> IN_USE + WalletLedger DEPOSIT_COMMIT"
+          - "WalletLedger LOYALTY_ACCRUAL (points_delta = loyalty_accrual FINAL) appended"
+
+      - from: FILLED
+        to: COMPLETED
+        trigger: "POST /v1/deliveries/{deliveryId}/deliver OR system (IN_STORE handoff at checkout when fulfillment_channel==IN_STORE)"
+        actor: [StoreClerk, system]
+        preconditions:
+          - "order.fulfillment_status == FILLED"
+        side_effects:
+          - "fulfillment_status := COMPLETED"
+
+      - from: CART
+        to: CANCELLED
+        trigger: "POST /v1/orders/{orderId}/cancel"
+        actor: [Member, StoreClerk]
+        preconditions:
+          - "order.fulfillment_status == CART"
+        side_effects:
+          - "fulfillment_status := CANCELLED"
+          - "all PROVISIONAL RefillLines -> VOIDED"
+
+      - from: FILLING
+        to: CANCELLED
+        trigger: "POST /v1/orders/{orderId}/cancel"
+        actor: [Member, StoreClerk]
+        preconditions:
+          - "order.fulfillment_status == FILLING"
+        side_effects:
+          - "fulfillment_status := CANCELLED"
+          - "each FINAL line -> VOIDED and its bin.on_hand_g += net_weight_g (grams returned)"
+
+  # ---- Order payment dimension (parallel with fulfillment, Rule 3) ----
+  - entity: Order
+    initial_state: UNPAID
+    terminal_states: [CAPTURED]
+    note: "payment_status dimension; evolves independently — fulfillment moves CART/FILLING/FILLED/COMPLETED/CANCELLED while payment stays UNPAID until checkout captures it in the same request"
+    transitions:
+      - from: UNPAID
+        to: CAPTURED
+        trigger: "POST /v1/orders/{orderId}/checkout"
+        actor: [Member, StoreClerk]
+        preconditions:
+          - "order.payment_status == UNPAID"
+        side_effects:
+          - "payment_status := CAPTURED"
+
+  # ---- RefillLine: PROVISIONAL -> FINAL -> VOIDED ----
+  - entity: RefillLine
+    initial_state: PROVISIONAL
+    terminal_states: [VOIDED]
+    transitions:
+      - from: PROVISIONAL
+        to: FINAL
+        trigger: "POST /v1/refill-lines/{lineId}/fill"
+        actor: StoreClerk
+        preconditions:
+          - "parent order.fulfillment_status == FILLING (else ERR_INVALID_ORDER_STATE) [priority 4]"
+          - "container.allergen_hold == NONE OR container.allergen_hold IN product.allergen_tags (else ERR_ALLERGEN_CONFLICT) [priority 5]"
+          - "container.member_id == order.member_id (else ERR_CONTAINER_NOT_OWNED) [priority 6]"
+          - "resolved bin.status IN {OPEN, LOW} (else ERR_BIN_QUARANTINED) [priority 5]"
+          - "gross_weight_g - container.measured_tare_g > 0 (else ERR_TARE_EXCEEDS_GROSS) [priority 8]"
+          - "net_weight_g <= bin.on_hand_g (else ERR_INSUFFICIENT_STOCK) [priority 9]"
+        side_effects:
+          - "container.measured_tare_g := payload.measured_tare_g"
+          - "gross_weight_g := payload.gross_weight_g; net_weight_g := gross_weight_g - measured_tare_g (FINAL)"
+          - "line_price_cents := refill_line_price(FINAL); pricing_stage := FINAL"
+          - "bin_id bound; bin.on_hand_g -= net_weight_g  (CASCADE hop 1->2)"
+          - "if bin.on_hand_g <= bin.reorder_threshold_g: bin.status := LOW (hop 2->3) and auto-create RestockTask (hop 3->4)"
+          - "container.allergen_hold := first(product.allergen_tags) if product.allergen_tags else unchanged"
+
+      - from: PROVISIONAL
+        to: VOIDED
+        trigger: "POST /v1/refill-lines/{lineId}/void"
+        actor: StoreClerk
+        preconditions:
+          - "line.pricing_stage == PROVISIONAL"
+        side_effects:
+          - "pricing_stage := VOIDED"
+
+      - from: FINAL
+        to: VOIDED
+        trigger: "POST /v1/refill-lines/{lineId}/void"
+        actor: StoreClerk
+        preconditions:
+          - "line.pricing_stage == FINAL"
+          - "parent order.payment_status == UNPAID (cannot void a captured line)"
+        side_effects:
+          - "pricing_stage := VOIDED"
+          - "bin.on_hand_g += net_weight_g  (grams conservation compensating action; may clear LOW back to OPEN if on_hand_g > reorder_threshold_g)"
+
+  # ---- BulkBin: OPEN <-> LOW; QUARANTINED ----
+  - entity: BulkBin
+    initial_state: OPEN
+    terminal_states: []
+    transitions:
+      - from: OPEN
+        to: LOW
+        trigger: "system (line FINAL fill drives on_hand_g <= reorder_threshold_g)"
+        actor: system
+        preconditions:
+          - "bin.on_hand_g <= bin.reorder_threshold_g"
+        side_effects:
+          - "status := LOW"
+          - "auto-create RestockTask(bin_id, requested_fill_g = capacity_g - on_hand_g, status=OPEN)"
+
+      - from: LOW
+        to: OPEN
+        trigger: "POST /v1/restock-tasks/{taskId}/complete OR system (line void raises on_hand_g > reorder_threshold_g)"
+        actor: [InventoryManager, system]
+        preconditions:
+          - "bin.on_hand_g > bin.reorder_threshold_g"
+        side_effects:
+          - "status := OPEN"
+
+      - from: OPEN
+        to: QUARANTINED
+        trigger: "POST /v1/bins/{binId}/recount (shrink_g exceeds SHRINK_QUARANTINE_G)"
+        actor: InventoryManager
+        preconditions:
+          - "recount reveals shrink_g > SHRINK_QUARANTINE_G"
+        side_effects:
+          - "status := QUARANTINED (dispensing blocked pending investigation)"
+
+      - from: LOW
+        to: QUARANTINED
+        trigger: "POST /v1/bins/{binId}/recount (shrink_g exceeds SHRINK_QUARANTINE_G)"
+        actor: InventoryManager
+        preconditions:
+          - "recount reveals shrink_g > SHRINK_QUARANTINE_G"
+        side_effects:
+          - "status := QUARANTINED"
+
+      - from: QUARANTINED
+        to: OPEN
+        trigger: "POST /v1/bins/{binId}/recount (shrink_g <= SHRINK_QUARANTINE_G on re-recount)"
+        actor: InventoryManager
+        preconditions:
+          - "bin.status == QUARANTINED"
+          - "recount shrink_g <= SHRINK_QUARANTINE_G"
+        side_effects:
+          - "status := OPEN"
+
+  # ---- RestockTask ----
+  - entity: RestockTask
+    initial_state: OPEN
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: COMPLETED
+        trigger: "POST /v1/restock-tasks/{taskId}/complete"
+        actor: InventoryManager
+        preconditions:
+          - "task.status == OPEN"
+          - "restocked_g >= 1"
+          - "bin.on_hand_g + restocked_g <= bin.capacity_g (else ERR_INSUFFICIENT_STOCK for overfill)"
+        side_effects:
+          - "restocked_g := payload.restocked_g"
+          - "bin.on_hand_g += restocked_g"
+          - "if bin.on_hand_g > bin.reorder_threshold_g: bin.status := OPEN"
+          - "status := COMPLETED"
+
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /v1/restock-tasks/{taskId}/complete (restocked_g=0 cancels) — see note"
+        actor: InventoryManager
+        preconditions:
+          - "task.status == OPEN"
+        side_effects:
+          - "status := CANCELLED"
+        note: "A complete call with restocked_g == 0 cancels the task without adding grams."
+
+  # ---- Subscription (OCC on run) ----
+  - entity: Subscription
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /v1/subscriptions/{subscriptionId}/run"
+        actor: [Member, StoreClerk]
+        preconditions:
+          - "subscription.status == ACTIVE"
+          - "payload.expected_subscription_version == subscription.version (else ERR_STALE_VERSION 412)"
+        side_effects:
+          - "create Order(member_id, station_id, fulfillment_channel=DELIVERY) in CART with one PROVISIONAL RefillLine for product_id at target_net_g"
+          - "last_run_order_id := new order id"
+          - "next_run_at := clock.now + interval_days days"
+          - "increments Subscription.version by 1"
+        note: "Self-loop (cyclic); each run legitimately supersedes the prior cycle's pending order, hence OCC on version."
+
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /v1/subscriptions/{subscriptionId}/cancel"
+        actor: [Member, StoreClerk]
+        preconditions: ["subscription.status == ACTIVE"]
+        side_effects: ["status := CANCELLED"]
+
+  # ---- Delivery (container return loop; guarded by Order state, Rule 7) ----
+  - entity: Delivery
+    initial_state: SCHEDULED
+    terminal_states: [DELIVERED, RETURNED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: DISPATCHED
+        trigger: "POST /v1/deliveries/{deliveryId}/dispatch"
+        actor: [StoreClerk, InventoryManager]
+        preconditions:
+          - "delivery.status == SCHEDULED"
+          - "order.fulfillment_status == FILLED (else ERR_DELIVERY_ORDER_NOT_READY) [cross-entity]"
+          - "order.payment_status == CAPTURED (else ERR_DELIVERY_ORDER_NOT_READY) [cross-entity]"
+        side_effects:
+          - "status := DISPATCHED"
+
+      - from: DISPATCHED
+        to: DELIVERED
+        trigger: "POST /v1/deliveries/{deliveryId}/deliver"
+        actor: [StoreClerk, InventoryManager]
+        preconditions:
+          - "delivery.status == DISPATCHED"
+        side_effects:
+          - "status := DELIVERED"
+          - "order.fulfillment_status := COMPLETED"
+
+      - from: DELIVERED
+        to: RETURNED
+        trigger: "POST /v1/deliveries/{deliveryId}/return-received"
+        actor: [StoreClerk, InventoryManager]
+        preconditions:
+          - "delivery.status == DELIVERED"
+        side_effects:
+          - "status := RETURNED"
+          - "each IN_USE container on the delivery's order -> RETURNED (CASCADE hop 1->2)"
+          - "each such container appends WalletLedger DEPOSIT_REFUND: wallet_delta +deposit_cents, liability_delta -deposit_cents (hop 2->3 mutates Member.wallet_balance_cents/deposit_liability_cents)"
+
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /v1/deliveries/{deliveryId}/cancel"
+        actor: [StoreClerk, InventoryManager]
+        preconditions: ["delivery.status == SCHEDULED"]
+        side_effects:
+          - "status := CANCELLED (frees the vehicle window for other deliveries)"
+
+# -----------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules (OCC — true CREATE-with-supersede race)
+# -----------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: subscription-run-stale-version
+    parent_entity: Subscription
+    write_endpoint: "POST /v1/subscriptions/{subscriptionId}/run"
+    occ_field: "expected_subscription_version"
+    description: |
+      Running a Subscription whose version has advanced since the client last
+      observed it is rejected. A run legitimately creates a fresh cycle Order
+      that supersedes any prior pending run-order; a client acting on a stale
+      view of the subscription (its version already bumped by an earlier run)
+      is rejected with a stale-version precondition rather than minting a
+      duplicate cycle order.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  # C1 — dual-variant tare/weight tiered line pricing (Rule 1 #1 domain=Order/RefillLine; Rule 2 mode (a))
+  - name: refill_line_price
+    trigger: "RefillLine add-line (PROVISIONAL) and RefillLine fill FINAL transition"
+    algorithm: tiered_pricing
+    formula: |
+      # net weight differs by stage (dual variant):
+      if stage == PROVISIONAL:
+          net_g = estimated_gross_g - declared_tare_g
+      else:  # FINAL
+          net_g = gross_weight_g - container.measured_tare_g
+      # tier selection at the >= boundary:
+      if net_g >= product.bulk_tier_threshold_g:
+          rate = product.bulk_tier_price_cents_per_100g
+      else:
+          rate = product.unit_price_cents_per_100g
+      goods = rate * net_g / 100.0                      # cents, real-valued
+      # membership discount applies only when tier is ACTIVE PLUS:
+      disc_factor = 0.10 if member.membership_tier == PLUS else 0.0
+      line_price_cents = round_half_up(goods * (1 - disc_factor))   # PER-LINE rounding
+    input_set: "single RefillLine; product tier config; owning member tier/status; stage-selected weights"
+    constants:
+      PLUS_DISCOUNT_FACTOR: 0.10
+    precision: "2 decimal places at line level, round_half_up; per-line rounding pinned (feeds C2)"
+    variants:
+      - name: provisional
+        when: "at add-line, before weighing"
+        difference: "net_g = estimated_gross_g - declared_tare_g (member-declared inputs)"
+      - name: final
+        when: "at fill, after clerk weighs empty + full container"
+        difference: "net_g = gross_weight_g - measured_tare_g; may cross the bulk tier the provisional estimate did not, yielding a different price"
+
+  # C2 — order totals with pinned rounding order (Rule 2 mode (b)) + evaluation order
+  - name: order_totals
+    trigger: "Order checkout FILLING->FILLED transition (recompute); also read-only on GET order"
+    algorithm: aggregation
+    formula: |
+      # PINNED ORDER: (1) each line already rounded in C1; sum the rounded line prices.
+      subtotal_cents = sum(line.line_price_cents for lines where pricing_stage == FINAL)   # round-per-line THEN sum
+      #   (NOT sum(raw goods) then round — that would differ by up to a cent per line)
+      # (2) loyalty redemption discount (order-level), capped at subtotal:
+      discount_cents = min(payload.redeem_points if provided else 0, subtotal_cents)       # 1 point == 1 cent
+      # (3) deposits are added AFTER discount and are never discounted or taxed:
+      deposit_total_cents = sum(container.deposit_cents for containers set IN_USE by this order's FINAL lines)
+      # (4) tax on taxable goods net of the taxable share of discount:
+      taxable_goods = sum(line.line_price_cents for FINAL taxable lines)
+      taxable_after_discount = max(0, taxable_goods - discount_cents) if subtotal_cents == taxable_goods else (taxable_goods - round_half_up(discount_cents * taxable_goods / subtotal_cents)) if subtotal_cents > 0 else 0
+      tax_cents = round_half_up(TAX_RATE * taxable_after_discount)
+      # (5) grand total:
+      total_cents = subtotal_cents - discount_cents + deposit_total_cents + tax_cents
+    input_set: "all FINAL non-VOIDED RefillLines on the order; committed containers; redeem_points"
+    constants:
+      TAX_RATE: 0.08
+    precision: "cents; round_half_up; per-line rounding precedes summation (mode b pinned)"
+
+  # C3 — dual-variant loyalty accrual (Rule 1 #2 domain=Member)
+  - name: loyalty_accrual
+    trigger: "PROVISIONAL estimate at start-fill (not persisted) and FINAL accrual at checkout (persisted to WalletLedger)"
+    algorithm: threshold
+    formula: |
+      base_points = floor(settled_subtotal_after_discount / LOYALTY_DIVISOR)   # FINAL uses (subtotal_cents - discount_cents)
+      multiplier = 1.5 if member.membership_tier == PLUS else 1.0
+      points = floor(base_points * multiplier)
+    input_set: "order subtotal (estimated for provisional, settled for final); member tier/status"
+    constants:
+      LOYALTY_DIVISOR: 100   # 1 base point per 100 cents ($1)
+    precision: "integer points; floor"
+    variants:
+      - name: provisional_estimate
+        when: "at start-fill, for the cart estimate shown to the member"
+        difference: "uses sum of PROVISIONAL line prices (estimated weights); floor(estimate/100)*multiplier; not written to any ledger"
+      - name: final_accrual
+        when: "at checkout"
+        difference: "uses settled FINAL subtotal minus discount; the floor may land on a different integer than the provisional estimate; this is the value credited"
+
+  # C4 — shrink reconciliation (ledger reconciliation; chronological)
+  - name: shrink_reconciliation
+    trigger: "POST /v1/bins/{binId}/recount"
+    algorithm: chronological
+    formula: |
+      # replay bin movements since last_recount_at in created_at ASC order:
+      dispensed = sum(line.net_weight_g for FINAL non-VOIDED lines with bin_id == bin.id and line.created_at >= bin.last_recount_at)
+      restocked = sum(task.restocked_g for COMPLETED RestockTasks with bin_id == bin.id and completed created_at >= bin.last_recount_at)
+      book_on_hand_g = bin.last_recount_g - dispensed + restocked      # theoretical
+      shrink_g = book_on_hand_g - physical_g                           # physical_g = recount payload
+      # on recount commit:
+      bin.last_shrink_g = shrink_g
+      bin.on_hand_g = physical_g
+      bin.last_recount_g = physical_g
+      bin.last_recount_at = clock.now
+    input_set: "physical_g from payload; FINAL lines and COMPLETED restocks since the prior recount baseline"
+    constants:
+      SHRINK_QUARANTINE_G: 200   # shrink_g strictly greater than this quarantines the bin
+    precision: "integer grams; created_at ASC replay order pinned (ties broken by created_at then never by id)"
+
+  # C5 — deposit float (conserved-quantity invariant; ledger)
+  - name: deposit_float
+    trigger: "checkout DEPOSIT_COMMIT and return DEPOSIT_REFUND WalletLedger appends"
+    algorithm: aggregation
+    formula: |
+      member.deposit_liability_cents = sum(WalletLedger.liability_delta_cents for member)
+      member.wallet_balance_cents    = sum(WalletLedger.wallet_delta_cents for member)
+      # global invariant (pinned): sum over Containers in status IN_USE of deposit_cents
+      #   == sum over Members of deposit_liability_cents   (at all times)
+    input_set: "WalletLedger rows per member; Containers with status IN_USE"
+    precision: "integer cents"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority; lower number wins)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "Acting role is permitted for the operation per §1.7 (e.g. only InventoryManager creates products/bins/stations/vehicles/recounts/restock-completes; only StoreClerk fills/issues; Member acts only on own resources)"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "Every path id and every FK in the body resolves to an existing resource, validated left-to-right (path ids before body FKs)"
+    error_id: "ERR_MEMBER_NOT_FOUND | ERR_PRODUCT_NOT_FOUND | ERR_STATION_NOT_FOUND | ERR_BIN_NOT_FOUND | ERR_CONTAINER_NOT_FOUND | ERR_ORDER_NOT_FOUND | ERR_LINE_NOT_FOUND | ERR_RESTOCK_TASK_NOT_FOUND | ERR_SUBSCRIPTION_NOT_FOUND | ERR_VEHICLE_NOT_FOUND | ERR_DELIVERY_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with a path id or FK body field"
+
+  - priority: 4
+    category: state
+    check: "Target resource is in a state that permits the requested transition (order fulfillment/payment, container status, bin status, line pricing_stage, restock/subscription/delivery status)"
+    error_id: "ERR_INVALID_ORDER_STATE | ERR_INVALID_CONTAINER_STATE | ERR_INVALID_STATE"
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 5
+    category: business_safety
+    check: "Allergen cross-contamination: container.allergen_hold must be NONE or a member of product.allergen_tags; the bin resolved for the line must not be QUARANTINED"
+    error_id: "ERR_ALLERGEN_CONFLICT | ERR_BIN_QUARANTINED"
+    http_status: 409
+    applies_to: "POST /v1/refill-lines/{lineId}/fill"
+
+  - priority: 6
+    category: business_referential
+    check: "Ownership/linkage: container.member_id == order.member_id for the line's container"
+    error_id: ERR_CONTAINER_NOT_OWNED
+    http_status: 409
+    applies_to: "POST /v1/refill-lines/{lineId}/fill"
+
+  - priority: 7
+    category: business_temporal
+    check: "Resource window free: an order fill-window must not overlap another non-cancelled order's window on the same station (half-open, adjacency OK); a delivery window must keep >= TURNAROUND_BUFFER_MIN from other non-cancelled windows on the same vehicle (closed + buffer)"
+    error_id: "ERR_STATION_SESSION_OVERLAP | ERR_VEHICLE_WINDOW_CONFLICT"
+    http_status: 409
+    applies_to: "POST /v1/orders, POST /v1/deliveries"
+
+  - priority: 8
+    category: business_constraint
+    check: "Structural constraints: order to start-fill/checkout has >= 1 (FINAL) non-VOIDED line (ERR_EMPTY_ORDER); net weight (gross - tare) > 0 (ERR_TARE_EXCEEDS_GROSS); email/plate uniqueness"
+    error_id: "ERR_EMPTY_ORDER | ERR_TARE_EXCEEDS_GROSS | ERR_DUPLICATE_EMAIL | ERR_DELIVERY_ORDER_NOT_READY"
+    http_status: 422
+    applies_to: "POST /v1/orders/{orderId}/start-fill, POST /v1/orders/{orderId}/checkout, POST /v1/refill-lines/{lineId}/fill, POST /v1/members, POST /v1/delivery-vehicles, POST /v1/deliveries/{deliveryId}/dispatch"
+
+  - priority: 9
+    category: business_fiscal
+    check: "Inventory/capacity: line net_weight_g <= bin.on_hand_g (ERR_INSUFFICIENT_STOCK); restock does not overfill capacity_g (ERR_INSUFFICIENT_STOCK)"
+    error_id: ERR_INSUFFICIENT_STOCK
+    http_status: 409
+    applies_to: "POST /v1/refill-lines/{lineId}/fill, POST /v1/restock-tasks/{taskId}/complete"
+
+  - priority: 10
+    category: business_constraint
+    check: "OCC stale-version guard: expected_subscription_version must equal current Subscription.version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /v1/subscriptions/{subscriptionId}/run"
+
+# =============================================================================
+# §1.5 API Endpoint Table  (all paths mounted under api_prefix /v1)
+# =============================================================================
+endpoints:
+  # ---- Logical clock (test-driving; default 2026-03-01T00:00:00Z) ----
+  - method: POST
+    path: "/v1/_clock/set_current_utc"
+    description: "Set the server logical clock. Before any call the clock reads the fixed startup default 2026-03-01T00:00:00Z (never real wall-clock). All next_run_at/window/recount timestamps derive from this clock."
+    roles: [InventoryManager]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["logical clock := to_iso8601"]
+
+  # ---- Member ----
+  - method: POST
+    path: "/v1/members"
+    description: "Register a member"
+    roles: [StoreClerk]
+    code: 201
+    input: [email, full_name, "membership_tier?"]
+    output: Member
+    side_effects: ["wallet_balance_cents=0, deposit_liability_cents=0, loyalty_points_balance=0"]
+
+  - method: GET
+    path: "/v1/members/{memberId}"
+    description: "Fetch a member with projected wallet/liability/loyalty"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: Member
+    side_effects: []
+
+  - method: GET
+    path: "/v1/members/{id}/wallet-ledger"
+    description: "List a member's WalletLedger movements (reverse-reachability for WalletLedger.member_id)"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WalletLedger[]
+    side_effects: []
+
+  # ---- Product ----
+  - method: POST
+    path: "/v1/products"
+    description: "Create a bulk SKU with tier + allergen config"
+    roles: [InventoryManager]
+    code: 201
+    input: [name, category, unit_price_cents_per_100g, bulk_tier_threshold_g, bulk_tier_price_cents_per_100g, "allergen_tags?", "taxable?"]
+    output: Product
+    side_effects: []
+
+  - method: GET
+    path: "/v1/products/{productId}"
+    description: "Fetch a product"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: Product
+    side_effects: []
+
+  # ---- RefillStation ----
+  - method: POST
+    path: "/v1/stations"
+    description: "Create a refill station"
+    roles: [InventoryManager]
+    code: 201
+    input: [name, "station_status?"]
+    output: RefillStation
+    side_effects: []
+
+  - method: GET
+    path: "/v1/stations/{stationId}"
+    description: "Fetch a station"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: RefillStation
+    side_effects: []
+
+  # ---- BulkBin ----
+  - method: POST
+    path: "/v1/bins"
+    description: "Create a bulk bin for a product at a station; on_hand_g initialized to last_recount_g"
+    roles: [InventoryManager]
+    code: 201
+    input: [product_id, station_id, capacity_g, reorder_threshold_g, last_recount_g]
+    output: BulkBin
+    side_effects: ["on_hand_g := last_recount_g", "last_recount_at := clock.now", "status := OPEN (or LOW if last_recount_g <= reorder_threshold_g)"]
+
+  - method: GET
+    path: "/v1/bins/{binId}"
+    description: "Fetch a bin"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: BulkBin
+    side_effects: []
+
+  - method: GET
+    path: "/v1/bins"
+    description: "List bins (reverse-reachability for BulkBin.product_id and BulkBin.station_id)"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: ["product_id?", "station_id?", "status?", "limit?", "offset?"]
+    output: BulkBin[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/bins/{binId}/recount"
+    description: "Record a physical recount; computes shrink and may quarantine/clear the bin"
+    roles: [InventoryManager]
+    code: 200
+    input: [physical_g]
+    output: BulkBin
+    side_effects:
+      - "shrink_reconciliation computes shrink_g against book_on_hand_g; last_shrink_g := shrink_g"
+      - "on_hand_g := physical_g; last_recount_g := physical_g; last_recount_at := clock.now"
+      - "if shrink_g > SHRINK_QUARANTINE_G: status := QUARANTINED; else if QUARANTINED and shrink_g <= SHRINK_QUARANTINE_G: status := OPEN"
+
+  # ---- Container ----
+  - method: POST
+    path: "/v1/containers"
+    description: "Register a container (store deposit stock or member BYO); deposit_cents set from container_type"
+    roles: [Member, StoreClerk]
+    code: 201
+    input: [container_type, declared_tare_g, "member_id?"]
+    output: Container
+    side_effects: ["deposit_cents from type (GLASS_500=150, GLASS_1000=250, BYO=0)", "status := AVAILABLE", "allergen_hold := NONE"]
+
+  - method: GET
+    path: "/v1/containers/{containerId}"
+    description: "Fetch a container"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: Container
+    side_effects: []
+
+  - method: GET
+    path: "/v1/containers"
+    description: "List containers (reverse-reachability for Container.member_id)"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: ["member_id?", "status?", "limit?", "offset?"]
+    output: Container[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/containers/{containerId}/issue"
+    description: "Issue an AVAILABLE container to a member"
+    roles: [StoreClerk]
+    code: 200
+    input: [member_id]
+    output: Container
+    side_effects: ["member_id := payload.member_id", "status := ISSUED"]
+
+  - method: POST
+    path: "/v1/containers/{containerId}/return"
+    description: "In-store return of an IN_USE container; refunds deposit"
+    roles: [Member, StoreClerk]
+    code: 200
+    input: []
+    output: Container
+    side_effects: ["status := RETURNED", "WalletLedger DEPOSIT_REFUND appended (wallet +deposit_cents, liability -deposit_cents)"]
+
+  - method: POST
+    path: "/v1/containers/{containerId}/inspect"
+    description: "Inspect a RETURNED/QUARANTINED container; result routes it AVAILABLE/QUARANTINED/RETIRED"
+    roles: [StoreClerk, InventoryManager]
+    code: 200
+    input: [result]
+    output: Container
+    side_effects: ["result=CLEAN -> AVAILABLE (allergen_hold=NONE, member_id=null, measured_tare_g=null)", "result=RESIDUE -> QUARANTINED", "result=RETIRE -> RETIRED"]
+
+  # ---- Order ----
+  - method: POST
+    path: "/v1/orders"
+    description: "Create a CART order occupying a station fill-window"
+    roles: [Member, StoreClerk]
+    code: 201
+    input: [member_id, station_id, fill_window_start_at, fill_window_end_at, "fulfillment_channel?"]
+    output: Order
+    side_effects: ["fulfillment_status=CART, payment_status=UNPAID", "reject if fill-window overlaps another non-cancelled order on station (ERR_STATION_SESSION_OVERLAP)"]
+
+  - method: GET
+    path: "/v1/orders/{orderId}"
+    description: "Fetch an order with computed totals"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+
+  - method: GET
+    path: "/v1/orders"
+    description: "List orders (reverse-reachability for Order.member_id and Order.station_id)"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: ["member_id?", "station_id?", "fulfillment_status?", "limit?", "offset?"]
+    output: Order[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/orders/{orderId}/lines"
+    description: "Add a PROVISIONAL refill line to a CART order"
+    roles: [Member, StoreClerk]
+    code: 201
+    input: [product_id, container_id, estimated_gross_g]
+    output: RefillLine
+    side_effects: ["order_id set from path", "declared_tare_g copied from container.declared_tare_g", "net_weight_g/line_price_cents computed PROVISIONAL", "pricing_stage=PROVISIONAL"]
+
+  - method: POST
+    path: "/v1/orders/{orderId}/start-fill"
+    description: "Move a CART order to FILLING"
+    roles: [StoreClerk]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["fulfillment_status := FILLING", "reject if zero non-VOIDED lines (ERR_EMPTY_ORDER) or station not OPEN"]
+
+  - method: POST
+    path: "/v1/orders/{orderId}/checkout"
+    description: "Checkout a FILLING order: capture payment, commit deposits, accrue loyalty, finalize totals"
+    roles: [Member, StoreClerk]
+    code: 200
+    input: ["redeem_points?"]
+    output: Order
+    side_effects:
+      - "requires every non-VOIDED line FINAL and >= 1 FINAL line (ERR_EMPTY_ORDER)"
+      - "fulfillment_status := FILLED; payment_status := CAPTURED"
+      - "recompute order_totals; each ISSUED container -> IN_USE + WalletLedger DEPOSIT_COMMIT"
+      - "if redeem_points > 0: WalletLedger LOYALTY_REDEEM (points_delta = -min(redeem_points, loyalty_points_balance)) and discount_cents applied"
+      - "WalletLedger LOYALTY_ACCRUAL (final points); if fulfillment_channel==IN_STORE, fulfillment_status := COMPLETED"
+
+  - method: POST
+    path: "/v1/orders/{orderId}/cancel"
+    description: "Cancel a CART or FILLING order"
+    roles: [Member, StoreClerk]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["fulfillment_status := CANCELLED", "PROVISIONAL lines -> VOIDED", "FILLING: FINAL lines -> VOIDED and bin.on_hand_g += net_weight_g"]
+
+  # ---- RefillLine ----
+  - method: GET
+    path: "/v1/refill-lines/{lineId}"
+    description: "Fetch a refill line"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: RefillLine
+    side_effects: []
+
+  - method: GET
+    path: "/v1/refill-lines"
+    description: "List refill lines (reverse-reachability for order_id, product_id, container_id, bin_id)"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: ["order_id?", "product_id?", "container_id?", "bin_id?", "pricing_stage?", "limit?", "offset?"]
+    output: RefillLine[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/refill-lines/{lineId}/fill"
+    description: "Weigh and finalize a line (FINAL pricing, bin depletion, cascade to LOW/restock)"
+    roles: [StoreClerk]
+    code: 200
+    input: [gross_weight_g, measured_tare_g]
+    output: RefillLine
+    side_effects:
+      - "container.measured_tare_g set; net_weight_g = gross_weight_g - measured_tare_g"
+      - "line_price_cents = refill_line_price(FINAL); pricing_stage := FINAL"
+      - "bin resolved (OPEN/LOW for product at order station); bin.on_hand_g -= net_weight_g"
+      - "if bin.on_hand_g <= reorder_threshold_g: bin.status := LOW + auto-create RestockTask"
+      - "container.allergen_hold := first(product.allergen_tags) if any"
+
+  - method: POST
+    path: "/v1/refill-lines/{lineId}/void"
+    description: "Void a PROVISIONAL or (pre-capture) FINAL line; FINAL void returns grams to the bin"
+    roles: [StoreClerk]
+    code: 200
+    input: []
+    output: RefillLine
+    side_effects: ["pricing_stage := VOIDED", "if was FINAL: bin.on_hand_g += net_weight_g (may clear LOW->OPEN)"]
+
+  # ---- RestockTask ----
+  - method: GET
+    path: "/v1/restock-tasks/{taskId}"
+    description: "Fetch a restock task"
+    roles: [StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: RestockTask
+    side_effects: []
+
+  - method: GET
+    path: "/v1/restock-tasks"
+    description: "List restock tasks (reverse-reachability for RestockTask.bin_id)"
+    roles: [StoreClerk, InventoryManager]
+    code: 200
+    input: ["bin_id?", "status?", "limit?", "offset?"]
+    output: RestockTask[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/restock-tasks/{taskId}/complete"
+    description: "Complete a restock task by adding grams (restocked_g=0 cancels the task)"
+    roles: [InventoryManager]
+    code: 200
+    input: [restocked_g]
+    output: RestockTask
+    side_effects: ["restocked_g>=1: bin.on_hand_g += restocked_g (reject overfill ERR_INSUFFICIENT_STOCK); bin.status->OPEN if above threshold; status := COMPLETED", "restocked_g==0: status := CANCELLED"]
+
+  # ---- Subscription ----
+  - method: POST
+    path: "/v1/subscriptions"
+    description: "Create a recurring refill subscription"
+    roles: [Member, StoreClerk]
+    code: 201
+    input: [member_id, product_id, station_id, target_net_g, interval_days]
+    output: Subscription
+    side_effects: ["status=ACTIVE", "next_run_at := clock.now + interval_days days"]
+
+  - method: GET
+    path: "/v1/subscriptions/{subscriptionId}"
+    description: "Fetch a subscription"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects: []
+
+  - method: GET
+    path: "/v1/subscriptions"
+    description: "List subscriptions (reverse-reachability for member_id, product_id, station_id)"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: ["member_id?", "product_id?", "station_id?", "status?", "limit?", "offset?"]
+    output: Subscription[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/subscriptions/{subscriptionId}/run"
+    description: "Run a subscription cycle now (OCC on version); creates a CART delivery order with one PROVISIONAL line"
+    roles: [Member, StoreClerk]
+    code: 201
+    input: [expected_subscription_version]
+    output: Order
+    side_effects:
+      - "reject if expected_subscription_version != Subscription.version (ERR_STALE_VERSION 412)"
+      - "create Order(member_id, station_id, fulfillment_channel=DELIVERY) CART + one PROVISIONAL RefillLine at target_net_g"
+      - "last_run_order_id := new order id; next_run_at := clock.now + interval_days days"
+      - "increments Subscription.version by 1"
+
+  - method: POST
+    path: "/v1/subscriptions/{subscriptionId}/cancel"
+    description: "Cancel an ACTIVE subscription"
+    roles: [Member, StoreClerk]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects: ["status := CANCELLED"]
+
+  # ---- DeliveryVehicle ----
+  - method: POST
+    path: "/v1/delivery-vehicles"
+    description: "Register a delivery vehicle"
+    roles: [InventoryManager]
+    code: 201
+    input: [plate, capacity_orders]
+    output: DeliveryVehicle
+    side_effects: []
+
+  - method: GET
+    path: "/v1/delivery-vehicles/{vehicleId}"
+    description: "Fetch a delivery vehicle"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: DeliveryVehicle
+    side_effects: []
+
+  # ---- Delivery ----
+  - method: POST
+    path: "/v1/deliveries"
+    description: "Schedule a delivery for a filled order on a vehicle window (turnaround buffer enforced)"
+    roles: [Member, StoreClerk]
+    code: 201
+    input: [order_id, vehicle_id, window_start_at, window_end_at]
+    output: Delivery
+    side_effects: ["member_id copied from order", "status=SCHEDULED", "reject if window within TURNAROUND_BUFFER_MIN of another non-cancelled window on the vehicle (ERR_VEHICLE_WINDOW_CONFLICT)"]
+
+  - method: GET
+    path: "/v1/deliveries/{deliveryId}"
+    description: "Fetch a delivery"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: Delivery
+    side_effects: []
+
+  - method: GET
+    path: "/v1/deliveries"
+    description: "List deliveries (reverse-reachability for order_id, vehicle_id, member_id)"
+    roles: [Member, StoreClerk, InventoryManager]
+    code: 200
+    input: ["order_id?", "vehicle_id?", "member_id?", "status?", "limit?", "offset?"]
+    output: Delivery[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/deliveries/{deliveryId}/dispatch"
+    description: "Dispatch a SCHEDULED delivery (requires order FILLED + CAPTURED)"
+    roles: [StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: Delivery
+    side_effects: ["status := DISPATCHED", "reject if order not FILLED+CAPTURED (ERR_DELIVERY_ORDER_NOT_READY)"]
+
+  - method: POST
+    path: "/v1/deliveries/{deliveryId}/deliver"
+    description: "Mark a DISPATCHED delivery DELIVERED; completes the order"
+    roles: [StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: Delivery
+    side_effects: ["status := DELIVERED", "order.fulfillment_status := COMPLETED"]
+
+  - method: POST
+    path: "/v1/deliveries/{deliveryId}/return-received"
+    description: "Close the container return loop: RETURN all IN_USE containers on the order and refund their deposits"
+    roles: [StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: Delivery
+    side_effects:
+      - "status := RETURNED"
+      - "each IN_USE container on the order -> RETURNED"
+      - "each such container appends WalletLedger DEPOSIT_REFUND (wallet +deposit_cents, liability -deposit_cents)"
+
+  - method: POST
+    path: "/v1/deliveries/{deliveryId}/cancel"
+    description: "Cancel a SCHEDULED delivery, freeing the vehicle window"
+    roles: [StoreClerk, InventoryManager]
+    code: 200
+    input: []
+    output: Delivery
+    side_effects: ["status := CANCELLED"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/unknown X-User-Role or X-User-ID header" }
+  - { id: ERR_UNAUTHORIZED, http: 403, condition: "Acting role not permitted for this operation, or Member acting on a resource it does not own" }
+  - { id: ERR_VALIDATION, http: 400, condition: "Malformed body, missing required field, or bad type/enum value" }
+  - { id: ERR_MEMBER_NOT_FOUND, http: 404, condition: "member id/FK does not resolve" }
+  - { id: ERR_PRODUCT_NOT_FOUND, http: 404, condition: "product id/FK does not resolve" }
+  - { id: ERR_STATION_NOT_FOUND, http: 404, condition: "station id/FK does not resolve" }
+  - { id: ERR_BIN_NOT_FOUND, http: 404, condition: "bin id/FK does not resolve, or no OPEN/LOW bin exists for the product at the order's station" }
+  - { id: ERR_CONTAINER_NOT_FOUND, http: 404, condition: "container id/FK does not resolve" }
+  - { id: ERR_ORDER_NOT_FOUND, http: 404, condition: "order id/FK does not resolve" }
+  - { id: ERR_LINE_NOT_FOUND, http: 404, condition: "refill line id does not resolve" }
+  - { id: ERR_RESTOCK_TASK_NOT_FOUND, http: 404, condition: "restock task id does not resolve" }
+  - { id: ERR_SUBSCRIPTION_NOT_FOUND, http: 404, condition: "subscription id does not resolve" }
+  - { id: ERR_VEHICLE_NOT_FOUND, http: 404, condition: "delivery vehicle id/FK does not resolve" }
+  - { id: ERR_DELIVERY_NOT_FOUND, http: 404, condition: "delivery id does not resolve" }
+  - { id: ERR_INVALID_ORDER_STATE, http: 409, condition: "order fulfillment/payment status forbids the operation (e.g. fill when not FILLING, checkout when not FILLING, add-line when not CART)" }
+  - { id: ERR_INVALID_CONTAINER_STATE, http: 409, condition: "container status forbids the operation (issue when not AVAILABLE, return when not IN_USE, inspect when not RETURNED/QUARANTINED)" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "bin/restock-task/subscription/delivery status forbids the operation" }
+  - { id: ERR_ALLERGEN_CONFLICT, http: 409, condition: "container.allergen_hold is a non-NONE allergen not carried by the product being filled" }
+  - { id: ERR_BIN_QUARANTINED, http: 409, condition: "the bin resolved for the line is QUARANTINED" }
+  - { id: ERR_CONTAINER_NOT_OWNED, http: 409, condition: "the line's container is not owned by the order's member" }
+  - { id: ERR_STATION_SESSION_OVERLAP, http: 409, condition: "order fill-window overlaps another non-cancelled order window on the same station (half-open; adjacency allowed)" }
+  - { id: ERR_VEHICLE_WINDOW_CONFLICT, http: 409, condition: "delivery window is within TURNAROUND_BUFFER_MIN of another non-cancelled window on the same vehicle (closed interval + buffer)" }
+  - { id: ERR_EMPTY_ORDER, http: 422, condition: "start-fill/checkout of an order with zero non-VOIDED (FINAL) lines" }
+  - { id: ERR_TARE_EXCEEDS_GROSS, http: 422, condition: "net weight (gross_weight_g - measured_tare_g) <= 0 at fill" }
+  - { id: ERR_INSUFFICIENT_STOCK, http: 409, condition: "line net_weight_g exceeds bin.on_hand_g, or restock would overfill bin.capacity_g" }
+  - { id: ERR_DELIVERY_ORDER_NOT_READY, http: 422, condition: "dispatch attempted while the order is not both FILLED and CAPTURED" }
+  - { id: ERR_DUPLICATE_EMAIL, http: 409, condition: "member email (or vehicle plate) already exists" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_subscription_version does not match current Subscription.version" }
+
+# =============================================================================
+# §1.7 RBAC Matrix (peer_roles)
+# =============================================================================
+roles:
+  - name: Member
+    description: "A registered customer acting on their own orders, containers, subscriptions, and deliveries."
+    identity: "entity_backed:Member"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /v1/orders (own member_id) — create cart"
+      - "POST /v1/orders/{id}/lines — add line"
+      - "POST /v1/orders/{id}/checkout — checkout own order"
+      - "POST /v1/orders/{id}/cancel — cancel own order"
+      - "POST /v1/containers — register BYO/own container"
+      - "POST /v1/containers/{id}/return — return own container"
+      - "POST /v1/subscriptions, /run, /cancel — manage own subscriptions"
+      - "POST /v1/deliveries — schedule own delivery"
+      - "GET reads on own/visible resources"
+
+  - name: StoreClerk
+    description: "Counter operator who weighs and fills lines, issues containers, starts fills, and runs logistics touch-points. Not tied to a persisted entity."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /v1/refill-lines/{id}/fill — weigh + finalize a line"
+      - "POST /v1/refill-lines/{id}/void — void a line"
+      - "POST /v1/containers/{id}/issue — issue container to member"
+      - "POST /v1/orders/{id}/start-fill — begin filling"
+      - "POST /v1/members — register a member at the counter"
+    shared_operations:
+      - "POST /v1/orders, /lines, /checkout, /cancel — assist any member"
+      - "POST /v1/containers, /return, /inspect"
+      - "POST /v1/subscriptions, /run, /cancel"
+      - "POST /v1/deliveries, /dispatch, /deliver, /return-received, /cancel"
+      - "GET reads"
+
+  - name: InventoryManager
+    description: "Owns catalog, inventory, stations, vehicles, restock, recounts, and the logical clock. Not tied to a persisted entity."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /v1/products — manage SKUs"
+      - "POST /v1/stations — manage stations"
+      - "POST /v1/bins — manage bins"
+      - "POST /v1/bins/{id}/recount — shrink recount"
+      - "POST /v1/restock-tasks/{id}/complete — complete restock"
+      - "POST /v1/delivery-vehicles — manage vehicles"
+      - "POST /v1/_clock/set_current_utc — set logical clock"
+    shared_operations:
+      - "POST /v1/containers/{id}/inspect"
+      - "POST /v1/deliveries/{id}/dispatch, /deliver, /return-received, /cancel"
+      - "GET reads"

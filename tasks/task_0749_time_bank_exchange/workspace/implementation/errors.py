@@ -1,0 +1,44 @@
+"""Custom error class and error ID constants."""
+
+
+class APIError(Exception):
+    def __init__(self, error_id: str, http_status: int, message: str = ""):
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+        super().__init__(self.message)
+
+
+# --- Error IDs ---
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+ERR_ROLE_NOT_PERMITTED = "ERR_ROLE_NOT_PERMITTED"
+ERR_RESOURCE_NOT_FOUND = "ERR_RESOURCE_NOT_FOUND"
+ERR_INVALID_STATE = "ERR_INVALID_STATE"
+ERR_STALE_MEMBER_VERSION = "ERR_STALE_MEMBER_VERSION"
+ERR_OWNERSHIP_VIOLATION = "ERR_OWNERSHIP_VIOLATION"
+ERR_MEMBER_SUSPENDED = "ERR_MEMBER_SUSPENDED"
+ERR_INSUFFICIENT_BALANCE = "ERR_INSUFFICIENT_BALANCE"
+ERR_SHIFT_TIME_CONFLICT = "ERR_SHIFT_TIME_CONFLICT"
+ERR_EXCHANGE_TIME_CONFLICT = "ERR_EXCHANGE_TIME_CONFLICT"
+ERR_TRUST_TIER_TOO_LOW = "ERR_TRUST_TIER_TOO_LOW"
+ERR_VERIFIER_INELIGIBLE = "ERR_VERIFIER_INELIGIBLE"
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+
+
+def raise_err(error_id: str, message: str = ""):
+    mapping = {
+        ERR_UNAUTHENTICATED: 401,
+        ERR_ROLE_NOT_PERMITTED: 403,
+        ERR_RESOURCE_NOT_FOUND: 404,
+        ERR_INVALID_STATE: 409,
+        ERR_STALE_MEMBER_VERSION: 412,
+        ERR_OWNERSHIP_VIOLATION: 403,
+        ERR_MEMBER_SUSPENDED: 403,
+        ERR_INSUFFICIENT_BALANCE: 402,
+        ERR_SHIFT_TIME_CONFLICT: 409,
+        ERR_EXCHANGE_TIME_CONFLICT: 409,
+        ERR_TRUST_TIER_TOO_LOW: 403,
+        ERR_VERIFIER_INELIGIBLE: 403,
+        ERR_INVALID_REQUEST: 400,
+    }
+    raise APIError(error_id, mapping[error_id], message)

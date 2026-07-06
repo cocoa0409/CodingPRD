@@ -1,0 +1,63 @@
+"""Error classes and error id constants for the flower DTC API."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message, http_status):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.http_status = http_status
+
+
+# --- Error IDs ---
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+ERR_CUSTOMER_NOT_FOUND = "ERR_CUSTOMER_NOT_FOUND"
+ERR_PLAN_NOT_FOUND = "ERR_PLAN_NOT_FOUND"
+ERR_SUBSCRIPTION_NOT_FOUND = "ERR_SUBSCRIPTION_NOT_FOUND"
+ERR_SHIPMENT_NOT_FOUND = "ERR_SHIPMENT_NOT_FOUND"
+ERR_STEM_LOT_NOT_FOUND = "ERR_STEM_LOT_NOT_FOUND"
+ERR_ROUTE_NOT_FOUND = "ERR_ROUTE_NOT_FOUND"
+ERR_CHARGE_NOT_FOUND = "ERR_CHARGE_NOT_FOUND"
+ERR_OFFER_NOT_FOUND = "ERR_OFFER_NOT_FOUND"
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+ERR_INVALID_STATE = "ERR_INVALID_STATE"
+ERR_SHIPMENT_NOT_SKIPPABLE = "ERR_SHIPMENT_NOT_SKIPPABLE"
+ERR_SUBSCRIPTION_NOT_ACTIVE = "ERR_SUBSCRIPTION_NOT_ACTIVE"
+ERR_LOT_EXPIRED = "ERR_LOT_EXPIRED"
+ERR_OFFER_NOT_REDEEMABLE = "ERR_OFFER_NOT_REDEEMABLE"
+ERR_STALE_VERSION = "ERR_STALE_VERSION"
+ERR_NOT_OWNER = "ERR_NOT_OWNER"
+ERR_OFFER_NOT_OWNED = "ERR_OFFER_NOT_OWNED"
+ERR_SKIP_WINDOW_CLOSED = "ERR_SKIP_WINDOW_CLOSED"
+ERR_OFFER_EXPIRED = "ERR_OFFER_EXPIRED"
+ERR_INSUFFICIENT_STEMS = "ERR_INSUFFICIENT_STEMS"
+ERR_ROUTE_WINDOW_CONFLICT = "ERR_ROUTE_WINDOW_CONFLICT"
+ERR_LOT_HOLD_CONFLICT = "ERR_LOT_HOLD_CONFLICT"
+ERR_SUBSTITUTION_NOT_ALLOWED = "ERR_SUBSTITUTION_NOT_ALLOWED"
+ERR_BILLING_PAST_DUE = "ERR_BILLING_PAST_DUE"
+ERR_REFUND_EXCEEDS_CAPTURED = "ERR_REFUND_EXCEEDS_CAPTURED"
+
+
+def bad_request(msg="Invalid request"):
+    return ApiError(ERR_INVALID_REQUEST, msg, 400)
+
+
+def unauthenticated(msg="Missing or invalid authentication"):
+    return ApiError(ERR_UNAUTHENTICATED, msg, 401)
+
+
+def unauthorized(msg="Role not permitted for this operation"):
+    return ApiError(ERR_UNAUTHORIZED, msg, 403)
+
+
+def not_found(entity, error_id):
+    return ApiError(error_id, f"{entity} not found", 404)
+
+
+def invalid_state(msg="Invalid state for this transition"):
+    return ApiError(ERR_INVALID_STATE, msg, 409)
+
+
+def stale_version():
+    return ApiError(ERR_STALE_VERSION, "Stale subscription version", 412)

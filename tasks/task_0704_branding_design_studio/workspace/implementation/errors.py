@@ -1,0 +1,66 @@
+"""Error classes and error-id constants (from PRD §5 error catalogue)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# --- Error catalogue: (error_id -> http status) per PRD §5 ---
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"            # 401
+ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"                  # 403
+ERR_NOT_FOUND = "ERR_NOT_FOUND"                        # 404
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"            # 400
+ERR_STALE_PROJECT_VERSION = "ERR_STALE_PROJECT_VERSION"  # 412
+ERR_INVALID_STATE = "ERR_INVALID_STATE"               # 409
+ERR_PROJECT_WRONG_STAGE = "ERR_PROJECT_WRONG_STAGE"   # 409
+ERR_PROJECT_NOT_ACTIVATED = "ERR_PROJECT_NOT_ACTIVATED"  # 409
+ERR_NO_MILESTONES = "ERR_NO_MILESTONES"               # 409
+ERR_CLIENT_NOT_ACTIVE = "ERR_CLIENT_NOT_ACTIVE"       # 409
+ERR_MOODBOARD_NOT_APPROVED = "ERR_MOODBOARD_NOT_APPROVED"  # 409
+ERR_NO_APPROVED_CONCEPT = "ERR_NO_APPROVED_CONCEPT"   # 409
+ERR_DELIVERABLES_INCOMPLETE = "ERR_DELIVERABLES_INCOMPLETE"  # 409
+ERR_DEPOSIT_UNPAID = "ERR_DEPOSIT_UNPAID"             # 402
+ERR_OPEN_INVOICES = "ERR_OPEN_INVOICES"               # 409
+ERR_REVISION_LIMIT_REACHED = "ERR_REVISION_LIMIT_REACHED"  # 409
+ERR_INTERVAL_OVERLAP = "ERR_INTERVAL_OVERLAP"         # 409
+ERR_ZERO_AMOUNT_MILESTONE = "ERR_ZERO_AMOUNT_MILESTONE"  # 409
+ERR_NOT_YET_DUE = "ERR_NOT_YET_DUE"                   # 409
+ERR_CYCLE_NOT_ENDED = "ERR_CYCLE_NOT_ENDED"           # 409
+ERR_OPEN_CYCLE = "ERR_OPEN_CYCLE"                     # 409
+ERR_INVALID_INTERVAL = "ERR_INVALID_INTERVAL"         # 400
+
+
+# Default HTTP status for each error id (single source of truth).
+HTTP_STATUS = {
+    ERR_UNAUTHENTICATED: 401,
+    ERR_UNAUTHORIZED: 403,
+    ERR_NOT_FOUND: 404,
+    ERR_INVALID_REQUEST: 400,
+    ERR_STALE_PROJECT_VERSION: 412,
+    ERR_INVALID_STATE: 409,
+    ERR_PROJECT_WRONG_STAGE: 409,
+    ERR_PROJECT_NOT_ACTIVATED: 409,
+    ERR_NO_MILESTONES: 409,
+    ERR_CLIENT_NOT_ACTIVE: 409,
+    ERR_MOODBOARD_NOT_APPROVED: 409,
+    ERR_NO_APPROVED_CONCEPT: 409,
+    ERR_DELIVERABLES_INCOMPLETE: 409,
+    ERR_DEPOSIT_UNPAID: 402,
+    ERR_OPEN_INVOICES: 409,
+    ERR_REVISION_LIMIT_REACHED: 409,
+    ERR_INTERVAL_OVERLAP: 409,
+    ERR_ZERO_AMOUNT_MILESTONE: 409,
+    ERR_NOT_YET_DUE: 409,
+    ERR_CYCLE_NOT_ENDED: 409,
+    ERR_OPEN_CYCLE: 409,
+    ERR_INVALID_INTERVAL: 400,
+}
+
+
+def err(error_id, message=None):
+    """Construct an ApiError using the catalogued HTTP status for error_id."""
+    return ApiError(error_id, HTTP_STATUS[error_id], message)

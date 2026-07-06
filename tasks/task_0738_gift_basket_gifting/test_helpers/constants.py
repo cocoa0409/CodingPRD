@@ -1,0 +1,25 @@
+"""Domain thresholds — numeric constants stated in the PRD's calculations."""
+
+# Bulk-order pricing (PRD §3.4).
+BRANDING_SURCHARGE_CENTS = 150
+RUSH_WINDOW_DAYS = 3
+RUSH_FEE_CENTS = 2500
+TIER_1_THRESHOLD_UNITS = 25
+TIER_2_THRESHOLD_UNITS = 100
+TIER_3_THRESHOLD_UNITS = 500
+
+# Loyalty (PRD §3.4).
+GOLD_THRESHOLD_CENTS = 1_000_000
+SILVER_THRESHOLD_CENTS = 250_000
+
+# Shipping (PRD §3.8).
+TEMPLATE_BASE_WEIGHT_KG = 1.2
+
+# Pagination (PRD §2.3).
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# Logical clock startup default (PRD §3.1).
+CLOCK_STARTUP_DEFAULT = "2026-03-01T00:00:00Z"

@@ -1,0 +1,42 @@
+"""Error class and HTTP status catalog."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = ERROR_STATUS.get(error_id, 400)
+
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_FK_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_PAGINATION": 400,
+    "ERR_STALE_VERSION": 412,
+    "ERR_INVALID_STATE": 409,
+    "ERR_POSTURE_LOCKDOWN": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_CANNOT_ACCEPT_CRITICAL": 409,
+    "ERR_CANNOT_DISMISS_HIGH_PRIORITY": 409,
+    "ERR_CANNOT_ESCALATE_LOW": 409,
+    "ERR_ENGAGEMENT_NOT_ACTIVE": 409,
+    "ERR_SCOPE_ASSET_INVALID": 409,
+    "ERR_OUTSIDE_WINDOW": 409,
+    "ERR_AUDIT_NOT_READY": 409,
+    "ERR_OPEN_CRITICAL_FINDINGS": 409,
+    "ERR_RETAINER_EXHAUSTED": 409,
+    "ERR_PERIOD_CLOSED": 409,
+    "ERR_DUPLICATE_HOSTNAME": 409,
+    "ERR_REOPEN_WINDOW_CLOSED": 409,
+    "ERR_ASSET_DECOMMISSIONED": 409,
+    "ERR_SCANS_IN_FLIGHT": 409,
+    "ERR_SCAN_NOT_COMPLETED": 409,
+    "ERR_AUDIT_NOT_IN_FIELDWORK": 409,
+    "ERR_CLIENT_NOT_ACTIVE": 409,
+    "ERR_WINDOW_OVERLAP": 409,
+    "ERR_SCAN_WINDOW_OVERLAP": 409,
+}
