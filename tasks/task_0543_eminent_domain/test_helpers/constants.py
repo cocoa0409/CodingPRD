@@ -1,0 +1,26 @@
+"""Domain thresholds — numeric constants stated in the PRD."""
+
+# Relocation-benefit caps (PRD §3.6).
+RESIDENTIAL_REPLACEMENT_CAP_CENTS = 3_150_000
+BUSINESS_REESTABLISHMENT_CAP_CENTS = 5_000_000
+
+# Prompt-settlement bonus tiers (PRD §3.4).
+PROMPT_BONUS_TIER_THRESHOLD_CENTS = 25_000_000
+PROMPT_BONUS_LOW_PCT = 0.03
+PROMPT_BONUS_HIGH_PCT = 0.05
+PROMPT_BONUS_MAX_ROUND = 2
+
+# Statutory interest (PRD §3.5).
+STATUTORY_DAILY_INTEREST_RATE = 0.0001
+
+# Logical-clock startup default (PRD §2.5).
+DEFAULT_CLOCK_UTC = "2026-05-01T00:00:00Z"
+
+# Common appraisal inputs used across setups whose offer basis == 27,000,000
+# (land 20,000,000 + improvements 5,000,000 + max(0, 3,000,000 - 1,000,000)).
+STD_LAND_CENTS = 20_000_000
+STD_IMPROVEMENTS_CENTS = 5_000_000
+STD_SEVERANCE_CENTS = 3_000_000
+STD_SPECIAL_BENEFITS_CENTS = 1_000_000
+STD_OFFER_BASIS_CENTS = 27_000_000
+STD_CONDEMNATION_BASIS_CENTS = 28_000_000

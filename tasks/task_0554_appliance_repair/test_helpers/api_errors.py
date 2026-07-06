@@ -1,0 +1,49 @@
+"""Error IDs and their HTTP status mapping (PRD §5).
+
+After defining the mapping we register it with the framework so validate_error()
+can cross-check HTTP status codes automatically.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+    ERR_NOT_OWNER = "ERR_NOT_OWNER"
+    ERR_VALIDATION = "ERR_VALIDATION"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_ESTIMATE_NOT_PENDING = "ERR_ESTIMATE_NOT_PENDING"
+    ERR_SAFETY_RECALL_HOLD = "ERR_SAFETY_RECALL_HOLD"
+    ERR_TECHNICIAN_OFF_DUTY = "ERR_TECHNICIAN_OFF_DUTY"
+    ERR_PARTS_NOT_READY = "ERR_PARTS_NOT_READY"
+    ERR_TECH_DOUBLE_BOOKED = "ERR_TECH_DOUBLE_BOOKED"
+    ERR_ZONE_CAPACITY_EXCEEDED = "ERR_ZONE_CAPACITY_EXCEEDED"
+    ERR_DUPLICATE_TRUCK_STOCK = "ERR_DUPLICATE_TRUCK_STOCK"
+    ERR_INSUFFICIENT_TRUCK_STOCK = "ERR_INSUFFICIENT_TRUCK_STOCK"
+    ERR_PAYMENT_AMOUNT_MISMATCH = "ERR_PAYMENT_AMOUNT_MISMATCH"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+
+
+HTTP_STATUS_CODES: dict[str, int] = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_UNAUTHORIZED: 403,
+    ApiErrorId.ERR_NOT_OWNER: 403,
+    ApiErrorId.ERR_VALIDATION: 400,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_ESTIMATE_NOT_PENDING: 409,
+    ApiErrorId.ERR_SAFETY_RECALL_HOLD: 409,
+    ApiErrorId.ERR_TECHNICIAN_OFF_DUTY: 409,
+    ApiErrorId.ERR_PARTS_NOT_READY: 409,
+    ApiErrorId.ERR_TECH_DOUBLE_BOOKED: 409,
+    ApiErrorId.ERR_ZONE_CAPACITY_EXCEEDED: 409,
+    ApiErrorId.ERR_DUPLICATE_TRUCK_STOCK: 409,
+    ApiErrorId.ERR_INSUFFICIENT_TRUCK_STOCK: 409,
+    ApiErrorId.ERR_PAYMENT_AMOUNT_MISMATCH: 422,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+}
+
+# Register with the framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(HTTP_STATUS_CODES)

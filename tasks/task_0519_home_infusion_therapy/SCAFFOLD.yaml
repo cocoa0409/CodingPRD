@@ -1,0 +1,1727 @@
+scenario: |
+  Home Infusion Therapy (Option Care style): referral & infusion order, drug compounding & pump setup,
+  nursing visit scheduling & teach, supply/ancillary kit, per-diem & drug (AWP) billing, prior-auth &
+  specialty drug, lab monitoring, adverse-reaction & discontinuation
+
+domain_name: home-infusion-therapy
+api_prefix: /
+
+# ---------------------------------------------------------------------------
+# Complexity profile (§0.1–§0.4) — Expert tier
+# ---------------------------------------------------------------------------
+complexity_profile:
+  primary_archetype: Ledger reconciliation        # estimate-vs-final claim adjudication on identical inputs
+  secondary_archetype: Compliance / audit          # prior-auth, lab-monitoring gates, adverse-event holds, segregation of duties
+  complexity_layers:
+    - dual_variant_calculation                     # estimate (scheduled) vs final (administered) on claim + per-diem
+    - cascading_side_effects                        # discontinuation cascades order -> compounds -> visits -> claim -> inventory
+    - rate_threshold_triggers                       # adverse-event severity threshold, AWP whole-vial ceiling, deductible waterfall
+    - optimistic_concurrency                        # OCC on InfusionOrder.version for claim creation / order amendment
+
+  entity_topology: flat                            # peer entities linked by FK; no deep URL nesting
+  state_machine_shape: branching                   # fork/join + revert/hold loops + cross-entity guards
+  relationship_patterns:
+    - one_to_many                                  # Patient -> Referral -> InfusionOrder -> NursingVisit / Compound
+    - many_to_many                                 # NursingVisit <-> Compound (a visit administers a compound), via FK fields
+    - cross_aggregate                              # Claim references Order + PayerPlan + Visits across aggregate boundaries
+    - polymorphic                                  # AdverseEvent references either an InfusionOrder or a NursingVisit subject
+
+  role_model: segregation_of_duties                # the clinician who reports an adverse event cannot adjudicate the order hold
+  consistency_model: immediate                     # all cascades atomic within the triggering request
+
+# ---------------------------------------------------------------------------
+# §1.0 Response Envelope (FIXED — verbatim)
+# ---------------------------------------------------------------------------
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# §1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+
+  # --- configuration entities ---
+  - name: DrugCatalog
+    parent: null
+    common_fields: true
+    fields:
+      - name: ndc_code
+        type: string
+        source: input
+        description: National Drug Code, unique catalog key
+        constraints: "unique across DrugCatalog"
+      - name: generic_name
+        type: string
+        source: input
+        description: drug generic name (e.g., vancomycin)
+      - name: therapy_category
+        type: enum
+        source: input
+        description: therapy class used to select per-diem rate and lab-monitoring policy
+        constraints: "one of {ANTI_INFECTIVE, AMINOGLYCOSIDE_OR_VANCO, TPN, IMMUNE_GLOBULIN, CHEMO}"
+      - name: vial_size_mg
+        type: integer
+        source: input
+        description: milligrams of active drug per vial; drives whole-vial billing ceiling
+        constraints: "> 0"
+      - name: awp_per_vial_cents
+        type: integer
+        source: input
+        description: Average Wholesale Price per vial in integer cents
+        constraints: ">= 0"
+      - name: is_specialty
+        type: boolean
+        source: input
+        description: when true an APPROVED PriorAuthorization is required before the order may be RELEASED
+        default: false
+      - name: requires_trough_lab
+        type: boolean
+        source: input
+        description: when true a trough LabResult is required before the 4th NursingVisit may complete
+        default: false
+      - name: lot_total_vials
+        type: integer
+        source: input
+        description: total vials in this lot at catalog creation; conserved quantity for inventory invariant
+        constraints: ">= 0"
+      - name: on_hand_vials
+        type: integer
+        source: computed
+        description: vials currently unreserved; on_hand + reserved + administered + wasted == lot_total_vials (invariant inv_drug_inventory)
+
+  - name: PayerPlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: plan_code
+        type: string
+        source: input
+        description: payer plan identifier, unique
+        constraints: "unique across PayerPlan"
+      - name: per_diem_rate_cents
+        type: object
+        source: input
+        description: |
+          map of therapy_category -> per-diem rate in integer cents
+          (e.g., {"ANTI_INFECTIVE": 12500, "AMINOGLYCOSIDE_OR_VANCO": 12500, "TPN": 22000})
+      - name: awp_discount_pct
+        type: number
+        source: input
+        description: fraction subtracted from AWP gross when adjudicating drug lines (e.g., 0.18)
+        constraints: ">= 0 and < 1"
+      - name: coinsurance_pct
+        type: number
+        source: input
+        description: patient coinsurance fraction applied after deductible in copay waterfall
+        constraints: ">= 0 and <= 1"
+      - name: deductible_remaining_cents
+        type: integer
+        source: input
+        description: patient deductible not yet met; reduced by claim posting (accumulator)
+        constraints: ">= 0"
+      - name: oop_max_remaining_cents
+        type: integer
+        source: input
+        description: out-of-pocket maximum still owable this year; caps patient responsibility (accumulator)
+        constraints: ">= 0"
+
+  - name: Nurse
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: clinician name
+      - name: license_state
+        type: string
+        source: input
+        description: two-letter state of licensure; must equal Patient.service_state on a visit
+        constraints: "two uppercase letters"
+      - name: status
+        type: enum
+        source: input
+        description: nurse availability state
+        default: ACTIVE
+        constraints: "one of {ACTIVE, INACTIVE}"
+
+  # --- core workflow entities ---
+  - name: Patient
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: patient name
+      - name: service_state
+        type: string
+        source: input
+        description: two-letter state where infusion is delivered; gates nurse licensure match
+        constraints: "two uppercase letters"
+      - name: payer_plan_id
+        type: string
+        source: input
+        description: "FK -> PayerPlan.id; the patient's active payer plan"
+      - name: status
+        type: enum
+        source: computed
+        description: patient lifecycle
+        default: ACTIVE
+        constraints: "one of {ACTIVE, DISCHARGED}"
+
+  - name: Referral
+    parent: null
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; subject of the referral"
+      - name: referring_provider_npi
+        type: string
+        source: input
+        description: referring physician NPI
+      - name: diagnosis_code
+        type: string
+        source: input
+        description: ICD-10 diagnosis driving therapy
+      - name: status
+        type: enum
+        source: computed
+        description: referral intake state
+        default: RECEIVED
+        constraints: "one of {RECEIVED, ACCEPTED, REJECTED}"
+
+  - name: InfusionOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: referral_id
+        type: string
+        source: input
+        description: "FK -> Referral.id; the accepted referral this order fulfills"
+      - name: patient_id
+        type: string
+        source: computed
+        description: "FK -> Patient.id; copied from the referral on creation"
+      - name: drug_id
+        type: string
+        source: input
+        description: "FK -> DrugCatalog.id; drug to be compounded and administered"
+      - name: route
+        type: enum
+        source: input
+        description: administration route
+        constraints: "one of {IV, SUBQ, INTRATHECAL}"
+      - name: daily_dose_mg
+        type: integer
+        source: input
+        description: milligrams administered per infusion day; drives whole-vial billing
+        constraints: "> 0"
+      - name: frequency_per_day
+        type: integer
+        source: input
+        description: infusions per day
+        constraints: ">= 1"
+      - name: start_date
+        type: datetime
+        source: input
+        description: therapy start; anchors lab-monitoring due window
+      - name: scheduled_days
+        type: integer
+        source: input
+        description: planned number of billable infusion days; estimate-variant per-diem multiplier
+        constraints: ">= 1"
+      - name: administered_days
+        type: integer
+        source: computed
+        description: count of NursingVisit in COMPLETED for this order; final-variant per-diem multiplier
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: order lifecycle
+        default: DRAFT
+        constraints: "one of {DRAFT, PENDING_AUTH, RELEASED, ON_HOLD, ACTIVE, DISCONTINUED, COMPLETED}"
+      - name: hold_reason
+        type: enum
+        source: computed
+        description: why the order is ON_HOLD; null otherwise
+        default: null
+        constraints: "one of {ADVERSE_EVENT, LAB_OVERDUE, null}"
+
+  - name: PriorAuthorization
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> InfusionOrder.id; the specialty order needing payer authorization"
+      - name: payer_plan_id
+        type: string
+        source: computed
+        description: "FK -> PayerPlan.id; copied from the order's patient on creation"
+      - name: requested_units
+        type: integer
+        source: input
+        description: vials requested for authorization
+        constraints: "> 0"
+      - name: approved_units
+        type: integer
+        source: computed
+        description: vials the payer approved; set on APPROVE, drives the auth-overage validation
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: prior-authorization state
+        default: SUBMITTED
+        constraints: "one of {SUBMITTED, APPROVED, DENIED}"
+
+  - name: Compound
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> InfusionOrder.id; the order this compound batch is prepared for"
+      - name: vials_reserved
+        type: integer
+        source: computed
+        description: vials drawn from DrugCatalog.on_hand_vials when COMPOUNDED; participates in inventory invariant
+        default: 0
+      - name: pump_id
+        type: string
+        source: input
+        description: "FK -> Pump.id; the pump paired to this compound for delivery"
+      - name: delivery_at
+        type: datetime
+        source: input
+        description: scheduled pump+compound delivery start; reservation interval start
+      - name: retrieval_at
+        type: datetime
+        source: input
+        description: scheduled pump retrieval; reservation interval end (half-open)
+      - name: status
+        type: enum
+        source: computed
+        description: compounding lifecycle
+        default: ORDERED
+        constraints: "one of {ORDERED, COMPOUNDED, DELIVERED, WASTED}"
+
+  - name: Pump
+    parent: null
+    common_fields: true
+    fields:
+      - name: asset_tag
+        type: string
+        source: input
+        description: durable pump asset identifier, unique
+        constraints: "unique across Pump"
+      - name: model
+        type: enum
+        source: input
+        description: pump model
+        constraints: "one of {AMBULATORY, STATIONARY}"
+      - name: status
+        type: enum
+        source: input
+        description: pump availability
+        default: AVAILABLE
+        constraints: "one of {AVAILABLE, RETIRED}"
+
+  - name: SupplyKit
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> InfusionOrder.id; the order this ancillary kit supports"
+      - name: kit_type
+        type: enum
+        source: input
+        description: ancillary kit class
+        constraints: "one of {START_OF_CARE, WEEKLY_RESUPPLY, FLUSH_ONLY}"
+      - name: line_count
+        type: integer
+        source: input
+        description: number of ancillary lines in the kit
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: computed
+        description: kit fulfillment state
+        default: PICKING
+        constraints: "one of {PICKING, SHIPPED, CANCELLED}"
+
+  - name: NursingVisit
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> InfusionOrder.id; the order this visit administers"
+      - name: nurse_id
+        type: string
+        source: input
+        description: "FK -> Nurse.id; assigned clinician"
+      - name: compound_id
+        type: string
+        source: input
+        description: "FK -> Compound.id; the compound this visit administers (null for a teach-only visit)"
+        default: null
+      - name: visit_type
+        type: enum
+        source: input
+        description: visit purpose
+        constraints: "one of {TEACH, ADMINISTER}"
+      - name: start_at
+        type: datetime
+        source: input
+        description: visit start time; nurse-overlap interval anchor
+      - name: duration_min
+        type: integer
+        source: input
+        description: visit duration in minutes
+        constraints: "> 0"
+      - name: sequence_index
+        type: integer
+        source: computed
+        description: 1-based ordinal of this visit within its order, by start_at ascending then created_at ascending; the 4th gate uses index == 4
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: visit lifecycle
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, COMPLETED, MISSED, CANCELLED}"
+
+  - name: LabResult
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> InfusionOrder.id; the monitored order"
+      - name: lab_type
+        type: enum
+        source: input
+        description: monitoring lab type
+        constraints: "one of {TROUGH, PEAK, CMP, CBC}"
+      - name: value_num
+        type: number
+        source: input
+        description: numeric lab value
+      - name: collected_at
+        type: datetime
+        source: input
+        description: specimen collection timestamp; must fall in the monitoring window
+      - name: is_critical
+        type: boolean
+        source: input
+        description: true when the value is outside the safe range
+        default: false
+
+  - name: AdverseEvent
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> InfusionOrder.id; the order the reaction occurred under"
+      - name: visit_id
+        type: string
+        source: input
+        description: "FK -> NursingVisit.id; the visit during which the reaction occurred (null if not visit-bound)"
+        default: null
+      - name: severity_grade
+        type: integer
+        source: input
+        description: CTCAE-style grade 1..4
+        constraints: "one of {1,2,3,4}"
+      - name: reaction_count
+        type: integer
+        source: input
+        description: number of distinct reactions reported
+        constraints: ">= 0"
+      - name: vital_instability
+        type: integer
+        source: input
+        description: 0 = stable, 1 = unstable vitals
+        constraints: "one of {0,1}"
+      - name: severity_score
+        type: integer
+        source: computed
+        description: weighted score; score >= AE_HOLD_THRESHOLD auto-holds the order (calc ae_severity_score)
+        default: 0
+      - name: reported_by_role
+        type: string
+        source: computed
+        description: X-User-Role that reported the event; segregation-of-duties bars this identity from adjudicating the resulting hold
+      - name: reported_by_user_id
+        type: string
+        source: computed
+        description: X-User-ID that reported the event
+      - name: status
+        type: enum
+        source: computed
+        description: adverse-event review state
+        default: REPORTED
+        constraints: "one of {REPORTED, ADJUDICATED}"
+
+  - name: Claim
+    parent: null
+    common_fields: true
+    fields:
+      - name: order_id
+        type: string
+        source: input
+        description: "FK -> InfusionOrder.id; the order being billed"
+      - name: payer_plan_id
+        type: string
+        source: computed
+        description: "FK -> PayerPlan.id; copied from the order's patient on creation"
+      - name: expected_order_version
+        type: integer
+        source: input
+        description: client's last-observed InfusionOrder.version; OCC guard (occ_field, rule claim-create-stale-order)
+      - name: billed_days
+        type: integer
+        source: computed
+        description: per-diem day multiplier; scheduled_days under estimate variant, administered_days under final variant
+        default: 0
+      - name: per_diem_cents
+        type: integer
+        source: computed
+        description: per-diem line total in cents (calc per_diem_line)
+        default: 0
+      - name: drug_allowed_cents
+        type: integer
+        source: computed
+        description: adjudicated drug line total in cents (calc drug_line_allowed)
+        default: 0
+      - name: allowed_total_cents
+        type: integer
+        source: computed
+        description: per_diem_cents + drug_allowed_cents
+        default: 0
+      - name: patient_responsibility_cents
+        type: integer
+        source: computed
+        description: patient portion after deductible+coinsurance waterfall, capped by OOP max (calc copay_waterfall)
+        default: 0
+      - name: plan_paid_cents
+        type: integer
+        source: computed
+        description: allowed_total_cents - patient_responsibility_cents; invariant inv_claim_ledger
+        default: 0
+      - name: variant
+        type: enum
+        source: computed
+        description: which calculation variant produced the figures
+        default: ESTIMATE
+        constraints: "one of {ESTIMATE, FINAL}"
+      - name: status
+        type: enum
+        source: computed
+        description: claim lifecycle
+        default: DRAFT
+        constraints: "one of {DRAFT, POSTED, VOID}"
+
+# ===========================================================================
+# §1.2 State Machine Table
+# ===========================================================================
+state_machines:
+
+  - entity: Referral
+    initial_state: RECEIVED
+    terminal_states: [REJECTED]
+    transitions:
+      - from: RECEIVED
+        to: ACCEPTED
+        trigger: "POST /referrals/{id}/accept"
+        actor: IntakeCoordinator
+        preconditions:
+          - "referral.status == RECEIVED"
+          - "Patient referenced by patient_id exists and status == ACTIVE"
+        side_effects:
+          - "increments Referral.version by 1"
+      - from: RECEIVED
+        to: REJECTED
+        trigger: "POST /referrals/{id}/reject"
+        actor: IntakeCoordinator
+        preconditions:
+          - "referral.status == RECEIVED"
+        side_effects:
+          - "increments Referral.version by 1"
+
+  - entity: InfusionOrder
+    initial_state: DRAFT
+    terminal_states: [DISCONTINUED, COMPLETED]
+    transitions:
+      - from: DRAFT
+        to: PENDING_AUTH
+        trigger: "POST /infusion-orders/{id}/submit"
+        actor: Pharmacist
+        preconditions:
+          - "order.status == DRAFT"
+          - "referenced DrugCatalog.is_specialty == true"
+        side_effects:
+          - "increments InfusionOrder.version by 1"
+        note: "non-specialty orders skip PENDING_AUTH and submit straight to RELEASED (separate transition)"
+      - from: DRAFT
+        to: RELEASED
+        trigger: "POST /infusion-orders/{id}/submit"
+        actor: Pharmacist
+        preconditions:
+          - "order.status == DRAFT"
+          - "referenced DrugCatalog.is_specialty == false"
+        side_effects:
+          - "increments InfusionOrder.version by 1"
+      - from: PENDING_AUTH
+        to: RELEASED
+        trigger: "system: PriorAuthorization for this order transitions to APPROVED"
+        actor: system
+        preconditions:
+          - "order.status == PENDING_AUTH"
+          - "the order's PriorAuthorization.status == APPROVED"
+        side_effects:
+          - "increments InfusionOrder.version by 1"
+      - from: PENDING_AUTH
+        to: DISCONTINUED
+        trigger: "system: PriorAuthorization for this order transitions to DENIED"
+        actor: system
+        preconditions:
+          - "order.status == PENDING_AUTH"
+        side_effects:
+          - "cascade: every SupplyKit for this order in PICKING -> CANCELLED (cascade chain casc_auth_denied hop 2)"
+          - "increments InfusionOrder.version by 1"
+      - from: RELEASED
+        to: ACTIVE
+        trigger: "system: first NursingVisit for this order transitions to COMPLETED"
+        actor: system
+        preconditions:
+          - "order.status == RELEASED"
+        side_effects:
+          - "sets InfusionOrder.administered_days via calc administered_days_count"
+          - "increments InfusionOrder.version by 1"
+      - from: ACTIVE
+        to: ON_HOLD
+        trigger: "system: AdverseEvent with severity_score >= AE_HOLD_THRESHOLD is REPORTED, or 4th visit blocked by overdue lab"
+        actor: system
+        preconditions:
+          - "order.status in {RELEASED, ACTIVE}"
+        side_effects:
+          - "sets InfusionOrder.hold_reason to ADVERSE_EVENT or LAB_OVERDUE"
+          - "cascade: every SCHEDULED NursingVisit for this order with start_at in the future -> MISSED (cascade chain casc_ae_hold hop 2)"
+          - "increments InfusionOrder.version by 1"
+      - from: RELEASED
+        to: ON_HOLD
+        trigger: "system: AdverseEvent with severity_score >= AE_HOLD_THRESHOLD is REPORTED"
+        actor: system
+        preconditions:
+          - "order.status == RELEASED"
+        side_effects:
+          - "sets InfusionOrder.hold_reason to ADVERSE_EVENT"
+          - "increments InfusionOrder.version by 1"
+      - from: ON_HOLD
+        to: ACTIVE
+        trigger: "POST /adverse-events/{id}/adjudicate with disposition RESUME"
+        actor: MedicalDirector
+        preconditions:
+          - "order.status == ON_HOLD"
+          - "the adjudicating X-User-ID != AdverseEvent.reported_by_user_id (segregation of duties)"
+        side_effects:
+          - "clears InfusionOrder.hold_reason to null"
+          - "sets AdverseEvent.status = ADJUDICATED"
+          - "increments InfusionOrder.version by 1"
+      - from: ON_HOLD
+        to: DISCONTINUED
+        trigger: "POST /adverse-events/{id}/adjudicate with disposition DISCONTINUE"
+        actor: MedicalDirector
+        preconditions:
+          - "order.status == ON_HOLD"
+          - "the adjudicating X-User-ID != AdverseEvent.reported_by_user_id (segregation of duties)"
+        side_effects:
+          - "sets AdverseEvent.status = ADJUDICATED"
+          - "cascade: every NursingVisit in SCHEDULED -> CANCELLED (cascade chain casc_discontinue hop 2)"
+          - "cascade: every Compound in {ORDERED, COMPOUNDED} -> WASTED; COMPOUNDED compounds return vials_reserved to DrugCatalog.on_hand_vials (cascade chain casc_discontinue hop 3)"
+          - "increments InfusionOrder.version by 1"
+      - from: ACTIVE
+        to: DISCONTINUED
+        trigger: "POST /infusion-orders/{id}/discontinue"
+        actor: MedicalDirector
+        preconditions:
+          - "order.status == ACTIVE"
+        side_effects:
+          - "cascade: every NursingVisit in SCHEDULED -> CANCELLED (cascade chain casc_discontinue hop 2)"
+          - "cascade: every Compound in {ORDERED, COMPOUNDED} -> WASTED; COMPOUNDED compounds return vials_reserved to DrugCatalog.on_hand_vials (cascade chain casc_discontinue hop 3)"
+          - "increments InfusionOrder.version by 1"
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "POST /infusion-orders/{id}/complete"
+        actor: Pharmacist
+        preconditions:
+          - "order.status == ACTIVE"
+          - "order.administered_days >= order.scheduled_days"
+        side_effects:
+          - "increments InfusionOrder.version by 1"
+
+  - entity: PriorAuthorization
+    initial_state: SUBMITTED
+    terminal_states: [APPROVED, DENIED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /prior-authorizations/{id}/approve"
+        actor: AuthSpecialist
+        preconditions:
+          - "auth.status == SUBMITTED"
+          - "the order referenced by order_id has status == PENDING_AUTH"
+        side_effects:
+          - "sets PriorAuthorization.approved_units from request body"
+          - "cross-entity: triggers InfusionOrder PENDING_AUTH -> RELEASED (cascade chain casc_auth_approved hop 2)"
+          - "increments PriorAuthorization.version by 1"
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /prior-authorizations/{id}/deny"
+        actor: AuthSpecialist
+        preconditions:
+          - "auth.status == SUBMITTED"
+        side_effects:
+          - "cross-entity: triggers InfusionOrder PENDING_AUTH -> DISCONTINUED (cascade chain casc_auth_denied hop 1)"
+          - "increments PriorAuthorization.version by 1"
+
+  - entity: Compound
+    initial_state: ORDERED
+    terminal_states: [DELIVERED, WASTED]
+    transitions:
+      - from: ORDERED
+        to: COMPOUNDED
+        trigger: "POST /compounds/{id}/compound"
+        actor: Pharmacist
+        preconditions:
+          - "compound.status == ORDERED"
+          - "the order referenced by order_id has status in {RELEASED, ACTIVE}"
+          - "DrugCatalog.on_hand_vials >= ceil(order.daily_dose_mg * order.scheduled_days / DrugCatalog.vial_size_mg)"
+          - "the paired Pump has status == AVAILABLE and no conflicting reservation (validation resource_temporal_overlap pump)"
+        side_effects:
+          - "sets Compound.vials_reserved = ceil(order.daily_dose_mg * order.scheduled_days / vial_size_mg)"
+          - "debits DrugCatalog.on_hand_vials by vials_reserved (invariant inv_drug_inventory)"
+          - "increments Compound.version by 1"
+      - from: COMPOUNDED
+        to: DELIVERED
+        trigger: "POST /compounds/{id}/deliver"
+        actor: Pharmacist
+        preconditions:
+          - "compound.status == COMPOUNDED"
+        side_effects:
+          - "increments Compound.version by 1"
+      - from: ORDERED
+        to: WASTED
+        trigger: "system: order discontinuation cascade"
+        actor: system
+        preconditions:
+          - "compound.status == ORDERED"
+        side_effects:
+          - "increments Compound.version by 1"
+      - from: COMPOUNDED
+        to: WASTED
+        trigger: "system: order discontinuation cascade"
+        actor: system
+        preconditions:
+          - "compound.status == COMPOUNDED"
+        side_effects:
+          - "credits DrugCatalog.on_hand_vials by vials_reserved (compensating action of inv_drug_inventory)"
+          - "increments Compound.version by 1"
+
+  - entity: NursingVisit
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, MISSED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "POST /nursing-visits/{id}/complete"
+        actor: VisitingNurse
+        preconditions:
+          - "visit.status == SCHEDULED"
+          - "the order referenced by order_id has status in {RELEASED, ACTIVE}"
+          - "if visit.sequence_index >= 4 and DrugCatalog.requires_trough_lab == true: a TROUGH LabResult with collected_at in [order.start_date, order.start_date + LAB_DUE_DAYS days] exists (validation lab_overdue_gate)"
+        side_effects:
+          - "if first COMPLETED visit for the order: triggers InfusionOrder RELEASED -> ACTIVE (cascade chain casc_first_visit hop 1)"
+          - "recomputes InfusionOrder.administered_days via calc administered_days_count (cascade chain casc_first_visit hop 2)"
+          - "increments NursingVisit.version by 1"
+      - from: SCHEDULED
+        to: MISSED
+        trigger: "POST /nursing-visits/{id}/miss OR system: order ON_HOLD cascade"
+        actor: VisitingNurse | system
+        preconditions:
+          - "visit.status == SCHEDULED"
+        side_effects:
+          - "increments NursingVisit.version by 1"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "system: order discontinuation cascade"
+        actor: system
+        preconditions:
+          - "visit.status == SCHEDULED"
+        side_effects:
+          - "increments NursingVisit.version by 1"
+
+  - entity: SupplyKit
+    initial_state: PICKING
+    terminal_states: [SHIPPED, CANCELLED]
+    transitions:
+      - from: PICKING
+        to: SHIPPED
+        trigger: "POST /supply-kits/{id}/ship"
+        actor: WarehouseClerk
+        preconditions:
+          - "kit.status == PICKING"
+          - "the order referenced by order_id has status in {RELEASED, ACTIVE}"
+        side_effects:
+          - "increments SupplyKit.version by 1"
+      - from: PICKING
+        to: CANCELLED
+        trigger: "system: order discontinuation or auth-denied cascade"
+        actor: system
+        preconditions:
+          - "kit.status == PICKING"
+        side_effects:
+          - "increments SupplyKit.version by 1"
+
+  - entity: AdverseEvent
+    initial_state: REPORTED
+    terminal_states: [ADJUDICATED]
+    transitions:
+      - from: REPORTED
+        to: ADJUDICATED
+        trigger: "POST /adverse-events/{id}/adjudicate"
+        actor: MedicalDirector
+        preconditions:
+          - "event.status == REPORTED"
+          - "the order referenced by order_id has status == ON_HOLD"
+          - "X-User-ID != AdverseEvent.reported_by_user_id (segregation of duties)"
+        side_effects:
+          - "drives InfusionOrder ON_HOLD -> ACTIVE (RESUME) or ON_HOLD -> DISCONTINUED (DISCONTINUE)"
+          - "increments AdverseEvent.version by 1"
+
+  - entity: Claim
+    initial_state: DRAFT
+    terminal_states: [VOID]
+    transitions:
+      - from: DRAFT
+        to: POSTED
+        trigger: "POST /claims/{id}/post"
+        actor: Biller
+        preconditions:
+          - "claim.status == DRAFT"
+          - "the order referenced by order_id has status in {ACTIVE, COMPLETED, DISCONTINUED}"
+        side_effects:
+          - "recomputes claim figures using FINAL variant (calc per_diem_line, drug_line_allowed, copay_waterfall); sets variant = FINAL"
+          - "debits PayerPlan.deductible_remaining_cents by the deductible portion applied (accumulator)"
+          - "debits PayerPlan.oop_max_remaining_cents by patient_responsibility_cents (accumulator)"
+          - "increments Claim.version by 1"
+      - from: POSTED
+        to: VOID
+        trigger: "POST /claims/{id}/void"
+        actor: Biller
+        preconditions:
+          - "claim.status == POSTED"
+        side_effects:
+          - "credits PayerPlan.deductible_remaining_cents back by the deductible portion previously applied (compensating action of inv_payer_accumulator)"
+          - "credits PayerPlan.oop_max_remaining_cents back by patient_responsibility_cents (compensating action of inv_payer_accumulator)"
+          - "increments Claim.version by 1"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules — true races only (OCC on parent version)
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: claim-create-stale-order
+    parent_entity: InfusionOrder
+    write_endpoint: "POST /claims"
+    occ_field: "expected_order_version"
+    description: |
+      Creating a Claim against an InfusionOrder whose version has advanced since
+      the client last observed it is rejected. A new claim may legitimately
+      supersede a prior DRAFT claim for the same order, so a second create with a
+      stale expected_order_version is a genuine lost-update, not a state precondition:
+      the order's version is bumped by intervening visit completions, holds, and
+      cascades that change the billable-day basis, so a stale view must be rejected.
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+
+# ===========================================================================
+# §1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+
+  - name: drug_line_allowed
+    trigger: "on POST /claims (ESTIMATE) and on POST /claims/{id}/post (FINAL); writes Claim.drug_allowed_cents"
+    algorithm: threshold
+    formula: |
+      billed_units = ceil( (order.daily_dose_mg * billed_days) / drug.vial_size_mg )   # whole-vial ceiling
+      gross_cents  = billed_units * drug.awp_per_vial_cents
+      drug_allowed_cents = round_half_up( gross_cents * (1 - plan.awp_discount_pct) )   # ROUND PER LINE, then this single value IS the drug line
+      # PINNED EVALUATION ORDER: apply the whole-vial ceiling BEFORE the discount; round the discounted line to whole cents.
+      # billed_days = order.scheduled_days under ESTIMATE; order.administered_days under FINAL.
+    input_set: "single drug line of the order's DrugCatalog; billed_days source depends on variant"
+    constants:
+      ROUNDING: round_half_up
+    precision: "integer cents, round_half_up at the single drug line"
+    variants:
+      - name: estimate
+        when: "Claim created (status DRAFT), variant ESTIMATE"
+        difference: "billed_days = order.scheduled_days; uses scheduled day count for the whole-vial ceiling"
+      - name: final
+        when: "Claim posted (DRAFT -> POSTED), variant FINAL"
+        difference: "billed_days = order.administered_days (COMPLETED visit count); fewer days lowers billed_units and gross"
+
+  - name: per_diem_line
+    trigger: "on POST /claims (ESTIMATE) and on POST /claims/{id}/post (FINAL); writes Claim.per_diem_cents and Claim.billed_days"
+    algorithm: aggregation
+    formula: |
+      rate_cents = plan.per_diem_rate_cents[ drug.therapy_category ]
+      billed_days = order.scheduled_days   (ESTIMATE)  |  order.administered_days   (FINAL)
+      per_diem_cents = rate_cents * billed_days
+    input_set: "per-diem rate selected by the order drug's therapy_category from the patient's PayerPlan"
+    constants: {}
+    precision: "integer cents (exact, no rounding — rate and day count are integers)"
+    variants:
+      - name: estimate
+        when: "Claim DRAFT"
+        difference: "billed_days = scheduled_days"
+      - name: final
+        when: "Claim POSTED"
+        difference: "billed_days = administered_days = count of this order's NursingVisit in COMPLETED"
+
+  - name: administered_days_count
+    trigger: "on NursingVisit SCHEDULED -> COMPLETED; writes InfusionOrder.administered_days"
+    algorithm: aggregation
+    formula: |
+      administered_days = count( NursingVisit
+                                 WHERE order_id == order.id
+                                 AND status == COMPLETED )
+    input_set: "this order's NursingVisit rows in status COMPLETED only (SCHEDULED/MISSED/CANCELLED excluded)"
+    constants: {}
+    precision: "integer count"
+
+  - name: copay_waterfall
+    trigger: "on POST /claims (ESTIMATE) and on POST /claims/{id}/post (FINAL); writes Claim.patient_responsibility_cents and Claim.plan_paid_cents"
+    algorithm: waterfall_allocation
+    formula: |
+      allowed_total = per_diem_cents + drug_allowed_cents
+      # bucket 1: deductible absorbs first
+      ded_applied   = min( plan.deductible_remaining_cents, allowed_total )
+      after_ded     = allowed_total - ded_applied
+      # bucket 2: coinsurance on the post-deductible remainder
+      coins_cents   = round_half_up( after_ded * plan.coinsurance_pct )
+      patient_pre_cap = ded_applied + coins_cents
+      # cap: patient never owes more than remaining OOP max
+      patient_responsibility_cents = min( patient_pre_cap, plan.oop_max_remaining_cents )
+      plan_paid_cents = allowed_total - patient_responsibility_cents
+      # PINNED ORDER: deductible bucket BEFORE coinsurance bucket; OOP cap applied LAST.
+    input_set: "the order's patient's PayerPlan accumulators (deductible_remaining_cents, oop_max_remaining_cents)"
+    constants:
+      ROUNDING: round_half_up
+    precision: "integer cents, round_half_up on the coinsurance bucket only"
+    variants:
+      - name: estimate
+        when: "Claim DRAFT — reads accumulators but does NOT debit them"
+        difference: "accumulators unchanged; figures are provisional"
+      - name: final
+        when: "Claim POSTED — debits accumulators by ded_applied and patient_responsibility_cents"
+        difference: "accumulators reduced; a later claim sees the lowered deductible/OOP (order-sensitive across claims)"
+
+  - name: ae_severity_score
+    trigger: "on POST /adverse-events; writes AdverseEvent.severity_score and may auto-hold the order"
+    algorithm: weighted_scoring
+    formula: |
+      severity_score = (W_SEVERITY * severity_grade)
+                     + (W_REACTION * reaction_count)
+                     + (W_VITAL    * vital_instability)
+      # if severity_score >= AE_HOLD_THRESHOLD the order is auto-held (ADVERSE_EVENT)
+    input_set: "the single AdverseEvent's grade, reaction_count, vital_instability"
+    constants:
+      W_SEVERITY: 2
+      W_REACTION: 1
+      W_VITAL: 3
+      AE_HOLD_THRESHOLD: 7
+    precision: "integer score (all inputs and weights integer)"
+
+  - name: pump_reservation_conflict
+    trigger: "on Compound ORDERED -> COMPOUNDED (validation resource_temporal_overlap pump)"
+    algorithm: interval_merge
+    formula: |
+      # The candidate compound occupies its pump over [delivery_at, retrieval_at) plus a trailing
+      # reprocessing buffer. A conflict exists with any other Compound on the SAME pump_id whose
+      # status in {COMPOUNDED, DELIVERED} when:
+      #   new.delivery_at < (existing.retrieval_at + PUMP_REPROCESS_MIN minutes)
+      #   AND new.retrieval_at > existing.delivery_at
+      # ASYMMETRIC buffer: buffer is added to the END of the existing interval only (trailing reprocessing),
+      # so a new reservation may START exactly at existing.retrieval_at + buffer (>=, not >).
+    input_set: "Compounds sharing pump_id in status {COMPOUNDED, DELIVERED}; tie/equality at the boundary uses >= (start at boundary allowed)"
+    constants:
+      PUMP_REPROCESS_MIN: 1440
+    precision: "minute-granular timestamp comparison"
+
+  - name: nurse_visit_conflict
+    trigger: "on POST /nursing-visits create (validation resource_temporal_overlap nurse)"
+    algorithm: interval_merge
+    formula: |
+      # A nurse's visit occupies [start_at, start_at + duration_min] (CLOSED interval) expanded by a
+      # SYMMETRIC travel buffer on BOTH ends. A conflict exists with any other SCHEDULED or COMPLETED
+      # NursingVisit for the SAME nurse_id when the buffered intervals overlap:
+      #   new.start_at < (existing.start_at + existing.duration_min + TRAVEL_BUFFER_MIN minutes)
+      #   AND (new.start_at + new.duration_min + TRAVEL_BUFFER_MIN minutes) > existing.start_at
+      # SYMMETRIC buffer (both ends) and CLOSED endpoints — distinct interval geometry from the pump rule.
+    input_set: "NursingVisit rows sharing nurse_id in status {SCHEDULED, COMPLETED}"
+    constants:
+      TRAVEL_BUFFER_MIN: 60
+    precision: "minute-granular timestamp comparison"
+
+# ===========================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /_clock/set_current_utc"
+
+  - priority: 2
+    category: auth
+    check: "the X-User-Role is permitted to invoke this endpoint per §1.7"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "every path/body resource id resolves to an existing entity, validated left-to-right in the path"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all with path/body ids"
+
+  - priority: 4
+    category: business_constraint
+    check: "required body fields present and well-typed; enum members valid; numeric constraints honored"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: "all writes"
+
+  - priority: 5
+    category: state
+    check: "target resource is in a state from which this transition is defined in §1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 6
+    category: business_safety
+    check: "segregation of duties: the X-User-ID adjudicating an AdverseEvent hold must differ from AdverseEvent.reported_by_user_id"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /adverse-events/{id}/adjudicate"
+
+  - priority: 7
+    category: business_safety
+    check: "lab-monitoring gate: a visit with sequence_index >= 4 on an order whose drug.requires_trough_lab == true cannot COMPLETE unless a TROUGH LabResult with collected_at in [order.start_date, order.start_date + LAB_DUE_DAYS days] exists"
+    error_id: ERR_LAB_OVERDUE
+    http_status: 409
+    applies_to: "POST /nursing-visits/{id}/complete"
+
+  - priority: 8
+    category: business_referential
+    check: "the assigned Nurse.license_state must equal the order's Patient.service_state, and Nurse.status == ACTIVE"
+    error_id: ERR_NURSE_NOT_LICENSED
+    http_status: 422
+    applies_to: "POST /nursing-visits"
+
+  - priority: 9
+    category: business_referential
+    check: "a specialty drug order may not be RELEASED until its PriorAuthorization.status == APPROVED"
+    error_id: ERR_AUTH_REQUIRED
+    http_status: 409
+    applies_to: "POST /infusion-orders/{id}/submit, system release"
+
+  - priority: 10
+    category: business_temporal
+    check: "pump reservation overlap: the candidate Compound's [delivery_at, retrieval_at)+trailing-buffer interval must not collide with another Compound on the same pump (calc pump_reservation_conflict)"
+    error_id: ERR_PUMP_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /compounds/{id}/compound"
+
+  - priority: 11
+    category: business_temporal
+    check: "nurse schedule overlap: the candidate NursingVisit's buffered closed interval must not collide with another visit for the same nurse (calc nurse_visit_conflict)"
+    error_id: ERR_NURSE_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /nursing-visits"
+
+  - priority: 12
+    category: business_constraint
+    check: "compounding may not reserve more vials than DrugCatalog.on_hand_vials"
+    error_id: ERR_INSUFFICIENT_INVENTORY
+    http_status: 409
+    applies_to: "POST /compounds/{id}/compound"
+
+  - priority: 13
+    category: business_constraint
+    check: "PriorAuthorization approved_units must be >= requested vials for the order; approving fewer than required is allowed but flagged, approving against an order needing more than approved_units bars compounding"
+    error_id: ERR_AUTH_UNITS_EXCEEDED
+    http_status: 422
+    applies_to: "POST /compounds/{id}/compound"
+
+  - priority: 14
+    category: business_fiscal
+    check: "OCC: Claim creation's expected_order_version must equal the current InfusionOrder.version"
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+    applies_to: "POST /claims"
+
+  - priority: 15
+    category: business_fiscal
+    check: "an order may not COMPLETE until administered_days >= scheduled_days"
+    error_id: ERR_THERAPY_INCOMPLETE
+    http_status: 409
+    applies_to: "POST /infusion-orders/{id}/complete"
+
+# ===========================================================================
+# §1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+
+  # --- test-driving clock ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Sets the server logical clock. Startup default is 2026-05-01T00:00:00Z; before any call the clock reads exactly this default and never falls back to wall-clock time."
+    roles: [IntakeCoordinator, Pharmacist, AuthSpecialist, MedicalDirector, Biller, WarehouseClerk, VisitingNurse]
+    code: 200
+    input: [to_iso8601]
+    output: "{ now: datetime }"
+    side_effects: ["advances logical clock used by all temporal windows"]
+
+  # --- DrugCatalog ---
+  - method: POST
+    path: "/drug-catalog"
+    description: "Register a drug and its lot."
+    roles: [Pharmacist]
+    code: 201
+    input: [ndc_code, generic_name, therapy_category, vial_size_mg, awp_per_vial_cents, "is_specialty?", "requires_trough_lab?", lot_total_vials]
+    output: DrugCatalog
+    side_effects: ["sets on_hand_vials = lot_total_vials"]
+  - method: GET
+    path: "/drug-catalog/{id}"
+    description: "Fetch a drug."
+    roles: [Pharmacist, AuthSpecialist, MedicalDirector, Biller, IntakeCoordinator]
+    code: 200
+    input: []
+    output: DrugCatalog
+    side_effects: []
+  - method: GET
+    path: "/drug-catalog"
+    description: "List drugs."
+    roles: [Pharmacist, AuthSpecialist, MedicalDirector, Biller, IntakeCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: DrugCatalog[]
+    side_effects: []
+
+  # --- PayerPlan ---
+  - method: POST
+    path: "/payer-plans"
+    description: "Register a payer plan."
+    roles: [Biller]
+    code: 201
+    input: [plan_code, per_diem_rate_cents, awp_discount_pct, coinsurance_pct, deductible_remaining_cents, oop_max_remaining_cents]
+    output: PayerPlan
+    side_effects: []
+  - method: GET
+    path: "/payer-plans/{id}"
+    description: "Fetch a payer plan (current accumulators)."
+    roles: [Biller, IntakeCoordinator, AuthSpecialist]
+    code: 200
+    input: []
+    output: PayerPlan
+    side_effects: []
+
+  # --- Nurse ---
+  - method: POST
+    path: "/nurses"
+    description: "Register a nurse."
+    roles: [IntakeCoordinator]
+    code: 201
+    input: [full_name, license_state, "status?"]
+    output: Nurse
+    side_effects: []
+  - method: GET
+    path: "/nurses/{id}"
+    description: "Fetch a nurse."
+    roles: [IntakeCoordinator, VisitingNurse, MedicalDirector]
+    code: 200
+    input: []
+    output: Nurse
+    side_effects: []
+
+  # --- Pump ---
+  - method: POST
+    path: "/pumps"
+    description: "Register a pump asset."
+    roles: [WarehouseClerk, Pharmacist]
+    code: 201
+    input: [asset_tag, model, "status?"]
+    output: Pump
+    side_effects: []
+  - method: GET
+    path: "/pumps/{id}"
+    description: "Fetch a pump."
+    roles: [WarehouseClerk, Pharmacist]
+    code: 200
+    input: []
+    output: Pump
+    side_effects: []
+
+  # --- Patient ---
+  - method: POST
+    path: "/patients"
+    description: "Register a patient."
+    roles: [IntakeCoordinator]
+    code: 201
+    input: [full_name, service_state, payer_plan_id]
+    output: Patient
+    side_effects: []
+  - method: GET
+    path: "/patients/{id}"
+    description: "Fetch a patient."
+    roles: [IntakeCoordinator, MedicalDirector, Biller]
+    code: 200
+    input: []
+    output: Patient
+    side_effects: []
+  - method: GET
+    path: "/patients"
+    description: "List patients, optionally filtered by payer plan."
+    roles: [IntakeCoordinator, MedicalDirector, Biller]
+    code: 200
+    input: ["payer_plan_id?", "limit?", "offset?"]
+    output: Patient[]
+    side_effects: []
+
+  # --- Referral ---
+  - method: POST
+    path: "/referrals"
+    description: "Create a referral for a patient."
+    roles: [IntakeCoordinator]
+    code: 201
+    input: [patient_id, referring_provider_npi, diagnosis_code]
+    output: Referral
+    side_effects: []
+  - method: GET
+    path: "/referrals/{id}"
+    description: "Fetch a referral."
+    roles: [IntakeCoordinator, Pharmacist, MedicalDirector]
+    code: 200
+    input: []
+    output: Referral
+    side_effects: []
+  - method: GET
+    path: "/referrals"
+    description: "List referrals, optionally filtered by patient."
+    roles: [IntakeCoordinator, Pharmacist, MedicalDirector]
+    code: 200
+    input: ["patient_id?", "limit?", "offset?"]
+    output: Referral[]
+    side_effects: []
+  - method: POST
+    path: "/referrals/{id}/accept"
+    description: "Accept a referral (RECEIVED -> ACCEPTED)."
+    roles: [IntakeCoordinator]
+    code: 200
+    input: []
+    output: Referral
+    side_effects: ["increments Referral.version"]
+  - method: POST
+    path: "/referrals/{id}/reject"
+    description: "Reject a referral (RECEIVED -> REJECTED)."
+    roles: [IntakeCoordinator]
+    code: 200
+    input: []
+    output: Referral
+    side_effects: ["increments Referral.version"]
+
+  # --- InfusionOrder ---
+  - method: POST
+    path: "/infusion-orders"
+    description: "Create an infusion order against an ACCEPTED referral."
+    roles: [Pharmacist]
+    code: 201
+    input: [referral_id, drug_id, route, daily_dose_mg, frequency_per_day, start_date, scheduled_days]
+    output: InfusionOrder
+    side_effects: ["copies patient_id from referral; status DRAFT"]
+  - method: GET
+    path: "/infusion-orders/{id}"
+    description: "Fetch an infusion order (includes version, administered_days, hold_reason)."
+    roles: [Pharmacist, MedicalDirector, Biller, AuthSpecialist, VisitingNurse]
+    code: 200
+    input: []
+    output: InfusionOrder
+    side_effects: []
+  - method: GET
+    path: "/infusion-orders"
+    description: "List infusion orders, optionally filtered by referral, patient, or drug."
+    roles: [Pharmacist, MedicalDirector, Biller, AuthSpecialist]
+    code: 200
+    input: ["referral_id?", "patient_id?", "drug_id?", "limit?", "offset?"]
+    output: InfusionOrder[]
+    side_effects: []
+  - method: POST
+    path: "/infusion-orders/{id}/submit"
+    description: "Submit a DRAFT order: specialty -> PENDING_AUTH, non-specialty -> RELEASED."
+    roles: [Pharmacist]
+    code: 200
+    input: []
+    output: InfusionOrder
+    side_effects: ["increments InfusionOrder.version"]
+  - method: POST
+    path: "/infusion-orders/{id}/discontinue"
+    description: "Discontinue an ACTIVE order (clinical decision)."
+    roles: [MedicalDirector]
+    code: 200
+    input: []
+    output: InfusionOrder
+    side_effects: ["cascade: SCHEDULED visits -> CANCELLED; ORDERED/COMPOUNDED compounds -> WASTED with vial return; increments InfusionOrder.version"]
+  - method: POST
+    path: "/infusion-orders/{id}/complete"
+    description: "Complete an ACTIVE order whose therapy days are fulfilled."
+    roles: [Pharmacist]
+    code: 200
+    input: []
+    output: InfusionOrder
+    side_effects: ["increments InfusionOrder.version"]
+
+  # --- PriorAuthorization ---
+  - method: POST
+    path: "/prior-authorizations"
+    description: "Submit a prior authorization for a PENDING_AUTH specialty order."
+    roles: [AuthSpecialist]
+    code: 201
+    input: [order_id, requested_units]
+    output: PriorAuthorization
+    side_effects: ["copies payer_plan_id from the order's patient; status SUBMITTED"]
+  - method: GET
+    path: "/prior-authorizations/{id}"
+    description: "Fetch a prior authorization."
+    roles: [AuthSpecialist, Pharmacist, MedicalDirector]
+    code: 200
+    input: []
+    output: PriorAuthorization
+    side_effects: []
+  - method: GET
+    path: "/prior-authorizations"
+    description: "List prior authorizations, optionally filtered by order or payer plan."
+    roles: [AuthSpecialist, Pharmacist, MedicalDirector]
+    code: 200
+    input: ["order_id?", "payer_plan_id?", "limit?", "offset?"]
+    output: PriorAuthorization[]
+    side_effects: []
+  - method: POST
+    path: "/prior-authorizations/{id}/approve"
+    description: "Approve a prior authorization; cascades the order PENDING_AUTH -> RELEASED."
+    roles: [AuthSpecialist]
+    code: 200
+    input: [approved_units]
+    output: PriorAuthorization
+    side_effects: ["sets approved_units; order PENDING_AUTH -> RELEASED; increments PriorAuthorization.version and InfusionOrder.version"]
+  - method: POST
+    path: "/prior-authorizations/{id}/deny"
+    description: "Deny a prior authorization; cascades the order PENDING_AUTH -> DISCONTINUED, kits CANCELLED."
+    roles: [AuthSpecialist]
+    code: 200
+    input: []
+    output: PriorAuthorization
+    side_effects: ["order PENDING_AUTH -> DISCONTINUED; PICKING kits -> CANCELLED; increments versions"]
+
+  # --- Compound + Pump reservation ---
+  - method: POST
+    path: "/compounds"
+    description: "Create a compound batch (ORDERED) pairing a drug order with a pump and a delivery window."
+    roles: [Pharmacist]
+    code: 201
+    input: [order_id, pump_id, delivery_at, retrieval_at]
+    output: Compound
+    side_effects: ["status ORDERED"]
+  - method: GET
+    path: "/compounds/{id}"
+    description: "Fetch a compound."
+    roles: [Pharmacist, MedicalDirector, VisitingNurse]
+    code: 200
+    input: []
+    output: Compound
+    side_effects: []
+  - method: GET
+    path: "/compounds"
+    description: "List compounds, optionally filtered by order or pump."
+    roles: [Pharmacist, MedicalDirector, VisitingNurse]
+    code: 200
+    input: ["order_id?", "pump_id?", "limit?", "offset?"]
+    output: Compound[]
+    side_effects: []
+  - method: POST
+    path: "/compounds/{id}/compound"
+    description: "Prepare the batch (ORDERED -> COMPOUNDED): reserves vials, validates inventory, auth units, and pump reservation overlap."
+    roles: [Pharmacist]
+    code: 200
+    input: []
+    output: Compound
+    side_effects: ["reserves vials; debits DrugCatalog.on_hand_vials; increments Compound.version"]
+  - method: POST
+    path: "/compounds/{id}/deliver"
+    description: "Mark a compound delivered (COMPOUNDED -> DELIVERED)."
+    roles: [Pharmacist]
+    code: 200
+    input: []
+    output: Compound
+    side_effects: ["increments Compound.version"]
+
+  # --- SupplyKit ---
+  - method: POST
+    path: "/supply-kits"
+    description: "Create an ancillary supply kit for an order."
+    roles: [WarehouseClerk, Pharmacist]
+    code: 201
+    input: [order_id, kit_type, line_count]
+    output: SupplyKit
+    side_effects: ["status PICKING"]
+  - method: GET
+    path: "/supply-kits/{id}"
+    description: "Fetch a supply kit."
+    roles: [WarehouseClerk, Pharmacist, MedicalDirector]
+    code: 200
+    input: []
+    output: SupplyKit
+    side_effects: []
+  - method: GET
+    path: "/supply-kits"
+    description: "List supply kits, optionally filtered by order."
+    roles: [WarehouseClerk, Pharmacist, MedicalDirector]
+    code: 200
+    input: ["order_id?", "limit?", "offset?"]
+    output: SupplyKit[]
+    side_effects: []
+  - method: POST
+    path: "/supply-kits/{id}/ship"
+    description: "Ship a kit (PICKING -> SHIPPED)."
+    roles: [WarehouseClerk]
+    code: 200
+    input: []
+    output: SupplyKit
+    side_effects: ["increments SupplyKit.version"]
+
+  # --- NursingVisit ---
+  - method: POST
+    path: "/nursing-visits"
+    description: "Schedule a nursing visit; validates nurse licensure and nurse-overlap."
+    roles: [IntakeCoordinator, VisitingNurse]
+    code: 201
+    input: [order_id, nurse_id, "compound_id?", visit_type, start_at, duration_min]
+    output: NursingVisit
+    side_effects: ["computes sequence_index; status SCHEDULED"]
+  - method: GET
+    path: "/nursing-visits/{id}"
+    description: "Fetch a nursing visit."
+    roles: [VisitingNurse, MedicalDirector, Pharmacist, IntakeCoordinator]
+    code: 200
+    input: []
+    output: NursingVisit
+    side_effects: []
+  - method: GET
+    path: "/nursing-visits"
+    description: "List nursing visits, optionally filtered by order, nurse, or compound."
+    roles: [VisitingNurse, MedicalDirector, Pharmacist, IntakeCoordinator]
+    code: 200
+    input: ["order_id?", "nurse_id?", "compound_id?", "limit?", "offset?"]
+    output: NursingVisit[]
+    side_effects: []
+  - method: POST
+    path: "/nursing-visits/{id}/complete"
+    description: "Complete a visit (SCHEDULED -> COMPLETED): lab gate, first-visit order activation, administered_days recompute."
+    roles: [VisitingNurse]
+    code: 200
+    input: []
+    output: NursingVisit
+    side_effects: ["may trigger order RELEASED -> ACTIVE; recomputes administered_days; increments versions"]
+  - method: POST
+    path: "/nursing-visits/{id}/miss"
+    description: "Mark a visit missed (SCHEDULED -> MISSED)."
+    roles: [VisitingNurse]
+    code: 200
+    input: []
+    output: NursingVisit
+    side_effects: ["increments NursingVisit.version"]
+
+  # --- LabResult ---
+  - method: POST
+    path: "/lab-results"
+    description: "Record a monitoring lab result for an order."
+    roles: [VisitingNurse, MedicalDirector]
+    code: 201
+    input: [order_id, lab_type, value_num, collected_at, "is_critical?"]
+    output: LabResult
+    side_effects: []
+  - method: GET
+    path: "/lab-results/{id}"
+    description: "Fetch a lab result."
+    roles: [VisitingNurse, MedicalDirector, Pharmacist]
+    code: 200
+    input: []
+    output: LabResult
+    side_effects: []
+  - method: GET
+    path: "/lab-results"
+    description: "List lab results, optionally filtered by order."
+    roles: [VisitingNurse, MedicalDirector, Pharmacist]
+    code: 200
+    input: ["order_id?", "limit?", "offset?"]
+    output: LabResult[]
+    side_effects: []
+
+  # --- AdverseEvent ---
+  - method: POST
+    path: "/adverse-events"
+    description: "Report an adverse reaction; computes severity_score and may auto-hold the order."
+    roles: [VisitingNurse, MedicalDirector]
+    code: 201
+    input: [order_id, "visit_id?", severity_grade, reaction_count, vital_instability]
+    output: AdverseEvent
+    side_effects: ["computes severity_score; stores reported_by_role/reported_by_user_id; if score >= 7 holds the order and misses future visits"]
+  - method: GET
+    path: "/adverse-events/{id}"
+    description: "Fetch an adverse event."
+    roles: [VisitingNurse, MedicalDirector, Pharmacist]
+    code: 200
+    input: []
+    output: AdverseEvent
+    side_effects: []
+  - method: GET
+    path: "/adverse-events"
+    description: "List adverse events, optionally filtered by order or visit."
+    roles: [VisitingNurse, MedicalDirector, Pharmacist]
+    code: 200
+    input: ["order_id?", "visit_id?", "limit?", "offset?"]
+    output: AdverseEvent[]
+    side_effects: []
+  - method: POST
+    path: "/adverse-events/{id}/adjudicate"
+    description: "Adjudicate a held order (RESUME or DISCONTINUE); enforces segregation of duties."
+    roles: [MedicalDirector]
+    code: 200
+    input: [disposition]
+    output: AdverseEvent
+    side_effects: ["RESUME: order ON_HOLD -> ACTIVE; DISCONTINUE: order ON_HOLD -> DISCONTINUED with cascade; increments versions"]
+
+  # --- Claim ---
+  - method: POST
+    path: "/claims"
+    description: "Create a DRAFT claim (ESTIMATE variant) with OCC on the order version."
+    roles: [Biller]
+    code: 201
+    input: [order_id, expected_order_version]
+    output: Claim
+    side_effects: ["computes ESTIMATE figures; reads (does not debit) accumulators"]
+  - method: GET
+    path: "/claims/{id}"
+    description: "Fetch a claim (all computed money fields)."
+    roles: [Biller, MedicalDirector]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: []
+  - method: GET
+    path: "/claims"
+    description: "List claims, optionally filtered by order or payer plan."
+    roles: [Biller, MedicalDirector]
+    code: 200
+    input: ["order_id?", "payer_plan_id?", "limit?", "offset?"]
+    output: Claim[]
+    side_effects: []
+  - method: POST
+    path: "/claims/{id}/post"
+    description: "Post a DRAFT claim (FINAL variant): recompute on administered days, debit accumulators."
+    roles: [Biller]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["recomputes FINAL; debits deductible and OOP accumulators; increments Claim.version"]
+  - method: POST
+    path: "/claims/{id}/void"
+    description: "Void a POSTED claim; reverses accumulator debits."
+    roles: [Biller]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["credits accumulators back; increments Claim.version"]
+
+# ===========================================================================
+# §1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing or malformed X-User-Role / X-User-ID headers"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "the acting role is not permitted to invoke this endpoint"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced path or body resource id does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "missing required field, bad type, invalid enum member, or violated numeric constraint"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "the target resource is not in a state from which this transition is defined"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "the adjudicating user is the same identity that reported the adverse event"
+  - id: ERR_LAB_OVERDUE
+    http: 409
+    condition: "4th+ visit on a trough-monitored order completing without a trough lab in the monitoring window"
+  - id: ERR_NURSE_NOT_LICENSED
+    http: 422
+    condition: "assigned nurse's license_state != patient.service_state, or nurse not ACTIVE"
+  - id: ERR_AUTH_REQUIRED
+    http: 409
+    condition: "specialty order cannot be RELEASED without an APPROVED prior authorization"
+  - id: ERR_PUMP_DOUBLE_BOOKED
+    http: 409
+    condition: "compound's pump interval (plus trailing reprocessing buffer) collides with another reservation on the same pump"
+  - id: ERR_NURSE_DOUBLE_BOOKED
+    http: 409
+    condition: "nursing visit's buffered interval collides with another visit for the same nurse"
+  - id: ERR_INSUFFICIENT_INVENTORY
+    http: 409
+    condition: "compounding would reserve more vials than DrugCatalog.on_hand_vials"
+  - id: ERR_AUTH_UNITS_EXCEEDED
+    http: 422
+    condition: "compounding requires more vials than the order's PriorAuthorization.approved_units"
+  - id: ERR_STALE_ORDER_VERSION
+    http: 412
+    condition: "claim creation's expected_order_version != current InfusionOrder.version"
+  - id: ERR_THERAPY_INCOMPLETE
+    http: 409
+    condition: "completing an order whose administered_days < scheduled_days"
+
+# ===========================================================================
+# §1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: IntakeCoordinator
+    description: "Registers patients, nurses, referrals; accepts/rejects referrals; schedules visits."
+    identity: opaque
+    exclusive_operations:
+      - "POST /patients"
+      - "POST /nurses"
+      - "POST /referrals"
+      - "POST /referrals/{id}/accept"
+      - "POST /referrals/{id}/reject"
+    shared_operations:
+      - "POST /nursing-visits"
+      - "GET reads on patients, nurses, referrals, infusion-orders, nursing-visits"
+
+  - name: Pharmacist
+    description: "Owns drug catalog, infusion orders, compounding, and pump pairing."
+    identity: opaque
+    exclusive_operations:
+      - "POST /drug-catalog"
+      - "POST /infusion-orders"
+      - "POST /infusion-orders/{id}/submit"
+      - "POST /infusion-orders/{id}/complete"
+      - "POST /compounds"
+      - "POST /compounds/{id}/compound"
+      - "POST /compounds/{id}/deliver"
+    shared_operations:
+      - "POST /pumps"
+      - "POST /supply-kits"
+      - "GET reads across the clinical record"
+
+  - name: AuthSpecialist
+    description: "Manages prior authorizations for specialty drugs."
+    identity: opaque
+    exclusive_operations:
+      - "POST /prior-authorizations"
+      - "POST /prior-authorizations/{id}/approve"
+      - "POST /prior-authorizations/{id}/deny"
+    shared_operations:
+      - "GET reads on prior-authorizations, infusion-orders, drug-catalog, payer-plans"
+
+  - name: VisitingNurse
+    description: "Completes/misses visits, records labs, reports adverse events."
+    identity: entity_backed:Nurse
+    exclusive_operations:
+      - "POST /nursing-visits/{id}/complete"
+      - "POST /nursing-visits/{id}/miss"
+    shared_operations:
+      - "POST /nursing-visits"
+      - "POST /lab-results"
+      - "POST /adverse-events"
+      - "GET reads on visits, orders, compounds, labs, adverse-events, nurses"
+
+  - name: MedicalDirector
+    description: "Adjudicates adverse-event holds, discontinues orders, records labs/adverse events; cannot adjudicate an event it reported (segregation of duties)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /adverse-events/{id}/adjudicate"
+      - "POST /infusion-orders/{id}/discontinue"
+    shared_operations:
+      - "POST /lab-results"
+      - "POST /adverse-events"
+      - "GET reads across the clinical and billing record"
+
+  - name: Biller
+    description: "Owns payer plans and the claim lifecycle (create/post/void)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /payer-plans"
+      - "POST /claims"
+      - "POST /claims/{id}/post"
+      - "POST /claims/{id}/void"
+    shared_operations:
+      - "GET reads on claims, payer-plans, infusion-orders, patients"
+
+  - name: WarehouseClerk
+    description: "Owns supply-kit shipping and pump registration."
+    identity: opaque
+    exclusive_operations:
+      - "POST /supply-kits/{id}/ship"
+    shared_operations:
+      - "POST /pumps"
+      - "POST /supply-kits"
+      - "GET reads on supply-kits, pumps"
+
+# ---------------------------------------------------------------------------
+# Conserved-quantity invariants (referenced by §1.8 compensating_invariant)
+# ---------------------------------------------------------------------------
+invariants:
+  - id: inv_drug_inventory
+    quantity: "DrugCatalog vial conservation"
+    formula: "on_hand_vials + sum(Compound.vials_reserved for compounds in {COMPOUNDED, DELIVERED}) == lot_total_vials at all times (WASTED-from-COMPOUNDED returns vials; WASTED-from-ORDERED reserved 0)"
+  - id: inv_payer_accumulator
+    quantity: "PayerPlan deductible+OOP accumulator conservation"
+    formula: "post(claim) debits deductible_remaining_cents by ded_applied and oop_max_remaining_cents by patient_responsibility_cents; void(claim) credits both back by the same amounts, returning the plan to its pre-post accumulator values"

@@ -1,0 +1,62 @@
+"""Error definitions. Each error carries an id, HTTP status, and default message."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Full HTTP-status map from the error catalogue (PRD §5).
+ERROR_STATUS = {
+    "ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER": 400,
+    "ERR_INSUFFICIENT_PERMISSIONS": 403,
+    "ERR_EXCAVATOR_NOT_FOUND": 404,
+    "ERR_MEMBER_UTILITY_NOT_FOUND": 404,
+    "ERR_LOCATE_TECH_NOT_FOUND": 404,
+    "ERR_TICKET_NOT_FOUND": 404,
+    "ERR_NOTIFICATION_NOT_FOUND": 404,
+    "ERR_ASSIGNMENT_NOT_FOUND": 404,
+    "ERR_MARKOUT_NOT_FOUND": 404,
+    "ERR_MEET_REQUEST_NOT_FOUND": 404,
+    "ERR_DAMAGE_REPORT_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_GEOMETRY": 422,
+    "ERR_TICKET_NOT_IN_INTAKE": 409,
+    "ERR_EXCAVATOR_SUSPENDED": 409,
+    "ERR_NO_MEMBERS_IN_AREA": 422,
+    "ERR_MEET_REQUEST_REQUIRED": 409,
+    "ERR_TICKET_NOT_MARKED": 409,
+    "ERR_DIG_WINDOW_EXPIRED": 409,
+    "ERR_TICKET_NOT_CANCELLABLE": 409,
+    "ERR_TICKET_NOT_ACCEPTING_RESPONSES": 409,
+    "ERR_TICKET_NOT_ALL_CLEAR": 409,
+    "ERR_NOTIFICATION_ALREADY_ANSWERED": 409,
+    "ERR_NOT_NOTIFICATION_OWNER": 403,
+    "ERR_TECH_NOT_CERTIFIED": 422,
+    "ERR_TECH_OFF_DUTY": 409,
+    "ERR_ASSIGNMENT_NOT_DISPATCHED": 409,
+    "ERR_ASSIGNMENT_NOT_EN_ROUTE": 409,
+    "ERR_ASSIGNMENT_NOT_CANCELLABLE": 409,
+    "ERR_ASSIGNMENT_ACTIVE": 409,
+    "ERR_NOT_ASSIGNMENT_TECH": 403,
+    "ERR_MARKOUT_NOT_COMPLETE": 409,
+    "ERR_MARKOUT_NOT_IN_PROGRESS": 409,
+    "ERR_MARKOUT_NOT_REFRESHABLE": 409,
+    "ERR_STALE_TICKET_VERSION": 412,
+    "ERR_MEET_NOT_REQUESTED": 409,
+    "ERR_MEET_NOT_SCHEDULED": 409,
+    "ERR_MEET_NOT_DECLINABLE": 409,
+    "ERR_MEET_WINDOW_OVERLAP": 409,
+    "ERR_NOT_MEET_OWNER": 403,
+    "ERR_DAMAGE_NOT_FILED": 409,
+    "ERR_DAMAGE_NOT_UNDER_REVIEW": 409,
+    "ERR_NOT_DAMAGE_OWNER": 403,
+    "ERR_NOT_DAMAGE_EXCAVATOR": 403,
+}
+
+
+def err(error_id, message=None):
+    return ApiError(error_id, ERROR_STATUS.get(error_id, 400), message)

@@ -1,0 +1,51 @@
+"""Error IDs and HTTP status mapping (PRD Section 5).
+
+After defining the mapping, register it with the framework so validate_error()
+can cross-check HTTP status codes automatically.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_PORTAL_AUTH_FAILED = "ERR_PORTAL_AUTH_FAILED"
+    ERR_FORBIDDEN = "ERR_FORBIDDEN"
+    ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    ERR_DUPLICATE = "ERR_DUPLICATE"
+    ERR_PAYMENT_EXISTS = "ERR_PAYMENT_EXISTS"
+    ERR_CALIBRATION_LAPSED = "ERR_CALIBRATION_LAPSED"
+    ERR_NO_VIOLATION = "ERR_NO_VIOLATION"
+    ERR_OWNER_LOOKUP_FAILED = "ERR_OWNER_LOOKUP_FAILED"
+    ERR_CONTEST_WINDOW_CLOSED = "ERR_CONTEST_WINDOW_CLOSED"
+    ERR_HEARING_TIME_INVALID = "ERR_HEARING_TIME_INVALID"
+    ERR_INVALID_REDUCTION = "ERR_INVALID_REDUCTION"
+    ERR_NOTHING_OWED = "ERR_NOTHING_OWED"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+
+
+HTTP_STATUS_CODES: dict[str, int] = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_PORTAL_AUTH_FAILED: 401,
+    ApiErrorId.ERR_FORBIDDEN: 403,
+    ApiErrorId.ERR_SEGREGATION_OF_DUTIES: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_DUPLICATE: 409,
+    ApiErrorId.ERR_PAYMENT_EXISTS: 409,
+    ApiErrorId.ERR_CALIBRATION_LAPSED: 422,
+    ApiErrorId.ERR_NO_VIOLATION: 422,
+    ApiErrorId.ERR_OWNER_LOOKUP_FAILED: 422,
+    ApiErrorId.ERR_CONTEST_WINDOW_CLOSED: 422,
+    ApiErrorId.ERR_HEARING_TIME_INVALID: 422,
+    ApiErrorId.ERR_INVALID_REDUCTION: 422,
+    ApiErrorId.ERR_NOTHING_OWED: 422,
+    ApiErrorId.ERR_INVALID_REQUEST: 422,
+}
+
+# Register with framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map(HTTP_STATUS_CODES)

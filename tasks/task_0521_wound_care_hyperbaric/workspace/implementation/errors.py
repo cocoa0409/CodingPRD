@@ -1,0 +1,60 @@
+"""Error catalog and ApiError exception."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# HTTP status per error id (from PRD §5 error catalogue)
+ERROR_HTTP = {
+    "ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER": 400,
+    "ERR_INSUFFICIENT_PERMISSIONS": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_CENTER_NOT_FOUND": 404,
+    "ERR_PATIENT_NOT_FOUND": 404,
+    "ERR_REFERRAL_NOT_FOUND": 404,
+    "ERR_ASSESSMENT_NOT_FOUND": 404,
+    "ERR_PLAN_NOT_FOUND": 404,
+    "ERR_AUTH_NOT_FOUND": 404,
+    "ERR_PROC_NOT_FOUND": 404,
+    "ERR_SESSION_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_TRANSFER_NOT_FOUND": 404,
+    "ERR_CHAMBER_NOT_FOUND": 404,
+    "ERR_CLINICIAN_NOT_FOUND": 404,
+    "ERR_POLICY_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_STALE_PLAN_VERSION": 412,
+    "ERR_REFERRAL_NOT_RECEIVED": 409,
+    "ERR_REFERRAL_NOT_NEEDS_INFO": 409,
+    "ERR_NO_ASSESSMENT_ON_FILE": 409,
+    "ERR_PLAN_NOT_DRAFT": 409,
+    "ERR_PLAN_NOT_ACTIVE": 409,
+    "ERR_PLAN_NOT_SUSPENDED": 409,
+    "ERR_PLAN_NOT_CLOSEABLE": 409,
+    "ERR_PATIENT_NOT_IN_CARE": 409,
+    "ERR_COVERAGE_DENIED": 409,
+    "ERR_OPEN_SESSIONS_EXIST": 409,
+    "ERR_AUTH_NOT_SUBMITTED": 409,
+    "ERR_AUTH_NOT_AWAITING_INFO": 409,
+    "ERR_PROC_NOT_SCHEDULED": 409,
+    "ERR_SESSION_NOT_SCHEDULED": 409,
+    "ERR_ORDER_NOT_SUBMITTED": 409,
+    "ERR_TRANSFER_NOT_INITIATED": 409,
+    "ERR_CROSS_CENTER_REFERENCE": 409,
+    "ERR_CLINICIAN_ROLE_MISMATCH": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_CHAMBER_SLOT_CONFLICT": 409,
+    "ERR_CLINICIAN_SLOT_CONFLICT": 409,
+    "ERR_COVERAGE_NOT_ACTIVE": 409,
+    "ERR_SUPPLY_BUDGET_EXCEEDED": 402,
+    "ERR_EMPTY_DIVE_LOG": 409,
+}
+
+
+def err(error_id, message=None):
+    return ApiError(error_id, ERROR_HTTP.get(error_id, 400), message)
