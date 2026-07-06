@@ -1,0 +1,43 @@
+"""Error classes and the error catalogue (id -> http status)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = ERROR_STATUS[error_id]
+        self.message = message or error_id
+
+
+ERROR_STATUS = {
+    "ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER": 400,
+    "ERR_FORBIDDEN_FOR_ROLE": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_INVALID_REQUEST": 422,
+    "ERR_INVALID_STATE": 409,
+    "ERR_CLIENT_NOT_ACTIVE": 409,
+    "ERR_ENGAGEMENT_NOT_ACTIVE": 409,
+    "ERR_ENGAGEMENT_HAS_OPEN_WORK": 409,
+    "ERR_AWARD_CLOSED": 409,
+    "ERR_OPPORTUNITY_CLOSED": 409,
+    "ERR_MATCH_NOT_PURSUING": 409,
+    "ERR_NO_NARRATIVE": 409,
+    "ERR_EMPTY_BUDGET": 409,
+    "ERR_DELIVERABLES_NOT_APPROVED": 409,
+    "ERR_REQUEST_OUT_OF_RANGE": 409,
+    "ERR_EMPTY_BODY": 409,
+    "ERR_NOT_REVIEWABLE": 409,
+    "ERR_OPEN_REVISIONS_BLOCK_APPROVAL": 409,
+    "ERR_OPEN_REVISIONS_BLOCK_FINAL": 409,
+    "ERR_FEE_MODEL_INCOMPLETE": 409,
+    "ERR_NO_AWARD_FOR_SUCCESS_FEE": 409,
+    "ERR_NOTHING_TO_BILL": 409,
+    "ERR_BILLING_PERIOD_OVERLAP": 409,
+    "ERR_REPORTS_OUTSTANDING": 409,
+    "ERR_SUBMISSION_NOT_ACCEPTED": 409,
+    "ERR_REPORT_WINDOW_OVERLAP": 409,
+    "ERR_STALE_PROPOSAL_VERSION": 412,
+    "ERR_STALE_SUBMISSION_VERSION": 412,
+    "ERR_INVALID_PAGINATION": 400,
+}

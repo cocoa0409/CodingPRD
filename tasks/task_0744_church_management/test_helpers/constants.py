@@ -1,0 +1,18 @@
+"""Domain thresholds derived from the PRD (refund window, coverage-score constants, etc.)."""
+
+REFUND_WINDOW_DAYS = 60
+URGENCY_HORIZON_HOURS = 72
+FILL_WEIGHT = 0.60
+URGENCY_WEIGHT = 0.40
+
+PRIORITY_WEIGHT = {
+    "SERVICE": 1.00,
+    "CLASS": 0.80,
+    "MEETING": 0.60,
+    "OUTREACH": 0.90,
+}
+
+PAGINATION_DEFAULT_LIMIT = 10
+PAGINATION_MAX_LIMIT = 100
+
+DEFAULT_CLOCK = "2026-03-01T00:00:00Z"

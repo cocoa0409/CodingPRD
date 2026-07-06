@@ -1,0 +1,39 @@
+"""Domain thresholds — numeric constants from the PRD's pricing and deposit rules."""
+
+# Equipment line pricing (PRD §3.6)
+STANDBY_RATE_FACTOR = 0.50
+MULTI_DAY_DISCOUNT = {"1_2": 0.00, "3_6": 0.10, "7_plus": 0.15}
+
+# Crew labor pricing (PRD §3.6)
+MIN_CALL_HOURS = 4
+OT_THRESHOLD_HOURS = 10
+OT_MULTIPLIER = 1.5
+OPERATOR_PREMIUM = 1.20
+
+# Order totals (PRD §3.6)
+VOLUME_DISCOUNT = {"t0": 0.00, "t1": 0.05, "t2": 0.10}
+VOLUME_TIER_1_FLOOR = 100_000
+VOLUME_TIER_2_FLOOR = 500_000
+RUSH_WINDOW_DAYS = 7
+RUSH_SURCHARGE_PCT = 0.08
+
+# Deposit settlement (PRD §3.7)
+DEPOSIT_RATE = 0.20
+
+# Crew turnaround (PRD §3.3)
+TURNAROUND_MINUTES = 60
+
+# Logical clock default (PRD §2.6)
+CLOCK_STARTUP_DEFAULT = "2026-03-01T00:00:00Z"
+
+# Pagination (PRD §2.3)
+PAGINATION_DEFAULT_LIMIT = 10
+PAGINATION_MIN_LIMIT = 1
+PAGINATION_MAX_LIMIT = 100
+
+TEST_DEFAULTS = {
+    "CREDIT_LIMIT_CENTS": 100_000_000,
+    "LED_DAILY_RATE_CENTS": 12000,
+    "LED_REPLACEMENT_VALUE_CENTS": 500000,
+    "LED_TOTAL_UNITS": 20,
+}

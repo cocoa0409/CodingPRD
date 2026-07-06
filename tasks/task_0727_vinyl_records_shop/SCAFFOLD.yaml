@@ -1,0 +1,582 @@
+scenario: "727. Vinyl Records & Used-Media Shop: inventory (new/used) & condition grading, buy/trade-in & credit, online + in-store catalog, RSD/exclusive allocation & pre-order, consignment, grading dispute, loyalty, special order"
+domain_name: "vinyl-records-shop"
+api_prefix: "/shop"
+
+complexity_profile:
+  primary_archetype: "Quota / allocation"          # RSD/exclusive allocation pool competed for, reserved, committed, released
+  secondary_archetype: "Ledger reconciliation"      # trade-in credit & consignment payout: provisional vs final valuations
+  complexity_layers:
+    - optimistic_concurrency          # OCC on Allocation.version for pre-order reservation supersede race
+    - cascading_side_effects          # dispute regrade → price recompute → order-line adjust; cancel → release → waitlist promote
+    - dual_variant_calculation        # trade-in credit (provisional/final) and consignment payout (estimated/actual)
+    - rate_threshold_triggers         # loyalty tier thresholds, free-ship threshold, commission tiers, allocation exhaustion boundary
+
+  entity_topology: hybrid             # Product/Allocation tree + flat FK peers (Order, TradeIn, Consignment) with cross-cutting InventoryItem references
+  state_machine_shape: parallel       # Order carries independent payment_status × fulfillment_status; GradingDispute is cyclic
+  relationship_patterns:
+    - one_to_many                     # Product→InventoryItem, Order→OrderLine, TradeIn→TradeInLine
+    - cross_aggregate                 # OrderLine→InventoryItem, GradingDispute→InventoryItem across aggregates
+    - polymorphic: false
+  role_model: peer_roles              # Customer owns own orders/trade-ins; StoreClerk, Grader, Manager own operational surfaces
+  consistency_model: immediate        # all cascades resolve atomically within the triggering request
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 Entity-Relationship Table
+# =====================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "unique login identifier", constraints: "unique, non-empty" }
+      - { name: full_name, type: string, source: input, description: "display name" }
+      - { name: store_credit_cents, type: integer, source: system, description: "trade-in credit + consignment payout balance, in cents", default: 0, constraints: ">= 0" }
+      - { name: loyalty_points, type: integer, source: system, description: "cumulative earned points, never reset by tier changes", default: 0, constraints: ">= 0" }
+      - { name: loyalty_tier, type: enum, source: computed, description: "derived from loyalty_points via loyalty_tier calc", constraints: "one of {STANDARD, SILVER, GOLD}" }
+
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - { name: artist, type: string, source: input, description: "recording artist" }
+      - { name: title, type: string, source: input, description: "release title" }
+      - { name: format, type: enum, source: input, description: "media format", constraints: "one of {VINYL, CD, CASSETTE}" }
+      - { name: base_price_cents, type: integer, source: input, description: "reference price for a NEAR-MINT (NM) copy, in cents", constraints: "> 0" }
+      - { name: is_rsd_exclusive, type: boolean, source: input, description: "true for Record Store Day / label-exclusive releases that require allocation & pre-order", default: false }
+      - { name: catalog_status, type: enum, source: system, description: "gates pre-order eligibility; see Product state machine", default: "DRAFT", constraints: "one of {DRAFT, LISTED, PRE_ORDER_OPEN, PRE_ORDER_CLOSED, DISCONTINUED}" }
+
+  - name: Allocation
+    parent: Product
+    common_fields: true
+    fields:
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the RSD/exclusive release this pool allocates" }
+      - { name: allocation_total, type: integer, source: input, description: "fixed number of units the store is allotted", constraints: "> 0, immutable after create" }
+      - { name: pickup_concurrency, type: integer, source: input, description: "max number of READY_FOR_PICKUP pre-orders whose pickup windows may overlap at once (aggregate pickup-desk capacity for this exclusive)", default: 1, constraints: ">= 1" }
+      - { name: available_count, type: integer, source: system, description: "units not yet reserved or committed", constraints: ">= 0; invariant available+reserved+committed == allocation_total" }
+      - { name: reserved_count, type: integer, source: system, description: "units held by RESERVED/WAITLISTED-promoted pre-orders", default: 0, constraints: ">= 0" }
+      - { name: committed_count, type: integer, source: system, description: "units committed to FULFILLED pre-orders", default: 0, constraints: ">= 0" }
+      - { name: window_open_at, type: datetime, source: input, description: "ISO8601 UTC; pre-orders permitted at/after this instant" }
+      - { name: window_close_at, type: datetime, source: input, description: "ISO8601 UTC; pre-orders rejected at/after this instant (half-open [open, close))" }
+
+  - name: InventoryItem
+    parent: Product
+    common_fields: true
+    fields:
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the catalog release this physical copy is a unit of" }
+      - { name: consignment_id, type: string, source: input, description: "FK -> Consignment.id; set when this copy is consignor-owned stock, else null", default: null }
+      - { name: is_used, type: boolean, source: input, description: "true = used/second-hand copy, false = new sealed copy" }
+      - { name: condition_grade, type: enum, source: input, description: "Goldmine grade; NEW copies must be M or NM", constraints: "one of {M, NM, VG_PLUS, VG, G, F, P}" }
+      - { name: list_price_cents, type: integer, source: computed, description: "derived from Product.base_price_cents and condition_grade via item_list_price calc", constraints: "> 0" }
+      - { name: status, type: enum, source: system, description: "physical-copy lifecycle; see InventoryItem state machine", default: "AVAILABLE", constraints: "one of {AVAILABLE, ON_DISPLAY, RESERVED, SOLD}" }
+      - { name: hold_start_at, type: datetime, source: system, description: "ISO8601 UTC; start of the active in-store pickup hold window on this copy (half-open)", default: null }
+      - { name: hold_end_at, type: datetime, source: system, description: "ISO8601 UTC; end of the active pickup hold window (exclusive)", default: null }
+
+  - name: TradeIn
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; the seller trading media in" }
+      - { name: payout_method, type: enum, source: input, description: "CREDIT grants a store-credit bonus; CASH pays face value", default: "CREDIT", constraints: "one of {CREDIT, CASH}" }
+      - { name: status, type: enum, source: system, description: "trade-in lifecycle; see TradeIn state machine", default: "DRAFT", constraints: "one of {DRAFT, SUBMITTED, UNDER_INSPECTION, APPROVED, REJECTED, REVERSED}" }
+      - { name: provisional_value_cents, type: integer, source: computed, description: "trade_in_credit_valuation provisional variant, computed at SUBMITTED from claimed grades", default: 0 }
+      - { name: final_value_cents, type: integer, source: computed, description: "trade_in_credit_valuation final variant, computed at APPROVED from inspected grades (includes CREDIT bonus)", default: 0 }
+
+  - name: TradeInLine
+    parent: TradeIn
+    common_fields: true
+    fields:
+      - { name: trade_in_id, type: string, source: input, description: "FK -> TradeIn.id; the submission this line belongs to" }
+      - { name: format, type: enum, source: input, description: "media format of the traded item", constraints: "one of {VINYL, CD, CASSETTE}" }
+      - { name: claimed_grade, type: enum, source: input, description: "seller-asserted condition at submission", constraints: "one of {M, NM, VG_PLUS, VG, G, F, P}" }
+      - { name: inspected_grade, type: enum, source: input, description: "grader-assigned condition set during UNDER_INSPECTION", default: null, constraints: "one of {M, NM, VG_PLUS, VG, G, F, P}" }
+      - { name: base_value_cents, type: integer, source: input, description: "reference buy value for this title at NM, in cents", constraints: "> 0" }
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; the buyer" }
+      - { name: channel, type: enum, source: input, description: "sales channel; affects shipping in order_total", constraints: "one of {ONLINE, IN_STORE}" }
+      - { name: payment_status, type: enum, source: system, description: "payment dimension of the parallel Order state machine", default: "UNPAID", constraints: "one of {UNPAID, AUTHORIZED, PAID, REFUNDED}" }
+      - { name: fulfillment_status, type: enum, source: system, description: "fulfillment dimension of the parallel Order state machine", default: "PENDING", constraints: "one of {PENDING, RESERVED, SHIPPED, PICKED_UP, CANCELLED}" }
+      - { name: subtotal_cents, type: integer, source: computed, description: "sum of line unit_price_cents*qty; see order_total calc", default: 0 }
+      - { name: discount_cents, type: integer, source: computed, description: "loyalty discount applied to NEW-item subtotal; see order_total calc", default: 0 }
+      - { name: shipping_cents, type: integer, source: computed, description: "shipping charge; see order_total calc", default: 0 }
+      - { name: total_cents, type: integer, source: computed, description: "subtotal - discount + shipping; see order_total calc", default: 0 }
+      - { name: points_earned, type: integer, source: computed, description: "loyalty points from loyalty_points_earned calc, awarded when payment_status reaches PAID", default: 0 }
+
+  - name: OrderLine
+    parent: Order
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> Order.id; the order this line belongs to" }
+      - { name: inventory_item_id, type: string, source: input, description: "FK -> InventoryItem.id; the specific physical copy purchased" }
+      - { name: qty, type: integer, source: input, description: "always 1 for unique physical copies", default: 1, constraints: "== 1" }
+      - { name: unit_price_cents, type: integer, source: computed, description: "snapshot of InventoryItem.list_price_cents at line creation, re-synced by dispute regrade cascade while Order fulfillment_status==PENDING", default: 0 }
+
+  - name: PreOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; the pre-ordering buyer" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the RSD/exclusive release" }
+      - { name: allocation_id, type: string, source: input, description: "FK -> Allocation.id; the pool a unit is reserved from" }
+      - { name: status, type: enum, source: system, description: "pre-order lifecycle; see PreOrder state machine", default: "RESERVED", constraints: "one of {RESERVED, WAITLISTED, READY_FOR_PICKUP, FULFILLED, CANCELLED}" }
+      - { name: pickup_window_start, type: datetime, source: input, description: "ISO8601 UTC; requested in-store pickup window start (half-open)" }
+      - { name: pickup_window_end, type: datetime, source: input, description: "ISO8601 UTC; requested pickup window end (exclusive)" }
+      - { name: fulfilled_item_id, type: string, source: system, description: "FK -> InventoryItem.id; the copy held/handed over at READY_FOR_PICKUP/FULFILLED", default: null }
+
+  - name: Consignment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: consignor_id, type: string, source: input, description: "FK -> Customer.id; the owner consigning stock for sale" }
+      - { name: display_slot_id, type: string, source: input, description: "FK -> DisplaySlot.id; the shelf slot booked while ACTIVE, else null", default: null }
+      - { name: list_price_cents, type: integer, source: input, description: "asking price while listed, in cents", constraints: "> 0" }
+      - { name: sale_price_cents, type: integer, source: input, description: "actual selling price at SOLD (may be marked down)", default: null }
+      - { name: status, type: enum, source: system, description: "consignment lifecycle; see Consignment state machine", default: "DRAFT", constraints: "one of {DRAFT, ACTIVE, SOLD, WITHDRAWN, EXPIRED}" }
+      - { name: display_start, type: datetime, source: input, description: "ISO8601 UTC; first day of the display booking (closed interval)", default: null }
+      - { name: display_end, type: datetime, source: input, description: "ISO8601 UTC; last day of the display booking (closed interval)", default: null }
+      - { name: estimated_payout_cents, type: integer, source: computed, description: "consignment_payout estimated variant, computed when ACTIVE from list_price", default: 0 }
+      - { name: actual_payout_cents, type: integer, source: computed, description: "consignment_payout actual variant, computed at SOLD from sale_price (credited to consignor)", default: 0 }
+
+  - name: DisplaySlot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: slot_label, type: string, source: input, description: "human label e.g. 'Front Window A'", constraints: "unique, non-empty" }
+      - { name: is_active, type: boolean, source: input, description: "false = slot retired, not bookable", default: true }
+
+  - name: GradingDispute
+    parent: null
+    common_fields: true
+    fields:
+      - { name: inventory_item_id, type: string, source: input, description: "FK -> InventoryItem.id; the used copy whose grade is disputed" }
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; the buyer raising the dispute" }
+      - { name: claimed_grade, type: enum, source: input, description: "grade the disputer believes is correct", constraints: "one of {M, NM, VG_PLUS, VG, G, F, P}" }
+      - { name: status, type: enum, source: system, description: "dispute lifecycle (cyclic); see GradingDispute state machine", default: "OPEN", constraints: "one of {OPEN, UNDER_REVIEW, NEEDS_INFO, RESOLVED_REGRADE, RESOLVED_UPHELD, ESCALATED}" }
+      - { name: resolution_grade, type: enum, source: system, description: "final grade applied to the item on RESOLVED_REGRADE", default: null, constraints: "one of {M, NM, VG_PLUS, VG, G, F, P}" }
+
+  - name: SpecialOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; the requester" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the catalog title requested, if it exists in catalog", default: null }
+      - { name: description, type: string, source: input, description: "free-text request when product_id is null" }
+      - { name: deposit_cents, type: integer, source: input, description: "non-refundable deposit taken at request, in cents", default: 0, constraints: ">= 0" }
+      - { name: status, type: enum, source: system, description: "special-order lifecycle; see SpecialOrder state machine", default: "REQUESTED", constraints: "one of {REQUESTED, SOURCING, ARRIVED, FULFILLED, CANCELLED}" }
+
+# =====================================================================
+# §1.2 State Machine Table
+# =====================================================================
+state_machines:
+  - entity: Product
+    initial_state: DRAFT
+    terminal_states: [DISCONTINUED]
+    transitions:
+      - { from: DRAFT, to: LISTED, trigger: "POST /shop/products/{id}/list", actor: Manager, preconditions: ["at least one InventoryItem exists for the product OR is_rsd_exclusive == true"], side_effects: ["catalog_status = LISTED"] }
+      - { from: LISTED, to: PRE_ORDER_OPEN, trigger: "POST /shop/products/{id}/open-preorders", actor: Manager, preconditions: ["is_rsd_exclusive == true", "an Allocation exists for this product", "current_utc < allocation.window_close_at"], side_effects: ["catalog_status = PRE_ORDER_OPEN"] }
+      - { from: PRE_ORDER_OPEN, to: PRE_ORDER_CLOSED, trigger: "system: current_utc >= allocation.window_close_at, evaluated on any PreOrder create attempt", actor: system, preconditions: ["current_utc >= allocation.window_close_at"], side_effects: ["catalog_status = PRE_ORDER_CLOSED"] }
+      - { from: LISTED, to: DISCONTINUED, trigger: "POST /shop/products/{id}/discontinue", actor: Manager, preconditions: ["no InventoryItem for this product in status RESERVED"], side_effects: ["catalog_status = DISCONTINUED", "every AVAILABLE/ON_DISPLAY InventoryItem for this product set to status=SOLD-blocked? no: remains but unlistable"] }
+
+  - entity: InventoryItem
+    initial_state: AVAILABLE
+    terminal_states: [SOLD]
+    transitions:
+      - { from: AVAILABLE, to: ON_DISPLAY, trigger: "POST /shop/consignments/{id}/activate (for consignor stock) or manager display action", actor: Manager, preconditions: ["item not already RESERVED"], side_effects: ["status = ON_DISPLAY"] }
+      - { from: ON_DISPLAY, to: AVAILABLE, trigger: "POST /shop/consignments/{id}/withdraw", actor: Manager, preconditions: [], side_effects: ["status = AVAILABLE"] }
+      - { from: AVAILABLE, to: RESERVED, trigger: "POST /shop/orders/{id}/lines (adds this item) OR PreOrder promotion", actor: Customer, preconditions: ["status == AVAILABLE"], side_effects: ["status = RESERVED", "if pickup context: set hold_start_at/hold_end_at"] }
+      - { from: ON_DISPLAY, to: RESERVED, trigger: "POST /shop/orders/{id}/lines (buying a consigned on-display copy)", actor: Customer, preconditions: ["status == ON_DISPLAY"], side_effects: ["status = RESERVED"] }
+      - { from: RESERVED, to: AVAILABLE, trigger: "POST /shop/orders/{id}/cancel OR PreOrder ready-hold release", actor: Customer, preconditions: [], side_effects: ["status = AVAILABLE", "clear hold_start_at/hold_end_at", "if item is consigned and its Consignment still ACTIVE: status = ON_DISPLAY instead"] }
+      - { from: RESERVED, to: SOLD, trigger: "POST /shop/orders/{id}/fulfill", actor: StoreClerk, preconditions: ["parent Order payment_status == PAID"], side_effects: ["status = SOLD", "if consigned: parent Consignment -> SOLD with actual_payout credited"] }
+
+  - entity: Order
+    initial_state: "payment=UNPAID, fulfillment=PENDING"
+    terminal_states: ["fulfillment=CANCELLED", "payment=REFUNDED+fulfillment in {SHIPPED,PICKED_UP}"]
+    transitions:
+      - { from: "payment=UNPAID", to: "payment=AUTHORIZED", trigger: "POST /shop/orders/{id}/authorize-payment", actor: Customer, preconditions: ["order has >= 1 OrderLine", "fulfillment_status == PENDING"], side_effects: ["payment_status = AUTHORIZED"], note: "payment dimension advances independently of fulfillment" }
+      - { from: "payment=AUTHORIZED", to: "payment=PAID", trigger: "POST /shop/orders/{id}/capture-payment", actor: StoreClerk, preconditions: ["store_credit applied does not exceed customer.store_credit_cents"], side_effects: ["payment_status = PAID", "debit customer.store_credit_cents by credit_applied_cents", "compute & award points_earned to customer.loyalty_points", "recompute customer.loyalty_tier"] }
+      - { from: "payment=PAID", to: "payment=REFUNDED", trigger: "POST /shop/orders/{id}/cancel", actor: StoreClerk, preconditions: ["fulfillment_status != SHIPPED", "fulfillment_status != PICKED_UP"], side_effects: ["payment_status = REFUNDED", "credit customer.store_credit_cents by credit_applied_cents (compensation)", "reverse points_earned from customer.loyalty_points", "recompute customer.loyalty_tier"], note: "compensating action for capture; conserves store credit" }
+      - { from: "fulfillment=PENDING", to: "fulfillment=RESERVED", trigger: "POST /shop/orders/{id}/lines", actor: Customer, preconditions: ["each added InventoryItem status in {AVAILABLE, ON_DISPLAY}"], side_effects: ["fulfillment_status = RESERVED", "each added InventoryItem -> RESERVED", "recompute subtotal/discount/shipping/total"] }
+      - { from: "fulfillment=RESERVED", to: "fulfillment=SHIPPED", trigger: "POST /shop/orders/{id}/ship", actor: StoreClerk, preconditions: ["channel == ONLINE", "payment_status == PAID"], side_effects: ["fulfillment_status = SHIPPED", "each OrderLine InventoryItem -> SOLD"] }
+      - { from: "fulfillment=RESERVED", to: "fulfillment=PICKED_UP", trigger: "POST /shop/orders/{id}/fulfill", actor: StoreClerk, preconditions: ["channel == IN_STORE", "payment_status == PAID"], side_effects: ["fulfillment_status = PICKED_UP", "each OrderLine InventoryItem -> SOLD"] }
+      - { from: "fulfillment=RESERVED", to: "fulfillment=CANCELLED", trigger: "POST /shop/orders/{id}/cancel", actor: Customer, preconditions: ["fulfillment_status not in {SHIPPED, PICKED_UP}"], side_effects: ["fulfillment_status = CANCELLED", "CASCADE(depth2): each OrderLine InventoryItem -> AVAILABLE (consigned items revert to ON_DISPLAY if their Consignment still ACTIVE)"] }
+
+  - entity: TradeIn
+    initial_state: DRAFT
+    terminal_states: [APPROVED, REJECTED, REVERSED]
+    transitions:
+      - { from: DRAFT, to: SUBMITTED, trigger: "POST /shop/trade-ins/{id}/submit", actor: Customer, preconditions: ["TradeIn has >= 1 TradeInLine"], side_effects: ["status = SUBMITTED", "compute provisional_value_cents from claimed grades"] }
+      - { from: SUBMITTED, to: UNDER_INSPECTION, trigger: "POST /shop/trade-ins/{id}/start-inspection", actor: Grader, preconditions: [], side_effects: ["status = UNDER_INSPECTION"] }
+      - { from: UNDER_INSPECTION, to: APPROVED, trigger: "POST /shop/trade-ins/{id}/approve", actor: Grader, preconditions: ["every TradeInLine has inspected_grade set"], side_effects: ["status = APPROVED", "compute final_value_cents from inspected grades (+CREDIT bonus)", "credit customer.store_credit_cents by final_value_cents (if CREDIT)", "create one AVAILABLE used InventoryItem per line at inspected_grade"] }
+      - { from: UNDER_INSPECTION, to: REJECTED, trigger: "POST /shop/trade-ins/{id}/reject", actor: Grader, preconditions: [], side_effects: ["status = REJECTED", "no credit granted"] }
+      - { from: APPROVED, to: REVERSED, trigger: "POST /shop/trade-ins/{id}/reverse", actor: Manager, preconditions: ["customer.store_credit_cents >= final_value_cents", "no InventoryItem created by this trade-in is RESERVED or SOLD"], side_effects: ["status = REVERSED", "debit customer.store_credit_cents by final_value_cents (compensation, conserves credit)", "delete/void the created InventoryItems"] }
+
+  - entity: PreOrder
+    initial_state: RESERVED
+    terminal_states: [FULFILLED, CANCELLED]
+    transitions:
+      - { from: RESERVED, to: READY_FOR_PICKUP, trigger: "POST /shop/pre-orders/{id}/ready", actor: StoreClerk, preconditions: ["an AVAILABLE InventoryItem exists for the product", "the count of already READY_FOR_PICKUP pre-orders on this allocation whose [pickup_window_start, pickup_window_end) half-open interval overlaps this one is < allocation.pickup_concurrency"], side_effects: ["status = READY_FOR_PICKUP", "select earliest-created AVAILABLE item (created_at ASC), set fulfilled_item_id", "item -> RESERVED with hold_start_at=pickup_window_start, hold_end_at=pickup_window_end"] }
+      - { from: WAITLISTED, to: RESERVED, trigger: "system: promotion when a unit frees up (cascade from Order cancel / PreOrder cancel)", actor: system, preconditions: ["Allocation.available_count >= 1 after the freeing event"], side_effects: ["status = RESERVED", "Allocation.available_count -= 1", "Allocation.reserved_count += 1"], note: "promotion picks earliest-created WAITLISTED pre-order for the product (created_at ASC)" }
+      - { from: RESERVED, to: FULFILLED, trigger: "POST /shop/pre-orders/{id}/fulfill", actor: StoreClerk, preconditions: ["status == READY_FOR_PICKUP OR status == RESERVED with fulfilled_item_id set"], side_effects: ["status = FULFILLED", "fulfilled_item_id InventoryItem -> SOLD", "Allocation.reserved_count -= 1", "Allocation.committed_count += 1"] }
+      - { from: READY_FOR_PICKUP, to: FULFILLED, trigger: "POST /shop/pre-orders/{id}/fulfill", actor: StoreClerk, preconditions: ["fulfilled_item_id set"], side_effects: ["status = FULFILLED", "fulfilled_item_id InventoryItem -> SOLD", "Allocation.reserved_count -= 1", "Allocation.committed_count += 1"] }
+      - { from: RESERVED, to: CANCELLED, trigger: "POST /shop/pre-orders/{id}/cancel", actor: Customer, preconditions: ["status not in {FULFILLED}"], side_effects: ["status = CANCELLED", "Allocation.reserved_count -= 1", "Allocation.available_count += 1", "CASCADE(depth2): earliest WAITLISTED PreOrder promoted -> RESERVED -> reserved_count += 1"] }
+      - { from: WAITLISTED, to: CANCELLED, trigger: "POST /shop/pre-orders/{id}/cancel", actor: Customer, preconditions: [], side_effects: ["status = CANCELLED"], note: "no allocation change: waitlisted pre-orders hold no unit" }
+
+  - entity: Consignment
+    initial_state: DRAFT
+    terminal_states: [SOLD, WITHDRAWN, EXPIRED]
+    transitions:
+      - { from: DRAFT, to: ACTIVE, trigger: "POST /shop/consignments/{id}/activate", actor: Manager, preconditions: ["DisplaySlot.is_active == true", "closed interval [display_start, display_end], after expanding every existing ACTIVE booking on the same slot by CONSIGNMENT_BUFFER_DAYS=2 on both sides, does not overlap this booking"], side_effects: ["status = ACTIVE", "compute estimated_payout_cents from list_price", "linked InventoryItem -> ON_DISPLAY"] }
+      - { from: ACTIVE, to: SOLD, trigger: "system: fired by POST /shop/orders/{id}/fulfill or /ship when an OrderLine references the consigned InventoryItem", actor: system, preconditions: ["linked InventoryItem is on an OrderLine of the fulfilling Order"], side_effects: ["sale_price_cents := that OrderLine.unit_price_cents", "status = SOLD", "compute actual_payout_cents from sale_price", "credit consignor.store_credit_cents by actual_payout_cents", "release DisplaySlot (set display_slot_id usable again)"] }
+      - { from: ACTIVE, to: WITHDRAWN, trigger: "POST /shop/consignments/{id}/withdraw", actor: Manager, preconditions: ["linked InventoryItem status != SOLD"], side_effects: ["status = WITHDRAWN", "linked InventoryItem -> AVAILABLE", "release DisplaySlot"] }
+      - { from: ACTIVE, to: EXPIRED, trigger: "system: current_utc > display_end, evaluated on consignment read/activate sweeps", actor: system, preconditions: ["current_utc > display_end"], side_effects: ["status = EXPIRED", "linked InventoryItem -> AVAILABLE", "release DisplaySlot"] }
+
+  - entity: GradingDispute
+    initial_state: OPEN
+    terminal_states: [RESOLVED_REGRADE, RESOLVED_UPHELD]
+    transitions:
+      - { from: OPEN, to: UNDER_REVIEW, trigger: "POST /shop/grading-disputes/{id}/start-review", actor: Grader, preconditions: ["disputed InventoryItem.is_used == true"], side_effects: ["status = UNDER_REVIEW"] }
+      - { from: UNDER_REVIEW, to: NEEDS_INFO, trigger: "POST /shop/grading-disputes/{id}/request-info", actor: Grader, preconditions: [], side_effects: ["status = NEEDS_INFO"] }
+      - { from: NEEDS_INFO, to: UNDER_REVIEW, trigger: "POST /shop/grading-disputes/{id}/provide-info", actor: Customer, preconditions: [], side_effects: ["status = UNDER_REVIEW"], note: "revision loop: NEEDS_INFO <-> UNDER_REVIEW may repeat (cyclic)" }
+      - { from: UNDER_REVIEW, to: RESOLVED_REGRADE, trigger: "POST /shop/grading-disputes/{id}/resolve-regrade", actor: Grader, preconditions: ["resolution_grade provided"], side_effects: ["status = RESOLVED_REGRADE", "set resolution_grade", "CASCADE(depth3): InventoryItem.condition_grade = resolution_grade -> InventoryItem.list_price_cents recomputed -> if item on an OrderLine whose Order.fulfillment_status==PENDING/RESERVED: OrderLine.unit_price_cents resynced -> Order totals recomputed"] }
+      - { from: UNDER_REVIEW, to: RESOLVED_UPHELD, trigger: "POST /shop/grading-disputes/{id}/resolve-uphold", actor: Grader, preconditions: [], side_effects: ["status = RESOLVED_UPHELD", "no grade/price change"] }
+      - { from: UNDER_REVIEW, to: ESCALATED, trigger: "POST /shop/grading-disputes/{id}/escalate", actor: Grader, preconditions: [], side_effects: ["status = ESCALATED"] }
+      - { from: ESCALATED, to: RESOLVED_REGRADE, trigger: "POST /shop/grading-disputes/{id}/resolve-regrade", actor: Manager, preconditions: ["resolution_grade provided"], side_effects: ["status = RESOLVED_REGRADE", "same cascade as UNDER_REVIEW->RESOLVED_REGRADE"] }
+      - { from: ESCALATED, to: RESOLVED_UPHELD, trigger: "POST /shop/grading-disputes/{id}/resolve-uphold", actor: Manager, preconditions: [], side_effects: ["status = RESOLVED_UPHELD"] }
+
+  - entity: SpecialOrder
+    initial_state: REQUESTED
+    terminal_states: [FULFILLED, CANCELLED]
+    transitions:
+      - { from: REQUESTED, to: SOURCING, trigger: "POST /shop/special-orders/{id}/start-sourcing", actor: StoreClerk, preconditions: [], side_effects: ["status = SOURCING"] }
+      - { from: SOURCING, to: ARRIVED, trigger: "POST /shop/special-orders/{id}/mark-arrived", actor: StoreClerk, preconditions: [], side_effects: ["status = ARRIVED", "create one AVAILABLE InventoryItem for product_id (if set)"] }
+      - { from: ARRIVED, to: FULFILLED, trigger: "POST /shop/special-orders/{id}/fulfill", actor: StoreClerk, preconditions: [], side_effects: ["status = FULFILLED"] }
+      - { from: REQUESTED, to: CANCELLED, trigger: "POST /shop/special-orders/{id}/cancel", actor: Customer, preconditions: [], side_effects: ["status = CANCELLED", "deposit_cents forfeited (non-refundable)"] }
+      - { from: SOURCING, to: CANCELLED, trigger: "POST /shop/special-orders/{id}/cancel", actor: Customer, preconditions: [], side_effects: ["status = CANCELLED", "deposit_cents forfeited"] }
+
+# =====================================================================
+# §1.2.1 Concurrency Rules
+# =====================================================================
+concurrency_rules:
+  - rule_id: preorder-create-stale-allocation
+    parent_entity: Allocation
+    write_endpoint: "POST /shop/pre-orders"
+    occ_field: "expected_allocation_version"
+    description: |
+      Creating a PreOrder that reserves a unit from an Allocation whose version
+      has advanced since the client last observed it is rejected. This captures
+      the case where another writer has just reserved a unit against the same
+      allocation (legitimately decrementing available_count), so the current
+      writer's view of the allocation's remaining capacity is stale. The write
+      is rejected on the stale version rather than silently over-committing the
+      finite pool.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 Calculation Rules Table
+# =====================================================================
+calculations:
+  - name: item_list_price
+    trigger: "InventoryItem create; recomputed on GradingDispute RESOLVED_REGRADE cascade"
+    algorithm: tiered_pricing
+    formula: |
+      # Consigned copies price from their Consignment; store-owned copies from the product grade.
+      if consignment_id != null:
+        list_price_cents = Consignment.list_price_cents          # consignor sets the ask
+      else:
+        mult = GRADE_MULTIPLIER[condition_grade]
+        raw  = Product.base_price_cents * mult
+        list_price_cents = round_half_up(raw)                    # 2-decimal cents => integer cents
+        # NEW (is_used == false) copies are never discounted below base:
+        if is_used == false: list_price_cents = max(list_price_cents, Product.base_price_cents)
+    input_set: "single InventoryItem + its parent Product; consigned copies read Consignment.list_price_cents"
+    constants:
+      GRADE_MULTIPLIER: { M: 1.10, NM: 1.00, VG_PLUS: 0.80, VG: 0.60, G: 0.40, F: 0.25, P: 0.15 }
+    precision: "integer cents, round_half_up on the product before flooring to whole cents"
+
+  - name: trade_in_credit_valuation
+    trigger: "provisional at TradeIn SUBMITTED; final at TradeIn APPROVED"
+    algorithm: aggregation
+    formula: |
+      # Per-line buy value = base_value_cents * grade multiplier, summed.
+      # Mode (b) NESTED ROUNDING — order is PINNED: round EACH line to whole cents
+      # FIRST, THEN sum. (Sum-then-round would differ by up to N-1 cents.)
+      per_line[i]   = round_half_up(TradeInLine[i].base_value_cents * BUY_MULTIPLIER[grade_i])
+      sum_lines     = sum(per_line[i] for all lines)
+      value_cents   = sum_lines
+      if payout_method == CREDIT (final variant only): value_cents = round_half_up(sum_lines * (1 + CREDIT_BONUS_PCT))
+    input_set: "all TradeInLines of the TradeIn; provisional uses claimed_grade, final uses inspected_grade"
+    constants:
+      BUY_MULTIPLIER: { M: 0.55, NM: 0.50, VG_PLUS: 0.40, VG: 0.30, G: 0.20, F: 0.10, P: 0.05 }
+      CREDIT_BONUS_PCT: 0.20
+    precision: "integer cents; round EACH line first (round_half_up), THEN sum; bonus rounded after summation"
+    variants:
+      - { name: provisional, when: "at SUBMITTED", difference: "uses claimed_grade per line; NEVER applies CREDIT_BONUS_PCT (bonus is an inspection-verified reward)" }
+      - { name: final, when: "at APPROVED", difference: "uses inspected_grade per line; applies CREDIT_BONUS_PCT when payout_method==CREDIT" }
+
+  - name: consignment_payout
+    trigger: "estimated when Consignment ACTIVE; actual at Consignment SOLD"
+    algorithm: tiered_pricing
+    formula: |
+      # Store commission is TIERED on the sale price (marginal per-tier rate),
+      # commission is what the SHOP keeps; payout is the remainder to consignor.
+      # Mode (a) non-linear: >=3 inputs (price, tier boundaries, tier rates) with tiered selection.
+      commission = 0
+      remaining = price_cents
+      prev = 0
+      for (bound, rate) in COMMISSION_TIERS:      # marginal: rate applies to the slice in (prev, bound]
+        slice = max(0, min(price_cents, bound) - prev)
+        commission += round_half_up(slice * rate)   # per-tier rounding PINNED (round each slice, then sum)
+        prev = bound
+      payout_cents = price_cents - commission
+    input_set: "single Consignment; estimated uses list_price_cents, actual uses sale_price_cents"
+    constants:
+      COMMISSION_TIERS: [[5000, 0.30], [20000, 0.20], [99999999, 0.10]]   # [upper_bound_cents_inclusive, marginal_rate]
+    precision: "integer cents; round EACH tier slice (round_half_up) THEN sum commission; payout = price - commission"
+    variants:
+      - { name: estimated, when: "at ACTIVE", difference: "uses list_price_cents as the price basis" }
+      - { name: actual, when: "at SOLD", difference: "uses sale_price_cents (post-markdown) as the price basis; this is what is credited" }
+
+  - name: order_total
+    trigger: "recomputed on OrderLine add and on GradingDispute regrade cascade"
+    algorithm: aggregation
+    formula: |
+      # Mode (c) EVALUATION-ORDER PINNED circular-looking dependency:
+      # discount is keyed on a loyalty tier derived from the NEW-item subtotal tier,
+      # but shipping depends on subtotal (pre-discount). Order is PINNED:
+      #   1. subtotal_cents = sum(line.unit_price_cents * line.qty)   [all lines]
+      #   2. new_subtotal   = sum over lines whose InventoryItem.is_used == false
+      #   3. discount_cents = round_half_up(new_subtotal * LOYALTY_DISCOUNT_PCT[customer.loyalty_tier])
+      #   4. shipping_cents = 0 if channel==IN_STORE
+      #                       else (0 if subtotal_cents >= FREE_SHIP_THRESHOLD_CENTS else FLAT_SHIP_CENTS)
+      #   5. total_cents    = subtotal_cents - discount_cents + shipping_cents
+    input_set: "all OrderLines of the Order (unit_price snapshots), the buyer's loyalty_tier at compute time"
+    constants:
+      LOYALTY_DISCOUNT_PCT: { STANDARD: 0.00, SILVER: 0.05, GOLD: 0.10 }
+      FREE_SHIP_THRESHOLD_CENTS: 5000
+      FLAT_SHIP_CENTS: 599
+    precision: "integer cents; discount rounded once on new_subtotal (round_half_up)"
+
+  - name: loyalty_points_earned
+    trigger: "awarded when Order payment_status reaches PAID; reversed on REFUNDED"
+    algorithm: threshold
+    formula: |
+      # 1 point per whole dollar of total_cents, with a GOLD-tier multiplier.
+      base_points = floor(total_cents / 100)
+      points_earned = floor(base_points * POINTS_MULTIPLIER[customer.loyalty_tier])
+    input_set: "single Order total_cents + buyer loyalty_tier at capture time"
+    constants:
+      POINTS_MULTIPLIER: { STANDARD: 1.0, SILVER: 1.0, GOLD: 1.5 }
+    precision: "integer points; floor after multiplier"
+
+  - name: loyalty_tier
+    trigger: "recomputed whenever customer.loyalty_points changes (capture, refund reversal)"
+    algorithm: threshold
+    formula: |
+      # Boundary precision PINNED with >= (inclusive lower bound of each tier).
+      if loyalty_points >= GOLD_MIN:   loyalty_tier = GOLD
+      elif loyalty_points >= SILVER_MIN: loyalty_tier = SILVER
+      else: loyalty_tier = STANDARD
+    input_set: "single Customer.loyalty_points"
+    constants:
+      SILVER_MIN: 100
+      GOLD_MIN: 500
+    precision: "exact integer comparison; >= is inclusive"
+
+# =====================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =====================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-Role and X-User-ID headers present and well-formed", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all except catalog GETs" }
+  - { priority: 2, category: auth, check: "acting role is permitted for this operation per §1.7 RBAC", error_id: ERR_FORBIDDEN, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: existence, check: "all path/body referenced resources exist, validated left-to-right", error_id: ERR_NOT_FOUND, http_status: 404, applies_to: "all" }
+  - { priority: 4, category: business_referential, check: "acting Customer/Consignor owns the resource (X-User-ID == resource.customer_id/consignor_id)", error_id: ERR_NOT_RESOURCE_OWNER, http_status: 403, applies_to: "Customer-owned resource mutations" }
+  - { priority: 5, category: state, check: "target resource is in a state that permits this transition (from-state matches)", error_id: ERR_INVALID_STATE, http_status: 409, applies_to: "all state transitions" }
+  - { priority: 6, category: state, check: "cross-entity guard: PreOrder ready requires product's Product.catalog_status permits; Order ship requires payment_status==PAID; InventoryItem fulfill requires parent Order payment_status==PAID", error_id: ERR_DEPENDENCY_NOT_READY, http_status: 409, applies_to: "orders/ship, orders/fulfill, pre-orders/ready" }
+  - { priority: 7, category: business_temporal, check: "PreOrder create only within half-open [window_open_at, window_close_at)", error_id: ERR_PREORDER_WINDOW_CLOSED, http_status: 409, applies_to: "pre-orders create" }
+  - { priority: 7.5, category: business_temporal, check: "pre-order ready rejected when overlapping READY_FOR_PICKUP count on the allocation (half-open [pickup_window_start, pickup_window_end) interval semantics) would reach pickup_concurrency", error_id: ERR_PICKUP_CAPACITY_EXCEEDED, http_status: 409, applies_to: "pre-orders/ready" }
+  - { priority: 8, category: business_constraint, check: "consignment activate targets a DisplaySlot with is_active == true", error_id: ERR_SLOT_INACTIVE, http_status: 409, applies_to: "consignments/activate" }
+  - { priority: 8.5, category: business_temporal, check: "Consignment display booking closed interval [display_start, display_end] must not overlap, after expanding each ACTIVE booking by CONSIGNMENT_BUFFER_DAYS on both sides, another ACTIVE consignment on the same DisplaySlot (buffered closed-interval semantics)", error_id: ERR_SLOT_OVERLAP, http_status: 409, applies_to: "consignments/activate" }
+  - { priority: 9, category: business_safety, check: "NEW InventoryItem (is_used==false) must have condition_grade in {M, NM}", error_id: ERR_INVALID_GRADE_FOR_NEW, http_status: 422, applies_to: "inventory-items create" }
+  - { priority: 10, category: business_constraint, check: "TradeIn approve requires every line has inspected_grade set", error_id: ERR_INSPECTION_INCOMPLETE, http_status: 422, applies_to: "trade-ins/approve" }
+  - { priority: 11, category: business_constraint, check: "Allocation reservation must not drive available_count below 0 (pool exhausted -> WAITLISTED instead of rejected only when window open)", error_id: ERR_ALLOCATION_EXHAUSTED, http_status: 409, applies_to: "pre-orders create" }
+  - { priority: 12, category: business_fiscal, check: "store_credit applied at capture must not exceed customer.store_credit_cents; TradeIn reverse requires sufficient balance to claw back", error_id: ERR_INSUFFICIENT_CREDIT, http_status: 402, applies_to: "orders/capture-payment, trade-ins/reverse" }
+  - { priority: 13, category: business_constraint, check: "OCC expected_allocation_version must match current Allocation.version on pre-order create", error_id: ERR_STALE_VERSION, http_status: 412, applies_to: "pre-orders create" }
+
+# =====================================================================
+# §1.5 API Endpoint Table
+# =====================================================================
+endpoints:
+  # ---- Customers -------------------------------------------------
+  - { method: POST, path: "/shop/customers", description: "register a customer", roles: [Anonymous], code: 201, input: [email, full_name], output: Customer, side_effects: ["loyalty_tier initialized to STANDARD"] }
+  - { method: GET, path: "/shop/customers/{id}", description: "read a customer (balances, tier)", roles: [Customer, StoreClerk, Manager], code: 200, input: [], output: Customer }
+  - { method: POST, path: "/shop/customers/{id}/credit-adjustments", description: "operator adjustment of store credit (admin/business surface for corrections & seeding)", roles: [Manager], code: 200, input: [delta_cents, reason], output: Customer, side_effects: ["store_credit_cents += delta_cents (must stay >= 0)"] }
+
+  # ---- Products / catalog ---------------------------------------
+  - { method: POST, path: "/shop/products", description: "create a catalog product", roles: [Manager], code: 201, input: [artist, title, format, base_price_cents, "is_rsd_exclusive?"], output: Product }
+  - { method: GET, path: "/shop/products/{id}", description: "read a product", roles: [Anonymous, Customer, StoreClerk, Manager], code: 200, input: [], output: Product }
+  - { method: GET, path: "/shop/products", description: "list/catalog products (online + in-store catalog)", roles: [Anonymous, Customer, StoreClerk, Manager], code: 200, input: ["format?", "catalog_status?", "is_rsd_exclusive?", "limit?", "offset?"], output: "Product[]" }
+  - { method: POST, path: "/shop/products/{id}/list", description: "transition DRAFT->LISTED", roles: [Manager], code: 200, input: [], output: Product, side_effects: ["catalog_status = LISTED"] }
+  - { method: POST, path: "/shop/products/{id}/open-preorders", description: "transition LISTED->PRE_ORDER_OPEN", roles: [Manager], code: 200, input: [], output: Product, side_effects: ["catalog_status = PRE_ORDER_OPEN"] }
+  - { method: POST, path: "/shop/products/{id}/discontinue", description: "transition LISTED->DISCONTINUED", roles: [Manager], code: 200, input: [], output: Product, side_effects: ["catalog_status = DISCONTINUED"] }
+
+  # ---- Allocations (RSD/exclusive pools) ------------------------
+  - { method: POST, path: "/shop/products/{id}/allocations", description: "create the finite allocation pool for an RSD/exclusive product", roles: [Manager], code: 201, input: [allocation_total, window_open_at, window_close_at, "pickup_concurrency?"], output: Allocation, side_effects: ["available_count = allocation_total"] }
+  - { method: GET, path: "/shop/allocations/{id}", description: "read an allocation (counts + version for OCC)", roles: [Customer, StoreClerk, Manager], code: 200, input: [], output: Allocation }
+  - { method: GET, path: "/shop/products/{id}/allocations", description: "reverse-reachability: allocations of a product", roles: [Customer, StoreClerk, Manager], code: 200, input: [], output: "Allocation[]" }
+
+  # ---- Inventory items ------------------------------------------
+  - { method: POST, path: "/shop/inventory-items", description: "add a physical copy to stock (new or used)", roles: [StoreClerk, Manager], code: 201, input: [product_id, is_used, condition_grade, "consignment_id?"], output: InventoryItem, side_effects: ["compute list_price_cents"] }
+  - { method: GET, path: "/shop/inventory-items/{id}", description: "read an inventory item", roles: [Anonymous, Customer, StoreClerk, Manager], code: 200, input: [], output: InventoryItem }
+  - { method: GET, path: "/shop/inventory-items", description: "list inventory; reverse-reachability for product_id and consignment_id FKs", roles: [Anonymous, Customer, StoreClerk, Manager], code: 200, input: ["product_id?", "consignment_id?", "status?", "is_used?", "limit?", "offset?"], output: "InventoryItem[]" }
+
+  # ---- Orders (parallel payment x fulfillment) ------------------
+  - { method: POST, path: "/shop/orders", description: "open an empty order", roles: [Customer], code: 201, input: [customer_id, channel], output: Order }
+  - { method: GET, path: "/shop/orders/{id}", description: "read an order with computed totals", roles: [Customer, StoreClerk, Manager], code: 200, input: [], output: Order }
+  - { method: GET, path: "/shop/orders", description: "list orders; reverse-reachability for customer_id FK", roles: [Customer, StoreClerk, Manager], code: 200, input: ["customer_id?", "payment_status?", "fulfillment_status?", "limit?", "offset?"], output: "Order[]" }
+  - { method: POST, path: "/shop/orders/{id}/lines", description: "add a line (reserves the item); fulfillment PENDING->RESERVED", roles: [Customer], code: 201, input: [inventory_item_id], output: OrderLine, side_effects: ["InventoryItem -> RESERVED", "recompute order totals", "fulfillment_status = RESERVED"] }
+  - { method: GET, path: "/shop/orders/{id}/lines", description: "reverse-reachability: lines of an order", roles: [Customer, StoreClerk, Manager], code: 200, input: [], output: "OrderLine[]" }
+  - { method: GET, path: "/shop/order-lines/{id}", description: "read a single order line", roles: [Customer, StoreClerk, Manager], code: 200, input: [], output: OrderLine }
+  - { method: GET, path: "/shop/order-lines", description: "reverse-reachability for OrderLine.inventory_item_id FK", roles: [StoreClerk, Manager], code: 200, input: ["inventory_item_id?", "order_id?", "limit?", "offset?"], output: "OrderLine[]" }
+  - { method: POST, path: "/shop/orders/{id}/authorize-payment", description: "payment UNPAID->AUTHORIZED", roles: [Customer], code: 200, input: [], output: Order, side_effects: ["payment_status = AUTHORIZED"] }
+  - { method: POST, path: "/shop/orders/{id}/capture-payment", description: "payment AUTHORIZED->PAID; applies store credit; awards points", roles: [StoreClerk], code: 200, input: ["credit_applied_cents?"], output: Order, side_effects: ["payment_status = PAID", "debit store credit", "award points", "recompute loyalty_tier"] }
+  - { method: POST, path: "/shop/orders/{id}/ship", description: "fulfillment RESERVED->SHIPPED (ONLINE only)", roles: [StoreClerk], code: 200, input: [], output: Order, side_effects: ["fulfillment_status = SHIPPED", "OrderLine items -> SOLD", "consigned items -> Consignment SOLD"] }
+  - { method: POST, path: "/shop/orders/{id}/fulfill", description: "fulfillment RESERVED->PICKED_UP (IN_STORE only)", roles: [StoreClerk], code: 200, input: [], output: Order, side_effects: ["fulfillment_status = PICKED_UP", "OrderLine items -> SOLD", "consigned items -> Consignment SOLD"] }
+  - { method: POST, path: "/shop/orders/{id}/cancel", description: "cancel: refund if PAID, release reserved items, promote waitlist", roles: [Customer, StoreClerk], code: 200, input: [], output: Order, side_effects: ["fulfillment_status = CANCELLED", "if PAID: refund + reverse points", "release items -> AVAILABLE", "cascade waitlist promotion"] }
+
+  # ---- Trade-ins ------------------------------------------------
+  - { method: POST, path: "/shop/trade-ins", description: "open a trade-in draft", roles: [Customer], code: 201, input: [customer_id, "payout_method?"], output: TradeIn }
+  - { method: GET, path: "/shop/trade-ins/{id}", description: "read a trade-in with provisional/final values", roles: [Customer, Grader, Manager], code: 200, input: [], output: TradeIn }
+  - { method: GET, path: "/shop/trade-ins", description: "list trade-ins; reverse-reachability for customer_id FK", roles: [Customer, Grader, Manager], code: 200, input: ["customer_id?", "status?", "limit?", "offset?"], output: "TradeIn[]" }
+  - { method: POST, path: "/shop/trade-ins/{id}/lines", description: "add a line to a DRAFT trade-in", roles: [Customer], code: 201, input: [format, claimed_grade, base_value_cents], output: TradeInLine }
+  - { method: GET, path: "/shop/trade-ins/{id}/lines", description: "reverse-reachability: lines of a trade-in", roles: [Customer, Grader, Manager], code: 200, input: [], output: "TradeInLine[]" }
+  - { method: POST, path: "/shop/trade-ins/{id}/submit", description: "DRAFT->SUBMITTED; compute provisional value", roles: [Customer], code: 200, input: [], output: TradeIn, side_effects: ["status = SUBMITTED", "compute provisional_value_cents"] }
+  - { method: POST, path: "/shop/trade-ins/{id}/start-inspection", description: "SUBMITTED->UNDER_INSPECTION", roles: [Grader], code: 200, input: [], output: TradeIn, side_effects: ["status = UNDER_INSPECTION"] }
+  - { method: PATCH, path: "/shop/trade-in-lines/{id}", description: "grader sets inspected_grade during inspection", roles: [Grader], code: 200, input: [inspected_grade], output: TradeInLine, side_effects: ["set inspected_grade"] }
+  - { method: POST, path: "/shop/trade-ins/{id}/approve", description: "UNDER_INSPECTION->APPROVED; final value; credit; create used items", roles: [Grader], code: 200, input: [], output: TradeIn, side_effects: ["status = APPROVED", "compute final_value_cents", "credit store_credit", "create used InventoryItems"] }
+  - { method: POST, path: "/shop/trade-ins/{id}/reject", description: "UNDER_INSPECTION->REJECTED", roles: [Grader], code: 200, input: [], output: TradeIn, side_effects: ["status = REJECTED"] }
+  - { method: POST, path: "/shop/trade-ins/{id}/reverse", description: "APPROVED->REVERSED; claw back credit; void items", roles: [Manager], code: 200, input: [], output: TradeIn, side_effects: ["status = REVERSED", "debit store_credit", "void created InventoryItems"] }
+
+  # ---- Pre-orders (allocation reservations) ---------------------
+  - { method: POST, path: "/shop/pre-orders", description: "reserve a unit of an RSD/exclusive product (OCC on allocation); WAITLISTED if pool exhausted", roles: [Customer], code: 201, input: [customer_id, product_id, allocation_id, pickup_window_start, pickup_window_end, expected_allocation_version], output: PreOrder, side_effects: ["available_count -= 1 & reserved_count += 1 (RESERVED) or status WAITLISTED", "increments Allocation.version by 1"] }
+  - { method: GET, path: "/shop/pre-orders/{id}", description: "read a pre-order", roles: [Customer, StoreClerk, Manager], code: 200, input: [], output: PreOrder }
+  - { method: GET, path: "/shop/pre-orders", description: "list pre-orders; reverse-reachability for customer_id, product_id, allocation_id, fulfilled_item_id FKs", roles: [Customer, StoreClerk, Manager], code: 200, input: ["customer_id?", "product_id?", "allocation_id?", "fulfilled_item_id?", "status?", "limit?", "offset?"], output: "PreOrder[]" }
+  - { method: POST, path: "/shop/pre-orders/{id}/ready", description: "RESERVED->READY_FOR_PICKUP; hold a copy for pickup window", roles: [StoreClerk], code: 200, input: [], output: PreOrder, side_effects: ["select earliest AVAILABLE item, set fulfilled_item_id, set hold window", "item -> RESERVED"] }
+  - { method: POST, path: "/shop/pre-orders/{id}/fulfill", description: "->FULFILLED; commit the unit", roles: [StoreClerk], code: 200, input: [], output: PreOrder, side_effects: ["status = FULFILLED", "item -> SOLD", "reserved_count -= 1, committed_count += 1"] }
+  - { method: POST, path: "/shop/pre-orders/{id}/cancel", description: "cancel a pre-order; release unit; promote waitlist", roles: [Customer], code: 200, input: [], output: PreOrder, side_effects: ["status = CANCELLED", "release unit if held", "cascade waitlist promotion"] }
+
+  # ---- Consignments & display slots -----------------------------
+  - { method: POST, path: "/shop/display-slots", description: "create a display slot", roles: [Manager], code: 201, input: [slot_label, "is_active?"], output: DisplaySlot }
+  - { method: GET, path: "/shop/display-slots/{id}", description: "read a display slot", roles: [StoreClerk, Manager], code: 200, input: [], output: DisplaySlot }
+  - { method: POST, path: "/shop/consignments", description: "create a consignment draft (with its linked InventoryItem)", roles: [StoreClerk, Manager], code: 201, input: [consignor_id, list_price_cents, product_id, condition_grade, "display_slot_id?", "display_start?", "display_end?"], output: Consignment, side_effects: ["create linked used InventoryItem (consignment_id set) in AVAILABLE"] }
+  - { method: GET, path: "/shop/consignments/{id}", description: "read a consignment with payout estimates", roles: [Customer, StoreClerk, Manager], code: 200, input: [], output: Consignment }
+  - { method: GET, path: "/shop/consignments", description: "list consignments; reverse-reachability for consignor_id, display_slot_id FKs", roles: [Customer, StoreClerk, Manager], code: 200, input: ["consignor_id?", "display_slot_id?", "status?", "limit?", "offset?"], output: "Consignment[]" }
+  - { method: POST, path: "/shop/consignments/{id}/activate", description: "DRAFT->ACTIVE; book slot; item ON_DISPLAY; estimated payout", roles: [Manager], code: 200, input: [], output: Consignment, side_effects: ["status = ACTIVE", "compute estimated_payout_cents", "item -> ON_DISPLAY"] }
+  - { method: POST, path: "/shop/consignments/{id}/markdown", description: "reduce an ACTIVE consignment's list_price_cents (markdown); resyncs the linked item's list_price. estimated_payout is NOT recomputed (it is pinned at ACTIVE), so actual payout at SOLD diverges.", roles: [Manager], code: 200, input: [new_list_price_cents], output: Consignment, side_effects: ["list_price_cents = new_list_price_cents", "linked InventoryItem.list_price_cents recomputed"] }
+  - { method: POST, path: "/shop/consignments/{id}/withdraw", description: "ACTIVE->WITHDRAWN; release slot; item AVAILABLE", roles: [Manager], code: 200, input: [], output: Consignment, side_effects: ["status = WITHDRAWN", "item -> AVAILABLE", "release slot"] }
+
+  # ---- Grading disputes (cyclic) --------------------------------
+  - { method: POST, path: "/shop/grading-disputes", description: "raise a grading dispute on a used copy", roles: [Customer], code: 201, input: [inventory_item_id, customer_id, claimed_grade], output: GradingDispute }
+  - { method: GET, path: "/shop/grading-disputes/{id}", description: "read a dispute", roles: [Customer, Grader, Manager], code: 200, input: [], output: GradingDispute }
+  - { method: GET, path: "/shop/grading-disputes", description: "list disputes; reverse-reachability for inventory_item_id, customer_id FKs", roles: [Customer, Grader, Manager], code: 200, input: ["inventory_item_id?", "customer_id?", "status?", "limit?", "offset?"], output: "GradingDispute[]" }
+  - { method: POST, path: "/shop/grading-disputes/{id}/start-review", description: "OPEN->UNDER_REVIEW", roles: [Grader], code: 200, input: [], output: GradingDispute }
+  - { method: POST, path: "/shop/grading-disputes/{id}/request-info", description: "UNDER_REVIEW->NEEDS_INFO", roles: [Grader], code: 200, input: [], output: GradingDispute }
+  - { method: POST, path: "/shop/grading-disputes/{id}/provide-info", description: "NEEDS_INFO->UNDER_REVIEW (cyclic)", roles: [Customer], code: 200, input: [], output: GradingDispute }
+  - { method: POST, path: "/shop/grading-disputes/{id}/escalate", description: "UNDER_REVIEW->ESCALATED", roles: [Grader], code: 200, input: [], output: GradingDispute }
+  - { method: POST, path: "/shop/grading-disputes/{id}/resolve-regrade", description: "->RESOLVED_REGRADE; regrade item; cascade price/order resync", roles: [Grader, Manager], code: 200, input: [resolution_grade], output: GradingDispute, side_effects: ["set resolution_grade", "InventoryItem.condition_grade updated", "list_price recomputed", "OrderLine/Order totals resynced if PENDING/RESERVED"] }
+  - { method: POST, path: "/shop/grading-disputes/{id}/resolve-uphold", description: "->RESOLVED_UPHELD; no change", roles: [Grader, Manager], code: 200, input: [], output: GradingDispute }
+
+  # ---- Special orders -------------------------------------------
+  - { method: POST, path: "/shop/special-orders", description: "request a special order (deposit non-refundable)", roles: [Customer], code: 201, input: [customer_id, description, "product_id?", "deposit_cents?"], output: SpecialOrder }
+  - { method: GET, path: "/shop/special-orders/{id}", description: "read a special order", roles: [Customer, StoreClerk, Manager], code: 200, input: [], output: SpecialOrder }
+  - { method: GET, path: "/shop/special-orders", description: "list special orders; reverse-reachability for customer_id, product_id FKs", roles: [Customer, StoreClerk, Manager], code: 200, input: ["customer_id?", "product_id?", "status?", "limit?", "offset?"], output: "SpecialOrder[]" }
+  - { method: POST, path: "/shop/special-orders/{id}/start-sourcing", description: "REQUESTED->SOURCING", roles: [StoreClerk], code: 200, input: [], output: SpecialOrder }
+  - { method: POST, path: "/shop/special-orders/{id}/mark-arrived", description: "SOURCING->ARRIVED; create AVAILABLE item if product_id set", roles: [StoreClerk], code: 200, input: [], output: SpecialOrder, side_effects: ["create InventoryItem for product_id"] }
+  - { method: POST, path: "/shop/special-orders/{id}/fulfill", description: "ARRIVED->FULFILLED", roles: [StoreClerk], code: 200, input: [], output: SpecialOrder }
+  - { method: POST, path: "/shop/special-orders/{id}/cancel", description: "cancel; forfeit deposit", roles: [Customer], code: 200, input: [], output: SpecialOrder, side_effects: ["deposit forfeited"] }
+
+  # ---- Test-driving: logical clock ------------------------------
+  - { method: POST, path: "/shop/_clock/set_current_utc", description: "set the server logical clock. Startup default is 2026-03-01T00:00:00Z; before any call the clock reads exactly this default and never falls back to wall-clock time.", roles: [Manager], code: 200, input: [to_iso8601], output: "{ current_utc: string }" }
+  - { method: POST, path: "/shop/_loyalty/adjust-points", description: "test-driving: directly set/add a customer's loyalty_points and recompute loyalty_tier, to reach a target tier without replaying many paid orders", roles: [Manager], code: 200, input: [customer_id, delta_points], output: Customer, side_effects: ["loyalty_points += delta_points", "recompute loyalty_tier"] }
+
+# =====================================================================
+# §1.6 Error Code Catalog
+# =====================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "missing/malformed X-User-Role or X-User-ID on a protected endpoint" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "acting role not permitted for this operation" }
+  - { id: ERR_NOT_RESOURCE_OWNER, http: 403, condition: "acting Customer/Consignor is not the owner of the targeted resource" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "referenced resource does not exist" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "missing required field, malformed body, or invalid enum value" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "resource not in a state permitting the requested transition" }
+  - { id: ERR_DEPENDENCY_NOT_READY, http: 409, condition: "cross-entity guard unmet (e.g., ship/fulfill before payment PAID)" }
+  - { id: ERR_INVALID_GRADE_FOR_NEW, http: 422, condition: "NEW inventory item graded outside {M, NM}" }
+  - { id: ERR_INSPECTION_INCOMPLETE, http: 422, condition: "trade-in approve attempted before every line has inspected_grade" }
+  - { id: ERR_PREORDER_WINDOW_CLOSED, http: 409, condition: "pre-order create outside half-open [window_open_at, window_close_at)" }
+  - { id: ERR_PICKUP_CAPACITY_EXCEEDED, http: 409, condition: "pre-order ready would exceed allocation.pickup_concurrency overlapping READY_FOR_PICKUP windows" }
+  - { id: ERR_ALLOCATION_EXHAUSTED, http: 409, condition: "allocation would go below zero and window is closed (cannot waitlist)" }
+  - { id: ERR_SLOT_OVERLAP, http: 409, condition: "consignment display booking overlaps another ACTIVE consignment on same slot within buffer" }
+  - { id: ERR_INSUFFICIENT_CREDIT, http: 402, condition: "store credit applied exceeds balance, or trade-in reverse cannot claw back full amount" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_allocation_version does not match current Allocation.version on pre-order create" }
+  - { id: ERR_SLOT_INACTIVE, http: 409, condition: "attempt to book a retired (is_active==false) DisplaySlot" }
+
+# =====================================================================
+# §1.7 RBAC Matrix
+# =====================================================================
+roles:
+  - name: Anonymous
+    description: "unauthenticated public catalog browser"
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations: ["register customer", "read products", "list catalog", "read inventory items"]
+
+  - name: Customer
+    description: "buyer/seller acting on own orders, trade-ins, pre-orders, disputes, special orders"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "open/pay-authorize/cancel own orders; add order lines"
+      - "open/submit/reverse-request own trade-ins; add trade-in lines"
+      - "create/cancel own pre-orders; provide dispute info"
+      - "raise grading disputes; create/cancel special orders"
+    shared_operations: ["read own orders/trade-ins/pre-orders/consignments/disputes/special-orders", "read catalog"]
+
+  - name: StoreClerk
+    description: "in-store operations: capture payment, ship/fulfill, ready pre-orders, source special orders, add inventory"
+    identity: "opaque"
+    exclusive_operations:
+      - "capture-payment, ship, fulfill orders"
+      - "ready/fulfill pre-orders"
+      - "start-sourcing/mark-arrived/fulfill special orders"
+      - "add inventory items"
+    shared_operations: ["create consignments", "read most resources", "cancel orders"]
+
+  - name: Grader
+    description: "grades trade-ins and adjudicates grading disputes"
+    identity: "opaque"
+    exclusive_operations:
+      - "start-inspection/approve/reject trade-ins; set inspected_grade"
+      - "start-review/request-info/escalate grading disputes"
+      - "resolve-regrade/resolve-uphold (non-escalated) disputes"
+    shared_operations: ["read trade-ins and disputes"]
+
+  - name: Manager
+    description: "catalog & allocation authority; consignment activation; trade-in reversal; escalated dispute resolution; credit adjustments"
+    identity: "opaque"
+    exclusive_operations:
+      - "create products/allocations/display-slots; list/open-preorders/discontinue products"
+      - "activate/withdraw consignments; reverse trade-ins"
+      - "resolve escalated disputes; credit adjustments; set logical clock"
+    shared_operations: ["create consignments", "create inventory items", "read all resources"]

@@ -1,0 +1,37 @@
+"""Domain thresholds — numeric constants from PRD calculations."""
+
+# Per-visit charge (PRD Section 3.6)
+SIZE_SURCHARGE = {"SMALL": 0, "MEDIUM": 1500, "LARGE": 3500}
+PET_SURCHARGE = 1000
+WEEKEND_MULTIPLIER = 1.25
+STANDARD_VISIT_MINUTES = 30
+MIN_DURATION_FACTOR = 0.5
+MAX_DURATION_FACTOR = 2.0
+
+# Invoice roll-up (PRD Section 3.9)
+DISCOUNT_TIER1_MIN = 20000
+DISCOUNT_TIER2_MIN = 50000
+DISCOUNT_TIER1_RATE = 0.05
+DISCOUNT_TIER2_RATE = 0.10
+SERVICE_FEE_RATE = 0.08
+TAX_RATE = 0.07
+
+# Incident liability exposure (PRD Section 3.7)
+SEVERITY_RESERVE = {"MINOR": 50000, "MAJOR": 200000, "EMERGENCY": 500000}
+
+# Sitter reliability (PRD Sections 2.10, 3.4)
+MISS_PENALTY = 20
+ESCALATION_PENALTY = 10
+MIN_RELIABILITY = 60
+INITIAL_RELIABILITY = 100
+
+# Property / geofence (PRD Sections 3.1, 3.6)
+DEFAULT_GEOFENCE_RADIUS_M = 150
+
+# Pagination (PRD Section 2.3)
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+
+# Logical clock startup default (PRD Section 2.5)
+CLOCK_STARTUP_DEFAULT = "2026-03-01T00:00:00Z"

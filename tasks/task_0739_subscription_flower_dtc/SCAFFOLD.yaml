@@ -1,0 +1,1349 @@
+scenario: "739. Subscription-Flower DTC (BloomsyBox style): subscription cadence & style/size, stem sourcing & cold-chain, recurring delivery & skip/pause, occasion/gift & message, substitution policy, vase add-on, churn/win-back, billing & renewal"
+domain_name: subscription-flower-dtc
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: workflow_orchestration      # fulfillment pipeline with skip/pause + sourcing/substitution branching
+  secondary_archetype: pricing_engine            # billing, renewal, proration-free tiered pricing, refunds
+  complexity_layers:
+    - dual_variant_calculation                   # refund estimate vs actual; stem reserved vs committed valuation
+    - cascading_side_effects                      # cancel -> shipment -> allocation -> lot; payment-fail -> billing -> shipment
+    - optimistic_concurrency                      # OCC on Subscription.version for /change
+    - scheduled_actions                           # recurring deliveries, skip cutoff, win-back window, cold-chain deadline
+
+  entity_topology: hybrid
+  # Subscription is the aggregate root over Shipment/Charge (tree); StemLot/CarrierRoute/SubstitutionRule
+  # are peer resources referenced by FK (flat cross-cutting); StemAllocation is a junction (Shipment x StemLot).
+
+  state_machine_shape: parallel
+  # Subscription carries two independent axes (lifecycle_status x billing_status); Shipment is branching
+  # (SOURCING -> {SOURCED, SUBSTITUTED}); Charge/StemAllocation/WinBackOffer are shorter machines.
+
+  relationship_patterns:
+    - one_to_many          # Customer->Subscription, Subscription->Shipment, Subscription->Charge, StemLot->StemAllocation
+    - many_to_many         # StemAllocation junctions Shipment <-> StemLot
+    - cross_aggregate      # Shipment->CarrierRoute, WalletEntry->Customer across aggregate boundaries
+
+  role_model: peer_roles
+  # Customer owns subscription lifecycle; FulfillmentOps owns sourcing/fulfillment; BillingAdmin owns money;
+  # PlatformAdmin owns configuration + clock. Non-overlapping resource ownership.
+
+  consistency_model: immediate
+  # All cascades (cancel, payment-fail, skip) settle synchronously within the triggering request.
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 Entity-Relationship Table
+# =====================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: "Account email; unique across customers."
+        constraints: "non-empty; unique"
+      - name: full_name
+        type: string
+        source: input
+        description: "Customer display name."
+      - name: default_zip
+        type: string
+        source: input
+        description: "Default delivery ZIP; optional."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Account status."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, CLOSED}"
+      - name: lifetime_cycles
+        type: integer
+        source: computed
+        description: "Count of Shipment rows for this customer's subscriptions with status=DELIVERED. Cross-entity computed."
+        default: 0
+      - name: loyalty_tier
+        type: enum
+        source: computed
+        description: "Derived from lifetime_cycles: BRONZE [0,2), SILVER [2,5), GOLD [5,inf). See calculations.loyalty_tier."
+        default: BRONZE
+        constraints: "one of {BRONZE, SILVER, GOLD}"
+      - name: wallet_credit_cents
+        type: integer
+        source: computed
+        description: "Sum of WalletEntry.amount_cents for this customer. See calculations.wallet_balance."
+        default: 0
+
+  - name: Plan
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Plan display name."
+      - name: cadence
+        type: enum
+        source: input
+        description: "Delivery cadence within a 30-day billing cycle."
+        constraints: "one of {WEEKLY, BIWEEKLY, MONTHLY}; drives DELIVERIES_PER_CYCLE {WEEKLY:4, BIWEEKLY:2, MONTHLY:1}"
+      - name: base_fee_cents
+        type: integer
+        source: input
+        description: "Monthly base fee in cents for this plan (before size/vase/discount)."
+        constraints: ">= 0"
+      - name: default_style
+        type: enum
+        source: input
+        description: "Default bouquet style."
+        default: ROUND
+        constraints: "one of {ROUND, GARDEN, EUROPEAN}"
+      - name: is_active
+        type: boolean
+        source: input
+        description: "Whether the plan can accept new subscriptions."
+        default: true
+
+  - name: Subscription
+    parent: Customer
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; owning customer."
+      - name: plan_id
+        type: string
+        source: input
+        description: "FK -> Plan.id; the plan this subscription follows."
+      - name: size
+        type: enum
+        source: input
+        description: "Bouquet size; drives SIZE_UPCHARGE_CENTS."
+        constraints: "one of {PETITE, ORIGINAL, DELUXE, GRAND}"
+      - name: style
+        type: enum
+        source: input
+        description: "Bouquet style."
+        default: ROUND
+        constraints: "one of {ROUND, GARDEN, EUROPEAN}"
+      - name: vase_addon
+        type: boolean
+        source: input
+        description: "Whether a vase add-on is included (adds VASE_UPCHARGE_CENTS)."
+        default: false
+      - name: is_gift
+        type: boolean
+        source: input
+        description: "Whether this subscription is a gift."
+        default: false
+      - name: occasion
+        type: string
+        source: input
+        description: "Optional occasion label applied to shipments."
+        default: null
+      - name: gift_message
+        type: string
+        source: input
+        description: "Optional gift message applied to shipments."
+        default: null
+      - name: lifecycle_status
+        type: enum
+        source: system
+        description: "Lifecycle axis (independent of billing_status)."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, PAUSED, CANCELLED, EXPIRED}"
+      - name: billing_status
+        type: enum
+        source: system
+        description: "Billing axis (independent of lifecycle_status)."
+        default: CURRENT
+        constraints: "one of {CURRENT, PAST_DUE}"
+      - name: current_cycle_index
+        type: integer
+        source: system
+        description: "1-based index of the current billing cycle."
+        default: 1
+      - name: next_renewal_date
+        type: datetime
+        source: system
+        description: "UTC instant the next renewal is due = start + CYCLE_DAYS*cycle."
+      - name: discount_pct
+        type: number
+        source: system
+        description: "Discount fraction applied to the NEXT renewal_price (0 normally; WINBACK_DISCOUNT_PCT after a win-back redeem, reset to 0 on renew)."
+        default: 0
+      - name: renewal_price_cents
+        type: integer
+        source: computed
+        description: "Current per-cycle price. See calculations.renewal_price."
+      - name: cancel_reason
+        type: string
+        source: input
+        description: "Reason captured at cancel; optional."
+        default: null
+
+  - name: Shipment
+    parent: Subscription
+    common_fields: true
+    fields:
+      - name: subscription_id
+        type: string
+        source: input
+        description: "FK -> Subscription.id; owning subscription."
+      - name: cycle_index
+        type: integer
+        source: system
+        description: "Billing cycle this delivery belongs to."
+      - name: scheduled_delivery_date
+        type: datetime
+        source: system
+        description: "UTC instant this delivery is scheduled = start + FIRST_LEAD_DAYS + CADENCE_SPACING_DAYS*k."
+      - name: status
+        type: enum
+        source: system
+        description: "Fulfillment state."
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, SKIPPED, SOURCING, SOURCED, SUBSTITUTED, SHIPPED, DELIVERED, CANCELLED}"
+      - name: occasion
+        type: string
+        source: system
+        description: "Copied from subscription at creation; optional."
+        default: null
+      - name: gift_message
+        type: string
+        source: system
+        description: "Copied from subscription at creation; optional."
+        default: null
+      - name: substitution_applied
+        type: boolean
+        source: system
+        description: "True iff confirmed via the SUBSTITUTED branch."
+        default: false
+      - name: route_id
+        type: string
+        source: system
+        description: "FK -> CarrierRoute.id; set at ship time; null until SHIPPED."
+        default: null
+      - name: delivery_window_start
+        type: datetime
+        source: system
+        description: "Booked delivery window start (half-open); set at ship time."
+        default: null
+      - name: delivery_window_end
+        type: datetime
+        source: system
+        description: "Booked delivery window end (exclusive); set at ship time."
+        default: null
+      - name: stem_cost_cents
+        type: integer
+        source: computed
+        description: "Total stem cost; set at confirm-sourced. See calculations.shipment_stem_cost."
+        default: null
+
+  - name: StemLot
+    parent: null
+    common_fields: true
+    fields:
+      - name: variety
+        type: string
+        source: input
+        description: "Flower variety (e.g. ROSE, TULIP)."
+      - name: grade
+        type: enum
+        source: input
+        description: "Quality grade."
+        constraints: "one of {A, B, C}"
+      - name: quantity_total
+        type: integer
+        source: input
+        description: "Stems originally received in this lot."
+        constraints: "> 0"
+      - name: unit_cost_cents
+        type: integer
+        source: input
+        description: "Wholesale cost per stem in cents."
+        constraints: ">= 0"
+      - name: sourced_at
+        type: datetime
+        source: input
+        description: "UTC instant the lot entered cold chain."
+      - name: shelf_life_hours
+        type: integer
+        source: input
+        description: "Cold-chain shelf life in hours."
+        constraints: "> 0"
+      - name: quantity_available
+        type: integer
+        source: computed
+        description: "quantity_total - sum(StemAllocation.quantity_reserved WHERE status IN {RESERVED, COMMITTED}). See calculations.stem_availability."
+      - name: usable_until
+        type: datetime
+        source: computed
+        description: "sourced_at + shelf_life_hours. See calculations.cold_chain_deadline."
+      - name: cold_chain_state
+        type: enum
+        source: computed
+        description: "FRESH while clock < usable_until, else EXPIRED (>= boundary is EXPIRED). See calculations.cold_chain_deadline."
+        constraints: "one of {FRESH, EXPIRED}"
+
+  - name: StemAllocation
+    parent: Shipment
+    common_fields: true
+    fields:
+      - name: shipment_id
+        type: string
+        source: input
+        description: "FK -> Shipment.id; the shipment consuming these stems."
+      - name: lot_id
+        type: string
+        source: input
+        description: "FK -> StemLot.id; the lot supplying stems."
+      - name: quantity_reserved
+        type: integer
+        source: input
+        description: "Stems held from the lot for this shipment."
+        constraints: "> 0"
+      - name: hold_start
+        type: datetime
+        source: input
+        description: "Start of the exclusive cold-room hold window on the lot (closed interval)."
+      - name: hold_end
+        type: datetime
+        source: input
+        description: "End of the exclusive cold-room hold window on the lot (closed interval)."
+      - name: status
+        type: enum
+        source: system
+        description: "Allocation state."
+        default: RESERVED
+        constraints: "one of {RESERVED, COMMITTED, RELEASED}"
+      - name: reserved_value_cents
+        type: integer
+        source: computed
+        description: "Provisional value at RESERVE time. See calculations.stem_valuation (reserved variant)."
+      - name: committed_value_cents
+        type: integer
+        source: computed
+        description: "Final value at COMMIT time, shrinkage-adjusted for age. See calculations.stem_valuation (committed variant); null until COMMITTED."
+        default: null
+
+  - name: CarrierRoute
+    parent: null
+    common_fields: true
+    fields:
+      - name: zone
+        type: string
+        source: input
+        description: "Delivery zone label."
+      - name: service_date
+        type: datetime
+        source: input
+        description: "UTC calendar date this route runs (deliveries booked into windows on this route/date)."
+
+  - name: Charge
+    parent: Subscription
+    common_fields: true
+    fields:
+      - name: subscription_id
+        type: string
+        source: input
+        description: "FK -> Subscription.id; the billed subscription."
+      - name: cycle_index
+        type: integer
+        source: system
+        description: "Billing cycle this charge covers."
+      - name: kind
+        type: enum
+        source: system
+        description: "Charge kind."
+        default: RENEWAL
+        constraints: "one of {RENEWAL, UPCHARGE}"
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Charge amount in cents (equal to subscription.renewal_price_cents at cycle open)."
+      - name: status
+        type: enum
+        source: system
+        description: "Payment state."
+        default: PENDING
+        constraints: "one of {PENDING, CAPTURED, FAILED, REFUNDED}"
+      - name: refunded_cents
+        type: integer
+        source: system
+        description: "Cumulative amount refunded; status flips to REFUNDED only when refunded_cents == amount_cents."
+        default: 0
+
+  - name: WalletEntry
+    parent: Customer
+    common_fields: false
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; owning customer."
+      - name: amount_cents
+        type: integer
+        source: system
+        description: "Signed cents; positive is a credit to the customer."
+      - name: reason
+        type: enum
+        source: system
+        description: "Origin of the entry."
+        constraints: "one of {REFUND, SKIP_CREDIT, ADJUSTMENT}"
+      - name: related_charge_id
+        type: string
+        source: system
+        description: "Non-FK reference: id of the Charge that produced this entry, when applicable; null otherwise (append-only, not reverse-queried)."
+        default: null
+
+  - name: WinBackOffer
+    parent: Customer
+    common_fields: true
+    fields:
+      - name: customer_id
+        type: string
+        source: input
+        description: "FK -> Customer.id; offer recipient."
+      - name: discount_pct
+        type: number
+        source: system
+        description: "Discount fraction granted on reactivation (WINBACK_DISCOUNT_PCT)."
+      - name: expires_at
+        type: datetime
+        source: system
+        description: "UTC instant after which the offer can no longer be redeemed (= cancel time + WINBACK_WINDOW_DAYS)."
+      - name: status
+        type: enum
+        source: system
+        description: "Offer state."
+        default: OFFERED
+        constraints: "one of {OFFERED, REDEEMED, EXPIRED}"
+
+  - name: SubstitutionRule
+    parent: null
+    common_fields: false
+    fields:
+      - name: from_variety
+        type: string
+        source: input
+        description: "Ordered variety being substituted away from."
+      - name: to_variety
+        type: string
+        source: input
+        description: "Variety substituted in."
+      - name: allowed
+        type: boolean
+        source: input
+        description: "Whether this substitution is permitted."
+        default: true
+      - name: max_substitution_pct
+        type: number
+        source: input
+        description: "Max fraction of a shipment that may be substituted under this rule."
+        default: 0.5
+      - name: quality_floor_grade
+        type: enum
+        source: input
+        description: "Minimum acceptable grade for the substitute."
+        default: B
+        constraints: "one of {A, B, C}"
+
+# =====================================================================
+# §1.2 State Machine Table
+# =====================================================================
+state_machines:
+  - entity: Subscription
+    initial_state: "lifecycle_status=ACTIVE, billing_status=CURRENT"
+    terminal_states: ["lifecycle_status=EXPIRED"]
+    note: "PARALLEL DIMENSIONS: lifecycle_status and billing_status evolve independently on the same row (Rule 3)."
+    transitions:
+      # ---- lifecycle axis ----
+      - from: "lifecycle=ACTIVE"
+        to: "lifecycle=PAUSED"
+        trigger: "POST /subscriptions/{id}/pause"
+        actor: Customer
+        preconditions: ["lifecycle_status == ACTIVE", "acting customer owns subscription"]
+        side_effects: ["set paused_until if resume_date given", "increments Subscription.version by 1"]
+      - from: "lifecycle=PAUSED"
+        to: "lifecycle=ACTIVE"
+        trigger: "POST /subscriptions/{id}/resume"
+        actor: Customer
+        preconditions: ["lifecycle_status == PAUSED", "acting customer owns subscription"]
+        side_effects: ["clear paused_until", "increments Subscription.version by 1"]
+      - from: "lifecycle IN {ACTIVE, PAUSED}"
+        to: "lifecycle=CANCELLED"
+        trigger: "POST /subscriptions/{id}/cancel"
+        actor: Customer
+        preconditions: ["lifecycle_status IN {ACTIVE, PAUSED}", "acting customer owns subscription"]
+        side_effects:
+          - "CASCADE (Rule 4, depth 3): every non-terminal Shipment of this subscription (status IN {SCHEDULED, SOURCING, SOURCED, SUBSTITUTED}) transitions to CANCELLED"
+          - "each cancelled Shipment releases its RESERVED/COMMITTED StemAllocations (status -> RELEASED)"
+          - "each released StemAllocation restores StemLot.quantity_available (calculations.stem_availability recomputes)"
+          - "compute actual cancellation refund (calculations.cancellation_refund actual variant) and, if refund_destination=WALLET, create a WalletEntry(reason=REFUND) and increment matching CAPTURED Charge.refunded_cents"
+          - "create a WinBackOffer(status=OFFERED, discount_pct=WINBACK_DISCOUNT_PCT, expires_at=now+WINBACK_WINDOW_DAYS)"
+          - "increments Subscription.version by 1"
+      - from: "lifecycle=CANCELLED"
+        to: "lifecycle=ACTIVE"
+        trigger: "POST /win-back-offers/{id}/redeem"
+        actor: Customer
+        preconditions:
+          - "target Subscription.lifecycle_status == CANCELLED"
+          - "WinBackOffer.status == OFFERED"
+          - "now <= WinBackOffer.expires_at (business_temporal)"
+          - "WinBackOffer.customer_id == acting customer AND body.subscription_id belongs to acting customer (business_referential)"
+        side_effects:
+          - "WinBackOffer.status -> REDEEMED"
+          - "set Subscription.discount_pct = WinBackOffer.discount_pct (applies to next renewal_price)"
+          - "recompute Subscription.renewal_price_cents (calculations.renewal_price)"
+          - "increments Subscription.version by 1"
+        note: "CYCLIC: CANCELLED -> ACTIVE (Rule 3 cyclic on lifecycle axis)."
+      - from: "lifecycle=CANCELLED"
+        to: "lifecycle=EXPIRED"
+        trigger: "system: any outstanding WinBackOffer has expires_at <= clock and is marked EXPIRED"
+        actor: system
+        preconditions: ["lifecycle_status == CANCELLED", "no OFFERED WinBackOffer with expires_at > clock"]
+        side_effects: ["WinBackOffer.status -> EXPIRED"]
+        note: "Terminal; observed lazily on read after clock advances past expires_at."
+      # ---- billing axis (parallel) ----
+      - from: "billing=CURRENT"
+        to: "billing=PAST_DUE"
+        trigger: "POST /charges/{id}/simulate-payment {outcome:FAILED}"
+        actor: BillingAdmin
+        preconditions: ["Charge.status == PENDING", "Charge.subscription_id == this subscription"]
+        side_effects:
+          - "Charge.status -> FAILED"
+          - "CASCADE (Rule 4, depth 2): Subscription.billing_status -> PAST_DUE; that PAST_DUE flip cancels every current-cycle Shipment with status == SCHEDULED (-> CANCELLED)"
+          - "increments Subscription.version by 1"
+      - from: "billing=PAST_DUE"
+        to: "billing=CURRENT"
+        trigger: "POST /charges/{id}/simulate-payment {outcome:SUCCEEDED} on a retry PENDING charge"
+        actor: BillingAdmin
+        preconditions: ["Charge.status == PENDING", "Charge.subscription_id == this subscription"]
+        side_effects: ["Charge.status -> CAPTURED", "Subscription.billing_status -> CURRENT", "increments Subscription.version by 1"]
+
+  - entity: Shipment
+    initial_state: SCHEDULED
+    terminal_states: [SKIPPED, DELIVERED, CANCELLED]
+    note: "BRANCHING fork-join: SOURCING -> {SOURCED, SUBSTITUTED} -> SHIPPED, with divergent side effects per branch (Rule 3)."
+    transitions:
+      - from: SCHEDULED
+        to: SKIPPED
+        trigger: "POST /shipments/{id}/skip"
+        actor: Customer
+        preconditions:
+          - "status == SCHEDULED (else ERR_SHIPMENT_NOT_SKIPPABLE)"
+          - "acting customer owns the subscription"
+          - "now <= scheduled_delivery_date - SKIP_CUTOFF_HOURS (business_temporal; boundary inclusive)"
+        side_effects:
+          - "release any RESERVED StemAllocations of this shipment (-> RELEASED), restoring StemLot.quantity_available"
+          - "create WalletEntry(reason=SKIP_CREDIT, amount_cents=+per_shipment_value) crediting the customer"
+      - from: SCHEDULED
+        to: SOURCING
+        trigger: "POST /shipments/{id}/source"
+        actor: FulfillmentOps
+        preconditions:
+          - "status == SCHEDULED"
+          - "CROSS-ENTITY (Rule 7 pair 1): Subscription.lifecycle_status == ACTIVE AND Subscription.billing_status == CURRENT (else ERR_SUBSCRIPTION_NOT_ACTIVE)"
+        side_effects: ["shipment ready to accept StemAllocations"]
+      - from: SOURCING
+        to: SOURCED
+        trigger: "POST /shipments/{id}/confirm-sourced {substitution_applied:false}"
+        actor: FulfillmentOps
+        preconditions:
+          - "status == SOURCING"
+          - "CROSS-ENTITY (Rule 7 pair 2): every RESERVED StemAllocation's StemLot.cold_chain_state == FRESH (else ERR_LOT_EXPIRED)"
+        side_effects:
+          - "BRANCH A: each RESERVED StemAllocation -> COMMITTED; set committed_value_cents (calculations.stem_valuation committed variant)"
+          - "compute Shipment.stem_cost_cents (calculations.shipment_stem_cost)"
+          - "substitution_applied stays false"
+      - from: SOURCING
+        to: SUBSTITUTED
+        trigger: "POST /shipments/{id}/confirm-sourced {substitution_applied:true, from_variety, to_variety}"
+        actor: FulfillmentOps
+        preconditions:
+          - "status == SOURCING"
+          - "every RESERVED StemAllocation's StemLot.cold_chain_state == FRESH (else ERR_LOT_EXPIRED)"
+          - "a SubstitutionRule(from_variety, to_variety, allowed=true) exists (else ERR_SUBSTITUTION_NOT_ALLOWED)"
+        side_effects:
+          - "BRANCH B: each RESERVED StemAllocation -> COMMITTED; set committed_value_cents"
+          - "compute Shipment.stem_cost_cents (calculations.shipment_stem_cost)"
+          - "set substitution_applied = true (divergent side effect vs BRANCH A)"
+      - from: "SOURCED | SUBSTITUTED"
+        to: SHIPPED
+        trigger: "POST /shipments/{id}/ship {route_id, delivery_window_start, delivery_window_end}"
+        actor: FulfillmentOps
+        preconditions:
+          - "status IN {SOURCED, SUBSTITUTED}"
+          - "CarrierRoute exists"
+          - "delivery window [start,end) does not overlap another SHIPPED shipment's window on the same route (Rule 8; half-open, adjacency allowed) else ERR_ROUTE_WINDOW_CONFLICT"
+        side_effects: ["set route_id, delivery_window_start, delivery_window_end"]
+      - from: SHIPPED
+        to: DELIVERED
+        trigger: "POST /shipments/{id}/deliver"
+        actor: FulfillmentOps
+        preconditions: ["status == SHIPPED"]
+        side_effects:
+          - "increment Customer.lifetime_cycles by 1; recompute Customer.loyalty_tier (calculations.loyalty_tier)"
+      - from: "SCHEDULED | SOURCING | SOURCED | SUBSTITUTED"
+        to: CANCELLED
+        trigger: "system: cascade from Subscription cancel, or from billing PAST_DUE flip (SCHEDULED only)"
+        actor: system
+        preconditions: ["status non-terminal"]
+        side_effects: ["release RESERVED/COMMITTED StemAllocations (-> RELEASED), restoring StemLot.quantity_available"]
+
+  - entity: StemAllocation
+    initial_state: RESERVED
+    terminal_states: [RELEASED]
+    transitions:
+      - from: RESERVED
+        to: COMMITTED
+        trigger: "POST /shipments/{id}/confirm-sourced (owning shipment)"
+        actor: FulfillmentOps
+        preconditions:
+          - "status == RESERVED"
+          - "CROSS-ENTITY (Rule 7 pair 2): StemLot.cold_chain_state == FRESH (else ERR_LOT_EXPIRED)"
+        side_effects: ["set committed_value_cents (calculations.stem_valuation committed variant)"]
+      - from: "RESERVED | COMMITTED"
+        to: RELEASED
+        trigger: "system: shipment SKIP/CANCEL cascade"
+        actor: system
+        preconditions: ["status IN {RESERVED, COMMITTED}"]
+        side_effects: ["restore StemLot.quantity_available by quantity_reserved (Rule 9 stem conservation)"]
+
+  - entity: Charge
+    initial_state: PENDING
+    terminal_states: [FAILED, REFUNDED]
+    transitions:
+      - from: PENDING
+        to: CAPTURED
+        trigger: "POST /charges/{id}/simulate-payment {outcome:SUCCEEDED}"
+        actor: BillingAdmin
+        preconditions: ["status == PENDING"]
+        side_effects: ["if subscription billing_status was PAST_DUE and this clears it, Subscription.billing_status -> CURRENT"]
+      - from: PENDING
+        to: FAILED
+        trigger: "POST /charges/{id}/simulate-payment {outcome:FAILED}"
+        actor: BillingAdmin
+        preconditions: ["status == PENDING"]
+        side_effects: ["Subscription.billing_status -> PAST_DUE (cascade, see Subscription billing axis)"]
+      - from: CAPTURED
+        to: REFUNDED
+        trigger: "POST /charges/{id}/refund {amount_cents} (full) or cancel cascade full refund"
+        actor: "BillingAdmin | system"
+        preconditions:
+          - "status == CAPTURED"
+          - "refunded_cents + amount_cents <= amount_cents (business_fiscal; else ERR_REFUND_EXCEEDS_CAPTURED)"
+        side_effects:
+          - "increment refunded_cents by amount_cents; if refunded_cents == amount_cents set status=REFUNDED"
+          - "create WalletEntry(reason=REFUND, amount_cents=+amount_cents) (Rule 9 money conservation)"
+        note: "Partial refund leaves status=CAPTURED with refunded_cents > 0."
+
+  - entity: WinBackOffer
+    initial_state: OFFERED
+    terminal_states: [REDEEMED, EXPIRED]
+    transitions:
+      - from: OFFERED
+        to: REDEEMED
+        trigger: "POST /win-back-offers/{id}/redeem {subscription_id}"
+        actor: Customer
+        preconditions:
+          - "status == OFFERED (else ERR_OFFER_NOT_REDEEMABLE)"
+          - "WinBackOffer.customer_id == acting customer AND body.subscription_id owned by acting customer (else ERR_OFFER_NOT_OWNED)"
+          - "now <= expires_at (else ERR_OFFER_EXPIRED)"
+          - "target subscription.lifecycle_status == CANCELLED"
+        side_effects: ["reactivate subscription (lifecycle CANCELLED -> ACTIVE)", "set subscription.discount_pct = discount_pct"]
+      - from: OFFERED
+        to: EXPIRED
+        trigger: "system: clock advances past expires_at"
+        actor: system
+        preconditions: ["status == OFFERED", "clock > expires_at"]
+        side_effects: ["offer no longer redeemable"]
+
+concurrency_rules:
+  - rule_id: change-stale-subscription
+    parent_entity: Subscription
+    write_endpoint: "POST /subscriptions/{id}/change"
+    occ_field: "expected_subscription_version"
+    description: |
+      Applying a plan/size/vase change against a Subscription whose version has
+      advanced since the client last observed it is rejected. A prior change (or
+      any cascade that bumped the subscription's version) legitimately supersedes
+      the config the current writer based its request on, so the stale-version
+      request must not silently overwrite it.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 Calculation Rules Table
+# =====================================================================
+calculations:
+  - name: renewal_price
+    trigger: "on POST /subscriptions (create), POST /subscriptions/{id}/change, and win-back redeem; recomputes Subscription.renewal_price_cents"
+    algorithm: threshold
+    formula: |
+      gross = plan.base_fee_cents
+            + SIZE_UPCHARGE_CENTS[size]
+            + (VASE_UPCHARGE_CENTS if vase_addon else 0)
+      raw_discount = round_half_up(gross * subscription.discount_pct)
+      applied_discount = min(raw_discount, MAX_DISCOUNT_CENTS)         # nested min (cap)
+      net = max(gross - applied_discount, MIN_PRICE_CENTS)             # nested max (floor)
+      renewal_price_cents = net
+    input_set: "single subscription's plan.base_fee_cents, size, vase_addon, discount_pct"
+    constants:
+      SIZE_UPCHARGE_CENTS: { PETITE: 0, ORIGINAL: 0, DELUXE: 1500, GRAND: 3000 }
+      VASE_UPCHARGE_CENTS: 1200
+      MAX_DISCOUNT_CENTS: 1000
+      MIN_PRICE_CENTS: 2000
+    precision: "integer cents, round_half_up"
+    note: "Rule 2 mode (a): >=3 inputs with non-linear nested min/max interaction."
+
+  - name: per_shipment_value
+    trigger: "used by cancellation_refund and skip credit"
+    algorithm: aggregation
+    formula: |
+      per_shipment_value_cents = round_half_up(subscription.renewal_price_cents / DELIVERIES_PER_CYCLE[plan.cadence])
+    input_set: "single subscription"
+    constants:
+      DELIVERIES_PER_CYCLE: { WEEKLY: 4, BIWEEKLY: 2, MONTHLY: 1 }
+    precision: "integer cents, round_half_up"
+
+  - name: cancellation_refund
+    trigger: "estimate: GET /subscriptions/{id}/cancel-preview; actual: POST /subscriptions/{id}/cancel"
+    algorithm: aggregation
+    formula: |
+      # estimate (provisional) — inclusion set is every current-cycle shipment not yet DELIVERED/CANCELLED:
+      estimate = per_shipment_value * count(Shipment WHERE subscription_id=S AND cycle_index=current_cycle_index
+                                            AND status NOT IN {DELIVERED, CANCELLED})
+      # actual (final) — inclusion set restricts to shipments whose stems were never committed:
+      actual   = per_shipment_value * count(Shipment WHERE subscription_id=S AND cycle_index=current_cycle_index
+                                            AND status IN {SCHEDULED, SKIPPED})
+    input_set: "current-cycle shipments; ordered by (cycle_index, scheduled_delivery_date, created_at) — id never used"
+    variants:
+      - name: estimate
+        when: "cancel-preview (before ops state is finalized)"
+        difference: "includes SOURCING/SOURCED/SUBSTITUTED shipments as refundable"
+      - name: actual
+        when: "cancel commit"
+        difference: "excludes any shipment past SCHEDULED whose stems are committed/in-progress (SOURCING+)"
+    precision: "integer cents"
+    note: "Rule 1 dual-variant on the Subscription/Charge domain; same data, two inclusion algorithms diverge."
+
+  - name: stem_valuation
+    trigger: "reserved variant on POST /shipments/{id}/allocations; committed variant on confirm-sourced"
+    algorithm: decay_function
+    formula: |
+      base = quantity_reserved * lot.unit_cost_cents
+      age_hours(at_time) = floor_hours(at_time - lot.sourced_at)
+      shrinkage(at_time) = 0.0            if age_hours(at_time) <  FRESH_HOURS
+                          = SHRINKAGE_PCT if FRESH_HOURS <= age_hours(at_time) and lot.cold_chain_state == FRESH
+      reserved_value_cents  = round_half_up(base * (1 - shrinkage(reserve_time)))
+      committed_value_cents = round_half_up(base * (1 - shrinkage(commit_time)))
+    input_set: "single StemAllocation + its StemLot"
+    constants:
+      FRESH_HOURS: 24
+      SHRINKAGE_PCT: 0.15
+    precision: "integer cents, round_half_up"
+    variants:
+      - name: reserved
+        when: "at RESERVE (allocation create)"
+        difference: "shrinkage evaluated at reserve_time (usually age 0 -> full value)"
+      - name: committed
+        when: "at COMMIT (confirm-sourced)"
+        difference: "shrinkage re-evaluated at commit_time; aged lots lose SHRINKAGE_PCT"
+    note: "Rule 1 dual-variant on the StemAllocation/StemLot domain (different domain from cancellation_refund)."
+
+  - name: shipment_stem_cost
+    trigger: "on POST /shipments/{id}/confirm-sourced; sets Shipment.stem_cost_cents"
+    algorithm: aggregation
+    formula: |
+      # ROUNDING ORDER IS PINNED: round each committed allocation line, THEN sum.
+      stem_cost_cents = sum over COMMITTED StemAllocations a of
+                          round_half_up(a.committed_value_cents * STEM_MARKUP)
+      # (contrast bulk order round_half_up(sum(committed_value)*STEM_MARKUP) is NOT used)
+    input_set: "COMMITTED StemAllocations of the shipment, ordered by created_at (id never used)"
+    constants:
+      STEM_MARKUP: 1.375
+    precision: "integer cents, round_half_up per line then integer sum"
+    note: "Rule 2 mode (b): round-per-line-then-sum vs sum-then-round diverge; the per-line order is pinned."
+
+  - name: stem_availability
+    trigger: "recomputed on allocation reserve/release/commit"
+    algorithm: aggregation
+    formula: |
+      quantity_available = quantity_total
+                         - sum(StemAllocation.quantity_reserved WHERE lot_id=L AND status IN {RESERVED, COMMITTED})
+    input_set: "StemAllocations of a lot filtered to status IN {RESERVED, COMMITTED}"
+    precision: "integer stems"
+    note: "Rule 9 conserved quantity = stems: quantity_total == quantity_available + sum(active allocations)."
+
+  - name: wallet_balance
+    trigger: "recomputed on WalletEntry create; exposed as Customer.wallet_credit_cents"
+    algorithm: aggregation
+    formula: |
+      wallet_credit_cents = sum(WalletEntry.amount_cents WHERE customer_id=C)
+    input_set: "all WalletEntry of a customer"
+    precision: "integer cents"
+    note: "Rule 9 conserved quantity = money: wallet_credit_cents == sum(WalletEntry.amount_cents)."
+
+  - name: cold_chain_deadline
+    trigger: "computed on read of StemLot"
+    algorithm: threshold
+    formula: |
+      usable_until = lot.sourced_at + hours(lot.shelf_life_hours)
+      cold_chain_state = FRESH  if clock <  usable_until
+                       = EXPIRED if clock >= usable_until      # >= boundary is EXPIRED
+    input_set: "single StemLot + logical clock"
+    precision: "instant comparison at second granularity"
+    note: "Rule 6 boundary (time): EXPIRED at exactly usable_until (inclusive)."
+
+  - name: loyalty_tier
+    trigger: "recomputed when Customer.lifetime_cycles changes (on shipment DELIVERED)"
+    algorithm: threshold
+    formula: |
+      loyalty_tier = BRONZE if lifetime_cycles <  2
+                   = SILVER if 2 <= lifetime_cycles < 5
+                   = GOLD   if lifetime_cycles >= 5
+    input_set: "single customer lifetime_cycles"
+    constants:
+      SILVER_MIN: 2
+      GOLD_MIN: 5
+    precision: "integer count thresholds"
+
+# =====================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =====================================================================
+validations:
+  - priority: 10
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 20
+    category: auth
+    check: "acting role is listed in the endpoint's roles"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+  - priority: 30
+    category: existence
+    check: "every path-referenced resource exists, validated left-to-right"
+    error_id: "ERR_<RESOURCE>_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with path ids"
+  - priority: 35
+    category: business_constraint
+    check: "body is well-formed: required fields present, enums valid, numbers in range, pagination limit in [1,100] and offset >= 0"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints and list endpoints"
+  - priority: 40
+    category: state
+    check: "target resource is in a valid state for the transition (state-machine from: matches); includes cross-entity state preconditions (source requires Subscription ACTIVE+CURRENT -> ERR_SUBSCRIPTION_NOT_ACTIVE; commit requires StemLot FRESH -> ERR_LOT_EXPIRED)"
+    error_id: "ERR_INVALID_STATE | ERR_SHIPMENT_NOT_SKIPPABLE | ERR_OFFER_NOT_REDEEMABLE | ERR_SUBSCRIPTION_NOT_ACTIVE | ERR_LOT_EXPIRED"
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 45
+    category: business_constraint
+    check: "OCC: expected_subscription_version equals current Subscription.version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /subscriptions/{id}/change"
+  - priority: 50
+    category: business_referential
+    check: "acting Customer owns the resource (subscription.customer_id / shipment's subscription / offer.customer_id == X-User-ID; redeem body.subscription_id owned by caller)"
+    error_id: "ERR_NOT_OWNER | ERR_OFFER_NOT_OWNED"
+    http_status: 403
+    applies_to: "Customer-scoped endpoints (pause, resume, change, cancel, skip, cancel-preview, redeem)"
+  - priority: 55
+    category: business_temporal
+    check: "time-window checks: skip only while now <= scheduled_delivery_date - SKIP_CUTOFF_HOURS; redeem only while now <= offer.expires_at"
+    error_id: "ERR_SKIP_WINDOW_CLOSED | ERR_OFFER_EXPIRED"
+    http_status: 422
+    applies_to: "POST /shipments/{id}/skip, POST /win-back-offers/{id}/redeem"
+  - priority: 60
+    category: business_constraint
+    check: "resource constraints: stem availability (quantity_reserved <= lot.quantity_available), route window non-overlap, lot hold non-overlap+buffer, substitution policy"
+    error_id: "ERR_INSUFFICIENT_STEMS | ERR_ROUTE_WINDOW_CONFLICT | ERR_LOT_HOLD_CONFLICT | ERR_SUBSTITUTION_NOT_ALLOWED"
+    http_status: 422
+    applies_to: "POST /shipments/{id}/allocations, POST /shipments/{id}/ship, POST /shipments/{id}/confirm-sourced"
+  - priority: 65
+    category: business_fiscal
+    check: "fiscal rules: operation blocked while Subscription.billing_status == PAST_DUE (change); refund amount <= captured minus already refunded"
+    error_id: "ERR_BILLING_PAST_DUE | ERR_REFUND_EXCEEDS_CAPTURED"
+    http_status: 402
+    applies_to: "POST /subscriptions/{id}/change, POST /charges/{id}/refund"
+
+# =====================================================================
+# §1.5 API Endpoint Table
+# =====================================================================
+endpoints:
+  # ---- configuration (PlatformAdmin) ----
+  - method: POST
+    path: "/plans"
+    description: "Create a subscription plan."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [name, cadence, base_fee_cents, "default_style?", "is_active?"]
+    output: Plan
+    side_effects: []
+  - method: POST
+    path: "/carrier-routes"
+    description: "Create a delivery route for a zone/service_date."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [zone, service_date]
+    output: CarrierRoute
+    side_effects: []
+  - method: GET
+    path: "/carrier-routes/{id}"
+    description: "Fetch a carrier route."
+    roles: [PlatformAdmin, FulfillmentOps]
+    code: 200
+    input: []
+    output: CarrierRoute
+    side_effects: []
+  - method: GET
+    path: "/carrier-routes/{id}/shipments"
+    description: "List shipments booked on a route (reverse-reachability for Shipment.route_id)."
+    roles: [PlatformAdmin, FulfillmentOps]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Shipment[]
+    side_effects: []
+  - method: POST
+    path: "/substitution-rules"
+    description: "Create a substitution policy rule."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [from_variety, to_variety, "allowed?", "max_substitution_pct?", "quality_floor_grade?"]
+    output: SubstitutionRule
+    side_effects: []
+  - method: GET
+    path: "/substitution-rules"
+    description: "List substitution rules, optionally filtered by from_variety."
+    roles: [PlatformAdmin, FulfillmentOps]
+    code: 200
+    input: ["from_variety?", "limit?", "offset?"]
+    output: SubstitutionRule[]
+    side_effects: []
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving: set the logical clock. Server startup default is 2026-03-01T00:00:00Z; before any call the clock reads exactly this default and never falls back to wall-clock time."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["advances logical clock; recomputes cold_chain_state / temporal gates on read"]
+
+  # ---- customers ----
+  - method: POST
+    path: "/customers"
+    description: "Create a customer account."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [email, full_name, "default_zip?"]
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/customers/{id}"
+    description: "Fetch a customer (includes computed lifetime_cycles, loyalty_tier, wallet_credit_cents)."
+    roles: [Customer, PlatformAdmin, BillingAdmin]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+  - method: GET
+    path: "/customers/{id}/wallet-entries"
+    description: "List a customer's wallet entries (reverse-reachability for WalletEntry.customer_id)."
+    roles: [Customer, BillingAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WalletEntry[]
+    side_effects: []
+  - method: GET
+    path: "/customers/{id}/win-back-offers"
+    description: "List a customer's win-back offers (reverse-reachability for WinBackOffer.customer_id)."
+    roles: [Customer, BillingAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: WinBackOffer[]
+    side_effects: []
+
+  # ---- subscriptions ----
+  - method: POST
+    path: "/subscriptions"
+    description: "Create a subscription; opens cycle 1."
+    roles: [Customer, PlatformAdmin]
+    code: 201
+    input: [customer_id, plan_id, size, "style?", "vase_addon?", "is_gift?", "occasion?", "gift_message?", "start_date?"]
+    output: Subscription
+    side_effects:
+      - "compute renewal_price_cents (calculations.renewal_price)"
+      - "create Charge(kind=RENEWAL, status=PENDING, cycle_index=1, amount_cents=renewal_price_cents)"
+      - "create DELIVERIES_PER_CYCLE[cadence] Shipments (status=SCHEDULED, cycle_index=1) at start+FIRST_LEAD_DAYS+CADENCE_SPACING_DAYS*k"
+      - "set next_renewal_date = start + CYCLE_DAYS"
+  - method: GET
+    path: "/subscriptions"
+    description: "List subscriptions, filterable (reverse-reachability for Subscription.customer_id and Subscription.plan_id)."
+    roles: [Customer, PlatformAdmin, BillingAdmin]
+    code: 200
+    input: ["customer_id?", "plan_id?", "status?", "limit?", "offset?"]
+    output: Subscription[]
+    side_effects: []
+  - method: GET
+    path: "/subscriptions/{id}"
+    description: "Fetch a subscription (includes computed renewal_price_cents, version, both status axes)."
+    roles: [Customer, PlatformAdmin, BillingAdmin]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects: []
+  - method: GET
+    path: "/subscriptions/{id}/shipments"
+    description: "List shipments of a subscription ordered by (cycle_index, scheduled_delivery_date, created_at) asc (reverse-reachability for Shipment.subscription_id)."
+    roles: [Customer, FulfillmentOps, PlatformAdmin]
+    code: 200
+    input: ["status?", "cycle_index?", "limit?", "offset?"]
+    output: Shipment[]
+    side_effects: []
+  - method: GET
+    path: "/subscriptions/{id}/charges"
+    description: "List charges of a subscription ordered by (cycle_index, created_at) asc (reverse-reachability for Charge.subscription_id)."
+    roles: [Customer, BillingAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Charge[]
+    side_effects: []
+  - method: POST
+    path: "/subscriptions/{id}/pause"
+    description: "Pause an active subscription (lifecycle ACTIVE->PAUSED)."
+    roles: [Customer]
+    code: 200
+    input: ["resume_date?"]
+    output: Subscription
+    side_effects: ["set paused_until", "increments Subscription.version by 1"]
+  - method: POST
+    path: "/subscriptions/{id}/resume"
+    description: "Resume a paused subscription (lifecycle PAUSED->ACTIVE)."
+    roles: [Customer]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects: ["clear paused_until", "increments Subscription.version by 1"]
+  - method: POST
+    path: "/subscriptions/{id}/change"
+    description: "Change size/style/vase/plan; OCC-guarded; recomputes renewal_price for next renewal."
+    roles: [Customer]
+    code: 200
+    input: ["size?", "style?", "vase_addon?", "plan_id?", expected_subscription_version]
+    output: Subscription
+    side_effects: ["recompute renewal_price_cents", "increments Subscription.version by 1"]
+  - method: POST
+    path: "/subscriptions/{id}/cancel"
+    description: "Cancel a subscription; cascades to shipments/allocations/lots, refunds current cycle, issues win-back offer."
+    roles: [Customer]
+    code: 200
+    input: ["reason?", "refund_destination?"]
+    output: Subscription
+    side_effects:
+      - "cascade cancel non-terminal shipments -> release allocations -> restore lots (Rule 4 depth 3)"
+      - "compute actual cancellation_refund; create WalletEntry(reason=REFUND) and bump matching Charge.refunded_cents when refund_destination=WALLET"
+      - "create WinBackOffer(status=OFFERED)"
+      - "increments Subscription.version by 1"
+  - method: GET
+    path: "/subscriptions/{id}/cancel-preview"
+    description: "Computed read: estimated refund if cancelled now (estimate variant of cancellation_refund)."
+    roles: [Customer]
+    code: 200
+    input: []
+    output: "{ estimated_refund_cents: integer, refundable_shipment_count: integer }"
+    side_effects: []
+  - method: POST
+    path: "/subscriptions/{id}/renew"
+    description: "Open the next billing cycle: new RENEWAL charge + shipments; applies then resets discount_pct."
+    roles: [BillingAdmin]
+    code: 201
+    input: []
+    output: Subscription
+    side_effects:
+      - "increment current_cycle_index; advance next_renewal_date by CYCLE_DAYS"
+      - "recompute renewal_price_cents then reset discount_pct to 0"
+      - "create Charge(kind=RENEWAL, PENDING) and DELIVERIES_PER_CYCLE new Shipments"
+      - "increments Subscription.version by 1"
+
+  # ---- shipments / fulfillment ----
+  - method: GET
+    path: "/shipments/{id}"
+    description: "Fetch a shipment."
+    roles: [Customer, FulfillmentOps]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: []
+  - method: POST
+    path: "/shipments/{id}/skip"
+    description: "Skip a scheduled delivery before the cutoff; releases stems and credits the wallet."
+    roles: [Customer]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: ["release RESERVED allocations -> restore lot", "create WalletEntry(reason=SKIP_CREDIT, +per_shipment_value)"]
+  - method: POST
+    path: "/shipments/{id}/source"
+    description: "Begin sourcing (SCHEDULED->SOURCING); requires the subscription ACTIVE+CURRENT."
+    roles: [FulfillmentOps]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: []
+  - method: POST
+    path: "/shipments/{id}/allocations"
+    description: "Reserve stems from a lot for a sourcing shipment; checks availability, hold overlap+buffer, lot freshness."
+    roles: [FulfillmentOps]
+    code: 201
+    input: [lot_id, quantity_reserved, hold_start, hold_end]
+    output: StemAllocation
+    side_effects: ["debit StemLot.quantity_available by quantity_reserved", "set reserved_value_cents (stem_valuation reserved variant)"]
+  - method: GET
+    path: "/shipments/{id}/allocations"
+    description: "List a shipment's stem allocations (reverse-reachability for StemAllocation.shipment_id)."
+    roles: [FulfillmentOps]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: StemAllocation[]
+    side_effects: []
+  - method: POST
+    path: "/shipments/{id}/confirm-sourced"
+    description: "Commit sourcing via SOURCED or SUBSTITUTED branch; commits allocations (needs FRESH lots) and computes stem_cost."
+    roles: [FulfillmentOps]
+    code: 200
+    input: ["substitution_applied?", "from_variety?", "to_variety?"]
+    output: Shipment
+    side_effects: ["RESERVED allocations -> COMMITTED, set committed_value_cents", "compute Shipment.stem_cost_cents", "if substitution_applied set true and validate SubstitutionRule"]
+  - method: POST
+    path: "/shipments/{id}/ship"
+    description: "Book a delivery window on a route (SOURCED/SUBSTITUTED->SHIPPED); rejects overlapping windows on the route."
+    roles: [FulfillmentOps]
+    code: 200
+    input: [route_id, delivery_window_start, delivery_window_end]
+    output: Shipment
+    side_effects: ["set route_id, delivery_window_start, delivery_window_end"]
+  - method: POST
+    path: "/shipments/{id}/deliver"
+    description: "Mark delivered (SHIPPED->DELIVERED); increments customer lifetime_cycles."
+    roles: [FulfillmentOps]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: ["increment Customer.lifetime_cycles; recompute loyalty_tier"]
+
+  # ---- stem lots ----
+  - method: POST
+    path: "/stem-lots"
+    description: "Register a cold-chain stem lot."
+    roles: [FulfillmentOps]
+    code: 201
+    input: [variety, grade, quantity_total, unit_cost_cents, sourced_at, shelf_life_hours]
+    output: StemLot
+    side_effects: []
+  - method: GET
+    path: "/stem-lots/{id}"
+    description: "Fetch a stem lot (includes computed quantity_available, usable_until, cold_chain_state)."
+    roles: [FulfillmentOps]
+    code: 200
+    input: []
+    output: StemLot
+    side_effects: []
+  - method: GET
+    path: "/stem-lots/{id}/allocations"
+    description: "List allocations drawing on a lot (reverse-reachability for StemAllocation.lot_id)."
+    roles: [FulfillmentOps]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: StemAllocation[]
+    side_effects: []
+
+  # ---- billing / win-back ----
+  - method: POST
+    path: "/charges/{id}/simulate-payment"
+    description: "Simulate a payment attempt on a PENDING charge (SUCCEEDED->CAPTURED or FAILED->PAST_DUE cascade)."
+    roles: [BillingAdmin]
+    code: 200
+    input: [outcome]
+    output: Charge
+    side_effects: ["on SUCCEEDED capture (clears PAST_DUE if applicable); on FAILED cascade billing PAST_DUE + cancel SCHEDULED shipments"]
+  - method: POST
+    path: "/charges/{id}/refund"
+    description: "Refund up to the captured amount; credits a wallet entry."
+    roles: [BillingAdmin]
+    code: 200
+    input: [amount_cents]
+    output: Charge
+    side_effects: ["increment refunded_cents; create WalletEntry(reason=REFUND)"]
+  - method: POST
+    path: "/win-back-offers/{id}/redeem"
+    description: "Redeem a win-back offer to reactivate a cancelled subscription with a discount."
+    roles: [Customer]
+    code: 200
+    input: [subscription_id]
+    output: WinBackOffer
+    side_effects: ["subscription lifecycle CANCELLED->ACTIVE", "set subscription.discount_pct"]
+
+# =====================================================================
+# §1.6 Error Code Catalog
+# =====================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/invalid X-User-Role or X-User-ID, or unknown role."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Acting role is not permitted for this endpoint."
+  - id: ERR_CUSTOMER_NOT_FOUND
+    http: 404
+    condition: "Referenced customer id does not exist."
+  - id: ERR_PLAN_NOT_FOUND
+    http: 404
+    condition: "Referenced plan id does not exist."
+  - id: ERR_SUBSCRIPTION_NOT_FOUND
+    http: 404
+    condition: "Referenced subscription id does not exist."
+  - id: ERR_SHIPMENT_NOT_FOUND
+    http: 404
+    condition: "Referenced shipment id does not exist."
+  - id: ERR_STEM_LOT_NOT_FOUND
+    http: 404
+    condition: "Referenced stem lot id does not exist."
+  - id: ERR_ROUTE_NOT_FOUND
+    http: 404
+    condition: "Referenced carrier route id does not exist."
+  - id: ERR_CHARGE_NOT_FOUND
+    http: 404
+    condition: "Referenced charge id does not exist."
+  - id: ERR_OFFER_NOT_FOUND
+    http: 404
+    condition: "Referenced win-back offer id does not exist."
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Malformed body: missing required field, bad enum, out-of-range number, or bad pagination."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Transition not permitted from the resource's current state (generic state-machine guard)."
+  - id: ERR_SHIPMENT_NOT_SKIPPABLE
+    http: 409
+    condition: "Skip attempted on a shipment whose status != SCHEDULED."
+  - id: ERR_SUBSCRIPTION_NOT_ACTIVE
+    http: 409
+    condition: "Sourcing attempted while the subscription is not ACTIVE+CURRENT (cross-entity gate)."
+  - id: ERR_LOT_EXPIRED
+    http: 409
+    condition: "Commit attempted while a required StemLot.cold_chain_state == EXPIRED (cross-entity gate)."
+  - id: ERR_OFFER_NOT_REDEEMABLE
+    http: 409
+    condition: "Redeem attempted on an offer whose status != OFFERED."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_subscription_version != current Subscription.version (OCC)."
+  - id: ERR_NOT_OWNER
+    http: 403
+    condition: "Acting customer does not own the targeted subscription/shipment."
+  - id: ERR_OFFER_NOT_OWNED
+    http: 403
+    condition: "Acting customer does not own the win-back offer or the target subscription in the redeem body."
+  - id: ERR_SKIP_WINDOW_CLOSED
+    http: 422
+    condition: "Skip attempted after now > scheduled_delivery_date - SKIP_CUTOFF_HOURS."
+  - id: ERR_OFFER_EXPIRED
+    http: 422
+    condition: "Redeem attempted after now > offer.expires_at."
+  - id: ERR_INSUFFICIENT_STEMS
+    http: 422
+    condition: "quantity_reserved > StemLot.quantity_available."
+  - id: ERR_ROUTE_WINDOW_CONFLICT
+    http: 422
+    condition: "Delivery window [start,end) overlaps another SHIPPED shipment's window on the same route (half-open, adjacency allowed)."
+  - id: ERR_LOT_HOLD_CONFLICT
+    http: 422
+    condition: "Allocation hold window collides with another active hold on the same lot within CLEAN_BUFFER_MINUTES (closed interval + buffer)."
+  - id: ERR_SUBSTITUTION_NOT_ALLOWED
+    http: 422
+    condition: "confirm-sourced substitution requested without a matching SubstitutionRule(from,to,allowed=true)."
+  - id: ERR_BILLING_PAST_DUE
+    http: 402
+    condition: "Change attempted while Subscription.billing_status == PAST_DUE."
+  - id: ERR_REFUND_EXCEEDS_CAPTURED
+    http: 422
+    condition: "refunded_cents + amount_cents > Charge.amount_cents."
+
+# =====================================================================
+# §1.7 RBAC Matrix
+# =====================================================================
+roles:
+  - name: Customer
+    description: "Subscriber acting on their own subscriptions, shipments, wallet, and offers."
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /subscriptions/{id}/pause"
+      - "POST /subscriptions/{id}/resume"
+      - "POST /subscriptions/{id}/change"
+      - "POST /subscriptions/{id}/cancel"
+      - "GET /subscriptions/{id}/cancel-preview"
+      - "POST /shipments/{id}/skip"
+      - "POST /win-back-offers/{id}/redeem"
+    shared_operations:
+      - "POST /subscriptions (shared with PlatformAdmin)"
+      - "GET /subscriptions, GET /subscriptions/{id}, GET /subscriptions/{id}/shipments, GET /subscriptions/{id}/charges"
+      - "GET /customers/{id}, GET /customers/{id}/wallet-entries, GET /customers/{id}/win-back-offers"
+      - "GET /shipments/{id}"
+  - name: FulfillmentOps
+    description: "Operations staff managing stem lots, allocations, and shipment fulfillment."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /stem-lots"
+      - "POST /shipments/{id}/source"
+      - "POST /shipments/{id}/allocations"
+      - "POST /shipments/{id}/confirm-sourced"
+      - "POST /shipments/{id}/ship"
+      - "POST /shipments/{id}/deliver"
+      - "GET /stem-lots/{id}, GET /stem-lots/{id}/allocations, GET /shipments/{id}/allocations"
+    shared_operations:
+      - "GET /shipments/{id}, GET /subscriptions/{id}/shipments"
+      - "GET /carrier-routes/{id}, GET /carrier-routes/{id}/shipments, GET /substitution-rules"
+  - name: BillingAdmin
+    description: "Billing operator running renewals, payments, and refunds."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /subscriptions/{id}/renew"
+      - "POST /charges/{id}/simulate-payment"
+      - "POST /charges/{id}/refund"
+    shared_operations:
+      - "GET /subscriptions, GET /subscriptions/{id}, GET /subscriptions/{id}/charges"
+      - "GET /customers/{id}, GET /customers/{id}/wallet-entries, GET /customers/{id}/win-back-offers"
+  - name: PlatformAdmin
+    description: "Configuration owner: plans, routes, substitution rules, customers, and the logical clock."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /plans"
+      - "POST /carrier-routes"
+      - "POST /substitution-rules"
+      - "POST /customers"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /subscriptions (shared with Customer)"
+      - "GET /subscriptions, GET /subscriptions/{id}, GET /subscriptions/{id}/shipments"
+      - "GET /carrier-routes/{id}, GET /carrier-routes/{id}/shipments"

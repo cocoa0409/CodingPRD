@@ -1,0 +1,41 @@
+"""Error classes and error-id constants."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Auth / existence
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_FORBIDDEN_ROLE = ("ERR_FORBIDDEN_ROLE", 403)
+ERR_NOT_RESOURCE_OWNER = ("ERR_NOT_RESOURCE_OWNER", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+
+# Request shape
+ERR_INVALID_REQUEST = ("ERR_INVALID_REQUEST", 400)
+ERR_INVALID_ENUM = ("ERR_INVALID_ENUM", 422)
+
+# State / OCC
+ERR_STALE_VERSION = ("ERR_STALE_VERSION", 412)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+
+# Business
+ERR_LABEL_NOT_APPROVED = ("ERR_LABEL_NOT_APPROVED", 409)
+ERR_ALLERGEN_CONFLICT = ("ERR_ALLERGEN_CONFLICT", 409)
+ERR_LOT_EXPIRED = ("ERR_LOT_EXPIRED", 409)
+ERR_NOT_DUE = ("ERR_NOT_DUE", 409)
+ERR_NOT_WINBACK_ELIGIBLE = ("ERR_NOT_WINBACK_ELIGIBLE", 409)
+ERR_SELF_REFERRAL = ("ERR_SELF_REFERRAL", 422)
+ERR_INSUFFICIENT_POINTS = ("ERR_INSUFFICIENT_POINTS", 422)
+ERR_INSUFFICIENT_INVENTORY = ("ERR_INSUFFICIENT_INVENTORY", 409)
+ERR_LOT_UNDERSTOCK = ("ERR_LOT_UNDERSTOCK", 409)
+ERR_DUPLICATE_EMAIL = ("ERR_DUPLICATE_EMAIL", 409)
+ERR_VALIDATION = ("ERR_VALIDATION", 422)
+
+
+def err(spec, message=None):
+    return ApiError(spec[0], spec[1], message)

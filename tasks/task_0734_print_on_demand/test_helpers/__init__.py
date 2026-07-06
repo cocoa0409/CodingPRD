@@ -1,0 +1,103 @@
+"""Barrel export: framework generics + PRD-specific code."""
+# Framework generics (re-exported for convenience)
+from prd_bench_local_runner.testing import (
+    validate_success,
+    validate_error,
+    validate_paginated,
+    validate_error_is_one_of,
+    get_success_data,
+    is_valid_uuid,
+    is_iso8601_timestamp,
+    assert_cost_precision,
+    assert_version_incremented,
+    assert_timestamp_format,
+    assert_race_outcome,
+    assert_exactly_one_succeeds,
+    assert_at_least_one_succeeds,
+    run_race,
+    build_user_headers,
+    NON_EXISTENT_UUID,
+)
+
+# PRD-specific
+from .types import *  # noqa: F401,F403
+from .api_client import api_client, ApiClient
+from .api_errors import ApiErrorId, HTTP_STATUS_CODES
+from .assertions import (
+    assert_creator,
+    assert_storefront,
+    assert_product,
+    assert_variant,
+    assert_design,
+    assert_listing,
+    assert_fulfillment_partner,
+    assert_order,
+    assert_fulfillment_job,
+    assert_reprint_request,
+    assert_payout_cycle,
+    assert_channel_sync_event,
+)
+from .factories import (
+    creator_register_payload,
+    creator_verify_payload,
+    storefront_payload,
+    storefront_update_payload,
+    link_channel_payload,
+    product_payload,
+    variant_payload,
+    design_payload,
+    listing_payload,
+    order_payload,
+    refund_payload,
+    fulfillment_partner_payload,
+    reprint_request_payload,
+    payout_cycle_payload,
+    clock_set_payload,
+    ingest_channel_order_payload,
+)
+from .constants import (
+    PLATFORM_FEE_BPS_BY_CATEGORY,
+    DOMESTIC_SHIPPING_CENTS,
+    CROSS_BORDER_SHIPPING_CENTS,
+    STRIKE_THRESHOLD,
+    DEFAULT_PAYOUT_FEE_BPS,
+    PAYOUT_RETURN_WINDOW_HOURS,
+    SAMPLE_ITEM_COUNT_MIN,
+    SAMPLE_ITEM_COUNT_MAX,
+    MARKUP_BPS_MIN,
+    MARKUP_BPS_MAX,
+    REPRINT_REASON_WEIGHTS,
+    REPRINT_CONSUMER_FAULT_SURCHARGE_PCT,
+    CLOCK_DEFAULT_START,
+    TEST_DEFAULTS,
+)
+from .test_users import (
+    TEST_USERS,
+    make_creator_headers,
+    make_fulfillment_partner_headers,
+    make_anonymous_headers,
+    make_platform_admin_headers,
+)
+from .fixtures import (
+    set_clock,
+    create_creator,
+    verify_creator,
+    create_verified_creator,
+    create_active_partner,
+    create_product_and_variant,
+    create_storefront,
+    upload_and_approve_design,
+    upload_mockup_ready_design,
+    create_and_publish_listing,
+    setup_basic_scenario,
+    create_order_and_authorize,
+    create_and_capture_order,
+    advance_order_to_shipped,
+    advance_order_to_delivered,
+    fail_shipped_job,
+    open_reprint_on_failed_job,
+    setup_shipped_order_with_open_reprint,
+    setup_delivered_order_scenario,
+    create_payout_cycle,
+    release_payout_cycle,
+)

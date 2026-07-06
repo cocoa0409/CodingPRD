@@ -1,0 +1,27 @@
+"""Domain thresholds — numeric constants from the PRD's money and SLA rules."""
+
+# --- Turnaround SLA (§3.6) ---
+TIER_SLA_HOURS = {"STANDARD": 72, "PRIORITY": 48, "RUSH": 24}
+SURCHARGE_HOURS_PER_TRACK = 6
+MULTITRACK_FLOOR_TRACKS = 2
+
+# --- Per-episode invoice (§3.5) ---
+TIER_BASE_CENTS = {"STANDARD": 15000, "PRIORITY": 22000, "RUSH": 35000}
+TRANSCRIPT_CENTS = 4000
+EXTRA_TRACK_FLOOR = 2
+EXTRA_TRACK_RATE_CENTS = 2500
+DISCOUNT_CAP_CENTS = 5000
+
+# --- Late-fee tiers (§3.7) ---
+GOLD_THRESHOLD_CENTS = 80000
+SILVER_THRESHOLD_CENTS = 40000
+LATE_FEE_PCT = {"BRONZE": 0.02, "SILVER": 0.035, "GOLD": 0.05}
+
+# --- Retainer overage rates (§3.8) ---
+OVERAGE_RATE_CENTS = {"STANDARD": 12000, "PRIORITY": 16000, "RUSH": 22000}
+
+# --- Clock default (§3.11) ---
+CLOCK_DEFAULT_UTC = "2026-03-01T00:00:00Z"
+
+# --- Loudness (§2.10) ---
+DEFAULT_TARGET_LOUDNESS_LUFS = -16.0

@@ -1,0 +1,51 @@
+"""Error IDs and HTTP status mapping (PRD §5).
+
+Registers the error_id -> HTTP status map with the framework so that
+validate_error() can auto-check HTTP status codes.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_FORBIDDEN_ROLE = "ERR_FORBIDDEN_ROLE"
+    ERR_NOT_RESOURCE_OWNER = "ERR_NOT_RESOURCE_OWNER"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+    ERR_PARK_CLOSED = "ERR_PARK_CLOSED"
+    ERR_WAIVER_MISSING = "ERR_WAIVER_MISSING"
+    ERR_GUARDIAN_REQUIRED = "ERR_GUARDIAN_REQUIRED"
+    ERR_HEIGHT_BELOW_MIN = "ERR_HEIGHT_BELOW_MIN"
+    ERR_LANE_TURN_OVERLAP = "ERR_LANE_TURN_OVERLAP"
+    ERR_BLOCK_WINDOW_CLOSED = "ERR_BLOCK_WINDOW_CLOSED"
+    ERR_LANE_UNAVAILABLE = "ERR_LANE_UNAVAILABLE"
+    ERR_PASS_DAILY_LIMIT = "ERR_PASS_DAILY_LIMIT"
+    ERR_PASS_NOT_VALID = "ERR_PASS_NOT_VALID"
+    ERR_CAPACITY_EXCEEDED = "ERR_CAPACITY_EXCEEDED"
+    ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+
+
+HTTP_STATUS_CODES: dict[str, int] = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_FORBIDDEN_ROLE: 403,
+    ApiErrorId.ERR_NOT_RESOURCE_OWNER: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+    ApiErrorId.ERR_PARK_CLOSED: 409,
+    ApiErrorId.ERR_WAIVER_MISSING: 409,
+    ApiErrorId.ERR_GUARDIAN_REQUIRED: 422,
+    ApiErrorId.ERR_HEIGHT_BELOW_MIN: 422,
+    ApiErrorId.ERR_LANE_TURN_OVERLAP: 409,
+    ApiErrorId.ERR_BLOCK_WINDOW_CLOSED: 409,
+    ApiErrorId.ERR_LANE_UNAVAILABLE: 409,
+    ApiErrorId.ERR_PASS_DAILY_LIMIT: 409,
+    ApiErrorId.ERR_PASS_NOT_VALID: 409,
+    ApiErrorId.ERR_CAPACITY_EXCEEDED: 409,
+    ApiErrorId.ERR_INVALID_REQUEST: 422,
+}
+
+# Register with the framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})
