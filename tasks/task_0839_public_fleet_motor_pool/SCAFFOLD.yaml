@@ -1,0 +1,1706 @@
+scenario: "839. Public Fleet & Motor-Pool Management: vehicle inventory & assignment/pool, motor-pool reservation & checkout, fuel/telematics & idle, PM & shop work order, utilization & lifecycle replacement, auction/disposal, accident & subrogation, department chargeback"
+domain_name: "public-fleet-motor-pool"
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: "Quota / allocation"          # a finite pool of vehicles/bays reserved, committed, released
+  secondary_archetype: "Ledger reconciliation"     # department chargeback provisional-vs-final divergence
+  complexity_layers:
+    - optimistic_concurrency        # OCC on Vehicle.version and Department.version for supersede-style creates
+    - cascading_side_effects        # accident -> vehicle out-of-service -> reservation auto-cancel -> budget release
+    - dual_variant_calculation      # provisional vs final chargeback; gross vs net subrogation
+    - rate_threshold_triggers       # tiered mileage rate; replacement_score threshold; idle-free minutes
+
+  entity_topology: flat             # peer entities linked by FK fields; no nesting in the identity model
+  state_machine_shape: parallel     # Vehicle carries two independent axes: operational_status x lifecycle_status
+  relationship_patterns:
+    - one_to_many                   # Department 1--* Vehicle; Vehicle 1--* FuelLog/WorkOrder/AccidentClaim/DisposalRecord
+    - cross_aggregate               # Reservation/WorkOrder transitions gate on Vehicle/ShopBay state
+  role_model: peer_roles            # each role owns a distinct resource surface; DepartmentUser is entity-backed
+  consistency_model: immediate      # all cascades resolve synchronously inside the triggering request
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 Entity-Relationship Table
+# =====================================================================
+entities:
+  - name: Vehicle
+    parent: null
+    common_fields: true
+    fields:
+      - name: vin
+        type: string
+        source: input
+        description: "Vehicle identification number; unique across fleet."
+        constraints: "unique; 1..64 chars"
+      - name: vehicle_class
+        type: enum
+        source: input
+        description: "Cost/telematics class. Matched by value to VehicleClassPolicy.vehicle_class for all rate lookups."
+        constraints: "one of {SEDAN, PICKUP, SUV, HEAVY_TRUCK, VAN}"
+      - name: acquisition_cost_cents
+        type: integer
+        source: input
+        description: "Capital cost at acquisition; depreciation base for cost-per-mile and replacement scoring."
+        constraints: ">= 0"
+      - name: in_service_date
+        type: datetime
+        source: input
+        description: "Date the vehicle entered service; drives age (years) and assignment-fee proration."
+      - name: odometer_miles
+        type: integer
+        source: computed
+        description: "Highest odometer observed across FuelLog.odometer_miles and Reservation.return_odometer; monotonic non-decreasing."
+        default: 0
+      - name: assignment_type
+        type: enum
+        source: computed
+        description: "POOL vehicles are reservable via motor-pool; DEPARTMENT_ASSIGNED vehicles are dedicated to assigned_department_id."
+        default: "POOL"
+        constraints: "one of {POOL, DEPARTMENT_ASSIGNED}; set via PATCH /vehicles/{id}/assignment"
+      - name: assigned_department_id
+        type: string
+        source: computed
+        description: "FK -> Department.id; null when assignment_type=POOL; set when DEPARTMENT_ASSIGNED."
+        default: null
+      - name: operational_status
+        type: enum
+        source: system
+        description: "Availability axis (independent of lifecycle_status). IN_SERVICE reservable; IN_SHOP under work order; OUT_OF_SERVICE after at-fault-eligible accident."
+        default: "IN_SERVICE"
+        constraints: "one of {IN_SERVICE, IN_SHOP, OUT_OF_SERVICE}"
+      - name: lifecycle_status
+        type: enum
+        source: system
+        description: "Lifecycle axis (independent of operational_status). ACTIVE -> FLAGGED_FOR_REPLACEMENT -> PENDING_DISPOSAL -> DISPOSED."
+        default: "ACTIVE"
+        constraints: "one of {ACTIVE, FLAGGED_FOR_REPLACEMENT, PENDING_DISPOSAL, DISPOSED}"
+      - name: lifetime_maintenance_cents
+        type: integer
+        source: computed
+        description: "Running sum of WorkOrder.total_cost_cents for this vehicle's COMPLETED work orders; incremented on each work-order completion."
+        default: 0
+      - name: replacement_score
+        type: number
+        source: computed
+        description: "Weighted lifecycle score in [0,100]; recomputed on work-order completion and on POST /vehicles/{id}/replacement-evaluation. See calculations.replacement_score."
+        default: 0
+      - name: open_accident_count
+        type: integer
+        source: computed
+        description: "Count of AccidentClaim rows for this vehicle whose status is not terminal (not in {RECOVERED, CLOSED_NO_FAULT, WRITTEN_OFF})."
+        default: 0
+      - name: lifetime_fuel_cents
+        type: integer
+        source: computed
+        description: "Running sum of FuelLog.fuel_cost_cents for this vehicle (all time); advanced on each fuel-log create."
+        default: 0
+      - name: cost_per_mile_cents
+        type: integer
+        source: computed
+        description: "round_half_up((lifetime_maintenance_cents + lifetime_fuel_cents) / odometer_miles); null when odometer_miles==0. Recomputed on fuel-log create and work-order completion. See calculations.vehicle_cost_per_mile."
+        default: null
+
+  - name: Department
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Department display name."
+      - name: cost_center_code
+        type: string
+        source: input
+        description: "Accounting cost center; unique."
+        constraints: "unique"
+      - name: monthly_budget_cents
+        type: integer
+        source: input
+        description: "Monthly motor-pool budget ceiling checked on reservation confirmation."
+        constraints: ">= 0"
+      - name: committed_budget_cents
+        type: integer
+        source: computed
+        description: "Sum of estimated_cost_cents over this department's reservations in status {CONFIRMED, CHECKED_OUT}; a hold placed on confirm and released on cancel/return-close."
+        default: 0
+      - name: billed_ytd_cents
+        type: integer
+        source: computed
+        description: "Cumulative total_cents of this department's ISSUED/PAID chargeback invoices minus reversals from ADJUSTED invoices."
+        default: 0
+
+  - name: VehicleClassPolicy
+    parent: null
+    common_fields: false
+    fields:
+      - name: vehicle_class
+        type: enum
+        source: input
+        description: "Class key this policy governs; unique across policies."
+        constraints: "unique; one of {SEDAN, PICKUP, SUV, HEAVY_TRUCK, VAN}"
+      - name: assignment_fee_cents_per_month
+        type: integer
+        source: input
+        description: "Flat monthly chargeback for a DEPARTMENT_ASSIGNED vehicle of this class; prorated by in-service days for partial periods."
+        constraints: ">= 0"
+      - name: mileage_tier1_rate_cents
+        type: integer
+        source: input
+        description: "Per-mile charge for miles at or below mileage_tier_boundary_miles."
+        constraints: ">= 0"
+      - name: mileage_tier2_rate_cents
+        type: integer
+        source: input
+        description: "Per-mile charge for miles strictly above mileage_tier_boundary_miles."
+        constraints: ">= 0"
+      - name: mileage_tier_boundary_miles
+        type: integer
+        source: input
+        description: "Tier boundary. Miles 1..boundary use tier1; miles > boundary use tier2 (marginal tiering)."
+        constraints: ">= 0"
+      - name: fuel_surcharge_multiplier
+        type: number
+        source: input
+        description: "Multiplier applied to summed fuel_cost_cents to derive the fuel surcharge line."
+        constraints: ">= 0; 4 decimal places"
+      - name: idle_free_minutes
+        type: integer
+        source: input
+        description: "Idle minutes per period granted free; excess idle billed at idle_penalty_cents_per_min."
+        constraints: ">= 0"
+      - name: idle_penalty_cents_per_min
+        type: integer
+        source: input
+        description: "Per-minute charge for idle minutes above idle_free_minutes."
+        constraints: ">= 0"
+      - name: replacement_age_years
+        type: integer
+        source: input
+        description: "Age (years) at which the age sub-score saturates to full weight."
+        constraints: ">= 1"
+      - name: replacement_mileage
+        type: integer
+        source: input
+        description: "Odometer at which the mileage sub-score saturates to full weight."
+        constraints: ">= 1"
+      - name: replacement_maint_ratio
+        type: number
+        source: input
+        description: "lifetime_maintenance_cents / acquisition_cost_cents ratio at which the maintenance sub-score saturates."
+        constraints: "> 0"
+
+  - name: Reservation
+    parent: null
+    common_fields: true
+    fields:
+      - name: department_id
+        type: string
+        source: input
+        description: "FK -> Department.id; the department that will be charged the budget hold."
+      - name: requested_start
+        type: datetime
+        source: input
+        description: "Half-open reservation window start (inclusive)."
+      - name: requested_end
+        type: datetime
+        source: input
+        description: "Half-open reservation window end (exclusive); must be strictly after requested_start."
+      - name: driver_name
+        type: string
+        source: input
+        description: "Authorized driver for the trip."
+      - name: purpose
+        type: string
+        source: input
+        description: "Free-text trip purpose."
+      - name: assigned_vehicle_id
+        type: string
+        source: system
+        description: "FK -> Vehicle.id; null until confirmation selects a POOL vehicle; set by POST /reservations/{id}/confirm."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Lifecycle: REQUESTED -> CONFIRMED -> CHECKED_OUT -> RETURNED; cancellable from REQUESTED/CONFIRMED."
+        default: "REQUESTED"
+        constraints: "one of {REQUESTED, CONFIRMED, CHECKED_OUT, RETURNED, CANCELLED}"
+      - name: estimated_cost_cents
+        type: integer
+        source: computed
+        description: "Budget hold placed on confirm; = ceil(window_hours) * hourly_pool_rate_cents. See calculations.reservation_hold."
+        default: 0
+      - name: checkout_odometer
+        type: integer
+        source: input
+        description: "Odometer recorded at checkout; null until CHECKED_OUT."
+        default: null
+      - name: return_odometer
+        type: integer
+        source: input
+        description: "Odometer recorded at return; null until RETURNED."
+        default: null
+      - name: miles_driven
+        type: integer
+        source: computed
+        description: "return_odometer - checkout_odometer; null until RETURNED."
+        default: null
+
+  - name: ShopBay
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Bay label; unique."
+        constraints: "unique"
+      - name: bay_type
+        type: enum
+        source: input
+        description: "Physical bay capability."
+        constraints: "one of {GENERAL, HEAVY, BODY}"
+      - name: status
+        type: enum
+        source: system
+        description: "AVAILABLE bays accept new work orders; CLOSED bays reject scheduling. Set via PATCH /shop-bays/{id}."
+        default: "AVAILABLE"
+        constraints: "one of {AVAILABLE, CLOSED}"
+
+  - name: WorkOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the vehicle serviced."
+      - name: bay_id
+        type: string
+        source: input
+        description: "FK -> ShopBay.id; the bay occupied for the scheduled window."
+      - name: wo_type
+        type: enum
+        source: input
+        description: "Preventive maintenance, general repair, or accident repair."
+        constraints: "one of {PM, REPAIR, ACCIDENT_REPAIR}"
+      - name: scheduled_start
+        type: datetime
+        source: input
+        description: "Closed-interval bay window start (inclusive)."
+      - name: scheduled_end
+        type: datetime
+        source: input
+        description: "Closed-interval bay window end (inclusive); must be strictly after scheduled_start."
+      - name: status
+        type: enum
+        source: system
+        description: "SCHEDULED -> IN_PROGRESS -> COMPLETED; IN_PROGRESS <-> AWAITING_PARTS loop; SCHEDULED -> CANCELLED."
+        default: "SCHEDULED"
+        constraints: "one of {SCHEDULED, IN_PROGRESS, AWAITING_PARTS, COMPLETED, CANCELLED}"
+      - name: labor_hours
+        type: number
+        source: input
+        description: "Billed labor hours, supplied at completion."
+        default: null
+      - name: labor_rate_cents
+        type: integer
+        source: input
+        description: "Labor cost per hour, supplied at scheduling."
+        constraints: ">= 0"
+      - name: parts_cost_cents
+        type: integer
+        source: input
+        description: "Parts cost, supplied at completion."
+        default: 0
+      - name: total_cost_cents
+        type: integer
+        source: computed
+        description: "round_half_up(labor_hours * labor_rate_cents) + parts_cost_cents; computed at completion. See calculations.work_order_cost."
+        default: null
+
+  - name: FuelLog
+    parent: null
+    common_fields: false
+    fields:
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the fueled/telematics-reporting vehicle."
+      - name: reading_at
+        type: datetime
+        source: input
+        description: "Timestamp of the fuel/telematics reading; used for chargeback period membership (period_start inclusive, period_end exclusive)."
+      - name: gallons
+        type: number
+        source: input
+        description: "Gallons dispensed."
+        constraints: ">= 0"
+      - name: fuel_cost_cents
+        type: integer
+        source: input
+        description: "Fuel cost for this transaction; summed into the chargeback fuel surcharge base."
+        constraints: ">= 0"
+      - name: odometer_miles
+        type: integer
+        source: input
+        description: "Odometer at reading; advances Vehicle.odometer_miles when higher."
+        constraints: ">= 0"
+      - name: idle_minutes
+        type: integer
+        source: input
+        description: "Idle minutes reported for the interval; summed into the chargeback idle penalty base."
+        default: 0
+        constraints: ">= 0"
+      - name: engine_hours
+        type: number
+        source: input
+        description: "Engine hours reported; informational for utilization."
+        default: 0
+
+  - name: AccidentClaim
+    parent: null
+    common_fields: true
+    fields:
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the vehicle involved in the accident."
+      - name: reported_at
+        type: datetime
+        source: input
+        description: "When the accident was reported."
+      - name: at_fault
+        type: boolean
+        source: input
+        description: "Whether the fleet driver was at fault; true drives OUT_OF_SERVICE and subrogation eligibility=false, false enables third-party subrogation."
+      - name: estimated_damage_cents
+        type: integer
+        source: input
+        description: "Estimated repair/damage cost; subrogation recovery base."
+        constraints: ">= 0"
+      - name: deductible_cents
+        type: integer
+        source: input
+        description: "Fleet-borne deductible subtracted in the NET subrogation variant."
+        default: 0
+        constraints: ">= 0"
+      - name: third_party_liable_pct
+        type: number
+        source: input
+        description: "Fraction [0,1] of damage the third party is liable for; 0 when at_fault=true."
+        default: 0
+        constraints: "0..1; 4 decimal places"
+      - name: status
+        type: enum
+        source: system
+        description: "REPORTED -> UNDER_INVESTIGATION -> SUBROGATION_PENDING (cycle back to UNDER_INVESTIGATION on dispute) -> RECOVERED; or CLOSED_NO_FAULT / WRITTEN_OFF terminals."
+        default: "REPORTED"
+        constraints: "one of {REPORTED, UNDER_INVESTIGATION, SUBROGATION_PENDING, RECOVERED, CLOSED_NO_FAULT, WRITTEN_OFF}"
+      - name: recovered_cents
+        type: integer
+        source: computed
+        description: "Cumulative subrogation dollars posted via record-recovery minus dispute reversals; conserved with outstanding_liable_cents."
+        default: 0
+      - name: outstanding_liable_cents
+        type: integer
+        source: computed
+        description: "round_half_up(estimated_damage_cents * third_party_liable_pct) - recovered_cents; the third-party liability not yet recovered."
+        default: 0
+      - name: gross_recoverable_cents
+        type: integer
+        source: computed
+        description: "GROSS subrogation variant: round_half_up(estimated_damage_cents * third_party_liable_pct). See calculations.subrogation_recovery."
+        default: 0
+      - name: net_recoverable_cents
+        type: integer
+        source: computed
+        description: "NET subrogation variant: max(0, gross_recoverable_cents - deductible_cents - SUBRO_ADMIN_FEE_CENTS). See calculations.subrogation_recovery."
+        default: 0
+
+  - name: DisposalRecord
+    parent: null
+    common_fields: true
+    fields:
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the vehicle being auctioned/disposed."
+      - name: reserve_price_cents
+        type: integer
+        source: input
+        description: "Minimum acceptable hammer price; a bid/sale below reserve is rejected."
+        constraints: ">= 0"
+      - name: reconditioning_cost_cents
+        type: integer
+        source: input
+        description: "Costs to prep for auction; subtracted from gross to derive net proceeds."
+        default: 0
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "LISTED -> BIDDING -> SOLD; BIDDING -> NO_SALE; NO_SALE -> LISTED (relist)."
+        default: "LISTED"
+        constraints: "one of {LISTED, BIDDING, SOLD, NO_SALE}"
+      - name: sale_price_cents
+        type: integer
+        source: input
+        description: "Winning hammer price supplied at sale; null until SOLD."
+        default: null
+      - name: commission_cents
+        type: integer
+        source: computed
+        description: "Auction commission = tiered rate keyed on sale_price_cents bracket. See calculations.disposal_net_proceeds."
+        default: null
+      - name: net_proceeds_cents
+        type: integer
+        source: computed
+        description: "sale_price_cents - commission_cents - reconditioning_cost_cents; credited to the vehicle's last assigned department."
+        default: null
+      - name: buyer_name
+        type: string
+        source: input
+        description: "Winning bidder; supplied at sale."
+        default: null
+
+  - name: ChargebackInvoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: department_id
+        type: string
+        source: input
+        description: "FK -> Department.id; the billed department."
+      - name: period_start
+        type: datetime
+        source: input
+        description: "Billing period start (inclusive) for FuelLog/usage membership."
+      - name: period_end
+        type: datetime
+        source: input
+        description: "Billing period end (exclusive)."
+      - name: basis
+        type: enum
+        source: input
+        description: "PROVISIONAL projects the partial period to full-period run-rate; FINAL bills observed usage only. See calculations.chargeback_total."
+        default: "FINAL"
+        constraints: "one of {PROVISIONAL, FINAL}"
+      - name: status
+        type: enum
+        source: system
+        description: "DRAFT -> ISSUED -> PAID; ISSUED -> DISPUTED -> ADJUSTED (reverses billed_ytd) or back to ISSUED (reaffirm)."
+        default: "DRAFT"
+        constraints: "one of {DRAFT, ISSUED, DISPUTED, ADJUSTED, PAID}"
+      - name: assignment_fee_cents
+        type: integer
+        source: computed
+        description: "Prorated flat fee for DEPARTMENT_ASSIGNED vehicles of the department. See calculations.chargeback_total."
+        default: 0
+      - name: mileage_charge_cents
+        type: integer
+        source: computed
+        description: "Tiered per-mile charge over department miles in period."
+        default: 0
+      - name: fuel_surcharge_cents
+        type: integer
+        source: computed
+        description: "Summed fuel_cost_cents * class fuel_surcharge_multiplier over period."
+        default: 0
+      - name: idle_penalty_cents
+        type: integer
+        source: computed
+        description: "Idle minutes above idle_free_minutes * idle_penalty_cents_per_min over period."
+        default: 0
+      - name: total_cents
+        type: integer
+        source: computed
+        description: "assignment_fee_cents + mileage_charge_cents + fuel_surcharge_cents + idle_penalty_cents (per-line rounding pinned; see calculations.chargeback_total)."
+        default: 0
+      - name: disputed_reason
+        type: string
+        source: input
+        description: "Reason supplied when a department disputes an ISSUED invoice."
+        default: null
+
+# =====================================================================
+# §1.2 State Machine Table
+# =====================================================================
+state_machines:
+  # Vehicle carries TWO INDEPENDENT state axes (parallel dimensions):
+  #   operational_status: {IN_SERVICE, IN_SHOP, OUT_OF_SERVICE}   (availability)
+  #   lifecycle_status:   {ACTIVE, FLAGGED_FOR_REPLACEMENT, PENDING_DISPOSAL, DISPOSED}
+  # The two axes advance on different triggers and neither gates the other except at DISPOSED.
+  - entity: Vehicle
+    initial_state: "IN_SERVICE"          # operational axis initial; lifecycle axis initial is ACTIVE
+    terminal_states: [DISPOSED]
+    transitions:
+      # ---- operational axis ----
+      - from: IN_SERVICE
+        to: IN_SHOP
+        trigger: "POST /work-orders/{id}/start"
+        actor: ShopTech
+        preconditions:
+          - "vehicle.operational_status IN {IN_SERVICE, OUT_OF_SERVICE}"
+          - "vehicle.lifecycle_status != DISPOSED"
+        side_effects:
+          - "vehicle.operational_status = IN_SHOP"
+        note: "axis=operational. Accident repair may start from OUT_OF_SERVICE."
+      - from: IN_SHOP
+        to: IN_SERVICE
+        trigger: "POST /work-orders/{id}/complete"
+        actor: ShopTech
+        preconditions:
+          - "work_order.status IN {IN_PROGRESS, AWAITING_PARTS}"
+        side_effects:
+          - "vehicle.operational_status = IN_SERVICE"
+          - "vehicle.lifetime_maintenance_cents += work_order.total_cost_cents  (cascade link 1)"
+          - "recompute vehicle.replacement_score from new lifetime_maintenance_cents (cascade link 2 driver)"
+          - "if replacement_score >= 70 and lifecycle_status == ACTIVE: lifecycle_status = FLAGGED_FOR_REPLACEMENT (cascade link 2)"
+        note: "axis=operational; also drives lifecycle cascade (transitive_cascade chain B, depth 2)."
+      - from: IN_SERVICE
+        to: OUT_OF_SERVICE
+        trigger: "POST /accident-claims (system side-effect when at_fault=true OR estimated_damage_cents >= 500000)"
+        actor: system
+        preconditions:
+          - "vehicle.lifecycle_status != DISPOSED"
+        side_effects:
+          - "vehicle.operational_status = OUT_OF_SERVICE  (cascade link 1)"
+          - "for each Reservation r with assigned_vehicle_id == vehicle.id and r.status IN {CONFIRMED} and r.requested_start > clock.now: r.status = CANCELLED  (cascade link 2)"
+          - "for each such cancelled r: Department[r.department_id].committed_budget_cents -= r.estimated_cost_cents  (cascade link 3)"
+        note: "axis=operational; transitive_cascade chain A, depth 3 (vehicle -> reservation -> department)."
+      - from: OUT_OF_SERVICE
+        to: IN_SERVICE
+        trigger: "POST /accident-claims/{id}/close (disposition RETURN_TO_SERVICE)"
+        actor: FinanceOfficer
+        preconditions:
+          - "accident_claim.status IN {UNDER_INVESTIGATION, SUBROGATION_PENDING}"
+          - "vehicle has no WorkOrder in status {SCHEDULED, IN_PROGRESS, AWAITING_PARTS}"
+        side_effects:
+          - "vehicle.operational_status = IN_SERVICE"
+        note: "axis=operational."
+      # ---- lifecycle axis ----
+      - from: FLAGGED_FOR_REPLACEMENT
+        to: PENDING_DISPOSAL
+        trigger: "POST /vehicles/{id}/disposals"
+        actor: FleetAdmin
+        preconditions:
+          - "vehicle.lifecycle_status == FLAGGED_FOR_REPLACEMENT"
+          - "vehicle.operational_status != IN_SHOP"
+          - "vehicle.open_accident_count == 0"
+        side_effects:
+          - "vehicle.lifecycle_status = PENDING_DISPOSAL"
+          - "creates DisposalRecord in status LISTED"
+        note: "axis=lifecycle. business_safety gate (open_accident_count==0) precedes any temporal/fiscal check."
+      - from: PENDING_DISPOSAL
+        to: DISPOSED
+        trigger: "POST /disposals/{id}/sell"
+        actor: FleetAdmin
+        preconditions:
+          - "disposal.status == BIDDING"
+          - "sale_price_cents >= disposal.reserve_price_cents"
+        side_effects:
+          - "vehicle.lifecycle_status = DISPOSED"
+          - "vehicle.operational_status = OUT_OF_SERVICE"
+          - "Department[vehicle.assigned_department_id].billed_ytd_cents -= net_proceeds_cents  (disposal credit; only if assigned_department_id != null)"
+        note: "axis=lifecycle; terminal."
+
+  - entity: Reservation
+    initial_state: REQUESTED
+    terminal_states: [RETURNED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: CONFIRMED
+        trigger: "POST /reservations/{id}/confirm"
+        actor: MotorPoolClerk
+        preconditions:
+          - "a POOL vehicle exists that is operational_status==IN_SERVICE, lifecycle_status==ACTIVE, and free of overlapping reservations for [requested_start, requested_end) (selector; see calculations.pool_vehicle_selector)"
+          - "Department.committed_budget_cents + estimated_cost_cents <= Department.monthly_budget_cents"
+        side_effects:
+          - "assigned_vehicle_id = selected pool vehicle id"
+          - "estimated_cost_cents computed via calculations.reservation_hold"
+          - "Department.committed_budget_cents += estimated_cost_cents  (budget hold)"
+        note: "cross_entity_state_dependency (Reservation -> Vehicle); resource_temporal_overlap on Vehicle (half-open)."
+      - from: CONFIRMED
+        to: CHECKED_OUT
+        trigger: "POST /reservations/{id}/checkout"
+        actor: MotorPoolClerk
+        preconditions:
+          - "assigned Vehicle.operational_status == IN_SERVICE"
+          - "checkout_odometer >= assigned Vehicle.odometer_miles"
+        side_effects:
+          - "checkout_odometer stored"
+        note: "cross_entity_state_dependency (Reservation -> Vehicle)."
+      - from: CHECKED_OUT
+        to: RETURNED
+        trigger: "POST /reservations/{id}/return"
+        actor: MotorPoolClerk
+        preconditions:
+          - "return_odometer >= checkout_odometer"
+        side_effects:
+          - "miles_driven = return_odometer - checkout_odometer"
+          - "assigned Vehicle.odometer_miles = max(vehicle.odometer_miles, return_odometer)"
+          - "Department.committed_budget_cents -= estimated_cost_cents  (hold released on close)"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /reservations/{id}/cancel"
+        actor: MotorPoolClerk
+        preconditions: []
+        side_effects:
+          - "no budget effect (no hold was placed before confirm)"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /reservations/{id}/cancel"
+        actor: MotorPoolClerk
+        preconditions: []
+        side_effects:
+          - "Department.committed_budget_cents -= estimated_cost_cents  (compensating release; compensating_invariant on committed_budget_cents)"
+        note: "compensating_invariant: confirm hold + cancel release net zero on Department.committed_budget_cents."
+
+  - entity: WorkOrder
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: IN_PROGRESS
+        trigger: "POST /work-orders/{id}/start"
+        actor: ShopTech
+        preconditions:
+          - "ShopBay[bay_id].status == AVAILABLE"
+          - "vehicle.lifecycle_status != DISPOSED"
+        side_effects:
+          - "vehicle.operational_status = IN_SHOP (see Vehicle machine)"
+        note: "cross_entity_state_dependency (WorkOrder -> ShopBay)."
+      - from: IN_PROGRESS
+        to: AWAITING_PARTS
+        trigger: "POST /work-orders/{id}/hold-parts"
+        actor: ShopTech
+        preconditions: []
+        side_effects: []
+        note: "cyclic loop with resume."
+      - from: AWAITING_PARTS
+        to: IN_PROGRESS
+        trigger: "POST /work-orders/{id}/start"
+        actor: ShopTech
+        preconditions: []
+        side_effects: []
+        note: "resume from parts hold (cycle)."
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /work-orders/{id}/complete"
+        actor: ShopTech
+        preconditions:
+          - "labor_hours supplied and >= 0"
+        side_effects:
+          - "total_cost_cents computed via calculations.work_order_cost"
+          - "cascade into Vehicle IN_SHOP -> IN_SERVICE (adds lifetime_maintenance, recomputes replacement_score)"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /work-orders/{id}/cancel"
+        actor: ShopTech
+        preconditions: []
+        side_effects: []
+
+  - entity: AccidentClaim
+    initial_state: REPORTED
+    terminal_states: [RECOVERED, CLOSED_NO_FAULT, WRITTEN_OFF]
+    transitions:
+      - from: REPORTED
+        to: UNDER_INVESTIGATION
+        trigger: "POST /accident-claims/{id}/investigate"
+        actor: FinanceOfficer
+        preconditions: []
+        side_effects:
+          - "vehicle.open_accident_count reflects this non-terminal claim"
+      - from: UNDER_INVESTIGATION
+        to: SUBROGATION_PENDING
+        trigger: "POST /accident-claims/{id}/subrogate"
+        actor: FinanceOfficer
+        preconditions:
+          - "at_fault == false"
+          - "third_party_liable_pct > 0"
+        side_effects:
+          - "outstanding_liable_cents = round_half_up(estimated_damage_cents * third_party_liable_pct) - recovered_cents"
+      - from: SUBROGATION_PENDING
+        to: SUBROGATION_PENDING
+        trigger: "POST /accident-claims/{id}/record-recovery"
+        actor: FinanceOfficer
+        preconditions:
+          - "amount_cents > 0"
+          - "recovered_cents + amount_cents <= round_half_up(estimated_damage_cents * third_party_liable_pct)"
+        side_effects:
+          - "recovered_cents += amount_cents"
+          - "outstanding_liable_cents = round_half_up(estimated_damage_cents * third_party_liable_pct) - recovered_cents  (compensating_invariant: recovered + outstanding conserved)"
+        note: "self-loop posting; multiple recoveries allowed."
+      - from: SUBROGATION_PENDING
+        to: UNDER_INVESTIGATION
+        trigger: "POST /accident-claims/{id}/dispute"
+        actor: FinanceOfficer
+        preconditions:
+          - "reversal_cents > 0"
+          - "reversal_cents <= recovered_cents"
+        side_effects:
+          - "recovered_cents -= reversal_cents  (compensation)"
+          - "outstanding_liable_cents = round_half_up(estimated_damage_cents * third_party_liable_pct) - recovered_cents  (invariant: recovered + outstanding unchanged by the pair)"
+        note: "cyclic: subrogation round can loop back to investigation."
+      - from: SUBROGATION_PENDING
+        to: RECOVERED
+        trigger: "POST /accident-claims/{id}/close (disposition RECOVERED)"
+        actor: FinanceOfficer
+        preconditions:
+          - "outstanding_liable_cents == 0"
+        side_effects:
+          - "vehicle.open_accident_count decremented (claim now terminal)"
+      - from: UNDER_INVESTIGATION
+        to: CLOSED_NO_FAULT
+        trigger: "POST /accident-claims/{id}/close (disposition RETURN_TO_SERVICE)"
+        actor: FinanceOfficer
+        preconditions:
+          - "at_fault == false"
+        side_effects:
+          - "vehicle.operational_status = IN_SERVICE (if OUT_OF_SERVICE and no open work order)"
+          - "vehicle.open_accident_count decremented"
+      - from: UNDER_INVESTIGATION
+        to: WRITTEN_OFF
+        trigger: "POST /accident-claims/{id}/close (disposition WRITE_OFF)"
+        actor: FinanceOfficer
+        preconditions:
+          - "at_fault == true"
+        side_effects:
+          - "vehicle.open_accident_count decremented"
+
+  - entity: DisposalRecord
+    initial_state: LISTED
+    terminal_states: [SOLD]
+    transitions:
+      - from: LISTED
+        to: BIDDING
+        trigger: "POST /disposals/{id}/open-bidding"
+        actor: FleetAdmin
+        preconditions:
+          - "vehicle.lifecycle_status == PENDING_DISPOSAL"
+        side_effects: []
+      - from: BIDDING
+        to: SOLD
+        trigger: "POST /disposals/{id}/sell"
+        actor: FleetAdmin
+        preconditions:
+          - "sale_price_cents >= reserve_price_cents"
+        side_effects:
+          - "commission_cents, net_proceeds_cents computed via calculations.disposal_net_proceeds"
+          - "vehicle.lifecycle_status = DISPOSED; vehicle.operational_status = OUT_OF_SERVICE"
+      - from: BIDDING
+        to: NO_SALE
+        trigger: "POST /disposals/{id}/no-sale"
+        actor: FleetAdmin
+        preconditions: []
+        side_effects: []
+      - from: NO_SALE
+        to: LISTED
+        trigger: "POST /disposals/{id}/open-bidding"
+        actor: FleetAdmin
+        preconditions:
+          - "vehicle.lifecycle_status == PENDING_DISPOSAL"
+        side_effects: []
+        note: "relist cycle."
+
+  - entity: ChargebackInvoice
+    initial_state: DRAFT
+    terminal_states: [PAID, ADJUSTED]
+    transitions:
+      - from: DRAFT
+        to: ISSUED
+        trigger: "POST /chargeback-invoices/{id}/issue"
+        actor: FinanceOfficer
+        preconditions:
+          - "total_cents computed (all four line items resolved)"
+        side_effects:
+          - "Department.billed_ytd_cents += total_cents"
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /chargeback-invoices/{id}/pay"
+        actor: FinanceOfficer
+        preconditions: []
+        side_effects: []
+      - from: ISSUED
+        to: DISPUTED
+        trigger: "POST /chargeback-invoices/{id}/dispute"
+        actor: DepartmentUser
+        preconditions:
+          - "disputed_reason supplied"
+        side_effects: []
+      - from: DISPUTED
+        to: ISSUED
+        trigger: "POST /chargeback-invoices/{id}/resolve (outcome REAFFIRM)"
+        actor: FinanceOfficer
+        preconditions: []
+        side_effects: []
+        note: "cycle: dispute can be reaffirmed back to ISSUED with no ledger change."
+      - from: DISPUTED
+        to: ADJUSTED
+        trigger: "POST /chargeback-invoices/{id}/resolve (outcome ADJUST)"
+        actor: FinanceOfficer
+        preconditions: []
+        side_effects:
+          - "Department.billed_ytd_cents -= total_cents  (full reversal; compensating credit)"
+
+# =====================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version)
+# =====================================================================
+concurrency_rules:
+  - rule_id: disposal-create-stale-vehicle
+    parent_entity: Vehicle
+    write_endpoint: "POST /vehicles/{id}/disposals"
+    occ_field: "expected_vehicle_version"
+    description: |
+      Creating a DisposalRecord against a Vehicle whose version has advanced
+      since the client last observed it is rejected. A new listing legitimately
+      supersedes a prior NO_SALE listing (relist), so a create carrying a stale
+      expected_vehicle_version is rejected because another writer has already
+      advanced the vehicle (e.g., flagged/relisted) and this writer's view is stale.
+    error_id: ERR_STALE_VEHICLE_VERSION
+    http_status: 412
+  - rule_id: chargeback-create-stale-department
+    parent_entity: Department
+    write_endpoint: "POST /departments/{id}/chargeback-invoices"
+    occ_field: "expected_department_version"
+    description: |
+      Creating a ChargebackInvoice for a Department whose version has advanced
+      since the client last read it is rejected. A new period invoice supersedes
+      a prior DRAFT for the same window; a stale expected_department_version
+      indicates another writer already advanced the department ledger.
+    error_id: ERR_STALE_DEPARTMENT_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 Calculation Rules Table
+# =====================================================================
+calculations:
+  - name: reservation_hold
+    trigger: "POST /reservations/{id}/confirm"
+    algorithm: threshold
+    formula: |
+      window_hours = (requested_end - requested_start) / 3600 seconds   # positive real
+      billable_hours = ceil(window_hours)                               # any partial hour rounds UP
+      estimated_cost_cents = billable_hours * HOURLY_POOL_RATE_CENTS
+    input_set: "The single reservation being confirmed."
+    constants:
+      HOURLY_POOL_RATE_CENTS: 1500
+    precision: "integer cents; ceil applied to hours before multiply"
+    variants: []
+
+  - name: pool_vehicle_selector
+    trigger: "POST /reservations/{id}/confirm (selects assigned_vehicle_id)"
+    algorithm: weighted_scoring
+    formula: |
+      candidates = Vehicle where
+        assignment_type == POOL
+        AND operational_status == IN_SERVICE
+        AND lifecycle_status == ACTIVE
+        AND NOT EXISTS Reservation x with x.assigned_vehicle_id == vehicle.id
+            AND x.status IN {CONFIRMED, CHECKED_OUT}
+            AND half_open_overlap([x.requested_start, x.requested_end),
+                                  [this.requested_start, this.requested_end))
+      # half_open_overlap(A,B) == (A.start < B.end) AND (B.start < A.end)  -> adjacency (A.end == B.start) does NOT overlap
+      rank: ORDER BY odometer_miles ASC, created_at ASC     # lowest-wear first; created_at tie-break, never id
+      select = first candidate; if candidates empty -> ERR_NO_VEHICLE_AVAILABLE
+    input_set: "All POOL vehicles; excludes IN_SHOP/OUT_OF_SERVICE, non-ACTIVE, and time-overlapping."
+    constants: {}
+    precision: "exact; deterministic ordering"
+    variants: []
+
+  - name: chargeback_total
+    trigger: "POST /departments/{id}/chargeback-invoices (compute lines) and recomputed at POST /chargeback-invoices/{id}/issue"
+    algorithm: tiered_pricing
+    formula: |
+      period_days   = (period_end - period_start) / 86400 seconds       # whole days
+      # ---- assignment_fee (per DEPARTMENT_ASSIGNED vehicle, ROUND PER VEHICLE THEN SUM) ----
+      assignment_fee_cents = 0
+      for v in Vehicles where assignment_type==DEPARTMENT_ASSIGNED AND assigned_department_id==dept.id:
+        p = VehicleClassPolicy(v.vehicle_class)
+        active_from = max(v.in_service_date, period_start)
+        active_days = max(0, (period_end - active_from)/86400)
+        proration   = min(1.0, active_days / period_days)
+        assignment_fee_cents += round_half_up(p.assignment_fee_cents_per_month * proration)
+      # ---- mileage_charge (marginal tiering per reservation; EXACT integer cents) ----
+      mileage_charge_cents = 0
+      for r in Reservations where department_id==dept.id AND status==RETURNED
+                             AND period_start <= r.requested_start < period_end:
+        p = VehicleClassPolicy(Vehicle(r.assigned_vehicle_id).vehicle_class)
+        t1 = min(r.miles_driven, p.mileage_tier_boundary_miles) * p.mileage_tier1_rate_cents
+        t2 = max(0, r.miles_driven - p.mileage_tier_boundary_miles) * p.mileage_tier2_rate_cents
+        mileage_charge_cents += (t1 + t2)
+      # ---- fuel_surcharge (per assigned vehicle, ROUND PER VEHICLE THEN SUM) ----
+      fuel_surcharge_cents = 0
+      for v in dept-assigned vehicles:
+        p = VehicleClassPolicy(v.vehicle_class)
+        fuel = sum FuelLog.fuel_cost_cents for v where period_start <= reading_at < period_end
+        fuel_surcharge_cents += round_half_up(fuel * p.fuel_surcharge_multiplier)
+      # ---- idle_penalty (per assigned vehicle; EXACT integer cents) ----
+      idle_penalty_cents = 0
+      for v in dept-assigned vehicles:
+        p = VehicleClassPolicy(v.vehicle_class)
+        idle = sum FuelLog.idle_minutes for v where period_start <= reading_at < period_end
+        idle_penalty_cents += max(0, idle - p.idle_free_minutes) * p.idle_penalty_cents_per_min
+      total_cents = assignment_fee_cents + mileage_charge_cents + fuel_surcharge_cents + idle_penalty_cents
+    input_set: "Department-assigned vehicles + department's RETURNED reservations within [period_start, period_end)."
+    constants: {}
+    precision: "round_half_up per-vehicle on assignment_fee and fuel_surcharge BEFORE summing; mileage and idle exact integer"
+    variants:
+      - name: FINAL
+        when: "basis == FINAL"
+        difference: "Bills observed usage exactly as summed above; no projection."
+      - name: PROVISIONAL
+        when: "basis == PROVISIONAL (issued mid-period)"
+        difference: |
+          The three USAGE lines (mileage_charge, fuel_surcharge, idle_penalty) are each scaled by
+          projection_factor = period_days / elapsed_days, where elapsed_days = max(1, floor((clock.now - period_start)/86400)),
+          computed on the pre-round usage value then round_half_up. assignment_fee is NOT projected (flat).
+          For identical usage data PROVISIONAL(total) != FINAL(total) whenever elapsed_days < period_days.
+
+  - name: subrogation_recovery
+    trigger: "recomputed on POST /accident-claims/{id}/subrogate, /record-recovery, /dispute; exposed on AccidentClaim.gross_recoverable_cents / net_recoverable_cents"
+    algorithm: threshold
+    formula: |
+      gross_recoverable_cents = round_half_up(estimated_damage_cents * third_party_liable_pct)
+      net_recoverable_cents   = max(0, gross_recoverable_cents - deductible_cents - SUBRO_ADMIN_FEE_CENTS)
+    input_set: "The single accident claim."
+    constants:
+      SUBRO_ADMIN_FEE_CENTS: 15000
+    precision: "round_half_up on gross before subtracting deductible and admin fee; floor at 0"
+    variants:
+      - name: GROSS
+        when: "reporting gross third-party liability (outstanding_liable_cents baseline)"
+        difference: "gross_recoverable_cents = damage * liable_pct, no deductible/admin subtraction."
+      - name: NET
+        when: "reporting net dollars the fleet actually keeps"
+        difference: "net_recoverable_cents subtracts deductible_cents and SUBRO_ADMIN_FEE_CENTS, floored at 0; diverges from GROSS whenever deductible+admin > 0."
+
+  - name: replacement_score
+    trigger: "POST /work-orders/{id}/complete (cascade) and POST /vehicles/{id}/replacement-evaluation"
+    algorithm: weighted_scoring
+    formula: |
+      p = VehicleClassPolicy(vehicle.vehicle_class)
+      age_years   = (clock.now - in_service_date) / 31536000 seconds
+      age_sub     = min(1.0, age_years / p.replacement_age_years)
+      mile_sub    = min(1.0, odometer_miles / p.replacement_mileage)
+      maint_ratio = lifetime_maintenance_cents / acquisition_cost_cents      # acquisition_cost_cents > 0
+      maint_sub   = min(1.0, maint_ratio / p.replacement_maint_ratio)
+      replacement_score = round_half_up(100 * (0.30*age_sub + 0.40*mile_sub + 0.30*maint_sub), 2)
+      # threshold: replacement_score >= 70.00 flags the vehicle (ACTIVE -> FLAGGED_FOR_REPLACEMENT)
+    input_set: "Single vehicle + its class policy; maintenance from lifetime_maintenance_cents."
+    constants:
+      FLAG_THRESHOLD: 70.00
+    precision: "2 decimal places, round_half_up; threshold comparison is >= (70.00 flags, 69.99 does not)"
+    variants: []
+
+  - name: vehicle_cost_per_mile
+    trigger: "recomputed on POST /vehicles/{id}/fuel-logs and POST /work-orders/{id}/complete; exposed on Vehicle.cost_per_mile_cents"
+    algorithm: aggregation
+    formula: |
+      lifetime_fuel_cents = sum FuelLog.fuel_cost_cents for this vehicle (all time)
+      numerator_cents     = lifetime_maintenance_cents + lifetime_fuel_cents   # SUM cost components FIRST
+      if odometer_miles == 0: cost_per_mile_cents = null
+      else: cost_per_mile_cents = round_half_up(numerator_cents / odometer_miles)   # divide once, ROUND ONCE at the end
+      # ROUNDING ORDER PINNED: do NOT round (maintenance/miles) and (fuel/miles) separately and add;
+      # that per-component rounding diverges from the single end rounding by up to 1 cent.
+    input_set: "Single vehicle: its COMPLETED-work-order maintenance total + all its fuel logs."
+    constants: {}
+    precision: "integer cents; single round_half_up applied once after summing components and dividing"
+    variants: []
+
+  - name: disposal_net_proceeds
+    trigger: "POST /disposals/{id}/sell"
+    algorithm: tiered_pricing
+    formula: |
+      # evaluation order is pinned: bracket is chosen from sale_price_cents FIRST, then commission, then net.
+      if sale_price_cents <= 500000:        rate = 0.10
+      elif sale_price_cents <= 2000000:     rate = 0.08
+      else:                                 rate = 0.06
+      commission_cents  = round_half_up(sale_price_cents * rate)
+      net_proceeds_cents = sale_price_cents - commission_cents - reconditioning_cost_cents
+    input_set: "The single disposal record at sale."
+    constants:
+      TIER1_MAX_CENTS: 500000
+      TIER2_MAX_CENTS: 2000000
+    precision: "round_half_up on commission; net is exact integer subtraction (may be negative)"
+    variants: []
+
+# =====================================================================
+# §1.4 Validation Rules Table (ordered by priority; lower number wins)
+# =====================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /_clock/set_current_utc"
+  - priority: 2
+    category: auth
+    check: "The acting role is permitted for this endpoint per §1.7 RBAC."
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "Every path/body id references an existing resource, validated left-to-right in the path then body FKs."
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+  - priority: 4
+    category: business_referential
+    check: "Request body is well-formed: required fields present, enums in range, numbers within stated constraints (e.g., requested_end > requested_start; third_party_liable_pct in [0,1])."
+    error_id: ERR_VALIDATION
+    http_status: 422
+    applies_to: "all POST/PATCH with a body"
+  - priority: 4
+    category: business_referential
+    check: "Pagination bounds: limit within [1,100], offset >= 0."
+    error_id: ERR_PAGINATION_INVALID
+    http_status: 400
+    applies_to: "all list endpoints"
+  - priority: 5
+    category: state
+    check: "OCC: expected_<parent>_version equals the parent's current version for supersede-style creates."
+    error_id: ERR_STALE_VEHICLE_VERSION
+    http_status: 412
+    applies_to: "POST /vehicles/{id}/disposals"
+  - priority: 5
+    category: state
+    check: "OCC: expected_department_version equals the department's current version."
+    error_id: ERR_STALE_DEPARTMENT_VERSION
+    http_status: 412
+    applies_to: "POST /departments/{id}/chargeback-invoices"
+  - priority: 6
+    category: state
+    check: "Target resource is in a state from which the requested transition is defined (see §1.2). Includes: reservation must be REQUESTED to confirm; disposal must be BIDDING to sell; vehicle must be FLAGGED_FOR_REPLACEMENT to list for disposal."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 6
+    category: state
+    check: "A vehicle whose lifecycle_status == DISPOSED rejects any new work order, reservation assignment, or accident claim."
+    error_id: ERR_VEHICLE_DISPOSED
+    http_status: 409
+    applies_to: "POST /work-orders, POST /reservations/{id}/confirm, POST /accident-claims"
+  - priority: 6
+    category: state
+    check: "A work order can only start (SCHEDULED->IN_PROGRESS) when its ShopBay.status == AVAILABLE (cross-entity dependency WorkOrder -> ShopBay)."
+    error_id: ERR_BAY_CLOSED
+    http_status: 409
+    applies_to: "POST /work-orders/{id}/start"
+  - priority: 7
+    category: business_safety
+    check: "A PM work order cannot be scheduled on a vehicle whose open_accident_count > 0 (accident repair takes precedence)."
+    error_id: ERR_OPEN_ACCIDENT_BLOCKS_WO
+    http_status: 409
+    applies_to: "POST /work-orders (wo_type==PM)"
+  - priority: 7
+    category: business_safety
+    check: "A vehicle cannot be listed for disposal while open_accident_count > 0 or operational_status == IN_SHOP."
+    error_id: ERR_DISPOSAL_BLOCKED
+    http_status: 409
+    applies_to: "POST /vehicles/{id}/disposals"
+  - priority: 8
+    category: business_temporal
+    check: "ShopBay closed-interval-with-buffer conflict: a new work order's [scheduled_start, scheduled_end] must be separated from every non-terminal work order on the same bay by at least BAY_BUFFER_MINUTES (= 60 minutes). Reject if (new.start < existing.end + buffer) AND (existing.start < new.end + buffer). Adjacency (gap < buffer) is rejected."
+    error_id: ERR_BAY_TIME_CONFLICT
+    http_status: 409
+    applies_to: "POST /work-orders"
+  - priority: 8
+    category: business_temporal
+    check: "Vehicle half-open reservation overlap (adjacency allowed): the confirm selector excludes any POOL vehicle with a {CONFIRMED,CHECKED_OUT} reservation x where (x.start < this.end) AND (this.start < x.end). Adjacent windows (x.end == this.start) do NOT conflict."
+    error_id: ERR_NO_VEHICLE_AVAILABLE
+    http_status: 409
+    applies_to: "POST /reservations/{id}/confirm"
+  - priority: 9
+    category: business_referential
+    check: "checkout_odometer >= assigned vehicle.odometer_miles; return_odometer >= checkout_odometer; sale_price_cents >= reserve_price_cents."
+    error_id: ERR_ODOMETER_ROLLBACK
+    http_status: 409
+    applies_to: "POST /reservations/{id}/checkout, POST /reservations/{id}/return"
+  - priority: 9
+    category: business_referential
+    check: "A sale below reserve is rejected."
+    error_id: ERR_BELOW_RESERVE
+    http_status: 409
+    applies_to: "POST /disposals/{id}/sell"
+  - priority: 9
+    category: business_constraint
+    check: "Subrogation requires at_fault==false and third_party_liable_pct > 0; recovery postings cannot exceed gross_recoverable_cents; dispute reversal cannot exceed recovered_cents."
+    error_id: ERR_SUBROGATION_INVALID
+    http_status: 409
+    applies_to: "POST /accident-claims/{id}/subrogate, /record-recovery, /dispute"
+  - priority: 10
+    category: business_constraint
+    check: "Uniqueness: Vehicle.vin, Department.cost_center_code, ShopBay.name, VehicleClassPolicy.vehicle_class are unique."
+    error_id: ERR_DUPLICATE
+    http_status: 409
+    applies_to: "POST /vehicles, POST /departments, POST /shop-bays, POST /vehicle-class-policies"
+  - priority: 10
+    category: business_constraint
+    check: "A DEPARTMENT_ASSIGNED assignment requires assignment_type transition to name a department; a POOL vehicle cannot carry assigned_department_id."
+    error_id: ERR_ASSIGNMENT_INVALID
+    http_status: 409
+    applies_to: "PATCH /vehicles/{id}/assignment"
+  - priority: 11
+    category: business_fiscal
+    check: "On confirm, Department.committed_budget_cents + estimated_cost_cents must not exceed Department.monthly_budget_cents."
+    error_id: ERR_BUDGET_EXCEEDED
+    http_status: 409
+    applies_to: "POST /reservations/{id}/confirm"
+
+# =====================================================================
+# §1.5 API Endpoint Table
+# =====================================================================
+endpoints:
+  # ---- Vehicles ----
+  - method: POST
+    path: "/vehicles"
+    description: "Create a vehicle (defaults: assignment_type POOL, operational IN_SERVICE, lifecycle ACTIVE)."
+    roles: [FleetAdmin]
+    code: 201
+    input: [vin, vehicle_class, acquisition_cost_cents, in_service_date]
+    output: Vehicle
+    side_effects: []
+  - method: GET
+    path: "/vehicles"
+    description: "List vehicles with filters and pagination."
+    roles: [FleetAdmin, MotorPoolClerk, ShopTech, FinanceOfficer]
+    code: 200
+    input: ["operational_status?", "lifecycle_status?", "assignment_type?", "vehicle_class?", "limit?", "offset?"]
+    output: Vehicle[]
+    side_effects: []
+  - method: GET
+    path: "/vehicles/{id}"
+    description: "Fetch one vehicle (exposes cost_per_mile_cents, replacement_score, both status axes)."
+    roles: [FleetAdmin, MotorPoolClerk, ShopTech, FinanceOfficer]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: []
+  - method: PATCH
+    path: "/vehicles/{id}/assignment"
+    description: "Assign a vehicle to a department (DEPARTMENT_ASSIGNED) or return it to the POOL."
+    roles: [FleetAdmin]
+    code: 200
+    input: ["assignment_type", "assigned_department_id?"]
+    output: Vehicle
+    side_effects: ["sets assignment_type and assigned_department_id"]
+  - method: POST
+    path: "/vehicles/{id}/replacement-evaluation"
+    description: "Recompute replacement_score against the current clock; may transition lifecycle ACTIVE -> FLAGGED_FOR_REPLACEMENT when score >= 70.00."
+    roles: [FleetAdmin]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: ["recompute replacement_score", "if >= 70.00 and lifecycle_status==ACTIVE: lifecycle_status=FLAGGED_FOR_REPLACEMENT"]
+  - method: POST
+    path: "/vehicles/{id}/fuel-logs"
+    description: "Record a fuel/telematics/idle reading for a vehicle."
+    roles: [FleetAdmin, ShopTech]
+    code: 201
+    input: ["reading_at", "gallons", "fuel_cost_cents", "odometer_miles", "idle_minutes?", "engine_hours?"]
+    output: FuelLog
+    side_effects: ["vehicle.odometer_miles = max(vehicle.odometer_miles, odometer_miles)", "vehicle.lifetime_fuel_cents += fuel_cost_cents", "recompute vehicle.cost_per_mile_cents"]
+  - method: GET
+    path: "/vehicles/{id}/fuel-logs"
+    description: "List a vehicle's fuel logs (FK reverse for FuelLog.vehicle_id)."
+    roles: [FleetAdmin, ShopTech, FinanceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: FuelLog[]
+    side_effects: []
+  - method: GET
+    path: "/vehicles/{id}/disposals"
+    description: "List a vehicle's disposal records (FK reverse for DisposalRecord.vehicle_id)."
+    roles: [FleetAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: DisposalRecord[]
+    side_effects: []
+  - method: POST
+    path: "/vehicles/{id}/disposals"
+    description: "List a FLAGGED_FOR_REPLACEMENT vehicle for auction; creates a DisposalRecord (LISTED) and moves vehicle lifecycle to PENDING_DISPOSAL. OCC-guarded on vehicle version; a relist supersedes a prior NO_SALE listing."
+    roles: [FleetAdmin]
+    code: 201
+    input: ["reserve_price_cents", "reconditioning_cost_cents?", "expected_vehicle_version"]
+    output: DisposalRecord
+    side_effects: ["creates DisposalRecord status=LISTED", "vehicle.lifecycle_status=PENDING_DISPOSAL", "increments Vehicle.version by 1"]
+  # ---- Departments ----
+  - method: POST
+    path: "/departments"
+    description: "Create a department."
+    roles: [FleetAdmin]
+    code: 201
+    input: [name, cost_center_code, monthly_budget_cents]
+    output: Department
+    side_effects: []
+  - method: GET
+    path: "/departments/{id}"
+    description: "Fetch one department (exposes committed_budget_cents, billed_ytd_cents)."
+    roles: [FleetAdmin, FinanceOfficer, DepartmentUser]
+    code: 200
+    input: []
+    output: Department
+    side_effects: []
+  - method: GET
+    path: "/departments/{id}/vehicles"
+    description: "List the vehicles assigned to a department (FK reverse for Vehicle.assigned_department_id)."
+    roles: [FleetAdmin, FinanceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Vehicle[]
+    side_effects: []
+  - method: GET
+    path: "/departments/{id}/chargeback-invoices"
+    description: "List a department's chargeback invoices (FK reverse for ChargebackInvoice.department_id)."
+    roles: [FleetAdmin, FinanceOfficer, DepartmentUser]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ChargebackInvoice[]
+    side_effects: []
+  - method: POST
+    path: "/departments/{id}/chargeback-invoices"
+    description: "Generate a DRAFT chargeback invoice for a period; computes all four line items per basis. OCC-guarded on department version (a new period invoice supersedes a prior DRAFT)."
+    roles: [FinanceOfficer]
+    code: 201
+    input: ["period_start", "period_end", "basis?", "expected_department_version"]
+    output: ChargebackInvoice
+    side_effects: ["computes assignment_fee/mileage/fuel/idle/total via calculations.chargeback_total", "increments Department.version by 1"]
+  # ---- Vehicle Class Policies ----
+  - method: POST
+    path: "/vehicle-class-policies"
+    description: "Create the rate policy for a vehicle class (unique per class)."
+    roles: [FleetAdmin]
+    code: 201
+    input: [vehicle_class, assignment_fee_cents_per_month, mileage_tier1_rate_cents, mileage_tier2_rate_cents, mileage_tier_boundary_miles, fuel_surcharge_multiplier, idle_free_minutes, idle_penalty_cents_per_min, replacement_age_years, replacement_mileage, replacement_maint_ratio]
+    output: VehicleClassPolicy
+    side_effects: []
+  - method: GET
+    path: "/vehicle-class-policies/{id}"
+    description: "Fetch one vehicle class policy."
+    roles: [FleetAdmin, FinanceOfficer]
+    code: 200
+    input: []
+    output: VehicleClassPolicy
+    side_effects: []
+  # ---- Reservations ----
+  - method: POST
+    path: "/reservations"
+    description: "Request a motor-pool reservation for a time window (status REQUESTED)."
+    roles: [MotorPoolClerk, DepartmentUser]
+    code: 201
+    input: [department_id, requested_start, requested_end, driver_name, purpose]
+    output: Reservation
+    side_effects: []
+  - method: GET
+    path: "/reservations/{id}"
+    description: "Fetch one reservation."
+    roles: [MotorPoolClerk, DepartmentUser, FleetAdmin]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: []
+  - method: GET
+    path: "/reservations"
+    description: "List reservations (FK reverse for Reservation.department_id and Reservation.assigned_vehicle_id)."
+    roles: [MotorPoolClerk, FleetAdmin]
+    code: 200
+    input: ["department_id?", "assigned_vehicle_id?", "status?", "limit?", "offset?"]
+    output: Reservation[]
+    side_effects: []
+  - method: POST
+    path: "/reservations/{id}/confirm"
+    description: "Confirm a REQUESTED reservation: select a POOL vehicle (calculations.pool_vehicle_selector), place a budget hold."
+    roles: [MotorPoolClerk]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["assigned_vehicle_id set", "estimated_cost_cents computed", "Department.committed_budget_cents += estimated_cost_cents"]
+  - method: POST
+    path: "/reservations/{id}/checkout"
+    description: "Check out a CONFIRMED reservation, recording the checkout odometer."
+    roles: [MotorPoolClerk]
+    code: 200
+    input: [checkout_odometer]
+    output: Reservation
+    side_effects: ["checkout_odometer stored"]
+  - method: POST
+    path: "/reservations/{id}/return"
+    description: "Return a CHECKED_OUT reservation; compute miles_driven; advance vehicle odometer; release budget hold."
+    roles: [MotorPoolClerk]
+    code: 200
+    input: [return_odometer]
+    output: Reservation
+    side_effects: ["miles_driven computed", "vehicle.odometer_miles advanced", "Department.committed_budget_cents -= estimated_cost_cents"]
+  - method: POST
+    path: "/reservations/{id}/cancel"
+    description: "Cancel a REQUESTED or CONFIRMED reservation; releases any budget hold placed at confirm."
+    roles: [MotorPoolClerk, DepartmentUser]
+    code: 200
+    input: []
+    output: Reservation
+    side_effects: ["if was CONFIRMED: Department.committed_budget_cents -= estimated_cost_cents"]
+  # ---- Shop Bays ----
+  - method: POST
+    path: "/shop-bays"
+    description: "Create a maintenance bay (status AVAILABLE)."
+    roles: [FleetAdmin, ShopTech]
+    code: 201
+    input: [name, bay_type]
+    output: ShopBay
+    side_effects: []
+  - method: GET
+    path: "/shop-bays/{id}"
+    description: "Fetch one shop bay."
+    roles: [FleetAdmin, ShopTech]
+    code: 200
+    input: []
+    output: ShopBay
+    side_effects: []
+  - method: PATCH
+    path: "/shop-bays/{id}"
+    description: "Open or close a bay (status AVAILABLE|CLOSED)."
+    roles: [FleetAdmin, ShopTech]
+    code: 200
+    input: [status]
+    output: ShopBay
+    side_effects: []
+  - method: GET
+    path: "/shop-bays/{id}/work-orders"
+    description: "List work orders scheduled on a bay (FK reverse for WorkOrder.bay_id)."
+    roles: [FleetAdmin, ShopTech]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WorkOrder[]
+    side_effects: []
+  # ---- Work Orders ----
+  - method: POST
+    path: "/work-orders"
+    description: "Schedule a work order on a vehicle+bay window (status SCHEDULED)."
+    roles: [ShopTech]
+    code: 201
+    input: [vehicle_id, bay_id, wo_type, scheduled_start, scheduled_end, labor_rate_cents]
+    output: WorkOrder
+    side_effects: []
+  - method: GET
+    path: "/work-orders/{id}"
+    description: "Fetch one work order."
+    roles: [FleetAdmin, ShopTech]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: []
+  - method: GET
+    path: "/work-orders"
+    description: "List work orders (FK reverse for WorkOrder.vehicle_id)."
+    roles: [FleetAdmin, ShopTech]
+    code: 200
+    input: ["vehicle_id?", "bay_id?", "status?", "limit?", "offset?"]
+    output: WorkOrder[]
+    side_effects: []
+  - method: POST
+    path: "/work-orders/{id}/start"
+    description: "Start (or resume from AWAITING_PARTS) a work order; moves vehicle to IN_SHOP."
+    roles: [ShopTech]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: ["vehicle.operational_status=IN_SHOP (on SCHEDULED->IN_PROGRESS)"]
+  - method: POST
+    path: "/work-orders/{id}/hold-parts"
+    description: "Put an IN_PROGRESS work order into AWAITING_PARTS (cyclic)."
+    roles: [ShopTech]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: []
+  - method: POST
+    path: "/work-orders/{id}/complete"
+    description: "Complete a work order; compute total_cost_cents; return vehicle to service; add to lifetime maintenance and recompute replacement_score."
+    roles: [ShopTech]
+    code: 200
+    input: ["labor_hours", "parts_cost_cents?"]
+    output: WorkOrder
+    side_effects: ["total_cost_cents computed", "vehicle.operational_status=IN_SERVICE", "vehicle.lifetime_maintenance_cents += total_cost_cents", "recompute replacement_score", "recompute cost_per_mile_cents", "may flag lifecycle"]
+  - method: POST
+    path: "/work-orders/{id}/cancel"
+    description: "Cancel a SCHEDULED work order."
+    roles: [ShopTech]
+    code: 200
+    input: []
+    output: WorkOrder
+    side_effects: []
+  # ---- Accident Claims ----
+  - method: POST
+    path: "/accident-claims"
+    description: "Report an accident on a vehicle; if at_fault or damage >= 500000, vehicle goes OUT_OF_SERVICE and future confirmed reservations auto-cancel (cascade)."
+    roles: [FinanceOfficer]
+    code: 201
+    input: ["vehicle_id", "reported_at", "at_fault", "estimated_damage_cents", "deductible_cents?", "third_party_liable_pct?"]
+    output: AccidentClaim
+    side_effects: ["vehicle.open_accident_count incremented", "if at_fault or damage>=500000: vehicle.operational_status=OUT_OF_SERVICE -> cancel future CONFIRMED reservations -> release their budget holds"]
+  - method: GET
+    path: "/accident-claims/{id}"
+    description: "Fetch one accident claim (exposes gross/net recoverable, recovered, outstanding)."
+    roles: [FinanceOfficer, FleetAdmin]
+    code: 200
+    input: []
+    output: AccidentClaim
+    side_effects: []
+  - method: GET
+    path: "/accident-claims"
+    description: "List accident claims (FK reverse for AccidentClaim.vehicle_id)."
+    roles: [FinanceOfficer, FleetAdmin]
+    code: 200
+    input: ["vehicle_id?", "status?", "limit?", "offset?"]
+    output: AccidentClaim[]
+    side_effects: []
+  - method: POST
+    path: "/accident-claims/{id}/investigate"
+    description: "Move a REPORTED claim to UNDER_INVESTIGATION."
+    roles: [FinanceOfficer]
+    code: 200
+    input: []
+    output: AccidentClaim
+    side_effects: []
+  - method: POST
+    path: "/accident-claims/{id}/subrogate"
+    description: "Open subrogation (UNDER_INVESTIGATION -> SUBROGATION_PENDING); requires at_fault==false and third_party_liable_pct>0."
+    roles: [FinanceOfficer]
+    code: 200
+    input: []
+    output: AccidentClaim
+    side_effects: ["outstanding_liable_cents recomputed"]
+  - method: POST
+    path: "/accident-claims/{id}/record-recovery"
+    description: "Post a subrogation recovery amount (self-loop on SUBROGATION_PENDING)."
+    roles: [FinanceOfficer]
+    code: 200
+    input: [amount_cents]
+    output: AccidentClaim
+    side_effects: ["recovered_cents += amount_cents", "outstanding_liable_cents recomputed"]
+  - method: POST
+    path: "/accident-claims/{id}/dispute"
+    description: "Reverse part of a recovery and loop back to UNDER_INVESTIGATION (compensation)."
+    roles: [FinanceOfficer]
+    code: 200
+    input: [reversal_cents]
+    output: AccidentClaim
+    side_effects: ["recovered_cents -= reversal_cents", "outstanding_liable_cents recomputed"]
+  - method: POST
+    path: "/accident-claims/{id}/close"
+    description: "Close a claim (disposition RECOVERED | RETURN_TO_SERVICE | WRITE_OFF); may return vehicle to service and decrements open_accident_count."
+    roles: [FinanceOfficer]
+    code: 200
+    input: [disposition]
+    output: AccidentClaim
+    side_effects: ["status -> terminal", "vehicle.open_accident_count decremented", "if RETURN_TO_SERVICE and no open work order: vehicle.operational_status=IN_SERVICE"]
+  # ---- Disposals ----
+  - method: GET
+    path: "/disposals/{id}"
+    description: "Fetch one disposal record."
+    roles: [FleetAdmin]
+    code: 200
+    input: []
+    output: DisposalRecord
+    side_effects: []
+  - method: POST
+    path: "/disposals/{id}/open-bidding"
+    description: "Open bidding on a LISTED (or relisted NO_SALE) disposal."
+    roles: [FleetAdmin]
+    code: 200
+    input: []
+    output: DisposalRecord
+    side_effects: []
+  - method: POST
+    path: "/disposals/{id}/sell"
+    description: "Record a sale >= reserve; compute commission and net proceeds; dispose the vehicle; credit the assigned department."
+    roles: [FleetAdmin]
+    code: 200
+    input: [sale_price_cents, buyer_name]
+    output: DisposalRecord
+    side_effects: ["commission_cents/net_proceeds_cents computed", "vehicle.lifecycle_status=DISPOSED; operational_status=OUT_OF_SERVICE", "if assigned_department_id!=null: Department.billed_ytd_cents -= net_proceeds_cents"]
+  - method: POST
+    path: "/disposals/{id}/no-sale"
+    description: "Mark a BIDDING disposal as NO_SALE (relistable)."
+    roles: [FleetAdmin]
+    code: 200
+    input: []
+    output: DisposalRecord
+    side_effects: []
+  # ---- Chargeback Invoices ----
+  - method: GET
+    path: "/chargeback-invoices/{id}"
+    description: "Fetch one chargeback invoice (exposes the four line items and total)."
+    roles: [FinanceOfficer, DepartmentUser, FleetAdmin]
+    code: 200
+    input: []
+    output: ChargebackInvoice
+    side_effects: []
+  - method: POST
+    path: "/chargeback-invoices/{id}/issue"
+    description: "Issue a DRAFT invoice; debits Department.billed_ytd_cents by total_cents."
+    roles: [FinanceOfficer]
+    code: 200
+    input: []
+    output: ChargebackInvoice
+    side_effects: ["Department.billed_ytd_cents += total_cents"]
+  - method: POST
+    path: "/chargeback-invoices/{id}/pay"
+    description: "Mark an ISSUED invoice PAID."
+    roles: [FinanceOfficer]
+    code: 200
+    input: []
+    output: ChargebackInvoice
+    side_effects: []
+  - method: POST
+    path: "/chargeback-invoices/{id}/dispute"
+    description: "Department disputes an ISSUED invoice (requires disputed_reason)."
+    roles: [DepartmentUser]
+    code: 200
+    input: [disputed_reason]
+    output: ChargebackInvoice
+    side_effects: []
+  - method: POST
+    path: "/chargeback-invoices/{id}/resolve"
+    description: "Resolve a DISPUTED invoice: REAFFIRM returns to ISSUED (no ledger change); ADJUST moves to ADJUSTED and reverses billed_ytd_cents."
+    roles: [FinanceOfficer]
+    code: 200
+    input: [outcome]
+    output: ChargebackInvoice
+    side_effects: ["if outcome==ADJUST: Department.billed_ytd_cents -= total_cents"]
+  # ---- Test-driving / clock ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock. Server startup default is 2026-03-01T00:00:00Z; before any set call the clock reads exactly this default (never real wall-clock). Drives age/proration/provisional-projection determinism."
+    roles: [FleetAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: datetime }"
+    side_effects: ["logical clock set to to_iso8601"]
+
+# =====================================================================
+# §1.6 Error Code Catalog
+# =====================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID header."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Authenticated role not permitted for this endpoint, or entity-backed DepartmentUser acting on another department's resource."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A referenced path id or body FK does not resolve to an existing resource."
+  - id: ERR_PAGINATION_INVALID
+    http: 400
+    condition: "limit outside [1,100] or offset < 0."
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "Malformed body: missing required field, out-of-range enum/number, or requested_end <= requested_start / third_party_liable_pct outside [0,1]."
+  - id: ERR_STALE_VEHICLE_VERSION
+    http: 412
+    condition: "expected_vehicle_version does not equal Vehicle.version on POST /vehicles/{id}/disposals."
+  - id: ERR_STALE_DEPARTMENT_VERSION
+    http: 412
+    condition: "expected_department_version does not equal Department.version on POST /departments/{id}/chargeback-invoices."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Requested transition is not defined from the resource's current state."
+  - id: ERR_VEHICLE_DISPOSED
+    http: 409
+    condition: "Operation attempted on a vehicle whose lifecycle_status == DISPOSED."
+  - id: ERR_BAY_CLOSED
+    http: 409
+    condition: "Work order start attempted while its ShopBay.status == CLOSED."
+  - id: ERR_OPEN_ACCIDENT_BLOCKS_WO
+    http: 409
+    condition: "PM work order scheduled on a vehicle with open_accident_count > 0."
+  - id: ERR_DISPOSAL_BLOCKED
+    http: 409
+    condition: "Disposal listing attempted while vehicle has open_accident_count > 0 or operational_status == IN_SHOP."
+  - id: ERR_BAY_TIME_CONFLICT
+    http: 409
+    condition: "Work order window violates the ShopBay closed-interval + BAY_BUFFER_MINUTES (= 60 minutes) separation from another non-terminal work order on the same bay."
+  - id: ERR_NO_VEHICLE_AVAILABLE
+    http: 409
+    condition: "Confirm found no POOL vehicle that is IN_SERVICE, ACTIVE, and free of half-open reservation overlap for the window."
+  - id: ERR_ODOMETER_ROLLBACK
+    http: 409
+    condition: "checkout_odometer < vehicle.odometer_miles or return_odometer < checkout_odometer."
+  - id: ERR_BELOW_RESERVE
+    http: 409
+    condition: "sale_price_cents < reserve_price_cents on POST /disposals/{id}/sell."
+  - id: ERR_SUBROGATION_INVALID
+    http: 409
+    condition: "Subrogate on at_fault/zero-liability claim, recovery exceeding gross recoverable, or dispute reversal exceeding recovered_cents."
+  - id: ERR_DUPLICATE
+    http: 409
+    condition: "Unique constraint violated: Vehicle.vin, Department.cost_center_code, ShopBay.name, or VehicleClassPolicy.vehicle_class already exists."
+  - id: ERR_ASSIGNMENT_INVALID
+    http: 409
+    condition: "assignment_type=DEPARTMENT_ASSIGNED without assigned_department_id, or POOL with an assigned_department_id supplied."
+  - id: ERR_BUDGET_EXCEEDED
+    http: 409
+    condition: "committed_budget_cents + estimated_cost_cents > monthly_budget_cents on confirm."
+
+# =====================================================================
+# §1.7 RBAC Matrix
+# =====================================================================
+roles:
+  - name: FleetAdmin
+    description: "Owns vehicle inventory, assignment, class policies, shop bays, lifecycle evaluation, and auction/disposal."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /vehicles, PATCH /vehicles/{id}/assignment, POST /vehicles/{id}/replacement-evaluation"
+      - "POST /departments, POST /vehicle-class-policies"
+      - "POST /vehicles/{id}/disposals, POST /disposals/{id}/open-bidding, POST /disposals/{id}/sell, POST /disposals/{id}/no-sale"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /shop-bays, PATCH /shop-bays/{id} (with ShopTech)"
+      - "read endpoints (vehicles, departments, reservations, work-orders, accident-claims, disposals, chargeback-invoices)"
+  - name: MotorPoolClerk
+    description: "Owns motor-pool reservations and checkout/return."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /reservations/{id}/confirm, POST /reservations/{id}/checkout, POST /reservations/{id}/return"
+    shared_operations:
+      - "POST /reservations, POST /reservations/{id}/cancel (with DepartmentUser)"
+      - "GET /reservations, GET /reservations/{id}"
+  - name: ShopTech
+    description: "Owns preventive-maintenance and shop work orders and fuel-log entry."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /work-orders, POST /work-orders/{id}/start, POST /work-orders/{id}/hold-parts, POST /work-orders/{id}/complete, POST /work-orders/{id}/cancel"
+    shared_operations:
+      - "POST /shop-bays, PATCH /shop-bays/{id} (with FleetAdmin)"
+      - "POST /vehicles/{id}/fuel-logs (with FleetAdmin)"
+      - "GET work-orders, shop-bays, vehicles, fuel-logs"
+  - name: FinanceOfficer
+    description: "Owns department chargeback invoicing and accident/subrogation."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /departments/{id}/chargeback-invoices, POST /chargeback-invoices/{id}/issue, POST /chargeback-invoices/{id}/pay, POST /chargeback-invoices/{id}/resolve"
+      - "POST /accident-claims, POST /accident-claims/{id}/investigate, /subrogate, /record-recovery, /dispute, /close"
+    shared_operations:
+      - "read endpoints (departments, chargeback-invoices, accident-claims, vehicles)"
+  - name: DepartmentUser
+    description: "A department end-user: requests reservations for and views chargebacks of its own department."
+    identity: "entity_backed:Department"
+    exclusive_operations:
+      - "POST /chargeback-invoices/{id}/dispute (own department's invoice)"
+    shared_operations:
+      - "POST /reservations, POST /reservations/{id}/cancel (with MotorPoolClerk)"
+      - "GET /departments/{id}, GET /departments/{id}/chargeback-invoices, GET /chargeback-invoices/{id}, GET /reservations/{id} (own department only; X-User-ID == Department.id)"

@@ -1,0 +1,18 @@
+#!/bin/bash
+D=/home/ubuntu/github/CodingPRD/tasks/task_0850_urban_forestry_tree_permit
+rm -f "$D/workspace/implementation/results".*.json
+run_round () {
+  prd-bench-local-run \
+    --start-command "cd $D/workspace/implementation && bash start.sh" \
+    --test-dir       "$D/test_suite" \
+    --isolation      per-test-server \
+    --timeout        120 \
+    --test-timeout   30 \
+    --results-file   "$D/workspace/implementation/results.$1.json"
+}
+# 4 waves of 2 to avoid self-saturation on this host
+for w in "1 2" "3 4" "5 6" "7 8"; do
+  for i in $w; do run_round $i & done
+  wait
+done
+echo "SWEEP DONE"

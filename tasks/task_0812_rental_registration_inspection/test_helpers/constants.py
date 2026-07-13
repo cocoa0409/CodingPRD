@@ -1,0 +1,37 @@
+"""Domain thresholds — numeric constants from PRD calculations (§3.3-§3.6)."""
+
+# Inspection scoring (§3.3, §3.4)
+SEVERITY_WEIGHT = {"MINOR": 1, "MAJOR": 3, "CRITICAL": 10}
+CATEGORY_MULT = {"LIFE_SAFETY": 2.0, "HABITABILITY": 1.0, "LEAD_PAINT": 1.5, "STRUCTURAL": 1.5}
+PASS_THRESHOLD = 5.0
+MANDATORY_CATEGORIES = ["LIFE_SAFETY", "HABITABILITY"]
+
+# License fee tiers (§3.5)
+TIER_1_CENTS = 15000       # unit_count == 1
+TIER_2_CENTS = 30000       # 2 <= unit_count <= 4
+TIER_3_CENTS = 60000       # 5 <= unit_count <= 20
+TIER_4_CENTS = 120000      # unit_count > 20
+LEAD_SURCHARGE_CENTS = 5000
+LEAD_YEAR = 1978
+LATE_MULTIPLIER = 1.5
+REINSTATEMENT_FEE_CENTS = 10000
+
+# Violation penalty (§3.6)
+CURE_DAYS = {"MINOR": 30, "MAJOR": 14, "CRITICAL": 3}
+DAILY_CENTS = {"MINOR": 1000, "MAJOR": 2500, "CRITICAL": 10000}
+MAX_RAW_CENTS = {"MINOR": 30000, "MAJOR": 75000, "CRITICAL": 300000}
+ADMIN_FEE_RATE = 0.075
+
+# Escalation / thresholds (§3.6)
+ESCALATION_CRITICAL_COUNT = 2
+
+# Scheduling windows (§3.2)
+COOLDOWN_HOURS = 24
+REINSPECTION_MIN_HOURS = 48
+
+# Notices (§3.7)
+NOTICE_ACK_DAYS = 30
+
+# Defaults
+DEFAULT_DURATION_MINUTES = 60
+CLOCK_STARTUP_DEFAULT = "2026-03-01T00:00:00Z"
