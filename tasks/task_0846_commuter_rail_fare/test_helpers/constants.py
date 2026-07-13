@@ -1,0 +1,38 @@
+"""Domain thresholds — numeric constants from the PRD calculations and rules."""
+
+# Pricing
+REDUCED_FARE_DISCOUNT_PCT = 0.50
+FARE_CAP_CENTS = 5000
+
+# Refunds
+REFUND_FEE_CENTS = 200
+REFUND_WINDOW_DAYS = 60
+
+# Upgrades
+ONBOARD_SURCHARGE_CENTS = 200
+
+# Citations / evasion
+EVASION_BASE_PENALTY_CENTS = 5000
+REPEAT_EVASION_THRESHOLD = 2
+EVASION_FARE_ESTIMATE_CENTS = 1000
+EVASION_REVOCATION_THRESHOLD = 3
+
+# Service credits / disruptions
+SERVICE_CREDIT_MIN_DELAY_MINUTES = 30
+DISRUPTION_BUFFER_MINUTES = 15
+
+# Eligibility / activation
+SENIOR_MIN_AGE = 65
+TICKET_ACTIVATION_DEADLINE_DAYS = 90
+
+# Ticket validity
+SINGLE_VALIDITY_MINUTES = 90
+
+# Zone miles for DISTANCE apportionment
+ZONE_MILES = {1: 10, 2: 20, 3: 30, 4: 40, 5: 50, 6: 60}
+
+# Clock
+DEFAULT_CLOCK = "2026-03-01T00:00:00Z"
+
+# A syntactically valid UUID that is never minted by the server.
+UNKNOWN_UUID = "00000000-0000-4000-8000-000000000000"

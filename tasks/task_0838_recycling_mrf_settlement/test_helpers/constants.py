@@ -1,0 +1,28 @@
+"""Domain thresholds — numeric constants from the PRD calculations (§2.5, §3.3, §3.5, §3.6)."""
+
+# Contamination adjustment (PRD §3.5)
+CLEAN_THRESHOLD_PCT = 5.0
+PENALTY_THRESHOLD_PCT = 12.0
+REJECT_THRESHOLD_PCT = 40.0
+CLEAN_REBATE_CENTS_PER_TON = 300
+PENALTY_CENTS_PER_TON_PER_POINT = 150
+
+# Bale valuation grade multipliers (PRD §3.6)
+GRADE_MULT = {"A": 1.00, "B": 0.90, "C": 0.75}
+
+# Sort line (PRD §3.3)
+DEFAULT_SHIFT_MINUTES = 480
+
+# Logical clock default at startup (PRD §2.9)
+DEFAULT_CLOCK = "2026-03-01T00:00:00Z"
+
+# Pagination (PRD §2.3)
+PAGINATION_DEFAULTS = {"limit": 10, "min": 1, "max": 100, "offset": 0}
+
+THRESHOLDS = {
+    "CLEAN_THRESHOLD_PCT": CLEAN_THRESHOLD_PCT,
+    "PENALTY_THRESHOLD_PCT": PENALTY_THRESHOLD_PCT,
+    "REJECT_THRESHOLD_PCT": REJECT_THRESHOLD_PCT,
+    "CLEAN_REBATE_CENTS_PER_TON": CLEAN_REBATE_CENTS_PER_TON,
+    "PENALTY_CENTS_PER_TON_PER_POINT": PENALTY_CENTS_PER_TON_PER_POINT,
+}

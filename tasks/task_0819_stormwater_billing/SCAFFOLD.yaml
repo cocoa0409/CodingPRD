@@ -1,0 +1,1508 @@
+scenario: |
+  819. Stormwater Utility & Impervious-Area Billing: parcel impervious measurement
+  & ERU calc, tiered fee & BMP credit, appeal & re-measure, exemption category,
+  billing on tax/utility, credit inspection, delinquency, capital vs operating.
+
+domain_name: stormwater-billing
+# Flat topology: entities are peers linked by foreign keys, so every collection
+# lives at the URL root and there is no single shared prefix segment.
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: ledger_reconciliation
+  complexity_layers:
+    - rate_threshold_triggers        # tiered ERU fee bands; delinquency grace-day breakpoint
+    - derived_field_reconciliation   # parcel eru/fee, account outstanding recomputed on source change
+    - optimistic_concurrency         # OCC on Parcel.version for create-with-supersede measurement
+    - cascading_side_effects         # inspection-fail and payment chains propagate across entities
+
+  entity_topology: flat
+  state_machine_shape: branching     # branching bill/exemption + a cyclic Appeal review loop
+  relationship_patterns:
+    - one_to_many                    # Account 1:N Parcel; Parcel 1:N Measurement/Bill/Credit
+    - cross_aggregate                # Bill/Appeal/Payment reference across Account & Parcel aggregates
+
+  role_model: segregation_of_duties  # payment creator may not refund it; peer operational roles
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - name: owner_name
+        type: string
+        source: input
+        description: Property owner / account holder name.
+      - name: contact_email
+        type: string
+        source: input
+        description: Billing contact email.
+      - name: billing_method
+        type: enum
+        source: input
+        default: UTILITY_BILL
+        description: Where the stormwater charge is placed.
+        constraints: "one of {TAX_ROLL, UTILITY_BILL}"
+      - name: mailing_address
+        type: string
+        source: input
+        description: Postal address for tax-roll billing.
+      - name: outstanding_balance_cents
+        type: integer
+        source: computed
+        default: 0
+        description: >
+          Sum over this account's non-VOID bills of (net_fee_cents - amount_paid_cents).
+          Recomputed on any bill/payment mutation touching the account.
+      - name: delinquency_status
+        type: enum
+        source: computed
+        default: CURRENT
+        description: >
+          CURRENT when no bill is past due_date; PAST_DUE when some bill is past
+          due_date but within GRACE_DAYS; DELINQUENT when some bill is past
+          due_date + GRACE_DAYS. Recomputed by POST /billing/run-cycle and on payment.
+        constraints: "one of {CURRENT, PAST_DUE, DELINQUENT}"
+
+  - name: Parcel
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; owning property account."
+      - name: parcel_number
+        type: string
+        source: input
+        description: Assessor parcel number.
+        constraints: "unique across all parcels"
+      - name: land_use
+        type: enum
+        source: input
+        description: Land-use classification.
+        constraints: "one of {RESIDENTIAL_SF, RESIDENTIAL_MF, COMMERCIAL, INDUSTRIAL, INSTITUTIONAL, UNDEVELOPED}"
+      - name: status
+        type: enum
+        source: computed
+        default: DRAFT
+        description: DRAFT until first ACTIVE measurement recorded, then ACTIVE.
+        constraints: "one of {DRAFT, ACTIVE}"
+      - name: active_measurement_id
+        type: string
+        source: computed
+        default: null
+        description: Computed pointer to the currently ACTIVE ImperviousMeasurement (identity only).
+      - name: impervious_area_sqft
+        type: integer
+        source: computed
+        default: 0
+        description: measured_sqft of the currently ACTIVE measurement; 0 when none.
+      - name: exempt_pct
+        type: number
+        source: computed
+        default: 0
+        description: granted_pct of this parcel's GRANTED Exemption (0 when none).
+      - name: billable_eru
+        type: number
+        source: computed
+        default: 0
+        description: >
+          Equivalent Residential Units. round_half_up((impervious_area_sqft *
+          (1 - exempt_pct)) / ERU_BASE_SQFT, 1). See calculations.eru_assessment.
+      - name: current_fee_cents
+        type: integer
+        source: computed
+        default: 0
+        description: >
+          Live MARGINAL-variant annual fee for the parcel's current state
+          (see calculations.stormwater_fee); recomputed on any eru/credit/exemption change.
+
+  - name: ImperviousMeasurement
+    parent: null
+    common_fields: true
+    fields:
+      - name: parcel_id
+        type: string
+        source: input
+        description: "FK -> Parcel.id; parcel measured."
+      - name: measured_sqft
+        type: integer
+        source: input
+        description: Measured impervious surface area in square feet.
+        constraints: ">= 0"
+      - name: method
+        type: enum
+        source: input
+        description: Measurement method.
+        constraints: "one of {GIS, FIELD_SURVEY, AERIAL}"
+      - name: source
+        type: enum
+        source: input
+        default: ROUTINE
+        description: ROUTINE assessment or APPEAL_REMEASURE (re-measure driven by an appeal).
+        constraints: "one of {ROUTINE, APPEAL_REMEASURE}"
+      - name: status
+        type: enum
+        source: computed
+        default: ACTIVE
+        description: ACTIVE when current; SUPERSEDED once a newer measurement replaces it.
+        constraints: "one of {ACTIVE, SUPERSEDED}"
+      - name: recorded_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the Assessor who recorded the measurement.
+
+  - name: Exemption
+    parent: null
+    common_fields: true
+    fields:
+      - name: parcel_id
+        type: string
+        source: input
+        description: "FK -> Parcel.id; parcel this exemption applies to."
+      - name: category
+        type: enum
+        source: input
+        description: Exemption category.
+        constraints: "one of {GOVERNMENT, RELIGIOUS, AGRICULTURAL, UNDEVELOPED, LOW_IMPACT}"
+      - name: requested_pct
+        type: number
+        source: input
+        description: Requested exemption fraction of impervious area (0..1).
+        constraints: "0 <= requested_pct <= 1"
+      - name: granted_pct
+        type: number
+        source: computed
+        default: 0
+        description: Fraction granted on approval; 0 until GRANTED.
+      - name: status
+        type: enum
+        source: computed
+        default: REQUESTED
+        description: REQUESTED -> GRANTED or DENIED.
+        constraints: "one of {REQUESTED, GRANTED, DENIED}"
+      - name: decision_note
+        type: string
+        source: input
+        default: null
+        description: Optional reviewer note supplied at decision time.
+
+  - name: BMPCredit
+    parent: null
+    common_fields: true
+    fields:
+      - name: parcel_id
+        type: string
+        source: input
+        description: "FK -> Parcel.id; parcel receiving the credit."
+      - name: bmp_type
+        type: enum
+        source: input
+        description: Best-Management-Practice type.
+        constraints: "one of {RAIN_GARDEN, DETENTION_POND, PERMEABLE_PAVEMENT, GREEN_ROOF, CISTERN}"
+      - name: self_reported_score
+        type: number
+        source: input
+        description: Owner-reported BMP performance score (0..100) used for the provisional credit.
+        constraints: "0 <= self_reported_score <= 100"
+      - name: inspected_score
+        type: number
+        source: computed
+        default: null
+        description: Score observed at credit inspection; null until an inspection COMPLETED.
+      - name: credit_pct
+        type: number
+        source: computed
+        default: 0
+        description: >
+          Provisional = min(MAX_CREDIT_PCT, self_reported_score/100 * CREDIT_SCALE);
+          after inspection recomputed from inspected_score. See calculations.bmp_credit_amount.
+      - name: status
+        type: enum
+        source: computed
+        default: ACTIVE
+        description: ACTIVE at creation (provisional); REVOKED on inspection FAIL; EXPIRED when inspection overdue.
+        constraints: "one of {ACTIVE, REVOKED, EXPIRED}"
+      - name: effective_date
+        type: datetime
+        source: input
+        description: Start of the coverage window (inclusive).
+      - name: expiry_date
+        type: datetime
+        source: input
+        description: End of the coverage window (exclusive; half-open [effective_date, expiry_date)).
+      - name: next_inspection_due
+        type: datetime
+        source: computed
+        description: effective_date + INSPECTION_INTERVAL_DAYS; drives EXPIRED sweep.
+
+  - name: CreditInspection
+    parent: null
+    common_fields: true
+    fields:
+      - name: bmp_credit_id
+        type: string
+        source: input
+        description: "FK -> BMPCredit.id; credit being inspected."
+      - name: scheduled_date
+        type: datetime
+        source: input
+        description: Date the inspection is scheduled for.
+      - name: observed_score
+        type: number
+        source: computed
+        default: null
+        description: Field-observed BMP score recorded at completion (0..100).
+      - name: result
+        type: enum
+        source: computed
+        default: null
+        description: PASS or FAIL; null until COMPLETED.
+        constraints: "one of {PASS, FAIL}"
+      - name: status
+        type: enum
+        source: computed
+        default: SCHEDULED
+        description: SCHEDULED -> COMPLETED.
+        constraints: "one of {SCHEDULED, COMPLETED}"
+      - name: inspector_note
+        type: string
+        source: input
+        default: null
+        description: Optional inspector note.
+
+  - name: StormwaterBill
+    parent: null
+    common_fields: true
+    fields:
+      - name: parcel_id
+        type: string
+        source: input
+        description: "FK -> Parcel.id; parcel billed."
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; account charged (must equal parcel.account_id)."
+      - name: period_start
+        type: datetime
+        source: input
+        description: Billing period start (inclusive).
+      - name: period_end
+        type: datetime
+        source: input
+        description: Billing period end (inclusive; closed interval [period_start, period_end]).
+      - name: due_date
+        type: datetime
+        source: input
+        description: Payment due date; drives delinquency.
+      - name: fee_variant
+        type: enum
+        source: input
+        default: MARGINAL
+        description: Fee algorithm variant applied at issuance.
+        constraints: "one of {MARGINAL, FLAT}"
+      - name: eru_snapshot
+        type: number
+        source: system
+        description: parcel.billable_eru captured at issuance (immutable unless appeal re-assesses).
+      - name: base_fee_cents
+        type: integer
+        source: computed
+        description: Tiered creditable fee (before fixed charge and credit). See calculations.stormwater_fee.
+      - name: fixed_charge_cents
+        type: integer
+        source: computed
+        default: 500
+        description: Flat per-bill administrative charge (non-creditable).
+      - name: credit_amount_cents
+        type: integer
+        source: computed
+        default: 0
+        description: round_half_up(base_fee_cents * active credit_pct); 0 when no ACTIVE credit.
+      - name: penalty_cents
+        type: integer
+        source: computed
+        default: 0
+        description: Delinquency penalty; 0 until POST /billing/run-cycle marks the bill DELINQUENT.
+      - name: assessed_fee_cents
+        type: integer
+        source: computed
+        description: fixed_charge_cents + base_fee_cents - credit_amount_cents.
+      - name: net_fee_cents
+        type: integer
+        source: computed
+        description: assessed_fee_cents + penalty_cents (total owed).
+      - name: amount_paid_cents
+        type: integer
+        source: computed
+        default: 0
+        description: Sum of APPLIED payments on this bill.
+      - name: status
+        type: enum
+        source: computed
+        default: ISSUED
+        description: Billing lifecycle state.
+        constraints: "one of {ISSUED, PARTIALLY_PAID, PAID, DELINQUENT, ADJUSTED, VOID}"
+
+  - name: Appeal
+    parent: null
+    common_fields: true
+    fields:
+      - name: parcel_id
+        type: string
+        source: input
+        description: "FK -> Parcel.id; parcel under appeal."
+      - name: bill_id
+        type: string
+        source: input
+        default: null
+        description: "FK -> StormwaterBill.id; the bill being disputed (optional)."
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; filing account."
+      - name: grounds
+        type: enum
+        source: input
+        description: Basis of the appeal.
+        constraints: "one of {MEASUREMENT_ERROR, LAND_USE_ERROR, EXEMPTION_DENIED, CREDIT_DENIED}"
+      - name: narrative
+        type: string
+        source: input
+        description: Free-text description of the dispute.
+      - name: status
+        type: enum
+        source: computed
+        default: SUBMITTED
+        description: >
+          SUBMITTED -> UNDER_REVIEW -> (NEEDS_REMEASURE <-> UNDER_REVIEW cycle) -> UPHELD or DENIED.
+        constraints: "one of {SUBMITTED, UNDER_REVIEW, NEEDS_REMEASURE, UPHELD, DENIED}"
+      - name: resolution_note
+        type: string
+        source: input
+        default: null
+        description: Optional note recorded at decision.
+      - name: filed_by_user_id
+        type: string
+        source: system
+        description: X-User-ID captured at filing (the owning Account.id or admin id).
+
+  - name: Payment
+    parent: null
+    common_fields: true
+    fields:
+      - name: bill_id
+        type: string
+        source: input
+        description: "FK -> StormwaterBill.id; bill being paid."
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; paying account (must equal bill.account_id)."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: Payment amount in cents.
+        constraints: "> 0"
+      - name: applied_amount_cents
+        type: integer
+        source: computed
+        description: Amount applied to the bill (equals amount_cents; overpayment is rejected up-front).
+      - name: method
+        type: enum
+        source: input
+        description: Payment tender.
+        constraints: "one of {ACH, CARD, CHECK, TAX_ROLL}"
+      - name: status
+        type: enum
+        source: computed
+        default: APPLIED
+        description: APPLIED -> REFUNDED.
+        constraints: "one of {APPLIED, REFUNDED}"
+      - name: created_by_user_id
+        type: string
+        source: system
+        description: X-User-ID that created the payment; enforced != refunder for segregation of duties.
+
+  - name: FundLedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: source_payment_id
+        type: string
+        source: system
+        description: "FK -> Payment.id; the payment (or refund) that produced this entry."
+      - name: fund
+        type: enum
+        source: system
+        description: Destination fund.
+        constraints: "one of {CAPITAL, OPERATING}"
+      - name: amount_cents
+        type: integer
+        source: system
+        description: Positive cents moved into (ALLOCATION) or out of (REVERSAL) the fund.
+      - name: entry_type
+        type: enum
+        source: system
+        description: ALLOCATION on payment; REVERSAL on refund.
+        constraints: "one of {ALLOCATION, REVERSAL}"
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Parcel
+    initial_state: DRAFT
+    terminal_states: []
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /impervious-measurements (first ACTIVE measurement for the parcel)"
+        actor: Assessor
+        preconditions:
+          - "parcel has no ACTIVE measurement yet"
+        side_effects:
+          - "sets active_measurement_id, impervious_area_sqft = measured_sqft"
+          - "recomputes billable_eru (calculations.eru_assessment) and current_fee_cents (calculations.stormwater_fee, MARGINAL)"
+          - "increments Parcel.version by 1"
+
+  - entity: ImperviousMeasurement
+    initial_state: ACTIVE
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "POST /impervious-measurements (a newer measurement for the same parcel is recorded)"
+        actor: system
+        preconditions:
+          - "a new ImperviousMeasurement is being created for the same parcel_id"
+        side_effects:
+          - "the prior ACTIVE measurement for the parcel moves to SUPERSEDED"
+        note: "Create-with-supersede: the new row is ACTIVE, the old one SUPERSEDED, in one request."
+
+  - entity: Exemption
+    initial_state: REQUESTED
+    terminal_states: [GRANTED, DENIED]
+    transitions:
+      - from: REQUESTED
+        to: GRANTED
+        trigger: "POST /exemptions/{id}/decision (outcome=GRANT)"
+        actor: Assessor
+        preconditions:
+          - "exemption.status == REQUESTED"
+          - "parcel has no other GRANTED exemption"
+        side_effects:
+          - "sets granted_pct (= payload granted_pct, else requested_pct)"
+          - "sets Parcel.exempt_pct = granted_pct; recomputes Parcel.billable_eru and current_fee_cents"
+          - "increments Parcel.version by 1"
+      - from: REQUESTED
+        to: DENIED
+        trigger: "POST /exemptions/{id}/decision (outcome=DENY)"
+        actor: Assessor
+        preconditions:
+          - "exemption.status == REQUESTED"
+        side_effects:
+          - "records decision_note; parcel unchanged"
+
+  - entity: BMPCredit
+    initial_state: ACTIVE
+    terminal_states: [REVOKED, EXPIRED]
+    transitions:
+      - from: ACTIVE
+        to: REVOKED
+        trigger: "POST /credit-inspections/{id}/complete (result=FAIL)"
+        actor: CreditInspector
+        preconditions:
+          - "credit.status == ACTIVE"
+        side_effects:
+          - "sets credit_pct = 0 and inspected_score = observed_score"
+          - "recomputes Parcel.current_fee_cents (credit removed) and increments Parcel.version by 1"
+        note: "Cascade link 2 of transitive_cascade.credit_fail_revocation_recompute."
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /credit-inspections/{id}/complete (result=PASS)"
+        actor: CreditInspector
+        preconditions:
+          - "credit.status == ACTIVE"
+        side_effects:
+          - "sets inspected_score = observed_score; recomputes credit_pct from inspected_score (calculations.bmp_credit_amount)"
+          - "recomputes Parcel.current_fee_cents and increments Parcel.version by 1"
+        note: "Re-inspection loop: credit remains ACTIVE but credit_pct may change."
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /billing/run-cycle (logical clock >= credit.next_inspection_due and no PASS inspection recorded)"
+        actor: system
+        preconditions:
+          - "credit.status == ACTIVE"
+          - "current_utc >= credit.next_inspection_due"
+        side_effects:
+          - "sets credit_pct = 0; recomputes Parcel.current_fee_cents and increments Parcel.version by 1"
+
+  - entity: CreditInspection
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED]
+    transitions:
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "POST /credit-inspections/{id}/complete"
+        actor: CreditInspector
+        preconditions:
+          - "inspection.status == SCHEDULED"
+          - "the referenced BMPCredit.status == ACTIVE (cross-entity)"
+        side_effects:
+          - "sets result and observed_score"
+          - "drives the BMPCredit ACTIVE->REVOKED (FAIL) or ACTIVE->ACTIVE re-score (PASS) transition"
+
+  - entity: StormwaterBill
+    initial_state: ISSUED
+    terminal_states: [VOID]
+    transitions:
+      - from: ISSUED
+        to: PARTIALLY_PAID
+        trigger: "POST /payments (0 < applied_amount < net_fee)"
+        actor: PropertyOwner
+        preconditions:
+          - "bill.status in {ISSUED, DELINQUENT}"
+        side_effects:
+          - "amount_paid_cents += applied_amount_cents"
+          - "recomputes Account.outstanding_balance_cents and delinquency_status"
+          - "creates CAPITAL + OPERATING FundLedgerEntry ALLOCATION rows (calculations.fund_allocation)"
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /payments (applied_amount == net_fee)"
+        actor: PropertyOwner
+        preconditions:
+          - "bill.status in {ISSUED, PARTIALLY_PAID, DELINQUENT}"
+        side_effects:
+          - "amount_paid_cents += applied_amount_cents; amount_paid_cents == net_fee_cents"
+          - "recomputes Account.outstanding_balance_cents and delinquency_status (cascade transitive_cascade.payment_settles_account)"
+          - "creates CAPITAL + OPERATING FundLedgerEntry ALLOCATION rows"
+      - from: PARTIALLY_PAID
+        to: PAID
+        trigger: "POST /payments (cumulative amount_paid == net_fee)"
+        actor: PropertyOwner
+        preconditions:
+          - "bill.status == PARTIALLY_PAID"
+        side_effects:
+          - "amount_paid_cents == net_fee_cents; recomputes Account balances; creates FundLedgerEntry ALLOCATION rows"
+      - from: ISSUED
+        to: DELINQUENT
+        trigger: "POST /billing/run-cycle (current_utc >= due_date + GRACE_DAYS, unpaid)"
+        actor: system
+        preconditions:
+          - "bill.status in {ISSUED, PARTIALLY_PAID}"
+          - "amount_paid_cents < net_fee_cents"
+          - "current_utc >= due_date + GRACE_DAYS (day boundary is inclusive)"
+        side_effects:
+          - "sets penalty_cents = round_half_up((assessed_fee_cents - amount_paid_cents) * DELINQUENCY_PENALTY_PCT)"
+          - "net_fee_cents becomes assessed_fee_cents + penalty_cents; recomputes Account.outstanding_balance_cents and delinquency_status"
+      - from: PARTIALLY_PAID
+        to: DELINQUENT
+        trigger: "POST /billing/run-cycle (current_utc >= due_date + GRACE_DAYS, unpaid)"
+        actor: system
+        preconditions:
+          - "amount_paid_cents < net_fee_cents"
+          - "current_utc >= due_date + GRACE_DAYS"
+        side_effects:
+          - "sets penalty_cents; recomputes Account balances"
+      - from: ISSUED
+        to: ADJUSTED
+        trigger: "POST /appeals/{id}/decide (outcome=UPHELD, bill linked)"
+        actor: StormwaterAdmin
+        preconditions:
+          - "bill.status in {ISSUED, PARTIALLY_PAID, DELINQUENT}"
+        side_effects:
+          - "re-assesses base_fee_cents/credit_amount_cents/assessed_fee_cents/net_fee_cents from parcel.billable_eru; eru_snapshot updated"
+          - "recomputes Account.outstanding_balance_cents and delinquency_status"
+      - from: PARTIALLY_PAID
+        to: ADJUSTED
+        trigger: "POST /appeals/{id}/decide (outcome=UPHELD, bill linked)"
+        actor: StormwaterAdmin
+        preconditions:
+          - "bill.status in {ISSUED, PARTIALLY_PAID, DELINQUENT}"
+        side_effects:
+          - "re-assesses fee fields; recomputes Account balances"
+      - from: DELINQUENT
+        to: ADJUSTED
+        trigger: "POST /appeals/{id}/decide (outcome=UPHELD, bill linked)"
+        actor: StormwaterAdmin
+        preconditions:
+          - "bill.status == DELINQUENT"
+        side_effects:
+          - "re-assesses fee fields (penalty recomputed on new assessed base); recomputes Account balances"
+      - from: ISSUED
+        to: VOID
+        trigger: "POST /bills/{id}/void"
+        actor: BillingClerk
+        preconditions:
+          - "bill.status in {ISSUED, PARTIALLY_PAID, DELINQUENT}"
+          - "bill has no APPLIED payment (must be refunded first)"
+        side_effects:
+          - "excludes the bill from Account.outstanding_balance_cents; recomputes delinquency_status"
+
+  - entity: Appeal
+    initial_state: SUBMITTED
+    terminal_states: [UPHELD, DENIED]
+    transitions:
+      - from: SUBMITTED
+        to: UNDER_REVIEW
+        trigger: "POST /appeals/{id}/review"
+        actor: StormwaterAdmin
+        preconditions:
+          - "appeal.status == SUBMITTED"
+        side_effects: []
+      - from: UNDER_REVIEW
+        to: NEEDS_REMEASURE
+        trigger: "POST /appeals/{id}/remeasure"
+        actor: StormwaterAdmin
+        preconditions:
+          - "appeal.status == UNDER_REVIEW"
+          - "appeal.grounds == MEASUREMENT_ERROR"
+        side_effects:
+          - "flags the parcel as awaiting an APPEAL_REMEASURE measurement"
+      - from: NEEDS_REMEASURE
+        to: UNDER_REVIEW
+        trigger: "POST /impervious-measurements (source=APPEAL_REMEASURE for the appealed parcel)"
+        actor: Assessor
+        preconditions:
+          - "appeal.status == NEEDS_REMEASURE"
+          - "measurement.source == APPEAL_REMEASURE and measurement.parcel_id == appeal.parcel_id"
+        side_effects:
+          - "the appeal returns to UNDER_REVIEW (revision loop)"
+        note: "Cyclic loop NEEDS_REMEASURE <-> UNDER_REVIEW."
+      - from: UNDER_REVIEW
+        to: UPHELD
+        trigger: "POST /appeals/{id}/decide (outcome=UPHELD)"
+        actor: StormwaterAdmin
+        preconditions:
+          - "appeal.status == UNDER_REVIEW"
+        side_effects:
+          - "if bill_id set, drives that bill ISSUED/PARTIALLY_PAID/DELINQUENT -> ADJUSTED (fee re-assessed from current parcel.billable_eru)"
+          - "recomputes Account.outstanding_balance_cents and delinquency_status"
+      - from: UNDER_REVIEW
+        to: DENIED
+        trigger: "POST /appeals/{id}/decide (outcome=DENIED)"
+        actor: StormwaterAdmin
+        preconditions:
+          - "appeal.status == UNDER_REVIEW"
+        side_effects:
+          - "records resolution_note; no fee change"
+
+  - entity: Payment
+    initial_state: APPLIED
+    terminal_states: [REFUNDED]
+    transitions:
+      - from: APPLIED
+        to: REFUNDED
+        trigger: "POST /payments/{id}/refund"
+        actor: BillingClerk
+        preconditions:
+          - "payment.status == APPLIED"
+          - "X-User-ID != payment.created_by_user_id (segregation of duties)"
+        side_effects:
+          - "bill.amount_paid_cents -= applied_amount_cents; bill status recomputed (PAID/PARTIALLY_PAID -> ISSUED)"
+          - "recomputes Account.outstanding_balance_cents and delinquency_status"
+          - "creates CAPITAL + OPERATING FundLedgerEntry REVERSAL rows equal and opposite to the original ALLOCATION rows"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: measurement-create-stale-parcel
+    parent_entity: Parcel
+    write_endpoint: "POST /impervious-measurements"
+    occ_field: "expected_parcel_version"
+    description: |
+      Recording a new ImperviousMeasurement supersedes the parcel's current
+      ACTIVE measurement and re-derives billable_eru. The request carries the
+      parcel version the client last observed; if the parcel's version has
+      advanced since then (another measurement was recorded, or an exemption
+      decision / credit change re-derived the parcel), the client's view is
+      stale and the create is rejected. This is the create-with-supersede case:
+      a second, strictly-later request would otherwise legitimately record a
+      superseding measurement off an outdated eru baseline.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: eru_assessment
+    trigger: "on POST /impervious-measurements, exemption GRANT/DENY, and any parcel re-derivation"
+    algorithm: threshold
+    formula: |
+      # Exemption is applied to AREA first, then divided, then rounded to 0.1 ERU.
+      # This order is pinned; rounding ERU first and then applying exempt_pct can
+      # differ at the 0.1-ERU boundary.
+      area_after_exempt = impervious_area_sqft * (1 - exempt_pct)
+      eru_raw = area_after_exempt / ERU_BASE_SQFT
+      billable_eru = round_half_up(eru_raw, 1)        # nearest 0.1 ERU
+    input_set: "the parcel's currently ACTIVE ImperviousMeasurement.measured_sqft and its GRANTED exemption granted_pct (0 if none)"
+    constants:
+      ERU_BASE_SQFT: 3000
+    precision: "billable_eru rounded to 1 decimal place (0.1 ERU), round_half_up"
+
+  - name: stormwater_fee
+    trigger: "on POST /bills (snapshot into base_fee_cents), GET /parcels/{id}/fee-quote, and parcel current_fee_cents recomputation"
+    algorithm: tiered_pricing
+    formula: |
+      # Tier bands over billable_eru (ERU):
+      #   Tier 1: (0.0 , 1.0]  -> RATE_T1 cents/ERU
+      #   Tier 2: (1.0 , 5.0]  -> RATE_T2 cents/ERU
+      #   Tier 3: (5.0 , inf)  -> RATE_T3 cents/ERU
+      # MARGINAL variant (default): charge each band at its own rate.
+      t1 = min(eru, 1.0)
+      t2 = max(0.0, min(eru, 5.0) - 1.0)
+      t3 = max(0.0, eru - 5.0)
+      base_fee_marginal = round_half_up(t1*RATE_T1 + t2*RATE_T2 + t3*RATE_T3)
+      # FLAT variant: charge the WHOLE eru at the single rate of the tier that
+      # the TOTAL eru falls into (strict '>' at each upper edge: eru==5.0 is Tier 2).
+      rate_flat = RATE_T1 if eru <= 1.0 else (RATE_T2 if eru <= 5.0 else RATE_T3)
+      base_fee_flat = round_half_up(eru * rate_flat)
+      # base_fee_cents = whichever variant the bill/quote selects.
+      assessed_fee_cents = FIXED_CHARGE_CENTS + base_fee_cents - credit_amount_cents
+    input_set: "parcel.billable_eru (or bill.eru_snapshot), the bill.fee_variant, and the parcel's ACTIVE BMPCredit.credit_pct"
+    constants:
+      RATE_T1: 4000
+      RATE_T2: 3500
+      RATE_T3: 3000
+      FIXED_CHARGE_CENTS: 500
+    precision: "cents, round_half_up applied once after summing the bands (sum-then-round, not per-band-round)"
+    variants:
+      - name: marginal
+        when: "bill.fee_variant == MARGINAL (default)"
+        difference: "each ERU band charged at its own tier rate."
+      - name: flat
+        when: "bill.fee_variant == FLAT"
+        difference: "the entire ERU charged at the single rate of the tier containing the total ERU; diverges from marginal whenever eru > 1.0."
+
+  - name: bmp_credit_amount
+    trigger: "on POST /bmp-credits (provisional) and POST /credit-inspections/{id}/complete (inspected)"
+    algorithm: weighted_scoring
+    formula: |
+      # Two valid readings of the SAME credit, on different score inputs:
+      credit_pct_provisional = min(MAX_CREDIT_PCT, (self_reported_score / 100.0) * CREDIT_SCALE)
+      credit_pct_inspected   = min(MAX_CREDIT_PCT, (inspected_score   / 100.0) * CREDIT_SCALE)
+      # credit_amount on a bill:
+      credit_amount_cents = round_half_up(base_fee_cents * credit_pct)   # applied to creditable base only, NOT the fixed charge
+      # at creation, the credit's re-inspection deadline is set:
+      next_inspection_due = effective_date + INSPECTION_INTERVAL_DAYS days
+    input_set: "one BMPCredit; provisional uses self_reported_score at creation, inspected uses observed_score once its CreditInspection is COMPLETED with PASS"
+    constants:
+      MAX_CREDIT_PCT: 0.50
+      CREDIT_SCALE: 0.60
+      INSPECTION_INTERVAL_DAYS: 365
+    precision: "credit_pct exact (float); credit_amount_cents round_half_up to whole cents"
+    variants:
+      - name: provisional
+        when: "credit ACTIVE with no COMPLETED inspection yet"
+        difference: "uses owner self_reported_score."
+      - name: inspected
+        when: "a CreditInspection COMPLETED with PASS"
+        difference: "uses field observed_score; may lower the credit and trigger parcel/bill re-derivation."
+
+  - name: fund_allocation
+    trigger: "on POST /payments (ALLOCATION) and POST /payments/{id}/refund (REVERSAL)"
+    algorithm: waterfall_allocation
+    formula: |
+      # Split each applied payment between the capital and operating funds.
+      # Rounding order is pinned: round the CAPITAL share, then SUBTRACT to get
+      # operating. (Rounding the operating share instead would diverge at the
+      # half-cent, e.g. amount=5 -> capital 2 / operating 3, not 1 / 4.)
+      capital_share_cents   = round_half_up(applied_amount_cents * CAPITAL_TARGET_PCT)
+      operating_share_cents = applied_amount_cents - capital_share_cents
+      # ALLOCATION on payment; on refund the same two amounts are written as REVERSAL.
+    input_set: "one APPLIED Payment.applied_amount_cents (ALLOCATION) or the same on refund (REVERSAL)"
+    constants:
+      CAPITAL_TARGET_PCT: 0.30
+    precision: "cents; round_half_up the capital share only, operating = applied - capital (sum is exactly the applied amount)"
+
+  - name: delinquency_penalty
+    trigger: "on POST /billing/run-cycle for each unpaid bill past its grace boundary"
+    algorithm: threshold
+    formula: |
+      overdue = (current_utc >= due_date + GRACE_DAYS)        # inclusive day boundary (>=)
+      unpaid_principal = assessed_fee_cents - amount_paid_cents
+      if overdue and unpaid_principal > 0:
+        penalty_cents = round_half_up(unpaid_principal * DELINQUENCY_PENALTY_PCT)
+        net_fee_cents = assessed_fee_cents + penalty_cents
+      # penalty is charged once per bill; a second run-cycle does not re-add it.
+    input_set: "each bill with status in {ISSUED, PARTIALLY_PAID}, amount_paid_cents < assessed_fee_cents, evaluated against the logical clock"
+    constants:
+      GRACE_DAYS: 30
+      DELINQUENCY_PENALTY_PCT: 0.10
+    precision: "cents, round_half_up; day boundary inclusive (current_utc == due_date + 30 days triggers)"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /_clock/set_current_utc requires only a staff role"
+
+  - priority: 2
+    category: auth
+    check: "the acting role is permitted for this endpoint per the RBAC matrix"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: "PropertyOwner acting on a resource must own it: X-User-ID == resource.account_id (or bill/appeal/payment account_id)"
+    error_id: ERR_FORBIDDEN_OWNERSHIP
+    http_status: 403
+    applies_to: "PropertyOwner-scoped reads and writes on Account/Parcel/StormwaterBill/Appeal/Payment/BMPCredit/Exemption"
+
+  - priority: 4
+    category: existence
+    check: "every path id and body FK references an existing resource, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints taking a path id or FK field"
+
+  - priority: 5
+    category: business_constraint
+    check: "all required body fields present"
+    error_id: ERR_MISSING_FIELD
+    http_status: 400
+    applies_to: "all POST endpoints"
+
+  - priority: 6
+    category: business_constraint
+    check: "enum values in-set and numeric fields within declared ranges (measured_sqft >= 0; 0<=requested_pct<=1; 0<=score<=100; amount_cents>0)"
+    error_id: ERR_OUT_OF_RANGE
+    http_status: 422
+    applies_to: "POST /impervious-measurements, POST /exemptions, POST /bmp-credits, POST /credit-inspections/{id}/complete, POST /payments"
+
+  - priority: 7
+    category: state
+    check: "target resource is in a state that permits this transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints (generic; specific ids below override for their endpoints)"
+
+  - priority: 7
+    category: state
+    check: "bill is payable (status in {ISSUED, PARTIALLY_PAID, DELINQUENT}); a VOID/PAID/ADJUSTED bill is not"
+    error_id: ERR_BILL_NOT_PAYABLE
+    http_status: 409
+    applies_to: "POST /payments"
+
+  - priority: 7
+    category: state
+    check: "appeal is in a state the requested step allows (review needs SUBMITTED; remeasure/decide need UNDER_REVIEW; remeasure needs grounds==MEASUREMENT_ERROR)"
+    error_id: ERR_APPEAL_NOT_REVIEWABLE
+    http_status: 409
+    applies_to: "POST /appeals/{id}/review, POST /appeals/{id}/remeasure, POST /appeals/{id}/decide"
+
+  - priority: 7
+    category: state
+    check: "inspection is SCHEDULED (not already COMPLETED)"
+    error_id: ERR_INSPECTION_ALREADY_COMPLETED
+    http_status: 409
+    applies_to: "POST /credit-inspections/{id}/complete"
+
+  - priority: 7
+    category: state
+    check: "the inspection's BMPCredit must be ACTIVE (cross-entity); a REVOKED/EXPIRED credit cannot be inspected"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /credit-inspections/{id}/complete"
+
+  - priority: 7
+    category: state
+    check: "a bill may be issued only for a parcel whose status is ACTIVE (has an ACTIVE measurement)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /bills"
+
+  - priority: 8
+    category: state
+    check: "expected_parcel_version equals the parcel's current version (optimistic concurrency)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /impervious-measurements"
+
+  - priority: 9
+    category: business_referential
+    check: "bill.account_id == parcel.account_id"
+    error_id: ERR_ACCOUNT_PARCEL_MISMATCH
+    http_status: 422
+    applies_to: "POST /bills"
+
+  - priority: 9
+    category: business_referential
+    check: "payment.account_id == bill.account_id"
+    error_id: ERR_ACCOUNT_PARCEL_MISMATCH
+    http_status: 422
+    applies_to: "POST /payments"
+
+  - priority: 9
+    category: business_referential
+    check: "appeal.bill_id (when set) belongs to appeal.parcel_id"
+    error_id: ERR_APPEAL_BILL_MISMATCH
+    http_status: 422
+    applies_to: "POST /appeals"
+
+  - priority: 10
+    category: business_constraint
+    check: "parcel_number is unique across all parcels"
+    error_id: ERR_DUPLICATE_PARCEL
+    http_status: 409
+    applies_to: "POST /parcels"
+
+  - priority: 10
+    category: business_constraint
+    check: "cannot create a BMPCredit on a parcel with a GRANTED exemption (fee already waived)"
+    error_id: ERR_PARCEL_EXEMPT
+    http_status: 409
+    applies_to: "POST /bmp-credits"
+
+  - priority: 10
+    category: business_constraint
+    check: "the X-User-ID refunding a payment must differ from payment.created_by_user_id (segregation of duties)"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /payments/{id}/refund"
+
+  - priority: 11
+    category: business_temporal
+    check: "period_start <= period_end and effective_date < expiry_date"
+    error_id: ERR_INVALID_PERIOD
+    http_status: 422
+    applies_to: "POST /bills, POST /bmp-credits"
+
+  - priority: 11
+    category: business_temporal
+    check: "new BMPCredit coverage window [effective_date, expiry_date) must not overlap an existing ACTIVE credit of the same bmp_type on the parcel (half-open: touching endpoints do NOT conflict)"
+    error_id: ERR_CREDIT_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /bmp-credits"
+
+  - priority: 11
+    category: business_temporal
+    check: "new bill period [period_start, period_end] must not overlap a non-VOID bill on the same parcel (closed: shared endpoint DOES conflict)"
+    error_id: ERR_BILL_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /bills"
+
+  - priority: 12
+    category: business_fiscal
+    check: "payment amount_cents must not exceed the bill's current outstanding (net_fee_cents - amount_paid_cents)"
+    error_id: ERR_OVERPAYMENT
+    http_status: 422
+    applies_to: "POST /payments"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Accounts ----
+  - method: POST
+    path: "/accounts"
+    description: "Create a property account."
+    roles: [Assessor, StormwaterAdmin]
+    code: 201
+    input: ["owner_name", "contact_email", "billing_method?", "mailing_address?"]
+    output: Account
+    side_effects: ["delinquency_status = CURRENT; outstanding_balance_cents = 0"]
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Fetch an account with its computed balances."
+    roles: [Assessor, BillingClerk, StormwaterAdmin, PropertyOwner]
+    code: 200
+    input: []
+    output: Account
+    side_effects: []
+
+  # ---- Parcels ----
+  - method: POST
+    path: "/parcels"
+    description: "Register a parcel under an account."
+    roles: [Assessor, StormwaterAdmin]
+    code: 201
+    input: [account_id, parcel_number, land_use]
+    output: Parcel
+    side_effects: ["status = DRAFT; billable_eru = 0"]
+  - method: GET
+    path: "/parcels/{id}"
+    description: "Fetch a parcel with its computed eru/fee."
+    roles: [Assessor, BillingClerk, StormwaterAdmin, PropertyOwner]
+    code: 200
+    input: []
+    output: Parcel
+    side_effects: []
+  - method: GET
+    path: "/parcels"
+    description: "List parcels, filterable by account or status."
+    roles: [Assessor, BillingClerk, StormwaterAdmin]
+    code: 200
+    input: ["account_id?", "status?", "limit?", "offset?"]
+    output: Parcel[]
+    side_effects: []
+  - method: GET
+    path: "/parcels/{id}/fee-quote"
+    description: "Compute both fee variants for the parcel's current state without issuing a bill."
+    roles: [Assessor, BillingClerk, StormwaterAdmin, PropertyOwner]
+    code: 200
+    input: []
+    output: "{ billable_eru: number, credit_pct: number, base_fee_marginal_cents: integer, base_fee_flat_cents: integer, marginal_assessed_cents: integer, flat_assessed_cents: integer }"
+    side_effects: []
+
+  # ---- Impervious Measurements ----
+  - method: POST
+    path: "/impervious-measurements"
+    description: "Record an authoritative measurement; supersedes the parcel's prior ACTIVE one. OCC-guarded on parcel version."
+    roles: [Assessor]
+    code: 201
+    input: ["parcel_id", "measured_sqft", "method", "source?", "expected_parcel_version"]
+    output: ImperviousMeasurement
+    side_effects:
+      - "prior ACTIVE measurement -> SUPERSEDED"
+      - "Parcel.impervious_area_sqft / billable_eru / current_fee_cents recomputed; Parcel DRAFT->ACTIVE on first"
+      - "increments Parcel.version by 1"
+      - "if source=APPEAL_REMEASURE and an Appeal for the parcel is NEEDS_REMEASURE, that appeal -> UNDER_REVIEW"
+  - method: GET
+    path: "/impervious-measurements/{id}"
+    description: "Fetch a measurement."
+    roles: [Assessor, StormwaterAdmin, PropertyOwner]
+    code: 200
+    input: []
+    output: ImperviousMeasurement
+    side_effects: []
+  - method: GET
+    path: "/impervious-measurements"
+    description: "List measurements for a parcel."
+    roles: [Assessor, StormwaterAdmin]
+    code: 200
+    input: ["parcel_id?", "status?", "limit?", "offset?"]
+    output: ImperviousMeasurement[]
+    side_effects: []
+
+  # ---- Exemptions ----
+  - method: POST
+    path: "/exemptions"
+    description: "File an exemption request for a parcel."
+    roles: [PropertyOwner, Assessor, StormwaterAdmin]
+    code: 201
+    input: ["parcel_id", "category", "requested_pct", "decision_note?"]
+    output: Exemption
+    side_effects: ["status = REQUESTED; granted_pct = 0"]
+  - method: GET
+    path: "/exemptions/{id}"
+    description: "Fetch an exemption."
+    roles: [Assessor, StormwaterAdmin, PropertyOwner]
+    code: 200
+    input: []
+    output: Exemption
+    side_effects: []
+  - method: GET
+    path: "/exemptions"
+    description: "List exemptions for a parcel."
+    roles: [Assessor, StormwaterAdmin]
+    code: 200
+    input: ["parcel_id?", "status?", "limit?", "offset?"]
+    output: Exemption[]
+    side_effects: []
+  - method: POST
+    path: "/exemptions/{id}/decision"
+    description: "Grant or deny a pending exemption."
+    roles: [Assessor, StormwaterAdmin]
+    code: 200
+    input: ["outcome", "granted_pct?", "decision_note?"]
+    output: Exemption
+    side_effects:
+      - "GRANT: sets granted_pct; Parcel.exempt_pct updated; eru/current_fee recomputed; Parcel.version += 1"
+      - "DENY: records decision_note only"
+
+  # ---- BMP Credits ----
+  - method: POST
+    path: "/bmp-credits"
+    description: "Create a provisional BMP credit (ACTIVE on the self-reported score)."
+    roles: [PropertyOwner, Assessor]
+    code: 201
+    input: [parcel_id, bmp_type, self_reported_score, effective_date, expiry_date]
+    output: BMPCredit
+    side_effects:
+      - "status = ACTIVE; credit_pct = provisional; next_inspection_due = effective_date + INSPECTION_INTERVAL_DAYS"
+      - "Parcel.current_fee_cents recomputed; Parcel.version += 1"
+  - method: GET
+    path: "/bmp-credits/{id}"
+    description: "Fetch a BMP credit."
+    roles: [PropertyOwner, Assessor, CreditInspector, StormwaterAdmin]
+    code: 200
+    input: []
+    output: BMPCredit
+    side_effects: []
+  - method: GET
+    path: "/bmp-credits"
+    description: "List BMP credits for a parcel."
+    roles: [Assessor, CreditInspector, StormwaterAdmin]
+    code: 200
+    input: ["parcel_id?", "status?", "limit?", "offset?"]
+    output: BMPCredit[]
+    side_effects: []
+
+  # ---- Credit Inspections ----
+  - method: POST
+    path: "/credit-inspections"
+    description: "Schedule a credit inspection."
+    roles: [CreditInspector]
+    code: 201
+    input: ["bmp_credit_id", "scheduled_date", "inspector_note?"]
+    output: CreditInspection
+    side_effects: ["status = SCHEDULED"]
+  - method: GET
+    path: "/credit-inspections/{id}"
+    description: "Fetch a credit inspection."
+    roles: [CreditInspector, Assessor, StormwaterAdmin]
+    code: 200
+    input: []
+    output: CreditInspection
+    side_effects: []
+  - method: GET
+    path: "/credit-inspections"
+    description: "List inspections for a credit."
+    roles: [CreditInspector, StormwaterAdmin]
+    code: 200
+    input: ["bmp_credit_id?", "status?", "limit?", "offset?"]
+    output: CreditInspection[]
+    side_effects: []
+  - method: POST
+    path: "/credit-inspections/{id}/complete"
+    description: "Record inspection result; PASS re-scores the credit, FAIL revokes it."
+    roles: [CreditInspector]
+    code: 200
+    input: ["result", "observed_score", "inspector_note?"]
+    output: CreditInspection
+    side_effects:
+      - "status = COMPLETED; sets result, observed_score"
+      - "PASS: BMPCredit credit_pct recomputed from observed_score; Parcel recomputed; Parcel.version += 1"
+      - "FAIL: BMPCredit ACTIVE->REVOKED (credit_pct=0); Parcel.current_fee_cents recomputed; Parcel.version += 1"
+
+  # ---- Bills ----
+  - method: POST
+    path: "/bills"
+    description: "Issue a stormwater bill snapshotting the parcel's current eru and credit."
+    roles: [BillingClerk]
+    code: 201
+    input: ["parcel_id", "account_id", "period_start", "period_end", "due_date", "fee_variant?"]
+    output: StormwaterBill
+    side_effects:
+      - "eru_snapshot = parcel.billable_eru; base_fee_cents/credit_amount_cents/assessed_fee_cents/net_fee_cents computed; status = ISSUED"
+      - "Account.outstanding_balance_cents recomputed"
+  - method: GET
+    path: "/bills/{id}"
+    description: "Fetch a bill."
+    roles: [PropertyOwner, BillingClerk, StormwaterAdmin]
+    code: 200
+    input: []
+    output: StormwaterBill
+    side_effects: []
+  - method: GET
+    path: "/bills"
+    description: "List bills, filterable by parcel or account."
+    roles: [BillingClerk, StormwaterAdmin]
+    code: 200
+    input: ["parcel_id?", "account_id?", "status?", "limit?", "offset?"]
+    output: StormwaterBill[]
+    side_effects: []
+  - method: POST
+    path: "/bills/{id}/void"
+    description: "Void a bill (must have no APPLIED payment)."
+    roles: [BillingClerk, StormwaterAdmin]
+    code: 200
+    input: []
+    output: StormwaterBill
+    side_effects: ["status = VOID; Account.outstanding_balance_cents and delinquency_status recomputed"]
+
+  # ---- Appeals ----
+  - method: POST
+    path: "/appeals"
+    description: "File an appeal against a parcel/bill."
+    roles: [PropertyOwner, StormwaterAdmin]
+    code: 201
+    input: ["parcel_id", "bill_id?", "account_id", "grounds", "narrative"]
+    output: Appeal
+    side_effects: ["status = SUBMITTED; filed_by_user_id = X-User-ID"]
+  - method: GET
+    path: "/appeals/{id}"
+    description: "Fetch an appeal."
+    roles: [PropertyOwner, StormwaterAdmin, Assessor]
+    code: 200
+    input: []
+    output: Appeal
+    side_effects: []
+  - method: GET
+    path: "/appeals"
+    description: "List appeals, filterable by parcel, bill, or account."
+    roles: [StormwaterAdmin, Assessor]
+    code: 200
+    input: ["parcel_id?", "bill_id?", "account_id?", "status?", "limit?", "offset?"]
+    output: Appeal[]
+    side_effects: []
+  - method: POST
+    path: "/appeals/{id}/review"
+    description: "Move a submitted appeal into review."
+    roles: [StormwaterAdmin]
+    code: 200
+    input: []
+    output: Appeal
+    side_effects: ["status SUBMITTED->UNDER_REVIEW"]
+  - method: POST
+    path: "/appeals/{id}/remeasure"
+    description: "Send a measurement-error appeal back for re-measurement."
+    roles: [StormwaterAdmin]
+    code: 200
+    input: []
+    output: Appeal
+    side_effects: ["status UNDER_REVIEW->NEEDS_REMEASURE; parcel flagged awaiting APPEAL_REMEASURE"]
+  - method: POST
+    path: "/appeals/{id}/decide"
+    description: "Uphold or deny an appeal; UPHELD re-assesses the linked bill."
+    roles: [StormwaterAdmin]
+    code: 200
+    input: ["outcome", "resolution_note?"]
+    output: Appeal
+    side_effects:
+      - "UPHELD: linked bill -> ADJUSTED (fee re-assessed from parcel.billable_eru); Account balances recomputed"
+      - "DENIED: records resolution_note"
+
+  # ---- Payments ----
+  - method: POST
+    path: "/payments"
+    description: "Apply a payment to a bill; splits revenue into capital/operating funds."
+    roles: [PropertyOwner, BillingClerk]
+    code: 201
+    input: [bill_id, account_id, amount_cents, method]
+    output: Payment
+    side_effects:
+      - "bill.amount_paid_cents += applied_amount_cents; bill status ISSUED/PARTIALLY_PAID/DELINQUENT -> PARTIALLY_PAID/PAID"
+      - "Account.outstanding_balance_cents and delinquency_status recomputed"
+      - "creates CAPITAL + OPERATING FundLedgerEntry ALLOCATION rows (calculations.fund_allocation)"
+      - "created_by_user_id = X-User-ID"
+  - method: GET
+    path: "/payments/{id}"
+    description: "Fetch a payment."
+    roles: [PropertyOwner, BillingClerk, StormwaterAdmin]
+    code: 200
+    input: []
+    output: Payment
+    side_effects: []
+  - method: GET
+    path: "/payments"
+    description: "List payments by bill or account."
+    roles: [BillingClerk, StormwaterAdmin]
+    code: 200
+    input: ["bill_id?", "account_id?", "limit?", "offset?"]
+    output: Payment[]
+    side_effects: []
+  - method: POST
+    path: "/payments/{id}/refund"
+    description: "Refund an applied payment (segregation of duties: refunder != creator)."
+    roles: [BillingClerk]
+    code: 200
+    input: []
+    output: Payment
+    side_effects:
+      - "status APPLIED->REFUNDED; bill.amount_paid_cents -= applied_amount_cents; bill status recomputed"
+      - "Account balances recomputed"
+      - "creates CAPITAL + OPERATING FundLedgerEntry REVERSAL rows equal and opposite to the ALLOCATION rows"
+
+  # ---- Fund Ledger (read-only; entries created by payment/refund) ----
+  - method: GET
+    path: "/fund-ledger/{id}"
+    description: "Fetch a single fund-ledger entry."
+    roles: [BillingClerk, StormwaterAdmin]
+    code: 200
+    input: []
+    output: FundLedgerEntry
+    side_effects: []
+  - method: GET
+    path: "/fund-ledger"
+    description: "List fund-ledger entries by source payment or fund."
+    roles: [BillingClerk, StormwaterAdmin]
+    code: 200
+    input: ["source_payment_id?", "fund?", "limit?", "offset?"]
+    output: FundLedgerEntry[]
+    side_effects: []
+
+  # ---- Periodic cycle ----
+  - method: POST
+    path: "/billing/run-cycle"
+    description: "Ops checkpoint: mark overdue bills DELINQUENT (+penalty) and EXPIRE credits past inspection."
+    roles: [BillingClerk, StormwaterAdmin]
+    code: 200
+    input: []
+    output: "{ bills_marked_delinquent: integer, credits_expired: integer }"
+    side_effects:
+      - "each unpaid bill past due_date+GRACE_DAYS -> DELINQUENT with penalty_cents (calculations.delinquency_penalty)"
+      - "each ACTIVE credit past next_inspection_due -> EXPIRED (credit_pct=0), parcel fee recomputed"
+      - "affected Accounts' outstanding_balance_cents and delinquency_status recomputed"
+
+  # ---- Logical clock (test-driving) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock. Default before any call is 2026-03-01T00:00:00Z (never real wall-clock)."
+    roles: [Assessor, BillingClerk, CreditInspector, StormwaterAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: datetime }"
+    side_effects: ["logical clock advanced; does not itself re-run delinquency (call POST /billing/run-cycle)"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unknown X-User-Role or missing X-User-ID."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Role not permitted for this endpoint."
+  - id: ERR_FORBIDDEN_OWNERSHIP
+    http: 403
+    condition: "PropertyOwner acting on a resource whose account_id != X-User-ID."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "Refunder X-User-ID equals the payment's created_by_user_id."
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "A path id or body FK references a non-existent resource."
+  - id: ERR_MISSING_FIELD
+    http: 400
+    condition: "A required body field is absent."
+  - id: ERR_OUT_OF_RANGE
+    http: 422
+    condition: "Enum value out of set or numeric field outside its range."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Generic: target resource not in a state permitting this transition."
+  - id: ERR_BILL_NOT_PAYABLE
+    http: 409
+    condition: "Payment attempted on a bill whose status is not in {ISSUED, PARTIALLY_PAID, DELINQUENT}."
+  - id: ERR_APPEAL_NOT_REVIEWABLE
+    http: 409
+    condition: "Appeal step attempted from the wrong state, or remeasure on non-MEASUREMENT_ERROR grounds."
+  - id: ERR_INSPECTION_ALREADY_COMPLETED
+    http: 409
+    condition: "Completing an inspection that is already COMPLETED, or whose credit is not ACTIVE."
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_parcel_version does not match the parcel's current version."
+  - id: ERR_ACCOUNT_PARCEL_MISMATCH
+    http: 422
+    condition: "bill.account_id != parcel.account_id, or payment.account_id != bill.account_id."
+  - id: ERR_APPEAL_BILL_MISMATCH
+    http: 422
+    condition: "appeal.bill_id belongs to a different parcel than appeal.parcel_id."
+  - id: ERR_DUPLICATE_PARCEL
+    http: 409
+    condition: "parcel_number already exists."
+  - id: ERR_PARCEL_EXEMPT
+    http: 409
+    condition: "BMP credit created on a parcel that already has a GRANTED exemption."
+  - id: ERR_INVALID_PERIOD
+    http: 422
+    condition: "period_start > period_end, or effective_date >= expiry_date."
+  - id: ERR_CREDIT_WINDOW_OVERLAP
+    http: 409
+    condition: "New credit window overlaps an existing ACTIVE credit of the same bmp_type (half-open)."
+  - id: ERR_BILL_PERIOD_OVERLAP
+    http: 409
+    condition: "New bill period overlaps a non-VOID bill on the same parcel (closed interval)."
+  - id: ERR_OVERPAYMENT
+    http: 422
+    condition: "Payment amount_cents exceeds the bill's current outstanding."
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PropertyOwner
+    description: "Account holder; views and pays own bills, files appeals and credit/exemption requests on own parcels."
+    identity: "entity_backed:Account"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /exemptions (own parcel)"
+      - "POST /bmp-credits (own parcel)"
+      - "POST /appeals (own parcel/bill)"
+      - "POST /payments (own bill)"
+      - "GET own Account/Parcel/StormwaterBill/Appeal/Payment/BMPCredit/Exemption and fee-quote"
+
+  - name: Assessor
+    description: "Records authoritative measurements, registers accounts/parcels, decides exemptions."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /accounts"
+      - "POST /parcels"
+      - "POST /impervious-measurements"
+      - "POST /exemptions/{id}/decision"
+    shared_operations:
+      - "POST /exemptions"
+      - "POST /bmp-credits"
+      - "reads on parcels/measurements/exemptions/credits/appeals"
+
+  - name: BillingClerk
+    description: "Issues bills, processes payments and refunds, runs the periodic delinquency cycle."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /bills"
+      - "POST /bills/{id}/void"
+      - "POST /payments/{id}/refund"
+      - "GET /fund-ledger and /fund-ledger/{id}"
+    shared_operations:
+      - "POST /payments"
+      - "POST /billing/run-cycle"
+      - "reads on bills/accounts/payments"
+
+  - name: CreditInspector
+    description: "Schedules and completes BMP credit inspections."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /credit-inspections"
+      - "POST /credit-inspections/{id}/complete"
+    shared_operations:
+      - "reads on credits/inspections"
+
+  - name: StormwaterAdmin
+    description: "Adjudicates appeals (review/remeasure/decide) and oversees exemptions and cycles."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /appeals/{id}/review"
+      - "POST /appeals/{id}/remeasure"
+      - "POST /appeals/{id}/decide"
+    shared_operations:
+      - "POST /accounts"
+      - "POST /exemptions and /exemptions/{id}/decision"
+      - "POST /appeals"
+      - "POST /bills/{id}/void"
+      - "POST /billing/run-cycle"
+      - "broad reads"
+
+

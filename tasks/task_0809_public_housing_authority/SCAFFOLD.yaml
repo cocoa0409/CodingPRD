@@ -1,0 +1,1411 @@
+scenario: "Public Housing Authority Operations (PHA): applicant preferences & points, waitlist lottery & purge, unit offer & refusal-limit, income recert & 30%-TTP rent calculation, interim change & adjustment, transfer/portability, HUD-50058 submission, grievance/eviction"
+domain_name: "public-housing-authority"
+api_prefix: "/pha"
+
+complexity_profile:
+  primary_archetype: "Quota / allocation"
+  secondary_archetype: "Pricing engine"
+  complexity_layers:
+    - "Optimistic concurrency"
+    - "Cascading side effects"
+    - "Dual-variant calculation"
+    - "Rate / threshold triggers"
+    - "Scheduled / deferred actions"
+
+  entity_topology: flat
+  # Peer entities linked by foreign keys (Applicant, Waitlist, Unit, Offer, Tenancy,
+  # Certification ...). URLs are mostly flat collections with a few sub-resource
+  # reads; no deep nesting chain drives ownership.
+
+  state_machine_shape: parallel
+  # Certification carries two independent state axes (status x hud_status). Several
+  # other machines are branching (Grievance, Offer, PreferenceClaim, InterimChange)
+  # or cyclic (Unit, WaitlistEntry, Certification.hud_status REJECTED->SUBMITTED).
+
+  relationship_patterns:
+    - one_to_many        # Applicant -> HouseholdMember / PreferenceClaim / WaitlistEntry; Tenancy -> Certification
+    - cross_aggregate    # Offer references WaitlistEntry and Unit across aggregates; Certification reads HouseholdMember income
+
+  role_model: peer_roles
+  # IntakeClerk owns applicant/waitlist admin; PropertyManager owns units & evictions;
+  # HousingSpecialist owns offers/certs/HUD; Applicant acts on its own resources.
+
+  consistency_model: immediate
+  # Every cascade (offer accept, interim process, eviction) settles atomically in
+  # the triggering request.
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ============================================================================
+# 1.1 ENTITY-RELATIONSHIP TABLE
+# ============================================================================
+entities:
+  - name: Applicant
+    parent: null
+    common_fields: true
+    fields:
+      - name: household_name
+        type: string
+        source: input
+        description: "Head-of-household display name."
+      - name: application_date
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp captured when the applicant record is created; used as the deterministic tie-order source."
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state; see Applicant state machine."
+        default: APPLIED
+        constraints: "one of {APPLIED, WAITLISTED, HOUSED, WITHDRAWN}"
+      - name: annual_gross_income_cents
+        type: integer
+        source: computed
+        description: "Denormalized sum of annual_income_cents over all HouseholdMember rows of this applicant (ACTUAL variant, excludes non-recurring). Recomputed when members change."
+      - name: household_size
+        type: integer
+        source: computed
+        description: "Count of HouseholdMember rows for this applicant."
+
+  - name: HouseholdMember
+    parent: null
+    common_fields: true
+    fields:
+      - name: applicant_id
+        type: string
+        source: input
+        description: "FK -> Applicant.id; the household this member belongs to."
+      - name: full_name
+        type: string
+        source: input
+        description: "Member name."
+      - name: relationship
+        type: enum
+        source: input
+        description: "Role in household."
+        constraints: "one of {HEAD, SPOUSE, DEPENDENT, OTHER_ADULT}"
+      - name: annual_income_cents
+        type: integer
+        source: input
+        description: "Recurring annual income of this member in whole cents."
+        default: 0
+        constraints: ">= 0"
+      - name: nonrecurring_income_cents
+        type: integer
+        source: input
+        description: "One-time / non-recurring annual income (bonus, lump sum) in whole cents; included only by the ANTICIPATED rent variant."
+        default: 0
+        constraints: ">= 0"
+      - name: is_dependent
+        type: boolean
+        source: input
+        description: "True if this member counts toward the dependent deduction."
+        default: false
+      - name: is_elderly
+        type: boolean
+        source: input
+        description: "True if member is elderly (age >= 62)."
+        default: false
+      - name: is_disabled
+        type: boolean
+        source: input
+        description: "True if member is disabled."
+        default: false
+
+  - name: PreferenceClaim
+    parent: null
+    common_fields: true
+    fields:
+      - name: applicant_id
+        type: string
+        source: input
+        description: "FK -> Applicant.id; applicant asserting this preference."
+      - name: preference_type
+        type: enum
+        source: input
+        description: "Category of admission preference claimed."
+        constraints: "one of {VETERAN, ELDERLY, DISABLED, INVOLUNTARY_DISPLACEMENT, LOCAL_RESIDENT, WORKING_FAMILY}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Verification lifecycle; see PreferenceClaim state machine."
+        default: CLAIMED
+        constraints: "one of {CLAIMED, VERIFIED, DENIED}"
+      - name: points_awarded
+        type: integer
+        source: computed
+        description: "Points granted when VERIFIED (from PREFERENCE_POINTS constant for preference_type); 0 while CLAIMED or DENIED."
+        default: 0
+
+  - name: Waitlist
+    parent: null
+    common_fields: true
+    fields:
+      - name: site_name
+        type: string
+        source: input
+        description: "Development / site this waitlist serves."
+      - name: bedroom_size
+        type: integer
+        source: input
+        description: "Bedroom count this waitlist admits to; must match Unit.bedroom_size to offer."
+        constraints: ">= 0 and <= 6"
+      - name: status
+        type: enum
+        source: computed
+        description: "Whether the waitlist accepts new entries and lottery draws."
+        default: OPEN
+        constraints: "one of {OPEN, CLOSED}"
+      - name: lottery_drawn
+        type: boolean
+        source: computed
+        description: "True once a lottery draw has assigned lottery numbers to PENDING entries."
+        default: false
+
+  - name: WaitlistEntry
+    parent: null
+    common_fields: true
+    fields:
+      - name: applicant_id
+        type: string
+        source: input
+        description: "FK -> Applicant.id; applicant enrolled on this waitlist."
+      - name: waitlist_id
+        type: string
+        source: input
+        description: "FK -> Waitlist.id; the waitlist enrolled on."
+      - name: status
+        type: enum
+        source: computed
+        description: "Position lifecycle; see WaitlistEntry state machine."
+        default: PENDING
+        constraints: "one of {PENDING, ACTIVE, OFFERED, HOUSED, PURGED, WITHDRAWN}"
+      - name: lottery_number
+        type: integer
+        source: computed
+        description: "Assigned at lottery draw in application_date ASC order starting at 1; null while PENDING."
+      - name: total_points
+        type: integer
+        source: computed
+        description: "Denormalized sum of points_awarded over the applicant's VERIFIED PreferenceClaims; recomputed on verify/revoke."
+        default: 0
+      - name: effective_rank
+        type: integer
+        source: computed
+        description: "1-based rank within the waitlist. Before the draw (waitlist.lottery_drawn == false): PRELIMINARY ordering over PENDING entries by applicant.application_date ASC. After the draw: FINAL ordering over ACTIVE entries by (total_points DESC, lottery_number ASC)."
+      - name: refusal_count
+        type: integer
+        source: computed
+        description: "Number of offers this entry has refused; at REFUSAL_LIMIT the entry is PURGED."
+        default: 0
+      - name: last_contact_at
+        type: datetime
+        source: computed
+        description: "Logical-clock time of the last activity (creation, draw, offer); drives stale purge."
+
+  - name: Unit
+    parent: null
+    common_fields: true
+    fields:
+      - name: address_label
+        type: string
+        source: input
+        description: "Human label of the physical unit."
+      - name: bedroom_size
+        type: integer
+        source: input
+        description: "Bedroom count; must equal the waitlist bedroom_size to be offered."
+        constraints: ">= 0 and <= 6"
+      - name: utility_allowance_cents
+        type: integer
+        source: input
+        description: "Monthly utility allowance in whole cents; subtracted from TTP to derive tenant rent."
+        default: 0
+        constraints: ">= 0"
+      - name: income_limit_cents
+        type: integer
+        source: input
+        description: "Annual gross income admission ceiling in whole cents; enforced at INITIAL certification finalize."
+        constraints: "> 0"
+      - name: status
+        type: enum
+        source: computed
+        description: "Occupancy lifecycle; see Unit state machine."
+        default: AVAILABLE
+        constraints: "one of {AVAILABLE, OFFERED, OCCUPIED}"
+      - name: last_lease_end_date
+        type: datetime
+        source: computed
+        description: "Lease end date of the most recent TERMINATED tenancy on this unit; null if never occupied. Drives the make-ready buffer at offer creation."
+
+  - name: Offer
+    parent: null
+    common_fields: true
+    fields:
+      - name: waitlist_entry_id
+        type: string
+        source: input
+        description: "FK -> WaitlistEntry.id; the entry being offered a unit."
+      - name: unit_id
+        type: string
+        source: input
+        description: "FK -> Unit.id; the unit offered."
+      - name: status
+        type: enum
+        source: computed
+        description: "Offer lifecycle; see Offer state machine."
+        default: PENDING
+        constraints: "one of {PENDING, ACCEPTED, REFUSED}"
+      - name: offered_at
+        type: datetime
+        source: computed
+        description: "Logical-clock time the offer was created."
+      - name: expires_at
+        type: datetime
+        source: input
+        description: "Deadline after which the offer may no longer be accepted (business_temporal check at accept)."
+
+  - name: Tenancy
+    parent: null
+    common_fields: true
+    fields:
+      - name: applicant_id
+        type: string
+        source: input
+        description: "FK -> Applicant.id; household now housed."
+      - name: unit_id
+        type: string
+        source: input
+        description: "FK -> Unit.id; the occupied unit."
+      - name: status
+        type: enum
+        source: computed
+        description: "Tenancy lifecycle; see Tenancy state machine."
+        default: ACTIVE
+        constraints: "one of {ACTIVE, TERMINATED}"
+      - name: lease_start_date
+        type: datetime
+        source: computed
+        description: "Logical-clock date the tenancy began (offer accept)."
+      - name: lease_end_date
+        type: datetime
+        source: computed
+        description: "Logical-clock date the tenancy terminated; null while ACTIVE."
+      - name: monthly_tenant_rent_cents
+        type: integer
+        source: computed
+        description: "Current tenant rent = max(0, latest EFFECTIVE Certification.ttp_cents - Unit.utility_allowance_cents); 0 until first cert is EFFECTIVE."
+        default: 0
+      - name: utility_reimbursement_cents
+        type: integer
+        source: computed
+        description: "Current reimbursement = max(0, Unit.utility_allowance_cents - latest EFFECTIVE Certification.ttp_cents)."
+        default: 0
+
+  - name: Certification
+    parent: null
+    common_fields: true
+    fields:
+      - name: tenancy_id
+        type: string
+        source: input
+        description: "FK -> Tenancy.id; the tenancy being certified."
+      - name: source_interim_change_id
+        type: string
+        source: input
+        description: "FK -> InterimChange.id; set only on INTERIM certs created by processing an interim change; null otherwise."
+        default: null
+      - name: cert_type
+        type: enum
+        source: input
+        description: "Certification kind; selects the rent income variant and validation set."
+        constraints: "one of {INITIAL, ANNUAL, INTERIM}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Certification status axis; see Certification state machine."
+        default: DRAFT
+        constraints: "one of {DRAFT, EFFECTIVE, SUPERSEDED}"
+      - name: hud_status
+        type: enum
+        source: computed
+        description: "Independent HUD-50058 submission axis, evolves separately from status."
+        default: NOT_SUBMITTED
+        constraints: "one of {NOT_SUBMITTED, SUBMITTED, ACCEPTED, REJECTED}"
+      - name: effective_date
+        type: datetime
+        source: input
+        description: "Date this certification's rent takes effect; must be strictly after the current EFFECTIVE cert's effective_date."
+      - name: childcare_expenses_annual_cents
+        type: integer
+        source: input
+        description: "Annual childcare expense deduction input in whole cents."
+        default: 0
+        constraints: ">= 0"
+      - name: medical_expenses_annual_cents
+        type: integer
+        source: input
+        description: "Annual medical expense input in whole cents; deductible above the 3% threshold only for elderly/disabled households."
+        default: 0
+        constraints: ">= 0"
+      - name: annual_gross_income_cents
+        type: integer
+        source: computed
+        description: "Snapshotted household annual gross at finalize per the cert_type income variant (ANTICIPATED for INITIAL/ANNUAL, ACTUAL for INTERIM)."
+        default: 0
+      - name: annual_adjusted_income_cents
+        type: integer
+        source: computed
+        description: "annual_gross_income_cents minus deductions; see household_annual_adjusted_income calculation."
+        default: 0
+      - name: ttp_cents
+        type: integer
+        source: computed
+        description: "Monthly Total Tenant Payment; see total_tenant_payment calculation."
+        default: 0
+
+  - name: InterimChange
+    parent: null
+    common_fields: true
+    fields:
+      - name: tenancy_id
+        type: string
+        source: input
+        description: "FK -> Tenancy.id; the tenancy the change is reported against."
+      - name: change_type
+        type: enum
+        source: input
+        description: "Nature of the reported interim change."
+        constraints: "one of {INCOME_DECREASE, INCOME_INCREASE, COMPOSITION}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Interim change lifecycle; see InterimChange state machine."
+        default: REPORTED
+        constraints: "one of {REPORTED, PROCESSED, DENIED}"
+      - name: reported_at
+        type: datetime
+        source: computed
+        description: "Logical-clock time the change was reported."
+      - name: effective_date
+        type: datetime
+        source: input
+        description: "Date the resulting INTERIM certification should take effect (first of the month following the change)."
+
+  - name: Grievance
+    parent: null
+    common_fields: true
+    fields:
+      - name: tenancy_id
+        type: string
+        source: input
+        description: "FK -> Tenancy.id; the tenancy under grievance or eviction."
+      - name: grievance_type
+        type: enum
+        source: input
+        description: "GRIEVANCE (tenant-initiated) or EVICTION (authority-initiated)."
+        constraints: "one of {GRIEVANCE, EVICTION}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Grievance lifecycle; see Grievance state machine."
+        default: FILED
+        constraints: "one of {FILED, SUSTAINED, OVERRULED}"
+      - name: reason
+        type: string
+        source: input
+        description: "Free-text basis of the filing."
+      - name: filed_at
+        type: datetime
+        source: computed
+        description: "Logical-clock time the grievance was filed."
+
+# ============================================================================
+# 1.2 STATE MACHINE TABLE
+# ============================================================================
+state_machines:
+  - entity: Applicant
+    initial_state: APPLIED
+    terminal_states: [HOUSED, WITHDRAWN]
+    transitions:
+      - from: APPLIED
+        to: WAITLISTED
+        trigger: "system: first WaitlistEntry created for this applicant (POST /pha/waitlists/{id}/entries)"
+        actor: system
+        preconditions: ["applicant.status == APPLIED"]
+        side_effects: ["set applicant.status = WAITLISTED"]
+      - from: WAITLISTED
+        to: HOUSED
+        trigger: "system: one of the applicant's WaitlistEntry enters HOUSED (cascade from offer accept)"
+        actor: system
+        preconditions: ["a WaitlistEntry of this applicant just entered HOUSED"]
+        side_effects:
+          - "set applicant.status = HOUSED"
+          - "cascade: every OTHER WaitlistEntry of this applicant whose status IN {PENDING, ACTIVE, OFFERED} transitions to WITHDRAWN"
+      - from: WAITLISTED
+        to: WITHDRAWN
+        trigger: "system: all of the applicant's WaitlistEntry rows are in {PURGED, WITHDRAWN}"
+        actor: system
+        preconditions: ["no WaitlistEntry of this applicant has status IN {PENDING, ACTIVE, OFFERED, HOUSED}"]
+        side_effects: ["set applicant.status = WITHDRAWN"]
+
+  - entity: PreferenceClaim
+    initial_state: CLAIMED
+    terminal_states: [DENIED]
+    transitions:
+      - from: CLAIMED
+        to: VERIFIED
+        trigger: "POST /pha/preference-claims/{id}/verify"
+        actor: IntakeClerk
+        preconditions: ["claim.status == CLAIMED"]
+        side_effects:
+          - "set points_awarded = PREFERENCE_POINTS[preference_type]"
+          - "cross-entity: recompute total_points on every WaitlistEntry of claim.applicant_id (+= points_awarded)"
+      - from: CLAIMED
+        to: DENIED
+        trigger: "POST /pha/preference-claims/{id}/verify with decision=DENY"
+        actor: IntakeClerk
+        preconditions: ["claim.status == CLAIMED"]
+        side_effects: ["points_awarded stays 0"]
+      - from: VERIFIED
+        to: CLAIMED
+        trigger: "POST /pha/preference-claims/{id}/revoke (compensating action)"
+        actor: IntakeClerk
+        preconditions: ["claim.status == VERIFIED"]
+        side_effects:
+          - "cross-entity: recompute total_points on every WaitlistEntry of claim.applicant_id (-= points_awarded)"
+          - "reset points_awarded = 0"
+
+  - entity: WaitlistEntry
+    initial_state: PENDING
+    terminal_states: [HOUSED, PURGED, WITHDRAWN]
+    transitions:
+      - from: PENDING
+        to: ACTIVE
+        trigger: "POST /pha/waitlists/{id}/lottery-draw (per PENDING entry)"
+        actor: IntakeClerk
+        preconditions: ["entry.status == PENDING", "waitlist.status == OPEN"]
+        side_effects:
+          - "assign lottery_number in application_date ASC order starting at 1"
+          - "set total_points from applicant's VERIFIED claims"
+          - "recompute effective_rank over all ACTIVE entries of the waitlist"
+          - "set last_contact_at = clock.now"
+      - from: ACTIVE
+        to: OFFERED
+        trigger: "system: POST /pha/offers created for this entry"
+        actor: system
+        preconditions: ["entry.status == ACTIVE"]
+        side_effects: ["set last_contact_at = clock.now"]
+      - from: OFFERED
+        to: HOUSED
+        trigger: "system: the Unit in this entry's accepted Offer enters OCCUPIED"
+        actor: system
+        preconditions: ["the offer on this entry is ACCEPTED and its Unit just became OCCUPIED"]
+        side_effects: ["set entry.status = HOUSED", "propagate: applicant WAITLISTED -> HOUSED"]
+      - from: OFFERED
+        to: ACTIVE
+        trigger: "system: POST /pha/offers/{id}/refuse when incremented refusal_count < REFUSAL_LIMIT"
+        actor: system
+        preconditions: ["entry.status == OFFERED", "refusal_count after increment < REFUSAL_LIMIT (3)"]
+        side_effects: ["increment refusal_count", "set last_contact_at = clock.now"]
+      - from: OFFERED
+        to: PURGED
+        trigger: "system: POST /pha/offers/{id}/refuse when incremented refusal_count >= REFUSAL_LIMIT"
+        actor: system
+        preconditions: ["entry.status == OFFERED", "refusal_count after increment >= REFUSAL_LIMIT (3)"]
+        side_effects: ["increment refusal_count", "remove entry from waitlist ranking"]
+      - from: ACTIVE
+        to: PURGED
+        trigger: "system: POST /pha/waitlists/{id}/purge when (clock.now - last_contact_at) in days >= PURGE_STALE_DAYS (90)"
+        actor: IntakeClerk
+        preconditions: ["entry.status == ACTIVE", "days_since(last_contact_at) >= 90"]
+        side_effects: ["remove entry from waitlist ranking"]
+      - from: ACTIVE
+        to: WITHDRAWN
+        trigger: "system: applicant housed on a different waitlist entry"
+        actor: system
+        preconditions: ["another WaitlistEntry of the same applicant entered HOUSED"]
+        side_effects: ["set entry.status = WITHDRAWN"]
+      - from: OFFERED
+        to: WITHDRAWN
+        trigger: "system: applicant housed on a different waitlist entry"
+        actor: system
+        preconditions: ["another WaitlistEntry of the same applicant entered HOUSED"]
+        side_effects: ["set entry.status = WITHDRAWN"]
+
+  - entity: Unit
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: OFFERED
+        trigger: "system: POST /pha/offers created against this unit"
+        actor: system
+        preconditions: ["unit.status == AVAILABLE"]
+        side_effects: ["set unit.status = OFFERED"]
+      - from: OFFERED
+        to: OCCUPIED
+        trigger: "system: a Tenancy referencing this unit enters ACTIVE (offer accept)"
+        actor: system
+        preconditions: ["unit.status == OFFERED"]
+        side_effects: ["set unit.status = OCCUPIED", "propagate: WaitlistEntry OFFERED -> HOUSED"]
+      - from: OFFERED
+        to: AVAILABLE
+        trigger: "system: POST /pha/offers/{id}/refuse releases the reserved unit"
+        actor: system
+        preconditions: ["unit.status == OFFERED"]
+        side_effects: ["set unit.status = AVAILABLE"]
+      - from: OCCUPIED
+        to: AVAILABLE
+        trigger: "system: the Tenancy on this unit enters TERMINATED (eviction overruled)"
+        actor: system
+        preconditions: ["unit.status == OCCUPIED"]
+        side_effects: ["set unit.status = AVAILABLE", "set last_lease_end_date = tenancy.lease_end_date"]
+
+  - entity: Offer
+    initial_state: PENDING
+    terminal_states: [ACCEPTED, REFUSED]
+    transitions:
+      - from: PENDING
+        to: ACCEPTED
+        trigger: "POST /pha/offers/{id}/accept"
+        actor: Applicant
+        preconditions:
+          - "offer.status == PENDING"
+          - "clock.now <= offer.expires_at"
+          - "offer.unit.status == OFFERED"
+        side_effects:
+          - "create Tenancy (ACTIVE) for offer.waitlist_entry.applicant_id and offer.unit_id; lease_start_date = clock.now"
+          - "create INITIAL Certification (DRAFT) for the new tenancy; effective_date = lease_start_date"
+          - "cascade: Unit OFFERED -> OCCUPIED"
+          - "cascade: WaitlistEntry OFFERED -> HOUSED"
+          - "cascade: Applicant WAITLISTED -> HOUSED and sibling entries WITHDRAWN"
+      - from: PENDING
+        to: REFUSED
+        trigger: "POST /pha/offers/{id}/refuse"
+        actor: Applicant
+        preconditions: ["offer.status == PENDING"]
+        side_effects:
+          - "cascade: Unit OFFERED -> AVAILABLE"
+          - "cascade: WaitlistEntry OFFERED -> ACTIVE (refusal_count++) or PURGED at REFUSAL_LIMIT"
+
+  - entity: Tenancy
+    initial_state: ACTIVE
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "system: an EVICTION Grievance on this tenancy is OVERRULED"
+        actor: system
+        preconditions: ["tenancy.status == ACTIVE"]
+        side_effects:
+          - "set lease_end_date = clock.now"
+          - "cascade: Unit OCCUPIED -> AVAILABLE (records last_lease_end_date)"
+
+  - entity: Certification
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED]
+    transitions:
+      # ---- status axis ----
+      - from: DRAFT
+        to: EFFECTIVE
+        trigger: "POST /pha/certifications/{id}/finalize"
+        actor: HousingSpecialist
+        preconditions:
+          - "cert.status == DRAFT"
+          - "cert.tenancy.status == ACTIVE"
+          - "effective_date strictly after latest EFFECTIVE cert.effective_date on this tenancy"
+          - "for cert_type == INITIAL: annual_gross_income_cents <= unit.income_limit_cents"
+        side_effects:
+          - "run household_annual_gross_income (ANTICIPATED variant), household_annual_adjusted_income, total_tenant_payment"
+          - "snapshot annual_gross_income_cents, annual_adjusted_income_cents, ttp_cents"
+          - "cascade: prior EFFECTIVE cert on this tenancy -> SUPERSEDED"
+          - "cascade: recompute Tenancy.monthly_tenant_rent_cents and utility_reimbursement_cents"
+      - from: DRAFT
+        to: EFFECTIVE
+        trigger: "system: POST /pha/interim-changes/{id}/process finalizes the INTERIM cert it created"
+        actor: system
+        preconditions: ["cert.status == DRAFT", "cert.cert_type == INTERIM", "cert.tenancy.status == ACTIVE"]
+        side_effects:
+          - "run household_annual_gross_income (ACTUAL variant), household_annual_adjusted_income, total_tenant_payment"
+          - "snapshot annual_gross_income_cents, annual_adjusted_income_cents, ttp_cents"
+          - "cascade: prior EFFECTIVE cert on this tenancy -> SUPERSEDED"
+          - "cascade: recompute Tenancy.monthly_tenant_rent_cents and utility_reimbursement_cents"
+      - from: EFFECTIVE
+        to: SUPERSEDED
+        trigger: "system: a newer cert on the same tenancy becomes EFFECTIVE"
+        actor: system
+        preconditions: ["cert.status == EFFECTIVE"]
+        side_effects: ["set status = SUPERSEDED"]
+      # ---- hud_status axis (independent of status) ----
+      - from: NOT_SUBMITTED
+        to: SUBMITTED
+        trigger: "POST /pha/certifications/{id}/hud-submit"
+        actor: HousingSpecialist
+        preconditions: ["cert.status == EFFECTIVE", "cert.hud_status IN {NOT_SUBMITTED, REJECTED}"]
+        side_effects: ["set hud_status = SUBMITTED", "note: hud axis moves independently of status axis"]
+      - from: SUBMITTED
+        to: ACCEPTED
+        trigger: "POST /pha/certifications/{id}/hud-result with result=ACCEPTED"
+        actor: HousingSpecialist
+        preconditions: ["cert.hud_status == SUBMITTED"]
+        side_effects: ["set hud_status = ACCEPTED"]
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /pha/certifications/{id}/hud-result with result=REJECTED"
+        actor: HousingSpecialist
+        preconditions: ["cert.hud_status == SUBMITTED"]
+        side_effects: ["set hud_status = REJECTED"]
+      - from: REJECTED
+        to: SUBMITTED
+        trigger: "POST /pha/certifications/{id}/hud-submit (resubmit after correction)"
+        actor: HousingSpecialist
+        preconditions: ["cert.hud_status == REJECTED", "cert.status == EFFECTIVE"]
+        side_effects: ["set hud_status = SUBMITTED"]
+
+  - entity: InterimChange
+    initial_state: REPORTED
+    terminal_states: [PROCESSED, DENIED]
+    transitions:
+      - from: REPORTED
+        to: PROCESSED
+        trigger: "POST /pha/interim-changes/{id}/process with decision=PROCESS"
+        actor: HousingSpecialist
+        preconditions: ["change.status == REPORTED", "change.tenancy.status == ACTIVE"]
+        side_effects:
+          - "create INTERIM Certification for change.tenancy_id with source_interim_change_id = this change; effective_date = change.effective_date"
+          - "cascade: the new INTERIM cert is finalized to EFFECTIVE (system) -> prior cert SUPERSEDED -> Tenancy rent recomputed"
+      - from: REPORTED
+        to: DENIED
+        trigger: "POST /pha/interim-changes/{id}/process with decision=DENY"
+        actor: HousingSpecialist
+        preconditions: ["change.status == REPORTED"]
+        side_effects: ["no certification created"]
+
+  - entity: Grievance
+    initial_state: FILED
+    terminal_states: [SUSTAINED, OVERRULED]
+    transitions:
+      - from: FILED
+        to: SUSTAINED
+        trigger: "POST /pha/grievances/{id}/decide with outcome=SUSTAINED"
+        actor: PropertyManager
+        preconditions: ["grievance.status == FILED"]
+        side_effects: ["tenant position upheld; tenancy unchanged (no termination on either grievance_type)"]
+      - from: FILED
+        to: OVERRULED
+        trigger: "POST /pha/grievances/{id}/decide with outcome=OVERRULED"
+        actor: PropertyManager
+        preconditions: ["grievance.status == FILED"]
+        side_effects:
+          - "if grievance_type == EVICTION: cascade Tenancy ACTIVE -> TERMINATED (which cascades Unit OCCUPIED -> AVAILABLE)"
+          - "if grievance_type == GRIEVANCE: tenancy unchanged"
+
+# ============================================================================
+# 1.2.1 CONCURRENCY RULES (OCC on parent version)
+# ============================================================================
+concurrency_rules:
+  - rule_id: cert-create-stale-tenancy
+    parent_entity: Tenancy
+    write_endpoint: "POST /pha/tenancies/{id}/certifications"
+    occ_field: "expected_tenancy_version"
+    description: |
+      Creating a new Certification against a Tenancy whose version has advanced
+      since the client last read it is rejected. This captures the case where
+      another writer already created (or finalized) a certification that
+      legitimately supersedes the prior one; the current writer's view of the
+      tenancy is stale, so its create is rejected on a version mismatch.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# ============================================================================
+# 1.3 CALCULATION RULES TABLE
+# ============================================================================
+calculations:
+  - name: household_annual_gross_income
+    trigger: "Certification finalize (status DRAFT -> EFFECTIVE), both actor-driven and interim system path"
+    algorithm: aggregation
+    formula: |
+      members = HouseholdMember rows where applicant_id == cert.tenancy.applicant_id
+      # variant selection keyed on cert.cert_type:
+      if variant == ANTICIPATED:   # INITIAL and ANNUAL certs
+        gross = sum over members of (annual_income_cents + nonrecurring_income_cents)
+      else:                        # ACTUAL variant, INTERIM certs
+        gross = sum over members of (annual_income_cents)
+      return gross    # whole cents, no rounding needed (inputs are whole cents)
+    input_set: "All HouseholdMember rows of the applicant at finalize time; no status filter (members are not lifecycle entities)."
+    constants: {}
+    precision: "whole cents; exact integer sum"
+    variants:
+      - name: ANTICIPATED
+        when: "cert_type IN {INITIAL, ANNUAL}"
+        difference: "adds each member's nonrecurring_income_cents to the recurring annual_income_cents (12-month forward projection)"
+      - name: ACTUAL
+        when: "cert_type == INTERIM"
+        difference: "counts recurring annual_income_cents only; nonrecurring lines are excluded, so identical member rows yield a lower gross than ANTICIPATED"
+
+  - name: household_annual_adjusted_income
+    trigger: "Certification finalize; runs after household_annual_gross_income"
+    algorithm: aggregation
+    formula: |
+      members = HouseholdMember rows where applicant_id == cert.tenancy.applicant_id
+      dependents = count(members where is_dependent == true)
+      dependent_deduction = dependents * DEPENDENT_DEDUCTION_ANNUAL_CENTS
+      elderly_disabled_household = any member has (is_elderly == true or is_disabled == true)
+      elderly_disabled_deduction = ELDERLY_DISABLED_DEDUCTION_ANNUAL_CENTS if elderly_disabled_household else 0
+      childcare_deduction = cert.childcare_expenses_annual_cents
+      # medical: only elderly/disabled households, only the portion above 3% of gross.
+      # ORDER IS PINNED: round the 3% threshold to whole cents FIRST, then subtract.
+      if elderly_disabled_household:
+        medical_threshold = round_half_up(MEDICAL_THRESHOLD_RATE * gross)   # whole cents
+        medical_deduction = max(0, cert.medical_expenses_annual_cents - medical_threshold)
+      else:
+        medical_deduction = 0
+      total_deductions = dependent_deduction + elderly_disabled_deduction + childcare_deduction + medical_deduction
+      adjusted = max(0, gross - total_deductions)
+      return adjusted   # whole cents
+    input_set: "Same member set as gross; deduction inputs from the cert (childcare/medical)."
+    constants:
+      DEPENDENT_DEDUCTION_ANNUAL_CENTS: 48000
+      ELDERLY_DISABLED_DEDUCTION_ANNUAL_CENTS: 40000
+      MEDICAL_THRESHOLD_RATE: 0.03
+    precision: "all deductions whole cents; medical threshold round_half_up to whole cents BEFORE subtraction; adjusted floored at 0"
+
+  - name: total_tenant_payment
+    trigger: "Certification finalize; runs after household_annual_adjusted_income"
+    algorithm: threshold
+    formula: |
+      # Greatest-of three components; each percentage component divides the ANNUAL
+      # figure by 12 WITHIN a single round_half_up step (never pre-round monthly income).
+      comp_adjusted = round_half_up(TTP_ADJ_RATE * adjusted / 12)
+      comp_gross    = round_half_up(TTP_GROSS_RATE * gross / 12)
+      ttp = max(comp_adjusted, comp_gross, MINIMUM_RENT_CENTS)
+      return ttp    # whole cents, monthly
+    input_set: "adjusted from household_annual_adjusted_income; gross from household_annual_gross_income."
+    constants:
+      TTP_ADJ_RATE: 0.30
+      TTP_GROSS_RATE: 0.10
+      MINIMUM_RENT_CENTS: 5000
+    precision: "each percentage component round_half_up to whole cents; final value is the integer max of the three"
+
+  - name: monthly_tenant_rent_and_reimbursement
+    trigger: "Certification becomes EFFECTIVE (cascade); recomputes Tenancy rent fields"
+    algorithm: aggregation
+    formula: |
+      ttp = latest EFFECTIVE Certification.ttp_cents on the tenancy
+      ua  = tenancy.unit.utility_allowance_cents
+      # evaluation order pinned: compute ttp and ua first, then the two clamped differences.
+      monthly_tenant_rent_cents = max(0, ttp - ua)
+      utility_reimbursement_cents = max(0, ua - ttp)
+      return {monthly_tenant_rent_cents, utility_reimbursement_cents}
+    input_set: "The single latest EFFECTIVE certification for the tenancy (by effective_date DESC, created_at DESC tie-break)."
+    constants: {}
+    precision: "whole cents; both outputs floored at 0"
+
+  - name: waitlist_total_points
+    trigger: "PreferenceClaim verify or revoke; recomputes each of the applicant's WaitlistEntry.total_points"
+    algorithm: aggregation
+    formula: |
+      claims = PreferenceClaim rows where applicant_id == entry.applicant_id and status == VERIFIED
+      total = sum over claims of PREFERENCE_POINTS[preference_type]
+      return total
+    input_set: "Only VERIFIED PreferenceClaims of the applicant; CLAIMED and DENIED excluded."
+    constants:
+      PREFERENCE_POINTS: "{VETERAN: 50, ELDERLY: 30, DISABLED: 30, INVOLUNTARY_DISPLACEMENT: 40, LOCAL_RESIDENT: 20, WORKING_FAMILY: 10}"
+    precision: "integer points"
+
+  - name: waitlist_effective_rank
+    trigger: "Lottery draw, and any add/remove of an ACTIVE entry; recomputes rank across the waitlist"
+    algorithm: weighted_scoring
+    formula: |
+      pool = WaitlistEntry rows where waitlist_id == W and status == ACTIVE
+      if variant == FINAL:      # after lottery_drawn == true
+        sort pool by (total_points DESC, lottery_number ASC)
+      else:                     # PRELIMINARY, before lottery_drawn
+        sort pool by (application_date ASC)   # applicant.application_date; deterministic, no id
+      effective_rank = 1-based index in the sorted pool
+      return effective_rank per entry
+    input_set: "PRELIMINARY pool = PENDING entries of the waitlist (pre-draw). FINAL pool = ACTIVE entries of the waitlist (post-draw). OFFERED/HOUSED/PURGED/WITHDRAWN always excluded."
+    constants: {}
+    precision: "integer rank; ties broken by lottery_number ASC (FINAL) which is unique per entry"
+    variants:
+      - name: PRELIMINARY
+        when: "waitlist.lottery_drawn == false"
+        difference: "orders solely by applicant.application_date ASC; preference points are ignored because they are not yet locked in"
+      - name: FINAL
+        when: "waitlist.lottery_drawn == true"
+        difference: "orders by (total_points DESC, lottery_number ASC); an entry with more verified points outranks an earlier applicant, diverging from PRELIMINARY"
+
+  - name: offer_refusal_outcome
+    trigger: "POST /pha/offers/{id}/refuse"
+    algorithm: threshold
+    formula: |
+      new_count = entry.refusal_count + 1
+      if new_count >= REFUSAL_LIMIT:
+        entry.status = PURGED
+      else:
+        entry.status = ACTIVE
+      entry.refusal_count = new_count
+      unit.status = AVAILABLE
+    input_set: "The single WaitlistEntry on the refused offer."
+    constants:
+      REFUSAL_LIMIT: 3
+    precision: "integer count; boundary is >= (the 3rd refusal purges, the 2nd does not)"
+
+# ============================================================================
+# 1.4 VALIDATION RULES TABLE (ordered by priority)
+# ============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this operation per the RBAC matrix (and for entity_backed Applicant, X-User-ID owns the target resource)"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "every id in the path resolves to a live resource, validated left-to-right"
+    error_id: "ERR_<RESOURCE>_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with a path id"
+  - priority: 4
+    category: state
+    check: "OCC: expected_tenancy_version equals the current Tenancy.version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /pha/tenancies/{id}/certifications"
+  - priority: 5
+    category: state
+    check: "target resource is in a state that admits this transition (offer PENDING to accept/refuse; cert DRAFT to finalize; claim CLAIMED to verify; entry ACTIVE to be offered; grievance FILED to decide; interim REPORTED to process)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints"
+  - priority: 6
+    category: state
+    check: "cross-entity state: Unit.status == AVAILABLE when creating an Offer"
+    error_id: ERR_UNIT_NOT_AVAILABLE
+    http_status: 409
+    applies_to: "POST /pha/offers"
+  - priority: 6
+    category: state
+    check: "cross-entity state: Offer.unit.status == OFFERED when accepting an Offer"
+    error_id: ERR_UNIT_NOT_AVAILABLE
+    http_status: 409
+    applies_to: "POST /pha/offers/{id}/accept"
+  - priority: 6
+    category: state
+    check: "cross-entity state: Tenancy.status == ACTIVE when finalizing a Certification, reporting/processing an interim change, or filing a grievance"
+    error_id: ERR_TENANCY_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /pha/certifications/{id}/finalize, POST /pha/tenancies/{id}/interim-changes, POST /pha/interim-changes/{id}/process, POST /pha/tenancies/{id}/grievances"
+  - priority: 7
+    category: business_constraint
+    check: "cross-entity state: Waitlist.status == OPEN when adding an entry or drawing the lottery"
+    error_id: ERR_WAITLIST_CLOSED
+    http_status: 409
+    applies_to: "POST /pha/waitlists/{id}/entries, POST /pha/waitlists/{id}/lottery-draw"
+  - priority: 8
+    category: business_referential
+    check: "Offer.unit.bedroom_size == the entry's Waitlist.bedroom_size"
+    error_id: ERR_BEDROOM_MISMATCH
+    http_status: 422
+    applies_to: "POST /pha/offers"
+  - priority: 9
+    category: business_temporal
+    check: "clock.now <= Offer.expires_at when accepting"
+    error_id: ERR_OFFER_EXPIRED
+    http_status: 409
+    applies_to: "POST /pha/offers/{id}/accept"
+  - priority: 9
+    category: business_temporal
+    check: "make-ready buffer: for a Unit with a last_lease_end_date, clock.now >= last_lease_end_date + MAKE_READY_DAYS (14) when creating an Offer"
+    error_id: ERR_UNIT_TURNOVER_CONFLICT
+    http_status: 409
+    applies_to: "POST /pha/offers"
+  - priority: 9
+    category: business_temporal
+    check: "Certification.effective_date strictly after the tenancy's current EFFECTIVE cert.effective_date (no backdated period overlap; equal dates rejected)"
+    error_id: ERR_CERT_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /pha/certifications/{id}/finalize"
+  - priority: 11
+    category: business_fiscal
+    check: "for cert_type == INITIAL: household ANTICIPATED annual_gross_income_cents <= Unit.income_limit_cents (equal passes; strictly greater fails)"
+    error_id: ERR_OVER_INCOME
+    http_status: 422
+    applies_to: "POST /pha/certifications/{id}/finalize"
+  - priority: 12
+    category: business_constraint
+    check: "request body fields conform to declared types, enum members, and non-negative numeric constraints; required fields present"
+    error_id: ERR_VALIDATION
+    http_status: 422
+    applies_to: "all write endpoints"
+
+# ============================================================================
+# 1.5 API ENDPOINT TABLE
+# ============================================================================
+endpoints:
+  # ---- Applicants & household ----
+  - method: POST
+    path: "/pha/applicants"
+    description: "Register a new applicant household (status APPLIED)."
+    roles: [IntakeClerk]
+    code: 201
+    input: [household_name]
+    output: Applicant
+    side_effects: ["set application_date = clock.now", "status = APPLIED"]
+  - method: GET
+    path: "/pha/applicants/{id}"
+    description: "Fetch one applicant."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: []
+    output: Applicant
+    side_effects: []
+  - method: POST
+    path: "/pha/applicants/{id}/members"
+    description: "Add a household member."
+    roles: [IntakeClerk]
+    code: 201
+    input: [full_name, relationship, "annual_income_cents?", "nonrecurring_income_cents?", "is_dependent?", "is_elderly?", "is_disabled?"]
+    output: HouseholdMember
+    side_effects: ["recompute Applicant.annual_gross_income_cents and household_size"]
+  - method: GET
+    path: "/pha/applicants/{id}/members"
+    description: "List an applicant's household members."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: HouseholdMember[]
+    side_effects: []
+  - method: POST
+    path: "/pha/applicants/{id}/preference-claims"
+    description: "Claim an admission preference."
+    roles: [IntakeClerk, Applicant]
+    code: 201
+    input: [preference_type]
+    output: PreferenceClaim
+    side_effects: ["status = CLAIMED", "points_awarded = 0"]
+  - method: GET
+    path: "/pha/applicants/{id}/preference-claims"
+    description: "List an applicant's preference claims."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PreferenceClaim[]
+    side_effects: []
+  - method: POST
+    path: "/pha/preference-claims/{id}/verify"
+    description: "Verify or deny a preference claim; VERIFY awards points and recomputes the applicant's waitlist points."
+    roles: [IntakeClerk]
+    code: 200
+    input: [decision]
+    output: PreferenceClaim
+    side_effects: ["VERIFY: points_awarded = PREFERENCE_POINTS[type], recompute each WaitlistEntry.total_points (+=)", "DENY: status = DENIED"]
+  - method: POST
+    path: "/pha/preference-claims/{id}/revoke"
+    description: "Compensating action: revert a VERIFIED claim to CLAIMED and remove its points."
+    roles: [IntakeClerk]
+    code: 200
+    input: []
+    output: PreferenceClaim
+    side_effects: ["recompute each WaitlistEntry.total_points (-= points_awarded)", "reset points_awarded = 0"]
+  - method: GET
+    path: "/pha/applicants/{id}/waitlist-entries"
+    description: "List an applicant's waitlist entries."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WaitlistEntry[]
+    side_effects: []
+
+  # ---- Waitlists ----
+  - method: POST
+    path: "/pha/waitlists"
+    description: "Create a waitlist for a site and bedroom size. Optional status defaults OPEN; pass CLOSED to open it closed."
+    roles: [IntakeClerk]
+    code: 201
+    input: [site_name, bedroom_size, "status?"]
+    output: Waitlist
+    side_effects: ["lottery_drawn = false"]
+  - method: GET
+    path: "/pha/waitlists/{id}"
+    description: "Fetch one waitlist."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: []
+    output: Waitlist
+    side_effects: []
+  - method: POST
+    path: "/pha/waitlists/{id}/entries"
+    description: "Enroll an applicant onto a waitlist (entry PENDING)."
+    roles: [IntakeClerk]
+    code: 201
+    input: [applicant_id]
+    output: WaitlistEntry
+    side_effects: ["entry status = PENDING", "set last_contact_at = clock.now", "Applicant APPLIED -> WAITLISTED", "recompute PRELIMINARY effective_rank over PENDING entries of this waitlist (application_date ASC)"]
+  - method: GET
+    path: "/pha/waitlists/{id}/entries"
+    description: "List entries on a waitlist."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WaitlistEntry[]
+    side_effects: []
+  - method: POST
+    path: "/pha/waitlists/{id}/lottery-draw"
+    description: "Run the lottery draw: assign lottery_number in application_date ASC order, move PENDING entries to ACTIVE, compute FINAL ranks."
+    roles: [IntakeClerk]
+    code: 200
+    input: []
+    output: Waitlist
+    side_effects: ["each PENDING entry -> ACTIVE with lottery_number and total_points", "lottery_drawn = true", "recompute effective_rank (FINAL)"]
+  - method: POST
+    path: "/pha/waitlists/{id}/purge"
+    description: "Purge ACTIVE entries whose last_contact_at is >= PURGE_STALE_DAYS (90) days before clock.now."
+    roles: [IntakeClerk]
+    code: 200
+    input: []
+    output: Waitlist
+    side_effects: ["stale ACTIVE entries -> PURGED", "recompute effective_rank over remaining ACTIVE entries"]
+
+  # ---- Units ----
+  - method: POST
+    path: "/pha/units"
+    description: "Create a housing unit (status AVAILABLE)."
+    roles: [PropertyManager]
+    code: 201
+    input: [address_label, bedroom_size, income_limit_cents, "utility_allowance_cents?"]
+    output: Unit
+    side_effects: ["status = AVAILABLE"]
+  - method: GET
+    path: "/pha/units/{id}"
+    description: "Fetch one unit."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: []
+    output: Unit
+    side_effects: []
+  - method: GET
+    path: "/pha/units"
+    description: "List units, optionally filtered by status or bedroom size."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: ["status?", "bedroom_size?", "limit?", "offset?"]
+    output: Unit[]
+    side_effects: []
+
+  # ---- Offers ----
+  - method: POST
+    path: "/pha/offers"
+    description: "Offer a unit to a waitlist entry."
+    roles: [HousingSpecialist]
+    code: 201
+    input: [waitlist_entry_id, unit_id, expires_at]
+    output: Offer
+    side_effects: ["Unit AVAILABLE -> OFFERED", "WaitlistEntry ACTIVE -> OFFERED", "set offered_at = clock.now"]
+  - method: GET
+    path: "/pha/offers/{id}"
+    description: "Fetch one offer."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: []
+    output: Offer
+    side_effects: []
+  - method: GET
+    path: "/pha/offers"
+    description: "List offers, optionally filtered by waitlist entry or unit."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: ["waitlist_entry_id?", "unit_id?", "limit?", "offset?"]
+    output: Offer[]
+    side_effects: []
+  - method: POST
+    path: "/pha/offers/{id}/accept"
+    description: "Applicant accepts the offer; creates the tenancy and initial certification and cascades occupancy."
+    roles: [Applicant]
+    code: 201
+    input: []
+    output: Tenancy
+    side_effects: ["Offer -> ACCEPTED", "create Tenancy ACTIVE + INITIAL Certification DRAFT", "Unit -> OCCUPIED", "WaitlistEntry -> HOUSED", "Applicant -> HOUSED, sibling entries -> WITHDRAWN"]
+  - method: POST
+    path: "/pha/offers/{id}/refuse"
+    description: "Applicant refuses the offer; releases the unit and increments the refusal count (purge at limit)."
+    roles: [Applicant]
+    code: 200
+    input: []
+    output: Offer
+    side_effects: ["Offer -> REFUSED", "Unit OFFERED -> AVAILABLE", "WaitlistEntry OFFERED -> ACTIVE (refusal_count++) or PURGED at REFUSAL_LIMIT"]
+
+  # ---- Tenancies ----
+  - method: GET
+    path: "/pha/tenancies/{id}"
+    description: "Fetch one tenancy."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: []
+    output: Tenancy
+    side_effects: []
+  - method: GET
+    path: "/pha/tenancies"
+    description: "List tenancies, optionally filtered by applicant or unit."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: ["applicant_id?", "unit_id?", "limit?", "offset?"]
+    output: Tenancy[]
+    side_effects: []
+
+  # ---- Certifications ----
+  - method: POST
+    path: "/pha/tenancies/{id}/certifications"
+    description: "Create an ANNUAL or INITIAL certification (DRAFT) against a tenancy. Requires expected_tenancy_version for OCC."
+    roles: [HousingSpecialist]
+    code: 201
+    input: [cert_type, effective_date, expected_tenancy_version, "childcare_expenses_annual_cents?", "medical_expenses_annual_cents?"]
+    output: Certification
+    side_effects: ["create Certification DRAFT", "increments Tenancy.version by 1"]
+  - method: GET
+    path: "/pha/certifications/{id}"
+    description: "Fetch one certification."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: []
+    output: Certification
+    side_effects: []
+  - method: GET
+    path: "/pha/certifications"
+    description: "List certifications, optionally filtered by tenancy or source interim change."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: ["tenancy_id?", "source_interim_change_id?", "limit?", "offset?"]
+    output: Certification[]
+    side_effects: []
+  - method: POST
+    path: "/pha/certifications/{id}/finalize"
+    description: "Finalize a DRAFT certification to EFFECTIVE: runs the rent calculations, supersedes the prior cert, recomputes tenancy rent."
+    roles: [HousingSpecialist]
+    code: 200
+    input: []
+    output: Certification
+    side_effects: ["run rent calcs and snapshot", "status DRAFT -> EFFECTIVE", "prior EFFECTIVE cert -> SUPERSEDED", "recompute Tenancy rent fields"]
+  - method: POST
+    path: "/pha/certifications/{id}/hud-submit"
+    description: "Submit (or resubmit) an EFFECTIVE certification's HUD-50058 (hud_status -> SUBMITTED)."
+    roles: [HousingSpecialist]
+    code: 200
+    input: []
+    output: Certification
+    side_effects: ["hud_status NOT_SUBMITTED|REJECTED -> SUBMITTED"]
+  - method: POST
+    path: "/pha/certifications/{id}/hud-result"
+    description: "Record the HUD-50058 adjudication result (ACCEPTED or REJECTED)."
+    roles: [HousingSpecialist]
+    code: 200
+    input: [result]
+    output: Certification
+    side_effects: ["hud_status SUBMITTED -> ACCEPTED or REJECTED"]
+
+  # ---- Interim changes ----
+  - method: POST
+    path: "/pha/tenancies/{id}/interim-changes"
+    description: "Tenant reports an interim change (income or composition)."
+    roles: [Applicant]
+    code: 201
+    input: [change_type, effective_date]
+    output: InterimChange
+    side_effects: ["status = REPORTED", "set reported_at = clock.now"]
+  - method: GET
+    path: "/pha/tenancies/{id}/interim-changes"
+    description: "List interim changes on a tenancy."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: InterimChange[]
+    side_effects: []
+  - method: POST
+    path: "/pha/interim-changes/{id}/process"
+    description: "Process or deny a reported interim change. PROCESS creates and finalizes an INTERIM cert and recomputes rent."
+    roles: [HousingSpecialist]
+    code: 200
+    input: [decision]
+    output: InterimChange
+    side_effects: ["PROCESS: create INTERIM cert -> finalize EFFECTIVE (ACTUAL variant) -> prior cert SUPERSEDED -> Tenancy rent recomputed", "DENY: status = DENIED"]
+
+  # ---- Grievances / eviction ----
+  - method: POST
+    path: "/pha/tenancies/{id}/grievances"
+    description: "File a grievance (tenant) or eviction (property manager) against a tenancy."
+    roles: [Applicant, PropertyManager]
+    code: 201
+    input: [grievance_type, reason]
+    output: Grievance
+    side_effects: ["status = FILED", "set filed_at = clock.now"]
+  - method: GET
+    path: "/pha/tenancies/{id}/grievances"
+    description: "List grievances on a tenancy."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager, Applicant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Grievance[]
+    side_effects: []
+  - method: POST
+    path: "/pha/grievances/{id}/decide"
+    description: "Decide a grievance. OVERRULED eviction terminates the tenancy and frees the unit."
+    roles: [PropertyManager]
+    code: 200
+    input: [outcome]
+    output: Grievance
+    side_effects: ["FILED -> SUSTAINED or OVERRULED", "EVICTION+OVERRULED: Tenancy -> TERMINATED, Unit OCCUPIED -> AVAILABLE"]
+
+  # ---- Test-driving clock ----
+  - method: POST
+    path: "/pha/_clock/set_current_utc"
+    description: "Set the server logical clock to any ISO-8601 UTC instant. Startup default is 2026-03-01T00:00:00Z; before any set call the clock reads exactly that default (never real wall-clock time)."
+    roles: [IntakeClerk, HousingSpecialist, PropertyManager]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: datetime }
+    side_effects: ["logical clock advances to to_iso8601 for all subsequent clock.now reads"]
+
+# ============================================================================
+# 1.6 ERROR CODE CATALOG
+# ============================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/invalid auth headers or unknown role"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "role not permitted, or entity_backed Applicant acting on a resource it does not own"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "missing required field, bad type, invalid enum member, or negative amount"
+  - id: ERR_APPLICANT_NOT_FOUND
+    http: 404
+    condition: "applicant id in path does not exist"
+  - id: ERR_PREFERENCE_CLAIM_NOT_FOUND
+    http: 404
+    condition: "preference claim id does not exist"
+  - id: ERR_WAITLIST_NOT_FOUND
+    http: 404
+    condition: "waitlist id does not exist"
+  - id: ERR_WAITLIST_ENTRY_NOT_FOUND
+    http: 404
+    condition: "waitlist entry id does not exist"
+  - id: ERR_UNIT_NOT_FOUND
+    http: 404
+    condition: "unit id does not exist"
+  - id: ERR_OFFER_NOT_FOUND
+    http: 404
+    condition: "offer id does not exist"
+  - id: ERR_TENANCY_NOT_FOUND
+    http: 404
+    condition: "tenancy id does not exist"
+  - id: ERR_CERTIFICATION_NOT_FOUND
+    http: 404
+    condition: "certification id does not exist"
+  - id: ERR_INTERIM_CHANGE_NOT_FOUND
+    http: 404
+    condition: "interim change id does not exist"
+  - id: ERR_GRIEVANCE_NOT_FOUND
+    http: 404
+    condition: "grievance id does not exist"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "target resource not in a state that admits the requested transition"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_tenancy_version does not match current Tenancy.version (OCC)"
+  - id: ERR_UNIT_NOT_AVAILABLE
+    http: 409
+    condition: "unit is not AVAILABLE when offered, or not OFFERED when accepted"
+  - id: ERR_TENANCY_NOT_ACTIVE
+    http: 409
+    condition: "tenancy is not ACTIVE for the requested operation"
+  - id: ERR_WAITLIST_CLOSED
+    http: 409
+    condition: "waitlist is CLOSED for entry creation or lottery draw"
+  - id: ERR_BEDROOM_MISMATCH
+    http: 422
+    condition: "offered unit bedroom_size does not equal the entry's waitlist bedroom_size"
+  - id: ERR_OFFER_EXPIRED
+    http: 409
+    condition: "accept attempted after Offer.expires_at"
+  - id: ERR_UNIT_TURNOVER_CONFLICT
+    http: 409
+    condition: "make-ready buffer not elapsed since the unit's last_lease_end_date"
+  - id: ERR_CERT_PERIOD_OVERLAP
+    http: 409
+    condition: "certification effective_date not strictly after the current EFFECTIVE cert's effective_date"
+  - id: ERR_OVER_INCOME
+    http: 422
+    condition: "INITIAL cert household anticipated gross income exceeds the unit income limit"
+
+# ============================================================================
+# 1.7 RBAC MATRIX
+# ============================================================================
+roles:
+  - name: IntakeClerk
+    description: "Applicant intake, preference verification, waitlist administration (lottery & purge)."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pha/applicants"
+      - "POST /pha/applicants/{id}/members"
+      - "POST /pha/preference-claims/{id}/verify"
+      - "POST /pha/preference-claims/{id}/revoke"
+      - "POST /pha/waitlists"
+      - "POST /pha/waitlists/{id}/entries"
+      - "POST /pha/waitlists/{id}/lottery-draw"
+      - "POST /pha/waitlists/{id}/purge"
+    shared_operations:
+      - "POST /pha/applicants/{id}/preference-claims"
+      - "POST /pha/_clock/set_current_utc"
+      - "all GET reads"
+  - name: HousingSpecialist
+    description: "Offers, certifications, HUD-50058 submissions, and interim change processing."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pha/offers"
+      - "POST /pha/tenancies/{id}/certifications"
+      - "POST /pha/certifications/{id}/finalize"
+      - "POST /pha/certifications/{id}/hud-submit"
+      - "POST /pha/certifications/{id}/hud-result"
+      - "POST /pha/interim-changes/{id}/process"
+    shared_operations:
+      - "POST /pha/_clock/set_current_utc"
+      - "all GET reads"
+  - name: PropertyManager
+    description: "Unit inventory and eviction/grievance adjudication."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pha/units"
+      - "POST /pha/grievances/{id}/decide"
+    shared_operations:
+      - "POST /pha/tenancies/{id}/grievances"
+      - "POST /pha/_clock/set_current_utc"
+      - "all GET reads"
+  - name: Applicant
+    description: "Household acting on its own resources: offers, interim reports, grievances."
+    identity: "entity_backed:Applicant"
+    exclusive_operations:
+      - "POST /pha/offers/{id}/accept"
+      - "POST /pha/offers/{id}/refuse"
+      - "POST /pha/tenancies/{id}/interim-changes"
+    shared_operations:
+      - "POST /pha/applicants/{id}/preference-claims"
+      - "POST /pha/tenancies/{id}/grievances"
+      - "all GET reads"

@@ -1,0 +1,36 @@
+"""Domain thresholds from the PRD's calculation rules (§3.8, §3.5, §3.1)."""
+
+# pod_dose_throughput_capacity (PRD §3.8)
+STAFF_PER_LANE = 2
+SURGE_LANE_THRESHOLD = 6
+SURGE_BONUS_MULTIPLIER = 1.15
+
+# mutual_aid_demand_forecast (PRD §3.8)
+NO_SHOW_RATE = 0.10
+
+# allocation_priority_score (PRD §3.5)
+BASE_QTY_WEIGHT = 0.01
+MAX_QTY_CAP = 5000
+RISK_TIER_WEIGHT = {"STANDARD": 1, "ELEVATED": 2, "CRITICAL": 3}
+
+# situation_report_rollup (PRD §3.8)
+RED_THRESHOLD = 50.0
+YELLOW_THRESHOLD = 80.0
+
+# POD.risk_tier ELEVATED boundary (PRD §3.2)
+ELEVATED_QUEUE_BACKLOG_THRESHOLD = 20
+
+# Default logical clock value before any /_clock/set_current_utc call (PRD §2.5)
+DEFAULT_CLOCK_UTC = "2026-03-01T00:00:00Z"
+
+THRESHOLDS = {
+    "STAFF_PER_LANE": STAFF_PER_LANE,
+    "SURGE_LANE_THRESHOLD": SURGE_LANE_THRESHOLD,
+    "SURGE_BONUS_MULTIPLIER": SURGE_BONUS_MULTIPLIER,
+    "NO_SHOW_RATE": NO_SHOW_RATE,
+    "BASE_QTY_WEIGHT": BASE_QTY_WEIGHT,
+    "MAX_QTY_CAP": MAX_QTY_CAP,
+    "RED_THRESHOLD": RED_THRESHOLD,
+    "YELLOW_THRESHOLD": YELLOW_THRESHOLD,
+    "ELEVATED_QUEUE_BACKLOG_THRESHOLD": ELEVATED_QUEUE_BACKLOG_THRESHOLD,
+}

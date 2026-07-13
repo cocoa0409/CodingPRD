@@ -1,0 +1,1129 @@
+# =============================================================================
+# Task 0847 — Airport Ground-Transportation & TNC Permitting
+# Seed tables (§1.0–§1.7). Design level: Expert.
+# =============================================================================
+
+scenario: |
+  847. Airport Ground-Transportation & TNC Permitting: operator/vehicle permit & decal,
+  geofenced staging-lot & FIFO queue, trip-fee (dead-head/pickup) accounting, dispatch &
+  curb assignment, trip-count & AVI, violation & suspension, monthly settlement,
+  wheelchair-accessible mandate
+
+domain_name: airport-ground-transport-tnc
+api_prefix: /v1
+
+complexity_profile:
+  primary_archetype: compliance_audit          # permit lifecycle + violation/suspension + audited monthly settlement
+  secondary_archetype: pricing_engine          # dead-head/pickup trip-fee accounting with provisional/final variants
+  complexity_layers:
+    - dual_variant_calculation                 # provisional vs final trip fee; rolling vs lifetime penalty score
+    - cascading_side_effects                    # operator suspend -> vehicle -> trip -> curb
+    - rate_threshold_triggers                   # penalty-point suspension threshold; WAV pledge ratio
+    - optimistic_concurrency                    # permit-create supersede on Vehicle.version
+
+  entity_topology: flat                         # peer entities linked by FK; no nesting in URL paths
+  state_machine_shape: branching                # operator cycle + violation fork-join
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate
+  role_model: peer_roles                        # AirportAuthority (regulator) / Operator (fleet) / CurbCoordinator (curb ops)
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Operator
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: legal_name, type: string, source: input, description: "Registered legal name of the ground-transport company" }
+      - { name: operator_type, type: enum, source: input, description: "TNC | TAXI | LIMO | SHUTTLE — drives base trip fee", constraints: "one of {TNC, TAXI, LIMO, SHUTTLE}" }
+      - { name: contact_email, type: string, source: input, description: "Billing/settlement contact email" }
+      - { name: wheelchair_pledge_pct, type: number, source: input, default: 0.0, description: "Pledged minimum fraction of monthly trips that must be wheelchair-accessible (0.0-1.0)" }
+      - { name: status, type: enum, source: system, default: PENDING, description: "PENDING | ACTIVE | SUSPENDED | REVOKED", constraints: "one of {PENDING, ACTIVE, SUSPENDED, REVOKED}" }
+      - { name: suspended_reason, type: enum, source: system, description: "ADMIN | PENALTY_THRESHOLD — set when status becomes SUSPENDED, null otherwise", constraints: "one of {ADMIN, PENALTY_THRESHOLD, null}" }
+      - { name: rolling_penalty_points, type: integer, source: computed, description: "Sum of penalty_points over this operator's Violations with status in {ASSESSED, UPHELD} whose assessed_at is within ROLLING_WINDOW_DAYS of the current clock; authoritative for auto-suspension" }
+      - { name: lifetime_penalty_points, type: integer, source: computed, description: "Sum of penalty_points over ALL this operator's Violations with status in {ASSESSED, UPHELD}, ignoring the date window; display/audit only" }
+      - { name: outstanding_fees_cents, type: integer, source: computed, description: "Sum of final_fee_cents over this operator's Trips with status==COMPLETED and settlement_statement_id==null (i.e., completed but not yet swept into a statement)" }
+
+  - name: Vehicle
+    parent: null
+    common_fields: true
+    fields:
+      - { name: operator_id, type: string, source: input, description: "FK -> Operator.id; owning operator" }
+      - { name: plate, type: string, source: input, description: "License plate string" }
+      - { name: is_wheelchair_accessible, type: boolean, source: input, default: false, description: "Whether the vehicle is a wheelchair-accessible vehicle (WAV)" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | SUSPENDED (toggled only by operator suspend/reinstate cascade)", constraints: "one of {ACTIVE, SUSPENDED}" }
+
+  - name: Permit
+    parent: null
+    common_fields: true
+    fields:
+      - { name: vehicle_id, type: string, source: input, description: "FK -> Vehicle.id; the vehicle this operating permit covers" }
+      - { name: avi_tag_id, type: string, source: input, description: "Automatic Vehicle Identification transponder id; globally unique across live permits" }
+      - { name: decal_number, type: string, source: system, description: "Physical decal serial; minted and assigned when the permit is ACTIVATED, null while ISSUED" }
+      - { name: valid_from, type: datetime, source: input, description: "ISO8601 UTC start of validity window" }
+      - { name: valid_until, type: datetime, source: input, description: "ISO8601 UTC end of validity window" }
+      - { name: fee_paid_cents, type: integer, source: input, description: "Permit issuance fee paid, in cents" }
+      - { name: permit_status, type: enum, source: system, default: ISSUED, description: "ISSUED | ACTIVE | SUSPENDED | EXPIRED | REVOKED", constraints: "one of {ISSUED, ACTIVE, SUSPENDED, EXPIRED, REVOKED}" }
+      - { name: suspended_reason, type: enum, source: system, description: "OPERATOR_SUSPENDED set when permit_status becomes SUSPENDED via the owning-vehicle cascade, null otherwise", constraints: "one of {OPERATOR_SUSPENDED, null}" }
+
+  - name: StagingLot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Human name of the geofenced staging lot" }
+      - { name: geofence_center_lat, type: number, source: input, description: "Latitude of geofence center (decimal degrees)" }
+      - { name: geofence_center_lng, type: number, source: input, description: "Longitude of geofence center (decimal degrees)" }
+      - { name: geofence_radius_m, type: number, source: input, description: "Geofence radius in meters; a vehicle may only join from inside this circle" }
+      - { name: capacity, type: integer, source: input, description: "Maximum number of WAITING QueueEntry rows the lot may hold at once" }
+
+  - name: QueueEntry
+    parent: null
+    common_fields: true
+    fields:
+      - { name: staging_lot_id, type: string, source: input, description: "FK -> StagingLot.id; the lot this entry queues in" }
+      - { name: vehicle_id, type: string, source: input, description: "FK -> Vehicle.id; the queued vehicle" }
+      - { name: position, type: integer, source: system, description: "FIFO position within the lot among WAITING entries, contiguous 1..N (1 = head)" }
+      - { name: status, type: enum, source: system, default: WAITING, description: "WAITING | RELEASED | EXITED | CANCELLED", constraints: "one of {WAITING, RELEASED, EXITED, CANCELLED}" }
+      - { name: enter_ts, type: datetime, source: system, description: "Logical clock time when the vehicle joined the queue" }
+      - { name: exit_ts, type: datetime, source: system, description: "Logical clock time when the entry left WAITING (release/exit/cancel), null while WAITING" }
+
+  - name: CurbZone
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Curb zone name" }
+      - { name: terminal, type: string, source: input, description: "Terminal identifier the zone belongs to" }
+      - { name: capacity, type: integer, source: input, description: "Maximum number of ACTIVE CurbAssignment intervals whose [start,end) windows may overlap at any single instant on this zone" }
+
+  - name: CurbAssignment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: curb_zone_id, type: string, source: input, description: "FK -> CurbZone.id; the curb zone occupied" }
+      - { name: trip_id, type: string, source: input, description: "FK -> Trip.id; the trip picking up at the curb" }
+      - { name: start_ts, type: datetime, source: input, description: "ISO8601 UTC start of the curb occupation (half-open interval start, inclusive)" }
+      - { name: end_ts, type: datetime, source: input, description: "ISO8601 UTC end of the curb occupation (half-open interval end, exclusive)" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | RELEASED", constraints: "one of {ACTIVE, RELEASED}" }
+
+  - name: Trip
+    parent: null
+    common_fields: true
+    fields:
+      - { name: operator_id, type: string, source: input, description: "FK -> Operator.id; owning operator, copied from the dispatched vehicle" }
+      - { name: vehicle_id, type: string, source: input, description: "FK -> Vehicle.id; the dispatched vehicle (must be at head of its lot queue)" }
+      - { name: trip_kind, type: enum, source: input, default: PICKUP, description: "PICKUP (fare pickup) | DEADHEAD (repositioning, flat fee)", constraints: "one of {PICKUP, DEADHEAD}" }
+      - { name: is_wheelchair_trip, type: boolean, source: input, default: false, description: "Whether the trip served a wheelchair passenger; counts toward WAV compliance" }
+      - { name: status, type: enum, source: system, default: DISPATCHED, description: "DISPATCHED | PICKED_UP | COMPLETED | CANCELLED | VOIDED", constraints: "one of {DISPATCHED, PICKED_UP, COMPLETED, CANCELLED, VOIDED}" }
+      - { name: dispatch_ts, type: datetime, source: system, description: "Logical clock time at dispatch; reference for the provisional fee" }
+      - { name: pickup_ts, type: datetime, source: system, description: "Logical clock time at PICKUP; reference for the final fee, null before pickup" }
+      - { name: complete_ts, type: datetime, source: system, description: "Logical clock time at COMPLETE, null before completion" }
+      - { name: provisional_fee_cents, type: integer, source: computed, description: "Fee estimated at dispatch (trip_fee variant=provisional, reference_ts=dispatch_ts)" }
+      - { name: final_fee_cents, type: integer, source: computed, description: "Fee locked at completion (trip_fee variant=final, reference_ts=pickup_ts), null before completion" }
+      - { name: settlement_statement_id, type: string, source: system, description: "FK -> SettlementStatement.id; set when the trip is swept into a statement at CLOSE, null before that" }
+
+  - name: Violation
+    parent: null
+    common_fields: true
+    fields:
+      - { name: operator_id, type: string, source: input, description: "FK -> Operator.id; the cited operator" }
+      - { name: trip_id, type: string, source: input, description: "FK -> Trip.id; optional trip the citation references, null for operator-level citations" }
+      - { name: violation_type, type: enum, source: input, description: "STAGING | CURB | AVI_MISMATCH | NO_DECAL | WAV_SHORTFALL", constraints: "one of {STAGING, CURB, AVI_MISMATCH, NO_DECAL, WAV_SHORTFALL}" }
+      - { name: source, type: enum, source: input, default: MANUAL, description: "MANUAL (issued by authority) | SYSTEM (auto-issued, e.g. WAV_SHORTFALL at settlement close)", constraints: "one of {MANUAL, SYSTEM}" }
+      - { name: penalty_points, type: integer, source: computed, description: "Points for this violation, looked up from PENALTY_POINTS_BY_TYPE (input, if any, ignored)" }
+      - { name: fine_cents, type: integer, source: computed, description: "Fine for this violation, looked up from FINE_CENTS_BY_TYPE" }
+      - { name: status, type: enum, source: system, default: OPEN, description: "OPEN | ASSESSED | APPEALED | UPHELD | OVERTURNED | DISMISSED | PAID | WAIVED", constraints: "one of {OPEN, ASSESSED, APPEALED, UPHELD, OVERTURNED, DISMISSED, PAID, WAIVED}" }
+      - { name: assessed_at, type: datetime, source: system, description: "Logical clock time at ASSESS; anchors the rolling-window and the appeal window, null before assessment" }
+
+  - name: SettlementStatement
+    parent: null
+    common_fields: true
+    fields:
+      - { name: operator_id, type: string, source: input, description: "FK -> Operator.id; the settled operator" }
+      - { name: period_year, type: integer, source: input, description: "Statement period calendar year (UTC)" }
+      - { name: period_month, type: integer, source: input, description: "Statement period calendar month 1-12 (UTC)" }
+      - { name: status, type: enum, source: system, default: OPEN, description: "OPEN | CLOSED | SETTLED", constraints: "one of {OPEN, CLOSED, SETTLED}" }
+      - { name: gross_fees_cents, type: integer, source: computed, description: "Sum of final_fee_cents over swept trips; 0 until CLOSE" }
+      - { name: admin_fee_cents, type: integer, source: computed, description: "round_half_up(gross_fees_cents * ADMIN_RATE) — SUM-THEN-ROUND once on the aggregate; 0 until CLOSE" }
+      - { name: wav_incentive_credit_cents, type: integer, source: computed, description: "WAV_INCENTIVE_CENTS * wav_trip_count; 0 until CLOSE" }
+      - { name: net_due_cents, type: integer, source: computed, description: "gross_fees_cents + admin_fee_cents - wav_incentive_credit_cents; 0 until CLOSE; the amount SETTLE must be paid with" }
+      - { name: total_trip_count, type: integer, source: computed, description: "Count of swept trips; 0 until CLOSE" }
+      - { name: wav_trip_count, type: integer, source: computed, description: "Count of swept trips with is_wheelchair_trip==true; 0 until CLOSE" }
+      - { name: closed_at, type: datetime, source: system, description: "Logical clock time at CLOSE, null before" }
+      - { name: settled_at, type: datetime, source: system, description: "Logical clock time at SETTLE, null before" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Operator
+    field: status
+    initial_state: PENDING
+    terminal_states: [REVOKED]
+    transitions:
+      - from: PENDING
+        to: ACTIVE
+        trigger: "POST /v1/operators/{operator_id}/transitions (action=ACTIVATE)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects: []
+
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /v1/operators/{operator_id}/transitions (action=SUSPEND)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects:
+          - "suspended_reason = ADMIN"
+          - "CASCADE link1: every Vehicle with operator_id==this and status==ACTIVE -> SUSPENDED (fires the Vehicle ACTIVE->SUSPENDED system transition, which itself cascades to that vehicle's Permits and Trips)"
+
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "system (Violation ASSESS/UPHOLD drives rolling_penalty_points >= SUSPENSION_THRESHOLD_POINTS)"
+        actor: system
+        preconditions:
+          - "rolling_penalty_points >= SUSPENSION_THRESHOLD_POINTS after the assessment"
+        side_effects:
+          - "suspended_reason = PENALTY_THRESHOLD"
+          - "CASCADE link1: every ACTIVE Vehicle of this operator -> SUSPENDED (which cascades onward to Permits and Trips)"
+
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /v1/operators/{operator_id}/transitions (action=REINSTATE)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects:
+          - "suspended_reason = null"
+          - "every Vehicle of this operator with status==SUSPENDED -> ACTIVE"
+          - "every Permit of those vehicles with permit_status==SUSPENDED and suspended_reason==OPERATOR_SUSPENDED -> ACTIVE"
+          - "Trips CANCELLED by the suspension are NOT restored"
+        note: "SUSPENDED<->ACTIVE forms the cycle that makes this a non-linear machine"
+
+      - from: ACTIVE
+        to: REVOKED
+        trigger: "POST /v1/operators/{operator_id}/transitions (action=REVOKE)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects:
+          - "every ACTIVE Vehicle of this operator -> SUSPENDED (cascades to Permits/Trips)"
+
+      - from: SUSPENDED
+        to: REVOKED
+        trigger: "POST /v1/operators/{operator_id}/transitions (action=REVOKE)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects: []
+
+  - entity: Vehicle
+    field: status
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "system (owning Operator becomes SUSPENDED or REVOKED)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "CASCADE link2: every Permit with vehicle_id==this and permit_status==ACTIVE -> SUSPENDED (suspended_reason=OPERATOR_SUSPENDED)"
+          - "CASCADE link2: every Trip with vehicle_id==this and status in {DISPATCHED, PICKED_UP} -> CANCELLED (fires the Trip system-cancel transition, which releases any ACTIVE CurbAssignment)"
+
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "system (owning Operator REINSTATE)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Permits suspended with reason OPERATOR_SUSPENDED -> ACTIVE"
+
+  - entity: Permit
+    field: permit_status
+    initial_state: ISSUED
+    terminal_states: [EXPIRED, REVOKED]
+    transitions:
+      - from: ISSUED
+        to: ACTIVE
+        trigger: "POST /v1/permits/{permit_id}/transitions (action=ACTIVATE)"
+        actor: AirportAuthority
+        preconditions:
+          - "valid_from <= current clock < valid_until"
+        side_effects:
+          - "decal_number minted and assigned"
+
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /v1/permits/{permit_id}/transitions (action=RENEW)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects:
+          - "valid_until extended to the supplied valid_until"
+
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "system (owning Vehicle becomes SUSPENDED)"
+        actor: system
+        preconditions: []
+        side_effects: ["suspended_reason = OPERATOR_SUSPENDED"]
+
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "system (owning Vehicle REINSTATE)"
+        actor: system
+        preconditions: []
+        side_effects: ["suspended_reason = null"]
+
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /v1/permits/{permit_id}/transitions (action=EXPIRE)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects: []
+
+      - from: ISSUED
+        to: REVOKED
+        trigger: "POST /v1/permits/{permit_id}/transitions (action=REVOKE)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects: []
+
+  - entity: Trip
+    field: status
+    initial_state: DISPATCHED
+    terminal_states: [COMPLETED, CANCELLED, VOIDED]
+    transitions:
+      - from: DISPATCHED
+        to: PICKED_UP
+        trigger: "POST /v1/trips/{trip_id}/transitions (action=PICKUP)"
+        actor: Operator
+        preconditions: []
+        side_effects: ["pickup_ts = current clock"]
+
+      - from: PICKED_UP
+        to: COMPLETED
+        trigger: "POST /v1/trips/{trip_id}/transitions (action=COMPLETE)"
+        actor: Operator
+        preconditions: []
+        side_effects:
+          - "complete_ts = current clock"
+          - "final_fee_cents computed via trip_fee variant=final (reference_ts=pickup_ts)"
+          - "LEDGER SYNC: operator.outstanding_fees_cents recomputed to include this trip's final_fee_cents"
+          - "every ACTIVE CurbAssignment with trip_id==this -> RELEASED"
+
+      - from: DISPATCHED
+        to: CANCELLED
+        trigger: "POST /v1/trips/{trip_id}/transitions (action=CANCEL)"
+        actor: Operator
+        preconditions: []
+        side_effects: ["every ACTIVE CurbAssignment with trip_id==this -> RELEASED"]
+
+      - from: DISPATCHED
+        to: CANCELLED
+        trigger: "system (owning Vehicle becomes SUSPENDED)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "CASCADE link3: every ACTIVE CurbAssignment with trip_id==this -> RELEASED"
+
+      - from: PICKED_UP
+        to: CANCELLED
+        trigger: "system (owning Vehicle becomes SUSPENDED)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "CASCADE link3: every ACTIVE CurbAssignment with trip_id==this -> RELEASED"
+
+      - from: COMPLETED
+        to: VOIDED
+        trigger: "POST /v1/trips/{trip_id}/transitions (action=VOID)"
+        actor: AirportAuthority
+        preconditions:
+          - "settlement_statement_id == null (a swept trip cannot be voided)"
+        side_effects:
+          - "COMPENSATION: operator.outstanding_fees_cents recomputed to exclude this trip's final_fee_cents"
+
+  - entity: Violation
+    field: status
+    initial_state: OPEN
+    terminal_states: [DISMISSED, PAID, OVERTURNED, WAIVED]
+    transitions:
+      - from: OPEN
+        to: ASSESSED
+        trigger: "POST /v1/violations/{violation_id}/transitions (action=ASSESS)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects:
+          - "assessed_at = current clock"
+          - "operator.rolling_penalty_points and lifetime_penalty_points recomputed to include this violation"
+          - "CASCADE link2: if operator.status==ACTIVE and rolling_penalty_points >= SUSPENSION_THRESHOLD_POINTS, operator -> SUSPENDED (suspended_reason=PENALTY_THRESHOLD)"
+
+      - from: OPEN
+        to: DISMISSED
+        trigger: "POST /v1/violations/{violation_id}/transitions (action=DISMISS)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects: []
+
+      - from: ASSESSED
+        to: APPEALED
+        trigger: "POST /v1/violations/{violation_id}/transitions (action=APPEAL)"
+        actor: Operator
+        preconditions:
+          - "current clock - assessed_at <= APPEAL_WINDOW_DAYS (14 days) (else ERR_APPEAL_WINDOW_CLOSED)"
+        side_effects: []
+
+      - from: APPEALED
+        to: UPHELD
+        trigger: "POST /v1/violations/{violation_id}/transitions (action=UPHOLD)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects:
+          - "penalty_points continue to count toward the operator's rolling/lifetime totals (no change)"
+
+      - from: APPEALED
+        to: OVERTURNED
+        trigger: "POST /v1/violations/{violation_id}/transitions (action=OVERTURN)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects:
+          - "violation no longer counts toward rolling/lifetime totals; operator.rolling_penalty_points and lifetime_penalty_points recomputed downward"
+          - "an already-SUSPENDED operator is NOT auto-reinstated"
+        note: "UPHELD vs OVERTURNED are the divergent branches: only OVERTURN mutates the operator's point totals"
+
+      - from: ASSESSED
+        to: PAID
+        trigger: "POST /v1/violations/{violation_id}/transitions (action=PAY)"
+        actor: Operator
+        preconditions: []
+        side_effects: []
+
+      - from: UPHELD
+        to: PAID
+        trigger: "POST /v1/violations/{violation_id}/transitions (action=PAY)"
+        actor: Operator
+        preconditions: []
+        side_effects: []
+
+      - from: ASSESSED
+        to: WAIVED
+        trigger: "POST /v1/violations/{violation_id}/transitions (action=WAIVE)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects:
+          - "violation no longer counts toward rolling/lifetime totals; operator totals recomputed downward"
+
+  - entity: SettlementStatement
+    field: status
+    initial_state: OPEN
+    terminal_states: [SETTLED]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /v1/settlements/{settlement_id}/transitions (action=CLOSE)"
+        actor: AirportAuthority
+        preconditions: []
+        side_effects:
+          - "sweep: select Trips where operator_id==operator, status==COMPLETED, settlement_statement_id==null, complete_ts in [period_start, period_end)"
+          - "gross_fees_cents, admin_fee_cents, wav_incentive_credit_cents, net_due_cents, total_trip_count, wav_trip_count computed (settlement_statement_totals)"
+          - "each swept Trip.settlement_statement_id = this statement.id (so it leaves operator.outstanding_fees_cents)"
+          - "WAV mandate: if total_trip_count > 0 and wav_trip_count/total_trip_count < operator.wheelchair_pledge_pct, auto-issue a Violation(violation_type=WAV_SHORTFALL, source=SYSTEM, status=OPEN, operator_id=operator)"
+          - "closed_at = current clock"
+
+      - from: CLOSED
+        to: SETTLED
+        trigger: "POST /v1/settlements/{settlement_id}/transitions (action=SETTLE)"
+        actor: Operator
+        preconditions:
+          - "payment_amount_cents == net_due_cents (else ERR_SETTLEMENT_AMOUNT_MISMATCH)"
+        side_effects:
+          - "settled_at = current clock"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: permit-create-stale-vehicle
+    parent_entity: Vehicle
+    write_endpoint: "POST /v1/permits"
+    occ_field: "expected_vehicle_version"
+    description: |
+      Issuing a Permit against a Vehicle whose version has advanced since the
+      client last observed it is rejected. A vehicle may legitimately have its
+      operating permit re-issued (a newly issued permit supersedes the prior
+      credential for that vehicle); a writer whose view of the vehicle is stale
+      — because another permit issuance has already advanced the vehicle's
+      version — is rejected on the stale-version check rather than silently
+      creating a second superseding permit.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: trip_fee
+    trigger: "computed at DISPATCH (provisional) and again at COMPLETE (final)"
+    algorithm: tiered_pricing
+    formula: |
+      # reference_ts and trip_kind depend on the variant (see variants below).
+      if trip_kind == "DEADHEAD":
+          fee_cents = DEADHEAD_FEE_CENTS
+      else:  # PICKUP
+          base = BASE_FEE_CENTS_BY_TYPE[operator.operator_type]
+          hour = utc_hour_of(reference_ts)                       # integer 0..23
+          mult = PEAK_MULTIPLIER if hour in PEAK_HOURS_UTC else 1.0
+          gross = round_half_up(base * mult)                     # integer cents
+          wav_adj = WAV_DISCOUNT_CENTS if is_wheelchair_trip else 0
+          fee_cents = max(FEE_FLOOR_CENTS, gross - wav_adj)
+    input_set: "single Trip plus its owning Operator's operator_type; no aggregation"
+    constants:
+      BASE_FEE_CENTS_BY_TYPE: { TNC: 350, TAXI: 300, LIMO: 500, SHUTTLE: 200 }
+      PEAK_HOURS_UTC: [7, 8, 9, 16, 17, 18]
+      PEAK_MULTIPLIER: 1.5
+      WAV_DISCOUNT_CENTS: 100
+      FEE_FLOOR_CENTS: 200
+      DEADHEAD_FEE_CENTS: 100
+    precision: "integer cents; round_half_up applied once to base*mult before the WAV subtraction"
+    variants:
+      - name: provisional
+        when: "at DISPATCH; stored in Trip.provisional_fee_cents"
+        difference: "reference_ts = dispatch_ts; trip_kind and is_wheelchair_trip taken from the dispatch request"
+      - name: final
+        when: "at COMPLETE; stored in Trip.final_fee_cents"
+        difference: "reference_ts = pickup_ts (the ACTUAL pickup hour, which may cross a peak boundary the dispatch hour did not), so final can differ from provisional for identical trip inputs"
+
+  - name: operator_penalty_score
+    trigger: "recomputed on Violation ASSESS/UPHOLD/OVERTURN/WAIVE and on every read of an Operator"
+    algorithm: weighted_scoring
+    formula: |
+      rolling = 0
+      lifetime = 0
+      for v in Violations where v.operator_id == operator.id and v.status in {ASSESSED, UPHELD}:
+          pts = PENALTY_POINTS_BY_TYPE[v.violation_type]
+          lifetime += pts
+          if v.assessed_at >= (current_clock - ROLLING_WINDOW_DAYS days):
+              rolling += pts
+      operator.rolling_penalty_points = rolling
+      operator.lifetime_penalty_points = lifetime
+    input_set: "Violations with status in {ASSESSED, UPHELD}; rolling additionally filters assessed_at within the trailing ROLLING_WINDOW_DAYS relative to the current clock"
+    constants:
+      PENALTY_POINTS_BY_TYPE: { STAGING: 3, CURB: 4, AVI_MISMATCH: 6, NO_DECAL: 6, WAV_SHORTFALL: 5 }
+      ROLLING_WINDOW_DAYS: 90
+      SUSPENSION_THRESHOLD_POINTS: 12
+    precision: "integer points"
+    variants:
+      - name: rolling
+        when: "authoritative for auto-suspension at ASSESS/UPHOLD"
+        difference: "counts only violations assessed within the trailing 90-day window"
+      - name: lifetime
+        when: "display/audit field"
+        difference: "counts all-time; diverges from rolling once any counting violation ages past 90 days"
+
+  - name: settlement_statement_totals
+    trigger: "computed at SETTLE-statement CLOSE"
+    algorithm: aggregation
+    formula: |
+      swept = Trips where operator_id == operator.id
+                        and status == COMPLETED
+                        and settlement_statement_id == null
+                        and period_start <= complete_ts < period_end
+              # period_start = <period_year>-<period_month>-01T00:00:00Z
+              # period_end   = first day of the following month, 00:00:00Z
+      total_trip_count = count(swept)
+      wav_trip_count   = count(t in swept where t.is_wheelchair_trip)
+      gross_fees_cents = sum(t.final_fee_cents for t in swept)          # sum of integers, exact
+      admin_fee_cents  = round_half_up(gross_fees_cents * ADMIN_RATE)   # SUM-THEN-ROUND: one rounding on the aggregate, NOT per-trip
+      wav_incentive_credit_cents = WAV_INCENTIVE_CENTS * wav_trip_count
+      net_due_cents = gross_fees_cents + admin_fee_cents - wav_incentive_credit_cents
+    input_set: "COMPLETED, unswept Trips of the operator whose complete_ts falls in the half-open month window [period_start, period_end)"
+    constants:
+      ADMIN_RATE: 0.025
+      WAV_INCENTIVE_CENTS: 50
+    precision: "integer cents; the ONLY rounding is round_half_up on gross_fees_cents*ADMIN_RATE (sum-then-round). Per-trip rounding is explicitly forbidden."
+
+  - name: wav_compliance_check
+    trigger: "evaluated at SETTLE-statement CLOSE after the totals are computed"
+    algorithm: threshold
+    formula: |
+      if total_trip_count == 0:
+          # empty-set edge: an operator that ran no trips this period cannot breach the mandate
+          no WAV_SHORTFALL violation is issued
+      else:
+          ratio = wav_trip_count / total_trip_count          # exact rational compare
+          if ratio < operator.wheelchair_pledge_pct:
+              auto-issue Violation(violation_type=WAV_SHORTFALL, source=SYSTEM, status=OPEN)
+    input_set: "the just-computed total_trip_count and wav_trip_count on the statement; the operator's wheelchair_pledge_pct"
+    constants: {}
+    precision: "exact rational comparison ratio < pledge; strict '<' (a ratio exactly equal to the pledge is compliant)"
+
+  - name: fifo_position_assignment
+    trigger: "on QueueEntry create (append) and on QueueEntry leaving WAITING (dispatch head-release / EXIT / CANCEL)"
+    algorithm: waterfall_allocation
+    formula: |
+      # append: new WAITING entry gets position = (current count of WAITING in the lot) + 1
+      # removal: when a WAITING entry at position p leaves WAITING, every remaining WAITING
+      #          entry in the same lot with position > p decrements position by 1, keeping
+      #          the surviving positions a contiguous block 1..(N-1).
+      # ordering key for FIFO is position (equivalently enter_ts ASC, created_at ASC tie-break);
+      # UUID id is NEVER used to order the queue.
+    input_set: "WAITING QueueEntry rows for a single StagingLot"
+    constants: {}
+    precision: "integer positions, contiguous starting at 1"
+    variants: []
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "role permitted for this endpoint/action; for entity_backed Operator, X-User-ID must own the target resource (operator_id match)"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: business_constraint
+    check: "request body is valid JSON, all required fields present, enum values in range, numeric fields well-formed, pagination limit in [1,100] and offset >= 0"
+    error_id: ERR_VALIDATION
+    http_status: 400
+    applies_to: "all"
+
+  - priority: 4
+    category: existence
+    check: "every id in the path and every FK referenced in the body exists (validated left-to-right)"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+
+  - priority: 5
+    category: business_referential
+    check: "expected_vehicle_version equals the current Vehicle.version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /v1/permits"
+
+  - priority: 6
+    category: state
+    check: "target resource is in a state from which the requested transition/action is legal"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /v1/operators/{operator_id}/transitions, POST /v1/permits/{permit_id}/transitions, POST /v1/trips/{trip_id}/transitions, POST /v1/violations/{violation_id}/transitions, POST /v1/settlements/{settlement_id}/transitions, POST /v1/queue-entries/{queue_entry_id}/transitions"
+
+  - priority: 7
+    category: state
+    check: "Vehicle.status == ACTIVE (checked before the permit check, since a suspended vehicle also has a suspended permit)"
+    error_id: ERR_VEHICLE_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /v1/trips, POST /v1/queue-entries"
+
+  - priority: 8
+    category: state
+    check: "owning Operator.status == ACTIVE"
+    error_id: ERR_OPERATOR_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /v1/trips"
+
+  - priority: 9
+    category: business_referential
+    check: "the dispatched/queued vehicle has a Permit with permit_status==ACTIVE"
+    error_id: ERR_VEHICLE_PERMIT_INVALID
+    http_status: 409
+    applies_to: "POST /v1/trips, POST /v1/queue-entries"
+
+  - priority: 10
+    category: business_safety
+    check: "join location (lat,lng) is within geofence_radius_m of the lot center"
+    error_id: ERR_GEOFENCE_VIOLATION
+    http_status: 422
+    applies_to: "POST /v1/queue-entries"
+
+  - priority: 11
+    category: business_constraint
+    check: "the vehicle has no other WAITING QueueEntry (in any lot)"
+    error_id: ERR_ALREADY_IN_QUEUE
+    http_status: 409
+    applies_to: "POST /v1/queue-entries"
+
+  - priority: 12
+    category: business_temporal
+    check: "current clock - vehicle's most recent QueueEntry.exit_ts (over statuses RELEASED/EXITED/CANCELLED) >= STAGING_COOLDOWN_MINUTES, where STAGING_COOLDOWN_MINUTES = 30"
+    error_id: ERR_STAGING_BUFFER_VIOLATION
+    http_status: 409
+    applies_to: "POST /v1/queue-entries"
+
+  - priority: 13
+    category: business_constraint
+    check: "count of WAITING QueueEntry in the lot < StagingLot.capacity"
+    error_id: ERR_LOT_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /v1/queue-entries"
+
+  - priority: 14
+    category: business_constraint
+    check: "the dispatched vehicle's WAITING QueueEntry is at position 1 (head) of its lot"
+    error_id: ERR_NOT_QUEUE_HEAD
+    http_status: 409
+    applies_to: "POST /v1/trips"
+
+  - priority: 15
+    category: business_referential
+    check: "referenced Trip.status in {DISPATCHED, PICKED_UP}"
+    error_id: ERR_TRIP_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /v1/curb-assignments"
+
+  - priority: 16
+    category: business_temporal
+    check: "number of ACTIVE CurbAssignment on the zone whose [start_ts,end_ts) half-open interval overlaps the requested [start_ts,end_ts) is < CurbZone.capacity"
+    error_id: ERR_CURB_CONFLICT
+    http_status: 409
+    applies_to: "POST /v1/curb-assignments"
+
+  - priority: 17
+    category: business_constraint
+    check: "avi_tag_id is not already held by another Permit whose permit_status in {ISSUED, ACTIVE, SUSPENDED}"
+    error_id: ERR_DUPLICATE_AVI_TAG
+    http_status: 409
+    applies_to: "POST /v1/permits"
+
+  - priority: 18
+    category: business_constraint
+    check: "no existing SettlementStatement for the same operator_id + period_year + period_month"
+    error_id: ERR_DUPLICATE_SETTLEMENT_PERIOD
+    http_status: 409
+    applies_to: "POST /v1/settlements"
+
+  - priority: 19
+    category: business_temporal
+    check: "current clock - Violation.assessed_at <= APPEAL_WINDOW_DAYS, where APPEAL_WINDOW_DAYS = 14"
+    error_id: ERR_APPEAL_WINDOW_CLOSED
+    http_status: 409
+    applies_to: "POST /v1/violations/{violation_id}/transitions (action=APPEAL)"
+
+  - priority: 20
+    category: business_constraint
+    check: "Trip.settlement_statement_id == null (a trip already swept into a statement cannot be voided)"
+    error_id: ERR_TRIP_ALREADY_SETTLED
+    http_status: 409
+    applies_to: "POST /v1/trips/{trip_id}/transitions (action=VOID)"
+
+  - priority: 21
+    category: business_fiscal
+    check: "payment_amount_cents == net_due_cents"
+    error_id: ERR_SETTLEMENT_AMOUNT_MISMATCH
+    http_status: 402
+    applies_to: "POST /v1/settlements/{settlement_id}/transitions (action=SETTLE)"
+
+# =============================================================================
+# §1.5 API Endpoint Table (32 endpoints)
+# =============================================================================
+endpoints:
+  # --- Logical clock (test-driving) ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock to an absolute UTC instant. Startup default is 2026-03-01T00:00:00Z; before any call the clock reads exactly this default and never falls back to wall-clock time."
+    roles: [AirportAuthority]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["logical clock advanced/rewound to the given instant"]
+
+  # --- Operator ---
+  - method: POST
+    path: "/v1/operators"
+    description: "Register a new ground-transport operator (starts PENDING)"
+    roles: [AirportAuthority]
+    code: 201
+    input: [legal_name, operator_type, contact_email, "wheelchair_pledge_pct?"]
+    output: Operator
+    side_effects: ["status = PENDING"]
+
+  - method: GET
+    path: "/v1/operators/{operator_id}"
+    description: "Fetch an operator including computed rolling/lifetime penalty points and outstanding fees"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: []
+    output: Operator
+    side_effects: []
+
+  - method: POST
+    path: "/v1/operators/{operator_id}/transitions"
+    description: "ACTIVATE | SUSPEND | REINSTATE | REVOKE the operator (cascades on SUSPEND/REVOKE/REINSTATE)"
+    roles: [AirportAuthority]
+    code: 200
+    input: [action, "reason?"]
+    output: Operator
+    side_effects:
+      - "SUSPEND/REVOKE: cascade ACTIVE vehicles -> SUSPENDED -> their permits SUSPENDED and active trips CANCELLED -> those trips' curb assignments RELEASED"
+      - "REINSTATE: restore suspended vehicles/permits to ACTIVE"
+
+  # --- Vehicle ---
+  - method: POST
+    path: "/v1/vehicles"
+    description: "Register a vehicle under an operator (acting Operator must own operator_id)"
+    roles: [Operator]
+    code: 201
+    input: [operator_id, plate, "is_wheelchair_accessible?"]
+    output: Vehicle
+    side_effects: ["status = ACTIVE"]
+
+  - method: GET
+    path: "/v1/vehicles/{vehicle_id}"
+    description: "Fetch a vehicle"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: []
+
+  - method: GET
+    path: "/v1/vehicles"
+    description: "List vehicles; filter by operator_id (reverse lookup for Vehicle.operator_id)"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: ["operator_id?", "limit?", "offset?"]
+    output: Vehicle[]
+    side_effects: []
+
+  # --- Permit ---
+  - method: POST
+    path: "/v1/permits"
+    description: "Issue an operating permit for a vehicle (OCC on Vehicle.version; supersede-safe)"
+    roles: [AirportAuthority]
+    code: 201
+    input: [vehicle_id, avi_tag_id, valid_from, valid_until, fee_paid_cents, expected_vehicle_version]
+    output: Permit
+    side_effects:
+      - "permit_status = ISSUED"
+      - "increments Vehicle.version by 1"
+
+  - method: GET
+    path: "/v1/permits/{permit_id}"
+    description: "Fetch a permit"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: []
+    output: Permit
+    side_effects: []
+
+  - method: GET
+    path: "/v1/permits"
+    description: "List permits; filter by vehicle_id (reverse lookup for Permit.vehicle_id)"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: ["vehicle_id?", "limit?", "offset?"]
+    output: Permit[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/permits/{permit_id}/transitions"
+    description: "ACTIVATE | RENEW | EXPIRE | REVOKE a permit"
+    roles: [AirportAuthority]
+    code: 200
+    input: [action, "valid_until?"]
+    output: Permit
+    side_effects:
+      - "ACTIVATE: permit_status=ACTIVE, decal_number minted"
+      - "RENEW: valid_until extended"
+      - "EXPIRE/REVOKE: terminal"
+
+  # --- StagingLot ---
+  - method: POST
+    path: "/v1/staging-lots"
+    description: "Create a geofenced staging lot"
+    roles: [AirportAuthority]
+    code: 201
+    input: [name, geofence_center_lat, geofence_center_lng, geofence_radius_m, capacity]
+    output: StagingLot
+    side_effects: []
+
+  # --- QueueEntry ---
+  - method: POST
+    path: "/v1/queue-entries"
+    description: "Vehicle joins a staging lot's FIFO queue from inside the geofence"
+    roles: [Operator]
+    code: 201
+    input: [staging_lot_id, vehicle_id, lat, lng]
+    output: QueueEntry
+    side_effects: ["position appended (fifo_position_assignment)", "status=WAITING", "enter_ts=clock"]
+
+  - method: GET
+    path: "/v1/queue-entries/{queue_entry_id}"
+    description: "Fetch a queue entry"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: []
+    output: QueueEntry
+    side_effects: []
+
+  - method: GET
+    path: "/v1/queue-entries"
+    description: "List queue entries; filter by staging_lot_id and/or vehicle_id (reverse lookup for both FKs)"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: ["staging_lot_id?", "vehicle_id?", "status?", "limit?", "offset?"]
+    output: QueueEntry[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/queue-entries/{queue_entry_id}/transitions"
+    description: "CANCEL or EXIT a WAITING queue entry (renumbers FIFO positions behind it)"
+    roles: [Operator]
+    code: 200
+    input: [action]
+    output: QueueEntry
+    side_effects: ["status -> CANCELLED/EXITED", "exit_ts=clock", "remaining WAITING positions decremented (fifo_position_assignment)"]
+
+  # --- CurbZone ---
+  - method: POST
+    path: "/v1/curb-zones"
+    description: "Create a curb zone with an overlap capacity"
+    roles: [AirportAuthority]
+    code: 201
+    input: [name, terminal, capacity]
+    output: CurbZone
+    side_effects: []
+
+  # --- CurbAssignment ---
+  - method: POST
+    path: "/v1/curb-assignments"
+    description: "Assign an active trip to a curb zone for a half-open [start_ts,end_ts) window"
+    roles: [CurbCoordinator]
+    code: 201
+    input: [curb_zone_id, trip_id, start_ts, end_ts]
+    output: CurbAssignment
+    side_effects: ["status=ACTIVE"]
+
+  - method: GET
+    path: "/v1/curb-assignments/{curb_assignment_id}"
+    description: "Fetch a curb assignment"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: []
+    output: CurbAssignment
+    side_effects: []
+
+  - method: GET
+    path: "/v1/curb-assignments"
+    description: "List curb assignments; filter by curb_zone_id and/or trip_id (reverse lookup for both FKs)"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: ["curb_zone_id?", "trip_id?", "status?", "limit?", "offset?"]
+    output: CurbAssignment[]
+    side_effects: []
+
+  # --- Trip ---
+  - method: POST
+    path: "/v1/trips"
+    description: "Dispatch the head-of-queue vehicle, creating a Trip in DISPATCHED"
+    roles: [Operator]
+    code: 201
+    input: [vehicle_id, staging_lot_id, "trip_kind?", "is_wheelchair_trip?"]
+    output: Trip
+    side_effects:
+      - "vehicle's head QueueEntry -> RELEASED, FIFO renumber"
+      - "status=DISPATCHED, dispatch_ts=clock, provisional_fee_cents computed (trip_fee variant=provisional)"
+      - "operator_id copied from the vehicle"
+
+  - method: GET
+    path: "/v1/trips/{trip_id}"
+    description: "Fetch a trip including provisional/final fees"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: []
+
+  - method: GET
+    path: "/v1/trips"
+    description: "List trips; filter by operator_id, vehicle_id, settlement_statement_id (reverse lookup for those FKs)"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: ["operator_id?", "vehicle_id?", "settlement_statement_id?", "status?", "limit?", "offset?"]
+    output: Trip[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/trips/{trip_id}/transitions"
+    description: "PICKUP | COMPLETE | CANCEL (Operator) or VOID (AirportAuthority)"
+    roles: [Operator, AirportAuthority]
+    code: 200
+    input: [action]
+    output: Trip
+    side_effects:
+      - "PICKUP: pickup_ts=clock"
+      - "COMPLETE: complete_ts=clock, final_fee_cents computed, operator.outstanding_fees_cents += final_fee, ACTIVE curb assignment RELEASED"
+      - "CANCEL: ACTIVE curb assignment RELEASED"
+      - "VOID: operator.outstanding_fees_cents -= final_fee (compensation)"
+
+  # --- Violation ---
+  - method: POST
+    path: "/v1/violations"
+    description: "Issue a violation citation against an operator (optionally referencing a trip)"
+    roles: [AirportAuthority]
+    code: 201
+    input: [operator_id, violation_type, "trip_id?"]
+    output: Violation
+    side_effects: ["status=OPEN, penalty_points and fine_cents looked up from type"]
+
+  - method: GET
+    path: "/v1/violations/{violation_id}"
+    description: "Fetch a violation"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: []
+    output: Violation
+    side_effects: []
+
+  - method: GET
+    path: "/v1/violations"
+    description: "List violations; filter by operator_id and/or trip_id (reverse lookup for both FKs)"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: ["operator_id?", "trip_id?", "status?", "limit?", "offset?"]
+    output: Violation[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/violations/{violation_id}/transitions"
+    description: "ASSESS | DISMISS | UPHOLD | OVERTURN | WAIVE (AirportAuthority) or APPEAL | PAY (Operator)"
+    roles: [AirportAuthority, Operator]
+    code: 200
+    input: [action]
+    output: Violation
+    side_effects:
+      - "ASSESS: assessed_at=clock, operator points recomputed, possible auto-suspend cascade"
+      - "OVERTURN/WAIVE: operator points recomputed downward"
+
+  # --- SettlementStatement ---
+  - method: POST
+    path: "/v1/settlements"
+    description: "Open a monthly settlement statement for an operator+period"
+    roles: [AirportAuthority]
+    code: 201
+    input: [operator_id, period_year, period_month]
+    output: SettlementStatement
+    side_effects: ["status=OPEN"]
+
+  - method: GET
+    path: "/v1/settlements/{settlement_id}"
+    description: "Fetch a settlement statement with computed totals"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: []
+    output: SettlementStatement
+    side_effects: []
+
+  - method: GET
+    path: "/v1/settlements"
+    description: "List settlement statements; filter by operator_id (reverse lookup for SettlementStatement.operator_id)"
+    roles: [AirportAuthority, Operator, CurbCoordinator]
+    code: 200
+    input: ["operator_id?", "limit?", "offset?"]
+    output: SettlementStatement[]
+    side_effects: []
+
+  - method: POST
+    path: "/v1/settlements/{settlement_id}/transitions"
+    description: "CLOSE (AirportAuthority: sweep trips, compute totals, WAV check) or SETTLE (Operator: pay net_due)"
+    roles: [AirportAuthority, Operator]
+    code: 200
+    input: [action, "payment_amount_cents?"]
+    output: SettlementStatement
+    side_effects:
+      - "CLOSE: sweep + settlement_statement_totals + WAV mandate check, swept trips get settlement_statement_id, closed_at set"
+      - "SETTLE: settled_at set (requires payment_amount_cents == net_due_cents)"
+
+# =============================================================================
+# §1.6 Error Code Catalog (21 codes)
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "X-User-Role/X-User-ID missing or role unknown" }
+  - { id: ERR_UNAUTHORIZED, http: 403, condition: "Role not permitted for the action, or entity_backed Operator acting on a resource it does not own" }
+  - { id: ERR_VALIDATION, http: 400, condition: "Malformed body, missing required field, out-of-range enum, or invalid pagination params" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "A path id or body FK does not resolve to an existing resource" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_vehicle_version does not match the current Vehicle.version on permit issuance" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Requested transition/action is not legal from the resource's current state" }
+  - { id: ERR_VEHICLE_PERMIT_INVALID, http: 409, condition: "Vehicle has no Permit in permit_status ACTIVE when queuing or dispatching" }
+  - { id: ERR_OPERATOR_NOT_ACTIVE, http: 409, condition: "Owning operator is not ACTIVE at dispatch time" }
+  - { id: ERR_VEHICLE_NOT_ACTIVE, http: 409, condition: "Vehicle is SUSPENDED (via operator cascade) when queuing or dispatching" }
+  - { id: ERR_GEOFENCE_VIOLATION, http: 422, condition: "Join location is outside the lot geofence radius" }
+  - { id: ERR_ALREADY_IN_QUEUE, http: 409, condition: "Vehicle already has a WAITING queue entry" }
+  - { id: ERR_STAGING_BUFFER_VIOLATION, http: 409, condition: "Vehicle re-entered a queue within STAGING_COOLDOWN_MINUTES of its last exit" }
+  - { id: ERR_LOT_CAPACITY_EXCEEDED, http: 409, condition: "Lot already holds capacity WAITING entries" }
+  - { id: ERR_NOT_QUEUE_HEAD, http: 409, condition: "Dispatched vehicle's queue entry is not at position 1 (head)" }
+  - { id: ERR_TRIP_NOT_ACTIVE, http: 409, condition: "Curb assignment references a trip not in DISPATCHED/PICKED_UP" }
+  - { id: ERR_CURB_CONFLICT, http: 409, condition: "Requested curb window overlaps ACTIVE assignments at or beyond zone capacity" }
+  - { id: ERR_DUPLICATE_AVI_TAG, http: 409, condition: "avi_tag_id already held by a live permit" }
+  - { id: ERR_DUPLICATE_SETTLEMENT_PERIOD, http: 409, condition: "A statement for that operator+year+month already exists" }
+  - { id: ERR_APPEAL_WINDOW_CLOSED, http: 409, condition: "Appeal filed more than APPEAL_WINDOW_DAYS after assessment" }
+  - { id: ERR_TRIP_ALREADY_SETTLED, http: 409, condition: "Void attempted on a trip already swept into a statement" }
+  - { id: ERR_SETTLEMENT_AMOUNT_MISMATCH, http: 402, condition: "Settle payment_amount_cents does not equal net_due_cents" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: AirportAuthority
+    description: "Airport ground-transport regulator/administrator: registers operators, issues and manages permits, defines staging lots and curb zones, issues and adjudicates violations, opens and closes settlements, sets the logical clock."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /_clock/set_current_utc"
+      - "POST /v1/operators"
+      - "POST /v1/operators/{operator_id}/transitions"
+      - "POST /v1/permits"
+      - "POST /v1/permits/{permit_id}/transitions"
+      - "POST /v1/staging-lots"
+      - "POST /v1/curb-zones"
+      - "POST /v1/violations"
+      - "POST /v1/settlements"
+      - "POST /v1/violations/{violation_id}/transitions (ASSESS, DISMISS, UPHOLD, OVERTURN, WAIVE)"
+      - "POST /v1/trips/{trip_id}/transitions (VOID)"
+      - "POST /v1/settlements/{settlement_id}/transitions (CLOSE)"
+    shared_operations:
+      - "GET (all read endpoints)"
+
+  - name: Operator
+    description: "A registered ground-transport company acting on its own fleet: registers vehicles, joins staging queues, dispatches and runs its trips, appeals and pays violations, settles statements. X-User-ID equals the Operator.id it acts as."
+    identity: "entity_backed:Operator"
+    exclusive_operations:
+      - "POST /v1/vehicles (must own operator_id)"
+      - "POST /v1/queue-entries (must own the vehicle)"
+      - "POST /v1/queue-entries/{queue_entry_id}/transitions"
+      - "POST /v1/trips (must own the vehicle)"
+      - "POST /v1/trips/{trip_id}/transitions (PICKUP, COMPLETE, CANCEL)"
+      - "POST /v1/violations/{violation_id}/transitions (APPEAL, PAY — must own the violation's operator)"
+      - "POST /v1/settlements/{settlement_id}/transitions (SETTLE — must own the statement's operator)"
+    shared_operations:
+      - "GET (all read endpoints)"
+
+  - name: CurbCoordinator
+    description: "Ground-side curb operations staff managing curb-zone assignments at the terminals. Operational identity not tied to any persisted entity."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /v1/curb-assignments"
+    shared_operations:
+      - "GET (all read endpoints)"

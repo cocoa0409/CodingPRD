@@ -1,0 +1,686 @@
+scenario: "Local-Services Lead-Gen & Quote Marketplace (Thumbtack/Angi style): customer request & category/details, pro matching & lead distribution, quote/message & booking, pay-per-lead vs subscription & credit/refund, review & rating, dispute & guarantee, pro profile/verification, calendar"
+domain_name: "local-services-leadgen"
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: quota_allocation          # a bounded pool of leads is distributed to a capped set of eligible pros, each charged/credited
+  secondary_archetype: pricing_engine          # pay-per-lead vs subscription billing with demand-tiered lead pricing and commission payout
+  complexity_layers:
+    - selector_policy                           # server picks WHICH pros receive a lead from a candidate pool (eligibility + ranking + tie-break + empty fallback)
+    - dual_variant_calculation                  # lead charge (pay-per-lead vs subscription) and rating (published vs provisional)
+    - cascading_side_effects                    # book -> quote accept -> lead convert -> sibling leads close + slot book
+    - optimistic_concurrency                    # distributing a request whose version advanced is rejected (CREATE-with-supersede)
+
+  entity_topology: flat                         # peer entities joined by foreign keys; no nested ownership URLs
+  state_machine_shape: branching                # also carries a cyclic machine (Quote revision loop) and parallel dims (Lead contact x billing)
+  relationship_patterns:
+    - one_to_many                               # Customer -> ServiceRequest, Pro -> AvailabilitySlot
+    - many_to_many                              # Lead is the junction of ServiceRequest and Pro
+    - cross_aggregate                           # Booking references Quote, Customer, Pro across aggregates
+  role_model: peer_roles                        # Customer owns requests/bookings/reviews; Pro owns quotes/profile/calendar; ops roles are opaque
+  consistency_model: immediate                  # every cascade resolves inside the triggering request
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 Entity-Relationship Table
+# =====================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "customer login/contact email", constraints: "unique, non-empty" }
+      - { name: full_name, type: string, source: input, description: "customer display name" }
+      - { name: phone, type: string, source: input, description: "contact phone", default: null }
+
+  - name: Pro
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "pro login/contact email", constraints: "unique, non-empty" }
+      - { name: business_name, type: string, source: input, description: "pro business display name" }
+      - { name: phone, type: string, source: input, description: "contact phone", default: null }
+      - { name: verification_status, type: enum, source: system, description: "profile verification standing", default: "UNVERIFIED", constraints: "one of UNVERIFIED, PENDING, VERIFIED, SUSPENDED" }
+      - { name: billing_mode, type: enum, source: input, description: "how this pro pays for leads", default: "PAY_PER_LEAD", constraints: "one of PAY_PER_LEAD, SUBSCRIPTION" }
+      - { name: subscription_plan_id, type: string, source: system, description: "FK -> SubscriptionPlan.id; null until the pro subscribes; set by POST /pros/{id}/subscribe", default: null }
+      - { name: credit_balance_cents, type: integer, source: system, description: "prepaid lead-credit wallet in cents; debited on pay-per-lead charge/overage, credited on refund/topup", default: 0, constraints: ">= 0" }
+      - { name: remaining_lead_credits, type: integer, source: system, description: "subscription included-lead counter; granted on subscribe, decremented on subscription lead, restored on refund", default: 0, constraints: ">= 0" }
+      - { name: service_zip_codes, type: array, source: input, description: "list of zip codes the pro serves", default: [] }
+      - { name: covered_category_ids, type: array, source: input, description: "list of ServiceCategory ids the pro serves (plain id array, not a single-value FK)", default: [] }
+      - { name: rating_avg, type: number, source: computed, description: "published rating = mean rating over PUBLISHED reviews, 2 decimals; 0.0 when no PUBLISHED reviews", default: 0.0 }
+      - { name: rating_count, type: integer, source: computed, description: "count of PUBLISHED reviews", default: 0 }
+      - { name: provisional_rating, type: number, source: computed, description: "internal eligibility rating = mean rating over PENDING+PUBLISHED reviews, 2 decimals; 0.0 when none", default: 0.0 }
+      - { name: dispute_count, type: integer, source: system, description: "count of disputes this pro raised that resolved RESOLVED_DENIED", default: 0 }
+
+  - name: ServiceCategory
+    parent: null
+    common_fields: false
+    fields:
+      - { name: name, type: string, source: input, description: "category display name e.g. House Cleaning", constraints: "unique, non-empty" }
+      - { name: base_lead_price_cents, type: integer, source: input, description: "base pay-per-lead price before demand multiplier", constraints: "> 0" }
+      - { name: max_leads_per_request, type: integer, source: input, description: "distribution cap: max pros a single request is distributed to", constraints: ">= 1" }
+      - { name: demand_high_threshold, type: integer, source: input, description: "open-lead count at/above which the high demand multiplier applies", constraints: ">= 0" }
+      - { name: demand_multiplier_high, type: number, source: input, description: "multiplier applied to base price when demand is high", constraints: ">= 1.0" }
+      - { name: refund_window_hours, type: integer, source: input, description: "hours after distribution during which a pro may self-serve a lead refund", constraints: ">= 0" }
+      - { name: min_rating_to_receive_leads, type: number, source: input, description: "minimum pro provisional_rating to be eligible; pros with rating_count==0 bypass this floor", constraints: "0.0..5.0" }
+
+  - name: SubscriptionPlan
+    parent: null
+    common_fields: false
+    fields:
+      - { name: tier, type: string, source: input, description: "plan tier label e.g. PLUS", constraints: "unique, non-empty" }
+      - { name: monthly_fee_cents, type: integer, source: input, description: "recurring monthly fee", constraints: "> 0" }
+      - { name: included_lead_credits, type: integer, source: input, description: "lead credits granted per subscription cycle", constraints: ">= 0" }
+      - { name: overage_price_cents, type: integer, source: input, description: "flat cents charged to wallet for a subscription lead once included credits are exhausted", constraints: "> 0" }
+
+  - name: ServiceRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; the requesting customer" }
+      - { name: category_id, type: string, source: input, description: "FK -> ServiceCategory.id; the requested service category" }
+      - { name: zip_code, type: string, source: input, description: "job location zip; used for pro geo matching" }
+      - { name: description, type: string, source: input, description: "free-text job details" }
+      - { name: budget_cents, type: integer, source: input, description: "customer's stated budget in cents", constraints: ">= 0" }
+      - { name: status, type: enum, source: system, description: "request lifecycle", default: "OPEN", constraints: "one of OPEN, DISTRIBUTED, BOOKED, CLOSED" }
+      - { name: distributed_lead_count, type: integer, source: computed, description: "number of Leads created by distribution for this request", default: 0 }
+
+  - name: Lead
+    parent: null
+    common_fields: true
+    fields:
+      - { name: request_id, type: string, source: system, description: "FK -> ServiceRequest.id; the request this lead was distributed from" }
+      - { name: pro_id, type: string, source: system, description: "FK -> Pro.id; the pro who received this lead" }
+      - { name: category_id, type: string, source: system, description: "category snapshot copied from the request at distribution" }
+      - { name: billing_mode, type: enum, source: system, description: "billing mode snapshot from the pro at distribution", constraints: "one of PAY_PER_LEAD, SUBSCRIPTION" }
+      - { name: charge_cents, type: integer, source: computed, description: "cents debited from the pro's wallet for this lead (0 when covered by an included subscription credit)", default: 0 }
+      - { name: credits_consumed, type: integer, source: computed, description: "subscription included credits consumed by this lead (0 or 1)", default: 0 }
+      - { name: contact_status, type: enum, source: system, description: "parallel dimension: contact/conversion progress", default: "DISTRIBUTED", constraints: "one of DISTRIBUTED, CONTACTED, QUOTED, CONVERTED, CLOSED" }
+      - { name: billing_status, type: enum, source: system, description: "parallel dimension: billing/refund state, evolves independently of contact_status", default: "CHARGED", constraints: "one of CHARGED, REFUNDED, DISPUTED" }
+      - { name: distributed_at, type: datetime, source: system, description: "logical-clock timestamp when the lead was distributed; anchors the refund window" }
+
+  - name: Quote
+    parent: null
+    common_fields: true
+    fields:
+      - { name: lead_id, type: string, source: input, description: "FK -> Lead.id; the lead this quote answers" }
+      - { name: pro_id, type: string, source: system, description: "FK -> Pro.id; copied from the lead's pro" }
+      - { name: customer_id, type: string, source: system, description: "FK -> Customer.id; copied from the lead's request customer" }
+      - { name: amount_cents, type: integer, source: input, description: "quoted price to the customer", constraints: "> 0" }
+      - { name: message, type: string, source: input, description: "pro's message to the customer" }
+      - { name: status, type: enum, source: system, description: "quote lifecycle (cyclic revision loop)", default: "SENT", constraints: "one of SENT, REVISION_REQUESTED, ACCEPTED" }
+      - { name: revision_count, type: integer, source: system, description: "number of times the customer requested a revision", default: 0 }
+      - { name: valid_until, type: datetime, source: input, description: "quote expiry timestamp (informational)", default: null }
+
+  - name: Booking
+    parent: null
+    common_fields: true
+    fields:
+      - { name: quote_id, type: string, source: input, description: "FK -> Quote.id; the accepted quote" }
+      - { name: customer_id, type: string, source: system, description: "FK -> Customer.id; copied from the quote" }
+      - { name: pro_id, type: string, source: system, description: "FK -> Pro.id; copied from the quote" }
+      - { name: availability_slot_id, type: string, source: input, description: "the pro AvailabilitySlot booked (plain id reference resolved to a slot; not a stored FK on this row)" }
+      - { name: scheduled_start, type: datetime, source: input, description: "appointment start (UTC)" }
+      - { name: scheduled_end, type: datetime, source: input, description: "appointment end (UTC)", constraints: "> scheduled_start" }
+      - { name: price_cents, type: integer, source: system, description: "copied from quote.amount_cents at booking" }
+      - { name: payout_cents, type: integer, source: computed, description: "pro payout after commission + processing fees, computed at completion", default: 0 }
+      - { name: status, type: enum, source: system, description: "booking lifecycle", default: "CONFIRMED", constraints: "one of CONFIRMED, COMPLETED, CANCELLED" }
+      - { name: cancellation_reason, type: string, source: input, description: "reason supplied on cancel", default: null }
+
+  - name: Review
+    parent: null
+    common_fields: true
+    fields:
+      - { name: booking_id, type: string, source: input, description: "FK -> Booking.id; the completed booking being reviewed" }
+      - { name: customer_id, type: string, source: system, description: "FK -> Customer.id; copied from the booking" }
+      - { name: pro_id, type: string, source: system, description: "FK -> Pro.id; copied from the booking" }
+      - { name: rating, type: integer, source: input, description: "star rating", constraints: "1..5 inclusive" }
+      - { name: text, type: string, source: input, description: "review body", default: null }
+      - { name: status, type: enum, source: system, description: "moderation state", default: "PENDING", constraints: "one of PENDING, PUBLISHED" }
+
+  - name: Dispute
+    parent: null
+    common_fields: true
+    fields:
+      - { name: lead_id, type: string, source: input, description: "FK -> Lead.id; the lead whose charge is disputed under the lead guarantee" }
+      - { name: raised_by_pro_id, type: string, source: system, description: "FK -> Pro.id; the pro raising the dispute" }
+      - { name: reason, type: string, source: input, description: "guarantee claim reason e.g. WRONG_NUMBER, DUPLICATE, OUT_OF_AREA" }
+      - { name: status, type: enum, source: system, description: "dispute lifecycle", default: "OPEN", constraints: "one of OPEN, UNDER_REVIEW, RESOLVED_REFUNDED, RESOLVED_DENIED" }
+      - { name: refund_cents, type: integer, source: computed, description: "cents refunded to the pro wallet when resolved in the pro's favor (0 otherwise)", default: 0 }
+      - { name: resolution_note, type: string, source: input, description: "CS note recorded at resolution", default: null }
+      - { name: assigned_cs_user_id, type: string, source: system, description: "opaque X-User-ID of the CustomerService operator who took the dispute under review", default: null }
+
+  - name: AvailabilitySlot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: pro_id, type: string, source: input, description: "FK -> Pro.id; the pro whose calendar this slot belongs to" }
+      - { name: start_utc, type: datetime, source: input, description: "slot start (UTC), half-open interval start" }
+      - { name: end_utc, type: datetime, source: input, description: "slot end (UTC), half-open interval end", constraints: "> start_utc" }
+      - { name: status, type: enum, source: system, description: "slot state", default: "OPEN", constraints: "one of OPEN, BOOKED" }
+      - { name: booking_id, type: string, source: system, description: "FK -> Booking.id; set when the slot is booked, cleared to null on cancel", default: null }
+
+# =====================================================================
+# §1.2 State Machine Table
+# =====================================================================
+state_machines:
+  - entity: Pro
+    initial_state: UNVERIFIED
+    terminal_states: []
+    note: "verification_status dimension"
+    transitions:
+      - from: UNVERIFIED
+        to: PENDING
+        trigger: "POST /pros/{id}/submit-verification"
+        actor: Pro
+        preconditions: ["acting pro is X-User-ID owner of the profile"]
+        side_effects: ["set verification_status=PENDING", "increments Pro.version by 1"]
+      - from: PENDING
+        to: VERIFIED
+        trigger: "POST /pros/{id}/verify with decision=APPROVE"
+        actor: PlatformAdmin
+        preconditions: ["verification_status == PENDING"]
+        side_effects: ["set verification_status=VERIFIED", "increments Pro.version by 1"]
+      - from: PENDING
+        to: SUSPENDED
+        trigger: "POST /pros/{id}/verify with decision=SUSPEND"
+        actor: PlatformAdmin
+        preconditions: ["verification_status == PENDING"]
+        side_effects: ["set verification_status=SUSPENDED", "increments Pro.version by 1"]
+      - from: VERIFIED
+        to: SUSPENDED
+        trigger: "POST /pros/{id}/verify with decision=SUSPEND"
+        actor: PlatformAdmin
+        preconditions: ["verification_status == VERIFIED"]
+        side_effects: ["set verification_status=SUSPENDED", "increments Pro.version by 1"]
+
+  - entity: ServiceRequest
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: DISTRIBUTED
+        trigger: "POST /service-requests/{id}/distribute"
+        actor: PlatformAdmin
+        note: "leads trickle one-per-call: each distribute grants the lead to exactly the single top-ranked eligible pro not already holding a lead for this request"
+        preconditions:
+          - "status == OPEN"
+          - "expected_service_request_version matches current ServiceRequest.version (OCC)"
+          - "distributed_lead_count < ServiceCategory.max_leads_per_request"
+          - "the candidate set (eligible pros not already holding a lead for this request) is non-empty per the selector policy"
+        side_effects:
+          - "select the single top-ranked eligible pro by the selector policy (provisional_rating DESC, tie-break pro.created_at ASC)"
+          - "create one Lead for that pro (contact_status=DISTRIBUTED, billing_status=CHARGED, distributed_at=clock now)"
+          - "run lead_charge: debit pro.credit_balance_cents and/or decrement pro.remaining_lead_credits"
+          - "increment distributed_lead_count by 1"
+          - "increments ServiceRequest.version by 1"
+      - from: DISTRIBUTED
+        to: DISTRIBUTED
+        trigger: "POST /service-requests/{id}/distribute (re-distribute / lead trickle)"
+        actor: PlatformAdmin
+        note: "self-loop that adds one more pro; the second sequential re-distribute with the correct version legitimately succeeds, so a stale version is a true CREATE-with-supersede race resolved by OCC (§1.2.1)"
+        preconditions:
+          - "status == DISTRIBUTED"
+          - "expected_service_request_version matches current ServiceRequest.version (OCC)"
+          - "distributed_lead_count < ServiceCategory.max_leads_per_request"
+          - "the candidate set (eligible pros not already holding a lead for this request) is non-empty"
+        side_effects:
+          - "select the single top-ranked eligible pro (provisional_rating DESC, tie-break pro.created_at ASC) not already holding a lead for this request"
+          - "create one Lead for that pro; run lead_charge"
+          - "increment distributed_lead_count by 1"
+          - "increments ServiceRequest.version by 1"
+      - from: DISTRIBUTED
+        to: BOOKED
+        trigger: "system: cascade from Booking creation (POST /bookings)"
+        actor: system
+        preconditions: ["status == DISTRIBUTED", "a Lead of this request reached contact_status=CONVERTED"]
+        side_effects: ["set status=BOOKED"]
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /service-requests/{id}/close"
+        actor: Customer
+        preconditions: ["status == OPEN", "acting customer owns the request"]
+        side_effects: ["set status=CLOSED"]
+      - from: DISTRIBUTED
+        to: CLOSED
+        trigger: "POST /service-requests/{id}/close"
+        actor: Customer
+        preconditions: ["status == DISTRIBUTED", "acting customer owns the request"]
+        side_effects:
+          - "set status=CLOSED"
+          - "for each Lead of this request with contact_status IN {DISTRIBUTED, CONTACTED, QUOTED}: set contact_status=CLOSED"
+
+  - entity: Lead
+    initial_state: DISTRIBUTED
+    terminal_states: [CLOSED]
+    note: "PARALLEL dimensions: contact_status (below) and billing_status evolve independently on the same row"
+    transitions:
+      - from: DISTRIBUTED
+        to: CONTACTED
+        trigger: "POST /leads/{id}/contact"
+        actor: Pro
+        preconditions: ["contact_status == DISTRIBUTED", "acting pro owns the lead"]
+        side_effects: ["set contact_status=CONTACTED"]
+      - from: CONTACTED
+        to: QUOTED
+        trigger: "system: cascade from Quote creation (POST /quotes)"
+        actor: system
+        preconditions: ["contact_status == CONTACTED"]
+        side_effects: ["set contact_status=QUOTED"]
+      - from: QUOTED
+        to: CONVERTED
+        trigger: "system: cascade from Booking creation (POST /bookings)"
+        actor: system
+        preconditions: ["contact_status == QUOTED", "the lead's Quote reached ACCEPTED"]
+        side_effects:
+          - "set contact_status=CONVERTED"
+          - "cascade: sibling Leads of the same request with contact_status IN {DISTRIBUTED, CONTACTED, QUOTED} -> contact_status=CLOSED"
+          - "cascade: ServiceRequest status OPEN/DISTRIBUTED -> BOOKED"
+      - from: "billing:CHARGED"
+        to: "billing:REFUNDED"
+        trigger: "POST /leads/{id}/refund-request (within refund window) OR system cascade from Dispute resolve RESOLVED_REFUNDED"
+        actor: Pro | system
+        preconditions:
+          - "billing_status == CHARGED"
+          - "refund-request path only: clock now < distributed_at + ServiceCategory.refund_window_hours"
+        side_effects:
+          - "set billing_status=REFUNDED"
+          - "credit pro.credit_balance_cents by Lead.charge_cents (pay-per-lead / overage) [invariant: pro_credit_conservation]"
+          - "if credits_consumed==1: increment pro.remaining_lead_credits by 1 [invariant: subscription_credit_conservation]"
+      - from: "billing:CHARGED"
+        to: "billing:DISPUTED"
+        trigger: "POST /disputes"
+        actor: Pro
+        preconditions: ["billing_status == CHARGED"]
+        side_effects: ["set billing_status=DISPUTED"]
+      - from: "billing:DISPUTED"
+        to: "billing:REFUNDED"
+        trigger: "system: cascade from Dispute resolve RESOLVED_REFUNDED"
+        actor: system
+        preconditions: ["billing_status == DISPUTED"]
+        side_effects:
+          - "set billing_status=REFUNDED"
+          - "credit pro.credit_balance_cents by Lead.charge_cents"
+          - "if credits_consumed==1: increment pro.remaining_lead_credits by 1"
+
+  - entity: Quote
+    initial_state: SENT
+    terminal_states: [ACCEPTED]
+    note: "CYCLIC: SENT <-> REVISION_REQUESTED revision loop (negotiation rounds)"
+    transitions:
+      - from: SENT
+        to: REVISION_REQUESTED
+        trigger: "POST /quotes/{id}/request-revision"
+        actor: Customer
+        preconditions: ["status == SENT", "acting customer owns the quote"]
+        side_effects: ["set status=REVISION_REQUESTED", "increment revision_count by 1"]
+      - from: REVISION_REQUESTED
+        to: SENT
+        trigger: "POST /quotes/{id}/send with new amount_cents"
+        actor: Pro
+        preconditions: ["status == REVISION_REQUESTED", "acting pro owns the quote"]
+        side_effects: ["set status=SENT", "update amount_cents"]
+      - from: SENT
+        to: ACCEPTED
+        trigger: "system: cascade from Booking creation (POST /bookings)"
+        actor: system
+        preconditions: ["status == SENT"]
+        side_effects: ["set status=ACCEPTED", "cascade: lead contact_status QUOTED->CONVERTED"]
+
+  - entity: Booking
+    initial_state: CONFIRMED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: CONFIRMED
+        to: COMPLETED
+        trigger: "POST /bookings/{id}/complete"
+        actor: Pro
+        preconditions: ["status == CONFIRMED", "acting pro owns the booking", "clock now >= scheduled_start"]
+        side_effects:
+          - "set status=COMPLETED"
+          - "run booking_payout: set payout_cents = price_cents - commission - processing"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /bookings/{id}/cancel"
+        actor: Customer | Pro
+        preconditions: ["status == CONFIRMED", "acting user is the booking's customer or pro"]
+        side_effects:
+          - "set status=CANCELLED"
+          - "compensation: referenced AvailabilitySlot status BOOKED->OPEN, booking_id->null [invariant: pro_slot_minutes_conservation]"
+
+  - entity: Review
+    initial_state: PENDING
+    terminal_states: [PUBLISHED]
+    transitions:
+      - from: PENDING
+        to: PUBLISHED
+        trigger: "POST /reviews/{id}/publish"
+        actor: PlatformAdmin | CustomerService
+        preconditions: ["status == PENDING"]
+        side_effects:
+          - "set status=PUBLISHED"
+          - "recompute pro.rating_avg and pro.rating_count (pro_rating published variant)"
+          - "recompute pro.provisional_rating (pro_rating provisional variant)"
+
+  - entity: Dispute
+    initial_state: OPEN
+    terminal_states: [RESOLVED_REFUNDED, RESOLVED_DENIED]
+    transitions:
+      - from: OPEN
+        to: UNDER_REVIEW
+        trigger: "POST /disputes/{id}/review"
+        actor: CustomerService
+        preconditions: ["status == OPEN"]
+        side_effects: ["set status=UNDER_REVIEW", "set assigned_cs_user_id = X-User-ID"]
+      - from: UNDER_REVIEW
+        to: RESOLVED_REFUNDED
+        trigger: "POST /disputes/{id}/resolve with decision=REFUND"
+        actor: CustomerService
+        preconditions: ["status == UNDER_REVIEW", "the disputed Lead.billing_status == DISPUTED"]
+        side_effects:
+          - "set status=RESOLVED_REFUNDED"
+          - "set refund_cents = disputed Lead.charge_cents"
+          - "cascade: Lead billing_status DISPUTED->REFUNDED (credit pro wallet by charge_cents; restore subscription credit if consumed)"
+      - from: UNDER_REVIEW
+        to: RESOLVED_DENIED
+        trigger: "POST /disputes/{id}/resolve with decision=DENY"
+        actor: CustomerService
+        preconditions: ["status == UNDER_REVIEW"]
+        side_effects:
+          - "set status=RESOLVED_DENIED"
+          - "set refund_cents=0"
+          - "cascade: Lead billing_status DISPUTED->CHARGED (revert)"
+          - "increment pro.dispute_count by 1"
+
+  - entity: AvailabilitySlot
+    initial_state: OPEN
+    terminal_states: []
+    transitions:
+      - from: OPEN
+        to: BOOKED
+        trigger: "system: cascade from Booking creation (POST /bookings)"
+        actor: system
+        preconditions: ["status == OPEN", "no CONFIRMED booking of this pro conflicts under the buffered-overlap rule"]
+        side_effects: ["set status=BOOKED", "set booking_id = new booking id"]
+      - from: BOOKED
+        to: OPEN
+        trigger: "system: cascade from Booking cancel (POST /bookings/{id}/cancel)"
+        actor: system
+        preconditions: ["status == BOOKED"]
+        side_effects: ["set status=OPEN", "set booking_id=null"]
+
+# =====================================================================
+# §1.2.1 Concurrency Rules
+# =====================================================================
+concurrency_rules:
+  - rule_id: distribute-stale-request
+    parent_entity: ServiceRequest
+    write_endpoint: "POST /service-requests/{id}/distribute"
+    occ_field: "expected_service_request_version"
+    description: |
+      Distributing a ServiceRequest whose version has advanced since the client
+      last observed it is rejected. This captures the CREATE-with-supersede case:
+      a prior distribute already created Leads and advanced the request version,
+      so the current caller's view of the request is stale and its distribution
+      would double-charge pros against an already-distributed request.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 Calculation Rules Table
+# =====================================================================
+calculations:
+  - name: lead_charge
+    trigger: "per selected pro during POST /service-requests/{id}/distribute (OPEN->DISTRIBUTED)"
+    algorithm: tiered_pricing
+    formula: |
+      # inputs: cat = ServiceCategory of the request; pro = selected pro; plan = pro.subscription_plan (if any)
+      open_leads = count(Lead L WHERE L.category_id == cat.id
+                         AND L.contact_status IN {DISTRIBUTED, CONTACTED, QUOTED}
+                         AND L.created_at < now)          # excludes CONVERTED/CLOSED and this new lead
+      demand_multiplier = cat.demand_multiplier_high IF open_leads >= cat.demand_high_threshold
+                          ELSE 1.0
+      gross_price_cents = round_half_up(cat.base_lead_price_cents * demand_multiplier)   # integer cents
+      IF pro.billing_mode == PAY_PER_LEAD:
+          charge_cents = gross_price_cents
+          credits_consumed = 0
+          # eligibility already guaranteed credit_balance_cents >= gross_price_cents
+          debit pro.credit_balance_cents by charge_cents
+      ELSE:  # SUBSCRIPTION
+          IF pro.remaining_lead_credits >= 1:
+              charge_cents = 0
+              credits_consumed = 1
+              decrement pro.remaining_lead_credits by 1
+          ELSE:  # overage
+              charge_cents = plan.overage_price_cents
+              credits_consumed = 0
+              debit pro.credit_balance_cents by charge_cents
+    input_set: "Lead rows of this category in non-terminal contact states, created strictly before now"
+    constants:
+      NORMAL_MULTIPLIER: 1.0
+    precision: "integer cents; round_half_up on base*multiplier"
+    variants:
+      - name: pay_per_lead
+        when: "pro.billing_mode == PAY_PER_LEAD"
+        difference: "charge_cents = gross_price_cents debited from wallet; credits_consumed=0"
+      - name: subscription
+        when: "pro.billing_mode == SUBSCRIPTION"
+        difference: "if included credits remain, charge_cents=0 and one credit consumed; else charge_cents=overage_price_cents from wallet"
+
+  - name: pro_rating
+    trigger: "on POST /reviews/{id}/publish (PENDING->PUBLISHED); provisional variant also recomputed on POST /reviews create"
+    algorithm: aggregation
+    formula: |
+      published = [r.rating for Review r WHERE r.pro_id == pro.id AND r.status == PUBLISHED]
+      rating_count = len(published)
+      rating_avg = round_half_up(sum(published) / rating_count, 2) IF rating_count > 0 ELSE 0.0
+    input_set: "Review rows of the pro; published variant filters status==PUBLISHED, provisional variant filters status IN {PENDING, PUBLISHED}"
+    constants: {}
+    precision: "2 decimal places, round_half_up; 0.0 when the filtered set is empty"
+    variants:
+      - name: published_rating
+        when: "computing pro.rating_avg / pro.rating_count (public)"
+        difference: "denominator/numerator over status==PUBLISHED reviews only"
+      - name: provisional_rating
+        when: "computing pro.provisional_rating (lead-eligibility gate)"
+        difference: "over status IN {PENDING, PUBLISHED}; a fresh PENDING low rating drags eligibility before moderation"
+
+  - name: booking_payout
+    trigger: "on POST /bookings/{id}/complete (CONFIRMED->COMPLETED)"
+    algorithm: weighted_scoring
+    formula: |
+      amount = booking.price_cents
+      commission_cents = round_half_up(amount * COMMISSION_PCT)                 # step 1, rounded independently
+      processing_cents = round_half_up(amount * PROCESSING_PCT + FLAT_FEE_CENTS) # step 2, rounded independently
+      payout_cents = amount - commission_cents - processing_cents               # step 3: subtract the two already-rounded fees
+      # PINNED ORDER: round each fee to whole cents FIRST, THEN subtract; never round(amount*(COMMISSION_PCT+PROCESSING_PCT))
+    input_set: "the single booking being completed"
+    constants:
+      COMMISSION_PCT: 0.15
+      PROCESSING_PCT: 0.029
+      FLAT_FEE_CENTS: 30
+    precision: "integer cents; each fee round_half_up independently before subtraction (order pinned)"
+
+# =====================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =====================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-Role and X-User-ID headers present and role recognized", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: all }
+  - { priority: 2, category: auth, check: "role is permitted for this operation per §1.7", error_id: ERR_FORBIDDEN_ROLE, http_status: 403, applies_to: all }
+  - { priority: 3, category: auth, check: "entity_backed actor owns the targeted resource (customer owns request/quote/booking; pro owns lead/quote/profile/slot)", error_id: ERR_NOT_RESOURCE_OWNER, http_status: 403, applies_to: "owner-scoped writes" }
+  - { priority: 4, category: existence, check: "path/body referenced resources exist, validated left-to-right", error_id: ERR_NOT_FOUND, http_status: 404, applies_to: all }
+  - { priority: 5, category: state, check: "target resource is in a state that permits this transition", error_id: ERR_INVALID_STATE, http_status: 409, applies_to: "all transition endpoints" }
+  - { priority: 6, category: business_referential, check: "cross-references cohere: quote.lead belongs to acting pro; booking slot belongs to the quote's pro; review.booking belongs to acting customer", error_id: ERR_REFERENCE_MISMATCH, http_status: 409, applies_to: "POST /quotes, POST /bookings, POST /reviews" }
+  - { priority: 7, category: business_safety, check: "on booking, the quote's pro verification_status == VERIFIED", error_id: ERR_PRO_NOT_VERIFIED, http_status: 409, applies_to: "POST /bookings" }
+  - { priority: 8, category: business_constraint, check: "on distribute, the candidate set is empty because either distributed_lead_count >= max_leads_per_request (cap reached) OR no VERIFIED pro has the category in covered_category_ids, zip in service_zip_codes, provisional_rating >= min_rating (unless rating_count==0), and is not already holding a lead for this request", error_id: ERR_NO_ELIGIBLE_PROS, http_status: 409, applies_to: "POST /service-requests/{id}/distribute" }
+  - { priority: 9, category: business_temporal, check: "refund-request is within distributed_at + category.refund_window_hours", error_id: ERR_REFUND_WINDOW_CLOSED, http_status: 409, applies_to: "POST /leads/{id}/refund-request" }
+  - { priority: 10, category: business_temporal, check: "new AvailabilitySlot does not overlap an existing slot of the same pro (half-open [start,end); touching endpoints allowed)", error_id: ERR_SLOT_OVERLAP, http_status: 409, applies_to: "POST /availability-slots" }
+  - { priority: 11, category: business_temporal, check: "booking window [scheduled_start, scheduled_end] fits inside the referenced OPEN slot [start_utc, end_utc] AND keeps at least BUFFER_MINUTES=30 clear of every other CONFIRMED booking of the same pro (closed interval expanded by a 30-minute travel buffer on both sides)", error_id: ERR_BOOKING_CONFLICT, http_status: 409, applies_to: "POST /bookings" }
+  - { priority: 12, category: business_fiscal, check: "on distribute, at least one candidate pro can fund the lead (pay-per-lead wallet >= gross_price, or subscription credit/overage-fundable)", error_id: ERR_INSUFFICIENT_CREDIT, http_status: 402, applies_to: "POST /service-requests/{id}/distribute" }
+  - { priority: 13, category: business_constraint, check: "rating is an integer 1..5; enum/range fields within declared constraints; scheduled_end > scheduled_start", error_id: ERR_INVALID_REQUEST, http_status: 422, applies_to: all }
+  - { priority: 14, category: business_constraint, check: "one Review per Booking (uniqueness)", error_id: ERR_DUPLICATE_REVIEW, http_status: 409, applies_to: "POST /reviews" }
+  - { priority: 15, category: business_constraint, check: "OCC expected_service_request_version matches on distribute", error_id: ERR_STALE_VERSION, http_status: 412, applies_to: "POST /service-requests/{id}/distribute" }
+
+# =====================================================================
+# §1.5 API Endpoint Table
+# =====================================================================
+endpoints:
+  # ---- Customer ----
+  - { method: POST, path: "/customers", description: "register a customer", roles: [PlatformAdmin], code: 201, input: [email, full_name, "phone?"], output: Customer, side_effects: [] }
+  - { method: GET, path: "/customers/{id}", description: "fetch a customer", roles: [Customer, PlatformAdmin, CustomerService], code: 200, input: [], output: Customer, side_effects: [] }
+
+  # ---- Pro ----
+  - { method: POST, path: "/pros", description: "register a pro (starts UNVERIFIED, PAY_PER_LEAD)", roles: [PlatformAdmin], code: 201, input: [email, business_name, "phone?", "billing_mode?", "service_zip_codes?", "covered_category_ids?"], output: Pro, side_effects: [] }
+  - { method: GET, path: "/pros/{id}", description: "fetch a pro profile", roles: [Pro, Customer, PlatformAdmin, CustomerService], code: 200, input: [], output: Pro, side_effects: [] }
+  - { method: GET, path: "/pros", description: "list/match pros with filters", roles: [PlatformAdmin, Customer], code: 200, input: ["subscription_plan_id?", "category_id?", "zip_code?", "verification_status?", "limit?", "offset?"], output: "Pro[]", side_effects: [] }
+  - { method: POST, path: "/pros/{id}/submit-verification", description: "pro submits profile for verification (UNVERIFIED->PENDING)", roles: [Pro], code: 200, input: [], output: Pro, side_effects: ["verification_status=PENDING", "increments Pro.version"] }
+  - { method: POST, path: "/pros/{id}/verify", description: "admin approves or suspends a pro", roles: [PlatformAdmin], code: 200, input: [decision], output: Pro, side_effects: ["verification_status=VERIFIED|SUSPENDED", "increments Pro.version"] }
+  - { method: POST, path: "/pros/{id}/credit-topup", description: "add prepaid lead credit to a pro wallet", roles: [PlatformAdmin], code: 200, input: [amount_cents], output: Pro, side_effects: ["credit_balance_cents += amount_cents", "increments Pro.version"] }
+  - { method: POST, path: "/pros/{id}/subscribe", description: "pro subscribes to a plan; grants included credits and sets SUBSCRIPTION mode", roles: [Pro], code: 200, input: [subscription_plan_id], output: Pro, side_effects: ["subscription_plan_id set", "billing_mode=SUBSCRIPTION", "remaining_lead_credits += plan.included_lead_credits", "increments Pro.version"] }
+
+  # ---- Config ----
+  - { method: POST, path: "/service-categories", description: "create a service category", roles: [PlatformAdmin], code: 201, input: [name, base_lead_price_cents, max_leads_per_request, demand_high_threshold, demand_multiplier_high, refund_window_hours, min_rating_to_receive_leads], output: ServiceCategory, side_effects: [] }
+  - { method: GET, path: "/service-categories/{id}", description: "fetch a category", roles: [PlatformAdmin, Customer, Pro, CustomerService], code: 200, input: [], output: ServiceCategory, side_effects: [] }
+  - { method: POST, path: "/subscription-plans", description: "create a subscription plan", roles: [PlatformAdmin], code: 201, input: [tier, monthly_fee_cents, included_lead_credits, overage_price_cents], output: SubscriptionPlan, side_effects: [] }
+  - { method: GET, path: "/subscription-plans/{id}", description: "fetch a plan", roles: [PlatformAdmin, Pro], code: 200, input: [], output: SubscriptionPlan, side_effects: [] }
+
+  # ---- ServiceRequest ----
+  - { method: POST, path: "/service-requests", description: "customer creates a service request", roles: [Customer], code: 201, input: [customer_id, category_id, zip_code, description, budget_cents], output: ServiceRequest, side_effects: [] }
+  - { method: GET, path: "/service-requests/{id}", description: "fetch a request", roles: [Customer, Pro, PlatformAdmin, CustomerService], code: 200, input: [], output: ServiceRequest, side_effects: [] }
+  - { method: GET, path: "/service-requests", description: "list requests with filters", roles: [Customer, PlatformAdmin], code: 200, input: ["customer_id?", "category_id?", "status?", "limit?", "offset?"], output: "ServiceRequest[]", side_effects: [] }
+  - { method: POST, path: "/service-requests/{id}/distribute", description: "grant the lead to the single top-ranked eligible pro not yet holding one (lead trickle, one pro per call, OCC guarded); repeat to reach up to max_leads_per_request pros", roles: [PlatformAdmin], code: 200, input: [expected_service_request_version], output: ServiceRequest, side_effects: ["create one Lead", "run lead_charge", "status=DISTRIBUTED", "distributed_lead_count += 1", "increments ServiceRequest.version"] }
+  - { method: POST, path: "/service-requests/{id}/close", description: "customer closes a request", roles: [Customer], code: 200, input: [], output: ServiceRequest, side_effects: ["status=CLOSED", "open Leads -> contact_status=CLOSED"] }
+
+  # ---- Lead ----
+  - { method: GET, path: "/leads/{id}", description: "fetch a lead", roles: [Pro, Customer, PlatformAdmin, CustomerService], code: 200, input: [], output: Lead, side_effects: [] }
+  - { method: GET, path: "/leads", description: "list leads with filters", roles: [Pro, PlatformAdmin, Customer], code: 200, input: ["request_id?", "pro_id?", "contact_status?", "billing_status?", "limit?", "offset?"], output: "Lead[]", side_effects: [] }
+  - { method: POST, path: "/leads/{id}/contact", description: "pro marks a lead contacted", roles: [Pro], code: 200, input: [], output: Lead, side_effects: ["contact_status=CONTACTED"] }
+  - { method: POST, path: "/leads/{id}/refund-request", description: "pro self-serves a lead refund within the window", roles: [Pro], code: 200, input: ["reason?"], output: Lead, side_effects: ["billing_status=REFUNDED", "credit pro wallet by charge_cents", "restore subscription credit if consumed", "increments Pro.version"] }
+
+  # ---- Quote ----
+  - { method: POST, path: "/quotes", description: "pro sends a quote for a lead (SENT); cascades lead CONTACTED->QUOTED", roles: [Pro], code: 201, input: [lead_id, amount_cents, message, "valid_until?"], output: Quote, side_effects: ["lead contact_status CONTACTED->QUOTED"] }
+  - { method: GET, path: "/quotes/{id}", description: "fetch a quote", roles: [Customer, Pro, PlatformAdmin], code: 200, input: [], output: Quote, side_effects: [] }
+  - { method: GET, path: "/quotes", description: "list quotes with filters", roles: [Customer, Pro, PlatformAdmin], code: 200, input: ["lead_id?", "pro_id?", "customer_id?", "status?", "limit?", "offset?"], output: "Quote[]", side_effects: [] }
+  - { method: POST, path: "/quotes/{id}/send", description: "pro (re)sends a revised quote (REVISION_REQUESTED->SENT)", roles: [Pro], code: 200, input: [amount_cents], output: Quote, side_effects: ["status=SENT", "amount_cents updated"] }
+  - { method: POST, path: "/quotes/{id}/request-revision", description: "customer requests a quote revision (SENT->REVISION_REQUESTED)", roles: [Customer], code: 200, input: [], output: Quote, side_effects: ["status=REVISION_REQUESTED", "revision_count += 1"] }
+
+  # ---- Booking ----
+  - { method: POST, path: "/bookings", description: "customer books an accepted quote onto a pro slot (cascades quote/lead/slot/request)", roles: [Customer], code: 201, input: [quote_id, availability_slot_id, scheduled_start, scheduled_end], output: Booking, side_effects: ["quote SENT->ACCEPTED", "lead QUOTED->CONVERTED + sibling leads CLOSED", "request ->BOOKED", "slot OPEN->BOOKED"] }
+  - { method: GET, path: "/bookings/{id}", description: "fetch a booking", roles: [Customer, Pro, PlatformAdmin], code: 200, input: [], output: Booking, side_effects: [] }
+  - { method: GET, path: "/bookings", description: "list bookings with filters", roles: [Customer, Pro, PlatformAdmin], code: 200, input: ["quote_id?", "customer_id?", "pro_id?", "status?", "limit?", "offset?"], output: "Booking[]", side_effects: [] }
+  - { method: POST, path: "/bookings/{id}/complete", description: "pro marks a booking completed; computes payout", roles: [Pro], code: 200, input: [], output: Booking, side_effects: ["status=COMPLETED", "run booking_payout"] }
+  - { method: POST, path: "/bookings/{id}/cancel", description: "customer or pro cancels a booking; frees the slot", roles: [Customer, Pro], code: 200, input: ["cancellation_reason?"], output: Booking, side_effects: ["status=CANCELLED", "slot BOOKED->OPEN, booking_id=null"] }
+
+  # ---- Review ----
+  - { method: POST, path: "/reviews", description: "customer reviews a completed booking (PENDING)", roles: [Customer], code: 201, input: [booking_id, rating, "text?"], output: Review, side_effects: ["recompute pro.provisional_rating"] }
+  - { method: GET, path: "/reviews/{id}", description: "fetch a review", roles: [Customer, Pro, PlatformAdmin, CustomerService], code: 200, input: [], output: Review, side_effects: [] }
+  - { method: GET, path: "/reviews", description: "list reviews with filters", roles: [Customer, Pro, PlatformAdmin, CustomerService], code: 200, input: ["booking_id?", "customer_id?", "pro_id?", "limit?", "offset?"], output: "Review[]", side_effects: [] }
+  - { method: POST, path: "/reviews/{id}/publish", description: "moderator publishes a review; recomputes ratings", roles: [PlatformAdmin, CustomerService], code: 200, input: [], output: Review, side_effects: ["status=PUBLISHED", "recompute pro.rating_avg/rating_count/provisional_rating"] }
+
+  # ---- Dispute ----
+  - { method: POST, path: "/disputes", description: "pro raises a lead-guarantee dispute on a lead", roles: [Pro], code: 201, input: [lead_id, reason], output: Dispute, side_effects: ["lead billing_status CHARGED->DISPUTED"] }
+  - { method: GET, path: "/disputes/{id}", description: "fetch a dispute", roles: [Pro, PlatformAdmin, CustomerService], code: 200, input: [], output: Dispute, side_effects: [] }
+  - { method: GET, path: "/disputes", description: "list disputes with filters", roles: [Pro, PlatformAdmin, CustomerService], code: 200, input: ["lead_id?", "raised_by_pro_id?", "status?", "limit?", "offset?"], output: "Dispute[]", side_effects: [] }
+  - { method: POST, path: "/disputes/{id}/review", description: "CS takes a dispute under review", roles: [CustomerService], code: 200, input: [], output: Dispute, side_effects: ["status=UNDER_REVIEW", "assigned_cs_user_id set"] }
+  - { method: POST, path: "/disputes/{id}/resolve", description: "CS resolves a dispute (refund or deny)", roles: [CustomerService], code: 200, input: [decision, "resolution_note?"], output: Dispute, side_effects: ["status=RESOLVED_REFUNDED|RESOLVED_DENIED", "lead billing cascade", "pro wallet/credit/dispute_count updates"] }
+
+  # ---- Calendar ----
+  - { method: POST, path: "/availability-slots", description: "pro creates a calendar slot (overlap-checked)", roles: [Pro], code: 201, input: [pro_id, start_utc, end_utc], output: AvailabilitySlot, side_effects: [] }
+  - { method: GET, path: "/availability-slots/{id}", description: "fetch a slot", roles: [Pro, Customer, PlatformAdmin], code: 200, input: [], output: AvailabilitySlot, side_effects: [] }
+  - { method: GET, path: "/availability-slots", description: "list slots with filters", roles: [Pro, Customer, PlatformAdmin], code: 200, input: ["pro_id?", "booking_id?", "status?", "limit?", "offset?"], output: "AvailabilitySlot[]", side_effects: [] }
+
+  # ---- Test-driving ----
+  - { method: POST, path: "/_clock/set_current_utc", description: "set the server logical clock; startup default is 2026-03-01T00:00:00Z (never real wall-clock)", roles: [PlatformAdmin], code: 200, input: [to_iso8601], output: null, side_effects: ["logical clock set to to_iso8601"] }
+
+# =====================================================================
+# §1.6 Error Code Catalog
+# =====================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "missing/invalid X-User-Role or X-User-ID headers" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "role not permitted for this operation" }
+  - { id: ERR_NOT_RESOURCE_OWNER, http: 403, condition: "entity-backed actor is not the owner of the targeted resource" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "referenced resource does not exist" }
+  - { id: ERR_INVALID_REQUEST, http: 422, condition: "malformed body, bad enum, out-of-range value, or end<=start" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "target resource is not in a state that permits this transition" }
+  - { id: ERR_REFERENCE_MISMATCH, http: 409, condition: "cross-referenced resources do not cohere (quote/lead/pro/customer/slot mismatch)" }
+  - { id: ERR_PRO_NOT_VERIFIED, http: 409, condition: "booking a quote whose pro is not VERIFIED" }
+  - { id: ERR_NO_ELIGIBLE_PROS, http: 409, condition: "distribution found no pro matching category+zip+rating eligibility" }
+  - { id: ERR_INSUFFICIENT_CREDIT, http: 402, condition: "no candidate pro can fund the lead charge (wallet/credit exhausted)" }
+  - { id: ERR_REFUND_WINDOW_CLOSED, http: 409, condition: "lead refund requested after distributed_at + category.refund_window_hours" }
+  - { id: ERR_SLOT_OVERLAP, http: 409, condition: "new availability slot overlaps an existing slot of the same pro" }
+  - { id: ERR_BOOKING_CONFLICT, http: 409, condition: "booking window falls outside the slot or within buffer of another CONFIRMED booking" }
+  - { id: ERR_DUPLICATE_REVIEW, http: 409, condition: "a review already exists for this booking" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_service_request_version does not match current ServiceRequest.version" }
+  - { id: ERR_VALIDATION_DECISION, http: 422, condition: "verify/resolve decision value not in the allowed enum" }
+  - { id: ERR_SUBSCRIPTION_REQUIRED, http: 409, condition: "subscribe called with a plan id that does not exist or pro already on that plan" }
+  - { id: ERR_DISPUTE_NOT_ALLOWED, http: 409, condition: "dispute raised on a lead not in billing_status CHARGED" }
+
+# =====================================================================
+# §1.7 RBAC Matrix
+# =====================================================================
+roles:
+  - name: Customer
+    description: "requests services, negotiates quotes, books, reviews"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /service-requests"
+      - "POST /service-requests/{id}/close"
+      - "POST /quotes/{id}/request-revision"
+      - "POST /bookings"
+      - "POST /reviews"
+    shared_operations:
+      - "GET /pros"
+      - "POST /bookings/{id}/cancel (shared with Pro)"
+      - "reads of own requests/quotes/bookings/reviews"
+
+  - name: Pro
+    description: "manages profile/verification, works leads, sends quotes, manages calendar, disputes lead charges"
+    identity: "entity_backed:Pro"
+    exclusive_operations:
+      - "POST /pros/{id}/submit-verification"
+      - "POST /pros/{id}/subscribe"
+      - "POST /leads/{id}/contact"
+      - "POST /leads/{id}/refund-request"
+      - "POST /quotes"
+      - "POST /quotes/{id}/send"
+      - "POST /bookings/{id}/complete"
+      - "POST /disputes"
+      - "POST /availability-slots"
+    shared_operations:
+      - "POST /bookings/{id}/cancel (shared with Customer)"
+      - "reads of own leads/quotes/bookings/slots/disputes"
+
+  - name: PlatformAdmin
+    description: "operator: onboarding, config, verification decisions, credit topups, lead distribution"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /customers"
+      - "POST /pros"
+      - "POST /pros/{id}/verify"
+      - "POST /pros/{id}/credit-topup"
+      - "POST /service-categories"
+      - "POST /subscription-plans"
+      - "POST /service-requests/{id}/distribute"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /reviews/{id}/publish (shared with CustomerService)"
+      - "broad read access"
+
+  - name: CustomerService
+    description: "operator: dispute intake, review, resolution, review moderation"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /disputes/{id}/review"
+      - "POST /disputes/{id}/resolve"
+    shared_operations:
+      - "POST /reviews/{id}/publish (shared with PlatformAdmin)"
+      - "read access to disputes/leads/pros/reviews"

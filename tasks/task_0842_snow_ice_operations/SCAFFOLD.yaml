@@ -1,0 +1,1312 @@
+scenario: "842. Snow & Ice Operations (municipal): route & priority tier (arterial/residential), plow/spreader assignment & GPS AVL, material (salt/brine) inventory & application rate, storm event & shift, callout & overtime, complaint & missed-street, deicing/pre-treat, cost-per-event reporting"
+domain_name: "snow-ice-operations"
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: "Quota / allocation"          # finite salt/brine + vehicle/operator pools reserved, committed, released
+  secondary_archetype: "Ledger reconciliation"     # cost-per-event estimate vs actual on the same storm produce divergent totals
+  complexity_layers:
+    - "Optimistic concurrency"                      # OCC on StormEvent.version for supersede-on-replan
+    - "Cascading side effects"                      # storm close and assignment cancel each propagate 3 entities deep
+    - "Dual-variant calculation"                    # overtime standard-vs-storm; cost estimate-vs-actual
+    - "Rate / threshold triggers"                   # overtime hour thresholds, tiered application rate, inventory floors
+
+  entity_topology: hybrid
+  # StormEvent -> (RouteAssignment, Callout, CostReport) hierarchy, plus flat FK peers
+  # (Depot, Vehicle, Operator, Route) referenced by foreign key across the tree.
+
+  state_machine_shape: parallel
+  # StormEvent carries two independent axes (operational_status x billing_status);
+  # Complaint is cyclic (RESOLVED -> REOPENED -> INVESTIGATING); RouteAssignment branches.
+
+  relationship_patterns:
+    - one_to_many          # StormEvent -> RouteAssignment/Callout; Depot -> Vehicle
+    - cross_aggregate      # RouteAssignment references Route/Vehicle/Operator across aggregate boundaries
+
+  role_model: peer_roles
+  # DispatchSupervisor owns storm/assignment/callout orchestration; Operator owns field
+  # reporting (applications, AVL, own callout completion); YardManager owns fleet/depot/roster;
+  # CitizenServices owns complaints. Non-overlapping resource ownership.
+
+  consistency_model: immediate
+  # Every debit/credit, cascade, and derived recompute lands atomically in the triggering request.
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: Depot
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Yard / depot name"
+      - name: salt_tons_on_hand
+        type: number
+        source: input
+        description: "Salt inventory in tons; debited on SALT application, credited on void. Up to 4 decimals."
+        constraints: ">= 0"
+      - name: brine_gallons_on_hand
+        type: number
+        source: input
+        description: "Brine inventory in gallons; debited on BRINE application, credited on void."
+        constraints: ">= 0"
+      - name: initial_salt_tons
+        type: number
+        source: system
+        description: "Snapshot of salt_tons_on_hand at creation; anchor for the material-conservation invariant."
+      - name: initial_brine_gallons
+        type: number
+        source: system
+        description: "Snapshot of brine_gallons_on_hand at creation; anchor for the material-conservation invariant."
+
+  - name: Vehicle
+    parent: null
+    common_fields: true
+    fields:
+      - name: home_depot_id
+        type: string
+        source: input
+        description: "FK -> Depot.id; the depot this unit is garaged at."
+      - name: unit_number
+        type: string
+        source: input
+        description: "Fleet unit number, human label"
+      - name: vehicle_type
+        type: enum
+        source: input
+        description: "PLOW (blade only), SPREADER (hopper only), COMBO (both)"
+        constraints: "one of {PLOW, SPREADER, COMBO}"
+      - name: has_spreader
+        type: boolean
+        source: computed
+        description: "True when vehicle_type in {SPREADER, COMBO}; required to service a salting/brining assignment."
+      - name: status
+        type: enum
+        source: input
+        description: "AVAILABLE (idle), ASSIGNED (reserved to an in-progress assignment), OUT_OF_SERVICE (maintenance). Defaults AVAILABLE on create."
+        default: "AVAILABLE"
+        constraints: "one of {AVAILABLE, ASSIGNED, OUT_OF_SERVICE}"
+
+  - name: Operator
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Operator name"
+      - name: badge_number
+        type: string
+        source: input
+        description: "Roster badge id"
+      - name: cdl_class
+        type: enum
+        source: input
+        description: "Commercial license class"
+        constraints: "one of {A, B, C}"
+      - name: hourly_rate_cents
+        type: integer
+        source: input
+        description: "Straight-time wage in integer cents per hour"
+        constraints: "> 0"
+      - name: regular_hours_accrued
+        type: number
+        source: computed
+        description: "Running sum of straight-time hours from COMPLETED callouts; decremented when a completed callout is cancelled."
+        default: 0
+      - name: overtime_hours_accrued
+        type: number
+        source: computed
+        description: "Running sum of overtime hours from COMPLETED callouts; decremented when a completed callout is cancelled."
+        default: 0
+
+  - name: Route
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Route / street-group name"
+      - name: tier
+        type: enum
+        source: input
+        description: "Priority tier. ARTERIAL (primary, factor 1.0) is plowed/salted first; RESIDENTIAL (factor 0.6) is lower priority."
+        constraints: "one of {ARTERIAL, RESIDENTIAL}"
+      - name: lane_miles
+        type: number
+        source: input
+        description: "Lane-miles in this route; drives the material-requirement calculation."
+        constraints: "> 0"
+      - name: zone
+        type: string
+        source: input
+        description: "Operational zone label"
+
+  - name: StormEvent
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Storm name / label"
+      - name: severity
+        type: enum
+        source: input
+        description: "LIGHT, MODERATE (both use STANDARD overtime), SEVERE, EMERGENCY (both trigger STORM_MODE overtime and the cost premium)."
+        constraints: "one of {LIGHT, MODERATE, SEVERE, EMERGENCY}"
+      - name: forecast_start_at
+        type: datetime
+        source: input
+        description: "Forecast storm onset (ISO 8601 UTC)"
+      - name: forecast_end_at
+        type: datetime
+        source: input
+        description: "Forecast storm end (ISO 8601 UTC)"
+      - name: operational_status
+        type: enum
+        source: computed
+        description: "Axis 1 (operations). PLANNED -> ACTIVE (activate) -> CLOSED (close). Starts PLANNED."
+        default: "PLANNED"
+        constraints: "one of {PLANNED, ACTIVE, CLOSED}"
+      - name: billing_status
+        type: enum
+        source: computed
+        description: "Axis 2 (billing), independent of operational_status. OPEN -> FINALIZED (finalize-billing). Starts OPEN."
+        default: "OPEN"
+        constraints: "one of {OPEN, FINALIZED}"
+      - name: closed_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp when operational_status became CLOSED"
+
+  - name: RouteAssignment
+    parent: StormEvent
+    common_fields: true
+    fields:
+      - name: storm_event_id
+        type: string
+        source: system
+        description: "FK -> StormEvent.id; owning storm (from the create path)."
+      - name: route_id
+        type: string
+        source: input
+        description: "FK -> Route.id; the route to be serviced."
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the plow/spreader unit."
+      - name: operator_id
+        type: string
+        source: input
+        description: "FK -> Operator.id; the driver (must hold an active callout for this storm)."
+      - name: assignment_type
+        type: enum
+        source: input
+        description: "PRETREAT (anti-icing/deicing brine run before onset) or PLOWING (salting/plowing during storm)."
+        constraints: "one of {PRETREAT, PLOWING}"
+      - name: window_start_at
+        type: datetime
+        source: input
+        description: "Occupation window start for the vehicle (ISO 8601 UTC), half-open [start,end)."
+      - name: window_end_at
+        type: datetime
+        source: input
+        description: "Occupation window end (exclusive)."
+      - name: planned_material_tons
+        type: number
+        source: input
+        description: "Planned salt tonnage for this run; drives the ESTIMATE cost variant."
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: computed
+        description: "PLANNED (initial) -> IN_PROGRESS (start) -> COMPLETED (complete). PLANNED -> SUPERSEDED (replan). PLANNED/IN_PROGRESS -> CANCELLED (cancel)."
+        default: "PLANNED"
+        constraints: "one of {PLANNED, IN_PROGRESS, COMPLETED, SUPERSEDED, CANCELLED}"
+      - name: last_lat
+        type: number
+        source: computed
+        description: "Most recent GPS/AVL latitude (from avl-ping); null until first ping."
+      - name: last_lon
+        type: number
+        source: computed
+        description: "Most recent GPS/AVL longitude"
+      - name: last_ping_at
+        type: datetime
+        source: computed
+        description: "Logical-clock time of the most recent AVL ping"
+      - name: plow_down
+        type: boolean
+        source: computed
+        description: "Whether the blade was reported down on the most recent AVL ping"
+        default: false
+
+  - name: MaterialApplication
+    parent: RouteAssignment
+    common_fields: true
+    fields:
+      - name: route_assignment_id
+        type: string
+        source: system
+        description: "FK -> RouteAssignment.id; the run this spread event belongs to (from the create path)."
+      - name: depot_id
+        type: string
+        source: input
+        description: "FK -> Depot.id; the yard the material is drawn from (inventory debited here)."
+      - name: material_type
+        type: enum
+        source: input
+        description: "SALT (debits Depot.salt_tons_on_hand by salt_tons) or BRINE (debits Depot.brine_gallons_on_hand by brine_gallons)."
+        constraints: "one of {SALT, BRINE}"
+      - name: salt_tons
+        type: number
+        source: input
+        description: "Tons of salt spread (required when material_type == SALT; must be 0 otherwise). Up to 4 decimals."
+        default: 0
+        constraints: ">= 0"
+      - name: brine_gallons
+        type: number
+        source: input
+        description: "Gallons of brine applied (required when material_type == BRINE; 0 otherwise)."
+        default: 0
+        constraints: ">= 0"
+      - name: lane_miles_treated
+        type: number
+        source: input
+        description: "Lane-miles covered by this spread event; input to the application-rate calc."
+        constraints: "> 0"
+      - name: pavement_temp_f
+        type: number
+        source: input
+        description: "Measured pavement temperature (deg F) at application; selects the tiered temperature factor."
+      - name: recommended_salt_tons
+        type: number
+        source: computed
+        description: "Application-rate recommendation = lane_miles_treated * BASE_RATE * temperature_factor(pavement_temp_f) * tier_multiplier(Route.tier); cross-entity (reads owning Route.tier). Rounded to 2 decimals."
+      - name: applied_at
+        type: datetime
+        source: system
+        description: "Logical-clock time when the application was recorded"
+      - name: status
+        type: enum
+        source: computed
+        description: "RECORDED (initial) -> VOIDED (void or cascade from assignment cancel). VOIDED credits the depot back."
+        default: "RECORDED"
+        constraints: "one of {RECORDED, VOIDED}"
+
+  - name: Callout
+    parent: StormEvent
+    common_fields: true
+    fields:
+      - name: storm_event_id
+        type: string
+        source: system
+        description: "FK -> StormEvent.id; the storm the operator is called out for (from create path)."
+      - name: operator_id
+        type: string
+        source: input
+        description: "FK -> Operator.id; the called-out operator."
+      - name: window_start_at
+        type: datetime
+        source: input
+        description: "Scheduled shift-window start (ISO 8601 UTC) for rest-buffer overlap checks."
+      - name: window_end_at
+        type: datetime
+        source: input
+        description: "Scheduled shift-window end."
+      - name: hours_worked
+        type: number
+        source: input
+        description: "Actual hours worked, supplied at completion (input on complete, null while ISSUED)."
+        default: 0
+        constraints: ">= 0"
+      - name: pay_mode
+        type: enum
+        source: computed
+        description: "STANDARD (severity LIGHT/MODERATE) or STORM_MODE (severity SEVERE/EMERGENCY); selected from the owning StormEvent.severity at completion."
+        constraints: "one of {STANDARD, STORM_MODE}"
+      - name: regular_hours
+        type: number
+        source: computed
+        description: "Straight-time hours credited at completion (see overtime_pay calc)."
+        default: 0
+      - name: overtime_hours
+        type: number
+        source: computed
+        description: "Overtime hours credited at completion."
+        default: 0
+      - name: pay_cents
+        type: integer
+        source: computed
+        description: "Total pay in integer cents credited at completion."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "ISSUED (initial) -> COMPLETED (complete). ISSUED/COMPLETED -> CANCELLED (cancel; cancelling a COMPLETED callout reverses the hours it accrued)."
+        default: "ISSUED"
+        constraints: "one of {ISSUED, COMPLETED, CANCELLED}"
+
+  - name: Complaint
+    parent: null
+    common_fields: true
+    fields:
+      - name: route_id
+        type: string
+        source: input
+        description: "FK -> Route.id; the street/route complained about."
+      - name: storm_event_id
+        type: string
+        source: input
+        description: "FK -> StormEvent.id; the storm the complaint is filed against."
+      - name: address
+        type: string
+        source: input
+        description: "Reported street address"
+      - name: complaint_type
+        type: enum
+        source: input
+        description: "MISSED_STREET, ICY_CONDITIONS, or PROPERTY_DAMAGE"
+        constraints: "one of {MISSED_STREET, ICY_CONDITIONS, PROPERTY_DAMAGE}"
+      - name: missed_street_confirmed
+        type: boolean
+        source: computed
+        description: "Set true by an investigate transition that confirms the street was never serviced; default false."
+        default: false
+      - name: reported_at
+        type: datetime
+        source: system
+        description: "Logical-clock time the complaint was filed"
+      - name: status
+        type: enum
+        source: computed
+        description: "OPEN (initial) -> INVESTIGATING (investigate) -> RESOLVED (resolve) -> REOPENED (reopen) -> INVESTIGATING (investigate again). Cyclic."
+        default: "OPEN"
+        constraints: "one of {OPEN, INVESTIGATING, RESOLVED, REOPENED}"
+
+  - name: CostReport
+    parent: StormEvent
+    common_fields: false   # immutable computed snapshot: id + created_at only, never mutated
+    fields:
+      - name: storm_event_id
+        type: string
+        source: system
+        description: "FK -> StormEvent.id; the storm this snapshot costs out (from create path)."
+      - name: variant
+        type: enum
+        source: input
+        description: "ESTIMATE (planned tonnage + straight-time projected labor) or ACTUAL (recorded applications + completed-callout pay)."
+        constraints: "one of {ESTIMATE, ACTUAL}"
+      - name: total_material_cost_cents
+        type: integer
+        source: computed
+        description: "Material cost in cents (round-per-line-then-sum; see cost_per_event calc)."
+      - name: total_labor_cost_cents
+        type: integer
+        source: computed
+        description: "Labor cost in cents for the chosen variant."
+      - name: total_cost_cents
+        type: integer
+        source: computed
+        description: "total_material_cost_cents + total_labor_cost_cents."
+      - name: generated_at
+        type: datetime
+        source: system
+        description: "Logical-clock time the snapshot was generated"
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: StormEvent
+    initial_state: "operational_status=PLANNED, billing_status=OPEN"
+    terminal_states: [CLOSED, FINALIZED]   # CLOSED terminal on the operational axis; FINALIZED terminal on the billing axis
+    transitions:
+      - from: PLANNED
+        to: ACTIVE
+        trigger: "POST /storm-events/{id}/activate"
+        actor: DispatchSupervisor
+        preconditions: ["operational_status == PLANNED"]
+        side_effects: ["operational_status set ACTIVE", "increments StormEvent.version by 1"]
+        note: "Only ACTIVE storms admit assignment starts and callouts of new work."
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /storm-events/{id}/close"
+        actor: DispatchSupervisor
+        preconditions: ["operational_status == ACTIVE"]
+        side_effects:
+          - "operational_status set CLOSED; closed_at stamped from the logical clock"
+          - "CASCADE hop-1: every RouteAssignment of this storm in status IN_PROGRESS transitions to COMPLETED"
+          - "CASCADE hop-1: every RouteAssignment of this storm in status PLANNED transitions to CANCELLED"
+          - "increments StormEvent.version by 1"
+        note: "Root of the depth-3 close cascade (StormEvent -> RouteAssignment -> Vehicle); hop-2/hop-3 live on the RouteAssignment transitions triggered here."
+      - from: OPEN
+        to: FINALIZED
+        trigger: "POST /storm-events/{id}/finalize-billing"
+        actor: DispatchSupervisor
+        preconditions: ["billing_status == OPEN", "operational_status == CLOSED"]
+        side_effects: ["billing_status set FINALIZED", "increments StormEvent.version by 1"]
+        note: "Billing axis is independent of the operational axis except this one guard (cannot finalize an un-closed storm)."
+
+  - entity: RouteAssignment
+    initial_state: PLANNED
+    terminal_states: [COMPLETED, SUPERSEDED, CANCELLED]
+    transitions:
+      - from: null
+        to: PLANNED
+        trigger: "POST /storm-events/{id}/assignments"
+        actor: DispatchSupervisor
+        preconditions:
+          - "StormEvent.operational_status in {PLANNED, ACTIVE}"
+          - "Vehicle.status != OUT_OF_SERVICE (safety)"
+          - "Vehicle.has_spreader == true when assignment_type == PLOWING (safety)"
+          - "Operator has a Callout for this storm in status in {ISSUED, COMPLETED} (referential)"
+          - "no other RouteAssignment with same vehicle_id in status {PLANNED, IN_PROGRESS} whose [window_start_at, window_end_at) overlaps (temporal)"
+          - "window_end_at > window_start_at"
+          - "expected_storm_event_version == StormEvent.version (OCC)"
+        side_effects:
+          - "creates RouteAssignment in PLANNED"
+          - "any existing RouteAssignment for the same (storm_event_id, route_id) in status PLANNED transitions to SUPERSEDED (replan supersede)"
+          - "increments StormEvent.version by 1"
+        note: "If an existing assignment for the route is IN_PROGRESS (not PLANNED), creation is rejected ERR_ROUTE_ALREADY_ACTIVE."
+      - from: PLANNED
+        to: IN_PROGRESS
+        trigger: "POST /assignments/{id}/start"
+        actor: DispatchSupervisor
+        preconditions:
+          - "status == PLANNED"
+          - "owning StormEvent.operational_status == ACTIVE (cross-entity)"
+          - "Vehicle.status == AVAILABLE"
+        side_effects: ["status set IN_PROGRESS", "Vehicle.status set ASSIGNED (reserve)"]
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /assignments/{id}/complete OR cascade from StormEvent close"
+        actor: DispatchSupervisor
+        preconditions: ["status == IN_PROGRESS"]
+        side_effects:
+          - "status set COMPLETED"
+          - "CASCADE hop-2/hop-3: Vehicle.status set AVAILABLE (release) — this vehicle release is caused by the assignment reaching COMPLETED, whether by direct complete or by the storm-close cascade"
+        note: "Third entity in the close cascade chain: StormEvent(close) -> RouteAssignment(COMPLETED) -> Vehicle(AVAILABLE)."
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /assignments/{id}/cancel OR cascade from StormEvent close"
+        actor: DispatchSupervisor
+        preconditions: ["status == PLANNED"]
+        side_effects: ["status set CANCELLED"]
+      - from: IN_PROGRESS
+        to: CANCELLED
+        trigger: "POST /assignments/{id}/cancel"
+        actor: DispatchSupervisor
+        preconditions: ["status == IN_PROGRESS"]
+        side_effects:
+          - "status set CANCELLED"
+          - "Vehicle.status set AVAILABLE (release)"
+          - "CASCADE hop-1: every MaterialApplication of this assignment in status RECORDED transitions to VOIDED"
+        note: "Root of the depth-3 cancel cascade (RouteAssignment -> MaterialApplication -> Depot); hop-2/hop-3 live on the MaterialApplication void transition."
+      - from: PLANNED
+        to: SUPERSEDED
+        trigger: "system: superseded by a newer assignment for the same (storm_event_id, route_id)"
+        actor: system
+        preconditions: ["status == PLANNED"]
+        side_effects: ["status set SUPERSEDED"]
+
+  - entity: MaterialApplication
+    initial_state: RECORDED
+    terminal_states: [VOIDED]
+    transitions:
+      - from: null
+        to: RECORDED
+        trigger: "POST /assignments/{id}/applications"
+        actor: Operator
+        preconditions:
+          - "acting Operator.id == owning RouteAssignment.operator_id (ownership)"
+          - "RouteAssignment.status == IN_PROGRESS (cross-entity state)"
+          - "material_type == SALT: Depot.salt_tons_on_hand >= salt_tons (fiscal)"
+          - "material_type == BRINE: Depot.brine_gallons_on_hand >= brine_gallons (fiscal)"
+        side_effects:
+          - "creates MaterialApplication in RECORDED; applied_at stamped; recommended_salt_tons computed from Route.tier + pavement_temp_f"
+          - "SALT: Depot.salt_tons_on_hand -= salt_tons (debit)"
+          - "BRINE: Depot.brine_gallons_on_hand -= brine_gallons (debit)"
+      - from: RECORDED
+        to: VOIDED
+        trigger: "POST /material-applications/{id}/void OR cascade from RouteAssignment cancel"
+        actor: DispatchSupervisor
+        preconditions: ["status == RECORDED"]
+        side_effects:
+          - "status set VOIDED"
+          - "CASCADE hop-2/hop-3: SALT: Depot.salt_tons_on_hand += salt_tons (credit restores inventory); BRINE: Depot.brine_gallons_on_hand += brine_gallons — this depot credit is caused by the application reaching VOIDED"
+        note: "Third entity in the cancel cascade: RouteAssignment(cancel) -> MaterialApplication(VOIDED) -> Depot(credit). Restores the material-conservation invariant."
+
+  - entity: Callout
+    initial_state: ISSUED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: null
+        to: ISSUED
+        trigger: "POST /storm-events/{id}/callouts"
+        actor: DispatchSupervisor
+        preconditions:
+          - "window_end_at > window_start_at"
+          - "no other Callout for the same operator_id in status {ISSUED, COMPLETED} whose window is within OPERATOR_REST_BUFFER_HOURS of this window (temporal rest buffer)"
+        side_effects: ["creates Callout in ISSUED"]
+      - from: ISSUED
+        to: COMPLETED
+        trigger: "POST /callouts/{id}/complete"
+        actor: Operator
+        preconditions:
+          - "acting Operator.id == operator_id (ownership)"
+          - "status == ISSUED"
+        side_effects:
+          - "pay_mode selected from owning StormEvent.severity; regular_hours/overtime_hours/pay_cents computed (overtime_pay calc)"
+          - "Operator.regular_hours_accrued += regular_hours; Operator.overtime_hours_accrued += overtime_hours (labor-hours ledger credit)"
+          - "status set COMPLETED"
+      - from: ISSUED
+        to: CANCELLED
+        trigger: "POST /callouts/{id}/cancel"
+        actor: DispatchSupervisor
+        preconditions: ["status == ISSUED"]
+        side_effects: ["status set CANCELLED"]
+      - from: COMPLETED
+        to: CANCELLED
+        trigger: "POST /callouts/{id}/cancel"
+        actor: DispatchSupervisor
+        preconditions: ["status == COMPLETED"]
+        side_effects:
+          - "status set CANCELLED"
+          - "Operator.regular_hours_accrued -= this callout.regular_hours; Operator.overtime_hours_accrued -= this callout.overtime_hours (compensating: reverses the labor-hours ledger credit so accrued totals return to their pre-completion value)"
+        note: "Compensating action for the labor-hours conservation invariant."
+
+  - entity: Complaint
+    initial_state: OPEN
+    terminal_states: []   # cyclic; complaints have no terminal state (can always be reopened/re-investigated)
+    transitions:
+      - from: OPEN
+        to: INVESTIGATING
+        trigger: "POST /complaints/{id}/investigate"
+        actor: CitizenServices
+        preconditions: ["status == OPEN"]
+        side_effects: ["status set INVESTIGATING", "missed_street_confirmed set from request body confirm_missed flag"]
+      - from: REOPENED
+        to: INVESTIGATING
+        trigger: "POST /complaints/{id}/investigate"
+        actor: CitizenServices
+        preconditions: ["status == REOPENED"]
+        side_effects: ["status set INVESTIGATING", "missed_street_confirmed set from request body confirm_missed flag"]
+      - from: INVESTIGATING
+        to: RESOLVED
+        trigger: "POST /complaints/{id}/resolve"
+        actor: CitizenServices
+        preconditions: ["status == INVESTIGATING"]
+        side_effects: ["status set RESOLVED"]
+      - from: RESOLVED
+        to: REOPENED
+        trigger: "POST /complaints/{id}/reopen"
+        actor: CitizenServices
+        preconditions: ["status == RESOLVED"]
+        side_effects: ["status set REOPENED"]
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: assignment-create-stale-storm
+    parent_entity: StormEvent
+    write_endpoint: "POST /storm-events/{id}/assignments"
+    occ_field: "expected_storm_event_version"
+    description: |
+      Creating a RouteAssignment against a StormEvent whose version has advanced
+      since the client last observed it is rejected. Assignment creation legitimately
+      supersedes a prior PLANNED assignment for the same route (a replan), so a writer
+      whose view of the storm is stale — because another writer has already created an
+      assignment that bumped the storm version and possibly superseded the route's prior
+      plan — must be rejected rather than silently overwrite the newer plan.
+    error_id: ERR_STALE_STORM_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: material_application_requirement
+    trigger: "on POST /assignments/{id}/applications (computes recommended_salt_tons on the new MaterialApplication)"
+    algorithm: tiered_pricing
+    formula: |
+      temperature_factor(pavement_temp_f):
+        if pavement_temp_f >= 30:      0.8
+        elif pavement_temp_f >= 20:    1.0      # 20 <= t < 30
+        elif pavement_temp_f >= 10:    1.3      # 10 <= t < 20
+        else:                          1.6      # t < 10
+      tier_multiplier(Route.tier):
+        ARTERIAL -> 1.0 ; RESIDENTIAL -> 0.6
+      recommended_salt_tons =
+        round_half_up(lane_miles_treated * BASE_RATE_TONS_PER_LANE_MILE
+                      * temperature_factor(pavement_temp_f)
+                      * tier_multiplier(owning_route.tier), 2)
+    input_set: "single MaterialApplication being created; Route resolved via RouteAssignment.route_id"
+    constants:
+      BASE_RATE_TONS_PER_LANE_MILE: 0.15
+      TIER_MULT_ARTERIAL: 1.0
+      TIER_MULT_RESIDENTIAL: 0.6
+      TEMP_TIER_MILD: 0.8       # t >= 30F
+      TEMP_TIER_MODERATE: 1.0   # 20 <= t < 30
+      TEMP_TIER_COLD: 1.3       # 10 <= t < 20
+      TEMP_TIER_FRIGID: 1.6     # t < 10
+    precision: "2 decimal places, round_half_up"
+    variants: []
+
+  - name: overtime_pay
+    trigger: "on POST /callouts/{id}/complete (computes regular_hours, overtime_hours, pay_cents, pay_mode)"
+    algorithm: threshold
+    formula: |
+      pay_mode = STORM_MODE if StormEvent.severity in {SEVERE, EMERGENCY} else STANDARD
+      threshold  = STORM_OT_THRESHOLD_HOURS (6.0) if STORM_MODE else DAILY_OT_THRESHOLD_HOURS (8.0)
+      ot_mult    = STORM_OT_MULTIPLIER (2.0) if STORM_MODE else STANDARD_OT_MULTIPLIER (1.5)
+      min_hours  = STORM_CALLOUT_MIN_HOURS (3.0) if STORM_MODE else STANDARD_CALLOUT_MIN_HOURS (2.0)
+      paid_hours = max(hours_worked, min_hours)          # callout guaranteed minimum
+      regular_hours  = min(paid_hours, threshold)
+      overtime_hours = max(0, paid_hours - threshold)    # overtime strictly ABOVE threshold (> not >=)
+      pay_cents = round_half_up(regular_hours * Operator.hourly_rate_cents
+                               + overtime_hours * Operator.hourly_rate_cents * ot_mult)
+    input_set: "single Callout; Operator.hourly_rate_cents and StormEvent.severity read at completion"
+    constants:
+      DAILY_OT_THRESHOLD_HOURS: 8.0
+      STORM_OT_THRESHOLD_HOURS: 6.0
+      STANDARD_OT_MULTIPLIER: 1.5
+      STORM_OT_MULTIPLIER: 2.0
+      STANDARD_CALLOUT_MIN_HOURS: 2.0
+      STORM_CALLOUT_MIN_HOURS: 3.0
+    precision: "pay_cents integer, round_half_up on the final cents value"
+    variants:
+      - name: STANDARD
+        when: "owning StormEvent.severity in {LIGHT, MODERATE}"
+        difference: "overtime threshold 8.0h, multiplier 1.5x, callout minimum 2.0h"
+      - name: STORM_MODE
+        when: "owning StormEvent.severity in {SEVERE, EMERGENCY}"
+        difference: "overtime threshold 6.0h, multiplier 2.0x, callout minimum 3.0h — same hours_worked yields a strictly higher pay_cents"
+
+  - name: cost_per_event
+    trigger: "on POST /storm-events/{id}/cost-reports (computes the CostReport totals for the chosen variant)"
+    algorithm: aggregation
+    formula: |
+      # MATERIAL COST — round-per-line-item THEN sum (this order is pinned; sum-then-round is WRONG)
+      unit_cost(material_type): SALT -> SALT_UNIT_COST_CENTS(8500) per ton
+                                BRINE -> BRINE_UNIT_COST_CENTS(25) per gallon
+      variant ACTUAL:
+        material_lines = MaterialApplication where route_assignment.storm_event_id == storm.id
+                         AND status == RECORDED
+        total_material_cost_cents =
+            sum over material_lines of
+              round_half_up( (salt_tons * 8500) if SALT else (brine_gallons * 25) )   # round each line first
+        labor_lines = Callout where storm_event_id == storm.id AND status == COMPLETED
+        total_labor_cost_cents = sum over labor_lines of pay_cents
+      variant ESTIMATE:
+        material_lines = RouteAssignment where storm_event_id == storm.id
+                         AND status in {PLANNED, IN_PROGRESS, COMPLETED}
+        total_material_cost_cents =
+            sum over material_lines of round_half_up( planned_material_tons * 8500 )
+        labor_lines = Callout where storm_event_id == storm.id AND status in {ISSUED, COMPLETED}
+        total_labor_cost_cents =
+            sum over labor_lines of
+              round_half_up( window_hours(window_start_at, window_end_at) * Operator.hourly_rate_cents )
+              # straight-time projection: window_hours * rate, NO overtime multiplier
+      total_cost_cents = total_material_cost_cents + total_labor_cost_cents
+    input_set: "storm-scoped; SALT/BRINE applications and callouts filtered by the status sets above"
+    constants:
+      SALT_UNIT_COST_CENTS: 8500     # per ton
+      BRINE_UNIT_COST_CENTS: 25      # per gallon
+    precision: "integer cents; round_half_up per material line, then sum; labor summed from already-integer pay_cents (ACTUAL) or per-line rounded projection (ESTIMATE)"
+    variants:
+      - name: ESTIMATE
+        when: "variant == ESTIMATE"
+        difference: "planned tonnage over non-terminal assignments + straight-time labor projection over issued/completed callouts"
+      - name: ACTUAL
+        when: "variant == ACTUAL"
+        difference: "recorded (non-voided) applications + realized completed-callout pay including overtime; diverges from ESTIMATE for identical storm data"
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this operation per §1.7"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: existence
+    check: "every path id and body FK (storm, route, vehicle, operator, depot, assignment, callout, application) resolves, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK body fields"
+  - priority: 4
+    category: business_constraint
+    check: "request body well-formed: required fields present, enums in range, numbers within stated constraints"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+  - priority: 5
+    category: business_constraint
+    check: "acting entity_backed Operator owns the target (Operator.id == RouteAssignment.operator_id for applications/avl; == Callout.operator_id for callout complete)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /assignments/{id}/applications, POST /assignments/{id}/avl-ping, POST /callouts/{id}/complete"
+  - priority: 6
+    category: state
+    check: "target resource is in the required state for the transition (storm ACTIVE for start; assignment PLANNED for start; assignment IN_PROGRESS for applications/avl/complete; callout ISSUED for complete; billing OPEN & storm CLOSED for finalize; application RECORDED for void; complaint in the transition's from-state)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+    note: "Domain-specific ids: ERR_STORM_NOT_ACTIVE, ERR_ASSIGNMENT_NOT_PLANNED, ERR_ASSIGNMENT_NOT_IN_PROGRESS, ERR_CALLOUT_NOT_ISSUED, ERR_STORM_NOT_CLOSED, ERR_BILLING_NOT_OPEN, ERR_ROUTE_ALREADY_ACTIVE, ERR_APPLICATION_ALREADY_VOIDED, ERR_COMPLAINT_INVALID_STATE."
+  - priority: 7
+    category: business_safety
+    check: "assignment's Vehicle is not OUT_OF_SERVICE, and has_spreader is true when assignment_type == PLOWING"
+    error_id: ERR_VEHICLE_OUT_OF_SERVICE
+    http_status: 422
+    applies_to: "POST /storm-events/{id}/assignments"
+    note: "ERR_VEHICLE_MISSING_SPREADER when the spreader requirement fails."
+  - priority: 8
+    category: business_referential
+    check: "assignment's Operator holds a Callout for this storm in status {ISSUED, COMPLETED}"
+    error_id: ERR_OPERATOR_NOT_ON_CALL
+    http_status: 409
+    applies_to: "POST /storm-events/{id}/assignments"
+  - priority: 9
+    category: business_temporal
+    check: "no vehicle double-booking: no other {PLANNED, IN_PROGRESS} RouteAssignment with the same vehicle_id whose half-open [window_start_at, window_end_at) overlaps (adjacency end==start is allowed)"
+    error_id: ERR_VEHICLE_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /storm-events/{id}/assignments"
+  - priority: 10
+    category: business_temporal
+    check: "no operator rest violation: no other {ISSUED, COMPLETED} Callout for the same operator_id whose window is within OPERATOR_REST_BUFFER_HOURS (8h) — i.e. this.window_start_at must be >= other.window_end_at + 8h OR other.window_start_at >= this.window_end_at + 8h"
+    error_id: ERR_OPERATOR_REST_VIOLATION
+    http_status: 409
+    applies_to: "POST /storm-events/{id}/callouts"
+  - priority: 11
+    category: business_temporal
+    check: "window_end_at > window_start_at on any windowed create"
+    error_id: ERR_INVALID_WINDOW
+    http_status: 422
+    applies_to: "POST /storm-events/{id}/assignments, POST /storm-events/{id}/callouts"
+  - priority: 12
+    category: state
+    check: "OCC: expected_storm_event_version equals the current StormEvent.version"
+    error_id: ERR_STALE_STORM_VERSION
+    http_status: 412
+    applies_to: "POST /storm-events/{id}/assignments"
+  - priority: 13
+    category: business_fiscal
+    check: "depot has sufficient material for the application (salt_tons_on_hand >= salt_tons for SALT; brine_gallons_on_hand >= brine_gallons for BRINE)"
+    error_id: ERR_INSUFFICIENT_MATERIAL
+    http_status: 409
+    applies_to: "POST /assignments/{id}/applications"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # --- Depot ---
+  - method: POST
+    path: "/depots"
+    description: "Register a depot with opening salt/brine inventory (snapshots initial_* anchors)."
+    roles: [YardManager]
+    code: 201
+    input: [name, salt_tons_on_hand, brine_gallons_on_hand]
+    output: Depot
+    side_effects: ["initial_salt_tons/initial_brine_gallons snapshotted from opening balances"]
+  - method: GET
+    path: "/depots/{id}"
+    description: "Read a depot including current inventory."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: []
+    output: Depot
+    side_effects: []
+
+  # --- Vehicle ---
+  - method: POST
+    path: "/vehicles"
+    description: "Register a plow/spreader unit at a depot."
+    roles: [YardManager]
+    code: 201
+    input: [home_depot_id, unit_number, vehicle_type, "status?"]
+    output: Vehicle
+    side_effects: ["has_spreader computed from vehicle_type"]
+  - method: GET
+    path: "/vehicles/{id}"
+    description: "Read a vehicle."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: []
+  - method: GET
+    path: "/vehicles"
+    description: "List/filter vehicles (reverse-reachability for Vehicle.home_depot_id)."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: ["home_depot_id?", "status?", "limit?", "offset?"]
+    output: Vehicle[]
+    side_effects: []
+
+  # --- Operator ---
+  - method: POST
+    path: "/operators"
+    description: "Register an operator (driver)."
+    roles: [YardManager]
+    code: 201
+    input: [full_name, badge_number, cdl_class, hourly_rate_cents]
+    output: Operator
+    side_effects: ["regular_hours_accrued/overtime_hours_accrued initialized to 0"]
+  - method: GET
+    path: "/operators/{id}"
+    description: "Read an operator including accrued hours."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: []
+    output: Operator
+    side_effects: []
+
+  # --- Route ---
+  - method: POST
+    path: "/routes"
+    description: "Create a route with priority tier and lane-miles."
+    roles: [DispatchSupervisor]
+    code: 201
+    input: [name, tier, lane_miles, zone]
+    output: Route
+    side_effects: []
+  - method: GET
+    path: "/routes/{id}"
+    description: "Read a route."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: []
+    output: Route
+    side_effects: []
+
+  # --- StormEvent ---
+  - method: POST
+    path: "/storm-events"
+    description: "Declare a storm event (starts operational_status=PLANNED, billing_status=OPEN)."
+    roles: [DispatchSupervisor]
+    code: 201
+    input: [name, severity, forecast_start_at, forecast_end_at]
+    output: StormEvent
+    side_effects: []
+  - method: GET
+    path: "/storm-events/{id}"
+    description: "Read a storm event including both status axes and version."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: []
+    output: StormEvent
+    side_effects: []
+  - method: POST
+    path: "/storm-events/{id}/activate"
+    description: "Move operational_status PLANNED -> ACTIVE."
+    roles: [DispatchSupervisor]
+    code: 200
+    input: []
+    output: StormEvent
+    side_effects: ["operational_status ACTIVE", "increments StormEvent.version by 1"]
+  - method: POST
+    path: "/storm-events/{id}/close"
+    description: "Move operational_status ACTIVE -> CLOSED; runs the depth-3 close cascade."
+    roles: [DispatchSupervisor]
+    code: 200
+    input: []
+    output: StormEvent
+    side_effects:
+      - "operational_status CLOSED; closed_at stamped"
+      - "IN_PROGRESS assignments -> COMPLETED (each releases its vehicle to AVAILABLE)"
+      - "PLANNED assignments -> CANCELLED"
+      - "increments StormEvent.version by 1"
+  - method: POST
+    path: "/storm-events/{id}/finalize-billing"
+    description: "Move billing_status OPEN -> FINALIZED (requires operational_status CLOSED)."
+    roles: [DispatchSupervisor]
+    code: 200
+    input: []
+    output: StormEvent
+    side_effects: ["billing_status FINALIZED", "increments StormEvent.version by 1"]
+
+  # --- RouteAssignment ---
+  - method: POST
+    path: "/storm-events/{id}/assignments"
+    description: "Create a route assignment (vehicle+operator+window). OCC on the storm; supersedes a prior PLANNED assignment for the same route."
+    roles: [DispatchSupervisor]
+    code: 201
+    input: [route_id, vehicle_id, operator_id, assignment_type, window_start_at, window_end_at, planned_material_tons, expected_storm_event_version]
+    output: RouteAssignment
+    side_effects:
+      - "creates RouteAssignment PLANNED"
+      - "prior PLANNED assignment for same (storm,route) -> SUPERSEDED"
+      - "increments StormEvent.version by 1"
+  - method: GET
+    path: "/storm-events/{id}/assignments"
+    description: "List assignments of a storm (reverse-reachability for RouteAssignment.storm_event_id)."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: RouteAssignment[]
+    side_effects: []
+  - method: GET
+    path: "/assignments/{id}"
+    description: "Read an assignment including AVL position and status."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: []
+    output: RouteAssignment
+    side_effects: []
+  - method: GET
+    path: "/assignments"
+    description: "List/filter assignments (reverse-reachability for route_id, vehicle_id, operator_id)."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: ["route_id?", "vehicle_id?", "operator_id?", "status?", "limit?", "offset?"]
+    output: RouteAssignment[]
+    side_effects: []
+  - method: POST
+    path: "/assignments/{id}/start"
+    description: "Move assignment PLANNED -> IN_PROGRESS; reserves the vehicle."
+    roles: [DispatchSupervisor]
+    code: 200
+    input: []
+    output: RouteAssignment
+    side_effects: ["status IN_PROGRESS", "Vehicle.status ASSIGNED"]
+  - method: POST
+    path: "/assignments/{id}/complete"
+    description: "Move assignment IN_PROGRESS -> COMPLETED; releases the vehicle."
+    roles: [DispatchSupervisor]
+    code: 200
+    input: []
+    output: RouteAssignment
+    side_effects: ["status COMPLETED", "Vehicle.status AVAILABLE"]
+  - method: POST
+    path: "/assignments/{id}/cancel"
+    description: "Cancel an assignment (PLANNED or IN_PROGRESS); voids its recorded applications and releases the vehicle. Root of the depth-3 cancel cascade."
+    roles: [DispatchSupervisor]
+    code: 200
+    input: []
+    output: RouteAssignment
+    side_effects: ["status CANCELLED", "RECORDED applications -> VOIDED (each credits its depot)", "Vehicle.status AVAILABLE if was reserved"]
+  - method: POST
+    path: "/assignments/{id}/avl-ping"
+    description: "Record a GPS/AVL ping from the field, updating last_lat/last_lon/last_ping_at/plow_down."
+    roles: [Operator]
+    code: 200
+    input: [lat, lon, "plow_down?"]
+    output: RouteAssignment
+    side_effects: ["last_lat/last_lon/plow_down updated; last_ping_at stamped from the logical clock"]
+
+  # --- MaterialApplication ---
+  - method: POST
+    path: "/assignments/{id}/applications"
+    description: "Record a salt/brine spread event; debits depot inventory and computes recommended_salt_tons."
+    roles: [Operator]
+    code: 201
+    input: [depot_id, material_type, "salt_tons?", "brine_gallons?", lane_miles_treated, pavement_temp_f]
+    output: MaterialApplication
+    side_effects: ["depot inventory debited", "recommended_salt_tons computed", "applied_at stamped"]
+  - method: GET
+    path: "/assignments/{id}/applications"
+    description: "List applications of an assignment (reverse-reachability for MaterialApplication.route_assignment_id)."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: MaterialApplication[]
+    side_effects: []
+  - method: GET
+    path: "/material-applications/{id}"
+    description: "Read a single application."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: []
+    output: MaterialApplication
+    side_effects: []
+  - method: GET
+    path: "/material-applications"
+    description: "List/filter applications (reverse-reachability for MaterialApplication.depot_id)."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: ["depot_id?", "route_assignment_id?", "status?", "limit?", "offset?"]
+    output: MaterialApplication[]
+    side_effects: []
+  - method: POST
+    path: "/material-applications/{id}/void"
+    description: "Void a recorded application; credits the depot back (compensating for the material-conservation invariant)."
+    roles: [DispatchSupervisor]
+    code: 200
+    input: []
+    output: MaterialApplication
+    side_effects: ["status VOIDED", "depot inventory credited by the application amount"]
+
+  # --- Callout ---
+  - method: POST
+    path: "/storm-events/{id}/callouts"
+    description: "Issue an overtime callout to an operator for a shift window (rest-buffer overlap checked)."
+    roles: [DispatchSupervisor]
+    code: 201
+    input: [operator_id, window_start_at, window_end_at]
+    output: Callout
+    side_effects: ["creates Callout ISSUED"]
+  - method: GET
+    path: "/storm-events/{id}/callouts"
+    description: "List callouts of a storm (reverse-reachability for Callout.storm_event_id)."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Callout[]
+    side_effects: []
+  - method: GET
+    path: "/callouts/{id}"
+    description: "Read a callout including computed pay fields."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: []
+    output: Callout
+    side_effects: []
+  - method: GET
+    path: "/callouts"
+    description: "List/filter callouts (reverse-reachability for Callout.operator_id)."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: ["operator_id?", "status?", "limit?", "offset?"]
+    output: Callout[]
+    side_effects: []
+  - method: POST
+    path: "/callouts/{id}/complete"
+    description: "Complete a callout with hours_worked; computes overtime/pay and credits the operator's hour ledger."
+    roles: [Operator]
+    code: 200
+    input: [hours_worked]
+    output: Callout
+    side_effects: ["pay_mode/regular_hours/overtime_hours/pay_cents computed", "Operator accrued hours incremented", "status COMPLETED"]
+  - method: POST
+    path: "/callouts/{id}/cancel"
+    description: "Cancel a callout; if it was COMPLETED, reverses the accrued hours (compensating invariant)."
+    roles: [DispatchSupervisor]
+    code: 200
+    input: []
+    output: Callout
+    side_effects: ["status CANCELLED", "if was COMPLETED: Operator accrued hours decremented by this callout's amounts"]
+
+  # --- Complaint ---
+  - method: POST
+    path: "/complaints"
+    description: "File a citizen complaint against a route in a storm."
+    roles: [CitizenServices]
+    code: 201
+    input: [route_id, storm_event_id, address, complaint_type]
+    output: Complaint
+    side_effects: ["creates Complaint OPEN; reported_at stamped"]
+  - method: GET
+    path: "/complaints/{id}"
+    description: "Read a complaint."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: []
+    output: Complaint
+    side_effects: []
+  - method: GET
+    path: "/complaints"
+    description: "List/filter complaints (reverse-reachability for route_id and storm_event_id)."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: ["route_id?", "storm_event_id?", "status?", "limit?", "offset?"]
+    output: Complaint[]
+    side_effects: []
+  - method: POST
+    path: "/complaints/{id}/investigate"
+    description: "Move complaint OPEN or REOPENED -> INVESTIGATING; optionally confirm a missed street."
+    roles: [CitizenServices]
+    code: 200
+    input: ["confirm_missed?"]
+    output: Complaint
+    side_effects: ["status INVESTIGATING", "missed_street_confirmed set from confirm_missed"]
+  - method: POST
+    path: "/complaints/{id}/resolve"
+    description: "Move complaint INVESTIGATING -> RESOLVED."
+    roles: [CitizenServices]
+    code: 200
+    input: []
+    output: Complaint
+    side_effects: ["status RESOLVED"]
+  - method: POST
+    path: "/complaints/{id}/reopen"
+    description: "Move complaint RESOLVED -> REOPENED (cyclic)."
+    roles: [CitizenServices]
+    code: 200
+    input: []
+    output: Complaint
+    side_effects: ["status REOPENED"]
+
+  # --- CostReport ---
+  - method: POST
+    path: "/storm-events/{id}/cost-reports"
+    description: "Generate an immutable cost-per-event snapshot for the chosen variant (ESTIMATE or ACTUAL)."
+    roles: [DispatchSupervisor]
+    code: 201
+    input: [variant]
+    output: CostReport
+    side_effects: ["totals computed per cost_per_event calc; generated_at stamped"]
+  - method: GET
+    path: "/storm-events/{id}/cost-reports"
+    description: "List cost-report snapshots of a storm (reverse-reachability for CostReport.storm_event_id)."
+    roles: [DispatchSupervisor, Operator, YardManager, CitizenServices]
+    code: 200
+    input: ["variant?", "limit?", "offset?"]
+    output: CostReport[]
+    side_effects: []
+
+  # --- Test-driving: logical clock ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock used for all *_at stamps and window math. Startup default is 2026-03-01T00:00:00Z; before any call the clock reads exactly this default and never falls back to wall-clock time."
+    roles: [DispatchSupervisor]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["logical clock set to the supplied instant"]
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing X-User-Role or X-User-ID header"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "acting role not permitted for this operation"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "entity_backed Operator acting on a resource it does not own"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "a referenced path id or body FK does not resolve"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "malformed body: missing required field, wrong type, or out-of-range number"
+  - id: ERR_INVALID_ENUM
+    http: 422
+    condition: "enum field carries a value outside its declared set"
+  - id: ERR_INVALID_WINDOW
+    http: 422
+    condition: "window_end_at <= window_start_at"
+  - id: ERR_STORM_NOT_ACTIVE
+    http: 409
+    condition: "operation requires operational_status ACTIVE (e.g. starting an assignment) but the storm is not ACTIVE"
+  - id: ERR_STORM_ALREADY_CLOSED
+    http: 409
+    condition: "activating or closing a storm whose operational_status is already CLOSED"
+  - id: ERR_STORM_NOT_CLOSED
+    http: 409
+    condition: "finalize-billing attempted while operational_status != CLOSED"
+  - id: ERR_BILLING_NOT_OPEN
+    http: 409
+    condition: "finalize-billing attempted while billing_status != OPEN"
+  - id: ERR_ASSIGNMENT_NOT_PLANNED
+    http: 409
+    condition: "start attempted on an assignment whose status != PLANNED"
+  - id: ERR_ASSIGNMENT_NOT_IN_PROGRESS
+    http: 409
+    condition: "application/avl/complete attempted on an assignment whose status != IN_PROGRESS"
+  - id: ERR_ROUTE_ALREADY_ACTIVE
+    http: 409
+    condition: "creating an assignment for a (storm,route) that already has an IN_PROGRESS assignment"
+  - id: ERR_APPLICATION_ALREADY_VOIDED
+    http: 409
+    condition: "voiding an application whose status is already VOIDED"
+  - id: ERR_CALLOUT_NOT_ISSUED
+    http: 409
+    condition: "completing a callout whose status != ISSUED"
+  - id: ERR_CALLOUT_NOT_CANCELLABLE
+    http: 409
+    condition: "cancelling a callout whose status is already CANCELLED"
+  - id: ERR_COMPLAINT_INVALID_STATE
+    http: 409
+    condition: "complaint transition attempted from a state that does not permit it"
+  - id: ERR_VEHICLE_OUT_OF_SERVICE
+    http: 422
+    condition: "assigning a vehicle whose status is OUT_OF_SERVICE"
+  - id: ERR_VEHICLE_MISSING_SPREADER
+    http: 422
+    condition: "assigning a vehicle without a spreader to a PLOWING assignment"
+  - id: ERR_OPERATOR_NOT_ON_CALL
+    http: 409
+    condition: "assigning an operator with no {ISSUED, COMPLETED} callout for this storm"
+  - id: ERR_VEHICLE_DOUBLE_BOOKED
+    http: 409
+    condition: "vehicle window overlaps another {PLANNED, IN_PROGRESS} assignment for the same vehicle"
+  - id: ERR_OPERATOR_REST_VIOLATION
+    http: 409
+    condition: "operator callout window is within OPERATOR_REST_BUFFER_HOURS of another {ISSUED, COMPLETED} callout"
+  - id: ERR_INSUFFICIENT_MATERIAL
+    http: 409
+    condition: "depot lacks the requested salt/brine for the application"
+  - id: ERR_STALE_STORM_VERSION
+    http: 412
+    condition: "expected_storm_event_version does not match the current StormEvent.version"
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: DispatchSupervisor
+    description: "Orchestrates storms: declares/activates/closes/finalizes storms, plans & drives assignments, issues callouts, voids applications, generates cost reports, sets the clock."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /routes"
+      - "POST /storm-events, activate, close, finalize-billing"
+      - "POST /storm-events/{id}/assignments; start; complete; cancel"
+      - "POST /material-applications/{id}/void"
+      - "POST /storm-events/{id}/callouts; POST /callouts/{id}/cancel"
+      - "POST /storm-events/{id}/cost-reports"
+      - "POST /_clock/set_current_utc"
+    shared_operations: ["all GET endpoints"]
+  - name: Operator
+    description: "Field driver; records material applications and AVL pings on OWN assignments and completes OWN callouts."
+    identity: "entity_backed:Operator"
+    exclusive_operations:
+      - "POST /assignments/{id}/applications (own)"
+      - "POST /assignments/{id}/avl-ping (own)"
+      - "POST /callouts/{id}/complete (own)"
+    shared_operations: ["all GET endpoints"]
+  - name: YardManager
+    description: "Manages fleet and roster: registers depots (with inventory), vehicles, and operators."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /depots"
+      - "POST /vehicles"
+      - "POST /operators"
+    shared_operations: ["all GET endpoints"]
+  - name: CitizenServices
+    description: "Owns the complaint lifecycle (file / investigate / resolve / reopen)."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /complaints; investigate; resolve; reopen"
+    shared_operations: ["all GET endpoints"]

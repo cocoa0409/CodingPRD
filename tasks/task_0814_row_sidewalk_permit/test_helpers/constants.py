@@ -1,0 +1,34 @@
+"""Domain thresholds — numeric constants from PRD calculations (§3.4, §3.8)."""
+
+# Occupancy fee (§3.4)
+ZONE_BASE_CENTS = {"RESIDENTIAL": 5000, "COMMERCIAL": 10000, "ARTERIAL": 20000}
+ZONE_DAILY_CENTS = {"RESIDENTIAL": 500, "COMMERCIAL": 1500, "ARTERIAL": 3000}
+ZONE_CAP_CENTS = {"RESIDENTIAL": 200000, "COMMERCIAL": 500000, "ARTERIAL": 1000000}
+AREA_FACTOR = {"SIDEWALK": 1.0, "LANE": 2.0, "FULL_ROAD": 3.5}
+
+# Total permit charge (§3.4)
+TCP_REVIEW_FEE_CENTS = 7500
+INSPECTION_FEE_CENTS = 4000
+SURCHARGE_PCT = 0.0725
+
+# Bond required (§3.3)
+BOND_FLOOR_CENTS = 50000
+BOND_MULTIPLIER = 2
+
+# Penalty assessment (§3.8)
+PENALTY_BASE_CENTS = 15000
+ESCALATION_PCT = 0.5
+PENALTY_MAX_CENTS = 100000
+PENALTY_REVOKE_THRESHOLD_CENTS = 37500
+
+# Utility-cut moratorium window (§3.1)
+MORATORIUM_YEARS = {"RESIDENTIAL": 2, "COMMERCIAL": 3, "ARTERIAL": 5}
+
+# Sidewalk obstruction clearance buffer (§3.6)
+SIDEWALK_BUFFER_DAYS = 3
+
+# Sidewalk span default clearance (§3.1)
+DEFAULT_ADA_MIN_CLEARANCE_FT = 4.0
+
+# Logical clock startup default (§2.10)
+CLOCK_STARTUP_DEFAULT = "2026-03-01T00:00:00Z"

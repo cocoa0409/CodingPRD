@@ -1,0 +1,38 @@
+"""Domain thresholds and constants from the registry PRD."""
+
+# Logical-clock default (server startup instant, per PRD 2.5).
+DEFAULT_CLOCK = "2026-03-01T00:00:00Z"
+
+# Registration fee tiers (PRD 3.1).
+LENDER_BASE_CENTS = 20000
+OWNER_BASE_CENTS = 10000
+ABANDONED_SURCHARGE_PCT = 0.5
+
+# Auto-suspension boundary (PRD 3.1).
+SUSPEND_THRESHOLD_CENTS = 100000
+
+# Fine accrual (PRD 3.5).
+DAILY_PENALTY_CENTS = 500
+TIER2_THRESHOLD_DAYS = 30
+MAX_MULTIPLE = 3
+
+# Lien interest (PRD 3.6).
+LIEN_INTEREST_BPS = 1000
+DAY_COUNT = 365
+
+# Fiscal thresholds.
+MIN_LIEN_CENTS = 25000
+DEMOLITION_MIN_VIOLATIONS = 3
+DEMOLITION_MIN_BALANCE_CENTS = 50000
+
+# Abatement buffer (PRD 3.7).
+ABATEMENT_BUFFER_HOURS = 24
+
+# Cost recovery (PRD 3.7).
+ADMIN_TIER1_CAP_CENTS = 100000
+ADMIN_TIER1_PCT = 0.15
+ADMIN_TIER2_PCT = 0.10
+INSPECTION_REIMB_CENTS = 5000
+
+# Registration term.
+REGISTRATION_TERM_DAYS = 365

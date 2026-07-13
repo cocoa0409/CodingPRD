@@ -1,0 +1,1382 @@
+scenario: "843. Street Sweeping & Posted-Restriction Schedule: route & sweep calendar, posted-restriction & signage, LPR/citation coordination, holiday/leaf-season suspension, complaint & missed-block, debris tonnage, equipment & shift, notification"
+domain_name: street-sweeping-schedule
+api_prefix: "/api"
+
+complexity_profile:
+  primary_archetype: temporal_windowing
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - cascading_side_effects
+    - scheduled_deferred_actions
+    - derived_field_reconciliation
+    - optimistic_concurrency
+  entity_topology: flat
+  # flat: peer entities linked by foreign keys; URLs are flat (/api/blocks/{id},
+  # /api/citations/{id}) with parent ids carried in request bodies / filters —
+  # no deep nesting of business resources in the path.
+  state_machine_shape: branching
+  # Citation and Complaint carry non-linear (branching / cyclic) machines on
+  # different entities; SweepEvent/Suspension/Shift are guarded pipelines.
+  relationship_patterns:
+    - one_to_many          # Route -> Block, Block -> SweepEvent/Citation
+    - self_referential     # SweepEvent.original_event_id -> SweepEvent (makeup)
+    - cross_aggregate      # SweepEvent.complete reads Shift/Equipment; Citation reads Block
+  role_model: segregation_of_duties
+  # The EnforcementOfficer who issued a Citation may not adjudicate its contest.
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 Entity-Relationship Table
+# =====================================================================
+entities:
+  - name: Route
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: Human-readable route name.
+      - name: zone_code
+        type: string
+        source: input
+        description: Operational zone this route belongs to (used for zone-scoped suspensions).
+      - name: sweep_weekday
+        type: enum
+        source: input
+        description: Day of week the route is swept.
+        constraints: "enum {MON, TUE, WED, THU, FRI, SAT, SUN}"
+      - name: sweep_ordinal
+        type: integer
+        source: input
+        description: Nth occurrence of sweep_weekday in the month; null means every week.
+        default: null
+        constraints: "null or 1..5"
+      - name: status
+        type: enum
+        source: input
+        description: Lifecycle flag; INACTIVE routes are retained for history.
+        default: ACTIVE
+        constraints: "enum {ACTIVE, INACTIVE}; set at creation"
+      - name: completed_block_count
+        type: integer
+        source: computed
+        description: "Derived counter: number of SweepEvents on this route's blocks currently in SWEPT. Incremented on complete, decremented on void. Reconciles to route_completed_block_count calculation."
+        default: 0
+
+  - name: Block
+    parent: null
+    common_fields: true
+    fields:
+      - name: route_id
+        type: string
+        source: input
+        description: "FK -> Route.id; the route this block belongs to."
+      - name: block_label
+        type: string
+        source: input
+        description: Street-segment label (e.g. "100-BLK MAIN ST").
+      - name: side
+        type: enum
+        source: input
+        description: Which side(s) of the street the restriction covers.
+        constraints: "enum {ODD, EVEN, BOTH}"
+      - name: restriction_start_local
+        type: string
+        source: input
+        description: Posted no-parking window start, local time-of-day HH:MM (compared as UTC time-of-day).
+        constraints: "HH:MM 24h"
+      - name: restriction_end_local
+        type: string
+        source: input
+        description: Posted no-parking window end, local time-of-day HH:MM. Window is half-open [start, end).
+        constraints: "HH:MM 24h; must be > restriction_start_local"
+      - name: linear_feet
+        type: integer
+        source: input
+        description: Curb length of the block in feet.
+        constraints: ">= 1"
+      - name: enforcement_enabled
+        type: boolean
+        source: input
+        description: Master switch for issuing citations on this block.
+        default: true
+      - name: sign_status
+        type: enum
+        source: system
+        description: Signage posting state. UNPOSTED at creation; POSTED after post-sign; VERIFIED after verify-sign.
+        default: UNPOSTED
+        constraints: "enum {UNPOSTED, POSTED, VERIFIED}"
+      - name: sign_posted_at
+        type: datetime
+        source: system
+        description: Logical-clock time the current sign was posted.
+        default: null
+      - name: sign_expires_at
+        type: datetime
+        source: input
+        description: Expiry timestamp supplied when the sign is posted.
+        default: null
+      - name: sign_enforceable
+        type: boolean
+        source: computed
+        description: "Derived: true iff sign_status == VERIFIED AND current_clock < sign_expires_at."
+        default: false
+      - name: pending_citation_cents
+        type: integer
+        source: computed
+        description: "Derived ledger: sum of amount_due_cents over this block's Citations whose status IN {ISSUED, CONTESTED}. See block_pending_citation_cents calculation."
+        default: 0
+
+  - name: Equipment
+    parent: null
+    common_fields: true
+    fields:
+      - name: unit_number
+        type: string
+        source: input
+        description: Fleet unit identifier (e.g. "SW-1").
+      - name: type
+        type: enum
+        source: input
+        description: Sweeper technology class.
+        constraints: "enum {MECHANICAL, REGENERATIVE_AIR, VACUUM}"
+      - name: hopper_capacity_lbs
+        type: integer
+        source: input
+        description: Maximum debris weight the hopper holds; caps a shift's total debris.
+        constraints: ">= 1"
+      - name: odometer_miles
+        type: integer
+        source: input
+        description: Current odometer reading.
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: AVAILABLE at creation; IN_SERVICE while a shift on this unit is IN_PROGRESS; back to AVAILABLE on shift close.
+        default: AVAILABLE
+        constraints: "enum {AVAILABLE, IN_SERVICE}"
+
+  - name: Shift
+    parent: null
+    common_fields: true
+    fields:
+      - name: equipment_id
+        type: string
+        source: input
+        description: "FK -> Equipment.id; the sweeper unit worked this shift."
+      - name: operator_name
+        type: string
+        source: input
+        description: Operator on duty.
+      - name: shift_date
+        type: string
+        source: input
+        description: Calendar date of the shift (YYYY-MM-DD).
+      - name: start_utc
+        type: datetime
+        source: input
+        description: Shift start timestamp (UTC).
+      - name: end_utc
+        type: datetime
+        source: input
+        description: Shift end timestamp (UTC); must be > start_utc.
+      - name: status
+        type: enum
+        source: system
+        description: PLANNED at creation; IN_PROGRESS after start; CLOSED after close.
+        default: PLANNED
+        constraints: "enum {PLANNED, IN_PROGRESS, CLOSED}"
+      - name: total_debris_lbs
+        type: integer
+        source: computed
+        description: "Derived gross weight: sum of debris_lbs over SweepEvents with this shift_id and status SWEPT. Incremented on complete, decremented on void. Used for the hopper-capacity check."
+        default: 0
+      - name: gross_tonnage
+        type: number
+        source: computed
+        description: "Derived: round_half_up(total_debris_lbs / LBS_PER_TON, 3). Counts every SWEPT event (including re-sweeps)."
+        default: 0
+      - name: net_tonnage
+        type: number
+        source: computed
+        description: "Derived: round_half_up(net_lbs / LBS_PER_TON, 3) where net_lbs de-duplicates to the latest SWEPT event per block. See shift_tonnage calculation."
+        default: 0
+
+  - name: SweepEvent
+    parent: null
+    common_fields: true
+    fields:
+      - name: block_id
+        type: string
+        source: input
+        description: "FK -> Block.id; the block scheduled to be swept."
+      - name: shift_id
+        type: string
+        source: system
+        description: "FK -> Shift.id; the shift that completed the sweep. Null until completion."
+        default: null
+      - name: original_event_id
+        type: string
+        source: system
+        description: "FK -> SweepEvent.id; for a makeup event, the missed event it replaces. Null for originals."
+        default: null
+      - name: scheduled_date
+        type: string
+        source: input
+        description: Calendar date the sweep is scheduled (YYYY-MM-DD).
+      - name: window_start_utc
+        type: datetime
+        source: input
+        description: Occupation window start on the block (UTC).
+      - name: window_end_utc
+        type: datetime
+        source: input
+        description: Occupation window end (UTC); must be > window_start_utc. Overlap interval is half-open [start, end).
+      - name: status
+        type: enum
+        source: system
+        description: Lifecycle of the scheduled sweep.
+        default: SCHEDULED
+        constraints: "enum {SCHEDULED, SWEPT, MISSED, SUSPENDED, VOIDED}"
+      - name: debris_lbs
+        type: integer
+        source: system
+        description: Debris weight recorded at completion. Null until SWEPT.
+        default: null
+      - name: completed_at
+        type: datetime
+        source: system
+        description: Logical-clock time the sweep was completed. Null until SWEPT.
+        default: null
+      - name: is_makeup
+        type: boolean
+        source: system
+        description: True when this event was auto-created to replace a MISSED event.
+        default: false
+      - name: notified_resident_count
+        type: integer
+        source: system
+        description: Number of residents notified for this event via the notify action.
+        default: 0
+
+  - name: Suspension
+    parent: null
+    common_fields: true
+    fields:
+      - name: reason
+        type: enum
+        source: input
+        description: Why sweeping is suspended.
+        constraints: "enum {HOLIDAY, LEAF_SEASON, WEATHER, OTHER}"
+      - name: scope
+        type: enum
+        source: input
+        description: SYSTEM suspends all routes; ROUTE suspends one route (route_id required).
+        constraints: "enum {SYSTEM, ROUTE}"
+      - name: route_id
+        type: string
+        source: input
+        description: "FK -> Route.id; required when scope == ROUTE, must be null when scope == SYSTEM."
+        default: null
+      - name: start_date
+        type: string
+        source: input
+        description: First suspended calendar date (YYYY-MM-DD, inclusive).
+      - name: end_date
+        type: string
+        source: input
+        description: Last suspended calendar date (YYYY-MM-DD, inclusive); must be >= start_date.
+      - name: status
+        type: enum
+        source: system
+        description: SCHEDULED at creation; ACTIVE after activate; LIFTED after lift.
+        default: SCHEDULED
+        constraints: "enum {SCHEDULED, ACTIVE, LIFTED}"
+      - name: suspended_event_count
+        type: integer
+        source: system
+        description: Number of SweepEvents moved to SUSPENDED by this suspension's activation.
+        default: 0
+
+  - name: Citation
+    parent: null
+    common_fields: true
+    fields:
+      - name: block_id
+        type: string
+        source: input
+        description: "FK -> Block.id; block where the plate was observed during the restriction window."
+      - name: sweep_event_id
+        type: string
+        source: input
+        description: "FK -> SweepEvent.id; the scheduled sweep the citation is tied to (optional). If set, suspending that event auto-dismisses this citation."
+        default: null
+      - name: plate
+        type: string
+        source: input
+        description: License plate read by the LPR unit.
+      - name: scanned_at_utc
+        type: datetime
+        source: input
+        description: LPR read timestamp; must fall in the block's half-open restriction window.
+      - name: issued_at
+        type: datetime
+        source: system
+        description: Logical-clock time the citation was issued (used to compute days_late).
+      - name: status
+        type: enum
+        source: system
+        description: Citation lifecycle.
+        default: ISSUED
+        constraints: "enum {ISSUED, CONTESTED, UPHELD, DISMISSED, PAID}"
+      - name: amount_due_cents
+        type: integer
+        source: computed
+        description: "Provisional fine pinned at issuance (days_late = 0). See citation_fine calculation, provisional variant."
+      - name: paid_amount_cents
+        type: integer
+        source: system
+        description: "Final fine computed at payment (days_late from issued_at to pay clock). See citation_fine final variant. Null until PAID."
+        default: null
+      - name: issuing_officer_id
+        type: string
+        source: system
+        description: X-User-ID of the EnforcementOfficer who issued the citation (segregation-of-duties key).
+      - name: adjudicator_id
+        type: string
+        source: system
+        description: X-User-ID of the officer who adjudicated the contest. Null until adjudicated.
+        default: null
+      - name: prior_upheld_count
+        type: integer
+        source: computed
+        description: "Derived at issuance: count of earlier Citations for the same plate with status IN {UPHELD, PAID}. Drives the repeat-offender multiplier."
+        default: 0
+      - name: days_late
+        type: integer
+        source: computed
+        description: "Whole days from issued_at to settlement clock; 0 while ISSUED/CONTESTED. Null until settled."
+        default: null
+
+  - name: Resident
+    parent: null
+    common_fields: true
+    fields:
+      - name: email
+        type: string
+        source: input
+        description: Contact email.
+      - name: full_name
+        type: string
+        source: input
+        description: Resident name.
+      - name: home_block_id
+        type: string
+        source: input
+        description: "FK -> Block.id; the block the resident lives on (targeted by notifications)."
+      - name: notify_opt_in
+        type: boolean
+        source: input
+        description: Whether the resident receives sweep notifications.
+        default: true
+
+  - name: Complaint
+    parent: null
+    common_fields: true
+    fields:
+      - name: resident_id
+        type: string
+        source: input
+        description: "FK -> Resident.id; the resident who filed the complaint (must equal X-User-ID)."
+      - name: block_id
+        type: string
+        source: input
+        description: "FK -> Block.id; the block the complaint concerns."
+      - name: category
+        type: enum
+        source: input
+        description: Complaint type.
+        constraints: "enum {MISSED_BLOCK, DEBRIS_LEFT, SIGN_DAMAGED, OTHER}"
+      - name: linked_sweep_event_id
+        type: string
+        source: input
+        description: "FK -> SweepEvent.id; optional sweep event the complaint references."
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: Complaint workflow state.
+        default: OPEN
+        constraints: "enum {OPEN, RESOLVED, REOPENED, REJECTED}"
+      - name: resolution_note
+        type: string
+        source: system
+        description: Free-text note recorded on resolve/reject.
+        default: null
+
+# =====================================================================
+# §1.2 State Machine Table
+# =====================================================================
+state_machines:
+  - entity: Block
+    initial_state: UNPOSTED        # sign_status dimension
+    terminal_states: []
+    transitions:
+      - from: UNPOSTED
+        to: POSTED
+        trigger: "POST /api/blocks/{id}/post-sign"
+        actor: SignageInspector
+        preconditions:
+          - "block exists"
+          - "expected_block_version == block.version (OCC)"
+        side_effects:
+          - "set sign_posted_at = current_clock, sign_expires_at = input.sign_expires_at"
+          - "set sign_status = POSTED (supersedes any prior sign)"
+          - "increments Block.version by 1"
+        note: "Re-posting from POSTED or VERIFIED is allowed and supersedes the prior sign."
+      - from: POSTED
+        to: POSTED
+        trigger: "POST /api/blocks/{id}/post-sign"
+        actor: SignageInspector
+        preconditions:
+          - "expected_block_version == block.version (OCC)"
+        side_effects:
+          - "supersede prior sign; refresh sign_posted_at / sign_expires_at"
+          - "increments Block.version by 1"
+      - from: VERIFIED
+        to: POSTED
+        trigger: "POST /api/blocks/{id}/post-sign"
+        actor: SignageInspector
+        preconditions:
+          - "expected_block_version == block.version (OCC)"
+        side_effects:
+          - "supersede prior sign; sign_status back to POSTED (re-verification required)"
+          - "increments Block.version by 1"
+      - from: POSTED
+        to: VERIFIED
+        trigger: "POST /api/blocks/{id}/verify-sign"
+        actor: SignageInspector
+        preconditions:
+          - "sign_status == POSTED"
+        side_effects:
+          - "set sign_status = VERIFIED (block now enforceable while clock < sign_expires_at)"
+
+  - entity: Equipment
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: IN_SERVICE
+        trigger: "POST /api/shifts/{id}/start (side effect on the shift's equipment)"
+        actor: RouteDispatcher
+        preconditions:
+          - "equipment.status == AVAILABLE"
+        side_effects:
+          - "set equipment.status = IN_SERVICE"
+      - from: IN_SERVICE
+        to: AVAILABLE
+        trigger: "POST /api/shifts/{id}/close (side effect on the shift's equipment)"
+        actor: RouteDispatcher
+        preconditions:
+          - "equipment.status == IN_SERVICE"
+        side_effects:
+          - "set equipment.status = AVAILABLE"
+
+  - entity: Shift
+    initial_state: PLANNED
+    terminal_states: [CLOSED]
+    transitions:
+      - from: PLANNED
+        to: IN_PROGRESS
+        trigger: "POST /api/shifts/{id}/start"
+        actor: RouteDispatcher
+        preconditions:
+          - "shift.status == PLANNED"
+          - "equipment.status == AVAILABLE"
+        side_effects:
+          - "set shift.status = IN_PROGRESS"
+          - "set equipment.status = IN_SERVICE"
+      - from: IN_PROGRESS
+        to: CLOSED
+        trigger: "POST /api/shifts/{id}/close"
+        actor: RouteDispatcher
+        preconditions:
+          - "shift.status == IN_PROGRESS"
+        side_effects:
+          - "set shift.status = CLOSED; finalize total_debris_lbs / gross_tonnage / net_tonnage"
+          - "set equipment.status = AVAILABLE"
+
+  - entity: SweepEvent
+    initial_state: SCHEDULED
+    terminal_states: [VOIDED]
+    transitions:
+      - from: SCHEDULED
+        to: SWEPT
+        trigger: "POST /api/sweep-events/{id}/complete"
+        actor: RouteDispatcher
+        preconditions:
+          - "event.status == SCHEDULED"
+          - "referenced shift exists AND shift.status == IN_PROGRESS (cross-entity)"
+          - "shift.total_debris_lbs + input.debris_lbs <= equipment.hopper_capacity_lbs (fiscal, strict >)"
+        side_effects:
+          - "set status = SWEPT, debris_lbs = input.debris_lbs, completed_at = current_clock, shift_id = input.shift_id"
+          - "Shift.total_debris_lbs += debris_lbs; recompute Shift.gross_tonnage / net_tonnage (bubble up)"
+          - "Route.completed_block_count += 1"
+      - from: SCHEDULED
+        to: MISSED
+        trigger: "POST /api/sweep-events/{id}/miss"
+        actor: RouteDispatcher
+        preconditions:
+          - "event.status == SCHEDULED"
+        side_effects:
+          - "set status = MISSED"
+          - "auto-create a makeup SweepEvent (is_makeup = true, original_event_id = this.id, same block_id, scheduled_date = current_clock date + MAKEUP_OFFSET_DAYS (MAKEUP_OFFSET_DAYS = 7 calendar days), status = SCHEDULED). The makeup event's window_start_utc / window_end_utc are the missed event's window shifted forward by the same MAKEUP_OFFSET_DAYS (7 days)."
+      - from: SCHEDULED
+        to: SUSPENDED
+        trigger: "system, cascaded from POST /api/suspensions/{id}/activate"
+        actor: system
+        preconditions:
+          - "event.status == SCHEDULED"
+          - "event.scheduled_date within [suspension.start_date, suspension.end_date] AND event in suspension scope"
+        side_effects:
+          - "set status = SUSPENDED"
+          - "for each Citation C with C.sweep_event_id == this.id AND C.status == ISSUED: transition C to DISMISSED (cascade hop 2)"
+      - from: SWEPT
+        to: VOIDED
+        trigger: "POST /api/sweep-events/{id}/void"
+        actor: RouteDispatcher
+        preconditions:
+          - "event.status == SWEPT"
+        side_effects:
+          - "set status = VOIDED"
+          - "Shift.total_debris_lbs -= debris_lbs; recompute gross_tonnage / net_tonnage"
+          - "Route.completed_block_count -= 1"
+
+  - entity: Suspension
+    initial_state: SCHEDULED
+    terminal_states: [LIFTED]
+    transitions:
+      - from: SCHEDULED
+        to: ACTIVE
+        trigger: "POST /api/suspensions/{id}/activate"
+        actor: PublicWorksAdmin
+        preconditions:
+          - "suspension.status == SCHEDULED"
+        side_effects:
+          - "for each SweepEvent E with status SCHEDULED, scheduled_date in [start_date, end_date], and (scope==SYSTEM OR E.block.route_id == route_id): transition E to SUSPENDED (cascade hop 1)"
+          - "set suspended_event_count = number of events suspended"
+          - "each suspended event dismisses its ISSUED citations (cascade hop 2 -> hop 3 = Block.pending_citation_cents recompute)"
+      - from: ACTIVE
+        to: LIFTED
+        trigger: "POST /api/suspensions/{id}/lift"
+        actor: PublicWorksAdmin
+        preconditions:
+          - "suspension.status == ACTIVE"
+        side_effects:
+          - "set status = LIFTED (suspended events are NOT auto-rescheduled; a dispatcher reschedules manually)"
+
+  - entity: Citation
+    initial_state: ISSUED
+    terminal_states: [DISMISSED, PAID]
+    transitions:
+      - from: ISSUED
+        to: CONTESTED
+        trigger: "POST /api/citations/{id}/contest"
+        actor: EnforcementOfficer
+        preconditions:
+          - "citation.status == ISSUED"
+        side_effects:
+          - "set status = CONTESTED (remains in pending-ledger set {ISSUED, CONTESTED}; pending_citation_cents unchanged)"
+      - from: CONTESTED
+        to: UPHELD
+        trigger: "POST /api/citations/{id}/adjudicate (decision=UPHOLD)"
+        actor: EnforcementOfficer
+        preconditions:
+          - "citation.status == CONTESTED"
+          - "X-User-ID != issuing_officer_id (segregation of duties)"
+        side_effects:
+          - "set status = UPHELD, adjudicator_id = X-User-ID"
+          - "Block.pending_citation_cents -= amount_due_cents (leaves the pending set)"
+      - from: CONTESTED
+        to: DISMISSED
+        trigger: "POST /api/citations/{id}/adjudicate (decision=DISMISS)"
+        actor: EnforcementOfficer
+        preconditions:
+          - "citation.status == CONTESTED"
+          - "X-User-ID != issuing_officer_id (segregation of duties)"
+        side_effects:
+          - "set status = DISMISSED, adjudicator_id = X-User-ID"
+          - "Block.pending_citation_cents -= amount_due_cents (compensates the issuance debit)"
+      - from: ISSUED
+        to: DISMISSED
+        trigger: "system, cascaded from a SweepEvent entering SUSPENDED"
+        actor: system
+        preconditions:
+          - "citation.status == ISSUED"
+          - "citation.sweep_event_id == the event being suspended"
+        side_effects:
+          - "set status = DISMISSED"
+          - "Block.pending_citation_cents -= amount_due_cents"
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /api/citations/{id}/pay"
+        actor: EnforcementOfficer
+        preconditions:
+          - "citation.status == ISSUED"
+        side_effects:
+          - "set days_late = whole days(current_clock - issued_at); paid_amount_cents = citation_fine final variant; status = PAID"
+          - "Block.pending_citation_cents -= amount_due_cents (provisional debit removed)"
+      - from: UPHELD
+        to: PAID
+        trigger: "POST /api/citations/{id}/pay"
+        actor: EnforcementOfficer
+        preconditions:
+          - "citation.status == UPHELD"
+        side_effects:
+          - "set days_late; paid_amount_cents = citation_fine final variant; status = PAID (already removed from pending on uphold)"
+
+  - entity: Complaint
+    initial_state: OPEN
+    terminal_states: [REJECTED]
+    transitions:
+      - from: OPEN
+        to: RESOLVED
+        trigger: "POST /api/complaints/{id}/resolve"
+        actor: RouteDispatcher
+        preconditions:
+          - "complaint.status == OPEN"
+        side_effects:
+          - "set status = RESOLVED, resolution_note = input.resolution_note"
+      - from: OPEN
+        to: REJECTED
+        trigger: "POST /api/complaints/{id}/reject"
+        actor: RouteDispatcher
+        preconditions:
+          - "complaint.status == OPEN"
+        side_effects:
+          - "set status = REJECTED, resolution_note = input.resolution_note"
+      - from: RESOLVED
+        to: REOPENED
+        trigger: "POST /api/complaints/{id}/reopen"
+        actor: Resident
+        preconditions:
+          - "complaint.status == RESOLVED"
+          - "X-User-ID == complaint.resident_id (owner)"
+        side_effects:
+          - "set status = REOPENED"
+      - from: REOPENED
+        to: RESOLVED
+        trigger: "POST /api/complaints/{id}/resolve"
+        actor: RouteDispatcher
+        preconditions:
+          - "complaint.status == REOPENED"
+        side_effects:
+          - "set status = RESOLVED, resolution_note = input.resolution_note"
+        note: "OPEN -> RESOLVED -> REOPENED -> RESOLVED forms the revision cycle."
+
+# =====================================================================
+# §1.2.1 Concurrency Rules
+# =====================================================================
+concurrency_rules:
+  - rule_id: sign-repost-stale-block
+    parent_entity: Block
+    write_endpoint: "POST /api/blocks/{id}/post-sign"
+    occ_field: "expected_block_version"
+    description: |
+      Posting a new sign against a Block whose version has advanced since the
+      client last observed it is rejected. A prior post-sign already superseded
+      the previous sign and bumped the block version, so a subsequent create
+      carrying the stale version is refused with a precondition failure.
+    error_id: ERR_STALE_BLOCK_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 Calculation Rules Table
+# =====================================================================
+calculations:
+  - name: citation_fine
+    trigger: "on POST /api/citations (provisional) and on POST /api/citations/{id}/pay (final)"
+    algorithm: tiered_pricing
+    formula: |
+      prior_upheld_count = count(Citation c2 where c2.plate == this.plate
+                                 AND c2.status IN {UPHELD, PAID}
+                                 AND c2.created_at < this.created_at)
+      repeat_multiplier =
+          1.0  if prior_upheld_count == 0
+          1.5  if 1 <= prior_upheld_count <= 2
+          2.0  if prior_upheld_count >= 3
+      late_fee_cents =
+          0     if days_late <= 0
+          1500  if 1  <= days_late <= 15
+          3000  if 16 <= days_late <= 30
+          5000  if days_late > 30
+      amount = min( round_half_up( (BASE_FINE_CENTS + late_fee_cents) * repeat_multiplier ),
+                    FINE_CAP_CENTS )
+    input_set: "prior_upheld_count counts the same plate's earlier citations in {UPHELD, PAID} only; ordered by created_at, self excluded."
+    constants:
+      BASE_FINE_CENTS: 6000
+      LATE_FEE_TIER_1_CENTS: 1500
+      LATE_FEE_TIER_2_CENTS: 3000
+      LATE_FEE_TIER_3_CENTS: 5000
+      FINE_CAP_CENTS: 20000
+    precision: "integer cents, round_half_up on the multiplier product before the cap"
+    variants:
+      - name: provisional
+        when: "at issuance (status becomes ISSUED); stored in amount_due_cents"
+        difference: "days_late is pinned to 0, so late_fee_cents = 0; only repeat_multiplier and BASE apply."
+      - name: final
+        when: "at payment (status becomes PAID); stored in paid_amount_cents"
+        difference: "days_late = whole days(pay_clock - issued_at); adds the applicable late-fee tier before the multiplier and cap."
+
+  - name: shift_tonnage
+    trigger: "recomputed on POST /api/sweep-events/{id}/complete and /void; finalized on POST /api/shifts/{id}/close"
+    algorithm: aggregation
+    formula: |
+      gross_lbs = sum(e.debris_lbs for e in SweepEvent
+                      where e.shift_id == shift.id AND e.status == SWEPT)
+      # net de-duplicates re-sweeps: one event per block, the latest by completed_at.
+      for each distinct block_id B in { e.block_id : e SWEPT on shift }:
+          winner(B) = the SWEPT event on B with the greatest completed_at;
+                      tie-break: greatest created_at
+      net_lbs = sum(winner(B).debris_lbs for B)
+      # ROUNDING ORDER IS PINNED: sum integer lbs FIRST, then divide, then round.
+      gross_tonnage = round_half_up(gross_lbs / LBS_PER_TON, 3)
+      net_tonnage   = round_half_up(net_lbs   / LBS_PER_TON, 3)
+    input_set: "only SweepEvents with status == SWEPT and matching shift_id; VOIDED/MISSED/SUSPENDED excluded."
+    constants:
+      LBS_PER_TON: 2000
+    precision: "tonnage to 3 decimals, round_half_up; total_debris_lbs = gross_lbs (integer)"
+    variants:
+      - name: gross
+        when: "capacity checks and total_debris_lbs / gross_tonnage"
+        difference: "counts every SWEPT event, including multiple sweeps of the same block."
+      - name: net
+        when: "net_tonnage reporting field"
+        difference: "counts only the latest SWEPT event per block, so re-sweeps are not double-counted."
+
+  - name: block_pending_citation_cents
+    trigger: "on citation issue/contest/adjudicate/pay/dismiss affecting a block"
+    algorithm: aggregation
+    formula: |
+      pending_citation_cents = sum(c.amount_due_cents for c in Citation
+                                   where c.block_id == block.id
+                                   AND c.status IN {ISSUED, CONTESTED})
+    input_set: "only citations on this block whose status IN {ISSUED, CONTESTED}; UPHELD/DISMISSED/PAID excluded."
+    constants: {}
+    precision: "integer cents; maintained incrementally (+= on issue, -= on leaving the set), reconciles to the sum above."
+
+  - name: route_completed_block_count
+    trigger: "on POST /api/sweep-events/{id}/complete (+1) and /void (-1)"
+    algorithm: aggregation
+    formula: |
+      completed_block_count = count(SweepEvent e
+                                    where e.block.route_id == route.id
+                                    AND e.status == SWEPT)
+    input_set: "SweepEvents on this route's blocks with status == SWEPT."
+    constants: {}
+    precision: "integer count; incremental +1/-1 reconciles to the count above."
+
+# =====================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =====================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and recognized"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this operation per §1.7"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: business_constraint
+    check: "request body has all required fields with valid types/enums; scope==ROUTE requires route_id (ERR_SUSPENSION_SCOPE_INVALID)"
+    error_id: ERR_VALIDATION
+    http_status: 422
+    applies_to: "all POST"
+  - priority: 4
+    category: existence
+    check: "path and body-referenced resources exist, validated left-to-right"
+    error_id: ERR_BLOCK_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints referencing an id"
+  - priority: 5
+    category: auth
+    check: "Resident acting on a Complaint owns it (X-User-ID == complaint.resident_id / body.resident_id)"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "POST /api/complaints, POST /api/complaints/{id}/reopen"
+  - priority: 6
+    category: state
+    check: "target resource is in a state that permits the transition (e.g. SweepEvent complete requires SCHEDULED; contest requires ISSUED)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 6
+    category: state
+    check: "SweepEvent complete: referenced Shift.status == IN_PROGRESS (cross-entity)"
+    error_id: ERR_SHIFT_NOT_IN_PROGRESS
+    http_status: 409
+    applies_to: "POST /api/sweep-events/{id}/complete"
+  - priority: 7
+    category: business_safety
+    check: "citation adjudicator X-User-ID != issuing_officer_id (segregation of duties)"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /api/citations/{id}/adjudicate"
+  - priority: 8
+    category: business_referential
+    check: "issuing a citation requires Block.sign_enforceable (sign_status == VERIFIED AND current_clock < sign_expires_at) AND enforcement_enabled"
+    error_id: ERR_SIGNAGE_NOT_ENFORCEABLE
+    http_status: 422
+    applies_to: "POST /api/citations"
+  - priority: 9
+    category: business_temporal
+    check: "no ACTIVE Suspension covering the block's route on the scanned date"
+    error_id: ERR_SWEEP_SUSPENDED
+    http_status: 409
+    applies_to: "POST /api/citations"
+  - priority: 10
+    category: business_temporal
+    check: "scanned_at_utc time-of-day within the block's half-open restriction window [restriction_start_local, restriction_end_local)"
+    error_id: ERR_OUTSIDE_RESTRICTION_WINDOW
+    http_status: 422
+    applies_to: "POST /api/citations"
+  - priority: 11
+    category: business_constraint
+    check: "new SweepEvent window [start,end) does not overlap another SweepEvent on the same block in {SCHEDULED, SWEPT}; adjacency (end==start) allowed"
+    error_id: ERR_SWEEP_OVERLAP
+    http_status: 409
+    applies_to: "POST /api/sweep-events"
+  - priority: 11
+    category: business_constraint
+    check: "new Shift [start,end] +/- SHIFT_BUFFER_MINUTES does not overlap another Shift on the same equipment; closed interval with 30-min buffer"
+    error_id: ERR_SHIFT_OVERLAP
+    http_status: 409
+    applies_to: "POST /api/shifts"
+  - priority: 12
+    category: business_fiscal
+    check: "on complete, shift.total_debris_lbs + debris_lbs <= equipment.hopper_capacity_lbs (strict > rejects)"
+    error_id: ERR_SHIFT_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /api/sweep-events/{id}/complete"
+  - priority: 13
+    category: business_constraint
+    check: "post-sign expected_block_version == block.version (OCC)"
+    error_id: ERR_STALE_BLOCK_VERSION
+    http_status: 412
+    applies_to: "POST /api/blocks/{id}/post-sign"
+
+# =====================================================================
+# §1.5 API Endpoint Table
+# =====================================================================
+endpoints:
+  # ---- Route ----
+  - method: POST
+    path: "/api/routes"
+    description: Create a sweeping route.
+    roles: [RouteDispatcher]
+    code: 201
+    input: [name, zone_code, sweep_weekday, "sweep_ordinal?", "status?"]
+    output: Route
+    side_effects: []
+  - method: GET
+    path: "/api/routes/{id}"
+    description: Fetch a route (includes completed_block_count).
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: []
+    output: Route
+    side_effects: []
+
+  # ---- Block ----
+  - method: POST
+    path: "/api/blocks"
+    description: Create a block on a route.
+    roles: [RouteDispatcher]
+    code: 201
+    input: [route_id, block_label, side, restriction_start_local, restriction_end_local, linear_feet, "enforcement_enabled?"]
+    output: Block
+    side_effects: []
+  - method: GET
+    path: "/api/blocks/{id}"
+    description: Fetch a block (includes sign_enforceable, pending_citation_cents).
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: []
+    output: Block
+    side_effects: []
+  - method: GET
+    path: "/api/blocks"
+    description: List blocks, optionally filtered by route.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: ["route_id?", "limit?", "offset?"]
+    output: Block[]
+    side_effects: []
+  - method: POST
+    path: "/api/blocks/{id}/post-sign"
+    description: Post (or re-post, superseding the prior) a restriction sign; OCC-guarded on block version.
+    roles: [SignageInspector]
+    code: 200
+    input: [expected_block_version, sign_expires_at]
+    output: Block
+    side_effects: ["set sign_status=POSTED", "supersede prior sign", "increments Block.version by 1"]
+  - method: POST
+    path: "/api/blocks/{id}/verify-sign"
+    description: Verify a posted sign, enabling enforcement.
+    roles: [SignageInspector]
+    code: 200
+    input: []
+    output: Block
+    side_effects: ["set sign_status=VERIFIED"]
+
+  # ---- Equipment ----
+  - method: POST
+    path: "/api/equipment"
+    description: Register a sweeper unit.
+    roles: [RouteDispatcher]
+    code: 201
+    input: [unit_number, type, hopper_capacity_lbs, "odometer_miles?"]
+    output: Equipment
+    side_effects: []
+  - method: GET
+    path: "/api/equipment/{id}"
+    description: Fetch a sweeper unit.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: []
+
+  # ---- Shift ----
+  - method: POST
+    path: "/api/shifts"
+    description: Schedule a shift on a sweeper unit (equipment overlap check w/ buffer).
+    roles: [RouteDispatcher]
+    code: 201
+    input: [equipment_id, operator_name, shift_date, start_utc, end_utc]
+    output: Shift
+    side_effects: []
+  - method: GET
+    path: "/api/shifts/{id}"
+    description: Fetch a shift (includes total_debris_lbs, gross_tonnage, net_tonnage).
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: []
+    output: Shift
+    side_effects: []
+  - method: GET
+    path: "/api/shifts"
+    description: List shifts, optionally filtered by equipment.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: ["equipment_id?", "limit?", "offset?"]
+    output: Shift[]
+    side_effects: []
+  - method: POST
+    path: "/api/shifts/{id}/start"
+    description: Start a shift (equipment -> IN_SERVICE).
+    roles: [RouteDispatcher]
+    code: 200
+    input: []
+    output: Shift
+    side_effects: ["shift.status=IN_PROGRESS", "equipment.status=IN_SERVICE"]
+  - method: POST
+    path: "/api/shifts/{id}/close"
+    description: Close a shift and finalize tonnage (equipment -> AVAILABLE).
+    roles: [RouteDispatcher]
+    code: 200
+    input: []
+    output: Shift
+    side_effects: ["shift.status=CLOSED", "finalize tonnage", "equipment.status=AVAILABLE"]
+
+  # ---- SweepEvent ----
+  - method: POST
+    path: "/api/sweep-events"
+    description: Schedule a sweep occurrence for a block (block overlap check).
+    roles: [RouteDispatcher]
+    code: 201
+    input: [block_id, scheduled_date, window_start_utc, window_end_utc]
+    output: SweepEvent
+    side_effects: []
+  - method: GET
+    path: "/api/sweep-events/{id}"
+    description: Fetch a sweep event.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: []
+    output: SweepEvent
+    side_effects: []
+  - method: GET
+    path: "/api/sweep-events"
+    description: List sweep events by block, shift, original event, or status.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: ["block_id?", "shift_id?", "original_event_id?", "status?", "limit?", "offset?"]
+    output: SweepEvent[]
+    side_effects: []
+  - method: POST
+    path: "/api/sweep-events/{id}/complete"
+    description: Record a completed sweep with debris weight against a running shift.
+    roles: [RouteDispatcher]
+    code: 200
+    input: [shift_id, debris_lbs]
+    output: SweepEvent
+    side_effects: ["status=SWEPT", "Shift.total_debris_lbs += debris_lbs", "recompute tonnage", "Route.completed_block_count += 1"]
+  - method: POST
+    path: "/api/sweep-events/{id}/miss"
+    description: Mark a sweep missed; auto-creates a makeup event.
+    roles: [RouteDispatcher]
+    code: 200
+    input: ["reason?"]
+    output: SweepEvent
+    side_effects: ["status=MISSED", "create makeup SweepEvent"]
+  - method: POST
+    path: "/api/sweep-events/{id}/void"
+    description: Void a completed sweep (data-entry correction); reverses debris and coverage.
+    roles: [RouteDispatcher]
+    code: 200
+    input: ["reason?"]
+    output: SweepEvent
+    side_effects: ["status=VOIDED", "Shift.total_debris_lbs -= debris_lbs", "Route.completed_block_count -= 1"]
+  - method: POST
+    path: "/api/sweep-events/{id}/notify"
+    description: Dispatch sweep notifications to opted-in residents on the block.
+    roles: [RouteDispatcher]
+    code: 200
+    input: ["channel?"]
+    output: SweepEvent
+    side_effects: ["notified_resident_count = count of opted-in residents on the block"]
+
+  # ---- Suspension ----
+  - method: POST
+    path: "/api/suspensions"
+    description: Create a holiday/leaf-season suspension window.
+    roles: [PublicWorksAdmin]
+    code: 201
+    input: [reason, scope, "route_id?", start_date, end_date]
+    output: Suspension
+    side_effects: []
+  - method: GET
+    path: "/api/suspensions/{id}"
+    description: Fetch a suspension.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: []
+    output: Suspension
+    side_effects: []
+  - method: GET
+    path: "/api/suspensions"
+    description: List suspensions by route or status.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: ["route_id?", "status?", "limit?", "offset?"]
+    output: Suspension[]
+    side_effects: []
+  - method: POST
+    path: "/api/suspensions/{id}/activate"
+    description: Activate a suspension; cascades to suspend scheduled sweeps and dismiss tied citations.
+    roles: [PublicWorksAdmin]
+    code: 200
+    input: []
+    output: Suspension
+    side_effects: ["cascade SweepEvent SCHEDULED->SUSPENDED", "cascade Citation ISSUED->DISMISSED", "set suspended_event_count"]
+  - method: POST
+    path: "/api/suspensions/{id}/lift"
+    description: Lift an active suspension.
+    roles: [PublicWorksAdmin]
+    code: 200
+    input: []
+    output: Suspension
+    side_effects: ["status=LIFTED"]
+
+  # ---- Citation ----
+  - method: POST
+    path: "/api/citations"
+    description: Issue an LPR citation for a plate observed during a restriction window.
+    roles: [EnforcementOfficer]
+    code: 201
+    input: [block_id, plate, scanned_at_utc, "sweep_event_id?"]
+    output: Citation
+    side_effects: ["status=ISSUED", "compute provisional amount_due_cents + prior_upheld_count", "Block.pending_citation_cents += amount_due_cents"]
+  - method: GET
+    path: "/api/citations/{id}"
+    description: Fetch a citation.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: []
+    output: Citation
+    side_effects: []
+  - method: GET
+    path: "/api/citations"
+    description: List citations by block, sweep event, plate, or status.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: ["block_id?", "sweep_event_id?", "plate?", "status?", "limit?", "offset?"]
+    output: Citation[]
+    side_effects: []
+  - method: POST
+    path: "/api/citations/{id}/contest"
+    description: Contest an issued citation.
+    roles: [EnforcementOfficer]
+    code: 200
+    input: ["reason?"]
+    output: Citation
+    side_effects: ["status=CONTESTED"]
+  - method: POST
+    path: "/api/citations/{id}/adjudicate"
+    description: Adjudicate a contested citation (uphold or dismiss); segregation of duties enforced.
+    roles: [EnforcementOfficer]
+    code: 200
+    input: [decision]
+    output: Citation
+    side_effects: ["status=UPHELD|DISMISSED", "set adjudicator_id", "Block.pending_citation_cents -= amount_due_cents"]
+  - method: POST
+    path: "/api/citations/{id}/pay"
+    description: Pay a citation; computes the final fine with any late-fee tier.
+    roles: [EnforcementOfficer]
+    code: 200
+    input: []
+    output: Citation
+    side_effects: ["compute days_late + paid_amount_cents (final)", "status=PAID", "Block.pending_citation_cents -= amount_due_cents"]
+
+  # ---- Resident ----
+  - method: POST
+    path: "/api/residents"
+    description: Register a resident on a block.
+    roles: [RouteDispatcher]
+    code: 201
+    input: [email, full_name, home_block_id, "notify_opt_in?"]
+    output: Resident
+    side_effects: []
+  - method: GET
+    path: "/api/residents/{id}"
+    description: Fetch a resident.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: []
+    output: Resident
+    side_effects: []
+  - method: GET
+    path: "/api/residents"
+    description: List residents, optionally filtered by home block.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: ["home_block_id?", "limit?", "offset?"]
+    output: Resident[]
+    side_effects: []
+
+  # ---- Complaint ----
+  - method: POST
+    path: "/api/complaints"
+    description: File a complaint (resident owner).
+    roles: [Resident]
+    code: 201
+    input: [resident_id, block_id, category, "linked_sweep_event_id?"]
+    output: Complaint
+    side_effects: ["status=OPEN"]
+  - method: GET
+    path: "/api/complaints/{id}"
+    description: Fetch a complaint.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: []
+    output: Complaint
+    side_effects: []
+  - method: GET
+    path: "/api/complaints"
+    description: List complaints by resident, block, or linked sweep event.
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer, Resident]
+    code: 200
+    input: ["resident_id?", "block_id?", "linked_sweep_event_id?", "status?", "limit?", "offset?"]
+    output: Complaint[]
+    side_effects: []
+  - method: POST
+    path: "/api/complaints/{id}/resolve"
+    description: Resolve an open or reopened complaint.
+    roles: [RouteDispatcher]
+    code: 200
+    input: ["resolution_note?"]
+    output: Complaint
+    side_effects: ["status=RESOLVED"]
+  - method: POST
+    path: "/api/complaints/{id}/reject"
+    description: Reject an open complaint.
+    roles: [RouteDispatcher]
+    code: 200
+    input: ["resolution_note?"]
+    output: Complaint
+    side_effects: ["status=REJECTED"]
+  - method: POST
+    path: "/api/complaints/{id}/reopen"
+    description: Reopen a resolved complaint (resident owner).
+    roles: [Resident]
+    code: 200
+    input: ["reason?"]
+    output: Complaint
+    side_effects: ["status=REOPENED"]
+
+  # ---- Test-driving ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the logical clock. Server startup default is 2026-03-01T00:00:00Z; before any call the clock reads exactly this default (never real wall-clock)."
+    roles: [PublicWorksAdmin, RouteDispatcher, SignageInspector, EnforcementOfficer]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["set logical clock to to_iso8601"]
+
+# =====================================================================
+# §1.6 Error Code Catalog
+# =====================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "Missing/unrecognized X-User-Role or X-User-ID."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "Acting role not permitted, or resident acting on a complaint it does not own."
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "Missing required field, bad type, or invalid enum value."
+  - id: ERR_SUSPENSION_SCOPE_INVALID
+    http: 422
+    condition: "scope==ROUTE without route_id, or scope==SYSTEM with a route_id."
+  - id: ERR_ROUTE_NOT_FOUND
+    http: 404
+    condition: "Referenced route id does not exist."
+  - id: ERR_BLOCK_NOT_FOUND
+    http: 404
+    condition: "Referenced block id does not exist."
+  - id: ERR_EQUIPMENT_NOT_FOUND
+    http: 404
+    condition: "Referenced equipment id does not exist."
+  - id: ERR_SHIFT_NOT_FOUND
+    http: 404
+    condition: "Referenced shift id does not exist."
+  - id: ERR_SWEEP_EVENT_NOT_FOUND
+    http: 404
+    condition: "Referenced sweep event id does not exist."
+  - id: ERR_SUSPENSION_NOT_FOUND
+    http: 404
+    condition: "Referenced suspension id does not exist."
+  - id: ERR_CITATION_NOT_FOUND
+    http: 404
+    condition: "Referenced citation id does not exist."
+  - id: ERR_RESIDENT_NOT_FOUND
+    http: 404
+    condition: "Referenced resident id does not exist."
+  - id: ERR_COMPLAINT_NOT_FOUND
+    http: 404
+    condition: "Referenced complaint id does not exist."
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Target resource is not in a state that permits the requested transition."
+  - id: ERR_SHIFT_NOT_IN_PROGRESS
+    http: 409
+    condition: "Completing a sweep against a shift not in IN_PROGRESS."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "Adjudicator X-User-ID equals the citation's issuing_officer_id."
+  - id: ERR_SIGNAGE_NOT_ENFORCEABLE
+    http: 422
+    condition: "Issuing a citation on a block whose sign is not VERIFIED/unexpired, or enforcement disabled."
+  - id: ERR_SWEEP_SUSPENDED
+    http: 409
+    condition: "Issuing a citation on a date covered by an ACTIVE suspension."
+  - id: ERR_OUTSIDE_RESTRICTION_WINDOW
+    http: 422
+    condition: "scanned_at_utc time-of-day outside the block's half-open restriction window."
+  - id: ERR_SWEEP_OVERLAP
+    http: 409
+    condition: "New sweep window overlaps an existing SCHEDULED/SWEPT event on the same block."
+  - id: ERR_SHIFT_OVERLAP
+    http: 409
+    condition: "New shift overlaps an existing shift on the same equipment within the buffer."
+  - id: ERR_SHIFT_CAPACITY_EXCEEDED
+    http: 409
+    condition: "Recorded debris would push shift total over the hopper capacity."
+  - id: ERR_STALE_BLOCK_VERSION
+    http: 412
+    condition: "post-sign expected_block_version does not match the current block version."
+
+# =====================================================================
+# §1.7 RBAC Matrix
+# =====================================================================
+roles:
+  - name: PublicWorksAdmin
+    description: "Manages holiday/leaf-season suspensions and their activation."
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/suspensions"
+      - "POST /api/suspensions/{id}/activate"
+      - "POST /api/suspensions/{id}/lift"
+    shared_operations:
+      - "all GET reads"
+      - "POST /_clock/set_current_utc"
+  - name: RouteDispatcher
+    description: "Owns routes, blocks, equipment, shifts, sweep calendar, and complaint disposition."
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/routes"
+      - "POST /api/blocks"
+      - "POST /api/equipment"
+      - "POST /api/shifts"
+      - "POST /api/shifts/{id}/start"
+      - "POST /api/shifts/{id}/close"
+      - "POST /api/sweep-events"
+      - "POST /api/sweep-events/{id}/complete"
+      - "POST /api/sweep-events/{id}/miss"
+      - "POST /api/sweep-events/{id}/void"
+      - "POST /api/sweep-events/{id}/notify"
+      - "POST /api/residents"
+      - "POST /api/complaints/{id}/resolve"
+      - "POST /api/complaints/{id}/reject"
+    shared_operations:
+      - "all GET reads"
+      - "POST /_clock/set_current_utc"
+  - name: SignageInspector
+    description: "Posts and verifies restriction signage."
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/blocks/{id}/post-sign"
+      - "POST /api/blocks/{id}/verify-sign"
+    shared_operations:
+      - "all GET reads"
+      - "POST /_clock/set_current_utc"
+  - name: EnforcementOfficer
+    description: "Coordinates LPR citations: issue, contest, adjudicate, pay."
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/citations"
+      - "POST /api/citations/{id}/contest"
+      - "POST /api/citations/{id}/adjudicate"
+      - "POST /api/citations/{id}/pay"
+    shared_operations:
+      - "all GET reads"
+      - "POST /_clock/set_current_utc"
+  - name: Resident
+    description: "Files and reopens complaints about their own block."
+    identity: "entity_backed:Resident"
+    exclusive_operations:
+      - "POST /api/complaints"
+      - "POST /api/complaints/{id}/reopen"
+    shared_operations:
+      - "all GET reads"

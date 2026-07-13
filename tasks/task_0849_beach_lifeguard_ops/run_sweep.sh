@@ -1,0 +1,17 @@
+#!/bin/bash
+TASK=/home/ubuntu/github/CodingPRD/tasks/task_0849_beach_lifeguard_ops
+rm -f $TASK/workspace/implementation/results.*.json
+# 4 waves of 2 concurrent rounds to avoid host self-saturation
+for wave in 1 2 3 4; do
+  for j in 1 2; do
+    i=$(( (wave-1)*2 + j ))
+    prd-bench-local-run \
+      --start-command "cd $TASK/workspace/implementation && bash start.sh" \
+      --test-dir       $TASK/test_suite \
+      --isolation      per-test-server \
+      --timeout        120 \
+      --test-timeout   30 \
+      --results-file   $TASK/workspace/implementation/results.${i}.json &
+  done
+  wait
+done
