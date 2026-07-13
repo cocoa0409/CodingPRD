@@ -1,0 +1,1155 @@
+scenario: "585. Final-Mile Big & Bulky Delivery (XPO/threshold white-glove style): order & route planning, delivery window & customer scheduling, threshold vs white-glove vs room-of-choice, assembly & haul-away/debris, two-person team & geo, damage/refusal & reattempt, signature/photo POD, capacity & dock"
+domain_name: final-mile-delivery
+api_prefix: /
+# Flat topology: multiple top-level collections (/depots, /docks, /delivery-teams,
+# /customers, /delivery-orders, /routes, ...) hang directly off the API root.
+
+complexity_profile:
+  primary_archetype: temporal_windowing
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - cascading_side_effects
+    - derived_field_reconciliation
+    - rate_threshold_triggers
+    - optimistic_concurrency
+  entity_topology: flat
+  # Peer entities linked by foreign keys (customer_id, team_id, order_id,
+  # route_id, dock_id) rather than a strict nested URL tree. Routes, windows,
+  # dock appointments, orders and teams are peers referenced by FK.
+  state_machine_shape: cyclic
+  # DeliveryOrder loops OUT_FOR_DELIVERY -> REFUSED_RETRY -> SCHEDULED ->
+  # ROUTED -> OUT_FOR_DELIVERY (reattempt loop); RouteStop forks PLANNED ->
+  # {COMPLETED, SKIPPED} with divergent capacity side-effects.
+  relationship_patterns:
+    - one_to_many        # Customer -> DeliveryOrder; Route -> RouteStop; Depot -> Dock/Team
+    - cross_aggregate    # RouteStop bridges Route x DeliveryOrder x DeliveryWindow across aggregates
+  role_model: peer_roles
+  # PlatformAdmin owns config entities; DispatchPlanner owns orders/routes;
+  # DockCoordinator owns docks/appointments; DeliveryLead records field POD;
+  # Customer confirms windows.
+  consistency_model: immediate
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Depot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Facility name" }
+      - { name: region_code, type: string, source: input, description: "Service region served by this depot (e.g., CA, NV)" }
+
+  - name: Dock
+    parent: null
+    common_fields: true
+    fields:
+      - { name: depot_id, type: string, source: input, description: "FK -> Depot.id; the depot this loading dock belongs to" }
+      - { name: dock_code, type: string, source: input, description: "Human dock label (e.g., D1)" }
+      - { name: slot_length_min, type: integer, source: input, default: 60, description: "Nominal appointment slot length in minutes (informational)" }
+      - { name: buffer_min, type: integer, source: input, default: 30, description: "Required clear-gap in minutes between two BOOKED appointments on this dock; drives ERR_DOCK_SLOT_CONFLICT geometry" }
+      - { name: status, type: enum, source: system, default: OPEN, description: "OPEN | CLOSED; CLOSED releases BOOKED appointments" }
+
+  - name: DeliveryTeam
+    parent: null
+    common_fields: true
+    fields:
+      - { name: depot_id, type: string, source: input, description: "FK -> Depot.id; home depot of the crew" }
+      - { name: team_name, type: string, source: input, description: "Crew name" }
+      - { name: lead_name, type: string, source: input, description: "Name of person 1, the crew lead (DeliveryLead identity)" }
+      - { name: member2_name, type: string, source: input, description: "Name of person 2 of the mandatory two-person crew" }
+      - { name: region_code, type: string, source: input, description: "Geo region this crew serves; must equal a customer's region_code to be scheduled" }
+      - { name: max_daily_stops, type: integer, source: input, description: "Capacity: maximum PLANNED+COMPLETED stops on one of this team's routes" }
+      - { name: max_daily_weight_lbs, type: integer, source: input, description: "Capacity: maximum committed weight (lbs) on one of this team's routes" }
+      - { name: max_daily_volume_cuft, type: integer, source: input, description: "Capacity: maximum committed volume (cuft) on one of this team's routes" }
+      - { name: white_glove_certified, type: boolean, source: input, default: false, description: "Whether the crew may deliver WHITE_GLOVE orders" }
+      - { name: assembly_certified, type: boolean, source: input, default: false, description: "Whether the crew may perform in-home assembly" }
+      - { name: status, type: enum, source: input, default: ACTIVE, description: "ACTIVE | OUT_OF_SERVICE; configuration flag, not a lifecycle" }
+      - { name: estimated_liability_points, type: integer, source: computed, default: 0, description: "Provisional damage exposure = sum over this team's DeliveryWindows in {RESERVED,CONFIRMED} whose order.service_level == WHITE_GLOVE of ceil(order.declared_value_cents / 100000)" }
+      - { name: settled_liability_points, type: integer, source: computed, default: 0, description: "Realized damage penalty = sum over DAMAGED DeliveryAttempts on this team's orders of {MAJOR:50, MINOR:20}" }
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Recipient name" }
+      - { name: address_line, type: string, source: input, description: "Delivery street address" }
+      - { name: region_code, type: string, source: input, description: "Geo region of the delivery address" }
+      - { name: geo_lat, type: number, source: input, description: "Latitude of delivery address" }
+      - { name: geo_lng, type: number, source: input, description: "Longitude of delivery address" }
+      - { name: outstanding_balance_cents, type: integer, source: computed, default: 0, description: "= sum of final_fee_cents over this customer's DeliveryOrders in status SETTLED; conserved money ledger" }
+
+  - name: DeliveryOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; recipient of this shipment" }
+      - { name: item_description, type: string, source: input, description: "Big & bulky item description" }
+      - { name: weight_lbs, type: number, source: input, description: "Item weight in lbs; must be > 0; drives weight surcharge tier and route weight capacity" }
+      - { name: volume_cuft, type: number, source: input, description: "Item volume in cubic feet; must be > 0; drives route volume capacity" }
+      - { name: declared_value_cents, type: integer, source: input, description: "Declared item value in cents; drives provisional team liability" }
+      - { name: service_level, type: enum, source: input, description: "THRESHOLD | ROOM_OF_CHOICE | WHITE_GLOVE (ordered level of service)" }
+      - { name: assembly_required, type: boolean, source: input, default: false, description: "Whether in-home assembly was ordered" }
+      - { name: haul_away_required, type: boolean, source: input, default: false, description: "Whether old-item haul-away/debris removal was ordered" }
+      - { name: stair_flights, type: integer, source: input, default: 0, description: "Number of stair flights to the room of choice; billed up to MAX_BILLABLE_FLIGHTS" }
+      - { name: status, type: enum, source: system, default: CREATED, description: "CREATED | SCHEDULED | ROUTED | OUT_FOR_DELIVERY | DELIVERED | REFUSED_RETRY | SETTLED | RETURNED | CANCELLED" }
+      - { name: reattempt_count, type: integer, source: computed, default: 0, description: "Number of failed DeliveryAttempts (REFUSED/CUSTOMER_UNAVAILABLE/DAMAGED) recorded so far" }
+      - { name: active_window_id, type: string, source: system, description: "Id of the current non-terminal DeliveryWindow (RESERVED/CONFIRMED); null when none" }
+      - { name: active_stop_id, type: string, source: system, description: "Id of the current PLANNED RouteStop; null when not routed" }
+      - { name: actual_placement_level, type: enum, source: system, description: "Placement level actually delivered (set from the DELIVERED attempt's placement); null until delivered" }
+      - { name: quoted_fee_cents, type: integer, source: computed, description: "Provisional fee computed at order creation (see calc order_fee_quote)" }
+      - { name: final_fee_cents, type: integer, source: computed, description: "Settled fee computed on DELIVERED (see calc order_fee_final); null until delivered" }
+
+  - name: DeliveryWindow
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> DeliveryOrder.id; the order this appointment window serves" }
+      - { name: team_id, type: string, source: input, description: "FK -> DeliveryTeam.id; the crew reserved for this window (occupies the team calendar)" }
+      - { name: service_date, type: string, source: input, description: "Delivery calendar date, YYYY-MM-DD" }
+      - { name: window_start_min, type: integer, source: input, description: "Window start, minutes-from-midnight [0,1440)" }
+      - { name: window_end_min, type: integer, source: input, description: "Window end, minutes-from-midnight; must be > window_start_min" }
+      - { name: status, type: enum, source: system, default: RESERVED, description: "RESERVED | CONFIRMED | RELEASED | COMPLETED" }
+
+  - name: Route
+    parent: null
+    common_fields: true
+    fields:
+      - { name: depot_id, type: string, source: input, description: "FK -> Depot.id; origin depot of this trip" }
+      - { name: team_id, type: string, source: input, description: "FK -> DeliveryTeam.id; crew running this route" }
+      - { name: service_date, type: string, source: input, description: "Calendar date of the trip, YYYY-MM-DD; must equal each stop's window service_date" }
+      - { name: status, type: enum, source: system, default: PLANNING, description: "PLANNING | DISPATCHED | CLOSED" }
+      - { name: dock_appointment_id, type: string, source: system, description: "Id of the current BOOKED DockAppointment for this route; null when none (back-link, cleared on release)" }
+      - { name: dock_ready, type: boolean, source: computed, default: false, description: "= (dock_appointment_id != null AND that appointment.status == BOOKED)" }
+      - { name: committed_stops, type: integer, source: computed, default: 0, description: "= count of this route's RouteStops in {PLANNED, COMPLETED}" }
+      - { name: committed_weight_lbs, type: number, source: computed, default: 0, description: "= sum of order.weight_lbs over this route's RouteStops in {PLANNED, COMPLETED}" }
+      - { name: committed_volume_cuft, type: number, source: computed, default: 0, description: "= sum of order.volume_cuft over this route's RouteStops in {PLANNED, COMPLETED}" }
+      - { name: route_settlement_cents, type: integer, source: computed, description: "Team payout computed on CLOSE (see calc route_settlement); null until CLOSED" }
+
+  - name: RouteStop
+    parent: Route
+    common_fields: true
+    fields:
+      - { name: route_id, type: string, source: input, description: "FK -> Route.id; the route this stop is on" }
+      - { name: order_id, type: string, source: input, description: "FK -> DeliveryOrder.id; the order delivered at this stop" }
+      - { name: window_id, type: string, source: input, description: "FK -> DeliveryWindow.id; the confirmed/reserved window this stop realizes" }
+      - { name: sequence, type: integer, source: input, default: 0, description: "Planner-set visiting order on the route (cosmetic; does not affect settlement)" }
+      - { name: status, type: enum, source: system, default: PLANNED, description: "PLANNED | COMPLETED | SKIPPED" }
+
+  - name: DockAppointment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: dock_id, type: string, source: input, description: "FK -> Dock.id; the dock reserved for loading" }
+      - { name: route_id, type: string, source: input, description: "FK -> Route.id; the route being loaded" }
+      - { name: appt_date, type: string, source: input, description: "Loading date, YYYY-MM-DD" }
+      - { name: appt_start_min, type: integer, source: input, description: "Appointment start, minutes-from-midnight" }
+      - { name: appt_end_min, type: integer, source: input, description: "Appointment end, minutes-from-midnight; must be > appt_start_min" }
+      - { name: status, type: enum, source: system, default: BOOKED, description: "BOOKED | RELEASED | COMPLETED" }
+
+  - name: DeliveryAttempt
+    parent: null
+    common_fields: false
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> DeliveryOrder.id; order this attempt was made against" }
+      - { name: stop_id, type: string, source: input, description: "FK -> RouteStop.id; the route stop this attempt realizes" }
+      - { name: attempt_number, type: integer, source: system, description: "1-based ordinal of this attempt for the order (= prior attempts + 1)" }
+      - { name: outcome, type: enum, source: input, description: "DELIVERED | REFUSED | CUSTOMER_UNAVAILABLE | DAMAGED" }
+      - { name: refusal_reason, type: string, source: input, description: "Free-text reason for a REFUSED/CUSTOMER_UNAVAILABLE/DAMAGED outcome; optional" }
+      - { name: damage_severity, type: enum, source: input, default: NONE, description: "NONE | MINOR | MAJOR; nonzero only meaningful for DAMAGED" }
+      - { name: placement, type: enum, source: input, description: "THRESHOLD | ROOM_OF_CHOICE | WHITE_GLOVE; actual placement achieved on a DELIVERED attempt (may downgrade the ordered level)" }
+      - { name: signature_captured, type: boolean, source: input, default: false, description: "Whether the customer signature POD was captured" }
+      - { name: photo_count, type: integer, source: input, default: 0, description: "Number of POD photos captured" }
+      - { name: assembly_completed, type: boolean, source: input, default: false, description: "Whether in-home assembly was actually completed" }
+      - { name: debris_weight_lbs, type: number, source: input, default: 0, description: "Weight (lbs) of haul-away debris removed on this attempt; drives actual disposal fee" }
+      - { name: fee_delta_cents, type: integer, source: computed, default: 0, description: "Contribution of this attempt to the order's final fee (reattempt fee for failures; disposal + reattempt attribution on the delivering attempt)" }
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: DeliveryOrder
+    initial_state: CREATED
+    terminal_states: [SETTLED, RETURNED, CANCELLED]
+    transitions:
+      - from: CREATED
+        to: SCHEDULED
+        trigger: "POST /delivery-orders/{orderId}/windows"
+        actor: DispatchPlanner
+        preconditions:
+          - "order.status == CREATED (ERR_INVALID_STATE)"
+          - "expected_order_version matches order.version (ERR_STALE_VERSION)"
+          - "team exists and team.status == ACTIVE (ERR_TEAM_OUT_OF_SERVICE)"
+          - "team.region_code == customer.region_code (ERR_REGION_MISMATCH)"
+          - "if order.service_level==WHITE_GLOVE then team.white_glove_certified; if order.assembly_required then team.assembly_certified (ERR_TEAM_NOT_CERTIFIED)"
+          - "window_end_min > window_start_min (ERR_INVALID_WINDOW)"
+          - "no team DeliveryWindow in {RESERVED,CONFIRMED} on same service_date whose [window_start_min,window_end_min) overlaps (ERR_TEAM_WINDOW_CONFLICT)"
+        side_effects:
+          - "create DeliveryWindow (status RESERVED); set order.active_window_id"
+          - "order.status -> SCHEDULED"
+          - "increments DeliveryOrder.version by 1"
+          - "recompute team.estimated_liability_points"
+      - from: REFUSED_RETRY
+        to: SCHEDULED
+        trigger: "POST /delivery-orders/{orderId}/windows"
+        actor: DispatchPlanner
+        preconditions:
+          - "order.status == REFUSED_RETRY (ERR_INVALID_STATE)"
+          - "expected_order_version matches order.version (ERR_STALE_VERSION)"
+          - "order.reattempt_count < MAX_REATTEMPTS (ERR_MAX_REATTEMPTS)"
+          - "team ACTIVE / region match / certification / window structure / team-calendar overlap (same checks as CREATED->SCHEDULED)"
+        side_effects:
+          - "create new DeliveryWindow (RESERVED); set order.active_window_id"
+          - "order.status -> SCHEDULED"
+          - "increments DeliveryOrder.version by 1"
+        note: "Cyclic reattempt loop re-entry after a failed attempt."
+      - from: SCHEDULED
+        to: SCHEDULED
+        trigger: "POST /delivery-orders/{orderId}/windows"
+        actor: DispatchPlanner
+        preconditions:
+          - "order.status == SCHEDULED (ERR_INVALID_STATE)"
+          - "expected_order_version matches order.version (ERR_STALE_VERSION)"
+          - "order.active_stop_id is null (order not yet ROUTED)"
+        side_effects:
+          - "prior active DeliveryWindow.status -> RELEASED (superseded)"
+          - "create new DeliveryWindow (RESERVED); set order.active_window_id"
+          - "increments DeliveryOrder.version by 1"
+          - "recompute team.estimated_liability_points"
+        note: "CREATE-with-supersede self-loop; the OCC race guarded by expected_order_version (see 1.2.1)."
+      - from: SCHEDULED
+        to: ROUTED
+        trigger: "POST /routes/{routeId}/stops"
+        actor: DispatchPlanner
+        preconditions:
+          - "order.status == SCHEDULED (ERR_INVALID_STATE)"
+          - "order.active_stop_id is null (ERR_ORDER_ALREADY_ROUTED)"
+          - "window_id refers to order.active_window_id and window.team_id == route.team_id (ERR_ROUTE_TEAM_MISMATCH)"
+          - "window.service_date == route.service_date (ERR_WINDOW_ROUTE_DATE_MISMATCH)"
+          - "route.status == PLANNING (ERR_INVALID_STATE)"
+          - "committed_stops + 1 <= team.max_daily_stops (ERR_ROUTE_STOPS_EXCEEDED)"
+          - "committed_weight_lbs + order.weight_lbs <= team.max_daily_weight_lbs (ERR_ROUTE_WEIGHT_EXCEEDED)"
+          - "committed_volume_cuft + order.volume_cuft <= team.max_daily_volume_cuft (ERR_ROUTE_VOLUME_EXCEEDED)"
+        side_effects:
+          - "create RouteStop (PLANNED); set order.active_stop_id"
+          - "order.status -> ROUTED"
+          - "recompute route.committed_stops / committed_weight_lbs / committed_volume_cuft"
+      - from: ROUTED
+        to: OUT_FOR_DELIVERY
+        trigger: "POST /routes/{routeId}/dispatch (cascade to each ROUTED order on the route)"
+        actor: DispatchPlanner
+        preconditions:
+          - "route.status == PLANNING (ERR_INVALID_STATE)"
+          - "route.dock_ready == true, i.e., a BOOKED DockAppointment exists (ERR_DOCK_APPOINTMENT_MISSING)"
+        side_effects:
+          - "order.status -> OUT_FOR_DELIVERY for each PLANNED stop's order"
+      - from: OUT_FOR_DELIVERY
+        to: DELIVERED
+        trigger: "POST /delivery-orders/{orderId}/attempts (outcome=DELIVERED)"
+        actor: DeliveryLead
+        preconditions:
+          - "order.status == OUT_FOR_DELIVERY (ERR_INVALID_STATE)"
+          - "acting DeliveryLead's team_id == route.team_id of order.active_stop_id (ERR_STOP_ORDER_MISMATCH)"
+          - "if placement==WHITE_GLOVE then team.white_glove_certified; if assembly_completed then team.assembly_certified (ERR_TEAM_NOT_CERTIFIED)"
+          - "signature_captured == true AND photo_count >= 1 (ERR_POD_REQUIRED)"
+        side_effects:
+          - "create DeliveryAttempt (attempt_number = reattempt_count + 1)"
+          - "order.active_stop_id RouteStop.status -> COMPLETED"
+          - "order.actual_placement_level = placement (defaults to order.service_level when omitted)"
+          - "compute order.final_fee_cents (calc order_fee_final)"
+          - "order.status -> DELIVERED; active DeliveryWindow.status -> COMPLETED; clear order.active_window_id and order.active_stop_id"
+      - from: OUT_FOR_DELIVERY
+        to: REFUSED_RETRY
+        trigger: "POST /delivery-orders/{orderId}/attempts (outcome in {REFUSED,CUSTOMER_UNAVAILABLE,DAMAGED})"
+        actor: DeliveryLead
+        preconditions:
+          - "order.status == OUT_FOR_DELIVERY (ERR_INVALID_STATE)"
+          - "acting DeliveryLead's team_id == route.team_id of order.active_stop_id (ERR_STOP_ORDER_MISMATCH)"
+        side_effects:
+          - "create DeliveryAttempt (attempt_number = reattempt_count + 1)"
+          - "order.reattempt_count += 1"
+          - "order.active_stop_id RouteStop.status -> SKIPPED  (hop2 of refusal cascade)"
+          - "recompute route.committed_stops / committed_weight_lbs / committed_volume_cuft (hop3: capacity released)"
+          - "active DeliveryWindow.status -> RELEASED; clear order.active_window_id and order.active_stop_id"
+          - "if outcome==DAMAGED: team.settled_liability_points += {MAJOR:50, MINOR:20}[damage_severity]"
+          - "order.status -> REFUSED_RETRY"
+        note: "Depth-3 transitive cascade origin: attempt -> order -> stop -> route load."
+      - from: DELIVERED
+        to: SETTLED
+        trigger: "POST /delivery-orders/{orderId}/settle"
+        actor: DispatchPlanner
+        preconditions:
+          - "order.status == DELIVERED (ERR_INVALID_STATE)"
+        side_effects:
+          - "order.status -> SETTLED"
+          - "customer.outstanding_balance_cents += order.final_fee_cents (forward money leg)"
+      - from: SETTLED
+        to: RETURNED
+        trigger: "POST /delivery-orders/{orderId}/void-delivery"
+        actor: DispatchPlanner
+        preconditions:
+          - "order.status == SETTLED (ERR_INVALID_STATE)"
+        side_effects:
+          - "order.status -> RETURNED"
+          - "customer.outstanding_balance_cents -= order.final_fee_cents (compensating money leg; net zero)"
+      - from: CREATED
+        to: CANCELLED
+        trigger: "POST /delivery-orders/{orderId}/cancel"
+        actor: DispatchPlanner
+        preconditions:
+          - "order.status in {CREATED, SCHEDULED, REFUSED_RETRY} (ERR_INVALID_STATE)"
+        side_effects:
+          - "any active DeliveryWindow.status -> RELEASED; clear order.active_window_id"
+          - "order.status -> CANCELLED"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /delivery-orders/{orderId}/cancel"
+        actor: DispatchPlanner
+        preconditions:
+          - "order.status in {CREATED, SCHEDULED, REFUSED_RETRY} (ERR_INVALID_STATE)"
+        side_effects:
+          - "any active DeliveryWindow.status -> RELEASED; clear order.active_window_id"
+          - "order.status -> CANCELLED"
+
+  - entity: RouteStop
+    initial_state: PLANNED
+    terminal_states: [COMPLETED, SKIPPED]
+    transitions:
+      - from: PLANNED
+        to: COMPLETED
+        trigger: "system: order DELIVERED attempt"
+        actor: system
+        preconditions:
+          - "parent order transitions OUT_FOR_DELIVERY -> DELIVERED"
+        side_effects:
+          - "stop remains counted in route committed_* (COMPLETED still occupies capacity)"
+        note: "Fork branch A: capacity retained."
+      - from: PLANNED
+        to: SKIPPED
+        trigger: "system: order failed attempt; or POST /routes/{routeId}/stops/{stopId}/remove"
+        actor: system
+        preconditions:
+          - "parent order failed delivery, OR planner un-routes before dispatch (route.status == PLANNING)"
+        side_effects:
+          - "recompute route.committed_stops / committed_weight_lbs / committed_volume_cuft (capacity released)"
+        note: "Fork branch B: capacity released — divergent side-effect set from COMPLETED."
+
+  - entity: Route
+    initial_state: PLANNING
+    terminal_states: [CLOSED]
+    transitions:
+      - from: PLANNING
+        to: DISPATCHED
+        trigger: "POST /routes/{routeId}/dispatch"
+        actor: DispatchPlanner
+        preconditions:
+          - "route.status == PLANNING (ERR_INVALID_STATE)"
+          - "route.committed_stops >= 1"
+          - "route.dock_ready == true (ERR_DOCK_APPOINTMENT_MISSING)"
+        side_effects:
+          - "each PLANNED stop's order.status -> OUT_FOR_DELIVERY"
+      - from: DISPATCHED
+        to: CLOSED
+        trigger: "POST /routes/{routeId}/close"
+        actor: DispatchPlanner
+        preconditions:
+          - "route.status == DISPATCHED (ERR_INVALID_STATE)"
+          - "every RouteStop of the route is in {COMPLETED, SKIPPED} (ERR_ROUTE_NOT_READY_TO_CLOSE)"
+        side_effects:
+          - "compute route.route_settlement_cents (calc route_settlement)"
+
+  - entity: DeliveryWindow
+    initial_state: RESERVED
+    terminal_states: [RELEASED, COMPLETED]
+    transitions:
+      - from: RESERVED
+        to: CONFIRMED
+        trigger: "POST /delivery-windows/{windowId}/confirm"
+        actor: Customer
+        preconditions:
+          - "window.status == RESERVED (ERR_INVALID_STATE)"
+          - "acting Customer.id == order.customer_id of window.order_id (ERR_NOT_RESOURCE_OWNER)"
+          - "order.status == SCHEDULED (ERR_INVALID_STATE)"
+        side_effects:
+          - "window.status -> CONFIRMED"
+      - from: RESERVED
+        to: RELEASED
+        trigger: "system: order re-reserves window, cancels, or is refused"
+        actor: system
+        preconditions: ["parent order supersedes or leaves the scheduling loop"]
+        side_effects: ["window.status -> RELEASED; recompute team.estimated_liability_points"]
+      - from: CONFIRMED
+        to: RELEASED
+        trigger: "system: order refused/cancelled"
+        actor: system
+        preconditions: ["parent order leaves the scheduling loop"]
+        side_effects: ["window.status -> RELEASED; recompute team.estimated_liability_points"]
+      - from: CONFIRMED
+        to: COMPLETED
+        trigger: "system: order DELIVERED"
+        actor: system
+        preconditions: ["parent order OUT_FOR_DELIVERY -> DELIVERED"]
+        side_effects: ["window.status -> COMPLETED"]
+      - from: RESERVED
+        to: COMPLETED
+        trigger: "system: order DELIVERED without explicit confirm"
+        actor: system
+        preconditions: ["parent order OUT_FOR_DELIVERY -> DELIVERED"]
+        side_effects: ["window.status -> COMPLETED"]
+
+  - entity: DockAppointment
+    initial_state: BOOKED
+    terminal_states: [RELEASED, COMPLETED]
+    transitions:
+      - from: BOOKED
+        to: RELEASED
+        trigger: "system: POST /docks/{dockId}/close releases the dock's BOOKED appointments"
+        actor: system
+        preconditions: ["dock.status transitions OPEN -> CLOSED"]
+        side_effects:
+          - "appointment.status -> RELEASED  (hop1 of dock-close cascade)"
+          - "owning route.dock_appointment_id -> null; route.dock_ready -> false  (hop2)"
+        note: "Depth-2 transitive cascade origin: dock -> appointment -> route."
+      - from: BOOKED
+        to: COMPLETED
+        trigger: "system: owning route CLOSED"
+        actor: system
+        preconditions: ["route.status DISPATCHED -> CLOSED"]
+        side_effects: ["appointment.status -> COMPLETED"]
+
+  - entity: Dock
+    initial_state: OPEN
+    terminal_states: []
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /docks/{dockId}/close"
+        actor: DockCoordinator
+        preconditions:
+          - "dock.status == OPEN (ERR_INVALID_STATE)"
+        side_effects:
+          - "every BOOKED DockAppointment on this dock -> RELEASED (cascade hop1)"
+          - "each such appointment's route.dock_appointment_id -> null, route.dock_ready -> false (cascade hop2)"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: window-reserve-stale-order
+    parent_entity: DeliveryOrder
+    write_endpoint: "POST /delivery-orders/{orderId}/windows"
+    occ_field: "expected_order_version"
+    description: |
+      Reserving a DeliveryWindow against a DeliveryOrder whose version has
+      advanced since the client last observed it is rejected. A window
+      reservation on a SCHEDULED order legitimately supersedes the prior
+      RESERVED window (RELEASED it); a second reservation still carrying the
+      pre-supersede version is therefore acting on a stale view of the order
+      and is rejected on the version mismatch.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: order_fee_quote
+    trigger: "POST /delivery-orders (order creation)"
+    algorithm: tiered_pricing
+    formula: |
+      base = SERVICE_BASE_CENTS[service_level]
+      wsur = weight_surcharge_cents(weight_lbs)   # tiered, see constants
+      wg_mult = 1.15 if service_level == WHITE_GLOVE else 1.00
+      core = round_half_up((base + wsur) * wg_mult)           # multiply-then-round FIRST
+      stair = min(stair_flights, MAX_BILLABLE_FLIGHTS) * PER_FLIGHT_CENTS
+      quoted_fee_cents = core
+                       + stair
+                       + (ASSEMBLY_FEE_CENTS if assembly_required else 0)
+                       + (HAUL_AWAY_FLAT_CENTS if haul_away_required else 0)
+    input_set: "the single DeliveryOrder being created; ordered service_level and flags"
+    constants:
+      SERVICE_BASE_CENTS: { THRESHOLD: 4000, ROOM_OF_CHOICE: 7000, WHITE_GLOVE: 12000 }
+      WEIGHT_TIERS_CENTS: "weight_lbs<=75 -> 0; 76..150 -> 1500; 151..300 -> 3500; >300 -> 6000"
+      PER_FLIGHT_CENTS: 800
+      MAX_BILLABLE_FLIGHTS: 5
+      ASSEMBLY_FEE_CENTS: 2500
+      HAUL_AWAY_FLAT_CENTS: 3000
+      WG_MULTIPLIER: 1.15
+    precision: "integer cents; round_half_up applied ONCE to (base+wsur)*wg_mult before adding flat surcharges"
+    variants:
+      - name: quoted
+        when: "at order creation, using ORDERED service_level and a FLAT haul-away estimate"
+        difference: "uses SERVICE_BASE[service_level], assumes assembly performed, HAUL_AWAY_FLAT_CENTS, and no reattempt fees"
+
+  - name: order_fee_final
+    trigger: "OUT_FOR_DELIVERY -> DELIVERED transition (POST /delivery-orders/{orderId}/attempts, outcome=DELIVERED)"
+    algorithm: tiered_pricing
+    formula: |
+      plevel = attempt.placement or order.service_level      # ACTUAL placement (may be a downgrade)
+      wsur = weight_surcharge_cents(order.weight_lbs)
+      wg_mult = 1.15 if plevel == WHITE_GLOVE else 1.00
+      core = round_half_up((SERVICE_BASE_CENTS[plevel] + wsur) * wg_mult)
+      stair = min(order.stair_flights, MAX_BILLABLE_FLIGHTS) * PER_FLIGHT_CENTS
+      assembly = ASSEMBLY_FEE_CENTS if attempt.assembly_completed else 0
+      disposal = (ceil(attempt.debris_weight_lbs / DISPOSAL_UNIT_LBS) * DISPOSAL_PER_UNIT_CENTS)
+                 if attempt.debris_weight_lbs > 0 else 0     # per-ticket rounding, then summed
+      reattempt = REATTEMPT_FEE_CENTS * order.reattempt_count  # count of prior FAILED attempts
+      final_fee_cents = core + stair + assembly + disposal + reattempt
+    input_set: "the delivering DeliveryOrder, its reattempt_count, and the DELIVERED DeliveryAttempt"
+    constants:
+      DISPOSAL_UNIT_LBS: 50
+      DISPOSAL_PER_UNIT_CENTS: 1000
+      REATTEMPT_FEE_CENTS: 2000
+    precision: "integer cents; disposal uses ceil per unit; core round_half_up once"
+    variants:
+      - name: final
+        when: "at DELIVERED, using ACTUAL placement, ACTUAL debris disposal, and accrued reattempt fees"
+        difference: "vs quoted: uses actual placement base (downgrade credit), replaces the flat haul-away with actual per-ticket disposal, bills ASSEMBLY only if assembly_completed, and adds REATTEMPT_FEE_CENTS per prior failed attempt"
+
+  - name: route_load_reconciliation
+    trigger: "RouteStop create/remove and PLANNED->{COMPLETED,SKIPPED} transitions"
+    algorithm: aggregation
+    formula: |
+      stops_in = [s for s in route.stops if s.status in {PLANNED, COMPLETED}]
+      committed_stops       = count(stops_in)
+      committed_weight_lbs  = sum(order(s).weight_lbs for s in stops_in)
+      committed_volume_cuft = sum(order(s).volume_cuft for s in stops_in)
+    input_set: "RouteStops of the route whose status is PLANNED or COMPLETED (SKIPPED excluded)"
+    constants: {}
+    precision: "committed_stops integer; weight/volume numeric exact sums"
+    variants: []
+
+  - name: team_liability
+    trigger: "window RESERVE/RELEASE (estimated) and DAMAGED attempt (settled)"
+    algorithm: aggregation
+    formula: |
+      estimated_liability_points = sum(
+        ceil(order(w).declared_value_cents / LIABILITY_VALUE_UNIT_CENTS)
+        for w in team.windows
+        if w.status in {RESERVED, CONFIRMED} and order(w).service_level == WHITE_GLOVE)
+      settled_liability_points = sum(
+        DAMAGE_PENALTY[a.damage_severity]
+        for a in attempts_on_team_orders if a.outcome == DAMAGED)
+    input_set: "estimated: team's WHITE_GLOVE windows in {RESERVED,CONFIRMED}; settled: DAMAGED attempts on team's orders"
+    constants:
+      LIABILITY_VALUE_UNIT_CENTS: 100000
+      DAMAGE_PENALTY: { MINOR: 20, MAJOR: 50 }
+    precision: "integer points; ceil per window for estimated"
+    variants:
+      - name: estimated
+        when: "forward-looking exposure while WHITE_GLOVE windows are still open"
+        difference: "projects risk from declared value of not-yet-delivered white-glove orders"
+      - name: settled
+        when: "realized after actual DAMAGED outcomes"
+        difference: "sums fixed penalties per actual damage severity; ignores declared value"
+
+  - name: route_settlement
+    trigger: "DISPATCHED -> CLOSED transition (POST /routes/{routeId}/close)"
+    algorithm: aggregation
+    formula: |
+      completed = [s for s in route.stops if s.status == COMPLETED]
+      # round the payout PER STOP, THEN sum (pinned order; sum-then-round differs)
+      route_settlement_cents = sum(
+        round_half_up(order(s).final_fee_cents * TEAM_PAYOUT_RATE) for s in completed)
+    input_set: "RouteStops of the route whose status is COMPLETED, ordered by created_at ASC (order-insensitive sum)"
+    constants:
+      TEAM_PAYOUT_RATE: 0.375
+    precision: "integer cents; round_half_up applied PER COMPLETED STOP before summing"
+    variants:
+      - name: per_stop_rounding
+        when: "always on close"
+        difference: "round(final_fee*0.375) per stop then sum; diverges from round(sum(final_fee)*0.375) by up to 1 cent per stop"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and role is recognized"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "acting role is permitted to perform this operation per RBAC matrix"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all write endpoints"
+  - priority: 3
+    category: auth
+    check: "for ownership-scoped ops: DeliveryLead's team == order's route team; Customer's id == order's customer"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /delivery-windows/{windowId}/confirm"
+  - priority: 4
+    category: existence
+    check: "every path id and body FK (depot_id, dock_id, team_id, customer_id, order_id, window_id, route_id, stop_id) resolves, left-to-right"
+    error_id: ERR_ORDER_NOT_FOUND
+    http_status: 404
+    applies_to: "all (per-entity NOT_FOUND variants in 1.6)"
+  - priority: 5
+    category: business_constraint
+    check: "required fields present; enums valid; weight_lbs>0, volume_cuft>0, declared_value_cents>=0; window_end_min>window_start_min"
+    error_id: ERR_VALIDATION
+    http_status: 422
+    applies_to: "all POST/PUT"
+  - priority: 5
+    category: business_temporal
+    check: "window_end_min > window_start_min (structural interval sanity)"
+    error_id: ERR_INVALID_WINDOW
+    http_status: 422
+    applies_to: "POST /delivery-orders/{orderId}/windows"
+  - priority: 6
+    category: state
+    check: "expected_order_version equals the order's current version (OCC)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /delivery-orders/{orderId}/windows"
+  - priority: 7
+    category: state
+    check: "target resource is in a state that permits the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state transitions"
+  - priority: 8
+    category: business_referential
+    check: "add stop: order has no active stop yet"
+    error_id: ERR_ORDER_ALREADY_ROUTED
+    http_status: 409
+    applies_to: "POST /routes/{routeId}/stops"
+  - priority: 8
+    category: business_referential
+    check: "add stop: window.team_id == route.team_id"
+    error_id: ERR_ROUTE_TEAM_MISMATCH
+    http_status: 409
+    applies_to: "POST /routes/{routeId}/stops"
+  - priority: 8
+    category: business_referential
+    check: "add stop: window.service_date == route.service_date"
+    error_id: ERR_WINDOW_ROUTE_DATE_MISMATCH
+    http_status: 409
+    applies_to: "POST /routes/{routeId}/stops"
+  - priority: 8
+    category: business_referential
+    check: "reserve window: team.region_code == customer.region_code"
+    error_id: ERR_REGION_MISMATCH
+    http_status: 409
+    applies_to: "POST /delivery-orders/{orderId}/windows"
+  - priority: 8
+    category: business_referential
+    check: "record attempt: acting DeliveryLead's team == route team of the order's active stop"
+    error_id: ERR_STOP_ORDER_MISMATCH
+    http_status: 409
+    applies_to: "POST /delivery-orders/{orderId}/attempts"
+  - priority: 9
+    category: business_safety
+    check: "reserve window: team.status == ACTIVE"
+    error_id: ERR_TEAM_OUT_OF_SERVICE
+    http_status: 409
+    applies_to: "POST /delivery-orders/{orderId}/windows"
+  - priority: 9
+    category: business_safety
+    check: "WHITE_GLOVE requires white_glove_certified team; assembly requires assembly_certified team (at reserve and at delivery)"
+    error_id: ERR_TEAM_NOT_CERTIFIED
+    http_status: 409
+    applies_to: "POST /delivery-orders/{orderId}/windows, POST /delivery-orders/{orderId}/attempts"
+  - priority: 9
+    category: business_safety
+    check: "DELIVERED attempt requires signature_captured==true AND photo_count>=1 (POD)"
+    error_id: ERR_POD_REQUIRED
+    http_status: 422
+    applies_to: "POST /delivery-orders/{orderId}/attempts"
+  - priority: 10
+    category: business_temporal
+    check: "reserve window: no team window in {RESERVED,CONFIRMED} on same service_date whose [start,end) overlaps"
+    error_id: ERR_TEAM_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /delivery-orders/{orderId}/windows"
+  - priority: 10
+    category: business_temporal
+    check: "book dock appt: no BOOKED appointment on same dock/date within buffer_min gap of the new interval"
+    error_id: ERR_DOCK_SLOT_CONFLICT
+    http_status: 409
+    applies_to: "POST /routes/{routeId}/dock-appointments"
+  - priority: 11
+    category: business_constraint
+    check: "reschedule (REFUSED_RETRY -> SCHEDULED): order.reattempt_count < MAX_REATTEMPTS (=2)"
+    error_id: ERR_MAX_REATTEMPTS
+    http_status: 409
+    applies_to: "POST /delivery-orders/{orderId}/windows"
+  - priority: 11
+    category: business_constraint
+    check: "dispatch: route.dock_ready == true (a BOOKED dock appointment exists)"
+    error_id: ERR_DOCK_APPOINTMENT_MISSING
+    http_status: 409
+    applies_to: "POST /routes/{routeId}/dispatch"
+  - priority: 11
+    category: business_constraint
+    check: "close route: every stop is COMPLETED or SKIPPED"
+    error_id: ERR_ROUTE_NOT_READY_TO_CLOSE
+    http_status: 409
+    applies_to: "POST /routes/{routeId}/close"
+  - priority: 12
+    category: business_fiscal
+    check: "add stop: committed_stops + 1 <= team.max_daily_stops"
+    error_id: ERR_ROUTE_STOPS_EXCEEDED
+    http_status: 409
+    applies_to: "POST /routes/{routeId}/stops"
+  - priority: 12
+    category: business_fiscal
+    check: "add stop: committed_weight_lbs + order.weight_lbs <= team.max_daily_weight_lbs"
+    error_id: ERR_ROUTE_WEIGHT_EXCEEDED
+    http_status: 409
+    applies_to: "POST /routes/{routeId}/stops"
+  - priority: 12
+    category: business_fiscal
+    check: "add stop: committed_volume_cuft + order.volume_cuft <= team.max_daily_volume_cuft"
+    error_id: ERR_ROUTE_VOLUME_EXCEEDED
+    http_status: 409
+    applies_to: "POST /routes/{routeId}/stops"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Depot ---
+  - method: POST
+    path: "/depots"
+    description: "Create a depot"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [name, region_code]
+    output: Depot
+    side_effects: []
+  - method: GET
+    path: "/depots"
+    description: "List depots"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "Depot[]"
+    side_effects: []
+
+  # --- Dock ---
+  - method: POST
+    path: "/docks"
+    description: "Create a loading dock at a depot"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [depot_id, dock_code, "slot_length_min?", "buffer_min?"]
+    output: Dock
+    side_effects: ["status = OPEN"]
+  - method: GET
+    path: "/docks"
+    description: "List docks (reverse-reachability for Dock.depot_id)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: ["depot_id?", "limit?", "offset?"]
+    output: "Dock[]"
+    side_effects: []
+  - method: GET
+    path: "/docks/{dockId}"
+    description: "Get a dock"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: []
+    output: Dock
+    side_effects: []
+  - method: POST
+    path: "/docks/{dockId}/close"
+    description: "Close a dock; releases its BOOKED appointments (cascade)"
+    roles: [DockCoordinator]
+    code: 200
+    input: []
+    output: Dock
+    side_effects:
+      - "status -> CLOSED"
+      - "each BOOKED DockAppointment on dock -> RELEASED (hop1)"
+      - "each such route.dock_appointment_id -> null, route.dock_ready -> false (hop2)"
+
+  # --- DeliveryTeam ---
+  - method: POST
+    path: "/delivery-teams"
+    description: "Create a two-person delivery crew"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [depot_id, team_name, lead_name, member2_name, region_code, max_daily_stops, max_daily_weight_lbs, max_daily_volume_cuft, "white_glove_certified?", "assembly_certified?", "status?"]
+    output: DeliveryTeam
+    side_effects: ["estimated_liability_points = 0", "settled_liability_points = 0"]
+  - method: GET
+    path: "/delivery-teams"
+    description: "List teams (reverse-reachability for DeliveryTeam.depot_id)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: ["depot_id?", "limit?", "offset?"]
+    output: "DeliveryTeam[]"
+    side_effects: []
+  - method: GET
+    path: "/delivery-teams/{teamId}"
+    description: "Get a team (exposes estimated/settled liability points)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: []
+    output: DeliveryTeam
+    side_effects: []
+
+  # --- Customer ---
+  - method: POST
+    path: "/customers"
+    description: "Create a customer / delivery address"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [full_name, address_line, region_code, geo_lat, geo_lng]
+    output: Customer
+    side_effects: ["outstanding_balance_cents = 0"]
+  - method: GET
+    path: "/customers/{customerId}"
+    description: "Get a customer (exposes outstanding_balance_cents)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  # --- DeliveryOrder ---
+  - method: POST
+    path: "/delivery-orders"
+    description: "Create a big & bulky delivery order"
+    roles: [DispatchPlanner]
+    code: 201
+    input: [customer_id, item_description, weight_lbs, volume_cuft, declared_value_cents, service_level, "assembly_required?", "haul_away_required?", "stair_flights?"]
+    output: DeliveryOrder
+    side_effects: ["status = CREATED", "compute quoted_fee_cents (calc order_fee_quote)"]
+  - method: GET
+    path: "/delivery-orders"
+    description: "List orders (reverse-reachability for DeliveryOrder.customer_id)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: ["customer_id?", "status?", "limit?", "offset?"]
+    output: "DeliveryOrder[]"
+    side_effects: []
+  - method: GET
+    path: "/delivery-orders/{orderId}"
+    description: "Get an order"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: []
+    output: DeliveryOrder
+    side_effects: []
+  - method: POST
+    path: "/delivery-orders/{orderId}/windows"
+    description: "Reserve (or reschedule/supersede) a delivery window for an order; OCC on order.version"
+    roles: [DispatchPlanner]
+    code: 201
+    input: [team_id, service_date, window_start_min, window_end_min, expected_order_version]
+    output: DeliveryWindow
+    side_effects:
+      - "create DeliveryWindow (RESERVED); set order.active_window_id"
+      - "order.status -> SCHEDULED"
+      - "prior active window (if any) -> RELEASED (supersede)"
+      - "increments DeliveryOrder.version by 1"
+      - "recompute team.estimated_liability_points"
+  - method: GET
+    path: "/delivery-orders/{orderId}/attempts"
+    description: "List an order's attempts (reverse-reachability for DeliveryAttempt.order_id)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "DeliveryAttempt[]"
+    side_effects: []
+  - method: POST
+    path: "/delivery-orders/{orderId}/attempts"
+    description: "Record a field delivery attempt (POD / refusal / damage)"
+    roles: [DeliveryLead]
+    code: 201
+    input: [outcome, "refusal_reason?", "damage_severity?", "placement?", "signature_captured?", "photo_count?", "assembly_completed?", "debris_weight_lbs?"]
+    output: DeliveryAttempt
+    side_effects:
+      - "DELIVERED: stop -> COMPLETED; order -> DELIVERED; compute order.final_fee_cents (calc order_fee_final); window -> COMPLETED"
+      - "FAILED: order.reattempt_count += 1; stop -> SKIPPED; recompute route committed_* (release); window -> RELEASED; order -> REFUSED_RETRY"
+      - "DAMAGED: team.settled_liability_points += penalty (recompute team_liability)"
+  - method: POST
+    path: "/delivery-orders/{orderId}/settle"
+    description: "Settle a delivered order onto the customer ledger"
+    roles: [DispatchPlanner]
+    code: 200
+    input: []
+    output: DeliveryOrder
+    side_effects: ["order -> SETTLED", "customer.outstanding_balance_cents += order.final_fee_cents"]
+  - method: POST
+    path: "/delivery-orders/{orderId}/void-delivery"
+    description: "Reverse a settled delivery (compensating money leg)"
+    roles: [DispatchPlanner]
+    code: 200
+    input: []
+    output: DeliveryOrder
+    side_effects: ["order -> RETURNED", "customer.outstanding_balance_cents -= order.final_fee_cents"]
+  - method: POST
+    path: "/delivery-orders/{orderId}/cancel"
+    description: "Cancel an order before delivery"
+    roles: [DispatchPlanner]
+    code: 200
+    input: []
+    output: DeliveryOrder
+    side_effects: ["any active window -> RELEASED", "order -> CANCELLED"]
+
+  # --- DeliveryWindow ---
+  - method: GET
+    path: "/delivery-windows"
+    description: "List windows (reverse-reachability for DeliveryWindow.order_id and DeliveryWindow.team_id)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: ["order_id?", "team_id?", "limit?", "offset?"]
+    output: "DeliveryWindow[]"
+    side_effects: []
+  - method: GET
+    path: "/delivery-windows/{windowId}"
+    description: "Get a delivery window"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: []
+    output: DeliveryWindow
+    side_effects: []
+  - method: POST
+    path: "/delivery-windows/{windowId}/confirm"
+    description: "Customer confirms a reserved window"
+    roles: [Customer]
+    code: 200
+    input: []
+    output: DeliveryWindow
+    side_effects: ["window.status -> CONFIRMED"]
+
+  # --- Route ---
+  - method: POST
+    path: "/routes"
+    description: "Create a route (trip) for a team on a service date"
+    roles: [DispatchPlanner]
+    code: 201
+    input: [depot_id, team_id, service_date]
+    output: Route
+    side_effects: ["status = PLANNING", "committed_* = 0", "dock_ready = false"]
+  - method: GET
+    path: "/routes"
+    description: "List routes (reverse-reachability for Route.depot_id and Route.team_id)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: ["depot_id?", "team_id?", "limit?", "offset?"]
+    output: "Route[]"
+    side_effects: []
+  - method: GET
+    path: "/routes/{routeId}"
+    description: "Get a route (exposes committed_* and route_settlement_cents)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: []
+    output: Route
+    side_effects: []
+  - method: POST
+    path: "/routes/{routeId}/stops"
+    description: "Add a scheduled order as a stop on the route (consumes route capacity)"
+    roles: [DispatchPlanner]
+    code: 201
+    input: [order_id, window_id, "sequence?"]
+    output: RouteStop
+    side_effects:
+      - "create RouteStop (PLANNED); set order.active_stop_id; order -> ROUTED"
+      - "recompute route.committed_stops / committed_weight_lbs / committed_volume_cuft"
+  - method: GET
+    path: "/routes/{routeId}/stops"
+    description: "List a route's stops (reverse-reachability for RouteStop.route_id)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "RouteStop[]"
+    side_effects: []
+  - method: POST
+    path: "/routes/{routeId}/stops/{stopId}/remove"
+    description: "Un-route a stop before dispatch (releases capacity)"
+    roles: [DispatchPlanner]
+    code: 200
+    input: []
+    output: RouteStop
+    side_effects:
+      - "stop -> SKIPPED; order -> SCHEDULED; clear order.active_stop_id"
+      - "recompute route committed_* (capacity released)"
+  - method: POST
+    path: "/routes/{routeId}/dispatch"
+    description: "Dispatch a route; cascades its orders to OUT_FOR_DELIVERY"
+    roles: [DispatchPlanner]
+    code: 200
+    input: []
+    output: Route
+    side_effects: ["route -> DISPATCHED", "each PLANNED stop's order -> OUT_FOR_DELIVERY"]
+  - method: POST
+    path: "/routes/{routeId}/close"
+    description: "Close a dispatched route; computes team payout settlement"
+    roles: [DispatchPlanner]
+    code: 200
+    input: []
+    output: Route
+    side_effects: ["route -> CLOSED", "compute route_settlement_cents (calc route_settlement)", "BOOKED dock appointment -> COMPLETED"]
+
+  # --- RouteStop list ---
+  - method: GET
+    path: "/route-stops/{stopId}"
+    description: "Get a single route stop"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: []
+    output: RouteStop
+    side_effects: []
+  - method: GET
+    path: "/route-stops"
+    description: "List stops (reverse-reachability for RouteStop.order_id and RouteStop.window_id)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: ["route_id?", "order_id?", "window_id?", "limit?", "offset?"]
+    output: "RouteStop[]"
+    side_effects: []
+
+  # --- DockAppointment ---
+  - method: POST
+    path: "/routes/{routeId}/dock-appointments"
+    description: "Book a dock loading slot for a route (temporal overlap + buffer on the dock)"
+    roles: [DockCoordinator]
+    code: 201
+    input: [dock_id, appt_date, appt_start_min, appt_end_min]
+    output: DockAppointment
+    side_effects: ["appointment BOOKED", "route.dock_appointment_id set", "route.dock_ready -> true"]
+  - method: GET
+    path: "/dock-appointments/{apptId}"
+    description: "Get a single dock appointment"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: []
+    output: DockAppointment
+    side_effects: []
+  - method: GET
+    path: "/dock-appointments"
+    description: "List dock appointments (reverse-reachability for DockAppointment.dock_id and DockAppointment.route_id)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: ["dock_id?", "route_id?", "limit?", "offset?"]
+    output: "DockAppointment[]"
+    side_effects: []
+
+  # --- DeliveryAttempt list ---
+  - method: GET
+    path: "/delivery-attempts/{attemptId}"
+    description: "Get a single delivery attempt"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: []
+    output: DeliveryAttempt
+    side_effects: []
+  - method: GET
+    path: "/delivery-attempts"
+    description: "List attempts (reverse-reachability for DeliveryAttempt.stop_id and DeliveryAttempt.order_id)"
+    roles: [PlatformAdmin, DispatchPlanner, DockCoordinator, DeliveryLead, Customer]
+    code: 200
+    input: ["order_id?", "stop_id?", "limit?", "offset?"]
+    output: "DeliveryAttempt[]"
+    side_effects: []
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/unrecognized X-User-Role or X-User-ID" }
+  - { id: ERR_UNAUTHORIZED, http: 403, condition: "Authenticated role not permitted for this operation" }
+  - { id: ERR_NOT_RESOURCE_OWNER, http: 403, condition: "Customer confirming a window that is not for their own order" }
+  - { id: ERR_VALIDATION, http: 422, condition: "Missing required field, bad enum/type, non-positive weight/volume, or negative declared value" }
+  - { id: ERR_DEPOT_NOT_FOUND, http: 404, condition: "depot_id does not resolve" }
+  - { id: ERR_DOCK_NOT_FOUND, http: 404, condition: "dock_id does not resolve" }
+  - { id: ERR_TEAM_NOT_FOUND, http: 404, condition: "team_id does not resolve" }
+  - { id: ERR_CUSTOMER_NOT_FOUND, http: 404, condition: "customer_id does not resolve" }
+  - { id: ERR_ORDER_NOT_FOUND, http: 404, condition: "order_id does not resolve" }
+  - { id: ERR_WINDOW_NOT_FOUND, http: 404, condition: "window_id does not resolve" }
+  - { id: ERR_ROUTE_NOT_FOUND, http: 404, condition: "route_id does not resolve" }
+  - { id: ERR_STOP_NOT_FOUND, http: 404, condition: "stop_id does not resolve" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Target resource not in a state that permits the requested transition" }
+  - { id: ERR_INVALID_WINDOW, http: 422, condition: "window_end_min <= window_start_min" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_order_version does not equal the order's current version (OCC)" }
+  - { id: ERR_ORDER_ALREADY_ROUTED, http: 409, condition: "Adding a stop for an order that already has an active PLANNED stop" }
+  - { id: ERR_ROUTE_TEAM_MISMATCH, http: 409, condition: "Stop's window.team_id differs from route.team_id" }
+  - { id: ERR_WINDOW_ROUTE_DATE_MISMATCH, http: 409, condition: "Stop's window.service_date differs from route.service_date" }
+  - { id: ERR_REGION_MISMATCH, http: 409, condition: "Team.region_code differs from customer.region_code at window reserve" }
+  - { id: ERR_STOP_ORDER_MISMATCH, http: 409, condition: "Attempting DeliveryLead's team is not the route team of the order's active stop" }
+  - { id: ERR_TEAM_OUT_OF_SERVICE, http: 409, condition: "Reserving a window on a team whose status is OUT_OF_SERVICE" }
+  - { id: ERR_TEAM_NOT_CERTIFIED, http: 409, condition: "WHITE_GLOVE without white_glove_certified team, or assembly without assembly_certified team" }
+  - { id: ERR_POD_REQUIRED, http: 422, condition: "DELIVERED attempt without signature_captured==true and photo_count>=1" }
+  - { id: ERR_TEAM_WINDOW_CONFLICT, http: 409, condition: "New window overlaps an existing RESERVED/CONFIRMED window for the same team on the same date" }
+  - { id: ERR_DOCK_SLOT_CONFLICT, http: 409, condition: "New dock appointment violates buffer_min gap against a BOOKED appointment on the same dock/date" }
+  - { id: ERR_MAX_REATTEMPTS, http: 409, condition: "Rescheduling when order.reattempt_count >= MAX_REATTEMPTS (2)" }
+  - { id: ERR_DOCK_APPOINTMENT_MISSING, http: 409, condition: "Dispatching a route with no BOOKED dock appointment (dock_ready false)" }
+  - { id: ERR_ROUTE_NOT_READY_TO_CLOSE, http: 409, condition: "Closing a route with a non-terminal (PLANNED) stop" }
+  - { id: ERR_ROUTE_STOPS_EXCEEDED, http: 409, condition: "Adding a stop would exceed team.max_daily_stops" }
+  - { id: ERR_ROUTE_WEIGHT_EXCEEDED, http: 409, condition: "Adding a stop would exceed team.max_daily_weight_lbs" }
+  - { id: ERR_ROUTE_VOLUME_EXCEEDED, http: 409, condition: "Adding a stop would exceed team.max_daily_volume_cuft" }
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Network operator; sets up depots, docks, teams, and customers"
+    identity: opaque
+    exclusive_operations:
+      - "POST /depots"
+      - "POST /docks"
+      - "POST /delivery-teams"
+      - "POST /customers"
+    shared_operations:
+      - "all GET endpoints"
+  - name: DispatchPlanner
+    description: "Plans orders, windows, routes and drives the fulfillment lifecycle"
+    identity: opaque
+    exclusive_operations:
+      - "POST /delivery-orders"
+      - "POST /delivery-orders/{orderId}/windows"
+      - "POST /delivery-orders/{orderId}/settle"
+      - "POST /delivery-orders/{orderId}/void-delivery"
+      - "POST /delivery-orders/{orderId}/cancel"
+      - "POST /routes"
+      - "POST /routes/{routeId}/stops"
+      - "POST /routes/{routeId}/stops/{stopId}/remove"
+      - "POST /routes/{routeId}/dispatch"
+      - "POST /routes/{routeId}/close"
+    shared_operations:
+      - "all GET endpoints"
+  - name: DockCoordinator
+    description: "Manages docks and dock loading appointments"
+    identity: opaque
+    exclusive_operations:
+      - "POST /docks/{dockId}/close"
+      - "POST /routes/{routeId}/dock-appointments"
+    shared_operations:
+      - "all GET endpoints"
+  - name: DeliveryLead
+    description: "Two-person crew lead; records field delivery attempts and POD"
+    identity: "entity_backed:DeliveryTeam"
+    exclusive_operations:
+      - "POST /delivery-orders/{orderId}/attempts"
+    shared_operations:
+      - "all GET endpoints"
+  - name: Customer
+    description: "Recipient; confirms their own reserved delivery window"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /delivery-windows/{windowId}/confirm"
+    shared_operations:
+      - "all GET endpoints"

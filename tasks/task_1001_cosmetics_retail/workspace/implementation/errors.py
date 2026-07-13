@@ -1,0 +1,57 @@
+"""Error catalogue (PRD section 5)."""
+
+HTTP_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_FORBIDDEN_OWNERSHIP": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_STORE_NOT_FOUND": 404,
+    "ERR_PRODUCT_NOT_FOUND": 404,
+    "ERR_VARIANT_NOT_FOUND": 404,
+    "ERR_CUSTOMER_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_ORDER_LINE_NOT_FOUND": 404,
+    "ERR_LOT_NOT_FOUND": 404,
+    "ERR_PROMOTION_NOT_FOUND": 404,
+    "ERR_ARTIST_NOT_FOUND": 404,
+    "ERR_BOOKING_NOT_FOUND": 404,
+    "ERR_RETURN_NOT_FOUND": 404,
+    "ERR_INVALID_ORDER_STATE": 409,
+    "ERR_INVALID_BOOKING_STATE": 409,
+    "ERR_INVALID_RETURN_STATE": 409,
+    "ERR_STALE_ORDER_VERSION": 412,
+    "ERR_STALE_LOT_VERSION": 412,
+    "ERR_RETURN_PRIVILEGE_SUSPENDED": 403,
+    "ERR_HYGIENE_NON_RETURNABLE": 422,
+    "ERR_TESTER_NOT_ALLOWED": 422,
+    "ERR_RETURN_WINDOW_EXPIRED": 422,
+    "ERR_RETURN_QUANTITY_EXCEEDS_LINE": 422,
+    "ERR_ARTIST_TIME_CONFLICT": 409,
+    "ERR_PICKUP_SLOT_FULL": 409,
+    "ERR_MAX_RESCHEDULES": 409,
+    "ERR_BOOKING_ORDER_MISMATCH": 422,
+    "ERR_STORE_NOT_ACTIVE": 409,
+    "ERR_VARIANT_NOT_SELLABLE": 409,
+    "ERR_LAUNCH_NOT_OPEN": 409,
+    "ERR_LAUNCH_TIER_LOCKED": 403,
+    "ERR_LAUNCH_CAP_EXCEEDED": 409,
+    "ERR_INSUFFICIENT_STOCK": 409,
+    "ERR_INSUFFICIENT_POINTS": 422,
+    "ERR_POINTS_EXCEED_SUBTOTAL": 422,
+    "ERR_PAYMENT_NOT_CAPTURED": 409,
+    "ERR_NO_SHADE_MATCH": 422,
+    "ERR_LOT_ALREADY_EXISTS": 409,
+    "ERR_NOT_FOUND": 404,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super(ApiError, self).__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = http_status or HTTP_STATUS.get(error_id, 400)
+
+
+def invalid(message):
+    return ApiError("ERR_INVALID_REQUEST", message)

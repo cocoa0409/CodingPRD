@@ -1,0 +1,25 @@
+"""Domain thresholds — numeric constants from the PRD's pricing rules."""
+
+# Rental / broomball tiered pricing (PRD §3.6)
+PEAK_RATE_CENTS_PER_HOUR = 20000
+OFF_PEAK_RATE_CENTS_PER_HOUR = 12000
+MEMBER_DISCOUNT_PCT = 0.10
+BROOMBALL_EQUIPMENT_CENTS = 5000
+RESURFACE_SURCHARGE_CENTS = 4000
+
+# Rink operating-hour defaults (PRD §3.1)
+DEFAULT_OPEN_HOUR_UTC = 6
+DEFAULT_CLOSE_HOUR_UTC = 23
+DEFAULT_PEAK_START_HOUR_UTC = 16
+
+# Logical clock startup default (PRD §2.4)
+CLOCK_STARTUP_DEFAULT = "2026-05-01T00:00:00Z"
+
+# Pagination (PRD §2.3)
+PAGINATION_DEFAULT_LIMIT = 10
+PAGINATION_MIN_LIMIT = 1
+PAGINATION_MAX_LIMIT = 100
+PAGINATION_DEFAULT_OFFSET = 0
+
+# Convenient large wallet balance for setups
+DEFAULT_WALLET_TOPUP = 100000

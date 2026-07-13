@@ -1,0 +1,33 @@
+"""Domain thresholds — numeric constants from the PRD's calculations and windows."""
+
+# Pricing / tax / surcharges
+TAX_RATE = 0.0875
+SEASONAL_SURCHARGE_CENTS_PER_SCOOP = 40
+
+# Inventory
+SCOOP_VOLUME_ML = 90
+SHRINK_ALLOWANCE_PCT = 0.05
+
+# Loyalty
+PUNCH_THRESHOLD = 10
+
+# Catering / deposits
+CATERING_RATE_CENTS_PER_ML = 2
+DEPOSIT_PCT = 0.20
+
+# Resource windows
+STATION_CLEAN_BUFFER_MIN = 30
+
+# The server's logical clock startup default (before any /_clock/set_current_utc call).
+DEFAULT_CLOCK_UTC = "2026-05-01T00:00:00Z"
+
+THRESHOLDS = {
+    "TAX_RATE": TAX_RATE,
+    "SEASONAL_SURCHARGE_CENTS_PER_SCOOP": SEASONAL_SURCHARGE_CENTS_PER_SCOOP,
+    "SCOOP_VOLUME_ML": SCOOP_VOLUME_ML,
+    "SHRINK_ALLOWANCE_PCT": SHRINK_ALLOWANCE_PCT,
+    "PUNCH_THRESHOLD": PUNCH_THRESHOLD,
+    "CATERING_RATE_CENTS_PER_ML": CATERING_RATE_CENTS_PER_ML,
+    "DEPOSIT_PCT": DEPOSIT_PCT,
+    "STATION_CLEAN_BUFFER_MIN": STATION_CLEAN_BUFFER_MIN,
+}
