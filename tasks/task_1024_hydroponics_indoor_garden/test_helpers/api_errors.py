@@ -1,0 +1,50 @@
+"""Error IDs and HTTP status mapping (PRD Section 5, Error Code Catalogue).
+
+After defining the mapping we register it with the framework so validate_error()
+auto-checks HTTP status codes.
+"""
+from enum import Enum
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+    ERR_OWNERSHIP_REQUIRED = "ERR_OWNERSHIP_REQUIRED"
+    ERR_NOT_FOUND = "ERR_NOT_FOUND"
+    ERR_VALIDATION = "ERR_VALIDATION"
+    ERR_INVALID_STATE = "ERR_INVALID_STATE"
+    ERR_ACCOUNT_NOT_ACTIVE = "ERR_ACCOUNT_NOT_ACTIVE"
+    ERR_SESSION_NOT_OPEN = "ERR_SESSION_NOT_OPEN"
+    ERR_SUBSCRIPTION_INVALID = "ERR_SUBSCRIPTION_INVALID"
+    ERR_HAZMAT_NOT_RETURNABLE = "ERR_HAZMAT_NOT_RETURNABLE"
+    ERR_CONSULTANT_UNAVAILABLE = "ERR_CONSULTANT_UNAVAILABLE"
+    ERR_ROOM_DOUBLE_BOOKED = "ERR_ROOM_DOUBLE_BOOKED"
+    ERR_PRODUCT_NOT_IN_ORDER = "ERR_PRODUCT_NOT_IN_ORDER"
+    ERR_INSUFFICIENT_STOCK = "ERR_INSUFFICIENT_STOCK"
+    ERR_CREDIT_LIMIT_EXCEEDED = "ERR_CREDIT_LIMIT_EXCEEDED"
+    ERR_STALE_VERSION = "ERR_STALE_VERSION"
+
+
+HTTP_STATUS_CODES: dict = {
+    ApiErrorId.ERR_UNAUTHENTICATED: 401,
+    ApiErrorId.ERR_UNAUTHORIZED: 403,
+    ApiErrorId.ERR_OWNERSHIP_REQUIRED: 403,
+    ApiErrorId.ERR_NOT_FOUND: 404,
+    ApiErrorId.ERR_VALIDATION: 422,
+    ApiErrorId.ERR_INVALID_STATE: 409,
+    ApiErrorId.ERR_ACCOUNT_NOT_ACTIVE: 409,
+    ApiErrorId.ERR_SESSION_NOT_OPEN: 409,
+    ApiErrorId.ERR_SUBSCRIPTION_INVALID: 409,
+    ApiErrorId.ERR_HAZMAT_NOT_RETURNABLE: 422,
+    ApiErrorId.ERR_CONSULTANT_UNAVAILABLE: 409,
+    ApiErrorId.ERR_ROOM_DOUBLE_BOOKED: 409,
+    ApiErrorId.ERR_PRODUCT_NOT_IN_ORDER: 409,
+    ApiErrorId.ERR_INSUFFICIENT_STOCK: 409,
+    ApiErrorId.ERR_CREDIT_LIMIT_EXCEEDED: 402,
+    ApiErrorId.ERR_STALE_VERSION: 412,
+}
+
+
+# Register with the framework so validate_error() auto-checks HTTP status.
+set_error_http_status_map({k.value: v for k, v in HTTP_STATUS_CODES.items()})

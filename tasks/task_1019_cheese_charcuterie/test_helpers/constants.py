@@ -1,0 +1,35 @@
+"""Domain thresholds and constants named in the PRD's calculations and rules (§2, §3)."""
+
+# Wholesale volume-discount tiers and delivery fee (PRD §3.5).
+WHOLESALE_TIER_1_WEIGHT_G = 5000      # >= this weight earns the tier-1 discount
+WHOLESALE_TIER_2_WEIGHT_G = 20000     # >= this weight earns the tier-2 discount
+WHOLESALE_TIER_1_PCT = 0.08
+WHOLESALE_TIER_2_PCT = 0.15
+MAX_WHOLESALE_DISCOUNT_CENTS = 50000
+DELIVERY_FEE_CENTS = 2500
+
+# Board assembly fee (PRD §3.3).
+BOARD_ASSEMBLY_FEE_CENTS = 1500
+
+# Lot shrink ceiling (PRD §3.2).
+LOT_MAX_SHRINK_PCT = 0.35
+
+# Raw-milk legal minimum aging (PRD §3.5).
+RAW_MILK_MIN_LEGAL_AGING_DAYS = 60
+
+# Wholesale fiscal floor at submit (PRD §3.5).
+WHOLESALE_MIN_ORDER_CENTS = 10000
+
+# Logical clock startup default (PRD §2.5).
+CLOCK_DEFAULT = "2026-07-01T00:00:00Z"
+
+THRESHOLDS = {
+    "WHOLESALE_TIER_1_WEIGHT_G": WHOLESALE_TIER_1_WEIGHT_G,
+    "WHOLESALE_TIER_2_WEIGHT_G": WHOLESALE_TIER_2_WEIGHT_G,
+    "MAX_WHOLESALE_DISCOUNT_CENTS": MAX_WHOLESALE_DISCOUNT_CENTS,
+    "DELIVERY_FEE_CENTS": DELIVERY_FEE_CENTS,
+    "BOARD_ASSEMBLY_FEE_CENTS": BOARD_ASSEMBLY_FEE_CENTS,
+    "LOT_MAX_SHRINK_PCT": LOT_MAX_SHRINK_PCT,
+    "RAW_MILK_MIN_LEGAL_AGING_DAYS": RAW_MILK_MIN_LEGAL_AGING_DAYS,
+    "WHOLESALE_MIN_ORDER_CENTS": WHOLESALE_MIN_ORDER_CENTS,
+}

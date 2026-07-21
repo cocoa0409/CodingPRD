@@ -1,0 +1,73 @@
+"""Domain thresholds and defaults drawn from the PRD's stated numbers."""
+
+# Fixed logical-clock startup instant (PRD §2.5).
+DEFAULT_CLOCK_UTC = "2026-07-01T00:00:00Z"
+
+THRESHOLDS = {
+    # Claim eligibility windows
+    "CLAIM_WINDOW_DAYS": 90,
+    "OFFER_GRACE_DAYS": 15,
+    "DEDUPE_WINDOW_DAYS": 365,
+    "MAX_CLAIMS_PER_CLAIMANT_PER_OFFER": 3,
+    "RECEIPT_MAX_LINES": 20,
+    "APPEAL_WINDOW_DAYS": 30,
+    "MAX_APPEALS_PER_CLAIM": 2,
+    # Rebate rate table
+    "DEALER_TIER_1_MAX_UNITS": 9,
+    "DEALER_TIER_2_MAX_UNITS": 49,
+    "DEALER_TIER_1_PCT": 0.05,
+    "DEALER_TIER_2_PCT": 0.08,
+    "DEALER_TIER_3_PCT": 0.12,
+    "CONSUMER_REBATE_PCT": 0.10,
+    "CONSUMER_FLAT_BONUS_CENTS": 500,
+    # Budget and accrual
+    "RESERVE_FACTOR": 0.15,
+    "BUDGET_WARN_PCT": 0.8000,
+    "BUDGET_HARD_PCT": 1.0000,
+    # Payout
+    "CHECK_FEE_CENTS": 150,
+    "CARD_FEE_CENTS": 50,
+    "CARD_METHOD_MIN_CENTS": 2500,
+    "PAYOUT_MIN_CENTS": 100,
+    # Escheat / dormancy
+    "ESCHEAT_DORMANCY_DAYS": 180,
+    "CARD_DORMANCY_DAYS": 90,
+    "VIRTUAL_CARD_VALID_DAYS": 365,
+    # Fraud scoring
+    "FRAUD_SCORE_MIN": 0,
+    "FRAUD_SCORE_MAX": 100,
+    "FRAUD_SCORE_THRESHOLD": 70,
+    "W_DENIED": 15,
+    "W_DUPLICATE": 25,
+    "W_VELOCITY": 10,
+    "W_HIGH_VALUE": 20,
+    "VELOCITY_FREE_CLAIMS": 2,
+    "VELOCITY_WINDOW_DAYS": 30,
+    "HIGH_VALUE_CLAIM_CENTS": 50000,
+    "SUBSTANTIATION_MULTIPLIER": 1.5,
+    "CLEARANCE_CREDIT": 30,
+}
+
+TEST_DEFAULTS = {
+    "CLOCK": "2026-07-10T00:00:00Z",
+    "BUDGET_TOTAL_CENTS": 1_000_000,
+    "LARGE_BUDGET_TOTAL_CENTS": 100_000_000,
+    "FISCAL_YEAR": 2026,
+    "ESCHEAT_JURISDICTION": "CA",
+    "OFFER_START": "2026-06-01T00:00:00Z",
+    "OFFER_END": "2026-09-01T00:00:00Z",
+    "PURCHASE_DATE": "2026-06-20T00:00:00Z",
+    "MAX_REBATE_CENTS_PER_CLAIM": 500_000,
+    "DEALER_SKU_SCOPE": "TOOLS",
+    "CONSUMER_SKU_SCOPE": "APPLIANCE",
+    "DEALER_MAILING_STATE": "CA",
+    "CONSUMER_MAILING_STATE": "NY",
+    "RETAILER_DEALER": "Bay Supply",
+    "RETAILER_CONSUMER": "MegaMart",
+}
+
+# Operator identifiers for the four opaque staff roles.
+ADMIN_USER_ID = "u-admin-1"
+PROCESSOR_USER_ID = "u-proc-1"
+FINANCE_USER_ID = "u-fin-1"
+FRAUD_USER_ID = "u-fraud-1"

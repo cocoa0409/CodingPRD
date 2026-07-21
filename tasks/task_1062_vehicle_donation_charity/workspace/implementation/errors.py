@@ -1,0 +1,71 @@
+"""Error catalogue (PRD section 5) and the ApiError exception."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_HTTP.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_FORBIDDEN_OWNER": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_DONOR_NOT_FOUND": 404,
+    "ERR_CHARITY_NOT_FOUND": 404,
+    "ERR_DONATION_NOT_FOUND": 404,
+    "ERR_VEHICLE_NOT_FOUND": 404,
+    "ERR_TITLE_RECORD_NOT_FOUND": 404,
+    "ERR_TOW_VENDOR_NOT_FOUND": 404,
+    "ERR_PICKUP_ORDER_NOT_FOUND": 404,
+    "ERR_VENUE_NOT_FOUND": 404,
+    "ERR_AUCTION_LOT_NOT_FOUND": 404,
+    "ERR_TAX_RECEIPT_NOT_FOUND": 404,
+    "ERR_BATCH_NOT_FOUND": 404,
+    "ERR_TASK_NOT_FOUND": 404,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_STALE_DONATION_VERSION": 412,
+    "ERR_STALE_BATCH_VERSION": 412,
+    "ERR_INVALID_DONATION_STATE": 409,
+    "ERR_INVALID_PAYOUT_STATE": 409,
+    "ERR_INVALID_TITLE_STATE": 409,
+    "ERR_INVALID_PICKUP_STATE": 409,
+    "ERR_INVALID_LOT_STATE": 409,
+    "ERR_INVALID_RECEIPT_STATE": 409,
+    "ERR_INVALID_BATCH_STATE": 409,
+    "ERR_INVALID_TASK_STATE": 409,
+    "ERR_DONOR_BLOCKED": 409,
+    "ERR_CHARITY_SUSPENDED": 409,
+    "ERR_VENDOR_SUSPENDED": 409,
+    "ERR_VENUE_SUSPENDED": 409,
+    "ERR_TITLE_NOT_CLEARED": 409,
+    "ERR_TITLE_RESUBMIT_LIMIT": 409,
+    "ERR_RECEIPT_ALREADY_ACTIVE": 409,
+    "ERR_VEHICLE_RECORD_MISSING": 409,
+    "ERR_DUPLICATE_VEHICLE": 409,
+    "ERR_DUPLICATE_VIN": 409,
+    "ERR_DUPLICATE_TITLE_RECORD": 409,
+    "ERR_DONATION_SETTLED": 409,
+    "ERR_PICKUP_WINDOW_INVALID": 422,
+    "ERR_BATCH_PERIOD_INVALID": 422,
+    "ERR_PICKUP_IN_PAST": 422,
+    "ERR_VENDOR_WINDOW_CONFLICT": 409,
+    "ERR_VENDOR_CAPACITY_EXCEEDED": 409,
+    "ERR_PICKUP_ATTEMPTS_EXCEEDED": 409,
+    "ERR_VENUE_CAPACITY_EXCEEDED": 409,
+    "ERR_DUPLICATE_EMAIL": 409,
+    "ERR_DUPLICATE_EIN": 409,
+    "ERR_RESERVE_NOT_MET": 422,
+    "ERR_BATCH_EMPTY": 422,
+    "ERR_FEE_PCT_OUT_OF_RANGE": 422,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers missing or role not recognised.",
+    "ERR_UNAUTHORIZED": "The acting role may not perform this operation.",
+    "ERR_FORBIDDEN_OWNER": "The acting identity does not own this resource.",
+    "ERR_INVALID_REQUEST": "The request payload is malformed.",
+}

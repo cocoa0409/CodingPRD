@@ -1,0 +1,41 @@
+"""Domain thresholds — numeric constants from the PRD calculations (Section 3)."""
+
+# Condition factor table (appraisals and trade-in valuation), PRD 3.2 / 3.5
+CONDITION_FACTOR = {
+    "NEW": 1.00,
+    "MINT": 0.95,
+    "EXCELLENT": 0.88,
+    "GOOD": 0.78,
+    "FAIR": 0.65,
+}
+BOX_PAPERS_PREMIUM = 0.08
+
+# Trade-in / consignment (PRD 3.5)
+TRADE_IN_RATE = 0.70
+CONSIGN_TIER1_CENTS = 500000
+CONSIGN_TIER2_CENTS = 2000000
+CONSIGN_TIER1_BPS = 2000
+CONSIGN_TIER2_BPS = 1500
+CONSIGN_TIER3_BPS = 1000
+
+# Service quote (PRD 3.6)
+BASE_LABOR = {"BATTERY": 8000, "MOVEMENT_OVERHAUL": 60000, "WATER_RESISTANCE": 25000}
+COMPLICATION_MULT = {"STANDARD": 1.0, "CHRONOGRAPH": 1.5, "GRAND_COMPLICATION": 2.5}
+WATER_SURCHARGE_PER_100M = 5000
+MIN_QUOTE_CENTS = 12000
+MAX_QUOTE_CENTS = 500000
+
+# Layaway (PRD 3.4)
+MIN_DEPOSIT_RATE = 0.20
+DEFAULT_GRACE_DAYS = 10
+RESTOCK_FEE_RATE = 0.05
+
+# Waitlist / offers (PRD 3.3)
+TIER_RANK = {"STANDARD": 1, "PREMIER": 2, "VIP": 3}
+OFFER_WINDOW_DAYS = 7
+
+# Bench scheduling (PRD 3.6)
+BENCH_BUFFER_MINUTES = 30
+
+# The server logical clock's startup default (PRD 2.6)
+CLOCK_STARTUP_DEFAULT = "2026-07-01T00:00:00Z"

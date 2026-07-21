@@ -1,0 +1,30 @@
+"""Domain thresholds and numeric constants from the PRD calculations and rules."""
+
+# --- Repair quote (PRD §3.4) ---
+LABOR_RATE_CENTS_PER_HOUR = {"WHEEL": 3500, "HANDLE": 4000, "ZIPPER": 3000, "OTHER": 4500}
+COMPLEXITY_MULT = {"STANDARD": 1.0, "COMPLEX": 1.5}
+MIN_LABOR_CENTS = 1500
+MAX_LABOR_CENTS = 20000
+DIAGNOSTIC_FEE_CENTS = 2500
+
+# --- Sales order pricing (PRD §3.5) ---
+MONOGRAM_FEE_CENTS = 1200
+GIFT_WRAP_FEE_CENTS = 800
+TAX_RATE = 0.08
+TIER_DISCOUNT = {"BRONZE": 0.00, "SILVER": 0.05, "GOLD": 0.10, "PLATINUM": 0.15}
+
+# --- Loyalty (PRD §3.2) ---
+TIER_THRESHOLDS_CENTS = {"BRONZE": 0, "SILVER": 50000, "GOLD": 150000, "PLATINUM": 500000}
+TIER_MULT = {"BRONZE": 1.00, "SILVER": 1.25, "GOLD": 1.50, "PLATINUM": 2.00}
+POINTS_PER_100_CENTS = 1
+
+# --- Trade-in (PRD §3.6) ---
+CONDITION_FACTOR = {"LIKE_NEW": 0.40, "GOOD": 0.30, "FAIR": 0.20, "POOR": 0.10}
+MIN_TRADE_CENTS = 500
+TRADE_IN_OFFER_DAYS = 14
+
+# --- Scheduling (PRD §2.10) ---
+STATION_BUFFER_MIN = 15
+
+# --- Logical clock (PRD §2.5) ---
+DEFAULT_CLOCK_UTC = "2026-07-01T00:00:00Z"
